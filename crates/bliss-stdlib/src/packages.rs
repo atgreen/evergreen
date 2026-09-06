@@ -1567,3 +1567,211 @@ pub fn use_package_by_name(target: BlissVal, used_name: &str) -> Result<(), Blis
     })?;
     use_package(&[used], target)
 }
+
+// ── Core-image serialization of the package registry (bliss-x0f2.7c) ────
+//
+// A core load skips bootstrap, so the stdlib PackageStore (per-package name /
+// nicknames / use-list / shadowing / symbol-table refs, keyed by the package
+// OBJECT's raw tagged value) must ride the image or a loaded core only has the
+// six standard packages Env::new seeded pre-load. The package OBJECTS and their
+// internal/external symbol tables are already carried by the heap snapshot +
+// OffHeap hash-table section — this block only records the Rust-side structure
+// and remaps its references on restore, like the CLOS/macro blocks.
+
+fn pk_put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn pk_put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn pk_put_str(out: &mut Vec<u8>, s: &str) {
+    pk_put_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn pk_get_u32(data: &[u8], off: &mut usize) -> Option<u32> {
+    if data.len() < *off + 4 {
+        return None;
+    }
+    let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+    *off += 4;
+    Some(v)
+}
+
+fn pk_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
+    if data.len() < *off + 8 {
+        return None;
+    }
+    let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    Some(v)
+}
+
+fn pk_get_str(data: &[u8], off: &mut usize) -> Option<String> {
+    let len = pk_get_u32(data, off)? as usize;
+    if data.len() < *off + len {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&data[*off..*off + len]).into_owned();
+    *off += len;
+    Some(s)
+}
+
+/// Serialize the active thread's package store for a core image. Reads raw
+/// tagged words only (no Bliss allocation) — GC-safe post-STW-GC.
+pub fn serialize_package_registry() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PKGS");
+    pk_put_u32(&mut out, 1); // version
+    let Ok(store_arc) = current_store() else {
+        pk_put_u32(&mut out, 0);
+        return out;
+    };
+    let Ok(guard) = store_arc.state.read() else {
+        pk_put_u32(&mut out, 0);
+        return out;
+    };
+    let pkgs: Vec<_> = guard.packages.values().collect();
+    pk_put_u32(&mut out, pkgs.len() as u32);
+    for pkg_arc in pkgs {
+        let Ok(p) = pkg_arc.read() else {
+            // Count already written; emit an empty placeholder record to keep
+            // the stream well-formed (never expected — read locks are short).
+            pk_put_u64(&mut out, 0);
+            pk_put_str(&mut out, "");
+            pk_put_u32(&mut out, 0);
+            pk_put_u32(&mut out, 0);
+            pk_put_u64(&mut out, 0);
+            pk_put_u64(&mut out, 0);
+            pk_put_u32(&mut out, 0);
+            pk_put_u32(&mut out, 0);
+            continue;
+        };
+        pk_put_u64(&mut out, p.object.to_raw());
+        pk_put_str(&mut out, &p.name);
+        pk_put_u32(&mut out, p.nicknames.len() as u32);
+        for n in &p.nicknames {
+            pk_put_str(&mut out, n);
+        }
+        pk_put_u32(&mut out, p.local_nicknames.len() as u32);
+        for (n, v) in &p.local_nicknames {
+            pk_put_str(&mut out, n);
+            pk_put_u64(&mut out, v.to_raw());
+        }
+        pk_put_u64(&mut out, p.internal_symbols.0.to_raw());
+        pk_put_u64(&mut out, p.external_symbols.0.to_raw());
+        pk_put_u32(&mut out, p.shadowing_symbols.len() as u32);
+        for s in &p.shadowing_symbols {
+            pk_put_str(&mut out, s);
+        }
+        pk_put_u32(&mut out, p.use_list.len() as u32);
+        for u in &p.use_list {
+            pk_put_u64(&mut out, u.to_raw());
+        }
+    }
+    out
+}
+
+/// Restore the package store from a core image's PKGS block, remapping every
+/// stored reference through `remap`. REPLACES the active store's contents (the
+/// pre-load seed packages point at the discarded pre-load heap). Returns the
+/// bytes consumed and the restored (name, nicknames) list so the caller can
+/// re-register reader package names. GC-safe: parsing + map inserts only.
+#[allow(clippy::type_complexity)]
+pub fn restore_package_registry(
+    data: &[u8],
+    remap: &dyn Fn(u64) -> u64,
+) -> Result<(usize, Vec<(String, Vec<String>)>), BlissError> {
+    let bad = || BlissError::InvalidImage("package registry block: truncated".into());
+    if data.len() < 8 || &data[..4] != b"PKGS" {
+        return Err(BlissError::InvalidImage(
+            "package registry block: bad marker".into(),
+        ));
+    }
+    let mut off = 4usize;
+    let version = pk_get_u32(data, &mut off).ok_or_else(bad)?;
+    if version != 1 {
+        return Err(BlissError::InvalidImage(format!(
+            "package registry block: unsupported version {version}"
+        )));
+    }
+    let n = pk_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    let mut restored: Vec<Package> = Vec::with_capacity(n);
+    let mut names: Vec<(String, Vec<String>)> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let object = BlissVal::from_raw(remap(pk_get_u64(data, &mut off).ok_or_else(bad)?));
+        let name = pk_get_str(data, &mut off).ok_or_else(bad)?;
+        let n_nick = pk_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let mut nicknames = Vec::with_capacity(n_nick);
+        for _ in 0..n_nick {
+            nicknames.push(pk_get_str(data, &mut off).ok_or_else(bad)?);
+        }
+        let n_local = pk_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let mut local_nicknames = HashMap::default();
+        for _ in 0..n_local {
+            let ln = pk_get_str(data, &mut off).ok_or_else(bad)?;
+            let lv = BlissVal::from_raw(remap(pk_get_u64(data, &mut off).ok_or_else(bad)?));
+            local_nicknames.insert(ln, lv);
+        }
+        let internal =
+            BlissVal::from_raw(remap(pk_get_u64(data, &mut off).ok_or_else(bad)?));
+        let external =
+            BlissVal::from_raw(remap(pk_get_u64(data, &mut off).ok_or_else(bad)?));
+        let n_shadow = pk_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let mut shadowing_symbols = HashSet::default();
+        for _ in 0..n_shadow {
+            shadowing_symbols.insert(pk_get_str(data, &mut off).ok_or_else(bad)?);
+        }
+        let n_use = pk_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let mut use_list = Vec::with_capacity(n_use);
+        for _ in 0..n_use {
+            use_list.push(BlissVal::from_raw(remap(
+                pk_get_u64(data, &mut off).ok_or_else(bad)?,
+            )));
+        }
+        if object == bliss_rt::value::NIL || name.is_empty() {
+            continue; // placeholder record (see serialize)
+        }
+        names.push((name.clone(), nicknames.clone()));
+        if std::env::var_os("BLISS_HOSTREG_DBG").is_some() {
+            eprintln!(
+                ";; pkg restore: {name} internal(is_table={} count={:?}) external(is_table={} count={:?})",
+                crate::hashtable::hash_table_p(internal),
+                crate::hashtable::hash_table_count(internal).ok(),
+                crate::hashtable::hash_table_p(external),
+                crate::hashtable::hash_table_count(external).ok(),
+            );
+        }
+        restored.push(Package {
+            object,
+            name,
+            nicknames,
+            local_nicknames,
+            internal_symbols: PackageSymbolTable(internal),
+            external_symbols: PackageSymbolTable(external),
+            shadowing_symbols,
+            use_list,
+        });
+    }
+    let store_arc = current_store()?;
+    let mut guard = store_arc
+        .state
+        .write()
+        .map_err(|_| lock_poisoned_error("restore_package_registry"))?;
+    guard.packages.clear();
+    for pkg in restored {
+        let id = pkg_id(pkg.object);
+        guard.packages.insert(
+            id,
+            Arc::new(OrderedRwLock::new(
+                LockLevel::Package,
+                id.max(1),
+                "package object",
+                pkg,
+            )),
+        );
+    }
+    Ok((off, names))
+}

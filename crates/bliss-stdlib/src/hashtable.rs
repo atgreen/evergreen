@@ -814,9 +814,56 @@ fn u8_to_weakness(b: u8) -> Option<Weakness> {
     }
 }
 
+/// One serialized hash-table slot value: either a raw tagged word (remapped
+/// through the heap map on restore) or, for an OFF-HEAP interned string (a
+/// `make_lisp_string` object `std::alloc`'d outside the GC heap, invisible to
+/// the snapshot — e.g. every package symbol-table key), the string CONTENT,
+/// re-created via `make_lisp_string` on restore. EQUAL/EQUALP hash strings by
+/// content and `make_lisp_string` interns, so the recreated key behaves
+/// identically.
+enum SlotRec {
+    Raw(u64),
+    Str(String),
+}
+
+fn serialize_slot(out: &mut Vec<u8>, v: BlissVal) {
+    let off_heap_string =
+        v.is_string() && !bliss_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize);
+    if off_heap_string {
+        let s = v.as_string();
+        out.push(1u8);
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    } else {
+        out.push(0u8);
+        out.extend_from_slice(&v.to_raw().to_le_bytes());
+    }
+}
+
+fn read_slot(data: &[u8], off: &mut usize) -> Option<SlotRec> {
+    if data.len() < *off + 1 {
+        return None;
+    }
+    let tag = data[*off];
+    *off += 1;
+    match tag {
+        1 => {
+            let len = read_u32_at(data, off)? as usize;
+            if data.len() < *off + len {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&data[*off..*off + len]).into_owned();
+            *off += len;
+            Some(SlotRec::Str(s))
+        }
+        _ => read_u64_at(data, off).map(SlotRec::Raw),
+    }
+}
+
 /// Serialize every live hash table for a core image. Record layout:
 /// `[n u32]` then per table `[old_addr u64][test u8][weakness u8][sync u8]
-/// [n_entries u32]([key u64][value u64])*`.
+/// [n_entries u32](key-slot value-slot)*`, where a slot is
+/// `[0 u8][raw u64]` or `[1 u8][len u32][utf8 bytes]` (see [`SlotRec`]).
 pub fn serialize_live_tables() -> Vec<u8> {
     let mut out = Vec::new();
     let addrs: Vec<usize> = {
@@ -836,15 +883,15 @@ pub fn serialize_live_tables() -> Vec<u8> {
             out.push(test_to_u8((*inner).test));
             out.push(weakness_to_u8((*inner).weakness));
             out.push((*inner).synchronized as u8);
-            let live: Vec<(u64, u64)> = (*inner)
+            let live: Vec<(BlissVal, BlissVal)> = (*inner)
                 .entries
                 .iter()
-                .filter_map(|e| e.as_ref().map(|e| (e.key.to_raw(), e.value.to_raw())))
+                .filter_map(|e| e.as_ref().map(|e| (e.key, e.value)))
                 .collect();
             out.extend_from_slice(&(live.len() as u32).to_le_bytes());
             for (k, v) in live {
-                out.extend_from_slice(&k.to_le_bytes());
-                out.extend_from_slice(&v.to_le_bytes());
+                serialize_slot(&mut out, k);
+                serialize_slot(&mut out, v);
             }
         }
     }
@@ -874,7 +921,7 @@ fn read_u64_at(data: &[u8], off: &mut usize) -> Option<u64> {
 // and stashes their entry lists; `populate` fills them once Pass 2 has made every
 // key object structurally hashable.
 thread_local! {
-    static PENDING_TABLES: std::cell::RefCell<Vec<(BlissVal, Vec<(u64, u64)>)>> =
+    static PENDING_TABLES: std::cell::RefCell<Vec<(BlissVal, Vec<(SlotRec, SlotRec)>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -916,7 +963,7 @@ pub fn allocate_live_tables(data: &[u8]) -> Vec<(usize, usize)> {
         };
         let mut entries = Vec::with_capacity(m as usize);
         for _ in 0..m {
-            let (Some(k), Some(v)) = (read_u64_at(data, &mut off), read_u64_at(data, &mut off))
+            let (Some(k), Some(v)) = (read_slot(data, &mut off), read_slot(data, &mut off))
             else {
                 break;
             };
@@ -930,28 +977,34 @@ pub fn allocate_live_tables(data: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Phase 2: fill every table allocated by `allocate_live_tables`, remapping each
-/// stored key/value reference through `remap` (the now-final heap old→new map).
-/// GC-safe: `set_gethash` stores already-remapped values and never allocates on
-/// the GC heap; key objects' internals are remapped by now, so hashing is valid.
+/// stored key/value reference through `remap` (the now-final heap old→new map)
+/// and re-creating off-heap-string slots from their carried content. GC-safe:
+/// `set_gethash` stores already-remapped values and `make_lisp_string`
+/// allocates only off the GC heap; key objects' internals are remapped by now,
+/// so hashing is valid.
 pub fn populate_live_tables(remap: &dyn Fn(u64) -> u64) {
     let mut skipped = 0usize;
     let pending = PENDING_TABLES.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (table, entries) in pending {
         for (k, v) in entries {
-            let rk = BlissVal::from_raw(remap(k));
-            let rv = BlissVal::from_raw(remap(v));
-            // A reference that did not relocate into the restored heap points at
-            // an object we could not carry — e.g. a key/value whose body is itself
-            // OFF the GC heap and not yet serialized (package-internal symbol
-            // tables key on off-heap strings; bliss-x0f2 follow-up). Skip it rather
-            // than dereference a stale pointer while hashing the key.
-            let bad = |x: BlissVal| {
-                x.is_heap_object() && !bliss_rt::gc::is_in_heap(unsafe { x.as_ptr() } as usize)
+            // A by-content slot re-creates a live off-heap string in THIS
+            // process — always valid. A raw slot that did not relocate into the
+            // restored heap points at an object we could not carry (an off-heap
+            // body of a type without a by-content record); skip it rather than
+            // dereference a stale pointer while hashing the key.
+            let resolve = |slot: SlotRec| match slot {
+                SlotRec::Raw(raw) => {
+                    let val = BlissVal::from_raw(remap(raw));
+                    let bad = val.is_heap_object()
+                        && !bliss_rt::gc::is_in_heap(unsafe { val.as_ptr() } as usize);
+                    if bad { None } else { Some(val) }
+                }
+                SlotRec::Str(s) => Some(crate::streams::make_lisp_string(&s)),
             };
-            if bad(rk) || bad(rv) {
+            let (Some(rk), Some(rv)) = (resolve(k), resolve(v)) else {
                 skipped += 1;
                 continue;
-            }
+            };
             let _ = set_gethash(rk, table, rv);
         }
     }

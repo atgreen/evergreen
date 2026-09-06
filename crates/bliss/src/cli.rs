@@ -1774,6 +1774,11 @@ fn host_serialize_registries() -> Vec<u8> {
             }
         }
     }
+    // Package registry (bliss-x0f2.7c): the stdlib PackageStore. The package
+    // objects and their symbol tables already ride the heap + OffHeap sections;
+    // this block carries the Rust-side structure (names/nicknames/use-lists/
+    // shadowing/table refs) a loaded core otherwise lacks.
+    out.extend_from_slice(&bliss_stdlib::packages::serialize_package_registry());
     out
 }
 
@@ -1976,6 +1981,28 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
             methods.push((name, defs));
         }
         PENDING_HOST_METHODS.with(|p| *p.borrow_mut() = methods);
+    }
+    // Package registry block (bliss-x0f2.7c): replace the pre-load seed store
+    // with the restored packages, and re-register every name/nickname with the
+    // reader's package-name registry (a plain global, safe to touch here).
+    if std::env::var_os("BLISS_HOSTREG_DBG").is_some() {
+        let peek: Vec<u8> = data[off.min(data.len())..data.len().min(off + 4)].to_vec();
+        eprintln!(
+            ";; host-registry restore: off={off} len={} next4={:?}",
+            data.len(),
+            String::from_utf8_lossy(&peek)
+        );
+    }
+    if off + 4 <= data.len() && &data[off..off + 4] == b"PKGS" {
+        let (consumed, names) = bliss_stdlib::packages::restore_package_registry(&data[off..], &remap)?;
+        off += consumed;
+        let _ = off;
+        for (name, nicknames) in names {
+            reader::register_package(&name);
+            for nick in nicknames {
+                reader::register_package(&nick);
+            }
+        }
     }
     Ok(())
 }

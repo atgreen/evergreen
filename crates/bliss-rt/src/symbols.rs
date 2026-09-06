@@ -456,7 +456,15 @@ fn decode_names(data: &[u8]) -> Result<Vec<String>, BlissError> {
 // address through the heap's per-object old→new map (`gc::remap_saved_pointer`),
 // NOT a uniform delta — so each symbol keeps its heap identity and cells.
 
-/// `[interned u32][obj_raw u64]*[uninterned u32][(idx u32, obj_raw u64)]*`.
+/// `[interned u32][obj_raw u64]*[uninterned u32][(idx u32, obj_raw u64)]*`
+/// `[(key_len u32, key bytes)]*` — one registry key per interned index.
+///
+/// The keys ride explicitly because they are NOT recoverable from the symbol
+/// objects: a package-interned symbol's heap name cell holds its bare name
+/// (`*QUAL*`) while its registry key is package-qualified (`QP::*QUAL*`).
+/// Rebuilding `name_to_index` from name cells made every qualified lookup miss
+/// after a core load, so reading `qp::*qual*` interned a FRESH symbol with
+/// unbound cells and defvar'd globals silently vanished (bliss-x0f2.7.3).
 pub fn serialize_objects() -> Vec<u8> {
     let mut buf = Vec::new();
     with_registry(|reg| {
@@ -473,6 +481,10 @@ pub fn serialize_objects() -> Vec<u8> {
         for (&idx, &obj) in &reg.uninterned {
             buf.extend_from_slice(&idx.to_le_bytes());
             buf.extend_from_slice(&obj.to_raw().to_le_bytes());
+        }
+        for key in &reg.index_to_key {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
         }
     });
     buf
@@ -505,13 +517,21 @@ pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
         let raw = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
         uninterned.insert(idx, remap(raw));
     }
+    // The saved registry keys — the EXACT strings each symbol was interned
+    // under (package-qualified where needed; see `serialize_objects`).
+    let mut saved_keys: Vec<String> = Vec::with_capacity(interned.len());
+    for _ in 0..interned.len() {
+        let len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+        let bytes = take(&mut pos, len)?;
+        saved_keys.push(String::from_utf8_lossy(bytes).into_owned());
+    }
 
-    // Read names + re-pin BEFORE taking the registry write lock (lock ordering:
-    // the heap lock is below the registry lock).
+    // Re-pin BEFORE taking the registry write lock (lock ordering: the heap
+    // lock is below the registry lock).
     let mut name_to_index: HashMap<String, u32> = HashMap::with_capacity(interned.len());
     let mut index_to_key: Vec<String> = Vec::with_capacity(interned.len());
     for (i, &obj) in interned.iter().enumerate() {
-        // Only dereference an entry that remaps to a genuine SYMBOL object in the
+        // Only re-pin an entry that remaps to a genuine SYMBOL object in the
         // current heap. A dangling entry (e.g. a symbol left in the global
         // registry by an earlier heap and absent from this image — or one whose
         // stale address happens to land in the new heap but on non-symbol bytes)
@@ -521,11 +541,13 @@ pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
             index_to_key.push(String::new());
             continue;
         }
-        // SAFETY: `obj` is a restored, remapped, in-heap SYMBOL object.
-        let name = unsafe { (*symbol_data(obj)).name }.as_string();
-        name_to_index.insert(name.clone(), i as u32);
-        index_to_key.push(name);
+        let key = saved_keys[i].clone();
+        if !key.is_empty() {
+            name_to_index.insert(key.clone(), i as u32);
+        }
+        index_to_key.push(key);
         crate::gc::pin_region_containing((obj.to_raw() & !crate::value::TAG_MASK) as usize);
+        // SAFETY: `obj` is a restored, remapped, in-heap SYMBOL object.
         let name_obj = unsafe { (*symbol_data(obj)).name };
         crate::gc::pin_region_containing((name_obj.to_raw() & !crate::value::TAG_MASK) as usize);
     }
