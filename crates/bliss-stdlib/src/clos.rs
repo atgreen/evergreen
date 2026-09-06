@@ -686,10 +686,10 @@ fn u8_to_combination(b: u8) -> MethodCombinationType {
 /// stop-the-world full GC; only reads raw tagged words (no Bliss allocation),
 /// so it is GC-safe.
 pub fn serialize_clos_state() -> Vec<u8> {
-    with_state(|st| {
+    let mut out = with_state(|st| {
         let mut out = Vec::new();
         out.extend_from_slice(b"CLST");
-        cs_put_u32(&mut out, 1); // format version
+        cs_put_u32(&mut out, 2); // format version
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -760,7 +760,59 @@ pub fn serialize_clos_state() -> Vec<u8> {
         }
         out.push(st.bootstrapped as u8);
         out
-    })
+    });
+    // ── Wrappers (bliss-x0f2.7b) ──
+    // Every restored STANDARD_OBJECT instance's offset-8 word is a raw
+    // `*mut ClassWrapper` the loader must remap. Serialize each DISTINCT live
+    // wrapper keyed by its save-time address: the classes' current wrappers,
+    // plus any wrapper still referenced from a heap instance (covers obsolete
+    // wrappers on stale instances after a class redefinition). Runs with no
+    // heap lock held (image.rs calls the hook at top level), so walk_heap can
+    // take it.
+    let current: Vec<(BlissVal, usize)> = with_state(|st| {
+        st.class_meta
+            .iter()
+            .filter(|(_, m)| !m.wrapper.is_null())
+            .map(|(c, m)| (*c, m.wrapper as usize))
+            .collect()
+    });
+    let mut addrs: Vec<usize> = current.iter().map(|(_, w)| *w).collect();
+    let _ = bliss_rt::gc::walk_heap(|body, tid, _size| {
+        if tid == type_id::STANDARD_OBJECT {
+            // SAFETY: walk_heap yields valid object BODY pointers; an
+            // instance's first body word is its wrapper pointer (or null).
+            let w = unsafe { *(body as *const usize) };
+            if w != 0 {
+                addrs.push(w);
+            }
+        }
+        true
+    });
+    addrs.sort_unstable();
+    addrs.dedup();
+    cs_put_u32(&mut out, addrs.len() as u32);
+    for &addr in &addrs {
+        // SAFETY: every collected address is a live leaked ClassWrapper.
+        let w = addr as *const ClassWrapper;
+        unsafe {
+            cs_put_u64(&mut out, addr as u64);
+            cs_put_u64(&mut out, (*w).stamp);
+            out.push((*w).state.load(Ordering::Acquire));
+            cs_put_val(&mut out, (*w).class);
+            cs_put_u32(&mut out, (*w).slot_count);
+            if (*w).layout.is_null() {
+                cs_put_u32(&mut out, 0);
+            } else {
+                cs_put_vals(&mut out, &(*(*w).layout).order);
+            }
+        }
+    }
+    cs_put_u32(&mut out, current.len() as u32);
+    for (class, addr) in &current {
+        cs_put_val(&mut out, *class);
+        cs_put_u64(&mut out, *addr as u64);
+    }
+    out
 }
 
 /// Restore `CLOS_STATE` from a core image's serialized record, remapping every
@@ -779,7 +831,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 1 {
+    if version != 2 {
         return Err(BlissError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -895,8 +947,80 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     st.function_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.heap_object_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.bootstrapped = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+    // ── Wrappers (bliss-x0f2.7b) ──
+    // Recreate each saved ClassWrapper/SlotLayout (leaked, like
+    // finalize_class_layout), building old→new so restored instances' offset-8
+    // words can be rewritten below. Stamps are preserved (instances and their
+    // wrappers must agree); CLASS_STAMP is advanced past the maximum so future
+    // wrappers never collide.
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    let mut wrapper_map: HashMap<usize, usize> = HashMap::with_capacity(n);
+    let mut max_stamp = 0u64;
+    for _ in 0..n {
+        let old_addr = cs_get_u64(data, &mut off).ok_or_else(bad)? as usize;
+        let stamp = cs_get_u64(data, &mut off).ok_or_else(bad)?;
+        let state = cs_get_u8(data, &mut off).ok_or_else(bad)?;
+        let class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let slot_count = cs_get_u32(data, &mut off).ok_or_else(bad)?;
+        let order = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        max_stamp = max_stamp.max(stamp);
+        let mut index = HashMap::with_capacity(order.len());
+        for (i, name) in order.iter().enumerate() {
+            index.insert(*name, i);
+        }
+        let layout: *const SlotLayout = Box::into_raw(Box::new(SlotLayout { order, index }));
+        let wrapper: *mut ClassWrapper = Box::into_raw(Box::new(ClassWrapper {
+            stamp,
+            state: AtomicU8::new(state),
+            class,
+            slot_count,
+            layout,
+        }));
+        wrapper_map.insert(old_addr, wrapper as usize);
+    }
+    // Advance the global stamp counter past every restored stamp.
+    let mut cur = CLASS_STAMP.load(Ordering::Relaxed);
+    while cur <= max_stamp {
+        match CLASS_STAMP.compare_exchange(
+            cur,
+            max_stamp + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(seen) => cur = seen,
+        }
+    }
+    // Point each class's meta at its recreated current wrapper.
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let old_addr = cs_get_u64(data, &mut off).ok_or_else(bad)? as usize;
+        if let (Some(meta), Some(&new_addr)) =
+            (st.class_meta.get_mut(&class), wrapper_map.get(&old_addr))
+        {
+            meta.wrapper = new_addr as *mut ClassWrapper;
+        }
+    }
     with_state_mut(|state| *state = st);
     install_clos_state_root_scanner();
+    // Rewrite every restored instance's wrapper word through the map. An
+    // unmatched (impossible unless the image is inconsistent) or null word is
+    // nulled so a later use fails the null check instead of deref'ing a stale
+    // save-time address. Runs after the host hook regained control, so no heap
+    // lock is held — walk_heap takes it.
+    bliss_rt::gc::walk_heap(|body, tid, _size| {
+        if tid == type_id::STANDARD_OBJECT {
+            // SAFETY: walk_heap yields valid object BODY pointers; the first
+            // body word of a STANDARD_OBJECT instance is its wrapper word.
+            unsafe {
+                let slot = body as *mut usize;
+                let old = *slot;
+                *slot = wrapper_map.get(&old).copied().unwrap_or(0);
+            }
+        }
+        true
+    })?;
     Ok(off)
 }
 
