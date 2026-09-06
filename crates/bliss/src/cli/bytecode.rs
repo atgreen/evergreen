@@ -7680,6 +7680,63 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
         }
     }
 
+    // ── Macros ─────────────────────────────────────────────────────
+    // Global DEFMACROs retain their source (params + body); re-emit each as a
+    // `(defmacro …)` source action so the restored image keeps its macros. Done
+    // BEFORE functions so a function serialized as `(defun …)` source expands its
+    // macro uses at image-load time. Without this, save-lisp-and-die produced an
+    // image that could hold ASDF but not load libraries whose code used UIOP
+    // macros such as NEST (bliss-cje1). Source-free BFASL macros (bytecode
+    // expanders) are excluded by global_macro_source_names — they have no
+    // re-emittable source; a follow-up can serialize their bytecode directly.
+    if let Some(defmacro) = resolve_sym("DEFMACRO") {
+        for name in super::global_macro_source_names() {
+            let Some(name_sym) = resolve_sym(&name) else {
+                continue;
+            };
+            if !name_sym.is_symbol() {
+                continue;
+            }
+            // Re-fetch source right before building the form: a fresh borrow with
+            // no allocation held across it, so params/body are the current
+            // (post-GC) objects. arena_cons roots its args, so the nested build is
+            // GC-safe (same pattern as the DEFUN emission below).
+            let Some((params_form, body)) = super::global_macro_source(&name) else {
+                continue;
+            };
+            let form = arena_cons(defmacro, arena_cons(name_sym, arena_cons(params_form, body)));
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        }
+    }
+
+    // ── Setf-function writers ──────────────────────────────────────
+    // Global `(defun (setf place) …)` writers live in their own registry, not
+    // env.funs; re-emit each as `(defun (setf place) params . body)` so the
+    // restored image can expand `(setf (place …) v)` — e.g. ASDF's
+    // `(setf (operate-level) …)` (bliss-cje1). Same GC-safe re-fetch/arena_cons
+    // pattern as the macros above.
+    if let (Some(defun), Some(setf_sym)) = (defun, resolve_sym("SETF")) {
+        for place in super::global_setf_fn_place_names() {
+            let Some(place_sym) = resolve_sym(&place) else {
+                continue;
+            };
+            if !place_sym.is_symbol() {
+                continue;
+            }
+            let Some((params_form, body)) = super::global_setf_fn_source(&place) else {
+                continue;
+            };
+            // name = (setf place); form = (defun (setf place) params . body)
+            let setf_name = arena_cons(setf_sym, arena_cons(place_sym, NIL));
+            let form = arena_cons(defun, arena_cons(setf_name, arena_cons(params_form, body)));
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        }
+    }
+
     // ── Functions ──────────────────────────────────────────────────
     // A user function lives either in `env.funs` (tree-walked, with its source
     // lambda-list + body) or in the symbol's global function cell as installed

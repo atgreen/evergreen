@@ -1514,6 +1514,58 @@ fn global_macro_insert(name: String, def: MacroDef) {
     bump_macro_env_generation();
 }
 
+/// Names of every global macro that retains source (a `defmacro` body, not a
+/// source-free BFASL bytecode expander). Used by image serialization to re-emit
+/// them as `(defmacro …)` load actions so a saved image keeps its macros
+/// (bliss-cje1 follow-up: `save-lisp-and-die` dropped them, so libraries using
+/// UIOP macros like NEST failed to load from an installed image).
+pub(crate) fn global_macro_source_names() -> Vec<String> {
+    GLOBAL_MACROS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, d)| d.bytecode.is_none())
+            .map(|(n, _)| n.clone())
+            .collect()
+    })
+}
+
+/// The `(params-form, body)` source of a named source-bearing global macro, or
+/// `None`. Re-fetched per name (a fresh borrow, no allocation held across it) so
+/// callers read the current post-GC object locations before rebuilding a form.
+pub(crate) fn global_macro_source(name: &str) -> Option<(BlissVal, BlissVal)> {
+    GLOBAL_MACROS.with(|m| {
+        m.borrow()
+            .get(name)
+            .filter(|d| d.bytecode.is_none())
+            .map(|d| (d.params_form, d.body))
+    })
+}
+
+/// Place names of every global `(defun (setf place) …)` writer (the key is
+/// `"(SETF place)"`; this returns `place`). Image serialization re-emits each as
+/// `(defun (setf place) …)` so a saved image keeps its setf-function writers —
+/// without them a restored image cannot expand `(setf (place …) v)` (bliss-cje1;
+/// e.g. ASDF's `(setf (operate-level) …)`).
+pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
+    GLOBAL_SETF_FNS.with(|m| {
+        m.borrow()
+            .keys()
+            .filter_map(|k| {
+                k.strip_prefix("(SETF ")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .map(str::to_string)
+            })
+            .collect()
+    })
+}
+
+/// The `(params-form, body)` source of a global setf-function writer for `place`,
+/// or `None`. Re-fetched per place (fresh borrow, no allocation across it).
+pub(crate) fn global_setf_fn_source(place: &str) -> Option<(BlissVal, BlissVal)> {
+    let key = format!("(SETF {place})");
+    GLOBAL_SETF_FNS.with(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
+}
+
 fn install_loaded_macro(
     name: BlissVal,
     function: Rc<bliss_rt::bytecode::BytecodeFunction>,

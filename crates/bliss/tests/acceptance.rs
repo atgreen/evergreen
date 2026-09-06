@@ -1259,6 +1259,68 @@ fn image_save_and_load_cycle() {
     );
 }
 
+/// bliss-cje1: a SAVE-LISP-AND-DIE image must preserve global macros and
+/// `(defun (setf place) …)` writers, not just plain functions. Before the fix
+/// the image dropped both — an ASDF-preloaded install could hold ASDF but failed
+/// to load libraries whose code used UIOP macros (NEST) or ASDF's setf-functions.
+#[test]
+fn image_preserves_macros_and_setf_functions() {
+    let dir = std::env::temp_dir().join("bliss_test_image_macros");
+    let _ = std::fs::create_dir_all(&dir);
+    let image_path = dir.join("mac.image");
+    let p = image_path.to_str().unwrap().replace('\\', "\\\\");
+
+    // Save an image defining a macro, a setf-function, and a serializable global.
+    let save_expr = format!(
+        "(progn \
+           (defmacro twice (x) (list '* x 2)) \
+           (defvar *cje1-place* (list 1 2 3)) \
+           (defun (setf cje1-second) (v l) (setf (cadr l) v) v) \
+           (save-lisp-and-die \"{p}\"))"
+    );
+    let output = bliss_bin()
+        .args(["--eval", &save_expr])
+        .output()
+        .expect("run bliss for save-lisp-and-die");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "save-lisp-and-die should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Reload and use the macro and the setf-function.
+    let output = bliss_bin()
+        .args([
+            "--image",
+            image_path.to_str().unwrap(),
+            "--eval",
+            "(progn (format t \"twice=~a \" (twice 21)) \
+                    (setf (cje1-second *cje1-place*) 99) \
+                    (format t \"place=~a\" *cje1-place*))",
+        ])
+        .output()
+        .expect("run bliss with saved image");
+    let _ = std::fs::remove_file(&image_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "reload should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("twice=42"),
+        "macro must survive the image (twice=42), got: {stdout}"
+    );
+    assert!(
+        stdout.contains("place=(1 99 3)"),
+        "setf-function must survive the image (place=(1 99 3)), got: {stdout}"
+    );
+}
+
 /// Regression for the handler re-signal bug (R5.94/R5.102): while a HANDLER-BIND
 /// handler runs, its cluster is disestablished, so a condition it re-signals is
 /// seen only by OLDER handlers — never itself. Before the fix this recursed into
