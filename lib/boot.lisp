@@ -1237,6 +1237,43 @@
                     (t size))))
     (%adjust-array array size fpn iel)))
 
+;; Bit-vector boolean operations (CLHS 14.2.1). Each takes two simple-bit-vectors
+;; of the same length and returns a fresh SIMPLE-BIT-VECTOR of the elementwise
+;; result; BIT-NOT is unary. The optional OPT-RESULT arg (NIL/omitted, T, or a
+;; bit-vector) selects the destination in ANSI, but bliss bit-vectors are built
+;; immutable (bliss-27f5), so these always allocate a fresh result — value-correct
+;; for the ubiquitous 2-arg use; a caller relying on in-place identity is not
+;; served until bit-vectors become mutable. Each op is a bit of a boolean of two
+;; single-bit inputs, so plain LOGAND/LOGIOR/LOGXOR and (- 1 bit) compute them.
+(defun %bit-op-2 (fn bv1 bv2)
+  (let ((n (length bv1)) (bits nil))
+    (dotimes (i n) (push (funcall fn (bit bv1 i) (bit bv2 i)) bits))
+    (%bit-vector-from-bits (nreverse bits))))
+(defun bit-and (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logand a b)) bv1 bv2))
+(defun bit-ior (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logior a b)) bv1 bv2))
+(defun bit-xor (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logxor a b)) bv1 bv2))
+(defun bit-eqv (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (- 1 (logxor a b))) bv1 bv2))
+(defun bit-nand (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (- 1 (logand a b))) bv1 bv2))
+(defun bit-nor (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (- 1 (logior a b))) bv1 bv2))
+(defun bit-andc1 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logand (- 1 a) b)) bv1 bv2))
+(defun bit-andc2 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logand a (- 1 b))) bv1 bv2))
+(defun bit-orc1 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logior (- 1 a) b)) bv1 bv2))
+(defun bit-orc2 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
+  (%bit-op-2 (lambda (a b) (logior a (- 1 b))) bv1 bv2))
+(defun bit-not (bv &optional opt-result) (declare (ignore opt-result))
+  (let ((n (length bv)) (bits nil))
+    (dotimes (i n) (push (- 1 (bit bv i)) bits))
+    (%bit-vector-from-bits (nreverse bits))))
+
 ;; MAKE-SEQUENCE result-type size &key initial-element — a fresh sequence of the
 ;; given type. Dispatches on the type's head: list types build a list, string
 ;; types (or (vector character …)) a string, everything else a general vector.

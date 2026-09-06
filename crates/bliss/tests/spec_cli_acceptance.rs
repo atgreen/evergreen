@@ -2710,3 +2710,28 @@ fn compile_produces_a_callable_function() {
         "(T NIL NIL)"
     );
 }
+
+#[test]
+fn bit_vector_boolean_operations() {
+    // bliss-4s5y: bit-and/ior/xor/not (+ eqv/nand/nor/andc1/andc2/orc1/orc2)
+    // were undefined. They return a fresh simple-bit-vector of the elementwise
+    // boolean (bliss bit-vectors are immutable, so the optional result arg always
+    // allocates fresh). Values checked against the ANSI truth tables.
+    assert_eq!(eval_ok("(bit-and #*1100 #*1010)"), "#*1000");
+    assert_eq!(eval_ok("(bit-ior #*1100 #*1010)"), "#*1110");
+    assert_eq!(eval_ok("(bit-xor #*1100 #*1010)"), "#*0110");
+    assert_eq!(eval_ok("(bit-not #*1100)"), "#*0011");
+    assert_eq!(eval_ok("(bit-eqv #*1100 #*1010)"), "#*1001");
+    assert_eq!(eval_ok("(bit-nand #*1100 #*1010)"), "#*0111");
+    assert_eq!(eval_ok("(bit-nor #*1100 #*1010)"), "#*0001");
+    assert_eq!(eval_ok("(bit-andc1 #*1100 #*1010)"), "#*0010");
+    assert_eq!(eval_ok("(bit-andc2 #*1100 #*1010)"), "#*0100");
+    assert_eq!(eval_ok("(bit-orc1 #*1100 #*1010)"), "#*1011");
+    assert_eq!(eval_ok("(bit-orc2 #*1100 #*1010)"), "#*1101");
+    assert_eq!(eval_ok("(bit-vector-p (bit-and #*11 #*10))"), "T");
+    // Callable as a function value (fboundp / #').
+    assert_eq!(
+        eval_ok("(reduce #'bit-and (list #*111 #*110 #*011))"),
+        "#*010"
+    );
+}
