@@ -287,6 +287,32 @@ actual crash backtrace, each with a filed bead:
    too. Approach: serialize off-heap bodies via their live registries; re-Box +
    re-register + remap keys/values on restore.
 
+## Blocker 2 LANDED: off-heap hash-table bodies (518d9e0, bliss-x0f2.9)
+
+Hash-tables ride a dedicated `OffHeap` image section (SectionType 9). Restore is
+**two-phase** to break a circular dependency: ALLOCATE runs between
+`restore_heap`'s two passes — it re-Boxes each table empty and folds its
+(old,new) body address into the relocation map so Pass 2 / symbol / package
+remaps relocate references TO tables like any heap object (safe under the heap
+lock: pure Box allocation, no GC) — and POPULATE runs after `restore_heap`
+returns, once Pass 2 has remapped key internals (EQUAL/EQUALP hashing recurses
+into the key structure) and the heap lock is free (hashing re-enters the
+collector). Entries whose key/value did not relocate into the restored heap
+(e.g. keys whose own body is off-heap and not yet serialized — package-internal
+symbol tables) are *skipped*, not deref'd (`BLISS_OFFHEAP_DBG=1` reports the
+count). Hooks: `bliss_rt::gc::set_offheap_hooks` ←
+`bliss_stdlib::hashtable::{serialize,allocate,populate}_live_tables`.
+
+Validating it exposed a **pre-existing loader bug** (bliss-64r1, fixed in the
+same commit): `restore_heap` replaced all region state without bumping
+`GC_MOVE_EPOCH`, so threads kept allocating from pre-restore TLABs whose space
+the reset region `alloc_top`s handed out again — the first allocating form
+after a core load silently overwrote the re-opened stdio streams ("stream
+error: not a stream"; reproducible with `BLISS_GC_DISABLE=1`, i.e. not a GC
+bug; masked under `BLISS_GC_STRESS=1`, which retires TLABs early). Remaining
+before the ASDF done-signal: CLOS_STATE restoration (blocker 1, bliss-x0f2.7)
+and any other off-heap body types (streams already re-open; enumerate the rest).
+
 ## Risks / open points
 
 - **Fixed-base availability.** MAP_FIXED_NOREPLACE can fail under ASLR; the delta
