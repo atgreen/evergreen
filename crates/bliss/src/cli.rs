@@ -1566,6 +1566,220 @@ pub(crate) fn global_setf_fn_source(place: &str) -> Option<(BlissVal, BlissVal)>
     GLOBAL_SETF_FNS.with(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
 }
 
+// ── Host-registry image hook (bliss-x0f2 M2) ───────────────────────────
+//
+// The core-dump image restores the GC heap, the symbol registry (value cells),
+// and packages wholesale — that already round-trips non-serializable global
+// VALUES (hash-tables, instances) because they hang off symbol value cells. What
+// the heap snapshot does NOT carry are the Rust-side CODE registries owned by
+// this crate: `GLOBAL_MACROS` and `GLOBAL_SETF_FNS`. bliss-rt cannot see them, so
+// the `bliss` crate contributes them through `image::set_host_registry_hooks` as
+// a `HostRegistries` image section.
+//
+// A macro/setf record is just `(name, params_form, body)` — the params/body are
+// heap conses that `restore_heap` already re-materializes; we only need to carry
+// their (save-time) raw pointers and remap them on restore. `captured_frame`
+// cannot be a heap pointer (it is a Rust `EnvFrame`), but a top-level macro's
+// captured frame is the root env shell (globals resolve through the symbol
+// registry, not the frame), so on restore we rebind it to the fresh root frame.
+// The restore hook runs inside `load_image`, before the interpreter builds its
+// top-level `Env`, so it cannot see that frame yet — it stashes the remapped
+// records in a thread-local pending buffer that the CLI drains right after it
+// constructs the root `Env` (see `drain_pending_host_registries`).
+
+thread_local! {
+    /// Remapped (name, params_form_raw, body_raw) records awaiting rebind to the
+    /// fresh root frame after an image load. Drained by the CLI post-`Env::new`.
+    static PENDING_HOST_MACROS: RefCell<Vec<(String, u64, u64)>> = const { RefCell::new(Vec::new()) };
+    /// Remapped ((SETF place) key, params, params_form_raw, body_raw) records.
+    static PENDING_HOST_SETF: RefCell<Vec<(String, Vec<String>, u64, u64)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn hr_put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn hr_get_str(data: &[u8], off: &mut usize) -> Option<String> {
+    if data.len() < *off + 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap()) as usize;
+    *off += 4;
+    if data.len() < *off + len {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&data[*off..*off + len]).into_owned();
+    *off += len;
+    Some(s)
+}
+
+fn hr_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
+    if data.len() < *off + 8 {
+        return None;
+    }
+    let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    Some(v)
+}
+
+/// Serialize the host-owned code registries into the `HostRegistries` section.
+/// Runs after a stop-the-world major GC (no mutator allocation); only reads raw
+/// tagged pointers, so it is GC-safe. Only source-bearing macros are emitted
+/// (bytecode expanders recompile on demand and their bodies are `NIL`).
+fn host_serialize_registries() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"HREG");
+    // Macros.
+    let macros: Vec<(String, u64, u64)> = GLOBAL_MACROS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, d)| d.bytecode.is_none())
+            .map(|(n, d)| (n.clone(), d.params_form.to_raw(), d.body.to_raw()))
+            .collect()
+    });
+    out.extend_from_slice(&(macros.len() as u32).to_le_bytes());
+    for (name, params_raw, body_raw) in &macros {
+        hr_put_str(&mut out, name);
+        out.extend_from_slice(&params_raw.to_le_bytes());
+        out.extend_from_slice(&body_raw.to_le_bytes());
+    }
+    // Setf-functions.
+    let setfs: Vec<(String, Vec<String>, u64, u64)> = GLOBAL_SETF_FNS.with(|m| {
+        m.borrow()
+            .iter()
+            .map(|(k, f)| {
+                (
+                    k.clone(),
+                    f.params.clone(),
+                    f.params_form.to_raw(),
+                    f.body.to_raw(),
+                )
+            })
+            .collect()
+    });
+    out.extend_from_slice(&(setfs.len() as u32).to_le_bytes());
+    for (key, params, params_raw, body_raw) in &setfs {
+        hr_put_str(&mut out, key);
+        out.extend_from_slice(&(params.len() as u32).to_le_bytes());
+        for p in params {
+            hr_put_str(&mut out, p);
+        }
+        out.extend_from_slice(&params_raw.to_le_bytes());
+        out.extend_from_slice(&body_raw.to_le_bytes());
+    }
+    out
+}
+
+/// Restore hook: parse the section, remap each saved pointer through the heap's
+/// old→new map, and stash the records in the pending buffers. Only pushes into
+/// Rust `Vec`s (no Bliss allocation), so it is GC-safe. The CLI later drains the
+/// buffers against the fresh root frame.
+fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
+    if data.len() < 4 || &data[..4] != b"HREG" {
+        return Err(BlissError::InvalidImage(
+            "host registry section: bad marker".into(),
+        ));
+    }
+    let mut off = 4usize;
+    let remap = bliss_rt::gc::remap_saved_pointer;
+    // Macros count (u32).
+    if data.len() < off + 4 {
+        return Err(BlissError::InvalidImage("host registry: truncated".into()));
+    }
+    let n_macros = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let mut macros = Vec::with_capacity(n_macros);
+    for _ in 0..n_macros {
+        let name = hr_get_str(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: bad macro name".into()))?;
+        let params = hr_get_u64(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: bad macro params".into()))?;
+        let body = hr_get_u64(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: bad macro body".into()))?;
+        macros.push((name, remap(params), remap(body)));
+    }
+    PENDING_HOST_MACROS.with(|p| *p.borrow_mut() = macros);
+    // Setf count (u32).
+    if data.len() < off + 4 {
+        return Err(BlissError::InvalidImage(
+            "host registry: truncated (setf)".into(),
+        ));
+    }
+    let n_setf = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let mut setfs = Vec::with_capacity(n_setf);
+    for _ in 0..n_setf {
+        let key = hr_get_str(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: bad setf key".into()))?;
+        let n_params = {
+            if data.len() < off + 4 {
+                return Err(BlissError::InvalidImage(
+                    "host registry: bad setf param count".into(),
+                ));
+            }
+            let n = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            n
+        };
+        let mut params = Vec::with_capacity(n_params);
+        for _ in 0..n_params {
+            params.push(hr_get_str(data, &mut off).ok_or_else(|| {
+                BlissError::InvalidImage("host registry: bad setf param".into())
+            })?);
+        }
+        let pform = hr_get_u64(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: bad setf params".into()))?;
+        let body = hr_get_u64(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: bad setf body".into()))?;
+        setfs.push((key, params, remap(pform), remap(body)));
+    }
+    PENDING_HOST_SETF.with(|p| *p.borrow_mut() = setfs);
+    Ok(())
+}
+
+/// Drain the pending host-registry records into the global tables, binding each
+/// macro/setf-fn to the fresh root frame. Called by the CLI once the top-level
+/// `Env` exists after an image load. GC-safe: no Bliss allocation (only
+/// `from_raw`, `Rc::clone`, and map inserts).
+// Wired into the core-format `--image` load path in M3 (bliss-x0f2.6); the
+// (de)serialization + pending-buffer logic lands and is tested here first.
+#[allow(dead_code)]
+fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
+    let macros = PENDING_HOST_MACROS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (name, params_raw, body_raw) in macros {
+        global_macro_insert(
+            name,
+            MacroDef {
+                params_form: BlissVal::from_raw(params_raw),
+                body: BlissVal::from_raw(body_raw),
+                captured_frame: Rc::clone(root_frame),
+                bytecode: None,
+            },
+        );
+    }
+    let setfs = PENDING_HOST_SETF.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (key, params, params_raw, body_raw) in setfs {
+        GLOBAL_SETF_FNS.with(|m| {
+            m.borrow_mut().insert(
+                key,
+                FunDef {
+                    params,
+                    params_form: BlissVal::from_raw(params_raw),
+                    body: BlissVal::from_raw(body_raw),
+                },
+            );
+        });
+    }
+}
+
+/// Register the host-registry image hooks with bliss-rt. Idempotent (bliss-rt
+/// stores the last registration); call once at CLI startup.
+pub(crate) fn register_host_registry_hooks() {
+    bliss_rt::image::set_host_registry_hooks(host_serialize_registries, host_restore_registries);
+}
+
 fn install_loaded_macro(
     name: BlissVal,
     function: Rc<bliss_rt::bytecode::BytecodeFunction>,
@@ -23592,6 +23806,10 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     bliss_rt::install_signal_handlers()?;
     bliss_rt::set_current_execution_foreground();
 
+    // Teach the image loader how to serialize/restore this crate's Rust-side
+    // code registries (macros/setf) as a HostRegistries section (bliss-x0f2 M2).
+    register_host_registry_hooks();
+
     let mut env = Env::new(ca.sandbox);
 
     // Set *command-line-args* (issue #4)
@@ -24080,6 +24298,106 @@ impl Default for ReplConfig {
 fn heap_test_lock() -> &'static std::sync::Mutex<()> {
     static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod host_registry_hook_tests {
+    use super::*;
+
+    // bliss-x0f2 M2: the host-registry (de)serialization + pending-buffer + drain
+    // round-trips global macros and setf-functions. In-process the heap reloc map
+    // is empty, so remap is identity and the (still-live) conses round-trip by
+    // value — this exercises the cli-side plumbing; cross-process pointer remap is
+    // covered by the bliss-rt spec_image_ops tests.
+    #[test]
+    fn host_registry_macros_and_setf_round_trip_through_drain() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = Env::new(false);
+
+        // A source macro: params (X), body ((LIST X)). Distinct name so we assert
+        // on exactly our entry regardless of any other macros on this thread.
+        // Root every intermediate that must survive the next allocation.
+        bliss_rt::rooted!(x = arena_str("X"));
+        bliss_rt::rooted!(params = arena_cons(*x, NIL));
+        bliss_rt::rooted!(list_sym = arena_str("LIST"));
+        bliss_rt::rooted!(x_arg = arena_cons(*x, NIL));
+        bliss_rt::rooted!(body_call = arena_cons(*list_sym, *x_arg));
+        bliss_rt::rooted!(body = arena_cons(*body_call, NIL));
+        let params = *params;
+        let body = *body;
+        let name = "HOST-HOOK-TEST-MAC";
+        global_macro_insert(
+            name.into(),
+            MacroDef {
+                params_form: params,
+                body,
+                captured_frame: Rc::new(RefCell::new(EnvFrame::default())),
+                bytecode: None,
+            },
+        );
+
+        // A setf-function writer.
+        let setf_key = "(SETF HOST-HOOK-TEST-PLACE)";
+        bliss_rt::rooted!(setf_v1 = arena_str("V"));
+        bliss_rt::rooted!(setf_params_form = arena_cons(*setf_v1, NIL));
+        bliss_rt::rooted!(setf_v2 = arena_str("V"));
+        bliss_rt::rooted!(setf_body = arena_cons(*setf_v2, NIL));
+        let setf_params_form = *setf_params_form;
+        let setf_body = *setf_body;
+        GLOBAL_SETF_FNS.with(|m| {
+            m.borrow_mut().insert(
+                setf_key.into(),
+                FunDef {
+                    params: vec!["V".into()],
+                    params_form: setf_params_form,
+                    body: setf_body,
+                },
+            );
+        });
+
+        let bytes = host_serialize_registries();
+
+        // Forget our entries, then restore + drain them back.
+        GLOBAL_MACROS.with(|m| {
+            m.borrow_mut().remove(name);
+        });
+        GLOBAL_SETF_FNS.with(|m| {
+            m.borrow_mut().remove(setf_key);
+        });
+        assert!(global_macro_source(name).is_none(), "macro cleared pre-drain");
+
+        host_restore_registries(&bytes).expect("restore host registries");
+        let fresh_frame = Rc::new(RefCell::new(EnvFrame::default()));
+        drain_pending_host_registries(&fresh_frame);
+
+        // Macro is back with the same params/body objects.
+        let (rp, rb) = global_macro_source(name).expect("macro restored via drain");
+        assert_eq!(rp.to_raw(), params.to_raw(), "macro params_form preserved");
+        assert_eq!(rb.to_raw(), body.to_raw(), "macro body preserved");
+        // Its captured frame is the fresh root frame (top-level rebind).
+        GLOBAL_MACROS.with(|m| {
+            let borrow = m.borrow();
+            let def = borrow.get(name).unwrap();
+            assert!(
+                Rc::ptr_eq(&def.captured_frame, &fresh_frame),
+                "restored macro rebinds captured_frame to the fresh root frame"
+            );
+            assert!(def.bytecode.is_none(), "restored macro recompiles on demand");
+        });
+
+        // Setf-function is back with the same source.
+        let (sp, sb) = global_setf_fn_source("HOST-HOOK-TEST-PLACE").expect("setf restored");
+        assert_eq!(sp.to_raw(), setf_params_form.to_raw());
+        assert_eq!(sb.to_raw(), setf_body.to_raw());
+
+        // Cleanup so we don't leak into other same-thread tests.
+        GLOBAL_MACROS.with(|m| {
+            m.borrow_mut().remove(name);
+        });
+        GLOBAL_SETF_FNS.with(|m| {
+            m.borrow_mut().remove(setf_key);
+        });
+    }
 }
 
 #[cfg(test)]
