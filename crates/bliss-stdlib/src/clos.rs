@@ -540,6 +540,366 @@ where
     CLOS_STATE.with(|cell| f(&mut cell.borrow_mut()))
 }
 
+// ── Core-image serialization of CLOS state (bliss-x0f2.7a) ─────────────
+//
+// A core load skips bootstrap, so CLOS_STATE (class/GF/method registries) must
+// ride the image or macro expansion / condition signaling in the loaded core
+// dies (fresh Env → initialize_condition_runtime_support → class_of → null).
+// Every BlissVal held here is either a heap value the snapshot already carries
+// (class objects, lambda lists, specializers) or an immediate meta-handle /
+// symbol — so records carry raw u64s remapped on restore, exactly like the
+// macro/setf HostRegistries records. The field set mirrors
+// `scan_clos_state_roots` (whatever the GC roots, the dump must capture).
+// `ClassMeta.wrapper` (a raw `*mut ClassWrapper`) is NOT serialized: wrappers
+// restore null and are lazily re-finalized from the restored `class_meta.slots`
+// by `finalize_class_layout` on the next instance allocation. Pre-save
+// INSTANCES therefore still hold dangling wrapper words after a load — that
+// remap is bliss-x0f2.7b.
+
+fn cs_put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn cs_put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn cs_put_val(out: &mut Vec<u8>, v: BlissVal) {
+    cs_put_u64(out, v.to_raw());
+}
+
+fn cs_put_vals(out: &mut Vec<u8>, vs: &[BlissVal]) {
+    cs_put_u32(out, vs.len() as u32);
+    for v in vs {
+        cs_put_val(out, *v);
+    }
+}
+
+fn cs_put_str(out: &mut Vec<u8>, s: &str) {
+    cs_put_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn cs_get_u32(data: &[u8], off: &mut usize) -> Option<u32> {
+    if data.len() < *off + 4 {
+        return None;
+    }
+    let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+    *off += 4;
+    Some(v)
+}
+
+fn cs_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
+    if data.len() < *off + 8 {
+        return None;
+    }
+    let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    Some(v)
+}
+
+fn cs_get_u8(data: &[u8], off: &mut usize) -> Option<u8> {
+    if data.len() < *off + 1 {
+        return None;
+    }
+    let v = data[*off];
+    *off += 1;
+    Some(v)
+}
+
+fn cs_get_val(data: &[u8], off: &mut usize, remap: &dyn Fn(u64) -> u64) -> Option<BlissVal> {
+    cs_get_u64(data, off).map(|raw| BlissVal::from_raw(remap(raw)))
+}
+
+fn cs_get_vals(
+    data: &[u8],
+    off: &mut usize,
+    remap: &dyn Fn(u64) -> u64,
+) -> Option<Vec<BlissVal>> {
+    let n = cs_get_u32(data, off)? as usize;
+    let mut vs = Vec::with_capacity(n);
+    for _ in 0..n {
+        vs.push(cs_get_val(data, off, remap)?);
+    }
+    Some(vs)
+}
+
+fn cs_get_str(data: &[u8], off: &mut usize) -> Option<String> {
+    let len = cs_get_u32(data, off)? as usize;
+    if data.len() < *off + len {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&data[*off..*off + len]).into_owned();
+    *off += len;
+    Some(s)
+}
+
+fn qualifier_to_u8(q: MethodQualifier) -> u8 {
+    match q {
+        MethodQualifier::Primary => 0,
+        MethodQualifier::Before => 1,
+        MethodQualifier::After => 2,
+        MethodQualifier::Around => 3,
+    }
+}
+
+fn u8_to_qualifier(b: u8) -> MethodQualifier {
+    match b {
+        1 => MethodQualifier::Before,
+        2 => MethodQualifier::After,
+        3 => MethodQualifier::Around,
+        _ => MethodQualifier::Primary,
+    }
+}
+
+fn combination_to_u8(c: MethodCombinationType) -> u8 {
+    match c {
+        MethodCombinationType::Standard => 0,
+        MethodCombinationType::Plus => 1,
+        MethodCombinationType::And => 2,
+        MethodCombinationType::Or => 3,
+        MethodCombinationType::List => 4,
+        MethodCombinationType::Append => 5,
+        MethodCombinationType::Nconc => 6,
+        MethodCombinationType::Min => 7,
+        MethodCombinationType::Max => 8,
+        MethodCombinationType::Progn => 9,
+    }
+}
+
+fn u8_to_combination(b: u8) -> MethodCombinationType {
+    match b {
+        1 => MethodCombinationType::Plus,
+        2 => MethodCombinationType::And,
+        3 => MethodCombinationType::Or,
+        4 => MethodCombinationType::List,
+        5 => MethodCombinationType::Append,
+        6 => MethodCombinationType::Nconc,
+        7 => MethodCombinationType::Min,
+        8 => MethodCombinationType::Max,
+        9 => MethodCombinationType::Progn,
+        _ => MethodCombinationType::Standard,
+    }
+}
+
+/// Serialize the whole `CLOS_STATE` for a core image. Runs after the save-time
+/// stop-the-world full GC; only reads raw tagged words (no Bliss allocation),
+/// so it is GC-safe.
+pub fn serialize_clos_state() -> Vec<u8> {
+    with_state(|st| {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"CLST");
+        cs_put_u32(&mut out, 1); // format version
+        cs_put_u32(&mut out, st.class_registry.len() as u32);
+        for (k, v) in &st.class_registry {
+            cs_put_val(&mut out, *k);
+            cs_put_val(&mut out, *v);
+        }
+        cs_put_u32(&mut out, st.class_by_name.len() as u32);
+        for (k, v) in &st.class_by_name {
+            cs_put_str(&mut out, k);
+            cs_put_val(&mut out, *v);
+        }
+        cs_put_u32(&mut out, st.class_meta.len() as u32);
+        for (class, meta) in &st.class_meta {
+            cs_put_val(&mut out, *class);
+            cs_put_val(&mut out, meta.name);
+            cs_put_vals(&mut out, &meta.direct_supers);
+            cs_put_vals(&mut out, &meta.direct_subs);
+            cs_put_vals(&mut out, &meta.slots);
+        }
+        cs_put_u32(&mut out, st.generic_functions.len() as u32);
+        for (gf, data) in &st.generic_functions {
+            cs_put_val(&mut out, *gf);
+            cs_put_val(&mut out, data.name);
+            cs_put_val(&mut out, data.lambda_list);
+            cs_put_vals(&mut out, &data.methods);
+        }
+        cs_put_u32(&mut out, st.method_meta.len() as u32);
+        for (method, meta) in &st.method_meta {
+            cs_put_val(&mut out, *method);
+            out.push(qualifier_to_u8(meta.qualifier));
+            cs_put_vals(&mut out, &meta.specializers);
+        }
+        cs_put_u32(&mut out, st.effective_methods.len() as u32);
+        for (key, em) in &st.effective_methods {
+            cs_put_val(&mut out, *key);
+            cs_put_vals(&mut out, &em.around);
+            cs_put_vals(&mut out, &em.before);
+            cs_put_vals(&mut out, &em.primary);
+            cs_put_vals(&mut out, &em.after);
+        }
+        cs_put_u32(&mut out, st.short_form_methods.len() as u32);
+        for (key, sf) in &st.short_form_methods {
+            cs_put_val(&mut out, *key);
+            out.push(combination_to_u8(sf.combination));
+            cs_put_vals(&mut out, &sf.methods);
+        }
+        cs_put_u64(&mut out, st.next_em_key as u64);
+        cs_put_u64(&mut out, st.next_gf_id as u64);
+        let structs: Vec<BlissVal> = st.structure_classes.iter().copied().collect();
+        cs_put_vals(&mut out, &structs);
+        cs_put_u32(&mut out, st.fixnum_registrations.len() as u32);
+        for (id, class) in &st.fixnum_registrations {
+            cs_put_u64(&mut out, *id as u64);
+            cs_put_val(&mut out, *class);
+        }
+        for v in [
+            st.fixnum_class,
+            st.character_class,
+            st.symbol_class,
+            st.null_class,
+            st.t_class_val,
+            st.standard_object_class,
+            st.cons_class,
+            st.float_class,
+            st.function_class,
+            st.heap_object_class,
+        ] {
+            cs_put_val(&mut out, v);
+        }
+        out.push(st.bootstrapped as u8);
+        out
+    })
+}
+
+/// Restore `CLOS_STATE` from a core image's serialized record, remapping every
+/// stored value through `remap` (the heap's final old→new map). Replaces the
+/// state wholesale: any pre-load registrations point at the discarded pre-load
+/// heap and must not survive. Wrappers restore null (see module comment).
+/// GC-safe: pure Rust parsing + map inserts, no Bliss allocation. Returns the
+/// number of bytes consumed so the caller can parse blocks appended after this
+/// one in the same section.
+pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usize, BlissError> {
+    let bad = || BlissError::InvalidImage("CLOS state section: truncated".into());
+    if data.len() < 8 || &data[..4] != b"CLST" {
+        return Err(BlissError::InvalidImage(
+            "CLOS state section: bad marker".into(),
+        ));
+    }
+    let mut off = 4usize;
+    let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
+    if version != 1 {
+        return Err(BlissError::InvalidImage(format!(
+            "CLOS state section: unsupported version {version}"
+        )));
+    }
+    let mut st = ClosState::new();
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let k = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let v = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        st.class_registry.insert(k, v);
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let k = cs_get_str(data, &mut off).ok_or_else(bad)?;
+        let v = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        st.class_by_name.insert(k, v);
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let name = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let direct_supers = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let direct_subs = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        st.class_meta.insert(
+            class,
+            ClassMeta {
+                name,
+                direct_supers,
+                direct_subs,
+                slots,
+                wrapper: std::ptr::null_mut(),
+            },
+        );
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let gf = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let name = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let lambda_list = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let methods = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        st.generic_functions.insert(
+            gf,
+            GFData {
+                name,
+                lambda_list,
+                methods,
+            },
+        );
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let method = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let qualifier = u8_to_qualifier(cs_get_u8(data, &mut off).ok_or_else(bad)?);
+        let specializers = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        st.method_meta.insert(
+            method,
+            MethodMeta {
+                specializers,
+                qualifier,
+            },
+        );
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let key = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let around = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let before = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let primary = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let after = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        st.effective_methods.insert(
+            key,
+            EffectiveMethod {
+                around,
+                before,
+                primary,
+                after,
+            },
+        );
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let key = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let combination = u8_to_combination(cs_get_u8(data, &mut off).ok_or_else(bad)?);
+        let methods = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        st.short_form_methods.insert(
+            key,
+            ShortFormMethod {
+                combination,
+                methods,
+            },
+        );
+    }
+    st.next_em_key = cs_get_u64(data, &mut off).ok_or_else(bad)? as i64;
+    st.next_gf_id = cs_get_u64(data, &mut off).ok_or_else(bad)? as i64;
+    for v in cs_get_vals(data, &mut off, remap).ok_or_else(bad)? {
+        st.structure_classes.insert(v);
+    }
+    let n = cs_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+    for _ in 0..n {
+        let id = cs_get_u64(data, &mut off).ok_or_else(bad)? as i64;
+        let class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        st.fixnum_registrations.push((id, class));
+    }
+    st.fixnum_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.character_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.symbol_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.null_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.t_class_val = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.standard_object_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.cons_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.float_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.function_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.heap_object_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.bootstrapped = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+    with_state_mut(|state| *state = st);
+    install_clos_state_root_scanner();
+    Ok(off)
+}
+
 fn is_builtin_class(st: &ClosState, class: BlissVal) -> bool {
     class == st.t_class_val
         || class == st.standard_object_class

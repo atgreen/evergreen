@@ -1593,12 +1593,34 @@ pub(crate) fn global_setf_fn_source(place: &str) -> Option<(BlissVal, BlissVal)>
 // records in a thread-local pending buffer that the CLI drains right after it
 // constructs the root `Env` (see `drain_pending_host_registries`).
 
+/// A serialized method-specializer: (tag, class-name, eql-raw). tag 0 = Any,
+/// 1 = Class(name), 2 = Eql(raw value, remapped on restore).
+type SpecRec = (u8, String, u64);
+/// A serialized MethodDef: (method_id_raw, lambda_list_raw, body_raw,
+/// qualifier, specializers).
+type MethodRec = (u64, u64, u64, u8, Vec<SpecRec>);
+
 thread_local! {
     /// Remapped (name, params_form_raw, body_raw) records awaiting rebind to the
     /// fresh root frame after an image load. Drained by the CLI post-`Env::new`.
     static PENDING_HOST_MACROS: RefCell<Vec<(String, u64, u64)>> = const { RefCell::new(Vec::new()) };
     /// Remapped ((SETF place) key, params, params_form_raw, body_raw) records.
     static PENDING_HOST_SETF: RefCell<Vec<(String, Vec<String>, u64, u64)>> =
+        const { RefCell::new(Vec::new()) };
+    /// Rc handles to the saving Env's generics/methods maps, stashed by
+    /// `save_core_and_die` for the serialize hook (whose signature has no Env).
+    /// Rc clones SHARE the live Env's storage, so the save-time full_gc root
+    /// scan keeps the contained BlissVals current — a deep copy here would go
+    /// stale when the compacting GC moves objects (bliss-x0f2.7a).
+    static SAVE_GENERICS: RefCell<Option<Rc<RefCell<HashMap<String, GenericDef>>>>> =
+        const { RefCell::new(None) };
+    static SAVE_METHODS: RefCell<Option<Rc<RefCell<HashMap<String, Vec<MethodDef>>>>>> =
+        const { RefCell::new(None) };
+    /// Remapped (name, generic_function_raw, combination) generic-function
+    /// records awaiting drain into the fresh root Env after an image load.
+    static PENDING_HOST_GENERICS: RefCell<Vec<(String, u64, u8)>> = const { RefCell::new(Vec::new()) };
+    /// Remapped per-generic method records awaiting the same drain.
+    static PENDING_HOST_METHODS: RefCell<Vec<(String, Vec<MethodRec>)>> =
         const { RefCell::new(Vec::new()) };
 }
 
@@ -1675,7 +1697,136 @@ fn host_serialize_registries() -> Vec<u8> {
         out.extend_from_slice(&params_raw.to_le_bytes());
         out.extend_from_slice(&body_raw.to_le_bytes());
     }
+    // CLOS state (bliss-x0f2.7a): classes/GFs/methods/effective methods. A core
+    // load skips bootstrap, so without this block macro expansion in the loaded
+    // core dies (fresh Env → condition setup → class_of → null).
+    out.extend_from_slice(&bliss_stdlib::clos::serialize_clos_state());
+    // Interpreter generic-function registries (bliss-x0f2.7a): DEFGENERIC /
+    // DEFMETHOD / accessor dispatch lives in the Env's generics/methods maps,
+    // which a fresh post-load Env lacks — without this block every GF call in a
+    // loaded core is "undefined function". The Env's maps are reached through
+    // the SAVE_GENERICS/SAVE_METHODS stash (Rc shares, still GC-scanned).
+    out.extend_from_slice(b"GFNS");
+    let generics: Vec<(String, u64, u8)> = SAVE_GENERICS.with(|g| {
+        g.borrow().as_ref().map_or_else(Vec::new, |map| {
+            map.borrow()
+                .iter()
+                .map(|(name, def)| {
+                    (
+                        name.clone(),
+                        def.generic_function.to_raw(),
+                        combination_to_u8(def.combination),
+                    )
+                })
+                .collect()
+        })
+    });
+    out.extend_from_slice(&(generics.len() as u32).to_le_bytes());
+    for (name, gf_raw, comb) in &generics {
+        hr_put_str(&mut out, name);
+        out.extend_from_slice(&gf_raw.to_le_bytes());
+        out.push(*comb);
+    }
+    let methods: Vec<(String, Vec<MethodRec>)> = SAVE_METHODS.with(|m| {
+        m.borrow().as_ref().map_or_else(Vec::new, |map| {
+            map.borrow()
+                .iter()
+                .map(|(name, defs)| {
+                    (
+                        name.clone(),
+                        defs.iter()
+                            .map(|d| {
+                                (
+                                    d.method_id.to_raw(),
+                                    d.lambda_list.to_raw(),
+                                    d.body.to_raw(),
+                                    qualifier_to_u8(d.qualifier),
+                                    d.specializers
+                                        .iter()
+                                        .map(|s| match s {
+                                            MethodSpecializer::Any => (0u8, String::new(), 0u64),
+                                            MethodSpecializer::Class(n) => (1, n.clone(), 0),
+                                            MethodSpecializer::Eql(v) => (2, String::new(), v.to_raw()),
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+    });
+    out.extend_from_slice(&(methods.len() as u32).to_le_bytes());
+    for (name, defs) in &methods {
+        hr_put_str(&mut out, name);
+        out.extend_from_slice(&(defs.len() as u32).to_le_bytes());
+        for (mid, ll, body, qual, specs) in defs {
+            out.extend_from_slice(&mid.to_le_bytes());
+            out.extend_from_slice(&ll.to_le_bytes());
+            out.extend_from_slice(&body.to_le_bytes());
+            out.push(*qual);
+            out.extend_from_slice(&(specs.len() as u32).to_le_bytes());
+            for (tag, name, eql_raw) in specs {
+                out.push(*tag);
+                hr_put_str(&mut out, name);
+                out.extend_from_slice(&eql_raw.to_le_bytes());
+            }
+        }
+    }
     out
+}
+
+fn combination_to_u8(c: bliss_stdlib::MethodCombinationType) -> u8 {
+    use bliss_stdlib::MethodCombinationType as M;
+    match c {
+        M::Standard => 0,
+        M::Plus => 1,
+        M::And => 2,
+        M::Or => 3,
+        M::List => 4,
+        M::Append => 5,
+        M::Nconc => 6,
+        M::Min => 7,
+        M::Max => 8,
+        M::Progn => 9,
+    }
+}
+
+fn u8_to_combination(b: u8) -> bliss_stdlib::MethodCombinationType {
+    use bliss_stdlib::MethodCombinationType as M;
+    match b {
+        1 => M::Plus,
+        2 => M::And,
+        3 => M::Or,
+        4 => M::List,
+        5 => M::Append,
+        6 => M::Nconc,
+        7 => M::Min,
+        8 => M::Max,
+        9 => M::Progn,
+        _ => M::Standard,
+    }
+}
+
+fn qualifier_to_u8(q: bliss_stdlib::MethodQualifier) -> u8 {
+    use bliss_stdlib::MethodQualifier as Q;
+    match q {
+        Q::Primary => 0,
+        Q::Before => 1,
+        Q::After => 2,
+        Q::Around => 3,
+    }
+}
+
+fn u8_to_qualifier(b: u8) -> bliss_stdlib::MethodQualifier {
+    use bliss_stdlib::MethodQualifier as Q;
+    match b {
+        1 => Q::Before,
+        2 => Q::After,
+        3 => Q::Around,
+        _ => Q::Primary,
+    }
 }
 
 /// Restore hook: parse the section, remap each saved pointer through the heap's
@@ -1742,6 +1893,90 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
         setfs.push((key, params, remap(pform), remap(body)));
     }
     PENDING_HOST_SETF.with(|p| *p.borrow_mut() = setfs);
+    // CLOS state block (bliss-x0f2.7a). Absent in pre-7a images — restore what
+    // is there and leave CLOS to the (empty) bootstrap-skipped state.
+    if off < data.len() {
+        off += bliss_stdlib::clos::restore_clos_state(&data[off..], &remap)?;
+    }
+    // Generic-function registry block (bliss-x0f2.7a): stash remapped records
+    // for the post-Env::new drain, like the macro/setf records above.
+    if off + 4 <= data.len() && &data[off..off + 4] == b"GFNS" {
+        off += 4;
+        let bad = || BlissError::InvalidImage("host registry: truncated (generics)".into());
+        let n_gf = {
+            if data.len() < off + 4 {
+                return Err(bad());
+            }
+            let n = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            n
+        };
+        let mut generics = Vec::with_capacity(n_gf);
+        for _ in 0..n_gf {
+            let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
+            let gf_raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            if data.len() < off + 1 {
+                return Err(bad());
+            }
+            let comb = data[off];
+            off += 1;
+            generics.push((name, remap(gf_raw), comb));
+        }
+        PENDING_HOST_GENERICS.with(|p| *p.borrow_mut() = generics);
+        let n_names = {
+            if data.len() < off + 4 {
+                return Err(bad());
+            }
+            let n = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            n
+        };
+        let mut methods = Vec::with_capacity(n_names);
+        for _ in 0..n_names {
+            let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
+            let n_defs = {
+                if data.len() < off + 4 {
+                    return Err(bad());
+                }
+                let n = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                n
+            };
+            let mut defs: Vec<MethodRec> = Vec::with_capacity(n_defs);
+            for _ in 0..n_defs {
+                let mid = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                let ll = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                let body = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                if data.len() < off + 1 {
+                    return Err(bad());
+                }
+                let qual = data[off];
+                off += 1;
+                let n_specs = {
+                    if data.len() < off + 4 {
+                        return Err(bad());
+                    }
+                    let n = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+                    off += 4;
+                    n
+                };
+                let mut specs: Vec<SpecRec> = Vec::with_capacity(n_specs);
+                for _ in 0..n_specs {
+                    if data.len() < off + 1 {
+                        return Err(bad());
+                    }
+                    let tag = data[off];
+                    off += 1;
+                    let cname = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                    let eql_raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                    specs.push((tag, cname, if tag == 2 { remap(eql_raw) } else { eql_raw }));
+                }
+                defs.push((remap(mid), remap(ll), remap(body), qual, specs));
+            }
+            methods.push((name, defs));
+        }
+        PENDING_HOST_METHODS.with(|p| *p.borrow_mut() = methods);
+    }
     Ok(())
 }
 
@@ -1774,6 +2009,43 @@ fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
                 },
             );
         });
+    }
+}
+
+/// Drain the pending generic-function records into the fresh root Env's
+/// generics/methods maps after an image load (bliss-x0f2.7a). GC-safe: only
+/// `from_raw` + map inserts, no Bliss allocation.
+fn drain_pending_host_generics(env: &Env) {
+    let generics = PENDING_HOST_GENERICS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (name, gf_raw, comb) in generics {
+        env.generics.borrow_mut().insert(
+            name,
+            GenericDef {
+                generic_function: BlissVal::from_raw(gf_raw),
+                combination: u8_to_combination(comb),
+            },
+        );
+    }
+    let methods = PENDING_HOST_METHODS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (name, defs) in methods {
+        let defs: Vec<MethodDef> = defs
+            .into_iter()
+            .map(|(mid, ll, body, qual, specs)| MethodDef {
+                method_id: BlissVal::from_raw(mid),
+                specializers: specs
+                    .into_iter()
+                    .map(|(tag, cname, eql_raw)| match tag {
+                        1 => MethodSpecializer::Class(cname),
+                        2 => MethodSpecializer::Eql(BlissVal::from_raw(eql_raw)),
+                        _ => MethodSpecializer::Any,
+                    })
+                    .collect(),
+                lambda_list: BlissVal::from_raw(ll),
+                qualifier: u8_to_qualifier(qual),
+                body: BlissVal::from_raw(body),
+            })
+            .collect();
+        env.methods.borrow_mut().insert(name, defs);
     }
 }
 
@@ -14463,7 +14735,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                     }
                 }
-                save_core_and_die(&path, executable)?;
+                save_core_and_die(&path, executable, env)?;
                 unreachable!("save_core_and_die exits the process");
             }
             "DEFPACKAGE" => return eval_defpackage(cdr, env),
@@ -23791,7 +24063,12 @@ fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
 /// appended to a copy of the runtime binary (reusing the `BLISSEXE` trailer
 /// scheme, recovered by `embedded_image` at startup). GC-safe: no Bliss
 /// allocation between the GC and the serialize walk.
-fn save_core_and_die(path: &str, executable: bool) -> Result<(), BlissError> {
+fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), BlissError> {
+    // Expose this Env's generic-function registries to the serialize hook
+    // (whose signature has no Env). Rc shares — the full_gc below relocates
+    // objects and the Env root scan updates this same storage (bliss-x0f2.7a).
+    SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(Rc::clone(&env.generics)));
+    SAVE_METHODS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.methods)));
     // Compact so the live set is a dense prefix and garbage is dropped.
     bliss_rt::gc::full_gc()?;
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
@@ -23838,17 +24115,25 @@ fn save_core_and_die(path: &str, executable: bool) -> Result<(), BlissError> {
 /// The heap must be initialized and empty of mutator objects — call this BEFORE
 /// the bootstrap prelude runs, so no live `BlissVal` in the interpreter's `Env`
 /// is stranded when `restore_heap` clears and re-materializes the heap.
-fn load_core_image_bytes(bytes: &[u8], frame: &Rc<RefCell<EnvFrame>>) -> Result<(), BlissError> {
+fn load_core_image_bytes(bytes: &[u8], env: &Env) -> Result<(), BlissError> {
     bliss_rt::gc::ensure_heap_initialized();
     bliss_rt::image::load_image_from_bytes(bytes)?;
     // Install the restored macros/setf-fns (stashed by the restore hook) into the
     // global tables, bound to the fresh top-level frame.
-    drain_pending_host_registries(frame);
+    drain_pending_host_registries(&env.frame);
+    // Install the restored generic-function/method registries into this Env
+    // (bliss-x0f2.7a) — without them every GF/accessor call is undefined.
+    drain_pending_host_generics(env);
     // Streams are process-specific resources with OFF-HEAP bodies (file handles,
     // buffers) that the heap snapshot cannot carry: the restored *STANDARD-OUTPUT*
     // etc. point at dead handles, so PRINT/FORMAT would deref freed memory. Re-open
     // the standard streams with fresh handles bound to this process's fds.
     reopen_standard_streams();
+    // The preallocated STORAGE-CONDITION pool was filled by the pre-load
+    // Env::new from the heap this restore just discarded; drop it so the next
+    // initialize_condition_runtime_support re-preallocates against the restored
+    // world instead of deref'ing dead instances (bliss-x0f2.7a).
+    bliss_stdlib::conditions::reset_storage_condition_pool();
     Ok(())
 }
 
@@ -23993,13 +24278,13 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     let mut core_loaded = false;
     let embedded_core = embedded_image().filter(|b| b.starts_with(&image_magic));
     if let Some(bytes) = embedded_core {
-        load_core_image_bytes(&bytes, &env.frame)?;
+        load_core_image_bytes(&bytes, &env)?;
         core_loaded = true;
     } else if let Some(ref image_path) = ca.image {
         let bytes = std::fs::read(image_path)
             .map_err(|e| BlissError::FileError(format!("--image {image_path}: {e}")))?;
         if bytes.starts_with(&image_magic) {
-            load_core_image_bytes(&bytes, &env.frame)?;
+            load_core_image_bytes(&bytes, &env)?;
             core_loaded = true;
         }
     }

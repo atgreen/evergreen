@@ -600,6 +600,22 @@ pub fn release_preallocated_storage_condition(condition: BlissVal) {
     });
 }
 
+/// Forget the preallocated STORAGE-CONDITION pool. Called after a core-image
+/// load (bliss-x0f2.7a): the pool instances were allocated in the pre-load heap
+/// that `restore_heap` discarded, so `storage_condition_pool_is_live`'s
+/// `class_of(first)` would deref a dead instance's wrapper word and SIGSEGV.
+/// Clearing lets the next `initialize_condition_runtime_support` re-preallocate
+/// from the restored world's classes.
+pub fn reset_storage_condition_pool() {
+    STORAGE_POOL.with(|p| {
+        p.initialized.store(false, Ordering::Release);
+        for slot in &p.slots {
+            slot.store(NIL.0, Ordering::Release);
+        }
+        p.claimed.store(0, Ordering::Release);
+    });
+}
+
 fn runtime_init_storage_condition_support() -> Result<(), BlissError> {
     initialize_condition_runtime_support()
 }
