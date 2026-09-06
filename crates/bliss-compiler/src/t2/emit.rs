@@ -2854,6 +2854,14 @@ fn emit_framed_inner(
                     ValueSource::Unbound => SlotSrc::Imm(bliss_rt::value::UNBOUND.0),
                     ValueSource::Remat(id) => SlotSrc::Remat(*id),
                 };
+                if std::env::var_os("BLISS_DEOPT_SRC_DBG").is_some() {
+                    let desc = match &s {
+                        SlotSrc::Home(h) => format!("Home({h:?})"),
+                        SlotSrc::Imm(b) => format!("Imm({b:#x})"),
+                        SlotSrc::Remat(_) => "Remat".to_string(),
+                    };
+                    eprintln!("[deopt-src] fn={} src={:?} -> {}", scope.function, vs, desc);
+                }
                 srcs.push(s);
             }
         }
@@ -3201,6 +3209,7 @@ mod tests {
             imm,
             frame_state: None,
             safepoint: false,
+            deopt_uses: Vec::new(),
         }
     }
 
