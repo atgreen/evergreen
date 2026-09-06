@@ -131,6 +131,30 @@ An "already borrowed" panic, a segfault, or an abort under stress that passes
 without it means you have one of these. A clean run under `BLISS_GC_STRESS=1`
 is the cheapest evidence a change that allocates is GC-safe.
 
+## Always cap bliss memory: `scripts/bliss-limited.sh`
+
+Runaway bliss runs (e.g. ASDF recursion-to-OOM bugs like bliss-hlsa) have
+driven this machine deep into swap and set off the global OOM killer. Wrap
+**every** ad-hoc `bliss-cli` invocation — and memory-hungry `cargo test` runs —
+in `scripts/bliss-limited.sh`:
+
+```bash
+scripts/bliss-limited.sh target/x86_64-unknown-linux-musl/debug/bliss-cli \
+    --no-init --eval '(form)'
+BLISS_MEM_MAX=8G BLISS_TIMEOUT=1200 scripts/bliss-limited.sh cargo test ...
+```
+
+It runs the command in a `systemd-run --user` scope with `MemoryMax`
+(default 4G) and `MemorySwapMax=0`, plus a wall-clock `timeout` (default 600s).
+Reading the outcome — the cap **cannot** masquerade as a GC bug:
+
+- exit **137** (SIGKILL) + the `[bliss-limited]` note = cgroup OOM kill —
+  memory cap hit, NOT corruption. Raise `BLISS_MEM_MAX` if legitimate.
+- exit **124** = wall-clock timeout (hang/runaway loop).
+- exit **139** (SIGSEGV) / **134** (SIGABRT) / "already borrowed" = a real
+  GC/rooting bug. The cap never causes these: the kernel OOM-kills the scope
+  outright, so bliss never sees a failed malloc.
+
 ## Running rr (reverse debugger) on this machine
 
 This box is an Intel **hybrid** CPU (P-cores 0–5, E-cores 6–13) whose model is
