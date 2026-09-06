@@ -123,6 +123,35 @@ already RE-MATERIALIZES objects and fixes pointers via the relocation table, so
   self-contained `bliss` whose libraries load. Done-signal: installed `bliss`
   runs `(asdf:load-system :cl-ppcre)`.
 
+## M2 progress + the per-object-relocation blocker (discovered while implementing)
+
+Done and committed:
+- **Tag-aware relocation** (2ee6adc): `serialize_relocation_table` now records
+  TAGGED Lisp pointer fields (cons/heap-object/function), not just raw body
+  pointers. Prerequisite for relocating a real object graph.
+
+Blocker found (a symbol-registry rebuild attempt SIGSEGV'd and was reverted):
+- `restore_heap` re-materializes objects by **bump-appending in dump order**, and
+  the loader relocates with a **single uniform delta** (`current_base -
+  original_base`). That is only correct when the restored heap reproduces the
+  saved heap's EXACT layout — true for the dense `record_object` tests, but NOT
+  for a real, non-compacted heap, nor when the loading process already holds
+  allocations. A registry rebuild that shifts saved symbol addresses by the
+  uniform delta then indexes GARBAGE → segfault.
+- **Required foundation:** replace uniform-delta relocation with a **per-object
+  old→new address map**. Concretely:
+  1. `serialize_heap_objects`: prepend each record with the object's OLD body
+     address.
+  2. `restore_heap`: build `old_body → new_body` as it appends; expose it.
+  3. Relocation: walk restored objects' pointer fields and remap each via the map
+     (tag-aware), replacing `apply_relocations`/uniform delta.
+  4. Registries (symbols, packages, macros/setf/CLOS): serialize
+     `index → old_body`; on restore, map to `new_body` and rebuild — no
+     re-interning, no uniform delta.
+  This makes cross-process restore correct for any heap layout; it changes the
+  heap section format and several §7 tests, so it is its own focused change and
+  the prerequisite for M2's registry rebuild, M3, and M4.
+
 ## Risks / open points
 
 - **Fixed-base availability.** MAP_FIXED_NOREPLACE can fail under ASLR; the delta
