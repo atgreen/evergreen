@@ -1508,6 +1508,12 @@ fn debug_validate_form(label: &str, name: &str, v: BlissVal) {
 
 /// Register a global (top-level DEFMACRO) macro.
 fn global_macro_insert(name: String, def: MacroDef) {
+    // A source DEFMACRO's params_form/body are heap conses reachable ONLY through
+    // GLOBAL_MACROS. Ensure the evaluator's global-root scanner is installed so a
+    // GC (minor or a save-time full_gc) retains and relocates them; without it a
+    // full_gc reclaims the macro body and its saved pointer dangles in a core
+    // image (bliss-x0f2 M3). Idempotent (Once-guarded).
+    install_evaluator_global_root_scanner();
     debug_validate_form("defmacro", &name, def.params_form);
     debug_validate_form("defmacro", &name, def.body);
     GLOBAL_MACROS.with(|m| m.borrow_mut().insert(name, def));
@@ -1743,9 +1749,6 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
 /// macro/setf-fn to the fresh root frame. Called by the CLI once the top-level
 /// `Env` exists after an image load. GC-safe: no Bliss allocation (only
 /// `from_raw`, `Rc::clone`, and map inserts).
-// Wired into the core-format `--image` load path in M3 (bliss-x0f2.6); the
-// (de)serialization + pending-buffer logic lands and is tested here first.
-#[allow(dead_code)]
 fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
     let macros = PENDING_HOST_MACROS.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (name, params_raw, body_raw) in macros {
@@ -14407,6 +14410,55 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 );
                 std::process::exit(0);
             }
+            "%SAVE-CORE" => {
+                // (%save-core path &key executable) — write a heap-snapshot CORE
+                // image (bliss-x0f2 M3) and terminate. Unlike SAVE-LISP-AND-DIE's
+                // source-form .bfasl, this captures the live GC heap byte-for-byte
+                // (hash-tables, instances, closures — any value), plus the symbol
+                // value/function cells, packages, and this crate's macro/setf
+                // registries (via the HostRegistries hook). Restored by `--image`
+                // detecting the BLISSIMG magic and loading into a fresh runtime.
+                let (path_form, rest) = cp(cdr);
+                let path_val = eval_form(path_form, env)?;
+                let path = path_designator_to_string(path_val)?;
+                let mut executable = false;
+                let mut key = rest;
+                while key.is_cons() {
+                    let (k, kr) = cp(key);
+                    let kname = if k.is_symbol() {
+                        symbol_bare_name(&sym_name(k))
+                    } else {
+                        String::new()
+                    };
+                    let value_is_missing = !kr.is_cons() || {
+                        let (v, _) = cp(kr);
+                        is_keyword_arg(v)
+                    };
+                    match kname.as_str() {
+                        "EXECUTABLE" => {
+                            if value_is_missing {
+                                executable = true;
+                                key = kr;
+                            } else {
+                                let (vform, kr2) = cp(kr);
+                                executable = eval_form(vform, env)? != NIL;
+                                key = kr2;
+                            }
+                        }
+                        _ => {
+                            if value_is_missing {
+                                key = kr;
+                            } else {
+                                let (vform, kr2) = cp(kr);
+                                let _ = eval_form(vform, env);
+                                key = kr2;
+                            }
+                        }
+                    }
+                }
+                save_core_and_die(&path, executable)?;
+                unreachable!("save_core_and_die exits the process");
+            }
             "DEFPACKAGE" => return eval_defpackage(cdr, env),
             "IN-PACKAGE" => {
                 let (pkg_form, _) = cp(cdr);
@@ -23723,6 +23775,114 @@ fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Write a heap-snapshot CORE image and terminate (bliss-x0f2 M3). Captures the
+/// live GC heap byte-for-byte plus the symbol/package registries and (via the
+/// HostRegistries hook) this crate's macro/setf tables. A compacting `full_gc`
+/// runs first so the serialized heap is dense and every root — including the
+/// scanned `GLOBAL_MACROS`/`GLOBAL_SETF_FNS` — carries post-compaction addresses
+/// that match the serialized object bodies. With `executable`, the core is
+/// appended to a copy of the runtime binary (reusing the `BLISSEXE` trailer
+/// scheme, recovered by `embedded_image` at startup). GC-safe: no Bliss
+/// allocation between the GC and the serialize walk.
+fn save_core_and_die(path: &str, executable: bool) -> Result<(), BlissError> {
+    // Compact so the live set is a dense prefix and garbage is dropped.
+    bliss_rt::gc::full_gc()?;
+    // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
+    // cell (serialized with the symbol table), not the image entry continuation.
+    bliss_rt::gc::set_entry_continuation(NIL);
+
+    let opts = bliss_rt::image::SaveImageOptions {
+        executable: false,
+        compression: bliss_rt::image::ImageCompression::None,
+        purify: true,
+    };
+
+    if executable {
+        // Serialize to a temp core file, then append its bytes to a runtime copy.
+        let tmp = format!("{path}.core.tmp");
+        bliss_rt::image::save_image(&tmp, &opts)
+            .map_err(|e| BlissError::FileError(format!("%save-core: {e}")))?;
+        let core_bytes = std::fs::read(&tmp)
+            .map_err(|e| BlissError::FileError(format!("%save-core: reread core: {e}")))?;
+        let _ = std::fs::remove_file(&tmp);
+        let exe_bytes = wrap_executable(&core_bytes)
+            .map_err(|e| BlissError::FileError(format!("%save-core :executable: {e}")))?;
+        std::fs::write(path, &exe_bytes)
+            .map_err(|e| BlissError::FileError(format!("%save-core: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+        }
+    } else {
+        bliss_rt::image::save_image(path, &opts)
+            .map_err(|e| BlissError::FileError(format!("%save-core: {e}")))?;
+    }
+
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let kind = if executable { "core executable" } else { "core image" };
+    eprintln!(";; wrote {kind} to {path}; exiting");
+    std::process::exit(0);
+}
+
+/// Load a heap-snapshot CORE image into the (freshly initialized) runtime and
+/// drain this crate's macro/setf registries against `frame` (bliss-x0f2 M3).
+/// The heap must be initialized and empty of mutator objects — call this BEFORE
+/// the bootstrap prelude runs, so no live `BlissVal` in the interpreter's `Env`
+/// is stranded when `restore_heap` clears and re-materializes the heap.
+fn load_core_image_bytes(bytes: &[u8], frame: &Rc<RefCell<EnvFrame>>) -> Result<(), BlissError> {
+    bliss_rt::gc::ensure_heap_initialized();
+    bliss_rt::image::load_image_from_bytes(bytes)?;
+    // Install the restored macros/setf-fns (stashed by the restore hook) into the
+    // global tables, bound to the fresh top-level frame.
+    drain_pending_host_registries(frame);
+    // Streams are process-specific resources with OFF-HEAP bodies (file handles,
+    // buffers) that the heap snapshot cannot carry: the restored *STANDARD-OUTPUT*
+    // etc. point at dead handles, so PRINT/FORMAT would deref freed memory. Re-open
+    // the standard streams with fresh handles bound to this process's fds.
+    reopen_standard_streams();
+    Ok(())
+}
+
+/// Re-open the standard stream specials with fresh handles bound to this
+/// process's file descriptors. Called after a core load (their snapshot values
+/// reference dead off-heap bodies) and mirrors the seeding in `Env::new`.
+/// GC-safe: each handle is rooted before the next allocation.
+fn reopen_standard_streams() {
+    let set_global = |name: &str, val: BlissVal| {
+        if let Some(s) = resolve_sym(name) {
+            bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), val);
+        }
+    };
+    // FIRST drop the restored stream objects from every stream special WITHOUT
+    // allocating. Their off-heap bodies were freed with the save process, so the
+    // moving GC must never trace them — and the fresh-handle allocations below can
+    // trigger a minor GC. Clearing the cells makes the dead streams unreachable,
+    // so the collector's mark phase never reaches `stream_trace` on a dead body.
+    for name in [
+        "*STANDARD-INPUT*",
+        "*STANDARD-OUTPUT*",
+        "*ERROR-OUTPUT*",
+        "*TRACE-OUTPUT*",
+        "*TERMINAL-IO*",
+        "*QUERY-IO*",
+        "*DEBUG-IO*",
+    ] {
+        set_global(name, NIL);
+    }
+    bliss_rt::rooted!(stdin_stream = bliss_stdlib::make_stdin());
+    bliss_rt::rooted!(stdout_stream = bliss_stdlib::make_stdout());
+    bliss_rt::rooted!(stderr_stream = bliss_stdlib::make_stderr());
+    set_global("*STANDARD-INPUT*", *stdin_stream);
+    set_global("*STANDARD-OUTPUT*", *stdout_stream);
+    set_global("*ERROR-OUTPUT*", *stderr_stream);
+    set_global("*TRACE-OUTPUT*", *stdout_stream);
+    set_global("*TERMINAL-IO*", *stdout_stream);
+    set_global("*QUERY-IO*", *stdout_stream);
+    set_global("*DEBUG-IO*", *stdout_stream);
+}
+
 /// If the running binary has an image appended by an `:executable` save, return
 /// it. Only the 16-byte trailer is read unless the magic matches, so a normal
 /// launch pays almost nothing.
@@ -23812,6 +23972,31 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
 
     let mut env = Env::new(ca.sandbox);
 
+    // ── Core-image fast path (bliss-x0f2 M3/M4) ──────────────────────────
+    // A heap-snapshot CORE (BLISSIMG magic) — appended to the executable by an
+    // `:executable` %save-core, or supplied via `--image` — restores the whole
+    // live world (GC heap + symbol value/function cells + packages + macro/setf
+    // registries) into THIS fresh runtime. It must load before the bootstrap
+    // prelude allocates: `restore_heap` clears and re-materializes the heap, so
+    // any live object the prelude created first would be stranded. When a core
+    // loads, bootstrap and the source-form image paths are skipped — the core
+    // already contains that world (env.frame is still empty here, so nothing is
+    // stranded).
+    let image_magic = bliss_rt::image::IMAGE_MAGIC.to_ne_bytes();
+    let mut core_loaded = false;
+    let embedded_core = embedded_image().filter(|b| b.starts_with(&image_magic));
+    if let Some(bytes) = embedded_core {
+        load_core_image_bytes(&bytes, &env.frame)?;
+        core_loaded = true;
+    } else if let Some(ref image_path) = ca.image {
+        let bytes = std::fs::read(image_path)
+            .map_err(|e| BlissError::FileError(format!("--image {image_path}: {e}")))?;
+        if bytes.starts_with(&image_magic) {
+            load_core_image_bytes(&bytes, &env.frame)?;
+            core_loaded = true;
+        }
+    }
+
     // Set *command-line-args* (issue #4)
     if !ca.cl_args.is_empty() {
         let args_list: Vec<BlissVal> = ca.cl_args.iter().map(|s| arena_str(s)).collect();
@@ -23827,7 +24012,7 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     // script — for every mode. `--no-bootstrap` opts out (raw evaluator);
     // `--bootstrap` is now the default and kept only for compatibility. A
     // failure here is fatal: the prelude is core.
-    if !ca.no_bootstrap {
+    if !ca.no_bootstrap && !core_loaded {
         let contents = boot_prelude_source()?;
         read_eval_all_env(&contents, &mut env)?;
     }
@@ -23859,8 +24044,10 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         load_init_file(&mut env);
     }
 
-    // Load image if specified (issue #8)
-    if let Some(ref image_path) = ca.image {
+    // Load image if specified (issue #8). A CORE image (BLISSIMG) was already
+    // restored by the fast path above; only the legacy .bfasl/text formats fall
+    // through to here.
+    if let (false, Some(image_path)) = (core_loaded, ca.image.as_ref()) {
         let bytes = std::fs::read(image_path)
             .map_err(|e| BlissError::FileError(format!("--image {image_path}: {e}")))?;
         // A binary image is a `.bfasl` unit (save-lisp-and-die); a legacy text

@@ -3766,7 +3766,7 @@ fn t0_default_config() -> GcConfig {
 
 /// Ensure the shared GC heap is initialized (idempotent) so the interpreter can
 /// allocate without an explicit runtime boot.
-fn ensure_heap_initialized() {
+pub fn ensure_heap_initialized() {
     // Serialize auto-boot: the check-and-init must be atomic. Two threads that
     // both observe an uninitialized heap would both call init_heap, which
     // unconditionally re-mmaps the heap and drops (munmaps) the previous
@@ -4912,6 +4912,19 @@ pub fn full_gc() -> Result<(), BlissError> {
 pub fn serialize_heap_objects() -> Vec<u8> {
     let mut out = Vec::new();
     let _ = walk_heap(|ptr, type_id, size| {
+        // Skip objects with OFF-HEAP bodies that cannot be snapshotted: a STREAM's
+        // body word 0 is a raw pointer to a process-local Rust block (file handle +
+        // buffers) that dies with the saving process. Serializing it would restore
+        // a heap object whose custom GC trace (STREAM_TRACE_FN) dereferences that
+        // freed block — a segfault the first time a minor GC traces it in the new
+        // process (bliss-x0f2 M3). Streams are re-opened on load instead; a core
+        // must not retain open streams other than the standard ones the loader
+        // re-creates. (Hash-tables also box their bodies off-heap, but their GC
+        // trace visits nothing, so they survive tracing and only a *use* faults —
+        // a separate off-heap-body follow-up, not a GC-safety hazard here.)
+        if type_id == crate::object::type_id::STREAM {
+            return true;
+        }
         out.extend_from_slice(&(ptr as u64).to_le_bytes());
         out.push(type_id);
         out.extend_from_slice(&(size as u32).to_le_bytes());
@@ -4995,9 +5008,19 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
         offset += size;
     }
 
-    // Pass 2: remap every pointer field of every restored object via the map.
+    // Pass 2: remap every pointer field of every restored object via the map,
+    // and PIN each object. A loaded core is the immortal base world: the rebuilt
+    // symbol/package/macro registries and the RELOC_MAP hold its post-restore
+    // addresses, and a minor GC firing after load (e.g. the first mutator
+    // allocation) must never relocate it out from under them. Pinning marks each
+    // restored object's header so `region_has_pinned` retains its nursery region
+    // in place; fresh mutator garbage still collects normally in other regions.
     for &new_body in map.values() {
         let header = (new_body - OBJECT_HEADER_SIZE) as *const u8;
+        unsafe {
+            let hdr = (new_body - OBJECT_HEADER_SIZE) as *mut ObjectHeader;
+            (*hdr).set_pinned();
+        }
         let (_type_id, body_size) = unsafe { read_object_header(header) };
         let mut fo = 0usize;
         while fo + 8 <= body_size as usize {

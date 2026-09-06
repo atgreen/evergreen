@@ -58,8 +58,8 @@ pub use gc::{
 };
 pub use image::{
     Arch, ImageCompression, ImageHeader, Os, SaveImageOptions, SectionEntry, SectionType,
-    current_platform_tag, find_appended_image, load_image, platform_tag, save_image,
-    validate_image_header,
+    current_platform_tag, find_appended_image, load_image, load_image_from_bytes, platform_tag,
+    save_image, validate_image_header,
 };
 pub use object::ObjectHeader;
 pub use runtime::{

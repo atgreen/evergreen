@@ -707,6 +707,14 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
     file.read_to_end(&mut file_data)
         .map_err(|e| BlissError::InvalidImage(format!("cannot read image file: {}", e)))?;
 
+    load_image_from_bytes(&file_data)
+}
+
+/// Load an image from an in-memory byte slice (the image header must start at
+/// offset 0). Used for images embedded in an `:executable` save (bliss-x0f2 M4),
+/// where the loader already holds the extracted image bytes. `load_image` is the
+/// path-based wrapper. The heap must be initialized before calling either.
+pub fn load_image_from_bytes(file_data: &[u8]) -> Result<BlissVal, BlissError> {
     if file_data.len() < HEADER_SIZE {
         return Err(BlissError::InvalidImage(
             "image file too small to contain header".into(),
