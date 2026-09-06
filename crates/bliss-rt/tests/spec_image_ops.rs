@@ -164,6 +164,84 @@ fn spec_image_round_trip_rebuilds_symbol_registry_cross_process() {
     );
 }
 
+// ── Host-crate registry hook (bliss-x0f2 M2) ──────────────────────────
+// The `bliss` crate owns registries (macros/setf/CLOS) invisible to bliss-rt.
+// It contributes them as an image section via set_host_registry_hooks. These
+// module statics stand in for that crate's state so we can drive the plumbing
+// with plain `fn` pointers (the hooks cannot be closures).
+static HOST_SAVED_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HOST_RESTORED_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HOST_RESTORE_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn host_serialize_hook() -> Vec<u8> {
+    // Emit a marker plus a saved heap pointer (a bare old-body address, the
+    // shape a registry BlissVal would carry).
+    let ptr = HOST_SAVED_PTR.load(std::sync::atomic::Ordering::SeqCst) as u64;
+    let mut out = b"HOSTREG1".to_vec();
+    out.extend_from_slice(&ptr.to_le_bytes());
+    out
+}
+
+fn host_restore_hook(data: &[u8]) -> Result<(), bliss_rt::error::BlissError> {
+    assert_eq!(&data[..8], b"HOSTREG1", "host section marker must round-trip");
+    let raw = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    // The hook runs after heap restore, so remap resolves the saved pointer
+    // into the newly materialized heap.
+    let remapped = bliss_rt::gc::remap_saved_pointer(raw);
+    HOST_RESTORED_PTR.store(remapped as usize, std::sync::atomic::Ordering::SeqCst);
+    HOST_RESTORE_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+#[test]
+fn spec_image_round_trip_invokes_host_registry_hook_after_heap_restore() {
+    // bliss-x0f2 M2: registries owned by the host crate ride along as a
+    // HostRegistries image section. save_image writes it from the registered
+    // serialize hook; load_image invokes the restore hook LAST — after the heap
+    // is materialized — so its saved pointers remap through the old→new map.
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_test_heap();
+    bliss_rt::image::set_host_registry_hooks(host_serialize_hook, host_restore_hook);
+    HOST_RESTORE_RAN.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    record_object(0x71, vec![10, 11, 12, 13]);
+    // Capture the live body address of the object we just recorded; the host
+    // "registry" saves this pointer.
+    let objs = walk_objects_with_data();
+    let old_body = objs
+        .iter()
+        .find(|(_, t, _)| *t == 0x71)
+        .map(|(p, _, _)| *p)
+        .expect("recorded object present before save");
+    HOST_SAVED_PTR.store(old_body, std::sync::atomic::Ordering::SeqCst);
+    set_entry_continuation(BlissVal::from_fixnum(7));
+
+    let path = temp_path("host-registry.bimg");
+    let _ = fs::remove_file(&path);
+    save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
+
+    init_test_heap();
+    load_image(path.to_str().unwrap()).expect("load_image");
+
+    assert!(
+        HOST_RESTORE_RAN.load(std::sync::atomic::Ordering::SeqCst),
+        "host restore hook must be invoked during load_image"
+    );
+    let remapped = HOST_RESTORED_PTR.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        bliss_rt::gc::is_in_heap(remapped),
+        "host-registry saved pointer must remap into the restored heap"
+    );
+    // The remapped body must name the restored 0x71 object.
+    let restored = walk_objects_with_data();
+    assert!(
+        restored
+            .iter()
+            .any(|(p, t, d)| *p == remapped && *t == 0x71 && d == &vec![10, 11, 12, 13]),
+        "remapped host pointer must resolve to the restored object"
+    );
+}
+
 #[test]
 fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
     // bliss-x0f2: real Lisp slots hold TAGGED values (cons=|001, heap-object=

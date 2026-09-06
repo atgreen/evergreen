@@ -97,6 +97,27 @@ pub enum SectionType {
     Reloc = 5,
     GcMeta = 6,
     Settings = 7,
+    /// Host-crate registries (bliss-x0f2 M2): macros, setf-functions/expanders,
+    /// CLOS state — data owned by the `bliss` crate, contributed via a registered
+    /// hook because `bliss-rt` cannot see it. Restored after the heap so its saved
+    /// pointers can be remapped through the heap old→new map.
+    HostRegistries = 8,
+}
+
+/// Host-crate registry serialization hooks (bliss-x0f2 M2). The `bliss` crate
+/// registers these so `save_image`/`load_image` can persist registries that live
+/// outside `bliss-rt` (macros, setf, CLOS). The serializer returns an opaque
+/// blob; the deserializer restores it AFTER the heap/symbols/packages are back,
+/// so it may use `gc::remap_saved_pointer`.
+type HostSerializeHook = fn() -> Vec<u8>;
+type HostRestoreHook = fn(&[u8]) -> Result<(), BlissError>;
+static HOST_SERIALIZE: std::sync::Mutex<Option<HostSerializeHook>> = std::sync::Mutex::new(None);
+static HOST_RESTORE: std::sync::Mutex<Option<HostRestoreHook>> = std::sync::Mutex::new(None);
+
+/// Register the host-crate registry hooks (called once at startup by `bliss`).
+pub fn set_host_registry_hooks(serialize: HostSerializeHook, restore: HostRestoreHook) {
+    *HOST_SERIALIZE.lock().unwrap() = Some(serialize);
+    *HOST_RESTORE.lock().unwrap() = Some(restore);
 }
 
 /// A single entry in the section directory. D7.02.
@@ -423,6 +444,14 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     let gc_meta_raw: Vec<u8> = crate::gc::serialize_gc_metadata();
     let gc_meta_uncompressed_size = gc_meta_raw.len();
 
+    // Build the host-crate registry section from the registered hook (bliss-x0f2
+    // M2): macros/setf/CLOS owned by the `bliss` crate. Empty if no hook.
+    let host_raw: Vec<u8> = match *HOST_SERIALIZE.lock().unwrap() {
+        Some(hook) => hook(),
+        None => Vec::new(),
+    };
+    let host_uncompressed_size = host_raw.len();
+
     // Apply compression if requested.
     let heap_data = if use_compression {
         compress_data(&heap_data_raw)
@@ -454,9 +483,14 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     } else {
         gc_meta_raw
     };
+    let host_data = if use_compression {
+        compress_data(&host_raw)
+    } else {
+        host_raw
+    };
 
-    // Section count: Heap, Symbols, Packages, Code, Reloc, GcMeta
-    let section_count: u32 = 6;
+    // Section count: Heap, Symbols, Packages, Code, Reloc, GcMeta, HostRegistries
+    let section_count: u32 = 7;
 
     // Page alignment constant (4 KiB) — §7.2.2 requires sections after
     // the directory to be page-aligned to allow mmap with MAP_FIXED (R7.02).
@@ -530,6 +564,15 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: gc_meta_data.len() as u64,
         uncompressed_size: gc_meta_uncompressed_size as u64,
     };
+    current_offset = align_to_page(current_offset + gc_meta_data.len());
+
+    let host_section = SectionEntry {
+        section_type: SectionType::HostRegistries as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: host_data.len() as u64,
+        uncompressed_size: host_uncompressed_size as u64,
+    };
 
     // Get the actual heap base address for relocation tracking (R7.03).
     let original_base = crate::gc::heap_base_address();
@@ -576,6 +619,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             code_section,
             reloc_section,
             gc_meta_section,
+            host_section,
         ];
         for section in &sections {
             let section_bytes = struct_to_bytes(section);
@@ -587,13 +631,14 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         // Write section data with page-alignment padding between sections.
         // Each section's file_offset was computed with page alignment, so
         // we pad to match those offsets.
-        let section_data_slices: [&[u8]; 6] = [
+        let section_data_slices: [&[u8]; 7] = [
             &heap_data,
             &symbol_data,
             &package_data,
             &code_data,
             &reloc_data,
             &gc_meta_data,
+            &host_data,
         ];
         let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
         for (idx, data) in section_data_slices.iter().enumerate() {
@@ -738,6 +783,7 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
     let mut code_entry: Option<SectionEntry> = None;
     let mut reloc_entry: Option<SectionEntry> = None;
     let mut gc_meta_entry: Option<SectionEntry> = None;
+    let mut host_entry: Option<SectionEntry> = None;
 
     for i in 0..header.section_count as usize {
         let entry_offset = section_dir_start + i * SECTION_ENTRY_SIZE;
@@ -751,6 +797,7 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
             t if t == SectionType::Code as u32 => code_entry = Some(entry),
             t if t == SectionType::Reloc as u32 => reloc_entry = Some(entry),
             t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
+            t if t == SectionType::HostRegistries as u32 => host_entry = Some(entry),
             _ => {
                 // Unknown section type — skip for forward compatibility.
             }
@@ -767,7 +814,7 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
     // Restore the heap section.
     let heap_entry = heap_entry
         .ok_or_else(|| BlissError::InvalidImage("image contains no heap section".into()))?;
-    let mut heap_bytes = read_section_data(&heap_entry)?;
+    let heap_bytes = read_section_data(&heap_entry)?;
 
     if heap_bytes.len() >= 8 {
         let mut buf = [0u8; 8];
@@ -817,6 +864,19 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
     if let Some(entry) = gc_meta_entry {
         let gc_meta_bytes = read_section_data(&entry)?;
         crate::gc::restore_gc_metadata(&gc_meta_bytes)?;
+    }
+
+    // Restore host-crate registries (bliss-x0f2 M2): macros/setf/CLOS owned by
+    // the `bliss` crate. Runs LAST so the heap old→new map and the symbol/package
+    // registries are already in place — the hook remaps its saved pointers via
+    // `gc::remap_saved_pointer`. A missing hook (or an empty section) is a no-op.
+    if let Some(entry) = host_entry {
+        let host_bytes = read_section_data(&entry)?;
+        if !host_bytes.is_empty() {
+            if let Some(hook) = *HOST_RESTORE.lock().unwrap() {
+                hook(&host_bytes)?;
+            }
+        }
     }
 
     // Store the restored entry continuation, remapped through the heap's old→new
