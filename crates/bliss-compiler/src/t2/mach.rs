@@ -92,6 +92,14 @@ pub struct MachInst {
     /// If this instruction is a safepoint or may deopt, the frame state whose
     /// locations the allocator must pin and record (spec §4.10 R4.65).
     pub frame_state: Option<FrameStateId>,
+    /// The frame state's register-sourced SSA values, as extra regalloc USES
+    /// (bliss-ad1e): a value live only because a deopt may reconstruct it is
+    /// otherwise invisible to regalloc2, so its register could be freed or
+    /// reused before the guard and the deopt would read a stale slot. Deduped
+    /// against `defs`/`uses`; fed to the allocator as Any-constraint late
+    /// uses, so they can live in spill slots and survive the instruction's own
+    /// writes (an in-place result reuse followed by a deopting `jo`).
+    pub deopt_uses: Vec<VReg>,
     /// True if this is a GC safepoint (needs a stack map, spec §4.7 R4.46).
     pub safepoint: bool,
 }

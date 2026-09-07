@@ -3272,6 +3272,7 @@ mod tests {
             uses,
             imm,
             frame_state: None,
+            deopt_uses: Vec::new(),
             safepoint: false,
         }
     }

@@ -223,6 +223,7 @@ impl<'f> Lowering<'f> {
             uses,
             imm: None,
             frame_state: None,
+            deopt_uses: Vec::new(),
             safepoint: false,
         });
     }
@@ -235,6 +236,7 @@ impl<'f> Lowering<'f> {
             uses,
             imm: None,
             frame_state: None,
+            deopt_uses: Vec::new(),
             safepoint: false,
         });
     }
@@ -250,6 +252,7 @@ impl<'f> Lowering<'f> {
             uses: vec![],
             imm: Some(imm),
             frame_state: None,
+            deopt_uses: Vec::new(),
             safepoint: false,
         });
     }
@@ -262,17 +265,38 @@ impl<'f> Lowering<'f> {
     fn emit_annotated(&mut self, i: Inst, op: u32, defs: Vec<VReg>, uses: Vec<VReg>) {
         let data = self.f.inst(i);
         let carries_state = data.flags.guard || data.flags.call || data.frame_state.is_some();
+        let frame_state = if carries_state {
+            data.frame_state
+        } else {
+            None
+        };
+        // Extend liveness of the frame state's register-sourced values to this
+        // instruction (bliss-ad1e): without an explicit operand, regalloc2 may
+        // free or reuse their registers before the guard, and a deopt would
+        // reconstruct the interpreter frame from stale slots. Dedup against
+        // the real defs/uses so a value isn't double-declared on the inst.
+        let mut deopt_uses: Vec<VReg> = Vec::new();
+        if let Some(fsid) = frame_state {
+            let fs = self.f.frame_states.get(fsid);
+            for scope in &fs.scopes {
+                for src in scope.locals.iter().chain(scope.stack.iter()) {
+                    if let crate::t2::frame_state::ValueSource::Value { value, .. } = src {
+                        let v = self.vreg(*value);
+                        if !defs.contains(&v) && !uses.contains(&v) && !deopt_uses.contains(&v) {
+                            deopt_uses.push(v);
+                        }
+                    }
+                }
+            }
+        }
         self.insts.push(MachInst {
             source_inst: Some(i),
             op,
             defs,
             uses,
             imm: None,
-            frame_state: if carries_state {
-                data.frame_state
-            } else {
-                None
-            },
+            frame_state,
+            deopt_uses,
             safepoint: data.flags.safepoint,
         });
     }

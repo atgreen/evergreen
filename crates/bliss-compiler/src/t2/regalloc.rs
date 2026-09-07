@@ -91,7 +91,8 @@ use std::collections::HashMap;
 
 use regalloc2::{
     Algorithm, Allocation, Block, Edit, Function as Ra2Function, Inst as Ra2Inst, InstPosition,
-    InstRange, MachineEnv, Operand, OperandKind, PReg, PRegSet, RegAllocError,
+    InstRange, MachineEnv, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet,
+    RegAllocError,
     RegClass as Ra2RegClass, RegallocOptions, VReg as Ra2VReg,
 };
 
@@ -235,12 +236,27 @@ impl Adapter {
         let mut operands: Vec<Vec<Operand>> = Vec::with_capacity(mf.insts.len());
         let mut clobbers: Vec<PRegSet> = Vec::with_capacity(mf.insts.len());
         for inst in &mf.insts {
-            let mut ops = Vec::with_capacity(inst.defs.len() + inst.uses.len());
+            let mut ops =
+                Vec::with_capacity(inst.defs.len() + inst.uses.len() + inst.deopt_uses.len());
             for &d in &inst.defs {
                 ops.push(Operand::reg_def(intern(d)));
             }
             for &u in &inst.uses {
                 ops.push(Operand::reg_use(intern(u)));
+            }
+            // Frame-state liveness extension (bliss-ad1e): a value a deopt may
+            // reconstruct must stay locatable AT AND AFTER this instruction —
+            // Any constraint (register or spill slot both fine; keeps pressure
+            // low) at the Late position (survives the inst's own writes, so an
+            // in-place result reuse followed by a deopting `jo` still finds
+            // the original value).
+            for &v in &inst.deopt_uses {
+                ops.push(Operand::new(
+                    intern(v),
+                    OperandConstraint::Any,
+                    OperandKind::Use,
+                    OperandPos::Late,
+                ));
             }
             operands.push(ops);
 
@@ -575,6 +591,7 @@ mod tests {
             uses,
             imm: None,
             frame_state: None,
+            deopt_uses: Vec::new(),
             safepoint: false,
         }
     }
@@ -593,6 +610,7 @@ mod tests {
             uses: vec![g0],
             imm: None,
             frame_state: Some(FrameStateId(7)),
+            deopt_uses: Vec::new(),
             safepoint: true,
         };
 
@@ -605,6 +623,49 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    /// bliss-ad1e: a value referenced ONLY by a guard's frame state (no
+    /// ordinary use after its def) must stay locatable at the guard — the
+    /// deopt reconstructs the interpreter frame from it. Its `deopt_uses`
+    /// entry is what tells regalloc2 it is live there; without it the value
+    /// is dead after its def and its register can be recycled.
+    #[test]
+    fn frame_state_only_value_stays_locatable_at_its_guard() {
+        let g0 = vreg(RegClass::Gpr, 0);
+        let g1 = vreg(RegClass::Gpr, 1);
+        let guard = MachInst {
+            source_inst: None,
+            op: 3,
+            defs: vec![g1],
+            uses: vec![],
+            imm: None,
+            frame_state: Some(FrameStateId(9)),
+            deopt_uses: vec![g0],
+            safepoint: false,
+        };
+        let mut mf = MachFunc {
+            insts: vec![
+                inst(1, vec![g0], vec![]), // def g0 — never ordinarily used again
+                guard,                     // inst 1: frame state names g0
+                inst(0, vec![], vec![g1]), // ret uses g1 only
+            ],
+            ..Default::default()
+        };
+        allocate(&mut mf).expect("regalloc2");
+        // The guard instruction is index 1; its Late program point in
+        // regalloc2's raw encoding is 2*1 + 1 = 3. Some recorded location
+        // range for g0 must still cover it.
+        let guard_late = 3;
+        let covered = mf
+            .value_locations
+            .iter()
+            .any(|r| r.vreg == g0 && r.start <= guard_late && r.end >= guard_late);
+        assert!(
+            covered,
+            "frame-state-only value g0 has no location at its guard: {:?}",
+            mf.value_locations
+        );
     }
 
     #[test]
@@ -693,6 +754,7 @@ mod tests {
             uses: vec![g0, gm],
             imm: None,
             frame_state: Some(FrameStateId(11)),
+            deopt_uses: Vec::new(),
             safepoint: true,
         };
 
