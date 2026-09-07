@@ -839,6 +839,12 @@ pub fn install_signal_handlers() -> Result<(), BlissError> {
         )
         .map_err(|_| BlissError::SignalError(syscall::SIGTERM))?;
         syscall::rt_sigaction(
+            syscall::SIGALRM,
+            sigalrm_handler as *const () as usize,
+            syscall::SA_RESTART,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGALRM))?;
+        syscall::rt_sigaction(
             syscall::SIGFPE,
             sigfpe_handler as *const () as usize,
             syscall::SA_RESTART,
@@ -866,8 +872,25 @@ extern "C" fn sigint_handler(_sig: i32) {
     SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Grace period between SIGTERM and the SIGALRM hard exit (seconds).
+const SIGTERM_GRACE_SECS: u32 = 5;
+
 extern "C" fn sigterm_handler(_sig: i32) {
     SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Arm a hard deadline (bliss-siv7): the cooperative shutdown flag only
+    // works where code polls it — a hot T2 native loop has no back-edge poll
+    // yet, so a SIGTERM'd process could spin until SIGKILL. If we are still
+    // alive when the alarm fires, the SIGALRM handler exits 128+15, matching
+    // systemd/timeout escalation semantics. A graceful shutdown that finishes
+    // inside the grace period exits first and the alarm dies with the process.
+    let _ = crate::syscall::alarm(SIGTERM_GRACE_SECS);
+}
+
+extern "C" fn sigalrm_handler(_sig: i32) {
+    // Only armed by sigterm_handler. Still alive => the cooperative shutdown
+    // never ran (or stalled); terminate every thread now.
+    crate::syscall::dbg_write(b"bliss: SIGTERM grace period expired; exiting\n");
+    crate::syscall::exit_group(128 + crate::syscall::SIGTERM);
 }
 
 extern "C" fn sigfpe_handler(_sig: i32) {

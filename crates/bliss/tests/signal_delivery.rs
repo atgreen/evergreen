@@ -258,6 +258,61 @@ fn sigterm_stops_a_hot_native_loop() {
     );
 }
 
+/// bliss-siv7: with T2 ENABLED, a hot loop that finishes background T2
+/// compilation runs native code with no back-edge signal poll at all, so the
+/// cooperative SIGTERM flag is never seen. The interim fix arms a hard
+/// deadline in the SIGTERM handler (alarm + SIGALRM exit_group(143)), so the
+/// process terminates within the grace period instead of spinning until an
+/// external SIGKILL. (The full fix — a real T2 back-edge safepoint poll with
+/// a stack map — is bliss-eeyj.)
+#[test]
+fn sigterm_terminates_a_t2_loop_within_the_grace_period() {
+    let program = "\
+        (progn \
+          (defun spin (n) \
+            (let ((s 0)) (dotimes (i n s) (setq s (the fixnum (+ s i)))))) \
+          (dotimes (w 60) (spin 200000)) \
+          (format t \"READY~%\") \
+          (force-output) \
+          (spin 1000000000000) \
+          (format t \"FELL-THROUGH~%\") \
+          (force-output))";
+
+    let mut child = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bliss-cli");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let ready = lines
+        .next()
+        .expect("child should print readiness")
+        .expect("read readiness");
+    assert_eq!(ready, "READY", "child should reach the hot loop");
+    // Give background T2 compilation a moment to install the native loop.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "kill -TERM should succeed");
+
+    // The SIGTERM grace deadline is 5s; the child must be gone well before
+    // wait_for_child's 15s SIGKILL backstop, with a real exit status (143 from
+    // the deadline, or an orderly code if a poll caught the flag first).
+    let output = wait_for_child(child, Duration::from_secs(15));
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.code().is_some(),
+        "a T2 loop must terminate on SIGTERM within the grace period (exit code), \
+         not be SIGKILLed at the deadline (bliss-siv7); stderr:\n{text}"
+    );
+}
+
 #[test]
 fn sigfpe_is_delivered_as_catchable_arithmetic_error() {
     let program = "\

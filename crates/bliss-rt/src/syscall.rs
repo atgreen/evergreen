@@ -36,6 +36,7 @@ pub mod nr {
     pub const EXIT_GROUP: usize = 231;
     pub const GETTID: usize = 186;
     pub const TGKILL: usize = 234;
+    pub const ALARM: usize = 37;
     pub const FUTEX: usize = 202;
     pub const POLL: usize = 7;
     pub const EPOLL_CREATE1: usize = 291;
@@ -347,7 +348,17 @@ pub const SIGABRT: i32 = 6;
 pub const SIGSEGV: i32 = 11;
 pub const SIGUSR1: i32 = 10;
 pub const SIGPIPE: i32 = 13;
+pub const SIGALRM: i32 = 14;
 pub const SIGTERM: i32 = 15;
+
+/// `alarm(2)` — deliver SIGALRM to this process after `seconds` (0 cancels).
+/// Async-signal-safe (a plain syscall); returns the previous alarm's remaining
+/// seconds.
+#[inline]
+pub fn alarm(seconds: u32) -> u32 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall1(nr::ALARM, seconds as usize) as u32 }
+}
 
 // ── Signal installation via rt_sigaction ─────────────────────────────────────
 // The kernel's sigaction differs from glibc's: on x86-64 the field order is
