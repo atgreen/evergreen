@@ -5091,6 +5091,22 @@ impl Env {
             features.push(resolve_sym(":WINDOWS").unwrap_or(NIL));
             features.push(resolve_sym(":WIN32").unwrap_or(NIL));
         }
+        // CPU, endianness, and word size follow the trivial-features canon
+        // (:X86-64/:ARM64, :LITTLE-ENDIAN/:BIG-ENDIAN, :64-BIT/:32-BIT) so
+        // trivial-features has nothing left to derive on Bliss and portable
+        // code (cffi, babel, ...) can dispatch without a tf-bliss shim.
+        #[cfg(target_arch = "x86_64")]
+        features.push(resolve_sym(":X86-64").unwrap_or(NIL));
+        #[cfg(target_arch = "aarch64")]
+        features.push(resolve_sym(":ARM64").unwrap_or(NIL));
+        #[cfg(target_endian = "little")]
+        features.push(resolve_sym(":LITTLE-ENDIAN").unwrap_or(NIL));
+        #[cfg(target_endian = "big")]
+        features.push(resolve_sym(":BIG-ENDIAN").unwrap_or(NIL));
+        #[cfg(target_pointer_width = "64")]
+        features.push(resolve_sym(":64-BIT").unwrap_or(NIL));
+        #[cfg(target_pointer_width = "32")]
+        features.push(resolve_sym(":32-BIT").unwrap_or(NIL));
         // *FEATURES* lives in the global symbol-value cell (not a frame binding),
         // so the reader's #+/#- conditionals can consult it directly — and (push
         // :foo *features*) routes to the same cell. lookup_var/set_var fall through
