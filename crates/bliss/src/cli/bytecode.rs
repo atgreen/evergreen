@@ -2402,7 +2402,9 @@ impl<'e> Lowerer<'e> {
         // closure over VAR captures THAT iteration's value — matching SBCL and
         // the tree-walker ((lambda () var) in the body yields 0 1 2, not the
         // final value shared across every closure).
-        let test = form_list(&[s("<")?, counter, limit]);
+        // Rooted: `test` is a heap cons held across the allocating form_list
+        // calls below (moving GC; caught by BLISS_GC_STRESS=8 as a T1 bail).
+        bliss_rt::rooted!(test = form_list(&[s("<")?, counter, limit]));
         bliss_rt::rooted!(iter_binding = form_list(&[var, counter]));
         bliss_rt::rooted!(iter_bindings = form_list(&[*iter_binding]));
         bliss_rt::rooted!(iter_let_items = vec![s("LET")?, *iter_bindings]);
@@ -2411,7 +2413,7 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted!(inc = form_list(&[s("+")?, counter, BlissVal::from_fixnum(1)]));
         bliss_rt::rooted!(step = form_list(&[s("SETQ")?, counter, *inc]));
         bliss_rt::rooted!(go_top = form_list(&[s("GO")?, top]));
-        bliss_rt::rooted!(when_form = form_list(&[s("WHEN")?, test, *iter_let, *step, *go_top]));
+        bliss_rt::rooted!(when_form = form_list(&[s("WHEN")?, *test, *iter_let, *step, *go_top]));
         bliss_rt::rooted!(tagbody_form = form_list(&[s("TAGBODY")?, top, *when_form]));
 
         bliss_rt::rooted!(counter_binding = form_list(&[counter, BlissVal::from_fixnum(0)]));
