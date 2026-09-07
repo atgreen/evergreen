@@ -7017,7 +7017,21 @@ fn reader_macro_invoker(
     bliss_rt::rooted!(stream = bliss_stdlib::make_string_input_stream(*text_val, 0, None)?);
     let sub_val = BlissVal::from_char(sub);
     let arg_val = infix.map(BlissVal::from_fixnum).unwrap_or(NIL);
-    let result = apply_function(handler, &[*stream, sub_val, arg_val], env)?;
+    let dbg = std::env::var_os("BLISS_RDMAC_DBG").is_some();
+    if dbg {
+        eprintln!(
+            ";; rdmac invoke: sub={sub:?} text[..40]={:?}",
+            &text.chars().take(40).collect::<String>()
+        );
+    }
+    let result = apply_function(handler, &[*stream, sub_val, arg_val], env);
+    if dbg {
+        match &result {
+            Ok(v) => eprintln!(";; rdmac ok: {:?}", format_val(*v).chars().take(60).collect::<String>()),
+            Err(e) => eprintln!(";; rdmac ERR: {e}"),
+        }
+    }
+    let result = result?;
     let zero_values = env.mv_active && env.mv.is_empty();
     let consumed = bliss_stdlib::file_position(*stream)?
         .as_fixnum()
@@ -9083,7 +9097,32 @@ fn build_bfasl_from_source(
     src_path: &str,
     env: &mut Env,
 ) -> Result<Vec<u8>, BlissError> {
-    let mut forms = read_forms_for_compile(source, env)?;
+    // A file whose READING depends on compile-time evaluation — e.g. iterate
+    // installs its #L dispatch macro via a mid-file eval-when, which the
+    // upfront read-all pass here cannot honor (CLHS compile-file interleaves
+    // read and :compile-toplevel processing; ours doesn't yet) — cannot be
+    // pre-read as forms. Downgrade to the source-only artifact: the loader
+    // re-reads the text form-by-form WITH evaluation, so the compile-time
+    // reader state exists when the custom syntax is reached (bliss-tzc2).
+    let mut forms = match read_forms_for_compile(source, env) {
+        Ok(forms) => forms,
+        Err(e) => {
+            if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
+                eprintln!("[bfasl] {src_path}: upfront read failed ({e}); source-only artifact");
+            }
+            return Ok(bliss_rt::bfasl::BfaslBuilder::new()
+                .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
+                .section(
+                    bliss_rt::bfasl::section::TOPLEVEL_FORMS,
+                    source.as_bytes().to_vec(),
+                )
+                .section(
+                    bliss_rt::bfasl::section::SOURCE_MAP,
+                    src_path.as_bytes().to_vec(),
+                )
+                .build());
+        }
+    };
     bliss_rt::rooted_ref!(_forms_root = &mut forms);
     match bytecode::build_bbu_from_forms(&forms, src_path, source, env)? {
         Some(bytecode_unit) => Ok(bliss_rt::bfasl::BfaslBuilder::new()

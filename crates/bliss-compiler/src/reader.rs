@@ -950,7 +950,10 @@ fn read_token_with_base(
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
-            if pos + 1 < chars.len() && chars[pos + 1] == '@' {
+            if pos + 1 < chars.len() && (chars[pos + 1] == '@' || chars[pos + 1] == '.') {
+                // `,@` splices; `,.` is the destructive-splice variant (CLHS
+                // 2.4.6) — append semantics are a conforming implementation and
+                // what iterate's `(progn ,.body)` skeleton needs (bliss-tzc2).
                 let (mut val, p) = read_token_with_base(
                     chars,
                     pos + 2,
@@ -2363,7 +2366,7 @@ fn skip_form(chars: &[char], pos: usize, depth: usize) -> Result<usize, BlissErr
         '"' => skip_string(chars, pos + 1),
         '\'' | '`' => skip_form(chars, pos + 1, depth + 1),
         ',' => {
-            if pos + 1 < chars.len() && chars[pos + 1] == '@' {
+            if pos + 1 < chars.len() && (chars[pos + 1] == '@' || chars[pos + 1] == '.') {
                 skip_form(chars, pos + 2, depth + 1)
             } else {
                 skip_form(chars, pos + 1, depth + 1)

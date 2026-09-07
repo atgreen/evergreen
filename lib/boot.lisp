@@ -1122,6 +1122,12 @@
 ;; string-get/string-set expand to (schar ...) / (setf (schar ...) ...).
 (defun schar (s i) (elt s i))
 (defun acons (key datum alist) (cons (cons key datum) alist))
+(defun pairlis (keys data &optional alist)
+  ;; CLHS PAIRLIS: prepend (key . datum) pairs onto ALIST (iterate uses it).
+  (do ((k keys (cdr k))
+       (d data (cdr d))
+       (acc alist (acons (car k) (car d) acc)))
+      ((or (endp k) (endp d)) acc)))
 (defun list-length (list) (length list))
 (defun nconc (&rest lists) (apply (function append) lists))
 (defun revappend (x y) (append (reverse x) y))
