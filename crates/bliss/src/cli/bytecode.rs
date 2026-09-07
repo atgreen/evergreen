@@ -12589,6 +12589,13 @@ fn native_loop_should_exit() -> u64 {
 /// cannot use `c2i_t1_backedge`; without any back-edge poll a hot OSR loop
 /// ignores SIGTERM and GC stop-the-world forever (the observed `timeout` hang).
 extern "C" fn c2i_osr_backedge() -> u64 {
+    // GC stop-the-world (bliss-eeyj): park here if a safepoint is requested.
+    // The OSR frame is on the rt thread stack under a conservative all-slots
+    // stack map (install_stack_map's single pc-0 entry matches every pc), and
+    // native code holds no heap refs in registers across this crossing — the
+    // same discipline that already makes moving GC safe at any T1/OSR runtime
+    // call — so parking and being scanned here is sound.
+    bliss_rt::safepoint::poll_safepoint();
     native_loop_should_exit()
 }
 
@@ -12605,6 +12612,14 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     if native_loop_should_exit() != 0 {
         return 1;
     }
+    // GC stop-the-world (bliss-eeyj): a call-free T1 loop reaches Rust only
+    // here, so this is where it must be stoppable by another thread's GC. Safe
+    // for the same reasons as any T1 runtime call: the frame is on the rt
+    // thread stack under the conservative all-slots stack map (the pc-0 entry
+    // resolves for every pc), and no heap refs live in registers across the
+    // crossing. Polled BEFORE any BlissVal/Rc is fetched below, so nothing
+    // here is held across the park.
+    bliss_rt::safepoint::poll_safepoint();
     let sym = sym as u32;
     let header_bcp = header_bcp as u32;
     let Some(body) = registry_get(sym) else {
