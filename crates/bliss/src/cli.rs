@@ -6628,6 +6628,72 @@ fn next_closure_id() -> u64 {
     })
 }
 
+thread_local! {
+    /// Registry size at the last closure prune (amortized doubling trigger).
+    static LAST_CLOSURE_PRUNE_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Drop CLOSURE_REGISTRY entries whose `(BLISS::CLOSURE . id)` cons no longer
+/// exists in the live heap (bliss-uamd). The registry never forgot an id, so a
+/// long ASDF load accumulated hundreds of thousands of dead closures whose
+/// params/body/captured frames the GC re-scanned as roots on EVERY collection
+/// — the root scan grew unboundedly and the load went superlinear.
+///
+/// Liveness: a registry entry is reachable from Lisp only through its
+/// `(BLISS::CLOSURE . id)` cons, and every such cons lives ON the GC heap (no
+/// matter who references it — frames, tables, Rust roots all keep the CONS
+/// alive). So: run a compacting full GC (garbage conses die), then walk the
+/// live heap collecting the referenced ids, and retain exactly those. A raw
+/// id briefly extracted into a Rust local (apply dispatch) is always taken
+/// from a cons the caller still holds live, so the walk retains its entry.
+/// Returns (before, after). GC-safe: called only from points where a GC could
+/// occur anyway (correct code roots across allocations).
+fn prune_closure_registry() -> (usize, usize) {
+    // Resolve the marker symbol BEFORE the GC (resolve_sym may intern); the
+    // result is an index-tagged immediate, safe to hold across collection.
+    let Some(closure_sym) = resolve_sym("BLISS::CLOSURE") else {
+        return (0, 0);
+    };
+    if bliss_rt::gc::full_gc().is_err() {
+        return (0, 0);
+    }
+    let mut live: HashSet<u64> = HashSet::new();
+    let _ = bliss_rt::gc::walk_heap(|body, type_id, size| {
+        if type_id == bliss_rt::object::type_id::CONS && size >= 16 {
+            // SAFETY: a CONS body is [car u64][cdr u64]; walk_heap hands us
+            // the body pointer of a live object under the heap lock.
+            let car = BlissVal::from_raw(unsafe { *(body as *const u64) });
+            if car == closure_sym {
+                let cdr = BlissVal::from_raw(unsafe { *(body as *const u64).add(1) });
+                if cdr.is_fixnum() {
+                    live.insert(cdr.as_fixnum() as u64);
+                }
+            }
+        }
+        true
+    });
+    let reg = CLOSURE_REGISTRY.with(Rc::clone);
+    let before = reg.borrow().len();
+    reg.borrow_mut().retain(|id, _| live.contains(id));
+    let after = reg.borrow().len();
+    LAST_CLOSURE_PRUNE_LEN.with(|c| c.set(after));
+    if std::env::var_os("BLISS_PRUNE_DBG").is_some() {
+        eprintln!(";; closure prune: {before} -> {after}");
+    }
+    (before, after)
+}
+
+/// Amortized prune trigger: fire when the registry has doubled since the last
+/// prune (and is big enough to matter). Called at file-load boundaries — a
+/// natural safe point between top-level forms.
+fn maybe_prune_closure_registry() {
+    let len = CLOSURE_REGISTRY.with(|r| r.borrow().len());
+    let last = LAST_CLOSURE_PRUNE_LEN.with(|c| c.get());
+    if len >= 8192 && len >= last.saturating_mul(2).max(8192) {
+        prune_closure_registry();
+    }
+}
+
 fn next_stdlib_class_id() -> BlissVal {
     NEXT_STDLIB_CLASS_ID.with(|c| {
         let v = *c.borrow();
@@ -8881,6 +8947,10 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
         env.define_local("*PACKAGE*", package_object(&saved_package));
         sync_package_value_cell(&saved_package);
     }
+    // A file-load boundary is a natural safe point to shed dead closures
+    // (bliss-uamd): a long ASDF load otherwise grows the closure registry —
+    // and with it every GC's root scan — without bound.
+    maybe_prune_closure_registry();
     result
 }
 
@@ -10128,6 +10198,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     NIL
                 });
+            }
+            "BLISS::%PRUNE-CLOSURES" => {
+                // (bliss::%prune-closures) → (before after): drop dead
+                // closure-registry entries (bliss-uamd). Also runs
+                // automatically at load boundaries and before core saves.
+                let (before, after) = prune_closure_registry();
+                bliss_rt::rooted!(b = BlissVal::from_fixnum(before as i64));
+                bliss_rt::rooted!(a = BlissVal::from_fixnum(after as i64));
+                return Ok(vec_to_list(&[*b, *a]));
             }
             "BLISS::%SYM-BY-INDEX" => {
                 let args = eval_args(cdr, env)?;
@@ -24683,6 +24762,9 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Blis
     // Expose this Env's generic-function registries to the serialize hook
     // (whose signature has no Env). Rc shares — the full_gc below relocates
     // objects and the Env root scan updates this same storage (bliss-x0f2.7a).
+    // Shed dead closures first so the CLSR block (and every restored core's
+    // permanent root set) carries only live ones (bliss-uamd).
+    prune_closure_registry();
     SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(Rc::clone(&env.generics)));
     SAVE_METHODS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.methods)));
     SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(Rc::clone(&env.classes)));
