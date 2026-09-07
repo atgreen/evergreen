@@ -25,6 +25,7 @@ pub mod format;
 
 // ── Pathnames ─────────────────────────────────────────────────────
 pub mod pathnames;
+pub mod offheap_image;
 
 // ── Developer tools ───────────────────────────────────────────────
 pub mod devtools;

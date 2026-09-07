@@ -1193,6 +1193,97 @@ pub fn make_lisp_string_fresh(s: &str) -> BlissVal {
     unsafe { BlissVal::from_heap_ptr(ptr) }
 }
 
+// ── Core-image serialization of interned strings (bliss-x0f2 off-heap M3) ──
+//
+// `make_lisp_string` allocates OFF the GC heap, so an interned string never
+// rides the heap image section — yet references to it sit anywhere a value
+// can: hash-table slots, cons cells, CLOS slots, symbol plists. Carrying the
+// intern table by content and folding each (old, new) header pair into the
+// reloc map lets Pass 2 rewrite every such reference like an on-heap one —
+// including ones buried inside structures (the cons-key case that crashed
+// EQUAL hashing during a babel-core restore). `make_lisp_string_fresh`
+// strings are NOT in the table and still cannot ride; converging stdlib
+// strings onto real heap objects (bliss-jtc.2) retires that gap for good.
+
+/// Serialize the interned-string table for a core image. Reads off-heap
+/// content only (no Bliss allocation) — GC-safe post-STW-GC.
+pub fn serialize_interned_strings() -> Vec<u8> {
+    let mut out = Vec::new();
+    let entries: Vec<(Vec<u8>, u64)> = {
+        let table = string_intern_table().lock().unwrap();
+        table
+            .iter()
+            .map(|(bytes, val)| (bytes.clone(), unsafe { val.as_ptr() } as u64))
+            .collect()
+    };
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (bytes, old_header) in entries {
+        out.extend_from_slice(&old_header.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+thread_local! {
+    /// (content bytes, restored string object) records between the allocate
+    /// and populate phases of a core restore.
+    static PENDING_INTERNED: std::cell::RefCell<Vec<(Vec<u8>, BlissVal)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Restore phase 1: re-create each saved string object and return
+/// (old_header, new_header) pairs for the reloc-map fold. Runs UNDER the heap
+/// lock, so it must not take the intern-table lock (lock order: InternedString
+/// sits below the GC heap) — table registration is deferred to
+/// [`populate_interned_strings`]. GC-safe: only `std::alloc` allocation.
+pub fn allocate_interned_strings(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut off = 0usize;
+    if data.len() < 4 {
+        return pairs;
+    }
+    let n = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    off += 4;
+    for _ in 0..n {
+        if data.len() < off + 12 {
+            break;
+        }
+        let old_header = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if data.len() < off + len {
+            break;
+        }
+        let bytes = data[off..off + len].to_vec();
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        off += len;
+        let val = unsafe { BlissVal::from_heap_ptr(alloc_string_object(&s)) };
+        let new_header = unsafe { val.as_ptr() } as usize;
+        PENDING_INTERNED.with(|p| p.borrow_mut().push((bytes, val)));
+        pairs.push((old_header as usize, new_header));
+    }
+    pairs
+}
+
+/// Restore phase 2 (heap lock released): register the restored strings in the
+/// intern table so future `make_lisp_string` calls with the same content
+/// return the SAME object references remapped to. A string the fresh process
+/// interned before the load keeps its table slot (the restored object still
+/// exists and every remapped reference is valid; only EQ-dedup with the
+/// pre-load object is lost — content equality holds either way).
+pub fn populate_interned_strings() {
+    let pending = PENDING_INTERNED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    let mut table = string_intern_table().lock().unwrap();
+    for (bytes, val) in pending {
+        table.entry(bytes).or_insert(val);
+    }
+}
+
 fn alloc_string_object(s: &str) -> *mut u8 {
     // A constructed simple string is a 32-bit SIMPLE_CHARACTER_STRING (SBCL
     // model, spec §1.6.3): holds any code point and is freely mutable. The

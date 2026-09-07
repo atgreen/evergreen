@@ -1632,3 +1632,316 @@ pub fn rename_file(
     let new_true = pathname_from_fs_path(Path::new(&new_path_str))?;
     Ok((new_name, old_true, new_true))
 }
+
+// ── Core-image serialization of pathnames (bliss-x0f2 off-heap M3) ──────
+//
+// A pathname VALUE is a 16-byte `std::alloc` block (PATHNAME header) OFF the
+// GC heap, with its real data in the off-heap PATHNAME_STORE side table —
+// `walk_heap` never visits either, so a %save-core image used to carry only
+// stale pointers: printing a restored *DEFAULT-PATHNAME-DEFAULTS* segfaulted
+// reading the dead header, and asdf:find-system crashed in parse_namestring.
+// These hooks ride the OffHeap section next to the hash-table bodies, with the
+// same two-phase contract: `allocate` re-creates the header blocks and returns
+// (old, new) pairs for the reloc-map fold; `populate` fills the store once the
+// final remap exists. Component slots use the hash-table SlotRec convention —
+// a raw tagged word (remapped) or, for an off-heap interned string, the string
+// CONTENT, re-created via make_string_bv (which also repopulates the
+// STRING_REGISTRY / STRING_REVERSE_REGISTRY caches).
+
+enum PnSlot {
+    Raw(u64),
+    Str(String),
+}
+
+fn pn_put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn pn_put_str(out: &mut Vec<u8>, s: &str) {
+    pn_put_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn pn_put_opt_str(out: &mut Vec<u8>, s: &Option<String>) {
+    match s {
+        Some(s) => {
+            out.push(1);
+            pn_put_str(out, s);
+        }
+        None => out.push(0),
+    }
+}
+
+fn pn_put_slot(out: &mut Vec<u8>, v: BlissVal) {
+    let off_heap_string =
+        v.is_string() && !bliss_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize);
+    if off_heap_string {
+        out.push(1);
+        pn_put_str(out, &v.as_string());
+    } else {
+        out.push(0);
+        out.extend_from_slice(&v.0.to_le_bytes());
+    }
+}
+
+fn pn_get_u32(data: &[u8], off: &mut usize) -> Option<u32> {
+    if data.len() < *off + 4 {
+        return None;
+    }
+    let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+    *off += 4;
+    Some(v)
+}
+
+fn pn_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
+    if data.len() < *off + 8 {
+        return None;
+    }
+    let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    Some(v)
+}
+
+fn pn_get_str(data: &[u8], off: &mut usize) -> Option<String> {
+    let len = pn_get_u32(data, off)? as usize;
+    if data.len() < *off + len {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&data[*off..*off + len]).into_owned();
+    *off += len;
+    Some(s)
+}
+
+fn pn_get_opt_str(data: &[u8], off: &mut usize) -> Option<Option<String>> {
+    if data.len() < *off + 1 {
+        return None;
+    }
+    let tag = data[*off];
+    *off += 1;
+    if tag == 1 {
+        pn_get_str(data, off).map(Some)
+    } else {
+        Some(None)
+    }
+}
+
+fn pn_get_slot(data: &[u8], off: &mut usize) -> Option<PnSlot> {
+    if data.len() < *off + 1 {
+        return None;
+    }
+    let tag = data[*off];
+    *off += 1;
+    if tag == 1 {
+        pn_get_str(data, off).map(PnSlot::Str)
+    } else {
+        pn_get_u64(data, off).map(PnSlot::Raw)
+    }
+}
+
+fn pn_put_parsed(out: &mut Vec<u8>, p: &ParsedPathname) {
+    out.push(p.is_logical as u8);
+    pn_put_opt_str(out, &p.host_name);
+    match &p.directory {
+        Some(d) => {
+            out.push(1);
+            out.push(d.absolute as u8);
+            pn_put_u32(out, d.parts.len() as u32);
+            for part in &d.parts {
+                match part {
+                    DirPart::Literal(s) => {
+                        out.push(0);
+                        pn_put_str(out, s);
+                    }
+                    DirPart::Wild => out.push(1),
+                    DirPart::WildInferiors => out.push(2),
+                    DirPart::Up => out.push(3),
+                }
+            }
+        }
+        None => out.push(0),
+    }
+    for comp in [&p.name, &p.type_field] {
+        match comp {
+            Some(ComponentSpec::Literal(s)) => {
+                out.push(1);
+                pn_put_str(out, s);
+            }
+            Some(ComponentSpec::Wild) => out.push(2),
+            None => out.push(0),
+        }
+    }
+}
+
+fn pn_get_parsed(data: &[u8], off: &mut usize) -> Option<ParsedPathname> {
+    if data.len() < *off + 1 {
+        return None;
+    }
+    let is_logical = data[*off] == 1;
+    *off += 1;
+    let host_name = pn_get_opt_str(data, off)?;
+    if data.len() < *off + 1 {
+        return None;
+    }
+    let has_dir = data[*off] == 1;
+    *off += 1;
+    let directory = if has_dir {
+        if data.len() < *off + 1 {
+            return None;
+        }
+        let absolute = data[*off] == 1;
+        *off += 1;
+        let n = pn_get_u32(data, off)? as usize;
+        let mut parts = Vec::with_capacity(n);
+        for _ in 0..n {
+            if data.len() < *off + 1 {
+                return None;
+            }
+            let tag = data[*off];
+            *off += 1;
+            parts.push(match tag {
+                0 => DirPart::Literal(pn_get_str(data, off)?),
+                1 => DirPart::Wild,
+                2 => DirPart::WildInferiors,
+                _ => DirPart::Up,
+            });
+        }
+        Some(DirectorySpec { absolute, parts })
+    } else {
+        None
+    };
+    let mut comps: [Option<ComponentSpec>; 2] = [None, None];
+    for c in comps.iter_mut() {
+        if data.len() < *off + 1 {
+            return None;
+        }
+        let tag = data[*off];
+        *off += 1;
+        *c = match tag {
+            1 => Some(ComponentSpec::Literal(pn_get_str(data, off)?)),
+            2 => Some(ComponentSpec::Wild),
+            _ => None,
+        };
+    }
+    let [name, type_field] = comps;
+    Some(ParsedPathname {
+        is_logical,
+        host_name,
+        directory,
+        name,
+        type_field,
+    })
+}
+
+/// Serialize every live pathname for a core image. Reads raw tagged words and
+/// off-heap record data only (no Bliss allocation) — GC-safe post-STW-GC.
+pub fn serialize_pathnames() -> Vec<u8> {
+    let mut out = Vec::new();
+    let records: Vec<(u64, PathnameRecord)> = {
+        let mut guard = PATHNAME_STORE.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_mut() {
+            Some(store) => store.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            None => Vec::new(),
+        }
+    };
+    pn_put_u32(&mut out, records.len() as u32);
+    for (raw, rec) in records {
+        let header = unsafe { BlissVal(raw).as_ptr() } as u64;
+        out.extend_from_slice(&header.to_le_bytes());
+        for comp in [
+            rec.host,
+            rec.device,
+            rec.directory,
+            rec.name,
+            rec.type_field,
+            rec.version,
+        ] {
+            pn_put_slot(&mut out, comp);
+        }
+        pn_put_opt_str(&mut out, &rec.namestring);
+        pn_put_parsed(&mut out, &rec.parsed);
+    }
+    out
+}
+
+/// Pending (new_value, component slots, parsed, namestring) records between the
+/// allocate and populate phases of a core restore.
+type PendingPathname = (BlissVal, Vec<PnSlot>, ParsedPathname, Option<String>);
+thread_local! {
+    static PENDING_PATHNAMES: std::cell::RefCell<Vec<PendingPathname>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Phase 1: re-create each pathname's 16-byte header block (off the GC heap)
+/// and return (old_header, new_header) pairs for the reloc-map fold. Component
+/// remapping and store insertion wait for `populate_pathnames`. GC-safe: only
+/// `std::alloc` allocation.
+pub fn allocate_pathnames(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut off = 0usize;
+    let Some(n) = pn_get_u32(data, &mut off) else {
+        return pairs;
+    };
+    for _ in 0..n {
+        let Some(old_header) = pn_get_u64(data, &mut off) else {
+            break;
+        };
+        let mut slots = Vec::with_capacity(6);
+        let mut ok = true;
+        for _ in 0..6 {
+            match pn_get_slot(data, &mut off) {
+                Some(s) => slots.push(s),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            break;
+        }
+        let Some(namestring) = pn_get_opt_str(data, &mut off) else {
+            break;
+        };
+        let Some(parsed) = pn_get_parsed(data, &mut off) else {
+            break;
+        };
+        let layout = std::alloc::Layout::from_size_align(16, 8).expect("pathname layout");
+        let bv = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout);
+            *(ptr as *mut ObjectHeader) = ObjectHeader::new(type_id::PATHNAME, 2);
+            BlissVal::from_heap_ptr(ptr)
+        };
+        let new_header = unsafe { bv.as_ptr() } as usize;
+        PENDING_PATHNAMES.with(|p| p.borrow_mut().push((bv, slots, parsed, namestring)));
+        pairs.push((old_header as usize, new_header));
+    }
+    pairs
+}
+
+/// Phase 2: resolve each pending record's component slots (raw words through
+/// `remap`, off-heap strings re-created via `make_string_bv`, which also
+/// repopulates the string registries) and insert the records into the
+/// PATHNAME_STORE. GC-safe: `make_lisp_string` allocates off the GC heap only.
+pub fn populate_pathnames(remap: &dyn Fn(u64) -> u64) {
+    install_pathname_global_root_scanner();
+    let pending = PENDING_PATHNAMES.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (bv, slots, parsed, namestring) in pending {
+        let resolve = |slot: &PnSlot| match slot {
+            PnSlot::Raw(raw) => BlissVal(remap(*raw)),
+            PnSlot::Str(s) => make_string_bv(s),
+        };
+        let rec = PathnameRecord {
+            host: resolve(&slots[0]),
+            device: resolve(&slots[1]),
+            directory: resolve(&slots[2]),
+            name: resolve(&slots[3]),
+            type_field: resolve(&slots[4]),
+            version: resolve(&slots[5]),
+            parsed,
+            namestring,
+        };
+        with_pathname_store(|store| {
+            store.insert(bv.0, rec);
+        });
+    }
+}

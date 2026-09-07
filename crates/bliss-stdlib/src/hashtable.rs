@@ -994,8 +994,15 @@ pub fn populate_live_tables(remap: &dyn Fn(u64) -> u64) {
             // dereference a stale pointer while hashing the key.
             let resolve = |slot: SlotRec| match slot {
                 SlotRec::Raw(raw) => {
-                    let val = BlissVal::from_raw(remap(raw));
-                    let bad = val.is_heap_object()
+                    let mapped = remap(raw);
+                    let val = BlissVal::from_raw(mapped);
+                    // Carried off-heap bodies (interned strings, pathnames,
+                    // tables) remap to NEW off-heap addresses — a value the
+                    // fold rewrote is valid wherever it lives. Only an
+                    // UNMAPPED reference to an object outside the restored
+                    // heap is a stale pointer we must not hash.
+                    let bad = mapped == raw
+                        && val.is_heap_object()
                         && !bliss_rt::gc::is_in_heap(unsafe { val.as_ptr() } as usize);
                     if bad { None } else { Some(val) }
                 }
