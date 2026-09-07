@@ -139,6 +139,28 @@ pub fn bit_vector_ref(v: BlissVal, i: usize) -> Option<u8> {
     Some((byte >> (i % 8)) & 1)
 }
 
+/// Store bit `i` of a bit-vector in place (bliss-27f5). Returns `false` if
+/// `v` is not a bit-vector or `i` is out of bounds. `bit` is stored as 0 for
+/// zero, 1 otherwise. No allocation — GC-safe anywhere.
+pub fn bit_vector_set(v: BlissVal, i: usize, bit: u8) -> bool {
+    let Some(len) = bit_vector_len(v) else {
+        return false;
+    };
+    if i >= len {
+        return false;
+    }
+    let ptr = unsafe { v.as_ptr() as *mut u8 };
+    unsafe {
+        let byte = ptr.add(24 + i / 8);
+        if bit != 0 {
+            *byte |= 1 << (i % 8);
+        } else {
+            *byte &= !(1 << (i % 8));
+        }
+    }
+    true
+}
+
 /// `NUMBERP` — fixnum, single-float, or heap numeric types.
 pub fn numberp(v: BlissVal) -> bool {
     if v.is_fixnum() || v.is_single_float() {

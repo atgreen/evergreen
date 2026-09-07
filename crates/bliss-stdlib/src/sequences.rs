@@ -1091,6 +1091,25 @@ pub fn set_elt(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), 
         string_set_char(sequence, index, value)?;
         return Ok(());
     }
+    // Bit-vectors store 0/1 in place (bliss-27f5): (SETF (AREF bv i)) /
+    // (SETF (SBIT bv i)). No allocation — GC-safe.
+    if bliss_rt::types::bit_vector_p(sequence) {
+        let len = bliss_rt::types::bit_vector_len(sequence).unwrap_or(0);
+        if index >= len {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("index {} in bounds (length {})", index, len),
+            });
+        }
+        if !value.is_fixnum() || !matches!(value.as_fixnum(), 0 | 1) {
+            return Err(BlissError::TypeError {
+                datum: value,
+                expected: "bit (0 or 1)".to_string(),
+            });
+        }
+        bliss_rt::types::bit_vector_set(sequence, index, value.as_fixnum() as u8);
+        return Ok(());
+    }
     // Lists are not setf-elt-able
     Err(BlissError::TypeError {
         datum: sequence,
