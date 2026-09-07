@@ -327,3 +327,45 @@ and any other off-heap body types (streams already re-open; enumerate the rest).
 - **GC-safety during dump.** The dump runs after a stop-the-world major GC with no
   mutator allocation; keep it allocation-free.
 - **Versioning.** Stamp a format version + a build id; refuse mismatched cores.
+
+## Milestone LANDED 2026-09-07: complete cores; save-lisp-and-die routed (710140d…61fe9b1)
+
+The session closed the remaining coverage gaps end-to-end (bliss-x0f2.7.3,
+bliss-gjey, bliss-zz6w, bliss-5ven):
+
+- **PKGS**: the stdlib PackageStore (names/nicknames/use-lists/shadowing/table
+  refs) rides HostRegistries; reader package names re-register on load.
+- **Symbol registry keys** are serialized explicitly (qualified keys are not
+  recoverable from bare-name cells).
+- **CLSD**: interpreter `ClassDef`s — slot :initforms, :initargs,
+  accessor/reader/writer names, :default-initargs, class-slot cells. (Also
+  fixed: `visit_class_def_roots` never visited default-initarg forms.)
+- **CLSR**: the tree-walker CLOSURE_REGISTRY with its captured `EnvFrame`
+  graph serialized once by Rc identity (shared frames stay shared), plus the
+  bytecode CLOSURE_ENV / CLOSURE_CONTROL tables; NEXT_CLOSURE_ID resumes.
+- **BCOD**: the bytecode registry as a synthetic BYTECODE_UNIT executed by the
+  ordinary BBU loader on restore — kind-3 reinstalls named functions reusing
+  the restored source-free stub objects in place; new kind-10 RegisterClosure
+  reinstalls closure bytecode under image-stable uninterned indices;
+  source-free bytecode macro expanders re-emit as kind-4 installs.
+- **OffHeap** grew two families beside hash tables, framed as
+  `[len u64][bytes]` sub-blocks (`bliss_stdlib::offheap_image`): **pathnames**
+  (16-byte header blocks + PathnameRecord side table) and the
+  **make_lisp_string intern table** by content — each (old,new) folds into the
+  reloc map, so references buried inside structures remap like heap objects.
+  Allocate hooks run under the heap lock and may take no lower-order locks
+  (intern-table registration defers to populate).
+
+**Done-signals reached**: a core saved after loading ASDF answers
+`find-system` and can `asdf:load-system` babel from the restored world; a core
+saved *after* loading babel runs its encoder immediately (instant-startup
+preloaded libraries, bliss-5uj); `save-lisp-and-die` now writes this core
+(SBCL semantics — restore via `--image`/`:executable`, not LOAD), so
+instance-valued globals survive it.
+
+Known remainders (tracked as beads): `symbol-package` mis-derives the home
+package of internal qualified symbols post-restore; `boundp` on qualified
+symbols is NIL even without an image (pre-existing); ~32 registry functions
+fail tree serialization (some UIOP); LOGICAL_TRANSLATIONS not yet carried;
+`make_lisp_string_fresh` strings still cannot ride (converge stdlib strings
+onto heap objects, bliss-jtc.2).
