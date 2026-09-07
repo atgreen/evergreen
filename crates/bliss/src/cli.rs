@@ -5107,7 +5107,17 @@ impl Env {
                 );
             }
         }
-        env.define_local("*MODULES*", NIL); // names of REQUIRE'd/PROVIDE'd modules
+        // *MODULES* (REQUIRE'd/PROVIDE'd module names) lives in the symbol
+        // VALUE CELL, not a frame binding: a frame binding masked the restored
+        // cell after a core load, so (require :asdf) in a core saw an empty
+        // module list and re-loaded asdf.lisp over the restored ASDF (minutes
+        // of load ending in a half-redefined world — bliss-o2da follow-up).
+        {
+            let idx = bliss_rt::symbols::intern("*MODULES*");
+            if global_value_cell(idx).is_none() {
+                bliss_rt::symbols::set_symbol_value(idx, NIL);
+            }
+        }
         env.define_local("*PACKAGE*", package_object("COMMON-LISP-USER"));
         sync_package_value_cell("COMMON-LISP-USER");
         env.seed_standard_constant(
@@ -8949,18 +8959,31 @@ fn build_bfasl_from_source(
 
 /// True if `name` (a module string, matched case-insensitively) is already in
 /// `*MODULES*`.
+/// The current `*MODULES*` list. Cell-first: the value cell is the
+/// authoritative global store and the only one a core image carries; a frame
+/// binding (if some legacy path made one) is only a fallback.
+fn modules_value(env: &Env) -> BlissVal {
+    bliss_rt::symbols::find_index("*MODULES*")
+        .and_then(global_value_cell)
+        .or_else(|| env.lookup_var("*MODULES*"))
+        .unwrap_or(NIL)
+}
+
 fn module_provided(env: &Env, name: &str) -> bool {
-    list_to_vec(env.lookup_var("*MODULES*").unwrap_or(NIL))
+    list_to_vec(modules_value(env))
         .iter()
         .any(|m| val_as_str(*m).eq_ignore_ascii_case(name))
 }
 
 /// Record `name` in `*MODULES*` (pushnew, case-insensitive) so a later REQUIRE is
-/// a no-op.
+/// a no-op. Writes the symbol VALUE CELL — see the Env::new seeding comment.
 fn record_module(env: &mut Env, name: &str) {
     if !module_provided(env, name) {
-        let cur = env.lookup_var("*MODULES*").unwrap_or(NIL);
-        env.set_var("*MODULES*", arena_cons(arena_str(name), cur));
+        bliss_rt::rooted!(cur = modules_value(env));
+        bliss_rt::rooted!(name_val = arena_str(name));
+        let list = arena_cons(*name_val, *cur);
+        let idx = bliss_rt::symbols::intern("*MODULES*");
+        bliss_rt::symbols::set_symbol_value(idx, list);
     }
 }
 
@@ -8973,6 +8996,16 @@ fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     // ANSI: REQUIRE does nothing if the module is already present (whether loaded
     // by a prior REQUIRE or a plain LOAD that PROVIDEd it). Re-loading asdf.lisp
     // over an already-loaded asdf re-defines its packages and errors.
+    if std::env::var_os("BLISS_REQDBG").is_some() {
+        eprintln!(
+            ";; require: {normalized:?} provided={} modules={:?}",
+            module_provided(env, &normalized),
+            list_to_vec(modules_value(env))
+                .iter()
+                .map(|m| val_as_str(*m))
+                .collect::<Vec<_>>()
+        );
+    }
     if module_provided(env, &normalized) {
         return Ok(NIL);
     }
@@ -10095,6 +10128,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     NIL
                 });
+            }
+            "BLISS::%SYM-BY-INDEX" => {
+                let args = eval_args(cdr, env)?;
+                let idx = args.first().map(|v| v.as_fixnum() as u32).unwrap_or(0);
+                return Ok(arena_str(&format!(
+                    "key={:?} name={:?}",
+                    bliss_rt::symbols::registry_key(idx),
+                    bliss_rt::symbols::symbol_name(idx)
+                )));
             }
             "BLISS::%FN-LAMBDA-LIST" => {
                 let args = eval_args(cdr, env)?;
@@ -24916,8 +24958,15 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     // they stay hermetic and reproducible (spec: an explicit --eval overrides
     // init-file discovery); --no-init opts the REPL out too (issue #8). A missing
     // file is normal; a broken init file is reported but non-fatal.
+    //
+    // An embedded-image executable with a :toplevel entry is a saved PROGRAM —
+    // it must run hermetically, so the init file is skipped. But an embedded
+    // image WITHOUT one (the installed ASDF-preloaded `bliss` from `make
+    // image`) is a general REPL: skipping ~/.blissrc there silently dropped
+    // the user's ocicl system-search hook, so (asdf:load-system :babel) died
+    // with MISSING-COMPONENT (SBCL's saved REPL images read ~/.sbclrc too).
     if !ca.no_init
-        && embedded.is_none()
+        && (embedded.is_none() || image_toplevel().is_none())
         && ca.eval_forms.is_empty()
         && ca.load.is_none()
         && ca.script.is_none()
