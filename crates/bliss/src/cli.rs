@@ -1616,11 +1616,19 @@ thread_local! {
         const { RefCell::new(None) };
     static SAVE_METHODS: RefCell<Option<Rc<RefCell<HashMap<String, Vec<MethodDef>>>>>> =
         const { RefCell::new(None) };
+    static SAVE_CLASSES: RefCell<Option<Rc<RefCell<HashMap<String, ClassDef>>>>> =
+        const { RefCell::new(None) };
     /// Remapped (name, generic_function_raw, combination) generic-function
     /// records awaiting drain into the fresh root Env after an image load.
     static PENDING_HOST_GENERICS: RefCell<Vec<(String, u64, u8)>> = const { RefCell::new(Vec::new()) };
     /// Remapped per-generic method records awaiting the same drain.
     static PENDING_HOST_METHODS: RefCell<Vec<(String, Vec<MethodRec>)>> =
+        const { RefCell::new(Vec::new()) };
+    /// Remapped interpreter class definitions (slot initforms/initargs/
+    /// accessors/default-initargs/class-slot values) awaiting drain into the
+    /// fresh root Env after an image load (bliss-x0f2.7c: without these,
+    /// MAKE-INSTANCE of a restored class silently skips every :initform).
+    static PENDING_HOST_CLASSES: RefCell<Vec<(String, ClassDef)>> =
         const { RefCell::new(Vec::new()) };
 }
 
@@ -1773,6 +1781,93 @@ fn host_serialize_registries() -> Vec<u8> {
                 out.extend_from_slice(&eql_raw.to_le_bytes());
             }
         }
+    }
+    // Interpreter class definitions (bliss-x0f2.7c): env.classes carries slot
+    // :initform forms, :initarg names, accessor/reader/writer names,
+    // :default-initargs, allocation, and class-slot values — none of which the
+    // stdlib CLOS state block covers. Without them MAKE-INSTANCE of a restored
+    // class silently skips every :initform (ASDF's session-cache slot, etc.).
+    // Reads raw tagged words post-full-gc; no Bliss allocation — GC-safe.
+    out.extend_from_slice(b"CLSD");
+    let class_recs: Vec<Vec<u8>> = SAVE_CLASSES.with(|c| {
+        c.borrow().as_ref().map_or_else(Vec::new, |map| {
+            map.borrow()
+                .iter()
+                .map(|(name, cd)| {
+                    let mut rec = Vec::new();
+                    hr_put_str(&mut rec, name);
+                    rec.extend_from_slice(&(cd.supers.len() as u32).to_le_bytes());
+                    for s in &cd.supers {
+                        hr_put_str(&mut rec, s);
+                    }
+                    rec.extend_from_slice(&(cd.default_initargs.len() as u32).to_le_bytes());
+                    for (n, form) in &cd.default_initargs {
+                        hr_put_str(&mut rec, n);
+                        rec.extend_from_slice(&form.to_raw().to_le_bytes());
+                    }
+                    let cells = match cd.class_slot_values.lock() {
+                        Ok(c) => c,
+                        Err(p) => p.into_inner(),
+                    };
+                    rec.extend_from_slice(&(cells.len() as u32).to_le_bytes());
+                    for (n, v) in cells.iter() {
+                        hr_put_str(&mut rec, n);
+                        match v {
+                            Some(v) => {
+                                rec.push(1);
+                                rec.extend_from_slice(&v.to_raw().to_le_bytes());
+                            }
+                            None => {
+                                rec.push(0);
+                                rec.extend_from_slice(&0u64.to_le_bytes());
+                            }
+                        }
+                    }
+                    rec.extend_from_slice(&(cd.slots.len() as u32).to_le_bytes());
+                    for slot in &cd.slots {
+                        hr_put_str(&mut rec, &slot.name);
+                        rec.extend_from_slice(&(slot.initargs.len() as u32).to_le_bytes());
+                        for ia in &slot.initargs {
+                            hr_put_str(&mut rec, ia);
+                        }
+                        match &slot.accessor {
+                            Some(a) => {
+                                rec.push(1);
+                                hr_put_str(&mut rec, a);
+                            }
+                            None => rec.push(0),
+                        }
+                        rec.extend_from_slice(&(slot.readers.len() as u32).to_le_bytes());
+                        for r in &slot.readers {
+                            hr_put_str(&mut rec, r);
+                        }
+                        rec.extend_from_slice(&(slot.writers.len() as u32).to_le_bytes());
+                        for w in &slot.writers {
+                            hr_put_str(&mut rec, w);
+                        }
+                        match slot.initform {
+                            Some(f) => {
+                                rec.push(1);
+                                rec.extend_from_slice(&f.to_raw().to_le_bytes());
+                            }
+                            None => {
+                                rec.push(0);
+                                rec.extend_from_slice(&0u64.to_le_bytes());
+                            }
+                        }
+                        rec.push(match slot.allocation {
+                            SlotAllocation::Instance => 0,
+                            SlotAllocation::Class => 1,
+                        });
+                    }
+                    rec
+                })
+                .collect()
+        })
+    });
+    out.extend_from_slice(&(class_recs.len() as u32).to_le_bytes());
+    for rec in &class_recs {
+        out.extend_from_slice(rec);
     }
     // Package registry (bliss-x0f2.7c): the stdlib PackageStore. The package
     // objects and their symbol tables already ride the heap + OffHeap sections;
@@ -1982,6 +2077,122 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
         }
         PENDING_HOST_METHODS.with(|p| *p.borrow_mut() = methods);
     }
+    // Interpreter class-definition block (bliss-x0f2.7c): stash remapped
+    // ClassDefs for the post-Env::new drain, like the generic/method records.
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CLSD" {
+        off += 4;
+        let bad = || BlissError::InvalidImage("host registry: truncated (classes)".into());
+        let get_u32 = |data: &[u8], off: &mut usize| -> Option<u32> {
+            if data.len() < *off + 4 {
+                return None;
+            }
+            let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+            *off += 4;
+            Some(v)
+        };
+        let n_classes = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let mut classes: Vec<(String, ClassDef)> = Vec::with_capacity(n_classes);
+        for _ in 0..n_classes {
+            let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
+            let n_supers = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut supers = Vec::with_capacity(n_supers);
+            for _ in 0..n_supers {
+                supers.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
+            }
+            let n_defaults = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut default_initargs = Vec::with_capacity(n_defaults);
+            for _ in 0..n_defaults {
+                let n = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let form = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                default_initargs.push((n, BlissVal::from_raw(remap(form))));
+            }
+            let n_cells = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut cells: HashMap<String, Option<BlissVal>> = HashMap::with_capacity(n_cells);
+            for _ in 0..n_cells {
+                let n = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                if data.len() < off + 1 {
+                    return Err(bad());
+                }
+                let present = data[off] == 1;
+                off += 1;
+                let raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                cells.insert(
+                    n,
+                    if present {
+                        Some(BlissVal::from_raw(remap(raw)))
+                    } else {
+                        None
+                    },
+                );
+            }
+            let n_slots = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut slots = Vec::with_capacity(n_slots);
+            for _ in 0..n_slots {
+                let sname = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let n_ia = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let mut initargs = Vec::with_capacity(n_ia);
+                for _ in 0..n_ia {
+                    initargs.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
+                }
+                if data.len() < off + 1 {
+                    return Err(bad());
+                }
+                let has_accessor = data[off] == 1;
+                off += 1;
+                let accessor = if has_accessor {
+                    Some(hr_get_str(data, &mut off).ok_or_else(bad)?)
+                } else {
+                    None
+                };
+                let n_r = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let mut readers = Vec::with_capacity(n_r);
+                for _ in 0..n_r {
+                    readers.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
+                }
+                let n_w = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let mut writers = Vec::with_capacity(n_w);
+                for _ in 0..n_w {
+                    writers.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
+                }
+                if data.len() < off + 1 {
+                    return Err(bad());
+                }
+                let has_initform = data[off] == 1;
+                off += 1;
+                let initform_raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                let initform = has_initform.then(|| BlissVal::from_raw(remap(initform_raw)));
+                if data.len() < off + 1 {
+                    return Err(bad());
+                }
+                let allocation = if data[off] == 1 {
+                    SlotAllocation::Class
+                } else {
+                    SlotAllocation::Instance
+                };
+                off += 1;
+                slots.push(SlotDef {
+                    name: sname,
+                    initargs,
+                    accessor,
+                    readers,
+                    writers,
+                    initform,
+                    allocation,
+                });
+            }
+            classes.push((
+                name.clone(),
+                ClassDef {
+                    name,
+                    supers,
+                    slots,
+                    class_slot_values: Arc::new(Mutex::new(cells)),
+                    default_initargs,
+                },
+            ));
+        }
+        PENDING_HOST_CLASSES.with(|p| *p.borrow_mut() = classes);
+    }
     // Package registry block (bliss-x0f2.7c): replace the pre-load seed store
     // with the restored packages, and re-register every name/nickname with the
     // reader's package-name registry (a plain global, safe to touch here).
@@ -2073,6 +2284,12 @@ fn drain_pending_host_generics(env: &Env) {
             })
             .collect();
         env.methods.borrow_mut().insert(name, defs);
+    }
+    // Restored interpreter class definitions (bliss-x0f2.7c). Insert-over: a
+    // bootstrap-seeded ClassDef of the same name is superseded by the saved one.
+    let classes = PENDING_HOST_CLASSES.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (name, def) in classes {
+        env.classes.borrow_mut().insert(name, def);
     }
 }
 
@@ -4053,6 +4270,12 @@ fn visit_class_def_roots(
         if let Some(initform) = &mut slot.initform {
             visit(initform);
         }
+    }
+    // The (:default-initargs …) value FORMS are heap conses too — unvisited,
+    // a moving GC leaves them stale and a later MAKE-INSTANCE evaluates a
+    // dangling form (same class of bug as bliss-wlf's slot initforms).
+    for (_, form) in &mut class.default_initargs {
+        visit(form);
     }
 
     let identity = Arc::as_ptr(&class.class_slot_values) as usize;
@@ -24096,6 +24319,7 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Blis
     // objects and the Env root scan updates this same storage (bliss-x0f2.7a).
     SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(Rc::clone(&env.generics)));
     SAVE_METHODS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.methods)));
+    SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(Rc::clone(&env.classes)));
     // Compact so the live set is a dense prefix and garbage is dropped.
     bliss_rt::gc::full_gc()?;
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
