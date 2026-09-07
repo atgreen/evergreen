@@ -213,6 +213,117 @@ fn registry_get(sym: u32) -> Option<Rc<BytecodeFunction>> {
     REGISTRY.with(|r| r.borrow().get(&sym).cloned())
 }
 
+/// Serialize every interned-symbol bytecode-registry entry as a synthetic
+/// BYTECODE_UNIT (function records + kind-3 install actions) for a core image
+/// (bliss-zz6w). A world loaded from compiled `.bfasl` fasls installs
+/// source-free stub function objects whose real code lives ONLY in this
+/// registry; the heap snapshot carries the stubs, so without this unit every
+/// such function silently evaluates its NIL body after a core load (babel's
+/// get-character-encoding returned NIL). The ordinary BBU loader executes the
+/// unit post-restore, re-registering the code behind each restored stub (the
+/// kind-3 install reuses an existing interpreted-function object in place, so
+/// heap identity is preserved). Uninterned (closure-private) entries and
+/// functions with non-poolable constants are skipped — those stubs stay
+/// registry-orphans exactly as before. Returns empty bytes when nothing is
+/// serializable. Pool encoding is Rust-only (no Bliss allocation) — GC-safe
+/// post-STW-GC.
+pub(super) fn serialize_registry_unit() -> Vec<u8> {
+    let mut pool = BbuConstPool::default();
+    let source_file_ref = pool.string("<core-registry>");
+    let mut functions: Vec<BbuFunction> = Vec::new();
+    let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
+    let entries: Vec<(u32, Rc<BytecodeFunction>)> = REGISTRY.with(|r| {
+        r.borrow()
+            .iter()
+            .map(|(k, v)| (*k, Rc::clone(v)))
+            .collect()
+    });
+    let (mut sk_pool, mut sk_tree) = (0usize, 0usize);
+    let dbg = std::env::var_os("BLISS_HOSTREG_DBG").is_some();
+    for (sym, bf) in entries {
+        if bliss_rt::symbols::is_uninterned(sym) {
+            // A closure-private entry: no pooled name — register the decoded
+            // function under this exact (image-stable) uninterned index via
+            // the kind-10 action; its stub object and CLOSURE_ENV frame ride
+            // separately (heap + CLSR block).
+            match serialize_bbu_function_tree(
+                &bf,
+                BBU_NO_INDEX,
+                BBU_FUNC_NESTED,
+                &mut pool,
+                &mut functions,
+            ) {
+                Some(function_index) => {
+                    load_actions.push((10, 0, function_index, sym, BBU_NO_INDEX));
+                }
+                None => sk_tree += 1,
+            }
+            continue;
+        }
+        let Some(name_ref) = pool.symbol_by_index(sym) else {
+            sk_pool += 1;
+            if dbg {
+                eprintln!(";; core save: unpoolable symbol {:?}", bliss_rt::symbols::symbol_name(sym));
+            }
+            continue;
+        };
+        match serialize_bbu_function_tree(&bf, name_ref, BBU_FUNC_NAMED, &mut pool, &mut functions)
+        {
+            Some(function_index) => {
+                load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
+            }
+            None => {
+                sk_tree += 1;
+                if dbg {
+                    eprintln!(";; core save: unserializable fn {:?}", bliss_rt::symbols::symbol_name(sym));
+                }
+            }
+        }
+    }
+    // Source-free bytecode MACRO expanders (kind-4 installs): the HREG macros
+    // block only carries source params/body, which are NIL for bfasl-loaded
+    // macros — re-emit their compiled expanders here.
+    for (name, bf_cell) in super::global_bytecode_macros() {
+        let Some(sym) = bliss_rt::symbols::find_index(&name) else {
+            sk_pool += 1;
+            continue;
+        };
+        let Some(name_ref) = pool.symbol_by_index(sym) else {
+            sk_pool += 1;
+            continue;
+        };
+        let bf = bf_cell.borrow();
+        match serialize_bbu_function_tree(&bf, name_ref, BBU_FUNC_MACRO, &mut pool, &mut functions)
+        {
+            Some(function_index) => {
+                load_actions.push((4, 0, function_index, name_ref, BBU_NO_INDEX));
+            }
+            None => {
+                sk_tree += 1;
+                if dbg {
+                    eprintln!(";; core save: unserializable macro expander {name:?}");
+                }
+            }
+        }
+    }
+    if (sk_pool + sk_tree) > 0 && dbg {
+        eprintln!(
+            ";; core save: bytecode-registry skips — unpoolable-name {sk_pool}, unserializable-tree {sk_tree}, kept {}",
+            load_actions.len()
+        );
+    }
+    if load_actions.is_empty() {
+        return Vec::new();
+    }
+    assemble_bbu(
+        &pool,
+        &functions,
+        &load_actions,
+        source_file_ref,
+        b"<core-registry>",
+    )
+}
+
 /// Whether `sym` currently names a registered bytecode function (e.g. a
 /// source-free `(defun (setf place) …)` writer installed from a `.bfasl`).
 pub(super) fn is_registered(sym: u32) -> bool {
@@ -8829,6 +8940,27 @@ pub(super) fn clear_closure_env(sym_idx: u32) {
     CLOSURE_CONTROL.with(|m| m.borrow_mut().remove(&sym_idx));
 }
 
+/// Snapshot the CLOSURE_ENV table for core-image serialization (bliss-zz6w).
+pub(super) fn closure_env_entries() -> Vec<(u32, Rc<RefCell<EnvFrame>>)> {
+    CLOSURE_ENV.with(|m| m.borrow().iter().map(|(k, v)| (*k, Rc::clone(v))).collect())
+}
+
+/// Snapshot the CLOSURE_CONTROL table for core-image serialization.
+#[allow(clippy::type_complexity)]
+pub(super) fn closure_control_entries()
+-> Vec<(u32, (Vec<(String, String)>, Vec<(String, String)>))> {
+    CLOSURE_CONTROL.with(|m| m.borrow().iter().map(|(k, v)| (*k, v.clone())).collect())
+}
+
+/// Install a restored block/tag scope snapshot for a closure (core restore).
+pub(super) fn install_closure_control(
+    sym_idx: u32,
+    blocks: Vec<(String, String)>,
+    tags: Vec<(String, String)>,
+) {
+    CLOSURE_CONTROL.with(|m| m.borrow_mut().insert(sym_idx, (blocks, tags)));
+}
+
 /// Materialize a callable value for a nested-lambda `MakeClosure`. Each
 /// evaluation yields a distinct function identity: a fresh uninterned symbol
 /// whose bytecode body is registered, wrapped in an interpreted-function object.
@@ -9900,6 +10032,22 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(bbu_error("EvalThunk has an unexpected argument"));
                 }
             }
+            10 => {
+                // RegisterClosure (core images, bliss-zz6w): register a nested
+                // function's bytecode under the raw uninterned symbol index in
+                // arg1 — the identity its restored stub object dispatches by.
+                if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error("RegisterClosure has unsupported flags/arguments"));
+                }
+                let function = &encoded_functions
+                    [bbu_index(action.arg0, encoded_functions.len(), "closure function")?];
+                if function.flags & BBU_FUNC_NESTED == 0 {
+                    return Err(bbu_error("RegisterClosure references a non-nested function"));
+                }
+                if !bliss_rt::symbols::is_uninterned(action.arg1) {
+                    return Err(bbu_error("RegisterClosure target is not an uninterned symbol"));
+                }
+            }
             9 => {
                 // EvalSource: arg0 is a constant-pool index of a source form to
                 // re-evaluate via the tree-walker at load time (the load-source
@@ -10094,6 +10242,11 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut form = constants[action.arg0 as usize];
                 bliss_rt::rooted_ref!(_form_root = &mut form);
                 last = eval_form(form, env)?;
+            }
+            10 => {
+                // RegisterClosure (core images, bliss-zz6w): re-register a
+                // closure's bytecode under its image-stable uninterned symbol.
+                registry_put(action.arg1, Rc::clone(&functions[action.arg0 as usize]));
             }
             _ => unreachable!("load actions were verified above"),
         }

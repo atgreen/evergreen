@@ -1520,6 +1520,24 @@ fn global_macro_insert(name: String, def: MacroDef) {
     bump_macro_env_generation();
 }
 
+/// Every global macro whose expander is source-free BFASL bytecode, as
+/// (registry key, expander) pairs. Core-image serialization re-emits these as
+/// kind-4 macro-install actions in the synthetic bytecode unit (bliss-zz6w) —
+/// the plain HREG macros block can only carry source params/body, which are
+/// NIL for these, so without this a restored bfasl-loaded macro (babel's
+/// STRING-GET) expands to NIL and its use sites become undefined-function
+/// calls.
+#[allow(clippy::type_complexity)]
+pub(crate) fn global_bytecode_macros()
+-> Vec<(String, Rc<RefCell<bliss_rt::bytecode::BytecodeFunction>>)> {
+    GLOBAL_MACROS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter_map(|(name, def)| def.bytecode.as_ref().map(|b| (name.clone(), Rc::clone(b))))
+            .collect()
+    })
+}
+
 /// Names of every global macro that retains source (a `defmacro` body, not a
 /// source-free BFASL bytecode expander). Used by image serialization to re-emit
 /// them as `(defmacro …)` load actions so a saved image keeps its macros
@@ -1630,6 +1648,9 @@ thread_local! {
     /// MAKE-INSTANCE of a restored class silently skips every :initform).
     static PENDING_HOST_CLASSES: RefCell<Vec<(String, ClassDef)>> =
         const { RefCell::new(Vec::new()) };
+    /// Serialized bytecode-registry BYTECODE_UNIT awaiting the post-Env drain
+    /// (bliss-zz6w) — the BBU loader needs an Env the restore hook lacks.
+    static PENDING_HOST_BYTECODE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 fn hr_put_str(out: &mut Vec<u8>, s: &str) {
@@ -1869,6 +1890,120 @@ fn host_serialize_registries() -> Vec<u8> {
     for rec in &class_recs {
         out.extend_from_slice(rec);
     }
+    // Tree-walker closures (bliss-zz6w): a closure VALUE is a
+    // `(BLISS::CLOSURE . id)` cons whose body/params/captured lexical frame
+    // live in the host-side CLOSURE_REGISTRY — without this block every
+    // restored closure (babel's encoder tables, ASDF hooks) is an orphan id
+    // that either fails to apply or runs with an empty environment. Captured
+    // EnvFrames are SHARED (Rc) between closures; serialize the frame graph
+    // once by identity so restored closures keep sharing. Reads raw tagged
+    // words post-full-gc; Rust reads only — GC-safe.
+    out.extend_from_slice(b"CLSR");
+    out.extend_from_slice(&NEXT_CLOSURE_ID.with(|c| *c.borrow()).to_le_bytes());
+    {
+        let reg = CLOSURE_REGISTRY.with(Rc::clone);
+        let reg = reg.borrow();
+        let bc_env = bytecode::closure_env_entries();
+        // Assign dense ids to every reachable frame (worklist over parents),
+        // from BOTH the tree-walker closures and the bytecode CLOSURE_ENV.
+        let mut frame_ids: HashMap<usize, u32> = HashMap::new();
+        let mut frames: Vec<Rc<RefCell<EnvFrame>>> = Vec::new();
+        let roots: Vec<Rc<RefCell<EnvFrame>>> = reg
+            .values()
+            .map(|c| Rc::clone(&c.captured_frame))
+            .chain(bc_env.iter().map(|(_, f)| Rc::clone(f)))
+            .collect();
+        for root in roots {
+            let mut cur = Some(root);
+            while let Some(f) = cur {
+                let key = Rc::as_ptr(&f) as usize;
+                if frame_ids.contains_key(&key) {
+                    break;
+                }
+                frame_ids.insert(key, frames.len() as u32);
+                let parent = f.borrow().parent.clone();
+                frames.push(f);
+                cur = parent;
+            }
+        }
+        out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        for f in &frames {
+            let fb = f.borrow();
+            out.extend_from_slice(&(fb.vars.len() as u32).to_le_bytes());
+            for (k, v) in &fb.vars {
+                hr_put_str(&mut out, k);
+                out.extend_from_slice(&v.to_raw().to_le_bytes());
+            }
+            out.extend_from_slice(&(fb.symbol_vars.len() as u32).to_le_bytes());
+            for (&idx, v) in &fb.symbol_vars {
+                out.extend_from_slice(&idx.to_le_bytes());
+                out.extend_from_slice(&v.to_raw().to_le_bytes());
+            }
+            let parent_id = fb
+                .parent
+                .as_ref()
+                .and_then(|p| frame_ids.get(&(Rc::as_ptr(p) as usize)).copied())
+                .unwrap_or(u32::MAX);
+            out.extend_from_slice(&parent_id.to_le_bytes());
+        }
+        out.extend_from_slice(&(reg.len() as u32).to_le_bytes());
+        for (&id, closure) in reg.iter() {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&closure.params_form.to_raw().to_le_bytes());
+            out.extend_from_slice(&closure.body.to_raw().to_le_bytes());
+            let fid = frame_ids
+                .get(&(Rc::as_ptr(&closure.captured_frame) as usize))
+                .copied()
+                .unwrap_or(u32::MAX);
+            out.extend_from_slice(&fid.to_le_bytes());
+            out.extend_from_slice(&(closure.captured_blocks.len() as u32).to_le_bytes());
+            for (a, b) in &closure.captured_blocks {
+                hr_put_str(&mut out, a);
+                hr_put_str(&mut out, b);
+            }
+            out.extend_from_slice(&(closure.captured_tags.len() as u32).to_le_bytes());
+            for (a, b) in &closure.captured_tags {
+                hr_put_str(&mut out, a);
+                hr_put_str(&mut out, b);
+            }
+        }
+        // Bytecode-closure captured environments (CLOSURE_ENV): the frame the
+        // registered bytecode body reaches its enclosing lexicals through,
+        // keyed by the closure's image-stable uninterned symbol index.
+        out.extend_from_slice(&(bc_env.len() as u32).to_le_bytes());
+        for (sym, frame) in &bc_env {
+            out.extend_from_slice(&sym.to_le_bytes());
+            let fid = frame_ids
+                .get(&(Rc::as_ptr(frame) as usize))
+                .copied()
+                .unwrap_or(u32::MAX);
+            out.extend_from_slice(&fid.to_le_bytes());
+        }
+        // Bytecode-closure lexical block/tag scopes (CLOSURE_CONTROL).
+        let bc_ctl = bytecode::closure_control_entries();
+        out.extend_from_slice(&(bc_ctl.len() as u32).to_le_bytes());
+        for (sym, (blocks, tags)) in &bc_ctl {
+            out.extend_from_slice(&sym.to_le_bytes());
+            out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+            for (a, b) in blocks {
+                hr_put_str(&mut out, a);
+                hr_put_str(&mut out, b);
+            }
+            out.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+            for (a, b) in tags {
+                hr_put_str(&mut out, a);
+                hr_put_str(&mut out, b);
+            }
+        }
+    }
+    // Bytecode registry (bliss-zz6w): the compiled code behind source-free
+    // stub function objects (everything installed from `.bfasl` fasls during
+    // an ASDF load), as a synthetic BYTECODE_UNIT executed by the ordinary
+    // BBU loader after restore.
+    out.extend_from_slice(b"BCOD");
+    let unit = bytecode::serialize_registry_unit();
+    out.extend_from_slice(&(unit.len() as u64).to_le_bytes());
+    out.extend_from_slice(&unit);
     // Package registry (bliss-x0f2.7c): the stdlib PackageStore. The package
     // objects and their symbol tables already ride the heap + OffHeap sections;
     // this block carries the Rust-side structure (names/nicknames/use-lists/
@@ -2192,6 +2327,150 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
             ));
         }
         PENDING_HOST_CLASSES.with(|p| *p.borrow_mut() = classes);
+    }
+    // Tree-walker closure block (bliss-zz6w): rebuild the shared frame graph,
+    // remap every captured value, and install the closures directly into the
+    // thread-local CLOSURE_REGISTRY (every Env on this thread shares it by Rc).
+    // Restored ids overwrite pre-load ids — those closures' conses lived in the
+    // discarded pre-load heap. Rust allocation + map inserts only — GC-safe.
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CLSR" {
+        off += 4;
+        let bad = || BlissError::InvalidImage("host registry: truncated (closures)".into());
+        let get_u32 = |data: &[u8], off: &mut usize| -> Option<u32> {
+            if data.len() < *off + 4 {
+                return None;
+            }
+            let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+            *off += 4;
+            Some(v)
+        };
+        let saved_next = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+        let n_frames = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let frames: Vec<Rc<RefCell<EnvFrame>>> = (0..n_frames)
+            .map(|_| {
+                Rc::new(RefCell::new(EnvFrame {
+                    vars: HashMap::new(),
+                    symbol_vars: HashMap::new(),
+                    parent: None,
+                }))
+            })
+            .collect();
+        let mut parent_ids: Vec<u32> = Vec::with_capacity(n_frames);
+        for frame in &frames {
+            let n_vars = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut fb = frame.borrow_mut();
+            for _ in 0..n_vars {
+                let k = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let v = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                fb.vars.insert(k, BlissVal::from_raw(remap(v)));
+            }
+            let n_sym = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            for _ in 0..n_sym {
+                let idx = get_u32(data, &mut off).ok_or_else(bad)?;
+                let v = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                fb.symbol_vars.insert(idx, BlissVal::from_raw(remap(v)));
+            }
+            drop(fb);
+            parent_ids.push(get_u32(data, &mut off).ok_or_else(bad)?);
+        }
+        for (frame, &pid) in frames.iter().zip(&parent_ids) {
+            if pid != u32::MAX {
+                if let Some(parent) = frames.get(pid as usize) {
+                    frame.borrow_mut().parent = Some(Rc::clone(parent));
+                }
+            }
+        }
+        let n_closures = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let registry = CLOSURE_REGISTRY.with(Rc::clone);
+        for _ in 0..n_closures {
+            let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let params = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let body = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let fid = get_u32(data, &mut off).ok_or_else(bad)?;
+            let n_blocks = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut captured_blocks = Vec::with_capacity(n_blocks);
+            for _ in 0..n_blocks {
+                let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                captured_blocks.push((a, b));
+            }
+            let n_tags = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut captured_tags = Vec::with_capacity(n_tags);
+            for _ in 0..n_tags {
+                let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                captured_tags.push((a, b));
+            }
+            let captured_frame = frames
+                .get(fid as usize)
+                .cloned()
+                .unwrap_or_else(|| {
+                    Rc::new(RefCell::new(EnvFrame {
+                        vars: HashMap::new(),
+                        symbol_vars: HashMap::new(),
+                        parent: None,
+                    }))
+                });
+            registry.borrow_mut().insert(
+                id,
+                Closure {
+                    params_form: BlissVal::from_raw(remap(params)),
+                    body: BlissVal::from_raw(remap(body)),
+                    captured_frame,
+                    captured_blocks,
+                    captured_tags,
+                },
+            );
+        }
+        // Bytecode-closure captured environments + block/tag scopes.
+        let n_bce = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        for _ in 0..n_bce {
+            let sym = get_u32(data, &mut off).ok_or_else(bad)?;
+            let fid = get_u32(data, &mut off).ok_or_else(bad)?;
+            if let Some(frame) = frames.get(fid as usize) {
+                bytecode::register_closure_env(sym, Rc::clone(frame));
+            }
+        }
+        let n_bcc = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        for _ in 0..n_bcc {
+            let sym = get_u32(data, &mut off).ok_or_else(bad)?;
+            let n_blocks = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut blocks = Vec::with_capacity(n_blocks);
+            for _ in 0..n_blocks {
+                let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                blocks.push((a, b));
+            }
+            let n_tags = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let mut tags = Vec::with_capacity(n_tags);
+            for _ in 0..n_tags {
+                let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                tags.push((a, b));
+            }
+            bytecode::install_closure_control(sym, blocks, tags);
+        }
+        NEXT_CLOSURE_ID.with(|c| {
+            let cur = *c.borrow();
+            *c.borrow_mut() = cur.max(saved_next);
+        });
+    }
+    // Bytecode-registry unit (bliss-zz6w): stash for the post-Env drain — the
+    // BBU loader needs the Env, which this hook does not have.
+    if off + 4 <= data.len() && &data[off..off + 4] == b"BCOD" {
+        off += 4;
+        let len = hr_get_u64(data, &mut off)
+            .ok_or_else(|| BlissError::InvalidImage("host registry: truncated (bytecode)".into()))?
+            as usize;
+        if data.len() < off + len {
+            return Err(BlissError::InvalidImage(
+                "host registry: truncated (bytecode unit)".into(),
+            ));
+        }
+        if len > 0 {
+            PENDING_HOST_BYTECODE.with(|p| *p.borrow_mut() = data[off..off + len].to_vec());
+        }
+        off += len;
     }
     // Package registry block (bliss-x0f2.7c): replace the pre-load seed store
     // with the restored packages, and re-register every name/nickname with the
@@ -9777,6 +10056,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_stdlib::close(stream, abort)?;
                 }
                 return Ok(T);
+            }
+            // Debug introspection (bliss-zz6w): raw body/lambda-list of an
+            // interpreted-function object, for inspecting restored cores.
+            "BLISS::%FN-BODY" => {
+                let args = eval_args(cdr, env)?;
+                let f = args.first().copied().unwrap_or(NIL);
+                return Ok(if bliss_rt::function::is_interpreted_function(f) {
+                    bliss_rt::function::body(f)
+                } else {
+                    NIL
+                });
+            }
+            "BLISS::%FN-LAMBDA-LIST" => {
+                let args = eval_args(cdr, env)?;
+                let f = args.first().copied().unwrap_or(NIL);
+                return Ok(if bliss_rt::function::is_interpreted_function(f) {
+                    bliss_rt::function::lambda_list(f)
+                } else {
+                    NIL
+                });
             }
             // ── TCP socket primitives (for the slynk backend) ──────────
             "BLISS::%SOCKET-LISTEN" => {
@@ -23099,6 +23398,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"
             | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "SLOT-VALUE" | "SLOT-BOUNDP"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
+            // Debug introspection (bliss-zz6w)
+            | "BLISS::%FN-BODY" | "BLISS::%FN-LAMBDA-LIST"
     )
 }
 
@@ -23141,6 +23442,24 @@ fn apply_builtin_fast(
             let val = args[0];
             env.clear_mv();
             Some(bliss_stdlib::set_gethash(args[1], args[2], val).map(|_| val))
+        }
+        // Debug introspection (bliss-zz6w): raw body/lambda-list of an
+        // interpreted-function object, for inspecting restored cores.
+        "BLISS::%FN-BODY" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if bliss_rt::function::is_interpreted_function(args[0]) {
+                bliss_rt::function::body(args[0])
+            } else {
+                NIL
+            }))
+        }
+        "BLISS::%FN-LAMBDA-LIST" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if bliss_rt::function::is_interpreted_function(args[0]) {
+                bliss_rt::function::lambda_list(args[0])
+            } else {
+                NIL
+            }))
         }
         "SYMBOL-PACKAGE" if args.len() == 1 => {
             env.clear_mv();
@@ -24366,7 +24685,7 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Blis
 /// The heap must be initialized and empty of mutator objects — call this BEFORE
 /// the bootstrap prelude runs, so no live `BlissVal` in the interpreter's `Env`
 /// is stranded when `restore_heap` clears and re-materializes the heap.
-fn load_core_image_bytes(bytes: &[u8], env: &Env) -> Result<(), BlissError> {
+fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), BlissError> {
     bliss_rt::gc::ensure_heap_initialized();
     bliss_rt::image::load_image_from_bytes(bytes)?;
     // Install the restored macros/setf-fns (stashed by the restore hook) into the
@@ -24375,6 +24694,14 @@ fn load_core_image_bytes(bytes: &[u8], env: &Env) -> Result<(), BlissError> {
     // Install the restored generic-function/method registries into this Env
     // (bliss-x0f2.7a) — without them every GF/accessor call is undefined.
     drain_pending_host_generics(env);
+    // Re-register the compiled code behind every restored source-free stub
+    // (bliss-zz6w): execute the saved bytecode-registry unit through the
+    // ordinary BBU loader (kind-3 installs reuse the restored function objects
+    // in place, so heap identity is preserved).
+    let unit = PENDING_HOST_BYTECODE.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    if !unit.is_empty() {
+        bytecode::load_bbu(&unit, env)?;
+    }
     // Streams are process-specific resources with OFF-HEAP bodies (file handles,
     // buffers) that the heap snapshot cannot carry: the restored *STANDARD-OUTPUT*
     // etc. point at dead handles, so PRINT/FORMAT would deref freed memory. Re-open
@@ -24529,13 +24856,13 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     let mut core_loaded = false;
     let embedded_core = embedded_image().filter(|b| b.starts_with(&image_magic));
     if let Some(bytes) = embedded_core {
-        load_core_image_bytes(&bytes, &env)?;
+        load_core_image_bytes(&bytes, &mut env)?;
         core_loaded = true;
     } else if let Some(ref image_path) = ca.image {
         let bytes = std::fs::read(image_path)
             .map_err(|e| BlissError::FileError(format!("--image {image_path}: {e}")))?;
         if bytes.starts_with(&image_magic) {
-            load_core_image_bytes(&bytes, &env)?;
+            load_core_image_bytes(&bytes, &mut env)?;
             core_loaded = true;
         }
     }
