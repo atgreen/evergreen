@@ -2914,7 +2914,8 @@ pub fn get_dispatch_macro_character(
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let guard = DISPATCH_SUB_CHARS.lock().unwrap();
     if let Some(table) = guard.as_ref() {
-        if let Some(&func) = table.get(&(key, disp_char, sub_char)) {
+        // Symmetric with set_dispatch_macro_character's CLHS upcasing.
+        if let Some(&func) = table.get(&(key, disp_char, sub_char.to_ascii_uppercase())) {
             return Ok(Some(func));
         }
     }
