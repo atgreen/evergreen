@@ -9291,6 +9291,9 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(val) = env.lookup_var(&name) {
             return Ok(val);
         }
+        if std::env::var_os("BLISS_UNBOUND_DBG").is_some() {
+            eprintln!(";; unbound {name:?} idx={} key={:?}", form.as_symbol_index(), bliss_rt::symbols::registry_key(form.as_symbol_index()));
+        }
         return Err(BlissError::UnboundVariable(form));
     }
     if form.is_cons() {
@@ -16776,7 +16779,10 @@ impl LoopParser {
             return None;
         }
         let n = sym_name(v);
-        let bare = n.strip_prefix("KEYWORD:").unwrap_or(&n).to_string();
+        // Bare NAME regardless of home package (CLHS 6.1.1.4: loop keywords
+        // match by name) — a package-qualified-keyed symbol like ITERATE:FOR
+        // must still read as the FOR keyword (bliss-tzc2).
+        let bare = symbol_bare_name(&n);
         if is_loop_keyword(&bare) {
             Some(bare)
         } else {
@@ -17576,7 +17582,7 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         let head = cp(cdr).0;
         if head.is_symbol() {
             let n = sym_name(head);
-            is_loop_keyword(n.strip_prefix("KEYWORD:").unwrap_or(&n))
+            is_loop_keyword(&symbol_bare_name(&n))
         } else {
             false
         }
@@ -17745,8 +17751,8 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             } else {
                                 String::new()
                             };
-                            let kind_bare =
-                                kind_name.strip_prefix("KEYWORD:").unwrap_or(&kind_name);
+                            let kind_bare = symbol_bare_name(&kind_name);
+                            let kind_bare = kind_bare.as_str();
                             let source = match kind_bare {
                                 "SYMBOLS" | "EXTERNAL-SYMBOLS" | "PRESENT-SYMBOLS" => {
                                     // The connective is :in or :of (ANSI accepts both).
@@ -17756,8 +17762,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                     } else {
                                         String::new()
                                     };
-                                    let conn_bare =
-                                        conn_name.strip_prefix("KEYWORD:").unwrap_or(&conn_name);
+                                    let conn_bare = &symbol_bare_name(&conn_name);
                                     if conn_bare != "IN" && conn_bare != "OF" {
                                         return Err(BlissError::Internal(
                                             "LOOP :for ... :being <symbols> expects :in or :of"
@@ -17780,7 +17785,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                     } else {
                                         String::new()
                                     };
-                                    if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF"
+                                    if symbol_bare_name(&of_name) != "OF"
                                     {
                                         return Err(BlissError::Internal(
                                             "LOOP :for ... :being :the :hash-keys expects :of"
@@ -17796,7 +17801,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                     } else {
                                         String::new()
                                     };
-                                    if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF"
+                                    if symbol_bare_name(&of_name) != "OF"
                                     {
                                         return Err(BlissError::Internal(
                                             "LOOP :for ... :being :the :hash-values expects :of"
