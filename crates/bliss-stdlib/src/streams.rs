@@ -2076,7 +2076,17 @@ pub fn file_position(stream: BlissVal) -> Result<BlissVal, BlissError> {
                 (os_pos - buffered_unread + pending_write) as i64,
             ))
         }
-        StreamInner::StringInput { position, .. } => Ok(BlissVal::from_fixnum(*position as i64)),
+        StreamInner::StringInput {
+            position, unread, ..
+        } => {
+            // A pending UNREAD-CHAR logically rewinds the stream one character;
+            // reporting the raw counter made a reader-macro caller (which
+            // measures how much the handler consumed via FILE-POSITION,
+            // bliss-r4mk) overshoot by one and swallow the delimiter the
+            // handler pushed back.
+            let pending = usize::from(unread.is_some());
+            Ok(BlissVal::from_fixnum(position.saturating_sub(pending) as i64))
+        }
         StreamInner::StringOutput { buffer, .. } => Ok(BlissVal::from_fixnum(buffer.len() as i64)),
         StreamInner::Synonym => {
             let target = resolve_synonym(comps[0])?;

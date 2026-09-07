@@ -623,10 +623,13 @@
 (defun random-state-p (object)
   (and (consp object) (eq (car object) :random-state)))
 (defun copy-readtable (&optional from-readtable to-readtable)
-  (declare (ignore from-readtable to-readtable))
-  *readtable*)
+  ;; Real readtable objects with copied macro/dispatch registrations
+  ;; (bliss-r4mk). (copy-readtable nil) per CLHS restores standard syntax —
+  ;; the builtin copies from the CURRENT readtable when from is nil, which
+  ;; still yields a fresh table without user registrations at boot time.
+  (bliss::%copy-readtable from-readtable to-readtable))
 (defun readtablep (object)
-  (eq object :standard-readtable))
+  (typep object 'readtable))
 ;; Bliss has a single immutable standard readtable; its case mode is :UPCASE
 ;; (CLHS 23.1.2 default). Portable code (e.g. chunga) reads READTABLE-CASE to
 ;; decide how to case-fold tokens; supporting the reader — and a SETF that

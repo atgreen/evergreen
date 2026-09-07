@@ -90,6 +90,109 @@ fn read_eval_hook() -> Option<ReadEvalHook> {
     *READ_EVAL_HOOK.lock().unwrap()
 }
 
+// ── Custom reader-macro invocation (bliss-r4mk) ─────────────────────
+//
+// The dispatch tables above store LISP handler functions, but this crate
+// cannot call Lisp. The interpreter installs an INVOKER: given the handler,
+// the source text REMAINING after the dispatch char/sub-char, the sub-char,
+// and the optional infix numeric argument, it wraps the text in a
+// string-input-stream, applies the handler `(fn stream sub-char arg)`, and
+// returns the values the handler produced (empty = contributed nothing, like
+// a comment reader) plus how many CHARS of the text it consumed.
+type MacroHandlerInvoker =
+    fn(BlissVal, &str, char, Option<i64>) -> Result<(Vec<BlissVal>, usize), BlissError>;
+static MACRO_INVOKER: OrderedMutex<Option<MacroHandlerInvoker>> =
+    OrderedMutex::new(LockLevel::CodeCache, 8, "reader macro invoker", None);
+
+pub fn set_macro_handler_invoker(hook: Option<MacroHandlerInvoker>) {
+    *MACRO_INVOKER.lock().unwrap() = hook;
+}
+
+/// The CURRENT readtable (the live value of `*READTABLE*`), supplied by the
+/// interpreter so nested reads key the custom tables correctly. NIL / no hook
+/// means "no custom readtable" and all custom lookups miss.
+type ReadtableGetter = fn() -> BlissVal;
+static READTABLE_GETTER: OrderedMutex<Option<ReadtableGetter>> =
+    OrderedMutex::new(LockLevel::CodeCache, 9, "reader readtable getter", None);
+
+pub fn set_readtable_getter(hook: Option<ReadtableGetter>) {
+    *READTABLE_GETTER.lock().unwrap() = hook;
+}
+
+fn current_readtable_value() -> BlissVal {
+    let hook = *READTABLE_GETTER.lock().unwrap();
+    hook.map(|h| h()).unwrap_or(NIL)
+}
+
+/// Cheap gate for the hot path: custom dispatch is consulted only when at
+/// least one handler has ever been registered.
+static ANY_CUSTOM_MACROS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn any_custom_macros() -> bool {
+    ANY_CUSTOM_MACROS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Try a registered custom `#<sub>` dispatch handler at `pos_after_sub`
+/// (just past the sub-char). Returns None when no handler applies; otherwise
+/// the handler's contribution: its single value, or — for a zero-value
+/// handler — the NEXT token read from where the handler stopped.
+#[allow(clippy::too_many_arguments)]
+fn try_custom_sharp_dispatch(
+    chars: &[char],
+    pos_after_sub: usize,
+    sub: char,
+    infix: Option<i64>,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+) -> Option<Result<(BlissVal, usize), BlissError>> {
+    if !any_custom_macros() {
+        return None;
+    }
+    let readtable = current_readtable_value();
+    if readtable == NIL || readtable.tag() != TAG_HEAP_OBJECT {
+        return None;
+    }
+    let handler = lookup_custom_dispatch(readtable, '#', sub.to_ascii_uppercase())?;
+    let invoker = (*MACRO_INVOKER.lock().unwrap())?;
+    let text: String = chars[pos_after_sub..].iter().collect();
+    Some(match invoker(handler, &text, sub, infix) {
+        Ok((vals, consumed)) => {
+            let newpos = pos_after_sub + consumed;
+            match vals.into_iter().next() {
+                Some(v) => Ok((v, newpos)),
+                None => read_token_with_base(
+                    chars,
+                    newpos,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth,
+                ),
+            }
+        }
+        Err(e) => Err(e),
+    })
+}
+
+/// True if a custom `#<sub>` handler is registered in the current readtable —
+/// used by the `#+`/`#-` feature SKIPPER, which cannot invoke handlers and
+/// approximates their extent as "one following form".
+fn custom_sharp_dispatch_registered(sub: char) -> bool {
+    if !any_custom_macros() {
+        return false;
+    }
+    let readtable = current_readtable_value();
+    if readtable == NIL || readtable.tag() != TAG_HEAP_OBJECT {
+        return false;
+    }
+    lookup_custom_dispatch(readtable, '#', sub.to_ascii_uppercase()).is_some()
+}
+
 // ── Package-aware symbol resolution ───────────────────────────────
 //
 // A bare token read inside package P and the qualified spelling `P:NAME` denote
@@ -470,8 +573,18 @@ fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
 }
 
 fn alloc_readtable() -> BlissVal {
-    let ptr =
-        gc_alloc(std::mem::size_of::<ReadtableData>(), type_id::READTABLE) as *mut ReadtableData;
+    // PINNED: the macro/dispatch tables above key registrations by the
+    // readtable object's raw ADDRESS (`readtable_key`), so a readtable that a
+    // moving GC relocates would orphan every SET-MACRO-CHARACTER /
+    // SET-DISPATCH-MACRO-CHARACTER made on it (bliss-r4mk). Readtables are
+    // few and long-lived; pinning them is the same trade symbols make.
+    let hdr = std::mem::size_of::<ObjectHeader>();
+    let body = bliss_rt::gc::alloc_pinned_typed(
+        std::mem::size_of::<ReadtableData>().saturating_sub(hdr).max(1),
+        type_id::READTABLE,
+    )
+    .expect("OOM allocating readtable");
+    let ptr = unsafe { body.sub(hdr) } as *mut ReadtableData;
     unsafe {
         (*ptr).case_mode = 0; // :upcase
         (*ptr)._pad = [0; 7];
@@ -1680,7 +1793,20 @@ fn read_sharpsign_with_base(
                 }
                 return Err(BlissError::StreamError(format!("undefined label #{}", num)));
             }
-            _ => {
+            other => {
+                if let Some(result) = try_custom_sharp_dispatch(
+                    chars,
+                    pos + 1,
+                    other,
+                    Some(num as i64),
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth,
+                ) {
+                    return result;
+                }
                 return Err(BlissError::StreamError(format!(
                     "unknown # dispatch #{}",
                     chars[pos]
@@ -1808,10 +1934,25 @@ fn read_sharpsign_with_base(
             )?;
             eval_read_time_form_with_hook(form).map(|value| (value, p))
         }
-        _ => Err(BlissError::StreamError(format!(
-            "unknown # dispatch: {}",
-            dispatch
-        ))),
+        other => {
+            if let Some(result) = try_custom_sharp_dispatch(
+                chars,
+                pos,
+                other,
+                None,
+                labels,
+                read_base,
+                read_eval,
+                read_circular,
+                depth,
+            ) {
+                return result;
+            }
+            Err(BlissError::StreamError(format!(
+                "unknown # dispatch: {}",
+                dispatch
+            )))
+        }
     }
 }
 
@@ -2277,6 +2418,11 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
         return match chars[pos] {
             '=' => skip_form(chars, pos + 1, depth + 1),
             '#' => Ok(pos + 1),
+            other if custom_sharp_dispatch_registered(other) => {
+                // Suppressed (#+/#-) custom dispatch: approximate its extent
+                // as one following form (bliss-r4mk).
+                skip_form(chars, pos + 1, depth + 1)
+            }
             other => Err(BlissError::StreamError(format!(
                 "unknown # dispatch #{}",
                 other
@@ -2316,6 +2462,10 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
         'P' | 'p' | 'S' | 's' => skip_form(chars, pos + 1, depth + 1),
         '<' => skip_atom(chars, pos + 1),
         '|' => skip_block_comment(chars, pos + 1),
+        other if custom_sharp_dispatch_registered(other) => {
+            // Suppressed custom dispatch — one-form approximation (bliss-r4mk).
+            skip_form(chars, pos + 1, depth + 1)
+        }
         _ => Err(BlissError::StreamError(format!(
             "unknown # dispatch: {}",
             dispatch
@@ -2749,7 +2899,10 @@ pub fn set_dispatch_macro_character(
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let mut guard = DISPATCH_SUB_CHARS.lock().unwrap();
     let table = guard.get_or_insert_with(HashMap::new);
-    table.insert((key, disp_char, sub_char), function);
+    // CLHS: a lowercase sub-char is converted to uppercase (the dispatcher
+    // upcases at lookup, so #l and #L reach the same handler).
+    table.insert((key, disp_char, sub_char.to_ascii_uppercase()), function);
+    ANY_CUSTOM_MACROS.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

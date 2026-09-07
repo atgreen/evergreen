@@ -5136,6 +5136,19 @@ impl Env {
         }
         env.define_local("*PACKAGE*", package_object("COMMON-LISP-USER"));
         sync_package_value_cell("COMMON-LISP-USER");
+        // *READTABLE* holds a REAL (pinned) readtable object so
+        // SET-DISPATCH-MACRO-CHARACTER & co. have an identity to key their
+        // registrations by (bliss-r4mk). Seeded in the value cell; boot.lisp's
+        // legacy `(defvar *readtable* :standard-readtable)` then finds it
+        // bound and leaves it alone.
+        {
+            let idx = bliss_rt::symbols::intern("*READTABLE*");
+            if global_value_cell(idx).is_none() {
+                if let Ok(rt) = reader::make_readtable(None) {
+                    bliss_rt::symbols::set_symbol_value(idx, rt);
+                }
+            }
+        }
         env.seed_standard_constant(
             "MOST-POSITIVE-FIXNUM",
             BlissVal::from_fixnum((1_i64 << 60) - 1),
@@ -6970,6 +6983,52 @@ fn reader_struct_constructor(name: BlissVal, slots: &[BlissVal]) -> Option<Bliss
     bliss_stdlib::make_instance(class, slots).ok()
 }
 
+/// The live `*READTABLE*` value for the reader's custom-macro lookups
+/// (bliss-r4mk). Reads the symbol value cell directly (readtable rebinding via
+/// LET is a special-variable dynamic bind, which lives in the cell).
+fn cli_current_readtable() -> BlissVal {
+    bliss_rt::symbols::find_index("*READTABLE*")
+        .and_then(global_value_cell)
+        .unwrap_or(NIL)
+}
+
+/// Invoke a Lisp reader-macro handler for the reader (bliss-r4mk): wrap the
+/// remaining source text in a string-input-stream, apply
+/// `(handler stream sub-char infix-arg)` in the enclosing load environment
+/// (the same READ_EVAL_ENV channel `#.` uses), and report the produced values
+/// plus how many characters the handler consumed (the stream's position —
+/// string streams are character-indexed).
+fn reader_macro_invoker(
+    handler: BlissVal,
+    text: &str,
+    sub: char,
+    infix: Option<i64>,
+) -> Result<(Vec<BlissVal>, usize), BlissError> {
+    let ptr = READ_EVAL_ENV.with(|c| c.get());
+    if ptr.is_null() {
+        return Err(BlissError::StreamError(
+            "custom reader macro used outside a load environment".into(),
+        ));
+    }
+    // Safety: as for read_time_eval — the pointer refers to the load loop's
+    // live `&mut Env` for exactly the span of the enclosing read.
+    let env = unsafe { &mut *ptr };
+    bliss_rt::rooted!(text_val = arena_str(text));
+    bliss_rt::rooted!(stream = bliss_stdlib::make_string_input_stream(*text_val, 0, None)?);
+    let sub_val = BlissVal::from_char(sub);
+    let arg_val = infix.map(BlissVal::from_fixnum).unwrap_or(NIL);
+    let result = apply_function(handler, &[*stream, sub_val, arg_val], env)?;
+    let zero_values = env.mv_active && env.mv.is_empty();
+    let consumed = bliss_stdlib::file_position(*stream)?
+        .as_fixnum()
+        .max(0) as usize;
+    env.clear_mv();
+    Ok((
+        if zero_values { Vec::new() } else { vec![result] },
+        consumed,
+    ))
+}
+
 fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() {
@@ -7053,6 +7112,8 @@ fn read_from_string_in_env(source: &str, env: &mut Env) -> Result<(BlissVal, usi
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted_ref!(_env_roots = env);
     reader::set_read_eval_hook(Some(read_time_eval));
+    reader::set_macro_handler_invoker(Some(reader_macro_invoker));
+    reader::set_readtable_getter(Some(cli_current_readtable));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
     reader::set_struct_constructor(Some(reader_struct_constructor));
@@ -7121,6 +7182,8 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
 fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
     with_eval_context(env, EvalContext::CompileFile, |env| {
         reader::set_read_eval_hook(Some(read_time_eval));
+        reader::set_macro_handler_invoker(Some(reader_macro_invoker));
+        reader::set_readtable_getter(Some(cli_current_readtable));
         let chars: Vec<char> = source.chars().collect();
         register_declared_packages(&chars);
         let mut pos = 0;
@@ -8540,7 +8603,13 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "HASH-TABLE" => bliss_stdlib::hash_table_count(object).is_ok(),
             "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
             "READTABLE" => {
-                object.is_symbol() && symbol_bare_name(&sym_name(object)) == "STANDARD-READTABLE"
+                // Real readtable heap objects (bliss-r4mk), plus the legacy
+                // :STANDARD-READTABLE placeholder for old images.
+                (object.is_heap_object()
+                    && bliss_rt::gc::heap_object_type_id(object)
+                        == Some(bliss_rt::object::type_id::READTABLE))
+                    || (object.is_symbol()
+                        && symbol_bare_name(&sym_name(object)) == "STANDARD-READTABLE")
             }
             "STREAM" | "FILE-STREAM" => is_stream(object),
             "SYNONYM-STREAM" => bliss_stdlib::synonym_stream_symbol(object).is_some(),
@@ -10214,6 +10283,113 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     NIL
                 });
+            }
+            // ── Custom reader macros (bliss-r4mk) ──────────────────────
+            // Registrations key by the (pinned) readtable OBJECT in
+            // *READTABLE*; handlers are coerced to pinned interpreted-function
+            // objects (or kept as index-immune symbols), so the reader tables'
+            // raw BlissVals never go stale under the moving GC.
+            "SET-DISPATCH-MACRO-CHARACTER" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() < 3 || !args[0].is_character() || !args[1].is_character() {
+                    return Err(BlissError::Internal(
+                        "SET-DISPATCH-MACRO-CHARACTER requires disp-char sub-char function"
+                            .into(),
+                    ));
+                }
+                let handler = coerce_installed_function(env, args[2]);
+                let rt = args
+                    .get(3)
+                    .copied()
+                    .filter(|v| v.is_heap_object())
+                    .unwrap_or_else(cli_current_readtable);
+                reader::set_dispatch_macro_character(
+                    rt,
+                    args[0].as_char(),
+                    args[1].as_char(),
+                    handler,
+                )?;
+                return Ok(T);
+            }
+            "GET-DISPATCH-MACRO-CHARACTER" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 || !args[0].is_character() || !args[1].is_character() {
+                    return Err(BlissError::Internal(
+                        "GET-DISPATCH-MACRO-CHARACTER requires disp-char sub-char".into(),
+                    ));
+                }
+                let rt = args
+                    .get(2)
+                    .copied()
+                    .filter(|v| v.is_heap_object())
+                    .unwrap_or_else(cli_current_readtable);
+                return Ok(reader::get_dispatch_macro_character(
+                    rt,
+                    args[0].as_char(),
+                    args[1].as_char(),
+                )?
+                .unwrap_or(NIL));
+            }
+            "MAKE-DISPATCH-MACRO-CHARACTER" => {
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() || !args[0].is_character() {
+                    return Err(BlissError::Internal(
+                        "MAKE-DISPATCH-MACRO-CHARACTER requires a character".into(),
+                    ));
+                }
+                let non_term = args.get(1).copied().unwrap_or(NIL) != NIL;
+                let rt = args
+                    .get(2)
+                    .copied()
+                    .filter(|v| v.is_heap_object())
+                    .unwrap_or_else(cli_current_readtable);
+                reader::make_dispatch_macro_character(rt, args[0].as_char(), non_term)?;
+                return Ok(T);
+            }
+            "SET-MACRO-CHARACTER" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 || !args[0].is_character() {
+                    return Err(BlissError::Internal(
+                        "SET-MACRO-CHARACTER requires char function".into(),
+                    ));
+                }
+                let handler = coerce_installed_function(env, args[1]);
+                let non_term = args.get(2).copied().unwrap_or(NIL) != NIL;
+                let rt = args
+                    .get(3)
+                    .copied()
+                    .filter(|v| v.is_heap_object())
+                    .unwrap_or_else(cli_current_readtable);
+                reader::set_macro_character(rt, args[0].as_char(), handler, non_term)?;
+                return Ok(T);
+            }
+            "GET-MACRO-CHARACTER" => {
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() || !args[0].is_character() {
+                    return Err(BlissError::Internal(
+                        "GET-MACRO-CHARACTER requires a character".into(),
+                    ));
+                }
+                let rt = args
+                    .get(1)
+                    .copied()
+                    .filter(|v| v.is_heap_object())
+                    .unwrap_or_else(cli_current_readtable);
+                let (func, non_term) = reader::get_macro_character(rt, args[0].as_char())?;
+                let f = func.unwrap_or(NIL);
+                env.set_mv(vec![f, if non_term { T } else { NIL }]);
+                return Ok(f);
+            }
+            "BLISS::%COPY-READTABLE" => {
+                let args = eval_args(cdr, env)?;
+                // CLHS: from omitted → copy the CURRENT readtable; from = NIL
+                // → a readtable with STANDARD syntax (no user registrations).
+                let to = args.get(1).copied().filter(|v| v.is_heap_object());
+                return match args.first().copied() {
+                    Some(v) if v.is_heap_object() => Ok(reader::copy_readtable(v, to)?),
+                    Some(v) if v == NIL => Ok(reader::make_readtable(None)?),
+                    _ => Ok(reader::copy_readtable(cli_current_readtable(), to)?),
+                };
             }
             "BLISS::%PRUNE-CLOSURES" => {
                 // (bliss::%prune-closures) → (before after): drop dead
@@ -15881,6 +16057,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let pkg = symbol_home_package_name(sym);
                 return Ok(package_object(&resolve_package_name(env, &pkg)));
+            }
+            "GENTEMP" => {
+                // (gentemp &optional (prefix "T") (package *package*)) — an
+                // INTERNED fresh symbol: probe PREFIX<n> for increasing n until
+                // the name is new in PACKAGE (CLHS GENTEMP; deprecated but used
+                // by iterate). Distinct from GENSYM, whose result is uninterned.
+                thread_local! { static GENTEMP_COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
+                let args = eval_args(cdr, env)?;
+                let prefix = args
+                    .first()
+                    .filter(|v| !v.is_nil())
+                    .map(|v| val_as_str(*v))
+                    .unwrap_or_else(|| "T".to_string());
+                let pkg_name = args
+                    .get(1)
+                    .filter(|v| !v.is_nil())
+                    .map(|v| resolve_package_name(env, &val_as_str(*v)))
+                    .unwrap_or_else(|| env.current_package.clone());
+                let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
+                    return Err(BlissError::PackageError(format!(
+                        "GENTEMP: no package named {pkg_name}"
+                    )));
+                };
+                loop {
+                    let n = GENTEMP_COUNTER.with(|c| {
+                        let v = *c.borrow();
+                        *c.borrow_mut() = v + 1;
+                        v
+                    });
+                    let name = format!("{prefix}{n}");
+                    if bliss_stdlib::find_present_symbol(pkg, &name).is_none() {
+                        let (sym, _) = bliss_stdlib::intern(&name, pkg)?;
+                        return Ok(sym);
+                    }
+                }
             }
             "GENSYM" => {
                 // (gensym &optional x) → a fresh UNINTERNED symbol. A string X is
