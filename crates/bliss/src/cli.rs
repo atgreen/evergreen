@@ -15138,14 +15138,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "SAVE-LISP-AND-DIE" | "SAVE-IMAGE-AND-DIE" => {
                 // (save-lisp-and-die pathname &key executable toplevel …) —
                 // `save-image-and-die` is an accepted alias.
-                // serialize the runtime world (packages, CLOS, user functions,
-                // bound globals) to a source-independent .bfasl image and
-                // terminate the process (bliss-5uj). Restored fast via LOAD or
-                // `--image`. With :executable t the image is appended to a copy
-                // of the runtime binary to make a standalone program; :toplevel
-                // names the entry point run on startup. Other SBCL keyword
-                // options (:compression, :save-runtime-options, …) are accepted
-                // and ignored.
+                // Write a heap-snapshot CORE of the whole live world (SBCL
+                // semantics, bliss-5ven): the GC heap byte-for-byte plus every
+                // host-side registry the HostRegistries/OffHeap sections carry
+                // (macros/setf/CLOS/ClassDefs/closures/bytecode/packages,
+                // hash-table and pathname bodies, interned strings). Restored
+                // via `--image` (BLISSIMG magic), NOT via LOAD — like an SBCL
+                // core. The legacy source-form .bfasl this used to write
+                // silently dropped instance-valued globals, closures, and
+                // registry state (bliss-x0f2). With :executable t the core is
+                // appended to a copy of the runtime binary to make a
+                // standalone program; :toplevel names the entry point run on
+                // startup. Other SBCL keyword options (:compression,
+                // :save-runtime-options, …) are accepted and ignored.
                 let (path_form, rest) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
                 let path = path_designator_to_string(path_val)?;
@@ -15206,37 +15211,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                     }
                 }
-                let image = bytecode::build_image_from_runtime(env)?;
-                let bytes = if executable {
-                    wrap_executable(&image).map_err(|e| {
-                        BlissError::FileError(format!("save-lisp-and-die :executable: {e}"))
-                    })?
-                } else {
-                    image
-                };
-                std::fs::write(&path, &bytes)
-                    .map_err(|e| BlissError::FileError(format!("save-lisp-and-die: {}", e)))?;
-                if executable {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-                    }
+                if executable && !toplevel_set {
+                    eprintln!(";; save-lisp-and-die: no :toplevel — the executable starts a REPL");
                 }
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                let kind = if executable { "executable" } else { "image" };
-                let entry = if executable && !toplevel_set {
-                    " (no :toplevel — starts a REPL)"
-                } else {
-                    ""
-                };
-                eprintln!(
-                    ";; wrote {kind} to {path} ({} bytes){entry}; exiting",
-                    bytes.len()
-                );
-                std::process::exit(0);
+                save_core_and_die(&path, executable, env)?;
+                unreachable!("save_core_and_die exits the process");
             }
             "%SAVE-CORE" => {
                 // (%save-core path &key executable) — write a heap-snapshot CORE
