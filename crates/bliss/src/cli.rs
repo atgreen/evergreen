@@ -1174,6 +1174,10 @@ struct MacroDef {
     /// Source-free BFASL macros execute this pre-lowered expander. Source and
     /// lexical MACROLET definitions retain the ordinary body representation.
     bytecode: Option<Rc<RefCell<bliss_rt::bytecode::BytecodeFunction>>>,
+    /// A first-class EXPANDER FUNCTION installed via (setf (macro-function
+    /// name) fn) (bliss-fo0o): applied as (fn whole-form env) per CLHS.
+    /// Pinned (coerce_installed_function) or an index-immune symbol.
+    function: Option<BlissVal>,
 }
 
 /// A registered SETF-expander.
@@ -2511,6 +2515,7 @@ fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
                 body: BlissVal::from_raw(body_raw),
                 captured_frame: Rc::clone(root_frame),
                 bytecode: None,
+                function: None,
             },
         );
     }
@@ -2598,6 +2603,7 @@ fn install_loaded_macro(
             body: NIL,
             captured_frame: Rc::clone(&env.frame),
             bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
+            function: None,
         },
     );
 }
@@ -2617,6 +2623,7 @@ fn install_loaded_setf_expander(
             body: NIL,
             captured_frame: Rc::clone(&env.frame),
             bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
+            function: None,
         }),
     );
 }
@@ -4509,6 +4516,9 @@ fn visit_macro_def_roots(
 ) {
     visit(&mut def.params_form);
     visit(&mut def.body);
+    if let Some(f) = &mut def.function {
+        visit(f);
+    }
     if let Some(function) = &def.bytecode {
         // A minor GC can fire mid-macro-expansion (alloc during the macro's own
         // bytecode run) while `expand_macro`/`run_loop` hold this cell borrowed,
@@ -7487,6 +7497,7 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
                     body: macro_body,
                     captured_frame: Rc::clone(&env.frame),
                     bytecode: None,
+                    function: None,
                 };
                 let prev = env.macros_mut().insert(name.clone(), mdef);
                 saved.push((name, prev));
@@ -10729,10 +10740,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let s = args.first().copied().unwrap_or(NIL);
                 if s.is_symbol() {
                     let name = sym_name(s);
-                    if lookup_macro(env, &name).is_some()
-                        || lookup_macro(env, &symbol_bare_name(&name)).is_some()
+                    if let Some(mdef) = lookup_macro(env, &name)
+                        .or_else(|| lookup_macro(env, &symbol_bare_name(&name)))
                     {
-                        return Ok(T);
+                        // A first-class expander round-trips (bliss-fo0o);
+                        // source/bytecode macros keep the legacy T boolean.
+                        return Ok(mdef.function.unwrap_or(T));
                     }
                 }
                 return Ok(NIL);
@@ -12084,6 +12097,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 bliss_rt::symbols::set_symbol_function(
                                     sym.as_symbol_index(),
                                     fnval,
+                                );
+                            }
+                            "MACRO-FUNCTION" => {
+                                // (setf (macro-function name) expander-fn) —
+                                // install a first-class macro expander applied
+                                // as (fn whole-form env) at expansion time
+                                // (bliss-fo0o; lisp-namespace installs its
+                                // namespace macros this way).
+                                let sym = eval_form(tgt_form, env)?;
+                                if !sym.is_symbol() {
+                                    return Err(BlissError::Internal(format!(
+                                        "SETF MACRO-FUNCTION: expected a symbol, got {}",
+                                        format_val(sym)
+                                    )));
+                                }
+                                let fnval = coerce_installed_function(env, *val);
+                                global_macro_insert(
+                                    sym_name(sym),
+                                    MacroDef {
+                                        params_form: NIL,
+                                        body: NIL,
+                                        captured_frame: Rc::clone(&env.frame),
+                                        bytecode: None,
+                                        function: Some(fnval),
+                                    },
                                 );
                             }
                             "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT"
@@ -21488,6 +21526,7 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             body,
             captured_frame: Rc::clone(&env.frame),
             bytecode: None,
+            function: None,
         },
     );
     Ok(name_form)
@@ -21507,6 +21546,7 @@ fn eval_define_setf_expander(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, B
             body,
             captured_frame: Rc::clone(&env.frame),
             bytecode: None,
+            function: None,
         }),
     );
     Ok(name_form)
@@ -22084,6 +22124,13 @@ fn expand_macro(
     // self-referential AND). This was gc-root-lint baseline finding
     // `expand_macro:arg_list`.
     bliss_rt::rooted!(arg_list = list_to_vec(args));
+    // A first-class expander installed via (setf (macro-function name) fn):
+    // CLHS 3.1.2.1.2.2 — apply it to the WHOLE macro call form and the
+    // environment (we pass NIL; bliss expanders that need lexical context use
+    // &environment macros instead).
+    if let Some(f) = mdef.function {
+        return apply_function(f, &[whole, NIL], env);
+    }
     if let Some(function) = &mdef.bytecode {
         return bytecode::run_macro(
             Rc::new(function.borrow().clone()),
@@ -22243,6 +22290,43 @@ fn augment_env_with_macros(
             }
             _ => {
                 let handle = next_macro_function_handle();
+                // First-class expander installed via (setf (macro-function …))
+                // (bliss-fo0o): register a bridge that applies it to the whole
+                // form. The function object is PINNED (coerce_installed_function)
+                // so capturing its raw bits in the Send+Sync closure is stable.
+                if let Some(f) = macro_def.function {
+                    let raw = f.to_raw();
+                    compiler_macroexpand::register_macro_function(
+                        handle,
+                        Arc::new(move |form, _call_macro_env| {
+                            let f = BlissVal::from_raw(raw);
+                            let mut macro_env = Env::new_for_macro_expansion(false);
+                            apply_function(f, &[form, NIL], &mut macro_env)
+                        }),
+                    );
+                    let symbol = resolve_sym(name).unwrap_or(NIL);
+                    // Cache keyed on the FUNCTION's identity (stored in
+                    // body_bits — the source body is NIL for these), so a
+                    // redefinition with a different expander re-registers.
+                    let params_bits = macro_bodies[idx].0.0;
+                    MACRO_FN_CACHE.with(|c| {
+                        c.borrow_mut().insert(
+                            name.clone(),
+                            MacroFnCacheEntry {
+                                params_bits,
+                                body_bits: raw,
+                                frame_ptr,
+                                bytecode_ptr,
+                                handle,
+                                symbol,
+                            },
+                        );
+                    });
+                    if !symbol.is_nil() {
+                        macro_env = macro_env.augment_function(symbol, FunctionInfo::Macro(handle));
+                    }
+                    continue;
+                }
                 if let Some(function) = &macro_def.bytecode {
                     let function = Arc::new(Mutex::new(function.borrow().clone()));
                     LOADED_COMPILER_MACRO_FUNCTIONS
@@ -22447,6 +22531,7 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 body: macro_body,
                 captured_frame: Rc::clone(&env.frame),
                 bytecode: None,
+                function: None,
             },
         );
     }
@@ -25812,6 +25897,7 @@ mod host_registry_hook_tests {
                 body,
                 captured_frame: Rc::new(RefCell::new(EnvFrame::default())),
                 bytecode: None,
+                function: None,
             },
         );
 
@@ -25931,6 +26017,7 @@ mod env_gc_root_tests {
                 body: marker(7),
                 captured_frame: Rc::clone(&parent),
                 bytecode: None,
+                function: None,
             },
         );
         env.setf_expanders.borrow_mut().insert(
@@ -25940,6 +26027,7 @@ mod env_gc_root_tests {
                 body: marker(9),
                 captured_frame: Rc::clone(&parent),
                 bytecode: None,
+                function: None,
             }),
         );
         env.setf_expanders
@@ -26102,6 +26190,7 @@ mod env_gc_root_tests {
                 body: marker(4),
                 captured_frame: Rc::clone(&parent.frame),
                 bytecode: None,
+                function: None,
             },
         );
 
@@ -26123,6 +26212,7 @@ mod env_gc_root_tests {
                 body: marker(9),
                 captured_frame: child_frame,
                 bytecode: None,
+                function: None,
             },
         );
 
@@ -26257,6 +26347,7 @@ mod transient_shadow_root_tests {
                     body: marker(1),
                     captured_frame: Rc::clone(&frame),
                     bytecode: None,
+                    function: None,
                 },
             );
         });

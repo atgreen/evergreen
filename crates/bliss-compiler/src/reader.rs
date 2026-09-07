@@ -2421,6 +2421,11 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
         return match chars[pos] {
             '=' => skip_form(chars, pos + 1, depth + 1),
             '#' => Ok(pos + 1),
+            // #nR radix integer / #n* sized bit-vector: one atom follows.
+            'r' | 'R' | '*' => skip_atom(chars, pos + 1),
+            // #nA(nested…) rank-n array literal: one form follows
+            // (bliss-fo0o: `#2a((a b))` inside a #+nil block errored).
+            'a' | 'A' => skip_form(chars, pos + 1, depth + 1),
             other if custom_sharp_dispatch_registered(other) => {
                 // Suppressed (#+/#-) custom dispatch: approximate its extent
                 // as one following form (bliss-r4mk).
