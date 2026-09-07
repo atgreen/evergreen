@@ -6188,6 +6188,34 @@ fn sym_name_uncached(val: BlissVal) -> String {
     format!("SYM#{}", idx)
 }
 
+/// The home-package NAME for SYMBOL-PACKAGE (bliss-xi01). The name-string
+/// heuristic alone is wrong under qualified-string identity: a bare-read
+/// symbol's registry key and name cell carry no package qualifier, so string
+/// parsing derived COMMON-LISP for any package-interned symbol whose qualified
+/// alias was never read — and, after a core restore, for every internal
+/// qualified symbol (the restored world holds only the bare-keyed entry the
+/// save process created). Prefer the qualifier when the name has one (it is
+/// authoritative for qualified-keyed symbols), otherwise reverse-look the
+/// symbol up by IDENTITY in the package store's present tables, and only then
+/// default to COMMON-LISP.
+fn symbol_home_package_name(sym: BlissVal) -> String {
+    let name = sym_name(sym);
+    if name.starts_with("KEYWORD:") {
+        return "KEYWORD".to_string();
+    }
+    if let Some((pkg, _)) = name.rsplit_once("::").or_else(|| name.rsplit_once(':')) {
+        return pkg.to_string();
+    }
+    for pkg in bliss_stdlib::list_all_packages() {
+        if bliss_stdlib::find_present_symbol(pkg, &name) == Some(sym) {
+            if let Some(pname) = bliss_stdlib::package_name(pkg) {
+                return pname;
+            }
+        }
+    }
+    "COMMON-LISP".to_string()
+}
+
 fn resolve_sym(name: &str) -> Option<BlissVal> {
     // `name` is always a known, delimiter-free symbol name (a Rust string
     // literal at every call site), so bypass the full reader — its
@@ -15714,19 +15742,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if !sym.is_symbol() {
                     return Ok(NIL);
                 }
-                let name = sym_name(sym);
-                let package = if name.starts_with("KEYWORD:") {
-                    Some("KEYWORD".to_string())
-                } else if let Some((pkg, _)) = name.rsplit_once("::") {
-                    Some(pkg.to_string())
-                } else if let Some((pkg, _)) = name.rsplit_once(':') {
-                    Some(pkg.to_string())
-                } else {
-                    Some("COMMON-LISP".to_string())
-                };
-                return Ok(package
-                    .map(|pkg| package_object(&resolve_package_name(env, &pkg)))
-                    .unwrap_or(NIL));
+                let pkg = symbol_home_package_name(sym);
+                return Ok(package_object(&resolve_package_name(env, &pkg)));
             }
             "GENSYM" => {
                 // (gensym &optional x) → a fresh UNINTERNED symbol. A string X is
@@ -23463,16 +23480,7 @@ fn apply_builtin_fast(
             if !args[0].is_symbol() {
                 return Some(Ok(NIL));
             }
-            let n = sym_name(args[0]);
-            let pkg = if n.starts_with("KEYWORD:") {
-                "KEYWORD".to_string()
-            } else if let Some((pkg, _)) = n.rsplit_once("::") {
-                pkg.to_string()
-            } else if let Some((pkg, _)) = n.rsplit_once(':') {
-                pkg.to_string()
-            } else {
-                "COMMON-LISP".to_string()
-            };
+            let pkg = symbol_home_package_name(args[0]);
             Some(Ok(package_object(&resolve_package_name(env, &pkg))))
         }
         "FIND-SYMBOL" if args.len() == 2 => {
@@ -24685,6 +24693,12 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Blis
 fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), BlissError> {
     bliss_rt::gc::ensure_heap_initialized();
     bliss_rt::image::load_image_from_bytes(bytes)?;
+    // The per-thread symbol-name cache is keyed by symbol INDEX, and the
+    // restore just replaced the whole index space: a pre-load entry aliases
+    // whatever restored symbol now owns that index, so sym_name served stale
+    // pre-load names (SYMBOL-PACKAGE derived COMMON-LISP for restored
+    // package-interned symbols — bliss-xi01). Flush it wholesale.
+    SYM_NAME_CACHE.with(|c| c.borrow_mut().clear());
     // Install the restored macros/setf-fns (stashed by the restore hook) into the
     // global tables, bound to the fresh top-level frame.
     drain_pending_host_registries(&env.frame);
