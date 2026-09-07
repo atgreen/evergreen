@@ -10801,12 +10801,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "BOUNDP" => {
                 let (sf, _) = cp(cdr);
                 let sym = eval_form(sf, env)?;
-                let name = if sym.is_symbol() {
-                    sym_name(sym)
-                } else {
-                    val_as_str(sym)
-                };
-                return Ok(if env.lookup_var(&name).is_some() {
+                // NIL and T are constant variables — always bound.
+                if sym.is_nil() || sym == T {
+                    return Ok(T);
+                }
+                // Resolve a SYMBOL argument by INDEX (the same resolution an
+                // evaluated variable reference uses), not by name string: a
+                // package-interned symbol's heap name cell holds its BARE name
+                // while the registry key is qualified, so the name-based
+                // lookup missed every qualified global (bliss-o2da).
+                return Ok(if sym.is_symbol() {
+                    if env.lookup_var_symbol(sym).is_some() {
+                        T
+                    } else {
+                        NIL
+                    }
+                } else if env.lookup_var(&val_as_str(sym)).is_some() {
                     T
                 } else {
                     NIL
@@ -10815,12 +10825,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "SYMBOL-VALUE" => {
                 let (sf, _) = cp(cdr);
                 let sym = eval_form(sf, env)?;
-                let name = if sym.is_symbol() {
-                    sym_name(sym)
+                // Constant variables (CLHS): (symbol-value 'nil) → NIL, 't → T.
+                if sym.is_nil() {
+                    return Ok(NIL);
+                }
+                if sym == T {
+                    return Ok(T);
+                }
+                // By-index resolution for symbols — see BOUNDP (bliss-o2da).
+                let resolved = if sym.is_symbol() {
+                    env.lookup_var_symbol(sym)
                 } else {
-                    val_as_str(sym)
+                    env.lookup_var(&val_as_str(sym))
                 };
-                return match env.lookup_var(&name) {
+                return match resolved {
                     Some(v) => Ok(v),
                     None => Err(BlissError::UnboundVariable(sym)),
                 };
