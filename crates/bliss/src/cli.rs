@@ -15942,20 +15942,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // definitions made in the body persist. `with_child_frame` swaps
                 // only the frame on the same env; `env.child()` would clone the
                 // copy-on-write tables and lose those mutations.
+                // Fresh child frame PER ITERATION (bliss-0oey): a closure over
+                // the loop variable captures that iteration's binding, matching
+                // SBCL and the bytecode backend's per-iteration LET — a single
+                // reused frame made every captured closure see the last value.
                 let parent = Rc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
-                    with_child_frame(env, parent, |env| {
-                        for i in 0..n {
+                    for i in 0..n {
+                        with_child_frame(env, Rc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, BlissVal::from_fixnum(i));
-                            eval_progn(*body, env)?;
-                        }
-                        if result_rest.is_cons() {
-                            let (result_form, _) = cp(*result_rest);
+                            eval_progn(*body, env)
+                        })?;
+                    }
+                    if result_rest.is_cons() {
+                        let (result_form, _) = cp(*result_rest);
+                        return with_child_frame(env, parent, |env| {
                             env.define_local_symbol(*var_form, BlissVal::from_fixnum(n));
-                            return eval_form(result_form, env);
-                        }
-                        Ok(NIL)
-                    })
+                            eval_form(result_form, env)
+                        });
+                    }
+                    Ok(NIL)
                 });
             }
             "DOLIST" => {
@@ -15969,20 +15975,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(body = body);
                 let list = eval_form(*list_form, env)?;
                 bliss_rt::rooted!(elems = list_to_vec(list));
+                // Fresh child frame PER ITERATION (bliss-0oey) — see DOTIMES.
                 let parent = Rc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
-                    with_child_frame(env, parent, |env| {
-                        for i in 0..elems.len() {
+                    for i in 0..elems.len() {
+                        with_child_frame(env, Rc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, elems[i]);
-                            eval_progn(*body, env)?;
-                        }
-                        if result_rest.is_cons() {
-                            let (result_form, _) = cp(*result_rest);
+                            eval_progn(*body, env)
+                        })?;
+                    }
+                    if result_rest.is_cons() {
+                        let (result_form, _) = cp(*result_rest);
+                        return with_child_frame(env, parent, |env| {
                             env.define_local_symbol(*var_form, NIL);
-                            return eval_form(result_form, env);
-                        }
-                        Ok(NIL)
-                    })
+                            eval_form(result_form, env)
+                        });
+                    }
+                    Ok(NIL)
                 });
             }
             "STRING=" => {

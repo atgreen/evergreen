@@ -2392,25 +2392,37 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted_ref!(_result_root = &mut result);
 
         let id = self.fresh_id();
+        let counter = resolve_sym(&format!("%DOTIMES-I{id}")).ok_or(Bail)?;
         let limit = resolve_sym(&format!("%DOTIMES-LIMIT{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%DOTIMES-TOP{id}")).ok_or(Bail)?;
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
-        let test = form_list(&[s("<")?, var, limit]);
-        bliss_rt::rooted!(when_items = vec![s("WHEN")?, test]);
-        when_items.extend(list_to_vec(body));
-        bliss_rt::rooted!(inc = form_list(&[s("+")?, var, BlissVal::from_fixnum(1)]));
-        when_items.push(form_list(&[s("SETQ")?, var, *inc]));
-        when_items.push(form_list(&[s("GO")?, top]));
-        bliss_rt::rooted!(when_form = form_list(&when_items));
+        // Fresh binding of VAR per iteration (bliss-0oey): the loop advances a
+        // hidden counter and each round binds VAR anew with an inner LET, so a
+        // closure over VAR captures THAT iteration's value — matching SBCL and
+        // the tree-walker ((lambda () var) in the body yields 0 1 2, not the
+        // final value shared across every closure).
+        let test = form_list(&[s("<")?, counter, limit]);
+        bliss_rt::rooted!(iter_binding = form_list(&[var, counter]));
+        bliss_rt::rooted!(iter_bindings = form_list(&[*iter_binding]));
+        bliss_rt::rooted!(iter_let_items = vec![s("LET")?, *iter_bindings]);
+        iter_let_items.extend(list_to_vec(body));
+        bliss_rt::rooted!(iter_let = form_list(&iter_let_items));
+        bliss_rt::rooted!(inc = form_list(&[s("+")?, counter, BlissVal::from_fixnum(1)]));
+        bliss_rt::rooted!(step = form_list(&[s("SETQ")?, counter, *inc]));
+        bliss_rt::rooted!(go_top = form_list(&[s("GO")?, top]));
+        bliss_rt::rooted!(when_form = form_list(&[s("WHEN")?, test, *iter_let, *step, *go_top]));
         bliss_rt::rooted!(tagbody_form = form_list(&[s("TAGBODY")?, top, *when_form]));
 
-        bliss_rt::rooted!(var_binding = form_list(&[var, BlissVal::from_fixnum(0)]));
+        bliss_rt::rooted!(counter_binding = form_list(&[counter, BlissVal::from_fixnum(0)]));
         bliss_rt::rooted!(limit_binding = form_list(&[limit, count_form]));
-        bliss_rt::rooted!(bindings = form_list(&[*var_binding, *limit_binding]));
-        bliss_rt::rooted!(final_setq = form_list(&[s("SETQ")?, var, limit]));
+        bliss_rt::rooted!(bindings = form_list(&[*counter_binding, *limit_binding]));
+        // The result form sees VAR bound to the count (CLHS), freshly bound.
+        bliss_rt::rooted!(result_binding = form_list(&[var, limit]));
+        bliss_rt::rooted!(result_bindings = form_list(&[*result_binding]));
+        bliss_rt::rooted!(result_let = form_list(&[s("LET")?, *result_bindings, result]));
         bliss_rt::rooted!(
-            let_form = form_list(&[s("LET")?, *bindings, *tagbody_form, *final_setq, result])
+            let_form = form_list(&[s("LET")?, *bindings, *tagbody_form, *result_let])
         );
         let block_form = form_list(&[s("BLOCK")?, NIL, *let_form]);
         self.lower_expr(block_form)
@@ -2452,22 +2464,29 @@ impl<'e> Lowerer<'e> {
         let top = resolve_sym(&format!("%DOLIST-TOP{id}")).ok_or(Bail)?;
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
+        // Fresh binding of VAR per iteration (bliss-0oey) — see lower_dotimes.
         bliss_rt::rooted!(car_rest = form_list(&[s("CAR")?, rest_var]));
-        bliss_rt::rooted!(bind_var = form_list(&[s("SETQ")?, var, *car_rest]));
-        bliss_rt::rooted!(when_items = vec![s("WHEN")?, rest_var, *bind_var]);
-        when_items.extend(list_to_vec(body));
+        bliss_rt::rooted!(iter_binding = form_list(&[var, *car_rest]));
+        bliss_rt::rooted!(iter_bindings = form_list(&[*iter_binding]));
+        bliss_rt::rooted!(iter_let_items = vec![s("LET")?, *iter_bindings]);
+        iter_let_items.extend(list_to_vec(body));
+        bliss_rt::rooted!(iter_let = form_list(&iter_let_items));
         bliss_rt::rooted!(cdr_rest = form_list(&[s("CDR")?, rest_var]));
-        when_items.push(form_list(&[s("SETQ")?, rest_var, *cdr_rest]));
-        when_items.push(form_list(&[s("GO")?, top]));
-        bliss_rt::rooted!(when_form = form_list(&when_items));
+        bliss_rt::rooted!(step = form_list(&[s("SETQ")?, rest_var, *cdr_rest]));
+        bliss_rt::rooted!(go_top = form_list(&[s("GO")?, top]));
+        bliss_rt::rooted!(
+            when_form = form_list(&[s("WHEN")?, rest_var, *iter_let, *step, *go_top])
+        );
         bliss_rt::rooted!(tagbody_form = form_list(&[s("TAGBODY")?, top, *when_form]));
 
-        bliss_rt::rooted!(var_binding = form_list(&[var, NIL]));
         bliss_rt::rooted!(rest_binding = form_list(&[rest_var, list_form]));
-        bliss_rt::rooted!(bindings = form_list(&[*var_binding, *rest_binding]));
-        bliss_rt::rooted!(final_setq = form_list(&[s("SETQ")?, var, NIL]));
+        bliss_rt::rooted!(bindings = form_list(&[*rest_binding]));
+        // The result form sees VAR bound to NIL (CLHS), freshly bound.
+        bliss_rt::rooted!(result_binding = form_list(&[var, NIL]));
+        bliss_rt::rooted!(result_bindings = form_list(&[*result_binding]));
+        bliss_rt::rooted!(result_let = form_list(&[s("LET")?, *result_bindings, result]));
         bliss_rt::rooted!(
-            let_form = form_list(&[s("LET")?, *bindings, *tagbody_form, *final_setq, result])
+            let_form = form_list(&[s("LET")?, *bindings, *tagbody_form, *result_let])
         );
         let block_form = form_list(&[s("BLOCK")?, NIL, *let_form]);
         self.lower_expr(block_form)
