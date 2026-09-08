@@ -1678,7 +1678,18 @@ pub fn format(
 
     let mut output = String::new();
     let mut arg_idx: usize = 0;
-    format_impl(control_string, args, &mut arg_idx, &mut output)?;
+    let result = format_impl(control_string, args, &mut arg_idx, &mut output);
+    if let Err(e) = &result {
+        if std::env::var_os("BLISS_FMT_DBG").is_some() {
+            eprintln!(
+                ";; fmt TOP error={} control={:?} nargs={}",
+                e,
+                control_string.chars().take(120).collect::<String>(),
+                args.len()
+            );
+        }
+    }
+    result?;
 
     if to_stdout {
         print!("{}", output);
