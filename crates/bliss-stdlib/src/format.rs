@@ -1913,7 +1913,7 @@ fn format_impl(
                     Param::Num(n) => Ok(*n),
                     Param::V => {
                         if *aidx >= args.len() {
-                            return Err(BlissError::Internal("too few args for V param".into()));
+                            return Err(BlissError::ControlError("too few args for V param".into()));
                         }
                         let v = args[*aidx];
                         *aidx += 1;
@@ -1958,7 +1958,15 @@ fn format_impl(
                     None => ' ',
                 };
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~A".into()));
+                    if std::env::var_os("BLISS_FMT_DBG").is_some() {
+                        eprintln!(
+                            ";; fmt too-few ~~A: arg_idx={} nargs={} control={:?}",
+                            arg_idx,
+                            args.len(),
+                            control.chars().take(80).collect::<String>()
+                        );
+                    }
+                    return Err(BlissError::ControlError("too few args for ~A".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -1986,7 +1994,7 @@ fn format_impl(
                     None => ' ',
                 };
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~S".into()));
+                    return Err(BlissError::ControlError("too few args for ~S".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2029,7 +2037,7 @@ fn format_impl(
                     3
                 };
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal(format!(
+                    return Err(BlissError::ControlError(format!(
                         "too few args for ~{}",
                         directive
                     )));
@@ -2068,7 +2076,7 @@ fn format_impl(
                     None
                 };
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~R".into()));
+                    return Err(BlissError::ControlError("too few args for ~R".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2093,7 +2101,7 @@ fn format_impl(
             }
             'F' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~F".into()));
+                    return Err(BlissError::ControlError("too few args for ~F".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2173,7 +2181,7 @@ fn format_impl(
             }
             'E' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~E".into()));
+                    return Err(BlissError::ControlError("too few args for ~E".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2223,7 +2231,7 @@ fn format_impl(
             }
             'G' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~G".into()));
+                    return Err(BlissError::ControlError("too few args for ~G".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2244,7 +2252,7 @@ fn format_impl(
             }
             '$' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~$".into()));
+                    return Err(BlissError::ControlError("too few args for ~$".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2427,7 +2435,7 @@ fn format_impl(
             }
             'C' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~C".into()));
+                    return Err(BlissError::ControlError("too few args for ~C".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2448,7 +2456,7 @@ fn format_impl(
             }
             'W' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~W".into()));
+                    return Err(BlissError::ControlError("too few args for ~W".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2456,7 +2464,7 @@ fn format_impl(
             }
             '?' => {
                 if *arg_idx >= args.len() {
-                    return Err(BlissError::Internal("too few args for ~?".into()));
+                    return Err(BlissError::ControlError("too few args for ~?".into()));
                 }
                 let ctrl_val = args[*arg_idx];
                 *arg_idx += 1;
@@ -2476,7 +2484,7 @@ fn format_impl(
                 } else {
                     // ~? — consume a separate list argument for the sub-format's args
                     if *arg_idx >= args.len() {
-                        return Err(BlissError::Internal("too few args for ~?".into()));
+                        return Err(BlissError::ControlError("too few args for ~?".into()));
                     }
                     let args_val = args[*arg_idx];
                     *arg_idx += 1;
@@ -2507,7 +2515,7 @@ fn format_impl(
                     if !colon && *arg_idx > 0 {
                         *arg_idx -= 1;
                     } else {
-                        return Err(BlissError::Internal("too few args for ~P".into()));
+                        return Err(BlissError::ControlError("too few args for ~P".into()));
                     }
                 }
                 let val = args[*arg_idx];
@@ -2567,7 +2575,7 @@ fn format_impl(
                 } else if colon {
                     // ~:{...~} — arg is a list of sublists; apply body to each sublist
                     if *arg_idx >= args.len() {
-                        return Err(BlissError::Internal("too few args for ~:{".into()));
+                        return Err(BlissError::ControlError("too few args for ~:{".into()));
                     }
                     let list_val = args[*arg_idx];
                     *arg_idx += 1;
@@ -2589,7 +2597,7 @@ fn format_impl(
                 } else {
                     // ~{...~} — arg is a list; iterate body over list elements
                     if *arg_idx >= args.len() {
-                        return Err(BlissError::Internal("too few args for ~{".into()));
+                        return Err(BlissError::ControlError("too few args for ~{".into()));
                     }
                     let list_val = args[*arg_idx];
                     *arg_idx += 1;
@@ -2617,7 +2625,7 @@ fn format_impl(
                 if colon {
                     // ~:[false~;true~] boolean conditional
                     if *arg_idx >= args.len() {
-                        return Err(BlissError::Internal("too few args for ~:[".into()));
+                        return Err(BlissError::ControlError("too few args for ~:[".into()));
                     }
                     let val = args[*arg_idx];
                     *arg_idx += 1;
@@ -2628,7 +2636,7 @@ fn format_impl(
                 } else if at_sign {
                     // ~@[clause~] true-test
                     if *arg_idx >= args.len() {
-                        return Err(BlissError::Internal("too few args for ~@[".into()));
+                        return Err(BlissError::ControlError("too few args for ~@[".into()));
                     }
                     let val = args[*arg_idx];
                     if !val.is_nil() {
@@ -2650,7 +2658,7 @@ fn format_impl(
                         resolve_param(&params[0], 0, arg_idx)?
                     } else {
                         if *arg_idx >= args.len() {
-                            return Err(BlissError::Internal("too few args for ~[".into()));
+                            return Err(BlissError::ControlError("too few args for ~[".into()));
                         }
                         let val = args[*arg_idx];
                         *arg_idx += 1;
