@@ -15217,6 +15217,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|value| arena_str(&value))
                     .unwrap_or(NIL));
             }
+            "BLISS-EXT:%BUILD-FINGERPRINT" => {
+                // A short hex tag that changes iff the running bliss-cli binary
+                // changes (its size xor mtime-nanos), for segregating the ASDF
+                // FASL cache per build (bliss-nk2o): a rebuilt binary must
+                // never load bytecode a different binary wrote (SIGSEGV / bad
+                // dispatch). Folded into lisp-version-string, so each build
+                // gets its own cache dir and recompiles cleanly. Falls back to
+                // a fixed tag if the exe can't be stat'd (cache still keyed by
+                // version).
+                let fp = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| std::fs::metadata(&p).ok())
+                    .map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        m.size() ^ (m.mtime() as u64).wrapping_mul(0x100000001b3)
+                    })
+                    .unwrap_or(0);
+                return Ok(arena_str(&format!("{:08x}", fp & 0xffff_ffff)));
+            }
             "BLISS-EXT:%MACHINE-TYPE" => {
                 // The build's target CPU as an uppercase MACHINE-TYPE string
                 // (SBCL convention), derived from cfg like *FEATURES* — so a

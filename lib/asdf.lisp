@@ -2281,6 +2281,11 @@ then returning the non-empty string value of the variable"
                 (excl:ics-target-case (:-ics "8"))
                 (and (member :smp *features*) "SBT"))
         #+armedbear (format nil "~a-fasl~a" s system::*fasl-version*)
+        ;; Bliss: append a per-binary build fingerprint so the FASL cache dir
+        ;; is segregated per build — a rebuilt bliss-cli never loads bytecode a
+        ;; different binary wrote (bliss-nk2o). Mirrors ABCL/Clozure/Mezzano,
+        ;; which fold their fasl-version into the identifier here.
+        #+bliss (format nil "~a-b~a" s (bliss-ext::%build-fingerprint))
         #+clisp
         (subseq s 0 (position #\space s)) ; strip build information (date, etc.)
         #+clozure
