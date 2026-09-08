@@ -1848,3 +1848,38 @@ fn r8pt_reduce_logand_live_through_list_survives_gc_across_reducer_call() {
         "logand-reduce must fold to 12; got: {out:?}"
     );
 }
+
+/// bliss-lwws: `emit_call` marshalled call arguments into the fixed argument
+/// registers with sequential moves, so a later argument whose home register was
+/// an earlier argument's DESTINATION was read after being clobbered — REDUCE's
+/// `:from-end` funcall (`mov rcx,r9; mov r8,rcx`) called `fn(x, x)` instead of
+/// `fn(x, acc)`, silently corrupting every right-fold once REDUCE reached T2.
+/// In-context this broke ASDF's `nest` macro (a `:from-end` reduce running at
+/// macroexpansion time) and surfaced as the bliss-kfhp "compute-action-stamp
+/// ... NIL" failure on every fresh `(asdf:load-system :babel)`. Warm REDUCE to
+/// T2 and check the right-fold results are the interpreter's.
+#[test]
+fn t2_reduce_from_end_folds_correctly() {
+    let program = "\
+        (dotimes (i 200) (reduce (quote cons) (list 1 2 3 4) :from-end t :initial-value nil)) \
+        (dotimes (i 2000) \
+          (when (eql (bliss-ext:function-tier (quote reduce)) 2) (return)) \
+          (reduce (quote cons) (list 1 2) :from-end t :initial-value nil)) \
+        (format t \"~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote reduce)) \
+          (reduce (quote cons) (list 1 2 3 4) :from-end t :initial-value nil) \
+          (reduce (quote +) (list 1 2 3) :from-end t :initial-value 0))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "5"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "20"),
+        ],
+    );
+    assert!(ok, "run failed: {out}");
+    assert_eq!(
+        out.lines().next().unwrap_or_default().trim(),
+        "2 (1 2 3 4) 6",
+        "T2 REDUCE right-fold diverged (tier fold-cons fold-plus): {out}"
+    );
+}

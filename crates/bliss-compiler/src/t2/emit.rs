@@ -977,6 +977,80 @@ fn emit_arith_inst(
     Ok(())
 }
 
+/// One pending call-argument move: `dst ← src`, where the source is either a
+/// register or a tagged immediate.
+enum ArgMoveSrc {
+    Reg(u8),
+    Imm(u64),
+}
+
+/// Move call arguments into their fixed argument registers as one SIMULTANEOUS
+/// parallel move (bliss-lwws). A naive in-order loop is wrong: a later
+/// argument's source register may itself be an argument register already
+/// written by an earlier move — REDUCE's `:from-end` funcall had `acc` homed in
+/// rcx, so `mov rcx,r9; mov r8,rcx` called `fn(x, x)` and silently corrupted
+/// every right-fold (the ASDF STAMP failure). Emit only moves whose destination
+/// no pending move still reads; break register cycles through a caller-saved
+/// scratch that no pending move touches (caller-saved registers outside the
+/// move set are dead here — the call is emitted immediately after, and values
+/// live across a call never have caller-saved homes).
+fn emit_call_arg_moves(a: &mut Asm, mut pending: Vec<(u8, ArgMoveSrc)>) -> Result<(), EmitError> {
+    pending.retain(|(dst, src)| !matches!(src, ArgMoveSrc::Reg(s) if *s == *dst));
+    while !pending.is_empty() {
+        let mut progressed = false;
+        let mut i = 0;
+        while i < pending.len() {
+            let dst = pending[i].0;
+            let still_read = pending
+                .iter()
+                .any(|(_, src)| matches!(src, ArgMoveSrc::Reg(s) if *s == dst));
+            if still_read {
+                i += 1;
+                continue;
+            }
+            let (dst, src) = pending.swap_remove(i);
+            match src {
+                ArgMoveSrc::Reg(s) => mov_rr(a, dst, s),
+                ArgMoveSrc::Imm(bits) => mov_imm64(a, dst, bits as i64),
+            }
+            progressed = true;
+        }
+        if progressed {
+            continue;
+        }
+        // Every pending destination is still read by some pending move: a
+        // register cycle. Stash one source in a free caller-saved scratch and
+        // redirect its readers there.
+        const CALLER_SAVED: [u8; 9] = [0, 11, 10, 9, 2, 1, 8, 6, 7];
+        let scratch = CALLER_SAVED
+            .into_iter()
+            .find(|r| {
+                pending.iter().all(|(dst, src)| {
+                    dst != r && !matches!(src, ArgMoveSrc::Reg(s) if s == r)
+                })
+            })
+            .ok_or(EmitError::UnsupportedOp(0xF3))?;
+        // A stall means every pending destination is still read by some pending
+        // source, so a source that is itself a pending destination must exist —
+        // stashing it elsewhere is what unblocks the cycle. Decline rather than
+        // loop forever if that ever fails to hold.
+        let victim = pending
+            .iter()
+            .find_map(|(_, src)| match src {
+                ArgMoveSrc::Reg(s) if pending.iter().any(|(dst, _)| dst == s) => Some(*s),
+                _ => None,
+            })
+            .ok_or(EmitError::UnsupportedOp(0xF3))?;
+        mov_rr(a, scratch, victim);
+        for (_, src) in pending.iter_mut() {
+            if matches!(src, ArgMoveSrc::Reg(s) if *s == victim) {
+                *src = ArgMoveSrc::Reg(scratch);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Emit a `Call` as a c2i call into the interpreter: move ≤3 arguments into the
 /// c2i argument registers (rdx, rcx, r8), set rdi=sym / rsi=nargs, and call.
 /// Values live across the call are in callee-saved registers, so the call cannot
@@ -1005,18 +1079,16 @@ fn emit_call(
     if let (Some(ss), Some(entry)) = (self_sym, self_entry) {
         const ARG_REGS: [u8; 4] = [1, 8, 9, 10]; // rcx, r8, r9, r10
         if sym == ss && nargs <= ARG_REGS.len() {
+            let mut moves = Vec::with_capacity(nargs);
             for (i, &arg) in data.args.iter().enumerate() {
-                let dst = ARG_REGS[i];
-                if let Some(&bits) = const_tagged.get(&arg) {
-                    mov_imm64(a, dst, bits as i64);
+                let src = if let Some(&bits) = const_tagged.get(&arg) {
+                    ArgMoveSrc::Imm(bits)
                 } else {
-                    mov_rr(
-                        a,
-                        dst,
-                        *reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?,
-                    );
-                }
+                    ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+                };
+                moves.push((ARG_REGS[i], src));
             }
+            emit_call_arg_moves(a, moves)?;
             a.call(entry);
             if let Some(&r0) = data.results.first() {
                 mov_rr(a, *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?, 0);
@@ -1030,15 +1102,16 @@ fn emit_call(
     if nargs > C2I_ARGS.len() {
         return Err(EmitError::UnsupportedOp(0xF9));
     }
+    let mut moves = Vec::with_capacity(nargs);
     for (i, &arg) in data.args.iter().enumerate() {
-        let dst = C2I_ARGS[i];
-        if let Some(&bits) = const_tagged.get(&arg) {
-            mov_imm64(a, dst, bits as i64);
+        let src = if let Some(&bits) = const_tagged.get(&arg) {
+            ArgMoveSrc::Imm(bits)
         } else {
-            let r = *reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            mov_rr(a, dst, r);
-        }
+            ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+        };
+        moves.push((C2I_ARGS[i], src));
     }
+    emit_call_arg_moves(a, moves)?;
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
     mov_imm64(a, 9, 0); // mov r9, no call-site profile
