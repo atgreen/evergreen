@@ -260,11 +260,19 @@
          (error 'type-error :datum ,place :expected-type ',typespec)
        (store-value (value) (setf ,place value)))))
 
-(defmacro assert (test-form &rest ignore)
-  (declare (ignore ignore))
-  `(if ,test-form
-       t
-       (error (format nil "ASSERT failed: ~S" ',test-form))))
+(defmacro assert (test-form &rest more)
+  ;; (assert test [(place*) [datum arg*]]) — honor the report format when one
+  ;; is given (CLHS 9.2): ASDF's stamp asserts carry the failing action's
+  ;; description, which an opaque "ASSERT failed" hid (bliss-kfhp). The places
+  ;; list and interactive restart are still not implemented.
+  (let ((datum (second more))
+        (args (cddr more)))
+    `(if ,test-form
+         t
+         ,(if datum
+              `(error (format nil "ASSERT failed: ~S: ~A" ',test-form
+                              (format nil ,datum ,@args)))
+              `(error (format nil "ASSERT failed: ~S" ',test-form))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CLOS convenience macros and standard condition accessors.
