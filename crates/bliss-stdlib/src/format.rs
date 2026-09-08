@@ -2367,10 +2367,17 @@ fn format_impl(
                 }
             }
             // ~I (indent) and ~_ (conditional/fill newline) are pretty-printer
-            // hints; this linear (non-pretty) printer ignores them. Any numeric
-            // parameter (e.g. ~3i) and the :/@ modifiers are already parsed and
+            // hints; this linear (non-pretty) printer ignores them, EXCEPT the
+            // mandatory conditional newline ~:@_, which breaks unconditionally
+            // (CLHS 22.3.5.1) and so must break here too. Any numeric parameter
+            // (e.g. ~3i) and the remaining :/@ modifiers are parsed and
             // harmlessly discarded. ASDF/UIOP use these inside ~<…~:> blocks.
-            'I' | '_' => {}
+            'I' => {}
+            '_' => {
+                if colon && at_sign {
+                    output.push('\n');
+                }
+            }
             '~' => {
                 let count = if !params.is_empty() {
                     resolve_param(&params[0], 1, arg_idx)?
@@ -2741,12 +2748,60 @@ fn format_impl(
                 };
                 i = skip_close_directive(&chars, body_end);
                 if close_is_colon {
-                    // Logical block: emit the segments with no justification
-                    // padding. (Splitting rather than formatting the raw body
-                    // keeps a `~;` inside the block from reaching the main
-                    // dispatch loop as an unknown directive.)
-                    for clause in &split_clauses(&body) {
-                        format_impl(clause, args, arg_idx, output)?;
+                    // Pretty-printing logical block (CLHS 22.3.5.2), rendered
+                    // linearly (everything "fits on one line"; only mandatory
+                    // newlines break). Segments are [prefix~;]body[~;suffix]
+                    // (a `~@;` separator marks a PER-LINE prefix, identical to
+                    // a plain prefix in linear rendering); prefix and suffix
+                    // are constant text. A `:` on the OPENING supplies the
+                    // default "("/")" pair. `@` on the opening formats the
+                    // block over the remaining arguments; otherwise the block
+                    // consumes ONE argument — a list, whose elements become
+                    // the body's arguments (SBCL errors even for a directive-
+                    // free body when that argument is missing) — and a
+                    // NON-list argument is printed by WRITE with the whole
+                    // block, prefix and suffix included, skipped (bliss-aspj).
+                    let clauses = split_clauses(&body);
+                    let (pre_seg, body_seg, suf_seg) = match clauses.len() {
+                        0 => (None, String::new(), None),
+                        1 => (None, clauses[0].clone(), None),
+                        2 => (Some(clauses[0].clone()), clauses[1].clone(), None),
+                        _ => (
+                            Some(clauses[0].clone()),
+                            clauses[1].clone(),
+                            Some(clauses[2].clone()),
+                        ),
+                    };
+                    let prefix =
+                        pre_seg.unwrap_or_else(|| if colon { "(" } else { "" }.to_string());
+                    let suffix =
+                        suf_seg.unwrap_or_else(|| if colon { ")" } else { "" }.to_string());
+                    // CLHS requires prefix/suffix to be constant strings, so
+                    // format them over NO arguments: literal directives (~~,
+                    // ~%) still render, while an argument-consuming directive
+                    // signals a control-error much as SBCL rejects it.
+                    let emit_const = |seg: &str, output: &mut String| -> Result<(), BlissError> {
+                        format_impl(seg, &[], &mut 0, output)
+                    };
+                    if at_sign {
+                        emit_const(&prefix, output)?;
+                        format_impl(&body_seg, args, arg_idx, output)?;
+                        emit_const(&suffix, output)?;
+                    } else {
+                        if *arg_idx >= args.len() {
+                            return Err(BlissError::ControlError("too few args for ~<".into()));
+                        }
+                        let val = args[*arg_idx];
+                        *arg_idx += 1;
+                        if val.is_cons() || val.is_nil() {
+                            let sub_args = cons_list_to_vec(val);
+                            let mut sub_idx = 0;
+                            emit_const(&prefix, output)?;
+                            format_impl(&body_seg, &sub_args, &mut sub_idx, output)?;
+                            emit_const(&suffix, output)?;
+                        } else {
+                            output.push_str(&blissval_to_print_string(val, true));
+                        }
                     }
                 } else {
                     // Justification: ~mincol,colinc,minpad,padchar<...~>.

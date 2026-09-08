@@ -1657,3 +1657,84 @@ fn format_fixed_and_exponential_floats_match_sbcl() {
         );
     }
 }
+
+// ── ~<...~:> logical block against SBCL ground truth (bliss-aspj) ──
+//
+// Every expectation was captured from SBCL 2.6.x on the identical control
+// string (scripted control|result| sweep diffed between the two systems).
+// The rules pinned down (CLHS 22.3.5.2):
+//   * a non-@ opening consumes ONE argument, a list, and the body formats
+//     over its ELEMENTS — even a directive-free body errors when that
+//     argument is missing;
+//   * a non-list argument is printed by WRITE and the whole block — prefix
+//     and suffix included — is skipped;
+//   * `~@<` formats over the remaining arguments instead;
+//   * segments are [prefix~;]body[~;suffix]; `~@;` marks a per-line prefix
+//     (identical to a plain prefix in linear rendering); `~:<` supplies the
+//     default "("/")" pair;
+//   * `~^` inside the block terminates on ITS list's exhaustion;
+//   * `~:@_` (mandatory conditional newline) always breaks; the other ~_
+//     variants and ~I are no-ops in linear rendering.
+
+fn lb_list(vals: &[BlissVal]) -> BlissVal {
+    use bliss_rt::object::ConsCell;
+    let mut list = NIL;
+    for &v in vals.iter().rev() {
+        let cell = Box::leak(Box::new(ConsCell { car: v, cdr: list }));
+        list = unsafe { BlissVal::from_cons_ptr(cell as *mut ConsCell as *mut u8) };
+    }
+    list
+}
+
+fn lb_fixlist(vals: &[i64]) -> BlissVal {
+    lb_list(&vals.iter().map(|&v| BlissVal::from_fixnum(v)).collect::<Vec<_>>())
+}
+
+#[test]
+fn format_logical_block_list_argument_consumption_matches_sbcl() {
+    let n = BlissVal::from_fixnum;
+    // Non-@ opening: one list argument, body formats its elements.
+    assert_eq!(format_nil_string("~<~a ~a~:>", &[lb_fixlist(&[1, 2])]), "1 2");
+    // The block consumes exactly one argument; the rest stay for the caller.
+    assert_eq!(format_nil_string("~<~a~:> ~a", &[lb_fixlist(&[1]), n(7)]), "1 7");
+    assert_eq!(format_nil_string("~<~a ~a~:>", &[lb_fixlist(&[1, 2]), n(9)]), "1 2");
+    // `:` on the opening supplies the parenthesis pair.
+    assert_eq!(format_nil_string("~:<~a ~a~:>", &[lb_fixlist(&[1, 2])]), "(1 2)");
+    assert_eq!(format_nil_string("~:<~a~:>", &[lb_fixlist(&[1, 2, 3])]), "(1)");
+    // `@` on the opening: format over the remaining arguments.
+    assert_eq!(format_nil_string("~@<~a ~a~:>", &[n(1), n(2)]), "1 2");
+    assert_eq!(format_nil_string("~:@<~a ~a~:>", &[n(1), n(2)]), "(1 2)");
+    // Segments: prefix / body / suffix; two segments = prefix + body.
+    assert_eq!(format_nil_string("~<[~;~a~;]~:>", &[lb_fixlist(&[5])]), "[5]");
+    assert_eq!(format_nil_string("~<[~;~a~:>", &[lb_fixlist(&[5])]), "[5");
+    // `~@;` per-line prefix renders as a plain prefix on one line.
+    assert_eq!(format_nil_string("~<;; ~@;~a~:>", &[lb_fixlist(&[7])]), ";; 7");
+    // Non-list argument: WRITE it, skip the block (prefix/suffix too).
+    assert_eq!(format_nil_string("~<~a~:>", &[n(5)]), "5");
+    assert_eq!(format_nil_string("~<[~;~a~;]~:>", &[n(9)]), "9");
+    // ~^ terminates on the BLOCK list's exhaustion.
+    assert_eq!(format_nil_string("~<~a~^ ~a~:>", &[lb_fixlist(&[1])]), "1");
+    // Fill-style close ~:@> is still a logical block.
+    assert_eq!(format_nil_string("~<~a ~a~:@>", &[lb_fixlist(&[1, 2])]), "1 2");
+    assert_eq!(format_nil_string("~<~a~:@>", &[lb_fixlist(&[1, 2, 3])]), "1");
+    // ~# inside the block counts the block's remaining elements.
+    assert_eq!(format_nil_string("~<~#[none~:;~a~]~:>", &[lb_fixlist(&[1])]), "1");
+    // Nested blocks: the inner block consumes a sublist element.
+    let nested = lb_list(&[n(1), lb_fixlist(&[2]), n(3)]);
+    assert_eq!(format_nil_string("~<~a ~<~a~:> ~a~:>", &[nested]), "1 2 3");
+    // Mandatory conditional newline breaks even in linear rendering.
+    assert_eq!(format_nil_string("~@<a~:@_b~:>", &[]), "a\nb");
+    assert_eq!(format_nil_string("~@<~a ~_~a~:>", &[n(1), n(2)]), "1 2");
+}
+
+#[test]
+fn format_logical_block_missing_or_exhausted_list_errors_like_sbcl() {
+    // SBCL: "No more arguments" — the list argument is consumed eagerly,
+    // even for a directive-free body.
+    assert!(format_nil("~<blk~:>", &[]).is_err());
+    assert!(format_nil("~@<~a~:>", &[]).is_err());
+    // Exhausting the block's list without ~^ errors.
+    assert!(format_nil("~<~a ~a~:>", &[lb_fixlist(&[1])]).is_err());
+    // NIL is a list — an empty one, so a consuming body still errors.
+    assert!(format_nil("~<~a~:>", &[NIL]).is_err());
+}
