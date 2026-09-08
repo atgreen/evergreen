@@ -686,10 +686,67 @@ fn emit_shadow_root_restore(
     Ok(())
 }
 
-/// Materialise a simultaneous set of block-parameter moves through a temporary
-/// stack snapshot. This handles register, spill-slot, and cyclic combinations
-/// uniformly; no destination is written until every source has been captured.
+/// One home-to-home move, RAX as intermediary where x86 needs one. RAX is
+/// never a value home (framed_machine_env hands out only rcx/r8/rbx/r12-r15),
+/// so it is always free scratch here.
+fn emit_home_move(a: &mut Asm, dst: FramedHome, src: HomeMoveSrc) {
+    match (dst, src) {
+        (FramedHome::Reg(d), HomeMoveSrc::Home(FramedHome::Reg(s))) => mov_rr(a, d, s),
+        (FramedHome::Reg(d), HomeMoveSrc::Home(h)) => load_home(a, d, h, 0),
+        (FramedHome::Reg(d), HomeMoveSrc::Const(bits)) => mov_imm64(a, d, bits as i64),
+        (FramedHome::Stack(_), HomeMoveSrc::Home(h)) => {
+            load_home(a, RAX, h, 0);
+            store_home(a, dst, RAX, 0);
+        }
+        (FramedHome::Stack(_), HomeMoveSrc::Const(bits)) => {
+            mov_imm64(a, RAX, bits as i64);
+            store_home(a, dst, RAX, 0);
+        }
+    }
+}
+
+/// Materialise a simultaneous set of block-parameter moves. Identity moves are
+/// dropped; the rest are emitted in an order where no destination is written
+/// while a pending move still reads it (bliss-x5y.28: the previous
+/// unconditional stack snapshot cost a sub-rsp + store/reload round trip PER
+/// MOVE — two of them on every fib activation for what is a single register
+/// move). Only a residual cycle takes the snapshot path, which captures every
+/// remaining source before writing any destination.
 fn parallel_home_move(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) {
+    let mut pending: Vec<(FramedHome, HomeMoveSrc)> = moves
+        .iter()
+        .filter(|(dst, src)| !matches!(src, HomeMoveSrc::Home(h) if h == dst))
+        .copied()
+        .collect();
+    loop {
+        let mut progressed = false;
+        let mut i = 0;
+        while i < pending.len() {
+            let dst = pending[i].0;
+            let still_read = pending
+                .iter()
+                .any(|(_, src)| matches!(src, HomeMoveSrc::Home(h) if *h == dst));
+            if still_read {
+                i += 1;
+                continue;
+            }
+            let (dst, src) = pending.swap_remove(i);
+            emit_home_move(a, dst, src);
+            progressed = true;
+        }
+        if pending.is_empty() {
+            return;
+        }
+        if !progressed {
+            break; // every pending destination is still read: a cycle
+        }
+    }
+    parallel_home_move_snapshot(a, &pending);
+}
+
+/// The general cyclic case: a temporary stack snapshot captures every source
+/// before any destination is written.
+fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) {
     if moves.is_empty() {
         return;
     }
