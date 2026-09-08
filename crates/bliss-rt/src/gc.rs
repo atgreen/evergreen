@@ -619,6 +619,25 @@ pub struct HeapCollector {
     promotion_threshold: u8,
 }
 
+thread_local! {
+    /// Persistent minor-GC scratch (bliss-5i3f). `HeapCollector`s are created
+    /// ad-hoc per collection, so these HashMap/HashSet/Vec were reallocated
+    /// and grown from empty on EVERY minor GC — at per-allocation GC frequency
+    /// on a load-heavy workload the hashbrown reserve_rehash churn dominated
+    /// (gdb: minor_gc_stw_body in reserve_rehash). The STW body is
+    /// single-threaded under the heap lock, so a thread-local reused across
+    /// collections is safe: `mem::take` it out at the top, `.clear()` (keeps
+    /// capacity), use as before, put it back before returning. No early return
+    /// or `?` runs between take and restore in minor_gc_stw_body; a panic in
+    /// the collector aborts the process, so lost restoration is moot.
+    static MINOR_NURSERY_INDEX: std::cell::RefCell<
+        std::collections::HashMap<usize, (usize, usize, u8, usize)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static MINOR_MARKED: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    static MINOR_WORKLIST: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+}
+
 /// True if `v` is a tagged heap reference (cons, heap object, or function
 /// pointer) whose referent the GC must trace. Immediates — fixnums, chars,
 /// single-floats, symbols-by-id, NIL/T — are not references.
@@ -1289,9 +1308,10 @@ impl HeapCollector {
             })
             .collect();
 
-        // body address -> (total size, region index, type id, body length)
-        let mut nursery_index: std::collections::HashMap<usize, (usize, usize, u8, usize)> =
-            std::collections::HashMap::new();
+        // body address -> (total size, region index, type id, body length).
+        // Reused across collections with retained capacity (bliss-5i3f).
+        let mut nursery_index = MINOR_NURSERY_INDEX.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        nursery_index.clear();
         for &nursery_idx in &nursery_indices {
             let base = state.regions[nursery_idx].base as usize;
             let top = state.regions[nursery_idx].header.alloc_top as usize;
@@ -1326,8 +1346,11 @@ impl HeapCollector {
             }
         }
 
-        let mut marked: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut mark_worklist: Vec<usize> = Vec::new();
+        // Reused across collections with retained capacity (bliss-5i3f).
+        let mut marked = MINOR_MARKED.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        marked.clear();
+        let mut mark_worklist = MINOR_WORKLIST.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        mark_worklist.clear();
         let mark_ref = |v: BlissVal,
                         marked: &mut std::collections::HashSet<usize>,
                         worklist: &mut Vec<usize>| {
@@ -1851,6 +1874,12 @@ impl HeapCollector {
         // Update local stats copy.
         self.gc_stats = state.stats.clone();
         GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
+
+        // Return the scratch to the thread-local with its capacity retained
+        // (bliss-5i3f). No early exit runs between the takes above and here.
+        MINOR_NURSERY_INDEX.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
+        MINOR_MARKED.with(|s| *s.borrow_mut() = std::mem::take(&mut marked));
+        MINOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut mark_worklist));
 
         Ok(())
     }
