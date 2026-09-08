@@ -15217,6 +15217,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|value| arena_str(&value))
                     .unwrap_or(NIL));
             }
+            "BLISS-EXT:%MACHINE-TYPE" => {
+                // The build's target CPU as an uppercase MACHINE-TYPE string
+                // (SBCL convention), derived from cfg like *FEATURES* — so a
+                // future aarch64 build reports "ARM64", not a hardcoded
+                // "X86-64" (bliss-meqs).
+                let arch = if cfg!(target_arch = "x86_64") {
+                    "X86-64"
+                } else if cfg!(target_arch = "aarch64") {
+                    "ARM64"
+                } else if cfg!(target_arch = "x86") {
+                    "X86"
+                } else if cfg!(target_arch = "riscv64") {
+                    "RISCV64"
+                } else {
+                    "UNKNOWN"
+                };
+                return Ok(arena_str(arch));
+            }
             // bliss-jtc.10: Lisp-visible tiering introspection. These make the
             // hotspot engine observable through the real binary — a test (or a
             // user) can watch a hot loop's counters climb and its tier promote,

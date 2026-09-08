@@ -2335,8 +2335,8 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 
 (defun lisp-implementation-type () "Bliss")
 (defun lisp-implementation-version () "0.1.0")
-(defun machine-type () "X86-64")
-(defun machine-version () "X86-64")
+(defun machine-type () (bliss-ext::%machine-type))
+(defun machine-version () (bliss-ext::%machine-type))
 (defun machine-instance () "localhost")
 (defun software-type () "Linux")
 (defun software-version () "1.0")
