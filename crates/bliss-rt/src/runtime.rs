@@ -932,7 +932,106 @@ extern "C" fn sigsegv_handler(
             }
             crate::syscall::dbg_write(b"bliss: stack guard SIGSEGV\n")
         }
-        SigsegvFaultKind::Ordinary => crate::syscall::dbg_write(b"bliss: unhandled SIGSEGV\n"),
+        SigsegvFaultKind::Ordinary => {
+            crate::syscall::dbg_write(b"bliss: unhandled SIGSEGV\n");
+            // Allocation-free diagnostics: fault address and RIP in hex.
+            let mut buf = [0u8; 64];
+            let mut n = 0;
+            let mut put = |bytes: &[u8], n: &mut usize| {
+                for &b in bytes {
+                    if *n < buf.len() {
+                        buf[*n] = b;
+                        *n += 1;
+                    }
+                }
+            };
+            let hex = |mut v: usize, out: &mut [u8; 16]| {
+                for i in (0..16).rev() {
+                    let d = (v & 0xF) as u8;
+                    out[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+                    v >>= 4;
+                }
+            };
+            let mut h = [0u8; 16];
+            put(b"addr=0x", &mut n);
+            hex(addr, &mut h);
+            put(&h, &mut n);
+            const UCONTEXT_RIP_OFFSET: usize = 168;
+            let rip = if _context.is_null() {
+                0
+            } else {
+                unsafe {
+                    core::ptr::read_unaligned(
+                        (_context as *const u8).add(UCONTEXT_RIP_OFFSET) as *const usize
+                    )
+                }
+            };
+            put(b" rip=0x", &mut n);
+            hex(rip, &mut h);
+            put(&h, &mut n);
+            put(b"\n", &mut n);
+            crate::syscall::dbg_write(&buf[..n]);
+            // Registers and the stack top, for wild-jump forensics.
+            let greg = |idx: usize| -> usize {
+                if _context.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        core::ptr::read_unaligned(
+                            (_context as *const u8).add(40 + idx * 8) as *const usize
+                        )
+                    }
+                }
+            };
+            // Linux x86_64 gregs order: R8 R9 R10 R11 R12 R13 R14 R15 RDI RSI
+            // RBP RBX RDX RAX RCX RSP RIP.
+            let names: [&[u8]; 16] = [
+                b"r8 ", b"r9 ", b"r10", b"r11", b"r12", b"r13", b"r14", b"r15",
+                b"rdi", b"rsi", b"rbp", b"rbx", b"rdx", b"rax", b"rcx", b"rsp",
+            ];
+            for (i, name) in names.iter().enumerate() {
+                let mut n2 = 0;
+                let mut b2 = [0u8; 32];
+                for &c in name.iter() {
+                    b2[n2] = c;
+                    n2 += 1;
+                }
+                b2[n2] = b'=';
+                n2 += 1;
+                let mut h2 = [0u8; 16];
+                hex(greg(i), &mut h2);
+                for &c in h2.iter() {
+                    b2[n2] = c;
+                    n2 += 1;
+                }
+                b2[n2] = b'\n';
+                n2 += 1;
+                crate::syscall::dbg_write(&b2[..n2]);
+            }
+            let rsp = greg(15);
+            for k in 0..8usize {
+                let v = unsafe { core::ptr::read_unaligned((rsp + k * 8) as *const usize) };
+                let mut n2 = 0;
+                let mut b2 = [0u8; 40];
+                for &c in b"stk".iter() {
+                    b2[n2] = c;
+                    n2 += 1;
+                }
+                b2[n2] = b'0' + k as u8;
+                n2 += 1;
+                b2[n2] = b'=';
+                n2 += 1;
+                let mut h2 = [0u8; 16];
+                hex(v, &mut h2);
+                for &c in h2.iter() {
+                    b2[n2] = c;
+                    n2 += 1;
+                }
+                b2[n2] = b'\n';
+                n2 += 1;
+                crate::syscall::dbg_write(&b2[..n2]);
+            }
+        }
     }
     crate::syscall::exit_group(128 + crate::syscall::SIGSEGV);
 }

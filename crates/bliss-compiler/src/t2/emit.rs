@@ -197,13 +197,15 @@ fn cmp_mem64_disp8(a: &mut Asm, lhs: u8, base: u8, disp: u8) {
 /// `movzx dst32, byte ptr [base + index + disp8]`. The 32-bit destination
 /// zero-extends to 64 bits; using the same register for `dst` and `index` is
 /// valid because address calculation reads the old index first.
-fn movzx_mem8_indexed(a: &mut Asm, dst: u8, base: u8, index: u8, disp: u8) {
-    let rex = 0x40 | (((dst >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
+fn movzx_mem8(a: &mut Asm, dst: u8, base: u8) {
+    // `movzx dst, byte [base]` — mod=01/disp8=0. rsp/rbp bases would need a
+    // SIB or different mod; the only caller passes SCRATCH (rdx).
+    debug_assert!(base & 7 != 4 && base & 7 != 5, "base needs SIB/disp handling");
+    let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((base >> 3) & 1);
     a.push(rex);
     a.extend_from_slice(&[0x0F, 0xB6]);
-    a.push(0x40 | ((dst & 7) << 3) | 0x04); // mod=01, rm=SIB
-    a.push(((index & 7) << 3) | (base & 7)); // scale=1
-    a.push(disp);
+    a.push(0x40 | ((dst & 7) << 3) | (base & 7)); // mod=01, rm=base
+    a.push(0); // disp8 = 0
 }
 
 /// `sar r64, imm8`.
@@ -375,15 +377,19 @@ fn guard_single_float(a: &mut Asm, r: u8, deopt: bliss_rt::asm::Label) {
 // operand is tag-checked — a statically-known fixnum constant needs no guard.
 
 const SCRATCH: u8 = 2; // rdx — reserved for guard temporaries, never a value reg
-const STRING_SCAN: u8 = 6; // rsi — transient UTF-8 prefix cursor
-const STRING_BYTE: u8 = 7; // rdi — transient byte; frame args are already loaded
+
 
 /// `test <r low byte>, 7 ; jne deopt` — the fixnum-tag guard on one operand.
-/// Correct for registers 0..=3 and 8..=15 (the framed value pool); registers
-/// 4..=7 would need a REX prefix to name their low byte and are never allocated.
+/// Correct for every GPR. Registers 4..=7 need a bare REX prefix so the r/m8
+/// encoding names their LOW byte (spl/bpl/sil/dil) — without it those
+/// encodings mean ah/ch/dh/bh, silently testing the wrong register's high
+/// byte (bliss-x5y.29: rsi joined the allocatable pool and every fixnum guard
+/// on an rsi-homed value became `test dh, 7`, a deopt storm or corruption).
 fn guard_fixnum(a: &mut Asm, r: u8, deopt: bliss_rt::asm::Label) {
     if r >= 8 {
         a.push(0x41); // REX.B → r8b..r15b
+    } else if r >= 4 {
+        a.push(0x40); // bare REX → spl/bpl/sil/dil, not ah/ch/dh/bh
     }
     a.push(0xF6); // test r/m8, imm8  (/0)
     a.push(0xC0 | (r & 7)); // mod=11, rm=r
@@ -1961,19 +1967,28 @@ fn emit_string_ascii_char_at(
     // selected element is ASCII.  Scanning the prefix prevents e.g. byte 2 of
     // "éa" from being returned as character 2; any multibyte prefix deopts to
     // the stdlib's UTF-8-aware CL:CHAR implementation.
-    mov_imm64(a, STRING_SCAN, 0);
+    //
+    // The scan is a moving-POINTER walk that needs no registers beyond the
+    // emitter's own: SCRATCH (holding the object base) becomes the cursor over
+    // &data[0]..=&data[idx], dst (holding the untagged index) becomes the
+    // bound address, and RAX carries the transient byte. The old version used
+    // rsi/rdi cursors, which silently corrupted values homed there the moment
+    // rsi joined the allocatable pool (bliss-x5y.29).
+    alu_rr(a, 0x01, dst, SCRATCH); // dst = base + idx
+    alu_r_imm(a, 0, dst, 16); // dst = &data[idx] (the bound)
+    alu_r_imm(a, 0, SCRATCH, 16); // SCRATCH = &data[0] (the cursor)
     let scan = a.label();
     let selected = a.label();
     a.bind(scan);
-    movzx_mem8_indexed(a, STRING_BYTE, SCRATCH, STRING_SCAN, 16);
-    alu_r_imm(a, 7, STRING_BYTE, 128);
+    movzx_mem8(a, RAX, SCRATCH);
+    alu_r_imm(a, 7, RAX, 128);
     a.jcc(Cc::Ge, deopt);
-    cmp_rr(a, STRING_SCAN, dst);
+    cmp_rr(a, SCRATCH, dst);
     a.jcc(Cc::E, selected);
-    alu_r_imm(a, 0, STRING_SCAN, 1);
+    alu_r_imm(a, 0, SCRATCH, 1);
     a.jmp(scan);
     a.bind(selected);
-    mov_rr(a, dst, STRING_BYTE);
+    mov_rr(a, dst, RAX);
     shl_imm(a, dst, 3);
     or_imm8(a, dst, bliss_rt::value::TAG_CHARACTER as u8);
     Ok(())
@@ -3216,9 +3231,45 @@ fn emit_framed_inner(
         if let Some(home) = frame_base_home {
             store_home(&mut a, home, 7 /* rdi */, 0);
         }
+        // Import only slots whose value is LIVE at the OSR target block.
+        // regalloc2 reuses one register for several disjoint-range values, so
+        // a slot map can legitimately name two values sharing a register home
+        // — at most one is live at the target. Loading a dead slot after the
+        // live one clobbered it (bliss-x5y.29: with the reduced register pool,
+        // live-osr's sum and a dead local shared rcx and the OSR result was
+        // the dead value). Liveness is read from regalloc2's precise
+        // per-ProgPoint ranges, the same source the safepoint roots use.
+        let target_pp = f
+            .block_order()
+            .iter()
+            .position(|&b| b == osr.block)
+            .map(|bi| machine.blocks[bi].start as u32 * 2);
+        let live_at_target = |value: Value| -> bool {
+            let Some(pp) = target_pp else { return true };
+            machine.value_locations.iter().any(|r| {
+                r.vreg.class == RegClass::Gpr
+                    && Value(r.vreg.num) == value
+                    && r.start <= pp
+                    && pp < r.end
+            })
+        };
         for spec in &specs {
             let slot = spec.index as usize;
             if let ValueSource::Value { value, .. } = &spec.source {
+                if std::env::var_os("BLISS_RA_DBG").is_some() {
+                    eprintln!(
+                        "[osr] fn={} slot={} v{} live={} home={:?} target_pp={:?}",
+                        f.name(),
+                        slot,
+                        value.0,
+                        live_at_target(*value),
+                        homes.get(value),
+                        target_pp
+                    );
+                }
+                if !live_at_target(*value) {
+                    continue;
+                }
                 if let Some(&home) = homes.get(value) {
                     match home {
                         FramedHome::Reg(r) => mov_from_frame(&mut a, r, 7 /* rdi */, slot),

@@ -170,9 +170,27 @@ fn machine_env() -> MachineEnv {
 /// ABI and instruction templates (rax, rdx, rsi, rdi) are excluded, as are
 /// r9-r11 which form the reload/result-temporary bank.  rcx/r8 are profitable
 /// for call-local ranges; rbx/r12-r15 survive runtime calls.
-fn framed_machine_env() -> MachineEnv {
+fn framed_machine_env(reduced: bool) -> MachineEnv {
+    // bliss-x5y.29: the REDUCED pool {rcx, r8, rsi, rbx} (abstract 1, 5, 3,
+    // 9) carries a single callee-saved register, so a small hot function's
+    // activation pays ONE push instead of three — measured ~12% fewer cycles
+    // on tak, neutral on fib. A fully caller-saved pool is rejected outright
+    // by regalloc2 (a call's result def may not land in a clobbered
+    // register: TooManyLiveRegs), and dropping rsi measures WORSE than the
+    // full pool (three GPRs is genuine pressure), so one callee-saved
+    // register is the sweet spot. The FULL pool adds r12–r15 for
+    // pressure-heavy functions (see allocate_framed's retry). Not offered
+    // anywhere: rax/rdx (emitter scratch), r9–r11 (the framed emitter's
+    // operand temps / regalloc2 edit scratch), and rdi (frame pointer while
+    // the interpreter entry loads parameter homes — a parameter homed there
+    // would clobber the base mid-load).
+    let int_pool: &[usize] = if reduced {
+        &[1, 5, 3, 9]
+    } else {
+        &[1, 5, 3, 9, 10, 11, 12, 13]
+    };
     let mut int_regs = PRegSet::empty();
-    for i in [1usize, 5, 9, 10, 11, 12, 13] {
+    for &i in int_pool {
         int_regs.add(PReg::new(i, Ra2RegClass::Int));
     }
     let mut float_regs = PRegSet::empty();
@@ -450,7 +468,20 @@ pub fn allocate(mf: &mut MachFunc) -> Result<(), RegAllocError> {
 /// Allocate for the live framed x86 emitter, reserving its ABI and scratch
 /// registers while still using the same regalloc2 pipeline and edit model.
 pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), RegAllocError> {
-    allocate_with_env(mf, framed_machine_env())
+    // Reduced-pool-first (bliss-x5y.29): short prologues for the small hot
+    // functions that dominate recursion, with a FULL-pool retry when the
+    // reduced pool genuinely runs out of registers — a retry costs one extra
+    // background-thread allocation pass, declining to T1 costs the tier.
+    // BLISS_T2_FRAME_ENV=full|reduced pins one environment for debugging.
+    match std::env::var("BLISS_T2_FRAME_ENV").as_deref() {
+        Ok("full") => return allocate_with_env(mf, framed_machine_env(false)),
+        Ok("reduced") => return allocate_with_env(mf, framed_machine_env(true)),
+        _ => {}
+    }
+    match allocate_with_env(mf, framed_machine_env(true)) {
+        Err(RegAllocError::TooManyLiveRegs) => allocate_with_env(mf, framed_machine_env(false)),
+        done => done,
+    }
 }
 
 fn allocate_with_env(mf: &mut MachFunc, env: MachineEnv) -> Result<(), RegAllocError> {

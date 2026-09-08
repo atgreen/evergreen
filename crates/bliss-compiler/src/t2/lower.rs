@@ -512,11 +512,19 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         }
 
         // ── memory loads (may be effectful) ──
-        Load | Car | Cdr | VecRef | SymbolValue => un_or_bin(lo, inst, op::LOAD, defs, uses),
+        Load | Car | Cdr | VecRef => un_or_bin(lo, inst, op::LOAD, defs, uses),
         StringByteLength | StringAsciiCharAt => lo.emit_annotated(inst, op::LOAD, defs, uses),
+        // A global read/write is emitted as a c2i helper CALL
+        // (c2i_load_global / c2i_store_global), which clobbers every
+        // caller-saved register — modelling it as a plain load/store let the
+        // allocator keep a live value in a caller-saved register across it
+        // (latent corruption; found during bliss-x5y.29's zero-push audit).
+        SymbolValue | SetSymbolValue => {
+            lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses);
+        }
 
         // ── memory stores ──
-        Store | SetCar | SetCdr | VecSet | SetSymbolValue => {
+        Store | SetCar | SetCdr | VecSet => {
             lo.emit_annotated(inst, op::STORE, defs, uses);
         }
         WriteBarrier => lo.emit_annotated(inst, op::WRITE_BARRIER, defs, uses),

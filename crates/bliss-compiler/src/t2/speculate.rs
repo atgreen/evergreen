@@ -829,10 +829,7 @@ fn rewrite_dominated_uses(
     to: Value,
     rewrite_anchor_args: bool,
 ) {
-    let rewrite_frame_state = |f: &mut Function, inst: Inst| {
-        let Some(fsid) = f.inst(inst).frame_state else {
-            return;
-        };
+    let rewrite_fs_id = |f: &mut Function, fsid: crate::t2::frame_state::FrameStateId| {
         let fs = f.frame_states.get_mut(fsid);
         for scope in &mut fs.scopes {
             for src in scope.locals.iter_mut().chain(scope.stack.iter_mut()) {
@@ -843,6 +840,12 @@ fn rewrite_dominated_uses(
                 }
             }
         }
+    };
+    let rewrite_frame_state = |f: &mut Function, inst: Inst| {
+        let Some(fsid) = f.inst(inst).frame_state else {
+            return;
+        };
+        rewrite_fs_id(f, fsid);
     };
     let rewrite_inst = |f: &mut Function, inst: Inst, with_frame_state: bool| {
         let data = f.inst_mut(inst);
@@ -891,6 +894,23 @@ fn rewrite_dominated_uses(
                 rewrite_inst(f, inst, true);
             }
         }
+    }
+    // OSR entry import maps (Function::osr_entries) record which value holds
+    // each interpreter slot AT a loop header, and are attached to no
+    // instruction — sweep them explicitly. A header strictly dominated by the
+    // guard must import the NARROWED value: the loop body reads it, and the
+    // stale original may be dead there, so the OSR stub would initialise a
+    // home the loop never reads and skip the one it does (bliss-x5y.29:
+    // live-osr's n imported into pre-guard rcx while the loop read the guard
+    // value's stack home).
+    let osr_states: Vec<crate::t2::frame_state::FrameStateId> = f
+        .osr_entries
+        .iter()
+        .filter(|o| o.block != block && dom.dominates(block, o.block))
+        .map(|o| o.frame_state)
+        .collect();
+    for fsid in osr_states {
+        rewrite_fs_id(f, fsid);
     }
 }
 

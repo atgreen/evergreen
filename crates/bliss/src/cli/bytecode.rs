@@ -13897,6 +13897,35 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let entry = buf.leak();
     maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
     maybe_write_jitdump_code_load("T2", entry as usize, &artifact.code, done.sym);
+    // BLISS_T2_DISASM=<substring>: print the installed code of matching
+    // functions to stderr at install time — the only way to inspect code that
+    // crashes on its first execution (bliss-x5y.29 forensics).
+    if let Ok(pat) = std::env::var("BLISS_T2_DISASM") {
+        if !pat.is_empty() && bf.name.contains(&pat) {
+            eprintln!(
+                "; T2 code for {} at {:p} ({} bytes, compiled_entry=+{})",
+                bf.name,
+                entry,
+                artifact.code.len(),
+                artifact.compiled_entry
+            );
+            let mut dec = iced_x86::Decoder::with_ip(
+                64,
+                &artifact.code,
+                entry as u64,
+                iced_x86::DecoderOptions::NONE,
+            );
+            let mut fmt = iced_x86::NasmFormatter::new();
+            let mut insn = iced_x86::Instruction::default();
+            let mut line = String::new();
+            while dec.can_decode() {
+                dec.decode_out(&mut insn);
+                line.clear();
+                iced_x86::Formatter::format(&mut fmt, &insn, &mut line);
+                eprintln!("  {:#x}: {}", insn.ip(), line);
+            }
+        }
+    }
     let nc = Rc::new(NativeCode {
         entry,
         code_len: artifact.code.len(),
