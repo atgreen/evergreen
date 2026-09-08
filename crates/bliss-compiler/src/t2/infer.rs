@@ -338,7 +338,10 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         | FloatCmpLt | GenericEq | GenericEqual | InstanceOf => boolean(),
 
         // A type check narrows its operand to the checked tag (spec R4.63).
-        TypeCheck => {
+        // A Guard VALUE does the same for its passed-through result: it exists
+        // only on the path where the check held (bliss-x5y.25b). A non-TypeTag
+        // guard (StringLayout) passes its operand's type through unchanged.
+        TypeCheck | Guard => {
             let tag = match aux {
                 AuxData::TypeTag(t) => *t,
                 _ => IRType::TOP,

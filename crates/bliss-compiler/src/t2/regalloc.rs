@@ -477,7 +477,30 @@ fn allocate_with_env(mf: &mut MachFunc, env: MachineEnv) -> Result<(), RegAllocE
         algorithm: Algorithm::Ion,
     };
 
-    let output = regalloc2::run(&adapter, &env, &options)?;
+    let output = regalloc2::run(&adapter, &env, &options).inspect_err(|e| {
+        if std::env::var_os("BLISS_RA_DBG").is_some() {
+            eprintln!("[ra] error {e:?}; machine insts:");
+            for (i, inst) in mf.insts.iter().enumerate() {
+                eprintln!(
+                    "[ra] {i}: op={} defs={:?} uses={:?} deopt={:?} fs={:?} sp={}",
+                    inst.op,
+                    inst.defs.iter().map(|v| v.num).collect::<Vec<_>>(),
+                    inst.uses.iter().map(|v| v.num).collect::<Vec<_>>(),
+                    inst.deopt_uses.iter().map(|v| v.num).collect::<Vec<_>>(),
+                    inst.frame_state,
+                    inst.safepoint,
+                );
+            }
+            for (i, b) in mf.blocks.iter().enumerate() {
+                eprintln!(
+                    "[ra] block {i}: [{}, {}) params={:?}",
+                    b.start,
+                    b.end,
+                    b.params.iter().map(|v| v.num).collect::<Vec<_>>()
+                );
+            }
+        }
+    })?;
 
     mf.num_spill_slots = output.num_spillslots as u32;
     mf.inst_allocations = (0..adapter.num_insts)

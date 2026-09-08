@@ -13,7 +13,7 @@
 //! *that* type instead — never both at once.
 
 use crate::t2::frame_state::FrameStateId;
-use crate::t2::ir::{AuxData, Function, IRType, Inst, InstFlags, Opcode, TypeBits};
+use crate::t2::ir::{AuxData, Function, IRType, Inst, InstFlags, Opcode, TypeBits, Value};
 
 /// The single type a call site may be speculated as (mutually exclusive).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -129,6 +129,14 @@ fn result_type(s: SpecType) -> IRType {
     })
 }
 
+/// T or NIL — a comparison's result. Both are non-pointer immediates (NIL/T are
+/// tag-111 specials), so typing the result this way lets the emitter's
+/// safepoint-root filter drop a live-across boolean from GC shadow sync
+/// (bliss-x5y.25 option b).
+fn boolean_type() -> IRType {
+    IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL))
+}
+
 fn frame_state_bcp(f: &Function, fs: FrameStateId) -> u32 {
     f.frame_states
         .get(fs)
@@ -202,11 +210,11 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                     _ => {}
                 }
             } else if let Some(cmp) = cmp_of(sym) {
-                // Comparison: guarded typed compare; the result is a boolean (T/NIL),
-                // so leave its type unrefined (TOP).
+                // Comparison: guarded typed compare; the result is a boolean
+                // (T/NIL) — both immediates, typed as SYMBOL|NULL.
                 if argc == 2 {
                     if let Some(op) = typed_cmp_opcode(cmp, spec) {
-                        work.push((inst, op, IRType::TOP));
+                        work.push((inst, op, boolean_type()));
                     }
                 }
             } else if let Some(bit) = bitwise_of(sym) {
@@ -227,6 +235,7 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
 
     // Mutation phase: turn each into a guarded typed op.
     let n = work.len();
+    let mut fixnum_sites: Vec<Inst> = Vec::new();
     for (inst, opcode, ty) in work {
         let results = f.inst(inst).results.clone();
         {
@@ -244,8 +253,265 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
         for r in results {
             f.refine_type(r, ty);
         }
+        if fixnum_family(opcode) {
+            fixnum_sites.push(inst);
+        }
     }
+    materialize_fixnum_operand_guards(f, &fixnum_sites);
     n
+}
+
+/// The speculated opcodes whose emitter guards every variable operand as a
+/// fixnum before executing (emit_arith_inst / emit_fixnum_cmp_value).
+fn fixnum_family(op: Opcode) -> bool {
+    use Opcode::*;
+    matches!(
+        op,
+        FixnumAdd
+            | FixnumSub
+            | FixnumMul
+            | FixnumNeg
+            | FixnumShl
+            | LogAnd
+            | LogOr
+            | LogXor
+            | LogNot
+            | FixnumCmpLt
+            | FixnumCmpGt
+            | FixnumCmpLe
+            | FixnumCmpGe
+            | FixnumCmpEq
+    )
+}
+
+/// bliss-x5y.25 (option b): materialise each speculated fixnum site's
+/// discharged operand proof as an explicit SSA `Guard` value — the same shape
+/// build.rs gives CAR/CDR's cons proof — and rewrite every use the guard
+/// dominates (instruction arguments, edge arguments, and FrameState sources)
+/// to the narrowed value.
+///
+/// Why: inference assigns each SSA value one type from its definition on, so a
+/// raw parameter stays TOP everywhere even though the emitter guards it before
+/// the op. With the proof reified as a FIXNUM-typed value that replaces the
+/// original downstream, the original dies at the guard and what stays live
+/// across later call safepoints is provably immediate — the emitter's
+/// safepoint-root filter drops it from GC shadow sync, and a function whose
+/// roots all vanish loses its frame_base_home, unlocking the direct self-call
+/// fast path (emit_call).
+///
+/// Soundness of the rewrite: the guard passes its input through unchanged, so
+/// substituting its result anywhere it dominates preserves values exactly. The
+/// guard reuses the site's FrameState (deopt before the op re-runs the op's
+/// bytecode in T0 — nothing has executed yet). The site's own FrameState is
+/// NOT rewritten: at a guard/op deopt the guard's result does not exist, so
+/// those sources must stay the original value.
+fn materialize_fixnum_operand_guards(f: &mut Function, sites: &[Inst]) {
+    use crate::t2::ir::{InstData, InstFlags, ValueRepresentation};
+    if sites.is_empty() {
+        return;
+    }
+    let dom = f.dominators();
+    for &site in sites {
+        // Locate the site (positions shift as guards are inserted, so look it
+        // up fresh each round; T2 bodies are small).
+        let Some((block, _)) = f
+            .block_order()
+            .to_vec()
+            .into_iter()
+            .find_map(|b| {
+                f.block(b)
+                    .insts
+                    .iter()
+                    .position(|&i| i == site)
+                    .map(|p| (b, p))
+            })
+        else {
+            continue;
+        };
+        let fs = f.inst(site).frame_state;
+        let source_pos = f.inst(site).source_pos;
+        let args = f.inst(site).args.clone();
+        let mut seen: Vec<Value> = Vec::new();
+        for v in args {
+            if seen.contains(&v) {
+                continue;
+            }
+            seen.push(v);
+            // Already provably fixnum (constant, arith result, earlier guard):
+            // the emitter will not re-check it and there is nothing to narrow.
+            let bits = f.value(v).ty.bits;
+            if !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits {
+                continue;
+            }
+            // EAGER placement for a call result (the Phase-3 half of option b):
+            // a result consumed by a speculated fixnum op would normally be
+            // guarded just before that op — too late to help any call
+            // safepoint in between (fib's r1 stays a GC root across the second
+            // recursive call). Instead anchor the guard right after the
+            // defining call, at the first following FrameState-carrying
+            // instruction in the same block: that state is exactly the
+            // post-call interpreter state (the result on the stack), so a
+            // guard failure resumes T0 there and simply re-runs the remainder
+            // generically. Falls back to just-before-the-site when no such
+            // anchor exists.
+            let eager = match f.value(v).def {
+                crate::t2::ir::ValueDef::Result { inst: def, .. }
+                    if f.inst(def).opcode == Opcode::Call =>
+                {
+                    f.block_order().to_vec().into_iter().find_map(|db| {
+                        let insts = &f.block(db).insts;
+                        let dp = insts.iter().position(|&i| i == def)?;
+                        insts[dp + 1..]
+                            .iter()
+                            .take_while(|&&i| i != site)
+                            .find(|&&i| f.inst(i).frame_state.is_some())
+                            .map(|&anchor| (db, anchor))
+                    })
+                }
+                _ => None,
+            };
+            let (guard_block, anchor, borrowed_fs, rewrite_anchor_args) = match eager {
+                Some((db, anchor)) => (db, anchor, f.inst(anchor).frame_state, false),
+                None => (block, site, fs, true),
+            };
+            // The guard gets its own CLONE of the borrowed FrameState. Sharing
+            // the id would let a later sibling guard's downstream rewrite
+            // reach back into this guard's deopt state and reference a value
+            // defined after it (regalloc2 EntryLivein); a private copy pins
+            // the state as it exists at the guard.
+            let guard_fs =
+                borrowed_fs.map(|id| f.frame_states.add(f.frame_states.get(id).clone()));
+            let (guard, results) = f.push_inst(
+                guard_block,
+                InstData {
+                    opcode: Opcode::Guard,
+                    args: vec![v],
+                    results: vec![],
+                    aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..InstFlags::default()
+                    },
+                    targets: vec![],
+                    frame_state: guard_fs,
+                    source_pos,
+                },
+                &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+            );
+            let narrowed = results[0];
+            // push_inst appended the guard at the end of the block (after the
+            // terminator); move it next to its anchor: immediately BEFORE a
+            // site anchor (the proof precedes the op), immediately AFTER an
+            // eager anchor (whose FrameState the guard borrows).
+            let insts = &mut f.block_mut(guard_block).insts;
+            let appended = insts.pop();
+            debug_assert_eq!(appended, Some(guard));
+            let anchor_pos = insts
+                .iter()
+                .position(|&i| i == anchor)
+                .expect("anchor is in its block");
+            insts.insert(
+                if rewrite_anchor_args {
+                    anchor_pos
+                } else {
+                    anchor_pos + 1
+                },
+                guard,
+            );
+            rewrite_dominated_uses(
+                f,
+                &dom,
+                guard_block,
+                anchor,
+                guard,
+                v,
+                narrowed,
+                rewrite_anchor_args,
+            );
+        }
+    }
+}
+
+/// Replace uses of `from` with `to` in everything the guard placed at `anchor`
+/// dominates: every instruction after the anchor in `block` (arguments, edge
+/// arguments, FrameState sources) and every instruction of every block
+/// strictly dominated by `block`. With `rewrite_anchor_args` (the guard sits
+/// immediately BEFORE the anchor — the speculated-site placement) the anchor's
+/// own arguments are rewritten too, while its FrameState keeps `from`: at a
+/// deopt of the guard or the site the guard's result does not exist yet. An
+/// eager anchor (guard AFTER it, borrowing its FrameState) is skipped whole
+/// for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_dominated_uses(
+    f: &mut Function,
+    dom: &crate::t2::ir::DominatorTree,
+    block: crate::t2::ir::Block,
+    site: Inst,
+    guard: Inst,
+    from: Value,
+    to: Value,
+    rewrite_anchor_args: bool,
+) {
+    let rewrite_frame_state = |f: &mut Function, inst: Inst| {
+        let Some(fsid) = f.inst(inst).frame_state else {
+            return;
+        };
+        let fs = f.frame_states.get_mut(fsid);
+        for scope in &mut fs.scopes {
+            for src in scope.locals.iter_mut().chain(scope.stack.iter_mut()) {
+                if let crate::t2::frame_state::ValueSource::Value { value, .. } = src {
+                    if *value == from {
+                        *value = to;
+                    }
+                }
+            }
+        }
+    };
+    let rewrite_inst = |f: &mut Function, inst: Inst, with_frame_state: bool| {
+        let data = f.inst_mut(inst);
+        for a in data.args.iter_mut() {
+            if *a == from {
+                *a = to;
+            }
+        }
+        for call in data.targets.iter_mut() {
+            for a in call.args.iter_mut() {
+                if *a == from {
+                    *a = to;
+                }
+            }
+        }
+        if with_frame_state {
+            rewrite_frame_state(f, inst);
+        }
+    };
+    // The anchor itself: arguments only, and only for a site anchor — its
+    // FrameState must keep `from` either way.
+    if rewrite_anchor_args {
+        rewrite_inst(f, site, false);
+    }
+    // The rest of the site's block, strictly after the site.
+    let insts = f.block(block).insts.clone();
+    let site_pos = insts
+        .iter()
+        .position(|&i| i == site)
+        .expect("site is in its block");
+    for &inst in &insts[site_pos + 1..] {
+        // The guard itself consumes `from` — never rewrite it to its own result.
+        if inst == guard {
+            continue;
+        }
+        rewrite_inst(f, inst, true);
+    }
+    // Every block strictly dominated by the site's block.
+    for b in f.block_order().to_vec() {
+        if b != block && dom.dominates(block, b) {
+            for inst in f.block(b).insts.clone() {
+                rewrite_inst(f, inst, true);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

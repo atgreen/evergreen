@@ -1762,6 +1762,37 @@ fn emit_cons_guard(
     Ok(())
 }
 
+/// A speculated fixnum operand proof reified as an SSA guard value
+/// (speculate.rs materialize_fixnum_operand_guards, bliss-x5y.25b): test the
+/// low three tag bits are zero, deopt otherwise, and pass the value through to
+/// its result register. Downstream typed ops skip their own operand re-check
+/// because the result's inferred type is FIXNUM.
+fn emit_fixnum_value_guard(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode, TypeBits};
+    if data.args.len() != 1
+        || data.results.len() != 1
+        || !matches!(data.aux, AuxData::TypeTag(t) if t.bits == TypeBits::FIXNUM)
+        || !data.flags.guard
+        || !data.flags.effectful
+        || data.frame_state.is_none()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard)));
+    }
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    guard_fixnum(a, xr, deopt);
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_rr(a, dst, xr);
+    Ok(())
+}
+
 /// Load CAR/CDR from a value refined by an explicit dominating cons guard.
 fn emit_cons_field_load(
     a: &mut Asm,
@@ -2342,6 +2373,29 @@ fn emit_framed_inner(
     // each runtime safepoint. The rich emitter uses stable `homes`, so these are
     // the locations that must be synchronized, not regalloc2's transient edit
     // locations. Only tagged values are GC roots; unboxed GPR values are omitted.
+    // Proven-immediate root filtering (bliss-x5y.25 option b). A value whose
+    // inferred type is confined to the NON-POINTER immediates — fixnum,
+    // single-float, character, symbol (an interning INDEX, not a pointer), and
+    // NIL/T — can never be relocated by the moving GC (`gc::is_heap_ref` is
+    // false for all of them), so it needs no shadow-root sync at safepoints.
+    // Soundness: the global inference map assigns each SSA value the type it
+    // has FROM ITS DEFINITION on (guards define fresh narrowed values), so the
+    // fact holds wherever the value is live. BOTTOM (unreached) stays rooted.
+    // Fewer roots means fewer sync sites, and a function whose roots vanish
+    // entirely loses its frame_base_home — unlocking the direct self-call
+    // fast path in emit_call.
+    let inference = crate::t2::infer::infer(f);
+    let proven_immediate = |value: Value| -> bool {
+        const IMMEDIATE: TypeBits = TypeBits(
+            TypeBits::FIXNUM.0
+                | TypeBits::SINGLE_FLOAT.0
+                | TypeBits::CHARACTER.0
+                | TypeBits::SYMBOL.0
+                | TypeBits::NULL.0,
+        );
+        let bits = inference.ty(value).bits;
+        !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
+    };
     let mut safepoint_roots: HashMap<Inst, Vec<Value>> = HashMap::new();
     if activation_slots.is_some() {
         for (mi, machine_inst) in machine.insts.iter().enumerate() {
@@ -2381,7 +2435,9 @@ fn emit_framed_inner(
                 if machine_inst.defs.contains(&range.vreg) {
                     continue;
                 }
-                if f.value(value).repr == ValueRepresentation::Tagged && homes.contains_key(&value)
+                if f.value(value).repr == ValueRepresentation::Tagged
+                    && homes.contains_key(&value)
+                    && !proven_immediate(value)
                 {
                     live.insert(value);
                 }
@@ -2394,6 +2450,7 @@ fn emit_framed_inner(
                     let value = Value(vreg.num);
                     if f.value(value).repr == ValueRepresentation::Tagged
                         && homes.contains_key(&value)
+                        && !proven_immediate(value)
                     {
                         live.insert(value);
                     }
@@ -2692,6 +2749,14 @@ fn emit_framed_inner(
                     }
                     AuxData::TypeTag(t) if t.bits == TypeBits::CONS => {
                         emit_cons_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
+                    }
+                    AuxData::TypeTag(t) if t.bits == TypeBits::FIXNUM => {
+                        emit_fixnum_value_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?;
+                        // The result is fixnum by construction; later typed ops
+                        // in this block need not re-test it.
+                        if let Some(&r0) = d.results.first() {
+                            proven.insert(r0);
+                        }
                     }
                     _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard))),
                 }
