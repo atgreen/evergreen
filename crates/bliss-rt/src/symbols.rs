@@ -556,12 +556,41 @@ pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
             crate::gc::pin_region_containing((obj.to_raw() & !crate::value::TAG_MASK) as usize);
         }
     }
+    // Advance the uninterned-symbol counter past every restored gensym index
+    // (bliss-0pn8). The counter is a fresh-process global that resets to
+    // UNINTERNED_BASE on load; the restored image holds gensyms at
+    // UNINTERNED_BASE.. (from macroexpansions performed before the save). Without
+    // this bump, a gensym made after the load (e.g. while compiling a library
+    // form) re-mints an index that aliases a restored gensym — the two symbols
+    // become EQ, so the new gensym silently adopts the restored one's cells,
+    // corrupting later use (observed as a stray gensym reaching UIOP's
+    // package-designator typecheck during (asdf:load-system :alexandria)). Mirrors
+    // the class/method-id counter advance for core images (bliss-66io).
+    let max_uninterned = uninterned.keys().copied().max();
     with_registry_mut(|reg| {
         reg.interned = interned;
         reg.uninterned = uninterned;
         reg.name_to_index = name_to_index;
         reg.index_to_key = index_to_key;
     });
+    if let Some(max_idx) = max_uninterned {
+        // Next free index is one past the highest restored gensym (never below
+        // the base). Saturating guards the degenerate case of an index space
+        // exhausted to u32::MAX — there is simply no free index to hand out then.
+        let next = max_idx.max(UNINTERNED_BASE).saturating_add(1);
+        let mut cur = UNINTERNED_COUNTER.load(Ordering::Relaxed);
+        while cur < next {
+            match UNINTERNED_COUNTER.compare_exchange(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
     Ok(())
 }
 

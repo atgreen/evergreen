@@ -1406,6 +1406,65 @@ fn image_load_then_defclass_preserves_restored_method_dispatch() {
     );
 }
 
+/// bliss-0pn8: gensyms created after a core image load must not re-mint the
+/// index of a gensym restored from the image. Uninterned-symbol indices come
+/// from a process-local counter that resets to its base on load; if it is not
+/// advanced past the restored gensyms, a post-load GENSYM aliases a restored one
+/// (same index ⇒ EQ), silently sharing its cells. Symptom in the wild: compiling
+/// alexandria's numbers.lisp after a core load produced a gensym that collided
+/// with a restored gensym and reached UIOP's package-designator typecheck,
+/// erroring with "#:G… is not of type PACKAGE-DESIGNATOR". Mirrors the
+/// class/method-id counter fix (bliss-66io).
+#[test]
+fn image_load_gensyms_do_not_alias_restored_gensyms() {
+    let dir = std::env::temp_dir().join("bliss_test_image_0pn8");
+    let _ = std::fs::create_dir_all(&dir);
+    let image_path = dir.join("gs.image");
+    let p = image_path.to_str().unwrap().replace('\\', "\\\\");
+
+    // Save an image retaining 50 gensyms (reachable ⇒ they survive the save GC).
+    let save_expr = format!(
+        "(progn \
+           (defparameter *saved* (let (acc) (dotimes (i 50 acc) (push (gensym) acc)))) \
+           (save-lisp-and-die \"{p}\"))"
+    );
+    let output = bliss_bin()
+        .args(["--eval", &save_expr])
+        .output()
+        .expect("run bliss for save-lisp-and-die");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "save-lisp-and-die should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Reload, mint many fresh gensyms, and confirm none is EQ to a restored one.
+    // Without the counter fix the fresh gensyms restart at the base index and
+    // collide with the restored set.
+    let load_expr = "(let ((new (let (acc) (dotimes (i 400 acc) (push (gensym) acc)))) (bad 0)) \
+        (dolist (g new) (when (member g *saved*) (incf bad))) \
+        (format t \"ALIASED=~a~%\" bad))";
+    let output = bliss_bin()
+        .args(["--image", image_path.to_str().unwrap(), "--eval", load_expr])
+        .output()
+        .expect("run bliss with saved image");
+    let _ = std::fs::remove_file(&image_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "reload should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ALIASED=0"),
+        "post-load gensyms must not alias restored gensyms (expected ALIASED=0), got: {stdout}"
+    );
+}
+
 /// Regression for the handler re-signal bug (R5.94/R5.102): while a HANDLER-BIND
 /// handler runs, its cluster is disestablished, so a condition it re-signals is
 /// seen only by OLDER handlers — never itself. Before the fix this recursed into
