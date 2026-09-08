@@ -6711,13 +6711,23 @@ fn prune_closure_registry() -> (usize, usize) {
         }
         true
     });
+    // Ids cached RUST-SIDE as raw numbers are invisible to the heap walk:
+    // BUILTIN_FN_WRAPPERS reconstitutes `(BLISS::CLOSURE . id)` conses on
+    // demand from its String→u64 cache, so its ids are permanently live even
+    // when no cons currently exists (bliss-kfhp: pruning one killed trivia's
+    // #'first wrapper mid-load). Keep them.
+    BUILTIN_FN_WRAPPERS.with(|c| {
+        for &id in c.borrow().values() {
+            live.insert(id);
+        }
+    });
     let reg = CLOSURE_REGISTRY.with(Rc::clone);
     let before = reg.borrow().len();
     reg.borrow_mut().retain(|id, _| live.contains(id));
     let after = reg.borrow().len();
     LAST_CLOSURE_PRUNE_LEN.with(|c| c.set(after));
     if std::env::var_os("BLISS_PRUNE_DBG").is_some() {
-        eprintln!(";; closure prune: {before} -> {after}");
+        eprintln!(";; closure prune: {before} -> {after}; live-set {} ids", live.len());
     }
     (before, after)
 }
@@ -6726,6 +6736,9 @@ fn prune_closure_registry() -> (usize, usize) {
 /// prune (and is big enough to matter). Called at file-load boundaries — a
 /// natural safe point between top-level forms.
 fn maybe_prune_closure_registry() {
+    if std::env::var_os("BLISS_NO_CLOSURE_PRUNE").is_some() {
+        return; // diagnostic: bisect prune-related "Cannot apply: Cons" reports
+    }
     let len = CLOSURE_REGISTRY.with(|r| r.borrow().len());
     let last = LAST_CLOSURE_PRUNE_LEN.with(|c| c.get());
     if len >= 8192 && len >= last.saturating_mul(2).max(8192) {
@@ -9059,8 +9072,17 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
     }
     // A file-load boundary is a natural safe point to shed dead closures
     // (bliss-uamd): a long ASDF load otherwise grows the closure registry —
-    // and with it every GC's root scan — without bound.
-    maybe_prune_closure_registry();
+    // and with it every GC's root scan — without bound. The prune runs a full
+    // (moving!) GC, so the load's result value must be rooted across it — an
+    // unrooted `result` here went stale and surfaced as corrupted values in
+    // nested ASDF loads ("Cannot apply: Cons" loading trivia, bliss-kfhp).
+    let mut result = result;
+    if let Ok(v) = &mut result {
+        bliss_rt::rooted_ref!(_result_root = v);
+        maybe_prune_closure_registry();
+    } else {
+        maybe_prune_closure_registry();
+    }
     result
 }
 
@@ -23784,6 +23806,14 @@ fn apply_function(
         let parent =
             bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Rc::clone(&env.frame));
         return eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh);
+    }
+    if std::env::var_os("BLISS_APPLY_DBG").is_some() && fn_val.is_cons() {
+        let (h, t) = cp(fn_val);
+        eprintln!(
+            ";; cannot-apply cons: car={} cdr={}",
+            format_val(h),
+            format_val(t)
+        );
     }
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
