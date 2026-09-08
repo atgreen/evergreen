@@ -1321,6 +1321,91 @@ fn image_preserves_macros_and_setf_functions() {
     );
 }
 
+/// bliss-66io: after a core image load, defining new CLOS classes/methods must
+/// NOT corrupt the dispatch of methods restored from the image. Class and method
+/// ids are minted from a process-local counter that resets on load; if it is not
+/// advanced past every restored metaobject id, a class/method defined after the
+/// load re-mints an id that aliases a restored one and silently overwrites its
+/// CLOS registration — e.g. a restored method's qualifier flips to `:primary`,
+/// so the effective method combination is wrong. Symptom in the wild: an
+/// ASDF-preloaded image failed `(asdf:load-system :cl-ppcre)` with "Required
+/// method PERFORM not implemented for cl-source-file" once enough of the
+/// library's own methods had been defined to collide with ASDF's restored
+/// perform methods.
+#[test]
+fn image_load_then_defclass_preserves_restored_method_dispatch() {
+    let dir = std::env::temp_dir().join("bliss_test_image_66io");
+    let _ = std::fs::create_dir_all(&dir);
+    let image_path = dir.join("clos.image");
+    let p = image_path.to_str().unwrap().replace('\\', "\\\\");
+
+    // Save an image whose surviving CLOS metaobject ids span a wide range, with
+    // the RENDER methods' ids near the TOP of that range. Padding must be
+    // *methods on a generic* (kept alive in the generic's method list) rather than
+    // bare classes (dropped by the save-time GC), so the restored id range really
+    // extends past where the rest of startup re-advances the id counter on load.
+    // RENDER carries :before/:after/:primary methods whose qualifiers are what a
+    // post-load id collision corrupts — and unlike a lone :around, their effect is
+    // observable: a :before wrongly demoted to :primary becomes the sole primary
+    // that runs, so neither the real primary nor the :after fire.
+    let save_expr = format!(
+        "(progn \
+           (defgeneric pad (x)) \
+           (dotimes (i 1500) \
+             (eval (list 'defmethod 'pad (list (list 'x (list 'eql i))) nil))) \
+           (defvar *log* nil) \
+           (defclass widget () ()) \
+           (defgeneric render (x)) \
+           (defmethod render :before ((x widget)) (push :before *log*)) \
+           (defmethod render :after ((x widget)) (push :after *log*)) \
+           (defmethod render ((x widget)) (push :primary *log*) :done) \
+           (save-lisp-and-die \"{p}\"))"
+    );
+    let output = bliss_bin()
+        .args(["--eval", &save_expr])
+        .output()
+        .expect("run bliss for save-lisp-and-die");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "save-lisp-and-die should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Reload, then mint many NEW methods (dense id consumption) covering the
+    // restored id range, then dispatch the restored generic. All three restored
+    // methods must still run in standard order → result :DONE, log
+    // (:before :primary :after). Without the counter fix, a post-load method
+    // re-mints a restored method's id and set-method-specializers overwrites its
+    // qualifier to :primary, so RENDER's :before runs as the lone primary and the
+    // real primary + :after never fire (result (:before), log (:before)).
+    let load_expr = "(progn \
+        (dotimes (i 3000) \
+          (eval (list 'defmethod 'render (list (list 'x (list 'eql i))) nil))) \
+        (setq *log* nil) \
+        (let ((r (render (make-instance 'widget)))) \
+          (format t \"RESULT=~a LOG=~a~%\" r (reverse *log*))))";
+    let output = bliss_bin()
+        .args(["--image", image_path.to_str().unwrap(), "--eval", load_expr])
+        .output()
+        .expect("run bliss with saved image");
+    let _ = std::fs::remove_file(&image_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "reload+dispatch should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("RESULT=DONE") && stdout.contains("LOG=(BEFORE PRIMARY AFTER)"),
+        "restored :before/:primary/:after methods must all dispatch in order after \
+         post-load method churn (expected RESULT=DONE LOG=(BEFORE PRIMARY AFTER)), got: {stdout}"
+    );
+}
+
 /// Regression for the handler re-signal bug (R5.94/R5.102): while a HANDLER-BIND
 /// handler runs, its cluster is disestablished, so a condition it re-signals is
 /// seen only by OLDER handlers — never itself. Before the fix this recursed into

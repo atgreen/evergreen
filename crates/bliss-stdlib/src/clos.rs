@@ -1024,6 +1024,64 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     Ok(off)
 }
 
+/// The maximum metaobject-handle id held anywhere in the restored CLOS state
+/// (class and method ids are minted from the interpreter's shared class-id
+/// counter). The core-image loader uses this to advance that counter past every
+/// restored id, so classes/methods defined after the load never re-mint an id
+/// that aliases a restored one (bliss-66io). Effective-method / short-form keys
+/// live in a separate counter range but are included for safety — advancing the
+/// class-id counter past them is harmless.
+pub fn max_metaobject_id() -> i64 {
+    with_state(|st| {
+        let mut max = 0i64;
+        let mut bump = |v: BlissVal| {
+            if v.is_meta_handle() {
+                let id = v.as_meta_handle_id();
+                if id > max {
+                    max = id;
+                }
+            }
+        };
+        for (k, v) in &st.class_registry {
+            bump(*k);
+            bump(*v);
+        }
+        for v in st.class_by_name.values() {
+            bump(*v);
+        }
+        for k in st.class_meta.keys() {
+            bump(*k);
+        }
+        for k in st.generic_functions.keys() {
+            bump(*k);
+        }
+        for k in st.method_meta.keys() {
+            bump(*k);
+        }
+        for v in &st.structure_classes {
+            bump(*v);
+        }
+        for v in [
+            st.fixnum_class,
+            st.character_class,
+            st.symbol_class,
+            st.null_class,
+            st.t_class_val,
+            st.standard_object_class,
+            st.cons_class,
+            st.float_class,
+            st.function_class,
+            st.heap_object_class,
+        ] {
+            bump(v);
+        }
+        for (_, class) in &st.fixnum_registrations {
+            bump(*class);
+        }
+        max
+    })
+}
+
 fn is_builtin_class(st: &ClosState, class: BlissVal) -> bool {
     class == st.t_class_val
         || class == st.standard_object_class

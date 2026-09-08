@@ -6756,6 +6756,24 @@ fn next_stdlib_class_id() -> BlissVal {
     })
 }
 
+/// Advance the class/method-id counter so the next minted id is strictly
+/// greater than `floor`. A core image restores CLOS class/method metaobjects
+/// whose ids were minted (pre-save) from this very counter, but the counter
+/// itself is a fresh-process thread-local that resets to its initial value on
+/// load. Without this bump, classes/methods defined AFTER a core load re-mint
+/// ids that alias restored ones, silently overwriting their CLOS_STATE
+/// registrations (e.g. a restored method's :around qualifier becomes :primary),
+/// which corrupts generic-function dispatch (bliss-66io). Called on core load
+/// with the maximum restored metaobject id.
+fn advance_stdlib_class_id_floor(floor: i64) {
+    NEXT_STDLIB_CLASS_ID.with(|c| {
+        let mut cur = c.borrow_mut();
+        if *cur <= floor {
+            *cur = floor + 1;
+        }
+    });
+}
+
 fn register_declared_packages(chars: &[char]) {
     let mut pos = 0;
     while pos < chars.len() {
@@ -25261,6 +25279,14 @@ fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), BlissError> 
     // Install the restored generic-function/method registries into this Env
     // (bliss-x0f2.7a) — without them every GF/accessor call is undefined.
     drain_pending_host_generics(env);
+    // Advance the class/method-id counter past every restored CLOS metaobject id
+    // (bliss-66io). The counter is a fresh-process thread-local that resets on
+    // load; leaving it low lets a class/method defined after the load re-mint an
+    // id that aliases a restored one, overwriting its CLOS registration (e.g. a
+    // restored :around method's qualifier becomes :primary) and corrupting
+    // generic dispatch. This must run after the CLOS state is restored (via the
+    // host hook inside load_image_from_bytes above).
+    advance_stdlib_class_id_floor(bliss_stdlib::clos::max_metaobject_id());
     // Re-register the compiled code behind every restored source-free stub
     // (bliss-zz6w): execute the saved bytecode-registry unit through the
     // ordinary BBU loader (kind-3 installs reuse the restored function objects
