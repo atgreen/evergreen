@@ -48,6 +48,38 @@ fn arith_of(sym: u32) -> Option<Arith> {
     }
 }
 
+/// `1+` / `1-` — unary increment/decrement, speculated as the binary fixnum
+/// op with a materialised constant-1 operand (bliss-x5y.25: TAK's `(1- z)`
+/// stayed a generic call, keeping a safepoint per site and `z` forever
+/// unproven).
+fn incdec_of(sym: u32) -> Option<Arith> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("1+") => Some(Arith::Add),
+        Some("1-") => Some(Arith::Sub),
+        _ => None,
+    }
+}
+
+/// `NOT` / `NULL` — pure boolean tests, equivalent to `(eq x nil)` for EVERY
+/// argument type, so the rewrite to `GenericEq(x, nil)` needs no profile, no
+/// guard, and no safepoint (bliss-x5y.25: TAK's `(not (< y x))` kept a generic
+/// call whose safepoint rooted every live value).
+fn is_not_of(sym: u32) -> bool {
+    matches!(
+        bliss_rt::symbols::symbol_name(sym).as_deref(),
+        Some("NOT") | Some("NULL")
+    )
+}
+
+/// An operand a mutation appends to the rewritten site's argument list,
+/// materialised as a const instruction placed just before it.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ExtraArg {
+    None,
+    FixnumOne,
+    Nil,
+}
+
 #[derive(Copy, Clone)]
 enum Bitwise {
     And,
@@ -179,7 +211,7 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> O
 pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -> usize {
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
-    let mut work: Vec<(Inst, Opcode, IRType)> = Vec::new();
+    let mut work: Vec<(Inst, Opcode, IRType, ExtraArg)> = Vec::new();
     for &b in f.block_order() {
         for &inst in &f.block(b).insts {
             let data = f.inst(inst);
@@ -190,6 +222,12 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                 AuxData::CallTarget(s) => *s,
                 _ => continue,
             };
+            let argc = data.args.len();
+            // NOT/NULL rewrite first: profile-free (correct for every type).
+            if is_not_of(sym) && argc == 1 {
+                work.push((inst, Opcode::GenericEq, boolean_type(), ExtraArg::Nil));
+                continue;
+            }
             // The site's bcp is on the Call's FrameState (P1 anchors it there).
             let Some(fs) = data.frame_state else { continue };
             let bcp = frame_state_bcp(f, fs);
@@ -197,37 +235,46 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             else {
                 continue;
             };
-            let argc = f.inst(inst).args.len();
             if let Some(arith) = arith_of(sym) {
                 match (arith, argc) {
                     // Binary arithmetic: the typed op's result is the numeric type.
-                    (_, 2) => work.push((inst, typed_opcode(arith, spec), result_type(spec))),
+                    (_, 2) => work.push((inst, typed_opcode(arith, spec), result_type(spec), ExtraArg::None)),
                     // Unary minus → negation (fixnum only; no FloatNeg opcode yet).
                     (Arith::Sub, 1) if spec == SpecType::Fixnum => {
-                        work.push((inst, Opcode::FixnumNeg, result_type(spec)))
+                        work.push((inst, Opcode::FixnumNeg, result_type(spec), ExtraArg::None))
                     }
                     // 1-arg +/* are identity; variadic (>2) forms: leave generic.
                     _ => {}
+                }
+            } else if let Some(arith) = incdec_of(sym) {
+                // 1+/1- : binary typed op with a materialised constant 1.
+                if spec == SpecType::Fixnum && argc == 1 {
+                    work.push((
+                        inst,
+                        typed_opcode(arith, SpecType::Fixnum),
+                        result_type(SpecType::Fixnum),
+                        ExtraArg::FixnumOne,
+                    ));
                 }
             } else if let Some(cmp) = cmp_of(sym) {
                 // Comparison: guarded typed compare; the result is a boolean
                 // (T/NIL) — both immediates, typed as SYMBOL|NULL.
                 if argc == 2 {
                     if let Some(op) = typed_cmp_opcode(cmp, spec) {
-                        work.push((inst, op, boolean_type()));
+                        work.push((inst, op, boolean_type(), ExtraArg::None));
                     }
                 }
             } else if let Some(bit) = bitwise_of(sym) {
                 // Bitwise ops are fixnum-only. Not is unary; And/Or/Xor are binary.
                 let want = if matches!(bit, Bitwise::Not) { 1 } else { 2 };
                 if spec == SpecType::Fixnum && argc == want {
-                    work.push((inst, bitwise_opcode(bit), result_type(SpecType::Fixnum)));
+                    work.push((inst, bitwise_opcode(bit), result_type(SpecType::Fixnum), ExtraArg::None));
                 }
             } else if bliss_rt::symbols::symbol_name(sym).as_deref() == Some("ASH") {
                 // Arithmetic shift by a (constant, checked at emit) amount: left is a
                 // multiply by 2^n (overflow-checked), right is an untag/sar/retag.
                 if spec == SpecType::Fixnum && argc == 2 {
-                    work.push((inst, Opcode::FixnumShl, result_type(SpecType::Fixnum)));
+                    work.push((inst, Opcode::FixnumShl, result_type(SpecType::Fixnum), ExtraArg::None));
                 }
             }
         }
@@ -236,19 +283,49 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     // Mutation phase: turn each into a guarded typed op.
     let n = work.len();
     let mut fixnum_sites: Vec<Inst> = Vec::new();
-    for (inst, opcode, ty) in work {
+    for (inst, opcode, ty, extra) in work {
+        // Materialise the appended constant operand (1+/1- → const 1; NOT →
+        // const NIL) as a const inst placed immediately before the site.
+        let extra_value = match extra {
+            ExtraArg::None => None,
+            ExtraArg::FixnumOne => Some(push_const_before(
+                f,
+                inst,
+                Opcode::ConstFixnum,
+                AuxData::FixnumImm(1),
+                IRType::of(TypeBits::FIXNUM),
+            )),
+            ExtraArg::Nil => Some(push_const_before(
+                f,
+                inst,
+                Opcode::ConstNil,
+                AuxData::None,
+                IRType::of(TypeBits::NULL),
+            )),
+        };
         let results = f.inst(inst).results.clone();
         {
             let data = f.inst_mut(inst);
             data.opcode = opcode;
-            // No longer a generic call/safepoint — now a deopt point: guard-flagged
-            // and ordered (effectful), keeping its FrameState so a wrong type or
-            // overflow resumes the interpreter. `aux`/`frame_state` are retained.
-            data.flags = InstFlags {
-                guard: true,
-                effectful: true,
-                ..InstFlags::default()
-            };
+            if let Some(v) = extra_value {
+                data.args.push(v);
+            }
+            if opcode == Opcode::GenericEq {
+                // (eq x nil) is PURE and total: no guard, no deopt state, no
+                // safepoint — the call's roots and FrameState liveness vanish.
+                data.flags = InstFlags::default();
+                data.frame_state = None;
+            } else {
+                // No longer a generic call/safepoint — now a deopt point:
+                // guard-flagged and ordered (effectful), keeping its FrameState
+                // so a wrong type or overflow resumes the interpreter.
+                // `aux`/`frame_state` are retained.
+                data.flags = InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                };
+            }
         }
         for r in results {
             f.refine_type(r, ty);
@@ -257,8 +334,307 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             fixnum_sites.push(inst);
         }
     }
+    let self_sym = f
+        .entry_frame_state
+        .map(|id| f.frame_states.get(id).scopes[0].function);
+    materialize_entry_param_preguards(f, &fixnum_sites, self_sym);
+    materialize_self_call_result_guards(f, self_sym);
     materialize_fixnum_operand_guards(f, &fixnum_sites);
     n
+}
+
+/// bliss-x5y.25 (tak shape): pre-guard entry parameters as fixnums AT FUNCTION
+/// ENTRY, so a parameter that only later flows into a speculated site (tak's
+/// `z`, first touched by `(1- z)` after two recursive calls) is proven before
+/// the FIRST safepoint instead of staying a GC root across every call.
+///
+/// Deopt semantics: the guard borrows the builder's entry FrameState (bcp 0,
+/// empty stack) — a failure re-runs the whole function in T0, which is always
+/// correct because nothing has executed yet.
+///
+/// Perma-deopt safety: a parameter is pre-guarded only when at least one use
+/// is a speculated fixnum site (runtime evidence of fixnum-ness) and every
+/// other use is NEUTRAL — a self-call argument, a return, a branch, an edge
+/// argument, a guard, or the pure `(eq x nil)` test. Any other use (a generic
+/// call, a heap accessor) is a path where a non-fixnum argument is legitimate,
+/// and an entry pre-guard would turn that call pattern into a deopt storm.
+fn materialize_entry_param_preguards(
+    f: &mut Function,
+    fixnum_sites: &[Inst],
+    self_sym: Option<u32>,
+) {
+    use crate::t2::ir::{InstData, ValueRepresentation};
+    let Some(entry_fs) = f.entry_frame_state else {
+        return;
+    };
+    if fixnum_sites.is_empty() {
+        return;
+    }
+    let entry = f.entry();
+    let params: Vec<Value> = f.block(entry).params.clone();
+    let dom = f.dominators();
+    let mut insert_at = 0usize;
+    for p in params {
+        let bits = f.value(p).ty.bits;
+        if !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits {
+            continue; // already proven (a declared parameter)
+        }
+        let mut evidence = false;
+        let mut disqualified = false;
+        for b in f.block_order().to_vec() {
+            for &inst in &f.block(b).insts.clone() {
+                let d = f.inst(inst);
+                if d.args.contains(&p) {
+                    if fixnum_sites.contains(&inst) {
+                        evidence = true;
+                    } else {
+                        let neutral = match d.opcode {
+                            Opcode::Call => {
+                                matches!(d.aux, AuxData::CallTarget(s) if Some(s) == self_sym)
+                            }
+                            Opcode::Return
+                            | Opcode::Brif
+                            | Opcode::Jump
+                            | Opcode::Guard
+                            | Opcode::GenericEq => true,
+                            _ => false,
+                        };
+                        if !neutral {
+                            disqualified = true;
+                        }
+                    }
+                }
+                // Edge arguments (block-param hand-off) are always neutral.
+            }
+        }
+        if !evidence || disqualified {
+            continue;
+        }
+        let gfs = f.frame_states.add(f.frame_states.get(entry_fs).clone());
+        let (guard, results) = f.push_inst(
+            entry,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![p],
+                results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(gfs),
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let narrowed = results[0];
+        let insts = &mut f.block_mut(entry).insts;
+        let appended = insts.pop();
+        debug_assert_eq!(appended, Some(guard));
+        insts.insert(insert_at, guard);
+        rewrite_dominated_uses(f, &dom, entry, guard, guard, p, narrowed, false);
+        insert_at += 1;
+    }
+}
+
+/// bliss-x5y.25 (tak shape): speculate SELF-call results as fixnums. Tak's
+/// inner recursive results feed the outer call's ARGUMENTS — not arithmetic —
+/// so no operand guard ever materialises for them and they stay GC roots
+/// across their sibling calls. When the function's every return value is
+/// provably a fixnum or another self-call result (so the speculation is
+/// self-consistent), guard each self-call's result right after the call, at
+/// the next FrameState-carrying instruction (the post-call interpreter state).
+fn materialize_self_call_result_guards(f: &mut Function, self_sym: Option<u32>) {
+    use crate::t2::ir::{InstData, ValueRepresentation};
+    let Some(self_sym) = self_sym else {
+        return;
+    };
+    if !returns_are_fixnum_or_self_call(f, self_sym) {
+        return;
+    }
+    let dom = f.dominators();
+    let mut work: Vec<(crate::t2::ir::Block, Inst, Value)> = Vec::new();
+    for b in f.block_order().to_vec() {
+        for &inst in &f.block(b).insts.clone() {
+            let d = f.inst(inst);
+            if d.opcode != Opcode::Call
+                || !matches!(d.aux, AuxData::CallTarget(s) if s == self_sym)
+            {
+                continue;
+            }
+            let Some(&r) = d.results.first() else { continue };
+            let bits = f.value(r).ty.bits;
+            if !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits {
+                continue;
+            }
+            work.push((b, inst, r));
+        }
+    }
+    for (b, call, r) in work {
+        // Anchor: the first FrameState-carrying instruction after the call in
+        // the same block; its state is the post-call interpreter state.
+        let anchor = {
+            let insts = &f.block(b).insts;
+            let Some(pos) = insts.iter().position(|&i| i == call) else {
+                continue;
+            };
+            insts[pos + 1..]
+                .iter()
+                .copied()
+                .find(|&i| f.inst(i).frame_state.is_some() && !f.inst(i).results.contains(&r))
+        };
+        let Some(anchor) = anchor else { continue };
+        // A CALL anchor (tak: the next FrameState carrier after the third
+        // inner call is the OUTER call) takes the guard BEFORE it: the call's
+        // pre-state (result on stack) is cloned for the guard — a failure
+        // re-runs that call in T0 — and the call's own args and FrameState
+        // are rewritten to the proven value, so the raw result dies at the
+        // guard instead of staying a root through the call's safepoint. Any
+        // other anchor keeps the eager after-placement.
+        let anchor_is_call = f.inst(anchor).opcode == Opcode::Call;
+        let anchor_fs = f.inst(anchor).frame_state;
+        let gfs = anchor_fs.map(|id| f.frame_states.add(f.frame_states.get(id).clone()));
+        let source_pos = f.inst(call).source_pos;
+        let (guard, results) = f.push_inst(
+            b,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![r],
+                results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: gfs,
+                source_pos,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let narrowed = results[0];
+        let insts = &mut f.block_mut(b).insts;
+        let appended = insts.pop();
+        debug_assert_eq!(appended, Some(guard));
+        let anchor_pos = insts
+            .iter()
+            .position(|&i| i == anchor)
+            .expect("anchor is in its block");
+        insts.insert(
+            if anchor_is_call { anchor_pos } else { anchor_pos + 1 },
+            guard,
+        );
+        rewrite_dominated_uses(f, &dom, b, anchor, guard, r, narrowed, anchor_is_call);
+    }
+}
+
+/// True when every value the function returns is provably a fixnum or the
+/// result of a self-call (following block-parameter phis) — the closure
+/// condition making self-call result speculation self-consistent.
+fn returns_are_fixnum_or_self_call(f: &Function, self_sym: u32) -> bool {
+    use crate::t2::ir::ValueDef;
+    use std::collections::HashSet;
+    fn value_ok(f: &Function, v: Value, self_sym: u32, visiting: &mut HashSet<Value>) -> bool {
+        let bits = f.value(v).ty.bits;
+        if !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits {
+            return true;
+        }
+        match f.value(v).def {
+            ValueDef::Result { inst, .. } => {
+                let d = f.inst(inst);
+                d.opcode == Opcode::Call
+                    && matches!(d.aux, AuxData::CallTarget(s) if s == self_sym)
+            }
+            ValueDef::Param { block, num } => {
+                if !visiting.insert(v) {
+                    return true; // loop phi: consistent under the assumption
+                }
+                // Every incoming edge argument for this parameter must be ok.
+                for b in f.block_order() {
+                    let Some(term) = f.terminator(*b) else { continue };
+                    for t in &f.inst(term).targets {
+                        if t.block == block {
+                            let Some(&arg) = t.args.get(num as usize) else {
+                                return false;
+                            };
+                            if !value_ok(f, arg, self_sym, visiting) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+    let mut any_return = false;
+    for b in f.block_order() {
+        let Some(term) = f.terminator(*b) else {
+            continue;
+        };
+        let d = f.inst(term);
+        if d.opcode != Opcode::Return {
+            continue;
+        }
+        any_return = true;
+        for &v in &d.args {
+            let mut visiting = HashSet::new();
+            if !value_ok(f, v, self_sym, &mut visiting) {
+                return false;
+            }
+        }
+    }
+    any_return
+}
+
+/// Create a const-producing instruction and position it immediately before
+/// `site` in its block; returns the const's result value.
+fn push_const_before(
+    f: &mut Function,
+    site: Inst,
+    opcode: Opcode,
+    aux: AuxData,
+    ty: IRType,
+) -> Value {
+    use crate::t2::ir::{InstData, ValueRepresentation};
+    let (block, _) = f
+        .block_order()
+        .to_vec()
+        .into_iter()
+        .find_map(|b| {
+            f.block(b)
+                .insts
+                .iter()
+                .position(|&i| i == site)
+                .map(|p| (b, p))
+        })
+        .expect("site is in a block");
+    let (inst, results) = f.push_inst(
+        block,
+        InstData {
+            opcode,
+            args: vec![],
+            results: vec![],
+            aux,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: f.inst(site).source_pos,
+        },
+        &[(ty, ValueRepresentation::Tagged)],
+    );
+    let insts = &mut f.block_mut(block).insts;
+    let appended = insts.pop();
+    debug_assert_eq!(appended, Some(inst));
+    let site_pos = insts
+        .iter()
+        .position(|&i| i == site)
+        .expect("site is in its block");
+    insts.insert(site_pos, inst);
+    results[0]
 }
 
 /// The speculated opcodes whose emitter guards every variable operand as a
@@ -486,10 +862,14 @@ fn rewrite_dominated_uses(
             rewrite_frame_state(f, inst);
         }
     };
-    // The anchor itself: arguments only, and only for a site anchor — its
-    // FrameState must keep `from` either way.
+    // The anchor itself, for a site anchor (guard placed immediately before
+    // it): arguments AND FrameState. The guard's own deopt state is a private
+    // CLONE holding the raw value, and at the anchor's deopt the guard has
+    // already executed, so its result exists — rewriting the anchor's state
+    // is what lets the raw value die at the guard instead of staying a GC
+    // root through the anchor's safepoint (bliss-x5y.25 tak outer call).
     if rewrite_anchor_args {
-        rewrite_inst(f, site, false);
+        rewrite_inst(f, site, true);
     }
     // The rest of the site's block, strictly after the site.
     let insts = f.block(block).insts.clone();

@@ -271,6 +271,35 @@ impl<'a> Builder<'a> {
         self.create_blocks();
         self.compute_total_preds()?;
         self.seed_entry();
+        // Record the function-entry interpreter state (bcp 0, empty stack):
+        // speculation anchors parameter pre-guards on it — a failed pre-guard
+        // deopts to bcp 0 and re-runs the whole function in T0, which is
+        // always correct because nothing has executed yet (bliss-x5y.25).
+        // Built by hand rather than via build_frame_state: at bcp 0 the
+        // non-parameter locals are UNINITIALISED, and read_var would conjure
+        // their (later-emitted) init values — a state at instruction 0 must
+        // not reference values defined after it (verify V8).
+        let entry = self.f.entry();
+        let params = self.f.block(entry).params.clone();
+        let locals = (0..self.bf.n_locals as usize)
+            .map(|i| match params.get(i) {
+                Some(&p) => ValueSource::Value {
+                    value: p,
+                    repr: ValueRepresentation::Tagged,
+                },
+                None => ValueSource::Unbound,
+            })
+            .collect();
+        let entry_fs = self.f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: self.root_symbol,
+                bcp: 0,
+                locals,
+                stack: Vec::new(),
+            }],
+            remat: vec![],
+        });
+        self.f.entry_frame_state = Some(entry_fs);
         self.process_blocks()?;
         self.capture_osr_entries();
         self.simplify_trivial_phis();

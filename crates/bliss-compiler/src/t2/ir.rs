@@ -346,6 +346,10 @@ pub struct Function {
     pub source_positions: Vec<SourcePosition>,
     /// Root-function loop headers eligible for on-stack replacement.
     pub osr_entries: Vec<OsrEntry>,
+    /// The interpreter state at function ENTRY (bcp 0, empty stack), recorded
+    /// by the builder so speculation can place parameter pre-guards whose
+    /// deopt harmlessly re-runs the whole function in T0 (bliss-x5y.25).
+    pub entry_frame_state: Option<crate::t2::frame_state::FrameStateId>,
     /// Entry parameters whose source declaration is enforced by the runtime
     /// call boundary. This is deliberately separate from `ValueData::ty`: an
     /// inferred/speculative type is not permission to omit its runtime guard.
@@ -380,6 +384,7 @@ impl Function {
             frame_states: crate::t2::frame_state::FrameStateTable::default(),
             source_positions: vec![SourcePosition::default()],
             osr_entries: Vec::new(),
+            entry_frame_state: None,
             checked_entry_params: Vec::new(),
             variadic: false,
             name: name.into(),
