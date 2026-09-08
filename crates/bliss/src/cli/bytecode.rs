@@ -13829,6 +13829,29 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
     {
         return false;
     }
+    // T2 exclusion by bare name. The permanent set is an INTERIM correctness
+    // guard (bliss-kfhp): REDUCE's T2 native code miscompiles in ASDF's
+    // action-stamp path — a fresh (asdf:load-system :babel) with T2 enabled
+    // fails "compute a stamp ... NIL" and excluding *only* REDUCE from T2 (T1
+    // is correct) fixes it. The underlying T2 bug (a higher-order function
+    // that funcalls its fn argument, miscompiling in this polymorphic context)
+    // is tracked separately; keeping REDUCE at T1 unblocks fresh ASDF
+    // compilation now. BLISS_T2_EXCLUDE=NAME[,NAME...] adds more at runtime
+    // (bisecting). BLISS_T2_NO_DEFAULT_EXCLUDE=1 drops the built-in set (to
+    // reproduce the bug).
+    {
+        let name = bliss_rt::symbols::symbol_name(sym).unwrap_or_default();
+        let bare = name.rsplit(':').next().unwrap_or(&name);
+        let default_excluded = std::env::var_os("BLISS_T2_NO_DEFAULT_EXCLUDE").is_none()
+            && bare.eq_ignore_ascii_case("REDUCE");
+        let env_excluded = std::env::var("BLISS_T2_EXCLUDE")
+            .map(|excl| excl.split(',').any(|e| e.eq_ignore_ascii_case(bare)))
+            .unwrap_or(false);
+        if default_excluded || env_excluded {
+            T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
+            return false;
+        }
+    }
     let Some(input) = snapshot_t2_input(sym, priority) else {
         T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
         return false;
