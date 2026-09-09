@@ -1034,6 +1034,34 @@ fn member_assoc_nonlist_signal_type_error() {
 }
 
 #[test]
+fn cons_chapter_list_functions_conform() {
+    // Batch of CONS-chapter conformance fixes (bliss-30be): COPY-ALIST fresh
+    // pairs; LDIFF preserves a dotted tail; LAST on a dotted list; ASSOC-IF
+    // TYPE-ERRORs on a non-cons alist element; the mapping functions TYPE-ERROR
+    // on a non-list arg; #'cons at wrong arity (funcall path) PROGRAM-ERRORs.
+    let expr = "(princ (list
+                  (let* ((x (list (cons 'a 'b))) (y (copy-alist x)))
+                    (list (equal x y) (eq (car x) (car y))))
+                  (ldiff '(a b c . d) 'z)
+                  (last '(a b . c))
+                  (typep (nth-value 1 (ignore-errors (assoc-if #'null '((a . b) :bad (c . d))))) 'type-error)
+                  (typep (nth-value 1 (ignore-errors (mapcar #'identity 3))) 'type-error)
+                  (typep (nth-value 1 (ignore-errors (maplist #'identity 3))) 'type-error)
+                  (typep (nth-value 1 (ignore-errors (funcall #'cons 'a))) 'program-error)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("((T NIL) (A B C . D) (B . C) T T T T)"),
+        "CONS-chapter list-function conformance, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).

@@ -11211,11 +11211,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
             "/" => return eval_arith_div(cdr, env),
             "CONS" => {
+                // CONS takes EXACTLY two arguments; any other count is a
+                // PROGRAM-ERROR (ANSI). Previously a missing 2nd arg defaulted to
+                // NIL and extra args were ignored, so `(mapcar #'cons '(a b c))`
+                // silently succeeded instead of signaling (mapcar.error.6/7,
+                // member-if.error.9, assoc-if.error.7).
                 let (af, r) = cp(cdr);
+                let (bf_form, extra) = cp(r);
+                if !cdr.is_cons() || !r.is_cons() || extra.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "CONS requires exactly two arguments".into(),
+                    ));
+                }
                 // Root the second arg FORM before evaluating the first: a young
                 // arg list relocates under the first eval's GC, dangling a bare
                 // `bf` (bliss-6b2 #2).
-                bliss_rt::rooted!(bf = cp(r).0);
+                bliss_rt::rooted!(bf = bf_form);
                 bliss_rt::rooted!(a = eval_form(af, env)?);
                 let b = eval_form(*bf, env)?;
                 return Ok(arena_cons(*a, b));
@@ -13548,14 +13559,44 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // apply_function allocates and can relocate the earlier, bare
                 // `Vec`-resident values and the not-yet-walked spine under a minor
                 // GC (bliss-6b2 #2).
+                // (mapcar) with no function argument is a PROGRAM-ERROR.
+                if !cdr.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "MAPCAR requires a function and at least one list".into(),
+                    ));
+                }
                 let (fn_form, r0) = cp(cdr);
                 bliss_rt::rooted!(r = r0);
                 bliss_rt::rooted!(fn_val = eval_form(fn_form, env)?);
+                // (mapcar fn) with no lists supplied is a PROGRAM-ERROR.
+                if !r.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "MAPCAR requires at least one list argument".into(),
+                    ));
+                }
                 bliss_rt::rooted!(lists = Vec::<Vec<BlissVal>>::new());
                 while r.is_cons() {
                     let (list_form, rest) = cp(*r);
                     bliss_rt::rooted!(rest = rest);
-                    let elems = list_to_vec(eval_form(list_form, env)?);
+                    bliss_rt::rooted!(lst = eval_form(list_form, env)?);
+                    // A list argument must be a proper list: walk the spine and
+                    // signal TYPE-ERROR if it ends in a non-NIL atom (a dotted
+                    // list) or is itself a non-list atom (ANSI mapcar.error.4/8).
+                    // The walk only calls `cp` (no allocation), so the plain
+                    // Vec is safe here.
+                    let mut elems: Vec<BlissVal> = Vec::new();
+                    let mut c = *lst;
+                    while c.is_cons() {
+                        let (car, cdr2) = cp(c);
+                        elems.push(car);
+                        c = cdr2;
+                    }
+                    if !c.is_nil() {
+                        return Err(BlissError::TypeError {
+                            datum: *lst,
+                            expected: "list".into(),
+                        });
+                    }
                     lists.push(elems);
                     *r = *rest;
                 }
@@ -21489,7 +21530,7 @@ fn bind_lambda_list_ex(
             // Odd keyword-argument count is a PROGRAM-ERROR (CLHS 3.5.1.6), which
             // must be catchable by HANDLER-CASE/IGNORE-ERRORS — ansi-test's
             // *.ERROR.* tests pass malformed &key args expecting a signalled error,
-            // not an uncatchable internal abort (bliss-cpm9).
+            // not an uncatchable internal abort (bliss-cpm9; member-if.error.6).
             return Err(BlissError::ProgramError(
                 "keyword arguments must appear in key/value pairs".into(),
             ));
@@ -21499,10 +21540,14 @@ fn bind_lambda_list_ex(
         for pair in tail.chunks(2) {
             let key = pair[0];
             if !key.is_symbol() {
-                return Err(BlissError::TypeError {
-                    datum: key,
-                    expected: "keyword".into(),
-                });
+                // A non-symbol in keyword position (e.g. `1 2`) is a
+                // PROGRAM-ERROR per 3.5.1.5, not a TYPE-ERROR — ansi-test
+                // member-if.error.7, assoc-if.error.5, rassoc.error.5.
+                let mut kbuf = String::new();
+                print_val(key, &mut kbuf);
+                return Err(BlissError::ProgramError(format!(
+                    "keyword argument name is not a symbol: {kbuf}"
+                )));
             }
             let bare = key_bare(key);
             if bare == "ALLOW-OTHER-KEYS" && !pair[1].is_nil() {
@@ -24474,10 +24519,12 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
         "-" => sub_vals(args),
         "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
         "CONS" => {
-            if args.len() >= 2 {
+            if args.len() == 2 {
                 Ok(arena_cons(args[0], args[1]))
             } else {
-                Err(BlissError::Internal("CONS requires 2 arguments".into()))
+                Err(BlissError::ProgramError(
+                    "CONS requires exactly 2 arguments".into(),
+                ))
             }
         }
         "CAR" | "FIRST" => {

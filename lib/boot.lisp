@@ -832,17 +832,24 @@
         unless (funcall pred (if key (funcall key (car l)) (car l)))
           return l))
 
+;; Each alist entry must be a cons or NIL; NIL entries are skipped, but a
+;; non-NIL atom is a type-error (ansi-test assoc-if.error.12). The DOLIST
+;; walk also signals on an improper alist tail via ENDP.
 (defun assoc-if (pred alist &key key)
   (dolist (pair alist nil)
-    (when (and (consp pair)
-               (funcall pred (if key (funcall key (car pair)) (car pair))))
-      (return pair))))
+    (cond ((null pair))
+          ((consp pair)
+           (when (funcall pred (if key (funcall key (car pair)) (car pair)))
+             (return pair)))
+          (t (error 'type-error :datum pair :expected-type 'list)))))
 
 (defun assoc-if-not (pred alist &key key)
   (dolist (pair alist nil)
-    (when (and (consp pair)
-               (not (funcall pred (if key (funcall key (car pair)) (car pair)))))
-      (return pair))))
+    (cond ((null pair))
+          ((consp pair)
+           (when (not (funcall pred (if key (funcall key (car pair)) (car pair))))
+             (return pair)))
+          (t (error 'type-error :datum pair :expected-type 'list)))))
 
 ;;; Item-based FIND / POSITION / COUNT. Defined in Lisp over ELT/LENGTH/FUNCALL
 ;;; (like the -IF family and REDUCE) because the stdlib's internal apply helper
@@ -1055,9 +1062,38 @@
        (l list (cdr l)))
       ((or (= i 0) (null l)) l)))
 (defun last (list &optional (n 1))
-  (nthcdr (max 0 (- (length list) n)) list))
+  ;; ANSI: return the last N conses of LIST. N must be a non-negative
+  ;; integer (a negative or non-integer N is a TYPE-ERROR). Works on dotted
+  ;; lists and on huge (bignum) N without walking N times: a lead pointer L
+  ;; advances up to N steps, then L and the trailing pointer R advance in
+  ;; lockstep until L reaches the terminating atom.
+  (unless (and (integerp n) (>= n 0))
+    (error 'type-error :datum n :expected-type '(integer 0)))
+  (let ((l list) (r list) (i 0))
+    (do () ((or (>= i n) (not (consp l))))
+      (setq l (cdr l)) (setq i (+ i 1)))
+    (do () ((not (consp l)) r)
+      (setq l (cdr l)) (setq r (cdr r)))))
 (defun butlast (list &optional (n 1))
-  (subseq list 0 (max 0 (- (length list) n))))
+  ;; ANSI: fresh copy of LIST with the last N conses removed. Handles dotted
+  ;; lists (LENGTH would error on them) and huge N. Non-destructive.
+  (unless (and (integerp n) (>= n 0))
+    (error 'type-error :datum n :expected-type '(integer 0)))
+  (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
+  (let ((len 0))
+    (do ((l list (cdr l))) ((not (consp l))) (setq len (+ len 1)))
+    (let ((keep (- len n)))
+      (if (<= keep 0)
+          nil
+          (let* ((head (cons (car list) nil))
+                 (tail head))
+            (do ((rest (cdr list) (cdr rest))
+                 (i 1 (+ i 1)))
+                ((>= i keep) head)
+              (let ((new (cons (car rest) nil)))
+                (setf (cdr tail) new)
+                (setq tail new))))))))
 ;; Ordinal list accessors. FIRST..THIRD have interpreter fast-paths, but the
 ;; higher ordinals (used by e.g. cl-ppcre's convert.lisp) need real function
 ;; cells so compiled code can call them (bliss-9q4).
@@ -1476,12 +1512,64 @@
             (setf (cdr tail) new)
             (setq tail new))))))
 
-(defun nbutlast (list &optional (n 1)) (butlast list n))
+(defun nbutlast (list &optional (n 1))
+  ;; ANSI: destructive butlast — snip the CDR of the (len-n)th cons and return
+  ;; the (possibly modified) original LIST, or NIL when nothing is kept.
+  (unless (and (integerp n) (>= n 0))
+    (error 'type-error :datum n :expected-type '(integer 0)))
+  (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
+  (let ((len 0))
+    (do ((l list (cdr l))) ((not (consp l))) (setq len (+ len 1)))
+    (let ((keep (- len n)))
+      (if (<= keep 0)
+          nil
+          (progn
+            (do ((l list (cdr l))
+                 (i 1 (+ i 1)))
+                ((>= i keep) (setf (cdr l) nil)))
+            list)))))
+
+(defun copy-alist (alist)
+  ;; ANSI: copy the list structure of ALIST and, for each element that is a
+  ;; cons, a fresh (car . cdr) cons; non-cons elements are shared. A dotted
+  ;; spine (improper alist) is a TYPE-ERROR.
+  (unless (listp alist)
+    (error 'type-error :datum alist :expected-type 'list))
+  (if (consp alist)
+      (let* ((p (car alist))
+             (head (cons (if (consp p) (cons (car p) (cdr p)) p) nil))
+             (tail head))
+        (do ((rest (cdr alist) (cdr rest)))
+            ((not (consp rest))
+             (unless (null rest)
+               (error 'type-error :datum alist :expected-type 'list))
+             head)
+          (let* ((q (car rest))
+                 (new (cons (if (consp q) (cons (car q) (cdr q)) q) nil)))
+            (setf (cdr tail) new)
+            (setq tail new))))
+      nil))
 
 (defun ldiff (list object)
-  (if (or (null list) (eql list object) (not (consp list)))
+  ;; ANSI: fresh list of the part of LIST before the tail EQL to OBJECT. If no
+  ;; tail matches, a full fresh copy is returned (preserving a dotted tail). A
+  ;; non-list LIST is a TYPE-ERROR. Built with a tail pointer rather than
+  ;; NRECONC/APPEND so the dotted terminating atom is preserved.
+  (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
+  (if (or (null list) (eql list object))
       nil
-      (cons (car list) (ldiff (cdr list) object))))
+      (let* ((head (cons (car list) nil))
+             (tail head))
+        (do ((rest (cdr list) (cdr rest)))
+            ((or (atom rest) (eql rest object))
+             (when (and (not (eql rest object)) (not (null rest)))
+               (setf (cdr tail) rest))
+             head)
+          (let ((new (cons (car rest) nil)))
+            (setf (cdr tail) new)
+            (setq tail new))))))
 
 (defun tailp (object list)
   (block nil
@@ -1667,15 +1755,25 @@
 
 ;;; --- list mapping variants --------------------------------------------------
 
-;; MAPLIST/MAPL require at least one list (CLHS): with zero lists `(some #'null
-;; lists)` is NIL, so the loop never terminates — signal PROGRAM-ERROR instead of
-;; hanging (ansi-test mapl.error.3/maplist.error.3; bliss-x7aa).
+;; %require-proper-lists — ANSI: the map* functions require proper lists.
+;; A cursor that is a non-NIL atom (a dotted list, or a non-list argument)
+;; is a TYPE-ERROR. Called before applying FN so the check happens even when
+;; FN would accept the atom (e.g. IDENTITY).
+(defun %require-proper-lists (lists)
+  (dolist (l lists)
+    (unless (listp l)
+      (error 'type-error :datum l :expected-type 'list))))
+
+;; MAPLIST/MAPL require at least one list (CLHS PROGRAM-ERROR): with zero lists
+;; `(some #'null lists)` is NIL so the loop never terminates. Each cursor must
+;; also be a proper list (%require-proper-lists) — bliss-x7aa/bliss-30be.
 (defun maplist (fn &rest lists)
   (when (null lists) (error 'program-error))
   (let ((result nil))
     (block nil
       (loop
         (when (some (function null) lists) (return))
+        (%require-proper-lists lists)
         (push (apply fn lists) result)
         (setq lists (mapcar (function cdr) lists))))
     (reverse result)))
@@ -1686,6 +1784,7 @@
     (block nil
       (loop
         (when (some (function null) lists) (return))
+        (%require-proper-lists lists)
         (apply fn lists)
         (setq lists (mapcar (function cdr) lists))))
     first))
