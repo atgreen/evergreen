@@ -1062,6 +1062,36 @@ fn cons_chapter_list_functions_conform() {
 }
 
 #[test]
+fn plist_places_and_nconc_conform() {
+    // bliss-30be plist/place + set-op batch (parallel agent D): PUSH/PUSHNEW/REMF
+    // evaluate the place subforms once via GET-SETF-EXPANSION and read the place
+    // after the other subforms (order); PUSH on a (GETF p k) place writes the new
+    // plist head back to p; PUSHNEW returns the list unchanged (EQ) when present;
+    // NCONC splices destructively (reuses the last cons) and treats a non-list
+    // final arg as the tail; a wrong-arity #'cons via a :key funcall PROGRAM-ERRORs.
+    let expr = "(princ (list
+                  (let ((x (list 1 2))) (push 0 x) x)
+                  (let ((x (list 1 2))) (pushnew 1 x) (eq x x))
+                  (let ((x (list 1 2))) (pushnew 3 x) x)
+                  (let ((p (list :a 1 :b 2))) (remf p :a) p)
+                  (let ((p (list :a 1))) (push 9 (getf p :a)) p)
+                  (let ((a (list 1 2)) (b (list 3 4))) (eq (cddr (nconc a b)) b))
+                  (nconc (list 'a 'b) 'z)
+                  (typep (nth-value 1 (ignore-errors (adjoin 1 '(2) :key #'cons))) 'program-error)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("((0 1 2) T (3 1 2) (:B 2) (:A (9 . 1)) T (A B . Z) T)"),
+        "plist/place + nconc conformance, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).

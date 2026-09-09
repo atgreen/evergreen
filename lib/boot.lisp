@@ -112,8 +112,24 @@
 ;;; Stack / place mutation
 ;;; ---------------------------------------------------------------------------
 
-(defmacro push (item place)
-  `(setf ,place (cons ,item ,place)))
+;; PUSH: evaluate ITEM first, then the PLACE subforms once each (left to right),
+;; read/store the place exactly once (CLHS 5.1.2 / push.order.*). Uses the
+;; place's setf-expansion so the subforms are lifted into temporaries; the store
+;; goes through operator SETF on the getter, which handles every built-in place
+;; (variables, CAR, AREF, GETF, …). A naive (setf place (cons item place))
+;; double-evaluates the place subforms and gets the order wrong.
+(defmacro push (item place &environment env)
+  ;; Macroexpand the PLACE in ENV first so a MACROLET/symbol-macro place is
+  ;; analysed as the place it denotes (push.4/5); GET-SETF-EXPANSION uses the
+  ;; expansion-time env, which does not carry the lexical macro bindings.
+  (let ((place (macroexpand place env)))
+    (multiple-value-bind (dummies vals newval setter getter)
+        (get-setf-expansion place env)
+      (declare (ignore newval setter))
+      (let ((g (gensym)))
+        `(let* ((,g ,item)
+                ,@(mapcar (function list) dummies vals))
+           (setf ,getter (cons ,g ,getter)))))))
 
 (defmacro pop (place)
   `(prog1 (car ,place)
@@ -1205,7 +1221,33 @@
     (when (endp fast) (return n))
     (when (endp (cdr fast)) (return (+ n 1)))
     (when (and (eq fast slow) (> n 0)) (return nil))))
-(defun nconc (&rest lists) (apply (function append) lists))
+;; NCONC: destructively concatenate lists. Each argument except the last must be
+;; a list (proper or dotted); its last cons is spliced onto the next non-empty
+;; argument. NIL arguments are skipped; the LAST argument is used as the final
+;; tail unchanged and may be any object (CLHS nconc). `(nconc)` => NIL and a lone
+;; argument is returned unmodified. Unlike APPEND, structure is reused — so
+;; `(nconc x y)` makes x's last cons point at y (nconc.4) and `(nconc x x)`
+;; builds a circular list (nconc.5) rather than copying/looping.
+(defun nconc (&rest lists)
+  (let ((result nil) (tail nil) (p lists))
+    (loop while p do
+      (let ((l (car p)) (lastp (null (cdr p))))
+        (cond
+          ((null l))                        ; skip a NIL argument
+          ((consp l)
+           (if tail (setf (cdr tail) l) (setq result l))
+           (unless lastp
+             (let ((q l))
+               (loop while (consp (cdr q)) do (setq q (cdr q)))
+               (setq tail q))))
+          (t
+           ;; A non-list is legal only as the LAST argument, where it becomes
+           ;; the final tail; anywhere else it is a type error.
+           (if lastp
+               (if tail (setf (cdr tail) l) (setq result l))
+               (error 'type-error :datum l :expected-type 'list)))))
+      (setq p (cdr p)))
+    result))
 (defun revappend (x y) (append (reverse x) y))
 ;; ANSI: a sequence/array size (and each array dimension) is a non-negative
 ;; integer; a negative or non-integer value is a TYPE-ERROR, not a silently
@@ -1694,9 +1736,21 @@
         list
         (cons item list))))
 
-;;; PUSHNEW now delegates to ADJOIN so :TEST/:KEY are honoured.
-(defmacro pushnew (item place &rest keys)
-  `(setf ,place (adjoin ,item ,place ,@keys)))
+;; PUSHNEW: like PUSH, but only prepend ITEM when ADJOIN reports it absent.
+;; ITEM is evaluated first, then the PLACE subforms, then the keyword forms in
+;; source order (pushnew.order.* / pushnew.12-15). ADJOIN returns the list
+;; unchanged (EQ) when the item is already present, so the place keeps its
+;; identity (pushnew.2/3). The setf-expansion lifts place subforms so they are
+;; evaluated once.
+(defmacro pushnew (item place &rest keys &environment env)
+  (let ((place (macroexpand place env)))
+    (multiple-value-bind (dummies vals newval setter getter)
+        (get-setf-expansion place env)
+      (declare (ignore newval setter))
+      (let ((g (gensym)))
+        `(let* ((,g ,item)
+                ,@(mapcar (function list) dummies vals))
+           (setf ,getter (adjoin ,g ,getter ,@keys)))))))
 
 ;;; --- reverse-association and tree equality ---------------------------------
 
@@ -1747,11 +1801,22 @@
           (progn (push (car p) result) (setq p (cdr p)))))
     (values (reverse result) found)))
 
-(defmacro remf (place indicator)
-  (let ((np (gensym)) (fp (gensym)))
-    `(multiple-value-bind (,np ,fp) (%remf ,place ,indicator)
-       (setf ,place ,np)
-       ,fp)))
+;; REMF: remove the INDICATOR/value pair from the plist in PLACE; return true iff
+;; a pair was removed. The PLACE subforms are evaluated once, left to right,
+;; BEFORE INDICATOR, and the place value is read only after that (CLHS 5.1.3 /
+;; remf.order.*). Using the setf-expansion getter guarantees the place is read
+;; after the indicator subform runs — remf.order.3 relies on that.
+(defmacro remf (place indicator &environment env)
+  (let ((place (macroexpand place env)))
+    (multiple-value-bind (dummies vals newval setter getter)
+        (get-setf-expansion place env)
+      (declare (ignore newval setter))
+      (let ((ind (gensym)) (r (gensym)) (f (gensym)))
+        `(let* (,@(mapcar (function list) dummies vals)
+                (,ind ,indicator))
+           (multiple-value-bind (,r ,f) (%remf ,getter ,ind)
+             (setf ,getter ,r)
+             ,f))))))
 
 ;;; --- list mapping variants --------------------------------------------------
 

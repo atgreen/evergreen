@@ -12614,15 +12614,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (get-setf-expansion place &optional environment) → five values.
                 let (place_form, _) = cp(cdr);
                 let place = eval_form(place_form, env)?;
-                let ex = get_setf_expansion(place, env)?;
+                let mut ex = get_setf_expansion(place, env)?;
+                // The store/access FORMS and the temp/val/store lists are freshly
+                // built conses; the vec_to_list calls below allocate and can fire
+                // a relocating minor GC that would move them, leaving stale
+                // pointers in the multiple-values vector (bliss-8qf). Root every
+                // piece across those allocations. Most places survived by luck
+                // (small lists rarely GC), but a richer expansion such as the
+                // GETF place used by `(push x (getf p k))` corrupted reliably
+                // under BLISS_GC_STRESS.
+                bliss_rt::rooted_ref!(_ex_temps = &mut ex.temps);
+                bliss_rt::rooted_ref!(_ex_vals = &mut ex.vals);
+                bliss_rt::rooted_ref!(_ex_stores = &mut ex.stores);
+                bliss_rt::rooted!(store_form = ex.store_form);
+                bliss_rt::rooted!(access_form = ex.access_form);
+                bliss_rt::rooted!(temps_list = vec_to_list(&ex.temps));
+                bliss_rt::rooted!(vals_list = vec_to_list(&ex.vals));
+                bliss_rt::rooted!(stores_list = vec_to_list(&ex.stores));
                 env.set_mv(vec![
-                    vec_to_list(&ex.temps),
-                    vec_to_list(&ex.vals),
-                    vec_to_list(&ex.stores),
-                    ex.store_form,
-                    ex.access_form,
+                    *temps_list,
+                    *vals_list,
+                    *stores_list,
+                    *store_form,
+                    *access_form,
                 ]);
-                return Ok(vec_to_list(&ex.temps));
+                return Ok(*temps_list);
             }
             "FLET" | "LABELS" => return eval_flet(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
@@ -22097,6 +22113,55 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
         } else {
             String::new()
         };
+        // GETF is a place whose FIRST argument is itself a place that must be
+        // written back: `(push x (getf p 'k))` / `(incf (getf p 'k))` must
+        // update the variable (or place) P, not a copy of its value. The generic
+        // cons fallback below lifts P into a value temporary and stores via a
+        // `(funcall (setf getf) …)` writer that does not exist, so it neither
+        // updates P nor evaluates. Expand P recursively as a sub-place and
+        // delegate the store to operator SETF on the reconstructed GETF place,
+        // which already knows how to write the new plist head back to P
+        // (CLHS getf, 5.1.2.2). An optional default form gets its own temp so it
+        // is evaluated once for the read.
+        if acc == "GETF" {
+            // Every BlissVal held across the gensym/list allocations below can be
+            // relocated by a minor GC, so root each one (moving GC; bliss-8qf).
+            let mut arg_forms = list_to_vec(args);
+            bliss_rt::rooted_ref!(_arg_forms = &mut arg_forms);
+            if !arg_forms.is_empty() {
+                let place_form = arg_forms[0];
+                let mut sub = get_setf_expansion(place_form, env)?;
+                bliss_rt::rooted_ref!(_sub_temps = &mut sub.temps);
+                bliss_rt::rooted_ref!(_sub_vals = &mut sub.vals);
+                bliss_rt::rooted!(p_access = sub.access_form);
+                let ind_temp = gensym_symbol("A");
+                let store = gensym_symbol("NEW");
+                let mut temps = sub.temps.clone();
+                let mut vals = sub.vals.clone();
+                bliss_rt::rooted_ref!(_temps = &mut temps);
+                bliss_rt::rooted_ref!(_vals = &mut vals);
+                temps.push(ind_temp);
+                vals.push(arg_forms.get(1).copied().unwrap_or(NIL));
+                let mut access_items = vec![accessor, *p_access, ind_temp];
+                if arg_forms.len() >= 3 {
+                    let def_temp = gensym_symbol("A");
+                    temps.push(def_temp);
+                    vals.push(arg_forms[2]);
+                    access_items.push(def_temp);
+                }
+                bliss_rt::rooted!(access_form = vec_to_list(&access_items));
+                bliss_rt::rooted!(getf_place = vec_to_list(&[accessor, *p_access, ind_temp]));
+                let store_form =
+                    vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *getf_place, store]);
+                return Ok(SetfExpansion {
+                    temps,
+                    vals,
+                    stores: vec![store],
+                    store_form,
+                    access_form: *access_form,
+                });
+            }
+        }
         // A user-defined expander wins.
         let expander = env.setf_expanders.borrow().get(&acc).cloned();
         if let Some(expander) = expander {
