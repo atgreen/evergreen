@@ -762,6 +762,54 @@ fn find_method_locates_by_qualifiers_and_specializers() {
     );
 }
 
+#[test]
+fn find_class_of_builtin_number_and_sequence_classes() {
+    // FIND-CLASS resolves the standard built-in classes INTEGER/NUMBER/REAL/
+    // STRING/… with a coherent CLASS-PRECEDENCE-LIST, additive over the existing
+    // FIXNUM/etc. (class-of and subtypep are unchanged) — bliss-qxfg, needed by
+    // ansi-test universe.lsp's `(mapcar #'find-class '(integer …))`.
+    let expr = "(princ (list (class-name (find-class 'integer))
+                              (mapcar #'class-name
+                                      (class-precedence-list (find-class 'integer)))
+                              (class-name (find-class 'string))
+                              (class-of 5)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(INTEGER (INTEGER RATIONAL REAL NUMBER T) STRING"),
+        "find-class must resolve the built-in number/sequence classes with a proper CPL, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn remove_duplicates_is_linear_and_honors_keywords() {
+    // REMOVE-DUPLICATES dedups a large list quickly (O(n) EQL hash fast path —
+    // the O(n^2) scan hung ansi-test universe.lsp; bliss-qxfg) and honors
+    // :test/:key/:from-end, keeping the LAST occurrence by default (CLHS 17.3).
+    let expr = "(princ (list
+                  (length (remove-duplicates (loop for i from 1 to 3000 collect (mod i 100))))
+                  (remove-duplicates '(a b a))
+                  (remove-duplicates '(a b a) :from-end t)
+                  (remove-duplicates (list \"a\" \"b\" \"a\") :test #'equal)
+                  (remove-duplicates '((1 . x) (2 . y) (1 . z)) :key #'car)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "remove-duplicates must not time out");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(100 (B A) (A B) (\"b\" \"a\") ((2 . Y) (1 . Z)))"),
+        "remove-duplicates fast path + keyword semantics, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CLOS (defclass / defmethod)
 // ══════════════════════════════════════════════════════════════════

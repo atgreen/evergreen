@@ -455,10 +455,10 @@
       type
       'rational))
 
-;; remove-duplicates: keeps the first occurrence and preserves order. The
-;; keyword arguments (:test/:key/:from-end/...) are accepted but ignored for
-;; now — the default EQL-style comparison via MEMBER covers the bootstrap uses
-;; (deduplicating symbol/keyword lists in the package machinery).
+;; Early bootstrap REMOVE-DUPLICATES: EQL only, keeps first occurrence. Used by
+;; the package machinery loaded before the full definition (further below, after
+;; GETF/FIND/%COERCE-LIKE) supersedes it. Deliberately simple so it compiles here
+;; with no forward references.
 (defun remove-duplicates (seq &rest keys)
   (declare (ignore keys))
   (let ((result nil))
@@ -1638,10 +1638,12 @@
 
 ;;; --- REMOVE-DUPLICATES (spec-faithful: default keeps last occurrence) ------
 
-(defun remove-duplicates (seq &key key (test (function eql)) test-not
-                                    from-end (start 0) end)
+;; General O(n^2) REMOVE-DUPLICATES honouring :key/:test/:test-not/:from-end/
+;; :start/:end via %SEQ-MATCH. Compiled (loop body, no forward refs). Reached only
+;; when the fast path below cannot serve the call.
+(defun %remove-duplicates-general (seq key test test-not from-end start end)
   (let* ((items (coerce seq 'list)) (len (length items)) (stop (or end len))
-         (testfn (or test-not test)) (neg (if test-not t nil))
+         (testfn (or test-not test (function eql))) (neg (if test-not t nil))
          (res nil) (i 0))
     (dolist (x items)
       (let ((keep t))
@@ -1657,6 +1659,35 @@
         (when keep (push x res)))
       (incf i))
     (%coerce-like (reverse res) seq)))
+
+;; REMOVE-DUPLICATES (CLHS 17.3). Default (FROM-END NIL) discards the EARLIER of
+;; each matching pair, so the LAST occurrence is retained; FROM-END T keeps the
+;; first. For the common case — default EQL test, whole sequence — dedup in O(n)
+;; through an EQL hash table (ansi-test universe.lsp's `(remove-duplicates
+;; (append …))` runs over hundreds of elements; the O(n^2) scan hung on it,
+;; bliss-qxfg). Uses &rest+GETF, not &key, and avoids any inner LAMBDA, so the
+;; hot function bytecode-compiles instead of falling back to the tree-walker.
+;; A custom :test/:test-not or a :start/:end window takes the general path above.
+(defun remove-duplicates (seq &rest keys)
+  (let ((test (getf keys :test))
+        (test-not (getf keys :test-not))
+        (key (getf keys :key))
+        (from-end (getf keys :from-end))
+        (start (or (getf keys :start) 0))
+        (end (getf keys :end)))
+    (if (and (null test) (null test-not) (eql start 0) (null end))
+        (let ((items (coerce seq 'list))
+              (seen (make-hash-table :test 'eql))
+              (out nil))
+          (dolist (x (if from-end items (reverse items)))
+            (let ((k (if key (funcall key x) x)))
+              (multiple-value-bind (v present) (gethash k seen)
+                (declare (ignore v))
+                (unless present
+                  (setf (gethash k seen) t)
+                  (push x out)))))
+          (%coerce-like (if from-end (reverse out) out) seq))
+        (%remove-duplicates-general seq key test test-not from-end start end))))
 
 (defun delete-duplicates (seq &rest keys)
   (apply (function remove-duplicates) seq keys))

@@ -1083,6 +1083,14 @@ pub fn max_metaobject_id() -> i64 {
 }
 
 fn is_builtin_class(st: &ClosState, class: BlissVal) -> bool {
+    // Every built-in class handle is a NEGATIVE fixnum (user classes get positive
+    // ids from next_stdlib_class_id, base 300_000), so the sign is the reliable
+    // discriminator and covers the numeric-tower / sequence / array classes added
+    // in bliss-qxfg without enumerating each. The explicit field checks below stay
+    // as documentation of the core classes.
+    if class.is_fixnum() && class.as_fixnum() < 0 {
+        return true;
+    }
     class == st.t_class_val
         || class == st.standard_object_class
         || class == st.fixnum_class
@@ -1126,6 +1134,24 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
     let flt_cls = BlissVal::from_fixnum(-8);
     let fun_cls = BlissVal::from_fixnum(-9);
     let hpo_cls = BlissVal::from_fixnum(-10);
+    // Additional CL built-in classes (bliss-qxfg). find-class previously had no
+    // metaobject for the numeric tower / sequence / array classes, so
+    // `(find-class 'integer)` — and FIND-METHOD over `(find-class …)` specializers,
+    // as ansi-test universe.lsp builds — errored. These are additive: class-of
+    // still returns the concrete leaf (FIXNUM/FLOAT/…) and SUBTYPEP uses the type
+    // lattice, not the CLOS CPL, so registering them changes neither.
+    let num_cls = BlissVal::from_fixnum(-11);
+    let real_cls = BlissVal::from_fixnum(-12);
+    let ratl_cls = BlissVal::from_fixnum(-13);
+    let int_cls = BlissVal::from_fixnum(-14);
+    let ratio_cls = BlissVal::from_fixnum(-15);
+    let cplx_cls = BlissVal::from_fixnum(-16);
+    let seq_cls = BlissVal::from_fixnum(-17);
+    let list_cls = BlissVal::from_fixnum(-18);
+    let arr_cls = BlissVal::from_fixnum(-19);
+    let vec_cls = BlissVal::from_fixnum(-20);
+    let str_cls = BlissVal::from_fixnum(-21);
+    let bitv_cls = BlissVal::from_fixnum(-22);
 
     // Names: interned into the shared registry by their real CL names
     // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
@@ -1147,6 +1173,18 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
     let flt_nm = nm("FLOAT");
     let fun_nm = nm("FUNCTION");
     let hpo_nm = nm("HEAP-OBJECT");
+    let num_nm = nm("NUMBER");
+    let real_nm = nm("REAL");
+    let ratl_nm = nm("RATIONAL");
+    let int_nm = nm("INTEGER");
+    let ratio_nm = nm("RATIO");
+    let cplx_nm = nm("COMPLEX");
+    let seq_nm = nm("SEQUENCE");
+    let list_nm = nm("LIST");
+    let arr_nm = nm("ARRAY");
+    let vec_nm = nm("VECTOR");
+    let str_nm = nm("STRING");
+    let bitv_nm = nm("BIT-VECTOR");
 
     with_state_mut(|st| {
         // Full reset so tests are independent
@@ -1196,6 +1234,39 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
                 ClassMeta {
                     name: *nm,
                     direct_supers: vec![std_obj],
+                    direct_subs: vec![],
+                    slots: vec![],
+                    wrapper: std::ptr::null_mut(),
+                },
+            );
+        }
+
+        // CL built-in classes with their CLHS superclass links, forming a
+        // coherent numeric tower and sequence/array hierarchy for FIND-CLASS /
+        // CLASS-PRECEDENCE-LIST (bliss-qxfg). Purely additive — see the handle
+        // comment above; the existing leaf classes (FIXNUM/FLOAT/CONS) keep their
+        // current supers, so no CPL/dispatch behaviour changes.
+        let hierarchy = [
+            (num_nm, num_cls, vec![t_cls]),
+            (real_nm, real_cls, vec![num_cls]),
+            (ratl_nm, ratl_cls, vec![real_cls]),
+            (int_nm, int_cls, vec![ratl_cls]),
+            (ratio_nm, ratio_cls, vec![ratl_cls]),
+            (cplx_nm, cplx_cls, vec![num_cls]),
+            (seq_nm, seq_cls, vec![t_cls]),
+            (list_nm, list_cls, vec![seq_cls]),
+            (arr_nm, arr_cls, vec![t_cls]),
+            (vec_nm, vec_cls, vec![arr_cls, seq_cls]),
+            (str_nm, str_cls, vec![vec_cls]),
+            (bitv_nm, bitv_cls, vec![vec_cls]),
+        ];
+        for (nm, cls, supers) in hierarchy {
+            st.class_registry.insert(nm, cls);
+            st.class_meta.insert(
+                cls,
+                ClassMeta {
+                    name: nm,
+                    direct_supers: supers,
                     direct_subs: vec![],
                     slots: vec![],
                     wrapper: std::ptr::null_mut(),
