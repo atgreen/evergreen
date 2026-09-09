@@ -1148,7 +1148,19 @@
        (d data (cdr d))
        (acc alist (acons (car k) (car d) acc)))
       ((or (endp k) (endp d)) acc)))
-(defun list-length (list) (length list))
+;; LIST-LENGTH (CLHS): the length of LIST, or NIL if it is circular. Floyd's
+;; tortoise/hare cycle detection — a circular list yields NIL instead of looping
+;; forever (ansi-test cons/list-length.lsp; the previous delegation to LENGTH
+;; hung do-tests). ENDP signals a TYPE-ERROR on a dotted/improper tail, matching
+;; the LIST-LENGTH.ERROR tests.
+(defun list-length (list)
+  (do ((n 0 (+ n 2))
+       (fast list (cddr fast))
+       (slow list (cdr slow)))
+      (nil)
+    (when (endp fast) (return n))
+    (when (endp (cdr fast)) (return (+ n 1)))
+    (when (and (eq fast slow) (> n 0)) (return nil))))
 (defun nconc (&rest lists) (apply (function append) lists))
 (defun revappend (x y) (append (reverse x) y))
 ;; ANSI: a sequence/array size (and each array dimension) is a non-negative
