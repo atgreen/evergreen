@@ -1152,6 +1152,7 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
     let vec_cls = BlissVal::from_fixnum(-20);
     let str_cls = BlissVal::from_fixnum(-21);
     let bitv_cls = BlissVal::from_fixnum(-22);
+    let htbl_cls = BlissVal::from_fixnum(-23);
 
     // Names: interned into the shared registry by their real CL names
     // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
@@ -1185,6 +1186,7 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
     let vec_nm = nm("VECTOR");
     let str_nm = nm("STRING");
     let bitv_nm = nm("BIT-VECTOR");
+    let htbl_nm = nm("HASH-TABLE");
 
     with_state_mut(|st| {
         // Full reset so tests are independent
@@ -1259,6 +1261,7 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
             (vec_nm, vec_cls, vec![arr_cls, seq_cls]),
             (str_nm, str_cls, vec![vec_cls]),
             (bitv_nm, bitv_cls, vec![vec_cls]),
+            (htbl_nm, htbl_cls, vec![t_cls]),
         ];
         for (nm, cls, supers) in hierarchy {
             st.class_registry.insert(nm, cls);
@@ -1540,6 +1543,12 @@ pub fn class_of(object: BlissVal) -> BlissVal {
         }
         if object.is_function() {
             return st.function_class;
+        }
+        // A hash table is a heap object whose CLOS class is the built-in
+        // HASH-TABLE class (handle -23, registered in `bootstrap_clos`), so
+        // `(class-of ht)` and `(typep ht (find-class 'hash-table))` are correct.
+        if crate::hash_table_p(object) {
+            return BlissVal::from_fixnum(-23);
         }
         if object.is_heap_object() {
             return st.heap_object_class;

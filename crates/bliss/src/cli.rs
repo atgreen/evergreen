@@ -8645,6 +8645,23 @@ fn vector_length_matches(size_args: &[BlissVal], object: BlissVal) -> bool {
 }
 
 fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
+    // A class metaobject used directly as a type specifier — e.g.
+    // `(typep ht (find-class 'hash-table))`. Class handles are neither symbols
+    // nor conses; `class_name` is non-NIL only for a registered class. OBJECT is
+    // of the type iff its class equals, or has as a precedence-list ancestor,
+    // that class (ansi-test hash-table.5).
+    if !type_spec.is_symbol() && !type_spec.is_cons() && !type_spec.is_nil() {
+        if !bliss_stdlib::class_name(type_spec).is_nil() {
+            let obj_class = bliss_stdlib::class_of(object);
+            if obj_class == type_spec {
+                return Ok(true);
+            }
+            return Ok(match bliss_stdlib::compute_class_precedence_list(obj_class) {
+                Ok(cpl) => cpl.iter().any(|c| *c == type_spec),
+                Err(_) => false,
+            });
+        }
+    }
     // A CLOS instance matches any type name in its class precedence list,
     // regardless of a same-bare-name DEFTYPE in another package: a class name IS
     // a type and DEFTYPE cannot shadow it. Check this against the UNRESOLVED
@@ -8899,6 +8916,60 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                     return true;
                 }
                 let n = bound.as_fixnum();
+                if is_lower { value >= n } else { value <= n }
+            };
+            let lower_ok = bounds
+                .first()
+                .copied()
+                .map(|b| bound_ok(b, true))
+                .unwrap_or(true);
+            let upper_ok = bounds
+                .get(1)
+                .copied()
+                .map(|b| bound_ok(b, false))
+                .unwrap_or(true);
+            Ok(lower_ok && upper_ok)
+        }
+        // Bounded numeric real types: (real low high), (float low high),
+        // (single-float …), (double-float …), (short-float …), (long-float …),
+        // (rational low high). A bound is `*`/omitted (unbounded), a number
+        // (inclusive), or a one-element list `(n)` (exclusive). Used by ansi-test
+        // hash-table-rehash-size/threshold (`(float (1.0) *)`, `(real 0 1)`).
+        "REAL" | "FLOAT" | "SINGLE-FLOAT" | "SHORT-FLOAT" | "DOUBLE-FLOAT" | "LONG-FLOAT"
+        | "RATIONAL" => {
+            let base_ok = match op.as_str() {
+                "REAL" => bliss_rt::types::realp(object),
+                "FLOAT" => bliss_rt::types::floatp(object),
+                "RATIONAL" => bliss_rt::types::rationalp(object),
+                "SINGLE-FLOAT" | "SHORT-FLOAT" => object.is_single_float(),
+                "DOUBLE-FLOAT" | "LONG-FLOAT" => object.is_double_float(),
+                _ => false,
+            };
+            if !base_ok {
+                return Ok(false);
+            }
+            let value = match num_val(object) {
+                Ok(v) => v,
+                Err(_) => return Ok(false),
+            };
+            let bounds = list_to_vec(args);
+            let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
+                if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
+                    return true;
+                }
+                if bound.is_cons() {
+                    // Exclusive bound `(n)`.
+                    let (b, _) = cp(bound);
+                    let n = match num_val(b) {
+                        Ok(n) => n,
+                        Err(_) => return true,
+                    };
+                    return if is_lower { value > n } else { value < n };
+                }
+                let n = match num_val(bound) {
+                    Ok(n) => n,
+                    Err(_) => return true,
+                };
                 if is_lower { value >= n } else { value <= n }
             };
             let lower_ok = bounds
@@ -12495,9 +12566,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // entry table, where it outlived the nursery
                                 // reset (bliss-4bp, caught by BLISS_GC_VERIFY).
                                 bliss_rt::rooted!(key = eval_form(tgt_form, env)?);
-                                let (tbl_form, _) = cp(cp(*aargs).1);
-                                let tbl = eval_form(tbl_form, env)?;
-                                bliss_stdlib::set_gethash(*key, tbl, *val)?;
+                                let (tbl_form, after_tbl) = cp(cp(*aargs).1);
+                                bliss_rt::rooted!(tbl = eval_form(tbl_form, env)?);
+                                // ANSI: the optional DEFAULT subform of the place
+                                // is still evaluated (for its side effects), even
+                                // though (SETF GETHASH) ignores its value
+                                // (gethash.5 / gethash.order.4). Root the table
+                                // across it — this eval can fire a minor GC.
+                                if after_tbl.is_cons() {
+                                    let (default_form, _) = cp(after_tbl);
+                                    eval_form(default_form, env)?;
+                                }
+                                bliss_stdlib::set_gethash(*key, *tbl, *val)?;
                             }
                             "GETF" => {
                                 // (setf (getf place indicator [default]) val):
@@ -13660,11 +13740,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "GETHASH" => {
                 // (gethash key table &optional default) -> value; sets the
-                // second value to the present-p flag.
+                // second value to the present-p flag. Wrong argument count is a
+                // (catchable) PROGRAM-ERROR (ANSI; gethash.error.*).
                 let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(BlissError::Internal(
-                        "GETHASH requires a key and a table".into(),
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(BlissError::ProgramError(
+                        "GETHASH requires a key, a table, and an optional default".into(),
                     ));
                 }
                 let key = args[0];
@@ -13792,9 +13873,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(val);
             }
             "REMHASH" => {
+                // (remhash key table) — exactly two args; otherwise PROGRAM-ERROR
+                // (ANSI; remhash.error.*).
                 let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(BlissError::Internal(
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(
                         "REMHASH requires a key and a table".into(),
                     ));
                 }
@@ -13802,23 +13885,76 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if removed { T } else { NIL });
             }
             "CLRHASH" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "CLRHASH requires exactly one argument".into(),
+                    ));
+                }
                 let (tbl_form, _) = cp(cdr);
                 let tbl = eval_form(tbl_form, env)?;
                 bliss_stdlib::clrhash(tbl)?;
                 return Ok(tbl);
             }
             "HASH-TABLE-COUNT" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "HASH-TABLE-COUNT requires exactly one argument".into(),
+                    ));
+                }
                 let (tbl_form, _) = cp(cdr);
                 let tbl = eval_form(tbl_form, env)?;
                 let n = bliss_stdlib::hash_table_count(tbl)?;
                 return Ok(BlissVal::from_fixnum(n as i64));
             }
             "HASH-TABLE-P" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "HASH-TABLE-P requires exactly one argument".into(),
+                    ));
+                }
                 let (tbl_form, _) = cp(cdr);
                 let tbl = eval_form(tbl_form, env)?;
                 return Ok(if is_hash_table_value(tbl) { T } else { NIL });
             }
+            "HASH-TABLE-SIZE" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "HASH-TABLE-SIZE requires exactly one argument".into(),
+                    ));
+                }
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                let n = bliss_stdlib::hash_table_size(tbl)?;
+                return Ok(BlissVal::from_fixnum(n as i64));
+            }
+            "HASH-TABLE-REHASH-SIZE" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "HASH-TABLE-REHASH-SIZE requires exactly one argument".into(),
+                    ));
+                }
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                let r = bliss_stdlib::hash_table_rehash_size(tbl)?;
+                return Ok(BlissVal::from_single_float(r as f32));
+            }
+            "HASH-TABLE-REHASH-THRESHOLD" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "HASH-TABLE-REHASH-THRESHOLD requires exactly one argument".into(),
+                    ));
+                }
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                let r = bliss_stdlib::hash_table_rehash_threshold(tbl)?;
+                return Ok(BlissVal::from_single_float(r as f32));
+            }
             "HASH-TABLE-TEST" => {
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "HASH-TABLE-TEST requires exactly one argument".into(),
+                    ));
+                }
                 let (tbl_form, _) = cp(cdr);
                 let tbl = eval_form(tbl_form, env)?;
                 let name = match bliss_stdlib::hash_table_test(tbl)? {
@@ -13850,8 +13986,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // only a native pointer. Iterates a snapshot so the table may be
                 // mutated (per-key) during the walk. Returns NIL.
                 let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(BlissError::Internal(
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(
                         "MAPHASH requires a function and a table".into(),
                     ));
                 }
@@ -13867,7 +14003,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "SXHASH" => {
                 // (sxhash object): a hash code such that equal objects hash equal
-                // (ANSI); routed to the stdlib hash (bliss-jtc.8).
+                // (ANSI); routed to the stdlib hash (bliss-jtc.8). Exactly one
+                // argument; otherwise PROGRAM-ERROR (sxhash.error.*).
+                if list_to_vec(cdr).len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "SXHASH requires exactly one argument".into(),
+                    ));
+                }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(bliss_stdlib::sxhash(v));
@@ -24822,7 +24964,8 @@ fn is_builtin_function(name: &str) -> bool {
             // Hash tables
             | "MAKE-HASH-TABLE" | "GETHASH" | "REMHASH" | "CLRHASH" | "MAPHASH"
             | "HASH-TABLE-COUNT" | "HASH-TABLE-P" | "HASH-TABLE-TEST" | "HASH-TABLE-KEYS"
-            | "HASH-TABLE-VALUES"
+            | "HASH-TABLE-VALUES" | "HASH-TABLE-SIZE" | "HASH-TABLE-REHASH-SIZE"
+            | "HASH-TABLE-REHASH-THRESHOLD"
             // Pathnames / files
             | "PATHNAME" | "NAMESTRING" | "MERGE-PATHNAMES" | "MAKE-PATHNAME"
             | "PATHNAME-NAME" | "PATHNAME-TYPE" | "PATHNAME-DIRECTORY" | "PATHNAME-HOST"
@@ -24878,7 +25021,7 @@ fn apply_builtin_fast(
             env.clear_mv();
             Some(Ok(if args[0] == args[1] { T } else { NIL }))
         }
-        "GETHASH" if args.len() >= 2 => {
+        "GETHASH" if args.len() == 2 || args.len() == 3 => {
             let default = if args.len() >= 3 { args[2] } else { NIL };
             Some(
                 bliss_stdlib::gethash(args[0], args[1], default).map(|(val, present)| {

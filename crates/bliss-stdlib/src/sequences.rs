@@ -129,6 +129,14 @@ pub fn string_char_count(v: BlissVal) -> Option<usize> {
     string_content(v).map(|s| s.chars().count())
 }
 
+/// UTF-8 content bytes of ANY string sequence — simple, fill-pointer, adjustable
+/// or displaced — or `None` for a non-string. Used by hash-table EQUAL/EQUALP and
+/// SXHASH content hashing so that e.g. a simple string and a fill-pointer string
+/// with the same active characters compare and hash alike.
+pub fn string_content_bytes(v: BlissVal) -> Option<Vec<u8>> {
+    string_content(v).map(String::into_bytes)
+}
+
 /// True if `v` is a character string usable as a sequence — a real string, and
 /// NOT a pathname. Pathnames are registry-backed values whose BlissVal can pass
 /// `is_string()` (they carry a namestring), but they are not sequences; treating

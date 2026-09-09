@@ -86,6 +86,26 @@
 (defconstant least-negative-normalized-double-float -2.2250738585072014d-308)
 (defconstant double-float-epsilon 1.1102230246251568d-16)
 (defconstant double-float-negative-epsilon 5.551115123125784d-17)
+;; bliss has two float formats: SHORT-FLOAT ≡ SINGLE-FLOAT and LONG-FLOAT ≡
+;; DOUBLE-FLOAT. The corresponding limit constants are aliases of the single/
+;; double values so that code referencing the short/long family (e.g. ansi-test
+;; make-hash-table.26/.29) resolves them (bliss hash-tables chapter).
+(defconstant most-positive-short-float most-positive-single-float)
+(defconstant most-negative-short-float most-negative-single-float)
+(defconstant least-positive-short-float least-positive-single-float)
+(defconstant least-positive-normalized-short-float least-positive-normalized-single-float)
+(defconstant least-negative-short-float least-negative-single-float)
+(defconstant least-negative-normalized-short-float least-negative-normalized-single-float)
+(defconstant short-float-epsilon single-float-epsilon)
+(defconstant short-float-negative-epsilon single-float-negative-epsilon)
+(defconstant most-positive-long-float most-positive-double-float)
+(defconstant most-negative-long-float most-negative-double-float)
+(defconstant least-positive-long-float least-positive-double-float)
+(defconstant least-positive-normalized-long-float least-positive-normalized-double-float)
+(defconstant least-negative-long-float least-negative-double-float)
+(defconstant least-negative-normalized-long-float least-negative-normalized-double-float)
+(defconstant long-float-epsilon double-float-epsilon)
+(defconstant long-float-negative-epsilon double-float-negative-epsilon)
 (defconstant lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &body &whole &environment))
 ;; Implementation limits: bliss caps these at MOST-POSITIVE-FIXNUM so they are
@@ -169,15 +189,22 @@
 ;; Within BODY, calling (name) returns (values more-p key value), advancing over
 ;; a snapshot of TABLE's entries, and (values nil) once exhausted (bliss-jtc.8).
 (defmacro with-hash-table-iterator (spec &rest body)
+  ;; NAME is established as a local MACRO (macrolet), per CLHS — so within BODY
+  ;; `(macroexpand '(name))` expands it (ansi with-hash-table-iterator.9). Each
+  ;; `(name)` expands to code that pops the next entry off a snapshot list held
+  ;; in the lexical variable REST, returning (values more-p key value), and
+  ;; (values nil) once exhausted.
   (let ((name (car spec)) (table (car (cdr spec)))
         (rest (gensym)) (pair (gensym)))
     `(let ((,rest (hash-table-entries ,table)))
-       (flet ((,name ()
-                (if ,rest
-                    (let ((,pair (car ,rest)))
-                      (setq ,rest (cdr ,rest))
-                      (values t (car ,pair) (cdr ,pair)))
-                    (values nil))))
+       (macrolet ((,name ()
+                    (list 'if ',rest
+                          (list 'let (list (list ',pair (list 'car ',rest)))
+                                (list 'setq ',rest (list 'cdr ',rest))
+                                (list 'values t
+                                      (list 'car ',pair)
+                                      (list 'cdr ',pair)))
+                          (list 'values nil))))
          ,@body))))
 
 ;; define-modify-macro: define NAME so that (NAME place args...) expands to

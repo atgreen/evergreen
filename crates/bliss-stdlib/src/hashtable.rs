@@ -10,7 +10,7 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 use bliss_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
+use bliss_rt::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_SYMBOL};
 use std::collections::HashSet;
 use std::sync::Once;
 
@@ -339,22 +339,22 @@ fn cl_equal(a: BlissVal, b: BlissVal) -> bool {
                 return sa == sb;
             }
         }
-        if is_simple_vector(a) && is_simple_vector(b) {
-            let len = vector_length(a);
-            if len != vector_length(b) {
-                return false;
-            }
-            for i in 0..len {
-                if !cl_equal(vector_elt(a, i), vector_elt(b, i)) {
-                    return false;
-                }
-            }
-            return true;
+        // Bit-vectors compare by bit content (ANSI EQUAL treats bit-vectors and
+        // strings specially — but NOT general arrays, which are EQ).
+        if let (Some(la), Some(lb)) = (
+            bliss_rt::types::bit_vector_len(a),
+            bliss_rt::types::bit_vector_len(b),
+        ) {
+            return la == lb
+                && (0..la)
+                    .all(|i| bliss_rt::types::bit_vector_ref(a, i) == bliss_rt::types::bit_vector_ref(b, i));
         }
     }
 
-    // Everything else: bit equality (matches EQL semantics for
-    // fixnums, characters, symbols, single-floats, etc.).
+    // Everything else — including a SIMPLE general vector, which ANSI EQUAL
+    // treats as EQ (compared by identity, already handled by the bit fast path
+    // at the top) — is bit equality (matches EQL for fixnums, characters,
+    // symbols, single-floats, etc.).
     false
 }
 
@@ -505,21 +505,86 @@ fn numeric_value_hash(object: BlissVal, depth: usize) -> Option<u64> {
                     numeric_or_scalar_hash(b, depth - 1),
                 ))
             }
-            type_id::DOUBLE_FLOAT => Some(hash_u64((*(p.add(8) as *const f64)).to_bits())),
+            type_id::DOUBLE_FLOAT => {
+                // Canonicalize signed zeros: +0.0 and -0.0 are similar under
+                // ANSI SXHASH and must hash alike (sxhash.17-19).
+                let f = *(p.add(8) as *const f64);
+                Some(hash_u64(if f == 0.0 { FLOAT_ZERO_HASH } else { f.to_bits() }))
+            }
             _ => None,
         }
     }
 }
 
+/// Canonical hash input for a floating zero of any format, so `+0.0` and `-0.0`
+/// (similar per ANSI) hash identically.
+const FLOAT_ZERO_HASH: u64 = 0x7a7a_5a5a_0f0f_a5a5;
+
+/// Hash a scalar leaf by value, canonicalizing signed float zeros. A non-zero
+/// single-float keeps its tagged-bit hash; everything else hashes by raw bits.
+fn scalar_leaf_hash(v: BlissVal) -> u64 {
+    if v.is_single_float() {
+        let f = v.as_single_float();
+        if f == 0.0 {
+            return hash_u64(FLOAT_ZERO_HASH);
+        }
+    }
+    hash_u64(v.0)
+}
+
 /// Hash a numeric part by value: a heap numeric via [`numeric_value_hash`], an
 /// immediate (fixnum / single-float) by its bits.
 fn numeric_or_scalar_hash(object: BlissVal, depth: usize) -> u64 {
-    numeric_value_hash(object, depth).unwrap_or_else(|| hash_u64(object.0))
+    numeric_value_hash(object, depth).unwrap_or_else(|| scalar_leaf_hash(object))
+}
+
+/// Hash the active-element sequence of a bit-vector (simple or fill-pointered)
+/// so an equal simple bit-vector and complex bit-vector hash alike (ANSI SXHASH
+/// similarity, sxhash.4/.6/.22). Each bit is hashed as its fixnum value, matching
+/// the per-element hash a complex (fixnum-backed) bit-vector produces. Returns
+/// `None` if `object` is not a bit-vector.
+fn bit_vector_content_hash(object: BlissVal) -> Option<u64> {
+    let n = bliss_rt::types::bit_vector_len(object)?;
+    let mut h = hash_u64(n as u64);
+    for i in 0..n {
+        let bit = bliss_rt::types::bit_vector_ref(object, i).unwrap_or(0);
+        h = combine_hashes(h, hash_u64(bit as u64));
+    }
+    Some(h)
+}
+
+/// Hash the active elements (0..fill-pointer) of a NON-string complex vector by
+/// value. A fill-pointer bit-vector is backed by a general complex vector of
+/// fixnum bits, so hashing its active fixnum elements the same way
+/// `bit_vector_content_hash` hashes each bit keeps the two consistent.
+fn complex_vector_content_hash(object: BlissVal, depth: usize, equalp: bool) -> Option<u64> {
+    if !crate::sequences::is_complex_vector(object) || crate::sequences::cvec_is_string(object) {
+        return None;
+    }
+    let n = crate::sequences::cvec_fill_pointer(object);
+    let mut h = hash_u64(n as u64);
+    for i in 0..n {
+        let e = crate::sequences::elt(object, i).ok()?;
+        // A fixnum bit hashes as its integer value, matching bit_vector_content_hash.
+        let eh = if let Some(bits) = e.is_fixnum().then(|| hash_u64(e.as_fixnum() as u64)) {
+            bits
+        } else if equalp {
+            equalp_hash(e, depth.saturating_sub(1))
+        } else {
+            equal_hash(e, depth.saturating_sub(1))
+        };
+        h = combine_hashes(h, eh);
+    }
+    Some(h)
 }
 
 fn equal_hash(object: BlissVal, depth: usize) -> u64 {
     if depth == 0 {
         return 0;
+    }
+    // Signed float zeros are similar per ANSI: hash +0.0 and -0.0 alike.
+    if object.is_single_float() && object.as_single_float() == 0.0 {
+        return hash_u64(FLOAT_ZERO_HASH);
     }
     if let Some(h) = numeric_value_hash(object, depth) {
         return h;
@@ -533,19 +598,34 @@ fn equal_hash(object: BlissVal, depth: usize) -> u64 {
             );
         }
     }
-    if object.is_heap_object() {
-        {
-            if let Some(bytes) = extract_string_bytes(object) {
-                return hash_bytes(&bytes, false);
-            }
+    // A symbol hashes by its NAME so two symbols with the same name (in any
+    // package, interned or uninterned) hash alike (ANSI; sxhash.13/.15/.23).
+    // Only real TAG_SYMBOL values carry a symbol index — NIL/T are represented
+    // specially and hash by their (stable) bits.
+    if object.tag() == TAG_SYMBOL {
+        if let Some(name) = bliss_rt::symbols::symbol_name(object.as_symbol_index()) {
+            return hash_bytes(name.as_bytes(), false);
         }
-        if is_simple_vector(object) {
-            let mut h = hash_u64(vector_length(object) as u64);
-            for i in 0..vector_length(object) {
-                h = combine_hashes(h, equal_hash(vector_elt(object, i), depth - 1));
-            }
+    }
+    if object.is_heap_object() {
+        // Any string (simple or complex/fill-pointer/displaced) — and a
+        // registry-backed string sentinel such as a pathname namestring, which
+        // `extract_string_bytes` resolves without dereferencing (sxhash.20) —
+        // hashes by its characters.
+        if let Some(bytes) =
+            extract_string_bytes(object).or_else(|| crate::sequences::string_content_bytes(object))
+        {
+            return hash_bytes(&bytes, false);
+        }
+        if let Some(h) = bit_vector_content_hash(object) {
             return h;
         }
+        if let Some(h) = complex_vector_content_hash(object, depth, false) {
+            return h;
+        }
+        // A SIMPLE general vector (and every other array) is EQUAL only to itself
+        // (ANSI treats non-string/non-bit arrays as EQ), so it hashes by identity
+        // — and stays stable when its contents change (sxhash.7).
     }
     hash_u64(object.0)
 }
@@ -656,12 +736,19 @@ fn key_address_sensitive(object: BlissVal, test: HashTest) -> bool {
                 return false; // content-hashed
             }
             if is_simple_vector(object) {
-                for i in 0..vector_length(object) {
-                    if structural(vector_elt(object, i), depth - 1, equalp) {
-                        return true;
+                // EQUALP hashes a simple vector element-wise, so its
+                // address-sensitivity follows its elements'. EQUAL hashes it by
+                // identity (ANSI treats non-string/non-bit arrays as EQ), so it is
+                // address-sensitive iff it is a movable pointer.
+                if equalp {
+                    for i in 0..vector_length(object) {
+                        if structural(vector_elt(object, i), depth - 1, equalp) {
+                            return true;
+                        }
                     }
+                    return false;
                 }
-                return false;
+                return is_movable_pointer(object);
             }
         }
         // Fall-through: hashed by address iff it is a movable pointer.
