@@ -2989,6 +2989,18 @@ fn bliss_error_to_condition(
         BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
         BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
         BlissError::ControlError(_) => build_condition_instance(env, "CONTROL-ERROR", &[])?,
+        // A genuine internal error (a builtin's arg-count/validation failure, an
+        // unimplemented path) is a real error and must be catchable by
+        // HANDLER-CASE/IGNORE-ERRORS as a SIMPLE-ERROR — otherwise it aborts the
+        // whole computation (e.g. every ansi-test *.error test that trips an
+        // uncatchable Internal killed do-tests instead of just failing; bliss-x7aa).
+        // EXCEPTION: control-flow tokens (THROW/GO/RETURN-FROM/HANDLER-CASE/
+        // RESTART-INVOKED) are also carried as BlissError::Internal, but their
+        // messages are always "__"-prefixed; those must keep propagating uncaught
+        // to their establishing form, so leave them as non-conditions.
+        BlissError::Internal(msg) if !msg.starts_with("__") => {
+            make_simple_error_condition(arena_str(msg), env)?
+        }
         _ => return Ok(None),
     };
     bliss_rt::rooted_ref!(_condition_root = &mut condition);
