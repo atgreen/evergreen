@@ -9863,6 +9863,28 @@ fn write_file_atomic(out_path: &str, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Fixed argument arity `(min, max)` for a core builtin, keyed by BARE name, so
+/// eval_list can signal a PROGRAM-ERROR on a wrong-count call (CLHS 3.5.1). Only
+/// strictly fixed-arity builtins that are NOT redefinable-by-default belong here;
+/// anything with &optional/&rest, or defined in boot.lisp, is omitted (boot.lisp
+/// functions validate their own lambda lists). bliss-30be.
+fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
+    // c[ad]{1,4}r accessors (CAR/CDR/CAAR/.../CDDDDR) are all one argument.
+    if bare.len() >= 3
+        && bare.len() <= 6
+        && bare.starts_with('C')
+        && bare.ends_with('R')
+        && bare[1..bare.len() - 1].bytes().all(|b| b == b'A' || b == b'D')
+    {
+        return Some((1, 1));
+    }
+    match bare {
+        "CONS" | "RPLACA" | "RPLACD" => Some((2, 2)),
+        "CONSP" | "ATOM" | "LISTP" | "ENDP" => Some((1, 1)),
+        _ => None,
+    }
+}
+
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -9895,6 +9917,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(mdef) = lookup_macro(env, &name) {
             let expanded = expand_macro(&mdef, cdr, env, form)?;
             return eval_form(expanded, env);
+        }
+
+        // Fixed-arity builtin arg-count check: calling a function with the wrong
+        // number of arguments is a PROGRAM-ERROR (CLHS). Many list builtins
+        // accepted any count silently — `(cons)`, `(consp 'a 'b)`, `(caddr)` — so
+        // ansi-test's *.ERROR.* PROGRAM-ERROR tests saw no error (bliss-30be).
+        // Only fires when the operator is a genuine builtin (not shadowed by a
+        // user/lexical function); boot.lisp functions are global_fns and validate
+        // their own lambda lists, so they are skipped here.
+        if let Some((lo, hi)) = fixed_arity_builtin(&symbol_bare_name(&name)) {
+            if global_fn(&name).is_none()
+                && !env.funs.borrow().contains_key(&name)
+                && local_fn_closure(env, &name).is_none()
+            {
+                let argc = list_to_vec(cdr).len();
+                if argc < lo || argc > hi {
+                    let want = if lo == hi {
+                        format!("{lo}")
+                    } else {
+                        format!("{lo} to {hi}")
+                    };
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} called with {argc} argument(s); requires {want}"
+                    )));
+                }
+            }
         }
 
         match name.as_str() {

@@ -982,6 +982,32 @@ fn get_properties_and_nsubst_keywords() {
 }
 
 #[test]
+fn fixed_arity_builtins_signal_program_error_on_wrong_count() {
+    // Calling a fixed-arity builtin with the wrong number of arguments is a
+    // PROGRAM-ERROR (CLHS 3.5.1) — bliss accepted any count silently, so
+    // ansi-test's (cons)/(consp 'a 'b)/(caddr)/... .ERROR tests saw no error
+    // (bliss-30be). Valid calls still work.
+    let expr = "(princ (list
+                  (typep (nth-value 1 (ignore-errors (cons))) 'program-error)
+                  (typep (nth-value 1 (ignore-errors (cons 'a 'b 'c))) 'program-error)
+                  (typep (nth-value 1 (ignore-errors (consp 'a 'b))) 'program-error)
+                  (typep (nth-value 1 (ignore-errors (caddr))) 'program-error)
+                  (cons 1 2)
+                  (caddr '(1 2 3 4))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(T T T T (1 . 2) 3)"),
+        "fixed-arity builtins must signal PROGRAM-ERROR on wrong count, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).
