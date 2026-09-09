@@ -9896,6 +9896,12 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // (rest list) — exactly one; (nth n list) — exactly two.
         "REST" => Some((1, 1)),
         "NTH" => Some((2, 2)),
+        // FIRST/SECOND/THIRD are evaluator builtins (CAR/FIRST share an arm and
+        // CAR is covered by the c…r pattern above, but FIRST/SECOND/THIRD are
+        // not), so a wrong-arity call bypassed lambda-list binding; each takes
+        // exactly one argument (FOURTH..TENTH are boot.lisp defuns already
+        // checked by the binder). ansi-test {first,second,third}.error.* (bliss-l6y9).
+        "FIRST" | "SECOND" | "THIRD" => Some((1, 1)),
         // (member item list &key ...) / (assoc item alist &key ...) — two
         // required, then an unbounded keyword tail (max == usize::MAX). bliss-l6y9.
         "MEMBER" | "ASSOC" => Some((2, usize::MAX)),
