@@ -378,6 +378,7 @@
 (defun simple-condition-format-arguments (c) (slot-value c 'format-arguments))
 (defun cell-error-name (c) (slot-value c 'name))
 (defun unbound-slot-instance (c) (slot-value c 'instance))
+(defun package-error-package (c) (slot-value c 'package))
 
 ;; String-producing printers, built on FORMAT now that ~A/~S print lists.
 (defun princ-to-string (x) (format nil "~a" x))
@@ -628,10 +629,65 @@
   (let ((var (car binding))
         (result (if (cdr binding) (car (cdr binding)) nil))
         (pkg (gensym)))
+    ;; CLHS: the result-form is evaluated with VAR bound to NIL after the loop.
     `(progn
-       (dolist (,pkg (list-all-packages) ,result)
+       (dolist (,pkg (list-all-packages))
          (dolist (,var (bliss-internal::package-symbols ,pkg t))
-           ,@body)))))
+           ,@body))
+       (let ((,var nil)) (declare (ignorable ,var)) ,result))))
+
+;;; WITH-PACKAGE-ITERATOR / FIND-ALL-SYMBOLS
+;;;
+;;; Built on the BLISS-INTERNAL::PACKAGE-SYMBOLS primitive:
+;;;   (… pkg nil)       → present symbols (internal + external)
+;;;   (… pkg :external)  → external symbols only
+;;;   (… pkg t)          → accessible symbols (present + inherited)
+;;; from which internal = present \ external and inherited = accessible \ present.
+
+(defun bliss-internal::%package-iterator-tuples (packages symbol-types)
+  ;; PACKAGES is a single package designator or a list of them. Returns a list
+  ;; of (symbol access-type package) triples for the requested SYMBOL-TYPES.
+  (let ((pkgs (if (listp packages) packages (list packages)))
+        (result nil))
+    (dolist (pd pkgs result)
+      (let* ((p (find-package pd)))
+        (when p
+          (let ((present (bliss-internal::package-symbols p nil))
+                (external (bliss-internal::package-symbols p :external))
+                (accessible (bliss-internal::package-symbols p t)))
+            (when (member :external symbol-types)
+              (dolist (s external) (push (list s :external p) result)))
+            (when (member :internal symbol-types)
+              (dolist (s present)
+                (unless (member s external) (push (list s :internal p) result))))
+            (when (member :inherited symbol-types)
+              (dolist (s accessible)
+                (unless (member s present) (push (list s :inherited p) result))))))))))
+
+(defmacro with-package-iterator ((name package-list-form &rest symbol-types) &body body)
+  (unless symbol-types
+    (error "WITH-PACKAGE-ITERATOR requires at least one symbol-type (:internal, :external, or :inherited)"))
+  (dolist (st symbol-types)
+    (unless (member st '(:internal :external :inherited))
+      (error "WITH-PACKAGE-ITERATOR: invalid symbol-type ~S" st)))
+  (let ((tuples (gensym "TUPLES"))
+        (tup (gensym "TUP")))
+    `(let ((,tuples (bliss-internal::%package-iterator-tuples
+                     ,package-list-form ',symbol-types)))
+       (macrolet ((,name ()
+                    '(if ,tuples
+                         (let ((,tup (pop ,tuples)))
+                           (values t (first ,tup) (second ,tup) (third ,tup)))
+                         (values nil nil nil nil))))
+         ,@body))))
+
+(defun find-all-symbols (string-designator)
+  (let ((name (string string-designator))
+        (result nil))
+    (dolist (p (list-all-packages) result)
+      (multiple-value-bind (sym access) (find-symbol name p)
+        (when (and access (not (eq access :inherited)))
+          (pushnew sym result))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Standard reader/printer control variables and WITH-STANDARD-IO-SYNTAX.
