@@ -1823,7 +1823,13 @@ fn macro_ecase_and_etypecase_error_on_fall_through() {
 
 #[test]
 fn macro_ignore_errors_returns_nil_on_error() {
-    assert_eq!(eval_ok("(ignore-errors (error \"boom\"))"), "NIL");
+    // IGNORE-ERRORS returns TWO values on error: NIL and the condition (CLHS;
+    // bliss-xy7t). eval_ok renders every returned value, so the caught SIMPLE-ERROR
+    // shows as the secondary value.
+    assert_eq!(
+        eval_ok("(ignore-errors (error \"boom\"))"),
+        "NIL\n#<SIMPLE-ERROR>"
+    );
     assert_eq!(eval_ok("(ignore-errors (+ 1 2))"), "3");
 }
 

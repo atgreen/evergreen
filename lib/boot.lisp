@@ -1198,6 +1198,14 @@
          (when ic-cell
            (fill-md-array-from-contents arr dimensions (car (cdr ic-cell))))
          arr))
+      ;; Rank-0 array (dimensions = NIL): a single-element MD array. Its lone
+      ;; element is the :initial-contents object itself (not a sequence) when
+      ;; given, else the :initial-element, else NIL (bliss-30be: ansi-test
+      ;; universe.lsp builds (make-array nil)).
+      ((null dimensions)
+       (%make-md-array nil (cond (ic-cell (car (cdr ic-cell)))
+                                 (iel-cell (car (cdr iel-cell)))
+                                 (t nil))))
       ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.

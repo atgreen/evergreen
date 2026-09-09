@@ -1117,6 +1117,43 @@ pub fn set_elt(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), 
     })
 }
 
+/// Read an array element the way AREF does — like `elt`, except that on a
+/// complex (fill-pointer) vector AREF **ignores the fill pointer** and may
+/// access any element up to the total allocated size (CLHS AREF: "aref ignores
+/// fill pointers"). `elt` bounds against the fill pointer; AREF bounds against
+/// the capacity. All other sequence kinds behave identically to `elt`.
+pub fn aref(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
+    if is_complex_vector(sequence) {
+        let cap = cvec_capacity(sequence);
+        if index >= cap {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("index {} in bounds (length {})", index, cap),
+            });
+        }
+        return Ok(vector_elt(cvec_storage(sequence), index));
+    }
+    elt(sequence, index)
+}
+
+/// Store an array element the way `(SETF AREF)` does — like `set_elt`, except
+/// that on a complex (fill-pointer) vector AREF ignores the fill pointer and
+/// bounds against the total allocated size (see `aref`).
+pub fn set_aref(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), BlissError> {
+    if is_complex_vector(sequence) {
+        let cap = cvec_capacity(sequence);
+        if index >= cap {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("index {} in bounds (length {})", index, cap),
+            });
+        }
+        vector_set_elt(cvec_storage(sequence), index, value);
+        return Ok(());
+    }
+    set_elt(sequence, index, value)
+}
+
 /// Copy a sequence (CL `COPY-SEQ`).
 pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
     if sequence.is_nil() {

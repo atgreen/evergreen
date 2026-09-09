@@ -1982,12 +1982,14 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
-            } else if let Some((mut seq, mut index)) = aref_setf_place(place) {
+            } else if let Some((prim, mut seq, mut index)) = aref_setf_place(place) {
                 // `(setf (aref|svref|char|schar|row-major-aref|elt seq i) val)` →
-                // the internal store primitive BLISS::SET-AREF (seq, index, value).
+                // the internal store primitive (seq, index, value). ELT lowers to
+                // SET-ELT (fill-pointer-bounded), the AREF family to SET-AREF
+                // (total-size-bounded) — see aref_setf_place (bliss-30be).
                 bliss_rt::rooted_ref!(_seq_root = &mut seq);
                 bliss_rt::rooted_ref!(_index_root = &mut index);
-                let sym = resolve_sym("BLISS::SET-AREF")
+                let sym = resolve_sym(prim)
                     .ok_or(Bail)?
                     .as_symbol_index();
                 self.lower_expr(seq)?;
@@ -4789,7 +4791,10 @@ fn symbol_function_setf_place(place: BlissVal) -> Option<BlissVal> {
     Some(arg)
 }
 
-fn aref_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
+/// Returns `(store-primitive, seq, index)`. ELT respects the fill pointer, so it
+/// lowers to `BLISS::SET-ELT`; the AREF family ignores it and lowers to
+/// `BLISS::SET-AREF` (bliss-30be — the two differ on fill-pointer vectors).
+fn aref_setf_place(place: BlissVal) -> Option<(&'static str, BlissVal, BlissVal)> {
     if !place.is_cons() {
         return None;
     }
@@ -4798,8 +4803,9 @@ fn aref_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
         return None;
     }
     match symbol_bare_name(&sym_name(items[0])).as_str() {
-        "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "ELT" | "BIT" | "SBIT" => {
-            Some((items[1], items[2]))
+        "ELT" => Some(("BLISS::SET-ELT", items[1], items[2])),
+        "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
+            Some(("BLISS::SET-AREF", items[1], items[2]))
         }
         _ => None,
     }

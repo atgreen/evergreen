@@ -559,6 +559,33 @@ fn sync_package_value_cell(canonical_name: &str) {
     }
 }
 
+/// The current package as CL code sees it — the dynamic value of `*PACKAGE*`
+/// when it names a live package, else the `env.current_package` field.
+///
+/// A user `(let ((*package* p)) …)` (or PROGV) rebinds `*PACKAGE*` through its
+/// value cell but does NOT touch `env.current_package`; the forward sync
+/// (`sync_package_value_cell`) only pushes the field into the cell, never back.
+/// Package operations that default to "the current package"
+/// (INTERN/SHADOW/IMPORT/EXPORT/USE-PACKAGE/…) must therefore read the cell, or
+/// a LET of `*PACKAGE*` silently targets the wrong package — e.g. ansi-test's
+/// `cl-test-package.lsp` does all its SHADOW/IMPORT/EXPORT inside
+/// `(let ((*package* pkg)) …)`, so without this its `(shadow 'handler-case)`
+/// landed in COMMON-LISP-USER and the shadow never took effect (bliss-30be).
+/// Mirrors the cell-first lookup the file loader already uses to pick up an
+/// ASDF-style LET of *PACKAGE*.
+fn effective_package_name(env: &mut Env) -> String {
+    let cell_val =
+        resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()));
+    let pkg_val = cell_val.or_else(|| env.lookup_var("*PACKAGE*"));
+    if let Some(pkg_val) = pkg_val {
+        let name = resolve_package_name(env, &val_as_str(pkg_val));
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    env.current_package.clone()
+}
+
 /// The canonical package object for `canonical_name` (nicknames resolved first).
 /// Find-or-create against the registry, so `*PACKAGE*` and package designators
 /// always yield an object; interned by the registry: same name ⇒ same handle.
@@ -12235,8 +12262,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                             "SETF ELT: index past end of list".into(),
                                         ));
                                     }
-                                } else {
+                                } else if acc == "ELT" {
+                                    // (setf (elt v i)) respects the fill pointer.
                                     bliss_stdlib::set_elt(seq, i, *val)?;
+                                } else {
+                                    // (setf (aref v i)) ignores the fill pointer,
+                                    // bounding against total size (bliss-30be).
+                                    bliss_stdlib::set_aref(seq, i, *val)?;
                                 }
                             }
                             "FILL-POINTER" => {
@@ -12670,7 +12702,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         expected: "non-negative array index".into(),
                     });
                 }
-                return bliss_stdlib::elt(arr, idx.as_fixnum() as usize);
+                // AREF ignores fill pointers — it may read any element up to the
+                // total size, not just the active prefix ELT bounds against
+                // (CLHS AREF; bliss-30be). SVREF/BIT/SBIT hit non-complex arrays
+                // so `aref` delegates to `elt` for them.
+                return bliss_stdlib::aref(arr, idx.as_fixnum() as usize);
             }
             "VECTOR" => {
                 // (vector &rest elements) → a fresh simple-vector.
@@ -12943,7 +12979,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         dims.iter().map(|&d| BlissVal::from_fixnum(d as i64)).collect();
                     return Ok(vec_to_list(&dim_vals));
                 }
-                let len = bliss_stdlib::length(*v)? as i64;
+                // Rank-1: the dimension is the TOTAL size — the backing capacity
+                // for a fill-pointer / adjustable vector, not its active length
+                // (bliss-30be, matching ARRAY-DIMENSION).
+                let len = if bliss_stdlib::is_complex_vector(*v) {
+                    bliss_stdlib::cvec_capacity(*v) as i64
+                } else {
+                    bliss_stdlib::length(*v)? as i64
+                };
                 return Ok(vec_to_list(&[BlissVal::from_fixnum(len)]));
             }
             "ARRAY-DIMENSION" => {
@@ -12968,6 +13011,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(BlissError::Internal(format!(
                         "ARRAY-DIMENSION: axis {axis} out of range for a rank-1 array"
                     )));
+                }
+                // A rank-1 dimension is the TOTAL size, not the active length: for
+                // a fill-pointer / adjustable vector ARRAY-DIMENSION returns the
+                // backing capacity (like ARRAY-TOTAL-SIZE), while LENGTH follows
+                // the fill pointer (bliss-30be).
+                if bliss_stdlib::is_complex_vector(*av) {
+                    return Ok(BlissVal::from_fixnum(bliss_stdlib::cvec_capacity(*av) as i64));
                 }
                 let len = bliss_stdlib::length(*av)? as i64;
                 return Ok(BlissVal::from_fixnum(len));
@@ -13120,11 +13170,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // Re-read from the rooted args: set_gethash may rehash/allocate.
                 return Ok(args.first().copied().unwrap_or(NIL));
             }
-            "BLISS::SET-AREF" => {
+            "BLISS::SET-AREF" | "BLISS::SET-ELT" => {
                 // Store primitive for bytecode-lowered `(setf (aref|svref|char|
                 // schar|row-major-aref|elt seq index) value)`. Arguments arrive
                 // already evaluated (seq, index, value); the element is mutated in
-                // place and the value returned (SETF semantics).
+                // place and the value returned (SETF semantics). SET-AREF ignores
+                // the fill pointer on a complex vector (bounds against total size);
+                // SET-ELT respects it. They differ only at the vector store below
+                // (bliss-30be).
+                let is_elt = name == "BLISS::SET-ELT";
                 let args = eval_args(cdr, env)?;
                 let seq = args.first().copied().unwrap_or(NIL);
                 let idx = args.get(1).copied().unwrap_or(NIL);
@@ -13157,8 +13211,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
                         }
                     }
-                } else {
+                } else if is_elt {
                     bliss_stdlib::set_elt(seq, i, val)?;
+                } else {
+                    bliss_stdlib::set_aref(seq, i, val)?;
                 }
                 // Re-read from the rooted args: the store may have allocated.
                 return Ok(args.get(2).copied().unwrap_or(NIL));
@@ -15108,8 +15164,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     i += 2;
                 }
                 let out_path = out_path.unwrap_or_else(|| {
-                    let stem = src_path.strip_suffix(".lisp").unwrap_or(&src_path);
-                    format!("{stem}.bfasl")
+                    // CLHS 3.2.3: COMPILE-FILE's default output MUST equal
+                    // (COMPILE-FILE-PATHNAME input). Match COMPILE-FILE-PATHNAME
+                    // below exactly — strip `.lisp` OR `.lsp`, append `.fasl` —
+                    // or `compile-and-load` (ansi-test, which compiles a `.lsp`
+                    // then LOADs compile-file-pathname's result) fails to find
+                    // the artifact (bliss-30be).
+                    let stem = src_path
+                        .strip_suffix(".lisp")
+                        .or_else(|| src_path.strip_suffix(".lsp"))
+                        .unwrap_or(&src_path);
+                    format!("{stem}.fasl")
                 });
                 let source = std::fs::read_to_string(&src_path).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
@@ -15977,7 +16042,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "BLISS-INTERNAL::PACKAGE-SYMBOLS" | "BLISS-INTERNAL:PACKAGE-SYMBOLS" => {
                 let args = eval_args(cdr, env)?;
                 let package = if args.is_empty() {
-                    env.current_package.clone()
+                    effective_package_name(env)
                 } else {
                     normalize_package_name(&val_as_str(args[0]))
                 };
@@ -16008,7 +16073,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let raw = val_as_str(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
-                    env.current_package.clone()
+                    effective_package_name(env)
                 };
                 // ensure_package_available creates the target if needed and adds
                 // each named package to its use-list (creating a placeholder for
@@ -16075,7 +16140,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let raw = val_as_str(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
-                    env.current_package.clone()
+                    effective_package_name(env)
                 };
                 // ANSI INTERN 2nd value: an EXISTING symbol reports its actual
                 // accessibility (:INTERNAL/:EXTERNAL/:INHERITED); a freshly created
@@ -16117,7 +16182,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg_name = if args.len() > 1 {
                     normalize_package_name(&val_as_str(args[1]))
                 } else {
-                    env.current_package.clone()
+                    effective_package_name(env)
                 };
                 ensure_package_available(env, &pkg_name, &[]);
                 let sym_vals: Vec<BlissVal> = if symbols.is_cons() {
@@ -16163,7 +16228,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg_name = if args.len() > 1 {
                     normalize_package_name(&val_as_str(args[1]))
                 } else {
-                    env.current_package.clone()
+                    effective_package_name(env)
                 };
                 ensure_package_available(env, &pkg_name, &[]);
                 let mut names = Vec::new();
@@ -16191,7 +16256,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg_name = if args.len() > 1 {
                     normalize_package_name(&val_as_str(args[1]))
                 } else {
-                    env.current_package.clone()
+                    effective_package_name(env)
                 };
                 let name = symbol_bare_name(&val_as_str(symbol));
                 let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
@@ -16231,7 +16296,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .get(1)
                     .filter(|v| !v.is_nil())
                     .map(|v| resolve_package_name(env, &val_as_str(*v)))
-                    .unwrap_or_else(|| env.current_package.clone());
+                    .unwrap_or_else(|| effective_package_name(env));
                 let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
                     return Err(BlissError::PackageError(format!(
                         "GENTEMP: no package named {pkg_name}"

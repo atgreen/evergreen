@@ -641,6 +641,53 @@ fn eval_handler_bind_invokes_handler() {
     );
 }
 
+#[test]
+fn aref_ignores_fill_pointer() {
+    // CLHS: AREF ignores fill pointers — it may access any element up to the
+    // total size, and (SETF AREF) likewise. ARRAY-DIMENSION/ARRAY-DIMENSIONS
+    // report the total size, while ELT/LENGTH follow the fill pointer. bliss-30be:
+    // previously AREF delegated to ELT and errored at any index >= fill pointer,
+    // which broke ansi-test universe.lsp's fill-pointer bit vectors.
+    let expr = "(let ((v (make-array 5 :fill-pointer 3 :initial-element 0)))
+                  (setf (aref v 4) 9)
+                  (princ (list (aref v 4) (length v)
+                               (array-dimension v 0) (array-dimensions v))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(9 3 5 (5))"),
+        "AREF must reach past the fill pointer and dimensions report total size, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn shadow_honors_let_bound_package() {
+    // A user `(let ((*package* pkg)) (shadow ...))` must shadow in PKG, not in
+    // the lexically-enclosing package: package operations read the dynamic value
+    // of *PACKAGE*, not a stale env field (bliss-30be). ansi-test's
+    // cl-test-package.lsp does all its SHADOW/IMPORT/EXPORT inside such a LET.
+    let expr = "(progn
+                  (make-package :zztest :use (list :cl))
+                  (let ((*package* (find-package :zztest))) (shadow 'foo))
+                  (princ (package-shadowing-symbols (find-package :zztest))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_uppercase().contains("FOO"),
+        "SHADOW under a LET of *PACKAGE* must record FOO in ZZTEST's shadowing list, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CLOS (defclass / defmethod)
 // ══════════════════════════════════════════════════════════════════
