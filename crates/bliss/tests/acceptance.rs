@@ -1008,6 +1008,32 @@ fn fixed_arity_builtins_signal_program_error_on_wrong_count() {
 }
 
 #[test]
+fn member_assoc_nonlist_signal_type_error() {
+    // MEMBER's list and ASSOC's alist must be proper lists; a non-list (or an
+    // improper tail reached without a match) is a TYPE-ERROR (CLHS; ansi-test
+    // member.error/assoc.error, check-type-error over non-lists). Valid and
+    // dotted-before-match calls still work.
+    let expr = "(princ (list
+                  (typep (nth-value 1 (ignore-errors (member 'a 1.3))) 'type-error)
+                  (typep (nth-value 1 (ignore-errors (member 'z '(a b . c)))) 'type-error)
+                  (typep (nth-value 1 (ignore-errors (assoc 'a 1.3))) 'type-error)
+                  (member 'b '(a b c))
+                  (member 'a '(a b . c))
+                  (assoc 'b '((a . 1) nil (b . 2)))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(T T T (B C) (A B . C) (B . 2))"),
+        "MEMBER/ASSOC non-list must signal TYPE-ERROR, valid calls unaffected, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).

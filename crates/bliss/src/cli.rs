@@ -13668,6 +13668,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (_, next) = cp(*c);
                     *c = next;
                 }
+                // MEMBER's LIST argument must be a proper list: a non-list (or an
+                // improper/dotted tail reached without a match) is a TYPE-ERROR
+                // (CLHS; ansi-test member.error, check-type-error over non-lists).
+                if !c.is_nil() {
+                    return Err(BlissError::TypeError {
+                        datum: *c,
+                        expected: "list".into(),
+                    });
+                }
                 return Ok(NIL);
             }
             "ASSOC" => {
@@ -13720,6 +13729,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     let (_, next) = cp(*c);
                     *c = next;
+                }
+                // ASSOC's ALIST must be a proper list of pairs: a non-list / improper
+                // tail is a TYPE-ERROR (CLHS; ansi-test assoc.error).
+                if !c.is_nil() {
+                    return Err(BlissError::TypeError {
+                        datum: *c,
+                        expected: "list".into(),
+                    });
                 }
                 return Ok(NIL);
             }
