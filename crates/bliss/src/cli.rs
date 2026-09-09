@@ -11020,9 +11020,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if let Some(mdef) = lookup_macro(env, &name)
                         .or_else(|| lookup_macro(env, &symbol_bare_name(&name)))
                     {
-                        // A first-class expander round-trips (bliss-fo0o);
-                        // source/bytecode macros keep the legacy T boolean.
-                        return Ok(mdef.function.unwrap_or(T));
+                        // A first-class expander installed via
+                        // (setf (macro-function name) fn) round-trips (bliss-fo0o).
+                        if let Some(f) = mdef.function {
+                            return Ok(f);
+                        }
+                        // Source / bytecode macros have no stored function object.
+                        // Synthesize a genuine two-argument (form environment)
+                        // expander per CLHS 3.1.2.1.2.2 so (funcall (macro-function
+                        // 'NAME) …) enforces the exact arity — a wrong count trips
+                        // the lambda-list binder's PROGRAM-ERROR (bliss-l6y9) — and,
+                        // called correctly, expands the form. ansi-test's
+                        // def-macro-test (push/pop/pushnew/remf.error) funcalls it
+                        // with 0/1/3 args expecting PROGRAM-ERROR (bliss-t5m5).
+                        // Build (LAMBDA (#:form #:env) (MACROEXPAND-1 #:form)) and
+                        // evaluate it to a closure. Two REQUIRED params give the
+                        // CLHS 2-argument arity; the body uses the one-argument
+                        // MACROEXPAND-1 (its optional-environment arm is a separate
+                        // gap) and ignores #:env. Root every freshly built piece
+                        // across the allocating vec_to_list / eval (moving GC).
+                        let lam = resolve_sym("LAMBDA").unwrap_or(NIL);
+                        let mexp = resolve_sym("MACROEXPAND-1").unwrap_or(NIL);
+                        let decl = resolve_sym("DECLARE").unwrap_or(NIL);
+                        let ignore = resolve_sym("IGNORE").unwrap_or(NIL);
+                        bliss_rt::rooted!(form_p = gensym_symbol("FORM"));
+                        bliss_rt::rooted!(env_p = gensym_symbol("ENV"));
+                        bliss_rt::rooted!(params = vec_to_list(&[*form_p, *env_p]));
+                        bliss_rt::rooted!(ign_clause = vec_to_list(&[ignore, *env_p]));
+                        bliss_rt::rooted!(decl_form = vec_to_list(&[decl, *ign_clause]));
+                        bliss_rt::rooted!(body = vec_to_list(&[mexp, *form_p]));
+                        bliss_rt::rooted!(lambda_form = vec_to_list(&[lam, *params, *decl_form, *body]));
+                        return eval_form(*lambda_form, env);
                     }
                 }
                 return Ok(NIL);
