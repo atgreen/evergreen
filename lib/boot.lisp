@@ -309,26 +309,33 @@
 
 (defmacro check-type (place typespec &rest ignore)
   (declare (ignore ignore))
-  ;; ANSI: signal a correctable TYPE-ERROR with a STORE-VALUE restart that
-  ;; supplies a new value for PLACE. Returns NIL when PLACE already conforms.
-  `(unless (typep ,place ',typespec)
-     (restart-case
-         (error 'type-error :datum ,place :expected-type ',typespec)
-       (store-value (value) (setf ,place value)))))
+  ;; ANSI (CLHS 9.1): signal a correctable TYPE-ERROR with a STORE-VALUE restart
+  ;; that supplies a new value for PLACE; after STORE-VALUE, re-test PLACE and
+  ;; re-signal if it still does not conform. Always returns NIL.
+  `(progn
+     (loop until (typep ,place ',typespec)
+           do (restart-case
+                  (error 'type-error :datum ,place :expected-type ',typespec)
+                (store-value (value) (setf ,place value))))
+     nil))
 
 (defmacro assert (test-form &rest more)
-  ;; (assert test [(place*) [datum arg*]]) — honor the report format when one
-  ;; is given (CLHS 9.2): ASDF's stamp asserts carry the failing action's
-  ;; description, which an opaque "ASSERT failed" hid (bliss-kfhp). The places
-  ;; list and interactive restart are still not implemented.
+  ;; (assert test [(place*) [datum arg*]]) — CLHS 9.2. Signal a correctable
+  ;; error with a CONTINUE restart; when CONTINUE is invoked, re-evaluate
+  ;; TEST-FORM and, if still false, re-signal. Always returns NIL. A DATUM (a
+  ;; condition type, a condition, or a format control) selects the condition
+  ;; type; otherwise a SIMPLE-ERROR is signalled. The optional PLACES list and
+  ;; the interactive restart values are still not implemented.
   (let ((datum (second more))
         (args (cddr more)))
-    `(if ,test-form
-         t
-         ,(if datum
-              `(error (format nil "ASSERT failed: ~S: ~A" ',test-form
-                              (format nil ,datum ,@args)))
-              `(error (format nil "ASSERT failed: ~S" ',test-form))))))
+    `(loop until ,test-form
+           do (restart-case
+                  ,(if datum
+                       `(error ,datum ,@args)
+                       `(error 'simple-error
+                               :format-control "Assertion failed: ~S"
+                               :format-arguments (list ',test-form)))
+                (continue () :report "Retry assertion." nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CLOS convenience macros and standard condition accessors.
@@ -379,6 +386,30 @@
 (defun cell-error-name (c) (slot-value c 'name))
 (defun unbound-slot-instance (c) (slot-value c 'instance))
 (defun package-error-package (c) (slot-value c 'package))
+
+;; FORMATTER (CLHS 22.3.9.3) — return a function equivalent to the control
+;; string, callable as (fn stream &rest args). FORMAT accepts such a function as
+;; its control string. The "unconsumed arguments" return value is approximated
+;; as NIL (all arguments are consumed by the embedded FORMAT).
+(defmacro formatter (control-string)
+  `(lambda (%formatter-stream &rest %formatter-args)
+     (apply #'format %formatter-stream ,control-string %formatter-args)
+     nil))
+
+;; INVOKE-DEBUGGER (CLHS 9.1). *DEBUGGER-HOOK*, when bound to a function, is
+;; called with the condition and the hook function itself, with *DEBUGGER-HOOK*
+;; rebound to NIL for the duration. If the hook returns normally (or there is
+;; none) we have no interactive debugger in batch mode, so the condition is
+;; re-signalled. The single required parameter makes (invoke-debugger) and
+;; (invoke-debugger c nil) PROGRAM-ERRORs (invoke-debugger.error.1/2), and
+;; funcalling a wrong-arity hook is a PROGRAM-ERROR too (error.3-5).
+(defvar *debugger-hook* nil)
+(defun invoke-debugger (condition)
+  (let ((hook *debugger-hook*))
+    (when hook
+      (let ((*debugger-hook* nil))
+        (funcall hook condition hook))))
+  (error condition))
 
 ;; String-producing printers, built on FORMAT now that ~A/~S print lists.
 (defun princ-to-string (x) (format nil "~a" x))
@@ -844,14 +875,14 @@
     (when r (invoke-restart r))))
 
 (defun abort (&optional condition)
-  "Invoke the most recent ABORT restart; signal an error if none is active."
+  "Invoke the most recent ABORT restart; signal CONTROL-ERROR if none is active."
   (let ((r (find-restart 'abort condition)))
-    (if r (invoke-restart r) (error "no ABORT restart is active"))))
+    (if r (invoke-restart r) (error 'control-error))))
 
 (defun muffle-warning (&optional condition)
-  "Invoke the most recent MUFFLE-WARNING restart; error if none is active."
+  "Invoke the most recent MUFFLE-WARNING restart; CONTROL-ERROR if none active."
   (let ((r (find-restart 'muffle-warning condition)))
-    (if r (invoke-restart r) (error "no MUFFLE-WARNING restart is active"))))
+    (if r (invoke-restart r) (error 'control-error))))
 
 (defun store-value (value &optional condition)
   "Invoke the most recent STORE-VALUE restart with VALUE, or NIL if none."

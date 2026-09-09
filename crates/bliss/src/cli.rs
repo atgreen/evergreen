@@ -1134,6 +1134,10 @@ struct Env {
     current_package: String,
     sandbox: bool,
     restarts: Vec<RestartEntry>,
+    /// Active WITH-CONDITION-RESTARTS associations, innermost last: each entry
+    /// maps a condition to the ids of the restarts associated with it for the
+    /// dynamic extent of the WITH-CONDITION-RESTARTS body (CLHS 9.1).
+    condition_restarts: Vec<(BlissVal, Vec<u64>)>,
     handlers: Vec<HandlerCluster>,
     /// Multiple values from last (values ...) or (floor ...) call
     mv: Vec<BlissVal>,
@@ -1317,6 +1321,40 @@ struct RestartEntry {
     interactive_function: Option<RestartFunction>,
     test_function: Option<RestartFunction>,
     unwind_on_invoke: bool,
+    /// The `env.restarts` length at the point the establishing construct
+    /// (RESTART-CASE / WITH-SIMPLE-RESTART / CERROR / …) began. When an
+    /// `unwind_on_invoke` restart fires, its clause body must run in the
+    /// dynamic environment *outside* that construct, so the restart stack is
+    /// truncated to this depth first — otherwise a clause that re-invokes the
+    /// same-named restart re-finds itself and recurses forever (restart-case.12).
+    group_base: usize,
+    /// A process-unique id identifying this specific restart binding, so a
+    /// restart *object* (from FIND-RESTART / COMPUTE-RESTARTS) can be mapped back
+    /// to it and WITH-CONDITION-RESTARTS can associate it with a condition.
+    id: u64,
+    /// The first-class RESTART object exposing this entry (created lazily; NIL
+    /// until first requested). Cloning the entry copies the same heap handle, so
+    /// object identity is stable (COMPUTE-RESTARTS.3's `eq`).
+    restart_obj: BlissVal,
+    /// A REPORT string (or report function) for the restart, used when the
+    /// restart object is printed with *print-escape* NIL (RESTART-CASE.20).
+    report: BlissVal,
+}
+
+thread_local! {
+    static NEXT_RESTART_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// One-shot: the restart ids that the NEXT `signal_condition_object` call
+    /// should associate with the condition it signals — set by
+    /// `eval_restart_case` when the restart-case body is a signalling form.
+    static PENDING_SIGNAL_RESTART_IDS: RefCell<Option<Vec<u64>>> = const { RefCell::new(None) };
+}
+
+fn next_restart_id() -> u64 {
+    NEXT_RESTART_ID.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    })
 }
 
 #[derive(Clone)]
@@ -2820,6 +2858,35 @@ fn take_control_value(token: &str) -> BlissVal {
     CONTROL_VALUES.with(|values| values.borrow_mut().remove(token).unwrap_or(NIL))
 }
 
+/// Stash the primary value AND the full multiple-value list produced by an
+/// invoked (unwinding) restart clause, so the establishing RESTART-CASE can
+/// republish them as its own values (RESTART-CASE.16, WITH-SIMPLE-RESTART.5).
+/// The value list is wrapped in a leading cons (`(T . values)`) so its presence
+/// is unambiguous even when the clause returned zero values.
+fn store_restart_result(name: &str, result: BlissVal, env: &Env) {
+    store_control_value(&format!("RESTART-RESULT:{name}"), result);
+    let values = if env.mv_active {
+        env.mv.clone()
+    } else {
+        vec![result]
+    };
+    bliss_rt::rooted!(list = vec_to_list(&values));
+    let token = format!("RESTART-MV:{name}");
+    store_control_value(&token, arena_cons(T, *list));
+}
+
+/// Retrieve a restart clause's stashed values (see `store_restart_result`),
+/// republishing the multiple-value state on `env`, and return the primary value.
+fn take_restart_result(name: &str, env: &mut Env) -> BlissVal {
+    let result = take_control_value(&format!("RESTART-RESULT:{name}"));
+    let wrapped = take_control_value(&format!("RESTART-MV:{name}"));
+    if wrapped.is_cons() {
+        let values = list_to_vec(cp(wrapped).1);
+        env.set_mv(values);
+    }
+    result
+}
+
 fn handler_case_token(error: &BlissError) -> Option<String> {
     let BlissError::Internal(message) = error else {
         return None;
@@ -3035,32 +3102,77 @@ fn build_condition_instance_impl(
     let class = ensure_condition_class_registered(env, type_name)?;
     let slot_specs = condition_slot_specs(env, type_name);
     let mut initargs = Vec::new();
+    bliss_rt::rooted_ref!(_initargs_root = &mut initargs);
     let mut seen_initargs = Vec::new();
+    // Slots already given a value: the leftmost initarg for a slot wins (CLHS
+    // 7.1.4; CONDITION-9-SLOTS.4/6), and one initarg may fill several slots
+    // (CONDITION-6's :both-slots).
+    let mut set_slots: Vec<String> = Vec::new();
+    let mut fill_slot = |initargs: &mut Vec<BlissVal>,
+                         set_slots: &mut Vec<String>,
+                         slot_name: &str,
+                         val: BlissVal| {
+        if !set_slots.iter().any(|s| s == slot_name) {
+            set_slots.push(slot_name.to_string());
+            initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
+            initargs.push(val);
+        }
+    };
     let mut i = 0;
     while i + 1 < initarg_pairs.len() {
         let key = initarg_pairs[i];
         let val = initarg_pairs[i + 1];
         let key_name = symbol_bare_name(&sym_name(key));
-        let slot_name = slot_specs
-            .iter()
-            .find(|(_, initarg)| initarg == &key_name)
-            .map(|(slot_name, _)| slot_name.clone())
-            .unwrap_or_else(|| key_name.clone());
-        seen_initargs.push(key_name);
-        initargs.push(resolve_sym(&slot_name).unwrap_or(NIL));
-        initargs.push(val);
+        seen_initargs.push(key_name.clone());
+        let mut matched = false;
+        for (slot_name, initarg) in &slot_specs {
+            if initarg == &key_name {
+                matched = true;
+                fill_slot(&mut initargs, &mut set_slots, slot_name, val);
+            }
+        }
+        if !matched {
+            // An initarg matching no slot :initarg is still passed through as its
+            // bare-named symbol (an INITIALIZE-INSTANCE &key may consume it).
+            fill_slot(&mut initargs, &mut set_slots, &key_name, val);
+        }
         i += 2;
     }
-    for (initarg_name, default_value) in condition_default_initargs(env, type_name) {
+    // :default-initargs supply forms that are EVALUATED (in the current dynamic
+    // environment) when no initarg for the slot was given (CLHS; CONDITION-20/24).
+    for (initarg_name, default_form) in condition_default_initargs(env, type_name) {
         if seen_initargs.iter().any(|seen| seen == &initarg_name) {
             continue;
         }
-        if let Some((slot_name, _)) = slot_specs
+        let matching_slots: Vec<String> = slot_specs
             .iter()
-            .find(|(_, initarg)| initarg == &initarg_name)
-        {
-            initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
-            initargs.push(default_value);
+            .filter(|(_, initarg)| initarg == &initarg_name)
+            .map(|(slot_name, _)| slot_name.clone())
+            .collect();
+        if matching_slots.is_empty() {
+            continue;
+        }
+        bliss_rt::rooted!(value = eval_form(default_form, env)?);
+        for slot_name in &matching_slots {
+            fill_slot(&mut initargs, &mut set_slots, slot_name, *value);
+        }
+    }
+    // Builtin condition slots with an ANSI :initform of NIL (SIMPLE-CONDITION's
+    // FORMAT-ARGUMENTS) default to NIL when not supplied, so their readers
+    // return NIL rather than signalling UNBOUND-SLOT (frob-simple-condition;
+    // ERROR.2/ERROR.3/CERROR.2).
+    {
+        let already_set: Vec<String> = initargs
+            .chunks_exact(2)
+            .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+            .collect();
+        for (slot_name, _) in &slot_specs {
+            if condition_slot_defaults_to_nil(slot_name)
+                && !already_set.iter().any(|s| s == slot_name)
+            {
+                initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
+                initargs.push(NIL);
+            }
         }
     }
     let instance = if pinned_gc {
@@ -3124,14 +3236,37 @@ fn eval_handler_impl(
 }
 
 fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    maybe_break_on_signals(condition, env)?;
+    // Root the condition for the whole signal: the handler loop below allocates
+    // heavily (handlers, re-signals), and the condition is compared by identity
+    // for the restart↔condition association — an unrooted copy would go stale
+    // and (worse) alias a later allocation, mis-associating restarts under a
+    // moving GC (restart-case.25 under GC stress).
+    bliss_rt::rooted!(condition = condition);
+    maybe_break_on_signals(*condition, env)?;
+    // Implicit restart-case↔condition association (CLHS 9.1): when the body of
+    // an enclosing RESTART-CASE is exactly this signalling call, its restarts are
+    // associated with the condition for the dynamic extent of the signal
+    // (restart-case.25-31, compute-restarts.9). The pending ids are a one-shot
+    // set by eval_restart_case; a nested (re-)signal sees None.
+    let pending_ids = PENDING_SIGNAL_RESTART_IDS.with(|c| c.borrow_mut().take());
+    let associated = pending_ids.is_some();
+    if let Some(ids) = pending_ids {
+        env.condition_restarts.push((*condition, ids));
+    }
     // Visit clusters newest-first; within a cluster try its handlers in source
     // order (first HANDLER-CASE clause wins). SIGNAL returns NIL if no handler
     // transfers control (R5.102).
+    let mut result = Ok(NIL);
     for ci in (0..env.handlers.len()).rev() {
-        run_handler_cluster(env, condition, ci)?;
+        if let Err(e) = run_handler_cluster(env, *condition, ci) {
+            result = Err(e);
+            break;
+        }
     }
-    Ok(NIL)
+    if associated {
+        env.condition_restarts.pop();
+    }
+    result
 }
 
 /// Run the handlers of the single cluster at `ci` against `condition`, in source
@@ -3938,7 +4073,13 @@ fn invoke_restart_function(
         } => {
             let mut restart_env = env.child_with_parent(Rc::clone(captured_frame));
             let function = eval_form(*function_form, &mut restart_env)?;
-            apply_function(function, args, &mut restart_env)
+            let r = apply_function(function, args, &mut restart_env)?;
+            // The clause body runs in a CHILD env, so a `(values …)` in it set
+            // restart_env.mv — propagate it so RESTART-CASE returns the clause's
+            // multiple values (RESTART-CASE.16, WITH-SIMPLE-RESTART.5).
+            env.mv = std::mem::take(&mut restart_env.mv);
+            env.mv_active = restart_env.mv_active;
+            Ok(r)
         }
         RestartFunction::Bytecode {
             function,
@@ -3959,13 +4100,129 @@ fn restart_applies(
     condition: Option<BlissVal>,
     env: &mut Env,
 ) -> Result<bool, BlissError> {
-    let Some(condition) = condition else {
-        return Ok(true);
-    };
+    // Condition-restart association (WITH-CONDITION-RESTARTS, CLHS 9.1): a
+    // restart associated with one or more conditions is visible, when a
+    // condition is supplied, only to a condition it is associated with. A
+    // restart associated with no condition is visible to all.
+    if let Some(condition) = condition {
+        let associated_with_any = env
+            .condition_restarts
+            .iter()
+            .any(|(_, ids)| ids.contains(&restart.id));
+        if associated_with_any {
+            let associated_with_c = env
+                .condition_restarts
+                .iter()
+                .any(|(c, ids)| *c == condition && ids.contains(&restart.id));
+            if !associated_with_c {
+                return Ok(false);
+            }
+        }
+    }
+    // The :test-function (if any) is always consulted, with the condition or
+    // NIL when none was supplied (CLHS restart :test-function; RESTART-CASE.19).
     let Some(test_function) = &restart.test_function else {
         return Ok(true);
     };
-    Ok(!invoke_restart_function(test_function, &[condition], env)?.is_nil())
+    let cond_arg = condition.unwrap_or(NIL);
+    Ok(!invoke_restart_function(test_function, &[cond_arg], env)?.is_nil())
+}
+
+// ── First-class restart objects ─────────────────────────────────
+// FIND-RESTART / COMPUTE-RESTARTS expose restarts as objects (instances of a
+// RESTART class) so RESTART-NAME works and same-named restarts stay distinct.
+// Each object caches back into its RestartEntry, so repeated lookups of one
+// restart return the same (eq) object (COMPUTE-RESTARTS.3).
+
+fn ensure_restart_class(env: &Env) -> Result<BlissVal, BlissError> {
+    let sym = resolve_sym("RESTART").unwrap_or(NIL);
+    if let Some(class) = bliss_stdlib::find_class(sym) {
+        return Ok(class);
+    }
+    let _ = env;
+    let class = next_stdlib_class_id();
+    let name_slot = resolve_sym("NAME").unwrap_or(NIL);
+    let id_slot = resolve_sym("%RESTART-ID").unwrap_or(NIL);
+    let report_slot = resolve_sym("%RESTART-REPORT").unwrap_or(NIL);
+    // Inherit STANDARD-OBJECT so the class is fully linked into the CLOS class
+    // table — an instance of a super-less class is not scanned/relocated like a
+    // normal STANDARD-OBJECT and is collected under a moving GC.
+    let supers: Vec<BlissVal> = resolve_sym("STANDARD-OBJECT")
+        .and_then(bliss_stdlib::find_class)
+        .into_iter()
+        .collect();
+    bliss_stdlib::define_class(sym, class, &supers, &[name_slot, id_slot, report_slot])?;
+    Ok(class)
+}
+
+fn make_restart_object(
+    env: &Env,
+    name: &str,
+    id: u64,
+    report: BlissVal,
+) -> Result<BlissVal, BlissError> {
+    let class = ensure_restart_class(env)?;
+    let initargs = [
+        resolve_sym("NAME").unwrap_or(NIL),
+        resolve_sym(name).unwrap_or(NIL),
+        resolve_sym("%RESTART-ID").unwrap_or(NIL),
+        BlissVal::from_fixnum(id as i64),
+        resolve_sym("%RESTART-REPORT").unwrap_or(NIL),
+        report,
+    ];
+    bliss_stdlib::make_instance(class, &initargs)
+}
+
+/// If `obj` is a RESTART object, return the id of the restart it names.
+fn restart_object_id(obj: BlissVal, env: &Env) -> Option<u64> {
+    if !bliss_stdlib::is_instance(obj) {
+        return None;
+    }
+    let names = instance_class_hierarchy_names(obj)?;
+    if !names.iter().any(|n| n == "RESTART") {
+        return None;
+    }
+    let id_slot = resolve_sym("%RESTART-ID")?;
+    let v = read_slot_value(obj, id_slot, env).ok()?;
+    v.is_fixnum().then(|| v.as_fixnum() as u64)
+}
+
+/// The restart object for `env.restarts[idx]`, created (and cached in the entry)
+/// on first request so its identity is stable.
+fn restart_obj_for(env: &mut Env, idx: usize) -> Result<BlissVal, BlissError> {
+    let existing = env.restarts[idx].restart_obj;
+    if !existing.is_nil() {
+        return Ok(existing);
+    }
+    let name = env.restarts[idx].name.clone();
+    let id = env.restarts[idx].id;
+    let report = env.restarts[idx].report;
+    let obj = make_restart_object(env, &name, id, report)?;
+    env.restarts[idx].restart_obj = obj;
+    Ok(obj)
+}
+
+/// Indices into `env.restarts` in COMPUTE-RESTARTS visibility order (most
+/// visible first): more recently established constructs first, but restarts of
+/// one construct in the order written (clause order). Restarts of a single
+/// construct form a contiguous run sharing `group_base`.
+fn restart_visibility_order(restarts: &[RestartEntry]) -> Vec<usize> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < restarts.len() {
+        let gb = restarts[i].group_base;
+        let mut j = i + 1;
+        while j < restarts.len() && restarts[j].group_base == gb {
+            j += 1;
+        }
+        runs.push((i, j));
+        i = j;
+    }
+    let mut order = Vec::with_capacity(restarts.len());
+    for &(start, end) in runs.iter().rev() {
+        order.extend(start..end);
+    }
+    order
 }
 
 fn invoke_primary_chain(
@@ -5086,6 +5343,11 @@ impl Env {
             if let Some(function) = &mut restart.test_function {
                 visit_restart_function_roots(function, state, visit);
             }
+            visit(&mut restart.restart_obj);
+            visit(&mut restart.report);
+        }
+        for (condition, _) in &mut self.condition_restarts {
+            visit(condition);
         }
         for cluster in &mut self.handlers {
             for entry in &mut cluster.entries {
@@ -5160,6 +5422,7 @@ impl Env {
             current_package: "COMMON-LISP-USER".to_string(),
             sandbox,
             restarts: Vec::new(),
+            condition_restarts: Vec::new(),
             handlers: Vec::new(),
             mv: Vec::new(),
             mv_active: false,
@@ -5400,6 +5663,7 @@ impl Env {
             current_package: self.current_package.clone(),
             sandbox: self.sandbox,
             restarts: self.restarts.clone(),
+            condition_restarts: self.condition_restarts.clone(),
             handlers: self.handlers.clone(),
             mv: self.mv.clone(),
             mv_active: self.mv_active,
@@ -5429,6 +5693,7 @@ impl Env {
             current_package: self.current_package.clone(),
             sandbox: self.sandbox,
             restarts: self.restarts.clone(),
+            condition_restarts: self.condition_restarts.clone(),
             handlers: self.handlers.clone(),
             mv: self.mv.clone(),
             mv_active: self.mv_active,
@@ -7100,18 +7365,54 @@ fn stdlib_print_object_hook(val: BlissVal, escape: bool) -> Option<String> {
     if !escape && bliss_stdlib::is_instance(val) && !PRINTING_OBJECT.with(|c| c.get()) {
         let ptr = PRINT_ENV.with(|c| c.get());
         if !ptr.is_null() {
+            // Root VAL: the allocations below (class-hierarchy walk, stream
+            // creation, report funcall) can fire a moving GC, which would leave
+            // this local copy stale and make the object look like a bare
+            // `#<HEAP-OBJECT>` (GC-stress reproduced exactly this).
+            bliss_rt::rooted!(val = val);
             // Safety: mirrors dispatch_print_object — the parked pointer is the
             // live print-entry Env; printing is single-threaded.
             let env = unsafe { &*ptr };
-            let is_condition = instance_class_hierarchy_names(val)
+            let is_condition = instance_class_hierarchy_names(*val)
                 .map(|ns| ns.iter().any(|n| n == "CONDITION"))
                 .unwrap_or(false);
             if is_condition {
                 PRINTING_OBJECT.with(|c| c.set(true));
-                let report = condition_report_string(env, val);
+                let report = condition_report_string(env, *val);
                 PRINTING_OBJECT.with(|c| c.set(false));
                 if let Some(report) = report {
                     return Some(report);
+                }
+            }
+            // A RESTART with escape NIL prints its :report (RESTART-CASE.20/22,
+            // RESTART-BIND.16): a string verbatim, a function applied to a stream.
+            let is_restart = instance_class_hierarchy_names(*val)
+                .map(|ns| ns.iter().any(|n| n == "RESTART"))
+                .unwrap_or(false);
+            if is_restart {
+                if let Some(report_slot) = resolve_sym("%RESTART-REPORT") {
+                    if let Ok(report) = read_slot_value(*val, report_slot, env) {
+                        if is_string_value(report) {
+                            return Some(val_as_str(report));
+                        }
+                        if !report.is_nil() {
+                            // Root REPORT across the allocating stream creation.
+                            bliss_rt::rooted!(report = report);
+                            // Safety: the parked pointer is the live &mut Env.
+                            let env_mut = unsafe { &mut *ptr };
+                            if let Ok(stream) = bliss_stdlib::make_string_output_stream(NIL) {
+                                bliss_rt::rooted!(stream = stream);
+                                PRINTING_OBJECT.with(|c| c.set(true));
+                                let r = apply_function(*report, &[*stream], env_mut);
+                                PRINTING_OBJECT.with(|c| c.set(false));
+                                if r.is_ok() {
+                                    if let Ok(s) = bliss_stdlib::get_output_stream_string(*stream) {
+                                        return Some(val_as_str(s));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8381,6 +8682,12 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
     }
 }
 
+/// Builtin condition slots whose ANSI slot definition has `:initform nil`, so
+/// MAKE-CONDITION leaves them bound to NIL when no initarg is supplied.
+fn condition_slot_defaults_to_nil(slot_name: &str) -> bool {
+    matches!(symbol_bare_name(slot_name).as_str(), "FORMAT-ARGUMENTS")
+}
+
 fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
     let mut specs = Vec::new();
     let type_name = symbol_bare_name(type_name);
@@ -8408,22 +8715,95 @@ fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
             if slot.is_cons() {
                 let (slot_name_form, opts_form) = cp(slot);
                 let slot_name = symbol_bare_name(&sym_name(slot_name_form));
-                let mut initarg = slot_name.clone();
+                // A slot may declare several :initarg options; each is a valid
+                // way to fill it (CONDITION-6/7). Emit one spec entry per initarg.
+                let mut initargs = Vec::new();
                 let opts = list_to_vec(opts_form);
                 let mut i = 0;
                 while i + 1 < opts.len() {
                     let opt_name = symbol_bare_name(&sym_name(opts[i]));
                     if opt_name == "INITARG" {
-                        initarg = symbol_bare_name(&sym_name(opts[i + 1]));
+                        initargs.push(symbol_bare_name(&sym_name(opts[i + 1])));
                     }
                     i += 2;
                 }
-                specs.push((slot_name, initarg));
+                if initargs.is_empty() {
+                    specs.push((slot_name.clone(), slot_name));
+                } else {
+                    for initarg in initargs {
+                        specs.push((slot_name.clone(), initarg));
+                    }
+                }
             }
         }
     }
 
     specs
+}
+
+/// The `:report` designator (a string, a function name, or a lambda form) from
+/// the DEFINE-CONDITION of `type_name`, if any (CLHS 9.3; CONDITION-16/17/18).
+fn condition_report_designator(env: &Env, type_name: &str) -> Option<BlissVal> {
+    let entry = condition_definition_entry(env, type_name)?;
+    // entry = (name parents slots options)
+    let (_, rest) = cp(entry);
+    let (_, rest2) = cp(rest);
+    let (_, rest3) = cp(rest2);
+    let (options_form, _) = cp(rest3);
+    for option in list_to_vec(options_form) {
+        if !option.is_cons() {
+            continue;
+        }
+        let (name_form, values_form) = cp(option);
+        if symbol_bare_name(&sym_name(name_form)) == "REPORT" && values_form.is_cons() {
+            return Some(cp(values_form).0);
+        }
+    }
+    None
+}
+
+/// Write `obj`'s DEFINE-CONDITION report to `stream`, returning true if a report
+/// was defined for its type. The report designator is a string (written
+/// verbatim), or a function of (condition stream).
+fn print_condition_defined_report(
+    obj: BlissVal,
+    stream: BlissVal,
+    env: &mut Env,
+) -> Result<bool, BlissError> {
+    if !bliss_stdlib::is_instance(obj) {
+        return Ok(false);
+    }
+    let Some(names) = instance_class_hierarchy_names(obj) else {
+        return Ok(false);
+    };
+    // Root OBJ / STREAM across the report designator eval + funcall below.
+    bliss_rt::rooted!(obj = obj);
+    bliss_rt::rooted!(stream = stream);
+    for tname in &names {
+        let Some(designator) = condition_report_designator(env, tname) else {
+            continue;
+        };
+        if is_string_value(designator) {
+            write_str_to(*stream, &val_as_str(designator))?;
+            return Ok(true);
+        }
+        bliss_rt::rooted!(desform = designator);
+        let function = if desform.is_symbol() {
+            let wrapped = arena_cons(
+                resolve_sym("FUNCTION").unwrap_or(NIL),
+                arena_cons(*desform, NIL),
+            );
+            eval_form(wrapped, env)?
+        } else if desform.is_cons() {
+            eval_form(*desform, env)?
+        } else {
+            return Ok(false);
+        };
+        bliss_rt::rooted!(function = function);
+        apply_function(*function, &[*obj, *stream], env)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, BlissVal)> {
@@ -8480,8 +8860,19 @@ fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<Bliss
         supers.push(ensure_condition_class_registered(env, &parent)?);
     }
 
+    // De-duplicate slot names: a slot with several :initarg options yields one
+    // spec entry per initarg (condition_slot_specs), but the class has one slot.
+    let mut seen_slots: Vec<String> = Vec::new();
     let slot_names: Vec<BlissVal> = condition_slot_specs(env, type_name)
         .into_iter()
+        .filter(|(slot_name, _)| {
+            if seen_slots.iter().any(|s| s == slot_name) {
+                false
+            } else {
+                seen_slots.push(slot_name.clone());
+                true
+            }
+        })
         .map(|(slot_name, _)| resolve_sym(&slot_name).unwrap_or(NIL))
         .collect();
     let class = next_stdlib_class_id();
@@ -8714,10 +9105,11 @@ fn vector_length_matches(size_args: &[BlissVal], object: BlissVal) -> bool {
 
 fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
     // A class metaobject used directly as a type specifier — e.g.
-    // `(typep ht (find-class 'hash-table))`. Class handles are neither symbols
-    // nor conses; `class_name` is non-NIL only for a registered class. OBJECT is
-    // of the type iff its class equals, or has as a precedence-list ancestor,
-    // that class (ansi-test hash-table.5).
+    // `(typep ht (find-class 'hash-table))` / `(typep cond (find-class 'foo))`.
+    // Class handles are neither symbols nor conses; `class_name` is non-NIL only
+    // for a registered class. OBJECT is of the type iff its class equals, or has
+    // as a precedence-list ancestor, that class (ansi-test hash-table.5,
+    // make-condition.2 — the CPL check covers condition instances too).
     if !type_spec.is_symbol() && !type_spec.is_cons() && !type_spec.is_nil() {
         if !bliss_stdlib::class_name(type_spec).is_nil() {
             let obj_class = bliss_stdlib::class_of(object);
@@ -9733,6 +10125,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "HANDLER-CASE"
             | "RESTART-BIND"
             | "RESTART-CASE"
+            | "WITH-CONDITION-RESTARTS"
             | "IGNORE-ERRORS"
             | "DESTRUCTURING-BIND"
             | "MULTIPLE-VALUE-BIND"
@@ -15472,6 +15865,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
             "RESTART-BIND" => return eval_restart_bind(cdr, env),
             "RESTART-CASE" => return eval_restart_case(cdr, env),
+            "WITH-CONDITION-RESTARTS" => return eval_with_condition_restarts(cdr, env),
             "SIGNAL" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
@@ -15481,14 +15875,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let initargs = &args[1..];
                 // (signal datum &rest args): a condition-type symbol is built into
                 // an instance so handler type-matching runs against the real CLOS
-                // class hierarchy.
-                let cond = coerce_condition_designator(env, *datum, initargs)?.unwrap_or(*datum);
+                // class hierarchy; a format-control string becomes a
+                // SIMPLE-CONDITION (CLHS 9.1; HANDLER-BIND.10, IGNORE-ERRORS.5/6).
+                let cond = match coerce_condition_designator(env, *datum, initargs)? {
+                    Some(condition) => condition,
+                    None => make_simple_condition("SIMPLE-CONDITION", *datum, initargs, env)?,
+                };
                 return signal_condition_object(cond, env);
             }
             "WARN" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
-                    return Err(BlissError::Internal("WARN requires an argument".into()));
+                    // Missing required argument (CLHS 3.5.1; WARN.15).
+                    return Err(BlissError::ProgramError("WARN requires an argument".into()));
                 }
                 bliss_rt::rooted!(datum = args[0]);
                 let rest_args = &args[1..];
@@ -15499,10 +15898,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     val_as_str(*datum)
                 };
+                let datum_is_instance = bliss_stdlib::is_instance(*datum);
                 let condition = match coerce_condition_designator(env, *datum, rest_args)? {
                     Some(condition) => condition,
                     None => make_simple_warning_condition(*datum, rest_args, env)?,
                 };
+                bliss_rt::rooted!(cond = condition);
+                // The effective condition must be of type WARNING, else a
+                // TYPE-ERROR (CLHS WARN; WARN.12/13/16/17/18). Passing initargs
+                // alongside an already-constructed condition is likewise invalid
+                // (WARN.14).
+                let warning_sym = resolve_sym("WARNING").unwrap_or(NIL);
+                let is_warning = typep_matches(env, *cond, warning_sym)?;
+                if !is_warning || (datum_is_instance && !rest_args.is_empty()) {
+                    return Err(BlissError::TypeError {
+                        datum: *datum,
+                        expected: "WARNING".into(),
+                    });
+                }
                 // Establish a MUFFLE-WARNING restart for the dynamic extent of the
                 // signal so a handler can suppress the default warning message.
                 let base_len = env.restarts.len();
@@ -15512,14 +15925,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     interactive_function: None,
                     test_function: None,
                     unwind_on_invoke: true,
+                    group_base: base_len,
+                    id: next_restart_id(),
+                    restart_obj: NIL,
+                    report: NIL,
                 });
-                let result = signal_condition_object(condition, env);
+                let result = signal_condition_object(*cond, env);
                 env.restarts.truncate(base_len);
                 match result {
                     Ok(_) => {
                         // Unhandled (or handler declined): print the warning per
-                        // R5.104 and return NIL. Warnings never enter the debugger.
-                        eprintln!("WARNING: {}", message);
+                        // R5.104 to *ERROR-OUTPUT* (WARN.4) and return NIL.
+                        // Warnings never enter the debugger.
+                        let text = condition_report_string(env, *cond).unwrap_or(message);
+                        let stream = env.lookup_var("*ERROR-OUTPUT*").unwrap_or(NIL);
+                        if !stream.is_nil() {
+                            let _ = write_str_to(stream, &format!("WARNING: {}\n", text));
+                        } else {
+                            eprintln!("WARNING: {}", text);
+                        }
                         return Ok(NIL);
                     }
                     Err(error) => {
@@ -15533,7 +15957,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MAKE-CONDITION" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
-                    return Err(BlissError::Internal(
+                    // A missing required argument is a PROGRAM-ERROR (CLHS 3.5.1;
+                    // MAKE-CONDITION.ERROR.1).
+                    return Err(BlissError::ProgramError(
                         "MAKE-CONDITION requires a type".into(),
                     ));
                 }
@@ -15541,7 +15967,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let type_name = if type_val.is_symbol() {
                     sym_name(type_val)
                 } else {
-                    val_as_str(type_val)
+                    // A class metaobject (e.g. from FIND-CLASS) designates its
+                    // name (MAKE-CONDITION.2).
+                    let cname = bliss_stdlib::class_name(type_val);
+                    if !cname.is_nil() {
+                        sym_name(cname)
+                    } else {
+                        val_as_str(type_val)
+                    }
                 };
                 // Initarg key/value pairs (drop an odd trailing arg, as the
                 // original loop did) are already evaluated and rooted in `args`.
@@ -15842,15 +16275,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "CERROR" => return eval_cerror(cdr, env),
             "COMPUTE-RESTARTS" => {
                 let args = list_to_vec(cdr);
-                let condition = if args.is_empty() {
-                    None
-                } else {
-                    Some(eval_form(args[0], env)?)
-                };
-                let mut restarts = Vec::new();
-                for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
-                    if restart_applies(&restart, condition, env)? {
-                        restarts.push(resolve_sym(&restart.name).unwrap_or(NIL));
+                bliss_rt::rooted!(
+                    condition = if args.is_empty() {
+                        None
+                    } else {
+                        Some(eval_form(args[0], env)?)
+                    }
+                );
+                // An explicit NIL condition means "no condition" — all restarts.
+                let cond_opt = condition.filter(|c| !c.is_nil());
+                let mut restarts: Vec<BlissVal> = Vec::new();
+                bliss_rt::rooted_ref!(_restarts_root = &mut restarts);
+                for idx in restart_visibility_order(&env.restarts) {
+                    let entry = env.restarts[idx].clone();
+                    if restart_applies(&entry, cond_opt, env)? {
+                        let obj = restart_obj_for(env, idx)?;
+                        restarts.push(obj);
                     }
                 }
                 return Ok(vec_to_list(&restarts));
@@ -15860,7 +16300,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // evaluations and the applies-loop (bliss-6b2 #2).
                 let (name_form, rest0) = cp(cdr);
                 bliss_rt::rooted!(rest = rest0);
-                let restart_name = symbol_bare_name(&val_as_str(eval_form(name_form, env)?));
+                bliss_rt::rooted!(name_val = eval_form(name_form, env)?);
                 bliss_rt::rooted!(
                     condition = if rest.is_cons() {
                         Some(eval_form(cp(*rest).0, env)?)
@@ -15868,56 +16308,128 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         None
                     }
                 );
-                for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
-                    if symbol_bare_name(&restart.name) == restart_name
-                        && restart_applies(&restart, *condition, env)?
+                // An explicit NIL condition means "no condition" — all restarts.
+                let cond_opt = condition.filter(|c| !c.is_nil());
+                // A restart-object designator is returned if it is still active.
+                if let Some(id) = restart_object_id(*name_val, env) {
+                    for idx in restart_visibility_order(&env.restarts) {
+                        let entry = env.restarts[idx].clone();
+                        if entry.id == id && restart_applies(&entry, cond_opt, env)? {
+                            return restart_obj_for(env, idx);
+                        }
+                    }
+                    return Ok(NIL);
+                }
+                let restart_name = symbol_bare_name(&val_as_str(*name_val));
+                for idx in restart_visibility_order(&env.restarts) {
+                    let entry = env.restarts[idx].clone();
+                    if symbol_bare_name(&entry.name) == restart_name
+                        && restart_applies(&entry, cond_opt, env)?
                     {
-                        return Ok(resolve_sym(&restart.name).unwrap_or(NIL));
+                        return restart_obj_for(env, idx);
                     }
                 }
                 return Ok(NIL);
+            }
+            "RESTART-NAME" => {
+                let (obj_form, _) = cp(cdr);
+                let obj = eval_form(obj_form, env)?;
+                let name_slot = resolve_sym("NAME").unwrap_or(NIL);
+                return read_slot_value(obj, name_slot, env);
+            }
+            "PRINT-OBJECT" => {
+                // The system PRINT-OBJECT (CLHS 22.1.3): print OBJECT to STREAM
+                // honouring *PRINT-ESCAPE*. A condition with a DEFINE-CONDITION
+                // :report prints via it when escape is NIL (CONDITION-16/17/18).
+                let args = eval_args(cdr, env)?;
+                bliss_rt::rooted!(obj = args.first().copied().unwrap_or(NIL));
+                bliss_rt::rooted!(stream = args.get(1).copied().unwrap_or(NIL));
+                let escape = env
+                    .lookup_var("*PRINT-ESCAPE*")
+                    .map(|v| !v.is_nil())
+                    .unwrap_or(true);
+                if !escape && print_condition_defined_report(*obj, *stream, env)? {
+                    return Ok(*obj);
+                }
+                let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
+                let control = if escape { "~S" } else { "~A" };
+                let result = bliss_stdlib::format(*stream, control, &[*obj]);
+                PRINT_ENV.with(|c| c.set(prev_env));
+                result?;
+                return Ok(*obj);
             }
             "INVOKE-RESTART" => {
                 // Root the source-arg spine across the name evaluation (bliss-6b2 #2).
                 let (name_form, rest0) = cp(cdr);
                 bliss_rt::rooted!(rest_args = rest0);
-                let name_val = eval_form(name_form, env)?;
-                let restart_name = val_as_str(name_val).to_uppercase();
+                bliss_rt::rooted!(name_val = eval_form(name_form, env)?);
                 let args = eval_args(*rest_args, env)?;
-                for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
-                    if restart.name == restart_name {
-                        let result = invoke_restart_function(&restart.function, &args, env)?;
-                        if restart.unwind_on_invoke {
-                            store_control_value(&format!("RESTART-RESULT:{restart_name}"), result);
-                            return Err(BlissError::Internal(format!(
-                                "__RESTART_INVOKED__:{}",
-                                restart_name
-                            )));
+                // A restart OBJECT invokes exactly that restart; a name invokes
+                // the most-visible restart with that name (first clause of the
+                // innermost construct wins — RESTART-CASE.6).
+                let idx_opt = if let Some(id) = restart_object_id(*name_val, env) {
+                    env.restarts.iter().position(|r| r.id == id)
+                } else {
+                    // Most-visible restart of this name whose :test (if any)
+                    // accepts NIL (RESTART-CASE.6/19).
+                    let restart_name = val_as_str(*name_val).to_uppercase();
+                    let mut found = None;
+                    for i in restart_visibility_order(&env.restarts) {
+                        if env.restarts[i].name == restart_name {
+                            let entry = env.restarts[i].clone();
+                            if restart_applies(&entry, None, env)? {
+                                found = Some(i);
+                                break;
+                            }
                         }
-                        return Ok(result);
                     }
+                    found
+                };
+                if let Some(idx) = idx_opt {
+                    let restart = env.restarts[idx].clone();
+                    let restart_name = restart.name.clone();
+                    if restart.unwind_on_invoke {
+                        // RESTART-CASE/CERROR/WITH-SIMPLE-RESTART restarts transfer
+                        // control OUT of the establishing construct: unwind its
+                        // restarts (and anything dynamically inside) BEFORE running
+                        // the clause body, so a body that re-invokes the same name
+                        // does not re-find itself (restart-case.12).
+                        env.restarts.truncate(restart.group_base);
+                        let result = invoke_restart_function(&restart.function, &args, env)?;
+                        store_restart_result(&restart_name, result, env);
+                        return Err(BlissError::Internal(format!(
+                            "__RESTART_INVOKED__:{}",
+                            restart_name
+                        )));
+                    }
+                    // RESTART-BIND: the function runs in the dynamic environment of
+                    // the INVOKE-RESTART call; no unwinding.
+                    return Ok(invoke_restart_function(&restart.function, &args, env)?);
                 }
-                return Err(BlissError::Internal(format!(
+                return Err(BlissError::ProgramError(format!(
                     "Restart {} not found",
-                    restart_name
+                    val_as_str(*name_val)
                 )));
             }
             "INVOKE-RESTART-INTERACTIVELY" => {
                 let (restart_form, _) = cp(cdr);
-                let restart = eval_form(restart_form, env)?;
-                let restart_name = symbol_bare_name(&val_as_str(restart)).to_uppercase();
-                let Some(entry) = env
-                    .restarts
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.name == restart_name)
-                    .cloned()
-                else {
-                    return Err(BlissError::Internal(format!(
+                bliss_rt::rooted!(restart_val = eval_form(restart_form, env)?);
+                let idx_opt = if let Some(id) = restart_object_id(*restart_val, env) {
+                    env.restarts.iter().position(|r| r.id == id)
+                } else {
+                    let restart_name = symbol_bare_name(&val_as_str(*restart_val)).to_uppercase();
+                    restart_visibility_order(&env.restarts)
+                        .into_iter()
+                        .find(|&i| env.restarts[i].name == restart_name)
+                };
+                let Some(idx) = idx_opt else {
+                    return Err(BlissError::ProgramError(format!(
                         "Restart {} not found",
-                        restart_name
+                        val_as_str(*restart_val)
                     )));
                 };
+                let entry = env.restarts[idx].clone();
+                let restart_name = entry.name.clone();
                 let interactive_args = if let Some(interactive) = &entry.interactive_function {
                     let value = invoke_restart_function(interactive, &[], env)?;
                     if value.is_nil() {
@@ -15930,15 +16442,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     Vec::new()
                 };
-                let result = invoke_restart_function(&entry.function, &interactive_args, env)?;
                 if entry.unwind_on_invoke {
-                    store_control_value(&format!("RESTART-RESULT:{restart_name}"), result);
+                    // Unwind the establishing construct before running the clause
+                    // body (see INVOKE-RESTART above); interactive args were already
+                    // computed in the current dynamic environment.
+                    env.restarts.truncate(entry.group_base);
+                    let result = invoke_restart_function(&entry.function, &interactive_args, env)?;
+                    store_restart_result(&restart_name, result, env);
                     return Err(BlissError::Internal(format!(
                         "__RESTART_INVOKED__:{}",
                         restart_name
                     )));
                 }
-                return Ok(result);
+                return Ok(invoke_restart_function(&entry.function, &interactive_args, env)?);
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
             "LOAD" => {
@@ -25631,11 +26147,20 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     let (protected_form, clauses) = cp(cdr);
     let base_len = env.handlers.len();
     let mut installed = Vec::new();
+    // A `(:no-error (lambda-list) body)` clause (CLHS 9.1) is not a handler: when
+    // the protected form returns normally, its body runs with the lambda-list
+    // bound to the returned values, OUTSIDE this HANDLER-CASE's handlers.
+    let mut no_error: Option<(BlissVal, BlissVal, Rc<RefCell<EnvFrame>>)> = None;
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);
         let (type_form, clause_rest) = cp(clause);
         let (bind_list, handler_body) = cp(clause_rest);
+        if symbol_bare_name(&sym_name(type_form)) == "NO-ERROR" {
+            no_error = Some((bind_list, handler_body, Rc::clone(&env.frame)));
+            c = rest;
+            continue;
+        }
         let token = next_control_token("handler-case");
         let var_name = if bind_list.is_cons() {
             Some(sym_name(cp(bind_list).0))
@@ -25667,7 +26192,28 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     env.handlers.truncate(base_len);
 
     match result {
-        Ok(val) => Ok(val),
+        Ok(val) => {
+            // Normal return: run a :no-error clause (if any) with its lambda list
+            // bound to the values the protected form produced (HANDLER-CASE.20+).
+            if let Some((params, body, frame)) = no_error {
+                let mut values: Vec<BlissVal> = if env.mv_active {
+                    env.mv.clone()
+                } else {
+                    vec![val]
+                };
+                bliss_rt::rooted_ref!(_values_root = &mut values);
+                let mut ne_env = env.child_with_parent(frame);
+                bliss_rt::rooted_ref!(_ne_env_root = &mut ne_env);
+                // A required-only lambda list bound to the wrong number of values
+                // is a PROGRAM-ERROR (HANDLER-CASE.23/24), surfaced by the binder.
+                bind_lambda_list(params, &values, &mut ne_env)?;
+                let r = eval_progn(body, &mut ne_env)?;
+                env.mv = std::mem::take(&mut ne_env.mv);
+                env.mv_active = ne_env.mv_active;
+                return Ok(r);
+            }
+            Ok(val)
+        }
         Err(error) => {
             // A condition signalled through HANDLER-CASE's own handlers arrives as
             // a control token naming the selected clause.
@@ -25818,13 +26364,58 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     outcome
 }
 
+/// True if `form` is (possibly after macroexpansion, honouring lexical
+/// MACROLET/SYMBOL-MACROLET) a call to SIGNAL / ERROR / CERROR / WARN — the
+/// forms for which RESTART-CASE implicitly associates its restarts with the
+/// signalled condition (CLHS 9.1; restart-case.25-31).
+fn restart_form_signals_condition(form: BlissVal, env: &mut Env) -> bool {
+    fn head_is_signaller(f: BlissVal) -> bool {
+        if !f.is_cons() {
+            return false;
+        }
+        let head = cp(f).0;
+        head.is_symbol()
+            && matches!(
+                symbol_bare_name(&sym_name(head)).as_str(),
+                "SIGNAL" | "ERROR" | "CERROR" | "WARN"
+            )
+    }
+    if head_is_signaller(form) {
+        return true;
+    }
+    bliss_rt::rooted!(f = form);
+    let mut macro_env = macroexpand_environment_from_cli(env);
+    bliss_rt::rooted_ref!(_macro_env_root = &mut macro_env);
+    match compiler_macroexpand::macroexpand(*f, &macro_env) {
+        Ok((expanded, _)) => head_is_signaller(expanded),
+        Err(_) => false,
+    }
+}
+
+/// Normalise a RESTART-CASE clause option designator (`:report` / `:interactive`
+/// / `:test`) to a FORM: NIL stays NIL; a bare symbol names a function and
+/// becomes `(function sym)`; any other form is used as-is.
+fn restart_designator_form(form: BlissVal) -> BlissVal {
+    if form.is_nil() {
+        NIL
+    } else if form.is_symbol() {
+        arena_cons(
+            resolve_sym("FUNCTION").unwrap_or(NIL),
+            arena_cons(form, NIL),
+        )
+    } else {
+        form
+    }
+}
+
 fn parse_restart_options(
     option_forms: BlissVal,
     captured_frame: &Rc<RefCell<EnvFrame>>,
-) -> (Option<RestartFunction>, Option<RestartFunction>) {
+) -> (Option<RestartFunction>, Option<RestartFunction>, BlissVal) {
     let options = list_to_vec(option_forms);
     let mut interactive_function = None;
     let mut test_function = None;
+    let mut report_form = NIL;
     let mut index = 0;
     while index + 1 < options.len() {
         let key = options[index];
@@ -25843,12 +26434,15 @@ fn parse_restart_options(
                         captured_frame: captured_frame.clone(),
                     });
                 }
+                // The :report-function value is a form evaluated ONCE at
+                // establishment (RESTART-BIND.16); the caller evaluates it.
+                "REPORT-FUNCTION" => report_form = value,
                 _ => {}
             }
         }
         index += 2;
     }
-    (interactive_function, test_function)
+    (interactive_function, test_function, report_form)
 }
 
 // ── RESTART-BIND ────────────────────────────────────────────────
@@ -25860,9 +26454,17 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     while c.is_cons() {
         let (binding, rest) = cp(c);
         let (name_form, binding_rest) = cp(binding);
-        let (function_form, option_forms) = cp(binding_rest);
-        let (interactive_function, test_function) =
+        let (mut function_form, option_forms) = cp(binding_rest);
+        bliss_rt::rooted_ref!(_function_form_root = &mut function_form);
+        let (interactive_function, test_function, report_form) =
             parse_restart_options(option_forms, &captured_frame);
+        // Evaluate a :report-function form ONCE now (RESTART-BIND.16).
+        bliss_rt::rooted!(report = if report_form.is_nil() {
+            NIL
+        } else {
+            let mut report_env = env.child_with_parent(captured_frame.clone());
+            eval_form(report_form, &mut report_env)?
+        });
         env.restarts.push(RestartEntry {
             name: sym_name(name_form).to_uppercase(),
             function: RestartFunction::FunctionForm {
@@ -25872,6 +26474,10 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
             interactive_function,
             test_function,
             unwind_on_invoke: false,
+            group_base: base_len,
+            id: next_restart_id(),
+            restart_obj: NIL,
+            report: *report,
         });
         c = rest;
     }
@@ -25884,6 +26490,32 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         ok => ok,
     };
     env.restarts.truncate(base_len);
+    result
+}
+
+// ── WITH-CONDITION-RESTARTS ─────────────────────────────────────
+// (with-condition-restarts condition-form restarts-form &body body): for the
+// dynamic extent of BODY, associate the restarts in RESTARTS-FORM (a list of
+// restart objects) with the condition, so FIND-RESTART/COMPUTE-RESTARTS filter
+// by that association (CLHS 9.1). Returns BODY's values.
+fn eval_with_condition_restarts(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (cond_form, rest) = cp(cdr);
+    let (restarts_form, mut body) = cp(rest);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
+    bliss_rt::rooted!(condition = eval_form(cond_form, env)?);
+    bliss_rt::rooted!(restarts_list = eval_form(restarts_form, env)?);
+    let mut ids = Vec::new();
+    let mut c = *restarts_list;
+    while c.is_cons() {
+        let (item, next) = cp(c);
+        if let Some(id) = restart_object_id(item, env) {
+            ids.push(id);
+        }
+        c = next;
+    }
+    env.condition_restarts.push((*condition, ids));
+    let result = eval_progn(body, env);
+    env.condition_restarts.pop();
     result
 }
 
@@ -25902,6 +26534,53 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         let (mut params_form, mut body) = cp(clause_rest);
         bliss_rt::rooted_ref!(_params_root = &mut params_form);
         bliss_rt::rooted_ref!(_clause_body_root = &mut body);
+        // Strip the leading clause options ([:report r] [:interactive i]
+        // [:test t]); the remaining forms are the clause body.
+        let mut report_form = NIL;
+        let mut interactive_form = NIL;
+        let mut test_form = NIL;
+        while body.is_cons() {
+            let (head, rest) = cp(body);
+            if head.is_symbol() {
+                let opt = symbol_bare_name(&sym_name(head));
+                if (opt == "REPORT" || opt == "INTERACTIVE" || opt == "TEST") && rest.is_cons() {
+                    let (val, rest2) = cp(rest);
+                    match opt.as_str() {
+                        "REPORT" => report_form = val,
+                        "INTERACTIVE" => interactive_form = val,
+                        _ => test_form = val,
+                    }
+                    body = rest2;
+                    continue;
+                }
+            }
+            break;
+        }
+        bliss_rt::rooted_ref!(_clause_body_root2 = &mut body);
+        // Normalise each option designator to a FORM (a bare symbol names a
+        // function → `(function sym)`; RESTART-CASE.21/34). :report is evaluated
+        // now to a value (string or closure) for printing; :interactive/:test
+        // keep their forms and are evaluated when invoked (like the clause body).
+        // Root each across the following allocations and the clause-lambda cons.
+        bliss_rt::rooted!(report_dform = restart_designator_form(report_form));
+        bliss_rt::rooted!(interactive_dform = restart_designator_form(interactive_form));
+        bliss_rt::rooted!(test_dform = restart_designator_form(test_form));
+        let report = if report_dform.is_nil() {
+            NIL
+        } else {
+            let mut report_env = env.child_with_parent(captured_frame.clone());
+            eval_form(*report_dform, &mut report_env)?
+        };
+        bliss_rt::rooted!(report = report);
+        let interactive_function =
+            (!interactive_dform.is_nil()).then(|| RestartFunction::FunctionForm {
+                function_form: *interactive_dform,
+                captured_frame: captured_frame.clone(),
+            });
+        let test_function = (!test_dform.is_nil()).then(|| RestartFunction::FunctionForm {
+            function_form: *test_dform,
+            captured_frame: captured_frame.clone(),
+        });
         env.restarts.push(RestartEntry {
             name: sym_name(name_form).to_uppercase(),
             function: RestartFunction::FunctionForm {
@@ -25911,15 +26590,29 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                 ),
                 captured_frame: captured_frame.clone(),
             },
-            interactive_function: None,
-            test_function: None,
+            interactive_function,
+            test_function,
             unwind_on_invoke: true,
+            group_base: base_len,
+            id: next_restart_id(),
+            restart_obj: NIL,
+            report: *report,
         });
         // Re-read the tail from the rooted cursor after the allocations.
         *c = cp(*c).1;
     }
 
+    // CLHS 9.1: if the protected form is (possibly after macroexpansion) a call
+    // to SIGNAL/ERROR/CERROR/WARN, the restarts this RESTART-CASE just
+    // established are associated with the condition it signals. Arm a one-shot
+    // that signal_condition_object consumes (restart-case.25-31).
+    if restart_form_signals_condition(restartable_form, env) {
+        let ids: Vec<u64> = env.restarts[base_len..].iter().map(|r| r.id).collect();
+        PENDING_SIGNAL_RESTART_IDS.with(|c| *c.borrow_mut() = Some(ids));
+    }
     let result = eval_form(restartable_form, env);
+    // Disarm the one-shot in case the form did not signal after all.
+    PENDING_SIGNAL_RESTART_IDS.with(|c| *c.borrow_mut() = None);
     // bliss-9kc: on a RAW evaluator error, give the live handler stack its turn
     // NOW — before the restarts we established are truncated below — so a handler
     // can INVOKE-RESTART a restart established inside this RESTART-CASE.
@@ -25932,7 +26625,7 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         Ok(value) => Ok(value),
         Err(error) => {
             if let Some(name) = restart_invoked_name(&error) {
-                return Ok(take_control_value(&format!("RESTART-RESULT:{name}")));
+                return Ok(take_restart_result(&name, env));
             }
             Err(error)
         }
@@ -25941,6 +26634,13 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 
 // ── CERROR ───────────────────────────────────────────────────────
 fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // CERROR needs at least a continue-format-control and a datum; a missing
+    // required argument is a PROGRAM-ERROR (CLHS 3.5.1; CERROR.ERROR.1/2).
+    if !cdr.is_cons() || !cp(cdr).1.is_cons() {
+        return Err(BlissError::ProgramError(
+            "CERROR requires a continue format control and a datum".into(),
+        ));
+    }
     let (_continue_form, rest) = cp(cdr);
     let (datum_form, mut arg_forms) = cp(rest);
     bliss_rt::rooted_ref!(_arg_forms_root = &mut arg_forms);
@@ -25966,6 +26666,10 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         interactive_function: None,
         test_function: None,
         unwind_on_invoke: true,
+        group_base: base_len,
+        id: next_restart_id(),
+        restart_obj: NIL,
+        report: NIL,
     });
 
     let result = signal_condition_object(condition, env);
@@ -26327,6 +27031,28 @@ fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (ff, fa) = cp(*r);
     bliss_rt::rooted!(fa = fa);
     bliss_rt::rooted!(fv = eval_form(ff, env)?);
+    // A function control (from FORMATTER, or any function) is applied to the
+    // output stream and the format arguments (CLHS 22.3; ERROR.5/9-12, CERROR.*,
+    // WARN.19). With a NIL destination it prints into a fresh string stream and
+    // returns the string.
+    if (*fv).is_function() {
+        let av = eval_args(*fa, env)?;
+        if (*dest).is_nil() {
+            bliss_rt::rooted!(stream = bliss_stdlib::make_string_output_stream(NIL)?);
+            let mut call_args: Vec<BlissVal> = Vec::with_capacity(av.len() + 1);
+            call_args.push(*stream);
+            call_args.extend_from_slice(&av);
+            bliss_rt::rooted_ref!(_call_args_root = &mut call_args);
+            apply_function(*fv, &call_args, env)?;
+            return bliss_stdlib::get_output_stream_string(*stream);
+        }
+        let mut call_args: Vec<BlissVal> = Vec::with_capacity(av.len() + 1);
+        call_args.push(*dest);
+        call_args.extend_from_slice(&av);
+        bliss_rt::rooted_ref!(_call_args_root = &mut call_args);
+        apply_function(*fv, &call_args, env)?;
+        return Ok(NIL);
+    }
     let fs = val_as_str(*fv);
     let av = eval_args(*fa, env)?;
     // Park the env so the formatter's `~A`/`~S` can dispatch user print-object
@@ -27596,6 +28322,10 @@ mod env_gc_root_tests {
                 captured_frame: Rc::clone(&parent),
             }),
             unwind_on_invoke: false,
+            group_base: 0,
+            id: next_restart_id(),
+            restart_obj: NIL,
+            report: NIL,
         });
         env.handlers.push(HandlerCluster {
             entries: vec![

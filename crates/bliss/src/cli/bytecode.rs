@@ -11906,6 +11906,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         interactive_function: None,
                         test_function: None,
                         unwind_on_invoke: true,
+                        group_base: restart_base,
+                        id: super::next_restart_id(),
+                        restart_obj: NIL,
+                        report: NIL,
                     });
                     cluster_values.push(resolve_sym(&restart.name).ok_or_else(|| {
                         BlissError::Internal(format!(
