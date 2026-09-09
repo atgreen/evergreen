@@ -2623,9 +2623,19 @@
 ;; cl-cookie calls simple-string-p via ppcre).
 (defun simple-string-p (x) (stringp x))
 
+;; ANSI 14.2: SUBLIS/NSUBLIS require a proper association list. An improper
+;; spine (e.g. ((a . 1) . bad)) is a TYPE-ERROR, not a silently-truncated walk
+;; (ansi-test sublis.error.8 / nsublis.error.8).
+(defun %check-sublis-alist (alist)
+  (do ((a alist (cdr a)))
+      ((null a))
+    (unless (consp a)
+      (error 'type-error :datum alist :expected-type 'list))))
+
 (defun sublis (alist tree &key key (test #'eql) test-not)
   "Substitute through TREE: any subtree/leaf matching an ALIST key is replaced
 by that pair's cdr (ANSI 14.2; bliss-d0b: flexi-streams)."
+  (%check-sublis-alist alist)
   (labels ((lookup (x)
              (let ((k (if key (funcall key x) x)))
                (let ((found nil))

@@ -9937,6 +9937,20 @@ fn validate_builtin_keywords(kwargs: &[BlissVal], allowed: &[&str]) -> Result<()
     Ok(())
 }
 
+/// Count the cons cells in an argument-FORM list (proper-list spine). Used to
+/// enforce the exact arity of fixed-arity builtins so calling one with the wrong
+/// count — e.g. `(funcall #'equal x)` where a :key/:test is applied at the wrong
+/// arity — is an ANSI PROGRAM-ERROR rather than a silent NIL-padded result
+/// (SUBST.ERROR.10 / NSUBST.ERROR.10). bliss-h1b5.
+fn form_arg_count(mut v: BlissVal) -> usize {
+    let mut n = 0;
+    while v.is_cons() {
+        n += 1;
+        v = cp(v).1;
+    }
+    n
+}
+
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -11741,6 +11755,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if matches { T } else { NIL });
             }
             "EQ" => {
+                // ANSI: EQ takes exactly two arguments; wrong arity (e.g. via
+                // `(funcall #'eq x)`) is a PROGRAM-ERROR, not a NIL-padded result.
+                let n = form_arg_count(cdr);
+                if n != 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "EQ requires exactly 2 arguments, got {n}"
+                    )));
+                }
                 let (af, r) = cp(cdr);
                 // Root the second arg FORM before evaluating the first: a young
                 // arg list relocates under the first eval's GC, dangling a bare
@@ -11753,6 +11775,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "EQL" => {
                 // EQL value-compares numbers of the same type, so two distinct
                 // heap bignums/ratios with equal value are EQL (bliss-jtc.5).
+                let n = form_arg_count(cdr);
+                if n != 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "EQL requires exactly 2 arguments, got {n}"
+                    )));
+                }
                 let (af, r) = cp(cdr);
                 // Root the second arg FORM before evaluating the first: a young
                 // arg list relocates under the first eval's GC, dangling a bare
@@ -11763,6 +11791,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if eql_values(*a, b) { T } else { NIL });
             }
             "EQUAL" | "EQUALP" => {
+                // ANSI: EQUAL/EQUALP take exactly two arguments; wrong arity
+                // (e.g. `:key #'equal` applied as `(funcall #'equal elt)`) is a
+                // PROGRAM-ERROR (SUBST.ERROR.10 / NSUBST.ERROR.10).
+                let n = form_arg_count(cdr);
+                if n != 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires exactly 2 arguments, got {n}"
+                    )));
+                }
                 let (af, r) = cp(cdr);
                 // Root the second arg FORM before evaluating the first: a young
                 // arg list relocates under the first eval's GC, dangling a bare
