@@ -9881,8 +9881,60 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
     match bare {
         "CONS" | "RPLACA" | "RPLACD" => Some((2, 2)),
         "CONSP" | "ATOM" | "LISTP" | "ENDP" => Some((1, 1)),
+        // (rest list) — exactly one; (nth n list) — exactly two.
+        "REST" => Some((1, 1)),
+        "NTH" => Some((2, 2)),
+        // (member item list &key ...) / (assoc item alist &key ...) — two
+        // required, then an unbounded keyword tail (max == usize::MAX). bliss-l6y9.
+        "MEMBER" | "ASSOC" => Some((2, usize::MAX)),
         _ => None,
     }
+}
+
+/// Validate the trailing keyword-argument plist of a `&key` builtin (MEMBER,
+/// ASSOC, …). CLHS 3.5.1: an odd-length plist, a non-symbol in a key position,
+/// or an unrecognised keyword (absent an active `:allow-other-keys`) is a
+/// catchable PROGRAM-ERROR — these builtins historically dropped bad keys
+/// silently, so ansi-test's *.ERROR.* PROGRAM-ERROR cases saw no error
+/// (bliss-l6y9). `allowed` lists the bare keyword names the builtin accepts.
+/// Does not allocate on the arena (only reads the already-rooted `kwargs`), so
+/// it is safe to call before the main walk.
+fn validate_builtin_keywords(kwargs: &[BlissVal], allowed: &[&str]) -> Result<(), BlissError> {
+    if kwargs.len() % 2 != 0 {
+        return Err(BlissError::ProgramError(
+            "keyword arguments must appear in key/value pairs".into(),
+        ));
+    }
+    // Every key must be a symbol (CLHS 3.5.1.5); note a live :allow-other-keys.
+    let mut call_allows_other_keys = false;
+    for pair in kwargs.chunks(2) {
+        let key = pair[0];
+        if !key.is_symbol() {
+            let mut kbuf = String::new();
+            print_val(key, &mut kbuf);
+            return Err(BlissError::ProgramError(format!(
+                "keyword argument name is not a symbol: {kbuf}"
+            )));
+        }
+        if key_bare(key) == "ALLOW-OTHER-KEYS" && !pair[1].is_nil() {
+            call_allows_other_keys = true;
+        }
+    }
+    if call_allows_other_keys {
+        return Ok(());
+    }
+    for pair in kwargs.chunks(2) {
+        let bare = key_bare(pair[0]);
+        if bare == "ALLOW-OTHER-KEYS" {
+            continue;
+        }
+        if !allowed.iter().any(|a| *a == bare) {
+            return Err(BlissError::ProgramError(format!(
+                "unexpected keyword argument: {bare}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -9933,7 +9985,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             {
                 let argc = list_to_vec(cdr).len();
                 if argc < lo || argc > hi {
-                    let want = if lo == hi {
+                    let want = if hi == usize::MAX {
+                        format!("at least {lo}")
+                    } else if lo == hi {
                         format!("{lo}")
                     } else {
                         format!("{lo} to {hi}")
@@ -13693,6 +13747,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(c = eval_form(*list_f, env)?);
                 // eval_args returns RootedVals (already GC-rooted).
                 let kwargs = eval_args(*kwrest, env)?;
+                // Bad keyword tail (odd count / non-symbol key / unknown key) is a
+                // catchable PROGRAM-ERROR, not silently ignored (bliss-l6y9).
+                validate_builtin_keywords(&kwargs, &["KEY", "TEST", "TEST-NOT"])?;
                 let has_key = matches!(find_key_arg(&kwargs, "KEY"), Some(v) if v != NIL);
                 let has_test = find_key_arg(&kwargs, "TEST").is_some();
                 let has_test_not = find_key_arg(&kwargs, "TEST-NOT").is_some();
@@ -13751,6 +13808,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(item = eval_form(item_f, env)?);
                 bliss_rt::rooted!(c = eval_form(*alist_f, env)?);
                 let kwargs = eval_args(*kwrest, env)?;
+                // Bad keyword tail (odd count / non-symbol key / unknown key) is a
+                // catchable PROGRAM-ERROR, not silently ignored (bliss-l6y9).
+                validate_builtin_keywords(&kwargs, &["KEY", "TEST", "TEST-NOT"])?;
                 let has_key = matches!(find_key_arg(&kwargs, "KEY"), Some(v) if v != NIL);
                 let has_test = find_key_arg(&kwargs, "TEST").is_some();
                 let has_test_not = find_key_arg(&kwargs, "TEST-NOT").is_some();
