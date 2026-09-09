@@ -1090,6 +1090,14 @@
   (do ((p plist (cddr p)))
       ((null p) default)
     (when (eq (car p) key) (return (cadr p)))))
+;; GET-PROPERTIES (CLHS): scan PLIST for the first indicator that is EQ to one in
+;; INDICATOR-LIST; return three values — that indicator, its value, and the PLIST
+;; tail beginning at it — or (values NIL NIL NIL) if none is found.
+(defun get-properties (plist indicator-list)
+  (do ((tail plist (cddr tail)))
+      ((null tail) (values nil nil nil))
+    (when (member (car tail) indicator-list :test (function eq))
+      (return (values (car tail) (cadr tail) tail)))))
 (defun nreverse (seq) (reverse seq))
 
 ;;; ---------------------------------------------------------------------------
@@ -1674,9 +1682,11 @@
 (defun subst-if-not (new pred tree &key key)
   (subst-if new (lambda (x) (not (funcall pred x))) tree :key key))
 
+;; NSUBST may reuse structure; delegating to SUBST is conforming — but it must
+;; forward :key/:test/:test-not (they were dropped, so nsubst ignored the test;
+;; ansi-test cons/nsubst.lsp).
 (defun nsubst (new old tree &rest keys)
-  (declare (ignore keys))
-  (subst new old tree))
+  (apply (function subst) new old tree keys))
 (defun nsubst-if (new pred tree &rest keys) (apply (function subst-if) new pred tree keys))
 (defun nsubst-if-not (new pred tree &rest keys) (apply (function subst-if-not) new pred tree keys))
 

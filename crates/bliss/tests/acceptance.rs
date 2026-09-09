@@ -959,6 +959,29 @@ fn copy_seq_and_subseq_of_string_are_fresh_and_mutable() {
 }
 
 #[test]
+fn get_properties_and_nsubst_keywords() {
+    // GET-PROPERTIES returns (indicator value tail) for the first PLIST indicator
+    // EQ to one in the list, else (nil nil nil). NSUBST must forward
+    // :key/:test/:test-not to SUBST (it dropped them). ansi-test CONS; bliss-30be.
+    let expr = "(princ (list
+                  (multiple-value-list (get-properties '(a b c d) '(c)))
+                  (multiple-value-list (get-properties '(a b) '(x)))
+                  (nsubst '(1 2) '(foo . bar)
+                          (list (cons 'foo 'baz) (cons 'foo 'bar)) :test #'equal)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("((C D (C D)) (NIL NIL NIL) ((FOO . BAZ) (1 2)))"),
+        "get-properties/nsubst keyword handling, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).
