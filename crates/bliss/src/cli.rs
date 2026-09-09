@@ -11670,7 +11670,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let args = eval_args(cdr, env)?;
                 let s = args.first().copied().unwrap_or(NIL);
                 let key = args.get(1).copied().unwrap_or(NIL);
-                if !s.is_symbol() {
+                // NIL and T report is_symbol()=true but carry the SPECIAL tag, not
+                // TAG_SYMBOL, so as_symbol_index() panics/aborts on them; they have
+                // no registry-backed plist, so nothing to remove (bliss-x7aa).
+                if !s.is_symbol() || s == NIL || s == T {
                     return Ok(NIL);
                 }
                 let idx = s.as_symbol_index();
