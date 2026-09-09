@@ -13515,7 +13515,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if is_last {
                         *tail = v;
                     } else {
-                        all.extend(list_to_vec(v));
+                        // A non-last APPEND argument must be a proper list; a
+                        // dotted/improper one is a TYPE-ERROR whose datum is the
+                        // offending non-list tail (so it genuinely violates
+                        // 'list — ANSI SIGNALS-ERROR rejects a datum that
+                        // satisfies its expected-type). append.error.1/2. The
+                        // walk only reads conses and pushes into the rooted
+                        // `all`, so it allocates nothing (GC-safe).
+                        let mut p = v;
+                        while p.is_cons() {
+                            let (car, cdr2) = cp(p);
+                            all.push(car);
+                            p = cdr2;
+                        }
+                        if !p.is_nil() {
+                            return Err(BlissError::TypeError {
+                                datum: p,
+                                expected: "list".into(),
+                            });
+                        }
                     }
                 }
                 // Cons the collected elements onto the (as-is) tail, right to left.
@@ -14033,6 +14051,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while c.is_cons() {
                     let (pair, _) = cp(*c);
                     // Skip NIL entries; only compare against real (cons) pairs.
+                    // A non-NIL, non-cons element is not a pair — a TYPE-ERROR
+                    // whose datum is that offending element (assoc.error.11).
+                    if !pair.is_cons() && !pair.is_nil() {
+                        return Err(BlissError::TypeError {
+                            datum: pair,
+                            expected: "list".into(),
+                        });
+                    }
                     if pair.is_cons() {
                         let (k, _) = cp(pair);
                         let probe = if has_key {

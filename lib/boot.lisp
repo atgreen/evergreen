@@ -1261,7 +1261,16 @@
                (error 'type-error :datum l :expected-type 'list)))))
       (setq p (cdr p)))
     result))
-(defun revappend (x y) (append (reverse x) y))
+;; Walk X; if it is not a proper list, signal a TYPE-ERROR whose datum is the
+;; offending non-list tail (so it genuinely violates the expected type 'list —
+;; ANSI's SIGNALS-ERROR rejects a type-error whose datum satisfies its
+;; expected-type). Returns X when proper.
+(defun %require-proper-list (x)
+  (do ((p x (cdr p)))
+      ((null p) x)
+    (unless (consp p)
+      (error 'type-error :datum p :expected-type 'list))))
+(defun revappend (x y) (%require-proper-list x) (append (reverse x) y))
 ;; ANSI: a sequence/array size (and each array dimension) is a non-negative
 ;; integer; a negative or non-integer value is a TYPE-ERROR, not a silently
 ;; empty result. (make-list -1) used to return NIL; (make-array -1) => #().
@@ -1597,8 +1606,12 @@
              (tail head))
         (do ((rest (cdr alist) (cdr rest)))
             ((not (consp rest))
+             ;; The offending object is the improper tail REST (a non-list),
+             ;; not the whole ALIST (which IS a list) — ANSI's SIGNALS-ERROR
+             ;; rejects a type-error whose datum satisfies its expected-type
+             ;; (copy-alist.error.3).
              (unless (null rest)
-               (error 'type-error :datum alist :expected-type 'list))
+               (error 'type-error :datum rest :expected-type 'list))
              head)
           (let* ((q (car rest))
                  (new (cons (if (consp q) (cons (car q) (cdr q)) q) nil)))
@@ -1632,7 +1645,7 @@
       (when (eql object list) (return t))
       (if (consp list) (setq list (cdr list)) (return (eql object list))))))
 
-(defun nreconc (list tail) (append (reverse list) tail))
+(defun nreconc (list tail) (%require-proper-list list) (append (reverse list) tail))
 
 ;;; --- set operations (KEY/TEST honoured via %seq-find) -----------------------
 
@@ -2643,7 +2656,10 @@
   (do ((a alist (cdr a)))
       ((null a))
     (unless (consp a)
-      (error 'type-error :datum alist :expected-type 'list))))
+      ;; Datum is the improper tail A (a non-list), not the whole ALIST: a
+      ;; type-error whose datum satisfies its expected-type is rejected by
+      ;; ANSI's SIGNALS-ERROR (sublis.error.8 / nsublis.error.8).
+      (error 'type-error :datum a :expected-type 'list))))
 
 (defun sublis (alist tree &key key (test #'eql) test-not)
   "Substitute through TREE: any subtree/leaf matching an ALIST key is replaced
