@@ -972,7 +972,11 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
 /// order, but the global-function step is reached from the symbol's registry
 /// INDEX instead of re-hashing its name.
 fn callable_body_of_symbol(env: &Env, sym: BlissVal, name: &str) -> Option<(BlissVal, BlissVal)> {
-    callable_body_inner(env, name, Some(sym.as_symbol_index()))
+    // NIL and T report is_symbol() true but carry the SPECIAL tag, not TAG_SYMBOL,
+    // so as_symbol_index() would panic; they never name an interpreted function,
+    // so fall back to the name-keyed lookup (sym_idx None) (bliss-x7aa).
+    let sym_idx = (sym.is_symbol() && sym != NIL && sym != T).then(|| sym.as_symbol_index());
+    callable_body_inner(env, name, sym_idx)
 }
 
 fn callable_body_inner(
@@ -8709,10 +8713,22 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             }
             "COMPLEX" => bliss_rt::types::complexp(object),
             // UNSIGNED-BYTE with no size == (integer 0 *); SIGNED-BYTE with no
-            // size == any integer; BIT == (integer 0 1). (UNSIGNED-BYTE stays
-            // fixnum-only: a bignum's sign is not checked here, and a negative
-            // bignum must not match.)
-            "UNSIGNED-BYTE" => object.is_fixnum() && object.as_fixnum() >= 0,
+            // size == any integer; BIT == (integer 0 1). UNSIGNED-BYTE must accept
+            // a POSITIVE BIGNUM, not just a non-negative fixnum — else e.g.
+            // `(typep (expt 2 64) 'unsigned-byte)` wrongly returned NIL, and
+            // ansi-test's check-type-error then fed that bignum to MAKE-LIST
+            // (building a 2^64-element list → hang) instead of skipping it as a
+            // valid unsigned-byte (bliss-x7aa). A bignum's sign is the i32 at body
+            // offset 8 (see alloc_bignum_cli): negative bignums have sign < 0.
+            "UNSIGNED-BYTE" => {
+                if object.is_fixnum() {
+                    object.as_fixnum() >= 0
+                } else if bliss_rt::types::integerp(object) {
+                    unsafe { *(object.as_ptr().add(8) as *const i32) >= 0 }
+                } else {
+                    false
+                }
+            }
             "SIGNED-BYTE" => bliss_rt::types::integerp(object),
             "BIT" => object.is_fixnum() && matches!(object.as_fixnum(), 0 | 1),
             "FLOAT" => bliss_rt::types::floatp(object),
@@ -13155,7 +13171,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "NTH" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
-                    return Err(BlissError::Internal(
+                    // Wrong arg count is a catchable PROGRAM-ERROR, not an
+                    // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).
+                    return Err(BlissError::ProgramError(
                         "NTH requires an index and a list".into(),
                     ));
                 }

@@ -863,6 +863,46 @@ fn odd_keyword_args_signal_catchable_error() {
     );
 }
 
+#[test]
+fn typep_unsigned_byte_accepts_positive_bignum() {
+    // (typep <positive bignum> 'unsigned-byte) must be T — UNSIGNED-BYTE is
+    // (integer 0 *), not fixnum-only. The old fixnum-only check returned NIL for
+    // 2^64, and ansi-test's check-type-error then fed that bignum to MAKE-LIST,
+    // building a 2^64-element list (hang) instead of skipping it (bliss-x7aa).
+    let expr = "(princ (list (typep (expt 2 64) 'unsigned-byte)
+                             (typep (expt 2 100) 'unsigned-byte)
+                             (typep (- (expt 2 64)) 'unsigned-byte)
+                             (typep -1 'unsigned-byte)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(T T NIL NIL)"),
+        "unsigned-byte must accept positive bignums and reject negatives, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn nth_wrong_arg_count_is_catchable() {
+    // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
+    // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).
+    let output = bliss_bin()
+        .args(["--eval", "(princ (ignore-errors (nth 0)))"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "must be caught, not abort");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NIL"),
+        "IGNORE-ERRORS should catch the NTH arg-count error, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CLOS (defclass / defmethod)
 // ══════════════════════════════════════════════════════════════════
