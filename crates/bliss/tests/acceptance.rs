@@ -912,6 +912,27 @@ fn append_last_argument_is_the_tail_as_is() {
 }
 
 #[test]
+fn mapl_maplist_with_no_lists_signal_not_hang() {
+    // MAPL/MAPLIST require >=1 list; with zero lists the "all exhausted" test
+    // `(some #'null '())` is NIL, so the loop never terminated. Signal a
+    // PROGRAM-ERROR instead of hanging (ansi-test mapl.error.3; bliss-x7aa).
+    let expr = "(princ (list (typep (nth-value 1 (ignore-errors (mapl #'append))) 'program-error)
+                             (typep (nth-value 1 (ignore-errors (maplist #'identity))) 'program-error)
+                             (mapl #'identity '(a b c))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "must signal, not hang");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(T T (A B C))"),
+        "MAPL/MAPLIST no-list must signal PROGRAM-ERROR and still work with a list, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).

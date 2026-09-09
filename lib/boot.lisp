@@ -1637,7 +1637,11 @@
 
 ;;; --- list mapping variants --------------------------------------------------
 
+;; MAPLIST/MAPL require at least one list (CLHS): with zero lists `(some #'null
+;; lists)` is NIL, so the loop never terminates — signal PROGRAM-ERROR instead of
+;; hanging (ansi-test mapl.error.3/maplist.error.3; bliss-x7aa).
 (defun maplist (fn &rest lists)
+  (when (null lists) (error 'program-error))
   (let ((result nil))
     (block nil
       (loop
@@ -1647,6 +1651,7 @@
     (reverse result)))
 
 (defun mapl (fn &rest lists)
+  (when (null lists) (error 'program-error))
   (let ((first (car lists)))
     (block nil
       (loop
