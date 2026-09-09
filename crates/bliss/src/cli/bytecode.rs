@@ -2143,7 +2143,15 @@ impl<'e> Lowerer<'e> {
         }
         let name = sym_name(name_form);
         let val_form = if vrest.is_cons() { cp(vrest).0 } else { NIL };
+        let val_may_produce = self.may_produce_multiple_values(val_form);
         self.lower_expr(val_form)?; // +1
+        if !val_may_produce {
+            // A single-value return value truncates any mv left by an earlier
+            // producer (e.g. the predicate call in MEMBER-IF's loop before
+            // `(return sublist)`) so the block yields exactly one value
+            // (bliss-i66o).
+            self.emit(Instr::ClearMv);
+        }
         self.emit_return_from(&name)?;
         // ReturnFrom transfers control; model it as consuming the value and
         // notionally yielding one (the trailing slot is dead code).
@@ -2173,7 +2181,11 @@ impl<'e> Lowerer<'e> {
     /// `(return value?)` == `(return-from nil value?)`.
     fn lower_return(&mut self, rest: BlissVal) -> LowerResult<()> {
         let val_form = if rest.is_cons() { cp(rest).0 } else { NIL };
+        let val_may_produce = self.may_produce_multiple_values(val_form);
         self.lower_expr(val_form)?;
+        if !val_may_produce {
+            self.emit(Instr::ClearMv); // single-value return truncates leaked mv (bliss-i66o)
+        }
         self.emit_return_from("NIL")?;
         self.pop_n(1);
         self.push_n(1);
@@ -3976,6 +3988,72 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// Conservative static analysis: can FORM possibly yield more than one
+    /// value? Returns `false` only when FORM is provably single-valued — an
+    /// atom/constant/variable reference, or a value-transparent form all of
+    /// whose result sub-forms are themselves provably single-valued. Every call
+    /// (user or opaque builtin), every genuine multiple-value producer, and
+    /// anything unrecognised returns `true`. This one-sidedness is the safety
+    /// property: a false positive merely leaves a (harmless) mv leak unfixed at
+    /// one site, whereas a false negative would wrongly truncate real secondary
+    /// values. Used to decide whether to emit ClearMv after a value-form so a
+    /// preceding producer's values do not leak through a single-value tail into
+    /// an enclosing MULTIPLE-VALUE-LIST / MULTIPLE-VALUE-BIND / function return
+    /// (bliss-i66o).
+    fn may_produce_multiple_values(&self, form: BlissVal) -> bool {
+        if !form.is_cons() {
+            return false; // atoms, constants and variable refs: exactly one value
+        }
+        let (op, rest) = cp(form);
+        if !op.is_symbol() {
+            return true; // ((lambda ...) ...) application — opaque
+        }
+        let name = sym_name(op);
+        let bare = name.rsplit(':').next().unwrap_or(&name);
+        match bare {
+            // ── value-transparent: value is that of the tail sub-form(s) ──
+            "PROGN" | "LOCALLY" => self.body_tail_may_produce(rest),
+            "AND" => self.body_tail_may_produce(rest),
+            "EVAL-WHEN" => {
+                let (_situations, body) = cp(rest);
+                self.body_tail_may_produce(body)
+            }
+            "LET" | "LET*" | "FLET" | "LABELS" | "MACROLET" | "SYMBOL-MACROLET"
+            | "PROGV" | "WHEN" | "UNLESS" => {
+                // (op head body...) — value is the body's tail form.
+                let (_head, body) = cp(rest);
+                self.body_tail_may_produce(body)
+            }
+            "THE" => {
+                let (_ty, r) = cp(rest);
+                r.is_cons() && self.may_produce_multiple_values(cp(r).0)
+            }
+            "OR" => list_to_vec(rest)
+                .into_iter()
+                .any(|f| self.may_produce_multiple_values(f)),
+            "IF" => {
+                let (_test, r) = cp(rest);
+                let (then_f, r2) = cp(r);
+                let else_f = if r2.is_cons() { cp(r2).0 } else { NIL };
+                self.may_produce_multiple_values(then_f)
+                    || self.may_produce_multiple_values(else_f)
+            }
+            // COND / CASE / BLOCK / CATCH / HANDLER-* / UNWIND-PROTECT and every
+            // call or genuine producer: conservatively assume multiple values.
+            _ => true,
+        }
+    }
+
+    /// Whether the value of an implicit-progn BODY (its last form; NIL if empty)
+    /// can produce multiple values.
+    fn body_tail_may_produce(&self, body: BlissVal) -> bool {
+        let forms = list_to_vec(body);
+        match forms.last() {
+            Some(&last) => self.may_produce_multiple_values(last),
+            None => false, // empty body => NIL, single-valued
+        }
+    }
+
     /// `(multiple-value-bind (vars...) values-form body...)`.
     fn lower_mvb(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (vars_form, r2) = cp(rest);
@@ -3994,7 +4072,15 @@ impl<'e> Lowerer<'e> {
 
         // Single-value context around the values form: clear, evaluate, read.
         self.emit(Instr::ClearMv);
-        self.lower_expr(values_form)?; // primary on stack (+1), mv set
+        let vf_may_produce = self.may_produce_multiple_values(values_form);
+        self.lower_expr(values_form)?; // primary on stack (+1), mv maybe set
+        if !vf_may_produce {
+            // The values form cannot itself produce multiple values, so any mv
+            // state now present leaked from a nested producer in a non-tail
+            // position (e.g. `(progn (values 1 2) x)`); truncate to the single
+            // primary before binding (bliss-i66o).
+            self.emit(Instr::ClearMv);
+        }
 
         let saved_next_local = self.next_local;
         self.enter_scope();
@@ -4017,7 +4103,14 @@ impl<'e> Lowerer<'e> {
     fn lower_mvlist(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (form, _) = cp(rest);
         self.emit(Instr::ClearMv);
-        self.lower_expr(form)?; // primary (+1), mv set
+        let form_may_produce = self.may_produce_multiple_values(form);
+        self.lower_expr(form)?; // primary (+1), mv maybe set
+        if !form_may_produce {
+            // FORM cannot itself produce multiple values; discard any mv leaked
+            // by a nested producer in a non-tail position so the list is just
+            // (primary) (bliss-i66o).
+            self.emit(Instr::ClearMv);
+        }
         self.emit(Instr::ValuesToList); // pop primary, push list
         Ok(())
     }
@@ -6142,6 +6235,13 @@ fn lower_body(lo: &mut Lowerer, body: BlissVal) -> LowerResult<()> {
         if i + 1 < n {
             lo.emit(Instr::Pop);
             lo.pop_n(1);
+        } else if !lo.may_produce_multiple_values(forms[i]) {
+            // The body's tail form is the function's return value. If it cannot
+            // itself produce multiple values, truncate any mv state left by a
+            // nested producer in a non-tail position, so the function returns a
+            // single value and does not leak a stale mv into its caller's
+            // MULTIPLE-VALUE-LIST / MULTIPLE-VALUE-BIND (bliss-i66o).
+            lo.emit(Instr::ClearMv);
         }
     }
     Ok(())
