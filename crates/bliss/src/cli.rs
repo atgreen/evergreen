@@ -4246,6 +4246,56 @@ fn generic_has_eql_specializer(env: &Env, name: &str) -> bool {
     })
 }
 
+/// Map a FIND-METHOD `qualifiers` list to the standard `MethodQualifier`.
+/// `()` is a primary method; `(:before)`/`(:after)`/`(:around)` are the standard
+/// auxiliary qualifiers. Any other list (multiple/user qualifiers) yields None —
+/// bliss's standard method combination has no such method, so FIND-METHOD cannot
+/// match one (bliss-7y1s).
+fn qualifiers_to_method_qualifier(qualifiers: BlissVal) -> Option<bliss_stdlib::MethodQualifier> {
+    use bliss_stdlib::MethodQualifier as Q;
+    let quals = list_to_vec(qualifiers);
+    match quals.as_slice() {
+        [] => Some(Q::Primary),
+        [q] if q.is_symbol() => match symbol_bare_name(&sym_name(*q)).as_str() {
+            "BEFORE" => Some(Q::Before),
+            "AFTER" => Some(Q::After),
+            "AROUND" => Some(Q::Around),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Does a method's parsed specializer match a FIND-METHOD specializer designator?
+/// The designator is a class metaobject (from `FIND-CLASS`) or an `(EQL object)`
+/// list. `MethodSpecializer::Any` (an unspecialized parameter) matches the class
+/// named T (bliss-7y1s).
+fn method_specializer_matches_designator(ms: &MethodSpecializer, arg: BlissVal) -> bool {
+    let arg_class_name = || {
+        let n = bliss_stdlib::class_name(arg);
+        n.is_symbol().then(|| symbol_bare_name(&sym_name(n)))
+    };
+    match ms {
+        MethodSpecializer::Any => arg_class_name().as_deref() == Some("T"),
+        MethodSpecializer::Class(cname) => {
+            arg_class_name().as_deref() == Some(symbol_bare_name(cname).as_str())
+        }
+        MethodSpecializer::Eql(v) => {
+            // `(EQL object)` designator — compare the object with EQL.
+            if arg.is_cons() {
+                let (head, tail) = cp(arg);
+                if head.is_symbol()
+                    && symbol_bare_name(&sym_name(head)) == "EQL"
+                    && tail.is_cons()
+                {
+                    return eql_values(cp(tail).0, *v);
+                }
+            }
+            false
+        }
+    }
+}
+
 /// The class-identity key for a generic call: the `class_of` identity bits of
 /// each argument. Over-keying on non-dispatched trailing args only lowers the hit
 /// rate, never correctness.
@@ -14866,6 +14916,69 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let class = eval_form(class_form, env)?;
                 return Ok(bliss_stdlib::class_name(class));
             }
+            "FIND-METHOD" => {
+                // (find-method generic-function qualifiers specializers &optional
+                // errorp) → the method with those qualifiers and specializers, or
+                // (when errorp, the default, is NIL) NIL, else signal an error
+                // (CLHS 7.6.2; bliss-7y1s). `#'gf` on a generic function yields its
+                // NAME symbol here, so accept a symbol designator or a GF object.
+                let args = eval_args(cdr, env)?;
+                if args.len() < 3 {
+                    return Err(BlissError::ProgramError(
+                        "FIND-METHOD requires a generic function, qualifiers, and specializers"
+                            .into(),
+                    ));
+                }
+                let gf = args[0];
+                let want_qual = qualifiers_to_method_qualifier(args[1]);
+                let spec_args = list_to_vec(args[2]);
+                let errorp = args.get(3).map(|v| !v.is_nil()).unwrap_or(true);
+
+                let gf_name = if gf.is_symbol() {
+                    Some(sym_name(gf))
+                } else {
+                    env.generics
+                        .borrow()
+                        .iter()
+                        .find(|(_, d)| d.generic_function == gf)
+                        .map(|(n, _)| n.clone())
+                };
+                let not_found = |env: &mut Env, msg: String| -> Result<BlissVal, BlissError> {
+                    if errorp {
+                        let condition = make_simple_error_condition(arena_str(&msg), env)?;
+                        return Err(signal_and_raise(env, condition, msg));
+                    }
+                    Ok(NIL)
+                };
+                let Some(gf_name) = gf_name else {
+                    return not_found(env, format!("FIND-METHOD: {} is not a generic function", format_val(gf)));
+                };
+                // `want_qual == None` means a qualifier list bliss's standard
+                // combination never produces — no method can match.
+                if let Some(want_qual) = want_qual {
+                    let methods = env
+                        .methods
+                        .borrow()
+                        .get(&gf_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    for m in &methods {
+                        if m.qualifier == want_qual
+                            && m.specializers.len() == spec_args.len()
+                            && m.specializers
+                                .iter()
+                                .zip(spec_args.iter())
+                                .all(|(ms, arg)| method_specializer_matches_designator(ms, *arg))
+                        {
+                            return Ok(m.method_id);
+                        }
+                    }
+                }
+                return not_found(
+                    env,
+                    format!("FIND-METHOD: no method for {gf_name} with the given qualifiers and specializers"),
+                );
+            }
             "SUBTYPEP" => {
                 // (subtypep type1 type2) → two values: subtype-p and certain-p.
                 let (t1_form, rest) = cp(cdr);
@@ -24075,7 +24188,7 @@ fn is_builtin_function(name: &str) -> bool {
             // Misc
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"
-            | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "SLOT-VALUE" | "SLOT-BOUNDP"
+            | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "FIND-METHOD" | "SLOT-VALUE" | "SLOT-BOUNDP"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
             // Debug introspection (bliss-zz6w)
             | "BLISS::%FN-BODY" | "BLISS::%FN-LAMBDA-LIST"

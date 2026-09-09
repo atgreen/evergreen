@@ -732,6 +732,36 @@ fn setf_unsupported_place_is_catchable() {
     );
 }
 
+#[test]
+fn find_method_locates_by_qualifiers_and_specializers() {
+    // FIND-METHOD returns the method with the given qualifiers and specializers
+    // (CLHS 7.6.2; bliss-7y1s: ansi-test universe.lsp builds *methods* with it).
+    // `#'gf` on a generic function yields the name symbol, which FIND-METHOD
+    // accepts as a designator. errorp NIL returns NIL when no method matches.
+    let expr = "(progn
+                  (defgeneric g30be (x y z))
+                  (defmethod g30be ((x fixnum) (y fixnum) (z fixnum)) (+ x y z))
+                  (defmethod g30be ((x symbol) (y t) (z t)) :sym)
+                  (let ((m (find-method #'g30be nil
+                             (mapcar #'find-class '(fixnum fixnum fixnum))))
+                        (m2 (find-method #'g30be nil
+                              (list (find-class 'symbol) (find-class 't) (find-class 't))))
+                        (none (find-method #'g30be nil
+                                (list (find-class 'character) (find-class 't) (find-class 't)) nil)))
+                    (princ (list (and m t) (and m2 t) (not (eql m m2)) none))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "FIND-METHOD must not error");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(T T T NIL)"),
+        "FIND-METHOD should locate both methods (distinct) and return NIL for no match, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CLOS (defclass / defmethod)
 // ══════════════════════════════════════════════════════════════════
