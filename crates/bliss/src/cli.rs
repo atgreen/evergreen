@@ -18388,6 +18388,17 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     env.block_stack.pop();
     match result {
         Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_value(&token)),
+        Ok(v) => {
+            // The implicit accumulator / NIL fall-through value of a LOOP is a
+            // single value. The loop body's last form may have set the
+            // multiple-values register (e.g. a predicate returning via
+            // `(apply #'values …)`, as ansi-aux's EQT does), which would
+            // otherwise leak into an enclosing MULTIPLE-VALUE-LIST — cons/LDIFF.8
+            // (bliss-i66o class). An explicit `(return (values …))` takes the
+            // control-token path above and keeps its values.
+            env.clear_mv();
+            Ok(v)
+        }
         other => other,
     }
 }
