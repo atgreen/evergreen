@@ -1555,9 +1555,31 @@
               (push x result))))
         (%set-difference-general a b key (or test-not test #'eql) (and test-not t)))))
 
+;; SET-EXCLUSIVE-OR: elements in exactly one of A/B. The test is always applied
+;; as (test a-element b-element) — list1 element FIRST — for BOTH directions
+;; (CLHS). Computing it as (set-difference b a) applied the test with swapped
+;; arguments, which is wrong for a non-symmetric :test (ansi-test
+;; set-exclusive-or with :test (lambda (x y) (= x (1- y))); bliss-30be). Apply the
+;; matcher directly with the fixed order instead.
+(defun %sxor-matches (kx ky testfn neg)
+  (let ((r (funcall testfn kx ky))) (if neg (not r) r)))
 (defun set-exclusive-or (a b &rest keys)
-  (append (apply (function set-difference) a b keys)
-          (apply (function set-difference) b a keys)))
+  (let* ((test (getf keys :test))
+         (test-not (getf keys :test-not))
+         (key (getf keys :key))
+         (keyfn (or key (function identity)))
+         (testfn (or test-not test (function eql)))
+         (neg (and test-not t))
+         (result nil))
+    (dolist (x a)
+      (let ((kx (funcall keyfn x)))
+        (unless (some (function (lambda (y) (%sxor-matches kx (funcall keyfn y) testfn neg))) b)
+          (push x result))))
+    (dolist (y b)
+      (let ((ky (funcall keyfn y)))
+        (unless (some (function (lambda (x) (%sxor-matches (funcall keyfn x) ky testfn neg))) a)
+          (push y result))))
+    (nreverse result)))
 
 (defun subsetp (a b &rest keys)
   (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
