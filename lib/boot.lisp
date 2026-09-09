@@ -131,9 +131,22 @@
                 ,@(mapcar (function list) dummies vals))
            (setf ,getter (cons ,g ,getter)))))))
 
-(defmacro pop (place)
-  `(prog1 (car ,place)
-     (setf ,place (cdr ,place))))
+;; POP: read the PLACE's list once (its subforms evaluated once, left to right),
+;; return its CAR, and store its CDR back into the place (CLHS 5.1.2 /
+;; pop.order.*). The naive (prog1 (car place) (setf place (cdr place)))
+;; double-evaluates the place subforms — e.g. (pop (aref a (progn (incf i) 0)))
+;; must increment I exactly once. Use the setf-expansion so the subforms are
+;; lifted into temporaries and the getter is read/stored once.
+(defmacro pop (place &environment env)
+  (let ((place (macroexpand place env)))
+    (multiple-value-bind (dummies vals newval setter getter)
+        (get-setf-expansion place env)
+      (declare (ignore newval setter))
+      (let ((g (gensym)))
+        `(let* (,@(mapcar (function list) dummies vals)
+                (,g ,getter))
+           (prog1 (car ,g)
+             (setf ,getter (cdr ,g))))))))
 
 ;; pushnew: add ITEM to the list in PLACE only if not already a MEMBER.
 ;; Keyword args (:test/:key) are accepted but only the default EQL test is

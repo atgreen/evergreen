@@ -12045,6 +12045,167 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_rt::rooted!(place = place);
                     bliss_rt::rooted!(val_form = val_form);
                     bliss_rt::rooted!(r2 = r2);
+                    // Order-correct handling for NTH and GETF places. CLHS
+                    // 5.1.1.1 requires the PLACE subforms to be evaluated (left
+                    // to right) BEFORE the value form; the generic path below
+                    // evaluates the value first (which reverses the order) and,
+                    // for GETF, re-evaluates the sub-place and skips the default
+                    // form. Handle those two here, before the value is evaluated,
+                    // so nth.order.1 / setf-getf.order.1-2 see the correct order.
+                    if place.is_cons() {
+                        let (pacc, pargs) = cp(*place);
+                        let pacc_name = if pacc.is_symbol() {
+                            symbol_bare_name(&sym_name(pacc))
+                        } else {
+                            String::new()
+                        };
+                        let user_expander =
+                            env.setf_expanders.borrow().contains_key(&pacc_name);
+                        if !user_expander && pacc_name == "NTH" && pargs.is_cons() {
+                            bliss_rt::rooted!(pargs = pargs);
+                            let (nform, rest) = cp(*pargs);
+                            if rest.is_cons() {
+                                let (lform, _) = cp(rest);
+                                bliss_rt::rooted!(nform = nform);
+                                bliss_rt::rooted!(lform = lform);
+                                // Place subforms first: index, then list.
+                                bliss_rt::rooted!(nval = eval_form(*nform, env)?);
+                                bliss_rt::rooted!(lst = eval_form(*lform, env)?);
+                                // Then the value form.
+                                bliss_rt::rooted!(v = eval_form(*val_form, env)?);
+                                let k = if nval.is_fixnum() {
+                                    nval.as_fixnum().max(0) as usize
+                                } else {
+                                    0
+                                };
+                                let mut tgt = *lst;
+                                for _ in 0..k {
+                                    if tgt.is_cons() {
+                                        tgt = cp(tgt).1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if tgt.is_cons() {
+                                    unsafe {
+                                        let cell = tgt.as_ptr() as *mut ConsCell;
+                                        bliss_rt::gc::store_ref(
+                                            std::ptr::addr_of_mut!((*cell).car),
+                                            *v,
+                                        );
+                                    }
+                                } else {
+                                    return Err(BlissError::Internal(
+                                        "SETF NTH: index past end of list".into(),
+                                    ));
+                                }
+                                result = *v;
+                                *c = *r2;
+                                continue;
+                            }
+                        }
+                        if !user_expander && pacc_name == "GETF" && pargs.is_cons() {
+                            bliss_rt::rooted!(pargs = pargs);
+                            // pargs = (place-subform indicator [default])
+                            let (placeform, rest) = cp(*pargs);
+                            if rest.is_cons() {
+                                let (indform, rest2) = cp(rest);
+                                let defform_opt = if rest2.is_cons() {
+                                    Some(cp(rest2).0)
+                                } else {
+                                    None
+                                };
+                                let has_def = defform_opt.is_some();
+                                bliss_rt::rooted!(placeform = placeform);
+                                bliss_rt::rooted!(indform = indform);
+                                bliss_rt::rooted!(defform = defform_opt.unwrap_or(NIL));
+                                // Setf-expansion of the SUB-PLACE so its subforms
+                                // are lifted into temporaries and it is read/stored
+                                // exactly once (allocates; placeform is rooted).
+                                let ex = get_setf_expansion(*placeform, env)?;
+                                bliss_rt::rooted!(access_form = ex.access_form);
+                                let mut temps = ex.temps.clone();
+                                let mut vals = ex.vals.clone();
+                                let parent = Rc::clone(&env.frame);
+                                let val_form_v = *val_form;
+                                let ind_form_v = *indform;
+                                let def_form_v = *defform;
+                                let access_v = *access_form;
+                                let rv = with_child_frame(env, parent, move |env| {
+                                    // Root the carried forms across the evals below:
+                                    // they are arena s-expressions that a minor GC
+                                    // during any eval_form here can relocate.
+                                    bliss_rt::rooted_ref!(_t = &mut temps);
+                                    bliss_rt::rooted_ref!(_vv = &mut vals);
+                                    bliss_rt::rooted!(val_form_v = val_form_v);
+                                    bliss_rt::rooted!(ind_form_v = ind_form_v);
+                                    bliss_rt::rooted!(def_form_v = def_form_v);
+                                    bliss_rt::rooted!(access_v = access_v);
+                                    // 1. place subforms, left to right.
+                                    for (temp, vf) in temps.iter().zip(vals.iter()) {
+                                        let tv = eval_form(*vf, env)?;
+                                        if temp.is_symbol() {
+                                            env.define_local_symbol(*temp, tv);
+                                        }
+                                    }
+                                    // 2. indicator subform.
+                                    bliss_rt::rooted!(ind = eval_form(*ind_form_v, env)?);
+                                    // 3. default subform (side effects only; the
+                                    //    stored default value is not used by SETF).
+                                    if has_def {
+                                        eval_form(*def_form_v, env)?;
+                                    }
+                                    // 4. value form.
+                                    bliss_rt::rooted!(v = eval_form(*val_form_v, env)?);
+                                    // 5. read the current plist via the getter.
+                                    bliss_rt::rooted!(plist = eval_form(*access_v, env)?);
+                                    let mut cur = *plist;
+                                    let mut found = false;
+                                    while cur.is_cons() {
+                                        let (k, restp) = cp(cur);
+                                        if !restp.is_cons() {
+                                            break;
+                                        }
+                                        if k == *ind {
+                                            unsafe {
+                                                let vcell = restp.as_ptr() as *mut ConsCell;
+                                                bliss_rt::gc::store_ref(
+                                                    std::ptr::addr_of_mut!((*vcell).car),
+                                                    *v,
+                                                );
+                                            }
+                                            found = true;
+                                            break;
+                                        }
+                                        cur = cp(restp).1;
+                                    }
+                                    if !found {
+                                        bliss_rt::rooted!(tail = arena_cons(*v, *plist));
+                                        bliss_rt::rooted!(newhead = arena_cons(*ind, *tail));
+                                        // Store the new head back through the getter
+                                        // place: (setf <access-form> (quote newhead)).
+                                        let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+                                        bliss_rt::rooted!(
+                                            quoted = arena_cons(
+                                                quote_sym,
+                                                arena_cons(*newhead, NIL)
+                                            )
+                                        );
+                                        let setf_form = vec_to_list(&[
+                                            resolve_sym("SETF").unwrap_or(NIL),
+                                            *access_v,
+                                            *quoted,
+                                        ]);
+                                        eval_form(setf_form, env)?;
+                                    }
+                                    Ok(*v)
+                                })?;
+                                result = rv;
+                                *c = *r2;
+                                continue;
+                            }
+                        }
+                    }
                     bliss_rt::rooted!(val = eval_form(*val_form, env)?);
                     if place.is_symbol() {
                         if let Some(mut expansion) = env.lookup_symbol_macro(*place) {
@@ -22193,14 +22354,18 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
         if let Some(expansion) = env.lookup_symbol_macro(place) {
             return get_setf_expansion(expansion, env);
         }
-        let store = gensym_symbol("NEW");
-        let setq = vec_to_list(&[resolve_sym("SETQ").unwrap_or(NIL), place, store]);
+        // gensym / resolve_sym / vec_to_list all allocate and can fire a minor
+        // GC; root PLACE and the store gensym so the SETQ store form and the
+        // access form do not capture relocated (stale) symbol pointers.
+        bliss_rt::rooted!(place = place);
+        bliss_rt::rooted!(store = gensym_symbol("NEW"));
+        let setq = vec_to_list(&[resolve_sym("SETQ").unwrap_or(NIL), *place, *store]);
         return Ok(SetfExpansion {
             temps: Vec::new(),
             vals: Vec::new(),
-            stores: vec![store],
+            stores: vec![*store],
             store_form: setq,
-            access_form: place,
+            access_form: *place,
         });
     }
     if place.is_cons() {
@@ -22311,45 +22476,77 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                     });
                 }
                 SetfExpander::ShortUpdate(update_fn) => {
-                    // (setf (name arg…) new) => (update-fn arg… new).
-                    let arg_forms = list_to_vec(args);
-                    let temps: Vec<BlissVal> =
-                        (0..arg_forms.len()).map(|_| gensym_symbol("A")).collect();
-                    let store = gensym_symbol("NEW");
-                    let mut access_items = vec![accessor];
+                    // (setf (name arg…) new) => (update-fn arg… new). gensym /
+                    // vec_to_list allocate; root the accessor, update-fn, argument
+                    // forms, temporaries and store gensym so a GC does not leave
+                    // stale pointers in the built forms.
+                    bliss_rt::rooted!(accessor = accessor);
+                    bliss_rt::rooted!(update_fn = update_fn);
+                    bliss_rt::rooted!(arg_forms = list_to_vec(args));
+                    let n = arg_forms.len();
+                    bliss_rt::rooted!(temps = Vec::<BlissVal>::with_capacity(n));
+                    for _ in 0..n {
+                        let g = gensym_symbol("A");
+                        temps.push(g);
+                    }
+                    bliss_rt::rooted!(store = gensym_symbol("NEW"));
+                    let mut access_items = Vec::with_capacity(n + 1);
+                    access_items.push(*accessor);
                     access_items.extend_from_slice(&temps);
-                    let mut store_items = vec![update_fn];
+                    bliss_rt::rooted_ref!(_ai = &mut access_items);
+                    bliss_rt::rooted!(access_form = vec_to_list(&access_items));
+                    let mut store_items = Vec::with_capacity(n + 2);
+                    store_items.push(*update_fn);
                     store_items.extend_from_slice(&temps);
-                    store_items.push(store);
+                    store_items.push(*store);
+                    bliss_rt::rooted_ref!(_si = &mut store_items);
+                    let store_form = vec_to_list(&store_items);
                     return Ok(SetfExpansion {
-                        temps,
-                        vals: arg_forms,
-                        stores: vec![store],
-                        store_form: vec_to_list(&store_items),
-                        access_form: vec_to_list(&access_items),
+                        temps: temps.clone(),
+                        vals: arg_forms.clone(),
+                        stores: vec![*store],
+                        store_form,
+                        access_form: *access_form,
                     });
                 }
             }
         }
         // Default expansion for a function place with a `(setf f)` writer: bind
         // each argument to a temporary, then store via `((setf f) new t1 t2 …)`
-        // and access via `(f t1 t2 …)`.
-        let arg_forms = list_to_vec(args);
-        let temps: Vec<BlissVal> = (0..arg_forms.len()).map(|_| gensym_symbol("A")).collect();
-        let store = gensym_symbol("NEW");
-        let mut access_items = vec![accessor];
+        // and access via `(f t1 t2 …)`. Everything below allocates (gensym /
+        // vec_to_list can fire a minor GC), so root the accessor, argument forms,
+        // temporaries, store gensym and each freshly built form — otherwise a
+        // relocation leaves a stale pointer in the returned expansion, which for
+        // the AREF/NTH place surfaced under GC stress as a store gensym leaking
+        // into the access form (an "unbound #:NEW-SETF-…" from PUSH/POP/PUSHNEW).
+        bliss_rt::rooted!(accessor = accessor);
+        bliss_rt::rooted!(arg_forms = list_to_vec(args));
+        let n = arg_forms.len();
+        bliss_rt::rooted!(temps = Vec::<BlissVal>::with_capacity(n));
+        for _ in 0..n {
+            let g = gensym_symbol("A");
+            temps.push(g);
+        }
+        bliss_rt::rooted!(store = gensym_symbol("NEW"));
+        let mut access_items = Vec::with_capacity(n + 1);
+        access_items.push(*accessor);
         access_items.extend_from_slice(&temps);
-        let access_form = vec_to_list(&access_items);
-        let setf_fn = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), accessor]);
-        let mut store_items = vec![resolve_sym("FUNCALL").unwrap_or(NIL), setf_fn, store];
+        bliss_rt::rooted_ref!(_ai = &mut access_items);
+        bliss_rt::rooted!(access_form = vec_to_list(&access_items));
+        bliss_rt::rooted!(
+            setf_fn = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *accessor])
+        );
+        let mut store_items =
+            vec![resolve_sym("FUNCALL").unwrap_or(NIL), *setf_fn, *store];
         store_items.extend_from_slice(&temps);
+        bliss_rt::rooted_ref!(_si = &mut store_items);
         let store_form = vec_to_list(&store_items);
         return Ok(SetfExpansion {
-            temps,
-            vals: arg_forms,
-            stores: vec![store],
+            temps: temps.clone(),
+            vals: arg_forms.clone(),
+            stores: vec![*store],
             store_form,
-            access_form,
+            access_form: *access_form,
         });
     }
     Err(BlissError::Internal(format!(
