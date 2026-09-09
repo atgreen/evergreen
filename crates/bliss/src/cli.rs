@@ -24354,9 +24354,15 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                     } = handler.handler
                     {
                         if entry_token == token {
+                            bliss_rt::rooted!(condition = condition);
                             let mut handler_env = env.child_with_parent(captured_frame);
+                            // Root the handler's env for the whole clause body: the
+                            // condition is bound only in this child frame, so a GC
+                            // fired by an allocation in the body must scan it or the
+                            // clause variable is left dangling (bliss-5jwg).
+                            bliss_rt::rooted_ref!(_handler_env_root = &mut handler_env);
                             if let Some(name) = var_name {
-                                handler_env.define_local(&name, condition);
+                                handler_env.define_local(&name, *condition);
                             }
                             let r = eval_progn(body, &mut handler_env)?;
                             // Propagate the handler's multiple-value state to the
@@ -24394,6 +24400,10 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                         {
                             if condition_matches_handler(env, condition, &handler.type_name) {
                                 let mut handler_env = env.child_with_parent(captured_frame);
+                                // Root the handler env for the clause body — its
+                                // frame holds the condition variable, which a body
+                                // GC would otherwise leave dangling (bliss-5jwg).
+                                bliss_rt::rooted_ref!(_handler_env_root = &mut handler_env);
                                 if let Some(name) = var_name {
                                     handler_env.define_local(&name, condition);
                                 }

@@ -944,6 +944,42 @@ fn handler_case_handler_clause_returns_all_values() {
 }
 
 #[test]
+fn handler_case_clause_variable_survives_gc_in_body() {
+    // bliss-5jwg: the HANDLER-CASE clause variable (the bound condition) and any
+    // clause-body local must survive a GC triggered by an allocation in the
+    // handler body. The tree-walker ran the clause in a child env that was not
+    // registered as a GC root, so a collection during the body left the condition
+    // (and body locals) dangling — under moving GC the value relocated but the
+    // frame slot did not, so `(typep c 'condition)` later saw a wrong object.
+    // BLISS_GC_STRESS collapses the latent, allocation-timing-dependent bug into
+    // a deterministic one (it manifests in the unoptimized/debug build; release
+    // codegen happens to keep the value otherwise reachable). The condition `c`
+    // is checked after an intervening allocation in the handler body.
+    let expr = r#"(progn
+  (dotimes (i 500)
+    (let ((ok (handler-case (error "x")
+                (error (c) (list i i i) (typep c 'condition)))))
+      (assert ok)))
+  (princ :ALL-OK))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .env("BLISS_GC_STRESS", "100")
+        .output()
+        .expect("failed to run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "handler-case clause state corrupted under GC stress; stdout='{stdout}' stderr='{stderr}'"
+    );
+    assert!(
+        stdout.contains("ALL-OK"),
+        "expected ALL-OK, got stdout='{stdout}' stderr='{stderr}'"
+    );
+}
+
+#[test]
 fn handler_case_catches_runtime_errors() {
     // Runtime errors raised by the evaluator (not only conditions raised through
     // SIGNAL/ERROR) are catchable CL conditions: HANDLER-CASE / IGNORE-ERRORS
