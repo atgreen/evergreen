@@ -3604,9 +3604,11 @@ impl<'e> Lowerer<'e> {
             // the condition already stored in `var_slot`.
             self.cur_stack = sp_restore;
             self.lower_progn(body)?; // clause value (+1)
-            // The tree-walker runs the clause in a child env, so a clause's
-            // secondary values do not propagate out of the handler-case.
-            self.emit(Instr::ClearMv);
+            // A handler clause returns the values of its last form, exactly like
+            // a PROGN — e.g. IGNORE-ERRORS' `(values nil c)` must keep the
+            // condition secondary value (bliss-xy7t). `lower_progn` already leaves
+            // the last form's multiple-value state in place, so do NOT clear it
+            // here (the old ClearMv mirrored a tree-walker bug since fixed).
             self.exit_scope(saved_next_local);
             self.emit(Instr::Br(0));
             clause_brs.push(self.code.len() - 1);

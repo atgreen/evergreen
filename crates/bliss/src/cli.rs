@@ -24358,7 +24358,18 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                             if let Some(name) = var_name {
                                 handler_env.define_local(&name, condition);
                             }
-                            return eval_progn(body, &mut handler_env);
+                            let r = eval_progn(body, &mut handler_env)?;
+                            // Propagate the handler's multiple-value state to the
+                            // caller. The handler body runs in a CHILD env, so a
+                            // `(values …)` in it set handler_env.mv, not env.mv;
+                            // without this the secondary values are lost — e.g.
+                            // IGNORE-ERRORS' `(values nil c)` dropped the condition
+                            // (bliss-xy7t). GC-safe: no allocation between
+                            // eval_progn returning and moving the value vector, so
+                            // `r` and the mv values stay put.
+                            env.mv = std::mem::take(&mut handler_env.mv);
+                            env.mv_active = handler_env.mv_active;
+                            return Ok(r);
                         }
                     }
                 }
@@ -24386,7 +24397,18 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                                 if let Some(name) = var_name {
                                     handler_env.define_local(&name, condition);
                                 }
-                                return eval_progn(body, &mut handler_env);
+                                let r = eval_progn(body, &mut handler_env)?;
+                            // Propagate the handler's multiple-value state to the
+                            // caller. The handler body runs in a CHILD env, so a
+                            // `(values …)` in it set handler_env.mv, not env.mv;
+                            // without this the secondary values are lost — e.g.
+                            // IGNORE-ERRORS' `(values nil c)` dropped the condition
+                            // (bliss-xy7t). GC-safe: no allocation between
+                            // eval_progn returning and moving the value vector, so
+                            // `r` and the mv values stay put.
+                            env.mv = std::mem::take(&mut handler_env.mv);
+                            env.mv_active = handler_env.mv_active;
+                            return Ok(r);
                             }
                         }
                     }

@@ -918,6 +918,32 @@ fn eval_multiple_values_do_not_leak_through_single_value_ops() {
 }
 
 #[test]
+fn handler_case_handler_clause_returns_all_values() {
+    // bliss-xy7t: a HANDLER-CASE handler clause returns the values of its last
+    // form, exactly like PROGN — so IGNORE-ERRORS' `(values nil c)` keeps the
+    // condition as its secondary value. The old code cleared multiple values on
+    // the handler path (tree-walker ran the clause in a child env; the bytecode
+    // lowerer mirrored that with an explicit ClearMv), dropping every secondary.
+    let expr = r#"(format nil "~A|~A|~A|~A"
+  (multiple-value-list (handler-case (error "x") (error (c) (values 1 2 3))))       ; -> (1 2 3)
+  (multiple-value-list (handler-case (error "x") (error (c) 42)))                    ; -> (42)
+  (multiple-value-list (handler-case (values 7 8 9) (error (c) 0)))                  ; -> (7 8 9)
+  (typep (nth-value 1 (ignore-errors (error "boom"))) 'condition))"#; // -> T
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(1 2 3)|(42)|(7 8 9)|T"),
+        "handler clause dropped secondary values or ignore-errors lost the \
+         condition, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn handler_case_catches_runtime_errors() {
     // Runtime errors raised by the evaluator (not only conditions raised through
     // SIGNAL/ERROR) are catchable CL conditions: HANDLER-CASE / IGNORE-ERRORS
