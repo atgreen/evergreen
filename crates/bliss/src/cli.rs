@@ -13159,18 +13159,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(NIL);
                 }
                 bliss_rt::rooted!(c = cdr);
+                // CLHS: APPEND copies every argument BUT THE LAST, and the last
+                // argument becomes the tail of the result AS-IS (any object — an
+                // atom yields a dotted list; a single argument is returned
+                // unchanged). Previously the last arg was flattened with
+                // list_to_vec, so its atom tail was dropped: `(append '(1 2) 'x)`
+                // wrongly gave (1 2) instead of (1 2 . x) (ansi-test append.4/5).
+                bliss_rt::rooted!(tail = NIL);
                 while c.is_cons() {
                     let (item_form, rest) = cp(*c);
                     bliss_rt::rooted!(rest = rest);
                     let is_last = !rest.is_cons();
                     let v = eval_form(item_form, env)?;
                     *c = *rest;
-                    if is_last && v.is_nil() {
-                        continue;
+                    if is_last {
+                        *tail = v;
+                    } else {
+                        all.extend(list_to_vec(v));
                     }
-                    all.extend(list_to_vec(v));
                 }
-                return Ok(vec_to_list(&all));
+                // Cons the collected elements onto the (as-is) tail, right to left.
+                bliss_rt::rooted!(result = *tail);
+                for i in (0..all.len()).rev() {
+                    *result = arena_cons(all[i], *result);
+                }
+                return Ok(*result);
             }
             "REVERSE" => {
                 // Delegate to the stdlib so lists, vectors, and strings all

@@ -887,6 +887,31 @@ fn typep_unsigned_byte_accepts_positive_bignum() {
 }
 
 #[test]
+fn append_last_argument_is_the_tail_as_is() {
+    // CLHS: APPEND copies all arguments but the last; the last becomes the tail
+    // AS-IS (an atom yields a dotted list). The old code flattened the last arg,
+    // dropping its atom tail — `(append '(1 2) 'x)` gave (1 2) not (1 2 . X)
+    // (ansi-test cons/append.lsp APPEND.4/APPEND.5; bliss-x7aa).
+    let expr = "(princ (list (append '(1 2) 'x)
+                             (append nil 'x)
+                             (append '(1) '(2) 3)
+                             (append nil nil 'a)
+                             (append '(1 2) '(3 4))
+                             (append 'z)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("((1 2 . X) X (1 2 . 3) A (1 2 3 4) Z)"),
+        "APPEND's last arg must be the tail as-is, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).
