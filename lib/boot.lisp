@@ -1141,6 +1141,7 @@
 (defun char= (c &rest more)
   (dolist (x more t) (unless (= (char-code c) (char-code x)) (return nil))))
 (defun char/= (&rest cs)
+  (when (null cs) (error 'program-error)) ; requires >=1 arg (char-compare-no-args)
   (do ((tail cs (cdr tail))) ((null tail) t)
     (dolist (y (cdr tail))
       (when (= (char-code (car tail)) (char-code y)) (return-from char/= nil)))))
@@ -2224,7 +2225,12 @@
 ;; Case-insensitive character comparisons.  EQUAL/NOT-EQUAL require all/none of
 ;; the arguments equal; the ordered comparisons require a monotonic chain.
 (defun %char-chain (fn cs)
-  (if (or (null cs) (null (cdr cs)))
+  ;; All CLHS character comparisons require at least one argument; a no-argument
+  ;; call is a PROGRAM-ERROR (char-compare-no-args). The recursion never reaches
+  ;; a null CS (it stops at one element), so this fires only on the top-level
+  ;; zero-argument call.
+  (when (null cs) (error 'program-error))
+  (if (null (cdr cs))
       t
       (and (funcall fn (car cs) (cadr cs)) (%char-chain fn (cdr cs)))))
 
@@ -2241,6 +2247,7 @@
 (defun char-not-equal (&rest cs)
   ;; every pair must differ (case-insensitively).  RETURN-FROM (not RETURN)
   ;; because the inner DOLIST establishes its own BLOCK NIL.
+  (when (null cs) (error 'program-error)) ; requires >=1 arg (char-compare-no-args)
   (block done
     (loop for tail on cs do
       (dolist (o (cdr tail))
@@ -2354,6 +2361,12 @@
 (defun realp (x) (or (rationalp x) (floatp x)))
 (defun complexp (x) (typep x 'complex))
 (defun characterp (x) (typep x 'character))
+;; CHARACTER (CLHS): coerce a character designator (a character, a 1-char string,
+;; or a symbol whose name is 1 char) to a character; anything else is a
+;; TYPE-ERROR. Exactly one required argument, so a wrong count signals
+;; PROGRAM-ERROR via the lambda-list binder (character.error.1/2). Delegates to
+;; the existing (coerce c 'character) machinery.
+(defun character (c) (coerce c 'character))
 (defun functionp (x) (typep x 'function))
 
 (defun ash (n count)

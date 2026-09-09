@@ -8981,6 +8981,12 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "COMPLEX" => &["NUMBER", "ATOM", "T"],
         "NUMBER" => &["ATOM", "T"],
         "CHARACTER" => &["ATOM", "T"],
+        // CLHS character type hierarchy: STANDARD-CHAR ⊆ BASE-CHAR ⊆ CHARACTER,
+        // and EXTENDED-CHAR ⊆ CHARACTER (ansi-test base-char.1/standard-char.1-2/
+        // extended-char.1).
+        "STANDARD-CHAR" => &["BASE-CHAR", "CHARACTER", "ATOM", "T"],
+        "BASE-CHAR" => &["CHARACTER", "ATOM", "T"],
+        "EXTENDED-CHAR" => &["CHARACTER", "ATOM", "T"],
         "SYMBOL" => &["ATOM", "T"],
         "KEYWORD" => &["SYMBOL", "ATOM", "T"],
         "NULL" => &["SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"],
@@ -10440,6 +10446,9 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // exactly one argument (FOURTH..TENTH are boot.lisp defuns already
         // checked by the binder). ansi-test {first,second,third}.error.* (bliss-l6y9).
         "FIRST" | "SECOND" | "THIRD" => Some((1, 1)),
+        // (char-code char) / (code-char code) take exactly one argument
+        // (ansi-test char-code.error/code-char.error).
+        "CHAR-CODE" | "CODE-CHAR" => Some((1, 1)),
         // (member item list &key ...) / (assoc item alist &key ...) — two
         // required, then an unbounded keyword tail (max == usize::MAX). bliss-l6y9.
         "MEMBER" | "ASSOC" => Some((2, usize::MAX)),
