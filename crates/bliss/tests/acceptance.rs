@@ -933,6 +933,32 @@ fn mapl_maplist_with_no_lists_signal_not_hang() {
 }
 
 #[test]
+fn copy_seq_and_subseq_of_string_are_fresh_and_mutable() {
+    // SUBSEQ (and COPY-SEQ = (subseq s 0)) must return a FRESH independent string,
+    // not the interned/shared one — else copies are EQ, mutating a copy aliases the
+    // original, and default-EQL MEMBER/UNION over COPY-SEQ'd strings mis-dedup
+    // (bliss-9kxg). Check distinct identity, mutation independence, and the EQL set
+    // ops that depend on it.
+    let expr = "(princ (list
+                  (eq (copy-seq \"xyz\") (copy-seq \"xyz\"))
+                  (let* ((s (copy-seq \"abc\")) (c (copy-seq s)))
+                    (setf (char c 0) #\\Z) (list s c))
+                  (member (copy-seq \"cc\") (list \"aa\" \"cc\"))
+                  (length (union (list (copy-seq \"x\")) (list (copy-seq \"x\"))))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(NIL (\"abc\" \"Zbc\") NIL 2)"),
+        "copy-seq/subseq strings must be fresh, mutable, and distinct, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).

@@ -1212,7 +1212,14 @@ pub fn subseq(
             });
         }
         let sub = chars[start..actual_end].iter().collect::<String>();
-        return Ok(crate::streams::make_lisp_string(&sub));
+        // SUBSEQ (and COPY-SEQ, which is (subseq seq 0)) must return a FRESH,
+        // independent, mutable string — not the interned/shared one. make_lisp_string
+        // interns by content, so `(copy-seq s)` returned an object EQ to `s` (a no-op)
+        // and mutations aliased; `(eq (copy-seq "x") (copy-seq "x"))` was T. Use the
+        // fresh constructor so copies have distinct identity and their own storage —
+        // this also un-breaks the default-EQL set ops over COPY-SEQ'd strings that
+        // ansi-test's CONS chapter exercises (bliss-9kxg).
+        return Ok(crate::streams::make_lisp_string_fresh(&sub));
     }
     let elems = collect_elements(sequence)?;
     let len = elems.len();
