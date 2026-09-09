@@ -8035,8 +8035,11 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissV
     ensure_package_available(env, &pkg_name, &[]);
     // Record the symbol's home package in its heap cell, pointing at the shared
     // bliss_rt PACKAGE object (bliss-jtc.6 Stage D). A no-op if the symbol is not
-    // registry-resident.
-    if sym.is_symbol() {
+    // registry-resident. NIL and T report `is_symbol()` true but carry the SPECIAL
+    // tag, not TAG_SYMBOL, so `as_symbol_index` would panic — and their home
+    // package (COMMON-LISP) is fixed anyway; exclude them (bliss-cpm9: `(intern
+    // "NIL" …)`/`(intern "T" …)` from ansi-test cl-symbol-names.lsp).
+    if sym.is_symbol() && sym != NIL && sym != T {
         let pkg = bliss_rt::packages::find_or_create(&pkg_name);
         bliss_rt::symbols::set_symbol_package(sym.as_symbol_index(), pkg);
     }
@@ -15251,7 +15254,36 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // LOAD accepts a pathname designator — a namestring OR a pathname
                 // object (e.g. `#P"…"`, common in a ~/.blissrc). `val_as_str` on a
                 // pathname yields its debug repr, so coerce via its namestring.
-                let path = path_designator_to_string(path_val)?;
+                let mut path = path_designator_to_string(path_val)?;
+                // A relative LOAD pathname resolves against *DEFAULT-PATHNAME-
+                // DEFAULTS* (CLHS): merge PATH with its directory when PATH is not
+                // absolute. Read the value cell first so a LET/binding of the
+                // variable is honored — ansi-test cons/load.lsp binds it to the
+                // chapter directory and then `(load "cons.lsp")` (bliss-cpm9). Merge
+                // through pathname objects so directory semantics are correct; the
+                // default ("./") leaves CWD-relative behaviour unchanged.
+                if !std::path::Path::new(&path).is_absolute() {
+                    let dpd = resolve_sym("*DEFAULT-PATHNAME-DEFAULTS*")
+                        .and_then(|s| global_value_cell(s.as_symbol_index()))
+                        .or_else(|| env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*"));
+                    if let Some(v) = dpd {
+                        if !v.is_nil() {
+                            if let (Ok(pn), Ok(dflt)) =
+                                (coerce_pathname_designator(path_val), coerce_pathname_designator(v))
+                            {
+                                if let Ok(merged) =
+                                    bliss_stdlib::merge_pathnames(pn, dflt, NIL)
+                                {
+                                    if let Ok(s) = path_designator_to_string(merged) {
+                                        if std::path::Path::new(&s).is_absolute() {
+                                            path = s;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if if_missing_nil && !std::path::Path::new(&path).exists() {
                     return Ok(NIL);
                 }
@@ -21345,7 +21377,11 @@ fn bind_lambda_list_ex(
         let start = key_start.unwrap_or(arg_i);
         let tail = args.get(start..).unwrap_or(&[]);
         if tail.len() % 2 != 0 {
-            return Err(BlissError::Internal(
+            // Odd keyword-argument count is a PROGRAM-ERROR (CLHS 3.5.1.6), which
+            // must be catchable by HANDLER-CASE/IGNORE-ERRORS — ansi-test's
+            // *.ERROR.* tests pass malformed &key args expecting a signalled error,
+            // not an uncatchable internal abort (bliss-cpm9).
+            return Err(BlissError::ProgramError(
                 "keyword arguments must appear in key/value pairs".into(),
             ));
         }
@@ -21727,7 +21763,7 @@ fn bind_macro_lambda_list(
         let start = key_start.unwrap_or(arg_i);
         let tail = args.get(start..).unwrap_or(&[]);
         if tail.len() % 2 != 0 {
-            return Err(BlissError::Internal(
+            return Err(BlissError::ProgramError(
                 "macro keyword arguments must appear in key/value pairs".into(),
             ));
         }
@@ -22394,6 +22430,26 @@ fn expand_macro(
     // build below, both of which allocate and can fire a relocating minor GC;
     // root it so the bound form is not left dangling (bliss-6b2 #2).
     bliss_rt::rooted_ref!(_whole_root = &mut whole);
+    // Macro expansion must be *PACKAGE*-neutral: a compiled expander runs in a
+    // child env whose captured frame carries the macro's DEFINITION package, and
+    // the bytecode run path syncs the *PACKAGE* value cell to it — so expanding a
+    // macro defined in another package (e.g. regression-test's DEFTEST from
+    // ansi-test, whose home resolves to COMMON-LISP-USER) silently clobbered the
+    // caller's *PACKAGE*, corrupting subsequent reads and nested LOADs (bliss-cpm9:
+    // a macroexpand in :cl-test left *PACKAGE* = CL-USER, so a following
+    // `(load "cons.lsp")` read DEFTEST as an undefined function). Snapshot and
+    // restore both the field and the value cell around the whole expansion.
+    let saved_package = env.current_package.clone();
+    let saved_package_cell =
+        resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()));
+    let restore_package = |env: &mut Env| {
+        env.current_package = saved_package.clone();
+        if let Some(cell) = saved_package_cell {
+            if let Some(s) = resolve_sym("*PACKAGE*") {
+                bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), cell);
+            }
+        }
+    };
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     // Root the forked expansion Env for the WHOLE expansion — both branches:
     // run_macro (bytecode expanders) and the tree-walked body below allocate
@@ -22413,14 +22469,18 @@ fn expand_macro(
     // environment (we pass NIL; bliss expanders that need lexical context use
     // &environment macros instead).
     if let Some(f) = mdef.function {
-        return apply_function(f, &[whole, NIL], env);
+        let r = apply_function(f, &[whole, NIL], env);
+        restore_package(env);
+        return r;
     }
     if let Some(function) = &mdef.bytecode {
-        return bytecode::run_macro(
+        let r = bytecode::run_macro(
             Rc::new(function.borrow().clone()),
             &arg_list,
             &mut child_env,
         );
+        restore_package(env);
+        return r;
     }
     // Building the macroexpand environment walks every frame and re-registers
     // *all* global macros into bliss-compiler's macro table (with fresh handles
@@ -22442,7 +22502,9 @@ fn expand_macro(
         macroexpand_env.as_ref(),
         Some(whole),
     )?;
-    let expansion = eval_progn(mdef.body, &mut child_env)?;
+    let expansion = eval_progn(mdef.body, &mut child_env);
+    restore_package(env);
+    let expansion = expansion?;
     debug_validate_form("expand-result", "tree-walk-macro", expansion);
     Ok(expansion)
 }

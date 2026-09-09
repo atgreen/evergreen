@@ -810,6 +810,59 @@ fn remove_duplicates_is_linear_and_honors_keywords() {
     );
 }
 
+#[test]
+fn macroexpansion_is_package_neutral() {
+    // Expanding a macro defined in another package must not change the caller's
+    // *PACKAGE* (bliss-cpm9): a macro expander runs in a fresh expansion env, and
+    // its package must not leak into the global cell — else a following relative
+    // LOAD (which resolves bare symbols against *PACKAGE*) breaks. Define a macro
+    // in CL-USER, switch to a fresh package that inherits it, macroexpand it, and
+    // confirm *PACKAGE* is still that package (not reset to CL-USER).
+    let expr = "(progn
+                  (defmacro pkgtest-m30 () (list '+ 1 2))
+                  (export 'pkgtest-m30)
+                  (make-package :pkgtest30 :use '(:common-lisp :common-lisp-user))
+                  (in-package :pkgtest30)
+                  (macroexpand-1 '(pkgtest-m30))
+                  (cl:format t \"~A\" (cl:package-name cl:*package*)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PKGTEST30"),
+        "macroexpand must leave *PACKAGE* unchanged (PKGTEST30), got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn odd_keyword_args_signal_catchable_error() {
+    // An odd number of keyword arguments is a catchable PROGRAM-ERROR, not an
+    // uncatchable internal abort — ansi-test's *.ERROR.* tests pass malformed
+    // &key args inside IGNORE-ERRORS (bliss-cpm9).
+    let expr = "(progn
+                  (defun kwfn (&key a b) (list a b))
+                  (princ (ignore-errors (kwfn :a 1 :b))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "odd &key args inside IGNORE-ERRORS must be caught, not abort"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NIL"),
+        "IGNORE-ERRORS should catch the odd-keyword PROGRAM-ERROR and yield NIL, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CLOS (defclass / defmethod)
 // ══════════════════════════════════════════════════════════════════

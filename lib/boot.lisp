@@ -284,6 +284,18 @@
 ;;; all that is needed.
 ;;; ---------------------------------------------------------------------------
 
+;; DEFINE-METHOD-COMBINATION (CLHS 7.7) — STUB. Accepts the short and long forms
+;; and returns NAME, but does not yet register a usable custom combination:
+;; invoking a generic function declared with a user-defined :method-combination
+;; is unsupported (only the built-in combinations — standard/+/and/or/list/
+;; append/nconc/min/max/progn — dispatch). This lets support code that merely
+;; DEFINES a combination load (ansi-test random-aux.lsp defines `randomized` but
+;; never uses it in the CONS/SYMBOLS/… chapters). Full custom-combination
+;; dispatch is tracked separately (bliss-cpm9).
+(defmacro define-method-combination (name &rest args)
+  (declare (ignore args))
+  `(quote ,name))
+
 (defmacro with-slots (slots instance &rest body)
   (let ((obj (gensym)))
     `(let ((,obj ,instance))
@@ -1461,38 +1473,83 @@
 
 ;;; --- set operations (KEY/TEST honoured via %seq-find) -----------------------
 
-(defun union (a b &key key (test (function eql)) test-not)
-  (let ((testfn (or test-not test)) (neg (if test-not t nil))
-        (result (copy-list b)))
+;; UNION / INTERSECTION / SET-DIFFERENCE / SUBSETP. The default EQL case builds
+;; an EQL hash set of B (or A) for O(n+m) membership, instead of the O(n*m)
+;; %SEQ-FIND scan — ansi-test cl-symbol-names.lsp runs these over ~1000-symbol
+;; lists (`(reduce #'union …)`, `set-difference …`), where the quadratic scan
+;; (also tree-walked, since a &key lambda list bails the compiler) hung
+;; (bliss-cpm9). &rest+GETF and no inner LAMBDA keep the hot path compilable; a
+;; custom :test/:test-not/:key takes the O(n*m) general helper.
+(defun %eql-membership-set (list key)
+  (let ((seen (make-hash-table :test 'eql)))
+    (dolist (x list seen)
+      (setf (gethash (if key (funcall key x) x) seen) t))))
+
+(defun %in-hash-set-p (x seen)
+  (multiple-value-bind (v p) (gethash x seen) (declare (ignore v)) p))
+
+(defun %union-general (a b key testfn neg)
+  (let ((result (copy-list b)))
     (dolist (x a result)
-      (let ((kx (if key (funcall key x) x)))
-        (unless (%seq-find kx b key testfn neg)
-          (push x result))))))
+      (unless (%seq-find (if key (funcall key x) x) b key testfn neg)
+        (push x result)))))
 
-(defun intersection (a b &key key (test (function eql)) test-not)
-  (let ((testfn (or test-not test)) (neg (if test-not t nil)) (result nil))
+(defun %intersection-general (a b key testfn neg)
+  (let ((result nil))
     (dolist (x a (reverse result))
-      (let ((kx (if key (funcall key x) x)))
-        (when (%seq-find kx b key testfn neg)
-          (push x result))))))
+      (when (%seq-find (if key (funcall key x) x) b key testfn neg)
+        (push x result)))))
 
-(defun set-difference (a b &key key (test (function eql)) test-not)
-  (let ((testfn (or test-not test)) (neg (if test-not t nil)) (result nil))
+(defun %set-difference-general (a b key testfn neg)
+  (let ((result nil))
     (dolist (x a (reverse result))
-      (let ((kx (if key (funcall key x) x)))
-        (unless (%seq-find kx b key testfn neg)
-          (push x result))))))
+      (unless (%seq-find (if key (funcall key x) x) b key testfn neg)
+        (push x result)))))
+
+(defun union (a b &rest keys)
+  (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
+    (if (and (null test) (null test-not))
+        (let ((seen (%eql-membership-set b key)) (result (copy-list b)))
+          (dolist (x a result)
+            (let ((kx (if key (funcall key x) x)))
+              (unless (%in-hash-set-p kx seen)
+                (setf (gethash kx seen) t)
+                (push x result)))))
+        (%union-general a b key (or test-not test #'eql) (and test-not t)))))
+
+(defun intersection (a b &rest keys)
+  (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
+    (if (and (null test) (null test-not))
+        (let ((seen (%eql-membership-set b key)) (result nil))
+          (dolist (x a (reverse result))
+            (when (%in-hash-set-p (if key (funcall key x) x) seen)
+              (push x result))))
+        (%intersection-general a b key (or test-not test #'eql) (and test-not t)))))
+
+(defun set-difference (a b &rest keys)
+  (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
+    (if (and (null test) (null test-not))
+        (let ((seen (%eql-membership-set b key)) (result nil))
+          (dolist (x a (reverse result))
+            (unless (%in-hash-set-p (if key (funcall key x) x) seen)
+              (push x result))))
+        (%set-difference-general a b key (or test-not test #'eql) (and test-not t)))))
 
 (defun set-exclusive-or (a b &rest keys)
   (append (apply (function set-difference) a b keys)
           (apply (function set-difference) b a keys)))
 
-(defun subsetp (a b &key key (test (function eql)) test-not)
-  (let ((testfn (or test-not test)) (neg (if test-not t nil)))
-    (dolist (x a t)
-      (let ((kx (if key (funcall key x) x)))
-        (unless (%seq-find kx b key testfn neg)
-          (return nil))))))
+(defun subsetp (a b &rest keys)
+  (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
+    (if (and (null test) (null test-not))
+        (let ((seen (%eql-membership-set b key)))
+          (dolist (x a t)
+            (unless (%in-hash-set-p (if key (funcall key x) x) seen)
+              (return nil))))
+        (let ((testfn (or test-not test #'eql)) (neg (and test-not t)))
+          (dolist (x a t)
+            (unless (%seq-find (if key (funcall key x) x) b key testfn neg)
+              (return nil)))))))
 
 ;; Destructive variants are permitted to reuse structure; delegating to the
 ;; non-destructive forms is a conforming implementation.

@@ -797,10 +797,34 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 /// global macro table (spec §4.2.3 Phase 1 step 2.e).
 ///
 /// Otherwise returns (form, false).
+/// Restores the `*PACKAGE*` value cell when dropped. Macro expansion must be
+/// *PACKAGE*-neutral, but a macro expander runs in a fresh expansion env whose
+/// (CL-USER) package leaks into the global cell — so expanding a macro defined in
+/// another package silently clobbered the caller's *PACKAGE*, breaking subsequent
+/// reads and nested LOADs (bliss-cpm9: a DEFTEST macroexpand in :cl-test left
+/// *PACKAGE* = CL-USER, so a following `(load "cons.lsp")` read DEFTEST as an
+/// undefined function). Snapshot the cell around every expansion and restore it.
+struct PackageCellGuard {
+    sym: Option<u32>,
+    saved: Option<BlissVal>,
+}
+impl Drop for PackageCellGuard {
+    fn drop(&mut self) {
+        if let (Some(sym), Some(saved)) = (self.sym, self.saved) {
+            bliss_rt::symbols::set_symbol_value(sym, saved);
+        }
+    }
+}
+
 pub fn macroexpand_1(
     mut form: BlissVal,
     env: &Environment,
 ) -> Result<(BlissVal, bool), BlissError> {
+    let _pkg_guard = {
+        let sym = bliss_rt::symbols::find_index("*PACKAGE*");
+        let saved = sym.and_then(bliss_rt::symbols::symbol_value);
+        PackageCellGuard { sym, saved }
+    };
     bliss_rt::rooted_ref!(_form_root = &mut form);
     // 1. Check if form is a symbol with a symbol-macro binding. *macroexpand-hook*
     // applies to symbol-macro expansion too (CLHS macroexpand-1: the hook mediates
