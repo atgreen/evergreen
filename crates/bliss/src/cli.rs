@@ -8864,9 +8864,10 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             };
             Ok(vector_length_matches(&size_args, object))
         }
+        // The (MEMBER …) type specifier compares with EQL (CLHS 4.2.3), not EQUAL.
         "MEMBER" => Ok(list_to_vec(args)
             .into_iter()
-            .any(|candidate| vals_equal(object, candidate))),
+            .any(|candidate| eql_values(object, candidate))),
         "EQL" => {
             let (value, _) = cp(args);
             Ok(eql_values(object, value))
@@ -13608,7 +13609,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     } else if has_test_not {
                         apply_function(fns[2], &[*item, probe], env)? == NIL
                     } else {
-                        vals_equal(probe, *item)
+                        eql_values(probe, *item)
                     };
                     if matched {
                         return Ok(*c);
@@ -13660,7 +13661,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         } else if has_test_not {
                             apply_function(fns[2], &[*item, probe], env)? == NIL
                         } else {
-                            vals_equal(probe, *item)
+                            eql_values(probe, *item)
                         };
                         if matched {
                             // Re-read the (rooted, GC-current) pair after the
