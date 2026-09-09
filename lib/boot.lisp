@@ -1656,7 +1656,28 @@
       (unless (%seq-find (if key (funcall key x) x) b key testfn neg)
         (push x result)))))
 
+;; Validate a set-operation keyword plist (:test :test-not :key
+;; :allow-other-keys). These functions parse KEYS with GETF rather than a strict
+;; &key lambda list, so malformed keyword arguments were silently accepted; ANSI
+;; requires a catchable PROGRAM-ERROR (CLHS 3.5.1.4/3.5.1.5/3.5.1.6). Signal it
+;; when the plist has odd length, a non-symbol sits in a key position, or an
+;; unrecognised keyword appears — the last unless :allow-other-keys is supplied
+;; with a true value (ansi-test union/intersection/subsetp/... .ERROR.3-6).
+(defun %check-set-op-keys (keys)
+  (let ((allow (getf keys :allow-other-keys)))
+    (do ((ks keys (cddr ks)))
+        ((null ks))
+      (unless (consp (cdr ks))
+        (error 'program-error))
+      (let ((k (car ks)))
+        (unless (symbolp k)
+          (error 'program-error))
+        (unless (or allow
+                    (member k '(:test :test-not :key :allow-other-keys)))
+          (error 'program-error))))))
+
 (defun union (a b &rest keys)
+  (%check-set-op-keys keys)
   (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
     (if (and (null test) (null test-not))
         (let ((seen (%eql-membership-set b key)) (result (copy-list b)))
@@ -1668,6 +1689,7 @@
         (%union-general a b key (or test-not test #'eql) (and test-not t)))))
 
 (defun intersection (a b &rest keys)
+  (%check-set-op-keys keys)
   (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
     (if (and (null test) (null test-not))
         (let ((seen (%eql-membership-set b key)) (result nil))
@@ -1677,6 +1699,7 @@
         (%intersection-general a b key (or test-not test #'eql) (and test-not t)))))
 
 (defun set-difference (a b &rest keys)
+  (%check-set-op-keys keys)
   (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
     (if (and (null test) (null test-not))
         (let ((seen (%eql-membership-set b key)) (result nil))
@@ -1694,6 +1717,7 @@
 (defun %sxor-matches (kx ky testfn neg)
   (let ((r (funcall testfn kx ky))) (if neg (not r) r)))
 (defun set-exclusive-or (a b &rest keys)
+  (%check-set-op-keys keys)
   (let* ((test (getf keys :test))
          (test-not (getf keys :test-not))
          (key (getf keys :key))
@@ -1712,6 +1736,7 @@
     (nreverse result)))
 
 (defun subsetp (a b &rest keys)
+  (%check-set-op-keys keys)
   (let ((test (getf keys :test)) (test-not (getf keys :test-not)) (key (getf keys :key)))
     (if (and (null test) (null test-not))
         (let ((seen (%eql-membership-set b key)))
