@@ -9412,6 +9412,18 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     poison_trap(form, "eval_form entry");
     bliss_rt::rooted!(form = form);
     let form = *form;
+    // Atoms, self-evaluating constants, and variable references each produce
+    // exactly ONE value, so evaluating one must reset the multiple-values
+    // register. Without this, when such an atom is the last form evaluated in a
+    // body (e.g. `(let ((y ...)) (g) y)` where `g` returned several values), the
+    // prior call's `set_mv` state persists and leaks into an enclosing
+    // MULTIPLE-VALUE-LIST / MULTIPLE-VALUE-BIND (bliss-i66o). Cons forms are left
+    // to eval_list, which sets the register for its own result. A symbol-macro
+    // whose expansion is multi-valued re-sets the register when the expansion is
+    // evaluated below, so clearing here first is harmless.
+    if !form.is_cons() {
+        env.clear_mv();
+    }
     if form.is_nil() || form == T {
         return Ok(form);
     }
