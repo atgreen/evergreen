@@ -12430,7 +12430,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         });
                                     }
                                 } else {
-                                    return Err(BlissError::Internal(format!(
+                                    // An unsupported/undefined SETF place is a
+                                    // PROGRAM-ERROR, not an internal abort: it must
+                                    // be catchable by HANDLER-CASE/IGNORE-ERRORS
+                                    // (a BlissError::Internal yields no condition and
+                                    // escapes them). ansi-test's universe.lsp wraps
+                                    // `(setf (logical-pathname-translations …) …)` in
+                                    // IGNORE-ERRORS precisely so impls lacking the
+                                    // place skip it (bliss-30be).
+                                    return Err(BlissError::ProgramError(format!(
                                         "SETF: unsupported place ({} ...)",
                                         other
                                     )));
@@ -12589,7 +12597,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     match symbol_function_object(env, *name) {
                         Some(f) => f,
                         None => {
-                            return Err(BlissError::Internal(format!(
+                            // A generic function / macro / builtin is already
+                            // callable and carries no ordinary function value —
+                            // COMPILE of such an fbound name is a no-op returning
+                            // NAME (ansi-test universe.lsp does `(compile
+                            // 'a-defgeneric)`; bliss-30be). A genuinely unbound
+                            // name is a PROGRAM-ERROR — catchable, not an internal
+                            // abort.
+                            let nm = if name.is_symbol() {
+                                sym_name(*name)
+                            } else {
+                                val_as_str(*name)
+                            };
+                            let fbound = env.generics.borrow().contains_key(&nm)
+                                || env.methods.borrow().contains_key(&nm)
+                                || macro_defined(env, &nm)
+                                || is_builtin_function(&symbol_bare_name(&nm));
+                            if fbound {
+                                let primary = if name.is_nil() { NIL } else { *name };
+                                env.set_mv(vec![primary, NIL, NIL]);
+                                return Ok(primary);
+                            }
+                            return Err(BlissError::ProgramError(format!(
                                 "COMPILE: {} is not fbound",
                                 format_val(*name)
                             )));

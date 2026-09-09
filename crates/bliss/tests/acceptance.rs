@@ -688,6 +688,50 @@ fn shadow_honors_let_bound_package() {
     );
 }
 
+#[test]
+fn compile_of_generic_function_is_noop() {
+    // (COMPILE name) on an already-callable generic function returns NAME rather
+    // than an uncatchable "not fbound" internal error — generic functions carry
+    // no ordinary function-cell value but are fbound (bliss-30be: ansi-test
+    // universe.lsp does `(compile 'a-defgeneric)`).
+    let expr = "(progn (defgeneric gf30be (x)) (princ (compile 'gf30be)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "COMPILE of a GF must not error");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_uppercase().contains("GF30BE"),
+        "COMPILE of a generic function should return its NAME, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn setf_unsupported_place_is_catchable() {
+    // An unsupported/undefined SETF place signals a catchable PROGRAM-ERROR (not
+    // an uncatchable internal abort), so IGNORE-ERRORS/HANDLER-CASE can handle it
+    // (bliss-30be: ansi-test universe.lsp wraps `(setf (logical-pathname-
+    // translations …) …)` in IGNORE-ERRORS).
+    let expr = "(princ (ignore-errors (setf (no-such-setf-place-30be 1) 2)))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an unsupported SETF place inside IGNORE-ERRORS must be caught, not abort"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NIL"),
+        "IGNORE-ERRORS should catch the unsupported place and yield NIL, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CLOS (defclass / defmethod)
 // ══════════════════════════════════════════════════════════════════
