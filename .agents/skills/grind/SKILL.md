@@ -136,10 +136,18 @@ bd update <id> --claim
    contention (pre-existing race, `bliss-lb6.20`); they pass in isolation. Don't
    attribute a flake to your change without re-running the suite single-threaded.
 4. GC fuzz + lint any allocating path you touched (§3).
-5. Commit with an imperative subject citing the bead id and a GC-safety note
+5. **Warning-clean build (non-negotiable, per the hackinator `finishing`
+   skill).** Read the build output, not just the exit code: `cargo build
+   --workspace` **and** `--release` must emit **zero** warnings before you
+   commit. Fix each, or gate it explicitly (`#[cfg(...)]` / `#[allow(...)]`
+   **with a comment saying why**) — never ignore. "Pre-existing" is not an
+   exemption for a file you're touching; if it's genuinely out of scope, file a
+   bead so it stays visible. "Only in the profile I don't build" is not an
+   exemption — check both. A build that scrolls warnings is not green.
+6. Commit with an imperative subject citing the bead id and a GC-safety note
    when relevant; end the message with:
    `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
-6. `bd close <id>` with the commit hash and what was verified; `bd sync`.
+7. `bd close <id>` with the commit hash and what was verified; `bd sync`.
    `git push` only when the user asks.
 
 ## 6. Loop or hand off
