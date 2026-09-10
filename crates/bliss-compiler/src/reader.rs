@@ -108,6 +108,16 @@ pub fn set_macro_handler_invoker(hook: Option<MacroHandlerInvoker>) {
     *MACRO_INVOKER.lock().unwrap() = hook;
 }
 
+// A plain (non-dispatch) macro character's handler takes only `(stream char)` —
+// no sub-char / infix argument — so it needs its own two-argument invoker.
+type PlainMacroInvoker = fn(BlissVal, &str, char) -> Result<(Vec<BlissVal>, usize), BlissError>;
+static PLAIN_MACRO_INVOKER: OrderedMutex<Option<PlainMacroInvoker>> =
+    OrderedMutex::new(LockLevel::CodeCache, 10, "reader plain macro invoker", None);
+
+pub fn set_plain_macro_invoker(hook: Option<PlainMacroInvoker>) {
+    *PLAIN_MACRO_INVOKER.lock().unwrap() = hook;
+}
+
 /// The CURRENT readtable (the live value of `*READTABLE*`), supplied by the
 /// interpreter so nested reads key the custom tables correctly. NIL / no hook
 /// means "no custom readtable" and all custom lookups miss.
@@ -122,6 +132,46 @@ pub fn set_readtable_getter(hook: Option<ReadtableGetter>) {
 fn current_readtable_value() -> BlissVal {
     let hook = *READTABLE_GETTER.lock().unwrap();
     hook.map(|h| h()).unwrap_or(NIL)
+}
+
+/// Set once any readtable is ever given a non-`:upcase` readtable-case, so the
+/// tokenizer's hot path can skip consulting the readtable entirely in the
+/// overwhelmingly common all-upcase case (mirrors `ANY_CUSTOM_MACROS`).
+static ANY_NONUPCASE_CASE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The current readtable's `readtable-case` as a small code:
+/// 0 = `:upcase` (default), 1 = `:downcase`, 2 = `:preserve`, 3 = `:invert`.
+/// Reads the `case_mode` byte from the live readtable object; a non-readtable
+/// value (e.g. the `:standard-readtable` placeholder) reads as `:upcase`.
+fn current_readtable_case_mode() -> u8 {
+    if !ANY_NONUPCASE_CASE.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let rt = current_readtable_value();
+    if rt.tag() != TAG_HEAP_OBJECT {
+        return 0;
+    }
+    unsafe {
+        let ptr = rt.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        if header.type_id() != type_id::READTABLE {
+            return 0;
+        }
+        (*(ptr as *const ReadtableData)).case_mode
+    }
+}
+
+/// Apply `readtable-case` folding to one UNESCAPED constituent character under
+/// modes that map char→char (`:upcase`, `:downcase`, `:preserve`). `:invert`
+/// (mode 3) is whole-token and handled by the caller, so it is left unchanged
+/// here.
+fn fold_case_char(c: char, case_mode: u8) -> char {
+    match case_mode {
+        1 => c.to_ascii_lowercase(),
+        2 | 3 => c,
+        _ => c.to_ascii_uppercase(),
+    }
 }
 
 /// Cheap gate for the hot path: custom dispatch is consulted only when at
@@ -257,6 +307,109 @@ fn construct_pathname(namestring: BlissVal) -> BlissVal {
 
 fn readtable_key(readtable: BlissVal) -> u64 {
     readtable.0 & !bliss_rt::value::TAG_MASK
+}
+
+// ── Per-readtable character syntax overrides (SET-SYNTAX-FROM-CHAR) ──
+//
+// Syntax codes:
+//   0 = constituent, 1 = whitespace, 2 = terminating macro,
+//   3 = non-terminating macro, 4 = single escape, 5 = multiple escape,
+//   6 = constituent-but-invalid (only via escape; reading bare signals error)
+// The stored `delegate` is the standard character whose built-in reader
+// behaviour a macro override emulates (so copying `(`'s syntax onto `!` makes
+// `!` open a list). For non-macro syntaxes it is the character itself.
+type CharSyntaxTable = HashMap<(u64, char), (u8, char)>;
+static CHAR_SYNTAX: OrderedMutex<Option<CharSyntaxTable>> =
+    OrderedMutex::new(LockLevel::CodeCache, 9, "reader char syntax overrides", None);
+
+/// Fast gate: consult the override table only once SET-SYNTAX-FROM-CHAR has ever
+/// run, so the standard readtable's hot path pays nothing.
+static ANY_CHAR_SYNTAX_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn any_char_syntax_override() -> bool {
+    ANY_CHAR_SYNTAX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The standard-readtable syntax `(code, delegate)` of `c`.
+fn standard_char_syntax(c: char) -> (u8, char) {
+    match c {
+        ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b' => (1, c), // whitespace[2]
+        '\\' => (4, c),                                       // single escape
+        '|' => (5, c),                                        // multiple escape
+        '"' | '\'' | '(' | ')' | ',' | ';' | '`' => (2, c),  // terminating macro
+        '#' => (3, c),                                        // non-terminating macro
+        // Backspace and Rubout are constituents with the invalid trait.
+        '\x08' | '\x7f' => (6, c),
+        _ => (0, c), // constituent
+    }
+}
+
+/// If `c` is a standard macro character, return `Some(non_terminating)`
+/// (`#` is the only standard non-terminating one). Otherwise `None`.
+pub fn standard_macro_char(c: char) -> Option<bool> {
+    match standard_char_syntax(c).0 {
+        2 => Some(false),
+        3 => Some(true),
+        _ => None,
+    }
+}
+
+/// Effective `(syntax-code, delegate)` of `c` in readtable `rt` — an override if
+/// one is registered, else the standard syntax.
+fn effective_char_syntax(rt: BlissVal, c: char) -> (u8, char) {
+    if any_char_syntax_override() && rt.tag() == TAG_HEAP_OBJECT {
+        let key = readtable_key(rt);
+        let guard = CHAR_SYNTAX.lock().unwrap();
+        if let Some(entry) = guard.as_ref().and_then(|t| t.get(&(key, c)).copied()) {
+            return entry;
+        }
+    }
+    standard_char_syntax(c)
+}
+
+/// SET-SYNTAX-FROM-CHAR: give `to_char` (in `to_rt`) the syntax `from_char` has
+/// in `from_rt`, including any reader-macro function. Returns nothing useful (CL
+/// returns T).
+pub fn set_syntax_from_char(
+    to_char: char,
+    from_char: char,
+    to_rt: BlissVal,
+    from_rt: BlissVal,
+) {
+    // Resolve the source syntax (override or standard).
+    let (code, delegate) = effective_char_syntax(from_rt, from_char);
+    if to_rt.tag() == TAG_HEAP_OBJECT {
+        let key = readtable_key(to_rt);
+        let mut guard = CHAR_SYNTAX.lock().unwrap();
+        let table = guard.get_or_insert_with(HashMap::new);
+        table.insert((key, to_char), (code, delegate));
+    }
+    // Copy any custom reader-macro function bound to from_char.
+    if let Some((handler, non_terminating)) = lookup_custom_macro(from_rt, from_char) {
+        let key = readtable_key(to_rt);
+        let mut guard = MACRO_CHARS.lock().unwrap();
+        let mtable = guard.get_or_insert_with(HashMap::new);
+        mtable.insert((key, to_char), (handler, non_terminating));
+    } else {
+        // The source has no custom handler; drop any stale one on to_char so it
+        // takes the (possibly standard) delegate behaviour instead.
+        let key = readtable_key(to_rt);
+        let mut guard = MACRO_CHARS.lock().unwrap();
+        if let Some(mtable) = guard.as_mut() {
+            mtable.remove(&(key, to_char));
+        }
+    }
+    ANY_CHAR_SYNTAX_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Characters that, when constituents, carry the "invalid" trait: reading them
+/// unescaped signals a reader-error (CLHS 2.1.4.2).
+fn is_invalid_constituent(c: char) -> bool {
+    matches!(
+        c,
+        '\x08' | '\t' | '\n' | '\x0b' | '\x0c' | '\r' | ' ' | '\x7f'
+    )
 }
 
 fn lookup_custom_macro(readtable: BlissVal, ch: char) -> Option<(BlissVal, bool)> {
@@ -819,6 +972,17 @@ pub fn read_form_at(
     read_base: u32,
     read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
+    // `*READ-SUPPRESS*`: parse the form's syntax, discard it, return NIL while
+    // still consuming the characters. `skip_form` implements exactly this
+    // parse-and-discard traversal (it also drives suppressed #+/#- branches).
+    if read_suppress_active() {
+        let mut p = skip_whitespace_and_comments(chars, start);
+        if p >= chars.len() {
+            return Ok((EOF, p));
+        }
+        p = skip_form(chars, p, 0)?;
+        return Ok((NIL, p));
+    }
     bliss_rt::rooted!(
         labels = CircularLabels {
             labels: HashMap::new(),
@@ -883,6 +1047,72 @@ fn read_token(
     read_token_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
+/// Read a form introduced by a user-defined dispatch macro character (registered
+/// via `make-dispatch-macro-character`): an optional infix integer, a sub-char,
+/// then the sub-char's handler. With no handler for the sub-char it is a
+/// reader-error (make-dispatch-macro-character.3).
+#[allow(clippy::too_many_arguments)]
+fn read_custom_dispatch_char(
+    chars: &[char],
+    pos: usize,
+    rt: BlissVal,
+    disp: char,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+) -> Result<(BlissVal, usize), BlissError> {
+    let mut p = pos + 1; // past the dispatch char
+    let mut infix: Option<i64> = None;
+    while p < chars.len() && chars[p].is_ascii_digit() {
+        let d = chars[p] as i64 - '0' as i64;
+        infix = Some(infix.unwrap_or(0) * 10 + d);
+        p += 1;
+    }
+    if p >= chars.len() {
+        return Err(BlissError::StreamError(
+            "unexpected end after dispatch character".into(),
+        ));
+    }
+    let sub = chars[p];
+    p += 1;
+    match lookup_custom_dispatch(rt, disp, sub.to_ascii_uppercase()) {
+        Some(handler) if handler != T => {
+            let disp_invoker = *MACRO_INVOKER.lock().unwrap();
+            if let Some(invoker) = disp_invoker {
+                let text: String = chars[p..].iter().collect();
+                match invoker(handler, &text, sub, infix) {
+                    Ok((vals, consumed)) => {
+                        let newpos = p + consumed;
+                        match vals.into_iter().next() {
+                            Some(v) => Ok((v, newpos)),
+                            None => read_token_with_base(
+                                chars,
+                                newpos,
+                                labels,
+                                read_base,
+                                read_eval,
+                                read_circular,
+                                depth,
+                            ),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                Err(BlissError::StreamError(
+                    "no dispatch function defined".into(),
+                ))
+            }
+        }
+        _ => Err(BlissError::StreamError(format!(
+            "no dispatch function defined for {}{}",
+            disp, sub
+        ))),
+    }
+}
+
 fn read_token_with_base(
     chars: &[char],
     mut pos: usize,
@@ -903,7 +1133,98 @@ fn read_token_with_base(
         return Ok((EOF, pos));
     }
     let ch = chars[pos];
-    match ch {
+    // Honour per-character syntax customised via SET-SYNTAX-FROM-CHAR before the
+    // standard hardcoded dispatch. `dispatch_ch` is the character whose built-in
+    // reader behaviour applies (the copied "delegate"), so e.g. a char given
+    // `(`-syntax opens a list.
+    let dispatch_ch = if any_char_syntax_override() {
+        let rt = current_readtable_value();
+        let (code, delegate) = effective_char_syntax(rt, ch);
+        match code {
+            // whitespace: skip it and read the next form
+            1 => {
+                return read_token_with_base(
+                    chars,
+                    pos + 1,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth,
+                );
+            }
+            // constituent (incl. invalid trait) or escape → start a token
+            0 | 6 | 4 | 5 => return read_atom_with_base(chars, pos, read_base),
+            // terminating / non-terminating macro → dispatch by the delegate
+            2 | 3 => {
+                // A char given a Lisp reader-macro function via
+                // set-macro-character: invoke it on the remaining text.
+                if let Some((handler, _)) = lookup_custom_macro(rt, ch) {
+                    if handler != T {
+                        let plain_invoker = *PLAIN_MACRO_INVOKER.lock().unwrap();
+                        if let Some(invoker) = plain_invoker {
+                            let text: String = chars[pos + 1..].iter().collect();
+                            return match invoker(handler, &text, ch) {
+                                Ok((vals, consumed)) => {
+                                    let newpos = pos + 1 + consumed;
+                                    match vals.into_iter().next() {
+                                        Some(v) => Ok((v, newpos)),
+                                        None => read_token_with_base(
+                                            chars,
+                                            newpos,
+                                            labels,
+                                            read_base,
+                                            read_eval,
+                                            read_circular,
+                                            depth,
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            };
+                        }
+                    }
+                }
+                // A char made a dispatch macro character (make-dispatch-macro-
+                // character) reads an optional infix arg + sub-char and routes to
+                // its per-sub handler, erroring if none is defined.
+                if dispatch_is_registered(rt, ch) {
+                    return read_custom_dispatch_char(
+                        chars,
+                        pos,
+                        rt,
+                        ch,
+                        labels,
+                        read_base,
+                        read_eval,
+                        read_circular,
+                        depth,
+                    );
+                }
+                if delegate == ';' {
+                    // line comment: consume to end of line and continue
+                    let mut p = pos + 1;
+                    while p < chars.len() && chars[p] != '\n' {
+                        p += 1;
+                    }
+                    return read_token_with_base(
+                        chars,
+                        p,
+                        labels,
+                        read_base,
+                        read_eval,
+                        read_circular,
+                        depth,
+                    );
+                }
+                delegate
+            }
+            _ => ch,
+        }
+    } else {
+        ch
+    };
+    match dispatch_ch {
         '(' => read_list_with_base(
             chars,
             pos + 1,
@@ -995,6 +1316,31 @@ fn read_token_with_base(
 }
 
 fn skip_whitespace_and_comments(chars: &[char], mut pos: usize) -> usize {
+    // When SET-SYNTAX-FROM-CHAR is in play, whitespace-skipping and comment
+    // recognition must follow the readtable, not the hardcoded set: a char given
+    // constituent syntax is no longer whitespace (so it starts a token, exposing
+    // its invalid trait), and a char given `;`-syntax starts a line comment.
+    if any_char_syntax_override() {
+        let rt = current_readtable_value();
+        loop {
+            if pos >= chars.len() {
+                return pos;
+            }
+            let (code, delegate) = effective_char_syntax(rt, chars[pos]);
+            if code == 1 {
+                pos += 1;
+            } else if code == 2 && delegate == ';' {
+                while pos < chars.len() && chars[pos] != '\n' {
+                    pos += 1;
+                }
+                if pos < chars.len() {
+                    pos += 1;
+                }
+            } else {
+                return pos;
+            }
+        }
+    }
     loop {
         if pos >= chars.len() {
             return pos;
@@ -1227,20 +1573,78 @@ fn read_atom_with_base(
 /// wanted this string, and tokenizing dominates the load-time allocation profile
 /// (bliss-gq5.9).
 fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool), BlissError> {
+    let case_mode = current_readtable_case_mode();
+    // When SET-SYNTAX-FROM-CHAR has customised any readtable, the tokenizer must
+    // consult per-character syntax (escape/constituent/delimiter) instead of the
+    // hardcoded `\`, `|`, `is_delimiter` fast path.
+    let overrides = any_char_syntax_override();
+    let rt = if overrides { current_readtable_value() } else { NIL };
     let mut name = String::new();
+    // For `:invert` (mode 3): track which chars of `name` are unescaped (and so
+    // eligible for whole-token case inversion). Left empty for other modes.
+    let mut invert_eligible: Vec<bool> = Vec::new();
     let mut in_multiple_escape = false;
     let mut had_escape = false;
 
     while pos < chars.len() {
         let c = chars[pos];
         if in_multiple_escape {
-            if c == '|' {
+            let closes = if overrides {
+                effective_char_syntax(rt, c).0 == 5
+            } else {
+                c == '|'
+            };
+            if closes {
                 in_multiple_escape = false;
                 pos += 1;
                 continue;
             }
             name.push(c); // escaped: preserve case
+            if case_mode == 3 {
+                invert_eligible.push(false);
+            }
             pos += 1;
+            continue;
+        }
+        if overrides {
+            let (code, _) = effective_char_syntax(rt, c);
+            match code {
+                4 => {
+                    // single escape
+                    had_escape = true;
+                    pos += 1;
+                    if pos >= chars.len() {
+                        return Err(BlissError::StreamError("trailing single escape".into()));
+                    }
+                    name.push(chars[pos]);
+                    if case_mode == 3 {
+                        invert_eligible.push(false);
+                    }
+                    pos += 1;
+                }
+                5 => {
+                    // multiple escape
+                    had_escape = true;
+                    in_multiple_escape = true;
+                    pos += 1;
+                }
+                1 | 2 => break, // whitespace or terminating macro ends the token
+                _ => {
+                    // constituent (incl. non-terminating macro `#` mid-token).
+                    // A whitespace/Backspace/Rubout char turned constituent
+                    // carries the invalid trait — reading it bare is an error.
+                    if is_invalid_constituent(c) {
+                        return Err(BlissError::StreamError(
+                            "invalid constituent character".into(),
+                        ));
+                    }
+                    name.push(fold_case_char(c, case_mode));
+                    if case_mode == 3 {
+                        invert_eligible.push(true);
+                    }
+                    pos += 1;
+                }
+            }
             continue;
         }
         match c {
@@ -1251,6 +1655,9 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
                     return Err(BlissError::StreamError("trailing single escape".into()));
                 }
                 name.push(chars[pos]); // escaped: preserve case
+                if case_mode == 3 {
+                    invert_eligible.push(false);
+                }
                 pos += 1;
             }
             '|' => {
@@ -1260,7 +1667,10 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
             }
             c if is_delimiter(c) => break,
             c => {
-                name.push(c.to_ascii_uppercase());
+                name.push(fold_case_char(c, case_mode));
+                if case_mode == 3 {
+                    invert_eligible.push(true);
+                }
                 pos += 1;
             }
         }
@@ -1269,6 +1679,39 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
         return Err(BlissError::StreamError(
             "unterminated multiple escape".into(),
         ));
+    }
+    if case_mode == 3 {
+        // `:invert` — if every unescaped letter is the same case, invert it;
+        // a mixed-case token is left unchanged (CLHS 23.1.2).
+        let mut saw_upper = false;
+        let mut saw_lower = false;
+        for (ch, eligible) in name.chars().zip(invert_eligible.iter()) {
+            if *eligible {
+                if ch.is_ascii_uppercase() {
+                    saw_upper = true;
+                } else if ch.is_ascii_lowercase() {
+                    saw_lower = true;
+                }
+            }
+        }
+        if saw_upper ^ saw_lower {
+            let inverted: String = name
+                .chars()
+                .zip(invert_eligible.iter())
+                .map(|(ch, eligible)| {
+                    if *eligible {
+                        if ch.is_ascii_uppercase() {
+                            ch.to_ascii_lowercase()
+                        } else {
+                            ch.to_ascii_uppercase()
+                        }
+                    } else {
+                        ch
+                    }
+                })
+                .collect();
+            name = inverted;
+        }
     }
     Ok((name, pos, had_escape))
 }
@@ -1560,6 +2003,24 @@ thread_local! {
 /// Set the reader's view of `*READ-DEFAULT-FLOAT-FORMAT*`: `true` = doubles.
 pub fn set_read_default_float_double(double: bool) {
     READ_DEFAULT_FLOAT_DOUBLE.with(|c| c.set(double));
+}
+
+thread_local! {
+    /// CLHS `*READ-SUPPRESS*`. When true, the reader parses a form's syntax and
+    /// discards it: no symbol interning, no `#.` read-eval, no object building —
+    /// the result is always NIL, but the full form's characters are consumed.
+    /// The host resolves the dynamic variable and sets this around each read.
+    static READ_SUPPRESS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Set the reader's view of `*READ-SUPPRESS*`.
+pub fn set_read_suppress_flag(suppress: bool) {
+    READ_SUPPRESS.with(|c| c.set(suppress));
+}
+
+/// Whether `*READ-SUPPRESS*` is currently in effect.
+pub fn read_suppress_active() -> bool {
+    READ_SUPPRESS.with(|c| c.get())
 }
 
 fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
@@ -2377,6 +2838,9 @@ fn skip_form(chars: &[char], pos: usize, depth: usize) -> Result<usize, BlissErr
 
     match chars[pos] {
         '(' => skip_list(chars, pos + 1, depth + 1),
+        // A bare `)` where a form is expected is malformed, even while skipping
+        // for *read-suppress* or a #+/#- branch (read-suppress.error.1: `')`).
+        ')' => Err(BlissError::StreamError("unexpected ')'".into())),
         '"' => skip_string(chars, pos + 1),
         '\'' | '`' => skip_form(chars, pos + 1, depth + 1),
         ',' => {
@@ -2425,74 +2889,62 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
         return Err(BlissError::StreamError("unexpected end after #".into()));
     }
 
-    if chars[pos].is_ascii_digit() {
-        while pos < chars.len() && chars[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if pos >= chars.len() {
-            return Err(BlissError::StreamError("unexpected end after #n".into()));
-        }
-        return match chars[pos] {
-            '=' => skip_form(chars, pos + 1, depth + 1),
-            '#' => Ok(pos + 1),
-            // #nR radix integer / #n* sized bit-vector: one atom follows.
-            'r' | 'R' | '*' => skip_atom(chars, pos + 1),
-            // #nA(nested…) rank-n array literal: one form follows
-            // (bliss-fo0o: `#2a((a b))` inside a #+nil block errored).
-            'a' | 'A' => skip_form(chars, pos + 1, depth + 1),
-            other if custom_sharp_dispatch_registered(other) => {
-                // Suppressed (#+/#-) custom dispatch: approximate its extent
-                // as one following form (bliss-r4mk).
-                skip_form(chars, pos + 1, depth + 1)
-            }
-            other => Err(BlissError::StreamError(format!(
-                "unknown # dispatch #{}",
-                other
-            ))),
-        };
+    // Optional infix numeric argument (`#3r…`, `#0(…)`, `#100000000\Space`).
+    // Its magnitude is irrelevant when skipping, so we never parse it — the
+    // dispatch that follows determines the syntax.
+    while pos < chars.len() && chars[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    if pos >= chars.len() {
+        return Err(BlissError::StreamError("unexpected end after #".into()));
     }
 
     let dispatch = chars[pos];
     match dispatch {
+        '=' => skip_form(chars, pos + 1, depth + 1),
+        '#' => Ok(pos + 1),
         '\'' | '+' | '-' | '.' => skip_form(chars, pos + 1, depth + 1),
-        '\\' => {
-            // #\c — a character literal. The character after the backslash is
-            // consumed UNCONDITIONALLY, even when it is a macro or escape
-            // character (#\', #\`, #\(, #\), #\", #\;, #\\); a multi-char name
-            // (#\Space, #\Newline) then continues over trailing constituents.
-            // Routing this through skip_atom treated #\' as an empty token
-            // (leaving the quote to misparse what follows) and #\\ as an
-            // escape that swallowed the next character — either way a
-            // skipped #+feature form containing character CASE keys derailed
-            // into "unterminated list" (bliss-d0b: cl-ppcre api.lisp).
-            let mut p = pos + 1;
-            if p < chars.len() {
-                p += 1; // the character itself, whatever it is
-                while p < chars.len()
-                    && !chars[p].is_whitespace()
-                    && !matches!(chars[p], '(' | ')' | '"' | '\'' | '`' | ',' | ';')
-                {
-                    p += 1;
-                }
-            }
-            Ok(p)
-        }
-        ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' => skip_atom(chars, pos + 1),
+        '\\' => Ok(skip_char_literal(chars, pos + 1)),
+        ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' | 'r' | 'R' | '*' => skip_atom(chars, pos + 1),
         '(' => skip_list(chars, pos + 1, depth + 1),
         'C' | 'c' => skip_form(chars, pos + 1, depth + 1),
-        '*' => skip_atom(chars, pos + 1),
+        // #nA(nested…) rank-n array literal: one form follows
+        // (bliss-fo0o: `#2a((a b))` inside a #+nil block errored).
+        'a' | 'A' => skip_form(chars, pos + 1, depth + 1),
         'P' | 'p' | 'S' | 's' => skip_form(chars, pos + 1, depth + 1),
-        '<' => skip_atom(chars, pos + 1),
+        // `#<` is explicitly unreadable (CLHS 2.4.8.20) — an error even under
+        // *read-suppress* (read-suppress.error.2).
         '|' => skip_block_comment(chars, pos + 1),
         other if custom_sharp_dispatch_registered(other) => {
             // Suppressed custom dispatch — one-form approximation (bliss-r4mk).
             skip_form(chars, pos + 1, depth + 1)
         }
-        _ => Err(BlissError::StreamError(format!(
+        other => Err(BlissError::StreamError(format!(
             "unknown # dispatch: {}",
-            dispatch
+            other
         ))),
     }
+}
+
+/// Skip a `#\c` character literal starting at `pos` (the position just past the
+/// backslash). The character after the backslash is consumed UNCONDITIONALLY,
+/// even when it is a macro or escape character (`#\'`, `#\(`, `#\)`, `#\"`,
+/// `#\;`, `#\\`); a multi-char name (`#\Space`, `#\Newline`) then continues over
+/// trailing constituents. Routing this through skip_atom treated `#\'` as an
+/// empty token and `#\\` as an escape that swallowed the next character —
+/// either way a skipped form with character keys derailed (bliss-d0b).
+fn skip_char_literal(chars: &[char], pos: usize) -> usize {
+    let mut p = pos;
+    if p < chars.len() {
+        p += 1; // the character itself, whatever it is
+        while p < chars.len()
+            && !chars[p].is_whitespace()
+            && !matches!(chars[p], '(' | ')' | '"' | '\'' | '`' | ',' | ';')
+        {
+            p += 1;
+        }
+    }
+    p
 }
 
 /// Coerce a numeric BlissVal to f64 for mixed-type arithmetic.
@@ -2882,7 +3334,50 @@ pub fn copy_readtable(from: BlissVal, to: Option<BlissVal>) -> Result<BlissVal, 
     for (disp_char, sub_char, handler) in sub_copies {
         sub_table.insert((dst_key, disp_char, sub_char), handler);
     }
+    // Carry the readtable-case across the copy. `(copy-readtable nil dest)`
+    // takes the standard readtable's case (:upcase); `(copy-readtable rt dest)`
+    // takes rt's (readtable-case.7).
+    if let Some(mode) = readtable_case_mode(from) {
+        set_readtable_case_mode(dest, mode);
+    }
     Ok(dest)
+}
+
+/// Read the `readtable-case` code (0=upcase, 1=downcase, 2=preserve, 3=invert)
+/// of a specific readtable object. Returns `None` if `rt` is not a readtable
+/// object (e.g. the `:standard-readtable` placeholder), whose case is `:upcase`.
+pub fn readtable_case_mode(rt: BlissVal) -> Option<u8> {
+    if rt.tag() != TAG_HEAP_OBJECT {
+        return None;
+    }
+    unsafe {
+        let ptr = rt.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        if header.type_id() != type_id::READTABLE {
+            return None;
+        }
+        Some((*(ptr as *const ReadtableData)).case_mode)
+    }
+}
+
+/// Set the `readtable-case` code on a specific readtable object. No-op for a
+/// non-readtable value. Returns whether the write happened.
+pub fn set_readtable_case_mode(rt: BlissVal, mode: u8) -> bool {
+    if rt.tag() != TAG_HEAP_OBJECT {
+        return false;
+    }
+    unsafe {
+        let ptr = rt.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        if header.type_id() != type_id::READTABLE {
+            return false;
+        }
+        (*(ptr as *mut ReadtableData)).case_mode = mode;
+        if mode != 0 {
+            ANY_NONUPCASE_CASE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
 }
 
 pub fn set_macro_character(
@@ -2892,9 +3387,24 @@ pub fn set_macro_character(
     non_terminating: bool,
 ) -> Result<(), BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
-    let mut guard = MACRO_CHARS.lock().unwrap();
-    let table = guard.get_or_insert_with(HashMap::new);
-    table.insert((key, ch), (function, non_terminating));
+    {
+        let mut guard = MACRO_CHARS.lock().unwrap();
+        let table = guard.get_or_insert_with(HashMap::new);
+        table.insert((key, ch), (function, non_terminating));
+    }
+    // Register the char's syntax so the tokenizer stops on it (a terminating
+    // macro char terminates a preceding token) and the entry dispatch routes it
+    // through its custom handler (set-macro-character.1/.2). Skip the T sentinel
+    // written by make-dispatch-macro-character (which manages its own syntax).
+    if function != T {
+        {
+            let mut guard = CHAR_SYNTAX.lock().unwrap();
+            let table = guard.get_or_insert_with(HashMap::new);
+            let code = if non_terminating { 3 } else { 2 };
+            table.insert((key, ch), (code, ch));
+        }
+        ANY_CHAR_SYNTAX_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -2944,6 +3454,12 @@ pub fn get_dispatch_macro_character(
     Ok(None)
 }
 
+/// Whether `ch` is a dispatch macro character in `readtable` (built-in `#`, or
+/// one made via `make-dispatch-macro-character`).
+pub fn is_dispatch_macro_character(readtable: BlissVal, ch: char) -> bool {
+    ch == '#' || dispatch_is_registered(readtable, ch)
+}
+
 pub fn make_dispatch_macro_character(
     readtable: BlissVal,
     ch: char,
@@ -2957,5 +3473,15 @@ pub fn make_dispatch_macro_character(
     }
     // Also register as a macro char
     set_macro_character(readtable, ch, T, non_terminating)?;
+    // Give the char macro syntax in this readtable so the tokenizer stops on it
+    // (a terminating dispatch char terminates a preceding token) and routes it
+    // through the dispatch path (make-dispatch-macro-character.1/.3).
+    {
+        let mut guard = CHAR_SYNTAX.lock().unwrap();
+        let table = guard.get_or_insert_with(HashMap::new);
+        let code = if non_terminating { 3 } else { 2 };
+        table.insert((key, ch), (code, ch));
+    }
+    ANY_CHAR_SYNTAX_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }

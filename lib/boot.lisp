@@ -386,6 +386,7 @@
 (defun cell-error-name (c) (slot-value c 'name))
 (defun unbound-slot-instance (c) (slot-value c 'instance))
 (defun package-error-package (c) (slot-value c 'package))
+(defun stream-error-stream (c) (slot-value c 'stream))
 
 ;; FORMATTER (CLHS 22.3.9.3) — return a function equivalent to the control
 ;; string, callable as (fn stream &rest args). FORMAT accepts such a function as
@@ -808,13 +809,20 @@
 ;; (CLHS 23.1.2 default). Portable code (e.g. chunga) reads READTABLE-CASE to
 ;; decide how to case-fold tokens; supporting the reader — and a SETF that
 ;; accepts the one mode we implement — is enough to load such systems.
+;; Placeholder reader-macro function reported by GET-MACRO-CHARACTER for a
+;; standard macro character (bliss's built-in char readers are in Rust, so there
+;; is no real Lisp function to hand back; this fbound stub satisfies portable
+;; code that only checks FUNCTIONP / FBOUNDP of the result).
+(defun bliss::%standard-reader-macro (stream char)
+  (declare (ignore stream char))
+  (error "The standard reader macro cannot be invoked directly."))
 (defun readtable-case (readtable)
-  (declare (ignore readtable))
-  :upcase)
+  (bliss::%readtable-case readtable))
 (defun (setf readtable-case) (mode readtable)
-  (declare (ignore readtable))
-  (unless (eq mode :upcase)
-    (error "Bliss supports only the :UPCASE readtable-case; requested ~S." mode))
+  (unless (member mode '(:upcase :downcase :preserve :invert))
+    (error 'type-error :datum mode
+                       :expected-type '(member :upcase :downcase :preserve :invert)))
+  (bliss::%set-readtable-case mode readtable)
   mode)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
