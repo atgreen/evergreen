@@ -9125,6 +9125,95 @@ fn coerce_to_pathname(v: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
 }
 
+/// If `object` is a class metaobject, return its class value. bliss represents a
+/// user/struct class as its name symbol, so `(find-class 'foo)` yields the symbol
+/// FOO; built-in classes are handle values. Returns None for anything not
+/// registered as a class.
+fn class_metaobject_of(object: BlissVal) -> Option<BlissVal> {
+    if object.is_symbol() && object != NIL && object != T {
+        if let Some(class) = bliss_stdlib::find_class(object) {
+            return Some(class);
+        }
+    }
+    if !bliss_stdlib::class_name(object).is_nil() {
+        return Some(object);
+    }
+    None
+}
+
+/// Whether `t` is a symbol naming a DEFSTRUCT structure class.
+fn is_structure_type_name(t: BlissVal) -> bool {
+    t.is_symbol()
+        && t != NIL
+        && t != T
+        && bliss_stdlib::find_class(t).is_some_and(bliss_stdlib::is_structure_class)
+}
+
+/// The standard built-in "system" type names that a STRUCTURE-OBJECT is provably
+/// disjoint from (CLHS 4.3.7 / *disjoint-types-list*). Used so SUBTYPEP answers a
+/// struct-vs-system-type relationship definitively (`(nil t)`) instead of
+/// "unknown" (`(nil nil)`) — ansi-test STRUCT-TEST-NN/{16,17}.
+fn is_builtin_disjoint_type(name: &str) -> bool {
+    matches!(
+        name,
+        "CONS"
+            | "LIST"
+            | "SYMBOL"
+            | "KEYWORD"
+            | "NULL"
+            | "BOOLEAN"
+            | "ARRAY"
+            | "SIMPLE-ARRAY"
+            | "VECTOR"
+            | "SIMPLE-VECTOR"
+            | "STRING"
+            | "SIMPLE-STRING"
+            | "BASE-STRING"
+            | "SIMPLE-BASE-STRING"
+            | "BIT-VECTOR"
+            | "NUMBER"
+            | "REAL"
+            | "INTEGER"
+            | "RATIONAL"
+            | "RATIO"
+            | "FLOAT"
+            | "SINGLE-FLOAT"
+            | "DOUBLE-FLOAT"
+            | "SHORT-FLOAT"
+            | "LONG-FLOAT"
+            | "COMPLEX"
+            | "FIXNUM"
+            | "BIGNUM"
+            | "BIT"
+            | "CHARACTER"
+            | "BASE-CHAR"
+            | "STANDARD-CHAR"
+            | "EXTENDED-CHAR"
+            | "HASH-TABLE"
+            | "FUNCTION"
+            | "COMPILED-FUNCTION"
+            | "GENERIC-FUNCTION"
+            | "STANDARD-GENERIC-FUNCTION"
+            | "READTABLE"
+            | "PACKAGE"
+            | "PATHNAME"
+            | "LOGICAL-PATHNAME"
+            | "STREAM"
+            | "BROADCAST-STREAM"
+            | "CONCATENATED-STREAM"
+            | "ECHO-STREAM"
+            | "FILE-STREAM"
+            | "STRING-STREAM"
+            | "SYNONYM-STREAM"
+            | "TWO-WAY-STREAM"
+            | "RANDOM-STATE"
+            | "CONDITION"
+            | "RESTART"
+            | "SEQUENCE"
+            | "STANDARD-OBJECT"
+    )
+}
+
 fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
     // A compound (parameterized/bounded) SUBTYPE narrows its head type, so it is
     // a subtype of whatever its head type is a subtype of: (integer 0 10) ⊆
@@ -9169,6 +9258,26 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
     };
     if n2 == "T" || n1 == n2 {
         return (true, true);
+    }
+    // Structure classes (DEFSTRUCT) form their own branch of the type lattice:
+    // each struct type is a subtype of STRUCTURE-OBJECT and T, and is *known*
+    // disjoint from every standard built-in system type and from STANDARD-OBJECT
+    // (CLHS 4.3.7). Deciding these definitively (second value T) is what ansi-test
+    // STRUCT-TEST-NN/{15A,15B,16,17} require. A struct's own :include ancestor
+    // relationship is still left to the CPL check below (both sides are structs).
+    let t1_struct = is_structure_type_name(t1);
+    let t2_struct = is_structure_type_name(t2);
+    if t1_struct {
+        if n2 == "STRUCTURE-OBJECT" {
+            return (true, true);
+        }
+        if !t2_struct && is_builtin_disjoint_type(&n2) {
+            return (false, true);
+        }
+    }
+    if t2_struct && !t1_struct && is_builtin_disjoint_type(&n1) {
+        // A built-in system type is disjoint from any structure type.
+        return (false, true);
     }
     // Built-in atomic type lattice.
     if let Some(supers) = builtin_supertypes(&n1) {
@@ -9255,6 +9364,27 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
     let type_spec = resolve_type_spec(env, type_spec);
     if type_spec.is_symbol() {
         let type_name = symbol_bare_name(&sym_name(type_spec));
+        // A class metaobject tested against a metaclass type. bliss represents a
+        // user/struct class as its name symbol, so `(find-class 'foo)` is that
+        // symbol; recognise it via the class registry. STRUCTURE-CLASS matches a
+        // DEFSTRUCT class, STANDARD-CLASS a DEFCLASS class, and CLASS/METAOBJECT/
+        // STANDARD-OBJECT any class metaobject — ansi-test STRUCT-TEST-NN/14.
+        if matches!(
+            type_name.as_str(),
+            "STRUCTURE-CLASS" | "STANDARD-CLASS" | "CLASS" | "METAOBJECT"
+        ) {
+            if let Some(class) = class_metaobject_of(object) {
+                let is_struct = bliss_stdlib::is_structure_class(class);
+                return Ok(match type_name.as_str() {
+                    "STRUCTURE-CLASS" => is_struct,
+                    // Built-in classes are handle-valued (non-symbol); a
+                    // symbol-valued metaobject that is not a struct is a
+                    // DEFCLASS standard class.
+                    "STANDARD-CLASS" => !is_struct && class.is_symbol(),
+                    _ => true, // CLASS / METAOBJECT
+                });
+            }
+        }
         // CLOS instances are represented internally as tagged fixnum ids, so the
         // immediate-type predicates below (INTEGER/FIXNUM/NUMBER, …) would alias
         // them. Route instances exclusively through their class hierarchy.
@@ -16393,6 +16523,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // with every bound slot shallow-copied (CLHS). Works for any
             // structure/instance regardless of type.
             "COPY-STRUCTURE" => {
+                // (copy-structure structure) — exactly one argument; a 0- or
+                // 2-argument call is a catchable PROGRAM-ERROR (ansi-test
+                // copy-structure.error.1/2).
+                let argc = {
+                    let mut n = 0usize;
+                    let mut c = cdr;
+                    while c.is_cons() {
+                        n += 1;
+                        c = cp(c).1;
+                    }
+                    n
+                };
+                if argc != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "COPY-STRUCTURE requires exactly one argument, got {argc}"
+                    )));
+                }
                 let (object_form, _) = cp(cdr);
                 bliss_rt::rooted!(orig = eval_form(object_form, env)?);
                 if !bliss_stdlib::is_instance(*orig) {
@@ -18840,6 +18987,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
         }
         if let Some(slot_name) = accessor_slot_name {
+            // A slot reader/accessor generic function has lambda list (object):
+            // it requires EXACTLY one argument. A zero- or two-argument call is a
+            // catchable PROGRAM-ERROR (CLHS 3.5.1), not a silent NIL — ansi-test's
+            // STRUCT-TEST-NN/ERROR.3 (0 args) and /ERROR.4 (2 args) (bliss struct).
+            let argc = {
+                let mut n = 0usize;
+                let mut c = cdr;
+                while c.is_cons() {
+                    n += 1;
+                    c = cp(c).1;
+                }
+                n
+            };
+            if argc != 1 {
+                return Err(BlissError::ProgramError(format!(
+                    "{name}: accessor requires exactly one argument, got {argc}"
+                )));
+            }
             let (inst_form, _) = cp(cdr);
             let inst = eval_form(inst_form, env)?;
             // A reader on a non-instance defers to an applicable explicit method
@@ -23249,6 +23414,13 @@ fn bind_lambda_list_ex(
     let mut key_default_forms: Vec<BlissVal> = Vec::new();
     bliss_rt::rooted_ref!(_key_defaults_guard = &mut key_default_forms);
     let mut key_specs: Vec<(String, String, usize, Option<String>)> = Vec::new();
+    // &aux bindings are deferred to AFTER the &key pass: an &aux init form may
+    // reference &key (and &optional/&rest) parameters, which are only bound once
+    // the whole required/optional/key list has been processed. Binding &aux
+    // eagerly in the loop left those vars unbound (ansi-test STRUCTURE-BOA-TEST-09/13).
+    let mut aux_default_forms: Vec<BlissVal> = Vec::new();
+    bliss_rt::rooted_ref!(_aux_defaults_guard = &mut aux_default_forms);
+    let mut aux_vars: Vec<String> = Vec::new();
 
     bliss_rt::rooted!(c = params_form);
     while c.is_cons() {
@@ -23330,13 +23502,10 @@ fn bind_lambda_list_ex(
                 key_specs.push((kw_bare, var, idx, supp));
             }
             Mode::Aux => {
+                // Deferred to after the &key pass (see aux_* declarations).
                 let (var, default_form, _) = parse_var_spec(elem);
-                let dv = if default_form == NIL {
-                    NIL
-                } else {
-                    eval_form(default_form, env)?
-                };
-                env.define_local(&var, dv);
+                aux_vars.push(var);
+                aux_default_forms.push(default_form);
             }
         }
     }
@@ -23411,6 +23580,14 @@ fn bind_lambda_list_ex(
             arg_i,
             args.len()
         )));
+    }
+
+    // Bind &aux last, in order — each init form sees every parameter (including
+    // &key) and any preceding &aux variable.
+    for i in 0..aux_vars.len() {
+        let df = aux_default_forms[i];
+        let dv = if df == NIL { NIL } else { eval_form(df, env)? };
+        env.define_local(&aux_vars[i], dv);
     }
 
     Ok(())
@@ -25376,12 +25553,39 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     // :copier, :type, :named) are accepted and ignored.
     let mut conc_name = format!("{name_str}-");
     let mut include_parent: Option<BlissVal> = None;
+    // `:include`'s trailing slot-override specs — `(slot [new-default . opts])` —
+    // which redefine an inherited slot's default/type/read-only in this child
+    // (ansi-test STRUCT-INCLUDE.*). Movable conses referenced across later
+    // allocations, so held in a rooted Vec.
+    bliss_rt::rooted!(include_overrides = Vec::<BlissVal>::new());
     // Each entry: (constructor-name-symbol, Option<BOA positional lambda list>).
     let mut constructors: Vec<(BlissVal, Option<Vec<BlissVal>>)> = Vec::new();
     let mut suppress_default_ctor = false;
+    // A bare `(:constructor)` option explicitly requests the default-named
+    // MAKE-NAME keyword constructor even when other named constructors are also
+    // given (ansi-test STRUCTURE-BOA-TEST-16).
+    let mut explicit_default_ctor = false;
+    // :predicate / :copier — Default (generate the standard NAME-P / COPY-NAME),
+    // None (`(:predicate nil)` — generate nothing), or Custom(name) (a caller-
+    // chosen name; the standard name is then NOT generated) (ansi-test
+    // struct-test-15/17/20/21).
+    enum NameSpec {
+        Default,
+        Suppressed,
+        Custom(BlissVal),
+    }
+    let mut predicate_spec = NameSpec::Default;
+    let mut copier_spec = NameSpec::Default;
     if name_spec.is_cons() {
         for opt in list_to_vec(cp(name_spec).1) {
+            // An atom option: `:conc-name` on its own (no prefix — accessors are
+            // the bare slot names), `:named`, `:predicate`, `:copier`, `:type`.
+            // Only `:conc-name` changes behaviour here; the rest are ignored, as
+            // are the list forms below (ansi-test struct-test-07/34) (bliss struct).
             if !opt.is_cons() {
+                if opt.is_symbol() && symbol_bare_name(&sym_name(opt)) == "CONC-NAME" {
+                    conc_name = String::new();
+                }
                 continue;
             }
             let (okey, orest) = cp(opt);
@@ -25403,13 +25607,18 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                 }
                 "INCLUDE" => {
                     if orest.is_cons() {
-                        include_parent = Some(cp(orest).0);
+                        let (parent, overrides) = cp(orest);
+                        include_parent = Some(parent);
+                        for o in list_to_vec(overrides) {
+                            include_overrides.push(o);
+                        }
                     }
                 }
                 "CONSTRUCTOR" => {
                     // (:constructor) → default; (:constructor nil) → none;
                     // (:constructor name) → keyword; (:constructor name (args)) → BOA.
                     if !orest.is_cons() {
+                        explicit_default_ctor = true;
                         continue;
                     }
                     let (cname, crest) = cp(orest);
@@ -25424,6 +25633,28 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                         constructors.push((cname, boa));
                     }
                 }
+                "PREDICATE" => {
+                    // (:predicate) → default; (:predicate nil) → none;
+                    // (:predicate name) → custom.
+                    if orest.is_cons() {
+                        let v = cp(orest).0;
+                        predicate_spec = if v == NIL {
+                            NameSpec::Suppressed
+                        } else {
+                            NameSpec::Custom(v)
+                        };
+                    }
+                }
+                "COPIER" => {
+                    if orest.is_cons() {
+                        let v = cp(orest).0;
+                        copier_spec = if v == NIL {
+                            NameSpec::Suppressed
+                        } else {
+                            NameSpec::Custom(v)
+                        };
+                    }
+                }
                 _ => {}
             }
         }
@@ -25435,17 +25666,38 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         default: BlissVal,
         accessor: BlissVal,
         initarg: BlissVal,
+        /// A `:read-only t` slot gets only a reader (no `(setf accessor)` writer).
+        read_only: bool,
     }
     let mut slots: Vec<StructSlot> = Vec::new();
     for slot_form in list_to_vec(slots_form) {
-        let (slot_sym, default) = if slot_form.is_cons() {
+        let (slot_sym, default, options) = if slot_form.is_cons() {
             let (sn, rest) = cp(slot_form);
-            (sn, if rest.is_cons() { cp(rest).0 } else { NIL })
+            if rest.is_cons() {
+                let (d, opts) = cp(rest);
+                (sn, d, opts)
+            } else {
+                (sn, NIL, NIL)
+            }
         } else {
-            (slot_form, NIL)
+            (slot_form, NIL, NIL)
         };
         if !slot_sym.is_symbol() {
             continue;
+        }
+        // Slot options are a plist tail; `:read-only <non-nil>` makes the slot
+        // read-only (any non-NIL value counts) (ansi-test struct-test-27/28/29/21).
+        let mut read_only = false;
+        let opt_vec = list_to_vec(options);
+        let mut k = 0;
+        while k + 1 < opt_vec.len() {
+            if opt_vec[k].is_symbol()
+                && symbol_bare_name(&sym_name(opt_vec[k])) == "READ-ONLY"
+                && !opt_vec[k + 1].is_nil()
+            {
+                read_only = true;
+            }
+            k += 2;
         }
         let slot_str = symbol_bare_name(&sym_name(slot_sym));
         let accessor = if conc_name.is_empty() {
@@ -25458,7 +25710,112 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             default,
             accessor,
             initarg: resolve_sym(&format!(":{}", slot_str)).unwrap_or(NIL),
+            read_only,
         });
+    }
+
+    // :include — generate this child's own accessors for every INHERITED slot and
+    // apply any slot-override defaults. bliss builds a struct as a DEFCLASS with
+    // the parent as a superclass, so inherited slots exist in the instance, but
+    // without this the child gets no CHILD-conc accessor for them and no way to
+    // override their defaults (ansi-test STRUCT-INCLUDE.1-7). Redeclaring an
+    // inherited slot in the child DEFCLASS is well-defined here: the child's
+    // :initform/:accessor win over the parent's (verified), yielding a single
+    // effective slot. Walk the parent chain collecting (name, initform) without
+    // allocating (env.classes borrow held only over the copy); the initforms are
+    // movable, so they ride in a rooted Vec across the accessor-symbol interning.
+    if let Some(parent_sym) = include_parent {
+        let mut inh_names: Vec<String> = Vec::new();
+        bliss_rt::rooted!(inh_forms = Vec::<BlissVal>::new());
+        {
+            let classes = env.classes.borrow();
+            let mut worklist = vec![sym_name(parent_sym)];
+            let mut seen_class: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(cname) = worklist.pop() {
+                if !seen_class.insert(cname.clone()) {
+                    continue;
+                }
+                if let Some(cd) = classes.get(&cname) {
+                    for sd in &cd.slots {
+                        if !inh_names.iter().any(|n| n == &sd.name) {
+                            inh_names.push(sd.name.clone());
+                            inh_forms.push(sd.initform.unwrap_or(NIL));
+                        }
+                    }
+                    for sup in &cd.supers {
+                        worklist.push(sup.clone());
+                    }
+                }
+            }
+        }
+        // Child's own direct slot bare names (already in `slots`).
+        let own: std::collections::HashSet<String> = slots
+            .iter()
+            .map(|s| symbol_bare_name(&sym_name(s.slot_sym)))
+            .collect();
+        let mut inherited: Vec<StructSlot> = Vec::new();
+        for i in 0..inh_names.len() {
+            let sname = &inh_names[i];
+            if own.contains(sname) {
+                continue;
+            }
+            // Apply an override's new default (its cadr) if one is given for this
+            // slot; otherwise keep the inherited initform.
+            let mut default = inh_forms[i];
+            for j in 0..include_overrides.len() {
+                let ov = include_overrides[j];
+                if !ov.is_cons() {
+                    continue;
+                }
+                let (ohead, orest) = cp(ov);
+                if ohead.is_symbol() && &symbol_bare_name(&sym_name(ohead)) == sname {
+                    if orest.is_cons() {
+                        default = cp(orest).0;
+                    }
+                    break;
+                }
+            }
+            let slot_sym = resolve_sym(sname).unwrap_or(NIL);
+            let accessor = if conc_name.is_empty() {
+                slot_sym
+            } else {
+                resolve_sym(&format!("{conc_name}{sname}")).unwrap_or(NIL)
+            };
+            // A `(slot … :read-only t)` override makes the inherited slot
+            // read-only in the child.
+            let mut read_only = false;
+            for j in 0..include_overrides.len() {
+                let ov = include_overrides[j];
+                if !ov.is_cons() {
+                    continue;
+                }
+                let (ohead, orest) = cp(ov);
+                if ohead.is_symbol() && &symbol_bare_name(&sym_name(ohead)) == sname {
+                    let ovec = list_to_vec(orest);
+                    let mut k = 1; // skip the new-default form at index 0
+                    while k + 1 < ovec.len() {
+                        if ovec[k].is_symbol()
+                            && symbol_bare_name(&sym_name(ovec[k])) == "READ-ONLY"
+                            && !ovec[k + 1].is_nil()
+                        {
+                            read_only = true;
+                        }
+                        k += 2;
+                    }
+                    break;
+                }
+            }
+            inherited.push(StructSlot {
+                slot_sym,
+                default,
+                accessor,
+                initarg: resolve_sym(&format!(":{sname}")).unwrap_or(NIL),
+                read_only,
+            });
+        }
+        // Inherited slots precede the child's own (CL slot order).
+        inherited.append(&mut slots);
+        slots = inherited;
     }
 
     let sym = |name: &str| resolve_sym(name).unwrap_or(NIL);
@@ -25476,13 +25833,16 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     bliss_rt::rooted!(slot_clauses = Vec::<BlissVal>::new());
     for s in &slots {
         bliss_rt::rooted!(default = s.default);
+        // A read-only slot gets only a :READER (no writer), so `(setf accessor)`
+        // is unbound as CLHS requires (ansi-test struct-test-NN/12).
+        let accessor_kw = if s.read_only { ":READER" } else { ":ACCESSOR" };
         let clause = vec_to_list(&[
             s.slot_sym,
             sym(":INITARG"),
             s.initarg,
             sym(":INITFORM"),
             *default,
-            sym(":ACCESSOR"),
+            sym(accessor_kw),
             s.accessor,
         ]);
         slot_clauses.push(clause);
@@ -25505,7 +25865,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     // Constructors. A keyword constructor forwards every initarg to
     // MAKE-INSTANCE (so inherited slots Just Work); a BOA constructor maps its
     // positional lambda list to slot initargs by name.
-    if constructors.is_empty() && !suppress_default_ctor {
+    if (constructors.is_empty() || explicit_default_ctor) && !suppress_default_ctor {
         constructors.push((sym(&format!("MAKE-{}", name_str)), None));
     }
     for (ctor_name, boa) in &constructors {
@@ -25526,26 +25886,121 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                 vec_to_list(&[sym("DEFUN"), *ctor_name, *lambda_list, *apply_call])
             }
             Some(params) => {
-                // (defun CTOR (params...) (make-instance 'NAME :p p ...)), where a
-                // param named like a slot supplies that slot; lambda-list keywords
-                // (&optional/&key/…) pass through into the lambda list untouched.
-                // Root the accumulator + intermediates so a minor GC during the
-                // per-param resolve_sym / vec_to_list cannot stale the movable
-                // quote(name_sym) cons already in it (bliss-bjue).
+                // BOA constructor (CLHS 3.4.6). Build
+                //   (defun CTOR (rewritten-ll) (make-instance 'NAME :slot var ...))
+                // where each slot bound by a parameter VARIABLE (the variable
+                // name, not the keyword) is initialised from it. Two BOA subtleties
+                // are handled that the naive "pass every param name as an initarg"
+                // approach got wrong (ansi-test STRUCTURE-BOA-TEST-05/08/09/13-16):
+                //   * an &optional/&key parameter that names a slot but supplies no
+                //     default form gets the SLOT's own initform as its default, so
+                //     an unsupplied argument yields the slot default, not NIL;
+                //   * &key parameters spelled `((:kw var) …)` / `((kw var) …)`, and
+                //     &aux vars, bind the slot named by VAR.
+                // The whole source lambda list is rooted (movable default forms are
+                // referenced across the per-param vec_to_list allocations); the
+                // accumulators are Vec<BlissVal> and rooted too (bliss struct/bjue).
+                #[derive(PartialEq, Clone, Copy)]
+                enum Sec {
+                    Req,
+                    Opt,
+                    Rest,
+                    Key,
+                    Aux,
+                }
+                // slot bare name -> (initarg, default initform)
+                let slot_info = |var: BlissVal| -> Option<(BlissVal, BlissVal)> {
+                    if !var.is_symbol() {
+                        return None;
+                    }
+                    let bare = symbol_bare_name(&sym_name(var));
+                    slots
+                        .iter()
+                        .find(|s| symbol_bare_name(&sym_name(s.slot_sym)) == bare)
+                        .map(|s| (s.initarg, s.default))
+                };
+                bliss_rt::rooted!(src = params.clone());
+                bliss_rt::rooted!(new_params = Vec::<BlissVal>::new());
+                // Flat (initarg, var, initarg, var, …) of slots bound by a param.
                 bliss_rt::rooted!(make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)]);
-                for p in params {
-                    let pname = if p.is_cons() { cp(*p).0 } else { *p };
-                    if pname.is_symbol() {
-                        let bare = symbol_bare_name(&sym_name(pname));
-                        if bare.starts_with('&') {
-                            continue;
+                let mut sec = Sec::Req;
+                for i in 0..src.len() {
+                    let p = src[i];
+                    if p.is_symbol() {
+                        match symbol_bare_name(&sym_name(p)).as_str() {
+                            "&OPTIONAL" => {
+                                sec = Sec::Opt;
+                                new_params.push(p);
+                                continue;
+                            }
+                            "&REST" => {
+                                sec = Sec::Rest;
+                                new_params.push(p);
+                                continue;
+                            }
+                            "&KEY" => {
+                                sec = Sec::Key;
+                                new_params.push(p);
+                                continue;
+                            }
+                            "&AUX" => {
+                                sec = Sec::Aux;
+                                new_params.push(p);
+                                continue;
+                            }
+                            "&ALLOW-OTHER-KEYS" => {
+                                new_params.push(p);
+                                continue;
+                            }
+                            _ => {}
                         }
-                        let kw = resolve_sym(&format!(":{bare}")).unwrap_or(NIL);
-                        make_call.push(kw);
-                        make_call.push(pname);
+                    }
+                    // Decompose the parameter into its parts.
+                    let parts = if p.is_cons() { list_to_vec(p) } else { vec![p] };
+                    // keyform: first element (for &key it may be `(kw var)`).
+                    let keyform = parts[0];
+                    let var = if keyform.is_cons() {
+                        // (kw var) — the variable is the second element.
+                        let kv = list_to_vec(keyform);
+                        if kv.len() >= 2 { kv[1] } else { keyform }
+                    } else {
+                        keyform
+                    };
+                    let has_default = parts.len() >= 2;
+                    let supplied = if parts.len() >= 3 { Some(parts[2]) } else { None };
+                    let slot = slot_info(var);
+                    match sec {
+                        Sec::Req | Sec::Rest | Sec::Aux => {
+                            // Passed through unchanged (required always supplied;
+                            // &aux binds its own value; &rest binds a list).
+                            new_params.push(p);
+                        }
+                        Sec::Opt | Sec::Key => {
+                            // Inject the slot's initform as the default when the
+                            // parameter names a slot and supplies none.
+                            if !has_default {
+                                if let Some((_, dflt)) = slot {
+                                    bliss_rt::rooted!(dflt_r = dflt);
+                                    let mut rebuilt = vec![keyform, *dflt_r];
+                                    if let Some(s) = supplied {
+                                        rebuilt.push(s);
+                                    }
+                                    bliss_rt::rooted!(rebuilt_r = rebuilt);
+                                    new_params.push(vec_to_list(&rebuilt_r));
+                                } else {
+                                    new_params.push(p);
+                                }
+                            } else {
+                                new_params.push(p);
+                            }
+                        }
+                    }
+                    if let Some((initarg, _)) = slot {
+                        make_call.push(initarg);
+                        make_call.push(var);
                     }
                 }
-                bliss_rt::rooted!(boa_lambda = vec_to_list(params));
+                bliss_rt::rooted!(boa_lambda = vec_to_list(&new_params));
                 bliss_rt::rooted!(boa_body = vec_to_list(&make_call));
                 vec_to_list(&[sym("DEFUN"), *ctor_name, *boa_lambda, *boa_body])
             }
@@ -25553,30 +26008,49 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         eval_form(ctor_defun, env)?;
     }
 
-    // (defun NAME-P (o) (typep o 'NAME)) — root the movable intermediates so a
-    // minor GC while a later element allocates cannot stale them (bliss-bjue).
-    bliss_rt::rooted!(pred_params = vec_to_list(&[obj]));
-    bliss_rt::rooted!(pred_body = vec_to_list(&[sym("TYPEP"), obj, quote(name_sym)]));
-    let pred_name = sym(&format!("{}-P", name_str));
-    let pred_defun = vec_to_list(&[sym("DEFUN"), pred_name, *pred_params, *pred_body]);
-    eval_form(pred_defun, env)?;
+    // (defun PRED (o) (typep o 'NAME)) — the predicate name is NAME-P by default,
+    // a caller-chosen name for `(:predicate name)`, or omitted for
+    // `(:predicate nil)` (ansi-test struct-test-15/17). Root the movable
+    // intermediates so a minor GC while a later element allocates cannot stale
+    // them (bliss-bjue).
+    let pred_name = match predicate_spec {
+        NameSpec::Default => Some(sym(&format!("{}-P", name_str))),
+        NameSpec::Custom(n) => Some(n),
+        NameSpec::Suppressed => None,
+    };
+    if let Some(pred_name) = pred_name {
+        bliss_rt::rooted!(pred_name_r = pred_name);
+        bliss_rt::rooted!(pred_params = vec_to_list(&[obj]));
+        bliss_rt::rooted!(pred_body = vec_to_list(&[sym("TYPEP"), obj, quote(name_sym)]));
+        let pred_defun = vec_to_list(&[sym("DEFUN"), *pred_name_r, *pred_params, *pred_body]);
+        eval_form(pred_defun, env)?;
+    }
 
     // (defun copy-NAME (o) (make-instance 'NAME :slot (accessor o) ...))
     // Copies this struct's own slots (inherited slots via :include are not
     // enumerated here; that path is unused by the code needing DEFSTRUCT).
     // The accumulator holds movable conses, so root it across the per-slot
     // allocations (bliss-bjue).
-    bliss_rt::rooted!(copy_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)]);
-    for s in &slots {
-        let accessor_call = vec_to_list(&[s.accessor, obj]);
-        copy_call.push(s.initarg);
-        copy_call.push(accessor_call);
+    // The copier is COPY-NAME by default, a caller-chosen name for
+    // `(:copier name)`, or omitted for `(:copier nil)` (ansi-test struct-test-20/21).
+    let copy_name = match copier_spec {
+        NameSpec::Default => Some(sym(&format!("COPY-{}", name_str))),
+        NameSpec::Custom(n) => Some(n),
+        NameSpec::Suppressed => None,
+    };
+    if let Some(copy_name) = copy_name {
+        bliss_rt::rooted!(copy_name_r = copy_name);
+        bliss_rt::rooted!(copy_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)]);
+        for s in &slots {
+            let accessor_call = vec_to_list(&[s.accessor, obj]);
+            copy_call.push(s.initarg);
+            copy_call.push(accessor_call);
+        }
+        bliss_rt::rooted!(copy_params = vec_to_list(&[obj]));
+        bliss_rt::rooted!(copy_body = vec_to_list(&copy_call));
+        let copy_defun = vec_to_list(&[sym("DEFUN"), *copy_name_r, *copy_params, *copy_body]);
+        eval_form(copy_defun, env)?;
     }
-    bliss_rt::rooted!(copy_params = vec_to_list(&[obj]));
-    bliss_rt::rooted!(copy_body = vec_to_list(&copy_call));
-    let copy_name = sym(&format!("COPY-{}", name_str));
-    let copy_defun = vec_to_list(&[sym("DEFUN"), copy_name, *copy_params, *copy_body]);
-    eval_form(copy_defun, env)?;
 
     Ok(*name_sym_r)
 }
