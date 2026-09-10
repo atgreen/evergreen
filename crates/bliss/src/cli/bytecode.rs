@@ -12543,6 +12543,31 @@ extern "C" fn c2i_take_values(primary: u64, dst: *mut BlissVal, n: u64) {
     }
 }
 
+/// `ValuesToList`: collect the current multiple-values into a fresh list. When
+/// `mv_active`, the values are `env.mv`; otherwise the single `primary` value.
+/// Mirrors the T0 `Instr::ValuesToList` arm exactly (bliss-rwiv) so the compiled
+/// tier produces the identical list. ALLOCATES (`vec_to_list` builds conses), so
+/// `primary`/`env.mv` are rooted before the allocation — the whole-function GC
+/// stack map covers the native operand slots, and `primary` (a caller-saved
+/// register argument, invisible to the scan) is rooted here in the helper frame.
+extern "C" fn c2i_values_to_list(primary: u64) -> u64 {
+    let env_ptr = NATIVE_ENV.with(|cell| cell.get());
+    if env_ptr.is_null() {
+        return primary;
+    }
+    // SAFETY: same window/contract as `c2i_call` — `run_native` keeps
+    // NATIVE_ENV pointing at a live &mut Env for the duration of the call.
+    let env = unsafe { &mut *env_ptr };
+    bliss_rt::rooted!(
+        vals = if env.mv_active {
+            env.mv.clone()
+        } else {
+            vec![BlissVal(primary)]
+        }
+    );
+    vec_to_list(&vals).0
+}
+
 extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64, profile_site: u64) -> u64 {
     if n > 3 {
         return NIL.0;
@@ -14648,6 +14673,7 @@ fn emit_native_x86(
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
     let take_values_addr =
         c2i_take_values as extern "C" fn(u64, *mut BlissVal, u64) as usize as u64;
+    let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
     let t2_backedge_addr =
         c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64 as usize as u64;
@@ -15311,6 +15337,16 @@ fn emit_native_x86(
             // reaches the emitter is provably local-only. This unblocks native
             // compilation of dolist/do/loop bodies (bliss-x5y).
             Instr::NamedTag { .. } => {}
+            Instr::ValuesToList => {
+                // Collect current multiple-values into a fresh list via the c2i
+                // helper (reads env.mv, allocates). Pop primary into rdi (arg 0);
+                // the helper roots it before allocating (bliss-rwiv).
+                pop_into(&mut c, 7, false); // rdi = primary
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+                c.extend_from_slice(&values_to_list_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
             unsupported => decline_t1!("unsupported opcode at bcp {bcp}: {unsupported:?}"),
         }
     }
