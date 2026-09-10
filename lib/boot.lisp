@@ -633,7 +633,13 @@
 ;;; state instead of bootstrap stubs.
 ;;; ---------------------------------------------------------------------------
 
-(defun symbol-name (s) (string s))
+;; SYMBOL-NAME requires a symbol; a non-symbol is a TYPE-ERROR whose datum is the
+;; offending object (ansi-test symbol-name.error.3). STRING would otherwise coerce
+;; a string/character silently.
+(defun symbol-name (s)
+  (if (symbolp s)
+      (string s)
+      (error 'type-error :datum s :expected-type 'symbol)))
 
 ;; SYMBOL-PACKAGE is provided as a builtin that inspects the symbol's real
 ;; package prefix; the previous bootstrap definition parsed (string s), which
@@ -747,6 +753,11 @@
 (defvar *print-readably* nil)
 (defvar *print-right-margin* nil)
 (defvar *read-base* 10)
+;; The suffix counter GENSYM appends to its default "G" prefix. GENSYM reads it,
+;; makes the symbol, then increments it; it must be a non-negative integer
+;; (CLHS *GENSYM-COUNTER*). Declared special here so `(let ((*gensym-counter* n))
+;; …)` rebinds it dynamically and GENSYM (a builtin) sees the bound value.
+(defvar *gensym-counter* 0)
 (defvar *read-default-float-format* 'single-float)
 (defvar *read-eval* t)
 (defvar *read-suppress* nil)

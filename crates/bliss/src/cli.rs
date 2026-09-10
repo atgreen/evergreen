@@ -6682,7 +6682,9 @@ fn symbol_package_value(env: &Env, sym: BlissVal) -> BlissVal {
     }
     if sym != NIL && sym != T {
         if let Some(idx) = sym.symbol_index() {
-            if symbol_is_homeless(idx) {
+            // Uninterned symbols (make-symbol / gensym / copy-symbol) and symbols
+            // made homeless by UNINTERN both have SYMBOL-PACKAGE = NIL.
+            if symbol_is_homeless(idx) || reader::is_uninterned(idx) {
                 return NIL;
             }
         }
@@ -10022,7 +10024,16 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let preserve = {
             let (car, _) = cp(form);
             if car.is_symbol() {
-                mv_form_preserves_values(&sym_name(car), env)
+                // An UNINTERNED operator (a gensym with an installed function cell)
+                // is a function call, so it propagates its callee's values — but its
+                // name is not fbound by-name, so `mv_form_preserves_values` misses
+                // it and would truncate them (symbol-function.1). Detect it by index.
+                let uninterned_fn = car
+                    .symbol_index()
+                    .filter(|idx| reader::is_uninterned(*idx))
+                    .and_then(bliss_rt::symbols::symbol_function)
+                    .is_some_and(bliss_rt::function::is_interpreted_function);
+                uninterned_fn || mv_form_preserves_values(&sym_name(car), env)
             } else {
                 // Lambda application `((lambda ...) ...)` — dispatches through
                 // eval_lambda_call, which sets mv from the body's tail form.
@@ -10366,6 +10377,19 @@ fn symbol_function_object(env: &mut Env, name_sym: BlissVal) -> Option<BlissVal>
     if let Some(c) = local_fn_closure(env, &fn_name) {
         return Some(c);
     }
+    // An UNINTERNED symbol's function cell is keyed only by its registry index
+    // (its name is not in the name→index map, so `global_fn` by name misses it):
+    // read it directly, so `(symbol-function (gensym-with-installed-fn))` returns
+    // the function object rather than the bare symbol (symbol-function.1).
+    if let Some(idx) = name_sym.symbol_index() {
+        if reader::is_uninterned(idx) {
+            if let Some(cell) = bliss_rt::symbols::symbol_function(idx) {
+                if bliss_rt::function::is_interpreted_function(cell) {
+                    return Some(cell);
+                }
+            }
+        }
+    }
     if let Some(f) = global_fn(&fn_name) {
         return Some(f);
     }
@@ -10467,6 +10491,17 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         | "EXPORT" | "UNEXPORT" | "IMPORT" | "SHADOWING-IMPORT" | "SHADOW" => Some((1, 2)),
         // (rename-package package new-name &optional new-nicknames).
         "RENAME-PACKAGE" => Some((2, 3)),
+        // Symbol functions with fixed arity — a wrong-count call is a
+        // PROGRAM-ERROR (CLHS 3.5.1), required by the ansi-test symbols
+        // *.ERROR.* cases (bliss symbols chapter).
+        "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "SYMBOL-VALUE" | "SYMBOL-NAME"
+        | "SYMBOL-FUNCTION" | "SYMBOLP" | "KEYWORDP" | "BOUNDP" | "MAKUNBOUND"
+        | "SPECIAL-OPERATOR-P" | "MAKE-SYMBOL" => Some((1, 1)),
+        "SET" | "REMPROP" => Some((2, 2)),
+        "GET" => Some((2, 3)),
+        "COPY-SYMBOL" => Some((1, 2)),
+        "GENSYM" => Some((0, 1)),
+        "GENTEMP" => Some((0, 2)),
         _ => None,
     }
 }
@@ -11630,7 +11665,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // matching the sibling MACRO-FUNCTION arm above.
                 let args = eval_args(cdr, env)?;
                 let s = args.first().copied().unwrap_or(NIL);
-                if s.is_symbol() && is_ansi_special_operator(&symbol_bare_name(&sym_name(s))) {
+                // A non-symbol argument is a TYPE-ERROR (special-operator-p.error.1).
+                if !s.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: s,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
+                if is_ansi_special_operator(&symbol_bare_name(&sym_name(s))) {
                     return Ok(T);
                 }
                 return Ok(NIL);
@@ -11654,12 +11696,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (symbol-plist symbol) → its property list
                 let (sf, _) = cp(cdr);
                 let s = eval_form(sf, env)?;
+                // A non-symbol argument is a TYPE-ERROR (symbol-plist.error.3).
+                if !s.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: s,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
                 return Ok(symbol_plist_of(s));
             }
             "GET" => {
                 // (get symbol indicator &optional default)
                 let args = eval_args(cdr, env)?;
                 let s = args.first().copied().unwrap_or(NIL);
+                // A non-symbol first argument is a TYPE-ERROR (get.error.4).
+                if !s.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: s,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
                 let key = args.get(1).copied().unwrap_or(NIL);
                 let default = args.get(2).copied().unwrap_or(NIL);
                 return Ok(plist_lookup(symbol_plist_of(s), key).unwrap_or(default));
@@ -11670,10 +11726,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let args = eval_args(cdr, env)?;
                 let s = args.first().copied().unwrap_or(NIL);
                 let key = args.get(1).copied().unwrap_or(NIL);
+                // A non-symbol is a TYPE-ERROR (remprop.error.4).
+                if !s.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: s,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
                 // NIL and T report is_symbol()=true but carry the SPECIAL tag, not
                 // TAG_SYMBOL, so as_symbol_index() panics/aborts on them; they have
                 // no registry-backed plist, so nothing to remove (bliss-x7aa).
-                if !s.is_symbol() || s == NIL || s == T {
+                if s == NIL || s == T {
                     return Ok(NIL);
                 }
                 let idx = s.as_symbol_index();
@@ -12088,6 +12151,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if sym.is_nil() || sym == T {
                     return Ok(T);
                 }
+                // Keywords are constant variables bound to themselves (CLHS 11.1.2.3.1).
+                if is_keyword_arg(sym) {
+                    return Ok(T);
+                }
+                // A non-symbol argument is a TYPE-ERROR (boundp.error.3/4/5/6).
+                if !sym.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: sym,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
                 // Resolve a SYMBOL argument by INDEX (the same resolution an
                 // evaluated variable reference uses), not by name string: a
                 // package-interned symbol's heap name cell holds its BARE name
@@ -12115,16 +12189,57 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if sym == T {
                     return Ok(T);
                 }
+                // Keywords evaluate to themselves (CLHS 11.1.2.3.1).
+                if is_keyword_arg(sym) {
+                    return Ok(sym);
+                }
+                // A non-symbol argument is a TYPE-ERROR (symbol-value.error.3).
+                if !sym.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: sym,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
                 // By-index resolution for symbols — see BOUNDP (bliss-o2da).
-                let resolved = if sym.is_symbol() {
-                    env.lookup_var_symbol(sym)
-                } else {
-                    env.lookup_var(&val_as_str(sym))
-                };
+                let resolved = env.lookup_var_symbol(sym);
                 return match resolved {
                     Some(v) => Ok(v),
                     None => Err(BlissError::UnboundVariable(sym)),
                 };
+            }
+            "SET" => {
+                // (set symbol value) — assign SYMBOL's dynamic (special) value,
+                // like SETQ on the symbol / (setf (symbol-value symbol) value).
+                // Returns VALUE. Arity (2,2) is enforced above (set.error.*).
+                let args = eval_args(cdr, env)?;
+                let sym = args[0];
+                bliss_rt::rooted!(val = args[1]);
+                if !sym.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: sym,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
+                env.set_var_symbol(sym, *val);
+                return Ok(*val);
+            }
+            "MAKUNBOUND" => {
+                // (makunbound symbol) — make SYMBOL's dynamic value unbound and
+                // return SYMBOL. Clearing the global value cell (to UNBOUND) makes
+                // BOUNDP report NIL and SYMBOL-VALUE signal UNBOUND-VARIABLE
+                // (makunbound.1/.2).
+                let (sf, _) = cp(cdr);
+                let sym = eval_form(sf, env)?;
+                if !sym.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: sym,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
+                if let Some(idx) = sym.symbol_index() {
+                    bliss_rt::symbols::set_symbol_value(idx, bliss_rt::value::UNBOUND);
+                }
+                return Ok(sym);
             }
             "SYMBOLP" => {
                 let (af, _) = cp(cdr);
@@ -12278,6 +12393,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "FDEFINITION" | "SYMBOL-FUNCTION" => {
                 let (sf, _) = cp(cdr);
                 let spec = eval_form(sf, env)?;
+                // SYMBOL-FUNCTION requires a symbol; a non-symbol is a TYPE-ERROR
+                // (symbol-function.error.3). FDEFINITION also accepts (setf name)
+                // function-name lists, so it keeps the lenient fallthrough below.
+                if name == "SYMBOL-FUNCTION" && !spec.is_symbol() {
+                    return Err(BlissError::TypeError {
+                        datum: spec,
+                        expected: "SYMBOL".to_string(),
+                    });
+                }
                 if spec.is_symbol() {
                     // Return the SAME first-class function object `#'name` yields
                     // (bliss-dnst): a builtin is reified to its FUNCTIONP wrapper,
@@ -13124,19 +13248,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             }
                             "GET" => {
                                 // (setf (get symbol indicator [default]) val)
-                                let sym = eval_form(tgt_form, env)?;
-                                let (key_form, _) = cp(cp(*aargs).1);
-                                let key = eval_form(key_form, env)?;
-                                symbol_plist_put(sym, key, *val);
+                                bliss_rt::rooted!(sym = eval_form(tgt_form, env)?);
+                                // A non-symbol place is a TYPE-ERROR (get.error.5).
+                                if !sym.is_symbol() {
+                                    return Err(BlissError::TypeError {
+                                        datum: *sym,
+                                        expected: "SYMBOL".to_string(),
+                                    });
+                                }
+                                let (key_form, after_key) = cp(cp(*aargs).1);
+                                bliss_rt::rooted!(key = eval_form(key_form, env)?);
+                                // ANSI: the optional DEFAULT subform of the place is
+                                // still evaluated (for its side effects), even though
+                                // (SETF GET) ignores its value (get.6 / get.order.4).
+                                if after_key.is_cons() {
+                                    let (default_form, _) = cp(after_key);
+                                    eval_form(default_form, env)?;
+                                }
+                                symbol_plist_put(*sym, *key, *val);
                             }
                             "SYMBOL-PLIST" => {
                                 // (setf (symbol-plist symbol) plist)
                                 let sym = eval_form(tgt_form, env)?;
-                                if sym.is_symbol() {
-                                    bliss_rt::symbols::set_symbol_plist(
-                                        sym.as_symbol_index(),
-                                        *val,
-                                    );
+                                // A non-symbol place is a TYPE-ERROR (symbol-plist.error.4).
+                                if !sym.is_symbol() {
+                                    return Err(BlissError::TypeError {
+                                        datum: sym,
+                                        expected: "SYMBOL".to_string(),
+                                    });
+                                }
+                                if let Some(idx) = sym.symbol_index() {
+                                    bliss_rt::symbols::set_symbol_plist(idx, *val);
                                 }
                             }
                             "SLOT-VALUE" => {
@@ -13152,12 +13294,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // (setf (symbol-value sym) val) — assign the
                                 // symbol's dynamic value, like SETQ on the symbol.
                                 let sym = eval_form(tgt_form, env)?;
-                                if sym.is_symbol() {
-                                    env.set_var_symbol(sym, *val);
-                                } else {
-                                    let name = val_as_str(sym);
-                                    env.set_var(&name, *val);
+                                // A non-symbol place is a TYPE-ERROR (symbol-value.error.4).
+                                if !sym.is_symbol() {
+                                    return Err(BlissError::TypeError {
+                                        datum: sym,
+                                        expected: "SYMBOL".to_string(),
+                                    });
                                 }
+                                env.set_var_symbol(sym, *val);
                             }
                             "SYMBOL-FUNCTION" | "FDEFINITION" => {
                                 // (setf (symbol-function sym) fn) / (setf
@@ -13167,17 +13311,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // (`(setf (symbol-function 'emptyp) …)`).
                                 let sym = eval_form(tgt_form, env)?;
                                 if !sym.is_symbol() {
-                                    return Err(BlissError::Internal(format!(
-                                        "SETF {}: expected a symbol name, got {}",
-                                        acc,
-                                        format_val(sym)
-                                    )));
+                                    // (setf (symbol-function x)) on a non-symbol is a
+                                    // TYPE-ERROR (symbol-function.error.4).
+                                    return Err(BlissError::TypeError {
+                                        datum: sym,
+                                        expected: "SYMBOL".to_string(),
+                                    });
                                 }
                                 let fnval = coerce_installed_function(env, *val);
-                                bliss_rt::symbols::set_symbol_function(
-                                    sym.as_symbol_index(),
-                                    fnval,
-                                );
+                                if let Some(idx) = sym.symbol_index() {
+                                    bliss_rt::symbols::set_symbol_function(idx, fnval);
+                                }
                             }
                             "MACRO-FUNCTION" => {
                                 // (setf (macro-function name) expander-fn) —
@@ -17934,8 +18078,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(NIL);
                 }
                 let sym = eval_form(args[0], env)?;
+                // A non-symbol argument is a TYPE-ERROR (symbol-package.error.3).
                 if !sym.is_symbol() {
-                    return Ok(NIL);
+                    return Err(BlissError::TypeError {
+                        datum: sym,
+                        expected: "SYMBOL".to_string(),
+                    });
                 }
                 return Ok(symbol_package_value(env, sym));
             }
@@ -17946,11 +18094,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // by iterate). Distinct from GENSYM, whose result is uninterned.
                 thread_local! { static GENTEMP_COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
                 let args = eval_args(cdr, env)?;
-                let prefix = args
-                    .first()
-                    .filter(|v| !v.is_nil())
-                    .map(|v| val_as_str(*v))
-                    .unwrap_or_else(|| "T".to_string());
+                // A supplied PREFIX must be a STRING; a non-string (including NIL)
+                // is a TYPE-ERROR whose datum is the argument (gentemp.error.1).
+                let prefix = match args.first() {
+                    None => "T".to_string(),
+                    Some(v) if is_string_value(*v) => val_as_str(*v),
+                    Some(v) => {
+                        return Err(BlissError::TypeError {
+                            datum: *v,
+                            expected: "STRING".to_string(),
+                        });
+                    }
+                };
                 let pkg_name = args
                     .get(1)
                     .filter(|v| !v.is_nil())
@@ -17975,53 +18130,120 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "GENSYM" => {
-                // (gensym &optional x) → a fresh UNINTERNED symbol. A string X is
-                // used as the name prefix (default "G"); an integer X names the
-                // suffix directly without bumping *gensym-counter*. Otherwise the
-                // shared counter supplies the suffix and is incremented. The result
-                // must be a real uninterned symbol (prints as #:NAME), never an
-                // interned symbol or a string — the old code returned both.
-                thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
-                let arg = match cdr {
-                    c if c.is_nil() => NIL,
-                    _ => {
-                        let (arg_form, _) = cp(cdr);
-                        eval_form(arg_form, env)?
+                // (gensym &optional x) → a fresh UNINTERNED symbol (prints as
+                // #:NAME). With no argument the name is "G" + *GENSYM-COUNTER*, and
+                // the counter is then incremented. A STRING X replaces the "G"
+                // prefix (counter still supplies the suffix and is incremented). A
+                // non-negative integer X is the suffix directly and the counter is
+                // NOT changed. NIL, a negative integer, or any other object is a
+                // TYPE-ERROR (gensym.error.1/8; the arg is (OR STRING UNSIGNED-BYTE)).
+                let arg = if cdr.is_nil() {
+                    None
+                } else {
+                    let (arg_form, _) = cp(cdr);
+                    Some(eval_form(arg_form, env)?)
+                };
+                let (name, bump) = match arg {
+                    None => {
+                        let counter = read_gensym_counter(env)?;
+                        (format!("G{}", format_val(counter)), Some(counter))
+                    }
+                    Some(a) if a.is_fixnum() && a.as_fixnum() >= 0 => {
+                        (format!("G{}", a.as_fixnum()), None)
+                    }
+                    Some(a)
+                        if !a.is_fixnum() && bigint_from_val(a).is_some_and(|b| b.sign >= 0) =>
+                    {
+                        (format!("G{}", format_val(a)), None)
+                    }
+                    Some(a) if is_string_value(a) => {
+                        let counter = read_gensym_counter(env)?;
+                        (format!("{}{}", val_as_str(a), format_val(counter)), Some(counter))
+                    }
+                    Some(a) => {
+                        return Err(BlissError::TypeError {
+                            datum: a,
+                            expected: "(OR STRING (INTEGER 0 *))".to_string(),
+                        });
                     }
                 };
-                let name = if arg == NIL {
-                    let n = COUNTER.with(|c| {
-                        let v = *c.borrow();
-                        *c.borrow_mut() = v + 1;
-                        v
-                    });
-                    format!("G{}", n)
-                } else if arg.is_fixnum() {
-                    format!("G{}", arg.as_fixnum())
-                } else {
-                    // string (or string-designator) prefix + shared counter suffix
-                    let prefix = val_as_str(arg);
-                    let n = COUNTER.with(|c| {
-                        let v = *c.borrow();
-                        *c.borrow_mut() = v + 1;
-                        v
-                    });
-                    format!("{}{}", prefix, n)
-                };
+                // The suffix (NAME) already captured the pre-increment counter, so
+                // the observable "increment after creating the symbol" ordering is
+                // preserved by NAME. Bump the counter FIRST — before the allocating
+                // make_uninterned_symbol — so no heap counter value (a bignum) is
+                // held live across that allocation (GC safety; gensym.3/9/10/11).
+                if let Some(counter) = bump {
+                    bump_gensym_counter(env, counter)?;
+                }
                 return Ok(reader::make_uninterned_symbol(&name));
             }
             "MAKE-SYMBOL" => {
                 // (make-symbol name) — a fresh uninterned symbol with that name.
+                // NAME must be a STRING (CLHS); a non-string (number, symbol, list
+                // of chars, …) is a TYPE-ERROR whose datum is the argument
+                // (make-symbol.error.1/.11). Specialised character vectors
+                // (base-char, fill-pointer, adjustable, displaced) and a zero-length
+                // nil-vector are strings (make-symbol.11-16).
                 let (name_form, _) = cp(cdr);
-                let name = val_as_str(eval_form(name_form, env)?);
+                let arg = eval_form(name_form, env)?;
+                let name = if is_string_value(arg) {
+                    val_as_str(arg)
+                } else if is_vector_value(arg) && bliss_stdlib::length(arg).unwrap_or(1) == 0 {
+                    String::new()
+                } else {
+                    return Err(BlissError::TypeError {
+                        datum: arg,
+                        expected: "STRING".to_string(),
+                    });
+                };
                 return Ok(reader::make_uninterned_symbol(&name));
             }
             "COPY-SYMBOL" => {
-                // (copy-symbol sym) — a fresh uninterned symbol with the same name.
-                let (sym_form, _) = cp(cdr);
-                let sym = eval_form(sym_form, env)?;
-                let name = symbol_name_string(&sym_name(sym));
-                return Ok(reader::make_uninterned_symbol(&name));
+                // (copy-symbol sym &optional copy-props) — a fresh uninterned
+                // symbol with the same name. When COPY-PROPS is true, the new
+                // symbol also gets a COPY of SYM's property list and, if SYM is
+                // bound/fbound, the same value / function (CLHS COPY-SYMBOL).
+                // Both argument forms are evaluated, left to right (copy-symbol.5).
+                let (sym_form, rest) = cp(cdr);
+                bliss_rt::rooted!(sym = eval_form(sym_form, env)?);
+                let copy_props = if rest.is_cons() {
+                    let (cp_form, _) = cp(rest);
+                    !eval_form(cp_form, env)?.is_nil()
+                } else {
+                    false
+                };
+                let name = symbol_name_string(&sym_name(*sym));
+                bliss_rt::rooted!(fresh = reader::make_uninterned_symbol(&name));
+                if copy_props {
+                    // Copy the property list (a fresh list with the same entries).
+                    bliss_rt::rooted!(src_plist = symbol_plist_of(*sym));
+                    let items = list_to_vec(*src_plist);
+                    bliss_rt::rooted!(new_plist = vec_to_list(&items));
+                    if let Some(idx) = fresh.symbol_index() {
+                        bliss_rt::symbols::set_symbol_plist(idx, *new_plist);
+                    }
+                    // Copy the dynamic value, if SYM is bound.
+                    let src_val = if sym.is_nil() {
+                        Some(NIL)
+                    } else if *sym == T {
+                        Some(T)
+                    } else if is_keyword_arg(*sym) {
+                        Some(*sym)
+                    } else {
+                        env.lookup_var_symbol(*sym)
+                    };
+                    if let Some(v) = src_val {
+                        env.set_var_symbol(*fresh, v);
+                    }
+                    // Copy the function binding, if SYM is fbound.
+                    if let Some(f) = symbol_function_object(env, *sym) {
+                        if let Some(idx) = fresh.symbol_index() {
+                            let fnval = coerce_installed_function(env, f);
+                            bliss_rt::symbols::set_symbol_function(idx, fnval);
+                        }
+                    }
+                }
+                return Ok(*fresh);
             }
             "DOTIMES" => {
                 // (dotimes (var count [result]) body...)
@@ -18263,9 +18485,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
         }
 
+        // An UNINTERNED operator symbol (a gensym whose function cell was set with
+        // `(setf (symbol-function (gensym)) …)`) has no name→index entry, so the
+        // name-keyed global-call path below cannot find it. Route it through the
+        // function-object apply path, which reads the cell by index and preserves
+        // multiple values (symbol-function.1).
+        if let Some(idx) = car.symbol_index() {
+            if reader::is_uninterned(idx) {
+                if let Some(cell) = bliss_rt::symbols::symbol_function(idx) {
+                    if bliss_rt::function::is_interpreted_function(cell) {
+                        bliss_rt::rooted!(cell = cell);
+                        let args = eval_args(cdr, env)?;
+                        return apply_function(*cell, &args, env);
+                    }
+                }
+            }
+        }
+
         // Check user-defined functions: lexical (FLET/LABELS/`(setf f)`) then the
-        // global function cell (bliss-jtc.6.8).
-        if let Some((params_form, body)) = callable_body(env, &name) {
+        // global function cell (bliss-jtc.6.8). Resolve via the operator symbol's
+        // registry INDEX (not just its name) so an UNINTERNED symbol whose function
+        // cell was installed with `(setf (symbol-function (gensym)) …)` is callable
+        // (symbol-function.1) — its name is not in the name→index map.
+        if let Some((params_form, body)) = callable_body_of_symbol(env, car, &name) {
             // Root the callee's params/body BEFORE evaluating arguments (which
             // allocates and can trigger a relocating minor GC). Held as bare
             // locals, these copies would go stale when the GC moves the callee's
@@ -23327,6 +23569,41 @@ fn bind_macro_lambda_list(
     Ok(())
 }
 
+/// The current value of `*GENSYM-COUNTER*`, validated to be a non-negative
+/// integer (CLHS: GENSYM signals a TYPE-ERROR otherwise — gensym.error.10/11/12).
+fn read_gensym_counter(env: &mut Env) -> Result<BlissVal, BlissError> {
+    let sym = resolve_sym("*GENSYM-COUNTER*").unwrap_or(NIL);
+    let v = env
+        .lookup_var_symbol(sym)
+        .unwrap_or_else(|| BlissVal::from_fixnum(0));
+    let ok = if v.is_fixnum() {
+        v.as_fixnum() >= 0
+    } else if let Some(b) = bigint_from_val(v) {
+        b.sign >= 0
+    } else {
+        false
+    };
+    if !ok {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "(INTEGER 0 *)".to_string(),
+        });
+    }
+    Ok(v)
+}
+
+/// Store `*GENSYM-COUNTER* + 1` back into the counter's current binding.
+fn bump_gensym_counter(env: &mut Env, mut current: BlissVal) -> Result<(), BlissError> {
+    // `current` may be a heap bignum; root it in place across resolve_sym (which
+    // can intern/allocate) and the fold's result allocation.
+    bliss_rt::rooted_ref!(_current_root = &mut current);
+    let sym = resolve_sym("*GENSYM-COUNTER*").unwrap_or(NIL);
+    let one = BlissVal::from_fixnum(1);
+    let next = fold_arith_vals(&[current, one], 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b)?;
+    env.set_var_symbol(sym, next);
+    Ok(())
+}
+
 // ── DEFMACRO ─────────────────────────────────────────────────────
 fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
@@ -25797,7 +26074,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "%MARK-CONSTANT"
             | "%DEFINE-CONDITION-PORTABLE" | "SYMBOL-NAME"
             | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
-            | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "GENSYM" | "GENTEMP"
+            | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "COPY-SYMBOL"
+            | "REMPROP" | "GENSYM" | "GENTEMP"
             | "INTERN" | "FIND-SYMBOL" | "FIND-PACKAGE" | "PACKAGE-NAME" | "PACKAGEP"
             | "MAKE-PACKAGE" | "PACKAGE-NAMES" | "PACKAGE-NICKNAMES"
             | "PACKAGE-SHADOWING-SYMBOLS" | "PACKAGE-USED-BY-LIST" | "PACKAGE-USE-LIST"
@@ -25904,7 +26182,11 @@ fn apply_builtin_fast(
         "SYMBOL-PACKAGE" if args.len() == 1 => {
             env.clear_mv();
             if !args[0].is_symbol() {
-                return Some(Ok(NIL));
+                // A non-symbol argument is a TYPE-ERROR (symbol-package.error.3).
+                return Some(Err(BlissError::TypeError {
+                    datum: args[0],
+                    expected: "SYMBOL".to_string(),
+                }));
             }
             Some(Ok(symbol_package_value(env, args[0])))
         }
