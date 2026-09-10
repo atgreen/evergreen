@@ -1138,32 +1138,50 @@
 (defun %do-step (b)
   (if (and (consp b) (cddr b)) (caddr b) (%do-var b)))
 
+;; Split leading (declare ...) forms off a DO/DO*/DOLIST/DOTIMES body: returns
+;; (values declarations remaining-body). The declarations belong at the top of
+;; the implicit variable-binding LET (CLHS 6.1.7 / 5.3.3), where a `(declare
+;; (special x))` scopes the whole loop body — putting them inside the tagbody
+;; would make them inert (DO.17-19, DO*.17-19).
+(defun %split-declares (forms)
+  (let ((decls nil))
+    (loop while (and (consp forms)
+                     (consp (car forms))
+                     (eq (car (car forms)) 'declare))
+          do (setq decls (cons (car forms) decls)
+                   forms (cdr forms)))
+    (values (reverse decls) forms)))
+
 (defmacro do (bindings end-test &rest body)
   (let ((vars (mapcar (function %do-var) bindings))
         (inits (mapcar (function %do-init) bindings))
         (steps (mapcar (function %do-step) bindings))
         (top (gensym)))
-    `(block nil
-       (let ,(mapcar (function list) vars inits)
-         (tagbody
-            ,top
-            (when ,(car end-test) (return (progn ,@(cdr end-test))))
-            ,@body
-            (psetq ,@(%zip-pairs vars steps))
-            (go ,top))))))
+    (multiple-value-bind (decls forms) (%split-declares body)
+      `(block nil
+         (let ,(mapcar (function list) vars inits)
+           ,@decls
+           (tagbody
+              ,top
+              (when ,(car end-test) (return (progn ,@(cdr end-test))))
+              ,@forms
+              (psetq ,@(%zip-pairs vars steps))
+              (go ,top)))))))
 
 (defmacro do* (bindings end-test &rest body)
   (let ((vars (mapcar (function %do-var) bindings))
         (steps (mapcar (function %do-step) bindings))
         (top (gensym)))
-    `(block nil
-       (let* ,(mapcar (function list) vars (mapcar (function %do-init) bindings))
-         (tagbody
-            ,top
-            (when ,(car end-test) (return (progn ,@(cdr end-test))))
-            ,@body
-            ,@(mapcar (lambda (v s) (list 'setq v s)) vars steps)
-            (go ,top))))))
+    (multiple-value-bind (decls forms) (%split-declares body)
+      `(block nil
+         (let* ,(mapcar (function list) vars (mapcar (function %do-init) bindings))
+           ,@decls
+           (tagbody
+              ,top
+              (when ,(car end-test) (return (progn ,@(cdr end-test))))
+              ,@forms
+              ,@(mapcar (lambda (v s) (list 'setq v s)) vars steps)
+              (go ,top)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Character functions (over CHAR-CODE / CODE-CHAR; ASCII case mapping).

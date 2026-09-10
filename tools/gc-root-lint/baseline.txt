@@ -2,6 +2,7 @@
 # Regenerate with: cargo run -p gc-root-lint -- --bless
 crates/bliss/src/cli.rs:eval_handler_case:result
 crates/bliss/src/cli.rs:eval_restart_case:result
+crates/bliss/src/cli.rs:eval_tagbody:result
 crates/bliss/src/cli/bytecode.rs:c2i_eval_form_with_frame:result
 crates/bliss/src/cli/bytecode.rs:lower_flet:is_capturing
 crates/bliss/src/cli/bytecode.rs:lower_function:captured

@@ -1509,6 +1509,18 @@ enum HandlerImpl {
 thread_local! {
     static CONTROL_VALUES: RefCell<HashMap<String, BlissVal>> = RefCell::new(HashMap::new());
     static CONTROL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
+    /// Stack of the innermost-enclosing LOOP's own implicit-block return token.
+    /// The LOOP `return` clause and `loop-finish` unwind THIS block (nil for an
+    /// unnamed loop, else the named block) — distinct from the Lisp RETURN
+    /// special form, which always targets a lexical `block nil`. `loop named
+    /// foo` establishes only block foo (no implicit nil), so a bare
+    /// `(return x)` in its body escapes to an OUTER nil block (LOOP.13.*).
+    static LOOP_RETURN_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Stack of the innermost-enclosing extended-LOOP's `loop-finish` token.
+    /// `(loop-finish)` stops iteration of that loop and proceeds to its
+    /// `finally` clause + accumulated result (CLHS: local macro established by
+    /// LOOP), distinct from `return` which skips `finally`.
+    static LOOP_FINISH_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static MACROEXPAND_ENVIRONMENTS: RefCell<HashMap<u64, MacroexpandEnv>> = RefCell::new(HashMap::new());
     static NEXT_MACROEXPAND_ENVIRONMENT_ID: RefCell<u64> = const { RefCell::new(1) };
     /// Global macro table. A top-level DEFMACRO has global effect (like DEFUN,
@@ -2947,6 +2959,55 @@ fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Rc<RefCell<EnvFrame>> {
 
 fn take_control_value(token: &str) -> BlissVal {
     CONTROL_VALUES.with(|values| values.borrow_mut().remove(token).unwrap_or(NIL))
+}
+
+/// Store a control-token value together with the full multiple-value list live
+/// on `env`, so a RETURN / RETURN-FROM out of a BLOCK carries ALL values (not
+/// just the primary) to the block's exit — `(return-from foo (values a b))`
+/// must yield two values, and `(return (values))` zero. Mirrors
+/// `store_restart_result`: the values are wrapped in a leading cons so their
+/// presence (even zero values) is unambiguous.
+fn store_control_mv(token: &str, primary: BlissVal, env: &Env) {
+    store_control_value(token, primary);
+    let values = if env.mv_active {
+        env.mv.clone()
+    } else {
+        vec![primary]
+    };
+    bliss_rt::rooted!(list = vec_to_list(&values));
+    store_control_value(&format!("{token}\u{0}MV"), arena_cons(T, *list));
+}
+
+/// RAII guard for the current extended-LOOP's `loop-finish` token: pushes on
+/// creation, pops on drop (covering every early return in eval_loop_extended).
+struct LoopFinishGuard(String);
+impl LoopFinishGuard {
+    fn new() -> Self {
+        let t = next_control_token("__LOOP_FINISH__");
+        LOOP_FINISH_TOKENS.with(|s| s.borrow_mut().push(t.clone()));
+        LoopFinishGuard(t)
+    }
+}
+impl Drop for LoopFinishGuard {
+    fn drop(&mut self) {
+        LOOP_FINISH_TOKENS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Retrieve a control-token value stored by `store_control_mv`, republishing
+/// its multiple-value state on `env`. Returns the primary value.
+fn take_control_mv(token: &str, env: &mut Env) -> BlissVal {
+    let primary = take_control_value(token);
+    let wrapped = take_control_value(&format!("{token}\u{0}MV"));
+    if wrapped.is_cons() {
+        let values = list_to_vec(cp(wrapped).1);
+        env.set_mv(values);
+    } else {
+        env.clear_mv();
+    }
+    primary
 }
 
 /// Stash the primary value AND the full multiple-value list produced by an
@@ -6138,7 +6199,7 @@ fn with_block_nil(
     let result = f(env);
     env.block_stack.pop();
     match result {
-        Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_value(&token)),
+        Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_mv(&token, env)),
         other => other,
     }
 }
@@ -7080,8 +7141,15 @@ fn list_to_vec(val: BlissVal) -> Vec<BlissVal> {
 }
 
 fn vec_to_list(elems: &[BlissVal]) -> BlissVal {
+    vec_to_list_with_tail(elems, NIL)
+}
+
+/// Build a list of `elems` ending in `tail` (NIL for a proper list, else a
+/// dotted final cdr). Used by LOOP `append`, which preserves the last appended
+/// list's tail (LOOP.9.22/42).
+fn vec_to_list_with_tail(elems: &[BlissVal], tail: BlissVal) -> BlissVal {
     bliss_rt::rooted!(elems = elems.to_vec());
-    bliss_rt::rooted!(result = NIL);
+    bliss_rt::rooted!(result = tail);
     for i in (0..elems.len()).rev() {
         *result = arena_cons(elems[i], *result);
     }
@@ -11262,6 +11330,13 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "APPLY"
             | "CALL-NEXT-METHOD"
             | "LOOP"
+            // DO/DO*/DOTIMES/DOLIST return the values of their result form,
+            // which may be multiple — `(dotimes (i n (values a b)))` (CLHS
+            // 6.1.1): DOTIMES.3A, DOLIST.8, DO.* result forms.
+            | "DO"
+            | "DO*"
+            | "DOTIMES"
+            | "DOLIST"
     )
 }
 
@@ -11859,6 +11934,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "LOOP" => return eval_loop(cdr, env),
+            "LOOP-FINISH" => {
+                // (loop-finish) — stop the innermost enclosing extended LOOP's
+                // iteration and run its `finally` clause / accumulated result
+                // (CLHS). Unwinds to the loop driver via its finish token; an
+                // occurrence outside any LOOP is a PROGRAM-ERROR.
+                if let Some(token) = LOOP_FINISH_TOKENS.with(|s| s.borrow().last().cloned()) {
+                    return Err(BlissError::Internal(token));
+                }
+                return Err(BlissError::ProgramError(
+                    "LOOP-FINISH used outside of a LOOP".into(),
+                ));
+            }
             "EVAL-WHEN" => {
                 let (situations, body) = cp(cdr);
                 return if eval_when_should_run(situations, env) {
@@ -11876,7 +11963,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 env.block_stack.pop();
                 match result {
                     Err(BlissError::Internal(msg)) if msg == token => {
-                        return Ok(take_control_value(&token));
+                        return Ok(take_control_mv(&token, env));
                     }
                     other => return other,
                 }
@@ -11892,8 +11979,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .rev()
                     .find(|(block_name, _)| block_name == &name)
                 {
-                    store_control_value(token, value);
-                    return Err(BlissError::Internal(token.clone()));
+                    let token = token.clone();
+                    store_control_mv(&token, value, env);
+                    return Err(BlissError::Internal(token));
                 }
                 return Err(BlissError::ControlError(format!(
                     "RETURN-FROM: no block named {} is currently visible",
@@ -11909,8 +11997,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .rev()
                     .find(|(block_name, _)| block_name == "NIL")
                 {
-                    store_control_value(token, value);
-                    return Err(BlissError::Internal(token.clone()));
+                    let token = token.clone();
+                    store_control_mv(&token, value, env);
+                    return Err(BlissError::Internal(token));
                 }
                 return Err(BlissError::ControlError(
                     "RETURN: no block named NIL is currently visible".into(),
@@ -11987,64 +12076,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 )));
             }
             "TAGBODY" => {
-                // (tagbody {tag | statement}*)
-                // Tags are symbols or integers; statements are forms evaluated in
-                // order. GO transfers control to a tag; TAGBODY returns NIL.
-                let mut items = list_to_vec(cdr);
-                // Root the statement vector in place: it holds BlissVals across the
-                // `eval_form(item)` below, which can fire a relocating minor GC. An
-                // unrooted Vec is invisible to the collector, so a moved statement
-                // form would be read back stale — a zeroed cons whose car is
-                // Fixnum(0), surfacing as "undefined function:" deep in cl-ppcre's
-                // tagbody-heavy scanner closures (bliss-255).
-                bliss_rt::rooted_ref!(_items_root = &mut items);
-                let token = next_control_token("__GO__");
-                // Record tag name -> statement index (index just after the tag).
-                let mut tag_index: HashMap<String, usize> = HashMap::new();
-                let base = env.tag_stack.len();
-                for (i, item) in items.iter().enumerate() {
-                    if let Some(name) = tag_key(*item) {
-                        tag_index.entry(name.clone()).or_insert(i);
-                        env.tag_stack.push((name, token.clone()));
-                    }
-                }
-                let mut pc = 0usize;
-                let result: Result<(), BlissError> = loop {
-                    if pc >= items.len() {
-                        break Ok(());
-                    }
-                    let item = items[pc];
-                    if tag_key(item).is_some() {
-                        pc += 1;
-                        continue;
-                    }
-                    match eval_form(item, env) {
-                        Ok(_) => {
-                            pc += 1;
-                        }
-                        Err(BlissError::Internal(msg)) if msg == token => {
-                            let target = val_as_str(take_control_value(&token));
-                            match tag_index.get(&target) {
-                                Some(idx) => {
-                                    pc = *idx;
-                                }
-                                None => break Err(BlissError::Internal(msg)),
-                            }
-                        }
-                        Err(e) => break Err(e),
-                    }
-                };
-                env.tag_stack.truncate(base);
-                match result {
-                    Ok(()) => {
-                        // TAGBODY always returns exactly one value, NIL — discard
-                        // any extra values a final statement produced (ansi
-                        // TAGBODY.3/.4).
-                        env.clear_mv();
-                        return Ok(NIL);
-                    }
-                    Err(e) => return Err(e),
-                }
+                // (tagbody {tag | statement}*) — tags (symbols/integers) are jump
+                // targets, statements are evaluated in order, GO transfers control,
+                // and the whole form returns NIL.
+                return eval_tagbody(cdr, env);
             }
             "GO" => {
                 // (go tag) — tag is not evaluated.
@@ -20009,18 +20044,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(count_form = count_form);
                 bliss_rt::rooted!(result_rest = result_rest);
                 bliss_rt::rooted!(body = body);
-                let count = eval_form(*count_form, env)?;
-                let n = num_val(count)? as i64;
-                if std::env::var_os("BLISS_8QF_DEBUG").is_some() {
-                    eprintln!(
-                        "DOTIMES: n={} count_bits={:#x} var_bits={:#x} body_bits={:#x} body_is_cons={}",
-                        n,
-                        count.0,
-                        (*var_form).0,
-                        (*body).0,
-                        (*body).is_cons()
-                    );
-                }
                 // Establish a fresh variable frame (so the loop variable shadows
                 // outer bindings and does not leak) while keeping the shared
                 // global tables — packages, functions, … — mutable in place, so
@@ -20033,10 +20056,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // reused frame made every captured closure see the last value.
                 let parent = Rc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
+                    // The count-form is inside the implicit block nil, so
+                    // `(dotimes (i (return 1)))` returns from DOTIMES's OWN
+                    // block (DOTIMES.8), not an outer one.
+                    let count = eval_form(*count_form, env)?;
+                    // Body executes max(count,0) times; a count <= 0 runs the
+                    // body zero times and leaves the variable at 0 for the
+                    // result form (DOTIMES.15/20 — not the negative count).
+                    let n = (num_val(count)? as i64).max(0);
                     for i in 0..n {
                         with_child_frame(env, Rc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, BlissVal::from_fixnum(i));
-                            eval_progn(*body, env)
+                            eval_tagbody(*body, env)
                         })?;
                     }
                     if result_rest.is_cons() {
@@ -20058,15 +20089,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(list_form = list_form);
                 bliss_rt::rooted!(result_rest = result_rest);
                 bliss_rt::rooted!(body = body);
-                let list = eval_form(*list_form, env)?;
-                bliss_rt::rooted!(elems = list_to_vec(list));
                 // Fresh child frame PER ITERATION (bliss-0oey) — see DOTIMES.
                 let parent = Rc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
+                    // The list-form is inside the implicit block nil, so
+                    // `(dolist (x (return 1)))` returns from DOLIST's OWN block
+                    // (DOLIST.11), not an outer one.
+                    let list = eval_form(*list_form, env)?;
+                    bliss_rt::rooted!(elems = list_to_vec(list));
                     for i in 0..elems.len() {
                         with_child_frame(env, Rc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, elems[i]);
-                            eval_progn(*body, env)
+                            eval_tagbody(*body, env)
                         })?;
                     }
                     if result_rest.is_cons() {
@@ -20494,6 +20528,62 @@ fn eval_progn(forms: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     Ok(r)
 }
 
+/// Evaluate BODY as an implicit tagbody (CLHS): tags (symbols/integers) are
+/// jump targets, other forms are statements, and `(go tag)` transfers control.
+/// Returns NIL. Used by the TAGBODY special form and by DO/DO*/DOTIMES/DOLIST,
+/// whose bodies are implicit tagbodies (DOTIMES.12, DOLIST.5).
+fn eval_tagbody(body: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let mut items = list_to_vec(body);
+    // Root the statement vector in place: it holds BlissVals across the
+    // `eval_form(item)` below, which can fire a relocating minor GC (bliss-255).
+    bliss_rt::rooted_ref!(_items_root = &mut items);
+    let token = next_control_token("__GO__");
+    // Record tag name -> statement index (index just after the tag).
+    let mut tag_index: HashMap<String, usize> = HashMap::new();
+    let base = env.tag_stack.len();
+    for (i, item) in items.iter().enumerate() {
+        if let Some(name) = tag_key(*item) {
+            tag_index.entry(name.clone()).or_insert(i);
+            env.tag_stack.push((name, token.clone()));
+        }
+    }
+    let mut pc = 0usize;
+    let result: Result<(), BlissError> = loop {
+        if pc >= items.len() {
+            break Ok(());
+        }
+        let item = items[pc];
+        if tag_key(item).is_some() {
+            pc += 1;
+            continue;
+        }
+        match eval_form(item, env) {
+            Ok(_) => {
+                pc += 1;
+            }
+            Err(BlissError::Internal(msg)) if msg == token => {
+                let target = val_as_str(take_control_value(&token));
+                match tag_index.get(&target) {
+                    Some(idx) => {
+                        pc = *idx;
+                    }
+                    None => break Err(BlissError::Internal(msg)),
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    env.tag_stack.truncate(base);
+    result.map(|()| {
+        // TAGBODY always returns exactly one value, NIL — discard any extra
+        // values a final statement produced (ansi TAGBODY.3/.4). Callers of
+        // eval_tagbody that establish their own value (DOTIMES/DOLIST result
+        // form) overwrite mv afterward, so clearing here is safe for them too.
+        env.clear_mv();
+        NIL
+    })
+}
+
 // ── LOOP (extended, bootstrap subset) ─────────────────────────────
 //
 // Supports the clauses ASDF's load path exercises:
@@ -20572,7 +20662,9 @@ enum LoopClause {
     Do(Vec<BlissVal>),
     Collect(BlissVal, Option<String>),
     Append(BlissVal, Option<String>),
-    Sum(BlissVal, Option<String>),
+    /// SUM: value form, optional INTO var, optional declared element type (bare
+    /// name) — the type selects the zero identity of an empty sum (LOOP.10.101-104).
+    Sum(BlissVal, Option<String>, Option<String>),
     Count(BlissVal, Option<String>),
     Maximize(BlissVal, Option<String>),
     Minimize(BlissVal, Option<String>),
@@ -20599,7 +20691,7 @@ impl bliss_rt::gc::TraceHostRoots for LoopClause {
             LoopClause::Do(forms) => forms.trace_host_roots(visit),
             LoopClause::Collect(expr, _)
             | LoopClause::Append(expr, _)
-            | LoopClause::Sum(expr, _)
+            | LoopClause::Sum(expr, _, _)
             | LoopClause::Count(expr, _)
             | LoopClause::Maximize(expr, _)
             | LoopClause::Minimize(expr, _)
@@ -20685,16 +20777,45 @@ impl LoopParser {
             Ok(None)
         }
     }
-    /// Consume an optional trailing `of-type <type>` on an accumulation or
-    /// iteration clause (e.g. `sum 1 into n of-type fixnum`). `OF-TYPE` is not
-    /// a LOOP keyword, so without this the main dispatch would silently stop at
-    /// it and drop every clause that follows.
+    /// Consume an optional trailing type specifier on an accumulation clause
+    /// (CLHS 6.1.3): either `of-type <type>` or a bare simple-type-spec
+    /// `fixnum | float | t | nil` (e.g. `sum i fixnum`, `sum x into n of-type
+    /// double-float`). These are not LOOP keywords, so without consuming them
+    /// the main dispatch would stop and drop every clause that follows
+    /// (LOOP.10.82: `sum i fixnum count t`). The declaration is ignored.
     fn skip_of_type(&mut self) -> Result<(), BlissError> {
         if self.at_sym("OF-TYPE") {
             self.advance();
             self.read_form()?;
+        } else if self.at_sym("FIXNUM")
+            || self.at_sym("FLOAT")
+            || self.at_sym("T")
+            || self.at_sym("NIL")
+        {
+            self.advance();
         }
         Ok(())
+    }
+    /// Like `skip_of_type`, but returns the declared type's bare name (upcased)
+    /// so SUM can pick the zero identity of an empty accumulation.
+    fn read_type_spec(&mut self) -> Option<String> {
+        let t = if self.at_sym("OF-TYPE") {
+            self.advance();
+            self.read_form().ok()?
+        } else if self.at_sym("FIXNUM")
+            || self.at_sym("FLOAT")
+            || self.at_sym("T")
+            || self.at_sym("NIL")
+        {
+            self.read_form().ok()?
+        } else {
+            return None;
+        };
+        if t.is_symbol() {
+            Some(symbol_bare_name(&sym_name(t)))
+        } else {
+            None
+        }
     }
     fn parse_clause(&mut self) -> Result<LoopClause, BlissError> {
         let kw = self
@@ -20717,8 +20838,8 @@ impl LoopParser {
             "SUM" | "SUMMING" => {
                 let e = self.read_form()?;
                 let into = self.read_into()?;
-                self.skip_of_type()?;
-                Ok(LoopClause::Sum(e, into))
+                let ty = self.read_type_spec();
+                Ok(LoopClause::Sum(e, into, ty))
             }
             "COUNT" | "COUNTING" => {
                 let e = self.read_form()?;
@@ -20781,11 +20902,11 @@ impl LoopParser {
     }
 }
 
-/// A scalar LOOP accumulator (sum / count / maximize / minimize).
+/// A scalar LOOP accumulator (sum / count / maximize / minimize). COUNT shares
+/// the additive `Sum` cell (it adds 1), so there is no separate Count variant.
 #[derive(Clone)]
 enum NumAcc {
     Sum(BlissVal),
-    Count(i64),
     Max(Option<BlissVal>),
     Min(Option<BlissVal>),
 }
@@ -20794,7 +20915,6 @@ impl NumAcc {
     fn finalize(&self) -> BlissVal {
         match self {
             NumAcc::Sum(v) => *v,
-            NumAcc::Count(c) => BlissVal::from_fixnum(*c),
             NumAcc::Max(v) | NumAcc::Min(v) => v.unwrap_or(NIL),
         }
     }
@@ -20803,6 +20923,10 @@ impl NumAcc {
 #[derive(Default)]
 struct LoopAccs {
     map: std::collections::HashMap<Option<String>, Vec<BlissVal>>,
+    /// The dotted tail of the LAST list appended into a given key, if non-NIL.
+    /// APPEND behaves like `(append l1 … lN)`, which preserves lN's final cdr,
+    /// so `append` of `((a) (b) (c . x))` is `(a b c . x)` (LOOP.9.22/42).
+    append_tail: std::collections::HashMap<Option<String>, BlissVal>,
     nums: std::collections::HashMap<Option<String>, NumAcc>,
     /// Default result for a boolean loop (ALWAYS/NEVER): T unless short-circuited.
     bool_default: Option<BlissVal>,
@@ -20813,8 +20937,29 @@ impl LoopAccs {
         self.map.entry(key).or_default().push(v);
     }
     fn append(&mut self, key: Option<String>, v: BlissVal) {
-        let items = list_to_vec(v);
-        self.map.entry(key).or_default().extend(items);
+        // Walk V collecting its proper elements; a non-NIL final cdr is the
+        // appended list's dotted tail. The LAST append's tail wins (a later
+        // proper list clears it) — mirroring `(append …)` (LOOP.9.22/42).
+        let mut cur = v;
+        while cur.is_cons() {
+            let (a, d) = cp(cur);
+            self.map.entry(key.clone()).or_default().push(a);
+            cur = d;
+        }
+        self.map.entry(key.clone()).or_default();
+        if cur.is_nil() {
+            self.append_tail.remove(&key);
+        } else {
+            self.append_tail.insert(key, cur);
+        }
+    }
+    /// Build the list value of a COLLECT/APPEND accumulator, honouring any
+    /// preserved dotted tail from APPEND.
+    fn finalize_list(&self, key: &Option<String>) -> BlissVal {
+        let empty: Vec<BlissVal> = Vec::new();
+        let items = self.map.get(key).unwrap_or(&empty);
+        let tail = self.append_tail.get(key).copied().unwrap_or(NIL);
+        vec_to_list_with_tail(items, tail)
     }
     fn sum(&mut self, key: Option<String>, v: BlissVal) -> Result<(), BlissError> {
         let entry = self
@@ -20826,13 +20971,21 @@ impl LoopAccs {
         }
         Ok(())
     }
-    fn count(&mut self, key: Option<String>, truthy: bool) {
-        let entry = self.nums.entry(key).or_insert(NumAcc::Count(0));
-        if let NumAcc::Count(c) = entry {
-            if truthy {
-                *c += 1;
+    fn count(&mut self, key: Option<String>, truthy: bool) -> Result<(), BlissError> {
+        // COUNT and SUM into the same variable accumulate together (CLHS 6.1.3:
+        // both are numeric additive), so COUNT adds 1 to a shared SUM cell —
+        // `(loop … sum i count t)` is sum+count (LOOP.10.82). A pure COUNT uses
+        // the same cell, giving the integer count.
+        let entry = self
+            .nums
+            .entry(key)
+            .or_insert(NumAcc::Sum(BlissVal::from_fixnum(0)));
+        if truthy {
+            if let NumAcc::Sum(acc) = entry {
+                *acc = loop_add_numbers(*acc, BlissVal::from_fixnum(1))?;
             }
         }
+        Ok(())
     }
     fn maximize(&mut self, key: Option<String>, v: BlissVal) -> Result<(), BlissError> {
         let entry = self.nums.entry(key).or_insert(NumAcc::Max(None));
@@ -20873,6 +21026,9 @@ impl LoopAccs {
             for v in vals.iter_mut() {
                 visit(v as *mut BlissVal);
             }
+        }
+        for v in self.append_tail.values_mut() {
+            visit(v as *mut BlissVal);
         }
         for n in self.nums.values_mut() {
             match n {
@@ -21051,12 +21207,54 @@ fn loop_body_has_terminator(clauses: &[LoopClause]) -> bool {
 /// Collect every `:into` accumulator name so they can be bound to NIL up
 /// front — LOOP guarantees accumulators are bound even if never accumulated,
 /// and :finally clauses read them.
+/// Collect the variable names introduced by a LOOP binding pattern (a symbol,
+/// or a destructuring tree of conses), for duplicate-binding detection. NIL and
+/// T are structural markers, not variables, and are skipped.
+fn loop_pattern_vars(pat: BlissVal, out: &mut Vec<String>) {
+    if pat.is_nil() || pat == T {
+        return;
+    }
+    if pat.is_symbol() {
+        out.push(sym_name(pat));
+    } else if pat.is_cons() {
+        let (a, d) = cp(pat);
+        loop_pattern_vars(a, out);
+        loop_pattern_vars(d, out);
+    }
+}
+
+/// The default value of an uninitialized typed LOOP variable (a self-evaluating
+/// literal, used as its init form): a numeric type gives the appropriate zero,
+/// everything else NIL (CLHS 6.1.1.7; LOOP.8.11/12).
+fn loop_type_default(type_name: Option<&str>) -> BlissVal {
+    match type_name {
+        Some("FIXNUM" | "INTEGER" | "BIGNUM" | "NUMBER" | "RATIONAL" | "UNSIGNED-BYTE") => {
+            BlissVal::from_fixnum(0)
+        }
+        Some("SINGLE-FLOAT" | "SHORT-FLOAT" | "FLOAT") => BlissVal::from_single_float(0.0),
+        Some("DOUBLE-FLOAT" | "LONG-FLOAT") => bliss_rt::gc::alloc_double_float(0.0),
+        _ => NIL,
+    }
+}
+
+/// The binding pattern of a `for`/`as` iteration clause.
+fn for_clause_pat(fc: &ForClause) -> BlissVal {
+    match fc {
+        ForClause::In { pat, .. }
+        | ForClause::On { pat, .. }
+        | ForClause::Eq { pat, .. }
+        | ForClause::From { pat, .. }
+        | ForClause::Across { pat, .. }
+        | ForClause::Being { pat, .. } => *pat,
+    }
+}
+
 fn loop_collect_intos(clauses: &[LoopClause], out: &mut Vec<String>) {
     for c in clauses {
         match c {
             LoopClause::Collect(_, Some(n))
             | LoopClause::Append(_, Some(n))
-            | LoopClause::Sum(_, Some(n))
+            | LoopClause::Sum(_, Some(n), _)
             | LoopClause::Count(_, Some(n))
             | LoopClause::Maximize(_, Some(n))
             | LoopClause::Minimize(_, Some(n)) => {
@@ -21090,6 +21288,38 @@ fn loop_has_boolean_clause(clauses: &[LoopClause]) -> bool {
     })
 }
 
+/// Seed sum/count accumulators to their additive identity (0) so an empty loop
+/// still returns 0 (LOOP.10.94-101), recursing into conditional branches.
+fn loop_seed_accs(clauses: &[LoopClause], accs: &mut LoopAccs) {
+    for c in clauses {
+        match c {
+            LoopClause::Sum(_, into, ty) => {
+                // The declared element type picks the zero identity of an empty
+                // sum: a float type gives 0.0 / 0.0d0, else the integer 0
+                // (LOOP.10.94-104).
+                let zero = match ty.as_deref() {
+                    Some("SINGLE-FLOAT" | "SHORT-FLOAT" | "FLOAT") => {
+                        BlissVal::from_single_float(0.0)
+                    }
+                    Some("DOUBLE-FLOAT" | "LONG-FLOAT") => bliss_rt::gc::alloc_double_float(0.0),
+                    _ => BlissVal::from_fixnum(0),
+                };
+                accs.nums.entry(into.clone()).or_insert(NumAcc::Sum(zero));
+            }
+            LoopClause::Count(_, into) => {
+                accs.nums
+                    .entry(into.clone())
+                    .or_insert(NumAcc::Sum(BlissVal::from_fixnum(0)));
+            }
+            LoopClause::Cond { then, els, .. } => {
+                loop_seed_accs(then, accs);
+                loop_seed_accs(els, accs);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn loop_exec_clauses(
     clauses: &[LoopClause],
     env: &mut Env,
@@ -21121,6 +21351,25 @@ fn loop_it_eval(expr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     eval_form(expr, env)
 }
 
+/// Write an `into` accumulator's running value back to its lexical variable so
+/// the loop body and `finally` see it updated each iteration (CLHS 6.1.3):
+/// `count x into foo collect foo` collects the running counts (LOOP.10.12), and
+/// `finally (return foo)` returns the final accumulation (LOOP.10.11/36). The
+/// variable was pre-bound to NIL at loop setup; `set_var` updates that binding.
+fn loop_sync_into(accs: &LoopAccs, key: &Option<String>, env: &mut Env) {
+    let Some(name) = key else {
+        return;
+    };
+    let val = if let Some(n) = accs.nums.get(key) {
+        n.finalize()
+    } else if accs.map.contains_key(key) {
+        accs.finalize_list(key)
+    } else {
+        return;
+    };
+    env.set_var(name, val);
+}
+
 fn loop_exec_clause(
     c: &LoopClause,
     env: &mut Env,
@@ -21138,7 +21387,16 @@ fn loop_exec_clause(
             }
         }
         LoopClause::Return(e) => {
-            *ret = Some(loop_it_eval(*e, env)?);
+            // An explicit `return` clause exits THIS loop with ALL values of E
+            // (`loop ... return (values a b)` yields two — LOOP.15.32) and
+            // bypasses any `finally` clause (CLHS 6.1.4). It unwinds the loop's
+            // own block (nil or named), carried on LOOP_RETURN_TOKENS.
+            let value = loop_it_eval(*e, env)?;
+            if let Some(token) = LOOP_RETURN_TOKENS.with(|s| s.borrow().last().cloned()) {
+                store_control_mv(&token, value, env);
+                return Err(BlissError::Internal(token));
+            }
+            *ret = Some(value);
         }
         LoopClause::ThereIs(e) => {
             let v = loop_it_eval(*e, env)?;
@@ -21158,29 +21416,35 @@ fn loop_exec_clause(
                 *ret = Some(NIL);
             }
         }
-        LoopClause::Sum(e, into) => {
+        LoopClause::Sum(e, into, _) => {
             let v = loop_it_eval(*e, env)?;
             accs.sum(into.clone(), v)?;
+            loop_sync_into(accs, into, env);
         }
         LoopClause::Count(e, into) => {
             let truthy = !loop_it_eval(*e, env)?.is_nil();
-            accs.count(into.clone(), truthy);
+            accs.count(into.clone(), truthy)?;
+            loop_sync_into(accs, into, env);
         }
         LoopClause::Maximize(e, into) => {
             let v = loop_it_eval(*e, env)?;
             accs.maximize(into.clone(), v)?;
+            loop_sync_into(accs, into, env);
         }
         LoopClause::Minimize(e, into) => {
             let v = loop_it_eval(*e, env)?;
             accs.minimize(into.clone(), v)?;
+            loop_sync_into(accs, into, env);
         }
         LoopClause::Collect(e, into) => {
             let v = loop_it_eval(*e, env)?;
             accs.collect(into.clone(), v);
+            loop_sync_into(accs, into, env);
         }
         LoopClause::Append(e, into) => {
             let v = loop_it_eval(*e, env)?;
             accs.append(into.clone(), v);
+            loop_sync_into(accs, into, env);
         }
         LoopClause::While(e) => {
             if eval_form(*e, env)?.is_nil() {
@@ -21214,25 +21478,6 @@ fn loop_exec_clause(
     Ok(())
 }
 
-/// If `form` is (RETURN x) or (RETURN-FROM nil x), return Some(x-form).
-fn loop_return_target(form: BlissVal) -> Option<BlissVal> {
-    if !form.is_cons() {
-        return None;
-    }
-    let (head, rest) = cp(form);
-    if !head.is_symbol() {
-        return None;
-    }
-    match sym_name(head).as_str() {
-        "RETURN" => Some(cp(rest).0),
-        "RETURN-FROM" => {
-            let (_blk, r) = cp(rest);
-            Some(cp(r).0)
-        }
-        _ => None,
-    }
-}
-
 /// A parsed `:for` iteration clause.
 enum ForClause {
     In {
@@ -21260,6 +21505,9 @@ enum ForClause {
         /// `:downfrom` counts downward: default step is -1 and a plain `:to` /
         /// `:below` limit is read as its descending counterpart.
         descending: bool,
+        /// True if `by` appeared before the limit keyword in the source, so the
+        /// step form is evaluated before the limit form (CLHS left-to-right).
+        step_first: bool,
     },
     Across {
         pat: BlissVal,
@@ -21419,24 +21667,24 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // definitions made in the loop body (intern, use-package, defun, …) persist.
     let parent = Rc::clone(&env.frame);
     // `loop named NAME` establishes a block named NAME so (return-from NAME …)
-    // exits the loop; every LOOP also establishes the implicit `block nil` so a
-    // bare (return x) exits with x. Both share one control token — a return
-    // through either unwinds the loop.
+    // exits the loop. An UNNAMED loop instead establishes the implicit `block
+    // nil`. A named loop does NOT also establish block nil (CLHS 6.1.1.4): a
+    // bare `(return x)` in `loop named foo …` targets a lexically-enclosing nil
+    // block, not the loop (LOOP.13.11/52/55/60/70/80).
     let (block_name, body) = loop_split_named(cdr);
     let token = next_control_token("__RETURN_FROM__");
-    env.block_stack.push(("NIL".to_string(), token.clone()));
-    let pushed_name = matches!(&block_name, Some(n) if n != "NIL");
-    if pushed_name {
-        env.block_stack
-            .push((block_name.clone().unwrap(), token.clone()));
-    }
+    let block_label = block_name.clone().unwrap_or_else(|| "NIL".to_string());
+    env.block_stack.push((block_label, token.clone()));
+    // Record this loop's block token so the LOOP `return` clause / `loop-finish`
+    // unwind THIS loop (whatever its block name) rather than a same-named outer.
+    LOOP_RETURN_TOKENS.with(|s| s.borrow_mut().push(token.clone()));
     let result = with_child_frame(env, parent, |env| eval_loop_inner(body, env));
-    if pushed_name {
-        env.block_stack.pop();
-    }
+    LOOP_RETURN_TOKENS.with(|s| {
+        s.borrow_mut().pop();
+    });
     env.block_stack.pop();
     match result {
-        Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_value(&token)),
+        Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_mv(&token, env)),
         Ok(v) => {
             // The implicit accumulator / NIL fall-through value of a LOOP is a
             // single value. The loop body's last form may have set the
@@ -21481,9 +21729,13 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             *c = *body;
             while c.is_cons() {
                 let f = cp(*c).0;
-                if let Some(tgt) = loop_return_target(f) {
-                    return eval_form(tgt, env);
-                }
+                // A `(return …)` / `(return-from …)` body form is evaluated
+                // normally: eval_form routes it through the RETURN control
+                // token (block NIL / the loop's named block, both pushed by
+                // eval_loop), which carries ALL values — `(loop (return
+                // (values a b)))` yields two values (SLOOP.3). The former
+                // fast-path short-circuit returned only the primary value and
+                // also mis-handled `(return-from OTHER …)`.
                 eval_form(f, env)?;
                 // Re-read the tail from the rooted cursor after evaluation: a GC
                 // fired inside eval_form would have staled a plain `rest` local.
@@ -21512,6 +21764,10 @@ fn eval_loop_repeat_remaining(
 }
 
 fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // Establish this loop's `loop-finish` token for the whole extent (the guard
+    // pops it on every return path). `(loop-finish)` in the body unwinds here.
+    let _finish_guard = LoopFinishGuard::new();
+    let finish_token = _finish_guard.0.clone();
     let toks = list_to_vec(cdr);
     let mut p = LoopParser { toks, pos: 0 };
     let mut with_bindings: Vec<(BlissVal, BlissVal)> = Vec::new();
@@ -21528,24 +21784,32 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                 p.advance();
                 loop {
                     let var = p.read_form()?;
-                    // Optional `of-type <type>` is accepted and ignored.
+                    // Capture an optional type specifier: `of-type <type>`, or a
+                    // bare simple-type-spec before `=` (CLHS 6.1.1.7; babel's
+                    // encoders use `with noctets fixnum = 0`).
+                    let mut type_name: Option<String> = None;
                     if p.at_sym("OF-TYPE") {
                         p.advance();
-                        p.read_form()?;
+                        let t = p.read_form()?;
+                        if t.is_symbol() {
+                            type_name = Some(symbol_bare_name(&sym_name(t)));
+                        }
                     } else if p.toks.get(p.pos + 1).is_some_and(|next| {
                         next.is_symbol() && symbol_bare_name(&sym_name(*next)) == "="
                     }) {
-                        // CLHS 6.1.1.7 also permits a bare type specifier
-                        // between the WITH variable and `=`.  Babel's generated
-                        // counters use `with noctets fixnum = 0`.
-                        p.advance();
+                        let t = p.read_form()?;
+                        if t.is_symbol() {
+                            type_name = Some(symbol_bare_name(&sym_name(t)));
+                        }
                     }
-                    // `= init` is optional; a bare `:with var` binds var to NIL.
+                    // `= init` is optional; an uninitialized WITH var defaults to
+                    // a type-appropriate zero (0 / 0.0 / 0.0d0) for a numeric
+                    // type, else NIL (CLHS 6.1.1.7; LOOP.8.11/12).
                     let init = if p.at_sym("=") {
                         p.advance();
                         p.read_form()?
                     } else {
-                        NIL
+                        loop_type_default(type_name.as_deref())
                     };
                     with_bindings.push((var, init));
                     if p.at_kw("AND") {
@@ -21618,7 +21882,10 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                         }
                         Some("BEING") => {
                             p.advance();
-                            if p.at_kw("THE") {
+                            // After BEING, ANSI allows `the` or `each` (CLHS
+                            // 6.1.2.1.6): `being the hash-keys` / `being each
+                            // hash-key`. Consume either.
+                            if p.at_kw("THE") || p.at_sym("EACH") {
                                 p.advance();
                             }
                             let kind = p.read_form()?;
@@ -21629,61 +21896,45 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             };
                             let kind_bare = symbol_bare_name(&kind_name);
                             let kind_bare = kind_bare.as_str();
-                            let source = match kind_bare {
-                                "SYMBOLS" | "EXTERNAL-SYMBOLS" | "PRESENT-SYMBOLS" => {
-                                    // The connective is :in or :of (ANSI accepts both).
-                                    let conn = p.read_form()?;
-                                    let conn_name = if conn.is_symbol() {
-                                        sym_name(conn)
-                                    } else {
-                                        String::new()
-                                    };
-                                    let conn_bare = &symbol_bare_name(&conn_name);
-                                    if conn_bare != "IN" && conn_bare != "OF" {
-                                        return Err(BlissError::Internal(
-                                            "LOOP :for ... :being <symbols> expects :in or :of"
-                                                .into(),
-                                        ));
-                                    }
-                                    let pkg = p.read_form()?;
-                                    match kind_bare {
-                                        "SYMBOLS" => LoopBeingSource::Symbols(pkg),
-                                        "EXTERNAL-SYMBOLS" => {
-                                            LoopBeingSource::ExternalSymbols(pkg)
-                                        }
-                                        _ => LoopBeingSource::OwnSymbols(pkg),
-                                    }
+                            // The connective between the iteration kind and its
+                            // source is `of` or `in` — both accepted for symbols
+                            // AND hash tables (CLHS): `hash-value of ht` /
+                            // `hash-value in ht` (LOOP.6.*/7.*). Both singular
+                            // and plural kind keywords are valid.
+                            let read_connective = |p: &mut LoopParser| -> Result<(), BlissError> {
+                                let conn = p.read_form()?;
+                                let conn_bare = if conn.is_symbol() {
+                                    symbol_bare_name(&sym_name(conn))
+                                } else {
+                                    String::new()
+                                };
+                                if conn_bare != "IN" && conn_bare != "OF" {
+                                    return Err(BlissError::Internal(
+                                        "LOOP :for ... :being expects :in or :of before the source"
+                                            .into(),
+                                    ));
                                 }
-                                "HASH-KEYS" => {
-                                    let of_kw = p.read_form()?;
-                                    let of_name = if of_kw.is_symbol() {
-                                        sym_name(of_kw)
-                                    } else {
-                                        String::new()
-                                    };
-                                    if symbol_bare_name(&of_name) != "OF"
-                                    {
-                                        return Err(BlissError::Internal(
-                                            "LOOP :for ... :being :the :hash-keys expects :of"
-                                                .into(),
-                                        ));
-                                    }
+                                Ok(())
+                            };
+                            let source = match kind_bare {
+                                "SYMBOL" | "SYMBOLS" => {
+                                    read_connective(&mut p)?;
+                                    LoopBeingSource::Symbols(p.read_form()?)
+                                }
+                                "EXTERNAL-SYMBOL" | "EXTERNAL-SYMBOLS" => {
+                                    read_connective(&mut p)?;
+                                    LoopBeingSource::ExternalSymbols(p.read_form()?)
+                                }
+                                "PRESENT-SYMBOL" | "PRESENT-SYMBOLS" => {
+                                    read_connective(&mut p)?;
+                                    LoopBeingSource::OwnSymbols(p.read_form()?)
+                                }
+                                "HASH-KEY" | "HASH-KEYS" => {
+                                    read_connective(&mut p)?;
                                     LoopBeingSource::HashKeys(p.read_form()?)
                                 }
-                                "HASH-VALUES" => {
-                                    let of_kw = p.read_form()?;
-                                    let of_name = if of_kw.is_symbol() {
-                                        sym_name(of_kw)
-                                    } else {
-                                        String::new()
-                                    };
-                                    if symbol_bare_name(&of_name) != "OF"
-                                    {
-                                        return Err(BlissError::Internal(
-                                            "LOOP :for ... :being :the :hash-values expects :of"
-                                                .into(),
-                                        ));
-                                    }
+                                "HASH-VALUE" | "HASH-VALUES" => {
+                                    read_connective(&mut p)?;
                                     LoopBeingSource::HashValues(p.read_form()?)
                                 }
                                 _ => {
@@ -21739,10 +21990,17 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             };
                             let mut step = None;
                             let mut limit = None;
+                            // Track whether `by` appears before the limit keyword,
+                            // so the executor evaluates the subforms in true
+                            // source order (LOOP.1.18/19/29/30).
+                            let mut step_first = false;
                             loop {
                                 match p.peek_kw().as_deref() {
                                     Some("BY") => {
                                         p.advance();
+                                        if limit.is_none() {
+                                            step_first = true;
+                                        }
                                         step = Some(p.read_form()?);
                                     }
                                     Some("BELOW") => {
@@ -21774,6 +22032,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                 step,
                                 limit,
                                 descending,
+                                step_first,
                             });
                         }
                         _ => {
@@ -21809,12 +22068,14 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                 }
             }
             "INITIALLY" => {
+                // Multiple INITIALLY clauses accumulate in order (CLHS 6.1.7.1);
+                // don't overwrite earlier ones (LOOP.17.1).
                 p.advance();
-                initially = p.read_forms();
+                initially.extend(p.read_forms());
             }
             "FINALLY" => {
                 p.advance();
-                finally = p.read_forms();
+                finally.extend(p.read_forms());
             }
             "WHILE" => {
                 p.advance();
@@ -21842,6 +22103,38 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     bliss_rt::rooted_ref!(_body_root = &mut body);
     bliss_rt::rooted_ref!(_repeat_form_root = &mut repeat_form);
 
+    // A variable may not be bound more than once by a single LOOP (CLHS
+    // 6.1.1.7): across `with`, the `for`/`as` iteration patterns (incl.
+    // destructuring, so `(e . e)` is caught), and `into` accumulators. Binding
+    // the same name twice is a PROGRAM-ERROR (LOOP.5/6/9/10 .ERROR tests).
+    {
+        let mut all_vars: Vec<String> = Vec::new();
+        for (var, _) in &with_bindings {
+            loop_pattern_vars(*var, &mut all_vars);
+        }
+        for fc in &for_clauses {
+            loop_pattern_vars(for_clause_pat(fc), &mut all_vars);
+            if let ForClause::Being { using: Some(u), .. } = fc {
+                loop_pattern_vars(*u, &mut all_vars);
+            }
+        }
+        // Collect `into` names into their own (self-deduplicated) list — the
+        // same accumulator var may legitimately appear in several compatible
+        // clauses — then append, so an `into` name clashing with a `with`/`for`
+        // variable is still detected as a double binding (LOOP.10.85/86).
+        let mut into_names: Vec<String> = Vec::new();
+        loop_collect_intos(&body, &mut into_names);
+        all_vars.extend(into_names);
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for n in &all_vars {
+            if !seen.insert(n.as_str()) {
+                return Err(BlissError::ProgramError(format!(
+                    "LOOP binds the variable {n} more than once"
+                )));
+            }
+        }
+    }
+
     // Establish :with bindings (sequential, LET*-style).
     for (var, init) in &with_bindings {
         let v = eval_form(*init, env)?;
@@ -21861,6 +22154,11 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     if loop_has_boolean_clause(&body) {
         accs.bool_default.get_or_insert(T);
     }
+    // Seed sum/count accumulators to their identity (0) at setup so a loop whose
+    // body never runs still returns 0 rather than NIL — `(loop for i in nil sum
+    // i)` is 0 (LOOP.10.94-101). Zero is the additive identity regardless of the
+    // (ignored) of-type declaration.
+    loop_seed_accs(&body, &mut accs);
     let mut ret: Option<BlissVal> = None;
 
     for f in &initially {
@@ -21880,7 +22178,12 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     if for_clauses.is_empty() && !has_terminator && repeat_remaining.is_none() {
         // No driver at all: run the body once (when/collect-only loops).
         let mut terminate = false;
-        loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate)?;
+        match loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate) {
+            Ok(()) => {}
+            // (loop-finish) ends iteration normally → run finally/finalize.
+            Err(BlissError::Internal(msg)) if msg == finish_token => {}
+            Err(e) => return Err(e),
+        }
     } else {
         // Build cursors, evaluating each list form once.
         let mut has_stepping_driver = false;
@@ -21948,8 +22251,9 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     step,
                     limit,
                     descending,
+                    step_first,
                 } => {
-                    // Root across the step eval: a bignum/float start is a
+                    // Root across the limit/step evals: a bignum/float start is a
                     // moving heap object (moving GC; bliss-4bp).
                     bliss_rt::rooted!(current_r = eval_form(*start, env)?);
                     // `:downfrom`, or a DOWNTO/ABOVE limit, counts down by default.
@@ -21958,35 +22262,57 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             limit,
                             Some((LoopForLimit::Downto, _)) | Some((LoopForLimit::Above, _))
                         );
+                    // Evaluate the start, then the limit, then the step — in the
+                    // order they appear in `from … to … by …` (CLHS: LOOP
+                    // subforms are evaluated left to right; LOOP.1.18/29). The
+                    // limit KEYWORD (adjusted for a descending loop) is a Copy
+                    // enum resolved without evaluating anything.
+                    let limit_kind = limit.as_ref().map(|(kind, _)| {
+                        // Under `:downfrom`, a plain ascending limit is read as
+                        // its descending counterpart (`to`→`downto`,
+                        // `below`→`above`) so termination compares downward.
+                        if *descending {
+                            match kind {
+                                LoopForLimit::To | LoopForLimit::Upto => LoopForLimit::Downto,
+                                LoopForLimit::Below => LoopForLimit::Above,
+                                other => *other,
+                            }
+                        } else {
+                            *kind
+                        }
+                    });
                     // `:by` is a positive step magnitude; a descending loop
                     // applies it as a decrement, so negate an explicit step (and
-                    // default to -1) when counting down.
-                    let step = match step {
+                    // default to -1) when counting down. Evaluate the step and
+                    // limit forms in the order they appear in source (`from … by
+                    // … to …` vs `from … to … by …`) — LOOP.1.18/19/29/30.
+                    bliss_rt::rooted!(limit_v = NIL);
+                    bliss_rt::rooted!(step_v = NIL);
+                    if !*step_first {
+                        if let Some((_, expr)) = limit {
+                            *limit_v = eval_form(*expr, env)?;
+                        }
+                    }
+                    *step_v = match step {
                         Some(expr) => {
                             let s = eval_form(*expr, env)?;
                             if down { loop_negate_number(s)? } else { s }
                         }
                         None => BlissVal::from_fixnum(if down { -1 } else { 1 }),
                     };
-                    let current = *current_r;
-                    let limit = match limit {
-                        Some((kind, expr)) => {
-                            // Under `:downfrom`, a plain ascending limit is read as
-                            // its descending counterpart (`to`→`downto`,
-                            // `below`→`above`) so termination compares downward.
-                            let kind = if *descending {
-                                match kind {
-                                    LoopForLimit::To | LoopForLimit::Upto => LoopForLimit::Downto,
-                                    LoopForLimit::Below => LoopForLimit::Above,
-                                    other => *other,
-                                }
-                            } else {
-                                *kind
-                            };
-                            Some((kind, eval_form(*expr, env)?))
+                    if *step_first {
+                        if let Some((_, expr)) = limit {
+                            *limit_v = eval_form(*expr, env)?;
                         }
-                        None => None,
-                    };
+                    }
+                    let step = *step_v;
+                    let current = *current_r;
+                    let limit = limit_kind.map(|kind| (kind, *limit_v));
+                    // Bind the driver variable to its start value up front so a
+                    // zero-iteration loop (start already past the limit) still
+                    // gives FINALLY the start value; the stepping below leaves it
+                    // at the last in-range value otherwise (LOOP.1.40-43).
+                    loop_bind(*pat, current, env);
                     states.push(ForState::From {
                         pat: *pat,
                         current,
@@ -22116,14 +22442,18 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                         step,
                         limit,
                     } => {
-                        // The arithmetic iteration variable is visible to
-                        // FINALLY with the value that failed the limit test.
-                        // For `from 0 below 2`, that final value is 2.
-                        loop_bind(*pat, *current, env);
+                        // Test the CURRENT value before binding it: on the
+                        // iteration whose value passes the limit, bind it and step
+                        // for next time; when it fails, exit WITHOUT rebinding, so
+                        // FINALLY sees the last in-range value — `from 1 to 5`
+                        // ends at 5, `from 1 below 5` at 4 (LOOP.1.40-43). The
+                        // variable was pre-bound to the start value, covering a
+                        // zero-iteration loop.
                         if loop_from_exhausted(*current, limit.as_ref())? {
                             exhausted = true;
                             break;
                         }
+                        loop_bind(*pat, *current, env);
                         *current = loop_add_numbers(*current, *step)?;
                     }
                     ForState::Across { pat, items, idx } => {
@@ -22159,7 +22489,12 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
             // `for … while …` sees the current binding); a triggered one sets
             // `terminate` and ends the loop after the clauses before it have run.
             let mut terminate = false;
-            loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate)?;
+            match loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate) {
+                Ok(()) => {}
+                // (loop-finish): stop iterating, then run finally/finalize.
+                Err(BlissError::Internal(msg)) if msg == finish_token => break,
+                Err(e) => return Err(e),
+            }
             if terminate {
                 break;
             }
@@ -22176,13 +22511,15 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     }
 
     // Publish named accumulators so :finally can read them.
-    let named: Vec<(String, Vec<BlissVal>)> = accs
+    let named_keys: Vec<Option<String>> = accs
         .map
-        .iter()
-        .filter_map(|(k, v)| k.as_ref().map(|name| (name.clone(), v.clone())))
+        .keys()
+        .filter(|k| k.is_some())
+        .cloned()
         .collect();
-    for (name, items) in named {
-        env.define_local(&name, vec_to_list(&items));
+    for key in named_keys {
+        let list = accs.finalize_list(&key);
+        env.define_local(key.as_ref().unwrap(), list);
     }
     // Numeric named accumulators (sum/count/maximize/minimize INTO var).
     let named_nums: Vec<(String, BlissVal)> = accs
@@ -22194,16 +22531,16 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
         env.define_local(&name, val);
     }
 
-    // :finally — an embedded (return X) ends the loop with X.
+    // :finally — an embedded (return X) / (return-from name X) ends the loop
+    // with ALL of X's values. Evaluated normally so eval_form routes the RETURN
+    // through the mv-carrying control token (block NIL / the loop's named
+    // block, both on env.block_stack): `finally (return (values a b))` yields
+    // two values (LOOP.14.5, LOOP.10.90).
     for f in &finally {
         if ret.is_some() {
             break;
         }
-        if let Some(tgt) = loop_return_target(*f) {
-            ret = Some(eval_form(tgt, env)?);
-        } else {
-            eval_form(*f, env)?;
-        }
+        eval_form(*f, env)?;
     }
 
     if let Some(r) = ret {
@@ -22217,18 +22554,18 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     if let Some(b) = accs.bool_default {
         return Ok(b);
     }
-    if let Some(items) = accs.map.get(&None) {
-        return Ok(vec_to_list(items));
+    if accs.map.contains_key(&None) {
+        return Ok(accs.finalize_list(&None));
     }
     Ok(NIL)
 }
 
 fn loop_add_numbers(lhs: BlissVal, rhs: BlissVal) -> Result<BlissVal, BlissError> {
-    if lhs.is_fixnum() && rhs.is_fixnum() {
-        return Ok(BlissVal::from_fixnum(lhs.as_fixnum() + rhs.as_fixnum()));
-    }
-    let sum = num_val(lhs)? + num_val(rhs)?;
-    Ok(BlissVal::from_single_float(sum as f32))
+    // Delegate to the general `+` fold so a LOOP `sum` keeps the full numeric
+    // tower — fixnum/bignum/ratio/float/complex — instead of collapsing to a
+    // single-float (LOOP.1.21 rationals, LOOP.10.73/87 complex, LOOP.10.88
+    // 10/17). Ratios stay exact; complex operands route through complex_arith.
+    fold_arith_vals(&[lhs, rhs], 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b)
 }
 
 /// Negate a LOOP step value, preserving fixnum vs float (bliss-lb6): a
