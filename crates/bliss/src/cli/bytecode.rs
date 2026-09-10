@@ -13824,7 +13824,13 @@ fn t2_invoke_threshold() -> u32 {
         if env_flag("BLISS_T2") == Some(true) {
             t1_threshold()
         } else {
-            5_000
+            // 5000 (HotSpot-C2-like) left warm-but-not-blistering load-time code
+            // stuck in T1 bytecode: an `(asdf:load-system …)` calls each library
+            // function hundreds–thousands of times but rarely 5000+, so nothing
+            // reached T2 before the load finished. 256 tiers that code to native
+            // — babel load ~22s -> ~15.6s (~29%), flat across 32..512 — while
+            // staying well above once-or-twice-called code (bliss-pohq).
+            256
         }
     })
 }
