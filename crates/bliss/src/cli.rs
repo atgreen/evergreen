@@ -26858,6 +26858,19 @@ fn expand_macro(
             }
         }
     };
+    // `mdef` is a CLONE — lookup_macro / setf-expander lookup return `.cloned()`.
+    // Only the REGISTERED MacroDef is scanned by visit_macro_def_roots, so this
+    // clone's by-value BlissVal fields (params_form / body / function) go stale
+    // if any allocation below (the child-env fork, arg-list build,
+    // bind_macro_lambda_list, or the macroexpand-env build) fires a moving GC:
+    // reading mdef.body at eval_progn then derefs a poisoned form. Adding a few
+    // defuns to boot.lisp shifted the GC-stress stride onto exactly this window
+    // and SIGSEGV'd init deterministically (bliss-pjun). Root local copies
+    // BEFORE the first allocation and use them throughout. captured_frame and
+    // bytecode are shared Rc (scanned via the registry entry), so no copy needed.
+    bliss_rt::rooted!(params_form = mdef.params_form);
+    bliss_rt::rooted!(body = mdef.body);
+    bliss_rt::rooted!(macro_function = mdef.function.unwrap_or(NIL));
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     // Root the forked expansion Env for the WHOLE expansion — both branches:
     // run_macro (bytecode expanders) and the tree-walked body below allocate
@@ -26876,8 +26889,8 @@ fn expand_macro(
     // CLHS 3.1.2.1.2.2 — apply it to the WHOLE macro call form and the
     // environment (we pass NIL; bliss expanders that need lexical context use
     // &environment macros instead).
-    if let Some(f) = mdef.function {
-        let r = apply_function(f, &[whole, NIL], env);
+    if mdef.function.is_some() {
+        let r = apply_function(*macro_function, &[whole, NIL], env);
         restore_package(env);
         return r;
     }
@@ -26896,7 +26909,7 @@ fn expand_macro(
     // `&ENVIRONMENT` parameter, which almost no macro has — doing it on every
     // expansion made loading macro-heavy files (lib/asdf.lisp) blow up to
     // multi-GB and never finish. Build it only when the lambda list uses it.
-    let macroexpand_env = if params_form_uses_environment(mdef.params_form) {
+    let macroexpand_env = if params_form_uses_environment(*params_form) {
         Some(macroexpand_environment_from_cli(env))
     } else {
         None
@@ -26904,13 +26917,13 @@ fn expand_macro(
     // (child_env is rooted above, before the arg-list build — the guard must
     // precede every allocation, including building a `&rest`/`&body` list.)
     bind_macro_lambda_list(
-        mdef.params_form,
+        *params_form,
         &arg_list,
         &mut child_env,
         macroexpand_env.as_ref(),
         Some(whole),
     )?;
-    let expansion = eval_progn(mdef.body, &mut child_env);
+    let expansion = eval_progn(*body, &mut child_env);
     restore_package(env);
     let expansion = expansion?;
     debug_validate_form("expand-result", "tree-walk-macro", expansion);
