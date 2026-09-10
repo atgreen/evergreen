@@ -2123,6 +2123,15 @@ fn read_radix_integer(
     mut pos: usize,
     radix: u32,
 ) -> Result<(BlissVal, usize), BlissError> {
+    // CLHS: the radix of #nR must be between 2 and 36; anything else is a reader
+    // error. Rust's from_str_radix PANICS on an out-of-range radix (and reading
+    // is reached across the c2i boundary, so a panic aborts the process), so
+    // validate first (ansi-test reader-aux #37R / #1R / #0R).
+    if !(2..=36).contains(&radix) {
+        return Err(BlissError::StreamError(format!(
+            "#{radix}R radix must be between 2 and 36"
+        )));
+    }
     let start = pos;
     let negative = if pos < chars.len() && (chars[pos] == '+' || chars[pos] == '-') {
         let neg = chars[pos] == '-';
