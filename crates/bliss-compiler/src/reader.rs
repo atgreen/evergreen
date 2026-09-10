@@ -1720,11 +1720,16 @@ fn read_sharpsign_with_base(
         if pos >= chars.len() {
             return Err(BlissError::StreamError("unexpected end after #n".into()));
         }
-        let num: u32 = chars[start..pos]
-            .iter()
-            .collect::<String>()
-            .parse()
-            .unwrap();
+        // A `#n…` infix argument that overflows u32 (e.g. a huge radix or label)
+        // is a reader error, not a process-crashing panic (ansi-test reader-aux).
+        let num: u32 = match chars[start..pos].iter().collect::<String>().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(BlissError::StreamError(
+                    "#n infix argument is too large".into(),
+                ))
+            }
+        };
         match chars[pos].to_ascii_uppercase() {
             'R' => {
                 pos += 1;
