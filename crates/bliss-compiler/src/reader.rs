@@ -627,7 +627,11 @@ fn read_nd_array_literal(
     let mut dims: Vec<usize> = Vec::new();
     bliss_rt::rooted!(flat = Vec::<BlissVal>::new());
     nd_collect(contents, rank, 0, &mut dims, &mut flat)?;
-    if rank <= 1 {
+    // Rank 1 is a SIMPLE_VECTOR; rank 0 and rank ≥ 2 are real MD_ARRAY objects
+    // (rank-0 has empty dims and a single-element row-major storage, matching
+    // `(make-array nil)` → %make-md-array in boot.lisp). Conflating rank 0 with
+    // rank 1 built `#0aX` as a rank-1 vector of dims (1) (bliss arrays chapter).
+    if rank == 1 {
         Ok((alloc_vector(&flat), p))
     } else {
         Ok((alloc_md_array(&dims, &flat), p))

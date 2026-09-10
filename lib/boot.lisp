@@ -1433,6 +1433,33 @@
       (setf (row-major-aref arr i) e)
       (setq i (+ i 1)))))
 
+;; ARRAY-ROW-MAJOR-INDEX array &rest subscripts — the row-major (flat) index for
+;; the given per-axis subscripts: fold (index*dim + subscript) across the axes.
+;; A rank-0 array (no subscripts) yields 0. Called with no arguments the missing
+;; required ARRAY signals a PROGRAM-ERROR (array-row-major-index.error.1).
+(defun array-row-major-index (array &rest subscripts)
+  (let ((dims (array-dimensions array))
+        (index 0))
+    (do ((s subscripts (cdr s))
+         (d dims (cdr d)))
+        ((null d) index)
+      (setq index (+ (* index (car d)) (car s))))))
+
+;; ARRAY-IN-BOUNDS-P array &rest subscripts — true iff there is one integer
+;; subscript per axis and each lies in [0, dimension). Uses ARRAY-DIMENSIONS
+;; (the backing capacity, ignoring any fill pointer, per CLHS). Non-integer,
+;; negative, or out-of-range subscripts (including bignums) all give NIL rather
+;; than an error.
+(defun array-in-bounds-p (array &rest subscripts)
+  (let ((dims (array-dimensions array)))
+    (and (= (length subscripts) (length dims))
+         (do ((s subscripts (cdr s))
+              (d dims (cdr d)))
+             ((null s) t)
+           (let ((x (car s)))
+             (unless (and (integerp x) (>= x 0) (< x (car d)))
+               (return nil)))))))
+
 ;; MAKE-ARRAY dimensions &key initial-element initial-contents element-type.
 ;; A dimension list of rank ≥ 2 builds a real multidimensional array (row-major
 ;; storage); rank-0/1 build a string (character element-type) or simple/complex

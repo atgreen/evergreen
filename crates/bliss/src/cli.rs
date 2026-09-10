@@ -15409,8 +15409,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (its length).
                 let (af, r) = cp(cdr);
                 bliss_rt::rooted!(av = eval_form(af, env)?);
-                let axis = eval_form(cp(r).0, env)?;
-                let axis = axis.as_fixnum();
+                let axis_v = eval_form(cp(r).0, env)?;
+                // The axis number must be a non-negative fixnum; anything else is
+                // a TYPE-ERROR, not a Rust panic (array-dimension.error tests pass
+                // symbols / negatives to probe the error signalling).
+                if !axis_v.is_fixnum() || axis_v.as_fixnum() < 0 {
+                    return Err(BlissError::TypeError {
+                        datum: axis_v,
+                        expected: "non-negative array axis number".into(),
+                    });
+                }
+                let axis = axis_v.as_fixnum();
                 if bliss_rt::types::md_array_p(*av) {
                     let dims = md_dims(*av)?;
                     if axis < 0 || axis as usize >= dims.len() {
@@ -15422,7 +15431,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(BlissVal::from_fixnum(dims[axis as usize] as i64));
                 }
                 if axis != 0 {
-                    return Err(BlissError::Internal(format!(
+                    // A catchable PROGRAM-ERROR, not an uncatchable Internal error
+                    // that would abort do-tests (bliss-dksg).
+                    return Err(BlissError::ProgramError(format!(
                         "ARRAY-DIMENSION: axis {axis} out of range for a rank-1 array"
                     )));
                 }
