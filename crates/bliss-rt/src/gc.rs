@@ -4022,6 +4022,39 @@ pub fn alloc_double_float(value: f64) -> BlissVal {
     }
 }
 
+/// Allocate a fresh, mutable 32-bit `SIMPLE_CHARACTER_STRING` ON the GC heap.
+///
+/// Body layout (matching the reader's `alloc_string` and the
+/// `write_character_string` read choke point): after the object header,
+/// `[char_len:u64 | u32 code points…]`. Allocating on the GC heap (rather than
+/// the historical off-heap `std::alloc` used by `make_lisp_string_fresh`) means
+/// the string RIDES the core-image heap snapshot and relocates like any other
+/// object — off-heap fresh strings were invisible to the snapshot AND to the
+/// intern-table image carry, so every reference to one dangled after restore
+/// (bliss-tmbg; the make_lisp_string_fresh gap noted for bliss-jtc.2). The
+/// returned object moves under GC exactly like a reader-produced string, so
+/// callers must root it across later allocations — the same contract they
+/// already honour for the vector/list results of SUBSEQ/REVERSE/COPY-SEQ.
+pub fn alloc_character_string(s: &str) -> BlissVal {
+    let char_len = s.chars().count();
+    // Total padded size includes the 8-byte header; the GC body is everything
+    // after it: the char_len word + the (padded) u32 code points.
+    let padded = crate::object::character_string_alloc_size(s);
+    let body_size = padded - OBJECT_HEADER_SIZE;
+    let body = alloc_typed(body_size, crate::object::type_id::SIMPLE_CHARACTER_STRING)
+        .expect("GC heap unavailable for character-string");
+    unsafe {
+        // payload+0 = char_len, payload+8 = u32 data (mirrors reader alloc_string).
+        *(body as *mut u64) = char_len as u64;
+        let data = body.add(8) as *mut u32;
+        for (i, c) in s.chars().enumerate() {
+            *data.add(i) = c as u32;
+        }
+        let off = body_header_offset(body_size);
+        BlissVal::from_heap_ptr(body.sub(off))
+    }
+}
+
 /// Allocate an immortal pinned object directly in old-gen.
 ///
 /// This is for process-lifetime objects whose raw addresses are cached outside

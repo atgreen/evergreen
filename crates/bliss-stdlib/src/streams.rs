@@ -1189,8 +1189,16 @@ pub fn make_lisp_string(s: &str) -> BlissVal {
 /// Two calls with the same content produce distinct BlissVal objects,
 /// preserving identity semantics for mutable strings. Issue #6.
 pub fn make_lisp_string_fresh(s: &str) -> BlissVal {
-    let ptr = alloc_string_object(s);
-    unsafe { BlissVal::from_heap_ptr(ptr) }
+    // Allocate ON the GC heap (not the historical off-heap std::alloc): an
+    // off-heap fresh string is invisible to the core-image heap snapshot and is
+    // not carried by the intern-table image mechanism either, so every reference
+    // to one dangled after image restore — crashing (asdf:load-system :babel) in
+    // a saved image when a type predicate read the dead string's header
+    // (bliss-tmbg). A heap string rides the snapshot and relocates normally. It
+    // MOVES under GC like any reader string, so callers root it across later
+    // allocations — the same contract they already honour for SUBSEQ/REVERSE/
+    // COPY-SEQ's vector/list results.
+    bliss_rt::gc::alloc_character_string(s)
 }
 
 // ── Core-image serialization of interned strings (bliss-x0f2 off-heap M3) ──
