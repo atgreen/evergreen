@@ -7562,6 +7562,7 @@ fn assemble_bbu(
 /// Rebuild a function-name FORM from an `env.methods`/`env.generics` key: a
 /// `(SETF PLACE)` writer key becomes the cons `(SETF PLACE)`; any other key its
 /// interned symbol. Returns None if a needed symbol can't be interned.
+#[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
 fn image_function_name_form(key: &str) -> Option<BlissVal> {
     if let Some(inner) = key.strip_prefix("(SETF ").and_then(|s| s.strip_suffix(')')) {
         let setf = resolve_sym("SETF")?;
@@ -7577,6 +7578,7 @@ fn image_function_name_form(key: &str) -> Option<BlissVal> {
 /// its identity from the callers that reference it; the metaobject preserves the
 /// identity established at `defclass` time. Falls back to a plain read when no
 /// class metaobject is registered (e.g. a built-in superclass).
+#[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
 fn image_class_symbol(bare: &str) -> Option<BlissVal> {
     let probe = resolve_sym(bare)?;
     if let Some(class) = bliss_stdlib::find_class(probe) {
@@ -7590,6 +7592,7 @@ fn image_class_symbol(bare: &str) -> Option<BlissVal> {
 
 /// The home-package name of an interned symbol (the prefix of its registry key),
 /// or None for an unqualified (COMMON-LISP) symbol.
+#[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
 fn image_home_package(sym: BlissVal) -> Option<String> {
     let key = bliss_rt::symbols::registry_key(sym.as_symbol_index())?;
     let pkg = key
@@ -7606,6 +7609,7 @@ fn image_home_package(sym: BlissVal) -> Option<String> {
 /// Intern `name` in package `pkg` (or the current package when `pkg` is None), so
 /// a reconstructed symbol lands in the same package as the definition it belongs
 /// to instead of wherever the image happens to be loaded.
+#[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
 fn image_qualified(pkg: &Option<String>, name: &str) -> Option<BlissVal> {
     match pkg {
         Some(p) => resolve_sym(&format!("{p}::{name}")),
@@ -7616,6 +7620,7 @@ fn image_qualified(pkg: &Option<String>, name: &str) -> Option<BlissVal> {
 /// The source name of a non-standard method combination, for a reconstructed
 /// `(:method-combination …)` option. `Standard` yields None (the default needs
 /// no defgeneric).
+#[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
 fn image_combination_name(c: bliss_stdlib::MethodCombinationType) -> Option<&'static str> {
     use bliss_stdlib::MethodCombinationType::*;
     match c {
@@ -7644,6 +7649,7 @@ fn image_combination_name(c: bliss_stdlib::MethodCombinationType) -> Option<&'st
 /// ensure-package load actions, and CLOS classes / generic functions / methods
 /// are reconstructed as `(defclass …)` / `(defgeneric …)` / `(defmethod …)`
 /// source actions from the retained metaobject definitions.
+#[allow(dead_code)] // alternate save-lisp-and-die image writer; not yet wired (image.rs save_image is the live path)
 pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
     let mut pool = BbuConstPool::default();
     let source_file_ref = pool.string("<image>");

@@ -823,6 +823,7 @@ fn stream_push_char(stream: BlissVal, ch: char, env: &mut Env) -> Result<(), Bli
 /// a complete form, which we push back. Returns `None` at end of input (only
 /// whitespace/comments remained). Neither consumes trailing whitespace beyond the
 /// single terminator. bliss-lb6.14: ASDF's slurp-stream-forms reads source files.
+#[allow(dead_code)] // ASDF slurp-stream-forms helper (bliss-lb6.14); awaiting caller
 fn read_one_form_from_stream(
     stream: BlissVal,
     env: &mut Env,
@@ -1719,6 +1720,7 @@ pub(crate) fn global_bytecode_macros()
 /// them as `(defmacro …)` load actions so a saved image keeps its macros
 /// (bliss-cje1 follow-up: `save-lisp-and-die` dropped them, so libraries using
 /// UIOP macros like NEST failed to load from an installed image).
+#[allow(dead_code)] // image macro-source retention API (bliss-cje1); tests + build_image_from_runtime
 pub(crate) fn global_macro_source_names() -> Vec<String> {
     GLOBAL_MACROS.with(|m| {
         m.borrow()
@@ -1732,6 +1734,7 @@ pub(crate) fn global_macro_source_names() -> Vec<String> {
 /// The `(params-form, body)` source of a named source-bearing global macro, or
 /// `None`. Re-fetched per name (a fresh borrow, no allocation held across it) so
 /// callers read the current post-GC object locations before rebuilding a form.
+#[allow(dead_code)] // image macro-source retention API (bliss-cje1); tests + build_image_from_runtime
 pub(crate) fn global_macro_source(name: &str) -> Option<(BlissVal, BlissVal)> {
     GLOBAL_MACROS.with(|m| {
         m.borrow()
@@ -1746,6 +1749,7 @@ pub(crate) fn global_macro_source(name: &str) -> Option<(BlissVal, BlissVal)> {
 /// `(defun (setf place) …)` so a saved image keeps its setf-function writers —
 /// without them a restored image cannot expand `(setf (place …) v)` (bliss-cje1;
 /// e.g. ASDF's `(setf (operate-level) …)`).
+#[allow(dead_code)] // image setf-writer retention API (bliss-cje1); build_image_from_runtime
 pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
     GLOBAL_SETF_FNS.with(|m| {
         m.borrow()
@@ -1761,6 +1765,7 @@ pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
 
 /// The `(params-form, body)` source of a global setf-function writer for `place`,
 /// or `None`. Re-fetched per place (fresh borrow, no allocation across it).
+#[allow(dead_code)] // image setf-writer retention API (bliss-cje1); build_image_from_runtime
 pub(crate) fn global_setf_fn_source(place: &str) -> Option<(BlissVal, BlissVal)> {
     let key = format!("(SETF {place})");
     GLOBAL_SETF_FNS.with(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
@@ -3314,9 +3319,9 @@ fn build_condition_instance_impl(
     // 7.1.4; CONDITION-9-SLOTS.4/6), and one initarg may fill several slots
     // (CONDITION-6's :both-slots).
     let mut set_slots: Vec<String> = Vec::new();
-    let mut fill_slot = |initargs: &mut Vec<BlissVal>,
-                         set_slots: &mut Vec<String>,
-                         slot_name: &str,
+    let fill_slot = |initargs: &mut Vec<BlissVal>,
+                     set_slots: &mut Vec<String>,
+                     slot_name: &str,
                          val: BlissVal| {
         if !set_slots.iter().any(|s| s == slot_name) {
             set_slots.push(slot_name.to_string());
@@ -5002,7 +5007,7 @@ fn invoke_generic_function_inner(
 /// visited once so a relocation callback never observes the same mutable slot
 /// twice during one collection.
 #[derive(Default)]
-struct EnvRootVisitState {
+pub(crate) struct EnvRootVisitState {
     frames: HashSet<usize>,
     class_slot_cells: HashSet<usize>,
 }
@@ -6876,6 +6881,7 @@ fn mark_symbol_homeless(idx: u32) {
 }
 
 /// Forget any homeless marking for `idx` (it was re-interned / re-homed).
+#[allow(dead_code)] // symbol home-package bookkeeping (bliss-55l8); awaiting caller
 fn unmark_symbol_homeless(idx: u32) {
     HOMELESS_SYMS.with(|s| {
         s.borrow_mut().remove(&idx);

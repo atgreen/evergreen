@@ -1987,13 +1987,6 @@ fn fits_fixnum(n: i64) -> bool {
     (MIN..=MAX).contains(&n)
 }
 
-/// Parse a base-10 float literal following CL float syntax. The exponent
-/// markers select the float format (CLHS 2.3.2.2): `d`/`D` and `l`/`L` are
-/// DOUBLE-FLOAT; `e`/`E`, `s`/`S`, `f`/`F`, and a marker-less `d.dd` default to
-/// SINGLE-FLOAT (bliss's `*read-default-float-format*` default). Returns
-/// `Some((value, is_double))`, or `None` for non-floats. The value is always
-/// parsed at `f64` precision so a double literal keeps full precision; the
-/// caller narrows to `f32` for the single-float case.
 thread_local! {
     /// CLHS `*READ-DEFAULT-FLOAT-FORMAT*` as seen by the reader: `true` means
     /// DOUBLE-FLOAT (or LONG-FLOAT, which bliss identifies with double). The
@@ -2027,6 +2020,13 @@ pub fn read_suppress_active() -> bool {
     READ_SUPPRESS.with(|c| c.get())
 }
 
+/// Parse a base-10 float literal following CL float syntax. The exponent
+/// markers select the float format (CLHS 2.3.2.2): `d`/`D` and `l`/`L` are
+/// DOUBLE-FLOAT; `e`/`E`, `s`/`S`, `f`/`F`, and a marker-less `d.dd` default to
+/// SINGLE-FLOAT (bliss's `*read-default-float-format*` default). Returns
+/// `Some((value, is_double))`, or `None` for non-floats. The value is always
+/// parsed at `f64` precision so a double literal keeps full precision; the
+/// caller narrows to `f32` for the single-float case.
 fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(chars.len());
