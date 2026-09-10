@@ -20348,7 +20348,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         } else {
             NIL
         };
-        let listing = if arg.is_symbol() {
+        // NIL and T report is_symbol()=true but have no symbol index —
+        // as_symbol_index() aborts on them (recurring NIL/T guard bug). Exclude
+        // them: neither names a disassemblable function.
+        let listing = if arg.is_symbol() && arg != NIL && arg != T {
             bytecode::disassemble_by_symbol(arg.as_symbol_index())
         } else {
             None
