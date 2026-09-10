@@ -2328,11 +2328,28 @@
       (incf i))
     (coerce (reverse res) 'string)))
 
-;; The N-string operators cannot mutate in place here (no settable string
-;; elements), so they return a freshly transformed string.
-(defun nstring-upcase (s &rest keys) (apply (function string-upcase) s keys))
-(defun nstring-downcase (s &rest keys) (apply (function string-downcase) s keys))
-(defun nstring-capitalize (s &rest keys) (apply (function string-capitalize) s keys))
+;; The N-string operators are DESTRUCTIVE: they mutate STRING in place (via
+;; (setf char)) over [start,end) and return the *same* string object, so
+;; (eq s (nstring-upcase s)) holds (ansi-test nstring-*.1-.7). They accept the
+;; ANSI &key (start 0) end bounding arguments; a bad/odd/unknown keyword or a
+;; missing required argument is a PROGRAM-ERROR via ordinary &key processing.
+(defun nstring-upcase (s &key (start 0) end)
+  (let ((stop (or end (length s))))
+    (do ((i start (+ i 1))) ((>= i stop) s)
+      (setf (char s i) (char-upcase (char s i))))))
+(defun nstring-downcase (s &key (start 0) end)
+  (let ((stop (or end (length s))))
+    (do ((i start (+ i 1))) ((>= i stop) s)
+      (setf (char s i) (char-downcase (char s i))))))
+(defun nstring-capitalize (s &key (start 0) end)
+  (let ((stop (or end (length s))) (in-word nil))
+    (do ((i start (+ i 1))) ((>= i stop) s)
+      (let ((c (char s i)))
+        (if (alphanumericp c)
+            (progn
+              (setf (char s i) (if in-word (char-downcase c) (char-upcase c)))
+              (setq in-word t))
+            (setq in-word nil))))))
 
 ;;; --- string comparison family (return mismatch index or NIL) ---------------
 

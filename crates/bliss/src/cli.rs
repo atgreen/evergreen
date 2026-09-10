@@ -11512,6 +11512,43 @@ fn form_arg_count(mut v: BlissVal) -> usize {
     n
 }
 
+/// For `(setf (accessor …subforms…) value)` on the element-accessor places
+/// (CHAR/SCHAR/AREF/SVREF/ROW-MAJOR-AREF/ELT/BIT/SBIT), ANSI requires the
+/// place's subforms to be evaluated BEFORE the new-value form (CLHS 5.1.1.1;
+/// ansi CHAR.ORDER.2 / SCHAR.ORDER.2 / *aref.order*). The SETF interpreter
+/// evaluates the new value up-front for every other place, so this predicate
+/// lets that one branch defer it. Returns the bare accessor name when the
+/// place is one of these accessors, else None. THE wrappers are unwrapped.
+fn order_sensitive_setf_accessor(mut place: BlissVal) -> Option<String> {
+    if !place.is_cons() {
+        return None;
+    }
+    loop {
+        let (head, _) = cp(place);
+        if head.is_symbol() && sym_name(head) == "THE" {
+            place = cp(cp(cp(place).1).1).0;
+            if !place.is_cons() {
+                return None;
+            }
+        } else {
+            break;
+        }
+    }
+    let (acc, _) = cp(place);
+    if !acc.is_symbol() {
+        return None;
+    }
+    let bare = symbol_bare_name(&sym_name(acc));
+    if matches!(
+        bare.as_str(),
+        "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT" | "BIT" | "SBIT"
+    ) {
+        Some(bare)
+    } else {
+        None
+    }
+}
+
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -12031,27 +12068,77 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (make-string size &key initial-element element-type) → a FRESH
                 // (non-interned) mutable string, so (setf (char s i) c) / REPLACE
                 // can mutate it without aliasing a shared literal.
+                //
+                // Argument validation is a catchable PROGRAM-ERROR (ansi
+                // MAKE-STRING.ERROR.1-6): no size, an odd number of keyword
+                // arguments, a non-symbol in keyword position, or an unknown
+                // keyword when :allow-other-keys is not (first-occurrence) true.
+                // For a repeated keyword the LEFTMOST value wins (KEYWORDS.7).
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
-                    return Err(BlissError::Internal("MAKE-STRING requires a size".into()));
+                    return Err(BlissError::ProgramError(
+                        "MAKE-STRING requires a size argument".into(),
+                    ));
                 }
                 let size = args[0];
                 if !size.is_fixnum() || size.as_fixnum() < 0 {
                     return Err(BlissError::TypeError {
                         datum: size,
-                        expected: "non-negative string size".into(),
+                        expected: "non-negative fixnum size".into(),
                     });
                 }
-                let mut fill = ' ';
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    let key = args[i];
-                    let val = args[i + 1];
-                    if key.is_symbol()
-                        && symbol_bare_name(&sym_name(key)) == "INITIAL-ELEMENT"
-                        && val.is_character()
+                let kv = &args[1..];
+                if kv.len() % 2 != 0 {
+                    return Err(BlissError::ProgramError(
+                        "MAKE-STRING: keyword arguments must appear in key/value pairs".into(),
+                    ));
+                }
+                // Determine :allow-other-keys from its FIRST occurrence (ANSI).
+                let mut allow_other = false;
+                let mut j = 0;
+                while j < kv.len() {
+                    if kv[j].is_symbol()
+                        && symbol_bare_name(&sym_name(kv[j])) == "ALLOW-OTHER-KEYS"
                     {
-                        fill = val.as_char();
+                        allow_other = !kv[j + 1].is_nil();
+                        break;
+                    }
+                    j += 2;
+                }
+                let mut fill = ' ';
+                let mut fill_set = false;
+                let mut i = 0;
+                while i < kv.len() {
+                    let key = kv[i];
+                    let val = kv[i + 1];
+                    if !key.is_symbol() {
+                        let mut kbuf = String::new();
+                        print_val(key, &mut kbuf);
+                        return Err(BlissError::ProgramError(format!(
+                            "MAKE-STRING: keyword argument name is not a symbol: {kbuf}"
+                        )));
+                    }
+                    match symbol_bare_name(&sym_name(key)).as_str() {
+                        "INITIAL-ELEMENT" => {
+                            if !fill_set {
+                                if !val.is_character() {
+                                    return Err(BlissError::TypeError {
+                                        datum: val,
+                                        expected: "character".into(),
+                                    });
+                                }
+                                fill = val.as_char();
+                                fill_set = true;
+                            }
+                        }
+                        "ELEMENT-TYPE" | "ALLOW-OTHER-KEYS" => {}
+                        other => {
+                            if !allow_other {
+                                return Err(BlissError::ProgramError(format!(
+                                    "MAKE-STRING: unknown keyword argument :{other}"
+                                )));
+                            }
+                        }
                     }
                     i += 2;
                 }
@@ -13213,6 +13300,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
             }
             "STRINGP" => {
+                // Exactly one argument, else a catchable PROGRAM-ERROR
+                // (ansi STRINGP.ERROR.1/2).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "STRINGP requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if is_string_value(v) { T } else { NIL });
@@ -14030,7 +14125,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             }
                         }
                     }
-                    bliss_rt::rooted!(val = eval_form(*val_form, env)?);
+                    // ANSI order (CLHS 5.1.1.1): a place's subforms are
+                    // evaluated left-to-right, then the new value. For the
+                    // element-accessor places the accessor branch below
+                    // evaluates the sequence and index first and then the value,
+                    // so defer the value eval here (CHAR.ORDER.2/SCHAR.ORDER.2).
+                    // A user SETF-expander for one of these names is respected
+                    // by evaluating the value before delegating to it.
+                    let deferred_setf_value =
+                        place.is_cons() && order_sensitive_setf_accessor(*place).is_some();
+                    bliss_rt::rooted!(val = if deferred_setf_value {
+                        NIL
+                    } else {
+                        eval_form(*val_form, env)?
+                    });
                     if place.is_symbol() {
                         if let Some(mut expansion) = env.lookup_symbol_macro(*place) {
                             // `resolve_sym` interns and so can relocate the nursery
@@ -14072,6 +14180,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // A user SETF-expander (DEFINE-SETF-EXPANDER / DEFSETF)
                         // takes precedence over the built-in place handling below.
                         if env.setf_expanders.borrow().contains_key(&acc) {
+                            // A deferred value (element-accessor place shadowed by
+                            // a user expander) must be evaluated before delegating.
+                            if deferred_setf_value {
+                                *val = eval_form(*val_form, env)?;
+                            }
                             result = apply_setf_expansion(*place, *val, env)?;
                             *c = *r2;
                             continue;
@@ -14468,6 +14581,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     } else {
                                         md_row_major_index(*seq_r, &subs)?
                                     };
+                                    // ANSI order: the new value is evaluated after
+                                    // the array and all subscript subforms.
+                                    if deferred_setf_value {
+                                        *val = eval_form(*val_form, env)?;
+                                    }
                                     let storage = bliss_rt::types::md_array_storage(*seq_r).unwrap();
                                     bliss_stdlib::set_elt(storage, flat, *val)?;
                                     *c = *r2;
@@ -14476,6 +14594,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 }
                                 let (idx_form, _) = cp(cp(*aargs).1);
                                 let idx = eval_form(idx_form, env)?;
+                                // ANSI order: the new value is evaluated after the
+                                // sequence and index subforms (CHAR.ORDER.2 etc.).
+                                if deferred_setf_value {
+                                    *val = eval_form(*val_form, env)?;
+                                }
                                 let seq = *seq_r;
                                 if !idx.is_fixnum() || idx.as_fixnum() < 0 {
                                     return Err(BlissError::TypeError {
@@ -16549,14 +16672,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(pn);
             }
             "STRING" => {
-                // (string x): a string is returned as-is; a symbol yields its
-                // bare SYMBOL-NAME (no package prefix); a character yields a
+                // (string x): exactly one argument (ansi STRING.ERROR.1/2 →
+                // PROGRAM-ERROR). A string is returned AS-IS (identity: (eq s
+                // (string s)); ansi STRING.16). A symbol yields its bare
+                // SYMBOL-NAME (no package prefix); a character yields a
                 // one-character string.
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "STRING requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                let s = if is_string_value(v) {
-                    val_as_str(v)
-                } else if v.is_character() {
+                if is_string_value(v) {
+                    return Ok(v);
+                }
+                let s = if v.is_character() {
                     v.as_char().to_string()
                 } else if v.is_symbol() || v.is_nil() || v == T {
                     symbol_name_string(&sym_name(v))
@@ -23438,7 +23570,10 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
                     s.push(e.as_char());
                 }
             }
-            Ok(arena_str(&s))
+            // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
+            // :element-type character :initial-contents) must be MUTABLE — an
+            // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
+            Ok(bliss_stdlib::make_lisp_string_fresh(&s))
         }
         "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => {
             if value.is_character() {
@@ -24198,6 +24333,51 @@ fn string_compare_bounds(
     let s1: Vec<char> = val_as_str(args[0]).chars().collect();
     let s2: Vec<char> = val_as_str(args[1]).chars().collect();
     let kw = &args[2..];
+    // ANSI keyword validation (catchable PROGRAM-ERROR): an odd number of
+    // keyword arguments, a non-symbol in keyword position, or an unknown
+    // keyword when :allow-other-keys is not (first-occurrence) true
+    // (ansi STRING=.ERROR.3-6 and family; also reached by STRING-EQUAL, which
+    // forwards its raw keys to STRING=).
+    if kw.len() % 2 != 0 {
+        return Err(BlissError::ProgramError(
+            "string comparison: keyword arguments must appear in key/value pairs".into(),
+        ));
+    }
+    let mut allow_other = false;
+    {
+        let mut j = 0;
+        while j < kw.len() {
+            if kw[j].is_symbol() && key_bare(kw[j]) == "ALLOW-OTHER-KEYS" {
+                allow_other = !kw[j + 1].is_nil();
+                break;
+            }
+            j += 2;
+        }
+    }
+    {
+        let mut j = 0;
+        while j < kw.len() {
+            let key = kw[j];
+            if !key.is_symbol() {
+                let mut kbuf = String::new();
+                print_val(key, &mut kbuf);
+                return Err(BlissError::ProgramError(format!(
+                    "string comparison: keyword argument name is not a symbol: {kbuf}"
+                )));
+            }
+            let bare = key_bare(key);
+            let known = matches!(
+                bare.as_str(),
+                "START1" | "END1" | "START2" | "END2" | "ALLOW-OTHER-KEYS"
+            );
+            if !known && !allow_other {
+                return Err(BlissError::ProgramError(format!(
+                    "string comparison: unknown keyword argument :{bare}"
+                )));
+            }
+            j += 2;
+        }
+    }
     // A present fixnum keyword wins; a missing keyword (or a NIL :endN) uses the
     // default. Everything is clamped into range so a bad index can't panic.
     let bound = |name: &str, default: usize| -> usize {
@@ -24368,6 +24548,7 @@ fn bind_lambda_list_ex(
         }
 
         let mut call_allows_other_keys = false;
+        let mut saw_allow_other_keys = false;
         for pair in tail.chunks(2) {
             let key = pair[0];
             if !key.is_symbol() {
@@ -24381,8 +24562,12 @@ fn bind_lambda_list_ex(
                 )));
             }
             let bare = key_bare(key);
-            if bare == "ALLOW-OTHER-KEYS" && !pair[1].is_nil() {
-                call_allows_other_keys = true;
+            // Per CLHS 3.4.1.4, the value of :allow-other-keys is taken from its
+            // FIRST occurrence, so (f ... :allow-other-keys nil :allow-other-keys t
+            // :foo bar) does NOT permit :foo (ansi STRING/=.ERROR.6 and family).
+            if bare == "ALLOW-OTHER-KEYS" && !saw_allow_other_keys {
+                saw_allow_other_keys = true;
+                call_allows_other_keys = !pair[1].is_nil();
             }
         }
 
