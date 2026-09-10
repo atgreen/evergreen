@@ -4997,10 +4997,15 @@ pub fn serialize_heap_objects() -> Vec<u8> {
     out
 }
 
+/// The old→new object-body relocation map built by [`restore_heap`]. Keyed by
+/// raw object addresses and grown to the whole snapshot's object count, so it is
+/// FxHash (a usize address needs no SipHash) and pre-sized to avoid the
+/// rehash storm — image/bfasl restore builds this per-object (bliss-pohq).
+type RelocMap = std::collections::HashMap<usize, usize, crate::fxhash::FxBuildHasher>;
+
 /// The old→new object-body map from the most recent [`restore_heap`], consulted
 /// by registry restores (symbols/packages) to remap their saved object addresses.
-static RELOC_MAP: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> =
-    std::sync::Mutex::new(None);
+static RELOC_MAP: std::sync::Mutex<Option<RelocMap>> = std::sync::Mutex::new(None);
 
 /// Remap one saved pointer value through the last restore's old→new map,
 /// tag-aware: a cons ref (|001) points at the body; a heap-object/function ref
@@ -5069,7 +5074,7 @@ pub fn set_pending_offheap(data: Option<Vec<u8>>) {
     *PENDING_OFFHEAP.lock().unwrap() = data;
 }
 
-fn remap_pointer_with(map: &std::collections::HashMap<usize, usize>, raw: u64) -> u64 {
+fn remap_pointer_with(map: &RelocMap, raw: u64) -> u64 {
     use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK};
     let tag = raw & TAG_MASK;
     match tag {
@@ -5106,8 +5111,12 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
     // allocator and refills from the restored region state.
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
-    // Pass 1: materialize every object, recording old-body → new-body.
-    let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // Pass 1: materialize every object, recording old-body → new-body. Pre-size
+    // to a generous estimate of the object count (each record is a >=13-byte
+    // header plus payload) so the per-object inserts never trigger a rehash
+    // (bliss-pohq: the rehash storm dominated large restores).
+    let mut map: RelocMap =
+        RelocMap::with_capacity_and_hasher(data.len() / 24 + 16, Default::default());
     let mut offset = 0usize;
     while offset < data.len() {
         if data.len() - offset < 13 {
