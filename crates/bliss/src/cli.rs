@@ -1244,10 +1244,99 @@ struct Env {
     eval_context: EvalContext,
 }
 
+/// A tiny insertion-ordered map backed by a `Vec`, for env-frame variable
+/// bindings. A fresh frame is allocated for every function call, LET, and loop
+/// iteration, and each holds only a handful of bindings — so a `HashMap` per
+/// frame was pure overhead: it allocated (and freed) a hash table per frame and
+/// hashed the variable's name/index on every access, which together dominated
+/// large loads (~a third of a babel load in HashMap insert/rehash/hash + malloc
+/// /free, bliss-pohq). Mature Lisps don't do this — lexical variables compile to
+/// indexed slots, and tree-walkers use small alists. `VecMap` is that alist: an
+/// empty frame allocates nothing, and a linear scan over a few entries beats
+/// hashing (no hash, cache-friendly). `insert` replaces an existing key so a
+/// forward `get` still returns the current binding (HashMap semantics).
+#[derive(Clone)]
+struct VecMap<K, V> {
+    entries: Vec<(K, V)>,
+}
+
+impl<K, V> Default for VecMap<K, V> {
+    fn default() -> Self {
+        VecMap { entries: Vec::new() }
+    }
+}
+
+impl<K: PartialEq, V> VecMap<K, V> {
+    #[inline]
+    fn get<Q>(&self, k: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        self.entries
+            .iter()
+            .find(|(ek, _)| ek.borrow() == k)
+            .map(|(_, v)| v)
+    }
+    #[inline]
+    fn contains_key<Q>(&self, k: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        self.entries.iter().any(|(ek, _)| ek.borrow() == k)
+    }
+    #[inline]
+    fn insert(&mut self, k: K, v: V) -> Option<V> {
+        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+            Some(std::mem::replace(&mut slot.1, v))
+        } else {
+            self.entries.push((k, v));
+            None
+        }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+    #[inline]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.entries.iter_mut().map(|(_, v)| v)
+    }
+    #[inline]
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a VecMap<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (K, V)>,
+        fn(&'a (K, V)) -> (&'a K, &'a V),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl<K: PartialEq + std::borrow::Borrow<Q>, Q: PartialEq + ?Sized, V> std::ops::Index<&Q>
+    for VecMap<K, V>
+{
+    type Output = V;
+    fn index(&self, k: &Q) -> &V {
+        self.get(k).expect("no entry found for key")
+    }
+}
+
 #[derive(Clone, Default)]
 struct EnvFrame {
-    vars: HashMap<String, BlissVal>,
-    symbol_vars: HashMap<u32, BlissVal>,
+    vars: VecMap<String, BlissVal>,
+    symbol_vars: VecMap<u32, BlissVal>,
     parent: Option<Rc<RefCell<EnvFrame>>>,
 }
 
@@ -1270,8 +1359,8 @@ struct EnvFrame {
 /// gd4 aliasing bug) and cannot be replaced by frame sharing while the registry
 /// stays in a separate crate behind `Send + Sync` bounds. See bliss-9sf.
 struct FrozenEnvFrame {
-    vars: Mutex<HashMap<String, BlissVal>>,
-    symbol_vars: Mutex<HashMap<u32, BlissVal>>,
+    vars: Mutex<VecMap<String, BlissVal>>,
+    symbol_vars: Mutex<VecMap<u32, BlissVal>>,
     parent: Option<Arc<FrozenEnvFrame>>,
 }
 
@@ -2530,8 +2619,8 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
         let frames: Vec<Rc<RefCell<EnvFrame>>> = (0..n_frames)
             .map(|_| {
                 Rc::new(RefCell::new(EnvFrame {
-                    vars: HashMap::new(),
-                    symbol_vars: HashMap::new(),
+                    vars: VecMap::default(),
+                    symbol_vars: VecMap::default(),
                     parent: None,
                 }))
             })
@@ -2587,8 +2676,8 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
                 .cloned()
                 .unwrap_or_else(|| {
                     Rc::new(RefCell::new(EnvFrame {
-                        vars: HashMap::new(),
-                        symbol_vars: HashMap::new(),
+                        vars: VecMap::default(),
+                        symbol_vars: VecMap::default(),
                         parent: None,
                     }))
                 });
@@ -5860,8 +5949,8 @@ impl Env {
     fn child(&self) -> Self {
         Env {
             frame: Rc::new(RefCell::new(EnvFrame {
-                vars: HashMap::new(),
-                symbol_vars: HashMap::new(),
+                vars: VecMap::default(),
+                symbol_vars: VecMap::default(),
                 parent: Some(Rc::clone(&self.frame)),
             })),
             funs: Rc::clone(&self.funs),
@@ -5890,8 +5979,8 @@ impl Env {
     fn child_with_parent(&self, parent: Rc<RefCell<EnvFrame>>) -> Self {
         Env {
             frame: Rc::new(RefCell::new(EnvFrame {
-                vars: HashMap::new(),
-                symbol_vars: HashMap::new(),
+                vars: VecMap::default(),
+                symbol_vars: VecMap::default(),
                 parent: Some(parent),
             })),
             funs: Rc::clone(&self.funs),
@@ -6180,8 +6269,8 @@ fn with_child_frame<T>(
     // the caller's locals would be unscanned during the call (bliss-6b2 #2).
     SUSPENDED_FRAMES.with(|s| s.borrow_mut().push(Rc::clone(&saved_frame)));
     env.frame = Rc::new(RefCell::new(EnvFrame {
-        vars: HashMap::new(),
-        symbol_vars: HashMap::new(),
+        vars: VecMap::default(),
+        symbol_vars: VecMap::default(),
         parent: Some(parent),
     }));
     let result = f(env);

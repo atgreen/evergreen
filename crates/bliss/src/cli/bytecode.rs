@@ -10578,8 +10578,8 @@ fn make_env_frame(
         return None;
     }
     let frame = Rc::new(RefCell::new(EnvFrame {
-        vars: std::collections::HashMap::new(),
-        symbol_vars: std::collections::HashMap::new(),
+        vars: super::VecMap::default(),
+        symbol_vars: super::VecMap::default(),
         parent: Some(parent),
     }));
     Some(frame)
@@ -11236,8 +11236,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 let act = &mut acts[top_idx];
                 let parent = act.env_frame.clone();
                 act.env_frame = Some(Rc::new(RefCell::new(EnvFrame {
-                    vars: std::collections::HashMap::new(),
-                    symbol_vars: std::collections::HashMap::new(),
+                    vars: super::VecMap::default(),
+                    symbol_vars: super::VecMap::default(),
                     parent,
                 })));
             }
@@ -12426,8 +12426,8 @@ extern "C" fn c2i_push_env_child() {
     NATIVE_ENV_FRAME.with(|slot| {
         let parent = slot.borrow().clone();
         *slot.borrow_mut() = Some(Rc::new(RefCell::new(EnvFrame {
-            vars: HashMap::new(),
-            symbol_vars: HashMap::new(),
+            vars: super::VecMap::default(),
+            symbol_vars: super::VecMap::default(),
             parent,
         })));
     });
