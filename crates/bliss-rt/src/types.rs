@@ -161,6 +161,39 @@ pub fn bit_vector_set(v: BlissVal, i: usize, bit: u8) -> bool {
     true
 }
 
+/// Build a fresh simple bit-vector from a slice of 0/1 bytes (any non-zero byte
+/// stores a 1). Mirrors the reader's `#*` allocation exactly (same
+/// `SIMPLE_ARRAY`/`ElementTypeTag::Bit` layout) so reader- and runtime-produced
+/// bit-vectors are indistinguishable. Layout: ObjectHeader(8) + element-type
+/// tag byte + padding(7) + length:u64(8) + LSB-first packed bits.
+///
+/// Bit-vectors are small objects (never the large-object path), so the standard
+/// 8-byte body-header offset applies and `from_heap_ptr` on the write base is
+/// correct. GC-safe: no live BlissVal is held across the single allocation.
+pub fn make_bit_vector(bits: &[u8]) -> BlissVal {
+    let hdr = core::mem::size_of::<ObjectHeader>();
+    let data_bytes = bits.len().div_ceil(8);
+    // body = element-type word(8) + length(8) + packed data
+    let body_size = (8 + 8 + data_bytes).max(1);
+    let body = match crate::gc::alloc_typed(body_size, type_id::SIMPLE_ARRAY) {
+        Some(b) => b,
+        None => std::alloc::handle_alloc_error(
+            std::alloc::Layout::from_size_align(hdr + body_size, hdr).unwrap(),
+        ),
+    };
+    unsafe {
+        // `body` is the payload start (offset hdr past the object header).
+        *body = ElementTypeTag::Bit as u8;
+        *(body.add(8) as *mut u64) = bits.len() as u64;
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                *body.add(16 + i / 8) |= 1 << (i % 8);
+            }
+        }
+        BlissVal::from_heap_ptr(body.sub(hdr))
+    }
+}
+
 /// `NUMBERP` — fixnum, single-float, or heap numeric types.
 pub fn numberp(v: BlissVal) -> bool {
     if v.is_fixnum() || v.is_single_float() {

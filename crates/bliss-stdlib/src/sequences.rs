@@ -278,6 +278,20 @@ fn build_vector(vals: &[BlissVal]) -> BlissVal {
     unsafe { BlissVal::from_heap_ptr(ptr) }
 }
 
+/// Build a fresh simple bit-vector from a slice of element values (each a
+/// fixnum 0 or 1). Used by SUBSEQ/COPY-SEQ/REVERSE so a bit-vector input yields
+/// a bit-vector result (ANSI: the result of these on a bit-vector is a
+/// bit-vector), not a general simple-vector (bliss-8z5f). A non-bit element is
+/// treated as 1 for any non-zero fixnum; callers only pass values collected from
+/// a bit-vector, so every element is already 0/1.
+fn build_bit_vector_from_vals(vals: &[BlissVal]) -> BlissVal {
+    let bits: Vec<u8> = vals
+        .iter()
+        .map(|v| if v.is_fixnum() && v.as_fixnum() == 0 { 0 } else { 1 })
+        .collect();
+    bliss_rt::types::make_bit_vector(&bits)
+}
+
 /// Get vector length from a heap-object BlissVal known to be a vector.
 #[inline]
 fn vector_payload_offset(ptr: *const u8) -> usize {
@@ -1175,6 +1189,13 @@ pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
         let elems = collect_elements(sequence)?;
         return Ok(build_vector(&elems));
     }
+    if bliss_rt::types::bit_vector_p(sequence) {
+        // COPY-SEQ of a bit-vector is a bit-vector, not a general vector
+        // (bliss-8z5f). (This direct entry point is normally shadowed by boot's
+        // `(subseq seq 0)`, but keep it correct.)
+        let elems = collect_elements(sequence)?;
+        return Ok(build_bit_vector_from_vals(&elems));
+    }
     if is_char_seq(sequence) {
         let s: String = collect_elements(sequence)?
             .iter()
@@ -1247,6 +1268,10 @@ pub fn subseq(
     let sub = &elems[start..actual_end];
     if is_list(sequence) {
         Ok(build_list(sub))
+    } else if bliss_rt::types::bit_vector_p(sequence) {
+        // SUBSEQ of a bit-vector is a bit-vector (and COPY-SEQ = (subseq x 0)),
+        // not a general vector (bliss-8z5f).
+        Ok(build_bit_vector_from_vals(sub))
     } else {
         Ok(build_vector(sub))
     }
@@ -1265,6 +1290,9 @@ pub fn reverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
         // REVERSE of a string is a string (ANSI): same element type as input.
         let s: String = elems.iter().map(|&c| c.as_char()).collect();
         Ok(crate::streams::make_lisp_string_fresh(&s))
+    } else if bliss_rt::types::bit_vector_p(sequence) {
+        // REVERSE of a bit-vector is a bit-vector (bliss-8z5f).
+        Ok(build_bit_vector_from_vals(&elems))
     } else {
         Ok(build_vector(&elems))
     }

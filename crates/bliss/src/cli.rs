@@ -5935,10 +5935,11 @@ impl Env {
     }
 
     fn lookup_symbol_macro(&self, symbol: BlissVal) -> Option<BlissVal> {
-        self.symbol_macros
-            .borrow()
-            .get(&symbol.as_symbol_index())
-            .copied()
+        // NIL and T report `is_symbol()` true but have no symbol-table index —
+        // `as_symbol_index()` would abort on them. They can never be symbol
+        // macros, so treat them (and any non-symbol) as "no symbol macro".
+        let idx = symbol.symbol_index()?;
+        self.symbol_macros.borrow().get(&idx).copied()
     }
 
     fn define_symbol_macro(&mut self, symbol: BlissVal, expansion: BlissVal) {
@@ -29560,6 +29561,18 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     }
     if is_string_value(a) && is_string_value(b) {
         return val_as_str(a) == val_as_str(b);
+    }
+    // Bit-vectors: ANSI EQUAL compares bit-vectors element-wise (like strings),
+    // unlike general arrays which EQUAL treats as EQ. Two bit-vectors of equal
+    // length with the same bits are EQUAL even if distinct objects — e.g.
+    // (equal #*1011 (copy-seq #*1011)). No allocation, so GC-safe (bliss-8z5f).
+    if let (Some(la), Some(lb)) = (
+        bliss_rt::types::bit_vector_len(a),
+        bliss_rt::types::bit_vector_len(b),
+    ) {
+        return la == lb
+            && (0..la)
+                .all(|i| bliss_rt::types::bit_vector_ref(a, i) == bliss_rt::types::bit_vector_ref(b, i));
     }
     // Pathnames: EQUAL when their components match. Comparing namestrings is the
     // faithful proxy and matches the EQUAL hash-table's `cl_equal`. ASDF compares
