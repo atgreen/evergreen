@@ -11729,8 +11729,17 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         // Backoff: clear the hot-loop counter so the loop must
                         // re-warm before another OSR attempt, bounding
                         // enter/deopt thrash on a loop that keeps overflowing.
-                        if let Some(f) = acts[top_idx].fn_obj {
-                            bliss_rt::function::reset_back_edge_count(f);
+                        match acts[top_idx].fn_obj {
+                            Some(f) => bliss_rt::function::reset_back_edge_count(f),
+                            None => {
+                                // Anonymous (top-level) loop: reset its per-(func,
+                                // header) back-edge count so it re-warms, matching
+                                // the named backoff (bliss-pohq).
+                                let key = (Rc::as_ptr(&acts[top_idx].func) as usize, target_bcp);
+                                ANON_BACK_EDGES.with(|m| {
+                                    m.borrow_mut().remove(&key);
+                                });
+                            }
                         }
                         let act = &mut acts[top_idx];
                         act.bcp = bcp as usize;
@@ -15291,6 +15300,17 @@ fn emit_native_x86(
                 c.extend_from_slice(&[0x41, 0x5E]); // pop r14
                 c.extend_from_slice(&[0xC3]); // ret
             }
+            // NamedTag only publishes a tag on the shared control-token stack
+            // so a *non-local* GO (from a nested closure) can reach it. Local
+            // GO within this tagbody is compiled directly by the `Go` arm
+            // (jump to target_bcp), so in native the publish is dead — the tag
+            // position is already a jump label. Safe to skip: the
+            // `native_would_lose_captured_control` guard (applied on both the
+            // T1-invoke and OSR compile paths) declines any function where a
+            // closure actually captures one of these tags, so a NamedTag that
+            // reaches the emitter is provably local-only. This unblocks native
+            // compilation of dolist/do/loop bodies (bliss-x5y).
+            Instr::NamedTag { .. } => {}
             unsupported => decline_t1!("unsupported opcode at bcp {bcp}: {unsupported:?}"),
         }
     }
@@ -15802,6 +15822,18 @@ thread_local! {
     /// Compiled OSR code per function symbol (bliss-izt.1).
     static OSR_REGISTRY: RefCell<HashMap<u32, Option<Rc<OsrCode>>>> =
         RefCell::new(HashMap::new());
+    /// Compiled OSR code for ANONYMOUS activations (top-level forms, gensym
+    /// lambdas) that have no registry symbol, keyed by the bytecode function's
+    /// Rc pointer. Top-level forms are `sym==u32::MAX` and were excluded from
+    /// OSR entirely, so a hot loop in one (e.g. babel's 13886-entry encoding-
+    /// table build) never tiered — it ran the whole load interpreted. Keying by
+    /// the live `Rc<BytecodeFunction>` address lets those loops OSR too
+    /// (bliss-pohq / bliss-izt).
+    static ANON_OSR_REGISTRY: RefCell<HashMap<usize, Option<Rc<OsrCode>>>> =
+        RefCell::new(HashMap::new());
+    /// Back-edge counts for anonymous activations (no `fn_obj` to hold the
+    /// count), keyed by the bytecode function's Rc pointer + loop-header bcp.
+    static ANON_BACK_EDGES: RefCell<HashMap<(usize, u32), u32>> = RefCell::new(HashMap::new());
     /// How many times each function ENTERED native code via OSR. FnMeta's tier
     /// does not reflect OSR (OSR code lives here, not in NATIVE_REGISTRY), so
     /// tests need this to assert promotion actually happened — output parity
@@ -15829,6 +15861,23 @@ fn osr_threshold() -> u32 {
     })
 }
 
+/// Back-edge threshold for OSR-compiling an ANONYMOUS activation's loop (a
+/// top-level form or gensym lambda). Much lower than `osr_threshold` because
+/// such forms run once — there is no per-call warmup to accumulate — so the
+/// loop's own iteration count is the only hotness signal, and a loop that has
+/// already gone this many times is worth compiling synchronously. Kept well
+/// above trivial loops so short one-shot loops aren't compiled needlessly.
+fn anon_osr_threshold() -> u32 {
+    use std::sync::OnceLock;
+    static T: OnceLock<u32> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("BLISS_ANON_OSR_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200)
+    })
+}
+
 /// Compile (once, memoized) a non-speculating native version of `sym` with OSR
 /// entry stubs. Returns `None` if it can't be compiled (cached so we don't retry
 /// every back-edge).
@@ -15836,42 +15885,78 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
     if let Some(cached) = OSR_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
         return cached;
     }
-    let result = (|| {
-        let bf = registry_get(sym)?;
-        // allow_speculation = true (bliss-izt.2): OSR now inlines fixnum
-        // arithmetic. A mid-loop guard failure no longer needs to re-run from the
-        // top — state-transfer deopt resumes T0 at the guard on the LIVE frame
-        // (the loop's locals and operands are already in the shared slots), so
-        // the loop runs at full native speed until (if ever) a value leaves the
-        // fixnum domain. Speculation only actually engages for `deopt_safe`
-        // functions (every call a pure primitive); others fall back to c2i.
-        //
-        // A leaked, non-zero back-edge counter makes the emitter install the
-        // sampled back-edge poll even though sym == u32::MAX keeps OSR out of
-        // T2 escalation: with sym == MAX the poll is the signal-only
-        // `c2i_osr_backedge`, so a hot OSR loop stays terminable (SIGTERM) and
-        // reachable by GC stop-the-world (bliss-7rdu).
-        let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
-            as *mut std::sync::atomic::AtomicU32 as usize as u64;
-        let (code, osr) = emit_native_x86(&bf, true, u32::MAX, backedge_counter)?;
-        if osr.is_empty() {
-            return None;
-        }
-        let num_slots = bf.num_slots();
-        let code_info = install_stack_map(num_slots)?;
-        let buf = bliss_rt::jit::JitBuffer::new(&code)?;
-        let entry = buf.leak();
-        maybe_write_perf_map(entry as usize, code.len(), sym);
-        maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
-        Some(Rc::new(OsrCode {
-            entry,
-            num_slots,
-            code_info,
-            entries: osr.into_iter().collect(),
-        }))
-    })();
+    let result = registry_get(sym).and_then(|bf| compile_osr_code(&bf, sym));
     OSR_REGISTRY.with(|r| r.borrow_mut().insert(sym, result.clone()));
     result
+}
+
+/// OSR-compile an ANONYMOUS activation's loop directly from its bytecode
+/// function (no registry symbol). Keyed/cached by the `Rc<BytecodeFunction>`
+/// address, which is stable for the running activation's lifetime. This is what
+/// lets a hot loop in a top-level form (babel's encoding-table build) reach
+/// native, since such activations carry `sym == u32::MAX` (bliss-pohq).
+fn compile_osr_from_func(func: &Rc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
+    let key = Rc::as_ptr(func) as usize;
+    if let Some(cached) = ANON_OSR_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let result = compile_osr_code(func, u32::MAX);
+    ANON_OSR_REGISTRY.with(|r| r.borrow_mut().insert(key, result.clone()));
+    result
+}
+
+/// Emit OSR-entry native code for one bytecode function (shared by the sym-keyed
+/// and anonymous paths). `sym` is used only for perf-map / jitdump labelling.
+fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> {
+    // Same safety gate as the T1-invoke path (see try_promote_to_t1): if a
+    // closure created here captures one of this function's blocks/tags, the
+    // native no-ops for PushBlock/PushTag/NamedTag would never publish the
+    // control token the closure's non-local exit needs. Decline OSR for those
+    // functions so the emitter's NamedTag no-op stays provably local-only.
+    if native_would_lose_captured_control(bf) {
+        if std::env::var_os("BLISS_OSR_DEBUG").is_some() {
+            eprintln!("[osr] declined for sym {sym}: captured control would be lost");
+        }
+        return None;
+    }
+    // allow_speculation = true (bliss-izt.2): OSR now inlines fixnum
+    // arithmetic. A mid-loop guard failure no longer needs to re-run from the
+    // top — state-transfer deopt resumes T0 at the guard on the LIVE frame
+    // (the loop's locals and operands are already in the shared slots), so
+    // the loop runs at full native speed until (if ever) a value leaves the
+    // fixnum domain. Speculation only actually engages for `deopt_safe`
+    // functions (every call a pure primitive); others fall back to c2i.
+    //
+    // A leaked, non-zero back-edge counter makes the emitter install the
+    // sampled back-edge poll: emitted with sym == u32::MAX the poll is the
+    // signal-only `c2i_osr_backedge`, so a hot OSR loop stays terminable
+    // (SIGTERM) and reachable by GC stop-the-world (bliss-7rdu) — which is why
+    // anonymous top-level OSR loops are GC-safe too.
+    let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+        as *mut std::sync::atomic::AtomicU32 as usize as u64;
+    let emitted = emit_native_x86(bf, true, u32::MAX, backedge_counter);
+    if std::env::var_os("BLISS_OSR_DEBUG").is_some() && emitted.is_none() {
+        eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
+    }
+    let (code, osr) = emitted?;
+    if osr.is_empty() {
+        if std::env::var_os("BLISS_OSR_DEBUG").is_some() {
+            eprintln!("[osr] osr map empty (no loop entry) for sym {sym}");
+        }
+        return None;
+    }
+    let num_slots = bf.num_slots();
+    let code_info = install_stack_map(num_slots)?;
+    let buf = bliss_rt::jit::JitBuffer::new(&code)?;
+    let entry = buf.leak();
+    maybe_write_perf_map(entry as usize, code.len(), sym);
+    maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
+    Some(Rc::new(OsrCode {
+        entry,
+        num_slots,
+        code_info,
+        entries: osr.into_iter().collect(),
+    }))
 }
 
 /// The result of entering OSR native code (bliss-izt.1/izt.2): either the loop
@@ -15954,7 +16039,7 @@ fn maybe_osr(
         *D.get_or_init(|| std::env::var_os("BLISS_OSR_DEBUG").is_some())
     }
     let dbg = osr_debug();
-    if (target_bcp as usize) >= act.bcp || act.sp_top != 0 || act.sym == u32::MAX {
+    if (target_bcp as usize) >= act.bcp || act.sp_top != 0 {
         if dbg {
             eprintln!(
                 "[osr] reject pre: target {} bcp {} sp_top {} sym {:#x}",
@@ -15963,17 +16048,51 @@ fn maybe_osr(
         }
         return None;
     }
-    let fn_obj = act.fn_obj?;
-    if bliss_rt::function::back_edge_count(fn_obj) < osr_threshold() {
-        return None;
-    }
-    let osr = match compile_osr(act.sym) {
-        Some(o) => o,
-        None => {
-            if dbg {
-                eprintln!("[osr] compile_osr failed for sym {}", act.sym);
+    // Two hotness paths. A NAMED function counts its back-edges on its FnMeta and
+    // OSRs at `osr_threshold`. An ANONYMOUS activation (a top-level form or gensym
+    // lambda, `sym == u32::MAX`, `fn_obj == None`) has no FnMeta, so it never
+    // tiered — yet a loop in a top-level form (babel's encoding-table build) is
+    // exactly where reactive per-call warmup can't help, because the form is
+    // entered once. Predict it from the loop itself: count this activation's
+    // back-edges by (function, header) and OSR-compile — synchronously, so it's
+    // deterministic — once it is clearly hot (`anon_osr_threshold`). This is what
+    // stops babel's 13886-iteration table build from running the whole load
+    // interpreted (bliss-pohq).
+    let osr = match act.fn_obj {
+        Some(fn_obj) => {
+            if bliss_rt::function::back_edge_count(fn_obj) < osr_threshold() {
+                return None;
             }
-            return None;
+            match compile_osr(act.sym) {
+                Some(o) => o,
+                None => {
+                    if dbg {
+                        eprintln!("[osr] compile_osr failed for sym {}", act.sym);
+                    }
+                    return None;
+                }
+            }
+        }
+        None => {
+            let key = (Rc::as_ptr(&act.func) as usize, target_bcp);
+            let count = ANON_BACK_EDGES.with(|m| {
+                let mut m = m.borrow_mut();
+                let e = m.entry(key).or_insert(0);
+                *e += 1;
+                *e
+            });
+            if count < anon_osr_threshold() {
+                return None;
+            }
+            match compile_osr_from_func(&act.func) {
+                Some(o) => o,
+                None => {
+                    if dbg {
+                        eprintln!("[osr] anon compile failed (func {:#x})", key.0);
+                    }
+                    return None;
+                }
+            }
         }
     };
     let stub_off = match osr.entries.get(&target_bcp) {
