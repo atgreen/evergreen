@@ -11380,8 +11380,11 @@ fn tag_key(form: BlissVal) -> Option<String> {
     if form.is_symbol() {
         return Some(sym_name(form));
     }
-    if form.is_fixnum() {
-        return Some(format!("#{}", form.as_fixnum()));
+    // Integer tags compare under EQL, so any integer — fixnum OR bignum — is a
+    // valid tag (ansi TAGBODY.15/.16 go to bignum tags). Key on the canonical
+    // decimal so the definition side and the GO side agree.
+    if bigint_from_val(form).is_some() {
+        return Some(format!("#{}", format_val(form)));
     }
     None
 }
@@ -11674,6 +11677,30 @@ fn form_arg_count(mut v: BlissVal) -> usize {
         v = cp(v).1;
     }
     n
+}
+
+/// A valid function-name designator per CLHS is a symbol, or a two-element
+/// list `(SETF symbol)`. `FBOUNDP`/`FDEFINITION`/`FMAKUNBOUND` must signal a
+/// TYPE-ERROR (naming the offending datum) on anything else — a fixnum, a
+/// string, `(x)`, `(setf)`, `(setf foo bar)`, `(setf foo . bar)`, etc.
+/// (ansi FBOUNDP.ERROR.*, FDEFINITION.ERROR.*, FMAKUNBOUND.ERROR.*).
+fn check_function_name(spec: BlissVal) -> Result<(), BlissError> {
+    if spec.is_symbol() {
+        return Ok(());
+    }
+    if spec.is_cons() {
+        let (a, d) = cp(spec);
+        if a.is_symbol() && sym_name(a) == "SETF" && d.is_cons() {
+            let (b, tail) = cp(d);
+            if b.is_symbol() && tail == NIL {
+                return Ok(());
+            }
+        }
+    }
+    Err(BlissError::TypeError {
+        datum: spec,
+        expected: "(OR SYMBOL (CONS (EQL SETF) (CONS SYMBOL NULL)))".to_string(),
+    })
 }
 
 /// For `(setf (accessor …subforms…) value)` on the element-accessor places
@@ -12009,7 +12036,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 env.tag_stack.truncate(base);
                 match result {
-                    Ok(()) => return Ok(NIL),
+                    Ok(()) => {
+                        // TAGBODY always returns exactly one value, NIL — discard
+                        // any extra values a final statement produced (ansi
+                        // TAGBODY.3/.4).
+                        env.clear_mv();
+                        return Ok(NIL);
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -12901,40 +12934,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let s = args.first().copied().unwrap_or(NIL);
                 if s.is_symbol() {
                     let name = sym_name(s);
-                    if let Some(mdef) = lookup_macro(env, &name)
-                        .or_else(|| lookup_macro(env, &symbol_bare_name(&name)))
-                    {
+                    let bare = symbol_bare_name(&name);
+                    let mdef =
+                        lookup_macro(env, &name).or_else(|| lookup_macro(env, &bare));
+                    if let Some(mdef) = &mdef {
                         // A first-class expander installed via
                         // (setf (macro-function name) fn) round-trips (bliss-fo0o).
                         if let Some(f) = mdef.function {
                             return Ok(f);
                         }
-                        // Source / bytecode macros have no stored function object.
-                        // Synthesize a genuine two-argument (form environment)
-                        // expander per CLHS 3.1.2.1.2.2 so (funcall (macro-function
-                        // 'NAME) …) enforces the exact arity — a wrong count trips
-                        // the lambda-list binder's PROGRAM-ERROR (bliss-l6y9) — and,
-                        // called correctly, expands the form. ansi-test's
-                        // def-macro-test (push/pop/pushnew/remf.error) funcalls it
-                        // with 0/1/3 args expecting PROGRAM-ERROR (bliss-t5m5).
-                        // Build (LAMBDA (#:form #:env) (MACROEXPAND-1 #:form)) and
-                        // evaluate it to a closure. Two REQUIRED params give the
-                        // CLHS 2-argument arity; the body uses the one-argument
-                        // MACROEXPAND-1 (its optional-environment arm is a separate
-                        // gap) and ignores #:env. Root every freshly built piece
-                        // across the allocating vec_to_list / eval (moving GC).
-                        let lam = resolve_sym("LAMBDA").unwrap_or(NIL);
-                        let mexp = resolve_sym("MACROEXPAND-1").unwrap_or(NIL);
-                        let decl = resolve_sym("DECLARE").unwrap_or(NIL);
-                        let ignore = resolve_sym("IGNORE").unwrap_or(NIL);
-                        bliss_rt::rooted!(form_p = gensym_symbol("FORM"));
-                        bliss_rt::rooted!(env_p = gensym_symbol("ENV"));
-                        bliss_rt::rooted!(params = vec_to_list(&[*form_p, *env_p]));
-                        bliss_rt::rooted!(ign_clause = vec_to_list(&[ignore, *env_p]));
-                        bliss_rt::rooted!(decl_form = vec_to_list(&[decl, *ign_clause]));
-                        bliss_rt::rooted!(body = vec_to_list(&[mexp, *form_p]));
-                        bliss_rt::rooted!(lambda_form = vec_to_list(&[lam, *params, *decl_form, *body]));
-                        return eval_form(*lambda_form, env);
+                    }
+                    // A registered source/bytecode macro, OR a standard CL macro
+                    // that bliss implements as a special-form arm (AND/OR/WHEN/COND/
+                    // MULTIPLE-VALUE-BIND/DEFUN/…). Either way MACRO-FUNCTION must
+                    // return a genuine two-argument (form environment) expander per
+                    // CLHS 3.1.2.1.2.2, so `(funcall (macro-function 'NAME) …)`
+                    // enforces the arity — a wrong count trips the lambda binder's
+                    // PROGRAM-ERROR (ansi AND/OR/WHEN/COND/RETURN/DEFUN/MULTIPLE-
+                    // VALUE-*/…-ERROR.1/2). Standard special OPERATORS that are not
+                    // macros (IF, PROGN, LET, QUOTE, …) are excluded and return NIL.
+                    if mdef.is_some() || is_ansi_standard_macro(&bare) {
+                        return synthesize_macro_expander(env);
                     }
                 }
                 return Ok(NIL);
@@ -13370,6 +13390,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if v.is_cons() { NIL } else { T });
             }
             "NULL" | "NOT" => {
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_nil() { T } else { NIL });
@@ -13723,16 +13749,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "FDEFINITION" | "SYMBOL-FUNCTION" => {
+                let argc = form_arg_count(cdr);
+                if argc != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires exactly 1 argument, got {argc}"
+                    )));
+                }
                 let (sf, _) = cp(cdr);
                 let spec = eval_form(sf, env)?;
                 // SYMBOL-FUNCTION requires a symbol; a non-symbol is a TYPE-ERROR
-                // (symbol-function.error.3). FDEFINITION also accepts (setf name)
-                // function-name lists, so it keeps the lenient fallthrough below.
+                // (symbol-function.error.3). FDEFINITION accepts any function-name
+                // designator (a symbol or `(setf symbol)`) and must TYPE-ERROR on
+                // anything else (fdefinition.error.*).
                 if name == "SYMBOL-FUNCTION" && !spec.is_symbol() {
                     return Err(BlissError::TypeError {
                         datum: spec,
                         expected: "SYMBOL".to_string(),
                     });
+                }
+                if name == "FDEFINITION" {
+                    check_function_name(spec)?;
                 }
                 if spec.is_symbol() {
                     // Return the SAME first-class function object `#'name` yields
@@ -13747,11 +13783,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // no plain function object here; return the name designator
                     // (funcall/apply accept it), preserving prior behaviour.
                     let n = sym_name(spec);
+                    let bare = symbol_bare_name(&n);
                     if fn_bound(env, &n)
                         || env.methods.borrow().contains_key(&n)
                         || env.generics.borrow().contains_key(&n)
                         || macro_defined(env, &n)
-                        || is_builtin_function(&symbol_bare_name(&n))
+                        || is_builtin_function(&bare)
+                        // Standard special operators and standard macros that the
+                        // evaluator implements directly are fbound in the CL sense,
+                        // so FDEFINITION must not signal (ansi FDEFINITION.2/.3 —
+                        // (fdefinition 'cond) / (fdefinition 'setq)).
+                        || is_ansi_special_operator(&bare)
+                        || is_ansi_standard_macro(&bare)
                     {
                         return Ok(spec);
                     }
@@ -13760,8 +13803,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(spec);
             }
             "FBOUNDP" => {
+                let argc = form_arg_count(cdr);
+                if argc != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "FBOUNDP requires exactly 1 argument, got {argc}"
+                    )));
+                }
                 let (sf, _) = cp(cdr);
                 let sym = eval_form(sf, env)?;
+                check_function_name(sym)?;
                 let name = if sym.is_symbol() {
                     sym_name(sym)
                 } else {
@@ -13777,8 +13827,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if bound { T } else { NIL });
             }
             "FMAKUNBOUND" => {
+                let argc = form_arg_count(cdr);
+                if argc != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "FMAKUNBOUND requires exactly 1 argument, got {argc}"
+                    )));
+                }
                 let (sf, _) = cp(cdr);
                 let sym = eval_form(sf, env)?;
+                check_function_name(sym)?;
                 let name = if sym.is_symbol() {
                     sym_name(sym)
                 } else {
@@ -14010,6 +14067,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let tv = eval_form(test, env)?;
                     if !tv.is_nil() {
                         if body.is_nil() {
+                            // CLHS: with no forms the *primary* value of the test
+                            // is returned — a single value, so discard any extra
+                            // values the test form produced (ansi COND.9).
+                            env.clear_mv();
                             return Ok(tv);
                         }
                         return eval_progn(*body, env);
@@ -15194,6 +15255,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(primary);
             }
             "FUNCALL" => {
+                // (funcall function &rest args): the function designator is
+                // required — no arguments is a PROGRAM-ERROR (ansi FUNCALL.ERROR.4).
+                if !cdr.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "FUNCALL requires at least 1 argument".into(),
+                    ));
+                }
                 // Root the callee across argument evaluation: eval_args allocates
                 // and can fire a relocating minor GC, leaving an unrooted `fn_val`
                 // pointing at the moved (now stale/zeroed) closure — "Cannot apply:
@@ -16333,10 +16401,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "SOME" | "EVERY" | "NOTANY" | "NOTEVERY" => {
                 let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(BlissError::Internal(format!(
-                        "{} requires a predicate",
-                        name
+                // CLHS `predicate &rest sequences+`: a predicate plus at least one
+                // sequence are required — fewer is a PROGRAM-ERROR, not a silent
+                // result (ansi SOME.ERROR.8/9, EVERY/NOTANY/NOTEVERY.ERROR.8/9).
+                if args.len() < 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires a predicate and at least one sequence"
                     )));
                 }
                 // Root predicate + all sequence elements across the apply loop
@@ -17603,18 +17673,38 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MULTIPLE-VALUE-SETQ" => {
                 let (vars_form, rest) = cp(cdr);
                 let (values_form, _) = cp(rest);
-                let vars = list_to_vec(vars_form);
-                let (_, values) = eval_form_collecting_values(values_form, env)?;
-                for (index, var_form) in vars.iter().enumerate() {
-                    let name = sym_name(*var_form);
-                    env.set_var(&name, values.get(index).copied().unwrap_or(NIL));
+                bliss_rt::rooted!(vars = list_to_vec(vars_form));
+                let (_, values0) = eval_form_collecting_values(values_form, env)?;
+                bliss_rt::rooted!(values = values0);
+                for index in 0..vars.len() {
+                    let var_form = vars[index];
+                    let v = values.get(index).copied().unwrap_or(NIL);
+                    // A var that names a symbol-macro is assigned through its
+                    // expansion as a place, exactly like SETF/SETQ (CLHS
+                    // MULTIPLE-VALUE-SETQ; ansi MULTIPLE-VALUE-SETQ.3-8). Everything
+                    // allocated below can fire a moving GC, so root the value and
+                    // the expansion place across the synthesized SETF.
+                    if let Some(expansion) = env.lookup_symbol_macro(var_form) {
+                        bliss_rt::rooted!(v = v);
+                        bliss_rt::rooted!(expansion = expansion);
+                        let setf_sym = resolve_sym("SETF").unwrap_or(NIL);
+                        let quote_sym = quote_sym();
+                        bliss_rt::rooted!(qtail = arena_cons(*v, NIL));
+                        bliss_rt::rooted!(quoted = arena_cons(quote_sym, *qtail));
+                        bliss_rt::rooted!(
+                            setf_form = vec_to_list(&[setf_sym, *expansion, *quoted])
+                        );
+                        eval_form(*setf_form, env)?;
+                    } else {
+                        let name = sym_name(var_form);
+                        env.set_var(&name, v);
+                    }
                 }
-                if values.is_empty() {
-                    env.set_mv(Vec::new());
-                    return Ok(NIL);
-                }
-                env.set_mv(values.clone());
-                return Ok(values[0]);
+                // MULTIPLE-VALUE-SETQ returns the *primary* value of the values
+                // form — a single value (NIL when there were none).
+                let primary = values.first().copied().unwrap_or(NIL);
+                env.clear_mv();
+                return Ok(primary);
             }
             "MULTIPLE-VALUE-LIST" => {
                 // (multiple-value-list form) — a list of all the values of form.
@@ -17623,9 +17713,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&values));
             }
             "VALUES-LIST" => {
+                // (values-list list) — exactly one argument, else a PROGRAM-ERROR
+                // (ansi VALUES-LIST.ERROR.1/2).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "VALUES-LIST requires exactly 1 argument, got {n}"
+                    )));
+                }
                 // (values-list list) — return the elements of list as values.
                 let (form, _) = cp(cdr);
                 let lst = eval_form(form, env)?;
+                // The argument must be a proper list; a dotted/improper list is a
+                // TYPE-ERROR (ansi VALUES-LIST.ERROR.4).
+                {
+                    let mut cur = lst;
+                    while cur.is_cons() {
+                        cur = cp(cur).1;
+                    }
+                    if !cur.is_nil() {
+                        return Err(BlissError::TypeError {
+                            datum: lst,
+                            expected: "LIST".to_string(),
+                        });
+                    }
+                }
                 let vals = list_to_vec(lst);
                 if vals.is_empty() {
                     env.set_mv(Vec::new());
@@ -23759,6 +23871,87 @@ fn is_ansi_special_operator(bare: &str) -> bool {
     )
 }
 
+/// Standard CL macros that bliss implements directly in the evaluator (as
+/// special-form arms) rather than as user-visible DEFMACROs. They are still
+/// `fboundp` in the CL sense, so FDEFINITION must return for them rather than
+/// signalling UNDEFINED-FUNCTION (ansi FDEFINITION.2).
+fn is_ansi_standard_macro(bare: &str) -> bool {
+    matches!(
+        bare,
+        "AND"
+            | "OR"
+            | "WHEN"
+            | "UNLESS"
+            | "COND"
+            | "CASE"
+            | "ECASE"
+            | "CCASE"
+            | "TYPECASE"
+            | "ETYPECASE"
+            | "CTYPECASE"
+            | "RETURN"
+            | "PROG"
+            | "PROG*"
+            | "PROG1"
+            | "PROG2"
+            | "PSETQ"
+            | "PSETF"
+            | "SETF"
+            | "INCF"
+            | "DECF"
+            | "PUSH"
+            | "POP"
+            | "PUSHNEW"
+            | "ROTATEF"
+            | "SHIFTF"
+            | "MULTIPLE-VALUE-BIND"
+            | "MULTIPLE-VALUE-LIST"
+            | "MULTIPLE-VALUE-SETQ"
+            | "NTH-VALUE"
+            | "DECLAIM"
+            | "DEFUN"
+            | "DEFVAR"
+            | "DEFPARAMETER"
+            | "DEFCONSTANT"
+            | "DEFMACRO"
+            | "DOLIST"
+            | "DOTIMES"
+            | "DO"
+            | "DO*"
+            | "LOOP"
+            | "DESTRUCTURING-BIND"
+            | "WITH-SLOTS"
+            | "WITH-ACCESSORS"
+            | "HANDLER-CASE"
+            | "HANDLER-BIND"
+            | "IGNORE-ERRORS"
+            | "RESTART-CASE"
+            | "CHECK-TYPE"
+            | "ASSERT"
+    )
+}
+
+/// Build a genuine two-argument `(lambda (#:form #:env) (macroexpand-1 #:form))`
+/// macro-expander closure (CLHS 3.1.2.1.2.2). Used by MACRO-FUNCTION so that
+/// funcalling the result enforces the exact 2-argument arity — a wrong count
+/// trips the lambda-list binder's PROGRAM-ERROR — and a valid call expands the
+/// form. Every freshly built piece is rooted across the allocating
+/// `vec_to_list` / `eval_form` (moving GC).
+fn synthesize_macro_expander(env: &mut Env) -> Result<BlissVal, BlissError> {
+    let lam = resolve_sym("LAMBDA").unwrap_or(NIL);
+    let mexp = resolve_sym("MACROEXPAND-1").unwrap_or(NIL);
+    let decl = resolve_sym("DECLARE").unwrap_or(NIL);
+    let ignore = resolve_sym("IGNORE").unwrap_or(NIL);
+    bliss_rt::rooted!(form_p = gensym_symbol("FORM"));
+    bliss_rt::rooted!(env_p = gensym_symbol("ENV"));
+    bliss_rt::rooted!(params = vec_to_list(&[*form_p, *env_p]));
+    bliss_rt::rooted!(ign_clause = vec_to_list(&[ignore, *env_p]));
+    bliss_rt::rooted!(decl_form = vec_to_list(&[decl, *ign_clause]));
+    bliss_rt::rooted!(body = vec_to_list(&[mexp, *form_p]));
+    bliss_rt::rooted!(lambda_form = vec_to_list(&[lam, *params, *decl_form, *body]));
+    eval_form(*lambda_form, env)
+}
+
 fn symbol_plist_of(sym: BlissVal) -> BlissVal {
     // symbol_index (not as_symbol_index): is_symbol reports NIL/T as symbols
     // but they carry no symbol-table index, so `(get nil …)` — legal CL,
@@ -23808,7 +24001,23 @@ fn seq_elements(seq: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         return Ok(Vec::new());
     }
     if seq.is_cons() {
-        return Ok(list_to_vec(seq));
+        // A dotted/improper list is not a valid sequence — signal a TYPE-ERROR
+        // rather than silently dropping the tail (ansi SOME/EVERY/NOTANY/
+        // NOTEVERY.ERROR.14).
+        let mut out = Vec::new();
+        let mut cur = seq;
+        while cur.is_cons() {
+            let (head, tail) = cp(cur);
+            out.push(head);
+            cur = tail;
+        }
+        if !cur.is_nil() {
+            return Err(BlissError::TypeError {
+                datum: seq,
+                expected: "LIST".to_string(),
+            });
+        }
+        return Ok(out);
     }
     let n = bliss_stdlib::length(seq)?;
     let mut out = Vec::with_capacity(n);
@@ -28021,6 +28230,19 @@ fn apply_function(
         if let Some(res) = apply_builtin_fast(&name, args, env) {
             return res;
         }
+        // A symbol that names ONLY a special operator or a standard macro (and
+        // not a function) is not a valid function designator: FUNCALL/APPLY of it
+        // signals UNDEFINED-FUNCTION rather than executing the special form
+        // (ansi FUNCALL.ERROR.1/2/3: (funcall 'quote 1), (funcall 'progn 1),
+        // (funcall 'defconstant …)).
+        {
+            let bare = symbol_bare_name(&name);
+            if !is_builtin_function(&bare)
+                && (is_ansi_special_operator(&bare) || is_ansi_standard_macro(&bare))
+            {
+                return Err(BlissError::UndefinedFunction(fn_val));
+            }
+        }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
@@ -28115,7 +28337,15 @@ fn apply_function(
             format_val(t)
         );
     }
-    Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
+    // fn_val is not a valid function designator (a symbol case is handled
+    // above; here it is a fixnum, string, character, random cons, …). ANSI
+    // requires FUNCALL/APPLY and the higher-order functions (SOME/EVERY/…)
+    // to signal a TYPE-ERROR naming the offending datum with expected type
+    // FUNCTION (ansi FUNCALL.ERROR.*, SOME.ERROR.*, EVERY.ERROR.*).
+    Err(BlissError::TypeError {
+        datum: fn_val,
+        expected: "FUNCTION".to_string(),
+    })
 }
 
 /// True if `name` (a bare, upcased function name) denotes a standard function

@@ -444,6 +444,10 @@
 ;;; ---------------------------------------------------------------------------
 
 (defmacro case (keyform &rest clauses)
+  ;; CLHS 5.3 CASE: the keys of a normal clause are a *designator for a list of
+  ;; keys*, so an atom key NIL means the empty key list (matches nothing), not
+  ;; the object NIL (ansi CASE.6). T / OTHERWISE introduce the default clause. A
+  ;; clause with no forms yields NIL, not the test value (ansi CASE.32/.33/.34).
   (let ((value (gensym))
         (expanded nil))
     (dolist (clause (reverse clauses))
@@ -452,17 +456,20 @@
         (push
           (cond
             ((or (eq keys 'otherwise) (eq keys t))
-             `(t ,@body))
+             `(t ,@(or body '(nil))))
+            ((null keys)
+             nil) ; empty key list — matches nothing
             ((consp keys)
              `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys))
-               ,@body))
+               ,@(or body '(nil))))
             (t
-             `((eql ,value ',keys) ,@body)))
+             `((eql ,value ',keys) ,@(or body '(nil)))))
           expanded)))
     `(let ((,value ,keyform))
-       (cond ,@expanded))))
+       (cond ,@(remove nil expanded)))))
 
 (defmacro typecase (keyform &rest clauses)
+  ;; A clause with no forms yields NIL, not the test value (ansi TYPECASE.12-14).
   (let ((value (gensym))
         (expanded nil))
     (dolist (clause (reverse clauses))
@@ -470,8 +477,8 @@
             (body (cdr clause)))
         (push
           (if (or (eq type 'otherwise) (eq type t))
-              `(t ,@body)
-              `((typep ,value ',type) ,@body))
+              `(t ,@(or body '(nil)))
+              `((typep ,value ',type) ,@(or body '(nil))))
           expanded)))
     `(let ((,value ,keyform))
        (cond ,@expanded))))
@@ -482,26 +489,35 @@
     (dolist (clause (reverse clauses))
       (let ((type (car clause))
             (body (cdr clause)))
-        (push `((typep ,value ',type) ,@body) expanded)))
+        (push `((typep ,value ',type) ,@(or body '(nil))) expanded)))
+    ;; ETYPECASE signals a TYPE-ERROR whose expected type is the disjunction of
+    ;; the clause types (ansi ETYPECASE.ERROR.*).
     `(let ((,value ,keyform))
        (cond ,@expanded
-             (t (error (format nil "ETYPECASE: no clause matched ~s (expected one of ~s)"
-                               ,value ',(mapcar #'car clauses))))))))
+             (t (error 'type-error :datum ,value
+                       :expected-type '(or ,@(mapcar #'car clauses))))))))
 
 (defmacro ecase (keyform &rest clauses)
   (let ((value (gensym))
-        (expanded nil))
+        (expanded nil)
+        (all-keys nil))
     (dolist (clause (reverse clauses))
       (let ((keys (car clause))
             (body (cdr clause)))
-        (push
-          (if (consp keys)
-              `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys)) ,@body)
-              `((eql ,value ',keys) ,@body))
-          expanded)))
+        (if (consp keys)
+            (progn
+              (dolist (k keys) (push k all-keys))
+              (push `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys)) ,@(or body '(nil)))
+                    expanded))
+            (progn
+              (push keys all-keys)
+              (push `((eql ,value ',keys) ,@(or body '(nil))) expanded)))))
+    ;; ECASE signals a (non-correctable) TYPE-ERROR whose datum is the value and
+    ;; whose expected type is the set of keys (ansi ECASE.ERROR.*/ECASE.4/.5).
     `(let ((,value ,keyform))
        (cond ,@expanded
-             (t (error (format nil "ECASE: ~s is not one of the expected keys" ,value)))))))
+             (t (error 'type-error :datum ,value
+                       :expected-type '(member ,@all-keys)))))))
 
 (defmacro ignore-errors (&rest body)
   `(handler-case (progn ,@body)
@@ -2657,7 +2673,13 @@
 ;;; CCASE / CTYPECASE: like ECASE / ETYPECASE but the key is a place and a
 ;;; correctable STORE-VALUE restart lets the handler supply a fresh value.
 (defmacro ccase (keyplace &rest clauses)
-  (let ((value (gensym)) (top (gensym)))
+  (let ((value (gensym)) (top (gensym))
+        (all-keys nil))
+    (dolist (clause clauses)
+      (let ((keys (car clause)))
+        (if (consp keys)
+            (dolist (k keys) (push k all-keys))
+            (push keys all-keys))))
     `(block nil
        (tagbody
           ,top
@@ -2668,11 +2690,15 @@
                             (let ((keys (car clause)) (body (cdr clause)))
                               (if (consp keys)
                                   `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys))
-                                    ,@body)
-                                  `((eql ,value ',keys) ,@body))))
+                                    ,@(or body '(nil)))
+                                  `((eql ,value ',keys) ,@(or body '(nil))))))
                           clauses)
+                ;; CCASE signals a correctable TYPE-ERROR whose expected type is
+                ;; the set of keys (not T) — ansi CCASE.4/.5 require the datum to
+                ;; NOT satisfy the expected type. STORE-VALUE retries.
                 (t (restart-case
-                       (error 'type-error :datum ,value :expected-type t)
+                       (error 'type-error :datum ,value
+                              :expected-type '(member ,@(reverse all-keys)))
                      (store-value (v) (setf ,keyplace v) (go ,top)))))))))))
 
 (defmacro ctypecase (keyplace &rest clauses)
@@ -2684,10 +2710,11 @@
             (let ((,value ,keyplace))
               (cond
                 ,@(mapcar (lambda (clause)
-                            `((typep ,value ',(car clause)) ,@(cdr clause)))
+                            `((typep ,value ',(car clause)) ,@(or (cdr clause) '(nil))))
                           clauses)
                 (t (restart-case
-                       (error 'type-error :datum ,value :expected-type t)
+                       (error 'type-error :datum ,value
+                              :expected-type '(or ,@(mapcar #'car clauses)))
                      (store-value (v) (setf ,keyplace v) (go ,top)))))))))))
 
 ;;; ---------------------------------------------------------------------------
