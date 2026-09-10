@@ -2949,8 +2949,10 @@ fn subtypep_compound_subtypes() {
         ("(subtypep '(unsigned-byte 8) 'integer)", "(T T)"),
         ("(subtypep '(simple-array t) 'array)", "(T T)"),
         ("(subtypep 'simple-vector 'vector)", "(T T)"),
-        // A wider type is NOT a subtype of a narrower bounded one.
-        ("(subtypep 'integer '(integer 0 10))", "(NIL NIL)"),
+        // A wider type is NOT a subtype of a narrower bounded one — and with the
+        // numeric-range interval algebra this is now a DEFINITE answer (NIL T),
+        // matching ansi-test subtypep.integer.4.
+        ("(subtypep 'integer '(integer 0 10))", "(NIL T)"),
         // Different compound heads are unrelated (no false positive).
         ("(subtypep '(integer 0 10) '(vector t))", "(NIL NIL)"),
         // NIL is a subtype of everything, including bounded types.

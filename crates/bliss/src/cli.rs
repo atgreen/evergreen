@@ -9097,8 +9097,27 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "NULL" => &["SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"],
         "CONS" => &["LIST", "SEQUENCE", "T"],
         "LIST" => &["SEQUENCE", "T"],
+        "SIMPLE-BASE-STRING" => &[
+            "BASE-STRING",
+            "SIMPLE-STRING",
+            "STRING",
+            "VECTOR",
+            "ARRAY",
+            "SEQUENCE",
+            "ATOM",
+            "T",
+        ],
         "SIMPLE-STRING" | "BASE-STRING" => &["STRING", "VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
         "STRING" => &["VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
+        "SIMPLE-BIT-VECTOR" => &[
+            "BIT-VECTOR",
+            "VECTOR",
+            "ARRAY",
+            "SEQUENCE",
+            "ATOM",
+            "T",
+        ],
+        "BIT-VECTOR" => &["VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
         "SIMPLE-VECTOR" => &["VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
         "VECTOR" => &["ARRAY", "SEQUENCE", "ATOM", "T"],
         "SIMPLE-ARRAY" => &["ARRAY", "ATOM", "T"],
@@ -9213,8 +9232,702 @@ fn is_builtin_disjoint_type(name: &str) -> bool {
             | "STANDARD-OBJECT"
     )
 }
+// ── Numeric-range SUBTYPEP algebra (bliss types-and-classes) ──────────
+//
+// Real interval containment for the numeric type heads (INTEGER, RATIONAL,
+// REAL, FLOAT and its subtypes). A bounded numeric type `(head lo hi)` denotes
+// the numbers of `head` in the interval [lo,hi]; `*`/missing is unbounded and a
+// one-element list `(n)` is an exclusive bound. `(head lo hi)` ⊆ `(head2 lo2
+// hi2)` iff head is a subtype head of head2 AND the interval is contained.
+//
+// GC-safety: this whole path is allocation-free — bounds are extracted to `f64`
+// only via `num_bound_f64` (which never allocates), so no minor GC can fire and
+// no `BlissVal` needs rooting across it.
+
+/// A numeric head that admits interval bounds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumHead {
+    Integer,
+    Rational,
+    Real,
+    Float,
+    SingleF,
+    DoubleF,
+    ShortF,
+    LongF,
+}
+
+/// `sub`'s head-set ⊆ `sup`'s head-set (ignoring bounds). INTEGER ⊆ RATIONAL ⊆
+/// REAL, every FLOAT subtype ⊆ FLOAT ⊆ REAL; the four named float formats are
+/// pairwise disjoint.
+fn num_head_subtype(sub: NumHead, sup: NumHead) -> bool {
+    use NumHead::*;
+    match sup {
+        Real => true,
+        Rational => matches!(sub, Integer | Rational),
+        Integer => matches!(sub, Integer),
+        Float => matches!(sub, Float | SingleF | DoubleF | ShortF | LongF),
+        SingleF => matches!(sub, SingleF),
+        DoubleF => matches!(sub, DoubleF),
+        ShortF => matches!(sub, ShortF),
+        LongF => matches!(sub, LongF),
+    }
+}
+
+fn num_head_from_name(name: &str) -> Option<NumHead> {
+    Some(match name {
+        "INTEGER" => NumHead::Integer,
+        "RATIONAL" => NumHead::Rational,
+        "REAL" => NumHead::Real,
+        "FLOAT" => NumHead::Float,
+        "SINGLE-FLOAT" => NumHead::SingleF,
+        "DOUBLE-FLOAT" => NumHead::DoubleF,
+        "SHORT-FLOAT" => NumHead::ShortF,
+        "LONG-FLOAT" => NumHead::LongF,
+        _ => return None,
+    })
+}
+
+/// One end of a numeric interval.
+#[derive(Clone, Copy)]
+enum Bnd {
+    Star,
+    Incl(f64),
+    Excl(f64),
+}
+
+struct NumType {
+    head: NumHead,
+    lo: Bnd,
+    hi: Bnd,
+}
+
+/// Extract a numeric bound value as `f64` WITHOUT allocating (so this path can
+/// never trigger a GC). Handles fixnums, single/double floats, and ratios whose
+/// numerator and denominator are fixnums — which covers every bound the ansi
+/// numeric-subtypep tests use. Bignums / big ratios return `None`, causing the
+/// caller to fall back to "unknown" rather than risk a moving-GC bug or an
+/// inexact answer.
+fn num_bound_f64(v: BlissVal) -> Option<f64> {
+    if v.is_fixnum() {
+        return Some(v.as_fixnum() as f64);
+    }
+    if v.is_single_float() {
+        return Some(v.as_single_float() as f64);
+    }
+    if v.is_double_float() {
+        return Some(v.as_double_float());
+    }
+    if let Some((n, d)) = ratio_parts_val(v) {
+        if n.is_fixnum() && d.is_fixnum() {
+            let df = d.as_fixnum() as f64;
+            if df == 0.0 {
+                return None;
+            }
+            return Some(n.as_fixnum() as f64 / df);
+        }
+        return None;
+    }
+    None
+}
+
+/// Parse a bound argument (`*`/missing → Star, `(n)` → exclusive, `n` →
+/// inclusive). Returns `None` if the value is a non-fixnum-based number we
+/// decline to compare (bignum), so the whole relation stays "unknown".
+fn parse_num_bound(arg: Option<BlissVal>) -> Option<Bnd> {
+    match arg {
+        None => Some(Bnd::Star),
+        Some(a) => {
+            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+                return Some(Bnd::Star);
+            }
+            if a.is_cons() {
+                let (inner, _) = cp(a);
+                return Some(Bnd::Excl(num_bound_f64(inner)?));
+            }
+            Some(Bnd::Incl(num_bound_f64(a)?))
+        }
+    }
+}
+
+/// Parse a type spec into a bounded numeric type, if it names a numeric head.
+/// Accepts both the atomic form (`integer` ≡ `(integer * *)`) and the compound
+/// form (`(integer lo hi)`). Returns `None` for anything that is not a numeric
+/// range type — the caller then falls through to the general lattice logic.
+fn parse_num_type(t: BlissVal) -> Option<NumType> {
+    if t.is_cons() {
+        let elems = list_to_vec(t);
+        let head_name = symbol_bare_name(&sym_name(*elems.first()?));
+        let head = num_head_from_name(&head_name)?;
+        let lo = parse_num_bound(elems.get(1).copied())?;
+        let hi = parse_num_bound(elems.get(2).copied())?;
+        Some(NumType { head, lo, hi })
+    } else if t.is_symbol() {
+        let name = symbol_bare_name(&sym_name(t));
+        // BIT ≡ (integer 0 1) as a complete type.
+        if name == "BIT" {
+            return Some(NumType {
+                head: NumHead::Integer,
+                lo: Bnd::Incl(0.0),
+                hi: Bnd::Incl(1.0),
+            });
+        }
+        let head = num_head_from_name(&name)?;
+        Some(NumType {
+            head,
+            lo: Bnd::Star,
+            hi: Bnd::Star,
+        })
+    } else {
+        None
+    }
+}
+
+/// VALUES (atomic or compound) and the COMPOUND `(function …)` type specifier
+/// are legal for declarations but not for TYPEP; testing membership in them is
+/// an error (ansi TYPEP.ERROR.4-7). Atomic FUNCTION *is* a valid TYPEP spec.
+fn type_spec_invalid_for_typep(spec: BlissVal) -> bool {
+    let compound = spec.is_cons();
+    let head = if compound { cp(spec).0 } else { spec };
+    if !head.is_symbol() {
+        return false;
+    }
+    match symbol_bare_name(&sym_name(head)).as_str() {
+        "VALUES" => true,
+        "FUNCTION" => compound,
+        _ => false,
+    }
+}
+
+/// Is the numeric type provably empty (no numbers)? A range with lo > hi, or an
+/// exclusive endpoint that collapses the interval, is the empty type.
+fn num_type_empty(t: &NumType) -> bool {
+    let (lv, l_excl) = match t.lo {
+        Bnd::Star => return false,
+        Bnd::Incl(v) => (v, false),
+        Bnd::Excl(v) => (v, true),
+    };
+    let (hv, h_excl) = match t.hi {
+        Bnd::Star => return false,
+        Bnd::Incl(v) => (v, false),
+        Bnd::Excl(v) => (v, true),
+    };
+    if lv > hv {
+        return true;
+    }
+    // Equal endpoints: empty unless both inclusive (a single point). For INTEGER
+    // an open endpoint at equal values is likewise empty.
+    if lv == hv && (l_excl || h_excl) {
+        return true;
+    }
+    false
+}
+
+fn num_single_point(t: &NumType) -> bool {
+    matches!((t.lo, t.hi), (Bnd::Incl(a), Bnd::Incl(b)) if a == b)
+}
+
+/// Lower-bound coverage: does `sup_lo` admit every x that `sub_lo` admits?
+fn num_lower_ok(sup_lo: Bnd, sub_lo: Bnd) -> bool {
+    match sup_lo {
+        Bnd::Star => true,
+        Bnd::Incl(a) => match sub_lo {
+            Bnd::Star => false,
+            Bnd::Incl(b) | Bnd::Excl(b) => a <= b,
+        },
+        Bnd::Excl(a) => match sub_lo {
+            Bnd::Star => false,
+            Bnd::Incl(b) => a < b,
+            Bnd::Excl(b) => a <= b,
+        },
+    }
+}
+
+/// Upper-bound coverage: does `sup_hi` admit every x that `sub_hi` admits?
+fn num_upper_ok(sup_hi: Bnd, sub_hi: Bnd) -> bool {
+    match sup_hi {
+        Bnd::Star => true,
+        Bnd::Incl(a) => match sub_hi {
+            Bnd::Star => false,
+            Bnd::Incl(b) | Bnd::Excl(b) => a >= b,
+        },
+        Bnd::Excl(a) => match sub_hi {
+            Bnd::Star => false,
+            Bnd::Incl(b) => a > b,
+            Bnd::Excl(b) => a >= b,
+        },
+    }
+}
+
+/// SUBTYPEP for two numeric range types. `Some((sub, true))` is a definite
+/// answer; `None` means "not a numeric-range relationship / undecided" and the
+/// caller should fall through.
+fn numeric_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
+    let p1 = parse_num_type(t1)?;
+    // The empty type is a subtype of everything — decide this before requiring
+    // t2 to also be numeric (an empty `(integer 5 4)` ⊆ symbol is still true).
+    if num_type_empty(&p1) {
+        return Some((true, true));
+    }
+    let p2 = parse_num_type(t2)?;
+    if !num_head_subtype(p1.head, p2.head) {
+        // Heads are not in a subtype relation, so t1 generally contains values
+        // (non-integers, floats, irrationals) that t2's head excludes → not a
+        // subtype. A single integer-valued point is the one ambiguous case
+        // (e.g. `(rational 5 5)` ⊆ integer) — stay safe and say "unknown".
+        if num_single_point(&p1) {
+            return None;
+        }
+        return Some((false, true));
+    }
+    let lo_ok = num_lower_ok(p2.lo, p1.lo);
+    let hi_ok = num_upper_ok(p2.hi, p1.hi);
+    Some((lo_ok && hi_ok, true))
+}
+
+// ── Array-type SUBTYPEP algebra (bliss types-and-classes) ─────────────
+//
+// Arrays are invariant in their (upgraded) element type and have a dimension
+// specifier; `simple-array` is the simple subtype of `array`. This normalizes
+// the array/vector/string family to `(simple?, element, dims)` and decides
+// containment. It is allocation-free (no GC), like the numeric algebra above.
+//
+// bliss upgrades every element type to one of exactly three: T, CHARACTER
+// (character/base-char/…) and BIT — matching `upgraded-array-element-type`. So
+// string ≡ base-string ≡ (array character (*)) here; the ansi
+// `:nil-vectors-are-strings` tests that need base-char arrays distinct from
+// character arrays are inherently unsatisfiable under this upgrade policy.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EltU {
+    T,
+    Character,
+    Bit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Elt {
+    Star,
+    Up(EltU),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum Dims {
+    Star,
+    Rank(usize),
+    // `None` = unspecified size (`*`); `Some(n)` = fixed size n.
+    List(Vec<Option<usize>>),
+}
+
+struct ArrType {
+    simple: bool,
+    elt: Elt,
+    dims: Dims,
+}
+
+fn upgrade_elt(spec: BlissVal) -> EltU {
+    if spec.is_symbol() {
+        return match symbol_bare_name(&sym_name(spec)).as_str() {
+            "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => EltU::Character,
+            "BIT" => EltU::Bit,
+            _ => EltU::T,
+        };
+    }
+    if spec.is_cons() {
+        // (integer 0 1) / (mod 2) / (unsigned-byte 1) upgrade to BIT; other
+        // compound element types upgrade to T under bliss's policy.
+        if let Some(nt) = parse_num_type(spec) {
+            if matches!(nt.head, NumHead::Integer) {
+                if let (Bnd::Incl(lo), Bnd::Incl(hi)) = (nt.lo, nt.hi) {
+                    if lo == 0.0 && hi == 1.0 {
+                        return EltU::Bit;
+                    }
+                }
+            }
+        }
+    }
+    EltU::T
+}
+
+fn parse_elt_arg(arg: Option<BlissVal>) -> Elt {
+    match arg {
+        None => Elt::Star,
+        Some(a) => {
+            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+                Elt::Star
+            } else {
+                Elt::Up(upgrade_elt(a))
+            }
+        }
+    }
+}
+
+fn fixnum_size(v: BlissVal) -> Option<usize> {
+    if v.is_fixnum() {
+        let n = v.as_fixnum();
+        if n >= 0 {
+            return Some(n as usize);
+        }
+    }
+    None
+}
+
+/// One dimension entry: `*` → None (any size), a non-negative fixnum → Some(n).
+fn parse_dim_entry(v: BlissVal) -> Option<Option<usize>> {
+    if v.is_symbol() && symbol_bare_name(&sym_name(v)) == "*" {
+        return Some(None);
+    }
+    Some(Some(fixnum_size(v)?))
+}
+
+/// Parse an ARRAY dimension specifier (the 3rd slot of `(array elt dims)`):
+/// missing → any (Star); `*` → Star; NIL (empty list) → rank 0; a fixnum → a
+/// rank; a list → per-axis sizes. Returns None if it can't be parsed cleanly.
+fn parse_array_dims(arg: Option<BlissVal>) -> Option<Dims> {
+    match arg {
+        None => Some(Dims::Star),
+        Some(a) => {
+            if a.is_nil() {
+                return Some(Dims::List(Vec::new()));
+            }
+            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+                return Some(Dims::Star);
+            }
+            if a.is_fixnum() {
+                return Some(Dims::Rank(fixnum_size(a)?));
+            }
+            if a.is_cons() {
+                let mut v = Vec::new();
+                for e in list_to_vec(a) {
+                    v.push(parse_dim_entry(e)?);
+                }
+                return Some(Dims::List(v));
+            }
+            None
+        }
+    }
+}
+
+/// A single-dimension (vector/string) size argument: missing/`*` → any, a
+/// fixnum → that size.
+fn parse_single_dim(arg: Option<BlissVal>) -> Option<Dims> {
+    match arg {
+        None => Some(Dims::List(vec![None])),
+        Some(a) => {
+            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+                Some(Dims::List(vec![None]))
+            } else {
+                Some(Dims::List(vec![Some(fixnum_size(a)?)]))
+            }
+        }
+    }
+}
+
+/// Normalize an array/vector/string type spec (atomic or compound) into an
+/// `ArrType`, or None if it doesn't name an array-family type.
+fn parse_arr_type(t: BlissVal) -> Option<ArrType> {
+    // (head args...) or a bare symbol head.
+    let (name, args): (String, Vec<BlissVal>) = if t.is_cons() {
+        let elems = list_to_vec(t);
+        (symbol_bare_name(&sym_name(*elems.first()?)), elems[1..].to_vec())
+    } else if t.is_symbol() {
+        (symbol_bare_name(&sym_name(t)), Vec::new())
+    } else {
+        return None;
+    };
+    let a0 = args.first().copied();
+    let a1 = args.get(1).copied();
+    let mk = |simple, elt, dims| Some(ArrType { simple, elt, dims });
+    match name.as_str() {
+        "ARRAY" => mk(false, parse_elt_arg(a0), parse_array_dims(a1)?),
+        "SIMPLE-ARRAY" => mk(true, parse_elt_arg(a0), parse_array_dims(a1)?),
+        "VECTOR" => mk(false, parse_elt_arg(a0), parse_single_dim(a1)?),
+        "SIMPLE-VECTOR" => mk(true, Elt::Up(EltU::T), parse_single_dim(a0)?),
+        "BIT-VECTOR" => mk(false, Elt::Up(EltU::Bit), parse_single_dim(a0)?),
+        "SIMPLE-BIT-VECTOR" => mk(true, Elt::Up(EltU::Bit), parse_single_dim(a0)?),
+        "STRING" | "BASE-STRING" => mk(false, Elt::Up(EltU::Character), parse_single_dim(a0)?),
+        "SIMPLE-STRING" | "SIMPLE-BASE-STRING" => {
+            mk(true, Elt::Up(EltU::Character), parse_single_dim(a0)?)
+        }
+        _ => None,
+    }
+}
+
+fn arr_dims_subtype(sub: &Dims, sup: &Dims) -> bool {
+    match sup {
+        Dims::Star => true,
+        Dims::Rank(n) => match sub {
+            Dims::Star => false,
+            Dims::Rank(m) => m == n,
+            Dims::List(l) => l.len() == *n,
+        },
+        Dims::List(lb) => match sub {
+            Dims::List(la) => {
+                la.len() == lb.len()
+                    && la.iter().zip(lb.iter()).all(|(a, b)| match b {
+                        None => true,
+                        Some(s) => *a == Some(*s),
+                    })
+            }
+            // A known rank with unknown sizes is contained only when every
+            // target axis is unspecified and the ranks match.
+            Dims::Rank(m) => *m == lb.len() && lb.iter().all(|b| b.is_none()),
+            Dims::Star => false,
+        },
+    }
+}
+
+/// SUBTYPEP for two array-family types. `Some((sub, true))` is definite; None
+/// means "not an array-vs-array relationship" and the caller falls through.
+fn array_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
+    let a = parse_arr_type(t1)?;
+    let b = parse_arr_type(t2)?;
+    // simple-array is the simple subtype: if B requires simple, A must be simple.
+    let simple_ok = !b.simple || a.simple;
+    // Arrays are invariant in the upgraded element type.
+    let elt_ok = match b.elt {
+        Elt::Star => true,
+        Elt::Up(be) => matches!(a.elt, Elt::Up(ae) if ae == be),
+    };
+    let dims_ok = arr_dims_subtype(&a.dims, &b.dims);
+    Some((simple_ok && elt_ok && dims_ok, true))
+}
+
+// ── CONS-type SUBTYPEP algebra (bliss types-and-classes) ──────────────
+//
+// `(cons a d)` is the set of conses whose car ∈ a and cdr ∈ d — covariant in
+// both. A missing or `*` component is T. If either component is the empty type,
+// the whole cons type is empty (a subtype of everything).
+
+/// Is `v` (a type spec) provably the empty type? The literal NIL, or an empty
+/// numeric range.
+fn type_spec_is_empty(v: BlissVal) -> bool {
+    if v.is_nil() {
+        return true;
+    }
+    if let Some(nt) = parse_num_type(v) {
+        return num_type_empty(&nt);
+    }
+    false
+}
+
+/// Parse a cons type spec into its (car, cdr) component type specs, defaulting a
+/// missing or `*` component to T. Returns None if `t` is not a CONS type.
+fn parse_cons_type(t: BlissVal) -> Option<(BlissVal, BlissVal)> {
+    let comp = |arg: Option<BlissVal>| -> BlissVal {
+        match arg {
+            None => T,
+            Some(a) => {
+                if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+                    T
+                } else {
+                    a
+                }
+            }
+        }
+    };
+    if t.is_cons() {
+        let elems = list_to_vec(t);
+        if symbol_bare_name(&sym_name(*elems.first()?)) != "CONS" {
+            return None;
+        }
+        Some((comp(elems.get(1).copied()), comp(elems.get(2).copied())))
+    } else if t.is_symbol() && symbol_bare_name(&sym_name(t)) == "CONS" {
+        Some((T, T))
+    } else {
+        None
+    }
+}
+
+fn cons_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
+    let (car1, cdr1) = parse_cons_type(t1)?;
+    // An empty component makes the whole cons type empty → subtype of anything.
+    if type_spec_is_empty(car1) || type_spec_is_empty(cdr1) {
+        return Some((true, true));
+    }
+    let (car2, cdr2) = parse_cons_type(t2)?;
+    // Covariant: (cons a d) ⊆ (cons c e) iff a ⊆ c and d ⊆ e. Root the
+    // component specs across the recursive relation calls, which may allocate
+    // when they reach CLOS class lookups (moving GC).
+    bliss_rt::rooted!(car1 = car1);
+    bliss_rt::rooted!(cdr1 = cdr1);
+    bliss_rt::rooted!(car2 = car2);
+    bliss_rt::rooted!(cdr2 = cdr2);
+    let (sa, va) = subtypep_relation(*car1, *car2);
+    let (sd, vd) = subtypep_relation(*cdr1, *cdr2);
+    if sa && va && sd && vd {
+        return Some((true, true));
+    }
+    // A component that is certainly NOT a subtype makes the whole relation a
+    // definite non-subtype (the cons type is non-empty, checked above).
+    if (va && !sa) || (vd && !sd) {
+        return Some((false, true));
+    }
+    Some((false, false))
+}
+
+// ── MEMBER / EQL and NOT SUBTYPEP (bliss types-and-classes) ───────────
+
+/// The elements of a `(member ...)` / `(eql x)` type, or None if not one.
+fn parse_member_type(t: BlissVal) -> Option<Vec<BlissVal>> {
+    if !t.is_cons() {
+        return None;
+    }
+    let elems = list_to_vec(t);
+    match symbol_bare_name(&sym_name(*elems.first()?)).as_str() {
+        "MEMBER" => Some(elems[1..].to_vec()),
+        "EQL" if elems.len() == 2 => Some(vec![elems[1]]),
+        _ => None,
+    }
+}
+
+/// The negated type of a `(not X)` spec, or None.
+fn parse_not_type(t: BlissVal) -> Option<BlissVal> {
+    if !t.is_cons() {
+        return None;
+    }
+    let elems = list_to_vec(t);
+    if elems.len() == 2 && symbol_bare_name(&sym_name(elems[0])) == "NOT" {
+        return Some(elems[1]);
+    }
+    None
+}
+
+/// SUBTYPEP for two MEMBER/EQL types: `(member x…)` ⊆ `(member y…)` iff every x
+/// is EQL to some y. An empty member type is the empty type.
+fn member_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
+    let e1 = parse_member_type(t1)?;
+    if e1.is_empty() {
+        return Some((true, true));
+    }
+    let e2 = parse_member_type(t2)?;
+    // Root both element vectors across eql_values, which may allocate (bignum
+    // comparison) and thus move nursery objects (moving GC).
+    bliss_rt::rooted!(e1 = e1);
+    bliss_rt::rooted!(e2 = e2);
+    let (n1, n2) = ((*e1).len(), (*e2).len());
+    for i in 0..n1 {
+        let mut found = false;
+        for j in 0..n2 {
+            if eql_values((*e1)[i], (*e2)[j]) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Some((false, true));
+        }
+    }
+    Some((true, true))
+}
+
+// ── COMPLEX-type SUBTYPEP (bliss types-and-classes) ───────────────────
+
+/// The head name of a type spec (atomic symbol, or the head of a compound).
+fn type_head_name(t: BlissVal) -> Option<String> {
+    if t.is_cons() {
+        Some(symbol_bare_name(&sym_name(cp(t).0)))
+    } else if t.is_symbol() {
+        Some(symbol_bare_name(&sym_name(t)))
+    } else {
+        None
+    }
+}
+
+fn is_complex_type(t: BlissVal) -> bool {
+    type_head_name(t).as_deref() == Some("COMPLEX")
+}
+
+/// A real (non-complex) numeric type spec: the whole numeric-range family plus
+/// the integer-subrange shorthands. COMPLEX is disjoint from all of these.
+fn is_real_numeric_type(t: BlissVal) -> bool {
+    matches!(
+        type_head_name(t).as_deref(),
+        Some(
+            "INTEGER"
+                | "RATIONAL"
+                | "REAL"
+                | "FLOAT"
+                | "SINGLE-FLOAT"
+                | "DOUBLE-FLOAT"
+                | "SHORT-FLOAT"
+                | "LONG-FLOAT"
+                | "FIXNUM"
+                | "BIGNUM"
+                | "BIT"
+                | "RATIO"
+                | "MOD"
+                | "UNSIGNED-BYTE"
+                | "SIGNED-BYTE"
+        )
+    )
+}
+
+/// The element-type name of a `(complex elt)` spec, or None for `*`/absent.
+fn complex_elt_name(t: BlissVal) -> Option<String> {
+    if !t.is_cons() {
+        return None;
+    }
+    let elems = list_to_vec(t);
+    let e = elems.get(1).copied()?;
+    if e.is_symbol() && symbol_bare_name(&sym_name(e)) == "*" {
+        return None;
+    }
+    Some(symbol_bare_name(&sym_name(if e.is_cons() { cp(e).0 } else { e })))
+}
+
+fn complex_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
+    let c1 = is_complex_type(t1);
+    let c2 = is_complex_type(t2);
+    if c1 && c2 {
+        // `(complex e1)` ⊆ `(complex e2)`. `(complex *)` (any element) as the
+        // supertype always contains it. Equal concrete element specs are also a
+        // subtype. Mixed concrete elements need upgrading rules we don't model —
+        // leave undetermined.
+        match complex_elt_name(t2) {
+            None => Some((true, true)),
+            Some(e2) => match complex_elt_name(t1) {
+                Some(e1) if e1 == e2 => Some((true, true)),
+                _ => Some((false, false)),
+            },
+        }
+    } else if (c1 && is_real_numeric_type(t2)) || (c2 && is_real_numeric_type(t1)) {
+        // COMPLEX is provably disjoint from every real numeric type.
+        Some((false, true))
+    } else {
+        None
+    }
+}
 
 fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
+    // `(not A) ⊆ (not B)` ⟺ `B ⊆ A` (contrapositive) — exact and definite.
+    if let (Some(a), Some(b)) = (parse_not_type(t1), parse_not_type(t2)) {
+        bliss_rt::rooted!(a = a);
+        bliss_rt::rooted!(b = b);
+        return subtypep_relation(*b, *a);
+    }
+    // Numeric range algebra first: bounded/atomic INTEGER, RATIONAL, REAL, FLOAT
+    // (and float subtypes) get exact interval containment. Returns None for any
+    // non-numeric relationship, so the general lattice logic below still runs.
+    if let Some(res) = numeric_subtypep(t1, t2) {
+        return res;
+    }
+    // Array/vector/string interval-and-element algebra.
+    if let Some(res) = array_subtypep(t1, t2) {
+        return res;
+    }
+    // CONS type covariance.
+    if let Some(res) = cons_subtypep(t1, t2) {
+        return res;
+    }
+    // MEMBER / EQL set containment.
+    if let Some(res) = member_subtypep(t1, t2) {
+        return res;
+    }
+    // COMPLEX element covariance and real-vs-complex disjointness.
+    if let Some(res) = complex_subtypep(t1, t2) {
+        return res;
+    }
     // A compound (parameterized/bounded) SUBTYPE narrows its head type, so it is
     // a subtype of whatever its head type is a subtype of: (integer 0 10) ⊆
     // integer/number, (vector t 3) ⊆ vector, (string 5) ⊆ string, (mod 5) ⊆
@@ -9235,12 +9948,12 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
             }
             return (false, false);
         }
-        // Both compound: a same-head parameterized type is treated as a subtype
-        // (e.g. (integer 0 10) ⊆ (integer 0 20)); different heads are unrelated.
-        let (h2, _) = cp(t2);
-        if symbol_bare_name(&sym_name(h2)) == hname {
-            return (true, true);
-        }
+        // Both compound. The covariant/parameterized heads that CAN be decided
+        // by a same-head shortcut (INTEGER/REAL/…, ARRAY/VECTOR/…, CONS, MEMBER,
+        // EQL) are handled by the dedicated algebras above. For any other head
+        // (combinators like AND/OR/NOT, plus COMPLEX/FUNCTION/VALUES/SATISFIES),
+        // a matching head does NOT imply a subtype relation, so we must not
+        // claim one — leave it undetermined.
         return (false, false);
     }
     let n1 = symbol_bare_name(&sym_name(t1));
@@ -12842,10 +13555,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "TYPEP" => {
+                // (typep object type &optional environment): 2 or 3 args, else a
+                // PROGRAM-ERROR (ansi TYPEP.ERROR.1/2/3).
+                let n = form_arg_count(cdr);
+                if !(2..=3).contains(&n) {
+                    return Err(BlissError::ProgramError(format!(
+                        "TYPEP requires 2 or 3 arguments, got {n}"
+                    )));
+                }
                 let (obj_form, r) = cp(cdr);
                 bliss_rt::rooted!(type_form = cp(r).0);
                 bliss_rt::rooted!(obj = eval_form(obj_form, env)?);
                 let raw_type_spec = eval_form(*type_form, env)?;
+                // VALUES and FUNCTION type specifiers are not valid for TYPEP —
+                // signal an error rather than silently returning NIL (ansi
+                // TYPEP.ERROR.4-7).
+                if type_spec_invalid_for_typep(raw_type_spec) {
+                    return Err(BlissError::ProgramError(
+                        "TYPEP: VALUES and FUNCTION type specifiers are not valid here".into(),
+                    ));
+                }
                 let matches = typep_matches(env, *obj, raw_type_spec)?;
                 return Ok(if matches { T } else { NIL });
             }
@@ -15329,21 +16058,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "COERCE" => {
+                // (coerce object result-type): exactly two arguments, or a
+                // PROGRAM-ERROR (CLHS — ansi COERCE.ERROR.6/7/8).
+                let (val_form, rest) = cp(cdr);
+                let (type_form, rest2) = cp(rest);
+                if !cdr.is_cons() || !rest.is_cons() || rest2.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "COERCE requires exactly two arguments".into(),
+                    ));
+                }
                 // Root the value and pending type form across the second eval
                 // (moving GC; bliss-4bp).
-                let (val_form, rest) = cp(cdr);
-                let (type_form, _) = cp(rest);
                 bliss_rt::rooted!(type_form = type_form);
                 bliss_rt::rooted!(value = eval_form(val_form, env)?);
                 let type_val = eval_form(*type_form, env)?;
                 // COERCE to FUNCTION: a symbol coerces to the function it NAMES
                 // (fdefinition), not the symbol itself, so the result is FUNCTIONP
-                // (bliss-v304). An already-callable value passes through.
+                // (bliss-v304). A lambda expression `(lambda …)` coerces to the
+                // function it denotes. An already-callable value passes through.
                 if type_val.is_symbol()
                     && symbol_bare_name(&sym_name(type_val)) == "FUNCTION"
                 {
                     if is_function_value(*value) {
                         return Ok(*value);
+                    }
+                    if value.is_cons()
+                        && symbol_bare_name(&sym_name(cp(*value).0)) == "LAMBDA"
+                    {
+                        // Evaluate #'(lambda …) to build the closure.
+                        bliss_rt::rooted!(fn_form = {
+                            let f = resolve_sym("FUNCTION").unwrap_or(NIL);
+                            vec_to_list(&[f, *value])
+                        });
+                        return eval_form(*fn_form, env);
                     }
                     if let Some(f) = symbol_function_object(env, *value) {
                         return Ok(f);
@@ -16676,7 +17423,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 );
             }
             "SUBTYPEP" => {
-                // (subtypep type1 type2) → two values: subtype-p and certain-p.
+                // (subtypep type1 type2 &optional environment) → two values:
+                // subtype-p and certain-p. 2 or 3 args, else a PROGRAM-ERROR
+                // (ansi SUBTYPEP.ERROR.1/2/3). The optional environment is
+                // accepted and ignored (ansi SUBTYPE.ENV.1/2).
+                let n = form_arg_count(cdr);
+                if !(2..=3).contains(&n) {
+                    return Err(BlissError::ProgramError(format!(
+                        "SUBTYPEP requires 2 or 3 arguments, got {n}"
+                    )));
+                }
                 let (t1_form, rest) = cp(cdr);
                 let (t2_form, _) = cp(rest);
                 // Root across later evals/resolutions: type specs are often
@@ -18734,6 +19490,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "TYPE-OF" => {
+                // (type-of object): exactly one argument, else a PROGRAM-ERROR
+                // (ansi TYPE-OF.ERROR.1/2).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "TYPE-OF requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 // CLOS instances: TYPE-OF returns the direct class name, not the
@@ -22561,6 +23325,26 @@ fn require_coerce_type(
     }
 }
 
+/// When COERCE's result type fixes an array/vector length (e.g. `(vector * 2)`),
+/// the source sequence must be exactly that long or COERCE signals a TYPE-ERROR
+/// (ansi COERCE.ERROR.2/3). A `*` or absent size imposes no constraint.
+fn coerce_check_array_length(type_val: BlissVal, len: usize) -> Result<(), BlissError> {
+    if let Some(at) = parse_arr_type(type_val) {
+        if let Dims::List(dl) = &at.dims {
+            if !dl.is_empty() && dl.iter().all(|d| d.is_some()) {
+                let total: usize = dl.iter().map(|d| d.unwrap()).product();
+                if total != len {
+                    return Err(BlissError::TypeError {
+                        datum: type_val,
+                        expected: "sequence of the specified length".into(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissError> {
     // Reduce the type spec to a bare head-symbol name.
     let head = if type_val.is_cons() {
@@ -22571,9 +23355,33 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
     if head.is_nil() {
         return Ok(value);
     }
-    let tname = symbol_bare_name(&sym_name(head));
+    // The head may be a class metaobject — e.g. `(coerce x (find-class 'vector))`
+    // (ansi COERCE.11). Recover its name symbol so the name-based dispatch below
+    // works uniformly with symbol type specs.
+    let tname = if head.is_symbol() {
+        symbol_bare_name(&sym_name(head))
+    } else {
+        let cn = bliss_stdlib::class_name(head);
+        if cn.is_nil() {
+            String::new()
+        } else {
+            symbol_bare_name(&sym_name(cn))
+        }
+    };
     match tname.as_str() {
         "T" => Ok(value),
+        // A cons is not built from a sequence; COERCE to CONS only accepts an
+        // existing cons, else a TYPE-ERROR (ansi COERCE.ERROR.4/9).
+        "CONS" => {
+            if value.is_cons() {
+                Ok(value)
+            } else {
+                Err(BlissError::TypeError {
+                    datum: value,
+                    expected: "cons".into(),
+                })
+            }
+        }
         "LIST" => {
             if value.is_cons() || value.is_nil() {
                 Ok(value)
@@ -22581,8 +23389,44 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
                 Ok(vec_to_list(&seq_elements(value)?))
             }
         }
+        "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => {
+            let elems = seq_elements(value)?;
+            coerce_check_array_length(type_val, elems.len())?;
+            let mut bits = Vec::with_capacity(elems.len());
+            for e in &elems {
+                match e.is_fixnum().then(|| e.as_fixnum()) {
+                    Some(0) => bits.push(0u8),
+                    Some(1) => bits.push(1u8),
+                    _ => {
+                        return Err(BlissError::TypeError {
+                            datum: *e,
+                            expected: "bit".into(),
+                        })
+                    }
+                }
+            }
+            Ok(bliss_compiler::reader::make_bit_vector(&bits))
+        }
         "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
-            Ok(bliss_stdlib::build_simple_vector(&seq_elements(value)?))
+            let elems = seq_elements(value)?;
+            coerce_check_array_length(type_val, elems.len())?;
+            Ok(bliss_stdlib::build_simple_vector(&elems))
+        }
+        // COMPLEX: an already-complex value passes through; a real coerces to a
+        // complex with a zero imaginary part (float parts stay uncanonicalised,
+        // so `(coerce 1.0 'complex)` → #C(1.0 0.0), ansi COERCE.20). A rational
+        // stays itself (#C(r 0) ≡ r). Non-numbers type-error.
+        "COMPLEX" => {
+            if bliss_rt::types::complexp(value) {
+                Ok(value)
+            } else if is_real_number(value) {
+                make_complex(value, BlissVal::from_fixnum(0))
+            } else {
+                Err(BlissError::TypeError {
+                    datum: value,
+                    expected: "number".into(),
+                })
+            }
         }
         "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
             if bliss_stdlib::registered_string(value).is_some() {
