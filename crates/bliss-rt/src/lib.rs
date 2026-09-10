@@ -12,6 +12,7 @@ pub mod bytecode;
 /// Portable fiber context switch (no libc ucontext) — bliss-bca.5.
 pub mod context;
 pub mod function;
+pub mod fxhash;
 pub mod object;
 pub mod packages;
 pub mod symbols;

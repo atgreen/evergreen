@@ -29,6 +29,7 @@ use crate::error::BlissError;
 use crate::lock_order::{LockLevel, OrderedRwLock};
 use crate::object::{ObjectHeader, SymbolData, type_id};
 use crate::value::{BlissVal, NIL, UNBOUND};
+use crate::fxhash::FxBuildHasher;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -53,8 +54,12 @@ fn header_size() -> usize {
 /// the program handles the symbol via `from_symbol_index(idx)` instead.
 struct SymbolRegistry {
     interned: Vec<BlissVal>,
-    uninterned: HashMap<u32, BlissVal>,
-    name_to_index: HashMap<String, u32>,
+    uninterned: HashMap<u32, BlissVal, FxBuildHasher>,
+    // name_to_index is the symbol interner's hot map: every symbol read/interned
+    // (thousands during a library load) hashes its name here. SipHash over the
+    // name bytes + grow-by-rehash dominated large loads; use FxHash + a generous
+    // pre-size to avoid both (bliss-pohq).
+    name_to_index: HashMap<String, u32, FxBuildHasher>,
     /// Reverse of `name_to_index`: the exact key an interned symbol was created
     /// under, indexed by symbol index. The key uniquely identifies the symbol
     /// (package-qualified where needed), so `intern(index_to_key[i])` round-trips
@@ -124,8 +129,10 @@ fn with_registry_mut<R>(f: impl FnOnce(&mut SymbolRegistry) -> R) -> R {
     let mut guard = REGISTRY.write().expect("symbol registry poisoned");
     let reg = guard.get_or_insert_with(|| SymbolRegistry {
         interned: Vec::new(),
-        uninterned: HashMap::new(),
-        name_to_index: HashMap::new(),
+        uninterned: HashMap::default(),
+        // Pre-size to the rough symbol count of a self-hosting load (asdf +
+        // libraries) so the interner never rehashes during a load (bliss-pohq).
+        name_to_index: HashMap::with_capacity_and_hasher(16384, FxBuildHasher::default()),
         index_to_key: Vec::new(),
     });
     f(reg)
@@ -511,7 +518,8 @@ pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
         interned.push(remap(raw));
     }
     let n_un = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
-    let mut uninterned: HashMap<u32, BlissVal> = HashMap::with_capacity(n_un);
+    let mut uninterned: HashMap<u32, BlissVal, FxBuildHasher> =
+        HashMap::with_capacity_and_hasher(n_un, FxBuildHasher::default());
     for _ in 0..n_un {
         let idx = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
         let raw = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
@@ -528,7 +536,8 @@ pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
 
     // Re-pin BEFORE taking the registry write lock (lock ordering: the heap
     // lock is below the registry lock).
-    let mut name_to_index: HashMap<String, u32> = HashMap::with_capacity(interned.len());
+    let mut name_to_index: HashMap<String, u32, FxBuildHasher> =
+        HashMap::with_capacity_and_hasher(interned.len(), FxBuildHasher::default());
     let mut index_to_key: Vec<String> = Vec::with_capacity(interned.len());
     for (i, &obj) in interned.iter().enumerate() {
         // Only re-pin an entry that remaps to a genuine SYMBOL object in the

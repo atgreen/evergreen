@@ -1158,14 +1158,20 @@ impl GrayStream for StreamMutableState {
 
 // ── String allocation ─────────────────────────────────────────────
 
-fn string_intern_table() -> &'static OrderedMutex<HashMap<Vec<u8>, BlissVal>> {
-    static TABLE: OnceLock<OrderedMutex<HashMap<Vec<u8>, BlissVal>>> = OnceLock::new();
+// The interned-string table is a main-thread hot map during a large load: every
+// make_lisp_string hashes its bytes here, and SipHash over the byte-string keys
+// plus grow-by-rehash was a large share of babel load (bliss-pohq). Use FxHash +
+// a generous pre-size so it neither SipHashes nor rehashes during a load.
+type InternTable = HashMap<Vec<u8>, BlissVal, bliss_rt::fxhash::FxBuildHasher>;
+
+fn string_intern_table() -> &'static OrderedMutex<InternTable> {
+    static TABLE: OnceLock<OrderedMutex<InternTable>> = OnceLock::new();
     TABLE.get_or_init(|| {
         OrderedMutex::new(
             LockLevel::InternedString,
             1,
             "interned string table",
-            HashMap::new(),
+            InternTable::with_capacity_and_hasher(16384, Default::default()),
         )
     })
 }
