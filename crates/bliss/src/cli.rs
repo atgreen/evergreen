@@ -11446,6 +11446,25 @@ fn cp(val: BlissVal) -> (BlissVal, BlissVal) {
     }
 }
 
+/// Return the single unevaluated argument form of `cdr`, or a catchable
+/// PROGRAM-ERROR when the call site does not supply exactly one argument. Used
+/// by one-argument builtins so a wrong arg count is a signalable CL error
+/// (ANSI PROGRAM-ERROR) rather than a silently-ignored extra arg or a panic.
+fn expect_one_arg(cdr: BlissVal, who: &str) -> Result<BlissVal, BlissError> {
+    if !cdr.is_cons() {
+        return Err(BlissError::ProgramError(format!(
+            "{who} requires exactly one argument"
+        )));
+    }
+    let (a, rest) = cp(cdr);
+    if rest.is_cons() {
+        return Err(BlissError::ProgramError(format!(
+            "{who} takes only one argument"
+        )));
+    }
+    Ok(a)
+}
+
 /// A TAGBODY tag is a symbol or an integer. Return its canonical string key,
 /// or None if the form is a statement (a cons or other non-tag object).
 fn tag_key(form: BlissVal) -> Option<String> {
@@ -13462,12 +13481,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "NUMBERP" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, "NUMBERP")?;
                 let v = eval_form(af, env)?;
                 return Ok(if is_number_value(v) { T } else { NIL });
             }
             "COMPLEXP" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, "COMPLEXP")?;
                 let v = eval_form(af, env)?;
                 return Ok(if bliss_rt::types::complexp(v) { T } else { NIL });
             }
@@ -13476,7 +13495,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // type — an integer 0 for a rational, 0.0 for a float) (CLHS).
             "REALPART" | "IMAGPART" => {
                 let want_real = name == "REALPART";
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
                 if let Some(rp) = bliss_rt::types::complex_realpart(v) {
                     return Ok(if want_real {
@@ -13516,7 +13535,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             // (RATIONAL x) / (RATIONALIZE x) — float → exact rational (bliss-k0jg).
             "RATIONAL" | "RATIONALIZE" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
                 return if name == "RATIONAL" {
                     cl_rational(v)
@@ -13995,7 +14014,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // Ordering-based eval_cmp when a complex operand is present.
                 let vals = eval_args(cdr, env)?;
                 if vals.is_empty() {
-                    return Err(BlissError::Internal(
+                    return Err(BlissError::ProgramError(
                         "= requires at least one argument".into(),
                     ));
                 }
@@ -17198,7 +17217,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(arena_str(&format_val_env(v, env, true)));
             }
             "1+" | "1-" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
                 // Delegate to the shared numeric tower so bignum/ratio/complex
                 // operands work (a fixnum-only path rejected them; bliss-05hy).
@@ -17209,7 +17228,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return sub_vals(&[v, one]);
             }
             "ZEROP" | "PLUSP" | "MINUSP" => {
-                let (af, _) = cp(cdr);
+                let (af, rest) = cp(cdr);
+                if !cdr.is_cons() || rest.is_cons() {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires exactly one argument"
+                    )));
+                }
                 let n = num_val(eval_form(af, env)?)?;
                 let result = match name.as_str() {
                     "ZEROP" => n == 0.0,
@@ -17219,7 +17243,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if result { T } else { NIL });
             }
             "EVENP" | "ODDP" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
                 // Parity must be exact: a bignum via f64 (num_val as i64)
                 // overflows and gives the wrong bit (bliss-05hy).
@@ -17237,7 +17261,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if even == (name == "EVENP") { T } else { NIL });
             }
             "ABS" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, "ABS")?;
                 let v = eval_form(af, env)?;
                 if v.is_fixnum() {
                     return Ok(BlissVal::from_fixnum(v.as_fixnum().abs()));
@@ -17273,7 +17297,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // stores numerator@8 / denominator@16 (RatioData) (bliss-apr).
             "NUMERATOR" | "DENOMINATOR" => {
                 let want_num = name == "NUMERATOR";
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
                 if bliss_rt::types::integerp(v) {
                     return Ok(if want_num { v } else { BlissVal::from_fixnum(1) });
@@ -17293,6 +17317,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // float prototype, the prototype's format. bliss floats are single;
             // route through num_val (bliss-apr).
             "FLOAT" => {
+                if !cdr.is_cons() || cp(cp(cdr).1).1.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "FLOAT takes one or two arguments".into(),
+                    ));
+                }
                 let (af, rest) = cp(cdr);
                 bliss_rt::rooted!(rest = rest);
                 bliss_rt::rooted!(v = eval_form(af, env)?);
@@ -17381,29 +17410,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "TRUNCATE" => {
                 let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(BlissError::Internal("TRUNCATE requires an argument".into()));
+                if args.is_empty() || args.len() > 2 {
+                    return Err(BlissError::ProgramError(
+                        "TRUNCATE takes one or two arguments".into(),
+                    ));
                 }
                 return eval_int_div(args[0], args.get(1).copied(), RoundMode::Truncate, env);
             }
             "CEILING" => {
                 let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(BlissError::Internal("CEILING requires an argument".into()));
+                if args.is_empty() || args.len() > 2 {
+                    return Err(BlissError::ProgramError(
+                        "CEILING takes one or two arguments".into(),
+                    ));
                 }
                 return eval_int_div(args[0], args.get(1).copied(), RoundMode::Ceiling, env);
             }
             "ROUND" => {
                 let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(BlissError::Internal("ROUND requires an argument".into()));
+                if args.is_empty() || args.len() > 2 {
+                    return Err(BlissError::ProgramError(
+                        "ROUND takes one or two arguments".into(),
+                    ));
                 }
                 return eval_int_div(args[0], args.get(1).copied(), RoundMode::Round, env);
             }
             "EXPT" => {
                 let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(BlissError::Internal("EXPT requires two arguments".into()));
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(
+                        "EXPT requires exactly two arguments".into(),
+                    ));
                 }
                 let a = args[0];
                 let b = args[1];
@@ -17428,6 +17465,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if bliss_rt::types::complexp(a) && b.is_fixnum() {
                     let e = b.as_fixnum();
                     if e == 0 {
+                        // (expt z 0) = 1, coerced to z's contagious float format:
+                        // a float complex yields #c(1.0 0.0) (CLHS type rules),
+                        // a rational complex the exact integer 1.
+                        let rp = bliss_rt::types::complex_realpart(a).unwrap_or(a);
+                        let ip = bliss_rt::types::complex_imagpart(a).unwrap_or(NIL);
+                        let kind = widen_float(real_float_kind(rp), real_float_kind(ip));
+                        if kind != FloatKind::None {
+                            bliss_rt::rooted!(one = box_float(1.0, kind));
+                            let zero = box_float(0.0, kind);
+                            return make_complex(*one, zero);
+                        }
                         return Ok(BlissVal::from_fixnum(1));
                     }
                     bliss_rt::rooted!(factors = vec![a; e.unsigned_abs() as usize]);
@@ -17452,7 +17500,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(box_float(av.powf(bv), kind));
             }
             "SQRT" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, "SQRT")?;
                 let v = eval_form(af, env)?;
                 // Complex argument → principal complex square root (bliss-k0jg
                 // follow-up): sqrt(a+bi) = √((r+a)/2) + sign(b)·√((r−a)/2)·i.
@@ -17527,8 +17575,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "INTEGER-DECODE-FLOAT" => {
                 // => (values mantissa exponent sign): f = mantissa·2^exponent·sign.
                 let (af, _) = cp(cdr);
-                let f = num_val(eval_form(af, env)?)? as f32;
-                let (sign, mantissa, exp) = decode_f32(f);
+                let v = eval_form(af, env)?;
+                let (sign, mantissa, exp) = if v.is_double_float() {
+                    decode_f64(v.as_double_float())
+                } else {
+                    decode_f32(num_val(v)? as f32)
+                };
                 env.set_mv(vec![
                     BlissVal::from_fixnum(mantissa as i64),
                     BlissVal::from_fixnum(exp as i64),
@@ -17539,28 +17591,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "DECODE-FLOAT" => {
                 // => (values significand exponent sign), significand in [1/2, 1).
                 let (af, _) = cp(cdr);
-                let f = num_val(eval_form(af, env)?)? as f32;
-                let (sign, mantissa, exp) = decode_f32(f);
+                let v = eval_form(af, env)?;
+                let is_double = v.is_double_float();
+                let (sign, mantissa, exp) = if is_double {
+                    decode_f64(v.as_double_float())
+                } else {
+                    decode_f32(num_val(v)? as f32)
+                };
                 let (significand, exponent) = if mantissa == 0 {
-                    (0.0f32, 0i32)
+                    (0.0f64, 0i32)
                 } else {
                     // value = mantissa·2^exp; put the significand in [1/2,1):
                     // significand = mantissa·2^(exp - E), where E makes it so.
                     let bits = (64 - mantissa.leading_zeros()) as i32; // bit length
                     let exponent = exp + bits;
-                    let significand = mantissa as f32 * 2f32.powi(exp - exponent);
+                    let significand = mantissa as f64 * 2f64.powi(exp - exponent);
                     (significand, exponent)
                 };
+                let kind = if is_double { FloatKind::Double } else { FloatKind::Single };
                 env.set_mv(vec![
-                    BlissVal::from_single_float(significand),
+                    box_float(significand, kind),
                     BlissVal::from_fixnum(exponent as i64),
-                    BlissVal::from_single_float(sign as f32),
+                    box_float(sign as f64, kind),
                 ]);
-                return Ok(BlissVal::from_single_float(significand));
+                return Ok(box_float(significand, kind));
             }
             "EXP" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "SINH" | "COSH" | "TANH"
             | "ASINH" | "ACOSH" | "ATANH" => {
-                let (af, _) = cp(cdr);
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
                 let x = num_val(v)?;
                 let r = match name.as_str() {
@@ -17582,6 +17640,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             // (ATAN y) = arctangent; (ATAN y x) = phase of x+yi (atan2).
             "ATAN" => {
+                if !cdr.is_cons() || cp(cp(cdr).1).1.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "ATAN takes one or two arguments".into(),
+                    ));
+                }
                 let (yf, r) = cp(cdr);
                 bliss_rt::rooted!(yv = eval_form(yf, env)?);
                 let y = num_val(*yv)?;
@@ -17596,6 +17659,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // (LOG x) = natural log; (LOG x base) = log_base(x) = ln x / ln base.
             // A negative real has a complex log ln|x| + iπ (matches SQRT).
             "LOG" => {
+                if !cdr.is_cons() || cp(cp(cdr).1).1.is_cons() {
+                    return Err(BlissError::ProgramError(
+                        "LOG takes one or two arguments".into(),
+                    ));
+                }
                 let (xf, r) = cp(cdr);
                 bliss_rt::rooted!(xv = eval_form(xf, env)?);
                 if r.is_cons() {
@@ -17659,6 +17727,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // 53 random mantissa bits give a uniform unit double in [0,1).
                     let unit = (next_random_u64() >> 11) as f64 / (1u64 << 53) as f64;
                     return Ok(bliss_rt::gc::alloc_double_float(unit * bound));
+                }
+                // Bignum limit: draw a random magnitude with the same limb count
+                // and reduce modulo the limit for a value in [0, limit).
+                if let Some(b) = bigint_from_val(limit) {
+                    if b.sign <= 0 {
+                        return Err(BlissError::ProgramError(
+                            "RANDOM limit must be a positive number".into(),
+                        ));
+                    }
+                    let mut limbs = Vec::with_capacity(b.mag.len());
+                    for _ in 0..b.mag.len() {
+                        limbs.push(next_random_u64());
+                    }
+                    let r = BigInt::from_mag(1, limbs);
+                    let (_, rem) = big_divmod(&r, &b);
+                    return Ok(rem.to_val());
                 }
                 return Err(BlissError::TypeError {
                     datum: limit,
@@ -23012,6 +23096,40 @@ fn decode_f32(f: f32) -> (i32, u64, i32) {
     }
 }
 
+/// Decompose a double-float into `(sign, mantissa, exponent)` with
+/// value = sign · mantissa · 2^exponent (mantissa a non-negative integer) — the
+/// core of INTEGER-DECODE-FLOAT / DECODE-FLOAT for binary64.
+fn decode_f64(f: f64) -> (i32, u64, i32) {
+    if f == 0.0 {
+        return (if f.is_sign_negative() { -1 } else { 1 }, 0, 0);
+    }
+    let bits = f.to_bits();
+    let sign = if bits >> 63 == 1 { -1 } else { 1 };
+    let exp_field = ((bits >> 52) & 0x7FF) as i32;
+    let mant_field = bits & 0xF_FFFF_FFFF_FFFF;
+    if exp_field == 0 {
+        (sign, mant_field, -1074) // subnormal
+    } else {
+        (sign, mant_field | 0x10_0000_0000_0000, exp_field - 1023 - 52)
+    }
+}
+
+/// The EXACT value of a double-float as a reduced rational (`mantissa · 2^e`),
+/// per IEEE-754 binary64 decoding. Zero maps to 0.
+fn f64_to_bigrat(f: f64) -> BigRat {
+    if f == 0.0 {
+        return BigRat::from_i64(0);
+    }
+    let (sign, mant, e) = decode_f64(f);
+    // mantissa ≤ 2^53 fits an i64; carry the sign into the numerator.
+    let m = BigInt::from_i64(sign as i64 * mant as i64);
+    if e >= 0 {
+        BigRat::from_bigint(big_mul(&m, &pow2_bigint(e as u32)))
+    } else {
+        BigRat::new(m, pow2_bigint((-e) as u32))
+    }
+}
+
 /// The EXACT value of a single-float as a reduced rational (`mantissa · 2^e`),
 /// per IEEE-754 binary32 decoding. Zero maps to 0.
 fn f32_to_bigrat(f: f32) -> BigRat {
@@ -23068,11 +23186,30 @@ fn simplest_between(lo: &BigRat, hi: &BigRat) -> BigRat {
     }
 }
 
+/// The exact rational value of a finite real (`fixnum`/`bignum`/`ratio` as
+/// itself; a float via its IEEE decoding). Caller must ensure a float operand
+/// is finite. Used by exact rational-vs-float comparison (CLHS 12.1.4.1).
+fn real_to_exact_bigrat(v: BlissVal) -> Result<BigRat, BlissError> {
+    if v.is_single_float() {
+        return Ok(f32_to_bigrat(v.as_single_float()));
+    }
+    if v.is_double_float() {
+        return Ok(f64_to_bigrat(v.as_double_float()));
+    }
+    as_bigrat(v).ok_or(BlissError::TypeError {
+        datum: v,
+        expected: "real".into(),
+    })
+}
+
 /// CL `RATIONAL`: the exact rational equal to a float's value; a rational (or
 /// integer) is returned reduced unchanged.
 fn cl_rational(v: BlissVal) -> Result<BlissVal, BlissError> {
     if v.is_single_float() {
         return Ok(f32_to_bigrat(v.as_single_float()).to_val());
+    }
+    if v.is_double_float() {
+        return Ok(f64_to_bigrat(v.as_double_float()).to_val());
     }
     if let Some(r) = as_bigrat(v) {
         return Ok(r.to_val());
@@ -23100,6 +23237,28 @@ fn cl_rationalize(v: BlissVal) -> Result<BlissVal, BlissError> {
         let x = f32_to_bigrat(af);
         let lower = f32_to_bigrat(f32::from_bits(bits - 1));
         let upper = f32_to_bigrat(f32::from_bits(bits + 1));
+        let two = BigRat::from_i64(2);
+        let lo = bigrat_div(&bigrat_add(&x, &lower), &two);
+        let hi = bigrat_div(&bigrat_add(&x, &upper), &two);
+        let mut r = simplest_between(&lo, &hi);
+        if neg {
+            r = bigrat_neg(&r);
+        }
+        return Ok(r.to_val());
+    }
+    if v.is_double_float() {
+        let f = v.as_double_float();
+        if f == 0.0 {
+            return Ok(BlissVal::from_fixnum(0));
+        }
+        let neg = f < 0.0;
+        let af = f.abs();
+        let bits = af.to_bits();
+        // Rounding interval [lo, hi] = reals nearest to `af`: midpoints to the
+        // adjacent representable floats. (af > 0, so bits±1 stay same-signed.)
+        let x = f64_to_bigrat(af);
+        let lower = f64_to_bigrat(f64::from_bits(bits - 1));
+        let upper = f64_to_bigrat(f64::from_bits(bits + 1));
         let two = BigRat::from_i64(2);
         let lo = bigrat_div(&bigrat_add(&x, &lower), &two);
         let hi = bigrat_div(&bigrat_add(&x, &upper), &two);
@@ -23800,6 +23959,19 @@ fn numeric_cmp(a: BlissVal, b: BlissVal) -> Result<Ordering, BlissError> {
         return Ok(a.as_fixnum().cmp(&b.as_fixnum()));
     }
     if bliss_rt::types::floatp(a) || bliss_rt::types::floatp(b) {
+        // CLHS 12.1.4.1: when a rational and a float are compared, the
+        // comparison is exact — the float is converted to the rational it
+        // denotes and compared as rationals (an f64 round-trip loses precision
+        // for large bignums, e.g. `(< 1d20 (1+ (ceiling (rational 1d20))))`).
+        // Non-finite floats (inf/NaN) have no rational value, so fall back to
+        // the f64 partial order for those.
+        let a_finite = !bliss_rt::types::floatp(a) || float_f64(a).is_finite();
+        let b_finite = !bliss_rt::types::floatp(b) || float_f64(b).is_finite();
+        if a_finite && b_finite {
+            let ra = real_to_exact_bigrat(a)?;
+            let rb = real_to_exact_bigrat(b)?;
+            return Ok(bigrat_cmp(&ra, &rb));
+        }
         let av = num_val(a)?;
         let bv = num_val(b)?;
         return Ok(av.partial_cmp(&bv).unwrap_or(Ordering::Equal));
@@ -23912,6 +24084,11 @@ fn fold_arith_vals(
 }
 
 fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    if !args.is_cons() {
+        return Err(BlissError::ProgramError(
+            "- requires at least one argument".into(),
+        ));
+    }
     bliss_rt::rooted!(remaining = args);
     bliss_rt::rooted!(vals = Vec::<BlissVal>::new());
     while remaining.is_cons() {
@@ -24009,7 +24186,7 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         vals.push(value);
     }
     if vals.is_empty() {
-        return Err(BlissError::ArithmeticError(
+        return Err(BlissError::ProgramError(
             "/ requires at least one argument".into(),
         ));
     }
@@ -24089,7 +24266,7 @@ fn eval_cmp(
     let vals = eval_args(args, env)?;
     let v: &[BlissVal] = &vals;
     if v.is_empty() {
-        return Err(BlissError::Internal(
+        return Err(BlissError::ProgramError(
             "numeric comparison requires at least one argument".into(),
         ));
     }
@@ -24113,7 +24290,7 @@ fn eval_not_equal(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     let vals = eval_args(args, env)?;
     let v: &[BlissVal] = &vals;
     if v.is_empty() {
-        return Err(BlissError::Internal(
+        return Err(BlissError::ProgramError(
             "/= requires at least one argument".into(),
         ));
     }
@@ -29007,7 +29184,12 @@ fn integer_or_float_remainder(a: BlissVal, b: BlissVal, q: i64, av: f64, bv: f64
     if a.is_fixnum() && b.is_fixnum() {
         BlissVal::from_fixnum(a.as_fixnum() - q * b.as_fixnum())
     } else {
-        BlissVal::from_single_float((av - (q as f64) * bv) as f32)
+        // The remainder is a float whose format follows numeric contagion over
+        // the operands (double dominates single). Computing in f64 and boxing to
+        // the right kind preserves double precision — the old unconditional f32
+        // cast lost it and mis-typed the remainder of a double operand.
+        let kind = widen_float(float_kind_of(a), float_kind_of(b));
+        box_float(av - (q as f64) * bv, kind)
     }
 }
 
@@ -29041,8 +29223,10 @@ fn round_half_even(x: f64) -> i64 {
 
 fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let args = eval_args(cdr, env)?;
-    if args.is_empty() {
-        return Err(BlissError::Internal("FLOOR requires an argument".into()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(BlissError::ProgramError(
+            "FLOOR takes one or two arguments".into(),
+        ));
     }
     eval_int_div(args[0], args.get(1).copied(), RoundMode::Floor, env)
 }
