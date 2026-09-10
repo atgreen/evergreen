@@ -14642,6 +14642,7 @@ fn emit_native_x86(
     allow_speculation: bool,
     sym: u32,
     backedge_counter: u64,
+    allow_traps: bool,
 ) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
     macro_rules! decline_t1 {
         ($($reason:tt)*) => {{
@@ -15157,30 +15158,48 @@ fn emit_native_x86(
                 c.extend_from_slice(&clear_mv_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
             }
+            // Env-var opcodes resolve their name at runtime via
+            // native_env_name(sym, idx) = registry_get(sym).names[idx]. OSR code
+            // is emitted with sym == u32::MAX (for the signal-only back-edge
+            // poll), which is not a registry key, so the lookup would fail
+            // ("native environment name vanished"). Under OSR, trap to T0 — which
+            // resolves the name from the live activation's own frame + names
+            // (bliss-zqit). The invoke path (allow_traps == false) carries the
+            // real sym and emits the native call as before.
             Instr::LoadEnvVar(name_idx) => {
-                c.push(0xBF); // mov edi, function symbol
-                c.extend_from_slice(&sym.to_le_bytes());
-                c.push(0xBE); // mov esi, name index
-                c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
-                c.extend_from_slice(&[0x48, 0xB8]);
-                c.extend_from_slice(&load_env_addr.to_le_bytes());
-                emit_c2i_helper_call(&mut c);
-                push_rax(&mut c);
+                if allow_traps {
+                    let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                    c.jmp(l);
+                } else {
+                    c.push(0xBF); // mov edi, function symbol
+                    c.extend_from_slice(&sym.to_le_bytes());
+                    c.push(0xBE); // mov esi, name index
+                    c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0xB8]);
+                    c.extend_from_slice(&load_env_addr.to_le_bytes());
+                    emit_c2i_helper_call(&mut c);
+                    push_rax(&mut c);
+                }
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
-                pop_into(&mut c, 2, false); // value -> rdx
-                c.push(0xBF); // mov edi, function symbol
-                c.extend_from_slice(&sym.to_le_bytes());
-                c.push(0xBE); // mov esi, name index
-                c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
-                c.extend_from_slice(&[0x48, 0xB8]);
-                let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
-                    store_env_addr
+                if allow_traps {
+                    let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                    c.jmp(l);
                 } else {
-                    define_env_addr
-                };
-                c.extend_from_slice(&helper.to_le_bytes());
-                emit_c2i_helper_call(&mut c);
+                    pop_into(&mut c, 2, false); // value -> rdx
+                    c.push(0xBF); // mov edi, function symbol
+                    c.extend_from_slice(&sym.to_le_bytes());
+                    c.push(0xBE); // mov esi, name index
+                    c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0xB8]);
+                    let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
+                        store_env_addr
+                    } else {
+                        define_env_addr
+                    };
+                    c.extend_from_slice(&helper.to_le_bytes());
+                    emit_c2i_helper_call(&mut c);
+                }
             }
             Instr::PushEnvChild | Instr::PopEnvChild => {
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -15347,7 +15366,28 @@ fn emit_native_x86(
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
-            unsupported => decline_t1!("unsupported opcode at bcp {bcp}: {unsupported:?}"),
+            unsupported => {
+                if allow_traps {
+                    // Uncommon trap (HotSpot-style; bliss-zqit). Rather than
+                    // decline the whole function, emit an unconditional deopt to
+                    // T0 at this opcode. T1 keeps the frame's locals AND operand
+                    // stack live in slot memory (r14/r15-relative), so the shared
+                    // deopt stub records (bcp, depth) via c2i_deopt_state and
+                    // run_native_osr returns OsrOutcome::Deopt{bcp,sp_top}; the
+                    // interpreter then repositions this activation at `bcp` and
+                    // executes the opcode — and the rest of the function — in T0.
+                    // Emitted only on the OSR path, where the hot loop is entered
+                    // PAST cold setup opcodes (restart-case/handler-case/special
+                    // binding), so the loop runs native and the cold/unsupported
+                    // code deopts. The jmp is this opcode's entire emission, so
+                    // r15 is still at the opcode's entry depth (nothing popped),
+                    // matching what T0 expects when it resumes here.
+                    let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                    c.jmp(l);
+                } else {
+                    decline_t1!("unsupported opcode at bcp {bcp}: {unsupported:?}");
+                }
+            }
         }
     }
 
@@ -15542,6 +15582,7 @@ fn emit_native_x86(
     _allow_speculation: bool,
     _sym: u32,
     _backedge_counter: u64,
+    _allow_traps: bool,
 ) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
     None
 }
@@ -15580,7 +15621,11 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // function that calls impure helpers emits no deopt-able ops.
     let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
         as *mut std::sync::atomic::AtomicU32 as usize as u64;
-    let (code, _osr) = emit_native_x86(&bf, allow_speculation, sym, backedge_counter)?;
+    // allow_traps = false: the T1-invoke entry runs from the top, where an
+    // unsupported opcode sits BEFORE any loop — trapping there would deopt
+    // immediately every call. Decline instead, keeping such functions at T0 for
+    // top-level calls (the OSR path below still traps to compile their loops).
+    let (code, _osr) = emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -15914,6 +15959,22 @@ fn anon_osr_threshold() -> u32 {
     })
 }
 
+/// Whether OSR compiles may emit HotSpot-style uncommon-trap deopts for
+/// unsupported opcodes instead of declining the whole function (bliss-zqit).
+/// OFF by default: enabling it expands the OSR compilation surface to functions
+/// with restart-case/handler-case/special-binding, which is correct (validated)
+/// but does not yet yield a wall-clock win — env-var opcodes still trap under
+/// OSR (they need native name resolution that does not go through
+/// registry_get(sym); see the follow-up), and babel's hot asdf functions are
+/// env-var-heavy, so their loops deopt rather than run native. Kept behind a
+/// flag until env-var-native OSR lands and the expanded surface is validated
+/// beyond the tier suite + babel.
+fn osr_traps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("BLISS_OSR_TRAPS").is_some())
+}
+
 /// Compile (once, memoized) a non-speculating native version of `sym` with OSR
 /// entry stubs. Returns `None` if it can't be compiled (cached so we don't retry
 /// every back-edge).
@@ -15970,7 +16031,12 @@ fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> 
     // anonymous top-level OSR loops are GC-safe too.
     let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
         as *mut std::sync::atomic::AtomicU32 as usize as u64;
-    let emitted = emit_native_x86(bf, true, u32::MAX, backedge_counter);
+    // On the OSR path the entry is a loop header PAST any cold setup
+    // (restart-case/handler-case/special binding), so unsupported opcodes CAN
+    // emit an uncommon-trap deopt to T0 instead of declining the whole function
+    // — the loop runs native, cold code deopts (bliss-zqit). Gated (default off)
+    // while env-var-native OSR is pending; see osr_traps_enabled.
+    let emitted = emit_native_x86(bf, true, u32::MAX, backedge_counter, osr_traps_enabled());
     if std::env::var_os("BLISS_OSR_DEBUG").is_some() && emitted.is_none() {
         eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
     }
@@ -16015,6 +16081,7 @@ fn run_native_osr(
     osr: &OsrCode,
     stub_off: usize,
     frame: *mut Frame,
+    env_frame: Option<Rc<RefCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<OsrOutcome, BlissError> {
     NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
@@ -16024,6 +16091,14 @@ fn run_native_osr(
     // place.
     let slots = unsafe { frame.add(1) as *mut u64 };
     let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
+    // Publish the activation's heap EnvFrame for environment bytecodes
+    // (LoadEnvVar/StoreEnvVar/DefineEnvVar) and closure construction, exactly as
+    // the invoke path (run_native) does. Without this, an OSR-compiled loop that
+    // touches a captured/env variable hits "native environment name vanished"
+    // (bliss-zqit — surfaced once uncommon-trap OSR unlocked env-var-using
+    // functions that previously declined).
+    let saved_env_frame =
+        NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
     let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_DEOPT.with(|d| d.set(false));
     let entry_addr = osr.entry as usize + stub_off;
@@ -16032,6 +16107,7 @@ fn run_native_osr(
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry_addr) };
     let ret = f(slots);
     NATIVE_ENV.with(|e| e.set(saved));
+    NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
@@ -16148,7 +16224,13 @@ fn maybe_osr(
     OSR_ENTRY_COUNTS.with(|c| {
         *c.borrow_mut().entry(act.sym).or_insert(0) += 1;
     });
-    Some(run_native_osr(&osr, stub_off, act.frame, env))
+    Some(run_native_osr(
+        &osr,
+        stub_off,
+        act.frame,
+        act.env_frame.clone(),
+        env,
+    ))
 }
 
 /// Drop a completed activation's non-local-exit handlers from the shared env
