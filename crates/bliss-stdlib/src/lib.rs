@@ -90,7 +90,8 @@ pub use packages::{
     unexport, unintern, unuse_package, use_package, use_package_by_name,
 };
 pub use pathnames::{
-    PathDirComp, delete_file, directory, ensure_directories_exist, is_pathname,
+    PathDirComp, delete_file, directory, ensure_directories_exist, is_logical_pathname,
+    is_pathname, logical_pathname_from_string,
     logical_pathname_translations, make_pathname, merge_pathnames, namestring, parse_namestring,
     pathname_device, pathname_directory, pathname_directory_components, pathname_host,
     pathname_match_p, pathname_name, pathname_type, pathname_version, pathnames_equal, probe_file,

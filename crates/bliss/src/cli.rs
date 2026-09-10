@@ -454,10 +454,88 @@ fn coerce_pathname_designator(v: BlissVal) -> Result<BlissVal, BlissError> {
     if bliss_stdlib::is_pathname(v) {
         Ok(v)
     } else {
-        let mut v = v;
+        let mut v = normalize_pathname_string_designator(v);
         bliss_rt::rooted_ref!(_v_root = &mut v);
         Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
     }
+}
+
+/// Validate the arguments to a `PATHNAME-{HOST,DEVICE,DIRECTORY,NAME,TYPE,
+/// VERSION}` accessor and return the pathname-designator argument. ANSI: the
+/// accessor takes one pathname designator, optionally followed by `:case
+/// <keyword>` pairs. Zero args, a stray positional, or any keyword other than
+/// `:case` is a PROGRAM-ERROR (ansi pathname-*.error tests) — not a type error.
+fn pathname_accessor_arg(name: &str, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    if args.is_empty() {
+        return Err(BlissError::ProgramError(format!(
+            "{name} requires a pathname argument"
+        )));
+    }
+    let rest = &args[1..];
+    // The keyword arguments must come in key/value pairs (ANSI &key).
+    if rest.len() % 2 != 0 {
+        return Err(BlissError::ProgramError(format!(
+            "{name} called with an odd number of keyword arguments"
+        )));
+    }
+    // :ALLOW-OTHER-KEYS is honoured by its leftmost occurrence: a true value
+    // there permits any other keyword (ansi pathname-host.5/.6).
+    let mut allow_other = false;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i].is_symbol()
+            && rest[i] != NIL
+            && symbol_bare_name(&sym_name(rest[i])).eq_ignore_ascii_case("ALLOW-OTHER-KEYS")
+        {
+            allow_other = rest[i + 1] != NIL;
+            break;
+        }
+        i += 2;
+    }
+    // Validate each key: :CASE and :ALLOW-OTHER-KEYS are always accepted; any
+    // other key requires allow-other-keys to be true (else PROGRAM-ERROR, ansi
+    // pathname-host.error.3).
+    let mut i = 0;
+    while i < rest.len() {
+        let key = rest[i];
+        let known = key.is_symbol()
+            && key != NIL
+            && {
+                let bare = symbol_bare_name(&sym_name(key));
+                bare.eq_ignore_ascii_case("CASE") || bare.eq_ignore_ascii_case("ALLOW-OTHER-KEYS")
+            };
+        if !known && !allow_other {
+            return Err(BlissError::ProgramError(format!(
+                "{name} called with invalid keyword arguments"
+            )));
+        }
+        i += 2;
+    }
+    Ok(args[0])
+}
+
+/// Normalize a *string* pathname designator to a plain simple Lisp string the
+/// stdlib pathname parser can read. A pathname designator may be any string
+/// type — a fill-pointer, adjustable, or displaced character array, or a
+/// base-char string (ANSI string designators; the ansi-test `do-special-strings`
+/// harness exercises all of these). The stdlib parser only decodes simple
+/// strings, so materialize the *active* characters of a non-simple string as a
+/// fresh simple string. Values that are already simple strings, pathnames, or
+/// non-strings pass through untouched (so a genuine non-designator still errors
+/// downstream, and streams are handled by their own coercers).
+fn normalize_pathname_string_designator(v: BlissVal) -> BlissVal {
+    if bliss_stdlib::is_pathname(v) {
+        return v;
+    }
+    // A registry-backed namestring is already a real simple string; leave it.
+    if v.is_string() {
+        return v;
+    }
+    // Fill-pointer / adjustable / displaced character array → its live contents.
+    if let Some(s) = bliss_stdlib::cvec_char_contents(v) {
+        return bliss_stdlib::make_lisp_string(&s);
+    }
+    v
 }
 
 // ── First-class PACKAGE objects, backed by the stdlib registry (bliss-bhs) ──
@@ -6341,6 +6419,25 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             out.push(')');
         }
     } else if val.is_heap_object() {
+        // Pathnames FIRST: a pathname's namestring is also present in the string
+        // registry, so the string branch below would otherwise print it as a bare
+        // string. Under escaping (prin1 / WRITE :readably) a pathname prints as
+        // `#P"namestring"` so it reads back to an EQUAL pathname (ansi
+        // pathnames-print-and-read-properly). bliss-lb6.
+        if bliss_stdlib::is_pathname(val) {
+            if let Ok(ns) = bliss_stdlib::namestring(val) {
+                let s = val_as_str(ns);
+                out.push_str("#P\"");
+                for c in s.chars() {
+                    if c == '"' || c == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+                return;
+            }
+        }
         if let Some(s) = bliss_stdlib::registered_string(val) {
             out.push('"');
             for c in s.chars() {
@@ -6359,7 +6456,7 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
         if bliss_stdlib::is_pathname(val) {
             if let Ok(ns) = bliss_stdlib::namestring(val) {
                 let s = val_as_str(ns);
-                out.push('"');
+                out.push_str("#P\"");
                 for c in s.chars() {
                     if c == '"' || c == '\\' {
                         out.push('\\');
@@ -6568,6 +6665,14 @@ fn princ_val(val: BlissVal, out: &mut String) {
         let bare = name.trim_start_matches("KEYWORD:");
         out.push_str(bare);
         return;
+    }
+    // A pathname prints as its bare namestring under PRINC/~A (no `#P"…"`
+    // escaping — that is the prin1/~S form emitted by print_val).
+    if bliss_stdlib::is_pathname(val) {
+        if let Ok(ns) = bliss_stdlib::namestring(val) {
+            out.push_str(&val_as_str(ns));
+            return;
+        }
     }
     print_val(val, out);
 }
@@ -6799,6 +6904,43 @@ fn quote_sym() -> BlissVal {
 /// to a physical namestring the pathname parser understands. Components are
 /// strings or the `:up`/`:back`/`:wild`/`:wild-inferiors` keywords. Returns None
 /// if the designator is not a list (leave it for the stdlib to handle).
+/// Validate a MAKE-PATHNAME `:directory` list. ANSI forbids `:up`/`:back`
+/// immediately after the `:absolute` marker (you cannot ascend above the root)
+/// or immediately after a `:wild-inferiors`; such a list is a FILE-ERROR
+/// (ansi make-pathname-error-absolute-up / -absolute-back /
+/// -relative-wild-inferiors-up / -*-wild-inferiors-back). Non-list designators
+/// (a string, `:wild`, NIL) impose no constraint here.
+fn validate_make_pathname_directory(dir: BlissVal) -> Result<(), BlissError> {
+    if !dir.is_cons() {
+        return Ok(());
+    }
+    let items = list_to_vec(dir);
+    // `prev_blocks_up` is true right after the :absolute marker or a
+    // :wild-inferiors component — the positions from which :up/:back is invalid.
+    let mut prev_blocks_up = false;
+    for (idx, &item) in items.iter().enumerate() {
+        if !item.is_symbol() || item == NIL || item == T {
+            prev_blocks_up = false;
+            continue;
+        }
+        let bare = symbol_bare_name(&sym_name(item));
+        if idx == 0 {
+            // Leading :absolute blocks a following :up/:back; :relative does not.
+            prev_blocks_up = bare.eq_ignore_ascii_case("ABSOLUTE");
+            continue;
+        }
+        if (bare.eq_ignore_ascii_case("UP") || bare.eq_ignore_ascii_case("BACK")) && prev_blocks_up
+        {
+            return Err(BlissError::FileError(format!(
+                "make-pathname: :{} is not allowed at this position in a directory list",
+                bare.to_lowercase()
+            )));
+        }
+        prev_blocks_up = bare.eq_ignore_ascii_case("WILD-INFERIORS");
+    }
+    Ok(())
+}
+
 fn directory_designator_to_namestring(dir: BlissVal) -> Option<String> {
     if !dir.is_cons() {
         return None;
@@ -9141,7 +9283,26 @@ fn coerce_to_pathname(v: BlissVal) -> Result<BlissVal, BlissError> {
     if bliss_stdlib::is_pathname(v) {
         return Ok(v);
     }
+    let v = normalize_pathname_string_designator(v);
     Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
+}
+
+/// Resolve a pathname designator against `*default-pathname-defaults*`, as ANSI
+/// TRUENAME / PROBE-FILE require: a *relative* pathname is anchored to the
+/// current default directory (an absolute one is left unchanged by the merge).
+/// Without this a relative namestring like `#p"sandbox/"` resolved only against
+/// the OS working directory, so the ansi-test harness's `*sandbox-path*`
+/// (`(truename #p"sandbox/")`) came back NIL and bound
+/// `*default-pathname-defaults*` to NIL for the whole run.
+fn resolve_against_dpd(v: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let mut pn = coerce_to_pathname(v)?;
+    bliss_rt::rooted_ref!(_pn = &mut pn);
+    if let Some(d) = env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*") {
+        if !d.is_nil() && bliss_stdlib::is_pathname(d) {
+            return bliss_stdlib::merge_pathnames(pn, d, NIL);
+        }
+    }
+    Ok(pn)
 }
 
 /// If `object` is a class metaobject, return its class value. bliss represents a
@@ -10196,7 +10357,9 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
             "PACKAGE" => is_package_value(env, object),
             "HASH-TABLE" => bliss_stdlib::hash_table_count(object).is_ok(),
-            "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
+            "PATHNAME" => bliss_stdlib::is_pathname(object),
+            // A logical pathname is a distinct subtype of PATHNAME (ANSI 19.3).
+            "LOGICAL-PATHNAME" => bliss_stdlib::is_logical_pathname(object),
             "READTABLE" => {
                 // Real readtable heap objects (bliss-r4mk), plus the legacy
                 // :STANDARD-READTABLE placeholder for old images.
@@ -14399,6 +14562,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 }
                                 bliss_stdlib::set_gethash(*key, *tbl, *val)?;
                             }
+                            "LOGICAL-PATHNAME-TRANSLATIONS" => {
+                                // (setf (logical-pathname-translations host) val):
+                                // register the host's translation rules. Storing
+                                // the value defines the host (ansi
+                                // load-logical-pathname-translations.1 relies on
+                                // this via universe.lsp; bliss-30be).
+                                let host = eval_form(tgt_form, env)?;
+                                let host_str = val_as_str(host);
+                                bliss_stdlib::set_logical_pathname_translations(&host_str, *val)?;
+                            }
                             "GETF" => {
                                 // (setf (getf place indicator [default]) val):
                                 // update the plist stored in PLACE. If INDICATOR
@@ -16285,6 +16458,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return sort_sequence(*seq, *predicate, key, env);
             }
             "PATHNAMEP" => {
+                // (pathnamep object) — exactly one argument; wrong arity is a
+                // PROGRAM-ERROR (ansi pathnamep.error.1/2/3).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "PATHNAMEP requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (thing_form, _) = cp(cdr);
                 let thing = eval_form(thing_form, env)?;
                 return Ok(if bliss_stdlib::is_pathname(thing) {
@@ -16313,6 +16494,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // reader keywords the stdlib can't match by hash; render
                         // it to a namestring the stdlib parser accepts.
                         "DIRECTORY" => {
+                            // Reject syntactically impossible directory lists
+                            // (`:up`/`:back` right after `:absolute` or a
+                            // `:wild-inferiors`) with a FILE-ERROR before
+                            // building the pathname (ansi make-pathname-error-*).
+                            validate_make_pathname_directory(val)?;
                             directory = Some(match directory_designator_to_namestring(val) {
                                 Some(s) => arena_str(&s),
                                 None => val,
@@ -16363,26 +16549,67 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(pathname);
             }
             "PARSE-NAMESTRING" => {
-                let (thing_form, rest) = cp(cdr);
-                // Keep the pending arg spine rooted across the thing eval
-                // (moving GC; bliss-4bp).
-                bliss_rt::rooted!(rest = rest);
-                let mut thing = eval_form(thing_form, env)?;
+                // (parse-namestring thing &optional host default &key start end
+                // junk-allowed) — at least one argument; zero args, an unknown
+                // keyword, or a dangling keyword is a PROGRAM-ERROR (ansi
+                // parse-namestring.error.1 / parse-name-string.error.2/.3).
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError(
+                        "PARSE-NAMESTRING requires at least 1 argument".into(),
+                    ));
+                }
+                // Validate the &key section (everything past thing/host/default).
+                if args.len() > 3 {
+                    let keys = &args[3..];
+                    if keys.len() % 2 != 0 {
+                        return Err(BlissError::ProgramError(
+                            "PARSE-NAMESTRING called with an odd number of keyword arguments".into(),
+                        ));
+                    }
+                    let mut i = 0;
+                    while i < keys.len() {
+                        let ok = keys[i].is_symbol() && keys[i] != NIL && {
+                            let bare = symbol_bare_name(&sym_name(keys[i]));
+                            matches!(bare.as_str(), "START" | "END" | "JUNK-ALLOWED")
+                        };
+                        if !ok {
+                            return Err(BlissError::ProgramError(
+                                "PARSE-NAMESTRING called with invalid keyword arguments".into(),
+                            ));
+                        }
+                        i += 2;
+                    }
+                }
+                let mut thing = args[0];
+                // A non-simple string designator (fill-pointer / adjustable /
+                // displaced char array) → a fresh simple string the parser reads
+                // (ansi parse-namestring.3). A pathname passes through unchanged.
+                if !bliss_stdlib::is_pathname(thing) {
+                    thing = normalize_pathname_string_designator(thing);
+                }
                 bliss_rt::rooted_ref!(_thing_root = &mut thing);
-                let mut host = if rest.is_cons() {
-                    Some(eval_form(cp(*rest).0, env)?)
-                } else {
-                    None
-                };
+                let mut host = args.get(1).copied();
                 bliss_rt::rooted_ref!(_host_root = &mut host);
                 let (pathname, position) = bliss_stdlib::parse_namestring(thing, host, None)?;
                 env.set_mv(vec![pathname, BlissVal::from_fixnum(position as i64)]);
                 return Ok(pathname);
             }
             "NAMESTRING" => {
+                // (namestring pathname) — exactly one pathname designator; a
+                // string coerces to a pathname first (ansi namestring.1/.2), and
+                // wrong arity is a PROGRAM-ERROR (namestring.error.1/.2).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "NAMESTRING requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
-                return bliss_stdlib::namestring(pathname);
+                let mut pathname = eval_form(pathname_form, env)?;
+                bliss_rt::rooted_ref!(_p = &mut pathname);
+                let pn = coerce_pathname_designator(pathname)?;
+                return bliss_stdlib::namestring(pn);
             }
             "PROBE-FILE" => {
                 // (probe-file pathspec) — truename if the file exists, else NIL.
@@ -16527,8 +16754,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "TRUENAME" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
-                return bliss_stdlib::truename(pathname);
+                let mut pathname = eval_form(pathname_form, env)?;
+                bliss_rt::rooted_ref!(_p = &mut pathname);
+                // Anchor a relative pathname to *default-pathname-defaults*
+                // before touching the filesystem (ANSI).
+                let resolved = resolve_against_dpd(pathname, env)?;
+                return bliss_stdlib::truename(resolved);
             }
             "PATHNAME" => {
                 // Coerce a pathname designator to a pathname: an existing
@@ -16536,14 +16767,100 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // namestring. Check is_pathname FIRST — pathnames are registry-
                 // backed pseudo-heap values, so calling is_string on one (as the
                 // string branch would) dereferences a bogus pointer and crashes.
+                // (pathname pathspec) — exactly one argument; wrong arity is a
+                // PROGRAM-ERROR (ansi pathname.error.1/2).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "PATHNAME requires exactly 1 argument, got {n}"
+                    )));
+                }
                 let (thing_form, _) = cp(cdr);
                 let mut thing = eval_form(thing_form, env)?;
                 bliss_rt::rooted_ref!(_thing_root = &mut thing);
                 if bliss_stdlib::is_pathname(thing) {
                     return Ok(thing);
                 }
+                thing = normalize_pathname_string_designator(thing);
                 let (pathname, _) = bliss_stdlib::parse_namestring(thing, None, None)?;
                 return Ok(pathname);
+            }
+            "LOGICAL-PATHNAME" => {
+                // (logical-pathname pathspec) — coerce a logical pathname, a
+                // logical namestring, or a logical-pathname stream to a logical
+                // pathname. A physical pathname, a non-logical stream, or a
+                // malformed namestring is a TYPE-ERROR; wrong arity is a
+                // PROGRAM-ERROR (ansi logical-pathname.error.*).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "LOGICAL-PATHNAME requires exactly 1 argument, got {n}"
+                    )));
+                }
+                let (thing_form, _) = cp(cdr);
+                let mut thing = eval_form(thing_form, env)?;
+                bliss_rt::rooted_ref!(_thing_root = &mut thing);
+                if bliss_stdlib::is_logical_pathname(thing) {
+                    return Ok(thing);
+                }
+                // A physical pathname is NOT a valid LOGICAL-PATHNAME designator.
+                if bliss_stdlib::is_pathname(thing) {
+                    return Err(BlissError::TypeError {
+                        datum: thing,
+                        expected: "logical pathname, string, or stream".to_string(),
+                    });
+                }
+                let norm = normalize_pathname_string_designator(thing);
+                if is_string_value(norm) {
+                    return bliss_stdlib::logical_pathname_from_string(&val_as_str(norm));
+                }
+                // Streams and every other value: bliss has no logical-pathname
+                // streams, so this is a TYPE-ERROR.
+                return Err(BlissError::TypeError {
+                    datum: thing,
+                    expected: "logical pathname, string, or stream".to_string(),
+                });
+            }
+            "TRANSLATE-LOGICAL-PATHNAME" => {
+                // (translate-logical-pathname pathname &key …) — a physical
+                // pathname translates to itself (EQ); a logical one is resolved
+                // through its host's translation rules. Extra keyword args
+                // (:allow-other-keys etc.) are accepted and ignored. Zero args is
+                // a PROGRAM-ERROR (ansi translate-logical-pathname.error.1).
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError(
+                        "TRANSLATE-LOGICAL-PATHNAME requires at least 1 argument".into(),
+                    ));
+                }
+                bliss_rt::rooted!(pn = coerce_to_pathname(args[0])?);
+                if bliss_stdlib::is_logical_pathname(*pn) {
+                    return bliss_stdlib::translate_logical_pathname(*pn);
+                }
+                return Ok(*pn);
+            }
+            "LOAD-LOGICAL-PATHNAME-TRANSLATIONS" => {
+                // (load-logical-pathname-translations host) → NIL when the host's
+                // translations are already defined (nothing to load); an ERROR
+                // when the host is unknown and no translations can be loaded
+                // (ansi load-logical-pathname-translations.1 / .error.1). bliss
+                // has no host-translations file, so an unknown host always fails.
+                // Wrong arity is a PROGRAM-ERROR (.error.2/.3).
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "LOAD-LOGICAL-PATHNAME-TRANSLATIONS requires exactly 1 argument, got {n}"
+                    )));
+                }
+                let (host_form, _) = cp(cdr);
+                let host = eval_form(host_form, env)?;
+                let host_str = val_as_str(host);
+                return match bliss_stdlib::logical_pathname_translations(&host_str) {
+                    Ok(_) => Ok(NIL),
+                    Err(_) => Err(BlissError::FileError(format!(
+                        "no logical pathname translations for host {host_str:?}"
+                    ))),
+                };
             }
             "MERGE-PATHNAMES" => {
                 // (merge-pathnames pathname &optional default-pathname default-version)
@@ -16577,25 +16894,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                     }
                 );
-                let default_version = if args.len() > 2 { args[2] } else { NIL };
+                // ANSI: default-version defaults to :NEWEST when not supplied, so
+                // a merged pathname whose name comes from a versionless source
+                // gets version :NEWEST (ansi merge-pathnames.2/.3/.4/.7). An
+                // explicit third argument (including NIL) is honoured as given
+                // (merge-pathnames.1 passes NIL and expects the version to stay
+                // NIL).
+                let default_version = if args.len() > 2 {
+                    args[2]
+                } else {
+                    resolve_sym(":NEWEST").unwrap_or(NIL)
+                };
                 return bliss_stdlib::merge_pathnames(*pathname, *default, default_version);
             }
             "PATHNAME-NAME" => {
-                let (pathname_form, _) = cp(cdr);
-                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
+                let args = eval_args(cdr, env)?;
+                let pathname =
+                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-NAME", &args)?)?;
                 return Ok(bliss_stdlib::pathname_name(pathname));
             }
             "PATHNAME-TYPE" => {
-                let (pathname_form, _) = cp(cdr);
-                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
+                let args = eval_args(cdr, env)?;
+                let pathname =
+                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-TYPE", &args)?)?;
                 return Ok(bliss_stdlib::pathname_type(pathname));
             }
             "PATHNAME-DIRECTORY" => {
-                let (pathname_form, _) = cp(cdr);
-                let mut pathname = eval_form(pathname_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let mut pathname = pathname_accessor_arg("PATHNAME-DIRECTORY", &args)?;
                 // Coerce a namestring designator to a pathname first (ANSI).
                 if !bliss_stdlib::is_pathname(pathname) {
-                    pathname = bliss_stdlib::parse_namestring(pathname, None, None)?.0;
+                    pathname = coerce_pathname_designator(pathname)?;
                 }
                 // ANSI PATHNAME-DIRECTORY returns a list (:absolute|:relative
                 // comp…), not a namestring — UIOP does directory-list arithmetic
@@ -16622,24 +16951,54 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "PATHNAME-HOST" => {
-                let (pathname_form, _) = cp(cdr);
-                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
+                let args = eval_args(cdr, env)?;
+                let pathname =
+                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-HOST", &args)?)?;
                 return Ok(bliss_stdlib::pathname_host(pathname));
             }
             "PATHNAME-DEVICE" => {
-                let (pathname_form, _) = cp(cdr);
-                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
+                let args = eval_args(cdr, env)?;
+                let pathname =
+                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-DEVICE", &args)?)?;
+                // A logical pathname's device is :UNSPECIFIC (ANSI 19.3.2.1;
+                // ansi pathname-device.7).
+                if bliss_stdlib::is_logical_pathname(pathname) {
+                    return Ok(resolve_sym(":UNSPECIFIC").unwrap_or(NIL));
+                }
                 return Ok(bliss_stdlib::pathname_device(pathname));
             }
             "PATHNAME-VERSION" => {
-                let (pathname_form, _) = cp(cdr);
-                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
+                // (pathname-version pathname) — no :case keyword, so any extra
+                // argument is a PROGRAM-ERROR (ansi pathname-version.error.2).
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "PATHNAME-VERSION requires exactly 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                let pathname = coerce_pathname_designator(args[0])?;
                 return Ok(bliss_stdlib::pathname_version(pathname));
             }
             "WILD-PATHNAME-P" => {
-                // (wild-pathname-p pathname &optional field-key)
+                // (wild-pathname-p pathname &optional field-key) — 1 or 2 args;
+                // other arity is a PROGRAM-ERROR (ansi wild-pathname-p.error.1/2).
                 let args = eval_args(cdr, env)?;
-                let pathname = if args.is_empty() { NIL } else { args[0] };
+                if args.is_empty() || args.len() > 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "WILD-PATHNAME-P requires 1 or 2 arguments, got {}",
+                        args.len()
+                    )));
+                }
+                // ANSI: the argument is a pathname designator (pathname, string,
+                // or file/synonym stream). A stream's pathname is never wild, so
+                // it answers NIL (ansi wild-pathname-p.29). A non-designator
+                // (number, char, list, …) is a TYPE-ERROR — coerce_to_pathname
+                // raises it (ansi wild-pathname-p.error.3/4).
+                if is_stream(args[0]) {
+                    return Ok(NIL);
+                }
+                let pathname = coerce_to_pathname(args[0])?;
                 let field = if args.len() > 1 { Some(args[1]) } else { None };
                 return Ok(if bliss_stdlib::wild_pathname_p(pathname, field) {
                     T
@@ -16648,11 +17007,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "PATHNAME-MATCH-P" => {
-                // (pathname-match-p pathname wildcard) — both args are pathname
-                // designators (strings coerce to pathnames), not just pathnames.
+                // (pathname-match-p pathname wildcard) — exactly two pathname
+                // designators (strings coerce to pathnames). Other arity is a
+                // PROGRAM-ERROR (ansi pathname-match-p.error.1/2/3).
                 let args = eval_args(cdr, env)?;
-                bliss_rt::rooted!(pn = coerce_to_pathname(args.first().copied().unwrap_or(NIL))?);
-                let wc = coerce_to_pathname(args.get(1).copied().unwrap_or(NIL))?;
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "PATHNAME-MATCH-P requires exactly 2 arguments, got {}",
+                        args.len()
+                    )));
+                }
+                bliss_rt::rooted!(pn = coerce_to_pathname(args[0])?);
+                let wc = coerce_to_pathname(args[1])?;
                 return Ok(if bliss_stdlib::pathname_match_p(*pn, wc)? {
                     T
                 } else {
@@ -27841,6 +28207,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "PATHNAME-DEVICE" | "PATHNAME-VERSION" | "PATHNAMEP" | "PARSE-NAMESTRING"
             | "PROBE-FILE" | "TRUENAME" | "DIRECTORY" | "WILD-PATHNAME-P"
             | "PATHNAME-MATCH-P" | "TRANSLATE-PATHNAME" | "ENSURE-DIRECTORIES-EXIST"
+            | "LOGICAL-PATHNAME" | "TRANSLATE-LOGICAL-PATHNAME"
+            | "LOAD-LOGICAL-PATHNAME-TRANSLATIONS"
             | "FILE-NAMESTRING" | "DIRECTORY-NAMESTRING" | "ENOUGH-NAMESTRING"
             | "COMPILE-FILE" | "COMPILE-FILE-PATHNAME" | "FILE-WRITE-DATE"
             // Time
@@ -29218,6 +29586,13 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
 fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
     if a == b {
         return true;
+    }
+    // Two pathnames are EQUALP iff their components match (compared via the
+    // non-allocating namestring proxy, like EQUAL). Without this, EQUALP fell
+    // through to identity and reported two component-equal pathnames unequal
+    // (ansi merge-pathnames.1 uses EQUALP on pathnames).
+    if bliss_stdlib::is_pathname(a) && bliss_stdlib::is_pathname(b) {
+        return bliss_stdlib::pathnames_equal(a, b);
     }
     if is_number_value(a) && is_number_value(b) {
         // numeric_equal handles COMPLEX (unordered → numeric_cmp fails on it).

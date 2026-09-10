@@ -289,6 +289,48 @@ pub fn is_pathname(val: BlissVal) -> bool {
     with_pathname_store(|store| store.contains_key(&val.0))
 }
 
+/// True if `val` is a *logical* pathname (its parse carries a logical host).
+/// Used to wire `(typep x 'logical-pathname)` and `LOGICAL-PATHNAME`. Safe for
+/// any value (a non-pathname simply has no record).
+pub fn is_logical_pathname(val: BlissVal) -> bool {
+    with_pathname_store(|store| store.get(&val.0).map(|r| r.parsed.is_logical).unwrap_or(false))
+}
+
+/// Coerce a namestring to a LOGICAL pathname (ANSI `LOGICAL-PATHNAME`). The
+/// string must name a host — a run of `[A-Za-z0-9-]` terminated by `:` — and use
+/// only characters legal in a logical namestring; otherwise a TYPE-ERROR is
+/// signalled (ansi logical-pathname.error.2/.10). An existing logical pathname
+/// value is returned by the caller before this is reached.
+pub fn logical_pathname_from_string(s: &str) -> Result<BlissVal, BlissError> {
+    let bad = || BlissError::TypeError {
+        datum: make_string_bv(s),
+        expected: "logical pathname namestring".to_string(),
+    };
+    // A logical namestring names a host before the first ':' (and before any
+    // ';', '/' or '.').
+    let colon = s.find(':').ok_or_else(bad)?;
+    if colon == 0 {
+        return Err(bad());
+    }
+    let host = &s[..colon];
+    if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(bad());
+    }
+    let rest = &s[colon + 1..];
+    // Legal logical-namestring body characters: letters, digits, hyphen, and the
+    // structural markers ';' '.' '*'. Anything else (e.g. '%') is invalid.
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ';' | '.' | '*'))
+    {
+        return Err(bad());
+    }
+    let parsed = parse_logical_namestring(s, None).map_err(|_| bad())?;
+    Ok(make_record_value(build_record_from_namestring(
+        parsed, None,
+    )))
+}
+
 fn nil_if_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -534,9 +576,12 @@ fn directory_from_val(val: BlissVal, uppercase: bool) -> Result<Option<Directory
         return Ok(parse_physical_namestring(&s)?.directory);
     }
     if is_wild(val) {
+        // ANSI: `(make-pathname :directory :wild)` yields an absolute directory
+        // with a single wild component — implementations pick `(:absolute
+        // :wild-inferiors)` or `(:absolute :wild)`; make-pathname.5 accepts either.
         return Ok(Some(DirectorySpec {
-            absolute: false,
-            parts: vec![DirPart::Wild],
+            absolute: true,
+            parts: vec![DirPart::WildInferiors],
         }));
     }
     if uppercase {
@@ -1110,8 +1155,18 @@ fn pathname_match_with_captures(
     pathname: &PathnameRecord,
     wildcard: &PathnameRecord,
 ) -> Option<MatchCaptures> {
-    if wildcard.host != NIL && pathname.host != wildcard.host {
-        return None;
+    // Compare hosts by NAME, not by raw value: two logical pathnames with the
+    // same host are separate interned strings (distinct BlissVal bits), so a
+    // pointer comparison spuriously failed to match `CLTEST:FOO.LSP` against
+    // `CLTEST:*.LSP` (ansi pathname-match-p.7/.8).
+    if wildcard.host != NIL {
+        let host_eq = match (&pathname.parsed.host_name, &wildcard.parsed.host_name) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => pathname.host == wildcard.host,
+        };
+        if !host_eq {
+            return None;
+        }
     }
     if wildcard.device != NIL && pathname.device != wildcard.device {
         return None;
@@ -1189,7 +1244,15 @@ pub fn wild_pathname_p(pathname: BlissVal, field: Option<BlissVal>) -> bool {
         None => return false,
     };
     match field {
+        // No field, or an explicit NIL field designator, means "any component":
+        // `(wild-pathname-p p nil)` is ANSI-equivalent to `(wild-pathname-p p)`.
         None => {
+            directory_is_wild(&rec.parsed.directory)
+                || component_is_wild(&rec.parsed.name)
+                || component_is_wild(&rec.parsed.type_field)
+                || is_wild(rec.version)
+        }
+        Some(field_kw) if field_kw == NIL => {
             directory_is_wild(&rec.parsed.directory)
                 || component_is_wild(&rec.parsed.name)
                 || component_is_wild(&rec.parsed.type_field)

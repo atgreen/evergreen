@@ -984,10 +984,12 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         if crate::pathnames::is_pathname(v) {
             if let Ok(ns) = crate::pathnames::namestring(v) {
                 if let Some(s) = extract_bliss_string(ns) {
-                    // Match cli's print_val: quoted (and body-escaped)
-                    // namestring under prin1/~S, bare namestring under princ/~A.
+                    // Match cli's print_val: `#P"namestring"` under prin1/~S so
+                    // it reads back as an EQUAL pathname (ansi
+                    // pathnames-print-and-read-properly), bare namestring under
+                    // princ/~A.
                     return if escapep {
-                        format!("\"{}\"", escape_string_body(&s))
+                        format!("#P\"{}\"", escape_string_body(&s))
                     } else {
                         s
                     };

@@ -2876,6 +2876,21 @@ by that pair's cdr (ANSI 14.2; bliss-d0b: flexi-streams)."
 (defun nsublis (alist tree &rest args)
   (apply #'sublis alist tree args))
 
+(defun host-namestring (pathname)
+  "The host portion of pathname PATHNAME as a string, or NIL when it has no
+host (ANSI 19.4). bliss physical pathnames carry no host, so this is NIL for
+them and the host name for a logical pathname."
+  (let* ((p (pathname pathname))
+         (host (pathname-host p)))
+    (if (stringp host) host nil)))
+
+(defun file-error-pathname (condition)
+  "The offending pathname of a FILE-ERROR (ANSI 19.5). Falls back to a null
+pathname when the condition carries no stored pathname, so callers that only
+check PATHNAMEP on the result behave sensibly."
+  (or (ignore-errors (slot-value condition 'pathname))
+      (make-pathname)))
+
 (defun enough-namestring (pathname &optional (defaults *default-pathname-defaults*))
   "A namestring just sufficient to identify PATHNAME relative to DEFAULTS:
 the namestring with DEFAULTS' directory prefix stripped when PATHNAME lies
