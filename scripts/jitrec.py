@@ -284,6 +284,7 @@ input#filter{font:inherit;padding:6px 11px;border:1px solid var(--line);border-r
 .corr pre{margin:0;font-family:var(--font-mono);font-size:.73rem;line-height:1.5;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre;max-height:62vh;overflow:auto;scroll-behavior:smooth}
 @media(prefers-reduced-motion:reduce){.corr pre{scroll-behavior:auto}}
 .corr .ln{display:block;border-radius:3px;padding:0 3px;margin:0 -3px}.corr .ln[data-bcp]{cursor:pointer}.corr .ln.lit{background:var(--accent);color:#fff}.corr .ln.lit .c,.corr .ln.lit .op,.corr .ln.lit .spec{color:#fff}
+.corr .ln.bcpmark{color:var(--accent);opacity:.72;letter-spacing:.04em;margin-top:4px;font-size:.92em}.corr .ln.bcpmark.lit{color:#fff;opacity:1}.corr-hint .mk{color:var(--accent);font-family:var(--font-mono)}.corr-hint b{color:var(--muted)}
 .corr-hint{font-size:.78rem;color:var(--faint);margin:2px 0 8px}.empty{color:var(--faint);font-style:italic}
 </style></head><body><div class=wrap>
 <header class=m><div><div class=e>bliss · jitrec explorer</div><h1>JIT Recording</h1></div><span class=sub id=sub>loading…</span></header>
@@ -310,14 +311,14 @@ function tintLisp(t){let s=esc(t);s=s.replace(/\b(defun|lambda|let|let\*|labels|
 // swallow). Later bcp wins a shared offset.
 function bcpRanges(map){const es=map.map((o,b)=>({o,b})).filter(e=>e.o!==NO_OFF).sort((a,b)=>a.o-b.o);return es.map((e,i)=>({o:e.o,b:e.b,end:i+1<es.length?es[i+1].o:e.o+1}))}
 function bcpAt(ranges,off){for(const r of ranges){if(off>=r.o&&off<r.end)return r.b}return null}
-function corrLines(text,native,map){const ranges=native?bcpRanges(map||[]):null;return text.split("\n").map(l=>{const e=tintDisasm(l);let b=null;if(native){const m=l.match(/^\s*\+([0-9a-f]+):/);if(m)b=bcpAt(ranges,parseInt(m[1],16))}else{const m=l.match(/^\s*(\d+):/);if(m)b=+m[1]}return`<span class=ln${b!=null?` data-bcp="${b}"`:""}>${e}</span>`}).join("")}
+function corrLines(text,native,map){const ranges=native?bcpRanges(map||[]):null;const out=[];let prev=null;text.split("\n").forEach(l=>{const e=tintDisasm(l);let b=null;if(native){const m=l.match(/^\s*\+([0-9a-f]+):/);if(m)b=bcpAt(ranges,parseInt(m[1],16))}else{const m=l.match(/^\s*(\d+):/);if(m)b=+m[1]}if(native&&b!=null&&b!==prev)out.push(`<span class="ln bcpmark" data-bcp="${b}">  ── bytecode ${b} ──</span>`);if(b!=null)prev=b;out.push(`<span class=ln${b!=null?` data-bcp="${b}"`:""}>${e}</span>`)});return out.join("")}
 function renderMulti(f){
  const cols=[["T0 · bytecode",corrLines(f.t0,false,null)]];
  if(f.t1)cols.push(["T1 · native x86-64",corrLines(f.t1,true,f.t1map)]);
  if(f.t2)cols.push(["T2 · native x86-64",corrLines(f.t2,true,f.t2map)]);
  const sparse=f.t2map&&f.t2map.some(o=>o===NO_OFF);
  const body=cols.map(([h,c])=>`<div class=col><h5>${h}</h5><pre>${c}</pre></div>`).join("");
- return`<p class=corr-hint>All tiers side by side — hover a line to light up the matching bytecode ↔ native across every pane and scroll them into view.${sparse?" (T2 is optimizer output — correlation is anchored at frame-state points.)":""}</p><div class=corr>${body}</div>`}
+ return`<p class=corr-hint>All tiers side by side — hover a line to light up the matching bytecode ↔ native; the <span class=mk>── bytecode N ──</span> markers show where each native run derives from. <b>T1</b> maps every bytecode; <b>T2</b> is optimizer output, so anchors are sparse — it fuses and reorders, and a marked region spans the native code between two frame-state points.</p><div class=corr>${body}</div>`}
 function wireCorr(root){const panes=[...root.querySelectorAll(".corr pre")];const all=root.querySelectorAll(".ln[data-bcp]");
  const lit=(b,on)=>all.forEach(el=>{if(el.dataset.bcp===b)el.classList.toggle("lit",on)});
  const sync=(b,own)=>panes.forEach(p=>{if(p===own)return;const t=p.querySelector('.ln[data-bcp="'+b+'"]');if(!t)return;const pr=p.getBoundingClientRect(),tr=t.getBoundingClientRect();const mg=p.clientHeight*0.22;if(tr.top>=pr.top+mg&&tr.bottom<=pr.bottom-mg)return;p.scrollTop+=(tr.top-pr.top)-p.clientHeight/2+tr.height/2});

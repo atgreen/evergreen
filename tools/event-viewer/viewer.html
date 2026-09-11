@@ -275,7 +275,12 @@
   .corr .ln[data-bcp] { cursor: pointer; }
   .corr .ln.lit { background: var(--accent); color: #fff; }
   .corr .ln.lit .c, .corr .ln.lit .op, .corr .ln.lit .spec { color: #fff; }
+  .corr .ln.bcpmark { color: var(--accent); opacity: .72; letter-spacing: .04em;
+    margin-top: 4px; font-size: .92em; }
+  .corr .ln.bcpmark.lit { color: #fff; opacity: 1; }
   .corr-hint { font-size: .78rem; color: var(--faint); margin: 2px 0 8px; }
+  .corr-hint .mk { color: var(--accent); font-family: var(--font-mono); }
+  .corr-hint b { color: var(--muted); }
 
   /* disassembly panel — the TriView payload */
   .disasm {
@@ -624,10 +629,15 @@ function bcpAt(ranges, off){
   return null;
 }
 // Tag each line of a listing with the bcp it belongs to: T0 by its leading
-// "  N:" index; a native tier by the bounded range its "+off" falls in.
+// "  N:" index; a native tier by the bounded range its "+off" falls in. In a
+// native pane, insert a "─ bytecode N ─" marker at each region boundary so the
+// (sparse, in T2) structure — which run of native code derives from which
+// bytecode — is visible even without hovering.
 function corrLines(text, native, map){
   const ranges = native ? bcpRanges(map || []) : null;
-  return text.split("\n").map(line=>{
+  const out = [];
+  let prev = null;
+  text.split("\n").forEach(line=>{
     const esc = tintDisasm(line);
     let bcp = null;
     if (native){
@@ -637,8 +647,13 @@ function corrLines(text, native, map){
       const m = line.match(/^\s*(\d+):/);
       if (m) bcp = +m[1];
     }
-    return `<span class="ln"${bcp!=null?` data-bcp="${bcp}"`:""}>${esc}</span>`;
-  }).join("");
+    if (native && bcp!=null && bcp!==prev){
+      out.push(`<span class="ln bcpmark" data-bcp="${bcp}">  ── bytecode ${bcp} ──</span>`);
+    }
+    if (bcp!=null) prev = bcp;
+    out.push(`<span class="ln"${bcp!=null?` data-bcp="${bcp}"`:""}>${esc}</span>`);
+  });
+  return out.join("");
 }
 // The multi-tier comparison: T0 bytecode | T1 native | T2 native, side by side,
 // each pane scrolling independently. Hovering a line lights up and scrolls the
@@ -649,7 +664,7 @@ function renderMulti(f){
   if (f.t2) cols.push(["T2 · native x86-64", corrLines(f.t2, true, f.t2map)]);
   const sparse = (f.t2map && f.t2map.some(o=>o===NO_OFF));
   const body = cols.map(([h,c])=>`<div class="col"><h5>${h}</h5><pre>${c}</pre></div>`).join("");
-  return `<p class="corr-hint">All tiers side by side — hover a line to light up the matching bytecode ↔ native across every pane and scroll them into view.${sparse?" (T2 is optimizer output — correlation is anchored at frame-state points.)":""}</p>
+  return `<p class="corr-hint">All tiers side by side — hover a line to light up the matching bytecode ↔ native across every pane; the <span class="mk">── bytecode N ──</span> markers show where each native run derives from. <b>T1</b> maps every bytecode; <b>T2</b> is optimizer output, so its anchors are sparse — the optimizer fuses and reorders, and a marked region is the span of native code between two frame-state points.</p>
     <div class="corr">${body}</div>`;
 }
 function wireCorrelation(root){
