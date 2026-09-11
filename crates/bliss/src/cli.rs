@@ -726,6 +726,38 @@ fn write_str_to(stream: BlissVal, s: &str) -> Result<(), BlissError> {
     bliss_stdlib::stream_write_string(stream, sv, 0, None)
 }
 
+/// Write a diagnostic report to `*TRACE-OUTPUT*` (falling back to
+/// `*STANDARD-OUTPUT*`, then process stdout). Used by TIME/ROOM (bliss-kfy4).
+/// Gray-stream aware. Allocates (the string), so callers must root any live
+/// `BlissVal`s across the call.
+fn write_trace_output(env: &mut Env, s: &str) -> Result<(), BlissError> {
+    let out = env
+        .lookup_var("*TRACE-OUTPUT*")
+        .filter(|v| is_stream(*v) || is_gray_stream(*v))
+        .or_else(|| {
+            env.lookup_var("*STANDARD-OUTPUT*")
+                .filter(|v| is_stream(*v) || is_gray_stream(*v))
+        })
+        .unwrap_or(NIL);
+    if out.is_nil() {
+        use std::io::Write;
+        print!("{s}");
+        let _ = std::io::stdout().flush();
+        return Ok(());
+    }
+    if is_gray_stream(out) {
+        let sv = arena_str(s);
+        invoke_generic_function(
+            "STREAM-WRITE-STRING",
+            &[out, sv, BlissVal::from_fixnum(0), NIL],
+            env,
+        )?;
+        Ok(())
+    } else {
+        write_str_to(out, s)
+    }
+}
+
 fn claim_process_signal_flags_for_current_execution() {
     fn post(signal: bliss_rt::PendingSignal) {
         if bliss_rt::post_foreground_pending_signal(signal).is_err() {
@@ -11649,6 +11681,8 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "FUNCALL"
             | "APPLY"
             | "CALL-NEXT-METHOD"
+            // TIME returns (and so must preserve) its body form's values.
+            | "TIME"
             | "LOOP"
             // DO/DO*/DOTIMES/DOLIST return the values of their result form,
             // which may be multiple — `(dotimes (i n (values a b)))` (CLHS
@@ -17114,6 +17148,78 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(
                     bliss_stdlib::time::get_internal_run_time(),
                 ));
+            }
+            "TIME" => {
+                // (time form): evaluate FORM, print a real/run/GC-time + bytes-
+                // consed report to *trace-output*, and return FORM's values
+                // (bliss-kfy4). A special form — it controls FORM's evaluation.
+                let (form, _rest) = cp(cdr);
+                let t0_real = bliss_stdlib::time::get_internal_real_time();
+                let t0_run = bliss_stdlib::time::get_internal_run_time();
+                let g0 = bliss_rt::heap_stats();
+                // Root the result AND the saved multiple values: the report write
+                // below allocates (make_lisp_string / arena_str), which can move
+                // nursery objects (GC-safety; bliss-6b2).
+                bliss_rt::rooted!(result = eval_form(form, env)?);
+                let saved_mv_active = env.mv_active;
+                bliss_rt::rooted!(saved_mv = std::mem::take(&mut env.mv));
+                let t1_real = bliss_stdlib::time::get_internal_real_time();
+                let t1_run = bliss_stdlib::time::get_internal_run_time();
+                let g1 = bliss_rt::heap_stats();
+                // internal-time-units-per-second is 1000 (milliseconds).
+                let secs = |units: i64| units as f64 / 1000.0;
+                let consed = g1.bytes_allocated.saturating_sub(g0.bytes_allocated);
+                let minor = g1.minor_gc_count.saturating_sub(g0.minor_gc_count);
+                let major = g1.major_gc_count.saturating_sub(g0.major_gc_count);
+                let gc_us = (g1.total_minor_pause_us + g1.total_major_pause_us)
+                    .saturating_sub(g0.total_minor_pause_us + g0.total_major_pause_us);
+                let report = format!(
+                    "\nEvaluation took:\n  \
+                     {:.6} seconds of real time\n  \
+                     {:.6} seconds of total run time\n  \
+                     {} bytes consed\n  \
+                     {} minor GCs, {} major GCs, {:.6} seconds of GC time\n",
+                    secs(t1_real - t0_real),
+                    secs(t1_run - t0_run),
+                    consed,
+                    minor,
+                    major,
+                    gc_us as f64 / 1_000_000.0,
+                );
+                write_trace_output(env, &report)?;
+                env.mv = std::mem::take(&mut *saved_mv);
+                env.mv_active = saved_mv_active;
+                return Ok(*result);
+            }
+            "ROOM" => {
+                // (room &optional verbose): print heap occupancy to *trace-output*
+                // (bliss-kfy4). The verbose designator (t/nil/:default) is
+                // accepted and ignored for now.
+                let _ = eval_args(cdr, env)?;
+                let g = bliss_rt::heap_stats();
+                let report = format!(
+                    "Heap:\n  \
+                     nursery:       {} / {} bytes used\n  \
+                     old generation: {} / {} bytes used\n  \
+                     large objects:  {} bytes\n  \
+                     total consed:   {} bytes\n  \
+                     GCs:            {} minor, {} major ({:.3}s + {:.3}s pause)\n  \
+                     regions:        {} total, {} free\n",
+                    g.nursery_used,
+                    g.nursery_capacity,
+                    g.old_gen_used,
+                    g.old_gen_capacity,
+                    g.large_object_bytes,
+                    g.bytes_allocated,
+                    g.minor_gc_count,
+                    g.major_gc_count,
+                    g.total_minor_pause_us as f64 / 1_000_000.0,
+                    g.total_major_pause_us as f64 / 1_000_000.0,
+                    g.regions_total,
+                    g.regions_free,
+                );
+                write_trace_output(env, &report)?;
+                return Ok(NIL);
             }
             "ENCODE-UNIVERSAL-TIME" => {
                 // (encode-universal-time second minute hour date month year
@@ -29335,6 +29441,8 @@ fn is_builtin_function(name: &str) -> bool {
             // Time
             | "GET-UNIVERSAL-TIME" | "ENCODE-UNIVERSAL-TIME" | "DECODE-UNIVERSAL-TIME"
             | "GET-INTERNAL-REAL-TIME" | "GET-INTERNAL-RUN-TIME"
+            // Profiling (bliss-kfy4)
+            | "TIME" | "ROOM"
             // I/O
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"

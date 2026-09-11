@@ -1200,6 +1200,12 @@ impl<'e> Lowerer<'e> {
                 "FLET" => self.lower_flet(rest, false),
                 "LABELS" => self.lower_flet(rest, true),
                 "MACROLET" | "SYMBOL-MACROLET" => self.lower_macrolet(form),
+                // TIME/ROOM are interpreter special forms (profiling; bliss-kfy4).
+                // The compiler has no lowering, and treating them as plain calls
+                // (the default below) would evaluate TIME's body in single-value
+                // context — dropping its multiple values. Bail so the enclosing
+                // form is interpreted, where TIME correctly preserves body values.
+                "TIME" | "ROOM" => Err(Bail),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
