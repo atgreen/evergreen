@@ -10,6 +10,7 @@ use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
 pub mod events;
+pub mod sprof;
 use bliss_rt::object::{ComplexData, ConsCell, ObjectHeader, RatioData, type_id};
 use bliss_rt::runtime::parse_cli as parse_runtime_cli;
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
@@ -6587,6 +6588,11 @@ fn eval_named_call_ex(
     parent: Rc<RefCell<EnvFrame>>,
     control: LexicalControl,
 ) -> Result<BlissVal, BlissError> {
+    // Lisp-aware statistical profiler (bliss-sc4t): this is the tree-walked call
+    // path — record the Lisp frame so a sampled stack shows the function, not the
+    // interpreter. The guard pops on every exit (return, `?`, non-local).
+    let _sf = sprof::Frame::name(name, sprof::TREEWALK);
+    sprof::maybe_sample();
     // Clone the FLET function's captured scope out (releasing the env.funs
     // borrow) and, if present, run the body with env.funs pointing at a fresh Rc
     // over that snapshot, restoring afterward. The snapshot is small (local funs
@@ -19365,6 +19371,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 write_trace_output(env, &out)?;
                 return Ok(NIL);
             }
+            // Lisp-aware statistical profiler (bliss-sc4t): samples a shadow
+            // stack of the Lisp call chain across tiers, so a flamegraph shows the
+            // real functions (T2/T0/treewalk mixed), not just the interpreter.
+            "BLISS-EXT:SPROF-START" => {
+                let args = eval_args(cdr, env)?;
+                let hz = args
+                    .first()
+                    .filter(|v| v.is_fixnum())
+                    .map(|v| v.as_fixnum() as u32)
+                    .unwrap_or(1000);
+                sprof::start(hz);
+                return Ok(T);
+            }
+            "BLISS-EXT:SPROF-STOP" => {
+                let _ = eval_args(cdr, env)?;
+                sprof::stop();
+                return Ok(BlissVal::from_fixnum(sprof::sample_count() as i64));
+            }
+            "BLISS-EXT:SPROF-FOLD" => {
+                let _ = eval_args(cdr, env)?;
+                write_trace_output(env, &sprof::fold())?;
+                return Ok(NIL);
+            }
             // Deterministic call-count profiler (bliss-xgr5 — the SBCL sb-profile
             // analog). PROFILE marks functions and snapshots their invocation
             // baseline; PROFILE-REPORT-CALLS shows the delta since; UNPROFILE and
@@ -31496,6 +31525,8 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     // JFR-style event stream (bliss-ai8n): honor BLISS_EVENTS=1 so a plain
     // `bliss-cli --load foo.lisp` run can be profiled without editing the code.
     events::init_from_env();
+    // Lisp-aware statistical profiler (bliss-sc4t): BLISS_SPROF=<hz>.
+    sprof::init_from_env();
 
     // Teach the image loader how to serialize/restore this crate's Rust-side
     // code registries (macros/setf) as a HostRegistries section (bliss-x0f2 M2).

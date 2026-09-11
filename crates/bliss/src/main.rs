@@ -13,6 +13,9 @@ fn main() {
     // bliss-jitrec: finalize the NDJSON stream (symbol + function records) and
     // close it, if BLISS_EVENTS_STREAM was set.
     cli::events::finalize_stream();
+    // Lisp-aware statistical profiler (bliss-sc4t): dump folded stacks if
+    // BLISS_SPROF was set.
+    cli::sprof::dump_on_exit();
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {

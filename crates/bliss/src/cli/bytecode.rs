@@ -420,6 +420,20 @@ pub fn call_registered(
         sym_label(sym)
     );
     let native = native_for_dispatch(sym, fn_obj, count);
+    // Lisp-aware statistical profiler (bliss-sc4t): record this compiled call's
+    // Lisp frame + tier so a sample shows the function, not the interpreter.
+    let _sf = if super::sprof::enabled() {
+        let tier = match &native {
+            Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
+                if nc.is_t2 { super::sprof::T2 } else { super::sprof::T1 }
+            }
+            _ => super::sprof::T0,
+        };
+        super::sprof::maybe_sample();
+        Some(super::sprof::Frame::sym(sym, tier))
+    } else {
+        None
+    };
     // Dispatch: native if promoted and under the depth cap, else run the callee
     // as BYTECODE — the profiling warmup tier. This is what gathers the operand
     // -type profile a function needs before it can be speculated at T2, even when
@@ -10987,6 +11001,8 @@ fn pop_condition_cluster_frame(stack: &bliss_rt::BlissStack, frame: *mut Frame) 
 /// hot loops simply go uncounted here rather than costing an atomic per edge.
 #[inline]
 fn record_back_edge_if_backward(act: &Activation, target: u32) {
+    // (Bytecode loop bodies are sampled at their CallNamed instructions, which
+    // see the full `acts` chain; a shadow-only sample here would misattribute.)
     if profiling_disabled() {
         return;
     }
@@ -11670,6 +11686,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 }
             }
             Instr::CallNamed { sym, nargs } => {
+                // Lisp-aware profiler (bliss-sc4t): a bytecode call is a
+                // consistent sampling point where the live Lisp call chain is
+                // exactly `acts` (the interpreter inlines callee activations here
+                // rather than recursing, so this is the only place to see them).
+                super::sprof::maybe_sample_stack(
+                    acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
+                );
                 // Collect arguments (pushed left-to-right, so arg0 is deepest).
                 let mut args = Vec::with_capacity(nargs as usize);
                 {
@@ -13122,6 +13145,9 @@ extern "C" fn c2i_osr_backedge() -> u64 {
     // same discipline that already makes moving GC safe at any T1/OSR runtime
     // call — so parking and being scanned here is sound.
     bliss_rt::safepoint::poll_safepoint();
+    // Lisp-aware profiler (bliss-sc4t): a native loop's back-edge is a consistent
+    // sampling point, so native T2 loops aren't invisible to the profile.
+    super::sprof::maybe_sample();
     native_loop_should_exit()
 }
 
@@ -13138,6 +13164,8 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     if native_loop_should_exit() != 0 {
         return 1;
     }
+    // Lisp-aware profiler (bliss-sc4t): sample native loop back-edges too.
+    super::sprof::maybe_sample();
     // GC stop-the-world (bliss-eeyj): a call-free T1 loop reaches Rust only
     // here, so this is where it must be stoppable by another thread's GC. Safe
     // for the same reasons as any T1 runtime call: the frame is on the rt
