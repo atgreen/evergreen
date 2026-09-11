@@ -12261,6 +12261,13 @@ thread_local! {
     /// Captured lexical environment for the currently executing native
     /// activation. Nested native calls save/restore this just like NATIVE_ENV.
     static NATIVE_ENV_FRAME: RefCell<Option<Rc<RefCell<EnvFrame>>>> = const { RefCell::new(None) };
+    /// The bytecode function whose OSR native code is currently running
+    /// (bliss-guck). OSR emits `sym == u32::MAX`, so env-var opcodes cannot map a
+    /// name index through `registry_get(sym)`; `native_env_name` falls back to
+    /// this function's `names`. Set by `run_native_osr` around the call (and
+    /// save/restored for nested OSR); null outside OSR. The pointee is kept alive
+    /// by the `Rc<OsrCode>` the caller holds for the whole native call.
+    static NATIVE_OSR_BF: std::cell::Cell<*const BytecodeFunction> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 /// c2i adapter: call the interpreted function named by `sym` with `n` arguments
@@ -12369,7 +12376,24 @@ fn stash_native_error(error: BlissError) {
 }
 
 fn native_env_name(function_sym: u64, name_index: u64) -> Option<String> {
-    registry_get(function_sym as u32).and_then(|body| body.names.get(name_index as usize).cloned())
+    if let Some(name) = registry_get(function_sym as u32)
+        .and_then(|body| body.names.get(name_index as usize).cloned())
+    {
+        return Some(name);
+    }
+    // OSR code is emitted with function_sym == u32::MAX, which is not a registry
+    // key. Fall back to the currently-running OSR function's names, published by
+    // run_native_osr (bliss-guck). The pointer is valid only while native OSR
+    // code is on the stack — exactly when this helper is reached from it.
+    let bf = NATIVE_OSR_BF.with(|c| c.get());
+    if bf.is_null() {
+        return None;
+    }
+    // SAFETY: run_native_osr holds the Rc<OsrCode> (hence the Rc<BytecodeFunction>)
+    // for the whole native call and sets/clears this pointer around it, so the
+    // pointee outlives every c2i callback made from that code.
+    let names: &[String] = unsafe { &(*bf).names };
+    names.get(name_index as usize).cloned()
 }
 
 extern "C" fn c2i_load_env(function_sym: u64, name_index: u64) -> u64 {
@@ -15159,47 +15183,34 @@ fn emit_native_x86(
                 emit_c2i_helper_call(&mut c);
             }
             // Env-var opcodes resolve their name at runtime via
-            // native_env_name(sym, idx) = registry_get(sym).names[idx]. OSR code
-            // is emitted with sym == u32::MAX (for the signal-only back-edge
-            // poll), which is not a registry key, so the lookup would fail
-            // ("native environment name vanished"). Under OSR, trap to T0 — which
-            // resolves the name from the live activation's own frame + names
-            // (bliss-zqit). The invoke path (allow_traps == false) carries the
-            // real sym and emits the native call as before.
+            // native_env_name(sym, idx). OSR bakes sym == u32::MAX (not a
+            // registry key), so native_env_name falls back to the running OSR
+            // function's names via NATIVE_OSR_BF (bliss-guck) — the invoke path
+            // carries the real sym. Either way the native call is correct.
             Instr::LoadEnvVar(name_idx) => {
-                if allow_traps {
-                    let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
-                    c.jmp(l);
-                } else {
-                    c.push(0xBF); // mov edi, function symbol
-                    c.extend_from_slice(&sym.to_le_bytes());
-                    c.push(0xBE); // mov esi, name index
-                    c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
-                    c.extend_from_slice(&[0x48, 0xB8]);
-                    c.extend_from_slice(&load_env_addr.to_le_bytes());
-                    emit_c2i_helper_call(&mut c);
-                    push_rax(&mut c);
-                }
+                c.push(0xBF); // mov edi, function symbol
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.push(0xBE); // mov esi, name index
+                c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&load_env_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
-                if allow_traps {
-                    let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
-                    c.jmp(l);
+                pop_into(&mut c, 2, false); // value -> rdx
+                c.push(0xBF); // mov edi, function symbol
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.push(0xBE); // mov esi, name index
+                c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
+                    store_env_addr
                 } else {
-                    pop_into(&mut c, 2, false); // value -> rdx
-                    c.push(0xBF); // mov edi, function symbol
-                    c.extend_from_slice(&sym.to_le_bytes());
-                    c.push(0xBE); // mov esi, name index
-                    c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
-                    c.extend_from_slice(&[0x48, 0xB8]);
-                    let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
-                        store_env_addr
-                    } else {
-                        define_env_addr
-                    };
-                    c.extend_from_slice(&helper.to_le_bytes());
-                    emit_c2i_helper_call(&mut c);
-                }
+                    define_env_addr
+                };
+                c.extend_from_slice(&helper.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
             }
             Instr::PushEnvChild | Instr::PopEnvChild => {
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -15897,6 +15908,12 @@ struct OsrCode {
     code_info: &'static CodeInfo,
     /// header bcp → entry-stub byte offset from `entry`.
     entries: std::collections::HashMap<u32, usize>,
+    /// The bytecode function this OSR code was compiled from (bliss-guck). OSR
+    /// emits `sym == u32::MAX`, so env-var opcodes cannot resolve their name via
+    /// `registry_get(sym).names`; holding the `bf` here (a) keeps its `names`
+    /// alive for the code's lifetime and (b) lets `run_native_osr` publish it
+    /// through `NATIVE_OSR_BF` so `native_env_name` can resolve names directly.
+    bf: Rc<BytecodeFunction>,
 }
 
 thread_local! {
@@ -16058,6 +16075,7 @@ fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> 
         num_slots,
         code_info,
         entries: osr.into_iter().collect(),
+        bf: Rc::clone(bf),
     }))
 }
 
@@ -16099,6 +16117,10 @@ fn run_native_osr(
     // functions that previously declined).
     let saved_env_frame =
         NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
+    // Publish this OSR function's bf so env-var opcodes can resolve their name
+    // (OSR bakes sym == u32::MAX; bliss-guck). osr.bf keeps it alive for the call.
+    let saved_osr_bf =
+        NATIVE_OSR_BF.with(|c| c.replace(Rc::as_ptr(&osr.bf)));
     let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_DEOPT.with(|d| d.set(false));
     let entry_addr = osr.entry as usize + stub_off;
@@ -16108,6 +16130,7 @@ fn run_native_osr(
     let ret = f(slots);
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
+    NATIVE_OSR_BF.with(|c| c.set(saved_osr_bf));
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
