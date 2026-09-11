@@ -19169,13 +19169,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&argv));
             }
             "READ-LINE" => {
-                // (read-line &optional stream eof-error-p eof-value)
-                let args = list_to_vec(cdr);
-                let stream = if !args.is_empty() {
-                    eval_form(args[0], env)?
-                } else {
-                    NIL
-                };
+                // (read-line &optional stream eof-error-p eof-value recursive-p)
+                // Mirror READ-CHAR's eof handling (bliss-49qk): eof-error-p and
+                // eof-value were previously ignored — the stream arg was the only
+                // one evaluated and EOF always returned NIL. Per CLHS, at EOF with
+                // nothing read, signal END-OF-FILE unless eof-error-p is NIL, in
+                // which case return eof-value (with a true second value).
+                let args = eval_args(cdr, env)?;
+                let stream = if !args.is_empty() { args[0] } else { NIL };
+                let eof_error_p = if args.len() > 1 { args[1] } else { T };
                 let inp = resolve_input_stream(stream, env);
                 if is_gray_stream(inp) {
                     // The Gray stream-read-line returns (values string eof-p);
@@ -19185,9 +19187,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let (line_val, missing_newline) = bliss_stdlib::stream_read_line(inp)?;
                 if line_val == EOF {
-                    // At end of input: honour the eof designator like the old
-                    // behaviour did — return NIL rather than signalling.
-                    return Ok(NIL);
+                    if eof_error_p.is_nil() {
+                        // Re-read eof-value from the rooted args after the
+                        // (allocating) read (bliss-6b2 #2). Second value is T at
+                        // EOF, matching read-line's missing-newline contract.
+                        let eof_value = if args.len() > 2 { args[2] } else { NIL };
+                        env.set_mv(vec![eof_value, T]);
+                        return Ok(eof_value);
+                    }
+                    return Err(BlissError::StreamError("end of file on READ-LINE".into()));
                 }
                 env.set_mv(vec![line_val, if missing_newline { T } else { NIL }]);
                 return Ok(line_val);
