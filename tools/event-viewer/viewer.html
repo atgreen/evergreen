@@ -257,7 +257,7 @@
 
   /* linked-selection correlated view: T0 bytecode | T1 native, side by side */
   .corr { display: flex; gap: 10px; overflow-x: auto; }
-  .corr .col { flex: 1 1 0; min-width: 240px; }
+  .corr .col { flex: 1 1 0; min-width: 200px; }
   .corr .col h5 {
     margin: 0 0 5px; font: 600 .7rem/1 var(--font-mono);
     text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
@@ -616,34 +616,33 @@ function bcpForOffset(map, off){
   for (const e of ents){ if (e.o<=off) bcp=e.bcp; else break; }
   return bcp;
 }
-// Build the correlated two-pane view: T0 bytecode lines (tagged by their bcp)
-// beside native lines (tagged by the bcp their offset maps to). Hovering a line
-// lights up every line sharing that bcp in BOTH panes. `nativeText`/`map`/`label`
-// select the tier (T1 dense map, T2 sparse map).
-function renderCorrelated(t0text, nativeText, map, label){
-  const sparse = map.filter(o=>o!==NO_OFF).length < map.length; // T2 is sparse
-  const t0 = t0text.split("\n").map(line=>{
-    const m = line.match(/^\s*(\d+):/);
+// Tag each line of a listing with the bcp it belongs to: T0 by its leading
+// "  N:" index; a native tier by the bcp its "+off" maps to (via its map).
+function corrLines(text, native, map){
+  return text.split("\n").map(line=>{
     const esc = tintDisasm(line);
-    // only tag T0 bcps the native map actually covers
-    const covered = m && map[+m[1]]!==undefined && map[+m[1]]!==NO_OFF;
-    return covered ? `<span class="ln" data-bcp="${m[1]}">${esc}</span>` : `<span class="ln">${esc}</span>`;
-  }).join("");
-  const nat = nativeText.split("\n").map(line=>{
-    const m = line.match(/^\s*\+([0-9a-f]+):/);
-    const esc = tintDisasm(line);
-    if (!m) return `<span class="ln">${esc}</span>`;
-    const bcp = bcpForOffset(map, parseInt(m[1],16));
+    let bcp = null;
+    if (native){
+      const m = line.match(/^\s*\+([0-9a-f]+):/);
+      if (m) bcp = bcpForOffset(map || [], parseInt(m[1],16));
+    } else {
+      const m = line.match(/^\s*(\d+):/);
+      if (m) bcp = +m[1];
+    }
     return `<span class="ln"${bcp!=null?` data-bcp="${bcp}"`:""}>${esc}</span>`;
   }).join("");
-  const note = sparse
-    ? "The optimized tier has no 1:1 mapping — correlation is anchored at frame-state points (calls, guards, deopts)."
-    : "Hover a line to light up the bytecode ↔ native instructions it maps to.";
-  return `<p class="corr-hint">${note}</p>
-    <div class="corr">
-      <div class="col"><h5>T0 · bytecode</h5><pre>${t0}</pre></div>
-      <div class="col"><h5>${label}</h5><pre>${nat}</pre></div>
-    </div>`;
+}
+// The multi-tier comparison: T0 bytecode | T1 native | T2 native, side by side,
+// each pane scrolling independently. Hovering a line lights up and scrolls the
+// matching bcp across EVERY pane (wireCorrelation handles any number of panes).
+function renderMulti(f){
+  const cols = [["T0 · bytecode", corrLines(f.t0, false, null)]];
+  if (f.t1) cols.push(["T1 · native x86-64", corrLines(f.t1, true, f.t1map)]);
+  if (f.t2) cols.push(["T2 · native x86-64", corrLines(f.t2, true, f.t2map)]);
+  const sparse = (f.t2map && f.t2map.some(o=>o===NO_OFF));
+  const body = cols.map(([h,c])=>`<div class="col"><h5>${h}</h5><pre>${c}</pre></div>`).join("");
+  return `<p class="corr-hint">All tiers side by side — hover a line to light up the matching bytecode ↔ native across every pane and scroll them into view.${sparse?" (T2 is optimizer output — correlation is anchored at frame-state points.)":""}</p>
+    <div class="corr">${body}</div>`;
 }
 function wireCorrelation(root){
   const panes = [...root.querySelectorAll(".corr pre")];
@@ -705,19 +704,18 @@ function openDrawer(name){
   // bytecode always; T1/T2 native captured at compile time even if later
   // deoptimised). Default to the highest tier reached.
   const f = funcs[name] || {};
-  const tiers = [["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
-  // Linked-selection tabs when we have bytecode and a native offset map.
-  const hasCorr1 = f.t0 && f.t1 && f.t1map && f.t1map.length;
-  const hasCorr2 = f.t0 && f.t2 && f.t2map && f.t2map.length;
-  if (hasCorr1) tiers.push(["corr","T0 ↔ T1"]);
-  if (hasCorr2) tiers.push(["corr2","T0 ↔ T2"]);
-  // How a tab renders into the pane (correlated view is multi-element markup).
+  // A single multi-tier comparison (T0 | T1 | T2 side by side) when there is a
+  // native tier to compare with the bytecode, then the individual listings.
+  const hasMulti = f.t0 && (f.t1 || f.t2);
+  const tiers = [];
+  if (hasMulti) tiers.push(["all","compare tiers"]);
+  [["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]]
+    .forEach(t=>{ if (f[t[0]]) tiers.push(t); });
   const renderTier = k =>
-    k==="corr"  ? renderCorrelated(f.t0, f.t1, f.t1map, "T1 · native x86-64") :
-    k==="corr2" ? renderCorrelated(f.t0, f.t2, f.t2map, "T2 · native x86-64") :
-    k==="src"   ? `<pre class="disasm">${tintLisp(f[k])}</pre>` :
-                  `<pre class="disasm">${tintDisasm(f[k])}</pre>`;
-  const defaultTab = hasCorr2 ? "corr2" : hasCorr1 ? "corr" : (tiers[tiers.length-1]||[])[0];
+    k==="all" ? renderMulti(f) :
+    k==="src" ? `<pre class="disasm">${tintLisp(f[k])}</pre>` :
+                `<pre class="disasm">${tintDisasm(f[k])}</pre>`;
+  const defaultTab = (tiers[0] || [])[0];  // "compare tiers" if present, else first
   let disasm;
   if (tiers.length){
     const initial = defaultTab;
@@ -734,7 +732,7 @@ function openDrawer(name){
 
   // wire the tier tabs
   const pane = document.getElementById("disasm-pane");
-  const paint = k => { pane.innerHTML = renderTier(k); if (k==="corr"||k==="corr2") wireCorrelation(pane); };
+  const paint = k => { pane.innerHTML = renderTier(k); if (k==="all") wireCorrelation(pane); };
   if (tiers.length) paint(defaultTab);
   document.querySelectorAll(".tiertab").forEach(btn=>{
     btn.onclick = ()=>{

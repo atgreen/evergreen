@@ -280,7 +280,7 @@ input#filter{font:inherit;padding:6px 11px;border:1px solid var(--line);border-r
 .tiertab[aria-pressed=true]{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .disasm{font-family:var(--font-mono);font-size:.77rem;line-height:1.5;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:11px 13px;overflow-x:auto;white-space:pre;margin:0}
 .disasm .c{color:var(--faint)}.disasm .spec{color:var(--accent);font-weight:600}.disasm .op{color:var(--ink)}
-.corr{display:flex;gap:10px;overflow-x:auto}.corr .col{flex:1 1 0;min-width:230px}.corr .col h5{margin:0 0 5px;font:600 .7rem/1 var(--font-mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.corr{display:flex;gap:10px;overflow-x:auto}.corr .col{flex:1 1 0;min-width:200px}.corr .col h5{margin:0 0 5px;font:600 .7rem/1 var(--font-mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
 .corr pre{margin:0;font-family:var(--font-mono);font-size:.73rem;line-height:1.5;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre;max-height:62vh;overflow:auto;scroll-behavior:smooth}
 @media(prefers-reduced-motion:reduce){.corr pre{scroll-behavior:auto}}
 .corr .ln{display:block;border-radius:3px;padding:0 3px;margin:0 -3px}.corr .ln[data-bcp]{cursor:pointer}.corr .ln.lit{background:var(--accent);color:#fff}.corr .ln.lit .c,.corr .ln.lit .op,.corr .ln.lit .spec{color:#fff}
@@ -305,12 +305,14 @@ function tintCode(s){return s.replace(/(^\s*(?:\+[0-9a-f]+|\d+):)/,'<span class=
 function tintDisasm(t){return t.split("\n").map(l=>{let e=esc(l);if(/^\s*;/.test(l))return`<span class=c>${e}</span>`;const i=e.indexOf("; ");if(i>=0){let c=e.slice(i).replace(/(⇒ speculate [A-Z-]+)/g,'<span class=spec>$1</span>');return tintCode(e.slice(0,i))+`<span class=c>${c}</span>`}return tintCode(e)}).join("\n")}
 function tintLisp(t){let s=esc(t);s=s.replace(/\b(defun|lambda|let|let\*|labels|flet|if|cond|when|unless|dotimes|dolist|loop|block|return-from|setq|setf|progn)\b/g,'<span class=op>$1</span>');return s.replace(/(^\(defun\s+)([^\s()]+)/,'$1<span class=spec>$2</span>')}
 function bcpForOffset(map,off){const es=map.map((o,b)=>({o,b})).filter(e=>e.o!==NO_OFF).sort((a,b)=>a.o-b.o);let bcp=null;for(const e of es){if(e.o<=off)bcp=e.b;else break}return bcp}
-function renderCorr(t0,nat,map,label){
- const sparse=map.filter(o=>o!==NO_OFF).length<map.length;
- const L=t0.split("\n").map(l=>{const m=l.match(/^\s*(\d+):/);const e=tintDisasm(l);const cov=m&&map[+m[1]]!==undefined&&map[+m[1]]!==NO_OFF;return cov?`<span class=ln data-bcp="${m[1]}">${e}</span>`:`<span class=ln>${e}</span>`}).join("");
- const R=nat.split("\n").map(l=>{const m=l.match(/^\s*\+([0-9a-f]+):/);const e=tintDisasm(l);if(!m)return`<span class=ln>${e}</span>`;const b=bcpForOffset(map,parseInt(m[1],16));return`<span class=ln${b!=null?` data-bcp="${b}"`:""}>${e}</span>`}).join("");
- const note=sparse?"Optimized tier has no 1:1 mapping — anchored at frame-state points (calls, guards, deopts).":"Hover a line to light up the bytecode ↔ native it maps to.";
- return`<p class=corr-hint>${note}</p><div class=corr><div class=col><h5>T0 · bytecode</h5><pre>${L}</pre></div><div class=col><h5>${label}</h5><pre>${R}</pre></div></div>`}
+function corrLines(text,native,map){return text.split("\n").map(l=>{const e=tintDisasm(l);let b=null;if(native){const m=l.match(/^\s*\+([0-9a-f]+):/);if(m)b=bcpForOffset(map||[],parseInt(m[1],16))}else{const m=l.match(/^\s*(\d+):/);if(m)b=+m[1]}return`<span class=ln${b!=null?` data-bcp="${b}"`:""}>${e}</span>`}).join("")}
+function renderMulti(f){
+ const cols=[["T0 · bytecode",corrLines(f.t0,false,null)]];
+ if(f.t1)cols.push(["T1 · native x86-64",corrLines(f.t1,true,f.t1map)]);
+ if(f.t2)cols.push(["T2 · native x86-64",corrLines(f.t2,true,f.t2map)]);
+ const sparse=f.t2map&&f.t2map.some(o=>o===NO_OFF);
+ const body=cols.map(([h,c])=>`<div class=col><h5>${h}</h5><pre>${c}</pre></div>`).join("");
+ return`<p class=corr-hint>All tiers side by side — hover a line to light up the matching bytecode ↔ native across every pane and scroll them into view.${sparse?" (T2 is optimizer output — correlation is anchored at frame-state points.)":""}</p><div class=corr>${body}</div>`}
 function wireCorr(root){const panes=[...root.querySelectorAll(".corr pre")];const all=root.querySelectorAll(".ln[data-bcp]");
  const lit=(b,on)=>all.forEach(el=>{if(el.dataset.bcp===b)el.classList.toggle("lit",on)});
  const sync=(b,own)=>panes.forEach(p=>{if(p===own)return;const t=p.querySelector('.ln[data-bcp="'+b+'"]');if(!t)return;const pr=p.getBoundingClientRect(),tr=t.getBoundingClientRect();if(tr.top>=pr.top&&tr.bottom<=pr.bottom)return;p.scrollTop+=(tr.top-pr.top)-p.clientHeight/2+tr.height/2});
@@ -351,14 +353,13 @@ async function openFn(sym,name){
  const f=await gj("/api/function?sym="+sym);
  const fr=window.FNS.find(x=>x.sym===sym)||{t1:0,t2:0,deopt:0,osr:0};
  const stats=`<div class=statline><span class=stat>T1 <b>${fr.t1}</b></span><span class=stat>T2 <b>${fr.t2}</b></span><span class=stat>deopts <b>${fr.deopt}</b></span><span class=stat>OSR <b>${fr.osr}</b></span></div>`;
- const tiers=[["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
- const c1=f.t0&&f.t1&&f.t1map&&f.t1map.length,c2=f.t0&&f.t2&&f.t2map&&f.t2map.length;
- if(c1)tiers.push(["corr","T0 ↔ T1"]);if(c2)tiers.push(["corr2","T0 ↔ T2"]);
- const rt=k=>k==="corr"?renderCorr(f.t0,f.t1,f.t1map,"T1 · native x86-64"):k==="corr2"?renderCorr(f.t0,f.t2,f.t2map,"T2 · native x86-64"):k==="src"?`<pre class=disasm>${tintLisp(f[k])}</pre>`:`<pre class=disasm>${tintDisasm(f[k])}</pre>`;
- const def=c2?"corr2":c1?"corr":(tiers[tiers.length-1]||[])[0];
+ const hasMulti=f.t0&&(f.t1||f.t2);const tiers=[];if(hasMulti)tiers.push(["all","compare tiers"]);
+ [["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].forEach(t=>{if(f[t[0]])tiers.push(t)});
+ const rt=k=>k==="all"?renderMulti(f):k==="src"?`<pre class=disasm>${tintLisp(f[k])}</pre>`:`<pre class=disasm>${tintDisasm(f[k])}</pre>`;
+ const def=(tiers[0]||[])[0];
  const tabs=tiers.map(([k,l])=>`<button class=tiertab data-tier="${k}" aria-pressed="${k===def}">${l}</button>`).join("");
  $("dbody").innerHTML=`<h4>JIT activity</h4>${stats}<h4>Representations</h4>${tiers.length?`<div class=tiertabs>${tabs}</div><div id=pane></div>`:'<p class=empty>No disassembly.</p>'}`;
- const pane=$("pane");const paint=k=>{pane.innerHTML=rt(k);if(k==="corr"||k==="corr2")wireCorr(pane)};
+ const pane=$("pane");const paint=k=>{pane.innerHTML=rt(k);if(k==="all")wireCorr(pane)};
  if(tiers.length)paint(def);
  document.querySelectorAll(".tiertab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tiertab").forEach(x=>x.setAttribute("aria-pressed","false"));b.setAttribute("aria-pressed","true");paint(b.dataset.tier)});
 }
