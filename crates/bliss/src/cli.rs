@@ -19318,6 +19318,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 write_trace_output(env, &out)?;
                 return Ok(NIL);
             }
+            // Flat aggregated view (JFR "flat" lens): engine totals + GC pause
+            // budget + a per-function T1/T2/deopt/osr table, complementing the
+            // time-ordered EVENTS-REPORT dump.
+            "BLISS-EXT:EVENTS-SUMMARY" => {
+                let _ = eval_args(cdr, env)?;
+                let mut out = String::new();
+                for line in events::summary_lines() {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                write_trace_output(env, &out)?;
+                return Ok(NIL);
+            }
             "BLISS-EXT:FUNCTION-INVOKE-COUNT" => {
                 let (f_form, _) = cp(cdr);
                 let d = eval_form(f_form, env)?;
