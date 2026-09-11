@@ -2750,6 +2750,14 @@ impl<'e> Lowerer<'e> {
                                 BlissVal::from_fixnum(1)
                             };
                             bliss_rt::rooted_ref!(_step_root = &mut step);
+                            // Descending if the FROM keyword was DOWNFROM OR the
+                            // LIMIT keyword was DOWNTO/ABOVE (`from N downto M`).
+                            // Deriving direction from `down` (DOWNFROM) alone made
+                            // `from N downto M` step UPWARD, so var never passed the
+                            // bound and the loop spun forever (bliss-876m). Computed
+                            // before the `if let` below consumes `limit`.
+                            let descending = down
+                                || matches!(limit.as_ref().map(|(_, c)| *c), Some(">=") | Some(">"));
                             if let Some((mut bound, cmp)) = limit {
                                 bliss_rt::rooted_ref!(_bound_root = &mut bound);
                                 // terminate when var passes the bound
@@ -2768,7 +2776,7 @@ impl<'e> Lowerer<'e> {
                                     form_list(&[s("GO")?, end]),
                                 ]));
                             }
-                            let op = if down { "-" } else { "+" };
+                            let op = if descending { "-" } else { "+" };
                             steps.push(form_list(&[
                                 s("SETQ")?,
                                 var,
