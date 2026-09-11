@@ -211,10 +211,11 @@ pub fn to_json() -> String {
     }
     s.push(']');
 
-    // Per-function disassembly of every function the JIT touched, so the viewer
-    // can show a JITWatch-style code panel (annotated bytecode for T0, native
-    // x86-64 for T1/T2) alongside each function's compile/deopt/OSR history.
-    // Resolved at dump time, so it reflects the final installed tier.
+    // Per-function TriView: the T0 / T1 / T2 representations of every function
+    // the JIT touched, so the viewer can show the whole tier progression —
+    // including tiers that have since been uninstalled (e.g. a function that
+    // deoptimised back to T0). T0 is the annotated bytecode; T1/T2 are the native
+    // x86-64 captured at compile time (bliss-kkd0).
     use std::collections::BTreeSet;
     let syms: BTreeSet<u32> = snapshot()
         .iter()
@@ -224,16 +225,20 @@ pub fn to_json() -> String {
     s.push_str(",\"functions\":{");
     let mut first = true;
     for sym in syms {
-        if let Some(disasm) = super::bytecode::disassemble_by_symbol(sym) {
+        if let Some((t0, t1, t2)) = super::bytecode::tier_disasm(sym) {
             if !first {
                 s.push(',');
             }
             first = false;
-            s.push_str(&format!(
-                "\"{}\":{{\"disasm\":\"{}\"}}",
-                json_escape(&sym_label(sym)),
-                json_escape(&disasm)
-            ));
+            s.push_str(&format!("\"{}\":{{", json_escape(&sym_label(sym))));
+            s.push_str(&format!("\"t0\":\"{}\"", json_escape(&t0)));
+            if let Some(t1) = t1 {
+                s.push_str(&format!(",\"t1\":\"{}\"", json_escape(&t1)));
+            }
+            if let Some(t2) = t2 {
+                s.push_str(&format!(",\"t2\":\"{}\"", json_escape(&t2)));
+            }
+            s.push('}');
         }
     }
     s.push('}');

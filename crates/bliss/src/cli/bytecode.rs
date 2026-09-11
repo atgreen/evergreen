@@ -453,26 +453,15 @@ fn sym_label(sym: u32) -> String {
     bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("#{sym}"))
 }
 
-/// `disassemble` (spec §6, CL:DISASSEMBLE): render a function's *current tier* —
-/// the annotated bytecode listing when it runs in the T0 interpreter, or the
-/// decoded x86-64 machine instructions when it has been promoted to native (T1).
-/// Returns `None` if `sym` names no compiled Bliss function (e.g. a builtin or a
-/// tree-walked closure), so the caller can fall back.
-pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
-    let bf = registry_get(sym)?;
-    let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
-    let mut out = String::new();
+/// Shared header for every tier's listing: signature + any checked parameter
+/// declarations.
+fn disasm_header(sym: u32, bf: &BytecodeFunction) -> String {
     use std::fmt::Write;
-
+    let mut out = String::new();
     let name = sym_label(sym);
-    let tier = match &native {
-        Some(nc) if nc.is_t2 => "T2 (native, profile-guided)",
-        Some(_) => "T1 (native)",
-        None => "T0 (bytecode interpreter)",
-    };
     let _ = writeln!(
         out,
-        "; disassembly of {name} — {} arg(s), {} local(s), {} stack slot(s)  [tier: {tier}]",
+        "; {name} — {} arg(s), {} local(s), {} stack slot(s)",
         bf.arity, bf.n_locals, bf.max_stack
     );
     let declared: Vec<String> = bf
@@ -489,72 +478,151 @@ pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
         })
         .collect();
     if !declared.is_empty() {
-        let _ = writeln!(
-            out,
-            "; checked parameter declarations: {}",
-            declared.join(", ")
-        );
+        let _ = writeln!(out, "; checked parameter declarations: {}", declared.join(", "));
     }
+    out
+}
 
-    match native {
-        // Promoted to native: decode the installed machine code (spec: "otherwise
-        // machine instructions"). The code is R+X-mapped, so reading it is safe.
-        Some(nc) => {
-            let _ = writeln!(out, "; {} bytes of x86-64 at {:p}", nc.code_len, nc.entry);
-            let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
-            let mut dec = iced_x86::Decoder::with_ip(
-                64,
-                bytes,
-                nc.entry as u64,
-                iced_x86::DecoderOptions::NONE,
-            );
-            let mut fmt = iced_x86::NasmFormatter::new();
-            let mut insn = iced_x86::Instruction::default();
-            let mut line = String::new();
-            while dec.can_decode() {
-                dec.decode_out(&mut insn);
-                line.clear();
-                use iced_x86::Formatter;
-                fmt.format(&insn, &mut line);
-                let _ = writeln!(out, "  {:#018x}:  {line}", insn.ip());
-            }
-        }
-        // Interpreted: the annotated bytecode listing (spec: "show the bytecode").
-        None => {
-            let func_ptr = Rc::as_ptr(&bf) as usize;
-            for (pc, instr) in bf.code.iter().enumerate() {
-                let ann = match instr {
-                    Instr::Const(i) => bf
-                        .constants
-                        .get(*i as usize)
-                        .map(|c| fmt_const_val(*c))
-                        .unwrap_or_default(),
-                    Instr::CallNamed { sym, nargs } => {
-                        let mut a = format!("({} …) / {nargs} arg(s)", sym_label(*sym));
-                        if let Some(p) = type_profile_at(func_ptr, pc as u32) {
-                            let spec = match p.dominant() {
-                                Some(SpecType::Fixnum) => " ⇒ speculate FIXNUM",
-                                Some(SpecType::SingleFloat) => " ⇒ speculate SINGLE-FLOAT",
-                                None => " ⇒ generic (polymorphic / cold)",
-                            };
-                            a.push_str(&format!(
-                                "  [profile fix:{} float:{} other:{}{}]",
-                                p.fixnum, p.single_float, p.other, spec
-                            ));
-                        }
-                        a
-                    }
-                    Instr::LoadGlobal(s) | Instr::StoreGlobal(s) => sym_label(*s),
-                    Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
-                    Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
-                    _ => String::new(),
-                };
-                if ann.is_empty() {
-                    let _ = writeln!(out, "  {pc:>4}: {instr:?}");
-                } else {
-                    let _ = writeln!(out, "  {pc:>4}: {instr:?}    ; {ann}");
+/// The annotated **bytecode** (T0) listing: each instruction, with call sites
+/// carrying the observed operand-type profile that drives tier-up speculation.
+fn format_bytecode_listing(sym: u32, bf: &Rc<BytecodeFunction>) -> String {
+    use std::fmt::Write;
+    let mut out = disasm_header(sym, bf);
+    out.push_str("; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n");
+    out.push_str("; runtime operand-type profile (fix/float/other) that drives tier-up.\n");
+    let func_ptr = Rc::as_ptr(bf) as usize;
+    for (pc, instr) in bf.code.iter().enumerate() {
+        let ann = match instr {
+            Instr::Const(i) => bf
+                .constants
+                .get(*i as usize)
+                .map(|c| fmt_const_val(*c))
+                .unwrap_or_default(),
+            Instr::CallNamed { sym, nargs } => {
+                let mut a = format!("({} …) / {nargs} arg(s)", sym_label(*sym));
+                if let Some(p) = type_profile_at(func_ptr, pc as u32) {
+                    let spec = match p.dominant() {
+                        Some(SpecType::Fixnum) => " ⇒ speculate FIXNUM",
+                        Some(SpecType::SingleFloat) => " ⇒ speculate SINGLE-FLOAT",
+                        None => " ⇒ generic (polymorphic / cold)",
+                    };
+                    a.push_str(&format!(
+                        "  [profile fix:{} float:{} other:{}{}]",
+                        p.fixnum, p.single_float, p.other, spec
+                    ));
                 }
+                a
             }
+            Instr::LoadGlobal(s) | Instr::StoreGlobal(s) => sym_label(*s),
+            Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
+            Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
+            _ => String::new(),
+        };
+        if ann.is_empty() {
+            let _ = writeln!(out, "  {pc:>4}: {instr:?}");
+        } else {
+            let _ = writeln!(out, "  {pc:>4}: {instr:?}    ; {ann}");
+        }
+    }
+    out
+}
+
+/// The **native x86-64** (T1/T2) listing for a specific installed `NativeCode`,
+/// with a header describing that tier's compilation strategy and its OSR loop
+/// entry points. Offsets are relative to the code entry (stable across runs,
+/// unlike absolute addresses). Reads the R+X-mapped code bytes, so it must be
+/// called while `nc` is installed (that is why the tier snapshots are captured
+/// at compile time — see [`capture_tier_disasm`]).
+fn format_native_listing(nc: &NativeCode) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    if nc.is_t2 {
+        out.push_str("; T2 — profile-guided native: speculates the dominant observed operand\n");
+        out.push_str("; types and monomorphic dispatch; a failed guard deoptimises to T0.\n");
+    } else {
+        out.push_str("; T1 — baseline native: optimistic FIXNUM arithmetic templates with\n");
+        out.push_str("; overflow/type guards; a failed guard deoptimises to T0.\n");
+    }
+    if !nc.osr_entries.is_empty() {
+        let mut es: Vec<u32> = nc.osr_entries.keys().copied().collect();
+        es.sort_unstable();
+        let _ = writeln!(out, "; OSR loop-header entry bcps: {es:?}");
+    }
+    let _ = writeln!(out, "; {} bytes of x86-64:", nc.code_len);
+    let base = nc.entry as u64;
+    let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
+    let mut dec = iced_x86::Decoder::with_ip(64, bytes, base, iced_x86::DecoderOptions::NONE);
+    let mut fmt = iced_x86::NasmFormatter::new();
+    let mut insn = iced_x86::Instruction::default();
+    let mut line = String::new();
+    while dec.can_decode() {
+        dec.decode_out(&mut insn);
+        line.clear();
+        use iced_x86::Formatter;
+        fmt.format(&insn, &mut line);
+        let _ = writeln!(out, "  +{:04x}:  {line}", insn.ip() - base);
+    }
+    out
+}
+
+thread_local! {
+    /// Snapshot of each function's T1 / T2 native disassembly text, captured at
+    /// compile time so the tiered-JIT viewer can show a representation that has
+    /// since been uninstalled (e.g. a function that deoptimised back to T0). Only
+    /// populated while the event stream is recording, so there is no cost off the
+    /// profiling path. (t1_text, t2_text).
+    static TIER_DISASM: RefCell<HashMap<u32, (Option<String>, Option<String>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Capture `nc`'s native listing under `sym` for the given tier. Called from
+/// `publish_native` (the single install point) while the code is mapped; a
+/// no-op unless the event stream is recording. The text is built first (reading
+/// only the code bytes — no BlissVal allocation), then stored, so it is
+/// GC-safe.
+fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
+    if !super::events::enabled() {
+        return;
+    }
+    let text = format_native_listing(nc);
+    TIER_DISASM.with(|m| {
+        let mut b = m.borrow_mut();
+        let e = b.entry(sym).or_insert((None, None));
+        if nc.is_t2 {
+            e.1 = Some(text);
+        } else {
+            e.0 = Some(text);
+        }
+    });
+}
+
+/// The T0 / T1 / T2 representations of `sym` for the tiered-JIT viewer. T0 (the
+/// annotated bytecode) is always available; T1 and T2 come from the compile-time
+/// snapshots and are present only for tiers this function actually reached while
+/// recording. Returns `None` if `sym` is not a compiled Bliss function.
+pub fn tier_disasm(sym: u32) -> Option<(String, Option<String>, Option<String>)> {
+    let bf = registry_get(sym)?;
+    let t0 = format_bytecode_listing(sym, &bf);
+    let (t1, t2) = TIER_DISASM.with(|m| m.borrow().get(&sym).cloned().unwrap_or((None, None)));
+    Some((t0, t1, t2))
+}
+
+/// `disassemble` (spec §6, CL:DISASSEMBLE): render a function's *current tier* —
+/// the annotated bytecode listing when it runs in the T0 interpreter, or the
+/// decoded x86-64 machine instructions when it has been promoted to native.
+/// Returns `None` if `sym` names no compiled Bliss function (e.g. a builtin or a
+/// tree-walked closure), so the caller can fall back.
+pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
+    let bf = registry_get(sym)?;
+    let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
+    let mut out = disasm_header(sym, &bf);
+    match native {
+        Some(nc) => out.push_str(&format_native_listing(&nc)),
+        None => {
+            // Re-emit without the duplicate header (format_bytecode_listing adds
+            // its own), keeping DISASSEMBLE's single-listing shape.
+            let body = format_bytecode_listing(sym, &bf);
+            out = body;
         }
     }
     Some(out)
@@ -13976,6 +14044,10 @@ fn publish_native(sym: u32, fn_obj: Option<BlissVal>, nc: &NativeCode) {
         if nc.is_t2 { 2 } else { 1 },
         0,
     );
+    // Snapshot this tier's native disassembly while it is still installed, so the
+    // viewer can show T1/T2 even after the function deoptimises back to T0
+    // (bliss-kkd0). No-op unless recording.
+    capture_tier_disasm(sym, nc);
 }
 
 fn background_safe_body(body: &BytecodeFunction) -> bool {

@@ -242,6 +242,19 @@
   .lifeline .tlabel { position: absolute; top: 30px; font-family: var(--font-mono);
     font-size: .62rem; color: var(--faint); transform: translateX(-50%); white-space: nowrap; }
 
+  /* tier tabs — T0 / T1 / T2 representations */
+  .tiertabs { display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }
+  .tiertab {
+    font: inherit; font-family: var(--font-mono); font-size: .78rem; cursor: pointer;
+    background: var(--surface-2); color: var(--muted);
+    border: 1px solid var(--line); border-bottom: none;
+    border-radius: 7px 7px 0 0; padding: 6px 13px;
+  }
+  .tiertab[aria-pressed="true"] {
+    background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600;
+  }
+  .tiertab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
   /* disassembly panel — the TriView payload */
   .disasm {
     font-family: var(--font-mono); font-size: .78rem; line-height: 1.5;
@@ -336,7 +349,11 @@ const EVENT_DATA = /*__EVENT_DATA__*/ {"events":[
   {"seq":5,"ns":6334200000,"kind":"deopt","name":"ADD1","reason":"guard","n":7},
   {"seq":6,"ns":6334600000,"kind":"deopt","name":"ADD1","reason":"blacklist","n":8},
   {"seq":7,"ns":6900000000,"kind":"gc-major","pause_us":9200,"regions_freed":3}
-],"functions":{"ADD1":{"disasm":"; disassembly of ADD1 — 1 arg(s), 1 local(s), 2 stack slot(s)  [tier: T0 (bytecode interpreter)]\n     0: LoadLocal(0)\n     1: Const(0)    ; 1\n     2: CallNamed { sym: 181, nargs: 2 }    ; (+ …) / 2 arg(s)  [profile fix:50 float:0 other:0 ⇒ speculate FIXNUM]\n     3: Return"}},"dropped":0} /*__END__*/;
+],"functions":{"ADD1":{
+  "t0":"; ADD1 — 1 arg(s), 1 local(s), 2 stack slot(s)\n; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n; runtime operand-type profile (fix/float/other) that drives tier-up.\n     0: LoadLocal(0)\n     1: Const(0)    ; 1\n     2: CallNamed { sym: 181, nargs: 2 }    ; (+ …) / 2 arg(s)  [profile fix:50 float:0 other:0 ⇒ speculate FIXNUM]\n     3: Return",
+  "t1":"; T1 — baseline native: optimistic FIXNUM arithmetic templates with\n; overflow/type guards; a failed guard deoptimises to T0.\n; 259 bytes of x86-64:\n  +0000:  push r14\n  +0002:  mov rax,[rdi]\n  +0005:  test al,1\n  +0007:  jne +0030\n  +0009:  add rax,2\n  +000d:  jo +0030\n  +0030:  ; deopt guard → T0",
+  "t2":"; T2 — profile-guided native: speculates the dominant observed operand\n; types and monomorphic dispatch; a failed guard deoptimises to T0.\n; 185 bytes of x86-64:\n  +0000:  mov rcx,[rdi]\n  +0004:  add rcx,2\n  +0008:  jo +0020\n  +000a:  mov [rsi],rcx\n  +000d:  ret"
+}},"dropped":0} /*__END__*/;
 
 const KINDS = [
   {key:"compile-t1", label:"T1 compile", css:"--k-t1",   match:e=>e.kind==="compile"&&e.tier<2},
@@ -537,21 +554,24 @@ function tierOf(name){
   return {t:"T0", c:"var(--muted)"};
 }
 
-// Light syntax tinting for the disassembly text (comments / speculation / ops).
+// Light syntax tinting for the disassembly text (comments / speculation / ops /
+// offset labels). Handles both the bytecode listing and native x86-64.
+const OPS = /\b(CallNamed|LoadLocal|LoadGlobal|StoreGlobal|StoreLocal|Const|Return|Br|BrIfFalse|BrIfTrue|Go|PushBlock|PopHandler|call|jmp|je|jne|jz|jnz|jg|jge|jl|jle|ret|mov|movabs|cmp|test|add|sub|imul|lea|push|pop|xor|and|or|shl|shr|sar)\b/g;
+function tintCode(s){
+  // offset / bytecode-index labels: "+0000:" or "  12:"
+  return s.replace(/(^\s*(?:\+[0-9a-f]+|\d+):)/,'<span class="c">$1</span>')
+          .replace(OPS,'<span class="op">$1</span>');
+}
 function tintDisasm(text){
   return text.split("\n").map(line=>{
     let esc = escapeHtml(line);
-    // whole-line comment (tier header etc.)
-    if (/^\s*;/.test(line)) return `<span class="c">${esc}</span>`;
-    // trailing "; annotation" — split at the first "; "
-    const ci = esc.indexOf("; ");
+    if (/^\s*;/.test(line)) return `<span class="c">${esc}</span>`;   // whole-line comment
+    const ci = esc.indexOf("; ");                                     // trailing "; annotation"
     if (ci >= 0){
-      let code = esc.slice(0,ci), cmt = esc.slice(ci);
-      cmt = cmt.replace(/(⇒ speculate [A-Z-]+)/g, '<span class="spec">$1</span>');
-      code = code.replace(/\b(CallNamed|LoadGlobal|StoreGlobal|Return|Br|BrIfFalse|BrIfTrue|Go|call|jmp|ret|mov|cmp|add|sub)\b/g,'<span class="op">$1</span>');
-      return code + `<span class="c">${cmt}</span>`;
+      let cmt = esc.slice(ci).replace(/(⇒ speculate [A-Z-]+)/g, '<span class="spec">$1</span>');
+      return tintCode(esc.slice(0,ci)) + `<span class="c">${cmt}</span>`;
     }
-    return esc.replace(/\b(CallNamed|LoadGlobal|StoreGlobal|Return|Br|BrIfFalse|BrIfTrue|Go|call|jmp|ret|mov|cmp|add|sub)\b/g,'<span class="op">$1</span>');
+    return tintCode(esc);
   }).join("\n");
 }
 
@@ -586,14 +606,34 @@ function openDrawer(name){
     ? `<div class="lifeline"><div class="track"></div>${dots}</div>`
     : `<p class="empty">Single event — no chain to plot.</p>`;
 
-  const disasm = funcs[name] && funcs[name].disasm
-    ? `<pre class="disasm">${tintDisasm(funcs[name].disasm)}</pre>`
-    : `<p class="empty">No disassembly captured for this function.</p>`;
+  // TriView: tabs for each tier representation this function reached (T0
+  // bytecode always; T1/T2 native captured at compile time even if later
+  // deoptimised). Default to the highest tier reached.
+  const f = funcs[name] || {};
+  const tiers = [["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
+  let disasm;
+  if (tiers.length){
+    const initial = tiers[tiers.length-1][0];
+    const tabs = tiers.map(([k,l])=>`<button class="tiertab" data-tier="${k}" aria-pressed="${k===initial}">${l}</button>`).join("");
+    disasm = `<div class="tiertabs">${tabs}</div><pre class="disasm" id="disasm-pre">${tintDisasm(f[initial])}</pre>`;
+  } else {
+    disasm = `<p class="empty">No disassembly captured for this function.</p>`;
+  }
 
   document.getElementById("drawer-body").innerHTML =
     `<h4>JIT activity</h4>${stats}
      <h4>Compile chain</h4>${lifeline}
-     <h4>Disassembly <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">— annotated bytecode (T0) or native x86-64 (T1/T2), as finally installed</span></h4>${disasm}`;
+     <h4>Representations <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">— each tier this function was compiled to, captured as installed</span></h4>${disasm}`;
+
+  // wire the tier tabs
+  const pre = document.getElementById("disasm-pre");
+  document.querySelectorAll(".tiertab").forEach(btn=>{
+    btn.onclick = ()=>{
+      document.querySelectorAll(".tiertab").forEach(b=>b.setAttribute("aria-pressed","false"));
+      btn.setAttribute("aria-pressed","true");
+      pre.innerHTML = tintDisasm(f[btn.dataset.tier]);
+    };
+  });
 
   lastFocus = document.activeElement;
   backdrop.classList.add("open");
