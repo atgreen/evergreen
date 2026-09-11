@@ -1380,6 +1380,30 @@ struct FunDef {
     /// Raw lambda list, for full &optional/&rest/&key binding.
     params_form: BlissVal,
     body: BlissVal,
+    /// The function-namespace in which this function's BODY is evaluated, when
+    /// it must differ from the caller's (bliss-ayq8). FLET captures an OWNED
+    /// snapshot of the ENCLOSING funs here, so a FLET function's body sees neither
+    /// its siblings nor itself (CLHS 3.1.2.1) — non-recursive. `None` means
+    /// "inherit the caller's funs", correct for LABELS (recursive within its own
+    /// scope) and for global/lambda functions. Owned (not `Rc`) so `FunDef` stays
+    /// `Send` — frozen macro-captures store `FunDef`s in a cross-thread global.
+    /// `env.funs` holds only lexical local functions (globals live in the symbol
+    /// table), so this snapshot is typically empty or tiny.
+    def_funs: Option<Box<HashMap<String, FunDef>>>,
+}
+
+impl FunDef {
+    /// A function whose body inherits the caller's function-namespace (globals,
+    /// LABELS locals, setf writers, lambdas). FLET builds its FunDefs with an
+    /// explicit `def_funs` instead (see `eval_flet`).
+    fn plain(params: Vec<String>, params_form: BlissVal, body: BlissVal) -> Self {
+        FunDef {
+            params,
+            params_form,
+            body,
+            def_funs: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2798,11 +2822,11 @@ fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
         GLOBAL_SETF_FNS.with(|m| {
             m.borrow_mut().insert(
                 key,
-                FunDef {
+                FunDef::plain(
                     params,
-                    params_form: BlissVal::from_raw(params_raw),
-                    body: BlissVal::from_raw(body_raw),
-                },
+                    BlissVal::from_raw(params_raw),
+                    BlissVal::from_raw(body_raw),
+                ),
             );
         });
     }
@@ -5308,6 +5332,16 @@ fn visit_env_frame_roots(
 fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut BlissVal)) {
     visit(&mut def.params_form);
     visit(&mut def.body);
+    // A FLET function captures its enclosing funs (bliss-ayq8); those FunDefs'
+    // bodies are cons trees the moving GC must root if this FunDef outlives the
+    // defining env (an escaped FLET closure). def_funs always points to a
+    // strictly-older scope, so the parent chain is acyclic and this terminates;
+    // the maps are distinct from the one being scanned, so the borrow is safe.
+    if let Some(scope) = &mut def.def_funs {
+        for inner in scope.values_mut() {
+            visit_fun_def_roots(inner, visit);
+        }
+    }
 }
 
 fn visit_macro_def_roots(
@@ -6477,6 +6511,46 @@ fn eval_lambda_call(
     parent: Rc<RefCell<EnvFrame>>,
 ) -> Result<BlissVal, BlissError> {
     eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Inherit)
+}
+
+/// Invoke a named function's body, honoring a FLET function's captured
+/// non-recursive scope (bliss-ayq8). When `is_local` and the local FunDef named
+/// `name` carries a `def_funs` scope (FLET), evaluate the body with `env.funs`
+/// swapped to it — so the body sees neither its siblings nor itself — then
+/// restore. Otherwise (LABELS locals inherit the recursive child scope; globals;
+/// package-qualified names) it is exactly `eval_lambda_call_ex`.
+#[allow(clippy::too_many_arguments)]
+fn eval_named_call_ex(
+    env: &mut Env,
+    name: &str,
+    is_local: bool,
+    params_form: BlissVal,
+    body: BlissVal,
+    args: &[BlissVal],
+    parent: Rc<RefCell<EnvFrame>>,
+    control: LexicalControl,
+) -> Result<BlissVal, BlissError> {
+    // Clone the FLET function's captured scope out (releasing the env.funs
+    // borrow) and, if present, run the body with env.funs pointing at a fresh Rc
+    // over that snapshot, restoring afterward. The snapshot is small (local funs
+    // only), so the per-call clone is cheap.
+    let def_scope = if is_local {
+        env.funs
+            .borrow()
+            .get(name)
+            .and_then(|f| f.def_funs.as_ref().map(|b| (**b).clone()))
+    } else {
+        None
+    };
+    match def_scope {
+        Some(scope_map) => {
+            let saved = std::mem::replace(&mut env.funs, Rc::new(RefCell::new(scope_map)));
+            let r = eval_lambda_call_ex(env, params_form, body, args, parent, control);
+            env.funs = saved;
+            r
+        }
+        None => eval_lambda_call_ex(env, params_form, body, args, parent, control),
+    }
 }
 
 fn eval_lambda_call_ex(
@@ -15403,7 +15477,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 ]);
                 return Ok(*temps_list);
             }
-            "FLET" | "LABELS" => return eval_flet(cdr, env),
+            "FLET" => return eval_flet(cdr, env, false),
+            "LABELS" => return eval_flet(cdr, env, true),
             "DEFMACRO" => return eval_defmacro(cdr, env),
             "DEFINE-SYMBOL-MACRO" => return eval_define_symbol_macro(cdr, env),
             "DEFINE-COMPILER-MACRO" => return eval_define_compiler_macro(cdr, env),
@@ -20715,8 +20790,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             };
             // The rooted argument vector is rewritten in place by any collection
             // (call_registered may have collected), so it is always current.
-            let res =
-                eval_lambda_call_ex(env, *params_form, *body, &rooted_args, call_parent, control);
+            // eval_named_call_ex swaps in a FLET function's captured scope
+            // (bliss-ayq8) when this is a local FLET name.
+            let res = eval_named_call_ex(
+                env,
+                &name,
+                is_local_fn,
+                *params_form,
+                *body,
+                &rooted_args,
+                call_parent,
+                control,
+            );
             if let Err(e) = &res {
                 calltrace_note(&name, e);
             }
@@ -25421,14 +25506,7 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let name = function_name_key(name_form);
         let params = extract_params(params_form);
         GLOBAL_SETF_FNS.with(|m| {
-            m.borrow_mut().insert(
-                name,
-                FunDef {
-                    params,
-                    params_form,
-                    body,
-                },
-            )
+            m.borrow_mut().insert(name, FunDef::plain(params, params_form, body))
         });
         // Also install the writer as an ordinary function on the mangled
         // %SETF-WRITER-place symbol. GLOBAL_SETF_FNS serves the interpreted SETF
@@ -25505,9 +25583,18 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
     Some(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)))
 }
 
-fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, BlissError> {
     let (defs_form, mut body) = cp(cdr);
     bliss_rt::rooted_ref!(_body_root = &mut body);
+    // Snapshot the ENCLOSING function-namespace. FLET's function bodies evaluate
+    // in this scope (siblings + self invisible; bliss-ayq8); LABELS' bodies
+    // inherit the recursive child scope instead. env.funs isn't mutated here (the
+    // inserts below copy-on-write child_env.funs), so this stays the pre-FLET map.
+    let parent_snapshot: HashMap<String, FunDef> = if recursive {
+        HashMap::new() // LABELS: unused
+    } else {
+        env.funs.borrow().clone()
+    };
     let mut child_env = env.child();
     let mut c = defs_form;
     bliss_rt::rooted_ref!(_defs_cursor_root = &mut c);
@@ -25552,6 +25639,14 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     params,
                     params_form,
                     body: fbody,
+                    // FLET (recursive=false): body sees the enclosing funs, not
+                    // its siblings or itself. LABELS (recursive=true): inherit the
+                    // recursive child scope (bliss-ayq8).
+                    def_funs: if recursive {
+                        None
+                    } else {
+                        Some(Box::new(parent_snapshot.clone()))
+                    },
                 },
             );
         }
@@ -28965,7 +29060,18 @@ fn apply_function(
             } else {
                 LexicalControl::Fresh
             };
-            let res = eval_lambda_call_ex(env, params_form, body, args, call_parent, control);
+            // eval_named_call_ex swaps in a FLET function's captured scope
+            // (bliss-ayq8) when this is a local FLET name; otherwise identical.
+            let res = eval_named_call_ex(
+                env,
+                &name,
+                is_local_fn,
+                params_form,
+                body,
+                args,
+                call_parent,
+                control,
+            );
             if let Err(e) = &res {
                 calltrace_note(&name, e);
             }
@@ -31600,11 +31706,7 @@ mod host_registry_hook_tests {
         GLOBAL_SETF_FNS.with(|m| {
             m.borrow_mut().insert(
                 setf_key.into(),
-                FunDef {
-                    params: vec!["V".into()],
-                    params_form: setf_params_form,
-                    body: setf_body,
-                },
+                FunDef::plain(vec!["V".into()], setf_params_form, setf_body),
             );
         });
 
@@ -31692,11 +31794,7 @@ mod env_gc_root_tests {
 
         env.funs.borrow_mut().insert(
             "LOCAL-FUN".into(),
-            FunDef {
-                params: Vec::new(),
-                params_form: marker(4),
-                body: marker(5),
-            },
+            FunDef::plain(Vec::new(), marker(4), marker(5)),
         );
         env.macros.borrow_mut().insert(
             "LOCAL-MACRO".into(),
@@ -31868,11 +31966,7 @@ mod env_gc_root_tests {
         let parent = Env::new(false);
         parent.funs.borrow_mut().insert(
             "PARENT".into(),
-            FunDef {
-                params: Vec::new(),
-                params_form: marker(0),
-                body: marker(1),
-            },
+            FunDef::plain(Vec::new(), marker(0), marker(1)),
         );
         parent.symbol_macros.borrow_mut().insert(99, marker(2));
         parent.macros.borrow_mut().insert(
@@ -31889,11 +31983,7 @@ mod env_gc_root_tests {
         let mut child = parent.child();
         child.funs_mut().insert(
             "CHILD".into(),
-            FunDef {
-                params: Vec::new(),
-                params_form: marker(5),
-                body: marker(6),
-            },
+            FunDef::plain(Vec::new(), marker(5), marker(6)),
         );
         child.symbol_macros_mut().insert(100, marker(7));
         let child_frame = Rc::clone(&child.frame);
