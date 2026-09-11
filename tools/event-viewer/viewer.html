@@ -608,23 +608,31 @@ function tintDisasm(text){
 }
 
 const NO_OFF = 4294967295; // u32::MAX — a bcp that emitted no native code
-// Given the T1 bcp→offset map, the bcp a native offset belongs to: the last bcp
-// whose start offset is <= off.
-function bcpForOffset(map, off){
+// Turn a bcp→offset map into disjoint native ranges [start, end) per bcp: each
+// bcp owns the code from its offset UP TO the next mapped offset. This bounds
+// attribution — an instruction is credited to one bcp, never a greedy tail. The
+// last mapped bcp gets only its own instruction (end = start+1), so epilogue and
+// cold deopt stubs past the final anchor stay unattributed instead of the anchor
+// swallowing them. When several bcps share an offset (e.g. a no-op PushBlock),
+// the later one wins the range.
+function bcpRanges(map){
   const ents = map.map((o,bcp)=>({o,bcp})).filter(e=>e.o!==NO_OFF).sort((a,b)=>a.o-b.o);
-  let bcp = null;
-  for (const e of ents){ if (e.o<=off) bcp=e.bcp; else break; }
-  return bcp;
+  return ents.map((e,i)=>({o:e.o, bcp:e.bcp, end: i+1<ents.length ? ents[i+1].o : e.o+1}));
+}
+function bcpAt(ranges, off){
+  for (const r of ranges){ if (off>=r.o && off<r.end) return r.bcp; }
+  return null;
 }
 // Tag each line of a listing with the bcp it belongs to: T0 by its leading
-// "  N:" index; a native tier by the bcp its "+off" maps to (via its map).
+// "  N:" index; a native tier by the bounded range its "+off" falls in.
 function corrLines(text, native, map){
+  const ranges = native ? bcpRanges(map || []) : null;
   return text.split("\n").map(line=>{
     const esc = tintDisasm(line);
     let bcp = null;
     if (native){
       const m = line.match(/^\s*\+([0-9a-f]+):/);
-      if (m) bcp = bcpForOffset(map || [], parseInt(m[1],16));
+      if (m) bcp = bcpAt(ranges, parseInt(m[1],16));
     } else {
       const m = line.match(/^\s*(\d+):/);
       if (m) bcp = +m[1];
@@ -651,13 +659,16 @@ function wireCorrelation(root){
     if (el.dataset.bcp===bcp) el.classList.toggle("lit", on);
   });
   // Scroll the OTHER pane(s) so this bcp's first matching line is in view; leave
-  // the pane under the cursor alone.
+  // the pane under the cursor alone. Re-center unless the target already sits
+  // comfortably inside the pane (a line pinned to the very top/bottom edge counts
+  // as "not comfortable" so it gets centered instead of hugging the border).
   const syncScroll = (bcp, ownPane) => panes.forEach(p=>{
     if (p===ownPane) return;
     const t = p.querySelector('.ln[data-bcp="'+bcp+'"]');
     if (!t) return;
     const pr = p.getBoundingClientRect(), tr = t.getBoundingClientRect();
-    if (tr.top >= pr.top && tr.bottom <= pr.bottom) return; // already visible
+    const margin = p.clientHeight * 0.22;
+    if (tr.top >= pr.top + margin && tr.bottom <= pr.bottom - margin) return;
     p.scrollTop += (tr.top - pr.top) - p.clientHeight/2 + tr.height/2;
   });
   all.forEach(el=>{

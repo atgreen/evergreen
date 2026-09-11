@@ -304,8 +304,13 @@ const OPS=/\b(CallNamed|LoadLocal|LoadGlobal|StoreGlobal|StoreLocal|Const|Return
 function tintCode(s){return s.replace(/(^\s*(?:\+[0-9a-f]+|\d+):)/,'<span class=c>$1</span>').replace(OPS,'<span class=op>$1</span>')}
 function tintDisasm(t){return t.split("\n").map(l=>{let e=esc(l);if(/^\s*;/.test(l))return`<span class=c>${e}</span>`;const i=e.indexOf("; ");if(i>=0){let c=e.slice(i).replace(/(⇒ speculate [A-Z-]+)/g,'<span class=spec>$1</span>');return tintCode(e.slice(0,i))+`<span class=c>${c}</span>`}return tintCode(e)}).join("\n")}
 function tintLisp(t){let s=esc(t);s=s.replace(/\b(defun|lambda|let|let\*|labels|flet|if|cond|when|unless|dotimes|dolist|loop|block|return-from|setq|setf|progn)\b/g,'<span class=op>$1</span>');return s.replace(/(^\(defun\s+)([^\s()]+)/,'$1<span class=spec>$2</span>')}
-function bcpForOffset(map,off){const es=map.map((o,b)=>({o,b})).filter(e=>e.o!==NO_OFF).sort((a,b)=>a.o-b.o);let bcp=null;for(const e of es){if(e.o<=off)bcp=e.b;else break}return bcp}
-function corrLines(text,native,map){return text.split("\n").map(l=>{const e=tintDisasm(l);let b=null;if(native){const m=l.match(/^\s*\+([0-9a-f]+):/);if(m)b=bcpForOffset(map||[],parseInt(m[1],16))}else{const m=l.match(/^\s*(\d+):/);if(m)b=+m[1]}return`<span class=ln${b!=null?` data-bcp="${b}"`:""}>${e}</span>`}).join("")}
+// Disjoint native ranges [start,end) per bcp: each bcp owns code up to the next
+// mapped offset; the last mapped bcp owns only its own instruction so the
+// epilogue/deopt-stub tail past the final anchor stays unattributed (no greedy
+// swallow). Later bcp wins a shared offset.
+function bcpRanges(map){const es=map.map((o,b)=>({o,b})).filter(e=>e.o!==NO_OFF).sort((a,b)=>a.o-b.o);return es.map((e,i)=>({o:e.o,b:e.b,end:i+1<es.length?es[i+1].o:e.o+1}))}
+function bcpAt(ranges,off){for(const r of ranges){if(off>=r.o&&off<r.end)return r.b}return null}
+function corrLines(text,native,map){const ranges=native?bcpRanges(map||[]):null;return text.split("\n").map(l=>{const e=tintDisasm(l);let b=null;if(native){const m=l.match(/^\s*\+([0-9a-f]+):/);if(m)b=bcpAt(ranges,parseInt(m[1],16))}else{const m=l.match(/^\s*(\d+):/);if(m)b=+m[1]}return`<span class=ln${b!=null?` data-bcp="${b}"`:""}>${e}</span>`}).join("")}
 function renderMulti(f){
  const cols=[["T0 · bytecode",corrLines(f.t0,false,null)]];
  if(f.t1)cols.push(["T1 · native x86-64",corrLines(f.t1,true,f.t1map)]);
@@ -315,7 +320,7 @@ function renderMulti(f){
  return`<p class=corr-hint>All tiers side by side — hover a line to light up the matching bytecode ↔ native across every pane and scroll them into view.${sparse?" (T2 is optimizer output — correlation is anchored at frame-state points.)":""}</p><div class=corr>${body}</div>`}
 function wireCorr(root){const panes=[...root.querySelectorAll(".corr pre")];const all=root.querySelectorAll(".ln[data-bcp]");
  const lit=(b,on)=>all.forEach(el=>{if(el.dataset.bcp===b)el.classList.toggle("lit",on)});
- const sync=(b,own)=>panes.forEach(p=>{if(p===own)return;const t=p.querySelector('.ln[data-bcp="'+b+'"]');if(!t)return;const pr=p.getBoundingClientRect(),tr=t.getBoundingClientRect();if(tr.top>=pr.top&&tr.bottom<=pr.bottom)return;p.scrollTop+=(tr.top-pr.top)-p.clientHeight/2+tr.height/2});
+ const sync=(b,own)=>panes.forEach(p=>{if(p===own)return;const t=p.querySelector('.ln[data-bcp="'+b+'"]');if(!t)return;const pr=p.getBoundingClientRect(),tr=t.getBoundingClientRect();const mg=p.clientHeight*0.22;if(tr.top>=pr.top+mg&&tr.bottom<=pr.bottom-mg)return;p.scrollTop+=(tr.top-pr.top)-p.clientHeight/2+tr.height/2});
  all.forEach(el=>{el.onmouseenter=()=>{lit(el.dataset.bcp,true);sync(el.dataset.bcp,el.closest("pre"))};el.onmouseleave=()=>lit(el.dataset.bcp,false)})}
 
 let SPAN=[0,1];const ms=ns=>(ns-SPAN[0])/1e6;
