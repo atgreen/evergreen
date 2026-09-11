@@ -19,6 +19,23 @@ pub fn init_from_env() {
     }
 }
 
+/// If `BLISS_EVENTS_DUMP=<path>` is set, write the recorded stream as JSON to
+/// that path. Called once as the process winds down (from `main`) so any
+/// workload — `--load`, `--eval`, a REPL session — can be captured without
+/// appending a dump form to it. Errors are reported but never fatal.
+/// scripts/event-viewer.sh relies on this to build the HTML viewer.
+pub fn maybe_dump_on_exit() {
+    let Ok(path) = std::env::var("BLISS_EVENTS_DUMP") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, to_json()) {
+        eprintln!("bliss: could not write BLISS_EVENTS_DUMP to {path}: {e}");
+    }
+}
+
 /// Resolve a symbol id to a printable function name (dump-time symbolication).
 fn sym_label(sym: u32) -> String {
     // NO_SYM is the sentinel for an anonymous activation — a top-level form or
@@ -104,6 +121,98 @@ pub fn report_lines() -> Vec<String> {
         "; summary: {compiles} compile, {deopts} deopt, {osrs} osr, {minors} gc-minor, {majors} gc-major"
     ));
     out
+}
+
+/// The kind tag emitted in the JSON export (stable, lower-kebab).
+fn kind_tag(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Compile => "compile",
+        EventKind::Deopt => "deopt",
+        EventKind::Osr => "osr",
+        EventKind::GcMinor => "gc-minor",
+        EventKind::GcMajor => "gc-major",
+    }
+}
+
+/// Minimal JSON string escaper — names come from the symbol registry (Lisp
+/// symbol names can contain quotes/backslashes), so escape defensively.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Machine-readable export of the whole stream as a JSON object
+/// `{"events":[...]}`, one entry per event with its symbolicated name and
+/// kind-specific fields. Consumed by the JITWatch-style HTML viewer
+/// (tools/event-viewer, scripts/event-viewer.sh). Hand-rolled (no serde dep) —
+/// the shape is small and fixed.
+pub fn to_json() -> String {
+    let events = snapshot();
+    let mut s = String::from("{\"events\":[");
+    for (i, ev) in events.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"seq\":{},\"ns\":{},\"kind\":\"{}\"",
+            ev.seq,
+            ev.nanos,
+            kind_tag(ev.kind)
+        ));
+        match ev.kind {
+            EventKind::Compile => {
+                s.push_str(&format!(
+                    ",\"name\":\"{}\",\"tier\":{}",
+                    json_escape(&sym_label(ev.sym)),
+                    ev.arg0
+                ));
+            }
+            EventKind::Deopt => {
+                s.push_str(&format!(
+                    ",\"name\":\"{}\",\"reason\":\"{}\",\"n\":{}",
+                    json_escape(&sym_label(ev.sym)),
+                    deopt_reason_name(ev.arg0),
+                    ev.arg1
+                ));
+            }
+            EventKind::Osr => {
+                s.push_str(&format!(
+                    ",\"name\":\"{}\",\"bcp\":{},\"n\":{}",
+                    json_escape(&sym_label(ev.sym)),
+                    ev.arg0,
+                    ev.arg1
+                ));
+            }
+            EventKind::GcMinor => {
+                s.push_str(&format!(
+                    ",\"pause_us\":{},\"promoted\":{}",
+                    ev.arg0, ev.arg1
+                ));
+            }
+            EventKind::GcMajor => {
+                s.push_str(&format!(
+                    ",\"pause_us\":{},\"regions_freed\":{}",
+                    ev.arg0, ev.arg1
+                ));
+            }
+        }
+        s.push('}');
+    }
+    s.push_str("],\"dropped\":");
+    s.push_str(&dropped().to_string());
+    s.push('}');
+    s
 }
 
 /// Per-function aggregate counts (the JFR "flat" lens, complementing the

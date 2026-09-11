@@ -19318,6 +19318,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 write_trace_output(env, &out)?;
                 return Ok(NIL);
             }
+            // Machine-readable JSON export of the stream, for the JITWatch-style
+            // HTML viewer (scripts/event-viewer.sh). Writes to the trace output
+            // like the other EVENTS-* builtins so it can be redirected to a file.
+            "BLISS-EXT:EVENTS-JSON" => {
+                let _ = eval_args(cdr, env)?;
+                let mut out = events::to_json();
+                out.push('\n');
+                write_trace_output(env, &out)?;
+                return Ok(NIL);
+            }
             // Flat aggregated view (JFR "flat" lens): engine totals + GC pause
             // budget + a per-function T1/T2/deopt/osr table, complementing the
             // time-ordered EVENTS-REPORT dump.

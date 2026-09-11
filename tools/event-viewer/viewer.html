@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bliss JIT Timeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  /* Light palette on bare :root — cool blue-graphite neutrals, chosen with a
+     slight bias toward the ember accent's opposite so the heat reads as heat. */
+  :root {
+    --bg: #eef1f5;
+    --surface: #ffffff;
+    --surface-2: #f5f7fa;
+    --ink: #1b2027;
+    --muted: #5c6672;
+    --faint: #8a93a0;
+    --line: #dbe0e8;
+    --accent: #d9541f;        /* thermal ember — the one bold spend */
+    --accent-soft: #f7e3d8;
+
+    /* Event-kind semantics — distinct from the accent hue. */
+    --k-t1:    #1f8f86;       /* T1 native — teal */
+    --k-t2:    #2f9e4e;       /* T2 profile-guided — green */
+    --k-osr:   #3f74c9;       /* OSR loop entry — blue */
+    --k-deopt: #d98324;       /* deopt (guard) — amber */
+    --k-black: #c23b3b;       /* deopt (blacklist/phase) — red */
+    --k-gc:    #7a8699;       /* minor GC — slate */
+    --k-gcmaj: #8a63b0;       /* major GC — violet */
+
+    --shadow: 0 1px 2px rgba(20,30,45,.06), 0 4px 16px rgba(20,30,45,.05);
+    --radius: 9px;
+    --font-ui: 'IBM Plex Sans', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b;
+      --surface: #1a1e26;
+      --surface-2: #21262f;
+      --ink: #e7eaf0;
+      --muted: #9aa4b1;
+      --faint: #6a7480;
+      --line: #2b323d;
+      --accent: #f0743a;
+      --accent-soft: #3a2418;
+      --k-t1:    #35b6ab;
+      --k-t2:    #4cc26d;
+      --k-osr:   #5b93e6;
+      --k-deopt: #e8a13f;
+      --k-black: #e5615f;
+      --k-gc:    #8b97aa;
+      --k-gcmaj: #a884cf;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 22px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151b;
+    --surface: #1a1e26;
+    --surface-2: #21262f;
+    --ink: #e7eaf0;
+    --muted: #9aa4b1;
+    --faint: #6a7480;
+    --line: #2b323d;
+    --accent: #f0743a;
+    --accent-soft: #3a2418;
+    --k-t1: #35b6ab; --k-t2: #4cc26d; --k-osr: #5b93e6;
+    --k-deopt: #e8a13f; --k-black: #e5615f; --k-gc: #8b97aa; --k-gcmaj: #a884cf;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 22px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header.masthead {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 18px;
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 16px; margin-bottom: 8px;
+  }
+  .masthead h1 {
+    font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.1rem);
+    font-weight: 700; letter-spacing: -.02em; margin: 0; text-wrap: balance;
+  }
+  .masthead .eyebrow {
+    font-family: var(--font-mono); font-size: .72rem; font-weight: 500;
+    letter-spacing: .16em; text-transform: uppercase; color: var(--accent);
+    display: block; margin-bottom: 2px;
+  }
+  .masthead .sub { color: var(--muted); font-size: .92rem; margin-left: auto; }
+
+  /* summary chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0 30px; }
+  .chip {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 10px 14px; min-width: 96px;
+    box-shadow: var(--shadow);
+  }
+  .chip .n {
+    font-family: var(--font-mono); font-size: 1.4rem; font-weight: 600;
+    font-variant-numeric: tabular-nums; line-height: 1.1;
+  }
+  .chip .l {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin-top: 3px;
+  }
+  .chip.warn { border-color: var(--k-black); }
+  .chip.warn .n { color: var(--k-black); }
+
+  section { margin-top: 34px; }
+  h2 {
+    font-size: 1.02rem; font-weight: 600; letter-spacing: -.01em;
+    margin: 0 0 4px; display: flex; align-items: center; gap: 10px;
+  }
+  h2 .hint { font-weight: 400; font-size: .82rem; color: var(--faint); }
+  .panel {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 16px 18px; margin-top: 12px;
+  }
+
+  /* legend / filters */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 6px; }
+  .legend button {
+    display: inline-flex; align-items: center; gap: 7px;
+    font: inherit; font-size: .82rem; cursor: pointer;
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px 5px 10px;
+    transition: opacity .12s, background .12s;
+  }
+  .legend button .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+  .legend button[aria-pressed="false"] { opacity: .38; }
+  .legend button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* timeline */
+  .timeline-scroll { overflow-x: auto; }
+  svg.timeline { display: block; width: 100%; min-width: 640px; }
+  svg.timeline text { font-family: var(--font-mono); fill: var(--muted); }
+  .lane-bg:nth-child(even) { fill: var(--surface-2); }
+  .axis line { stroke: var(--line); }
+  .marker { cursor: pointer; }
+  .marker:hover { stroke: var(--ink); stroke-width: 1.4; }
+
+  #tooltip {
+    position: fixed; pointer-events: none; z-index: 20; opacity: 0;
+    transition: opacity .1s; max-width: 300px;
+    background: var(--ink); color: var(--surface);
+    border-radius: 7px; padding: 8px 11px; font-size: .8rem; line-height: 1.45;
+    box-shadow: 0 6px 24px rgba(0,0,0,.28);
+  }
+  #tooltip .tt-name { font-family: var(--font-mono); font-weight: 600; }
+  #tooltip .tt-meta { opacity: .8; }
+
+  /* tables */
+  table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 600; border-bottom: 1.5px solid var(--line);
+    position: sticky; top: 0; background: var(--surface);
+  }
+  td.name { font-family: var(--font-mono); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
+  tr:last-child td { border-bottom: none; }
+  .heatcell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .heatbar { height: 7px; border-radius: 3px;
+    background: linear-gradient(90deg, var(--k-t1), var(--accent)); flex: none; }
+  .tier-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-left:6px; vertical-align: middle; }
+
+  .reason { font-family: var(--font-mono); font-size: .78rem; padding: 1px 7px;
+    border-radius: 4px; font-weight: 500; }
+  .reason.guard { background: color-mix(in srgb, var(--k-deopt) 20%, transparent); color: var(--k-deopt); }
+  .reason.phase-change { background: color-mix(in srgb, var(--k-black) 18%, transparent); color: var(--k-black); }
+  .reason.blacklist { background: color-mix(in srgb, var(--k-black) 22%, transparent); color: var(--k-black); }
+
+  .empty { color: var(--faint); font-style: italic; padding: 8px 2px; }
+  footer { margin-top: 48px; color: var(--faint); font-size: .8rem;
+    border-top: 1px solid var(--line); padding-top: 14px; }
+  footer code { font-family: var(--font-mono); color: var(--muted); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <div>
+      <span class="eyebrow">Bliss · tiered JIT event stream</span>
+      <h1>JIT Compilation Timeline</h1>
+    </div>
+    <span class="sub" id="run-sub">—</span>
+  </header>
+
+  <div class="chips" id="chips"></div>
+
+  <section>
+    <h2>Timeline <span class="hint">every tier promotion, deopt, OSR entry and GC pause, in record order · hover for detail · click a kind to filter</span></h2>
+    <div class="panel">
+      <div class="legend" id="legend"></div>
+      <div class="timeline-scroll">
+        <svg class="timeline" id="timeline" role="img" aria-label="Event timeline"></svg>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Per-function JIT activity <span class="hint">the flat lens — where the compiler spent effort, hottest first</span></h2>
+    <div class="panel" style="overflow-x:auto">
+      <table id="fn-table">
+        <thead><tr>
+          <th>Function</th><th>T1</th><th>T2</th><th>Deopts</th><th>OSR</th><th>Activity</th>
+        </tr></thead>
+        <tbody id="fn-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Deoptimizations <span class="hint">speculation guards that failed and fell back to the interpreter</span></h2>
+    <div class="panel" style="overflow-x:auto">
+      <table id="deopt-table">
+        <thead><tr>
+          <th>Time</th><th>Function</th><th>Reason</th><th>#</th>
+        </tr></thead>
+        <tbody id="deopt-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    Generated from the bliss event stream (<code>BLISS-EXT:EVENTS-JSON</code>).
+    Record it with <code>BLISS_EVENTS=1</code> or <code>(bliss-ext:events-start)</code>;
+    build this page with <code>scripts/event-viewer.sh</code>.
+  </footer>
+</div>
+<div id="tooltip" role="status" aria-live="polite"></div>
+
+<script>
+// The build script (scripts/event-viewer.sh) replaces the object on the next
+// line with a live recording. The default is a small illustrative sample so the
+// template renders standalone.
+const EVENT_DATA = /*__EVENT_DATA__*/ {"events":[
+  {"seq":0,"ns":520000000,"kind":"compile","name":"ADD1","tier":1},
+  {"seq":1,"ns":539000000,"kind":"compile","name":"ADD1","tier":2},
+  {"seq":2,"ns":540000000,"kind":"osr","name":"<anonymous/top-level>","bcp":8,"n":1},
+  {"seq":3,"ns":610000000,"kind":"gc-minor","pause_us":1400,"promoted":8192},
+  {"seq":4,"ns":6334000000,"kind":"deopt","name":"ADD1","reason":"guard","n":1},
+  {"seq":5,"ns":6334200000,"kind":"deopt","name":"ADD1","reason":"guard","n":7},
+  {"seq":6,"ns":6334600000,"kind":"deopt","name":"ADD1","reason":"blacklist","n":8},
+  {"seq":7,"ns":6900000000,"kind":"gc-major","pause_us":9200,"regions_freed":3}
+],"dropped":0} /*__END__*/;
+
+const KINDS = [
+  {key:"compile-t1", label:"T1 compile", css:"--k-t1",   match:e=>e.kind==="compile"&&e.tier<2},
+  {key:"compile-t2", label:"T2 compile", css:"--k-t2",   match:e=>e.kind==="compile"&&e.tier>=2},
+  {key:"osr",        label:"OSR entry",  css:"--k-osr",  match:e=>e.kind==="osr"},
+  {key:"deopt",      label:"Deopt",      css:"--k-deopt",match:e=>e.kind==="deopt"},
+  {key:"gc-minor",   label:"GC minor",   css:"--k-gc",   match:e=>e.kind==="gc-minor"},
+  {key:"gc-major",   label:"GC major",   css:"--k-gcmaj",match:e=>e.kind==="gc-major"},
+];
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const kindOf = e => KINDS.find(k => k.match(e));
+const active = new Set(KINDS.map(k=>k.key));
+
+const events = (EVENT_DATA.events||[]).slice().sort((a,b)=>a.ns-b.ns);
+const t0 = events.length ? events[0].ns : 0;
+const t1 = events.length ? events[events.length-1].ns : 0;
+const spanNs = Math.max(1, t1 - t0);
+const ms = ns => (ns - t0) / 1e6;
+const fmtMs = v => v.toLocaleString(undefined,{maximumFractionDigits:v<10?2:0}) + " ms";
+
+/* ---- summary chips ---- */
+function renderChips(){
+  const c = t => events.filter(t).length;
+  const gcMinorUs = events.filter(e=>e.kind==="gc-minor").reduce((s,e)=>s+e.pause_us,0);
+  const gcMajorUs = events.filter(e=>e.kind==="gc-major").reduce((s,e)=>s+e.pause_us,0);
+  const chips = [
+    {n:c(e=>e.kind==="compile"), l:"Compiles"},
+    {n:c(e=>e.kind==="deopt"),   l:"Deopts"},
+    {n:c(e=>e.kind==="osr"),     l:"OSR entries"},
+    {n:c(e=>e.kind==="gc-minor")+c(e=>e.kind==="gc-major"), l:"GC pauses"},
+    {n:((gcMinorUs+gcMajorUs)/1000).toLocaleString(undefined,{maximumFractionDigits:1})+" ms", l:"GC pause total"},
+  ];
+  const host = document.getElementById("chips");
+  host.innerHTML = chips.map(x=>`<div class="chip"><div class="n">${x.n}</div><div class="l">${x.l}</div></div>`).join("");
+  if (EVENT_DATA.dropped>0)
+    host.insertAdjacentHTML("beforeend",
+      `<div class="chip warn"><div class="n">${EVENT_DATA.dropped}</div><div class="l">dropped (ring full)</div></div>`);
+  document.getElementById("run-sub").textContent =
+    events.length ? `${events.length} events over ${fmtMs(ms(t1))}` : "no events recorded";
+}
+
+/* ---- legend / filters ---- */
+function renderLegend(){
+  const host = document.getElementById("legend");
+  host.innerHTML = "";
+  KINDS.forEach(k=>{
+    const n = events.filter(k.match).length;
+    const b = document.createElement("button");
+    b.setAttribute("aria-pressed","true");
+    b.innerHTML = `<span class="sw" style="background:var(${k.css})"></span>${k.label} <b style="font-variant-numeric:tabular-nums;opacity:.6">${n}</b>`;
+    b.onclick = () => {
+      if (active.has(k.key)) { active.delete(k.key); b.setAttribute("aria-pressed","false"); }
+      else { active.add(k.key); b.setAttribute("aria-pressed","true"); }
+      renderTimeline();
+    };
+    host.appendChild(b);
+  });
+}
+
+/* ---- timeline (SVG lanes) ---- */
+const tip = document.getElementById("tooltip");
+function showTip(html, x, y){
+  tip.innerHTML = html; tip.style.opacity = 1;
+  tip.style.left = Math.min(x+14, window.innerWidth-tip.offsetWidth-12) + "px";
+  tip.style.top  = Math.min(y+14, window.innerHeight-tip.offsetHeight-12) + "px";
+}
+function hideTip(){ tip.style.opacity = 0; }
+
+function renderTimeline(){
+  const lanes = KINDS.filter(k=>active.has(k.key));
+  const padL = 96, padR = 20, padT = 14, laneH = 34, axisH = 26;
+  const W = Math.max(640, document.querySelector(".timeline-scroll").clientWidth);
+  const innerW = W - padL - padR;
+  const H = padT + lanes.length*laneH + axisH;
+  const x = ns => padL + (ns - t0)/spanNs * innerW;
+
+  const svg = document.getElementById("timeline");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("height", H);
+  let s = "";
+
+  lanes.forEach((k,i)=>{
+    const y = padT + i*laneH;
+    s += `<rect class="lane-bg" x="0" y="${y}" width="${W}" height="${laneH}" fill="${i%2?cssVar('--surface-2'):'transparent'}"></rect>`;
+    s += `<text x="${padL-12}" y="${y+laneH/2+4}" text-anchor="end" font-size="11">${k.label}</text>`;
+    s += `<rect x="${padL-6}" y="${y+laneH/2-8}" width="4" height="16" rx="2" fill="var(${k.css})"></rect>`;
+  });
+
+  // axis ticks
+  const ticks = 6, axisY = padT + lanes.length*laneH;
+  s += `<g class="axis">`;
+  for (let i=0;i<=ticks;i++){
+    const tx = padL + i/ticks*innerW, tms = i/ticks*ms(t1);
+    s += `<line x1="${tx}" y1="${padT}" x2="${tx}" y2="${axisY}" stroke="${cssVar('--line')}"></line>`;
+    s += `<text x="${tx}" y="${axisY+16}" text-anchor="middle" font-size="10">${fmtMs(tms)}</text>`;
+  }
+  s += `</g>`;
+
+  // markers
+  events.forEach(e=>{
+    const k = kindOf(e); if(!k || !active.has(k.key)) return;
+    const laneIdx = lanes.indexOf(k); if (laneIdx<0) return;
+    const cy = padT + laneIdx*laneH + laneH/2;
+    const cx = x(e.ns);
+    const col = cssVar(k.css);
+    let title, meta;
+    if (e.kind==="compile"){ title=e.name; meta=`promoted to T${e.tier}`; }
+    else if (e.kind==="osr"){ title=e.name; meta=`OSR into native @bcp ${e.bcp} (entry #${e.n})`; }
+    else if (e.kind==="deopt"){ title=e.name; meta=`deopt: ${e.reason} (#${e.n})`; }
+    else if (e.kind==="gc-minor"){ title="minor GC"; meta=`${(e.pause_us/1000).toFixed(2)} ms · ${e.promoted.toLocaleString()} B promoted`; }
+    else { title="major GC"; meta=`${(e.pause_us/1000).toFixed(2)} ms · ${e.regions_freed} regions freed`; }
+    const tt = `<div class="tt-name">${escapeHtml(title)}</div><div class="tt-meta">${escapeHtml(meta)}</div><div class="tt-meta">@ ${fmtMs(ms(e.ns))}</div>`;
+
+    if (e.kind==="gc-minor" || e.kind==="gc-major"){
+      // pause as a width-scaled bar (min 2px), rooted at the event time
+      const w = Math.max(2, e.pause_us/1000 / Math.max(1, ms(t1)) * innerW);
+      s += `<rect class="marker" data-tt="${encodeURIComponent(tt)}" x="${cx}" y="${cy-9}" width="${w}" height="18" rx="2" fill="${col}" fill-opacity="0.75" stroke="${col}"></rect>`;
+    } else {
+      const fill = (e.kind==="deopt" && e.reason!=="guard") ? cssVar('--k-black') : col;
+      s += `<circle class="marker" data-tt="${encodeURIComponent(tt)}" cx="${cx}" cy="${cy}" r="5" fill="${fill}" fill-opacity="0.9" stroke="${fill}"></circle>`;
+    }
+  });
+
+  svg.innerHTML = s;
+  svg.querySelectorAll(".marker").forEach(m=>{
+    m.addEventListener("mousemove", ev => showTip(decodeURIComponent(m.dataset.tt), ev.clientX, ev.clientY));
+    m.addEventListener("mouseleave", hideTip);
+  });
+}
+
+/* ---- per-function heat table ---- */
+function renderFnTable(){
+  const map = new Map();
+  events.forEach(e=>{
+    if (!e.name || e.name==="<anonymous/top-level>") {
+      // keep top-level OSR visible but grouped
+    }
+    if (!("name" in e)) return;
+    const r = map.get(e.name) || {name:e.name,t1:0,t2:0,deopt:0,osr:0};
+    if (e.kind==="compile") (e.tier>=2 ? r.t2++ : r.t1++);
+    else if (e.kind==="deopt") r.deopt++;
+    else if (e.kind==="osr") r.osr++;
+    map.set(e.name, r);
+  });
+  const rows = [...map.values()].map(r=>({...r,total:r.t1+r.t2+r.deopt+r.osr}))
+                                .sort((a,b)=>b.total-a.total);
+  const maxTotal = rows.reduce((m,r)=>Math.max(m,r.total),1);
+  const body = document.getElementById("fn-body");
+  if (!rows.length){ body.innerHTML = `<tr><td colspan="6" class="empty">No per-function events.</td></tr>`; return; }
+  body.innerHTML = rows.map(r=>`
+    <tr>
+      <td class="name">${escapeHtml(r.name)}${r.t2?'<span class="tier-dot" style="background:var(--k-t2)" title="reached T2"></span>':r.t1?'<span class="tier-dot" style="background:var(--k-t1)" title="reached T1"></span>':''}</td>
+      <td class="num">${r.t1||'·'}</td>
+      <td class="num">${r.t2||'·'}</td>
+      <td class="num" style="color:${r.deopt?'var(--k-black)':'inherit'}">${r.deopt||'·'}</td>
+      <td class="num">${r.osr||'·'}</td>
+      <td><div class="heatcell"><span class="num" style="color:var(--muted)">${r.total}</span><span class="heatbar" style="width:${Math.round(r.total/maxTotal*120)}px"></span></div></td>
+    </tr>`).join("");
+}
+
+/* ---- deopt log ---- */
+function renderDeopts(){
+  const ds = events.filter(e=>e.kind==="deopt");
+  const body = document.getElementById("deopt-body");
+  if (!ds.length){ body.innerHTML = `<tr><td colspan="4" class="empty">No deoptimizations — every speculation held.</td></tr>`; return; }
+  body.innerHTML = ds.map(e=>`
+    <tr>
+      <td class="num">${fmtMs(ms(e.ns))}</td>
+      <td class="name">${escapeHtml(e.name)}</td>
+      <td><span class="reason ${e.reason}">${e.reason}</span></td>
+      <td class="num">${e.n}</td>
+    </tr>`).join("");
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+renderChips(); renderLegend(); renderFnTable(); renderDeopts(); renderTimeline();
+let rt; window.addEventListener("resize", ()=>{ clearTimeout(rt); rt=setTimeout(renderTimeline,120); });
+</script>
+</body>
+</html>
