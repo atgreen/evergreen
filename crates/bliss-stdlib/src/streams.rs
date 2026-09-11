@@ -316,6 +316,73 @@ fn file_read_char_buffered(
     }
 }
 
+/// Read a whole line (up to and consuming a `\n`, or to EOF) from a buffered
+/// UTF-8/ASCII file input in bulk, instead of decoding and pushing one char at a
+/// time (the per-char loop paid a UTF-8 decode + a `Vec<char>` push per byte).
+/// The newline byte 0x0A never occurs inside a UTF-8 multi-byte sequence (those
+/// are 0x80–0xBF continuation / 0xC0+ leading bytes), so scanning the raw buffer
+/// for 0x0A splits exactly at line boundaries; the bytes between boundaries are
+/// therefore complete UTF-8 and decode as one `String`. Returns `(line,
+/// missing-newline-p)`; `(EOF, true)` at end of input with nothing buffered.
+fn file_read_line_buffered(
+    file: &mut std::fs::File,
+    read_buf: &mut Vec<u8>,
+    buf_pos: &mut usize,
+    buf_fill: &mut usize,
+    line: &mut u64,
+    col: &mut u64,
+    unread: &mut Option<char>,
+) -> Result<(BlissVal, bool), BlissError> {
+    let mut line_bytes: Vec<u8> = Vec::new();
+    // A pushed-back (unread) char is logically the first char of the line.
+    if let Some(c) = unread.take() {
+        if c == '\n' {
+            *line += 1;
+            *col = 0;
+            return Ok((make_lisp_string(""), false));
+        }
+        let mut tmp = [0u8; 4];
+        line_bytes.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+    }
+    let decode = |bytes: Vec<u8>| -> Result<String, BlissError> {
+        String::from_utf8(bytes)
+            .map_err(|_| BlissError::StreamError("invalid UTF-8 in file stream".into()))
+    };
+    loop {
+        if *buf_pos >= *buf_fill {
+            read_buf.resize(FILE_BUF_SIZE, 0);
+            let n = file
+                .read(&mut read_buf[..])
+                .map_err(|e| BlissError::StreamError(format!("file read error: {}", e)))?;
+            if n == 0 {
+                if line_bytes.is_empty() {
+                    return Ok((EOF, true));
+                }
+                let s = decode(line_bytes)?;
+                *col += s.chars().count() as u64;
+                return Ok((make_lisp_string(&s), true));
+            }
+            *buf_pos = 0;
+            *buf_fill = n;
+        }
+        let slice = &read_buf[*buf_pos..*buf_fill];
+        match slice.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                line_bytes.extend_from_slice(&slice[..idx]);
+                *buf_pos += idx + 1; // consume through the newline
+                *line += 1;
+                *col = 0;
+                let s = decode(line_bytes)?;
+                return Ok((make_lisp_string(&s), false));
+            }
+            None => {
+                line_bytes.extend_from_slice(slice);
+                *buf_pos = *buf_fill;
+            }
+        }
+    }
+}
+
 /// Read a single raw byte from a buffered file input (for binary streams). Issue #10.
 fn file_read_byte_raw(
     file: &mut std::fs::File,
@@ -1032,6 +1099,30 @@ impl GrayStream for StreamMutableState {
 
     fn stream_read_line(&mut self) -> Result<(BlissVal, bool), BlissError> {
         self.check_input()?;
+        // Bulk path for buffered UTF-8/ASCII character file input: scan the read
+        // buffer for the newline byte and decode the run in one shot, rather than
+        // decoding + pushing one char at a time. Other variants (string streams,
+        // byte/other-encoding, composites) keep the generic per-char loop below.
+        if let StreamInner::FileInput {
+            file,
+            read_buf,
+            buf_pos,
+            buf_fill,
+            line,
+            col,
+            unread,
+            external_format,
+            element_type,
+        } = &mut self.inner
+        {
+            if *element_type == StreamElementType::Character
+                && matches!(external_format, ExternalFormat::Utf8 | ExternalFormat::Ascii)
+            {
+                return file_read_line_buffered(
+                    file, read_buf, buf_pos, buf_fill, line, col, unread,
+                );
+            }
+        }
         let mut chars = Vec::new();
         loop {
             let ch = self.stream_read_char()?;
