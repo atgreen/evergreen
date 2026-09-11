@@ -265,8 +265,12 @@
   .corr pre {
     margin: 0; font-family: var(--font-mono); font-size: .74rem; line-height: 1.5;
     background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
-    padding: 10px; overflow-x: auto; white-space: pre;
+    padding: 10px; white-space: pre;
+    /* each pane scrolls independently so hover-sync can bring the matching
+       lines into view without moving the whole drawer */
+    max-height: 62vh; overflow: auto; scroll-behavior: smooth;
   }
+  @media (prefers-reduced-motion: reduce) { .corr pre { scroll-behavior: auto; } }
   .corr .ln { display: block; border-radius: 3px; padding: 0 3px; margin: 0 -3px; }
   .corr .ln[data-bcp] { cursor: pointer; }
   .corr .ln.lit { background: var(--accent); color: #fff; }
@@ -642,12 +646,26 @@ function renderCorrelated(t0text, nativeText, map, label){
     </div>`;
 }
 function wireCorrelation(root){
+  const panes = [...root.querySelectorAll(".corr pre")];
   const all = root.querySelectorAll(".ln[data-bcp]");
   const setLit = (bcp, on) => all.forEach(el=>{
     if (el.dataset.bcp===bcp) el.classList.toggle("lit", on);
   });
+  // Scroll the OTHER pane(s) so this bcp's first matching line is in view; leave
+  // the pane under the cursor alone.
+  const syncScroll = (bcp, ownPane) => panes.forEach(p=>{
+    if (p===ownPane) return;
+    const t = p.querySelector('.ln[data-bcp="'+bcp+'"]');
+    if (!t) return;
+    const pr = p.getBoundingClientRect(), tr = t.getBoundingClientRect();
+    if (tr.top >= pr.top && tr.bottom <= pr.bottom) return; // already visible
+    p.scrollTop += (tr.top - pr.top) - p.clientHeight/2 + tr.height/2;
+  });
   all.forEach(el=>{
-    el.addEventListener("mouseenter", ()=>setLit(el.dataset.bcp, true));
+    el.addEventListener("mouseenter", ()=>{
+      setLit(el.dataset.bcp, true);
+      syncScroll(el.dataset.bcp, el.closest("pre"));
+    });
     el.addEventListener("mouseleave", ()=>setLit(el.dataset.bcp, false));
   });
 }
