@@ -291,10 +291,13 @@ input#filter{font:inherit;padding:6px 11px;border:1px solid var(--line);border-r
 <section><h2>Functions <span class=h>JIT activity, hottest first — click to inspect</span></h2><input id=filter placeholder="filter by name…"><div class=panel style=overflow-x:auto><table><thead><tr><th>Function<th>T1<th>T2<th>Deopts<th>OSR<th>Activity</tr></thead><tbody id=fnbody></tbody></table></div></section>
 </div>
 <div id=backdrop></div><aside id=drawer><div class=dh><h3 id=dt></h3><button id=dc aria-label=Close>×</button></div><div class=db id=dbody></div></aside>
+<!--SNAP-->
 <script>
 const NO_OFF=4294967295, DR={0:"guard",1:"phase-change",2:"blacklist"};
 const $=id=>document.getElementById(id);
-const gj=async u=>(await fetch(u)).json();
+// In a live server the data comes from the API; a `snapshot` bakes it into
+// window.SNAP so the same page renders offline.
+const gj=async u=>(window.SNAP&&(u in window.SNAP))?window.SNAP[u]:(await fetch(u)).json();
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const OPS=/\b(CallNamed|LoadLocal|LoadGlobal|StoreGlobal|StoreLocal|Const|Return|Br|BrIfFalse|BrIfTrue|Go|PushBlock|PopHandler|call|jmp|je|jne|jz|jnz|jg|jge|jl|jle|ret|mov|movabs|cmp|test|add|sub|imul|lea|push|pop|xor|and|or|shl|shr|sar)\b/g;
 function tintCode(s){return s.replace(/(^\s*(?:\+[0-9a-f]+|\d+):)/,'<span class=c>$1</span>').replace(OPS,'<span class=op>$1</span>')}
@@ -361,16 +364,41 @@ boot();
 </script></body></html>"""
 
 
+def snapshot(db_path, out_path):
+    """Bake a DB's query responses into a self-contained explorer page — the same
+    UI as `serve`, but rendering offline (for sharing a specific recording, or a
+    demo). Re-embeds everything, so it is for a bounded run, not a giant one."""
+    con = sqlite3.connect(db_path)
+    snap = {
+        "/api/summary": api_summary(con),
+        "/api/functions": api_functions(con),
+        "/api/timeline?buckets=240": api_timeline(con, 240),
+    }
+    for f in snap["/api/functions"]["functions"]:
+        snap[f"/api/function?sym={f['sym']}"] = api_function(con, f["sym"])
+    con.close()
+    html = EXPLORER_HTML.replace(
+        "<!--SNAP-->", "<script>window.SNAP=" + json.dumps(snap) + ";</script>"
+    )
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"[jitrec] wrote self-contained snapshot {out_path} "
+          f"({len(snap['/api/functions']['functions'])} functions)", file=sys.stderr)
+
+
 def main():
     a = sys.argv[1:]
     if len(a) >= 3 and a[0] == "ingest":
         ingest(a[1], a[2])
     elif len(a) >= 2 and a[0] == "serve":
         serve(a[1], int(a[2]) if len(a) > 2 else 8765)
+    elif len(a) >= 3 and a[0] == "snapshot":
+        snapshot(a[1], a[2])
     else:
         print(__doc__)
-        print("usage: jitrec.py ingest <run.ndjson|-> <run.db>\n"
-              "       jitrec.py serve  <run.db> [port]", file=sys.stderr)
+        print("usage: jitrec.py ingest   <run.ndjson|-> <run.db>\n"
+              "       jitrec.py serve    <run.db> [port]\n"
+              "       jitrec.py snapshot <run.db> <out.html>", file=sys.stderr)
         sys.exit(2)
 
 
