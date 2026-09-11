@@ -603,6 +603,30 @@ thread_local! {
     static SOURCE_TEXT: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
 }
 
+/// Pin `sym` to the T0 interpreter for deterministic profiling (bliss-xgr5):
+/// add it to the pin set and, if it is already native, revert it to T0 the same
+/// way the deopt-blacklist path does (drop it from the native registry — dispatch
+/// keys on the registry — and reset its tier). Must be called with the function
+/// not on the stack (PROFILE runs at top level).
+pub fn profile_pin(sym: u32) {
+    PROFILE_PIN.with(|s| s.borrow_mut().insert(sym));
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    if let Some(f) = bliss_rt::symbols::symbol_function(sym)
+        .filter(|&v| bliss_rt::function::is_interpreted_function(v))
+    {
+        bliss_rt::function::set_tier(f, 0);
+    }
+}
+
+/// Release a profiler T0 pin (bliss-xgr5); the function may tier up again.
+pub fn profile_unpin(sym: u32) {
+    PROFILE_PIN.with(|s| s.borrow_mut().remove(&sym));
+}
+
+fn is_profile_pinned(sym: u32) -> bool {
+    PROFILE_PIN.with(|s| s.borrow().contains(&sym))
+}
+
 /// Record `sym`'s source text (called from eval_defun while recording).
 pub fn set_source_text(sym: u32, text: String) {
     SOURCE_TEXT.with(|m| {
@@ -13766,6 +13790,14 @@ thread_local! {
     /// Functions whose speculation proved unprofitable; kept in T0 thereafter.
     static DEOPT_BLACKLIST: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// Functions pinned to T0 by the deterministic profiler (bliss-xgr5): the
+    /// tiering counters only count invocations until a function promotes to
+    /// native (the native prologue stops bumping them). To make PROFILE's call
+    /// counts EXACT — the way SBCL's sb-profile encapsulation adds overhead but
+    /// counts every call — a profiled function is held in the interpreter, where
+    /// every invocation is recorded. UNPROFILE releases it.
+    static PROFILE_PIN: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
     /// Bodies that the optimising compiler cannot currently handle.  Remember
     /// the decline so a hot T1 function does not synchronously retry T2 on every
     /// invocation.  Redefining/removing the function clears this bit.
@@ -14050,6 +14082,12 @@ fn dispatch_invoke_count_snapshot(sym: u32, fn_obj: Option<BlissVal>) -> u32 {
 }
 
 fn publish_native(sym: u32, fn_obj: Option<BlissVal>, nc: &NativeCode) {
+    // Pinned to T0 for deterministic profiling (bliss-xgr5): never install native
+    // code, so the interpreter counts every call. Catches the T2 install path too
+    // (both tiers publish here).
+    if is_profile_pinned(sym) {
+        return;
+    }
     if let Some(f) = fn_obj {
         bliss_rt::function::set_entry(f, nc.entry as *mut u8);
         bliss_rt::function::set_tier(f, if nc.is_t2 { 2 } else { 1 });
@@ -15759,6 +15797,11 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // Blacklisted (bliss-jtc.27): a function whose speculation repeatedly failed
     // is not recompiled — it stays in T0 to avoid churning through deopts.
     if DEOPT_BLACKLIST.with(|s| s.borrow().contains(&sym)) {
+        return None;
+    }
+    // Pinned to T0 for deterministic profiling (bliss-xgr5): never promote, so
+    // every call keeps flowing through the counting interpreter.
+    if is_profile_pinned(sym) {
         return None;
     }
     let bf = registry_get(sym)?;

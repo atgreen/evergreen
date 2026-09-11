@@ -383,6 +383,17 @@ thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
 }
 
+thread_local! {
+    /// Deterministic call-count profiler (bliss-xgr5, the sb-profile analog):
+    /// the set of profiled functions keyed by SYMBOL INDEX (a stable u32 — never
+    /// a function BlissVal, which the moving GC would relocate), mapping to the
+    /// (invoke_count, back_edge_count) baseline captured when profiling began or
+    /// was last reset. REPORT shows the delta since the baseline, so counts are
+    /// exact (deterministic), read straight from the tiering counters the engine
+    /// already maintains — no wrapper, so compiled call sites cannot bypass it.
+    static PROFILED_FNS: RefCell<HashMap<u32, (u32, u32)>> = RefCell::new(HashMap::new());
+}
+
 /// Bytecode compiler-macro expanders live in bliss-compiler's Send + Sync
 /// global callback table. Keep weak handles here so the evaluator GC scanner
 /// can relocate their literal pools without retaining obsolete redefinitions.
@@ -1032,6 +1043,19 @@ fn resolve_tiered_fn(val: BlissVal) -> Option<BlissVal> {
         return global_fn(&sym_name(val));
     }
     None
+}
+
+/// Resolve a function designator (a symbol, or a function object) to the stable
+/// SYMBOL INDEX under which the deterministic profiler tracks it (bliss-xgr5).
+/// A symbol maps to its own index; a function object maps to its name symbol's
+/// index. Returns `None` for an anonymous or unnamed function.
+fn profiled_index_of(d: BlissVal) -> Option<u32> {
+    if d.is_symbol() {
+        return Some(d.as_symbol_index());
+    }
+    let f = resolve_tiered_fn(d)?;
+    let name = bliss_rt::function::name(f);
+    name.is_symbol().then(|| name.as_symbol_index())
 }
 
 /// True if `name` names a function — lexically (FLET/LABELS or `(setf f)` in
@@ -19338,6 +19362,103 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     out.push_str(&line);
                     out.push('\n');
                 }
+                write_trace_output(env, &out)?;
+                return Ok(NIL);
+            }
+            // Deterministic call-count profiler (bliss-xgr5 — the SBCL sb-profile
+            // analog). PROFILE marks functions and snapshots their invocation
+            // baseline; PROFILE-REPORT-CALLS shows the delta since; UNPROFILE and
+            // PROFILE-RESET manage the set. Exact counts from the engine's own
+            // tiering counters — no function wrapper, so compiled/native call sites
+            // are counted too (the bug that sank the earlier wrapper approach).
+            "BLISS-EXT:PROFILE" => {
+                let args = eval_args(cdr, env)?;
+                for &d in args.iter() {
+                    if let Some(idx) = profiled_index_of(d) {
+                        // Pin to T0 so counts are exact (native prologues stop
+                        // bumping the tiering counter), then snapshot the baseline.
+                        bytecode::profile_pin(idx);
+                        let f = bliss_rt::symbols::symbol_function(idx);
+                        let (ic, bc) = f
+                            .map(|f| {
+                                (
+                                    bliss_rt::function::invoke_count(f),
+                                    bliss_rt::function::back_edge_count(f),
+                                )
+                            })
+                            .unwrap_or((0, 0));
+                        PROFILED_FNS.with(|m| m.borrow_mut().insert(idx, (ic, bc)));
+                    }
+                }
+                return Ok(NIL);
+            }
+            "BLISS-EXT:UNPROFILE" => {
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    PROFILED_FNS.with(|m| {
+                        for idx in m.borrow().keys().copied().collect::<Vec<_>>() {
+                            bytecode::profile_unpin(idx);
+                        }
+                        m.borrow_mut().clear();
+                    });
+                } else {
+                    for &d in args.iter() {
+                        if let Some(idx) = profiled_index_of(d) {
+                            bytecode::profile_unpin(idx);
+                            PROFILED_FNS.with(|m| m.borrow_mut().remove(&idx));
+                        }
+                    }
+                }
+                return Ok(NIL);
+            }
+            "BLISS-EXT:PROFILE-RESET" => {
+                let _ = eval_args(cdr, env)?;
+                PROFILED_FNS.with(|m| {
+                    let keys: Vec<u32> = m.borrow().keys().copied().collect();
+                    let mut b = m.borrow_mut();
+                    for idx in keys {
+                        let (ic, bc) = bliss_rt::symbols::symbol_function(idx)
+                            .map(|f| {
+                                (
+                                    bliss_rt::function::invoke_count(f),
+                                    bliss_rt::function::back_edge_count(f),
+                                )
+                            })
+                            .unwrap_or((0, 0));
+                        b.insert(idx, (ic, bc));
+                    }
+                });
+                return Ok(NIL);
+            }
+            "BLISS-EXT:PROFILE-REPORT-CALLS" => {
+                let _ = eval_args(cdr, env)?;
+                // Collect (name, calls, back-edges) deltas, most-called first.
+                let mut rows: Vec<(String, u64, u64)> = PROFILED_FNS.with(|m| {
+                    m.borrow()
+                        .iter()
+                        .map(|(&idx, &(ic0, bc0))| {
+                            let (ic, bc) = bliss_rt::symbols::symbol_function(idx)
+                                .map(|f| {
+                                    (
+                                        bliss_rt::function::invoke_count(f),
+                                        bliss_rt::function::back_edge_count(f),
+                                    )
+                                })
+                                .unwrap_or((ic0, bc0));
+                            let name = bliss_rt::symbols::registry_key(idx)
+                                .unwrap_or_else(|| format!("#<sym {idx}>"));
+                            (name, u64::from(ic.saturating_sub(ic0)), u64::from(bc.saturating_sub(bc0)))
+                        })
+                        .collect()
+                });
+                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                let mut out = String::from("Deterministic call profile (calls since PROFILE/RESET)\n");
+                out.push_str(&format!("{:>12}  {:>12}  {}\n", "calls", "back-edges", "function"));
+                let total: u64 = rows.iter().map(|r| r.1).sum();
+                for (name, calls, be) in &rows {
+                    out.push_str(&format!("{calls:>12}  {be:>12}  {name}\n"));
+                }
+                out.push_str(&format!("{total:>12}  {:>12}  (total; {} function(s) profiled)\n", "", rows.len()));
                 write_trace_output(env, &out)?;
                 return Ok(NIL);
             }
