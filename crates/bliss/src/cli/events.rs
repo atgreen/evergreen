@@ -17,6 +17,70 @@ pub fn init_from_env() {
     if std::env::var("BLISS_EVENTS").ok().as_deref() == Some("1") {
         set_enabled(true);
     }
+    // BLISS_EVENTS_STREAM=<path>: open an unbounded NDJSON event stream for the
+    // bliss-jitrec recorder (record-then-explore, for large programs).
+    if let Ok(path) = std::env::var("BLISS_EVENTS_STREAM") {
+        if !path.is_empty() {
+            open_stream(&path);
+        }
+    }
+}
+
+/// Emit a `bcp→native-offset` map as a JSON array field, or nothing if empty.
+fn json_map_field(s: &mut String, key: &str, map: &[u32]) {
+    if map.is_empty() {
+        return;
+    }
+    s.push_str(&format!(",\"{key}\":["));
+    for (i, off) in map.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&off.to_string());
+    }
+    s.push(']');
+}
+
+/// Finalize the NDJSON stream (bliss-jitrec): after the workload has run and all
+/// events streamed live, append the bounded metadata — a `sym` record (id→name)
+/// for every symbol seen in an event, and an `fn` record (source + T0/T1/T2
+/// disassembly + bcp maps) for every compiled function touched — then close it.
+/// Called once as the process exits.
+pub fn finalize_stream() {
+    if !streaming() {
+        return;
+    }
+    let syms = seen_syms();
+    for &sym in &syms {
+        let name = bliss_rt::symbols::registry_key(sym).unwrap_or_else(|| format!("#<sym {sym}>"));
+        stream_line(&format!(
+            "{{\"t\":\"sym\",\"id\":{sym},\"name\":\"{}\"}}",
+            json_escape(&name)
+        ));
+    }
+    for &sym in &syms {
+        if let Some(td) = super::bytecode::tier_disasm(sym) {
+            let mut s = format!(
+                "{{\"t\":\"fn\",\"sym\":{sym},\"name\":\"{}\"",
+                json_escape(&sym_label(sym))
+            );
+            if let Some(src) = super::bytecode::source_text(sym) {
+                s.push_str(&format!(",\"src\":\"{}\"", json_escape(&src)));
+            }
+            s.push_str(&format!(",\"t0\":\"{}\"", json_escape(&td.t0)));
+            if let Some(t1) = td.t1 {
+                s.push_str(&format!(",\"t1\":\"{}\"", json_escape(&t1)));
+            }
+            if let Some(t2) = td.t2 {
+                s.push_str(&format!(",\"t2\":\"{}\"", json_escape(&t2)));
+            }
+            json_map_field(&mut s, "t1map", &td.t1_map);
+            json_map_field(&mut s, "t2map", &td.t2_map);
+            s.push('}');
+            stream_line(&s);
+        }
+    }
+    close_stream();
 }
 
 /// If `BLISS_EVENTS_DUMP=<path>` is set, write the recorded stream as JSON to
@@ -123,17 +187,6 @@ pub fn report_lines() -> Vec<String> {
     out
 }
 
-/// The kind tag emitted in the JSON export (stable, lower-kebab).
-fn kind_tag(kind: EventKind) -> &'static str {
-    match kind {
-        EventKind::Compile => "compile",
-        EventKind::Deopt => "deopt",
-        EventKind::Osr => "osr",
-        EventKind::GcMinor => "gc-minor",
-        EventKind::GcMajor => "gc-major",
-    }
-}
-
 /// Minimal JSON string escaper — names come from the symbol registry (Lisp
 /// symbol names can contain quotes/backslashes), so escape defensively.
 fn json_escape(s: &str) -> String {
@@ -224,20 +277,6 @@ pub fn to_json() -> String {
         .collect();
     s.push_str(",\"functions\":{");
     let mut first = true;
-    // Emit a bcp→native-offset map as a JSON array of ints.
-    let push_map = |s: &mut String, key: &str, map: &[u32]| {
-        if map.is_empty() {
-            return;
-        }
-        s.push_str(&format!(",\"{key}\":["));
-        for (i, off) in map.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&off.to_string());
-        }
-        s.push(']');
-    };
     for sym in syms {
         if let Some(td) = super::bytecode::tier_disasm(sym) {
             if !first {
@@ -256,8 +295,8 @@ pub fn to_json() -> String {
                 s.push_str(&format!(",\"t2\":\"{}\"", json_escape(&t2)));
             }
             // bcp→native-offset maps for the viewer's linked selection.
-            push_map(&mut s, "t1map", &td.t1_map);
-            push_map(&mut s, "t2map", &td.t2_map);
+            json_map_field(&mut s, "t1map", &td.t1_map);
+            json_map_field(&mut s, "t2map", &td.t2_map);
             s.push('}');
         }
     }

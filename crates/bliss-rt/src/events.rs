@@ -97,6 +97,28 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static BUFFER: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
 
+/// Optional append-only NDJSON stream (bliss-jitrec). When open, every event is
+/// written as one JSON line as it is recorded — UNBOUNDED, unlike the ring — so
+/// a large program's full history reaches the recorder process without the 64k
+/// cap. Symbol names and disassembly are bounded by function count, not event
+/// count, so the CLI layer streams those (as `sym`/`fn` records) at the end.
+static STREAM: Mutex<Option<std::io::BufWriter<std::fs::File>>> = Mutex::new(None);
+/// Distinct symbol ids that appeared in any recorded event (bounded by function
+/// count), so the CLI layer can emit a name for each even if its events were
+/// dropped from the ring.
+static SEEN_SYMS: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
+
+/// Short stable tag for an event kind, used in the NDJSON stream and DB.
+pub fn kind_tag(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Compile => "compile",
+        EventKind::Deopt => "deopt",
+        EventKind::Osr => "osr",
+        EventKind::GcMinor => "gc-minor",
+        EventKind::GcMajor => "gc-major",
+    }
+}
+
 fn origin() -> Instant {
     use std::sync::OnceLock;
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
@@ -114,6 +136,68 @@ pub fn enabled() -> bool {
 /// events (call [`reset`] for that), matching a JFR recording you can pause.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Open an append-only NDJSON event stream at `path` (truncating any existing
+/// file) and begin recording. Returns whether the file opened. The CLI wires
+/// this from `BLISS_EVENTS_STREAM`.
+pub fn open_stream(path: &str) -> bool {
+    match std::fs::File::create(path) {
+        Ok(f) => {
+            if let Ok(mut g) = STREAM.lock() {
+                *g = Some(std::io::BufWriter::new(f));
+            }
+            set_enabled(true);
+            true
+        }
+        Err(e) => {
+            eprintln!("bliss: could not open BLISS_EVENTS_STREAM {path}: {e}");
+            false
+        }
+    }
+}
+
+/// True if an NDJSON stream sink is open.
+pub fn streaming() -> bool {
+    STREAM.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// Append one raw line (a complete JSON record, no trailing newline) to the
+/// stream. Used by the CLI layer to emit `sym`/`fn`/`meta` records the runtime
+/// crate cannot symbolicate itself. No-op if the stream is closed.
+pub fn stream_line(line: &str) {
+    if let Ok(mut guard) = STREAM.lock() {
+        if let Some(w) = guard.as_mut() {
+            use std::io::Write;
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.write_all(b"\n");
+        }
+    }
+}
+
+/// Flush and close the stream (called as the process exits).
+pub fn close_stream() {
+    if let Ok(mut guard) = STREAM.lock() {
+        if let Some(w) = guard.as_mut() {
+            use std::io::Write;
+            let _ = w.flush();
+        }
+        *guard = None;
+    }
+}
+
+/// The distinct symbol ids seen in recorded events (for name resolution at the
+/// CLI layer), sorted.
+pub fn seen_syms() -> Vec<u32> {
+    SEEN_SYMS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| {
+            let mut v: Vec<u32> = s.iter().copied().collect();
+            v.sort_unstable();
+            v
+        }))
+        .unwrap_or_default()
 }
 
 /// Drop all recorded events and reset the sequence + dropped counters.
@@ -155,6 +239,23 @@ fn record_slow(kind: EventKind, sym: u32, arg0: u64, arg1: u64) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
         b.push_back(ev);
+    }
+    // Stream the event as NDJSON (unbounded) if a recorder sink is open. No
+    // BlissVal allocation — only Rust-side formatting/IO — so still GC-safe.
+    if let Ok(mut guard) = STREAM.lock() {
+        if let Some(w) = guard.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(
+                w,
+                "{{\"t\":\"e\",\"s\":{seq},\"n\":{nanos},\"k\":\"{}\",\"y\":{sym},\"a\":{arg0},\"b\":{arg1}}}",
+                kind_tag(kind)
+            );
+        }
+    }
+    if sym != NO_SYM {
+        if let Ok(mut g) = SEEN_SYMS.lock() {
+            g.get_or_insert_with(std::collections::HashSet::new).insert(sym);
+        }
     }
 }
 
