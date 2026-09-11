@@ -1657,8 +1657,8 @@ thread_local! {
     /// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
     /// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
     static GF_DISPATCH_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static GF_DISPATCH_CACHE: RefCell<HashMap<(String, Vec<u64>), GfDispatchEntry>> =
-        RefCell::new(HashMap::new());
+    static GF_DISPATCH_CACHE: RefCell<HashMap<GfKey, GfDispatchEntry, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
 
     /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
     /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
@@ -4792,12 +4792,36 @@ fn calltrace_note(name: &str, e: &BlissError) {
 
 /// A cached standard-combination effective method: the applicable methods, split
 /// by role, as `method_id` immediates (bliss-x5y.20).
-struct GfDispatchEntry {
-    generation: u64,
+/// The four standard-combination method-id lists for one (generic, arg-classes)
+/// dispatch decision. Held behind an `Rc` in the cache so a cache HIT clones a
+/// single refcount, not four `Vec`s (bliss-fy37). The ids are `from_meta_handle`
+/// immediates, so the `Rc` holds no movable GC pointers and needs no tracing.
+struct GfEffective {
     around: Vec<BlissVal>,
     before: Vec<BlissVal>,
     primary: Vec<BlissVal>,
     after: Vec<BlissVal>,
+}
+
+struct GfDispatchEntry {
+    generation: u64,
+    methods: Rc<GfEffective>,
+}
+
+/// Allocation-free dispatch-cache key (bliss-fy37): the generic's interned
+/// symbol index plus the `class_of` identity bits of up to `GF_KEY_MAX_ARGS`
+/// arguments. It is `Copy`, so building one and looking it up costs no heap
+/// allocation — the previous key was a fresh `String` (`name.to_string()`) plus a
+/// `Vec<u64>` (`dispatch_class_key`) built on every single dispatch, even cache
+/// hits. A call with more arguments than fit here bypasses the cache (rare; see
+/// `invoke_generic_function_inner`) rather than truncating the key, which would
+/// be unsound (distinct arg-class tuples must never collide to one entry).
+const GF_KEY_MAX_ARGS: usize = 4;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GfKey {
+    gf: u32,
+    n: u8,
+    classes: [u64; GF_KEY_MAX_ARGS],
 }
 
 /// Invalidate every cached dispatch decision. Cheap (a counter bump); called when
@@ -4867,13 +4891,6 @@ fn method_specializer_matches_designator(ms: &MethodSpecializer, arg: BlissVal) 
             false
         }
     }
-}
-
-/// The class-identity key for a generic call: the `class_of` identity bits of
-/// each argument. Over-keying on non-dispatched trailing args only lowers the hit
-/// rate, never correctness.
-fn dispatch_class_key(args: &[BlissVal]) -> Vec<u64> {
-    args.iter().map(|a| bliss_stdlib::class_of(*a).0).collect()
 }
 
 /// Look up the `MethodDef`s named by `ids` (in order) from the generic's method
@@ -4967,21 +4984,38 @@ fn invoke_generic_function_inner(
     // Class-keyed effective-method cache for the common case (bliss-x5y.20).
     let cacheable = matches!(combination, bliss_stdlib::MethodCombinationType::Standard)
         && !generic_has_eql_specializer(env, name);
-    let dispatch_key = if cacheable {
-        Some((name.to_string(), dispatch_class_key(args)))
+    // Build the allocation-free dispatch key (bliss-fy37): interned GF symbol
+    // index + up to GF_KEY_MAX_ARGS `class_of` identity bits. `None` (bypass the
+    // cache) if not cacheable, if the GF name is somehow un-interned, or if there
+    // are more args than the inline key holds (truncating would be unsound).
+    let dispatch_key = if cacheable && args.len() <= GF_KEY_MAX_ARGS {
+        bliss_rt::symbols::find_index(name).map(|gf| {
+            let mut classes = [0u64; GF_KEY_MAX_ARGS];
+            for (slot, a) in classes.iter_mut().zip(args.iter()) {
+                *slot = bliss_stdlib::class_of(*a).0;
+            }
+            GfKey {
+                gf,
+                n: args.len() as u8,
+                classes,
+            }
+        })
     } else {
         None
     };
-    if let Some(key) = &dispatch_key {
+    if let Some(key) = dispatch_key {
         let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
+        // Cache HIT clones a single Rc (a refcount bump), not the four method-id
+        // Vecs the old (String, Vec) entry cloned on every call.
         let cached = GF_DISPATCH_CACHE.with(|c| {
-            c.borrow().get(key).filter(|e| e.generation == generation).map(|e| {
-                (e.around.clone(), e.before.clone(), e.primary.clone(), e.after.clone())
-            })
+            c.borrow()
+                .get(&key)
+                .filter(|e| e.generation == generation)
+                .map(|e| Rc::clone(&e.methods))
         });
-        if let Some((around, before, primary, after)) = cached {
+        if let Some(m) = cached {
             if let Some(result) =
-                run_standard_from_ids(env, &around, &before, &primary, &after, name, args)?
+                run_standard_from_ids(env, &m.around, &m.before, &m.primary, &m.after, name, args)?
             {
                 return Ok(result);
             }
@@ -5033,9 +5067,17 @@ fn invoke_generic_function_inner(
                     "missing standard effective method".into(),
                 ));
             };
-            // Cache this (name, arg-classes) → effective-method decision for the
-            // next call with the same classes (bliss-x5y.20). Only reached on a
-            // cacheable generic (see `dispatch_key`).
+            // Cache this (generic, arg-classes) → effective-method decision for
+            // the next call with the same classes (bliss-x5y.20). The four id
+            // lists move into one Rc; the cache entry holds a refcount clone, and
+            // we run from the same Rc — no Vec cloning on the miss path either
+            // (bliss-fy37). Only reached on a cacheable generic (see dispatch_key).
+            let effective = Rc::new(GfEffective {
+                around: around_ids,
+                before: before_ids,
+                primary: primary_ids,
+                after: after_ids,
+            });
             if let Some(key) = dispatch_key {
                 let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
                 GF_DISPATCH_CACHE.with(|c| {
@@ -5043,20 +5085,17 @@ fn invoke_generic_function_inner(
                         key,
                         GfDispatchEntry {
                             generation,
-                            around: around_ids.clone(),
-                            before: before_ids.clone(),
-                            primary: primary_ids.clone(),
-                            after: after_ids.clone(),
+                            methods: Rc::clone(&effective),
                         },
                     );
                 });
             }
             match run_standard_from_ids(
                 env,
-                &around_ids,
-                &before_ids,
-                &primary_ids,
-                &after_ids,
+                &effective.around,
+                &effective.before,
+                &effective.primary,
+                &effective.after,
                 name,
                 args,
             )? {
