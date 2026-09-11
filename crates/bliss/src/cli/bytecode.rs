@@ -13567,6 +13567,25 @@ pub(super) fn generic_receiver_profile_counts(name: &str) -> (u32, usize) {
     })
 }
 
+/// Per-generic receiver polymorphism for PROFILE-REPORT (bliss-4q30):
+/// (generic name, distinct receiver classes observed, total sampled dispatches).
+pub fn receiver_profile_summary() -> Vec<(String, usize, u64)> {
+    snapshot_receiver_profiles_for_t2()
+        .into_iter()
+        .map(|(name, entries)| {
+            let distinct = entries.len();
+            let total: u64 = entries.iter().map(|e| u64::from(e.count)).sum();
+            (name, distinct, total)
+        })
+        .collect()
+}
+
+/// Per-function OSR native-entry counts for PROFILE-REPORT (bliss-4q30):
+/// (function symbol index, times an OSR loop was entered natively).
+pub fn osr_entry_counts_snapshot() -> Vec<(u32, u32)> {
+    OSR_ENTRY_COUNTS.with(|c| c.borrow().iter().map(|(&s, &n)| (s, n)).collect())
+}
+
 fn snapshot_receiver_profiles_for_t2() -> Vec<(String, Vec<ReceiverTypeProfileEntrySnapshot>)> {
     GENERIC_RECEIVER_PROFILE.with(|m| {
         m.borrow()

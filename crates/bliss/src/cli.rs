@@ -19225,6 +19225,60 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|f| BlissVal::from_fixnum(bliss_rt::function::tier(f) as i64))
                     .unwrap_or(NIL));
             }
+            // Tier-aware engine profile (bliss-4q30, profiling epic bliss-bfxm):
+            // surface the HotSpot-style instrumentation bliss already collects —
+            // GC, deoptimizations, OSR native entries, and generic-function
+            // receiver polymorphism. Prints to *trace-output*, returns NIL.
+            "BLISS-EXT:PROFILE-REPORT" => {
+                let _ = eval_args(cdr, env)?;
+                let g = bliss_rt::heap_stats();
+                let mut out = String::new();
+                out.push_str("Bliss engine profile\n");
+                out.push_str(&format!(
+                    "  GC:      {} minor, {} major ({:.3}s + {:.3}s pause); {} bytes consed; {} promoted\n",
+                    g.minor_gc_count,
+                    g.major_gc_count,
+                    g.total_minor_pause_us as f64 / 1_000_000.0,
+                    g.total_major_pause_us as f64 / 1_000_000.0,
+                    g.bytes_allocated,
+                    g.bytes_promoted,
+                ));
+                out.push_str(&format!(
+                    "  Deopts:  {} total (speculation/uncommon-trap returns to T0)\n",
+                    bytecode::deopt_count(),
+                ));
+                // OSR native entries, hottest first.
+                let mut osr = bytecode::osr_entry_counts_snapshot();
+                osr.sort_by(|a, b| b.1.cmp(&a.1));
+                let osr_total: u64 = osr.iter().map(|(_, n)| u64::from(*n)).sum();
+                out.push_str(&format!(
+                    "  OSR:     {} native loop entries across {} functions\n",
+                    osr_total,
+                    osr.len(),
+                ));
+                for (sym, n) in osr.iter().take(10) {
+                    let name = bliss_rt::symbols::registry_key(*sym)
+                        .unwrap_or_else(|| format!("#<sym {sym}>"));
+                    out.push_str(&format!("             {n:>8}  {name}\n"));
+                }
+                // Generic-function dispatch: monomorphic vs polymorphic sites.
+                let mut recv = bytecode::receiver_profile_summary();
+                recv.sort_by(|a, b| b.2.cmp(&a.2));
+                let poly = recv.iter().filter(|(_, d, _)| *d > 1).count();
+                out.push_str(&format!(
+                    "  Generic dispatch: {} profiled generics ({} polymorphic, {} monomorphic)\n",
+                    recv.len(),
+                    poly,
+                    recv.len() - poly,
+                ));
+                for (name, distinct, total) in recv.iter().take(10) {
+                    out.push_str(&format!(
+                        "             {total:>8} calls, {distinct} receiver class(es)  {name}\n"
+                    ));
+                }
+                write_trace_output(env, &out)?;
+                return Ok(NIL);
+            }
             "BLISS-EXT:FUNCTION-INVOKE-COUNT" => {
                 let (f_form, _) = cp(cdr);
                 let d = eval_form(f_form, env)?;
