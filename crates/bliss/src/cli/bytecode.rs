@@ -546,6 +546,52 @@ fn format_bytecode_listing(sym: u32, bf: &Rc<BytecodeFunction>) -> String {
     out
 }
 
+/// The first immediate operand of a decoded instruction, if any.
+fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
+    use iced_x86::OpKind::*;
+    (0..insn.op_count()).find_map(|i| match insn.op_kind(i) {
+        Immediate8 | Immediate16 | Immediate32 | Immediate64 | Immediate8to16
+        | Immediate8to32 | Immediate8to64 | Immediate32to64 => Some(insn.immediate(i)),
+        _ => None,
+    })
+}
+
+/// Decode a tagged `BlissVal` immediate to a readable CL value, if it is clearly
+/// one. Bliss tags values in the low 3 bits: fixnum = `n<<3` (tag 000), NIL =
+/// `0x7`. Only unambiguous cases are named (large immediates are code/heap
+/// addresses, not values, so they are left alone).
+fn decode_tagged_immediate(imm: u64) -> Option<String> {
+    if imm == bliss_rt::value::NIL_BITS {
+        return Some("NIL".into());
+    }
+    if imm != 0 && imm & bliss_rt::value::TAG_MASK == bliss_rt::value::TAG_FIXNUM && imm < (1 << 24) {
+        return Some(format!("fixnum {}", (imm >> 3) as i64));
+    }
+    None
+}
+
+/// A short semantic note for a native instruction, derived only from patterns
+/// that are unambiguous in bliss's codegen (no false positives): the tag-check
+/// and overflow guards that implement speculation, and decoded tagged-value
+/// immediates. Empty for anything not confidently recognised.
+fn native_insn_annotation(insn: &iced_x86::Instruction) -> Option<String> {
+    use iced_x86::Mnemonic;
+    match insn.mnemonic() {
+        // A failed fixnum-overflow / type-tag check is how speculation deopts.
+        Mnemonic::Jo | Mnemonic::Jno => return Some("overflow guard → deopt to T0".into()),
+        _ => {}
+    }
+    let imm = native_immediate(insn)?;
+    match insn.mnemonic() {
+        // `test rX, 7` masks the low 3 tag bits — the fixnum/type guard.
+        Mnemonic::Test if imm == bliss_rt::value::TAG_MASK => {
+            Some("tag check (low 3 bits select the type) → deopt on mismatch".into())
+        }
+        Mnemonic::Mov | Mnemonic::Cmp => decode_tagged_immediate(imm),
+        _ => None,
+    }
+}
+
 /// The **native x86-64** (T1/T2) listing for a specific installed `NativeCode`,
 /// with a header describing that tier's compilation strategy and its OSR loop
 /// entry points. Offsets are relative to the code entry (stable across runs,
@@ -579,7 +625,14 @@ fn format_native_listing(nc: &NativeCode) -> String {
         line.clear();
         use iced_x86::Formatter;
         fmt.format(&insn, &mut line);
-        let _ = writeln!(out, "  +{:04x}:  {line}", insn.ip() - base);
+        match native_insn_annotation(&insn) {
+            Some(ann) => {
+                let _ = writeln!(out, "  +{:04x}:  {line}    ; {ann}", insn.ip() - base);
+            }
+            None => {
+                let _ = writeln!(out, "  +{:04x}:  {line}", insn.ip() - base);
+            }
+        }
     }
     out
 }
