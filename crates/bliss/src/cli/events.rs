@@ -31,6 +31,12 @@ pub enum EventKind {
     /// interpreter. `arg0` = a `DEOPT_*` reason code; `arg1` = the running
     /// per-function deopt count.
     Deopt,
+    /// A hot loop entered native code mid-run via on-stack replacement. `arg0` =
+    /// the bytecode position of the loop header; `arg1` = the running per-
+    /// function OSR entry count. (T0→native OSR is invisible to FUNCTION-TIER —
+    /// the native OSR code lives in its own registry — so this is the observable
+    /// for "a hot loop was promoted mid-run", the S5 gate.)
+    Osr,
 }
 
 /// A single recorded event. All fields are plain integers so the struct is
@@ -167,6 +173,11 @@ pub fn dropped() -> u64 {
 /// Resolve a symbol id to a printable function name (dump-time symbolication),
 /// falling back to `#<sym N>` when the id no longer resolves.
 fn sym_label(sym: u32) -> String {
+    // u32::MAX is the sentinel for an anonymous activation — a top-level form or
+    // gensym lambda with no FnMeta (see maybe_osr); it has no registry name.
+    if sym == u32::MAX {
+        return "<anonymous/top-level>".to_string();
+    }
     // registry_key is the same resolver PROFILE-REPORT uses for these engine
     // sym ids, so names line up across the profiling reports.
     bliss_rt::symbols::registry_key(sym).unwrap_or_else(|| format!("#<sym {sym}>"))
@@ -188,7 +199,7 @@ pub fn report_lines() -> Vec<String> {
             String::new()
         }
     ));
-    let (mut compiles, mut deopts) = (0u64, 0u64);
+    let (mut compiles, mut deopts, mut osrs) = (0u64, 0u64, 0u64);
     for ev in &events {
         let ms = ev.nanos as f64 / 1_000_000.0;
         match ev.kind {
@@ -213,10 +224,19 @@ pub fn report_lines() -> Vec<String> {
                     sym_label(ev.sym)
                 ));
             }
+            EventKind::Osr => {
+                osrs += 1;
+                out.push(format!(
+                    "{:>10.3}ms  #{:<6} OSR      @bcp {:<6} (#{}) {}",
+                    ms,
+                    ev.seq,
+                    ev.arg0,
+                    ev.arg1,
+                    sym_label(ev.sym)
+                ));
+            }
         }
     }
-    out.push(format!(
-        "; summary: {compiles} compile, {deopts} deopt"
-    ));
+    out.push(format!("; summary: {compiles} compile, {deopts} deopt, {osrs} osr"));
     out
 }

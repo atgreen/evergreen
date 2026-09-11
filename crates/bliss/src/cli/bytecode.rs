@@ -16300,9 +16300,20 @@ fn maybe_osr(
         }
     };
     // Record the native entry so promotion is observable (bliss-f88w).
-    OSR_ENTRY_COUNTS.with(|c| {
-        *c.borrow_mut().entry(act.sym).or_insert(0) += 1;
+    let osr_n = OSR_ENTRY_COUNTS.with(|c| {
+        let mut b = c.borrow_mut();
+        let e = b.entry(act.sym).or_insert(0);
+        *e += 1;
+        *e
     });
+    // JFR-style event stream (bliss-ai8n / bliss-u3h0): a hot loop entered native
+    // code mid-run. Allocation-free — GC-safe (see cli::events).
+    super::events::record(
+        super::events::EventKind::Osr,
+        act.sym,
+        u64::from(target_bcp),
+        u64::from(osr_n),
+    );
     Some(run_native_osr(
         &osr,
         stub_off,
