@@ -596,6 +596,25 @@ fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
     });
 }
 
+thread_local! {
+    /// The original Lisp source form (rendered to text) of each defun'd function,
+    /// captured at definition time so the viewer can show the "treewalk" source
+    /// alongside its T0/T1/T2 representations. Populated only while recording.
+    static SOURCE_TEXT: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
+}
+
+/// Record `sym`'s source text (called from eval_defun while recording).
+pub fn set_source_text(sym: u32, text: String) {
+    SOURCE_TEXT.with(|m| {
+        m.borrow_mut().insert(sym, text);
+    });
+}
+
+/// The captured source text of `sym`, if any.
+pub fn source_text(sym: u32) -> Option<String> {
+    SOURCE_TEXT.with(|m| m.borrow().get(&sym).cloned())
+}
+
 /// The T0 / T1 / T2 representations of `sym` for the tiered-JIT viewer. T0 (the
 /// annotated bytecode) is always available; T1 and T2 come from the compile-time
 /// snapshots and are present only for tiers this function actually reached while

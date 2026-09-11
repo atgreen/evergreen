@@ -25646,6 +25646,24 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted_ref!(_name_root = &mut name_form);
     bliss_rt::rooted_ref!(_params_root = &mut params_form);
     bliss_rt::rooted_ref!(_body_root = &mut body);
+    // TriView (bliss-kkd0): while the event stream is recording, snapshot the
+    // ORIGINAL source form now — before the implicit-block wrap and macroexpand
+    // below — so the viewer can show the "treewalk" representation next to the
+    // compiled tiers. Reconstruct `(defun name params . body)` as a rooted list
+    // and render it once. print_val can allocate (interning / the *print-circle*
+    // table), which can GC, so we must NOT hold an unrooted cons across it —
+    // build the whole form rooted first, then print the rooted value.
+    if bliss_rt::events::enabled() && name_form.is_symbol() {
+        let sym_idx = name_form.as_symbol_index();
+        if let Some(defun_sym) = resolve_sym("DEFUN") {
+            bliss_rt::rooted!(pb = arena_cons(params_form, body));
+            bliss_rt::rooted!(npb = arena_cons(name_form, *pb));
+            bliss_rt::rooted!(form = arena_cons(defun_sym, *npb));
+            let mut src = String::new();
+            print_val(*form, &mut src);
+            bytecode::set_source_text(sym_idx, src);
+        }
+    }
     // A defun body is wrapped in an implicit block named after the function
     // (ANSI 3.1.2.1), so `(return-from NAME ...)` works from anywhere in the
     // body — including inside nested flet/loop/etypecase forms. For `(setf x)`

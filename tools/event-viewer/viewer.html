@@ -350,6 +350,7 @@ const EVENT_DATA = /*__EVENT_DATA__*/ {"events":[
   {"seq":6,"ns":6334600000,"kind":"deopt","name":"ADD1","reason":"blacklist","n":8},
   {"seq":7,"ns":6900000000,"kind":"gc-major","pause_us":9200,"regions_freed":3}
 ],"functions":{"ADD1":{
+  "src":"(defun ADD1 (X)\n  (+ X 1))",
   "t0":"; ADD1 — 1 arg(s), 1 local(s), 2 stack slot(s)\n; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n; runtime operand-type profile (fix/float/other) that drives tier-up.\n     0: LoadLocal(0)\n     1: Const(0)    ; 1\n     2: CallNamed { sym: 181, nargs: 2 }    ; (+ …) / 2 arg(s)  [profile fix:50 float:0 other:0 ⇒ speculate FIXNUM]\n     3: Return",
   "t1":"; T1 — baseline native: optimistic FIXNUM arithmetic templates with\n; overflow/type guards; a failed guard deoptimises to T0.\n; 259 bytes of x86-64:\n  +0000:  push r14\n  +0002:  mov rax,[rdi]\n  +0005:  test al,1\n  +0007:  jne +0030\n  +0009:  add rax,2\n  +000d:  jo +0030\n  +0030:  ; deopt guard → T0",
   "t2":"; T2 — profile-guided native: speculates the dominant observed operand\n; types and monomorphic dispatch; a failed guard deoptimises to T0.\n; 185 bytes of x86-64:\n  +0000:  mov rcx,[rdi]\n  +0004:  add rcx,2\n  +0008:  jo +0020\n  +000a:  mov [rsi],rcx\n  +000d:  ret"
@@ -562,6 +563,13 @@ function tintCode(s){
   return s.replace(/(^\s*(?:\+[0-9a-f]+|\d+):)/,'<span class="c">$1</span>')
           .replace(OPS,'<span class="op">$1</span>');
 }
+// Light tinting for the Lisp source form: defining keywords + the defun name.
+function tintLisp(text){
+  let s = escapeHtml(text);
+  s = s.replace(/\b(defun|lambda|let|let\*|labels|flet|if|cond|when|unless|dotimes|dolist|loop|block|return-from|setq|setf|progn)\b/g,'<span class="op">$1</span>');
+  s = s.replace(/(^\(defun\s+)([^\s()]+)/,'$1<span class="spec">$2</span>');
+  return s;
+}
 function tintDisasm(text){
   return text.split("\n").map(line=>{
     let esc = escapeHtml(line);
@@ -610,12 +618,14 @@ function openDrawer(name){
   // bytecode always; T1/T2 native captured at compile time even if later
   // deoptimised). Default to the highest tier reached.
   const f = funcs[name] || {};
-  const tiers = [["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
+  const tiers = [["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
   let disasm;
   if (tiers.length){
+    // default to the highest compiled tier (last), not the source
     const initial = tiers[tiers.length-1][0];
     const tabs = tiers.map(([k,l])=>`<button class="tiertab" data-tier="${k}" aria-pressed="${k===initial}">${l}</button>`).join("");
-    disasm = `<div class="tiertabs">${tabs}</div><pre class="disasm" id="disasm-pre">${tintDisasm(f[initial])}</pre>`;
+    const render = k => k==="src" ? tintLisp(f[k]) : tintDisasm(f[k]);
+    disasm = `<div class="tiertabs">${tabs}</div><pre class="disasm" id="disasm-pre">${render(initial)}</pre>`;
   } else {
     disasm = `<p class="empty">No disassembly captured for this function.</p>`;
   }
@@ -631,7 +641,8 @@ function openDrawer(name){
     btn.onclick = ()=>{
       document.querySelectorAll(".tiertab").forEach(b=>b.setAttribute("aria-pressed","false"));
       btn.setAttribute("aria-pressed","true");
-      pre.innerHTML = tintDisasm(f[btn.dataset.tier]);
+      const k = btn.dataset.tier;
+      pre.innerHTML = k==="src" ? tintLisp(f[k]) : tintDisasm(f[k]);
     };
   });
 

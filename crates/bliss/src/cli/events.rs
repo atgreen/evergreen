@@ -231,6 +231,9 @@ pub fn to_json() -> String {
             }
             first = false;
             s.push_str(&format!("\"{}\":{{", json_escape(&sym_label(sym))));
+            if let Some(src) = super::bytecode::source_text(sym) {
+                s.push_str(&format!("\"src\":\"{}\",", json_escape(&src)));
+            }
             s.push_str(&format!("\"t0\":\"{}\"", json_escape(&t0)));
             if let Some(t1) = t1 {
                 s.push_str(&format!(",\"t1\":\"{}\"", json_escape(&t1)));
