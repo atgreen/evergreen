@@ -570,26 +570,65 @@ fn decode_tagged_immediate(imm: u64) -> Option<String> {
     None
 }
 
-/// A short semantic note for a native instruction, derived only from patterns
-/// that are unambiguous in bliss's codegen (no false positives): the tag-check
-/// and overflow guards that implement speculation, and decoded tagged-value
-/// immediates. Empty for anything not confidently recognised.
-fn native_insn_annotation(insn: &iced_x86::Instruction) -> Option<String> {
+/// True if `insn` is a fixnum tag guard: `test r/m8, 7` (masking the low 3 tag
+/// bits before a conditional deopt jump).
+fn is_tag_guard(insn: &iced_x86::Instruction) -> bool {
+    insn.mnemonic() == iced_x86::Mnemonic::Test
+        && native_immediate(insn) == Some(bliss_rt::value::TAG_MASK)
+}
+
+/// A short semantic note for one native instruction. `prev` is the preceding
+/// instruction (to pair a guard jump with its `test`); `base`/`len` bound the
+/// function's code; `osr` maps native offsets that are OSR loop entries;
+/// `deopt_start` is the offset where the cold deopt-stub section begins. Only
+/// unambiguous patterns are annotated (no false positives).
+fn native_insn_annotation(
+    insn: &iced_x86::Instruction,
+    prev: Option<&iced_x86::Instruction>,
+    base: u64,
+    len: u64,
+    osr: &std::collections::HashMap<u32, usize>,
+    deopt_start: Option<u64>,
+) -> Option<String> {
     use iced_x86::Mnemonic;
-    match insn.mnemonic() {
-        // A failed fixnum-overflow / type-tag check is how speculation deopts.
-        Mnemonic::Jo | Mnemonic::Jno => return Some("overflow guard → deopt to T0".into()),
-        _ => {}
-    }
-    let imm = native_immediate(insn)?;
-    match insn.mnemonic() {
-        // `test rX, 7` masks the low 3 tag bits — the fixnum/type guard.
-        Mnemonic::Test if imm == bliss_rt::value::TAG_MASK => {
-            Some("tag check (low 3 bits select the type) → deopt on mismatch".into())
+    // Branches: resolve the target to an in-function offset and name its role.
+    // A jump's target is its first operand, a NearBranch (no instr_info feature
+    // needed, unlike flow_control()).
+    if matches!(
+        insn.op0_kind(),
+        iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64
+    ) {
+        let tgt = insn.near_branch_target();
+        if tgt >= base && tgt < base + len {
+            let off = tgt - base;
+            let role = if osr.values().any(|&o| o as u64 == off) {
+                " (OSR entry)"
+            } else if deopt_start.is_some_and(|d| tgt >= d) {
+                " (deopt)"
+            } else {
+                ""
+            };
+            let kind = match insn.mnemonic() {
+                Mnemonic::Jo | Mnemonic::Jno => "overflow guard ",
+                // a conditional jump right after a tag `test` is the type guard
+                _ if prev.is_some_and(is_tag_guard)
+                    && matches!(insn.mnemonic(), Mnemonic::Jne | Mnemonic::Je) =>
+                {
+                    "type guard "
+                }
+                _ => "",
+            };
+            return Some(format!("{kind}→ +{off:04x}{role}"));
         }
-        Mnemonic::Mov | Mnemonic::Cmp => decode_tagged_immediate(imm),
-        _ => None,
+        return None; // external target (a runtime/c2i call) — left bare
     }
+    if is_tag_guard(insn) {
+        return Some("tag check (low 3 bits select the type)".into());
+    }
+    if matches!(insn.mnemonic(), Mnemonic::Mov | Mnemonic::Cmp) {
+        return native_immediate(insn).and_then(decode_tagged_immediate);
+    }
+    None
 }
 
 /// The **native x86-64** (T1/T2) listing for a specific installed `NativeCode`,
@@ -615,17 +654,50 @@ fn format_native_listing(nc: &NativeCode) -> String {
     }
     let _ = writeln!(out, "; {} bytes of x86-64:", nc.code_len);
     let base = nc.entry as u64;
+    let len = nc.code_len as u64;
     let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
+
+    // Pass 1: decode everything, then locate the cold deopt-stub section. A
+    // failed speculation guard — an overflow `jo`/`jno`, or a `jne`/`je` right
+    // after a `test rX,7` tag check — jumps FORWARD into the deopt stubs, which
+    // the emitter lays out contiguously at the tail. The lowest such target is
+    // where that cold section begins (reached only on guard failure).
     let mut dec = iced_x86::Decoder::with_ip(64, bytes, base, iced_x86::DecoderOptions::NONE);
-    let mut fmt = iced_x86::NasmFormatter::new();
-    let mut insn = iced_x86::Instruction::default();
-    let mut line = String::new();
+    let mut insns: Vec<iced_x86::Instruction> = Vec::new();
     while dec.can_decode() {
-        dec.decode_out(&mut insn);
+        let mut i = iced_x86::Instruction::default();
+        dec.decode_out(&mut i);
+        insns.push(i);
+    }
+    let mut deopt_start: Option<u64> = None;
+    for (k, insn) in insns.iter().enumerate() {
+        let is_overflow = matches!(insn.mnemonic(), iced_x86::Mnemonic::Jo | iced_x86::Mnemonic::Jno);
+        let is_type_guard = k > 0
+            && is_tag_guard(&insns[k - 1])
+            && matches!(insn.mnemonic(), iced_x86::Mnemonic::Jne | iced_x86::Mnemonic::Je);
+        if is_overflow || is_type_guard {
+            let tgt = insn.near_branch_target();
+            if tgt > insn.ip() && tgt < base + len {
+                deopt_start = Some(deopt_start.map_or(tgt, |d| d.min(tgt)));
+            }
+        }
+    }
+
+    // Pass 2: format, resolving branch targets and marking the deopt section.
+    let mut fmt = iced_x86::NasmFormatter::new();
+    let mut line = String::new();
+    for (k, insn) in insns.iter().enumerate() {
+        if Some(insn.ip()) == deopt_start {
+            let _ = writeln!(
+                out,
+                "; ── deoptimization stubs (cold — reached only when a guard fails; rebuild the T0 frame and resume) ──"
+            );
+        }
         line.clear();
         use iced_x86::Formatter;
-        fmt.format(&insn, &mut line);
-        match native_insn_annotation(&insn) {
+        fmt.format(insn, &mut line);
+        let prev = (k > 0).then(|| &insns[k - 1]);
+        match native_insn_annotation(insn, prev, base, len, &nc.osr_entries, deopt_start) {
             Some(ann) => {
                 let _ = writeln!(out, "  +{:04x}:  {line}    ; {ann}", insn.ip() - base);
             }
