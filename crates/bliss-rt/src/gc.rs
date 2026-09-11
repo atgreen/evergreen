@@ -1871,6 +1871,16 @@ impl HeapCollector {
         let elapsed_us = start.elapsed().as_micros() as u64;
         state.stats.total_minor_pause_us += elapsed_us;
 
+        // JFR-style event stream (bliss-u3h0): a minor collection finished. This
+        // runs at collection *completion* — all scanning/moving is done — and
+        // record() allocates no heap value, so it cannot re-enter the GC.
+        crate::events::record(
+            crate::events::EventKind::GcMinor,
+            crate::events::NO_SYM,
+            elapsed_us,
+            bytes_promoted as u64,
+        );
+
         // Update local stats copy.
         self.gc_stats = state.stats.clone();
         GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
@@ -2471,6 +2481,15 @@ impl Collector for HeapCollector {
         state.stats.regions_free += regions_freed;
         let elapsed_us = start.elapsed().as_micros() as u64;
         state.stats.total_major_pause_us += elapsed_us;
+
+        // JFR-style event stream (bliss-u3h0): a major collection finished (see
+        // the minor-GC note above for why recording here is GC-safe).
+        crate::events::record(
+            crate::events::EventKind::GcMajor,
+            crate::events::NO_SYM,
+            elapsed_us,
+            regions_freed as u64,
+        );
 
         self.gc_stats = state.stats.clone();
 

@@ -44,6 +44,7 @@ pub mod sandbox;
 
 // ── Error types ───────────────────────────────────────────────────
 pub mod error;
+pub mod events;
 
 // ── Top-level entry ───────────────────────────────────────────────
 pub mod runtime;
