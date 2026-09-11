@@ -4910,6 +4910,37 @@ fn methods_by_ids(env: &Env, name: &str, ids: &[BlissVal]) -> Option<Vec<MethodD
 /// Reconstruct the standard-combination method roles from cached/computed
 /// `method_id` lists and run them. Returns `Ok(None)` if any id is missing (a
 /// stale cache entry), so the caller recomputes from scratch.
+/// Fast path for the overwhelmingly common effective-method shape: exactly one
+/// applicable primary method and no :around/:before/:after (bliss-fy37 #2). When
+/// that method's body is compiled — which only happens if it has no
+/// call-next-method and no captured lexicals (bliss-x5y.20) — it neither reads
+/// `env.method_context` nor needs a next-method chain, so it can be invoked
+/// directly through `apply_function`, skipping the four `methods_by_ids`
+/// name-lookups, the empty-list plumbing in `invoke_standard_methods` /
+/// `invoke_primary_chain`, and the `MethodContext` push/pop. Works from the
+/// cached method-ids alone (METHOD_COMPILED is keyed by method-id), so it never
+/// re-resolves the MethodDef. Returns None to fall through to the general path
+/// (aux methods present, more than one primary, or an uncompiled body).
+fn try_single_primary_fast(
+    env: &mut Env,
+    around_ids: &[BlissVal],
+    before_ids: &[BlissVal],
+    primary_ids: &[BlissVal],
+    after_ids: &[BlissVal],
+    args: &[BlissVal],
+) -> Option<Result<BlissVal, BlissError>> {
+    if !(around_ids.is_empty()
+        && before_ids.is_empty()
+        && after_ids.is_empty()
+        && primary_ids.len() == 1)
+    {
+        return None;
+    }
+    let id = primary_ids[0];
+    let callable = METHOD_COMPILED.with(|m| m.borrow().get(&id.0).copied())?;
+    Some(apply_function(callable, args, env))
+}
+
 fn run_standard_from_ids(
     env: &mut Env,
     around_ids: &[BlissVal],
@@ -5014,6 +5045,13 @@ fn invoke_generic_function_inner(
                 .map(|e| Rc::clone(&e.methods))
         });
         if let Some(m) = cached {
+            // Single-primary fast path (bliss-fy37 #2): the common case skips the
+            // general standard-combination machinery entirely.
+            if let Some(fast) =
+                try_single_primary_fast(env, &m.around, &m.before, &m.primary, &m.after, args)
+            {
+                return fast;
+            }
             if let Some(result) =
                 run_standard_from_ids(env, &m.around, &m.before, &m.primary, &m.after, name, args)?
             {
@@ -5089,6 +5127,18 @@ fn invoke_generic_function_inner(
                         },
                     );
                 });
+            }
+            // Single-primary fast path (bliss-fy37 #2), now that the decision is
+            // cached for subsequent calls.
+            if let Some(fast) = try_single_primary_fast(
+                env,
+                &effective.around,
+                &effective.before,
+                &effective.primary,
+                &effective.after,
+                args,
+            ) {
+                return fast;
             }
             match run_standard_from_ids(
                 env,
