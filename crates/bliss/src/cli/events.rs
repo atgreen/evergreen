@@ -224,8 +224,22 @@ pub fn to_json() -> String {
         .collect();
     s.push_str(",\"functions\":{");
     let mut first = true;
+    // Emit a bcp→native-offset map as a JSON array of ints.
+    let push_map = |s: &mut String, key: &str, map: &[u32]| {
+        if map.is_empty() {
+            return;
+        }
+        s.push_str(&format!(",\"{key}\":["));
+        for (i, off) in map.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&off.to_string());
+        }
+        s.push(']');
+    };
     for sym in syms {
-        if let Some((t0, t1, t2, t1map)) = super::bytecode::tier_disasm(sym) {
+        if let Some(td) = super::bytecode::tier_disasm(sym) {
             if !first {
                 s.push(',');
             }
@@ -234,24 +248,16 @@ pub fn to_json() -> String {
             if let Some(src) = super::bytecode::source_text(sym) {
                 s.push_str(&format!("\"src\":\"{}\",", json_escape(&src)));
             }
-            s.push_str(&format!("\"t0\":\"{}\"", json_escape(&t0)));
-            if let Some(t1) = t1 {
+            s.push_str(&format!("\"t0\":\"{}\"", json_escape(&td.t0)));
+            if let Some(t1) = td.t1 {
                 s.push_str(&format!(",\"t1\":\"{}\"", json_escape(&t1)));
             }
-            if let Some(t2) = t2 {
+            if let Some(t2) = td.t2 {
                 s.push_str(&format!(",\"t2\":\"{}\"", json_escape(&t2)));
             }
-            // T1 bcp→native-offset map for the viewer's linked selection.
-            if !t1map.is_empty() {
-                s.push_str(",\"t1map\":[");
-                for (i, off) in t1map.iter().enumerate() {
-                    if i > 0 {
-                        s.push(',');
-                    }
-                    s.push_str(&off.to_string());
-                }
-                s.push(']');
-            }
+            // bcp→native-offset maps for the viewer's linked selection.
+            push_map(&mut s, "t1map", &td.t1_map);
+            push_map(&mut s, "t2map", &td.t2_map);
             s.push('}');
         }
     }

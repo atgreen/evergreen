@@ -578,6 +578,8 @@ struct TierSnap {
     /// T1 bytecode→native offset map (index = bcp, value = native offset,
     /// `u32::MAX` = no code), for the viewer's bcp↔asm linked selection.
     t1_map: Vec<u32>,
+    /// T2 bytecode→native offset map (sparse — only frame-state bcps).
+    t2_map: Vec<u32>,
 }
 
 thread_local! {
@@ -604,6 +606,7 @@ fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
         let e = b.entry(sym).or_default();
         if nc.is_t2 {
             e.t2 = Some(text);
+            e.t2_map = nc.bcp_offsets.clone();
         } else {
             e.t1 = Some(text);
             e.t1_map = nc.bcp_offsets.clone();
@@ -658,11 +661,25 @@ pub fn source_text(sym: u32) -> Option<String> {
 /// annotated bytecode) is always available; T1 and T2 come from the compile-time
 /// snapshots and are present only for tiers this function actually reached while
 /// recording. Returns `None` if `sym` is not a compiled Bliss function.
-pub fn tier_disasm(sym: u32) -> Option<(String, Option<String>, Option<String>, Vec<u32>)> {
+pub struct TierDisasm {
+    pub t0: String,
+    pub t1: Option<String>,
+    pub t2: Option<String>,
+    pub t1_map: Vec<u32>,
+    pub t2_map: Vec<u32>,
+}
+
+pub fn tier_disasm(sym: u32) -> Option<TierDisasm> {
     let bf = registry_get(sym)?;
     let t0 = format_bytecode_listing(sym, &bf);
     let snap = TIER_DISASM.with(|m| m.borrow().get(&sym).cloned().unwrap_or_default());
-    Some((t0, snap.t1, snap.t2, snap.t1_map))
+    Some(TierDisasm {
+        t0,
+        t1: snap.t1,
+        t2: snap.t2,
+        t1_map: snap.t1_map,
+        t2_map: snap.t2_map,
+    })
 }
 
 /// `disassemble` (spec §6, CL:DISASSEMBLE): render a function's *current tier* —
@@ -13856,6 +13873,8 @@ struct T2Artifact {
     code: Vec<u8>,
     compiled_entry: usize,
     osr_entries: Vec<(u32, usize)>,
+    /// Sparse bytecode→native map for the viewer (bliss-zmmb).
+    bcp_offsets: Vec<u32>,
     shadow_root_slots: u16,
     emitted_safepoints: usize,
     root_sync_sites: Vec<bliss_compiler::t2::emit::RootSyncSite>,
@@ -14306,7 +14325,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         num_slots: total_slots,
         compiled_entry: artifact.compiled_entry,
         osr_entries: artifact.osr_entries.into_iter().collect(),
-        bcp_offsets: Vec::new(), // T2 compiler does not emit a bcp→asm map (yet)
+        bcp_offsets: artifact.bcp_offsets, // sparse T2 bcp→native map (bliss-zmmb)
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
@@ -16112,6 +16131,7 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
         code,
         compiled_entry: framed.compiled_entry,
         osr_entries: framed.osr_entries,
+        bcp_offsets: framed.bcp_offsets,
         shadow_root_slots: framed.shadow_root_slots,
         emitted_safepoints: framed.emitted_safepoints,
         root_sync_sites: framed.root_sync_sites,

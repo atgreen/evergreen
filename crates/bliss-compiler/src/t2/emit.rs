@@ -550,6 +550,12 @@ pub struct FramedCode {
     /// the live frame-slot pointer in rdi, reconstructs SSA registers, and
     /// enters the optimized loop without restarting the function.
     pub osr_entries: Vec<(u32, usize)>,
+    /// Bytecode→native position map for the tiered-JIT viewer (bliss-zmmb):
+    /// `bcp_offsets[bcp]` is the earliest native offset carrying that bytecode
+    /// position (`u32::MAX` if none). Sparse — populated only at frame-state
+    /// instructions, since the optimizer has no 1:1 mapping. Not used by
+    /// execution.
+    pub bcp_offsets: Vec<u32>,
     /// Total eight-byte native stack homes reserved by the framed emitter.
     pub native_spill_slots: u32,
     /// Spill slots chosen directly by regalloc2 before split ranges are assigned
@@ -2718,6 +2724,11 @@ fn emit_framed_inner(
 
     let mut root_sync_sites = Vec::new();
     let mut emitted_safepoints = 0usize;
+    // Bytecode→native correlation for the tiered-JIT viewer (bliss-zmmb): the T2
+    // optimizer has no 1:1 bcp mapping, but every instruction carrying a frame
+    // state knows the bytecode position it deoptimizes to. Collect (native
+    // offset, bcp) at those points; post-processed into a per-bcp map below.
+    let mut bcp_sites: Vec<(u32, u32)> = Vec::new();
 
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
@@ -2782,6 +2793,15 @@ fn emit_framed_inner(
                 )?;
             }
             let sync_offset = a.here();
+            // Record the bytecode position this instruction reconstructs, at its
+            // native offset (bliss-zmmb).
+            if let Some(fsid) = d.frame_state {
+                if let Some(bcp) = f.frame_states.get(fsid).scopes.last().map(|s| s.bcp) {
+                    if bcp != u32::MAX {
+                        bcp_sites.push((sync_offset as u32, bcp));
+                    }
+                }
+            }
             let (mut inst_reg, result_stores) =
                 prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?;
             let mut inst_pool = Vec::new();
@@ -3286,10 +3306,26 @@ fn emit_framed_inner(
     }
 
     let code = a.finish().ok_or(EmitError::BadBranch)?;
+    // Per-bcp native offset map (bliss-zmmb): the earliest native offset carrying
+    // each bytecode position. Sparse — only bcps with a frame-state instruction
+    // appear; the rest stay u32::MAX. Same shape as the T1 map so the viewer can
+    // consume both identically.
+    let bcp_offsets = if bcp_sites.is_empty() {
+        Vec::new()
+    } else {
+        let max_bcp = bcp_sites.iter().map(|&(_, b)| b).max().unwrap_or(0) as usize;
+        let mut m = vec![u32::MAX; max_bcp + 1];
+        for &(off, bcp) in &bcp_sites {
+            let slot = &mut m[bcp as usize];
+            *slot = (*slot).min(off);
+        }
+        m
+    };
     Ok(FramedCode {
         code,
         compiled_entry,
         osr_entries,
+        bcp_offsets,
         native_spill_slots,
         regalloc_spill_slots,
         allocation_edits,

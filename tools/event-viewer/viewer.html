@@ -372,7 +372,8 @@ const EVENT_DATA = /*__EVENT_DATA__*/ {"events":[
   "t0":"; ADD1 — 1 arg(s), 1 local(s), 2 stack slot(s)\n; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n; runtime operand-type profile (fix/float/other) that drives tier-up.\n     0: LoadLocal(0)\n     1: Const(0)    ; 1\n     2: CallNamed { sym: 181, nargs: 2 }    ; (+ …) / 2 arg(s)  [profile fix:50 float:0 other:0 ⇒ speculate FIXNUM]\n     3: Return",
   "t1":"; T1 — baseline native: optimistic FIXNUM arithmetic templates with\n; overflow/type guards; a failed guard deoptimises to T0.\n; 259 bytes of x86-64:\n  +0000:  push r14\n  +0002:  mov rax,[rdi]\n  +0005:  test al,1\n  +0007:  jne +0030\n  +0009:  add rax,2\n  +000d:  jo +0030\n  +0030:  ; deopt guard → T0",
   "t2":"; T2 — profile-guided native: speculates the dominant observed operand\n; types and monomorphic dispatch; a failed guard deoptimises to T0.\n; 185 bytes of x86-64:\n  +0000:  mov rcx,[rdi]\n  +0004:  add rcx,2\n  +0008:  jo +0020\n  +000a:  mov [rsi],rcx\n  +000d:  ret",
-  "t1map":[18,18,32,49,89,89]
+  "t1map":[18,18,32,49,89,89],
+  "t2map":[9,4294967295,4294967295,18]
 }},"dropped":0} /*__END__*/;
 
 const KINDS = [
@@ -612,28 +613,32 @@ function bcpForOffset(map, off){
   return bcp;
 }
 // Build the correlated two-pane view: T0 bytecode lines (tagged by their bcp)
-// beside T1 native lines (tagged by the bcp their offset maps to). Hovering a
-// line lights up every line sharing that bcp in BOTH panes.
-function renderCorrelated(f){
-  const map = f.t1map || [];
-  // left: T0 — leading "  N:" gives the bcp
-  const t0 = f.t0.split("\n").map(line=>{
+// beside native lines (tagged by the bcp their offset maps to). Hovering a line
+// lights up every line sharing that bcp in BOTH panes. `nativeText`/`map`/`label`
+// select the tier (T1 dense map, T2 sparse map).
+function renderCorrelated(t0text, nativeText, map, label){
+  const sparse = map.filter(o=>o!==NO_OFF).length < map.length; // T2 is sparse
+  const t0 = t0text.split("\n").map(line=>{
     const m = line.match(/^\s*(\d+):/);
     const esc = tintDisasm(line);
-    return m ? `<span class="ln" data-bcp="${m[1]}">${esc}</span>` : `<span class="ln">${esc}</span>`;
+    // only tag T0 bcps the native map actually covers
+    const covered = m && map[+m[1]]!==undefined && map[+m[1]]!==NO_OFF;
+    return covered ? `<span class="ln" data-bcp="${m[1]}">${esc}</span>` : `<span class="ln">${esc}</span>`;
   }).join("");
-  // right: T1 — leading "+XXXX:" gives the offset → bcp via the map
-  const t1 = f.t1.split("\n").map(line=>{
+  const nat = nativeText.split("\n").map(line=>{
     const m = line.match(/^\s*\+([0-9a-f]+):/);
     const esc = tintDisasm(line);
     if (!m) return `<span class="ln">${esc}</span>`;
     const bcp = bcpForOffset(map, parseInt(m[1],16));
     return `<span class="ln"${bcp!=null?` data-bcp="${bcp}"`:""}>${esc}</span>`;
   }).join("");
-  return `<p class="corr-hint">Hover a line to light up the bytecode ↔ native instructions it maps to.</p>
+  const note = sparse
+    ? "The optimized tier has no 1:1 mapping — correlation is anchored at frame-state points (calls, guards, deopts)."
+    : "Hover a line to light up the bytecode ↔ native instructions it maps to.";
+  return `<p class="corr-hint">${note}</p>
     <div class="corr">
       <div class="col"><h5>T0 · bytecode</h5><pre>${t0}</pre></div>
-      <div class="col"><h5>T1 · native x86-64</h5><pre>${t1}</pre></div>
+      <div class="col"><h5>${label}</h5><pre>${nat}</pre></div>
     </div>`;
 }
 function wireCorrelation(root){
@@ -683,17 +688,21 @@ function openDrawer(name){
   // deoptimised). Default to the highest tier reached.
   const f = funcs[name] || {};
   const tiers = [["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
-  // A linked-selection tab when we have both bytecode and its T1 offset map.
-  const hasCorr = f.t0 && f.t1 && f.t1map && f.t1map.length;
-  if (hasCorr) tiers.push(["corr","T0 ↔ T1"]);
+  // Linked-selection tabs when we have bytecode and a native offset map.
+  const hasCorr1 = f.t0 && f.t1 && f.t1map && f.t1map.length;
+  const hasCorr2 = f.t0 && f.t2 && f.t2map && f.t2map.length;
+  if (hasCorr1) tiers.push(["corr","T0 ↔ T1"]);
+  if (hasCorr2) tiers.push(["corr2","T0 ↔ T2"]);
   // How a tab renders into the pane (correlated view is multi-element markup).
   const renderTier = k =>
-    k==="corr" ? renderCorrelated(f) :
-    k==="src"  ? `<pre class="disasm">${tintLisp(f[k])}</pre>` :
-                 `<pre class="disasm">${tintDisasm(f[k])}</pre>`;
+    k==="corr"  ? renderCorrelated(f.t0, f.t1, f.t1map, "T1 · native x86-64") :
+    k==="corr2" ? renderCorrelated(f.t0, f.t2, f.t2map, "T2 · native x86-64") :
+    k==="src"   ? `<pre class="disasm">${tintLisp(f[k])}</pre>` :
+                  `<pre class="disasm">${tintDisasm(f[k])}</pre>`;
+  const defaultTab = hasCorr2 ? "corr2" : hasCorr1 ? "corr" : (tiers[tiers.length-1]||[])[0];
   let disasm;
   if (tiers.length){
-    const initial = hasCorr ? "corr" : tiers[tiers.length-1][0];
+    const initial = defaultTab;
     const tabs = tiers.map(([k,l])=>`<button class="tiertab" data-tier="${k}" aria-pressed="${k===initial}">${l}</button>`).join("");
     disasm = `<div class="tiertabs">${tabs}</div><div id="disasm-pane">${renderTier(initial)}</div>`;
   } else {
@@ -707,8 +716,8 @@ function openDrawer(name){
 
   // wire the tier tabs
   const pane = document.getElementById("disasm-pane");
-  const paint = k => { pane.innerHTML = renderTier(k); if (k==="corr") wireCorrelation(pane); };
-  if (tiers.length) paint(hasCorr ? "corr" : tiers[tiers.length-1][0]);
+  const paint = k => { pane.innerHTML = renderTier(k); if (k==="corr"||k==="corr2") wireCorrelation(pane); };
+  if (tiers.length) paint(defaultTab);
   document.querySelectorAll(".tiertab").forEach(btn=>{
     btn.onclick = ()=>{
       document.querySelectorAll(".tiertab").forEach(b=>b.setAttribute("aria-pressed","false"));
