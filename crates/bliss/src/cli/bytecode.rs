@@ -497,36 +497,50 @@ fn format_bytecode_listing(sym: u32, bf: &Rc<BytecodeFunction>) -> String {
     out.push_str("; runtime operand-type profile (fix/float/other) that drives tier-up.\n");
     let func_ptr = Rc::as_ptr(bf) as usize;
     for (pc, instr) in bf.code.iter().enumerate() {
+        // Render the instruction with symbol NAMES substituted for the raw sym
+        // ids in the Debug form (e.g. `CallNamed { sym: +, nargs: 2 }`).
+        let mut disp = format!("{instr:?}");
+        match instr {
+            Instr::CallNamed { sym, .. } => {
+                disp = disp.replace(
+                    &format!("sym: {sym}"),
+                    &format!("sym: {}", sym_label(*sym)),
+                );
+            }
+            Instr::LoadGlobal(s) | Instr::StoreGlobal(s) => {
+                disp = disp.replace(&format!("({s})"), &format!("({})", sym_label(*s)));
+            }
+            _ => {}
+        }
         let ann = match instr {
             Instr::Const(i) => bf
                 .constants
                 .get(*i as usize)
                 .map(|c| fmt_const_val(*c))
                 .unwrap_or_default(),
-            Instr::CallNamed { sym, nargs } => {
-                let mut a = format!("({} …) / {nargs} arg(s)", sym_label(*sym));
-                if let Some(p) = type_profile_at(func_ptr, pc as u32) {
+            // The callee name is now inline; the annotation carries the observed
+            // operand-type profile that drives tier-up speculation.
+            Instr::CallNamed { .. } => type_profile_at(func_ptr, pc as u32)
+                .map(|p| {
                     let spec = match p.dominant() {
                         Some(SpecType::Fixnum) => " ⇒ speculate FIXNUM",
                         Some(SpecType::SingleFloat) => " ⇒ speculate SINGLE-FLOAT",
                         None => " ⇒ generic (polymorphic / cold)",
                     };
-                    a.push_str(&format!(
-                        "  [profile fix:{} float:{} other:{}{}]",
+                    format!(
+                        "[profile fix:{} float:{} other:{}{}]",
                         p.fixnum, p.single_float, p.other, spec
-                    ));
-                }
-                a
-            }
-            Instr::LoadGlobal(s) | Instr::StoreGlobal(s) => sym_label(*s),
+                    )
+                })
+                .unwrap_or_default(),
             Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
             Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
             _ => String::new(),
         };
         if ann.is_empty() {
-            let _ = writeln!(out, "  {pc:>4}: {instr:?}");
+            let _ = writeln!(out, "  {pc:>4}: {disp}");
         } else {
-            let _ = writeln!(out, "  {pc:>4}: {instr:?}    ; {ann}");
+            let _ = writeln!(out, "  {pc:>4}: {disp}    ; {ann}");
         }
     }
     out
