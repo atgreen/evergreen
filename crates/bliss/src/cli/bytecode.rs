@@ -411,9 +411,14 @@ pub fn call_registered(
     // Anonymous/gensym bytecode functions have no FnMeta, so maintain their
     // fallback counter here on every call (including calls after T1 installs).
     let count = dispatch_invoke_count(sym, fn_obj);
-    if std::env::var_os("BLISS_T1_TRACE").is_some() {
-        eprintln!("[T1] {}: dispatch at invocation {count}", sym_label(sym));
-    }
+    // Unified logging (bliss-89rd): tag "compile" (BLISS_LOG=compile=trace, or the
+    // legacy BLISS_T1_TRACE folded in).
+    bliss_rt::blog!(
+        "compile",
+        bliss_rt::log::TRACE,
+        "[T1] {}: dispatch at invocation {count}",
+        sym_label(sym)
+    );
     let native = native_for_dispatch(sym, fn_obj, count);
     // Dispatch: native if promoted and under the depth cap, else run the callee
     // as BYTECODE — the profiling warmup tier. This is what gathers the operand
@@ -690,9 +695,9 @@ thread_local! {
 }
 
 fn bail_trace_on() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BLISS_BAIL_TRACE").is_some())
+    // Unified logging (bliss-89rd): tag "bail" (BLISS_LOG=bail=trace, or the
+    // legacy BLISS_BAIL_TRACE folded in).
+    bliss_rt::log::enabled("bail", bliss_rt::log::TRACE)
 }
 
 /// Record why the lowerer is about to bail. The reason is built lazily so
@@ -14855,9 +14860,9 @@ fn emit_native_x86(
 ) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
     macro_rules! decline_t1 {
         ($($reason:tt)*) => {{
-            if std::env::var_os("BLISS_T1_TRACE").is_some() {
-                eprintln!("[T1] {}: declined: {}", bf.name, format_args!($($reason)*));
-            }
+            // Unified logging (bliss-89rd): tag "compile".
+            bliss_rt::blog!("compile", bliss_rt::log::TRACE,
+                "[T1] {}: declined: {}", bf.name, format_args!($($reason)*));
             return None;
         }};
     }
@@ -16359,9 +16364,9 @@ fn maybe_osr(
     // this way: every activation ran with sym == u32::MAX). Cached: this runs
     // on every backward jump of interpreted code.
     fn osr_debug() -> bool {
-        use std::sync::OnceLock;
-        static D: OnceLock<bool> = OnceLock::new();
-        *D.get_or_init(|| std::env::var_os("BLISS_OSR_DEBUG").is_some())
+        // Unified logging (bliss-89rd): tag "osr" (BLISS_LOG=osr=trace, or the
+        // legacy BLISS_OSR_DEBUG folded in).
+        bliss_rt::log::enabled("osr", bliss_rt::log::TRACE)
     }
     let dbg = osr_debug();
     if (target_bcp as usize) >= act.bcp || act.sp_top != 0 {
@@ -16674,12 +16679,9 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
 /// differential tests to assert a program actually ran on the bytecode backend
 /// rather than silently falling back to the tree-walker.
 fn trace(what: &str) {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("BLISS_BYTECODE_TRACE").is_some());
-    if on {
-        eprintln!("[bytecode] {what}");
-    }
+    // Unified logging (bliss-89rd): tag "bytecode". Controlled by
+    // BLISS_LOG=bytecode=trace or the legacy BLISS_BYTECODE_TRACE (folded in).
+    bliss_rt::blog!("bytecode", bliss_rt::log::TRACE, "{what}");
 }
 
 /// Optional per-definition compile trace. Kept separate from
