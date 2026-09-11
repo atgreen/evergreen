@@ -5613,8 +5613,8 @@ fn parse_lambda_list(params_form: BlissVal) -> Option<(Vec<String>, u16, Option<
         let (elem, rest) = cp(c);
         c = rest;
         if elem.is_symbol() {
-            let n = sym_name(elem);
-            match n.as_str() {
+            let n = super::sym_name_rc(elem); // borrow-only (bliss-lxpg.2)
+            match &*n {
                 "&OPTIONAL" => {
                     mode = Mode::Opt;
                     variadic = true;

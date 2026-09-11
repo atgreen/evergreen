@@ -485,7 +485,7 @@ fn pathname_accessor_arg(name: &str, args: &[BlissVal]) -> Result<BlissVal, Blis
     while i < rest.len() {
         if rest[i].is_symbol()
             && rest[i] != NIL
-            && symbol_bare_name(&sym_name(rest[i])).eq_ignore_ascii_case("ALLOW-OTHER-KEYS")
+            && symbol_bare_name(&sym_name_rc(rest[i])).eq_ignore_ascii_case("ALLOW-OTHER-KEYS")
         {
             allow_other = rest[i + 1] != NIL;
             break;
@@ -501,7 +501,7 @@ fn pathname_accessor_arg(name: &str, args: &[BlissVal]) -> Result<BlissVal, Blis
         let known = key.is_symbol()
             && key != NIL
             && {
-                let bare = symbol_bare_name(&sym_name(key));
+                let bare = symbol_bare_name(&sym_name_rc(key));
                 bare.eq_ignore_ascii_case("CASE") || bare.eq_ignore_ascii_case("ALLOW-OTHER-KEYS")
             };
         if !known && !allow_other {
@@ -1049,7 +1049,7 @@ fn fn_bound(env: &Env, name: &str) -> bool {
 fn function_name_key(name_form: BlissVal) -> String {
     if name_form.is_cons() {
         let (head, tail) = cp(name_form);
-        if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SETF" && tail.is_cons() {
+        if head.is_symbol() && symbol_bare_name(&sym_name_rc(head)) == "SETF" && tail.is_cons() {
             return format!("(SETF {})", sym_name(cp(tail).0));
         }
     }
@@ -1161,7 +1161,7 @@ fn maybe_lazy_compile(name: &str, params: BlissVal, body: BlissVal, env: &Env) {
 /// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
 /// tell an optional positional stream argument apart from &key start/end.
 fn is_keyword_arg(val: BlissVal) -> bool {
-    val.is_symbol() && sym_name(val).starts_with("KEYWORD:")
+    val.is_symbol() && sym_name_rc(val).starts_with("KEYWORD:")
 }
 
 /// Parse trailing (already-evaluated) `:start`/`:end` keyword pairs for a bounded
@@ -1172,7 +1172,7 @@ fn read_start_end_keys(kv: &[BlissVal], len: usize) -> (usize, usize) {
     let mut end = len;
     let mut i = 0;
     while i + 1 < kv.len() {
-        match symbol_bare_name(&sym_name(kv[i])).as_str() {
+        match symbol_bare_name(&sym_name_rc(kv[i])).as_str() {
             "START" if kv[i + 1].is_fixnum() => start = kv[i + 1].as_fixnum() as usize,
             "END" if kv[i + 1].is_fixnum() => end = kv[i + 1].as_fixnum() as usize,
             _ => {}
@@ -3486,7 +3486,7 @@ fn build_condition_instance_impl(
     while i + 1 < initarg_pairs.len() {
         let key = initarg_pairs[i];
         let val = initarg_pairs[i + 1];
-        let key_name = symbol_bare_name(&sym_name(key));
+        let key_name = symbol_bare_name(&sym_name_rc(key));
         seen_initargs.push(key_name.clone());
         let mut matched = false;
         for (slot_name, initarg) in &slot_specs {
@@ -3528,7 +3528,7 @@ fn build_condition_instance_impl(
     {
         let already_set: Vec<String> = initargs
             .chunks_exact(2)
-            .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+            .map(|pair| symbol_bare_name(&sym_name_rc(pair[0])))
             .collect();
         for (slot_name, _) in &slot_specs {
             if condition_slot_defaults_to_nil(slot_name)
@@ -3550,7 +3550,7 @@ fn build_condition_instance_impl(
     };
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
-        .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+        .map(|pair| symbol_bare_name(&sym_name_rc(pair[0])))
         .collect();
     let cond_class_name = class_name_for_instance_class(class);
     apply_class_initforms(instance, &cond_class_name, env, None, &explicit_slots)?;
@@ -3841,7 +3841,7 @@ fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, Blis
 }
 
 fn resolve_slot_symbol(class_name: &str, key: BlissVal, env: &Env) -> Result<BlissVal, BlissError> {
-    let key_name = symbol_bare_name(&sym_name(key));
+    let key_name = symbol_bare_name(&sym_name_rc(key));
     if let Some(slot) = lookup_slot_by_initarg(env, class_name, &key_name) {
         return Ok(resolve_sym(&slot.name).unwrap_or(NIL));
     }
@@ -3908,7 +3908,7 @@ fn split_initargs_for_class(
     while i + 1 < initargs.len() {
         let slot_sym = initargs[i];
         let value = initargs[i + 1];
-        let slot_name = symbol_bare_name(&sym_name(slot_sym));
+        let slot_name = symbol_bare_name(&sym_name_rc(slot_sym));
         if matches!(
             lookup_slot_def(env, class_name, &slot_name).map(|slot| slot.allocation),
             Some(SlotAllocation::Class)
@@ -4046,7 +4046,7 @@ fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, Bliss
 
 fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<BlissVal, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
-    let slot_name = symbol_bare_name(&sym_name(slot));
+    let slot_name = symbol_bare_name(&sym_name_rc(slot));
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
         // A `:allocation :class` value is SHARED by every subclass, so it lives
         // in the OWNING class's cell — not the instance's own class. Reading it
@@ -4099,7 +4099,7 @@ fn slot_value_or_signal(
             Err(signal_and_raise(
                 env,
                 condition,
-                format!("slot {} is unbound", symbol_bare_name(&sym_name(slot))),
+                format!("slot {} is unbound", symbol_bare_name(&sym_name_rc(slot))),
             ))
         }
         Err(error) => Err(error),
@@ -4108,7 +4108,7 @@ fn slot_value_or_signal(
 
 fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
-    let slot_name = symbol_bare_name(&sym_name(slot));
+    let slot_name = symbol_bare_name(&sym_name_rc(slot));
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
         if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
             let values = class_def.class_slot_values.lock().unwrap();
@@ -4130,7 +4130,7 @@ fn write_slot_value(
     env: &Env,
 ) -> Result<(), BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
-    let slot_name = symbol_bare_name(&sym_name(slot));
+    let slot_name = symbol_bare_name(&sym_name_rc(slot));
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
         // Write the shared value into the OWNING class's cell so all subclass
         // instances see it (bliss-x4p).
@@ -4928,7 +4928,7 @@ fn qualifiers_to_method_qualifier(qualifiers: BlissVal) -> Option<bliss_stdlib::
     let quals = list_to_vec(qualifiers);
     match quals.as_slice() {
         [] => Some(Q::Primary),
-        [q] if q.is_symbol() => match symbol_bare_name(&sym_name(*q)).as_str() {
+        [q] if q.is_symbol() => match symbol_bare_name(&sym_name_rc(*q)).as_str() {
             "BEFORE" => Some(Q::Before),
             "AFTER" => Some(Q::After),
             "AROUND" => Some(Q::Around),
@@ -4945,7 +4945,7 @@ fn qualifiers_to_method_qualifier(qualifiers: BlissVal) -> Option<bliss_stdlib::
 fn method_specializer_matches_designator(ms: &MethodSpecializer, arg: BlissVal) -> bool {
     let arg_class_name = || {
         let n = bliss_stdlib::class_name(arg);
-        n.is_symbol().then(|| symbol_bare_name(&sym_name(n)))
+        n.is_symbol().then(|| symbol_bare_name(&sym_name_rc(n)))
     };
     match ms {
         MethodSpecializer::Any => arg_class_name().as_deref() == Some("T"),
@@ -4957,7 +4957,7 @@ fn method_specializer_matches_designator(ms: &MethodSpecializer, arg: BlissVal) 
             if arg.is_cons() {
                 let (head, tail) = cp(arg);
                 if head.is_symbol()
-                    && symbol_bare_name(&sym_name(head)) == "EQL"
+                    && symbol_bare_name(&sym_name_rc(head)) == "EQL"
                     && tail.is_cons()
                 {
                     return eql_values(cp(tail).0, *v);
@@ -6724,12 +6724,12 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
         let class = bliss_stdlib::class_of(val);
         if bliss_stdlib::is_structure_class(class) {
             out.push_str("#S(");
-            out.push_str(&symbol_bare_name(&sym_name(bliss_stdlib::class_name(class))));
+            out.push_str(&symbol_bare_name(&sym_name_rc(bliss_stdlib::class_name(class))));
             let prev = PRINT_ESCAPE.with(|c| c.replace(true));
             for slot in bliss_stdlib::effective_slots(class) {
                 if let Ok(sv) = bliss_stdlib::slot_value(val, slot) {
                     out.push_str(" :");
-                    out.push_str(&symbol_bare_name(&sym_name(slot)));
+                    out.push_str(&symbol_bare_name(&sym_name_rc(slot)));
                     out.push(' ');
                     print_val_inner(sv, out);
                 }
@@ -7337,7 +7337,7 @@ fn validate_make_pathname_directory(dir: BlissVal) -> Result<(), BlissError> {
             prev_blocks_up = false;
             continue;
         }
-        let bare = symbol_bare_name(&sym_name(item));
+        let bare = symbol_bare_name(&sym_name_rc(item));
         if idx == 0 {
             // Leading :absolute blocks a following :up/:back; :relative does not.
             prev_blocks_up = bare.eq_ignore_ascii_case("ABSOLUTE");
@@ -7364,7 +7364,7 @@ fn directory_designator_to_namestring(dir: BlissVal) -> Option<String> {
     let mut start = 0;
     if let Some(&first) = items.first() {
         if first.is_symbol() {
-            match symbol_bare_name(&sym_name(first)).as_str() {
+            match symbol_bare_name(&sym_name_rc(first)).as_str() {
                 "ABSOLUTE" => {
                     out.push('/');
                     start = 1;
@@ -7376,7 +7376,7 @@ fn directory_designator_to_namestring(dir: BlissVal) -> Option<String> {
     }
     for &item in &items[start..] {
         let part = if item.is_symbol() {
-            match symbol_bare_name(&sym_name(item)).as_str() {
+            match symbol_bare_name(&sym_name_rc(item)).as_str() {
                 "UP" | "BACK" => "..".to_string(),
                 "WILD" => "*".to_string(),
                 "WILD-INFERIORS" => "**".to_string(),
@@ -8251,7 +8251,7 @@ fn sync_reader_float_format(env: &Env) {
         .is_some_and(|v| {
             v.is_symbol()
                 && matches!(
-                    symbol_bare_name(&sym_name(v)).as_str(),
+                    symbol_bare_name(&sym_name_rc(v)).as_str(),
                     "DOUBLE-FLOAT" | "LONG-FLOAT"
                 )
         });
@@ -8987,7 +8987,7 @@ fn symbol_bare_name(name: &str) -> String {
 fn alien_type_from_keyword(kw: BlissVal) -> Result<bliss_rt::ffi::AlienType, BlissError> {
     use bliss_rt::ffi::AlienType;
     let int = |signed, bits| AlienType::Int { signed, bits };
-    let name = symbol_bare_name(&sym_name(kw));
+    let name = symbol_bare_name(&sym_name_rc(kw));
     Ok(match name.as_str() {
         "VOID" => AlienType::Void,
         "CHAR" | "INT8" | "SIGNED-CHAR" => int(true, 8),
@@ -9015,7 +9015,7 @@ fn alien_type_from_keyword(kw: BlissVal) -> Result<bliss_rt::ffi::AlienType, Bli
 /// type is otherwise an ordinary pointer (see [`alien_type_from_keyword`]),
 /// so only the marshalling differs (bliss-124).
 fn is_string_alien_kw(kw: BlissVal) -> bool {
-    kw.is_symbol() && symbol_bare_name(&sym_name(kw)) == "STRING"
+    kw.is_symbol() && symbol_bare_name(&sym_name_rc(kw)) == "STRING"
 }
 
 /// Read a NUL-terminated C string at address `ptr` into a fresh Lisp string.
@@ -9259,7 +9259,7 @@ fn resolve_type_spec(env: &Env, type_spec: BlissVal) -> BlissVal {
         if bliss_stdlib::find_class(type_spec).is_some() {
             return type_spec;
         }
-        let name = symbol_bare_name(&sym_name(type_spec));
+        let name = symbol_bare_name(&sym_name_rc(type_spec));
         if let Some(expanded) =
             plist_get(env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL), &name)
         {
@@ -9376,22 +9376,22 @@ fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
         }
         for slot in list_to_vec(slots_form) {
             if slot.is_symbol() {
-                let name = symbol_bare_name(&sym_name(slot));
+                let name = symbol_bare_name(&sym_name_rc(slot));
                 specs.push((name.clone(), name));
                 continue;
             }
             if slot.is_cons() {
                 let (slot_name_form, opts_form) = cp(slot);
-                let slot_name = symbol_bare_name(&sym_name(slot_name_form));
+                let slot_name = symbol_bare_name(&sym_name_rc(slot_name_form));
                 // A slot may declare several :initarg options; each is a valid
                 // way to fill it (CONDITION-6/7). Emit one spec entry per initarg.
                 let mut initargs = Vec::new();
                 let opts = list_to_vec(opts_form);
                 let mut i = 0;
                 while i + 1 < opts.len() {
-                    let opt_name = symbol_bare_name(&sym_name(opts[i]));
+                    let opt_name = symbol_bare_name(&sym_name_rc(opts[i]));
                     if opt_name == "INITARG" {
-                        initargs.push(symbol_bare_name(&sym_name(opts[i + 1])));
+                        initargs.push(symbol_bare_name(&sym_name_rc(opts[i + 1])));
                     }
                     i += 2;
                 }
@@ -9423,7 +9423,7 @@ fn condition_report_designator(env: &Env, type_name: &str) -> Option<BlissVal> {
             continue;
         }
         let (name_form, values_form) = cp(option);
-        if symbol_bare_name(&sym_name(name_form)) == "REPORT" && values_form.is_cons() {
+        if symbol_bare_name(&sym_name_rc(name_form)) == "REPORT" && values_form.is_cons() {
             return Some(cp(values_form).0);
         }
     }
@@ -9490,13 +9490,13 @@ fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, BlissV
                 continue;
             }
             let (name_form, values_form) = cp(option);
-            if symbol_bare_name(&sym_name(name_form)) != "DEFAULT-INITARGS" {
+            if symbol_bare_name(&sym_name_rc(name_form)) != "DEFAULT-INITARGS" {
                 continue;
             }
             let values = list_to_vec(values_form);
             let mut i = 0;
             while i + 1 < values.len() {
-                defaults.push((symbol_bare_name(&sym_name(values[i])), values[i + 1]));
+                defaults.push((symbol_bare_name(&sym_name_rc(values[i])), values[i + 1]));
                 i += 2;
             }
         }
@@ -9517,7 +9517,7 @@ fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<Bliss
         let (_, rest) = cp(entry);
         let (parents_form, _) = cp(rest);
         for parent in list_to_vec(parents_form) {
-            parent_names.push(symbol_bare_name(&sym_name(parent)));
+            parent_names.push(symbol_bare_name(&sym_name_rc(parent)));
         }
     } else {
         parent_names.push("CONDITION".into());
@@ -9562,7 +9562,7 @@ fn instance_class_hierarchy_names(object: BlissVal) -> Option<Vec<String>> {
     for class in cpl {
         let name = bliss_stdlib::class_name(class);
         if name.is_symbol() {
-            names.push(symbol_bare_name(&sym_name(name)));
+            names.push(symbol_bare_name(&sym_name_rc(name)));
         }
     }
     if names.is_empty() { None } else { Some(names) }
@@ -9575,7 +9575,7 @@ fn condition_type_hierarchy_names(cond: BlissVal) -> Option<Vec<String>> {
     for class in cpl {
         let name = bliss_stdlib::class_name(class);
         if name.is_symbol() {
-            names.push(symbol_bare_name(&sym_name(name)));
+            names.push(symbol_bare_name(&sym_name_rc(name)));
         }
     }
     if names.iter().any(|name| name == "CONDITION") {
@@ -9920,7 +9920,7 @@ fn parse_num_bound(arg: Option<BlissVal>) -> Option<Bnd> {
     match arg {
         None => Some(Bnd::Star),
         Some(a) => {
-            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+            if a.is_symbol() && symbol_bare_name(&sym_name_rc(a)) == "*" {
                 return Some(Bnd::Star);
             }
             if a.is_cons() {
@@ -9939,13 +9939,13 @@ fn parse_num_bound(arg: Option<BlissVal>) -> Option<Bnd> {
 fn parse_num_type(t: BlissVal) -> Option<NumType> {
     if t.is_cons() {
         let elems = list_to_vec(t);
-        let head_name = symbol_bare_name(&sym_name(*elems.first()?));
+        let head_name = symbol_bare_name(&sym_name_rc(*elems.first()?));
         let head = num_head_from_name(&head_name)?;
         let lo = parse_num_bound(elems.get(1).copied())?;
         let hi = parse_num_bound(elems.get(2).copied())?;
         Some(NumType { head, lo, hi })
     } else if t.is_symbol() {
-        let name = symbol_bare_name(&sym_name(t));
+        let name = symbol_bare_name(&sym_name_rc(t));
         // BIT ≡ (integer 0 1) as a complete type.
         if name == "BIT" {
             return Some(NumType {
@@ -9974,7 +9974,7 @@ fn type_spec_invalid_for_typep(spec: BlissVal) -> bool {
     if !head.is_symbol() {
         return false;
     }
-    match symbol_bare_name(&sym_name(head)).as_str() {
+    match symbol_bare_name(&sym_name_rc(head)).as_str() {
         "VALUES" => true,
         "FUNCTION" => compound,
         _ => false,
@@ -10109,7 +10109,7 @@ struct ArrType {
 
 fn upgrade_elt(spec: BlissVal) -> EltU {
     if spec.is_symbol() {
-        return match symbol_bare_name(&sym_name(spec)).as_str() {
+        return match symbol_bare_name(&sym_name_rc(spec)).as_str() {
             "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => EltU::Character,
             "BIT" => EltU::Bit,
             _ => EltU::T,
@@ -10135,7 +10135,7 @@ fn parse_elt_arg(arg: Option<BlissVal>) -> Elt {
     match arg {
         None => Elt::Star,
         Some(a) => {
-            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+            if a.is_symbol() && symbol_bare_name(&sym_name_rc(a)) == "*" {
                 Elt::Star
             } else {
                 Elt::Up(upgrade_elt(a))
@@ -10156,7 +10156,7 @@ fn fixnum_size(v: BlissVal) -> Option<usize> {
 
 /// One dimension entry: `*` → None (any size), a non-negative fixnum → Some(n).
 fn parse_dim_entry(v: BlissVal) -> Option<Option<usize>> {
-    if v.is_symbol() && symbol_bare_name(&sym_name(v)) == "*" {
+    if v.is_symbol() && symbol_bare_name(&sym_name_rc(v)) == "*" {
         return Some(None);
     }
     Some(Some(fixnum_size(v)?))
@@ -10172,7 +10172,7 @@ fn parse_array_dims(arg: Option<BlissVal>) -> Option<Dims> {
             if a.is_nil() {
                 return Some(Dims::List(Vec::new()));
             }
-            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+            if a.is_symbol() && symbol_bare_name(&sym_name_rc(a)) == "*" {
                 return Some(Dims::Star);
             }
             if a.is_fixnum() {
@@ -10196,7 +10196,7 @@ fn parse_single_dim(arg: Option<BlissVal>) -> Option<Dims> {
     match arg {
         None => Some(Dims::List(vec![None])),
         Some(a) => {
-            if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+            if a.is_symbol() && symbol_bare_name(&sym_name_rc(a)) == "*" {
                 Some(Dims::List(vec![None]))
             } else {
                 Some(Dims::List(vec![Some(fixnum_size(a)?)]))
@@ -10211,9 +10211,9 @@ fn parse_arr_type(t: BlissVal) -> Option<ArrType> {
     // (head args...) or a bare symbol head.
     let (name, args): (String, Vec<BlissVal>) = if t.is_cons() {
         let elems = list_to_vec(t);
-        (symbol_bare_name(&sym_name(*elems.first()?)), elems[1..].to_vec())
+        (symbol_bare_name(&sym_name_rc(*elems.first()?)), elems[1..].to_vec())
     } else if t.is_symbol() {
-        (symbol_bare_name(&sym_name(t)), Vec::new())
+        (symbol_bare_name(&sym_name_rc(t)), Vec::new())
     } else {
         return None;
     };
@@ -10300,7 +10300,7 @@ fn parse_cons_type(t: BlissVal) -> Option<(BlissVal, BlissVal)> {
         match arg {
             None => T,
             Some(a) => {
-                if a.is_symbol() && symbol_bare_name(&sym_name(a)) == "*" {
+                if a.is_symbol() && symbol_bare_name(&sym_name_rc(a)) == "*" {
                     T
                 } else {
                     a
@@ -10310,11 +10310,11 @@ fn parse_cons_type(t: BlissVal) -> Option<(BlissVal, BlissVal)> {
     };
     if t.is_cons() {
         let elems = list_to_vec(t);
-        if symbol_bare_name(&sym_name(*elems.first()?)) != "CONS" {
+        if symbol_bare_name(&sym_name_rc(*elems.first()?)) != "CONS" {
             return None;
         }
         Some((comp(elems.get(1).copied()), comp(elems.get(2).copied())))
-    } else if t.is_symbol() && symbol_bare_name(&sym_name(t)) == "CONS" {
+    } else if t.is_symbol() && symbol_bare_name(&sym_name_rc(t)) == "CONS" {
         Some((T, T))
     } else {
         None
@@ -10356,7 +10356,7 @@ fn parse_member_type(t: BlissVal) -> Option<Vec<BlissVal>> {
         return None;
     }
     let elems = list_to_vec(t);
-    match symbol_bare_name(&sym_name(*elems.first()?)).as_str() {
+    match symbol_bare_name(&sym_name_rc(*elems.first()?)).as_str() {
         "MEMBER" => Some(elems[1..].to_vec()),
         "EQL" if elems.len() == 2 => Some(vec![elems[1]]),
         _ => None,
@@ -10369,7 +10369,7 @@ fn parse_not_type(t: BlissVal) -> Option<BlissVal> {
         return None;
     }
     let elems = list_to_vec(t);
-    if elems.len() == 2 && symbol_bare_name(&sym_name(elems[0])) == "NOT" {
+    if elems.len() == 2 && symbol_bare_name(&sym_name_rc(elems[0])) == "NOT" {
         return Some(elems[1]);
     }
     None
@@ -10408,9 +10408,9 @@ fn member_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
 /// The head name of a type spec (atomic symbol, or the head of a compound).
 fn type_head_name(t: BlissVal) -> Option<String> {
     if t.is_cons() {
-        Some(symbol_bare_name(&sym_name(cp(t).0)))
+        Some(symbol_bare_name(&sym_name_rc(cp(t).0)))
     } else if t.is_symbol() {
-        Some(symbol_bare_name(&sym_name(t)))
+        Some(symbol_bare_name(&sym_name_rc(t)))
     } else {
         None
     }
@@ -10452,10 +10452,10 @@ fn complex_elt_name(t: BlissVal) -> Option<String> {
     }
     let elems = list_to_vec(t);
     let e = elems.get(1).copied()?;
-    if e.is_symbol() && symbol_bare_name(&sym_name(e)) == "*" {
+    if e.is_symbol() && symbol_bare_name(&sym_name_rc(e)) == "*" {
         return None;
     }
-    Some(symbol_bare_name(&sym_name(if e.is_cons() { cp(e).0 } else { e })))
+    Some(symbol_bare_name(&sym_name_rc(if e.is_cons() { cp(e).0 } else { e })))
 }
 
 fn complex_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
@@ -10518,7 +10518,7 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
     // two compound types compare equal (a false positive).
     if t1.is_cons() {
         let (head, _) = cp(t1);
-        let hname = symbol_bare_name(&sym_name(head));
+        let hname = symbol_bare_name(&sym_name_rc(head));
         let base = match hname.as_str() {
             "MOD" | "UNSIGNED-BYTE" | "SIGNED-BYTE" | "BIT" => "INTEGER",
             other => other,
@@ -10538,7 +10538,7 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
         // claim one — leave it undetermined.
         return (false, false);
     }
-    let n1 = symbol_bare_name(&sym_name(t1));
+    let n1 = symbol_bare_name(&sym_name_rc(t1));
     // NIL (the empty type) is a subtype of every type, including bounded ones.
     if n1 == "NIL" {
         return (true, true);
@@ -10549,7 +10549,7 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
         // leave it undetermined.
         return (false, false);
     } else {
-        symbol_bare_name(&sym_name(t2))
+        symbol_bare_name(&sym_name_rc(t2))
     };
     if n2 == "T" || n1 == n2 {
         return (true, true);
@@ -10607,7 +10607,7 @@ fn vector_length_matches(size_args: &[BlissVal], object: BlissVal) -> bool {
     let Some(size) = size_args.first().copied() else {
         return true;
     };
-    if size.is_symbol() && symbol_bare_name(&sym_name(size)) == "*" {
+    if size.is_symbol() && symbol_bare_name(&sym_name_rc(size)) == "*" {
         return true;
     }
     if size.is_fixnum() {
@@ -10647,7 +10647,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
     // OBJECT / STRUCTURE-OBJECT / CONDITION distinctions are left to the general
     // instance handling below.
     if type_spec.is_symbol() && bliss_stdlib::is_instance(object) {
-        let orig = symbol_bare_name(&sym_name(type_spec));
+        let orig = symbol_bare_name(&sym_name_rc(type_spec));
         if orig != "T" && orig != "STANDARD-OBJECT" && orig != "STRUCTURE-OBJECT" {
             if let Some(names) = instance_class_hierarchy_names(object) {
                 if names.iter().any(|n| n == &orig) {
@@ -10658,7 +10658,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
     }
     let type_spec = resolve_type_spec(env, type_spec);
     if type_spec.is_symbol() {
-        let type_name = symbol_bare_name(&sym_name(type_spec));
+        let type_name = symbol_bare_name(&sym_name_rc(type_spec));
         // A class metaobject tested against a metaclass type. bliss represents a
         // user/struct class as its name symbol, so `(find-class 'foo)` is that
         // symbol; recognise it via the class registry. STRUCTURE-CLASS matches a
@@ -10788,7 +10788,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                     && bliss_rt::gc::heap_object_type_id(object)
                         == Some(bliss_rt::object::type_id::READTABLE))
                     || (object.is_symbol()
-                        && symbol_bare_name(&sym_name(object)) == "STANDARD-READTABLE")
+                        && symbol_bare_name(&sym_name_rc(object)) == "STANDARD-READTABLE")
             }
             "STREAM" | "FILE-STREAM" => is_stream(object),
             "SYNONYM-STREAM" => bliss_stdlib::synonym_stream_symbol(object).is_some(),
@@ -10822,7 +10822,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
     }
 
     let (head, args) = cp(type_spec);
-    let op = symbol_bare_name(&sym_name(head));
+    let op = symbol_bare_name(&sym_name_rc(head));
     match op.as_str() {
         "OR" => {
             for spec in list_to_vec(args) {
@@ -10899,7 +10899,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             // `(integer 0 (array-dimension-limit))` — an exclusive upper bound,
             // so calling as_fixnum on the `(n)` cons used to panic.
             let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
-                if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
+                if bound.is_symbol() && symbol_bare_name(&sym_name_rc(bound)) == "*" {
                     return true;
                 }
                 if bound.is_cons() {
@@ -10952,7 +10952,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             };
             let bounds = list_to_vec(args);
             let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
-                if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
+                if bound.is_symbol() && symbol_bare_name(&sym_name_rc(bound)) == "*" {
                     return true;
                 }
                 if bound.is_cons() {
@@ -10990,7 +10990,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             let bounds = list_to_vec(args);
             // The size/modulus argument may be omitted or `*` (wild).
             let size = bounds.first().copied().and_then(|b| {
-                if b.is_symbol() && symbol_bare_name(&sym_name(b)) == "*" {
+                if b.is_symbol() && symbol_bare_name(&sym_name_rc(b)) == "*" {
                     None
                 } else {
                     Some(b.as_fixnum())
@@ -11134,7 +11134,7 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
     let uses = {
         if let Some(pkg) = bliss_stdlib::find_package(&package_name) {
             for sym in bliss_stdlib::present_symbols(pkg) {
-                seen.entry(symbol_bare_name(&sym_name(sym))).or_insert(sym);
+                seen.entry(symbol_bare_name(&sym_name_rc(sym))).or_insert(sym);
             }
             if include_inherited {
                 bliss_stdlib::package_use_list(pkg)
@@ -11156,7 +11156,7 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
         // symbol yields the package-qualified name, which never matched (leaking
         // shadowed inherited symbols, ansi-test DO-SYMBOLS.4).
         for sym in package_external_symbols(env, used) {
-            seen.entry(symbol_bare_name(&sym_name(sym))).or_insert(sym);
+            seen.entry(symbol_bare_name(&sym_name_rc(sym))).or_insert(sym);
         }
     }
     seen.into_values().collect()
@@ -11563,7 +11563,7 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .filter(|idx| reader::is_uninterned(*idx))
                     .and_then(bliss_rt::symbols::symbol_function)
                     .is_some_and(bliss_rt::function::is_interpreted_function);
-                uninterned_fn || mv_form_preserves_values(&sym_name(car), env)
+                uninterned_fn || mv_form_preserves_values(&sym_name_rc(car), env)
             } else {
                 // Lambda application `((lambda ...) ...)` — dispatches through
                 // eval_lambda_call, which sets mv from the body's tail form.
@@ -12177,7 +12177,7 @@ fn order_sensitive_setf_accessor(mut place: BlissVal) -> Option<String> {
     if !acc.is_symbol() {
         return None;
     }
-    let bare = symbol_bare_name(&sym_name(acc));
+    let bare = symbol_bare_name(&sym_name_rc(acc));
     if matches!(
         bare.as_str(),
         "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT" | "BIT" | "SBIT"
@@ -12560,7 +12560,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut escape = true;
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = symbol_bare_name(&sym_name(args[i]));
+                    let key = symbol_bare_name(&sym_name_rc(args[i]));
                     let val = args[i + 1];
                     match key.as_str() {
                         "STREAM" => stream_idx = Some(i + 1),
@@ -12703,7 +12703,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut j = 0;
                 while j < kv.len() {
                     if kv[j].is_symbol()
-                        && symbol_bare_name(&sym_name(kv[j])) == "ALLOW-OTHER-KEYS"
+                        && symbol_bare_name(&sym_name_rc(kv[j])) == "ALLOW-OTHER-KEYS"
                     {
                         allow_other = !kv[j + 1].is_nil();
                         break;
@@ -12723,7 +12723,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             "MAKE-STRING: keyword argument name is not a symbol: {kbuf}"
                         )));
                     }
-                    match symbol_bare_name(&sym_name(key)).as_str() {
+                    match symbol_bare_name(&sym_name_rc(key)).as_str() {
                         "INITIAL-ELEMENT" => {
                             if !fill_set {
                                 if !val.is_character() {
@@ -12834,7 +12834,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut i = 1;
                 while i + 1 < args.len() {
                     let key = args[i];
-                    if key.is_symbol() && symbol_bare_name(&sym_name(key)) == "ABORT" {
+                    if key.is_symbol() && symbol_bare_name(&sym_name_rc(key)) == "ABORT" {
                         abort = args[i + 1] != NIL;
                     }
                     i += 2;
@@ -13030,7 +13030,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let args = eval_args(cdr, env)?;
                 let mode_kw = args.first().copied().unwrap_or(NIL);
                 let rt = args.get(1).copied().unwrap_or(NIL);
-                let name = symbol_bare_name(&sym_name(mode_kw));
+                let name = symbol_bare_name(&sym_name_rc(mode_kw));
                 let code = match name.as_str() {
                     "UPCASE" => 0u8,
                     "DOWNCASE" => 1,
@@ -13381,7 +13381,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         expected: "SYMBOL".to_string(),
                     });
                 }
-                if is_ansi_special_operator(&symbol_bare_name(&sym_name(s))) {
+                if is_ansi_special_operator(&symbol_bare_name(&sym_name_rc(s))) {
                     return Ok(T);
                 }
                 return Ok(NIL);
@@ -13621,7 +13621,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 {
                     let mut j = 0;
                     while j + 1 < key_tail.len() {
-                        if symbol_bare_name(&sym_name(key_tail[j])) == "ALLOW-OTHER-KEYS" {
+                        if symbol_bare_name(&sym_name_rc(key_tail[j])) == "ALLOW-OTHER-KEYS" {
                             allow_other = !key_tail[j + 1].is_nil();
                             break;
                         }
@@ -13630,7 +13630,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let mut j = 0;
                 while j + 1 < key_tail.len() {
-                    match symbol_bare_name(&sym_name(key_tail[j])).as_str() {
+                    match symbol_bare_name(&sym_name_rc(key_tail[j])).as_str() {
                         "START" => {
                             start = val_as_str(key_tail[j + 1])
                                 .parse()
@@ -14030,7 +14030,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     true
                 } else if v.is_cons() {
                     let (h, _) = cp(v);
-                    h.is_symbol() && symbol_bare_name(&sym_name(h)) == "QUOTE"
+                    h.is_symbol() && symbol_bare_name(&sym_name_rc(h)) == "QUOTE"
                 } else if v.is_symbol() {
                     is_keyword_arg(v) || CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(v)))
                 } else {
@@ -14607,7 +14607,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if place.is_cons() {
                         let (pacc, pargs) = cp(*place);
                         let pacc_name = if pacc.is_symbol() {
-                            symbol_bare_name(&sym_name(pacc))
+                            symbol_bare_name(&sym_name_rc(pacc))
                         } else {
                             String::new()
                         };
@@ -16624,7 +16624,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let result_type = *result_type;
                 let result_name = if result_type.is_symbol() {
-                    symbol_bare_name(&sym_name(result_type))
+                    symbol_bare_name(&sym_name_rc(result_type))
                 } else {
                     val_as_str(result_type).to_uppercase()
                 };
@@ -16864,13 +16864,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (bliss-v304). A lambda expression `(lambda …)` coerces to the
                 // function it denotes. An already-callable value passes through.
                 if type_val.is_symbol()
-                    && symbol_bare_name(&sym_name(type_val)) == "FUNCTION"
+                    && symbol_bare_name(&sym_name_rc(type_val)) == "FUNCTION"
                 {
                     if is_function_value(*value) {
                         return Ok(*value);
                     }
                     if value.is_cons()
-                        && symbol_bare_name(&sym_name(cp(*value).0)) == "LAMBDA"
+                        && symbol_bare_name(&sym_name_rc(cp(*value).0)) == "LAMBDA"
                     {
                         // Evaluate #'(lambda …) to build the closure.
                         bliss_rt::rooted!(fn_form = {
@@ -16901,7 +16901,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let key = if rest2.is_cons() {
                     let (kw_form, rest3) = cp(*rest2);
                     if kw_form.is_symbol()
-                        && symbol_bare_name(&sym_name(kw_form)).eq_ignore_ascii_case("KEY")
+                        && symbol_bare_name(&sym_name_rc(kw_form)).eq_ignore_ascii_case("KEY")
                         && rest3.is_cons()
                     {
                         Some(eval_form(cp(rest3).0, env)?)
@@ -16925,7 +16925,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let key = if rest2.is_cons() {
                     let (kw_form, rest3) = cp(*rest2);
                     if kw_form.is_symbol()
-                        && symbol_bare_name(&sym_name(kw_form)).eq_ignore_ascii_case("KEY")
+                        && symbol_bare_name(&sym_name_rc(kw_form)).eq_ignore_ascii_case("KEY")
                         && rest3.is_cons()
                     {
                         Some(eval_form(cp(rest3).0, env)?)
@@ -16965,7 +16965,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut defaults: Option<BlissVal> = None;
                 let mut i = 0;
                 while i + 1 < args.len() {
-                    let key = symbol_bare_name(&sym_name(args[i]));
+                    let key = symbol_bare_name(&sym_name_rc(args[i]));
                     let val = args[i + 1];
                     match key.as_str() {
                         "HOST" => host = Some(val),
@@ -17050,7 +17050,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let mut i = 0;
                     while i < keys.len() {
                         let ok = keys[i].is_symbol() && keys[i] != NIL && {
-                            let bare = symbol_bare_name(&sym_name(keys[i]));
+                            let bare = symbol_bare_name(&sym_name_rc(keys[i]));
                             matches!(bare.as_str(), "START" | "END" | "JUNK-ALLOWED")
                         };
                         if !ok {
@@ -17626,7 +17626,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let s = if v.is_character() {
                     v.as_char().to_string()
                 } else if v.is_symbol() || v.is_nil() || v == T {
-                    symbol_name_string(&sym_name(v))
+                    symbol_name_string(&sym_name_rc(v))
                 } else {
                     val_as_str(v)
                 };
@@ -18647,7 +18647,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let instance = eval_form(instance_form, env)?;
                 let slot = eval_form(slot_form, env)?;
                 let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
-                let slot_name = symbol_bare_name(&sym_name(slot));
+                let slot_name = symbol_bare_name(&sym_name_rc(slot));
                 let exists = lookup_slot_def(env, &class_name, &slot_name).is_some();
                 return Ok(if exists { T } else { NIL });
             }
@@ -18666,7 +18666,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let initargs = evaluated_initargs(&class_name, init_args, env)?;
                 let explicit_slots: Vec<String> = initargs
                     .chunks_exact(2)
-                    .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+                    .map(|pair| symbol_bare_name(&sym_name_rc(pair[0])))
                     .collect();
                 let (instance_initargs, class_initargs) =
                     split_initargs_for_class(env, &class_name, &initargs);
@@ -18932,7 +18932,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut i = 1;
                 while i + 1 < args.len() {
                     if args[i].is_symbol()
-                        && symbol_bare_name(&sym_name(args[i])) == "IF-DOES-NOT-EXIST"
+                        && symbol_bare_name(&sym_name_rc(args[i])) == "IF-DOES-NOT-EXIST"
                     {
                         if_missing_nil = args[i + 1] == NIL;
                     }
@@ -19038,7 +19038,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             format_val(key)
                         )));
                     }
-                    if symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE" && val != NIL {
+                    if symbol_bare_name(&sym_name_rc(key)) == "OUTPUT-FILE" && val != NIL {
                         out_path = Some(path_designator_to_string(val)?);
                     }
                     i += 2;
@@ -19137,7 +19137,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while i + 1 < args.len() {
                     let key = args[i];
                     let val = args[i + 1];
-                    if key.is_symbol() && symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE" {
+                    if key.is_symbol() && symbol_bare_name(&sym_name_rc(key)) == "OUTPUT-FILE" {
                         if val != NIL {
                             let (pn, _) = bliss_stdlib::parse_namestring(
                                 arena_str(&path_designator_to_string(val)?),
@@ -19620,7 +19620,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(stream = stream);
                 let spec = eval_form(args[1], env)?;
                 if spec.is_symbol() {
-                    match symbol_bare_name(&sym_name(spec)).as_str() {
+                    match symbol_bare_name(&sym_name_rc(spec)).as_str() {
                         "END" => return bliss_stdlib::set_file_position_to_end(*stream),
                         "START" => {
                             return bliss_stdlib::set_file_position(
@@ -19683,7 +19683,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while key.is_cons() {
                     let (k, kr) = cp(key);
                     let kname = if k.is_symbol() {
-                        symbol_bare_name(&sym_name(k))
+                        symbol_bare_name(&sym_name_rc(k))
                     } else {
                         String::new()
                     };
@@ -19756,7 +19756,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while key.is_cons() {
                     let (k, kr) = cp(key);
                     let kname = if k.is_symbol() {
-                        symbol_bare_name(&sym_name(k))
+                        symbol_bare_name(&sym_name_rc(k))
                     } else {
                         String::new()
                     };
@@ -19796,7 +19796,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // evaluated (CLHS): a symbol (interned or uninterned) or string
                 // whose name is used.
                 let raw = if pkg_form.is_symbol() {
-                    symbol_bare_name(&sym_name(pkg_form))
+                    symbol_bare_name(&sym_name_rc(pkg_form))
                 } else if is_string_value(pkg_form) {
                     val_as_str(pkg_form)
                 } else {
@@ -19855,7 +19855,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut uses: Vec<String> = Vec::new();
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = symbol_bare_name(&sym_name(args[i]));
+                    let key = symbol_bare_name(&sym_name_rc(args[i]));
                     let value = args[i + 1];
                     match key.as_str() {
                         "NICKNAMES" => {
@@ -20076,7 +20076,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // only (DO-EXTERNAL-SYMBOLS), any other true value → accessible
                 // (present + inherited) symbols.
                 let mode = args.get(1).copied().unwrap_or(NIL);
-                if mode.is_symbol() && symbol_bare_name(&sym_name(mode)) == "EXTERNAL" {
+                if mode.is_symbol() && symbol_bare_name(&sym_name_rc(mode)) == "EXTERNAL" {
                     return Ok(vec_to_list(&package_external_symbols(env, &package)));
                 }
                 return Ok(vec_to_list(&package_symbols(env, &package, !mode.is_nil())));
@@ -20581,7 +20581,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     false
                 };
-                let name = symbol_name_string(&sym_name(*sym));
+                let name = symbol_name_string(&sym_name_rc(*sym));
                 bliss_rt::rooted!(fresh = reader::make_uninterned_symbol(&name));
                 if copy_props {
                     // Copy the property list (a fresh list with the same entries).
@@ -21078,7 +21078,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
     // CL:DISASSEMBLE (spec §6) — render the callee's current tier: annotated
     // bytecode while interpreted (T0), decoded x86-64 once native (T1).
-    if car.is_symbol() && symbol_bare_name(&sym_name(car)) == "DISASSEMBLE" {
+    if car.is_symbol() && symbol_bare_name(&sym_name_rc(car)) == "DISASSEMBLE" {
         let arg = if cdr.is_cons() {
             eval_form(cp(cdr).0, env)?
         } else {
@@ -21342,7 +21342,7 @@ impl LoopParser {
     /// regardless of package. Does not consume.
     fn at_sym(&self, name: &str) -> bool {
         match self.peek() {
-            Some(v) if v.is_symbol() => symbol_bare_name(&sym_name(v)) == name,
+            Some(v) if v.is_symbol() => symbol_bare_name(&sym_name_rc(v)) == name,
             _ => false,
         }
     }
@@ -21401,7 +21401,7 @@ impl LoopParser {
             return None;
         };
         if t.is_symbol() {
-            Some(symbol_bare_name(&sym_name(t)))
+            Some(symbol_bare_name(&sym_name_rc(t)))
         } else {
             None
         }
@@ -21932,7 +21932,7 @@ fn loop_exec_clauses(
 /// lexical variable `IT`. A nested `it` (e.g. `collect (list it)`) resolves via
 /// that same binding through the normal evaluator.
 fn loop_it_eval(expr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    if expr.is_symbol() && symbol_bare_name(&sym_name(expr)) == "IT" {
+    if expr.is_symbol() && symbol_bare_name(&sym_name_rc(expr)) == "IT" {
         if let Some(v) = env.lookup_var("IT") {
             return Ok(v);
         }
@@ -22238,7 +22238,7 @@ fn loop_split_named(cdr: BlissVal) -> (Option<String>, BlissVal) {
     if cdr.is_cons() {
         let (head, rest) = cp(cdr);
         if head.is_symbol()
-            && symbol_bare_name(&sym_name(head)) == "NAMED"
+            && symbol_bare_name(&sym_name_rc(head)) == "NAMED"
             && rest.is_cons()
         {
             let (name, body) = cp(rest);
@@ -22381,14 +22381,14 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                         p.advance();
                         let t = p.read_form()?;
                         if t.is_symbol() {
-                            type_name = Some(symbol_bare_name(&sym_name(t)));
+                            type_name = Some(symbol_bare_name(&sym_name_rc(t)));
                         }
                     } else if p.toks.get(p.pos + 1).is_some_and(|next| {
-                        next.is_symbol() && symbol_bare_name(&sym_name(*next)) == "="
+                        next.is_symbol() && symbol_bare_name(&sym_name_rc(*next)) == "="
                     }) {
                         let t = p.read_form()?;
                         if t.is_symbol() {
-                            type_name = Some(symbol_bare_name(&sym_name(t)));
+                            type_name = Some(symbol_bare_name(&sym_name_rc(t)));
                         }
                     }
                     // `= init` is optional; an uninitialized WITH var defaults to
@@ -22493,7 +22493,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             let read_connective = |p: &mut LoopParser| -> Result<(), BlissError> {
                                 let conn = p.read_form()?;
                                 let conn_bare = if conn.is_symbol() {
-                                    symbol_bare_name(&sym_name(conn))
+                                    symbol_bare_name(&sym_name_rc(conn))
                                 } else {
                                     String::new()
                                 };
@@ -22628,7 +22628,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             // :for var = init [:then step]. Both `=` and the
                             // keyword `:=` are valid LOOP stepping tokens.
                             let eq = p.read_form()?;
-                            if !(eq.is_symbol() && symbol_bare_name(&sym_name(eq)) == "=") {
+                            if !(eq.is_symbol() && symbol_bare_name(&sym_name_rc(eq)) == "=") {
                                 let found = if eq.is_symbol() {
                                     sym_name(eq)
                                 } else {
@@ -25100,13 +25100,13 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
     // (ansi COERCE.11). Recover its name symbol so the name-based dispatch below
     // works uniformly with symbol type specs.
     let tname = if head.is_symbol() {
-        symbol_bare_name(&sym_name(head))
+        symbol_bare_name(&sym_name_rc(head))
     } else {
         let cn = bliss_stdlib::class_name(head);
         if cn.is_nil() {
             String::new()
         } else {
-            symbol_bare_name(&sym_name(cn))
+            symbol_bare_name(&sym_name_rc(cn))
         }
     };
     match tname.as_str() {
@@ -25195,7 +25195,7 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
             let s_opt: Option<String> = if is_string_value(value) {
                 Some(val_as_str(value))
             } else if value.is_symbol() {
-                Some(symbol_bare_name(&sym_name(value)))
+                Some(symbol_bare_name(&sym_name_rc(value)))
             } else {
                 None
             };
@@ -25365,7 +25365,7 @@ thread_local! {
 /// Register `sym` as globally special (idempotent). No-op for non-symbols.
 fn proclaim_special(sym: BlissVal) {
     if sym.is_symbol() {
-        let bare = symbol_bare_name(&sym_name(sym));
+        let bare = symbol_bare_name(&sym_name_rc(sym));
         PROCLAIMED_SPECIAL.with(|s| s.borrow_mut().insert(bare));
     }
 }
@@ -25389,7 +25389,7 @@ fn is_special_var(sym: BlissVal) -> bool {
     if !sym.is_symbol() {
         return false;
     }
-    let bare = symbol_bare_name(&sym_name(sym));
+    let bare = symbol_bare_name(&sym_name_rc(sym));
     let b = bare.as_bytes();
     if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' {
         return true;
@@ -25416,7 +25416,7 @@ fn let_body_special_decls(body: BlissVal) -> Vec<u32> {
             break;
         }
         let (head, decls) = cp(form);
-        if !(head.is_symbol() && symbol_bare_name(&sym_name(head)) == "DECLARE") {
+        if !(head.is_symbol() && symbol_bare_name(&sym_name_rc(head)) == "DECLARE") {
             break;
         }
         let mut d = decls;
@@ -25427,7 +25427,7 @@ fn let_body_special_decls(body: BlissVal) -> Vec<u32> {
                 continue;
             }
             let (kind, names) = cp(spec);
-            if kind.is_symbol() && symbol_bare_name(&sym_name(kind)) == "SPECIAL" {
+            if kind.is_symbol() && symbol_bare_name(&sym_name_rc(kind)) == "SPECIAL" {
                 let mut n = names;
                 while n.is_cons() {
                     let (nm, nrest) = cp(n);
@@ -26070,7 +26070,7 @@ fn bind_lambda_list_ex(
         let (elem, rest) = cp(*c);
         *c = rest;
         if elem.is_symbol() {
-            match sym_name(elem).as_str() {
+            match &*sym_name_rc(elem) {
                 "&OPTIONAL" => {
                     mode = Mode::Opt;
                     continue;
@@ -26397,7 +26397,7 @@ fn bind_macro_lambda_list(
         c = rest;
 
         if elem.is_symbol() {
-            match sym_name(elem).as_str() {
+            match &*sym_name_rc(elem) {
                 "&WHOLE" => {
                     let (var, rest_after_var) = cp(c);
                     whole_var = Some(var);
@@ -26508,7 +26508,7 @@ fn bind_macro_lambda_list(
                 // load-system silently loaded nothing (bliss-dyh2; mirrors
                 // parse_key_spec / bliss-lb6.12 on the function binder).
                 let (kw_bare, pattern, default_form, supp) = if elem.is_symbol() {
-                    let bare = symbol_bare_name(&sym_name(elem));
+                    let bare = symbol_bare_name(&sym_name_rc(elem));
                     (bare, elem, NIL, None)
                 } else if elem.is_cons() {
                     let (head, r) = cp(elem);
@@ -26519,7 +26519,7 @@ fn bind_macro_lambda_list(
                         None
                     };
                     if head.is_symbol() {
-                        (symbol_bare_name(&sym_name(head)), head, default, supp)
+                        (symbol_bare_name(&sym_name_rc(head)), head, default, supp)
                     } else if head.is_cons() {
                         let (kw_sym, r3) = cp(head);
                         let pattern = if r3.is_cons() { cp(r3).0 } else { NIL };
@@ -27900,13 +27900,13 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             continue;
         }
         let (opt_key, opt_rest) = cp(option);
-        if !opt_key.is_symbol() || symbol_bare_name(&sym_name(opt_key)) != "DEFAULT-INITARGS" {
+        if !opt_key.is_symbol() || symbol_bare_name(&sym_name_rc(opt_key)) != "DEFAULT-INITARGS" {
             continue;
         }
         let pairs = list_to_vec(opt_rest);
         let mut j = 0;
         while j + 1 < pairs.len() {
-            let initarg = symbol_bare_name(&sym_name(pairs[j]))
+            let initarg = symbol_bare_name(&sym_name_rc(pairs[j]))
                 .trim_start_matches("KEYWORD:")
                 .trim_start_matches(':')
                 .to_string();
@@ -28020,7 +28020,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                 } else if opt_bare == "ALLOCATION" {
                     if i + 1 < opts.len() {
-                        let allocation_name = symbol_bare_name(&sym_name(opts[i + 1]));
+                        let allocation_name = symbol_bare_name(&sym_name_rc(opts[i + 1]));
                         if allocation_name == "CLASS" {
                             allocation = SlotAllocation::Class;
                         }
@@ -28206,7 +28206,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     };
     // Register the struct name present INTERNAL in CL-USER (bliss-4n3h).
     home_defined_symbol(env, name_sym);
-    let name_str = symbol_bare_name(&sym_name(name_sym));
+    let name_str = symbol_bare_name(&sym_name_rc(name_sym));
 
     // Parse DEFSTRUCT options from the `(name option...)` head. Supported:
     // :conc-name (accessor prefix), :constructor (custom / BOA / suppressed),
@@ -28244,14 +28244,14 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             // Only `:conc-name` changes behaviour here; the rest are ignored, as
             // are the list forms below (ansi-test struct-test-07/34) (bliss struct).
             if !opt.is_cons() {
-                if opt.is_symbol() && symbol_bare_name(&sym_name(opt)) == "CONC-NAME" {
+                if opt.is_symbol() && symbol_bare_name(&sym_name_rc(opt)) == "CONC-NAME" {
                     conc_name = String::new();
                 }
                 continue;
             }
             let (okey, orest) = cp(opt);
             let oname = if okey.is_symbol() {
-                symbol_bare_name(&sym_name(okey))
+                symbol_bare_name(&sym_name_rc(okey))
             } else {
                 continue;
             };
@@ -28261,7 +28261,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                     conc_name = if v == NIL {
                         String::new()
                     } else if v.is_symbol() {
-                        symbol_bare_name(&sym_name(v))
+                        symbol_bare_name(&sym_name_rc(v))
                     } else {
                         val_as_str(v)
                     };
@@ -28353,14 +28353,14 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         let mut k = 0;
         while k + 1 < opt_vec.len() {
             if opt_vec[k].is_symbol()
-                && symbol_bare_name(&sym_name(opt_vec[k])) == "READ-ONLY"
+                && symbol_bare_name(&sym_name_rc(opt_vec[k])) == "READ-ONLY"
                 && !opt_vec[k + 1].is_nil()
             {
                 read_only = true;
             }
             k += 2;
         }
-        let slot_str = symbol_bare_name(&sym_name(slot_sym));
+        let slot_str = symbol_bare_name(&sym_name_rc(slot_sym));
         let accessor = if conc_name.is_empty() {
             slot_sym
         } else {
@@ -28412,7 +28412,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         // Child's own direct slot bare names (already in `slots`).
         let own: std::collections::HashSet<String> = slots
             .iter()
-            .map(|s| symbol_bare_name(&sym_name(s.slot_sym)))
+            .map(|s| symbol_bare_name(&sym_name_rc(s.slot_sym)))
             .collect();
         let mut inherited: Vec<StructSlot> = Vec::new();
         for i in 0..inh_names.len() {
@@ -28429,7 +28429,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                     continue;
                 }
                 let (ohead, orest) = cp(ov);
-                if ohead.is_symbol() && &symbol_bare_name(&sym_name(ohead)) == sname {
+                if ohead.is_symbol() && &symbol_bare_name(&sym_name_rc(ohead)) == sname {
                     if orest.is_cons() {
                         default = cp(orest).0;
                     }
@@ -28451,12 +28451,12 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                     continue;
                 }
                 let (ohead, orest) = cp(ov);
-                if ohead.is_symbol() && &symbol_bare_name(&sym_name(ohead)) == sname {
+                if ohead.is_symbol() && &symbol_bare_name(&sym_name_rc(ohead)) == sname {
                     let ovec = list_to_vec(orest);
                     let mut k = 1; // skip the new-default form at index 0
                     while k + 1 < ovec.len() {
                         if ovec[k].is_symbol()
-                            && symbol_bare_name(&sym_name(ovec[k])) == "READ-ONLY"
+                            && symbol_bare_name(&sym_name_rc(ovec[k])) == "READ-ONLY"
                             && !ovec[k + 1].is_nil()
                         {
                             read_only = true;
@@ -28574,10 +28574,10 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                     if !var.is_symbol() {
                         return None;
                     }
-                    let bare = symbol_bare_name(&sym_name(var));
+                    let bare = symbol_bare_name(&sym_name_rc(var));
                     slots
                         .iter()
-                        .find(|s| symbol_bare_name(&sym_name(s.slot_sym)) == bare)
+                        .find(|s| symbol_bare_name(&sym_name_rc(s.slot_sym)) == bare)
                         .map(|s| (s.initarg, s.default))
                 };
                 bliss_rt::rooted!(src = params.clone());
@@ -28588,7 +28588,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                 for i in 0..src.len() {
                     let p = src[i];
                     if p.is_symbol() {
-                        match symbol_bare_name(&sym_name(p)).as_str() {
+                        match symbol_bare_name(&sym_name_rc(p)).as_str() {
                             "&OPTIONAL" => {
                                 sec = Sec::Opt;
                                 new_params.push(p);
@@ -28736,7 +28736,7 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         if option.is_cons() {
             let (option_name, option_rest) = cp(option);
             if option_name.is_symbol() {
-                match symbol_bare_name(&sym_name(option_name)).as_str() {
+                match symbol_bare_name(&sym_name_rc(option_name)).as_str() {
                     "METHOD-COMBINATION" => {
                         let method_combination = cp(option_rest).0;
                         combination = method_combination_from_name(&sym_name(method_combination))
@@ -28793,7 +28793,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         if !head.is_symbol() {
             break;
         }
-        match symbol_bare_name(&sym_name(head)).as_str() {
+        match symbol_bare_name(&sym_name_rc(head)).as_str() {
             "AROUND" => qualifier = bliss_stdlib::MethodQualifier::Around,
             "BEFORE" => qualifier = bliss_stdlib::MethodQualifier::Before,
             "AFTER" => qualifier = bliss_stdlib::MethodQualifier::After,
@@ -28822,7 +28822,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     for i in 0..params_list.len() {
         let p = params_list[i];
         if p.is_symbol() {
-            let bare = symbol_bare_name(&sym_name(p));
+            let bare = symbol_bare_name(&sym_name_rc(p));
             if bare.starts_with('&') {
                 past_required = true;
                 plain_params.push(p);
@@ -28843,7 +28843,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             let (class_form, _) = cp(rest_p);
             if class_form.is_cons() {
                 let (head, value_rest) = cp(class_form);
-                if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "EQL" {
+                if head.is_symbol() && symbol_bare_name(&sym_name_rc(head)) == "EQL" {
                     specializers.push(MethodSpecializer::Eql(eval_form(cp(value_rest).0, env)?));
                 } else {
                     specializers.push(MethodSpecializer::Class(sym_name(class_form)));
@@ -28961,7 +28961,7 @@ fn lambda_list_has_key(lambda_list: BlissVal) -> bool {
     let mut cur = lambda_list;
     while cur.is_cons() {
         let (item, rest) = cp(cur);
-        if item.is_symbol() && symbol_bare_name(&sym_name(item)) == "&KEY" {
+        if item.is_symbol() && symbol_bare_name(&sym_name_rc(item)) == "&KEY" {
             return true;
         }
         cur = rest;
@@ -28980,7 +28980,7 @@ fn body_uses_next_method(body: BlissVal) -> bool {
             return true;
         }
         if v.is_symbol() {
-            let n = symbol_bare_name(&sym_name(v));
+            let n = symbol_bare_name(&sym_name_rc(v));
             return n == "CALL-NEXT-METHOD" || n == "NEXT-METHOD-P";
         }
         if v.is_cons() {
@@ -29068,7 +29068,7 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
             .filter_map(|pair| eval_form(pair[0], env).ok())
             .filter(|k| k.is_symbol())
             .map(|k| {
-                symbol_bare_name(&sym_name(k))
+                symbol_bare_name(&sym_name_rc(k))
                     .trim_start_matches("KEYWORD:")
                     .trim_start_matches(':')
                     .to_string()
@@ -29094,7 +29094,7 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     bliss_rt::rooted_ref!(_ig = &mut initargs);
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
-        .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+        .map(|pair| symbol_bare_name(&sym_name_rc(pair[0])))
         .collect();
     let (instance_initargs, class_initargs) = split_initargs_for_class(env, &class_name, &initargs);
     let instance = bliss_stdlib::make_instance(class, &instance_initargs)?;
@@ -29858,7 +29858,7 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         let (clause, rest) = cp(c);
         let (type_form, clause_rest) = cp(clause);
         let (bind_list, handler_body) = cp(clause_rest);
-        if symbol_bare_name(&sym_name(type_form)) == "NO-ERROR" {
+        if symbol_bare_name(&sym_name_rc(type_form)) == "NO-ERROR" {
             no_error = Some((bind_list, handler_body, Rc::clone(&env.frame)));
             c = rest;
             continue;
@@ -30078,7 +30078,7 @@ fn restart_form_signals_condition(form: BlissVal, env: &mut Env) -> bool {
         let head = cp(f).0;
         head.is_symbol()
             && matches!(
-                symbol_bare_name(&sym_name(head)).as_str(),
+                symbol_bare_name(&sym_name_rc(head)).as_str(),
                 "SIGNAL" | "ERROR" | "CERROR" | "WARN"
             )
     }
@@ -30123,7 +30123,7 @@ fn parse_restart_options(
         let key = options[index];
         let value = options[index + 1];
         if key.is_symbol() {
-            match symbol_bare_name(&sym_name(key)).as_str() {
+            match symbol_bare_name(&sym_name_rc(key)).as_str() {
                 "INTERACTIVE-FUNCTION" => {
                     interactive_function = Some(RestartFunction::FunctionForm {
                         function_form: value,
@@ -30244,7 +30244,7 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         while body.is_cons() {
             let (head, rest) = cp(body);
             if head.is_symbol() {
-                let opt = symbol_bare_name(&sym_name(head));
+                let opt = symbol_bare_name(&sym_name_rc(head));
                 if (opt == "REPORT" || opt == "INTERACTIVE" || opt == "TEST") && rest.is_cons() {
                     let (val, rest2) = cp(rest);
                     match opt.as_str() {
@@ -30426,10 +30426,10 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     let mut if_dne_supplied = false;
     let mut i = 0;
     while i + 1 < opts.len() {
-        let opt_bare = symbol_bare_name(&sym_name(opts[i]));
+        let opt_bare = symbol_bare_name(&sym_name_rc(opts[i]));
         let value = eval_form(opts[i + 1], env)?;
         match opt_bare.as_str() {
-            "DIRECTION" => match symbol_bare_name(&sym_name(value)).as_str() {
+            "DIRECTION" => match symbol_bare_name(&sym_name_rc(value)).as_str() {
                 "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
                 "IO" => direction = bliss_stdlib::StreamDirection::Io,
                 "INPUT" => direction = bliss_stdlib::StreamDirection::Input,
@@ -30439,7 +30439,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
                 // (unsigned-byte 8) or the fixnum 8 selects a byte stream.
                 let is_byte = value == BlissVal::from_fixnum(8)
                     || (value.is_cons()
-                        && symbol_bare_name(&sym_name(cp(value).0)) == "UNSIGNED-BYTE");
+                        && symbol_bare_name(&sym_name_rc(cp(value).0)) == "UNSIGNED-BYTE");
                 element_type = if is_byte { BlissVal::from_fixnum(8) } else { T };
             }
             "IF-EXISTS" => if_exists = value,
@@ -30494,7 +30494,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 /// (:REEXPORT / UIOP's :USE-REEXPORT and :MIX-REEXPORT).
 fn push_reexports(env: &Env, from: &str, exports: &mut Vec<String>) {
     for sym in package_external_symbols(env, from) {
-        exports.push(symbol_bare_name(&sym_name(sym)));
+        exports.push(symbol_bare_name(&sym_name_rc(sym)));
     }
 }
 
@@ -30506,7 +30506,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     // name is used. Evaluating it would look an uninterned symbol up as a
     // variable and signal UNBOUND-VARIABLE.
     let name_raw = if name_form.is_symbol() {
-        symbol_bare_name(&sym_name(name_form))
+        symbol_bare_name(&sym_name_rc(name_form))
     } else if is_string_value(name_form) {
         val_as_str(name_form)
     } else {
@@ -30926,8 +30926,8 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
     // GC-safe (bliss-rup1).
     if bliss_stdlib::is_instance(a) && bliss_stdlib::is_instance(b) {
         let ca = bliss_stdlib::class_of(a);
-        let na = symbol_bare_name(&sym_name(bliss_stdlib::class_name(ca)));
-        let nb = symbol_bare_name(&sym_name(bliss_stdlib::class_name(bliss_stdlib::class_of(b))));
+        let na = symbol_bare_name(&sym_name_rc(bliss_stdlib::class_name(ca)));
+        let nb = symbol_bare_name(&sym_name_rc(bliss_stdlib::class_name(bliss_stdlib::class_of(b))));
         if na != nb || !bliss_stdlib::is_structure_class(ca) {
             return false;
         }
