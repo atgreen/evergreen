@@ -255,6 +255,24 @@
   }
   .tiertab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+  /* linked-selection correlated view: T0 bytecode | T1 native, side by side */
+  .corr { display: flex; gap: 10px; overflow-x: auto; }
+  .corr .col { flex: 1 1 0; min-width: 240px; }
+  .corr .col h5 {
+    margin: 0 0 5px; font: 600 .7rem/1 var(--font-mono);
+    text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+  }
+  .corr pre {
+    margin: 0; font-family: var(--font-mono); font-size: .74rem; line-height: 1.5;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; overflow-x: auto; white-space: pre;
+  }
+  .corr .ln { display: block; border-radius: 3px; padding: 0 3px; margin: 0 -3px; }
+  .corr .ln[data-bcp] { cursor: pointer; }
+  .corr .ln.lit { background: var(--accent); color: #fff; }
+  .corr .ln.lit .c, .corr .ln.lit .op, .corr .ln.lit .spec { color: #fff; }
+  .corr-hint { font-size: .78rem; color: var(--faint); margin: 2px 0 8px; }
+
   /* disassembly panel — the TriView payload */
   .disasm {
     font-family: var(--font-mono); font-size: .78rem; line-height: 1.5;
@@ -353,7 +371,8 @@ const EVENT_DATA = /*__EVENT_DATA__*/ {"events":[
   "src":"(defun ADD1 (X)\n  (+ X 1))",
   "t0":"; ADD1 — 1 arg(s), 1 local(s), 2 stack slot(s)\n; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n; runtime operand-type profile (fix/float/other) that drives tier-up.\n     0: LoadLocal(0)\n     1: Const(0)    ; 1\n     2: CallNamed { sym: 181, nargs: 2 }    ; (+ …) / 2 arg(s)  [profile fix:50 float:0 other:0 ⇒ speculate FIXNUM]\n     3: Return",
   "t1":"; T1 — baseline native: optimistic FIXNUM arithmetic templates with\n; overflow/type guards; a failed guard deoptimises to T0.\n; 259 bytes of x86-64:\n  +0000:  push r14\n  +0002:  mov rax,[rdi]\n  +0005:  test al,1\n  +0007:  jne +0030\n  +0009:  add rax,2\n  +000d:  jo +0030\n  +0030:  ; deopt guard → T0",
-  "t2":"; T2 — profile-guided native: speculates the dominant observed operand\n; types and monomorphic dispatch; a failed guard deoptimises to T0.\n; 185 bytes of x86-64:\n  +0000:  mov rcx,[rdi]\n  +0004:  add rcx,2\n  +0008:  jo +0020\n  +000a:  mov [rsi],rcx\n  +000d:  ret"
+  "t2":"; T2 — profile-guided native: speculates the dominant observed operand\n; types and monomorphic dispatch; a failed guard deoptimises to T0.\n; 185 bytes of x86-64:\n  +0000:  mov rcx,[rdi]\n  +0004:  add rcx,2\n  +0008:  jo +0020\n  +000a:  mov [rsi],rcx\n  +000d:  ret",
+  "t1map":[18,18,32,49,89,89]
 }},"dropped":0} /*__END__*/;
 
 const KINDS = [
@@ -583,6 +602,51 @@ function tintDisasm(text){
   }).join("\n");
 }
 
+const NO_OFF = 4294967295; // u32::MAX — a bcp that emitted no native code
+// Given the T1 bcp→offset map, the bcp a native offset belongs to: the last bcp
+// whose start offset is <= off.
+function bcpForOffset(map, off){
+  const ents = map.map((o,bcp)=>({o,bcp})).filter(e=>e.o!==NO_OFF).sort((a,b)=>a.o-b.o);
+  let bcp = null;
+  for (const e of ents){ if (e.o<=off) bcp=e.bcp; else break; }
+  return bcp;
+}
+// Build the correlated two-pane view: T0 bytecode lines (tagged by their bcp)
+// beside T1 native lines (tagged by the bcp their offset maps to). Hovering a
+// line lights up every line sharing that bcp in BOTH panes.
+function renderCorrelated(f){
+  const map = f.t1map || [];
+  // left: T0 — leading "  N:" gives the bcp
+  const t0 = f.t0.split("\n").map(line=>{
+    const m = line.match(/^\s*(\d+):/);
+    const esc = tintDisasm(line);
+    return m ? `<span class="ln" data-bcp="${m[1]}">${esc}</span>` : `<span class="ln">${esc}</span>`;
+  }).join("");
+  // right: T1 — leading "+XXXX:" gives the offset → bcp via the map
+  const t1 = f.t1.split("\n").map(line=>{
+    const m = line.match(/^\s*\+([0-9a-f]+):/);
+    const esc = tintDisasm(line);
+    if (!m) return `<span class="ln">${esc}</span>`;
+    const bcp = bcpForOffset(map, parseInt(m[1],16));
+    return `<span class="ln"${bcp!=null?` data-bcp="${bcp}"`:""}>${esc}</span>`;
+  }).join("");
+  return `<p class="corr-hint">Hover a line to light up the bytecode ↔ native instructions it maps to.</p>
+    <div class="corr">
+      <div class="col"><h5>T0 · bytecode</h5><pre>${t0}</pre></div>
+      <div class="col"><h5>T1 · native x86-64</h5><pre>${t1}</pre></div>
+    </div>`;
+}
+function wireCorrelation(root){
+  const all = root.querySelectorAll(".ln[data-bcp]");
+  const setLit = (bcp, on) => all.forEach(el=>{
+    if (el.dataset.bcp===bcp) el.classList.toggle("lit", on);
+  });
+  all.forEach(el=>{
+    el.addEventListener("mouseenter", ()=>setLit(el.dataset.bcp, true));
+    el.addEventListener("mouseleave", ()=>setLit(el.dataset.bcp, false));
+  });
+}
+
 function openDrawer(name){
   if (!name || name==="<anonymous/top-level>") return;
   const es = events.filter(e=>e.name===name).sort((a,b)=>a.ns-b.ns);
@@ -619,13 +683,19 @@ function openDrawer(name){
   // deoptimised). Default to the highest tier reached.
   const f = funcs[name] || {};
   const tiers = [["src","source"],["t0","T0 · bytecode"],["t1","T1 · native"],["t2","T2 · native"]].filter(([k])=>f[k]);
+  // A linked-selection tab when we have both bytecode and its T1 offset map.
+  const hasCorr = f.t0 && f.t1 && f.t1map && f.t1map.length;
+  if (hasCorr) tiers.push(["corr","T0 ↔ T1"]);
+  // How a tab renders into the pane (correlated view is multi-element markup).
+  const renderTier = k =>
+    k==="corr" ? renderCorrelated(f) :
+    k==="src"  ? `<pre class="disasm">${tintLisp(f[k])}</pre>` :
+                 `<pre class="disasm">${tintDisasm(f[k])}</pre>`;
   let disasm;
   if (tiers.length){
-    // default to the highest compiled tier (last), not the source
-    const initial = tiers[tiers.length-1][0];
+    const initial = hasCorr ? "corr" : tiers[tiers.length-1][0];
     const tabs = tiers.map(([k,l])=>`<button class="tiertab" data-tier="${k}" aria-pressed="${k===initial}">${l}</button>`).join("");
-    const render = k => k==="src" ? tintLisp(f[k]) : tintDisasm(f[k]);
-    disasm = `<div class="tiertabs">${tabs}</div><pre class="disasm" id="disasm-pre">${render(initial)}</pre>`;
+    disasm = `<div class="tiertabs">${tabs}</div><div id="disasm-pane">${renderTier(initial)}</div>`;
   } else {
     disasm = `<p class="empty">No disassembly captured for this function.</p>`;
   }
@@ -636,13 +706,14 @@ function openDrawer(name){
      <h4>Representations <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">— each tier this function was compiled to, captured as installed</span></h4>${disasm}`;
 
   // wire the tier tabs
-  const pre = document.getElementById("disasm-pre");
+  const pane = document.getElementById("disasm-pane");
+  const paint = k => { pane.innerHTML = renderTier(k); if (k==="corr") wireCorrelation(pane); };
+  if (tiers.length) paint(hasCorr ? "corr" : tiers[tiers.length-1][0]);
   document.querySelectorAll(".tiertab").forEach(btn=>{
     btn.onclick = ()=>{
       document.querySelectorAll(".tiertab").forEach(b=>b.setAttribute("aria-pressed","false"));
       btn.setAttribute("aria-pressed","true");
-      const k = btn.dataset.tier;
-      pre.innerHTML = k==="src" ? tintLisp(f[k]) : tintDisasm(f[k]);
+      paint(btn.dataset.tier);
     };
   });
 

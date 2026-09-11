@@ -225,7 +225,7 @@ pub fn to_json() -> String {
     s.push_str(",\"functions\":{");
     let mut first = true;
     for sym in syms {
-        if let Some((t0, t1, t2)) = super::bytecode::tier_disasm(sym) {
+        if let Some((t0, t1, t2, t1map)) = super::bytecode::tier_disasm(sym) {
             if !first {
                 s.push(',');
             }
@@ -240,6 +240,17 @@ pub fn to_json() -> String {
             }
             if let Some(t2) = t2 {
                 s.push_str(&format!(",\"t2\":\"{}\"", json_escape(&t2)));
+            }
+            // T1 bcp→native-offset map for the viewer's linked selection.
+            if !t1map.is_empty() {
+                s.push_str(",\"t1map\":[");
+                for (i, off) in t1map.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&off.to_string());
+                }
+                s.push(']');
             }
             s.push('}');
         }

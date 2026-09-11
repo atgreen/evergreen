@@ -160,6 +160,15 @@ impl Asm {
         Label(self.labels.len() - 1)
     }
 
+    /// The buffer offset a bound label resolves to, or `None` if unbound. Offsets
+    /// are final: all control flow uses fixed `rel32` displacements, so `finish`
+    /// patches in place without moving code (no jump relaxation). Used to build
+    /// the bytecode→native position map for the tiered-JIT viewer (bliss-zmmb).
+    #[inline]
+    pub fn label_offset(&self, l: Label) -> Option<usize> {
+        self.labels[l.0]
+    }
+
     /// Bind a label to the current buffer position. A label must be bound
     /// exactly once before [`finish`](Self::finish); binding twice is a codegen
     /// bug and panics rather than silently resolving to the wrong site.

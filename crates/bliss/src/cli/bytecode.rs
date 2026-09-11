@@ -570,20 +570,29 @@ fn format_native_listing(nc: &NativeCode) -> String {
     out
 }
 
+/// Compile-time snapshot of a function's native tiers for the viewer.
+#[derive(Default, Clone)]
+struct TierSnap {
+    t1: Option<String>,
+    t2: Option<String>,
+    /// T1 bytecode→native offset map (index = bcp, value = native offset,
+    /// `u32::MAX` = no code), for the viewer's bcp↔asm linked selection.
+    t1_map: Vec<u32>,
+}
+
 thread_local! {
-    /// Snapshot of each function's T1 / T2 native disassembly text, captured at
+    /// Snapshot of each function's T1 / T2 native disassembly, captured at
     /// compile time so the tiered-JIT viewer can show a representation that has
     /// since been uninstalled (e.g. a function that deoptimised back to T0). Only
     /// populated while the event stream is recording, so there is no cost off the
-    /// profiling path. (t1_text, t2_text).
-    static TIER_DISASM: RefCell<HashMap<u32, (Option<String>, Option<String>)>> =
-        RefCell::new(HashMap::new());
+    /// profiling path.
+    static TIER_DISASM: RefCell<HashMap<u32, TierSnap>> = RefCell::new(HashMap::new());
 }
 
-/// Capture `nc`'s native listing under `sym` for the given tier. Called from
-/// `publish_native` (the single install point) while the code is mapped; a
-/// no-op unless the event stream is recording. The text is built first (reading
-/// only the code bytes — no BlissVal allocation), then stored, so it is
+/// Capture `nc`'s native listing (and, for T1, its bcp→native map) under `sym`.
+/// Called from `publish_native` (the single install point) while the code is
+/// mapped; a no-op unless the event stream is recording. The text is built first
+/// (reading only the code bytes — no BlissVal allocation), then stored, so it is
 /// GC-safe.
 fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
     if !super::events::enabled() {
@@ -592,11 +601,12 @@ fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
     let text = format_native_listing(nc);
     TIER_DISASM.with(|m| {
         let mut b = m.borrow_mut();
-        let e = b.entry(sym).or_insert((None, None));
+        let e = b.entry(sym).or_default();
         if nc.is_t2 {
-            e.1 = Some(text);
+            e.t2 = Some(text);
         } else {
-            e.0 = Some(text);
+            e.t1 = Some(text);
+            e.t1_map = nc.bcp_offsets.clone();
         }
     });
 }
@@ -648,11 +658,11 @@ pub fn source_text(sym: u32) -> Option<String> {
 /// annotated bytecode) is always available; T1 and T2 come from the compile-time
 /// snapshots and are present only for tiers this function actually reached while
 /// recording. Returns `None` if `sym` is not a compiled Bliss function.
-pub fn tier_disasm(sym: u32) -> Option<(String, Option<String>, Option<String>)> {
+pub fn tier_disasm(sym: u32) -> Option<(String, Option<String>, Option<String>, Vec<u32>)> {
     let bf = registry_get(sym)?;
     let t0 = format_bytecode_listing(sym, &bf);
-    let (t1, t2) = TIER_DISASM.with(|m| m.borrow().get(&sym).cloned().unwrap_or((None, None)));
-    Some((t0, t1, t2))
+    let snap = TIER_DISASM.with(|m| m.borrow().get(&sym).cloned().unwrap_or_default());
+    Some((t0, snap.t1, snap.t2, snap.t1_map))
 }
 
 /// `disassemble` (spec §6, CL:DISASSEMBLE): render a function's *current tier* —
@@ -13316,6 +13326,11 @@ struct NativeCode {
     compiled_entry: usize,
     /// Optimized loop-header entry offsets for T1→T2 on-stack replacement.
     osr_entries: HashMap<u32, usize>,
+    /// Bytecode→native position map for the tiered-JIT viewer (bliss-zmmb):
+    /// `bcp_offsets[bcp]` is the native code offset where bytecode `bcp` begins
+    /// (`u32::MAX` if that bcp emitted no code). Populated for T1; empty for
+    /// tiers whose compiler does not emit it (e.g. T2). Not used by execution.
+    bcp_offsets: Vec<u32>,
     /// Validated GC stack-map metadata for this function's activation, installed
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
     /// pushes, so the collector scans compiled frames through the map.
@@ -14291,6 +14306,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         num_slots: total_slots,
         compiled_entry: artifact.compiled_entry,
         osr_entries: artifact.osr_entries.into_iter().collect(),
+        bcp_offsets: Vec::new(), // T2 compiler does not emit a bcp→asm map (yet)
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
@@ -14857,7 +14873,7 @@ fn emit_native_x86(
     sym: u32,
     backedge_counter: u64,
     allow_traps: bool,
-) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
+) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>)> {
     macro_rules! decline_t1 {
         ($($reason:tt)*) => {{
             // Unified logging (bliss-89rd): tag "compile".
@@ -15641,7 +15657,14 @@ fn emit_native_x86(
         c.jmp(target);
         osr_entries.push((header, stub_off));
     }
-    Some((c.finish()?, osr_entries))
+    // Bytecode→native position map for the viewer (bliss-zmmb): each bcp's label
+    // was bound at that instruction's first native byte; offsets are final (rel32
+    // control flow, no relaxation). u32::MAX marks a bcp with no emitted code.
+    let bcp_offsets: Vec<u32> = bcp_labels
+        .iter()
+        .map(|&l| c.label_offset(l).map_or(u32::MAX, |o| o as u32))
+        .collect();
+    Some((c.finish()?, osr_entries, bcp_offsets))
 }
 
 /// Whether `sym` names a primitive that is safe to re-execute from scratch — no
@@ -15784,7 +15807,7 @@ fn emit_native_x86(
     _sym: u32,
     _backedge_counter: u64,
     _allow_traps: bool,
-) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
+) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>)> {
     None
 }
 
@@ -15831,7 +15854,8 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // unsupported opcode sits BEFORE any loop — trapping there would deopt
     // immediately every call. Decline instead, keeping such functions at T0 for
     // top-level calls (the OSR path below still traps to compile their loops).
-    let (code, _osr) = emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
+    let (code, _osr, bcp_offsets) =
+        emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -15849,6 +15873,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         num_slots,
         compiled_entry: 0, // T1 baseline has no distinct register entry yet
         osr_entries: HashMap::new(),
+        bcp_offsets,
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
@@ -16252,7 +16277,7 @@ fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> 
     if std::env::var_os("BLISS_OSR_DEBUG").is_some() && emitted.is_none() {
         eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
     }
-    let (code, osr) = emitted?;
+    let (code, osr, _bcp_offsets) = emitted?;
     if osr.is_empty() {
         if std::env::var_os("BLISS_OSR_DEBUG").is_some() {
             eprintln!("[osr] osr map empty (no loop entry) for sym {sym}");
