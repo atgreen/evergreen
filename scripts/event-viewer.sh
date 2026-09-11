@@ -65,8 +65,12 @@ import os, re
 tpl = open(os.environ["TEMPLATE"], encoding="utf-8").read()
 json = os.environ["JSON"]
 # Replace everything between the two markers (the default sample) with live data.
+# Use a replacement *function*, not a string: a string replacement would have
+# re interpret backslash escapes in the JSON (turning \n / \\ into real control
+# chars and corrupting it). A callable's return value is inserted verbatim.
+repl = "/*__EVENT_DATA__*/ " + json + " /*__END__*/"
 new, n = re.subn(r"/\*__EVENT_DATA__\*/.*?/\*__END__\*/",
-                 "/*__EVENT_DATA__*/ " + json + " /*__END__*/",
+                 lambda m: repl,
                  tpl, count=1, flags=re.DOTALL)
 if n != 1:
     raise SystemExit("event-viewer.sh: could not find injection markers in template")

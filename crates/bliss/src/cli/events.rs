@@ -209,7 +209,36 @@ pub fn to_json() -> String {
         }
         s.push('}');
     }
-    s.push_str("],\"dropped\":");
+    s.push(']');
+
+    // Per-function disassembly of every function the JIT touched, so the viewer
+    // can show a JITWatch-style code panel (annotated bytecode for T0, native
+    // x86-64 for T1/T2) alongside each function's compile/deopt/OSR history.
+    // Resolved at dump time, so it reflects the final installed tier.
+    use std::collections::BTreeSet;
+    let syms: BTreeSet<u32> = snapshot()
+        .iter()
+        .map(|e| e.sym)
+        .filter(|&s| s != NO_SYM)
+        .collect();
+    s.push_str(",\"functions\":{");
+    let mut first = true;
+    for sym in syms {
+        if let Some(disasm) = super::bytecode::disassemble_by_symbol(sym) {
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            s.push_str(&format!(
+                "\"{}\":{{\"disasm\":\"{}\"}}",
+                json_escape(&sym_label(sym)),
+                json_escape(&disasm)
+            ));
+        }
+    }
+    s.push('}');
+
+    s.push_str(",\"dropped\":");
     s.push_str(&dropped().to_string());
     s.push('}');
     s

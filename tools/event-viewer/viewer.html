@@ -183,6 +183,76 @@
   .reason.phase-change { background: color-mix(in srgb, var(--k-black) 18%, transparent); color: var(--k-black); }
   .reason.blacklist { background: color-mix(in srgb, var(--k-black) 22%, transparent); color: var(--k-black); }
 
+  tbody tr.fnrow { cursor: pointer; }
+  tbody tr.fnrow:hover td { background: var(--surface-2); }
+  tbody tr.fnrow:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* drill-down drawer */
+  #backdrop {
+    position: fixed; inset: 0; background: rgba(10,14,20,.44);
+    opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 30;
+  }
+  #backdrop.open { opacity: 1; pointer-events: auto; }
+  #drawer {
+    position: fixed; top: 0; right: 0; height: 100%; width: min(660px, 94vw);
+    background: var(--surface); border-left: 1px solid var(--line);
+    box-shadow: -12px 0 40px rgba(10,14,20,.28); z-index: 31;
+    transform: translateX(100%); transition: transform .22s cubic-bezier(.4,0,.2,1);
+    display: flex; flex-direction: column;
+  }
+  #drawer.open { transform: translateX(0); }
+  .drawer-head {
+    padding: 20px 22px 14px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: flex-start; gap: 12px;
+  }
+  .drawer-head h3 {
+    font-family: var(--font-mono); font-size: 1.15rem; font-weight: 600;
+    margin: 0; word-break: break-all;
+  }
+  .drawer-head .tierbadge {
+    font-family: var(--font-mono); font-size: .72rem; font-weight: 600;
+    letter-spacing: .04em; padding: 3px 9px; border-radius: 5px; white-space: nowrap;
+    color: #fff;
+  }
+  .drawer-close {
+    margin-left: auto; background: none; border: 1px solid var(--line);
+    color: var(--muted); border-radius: 7px; width: 30px; height: 30px;
+    font-size: 1.1rem; cursor: pointer; flex: none;
+  }
+  .drawer-close:hover { color: var(--ink); border-color: var(--muted); }
+  .drawer-body { overflow-y: auto; padding: 18px 22px 40px; flex: 1; }
+  .drawer-body h4 {
+    font-size: .74rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 22px 0 9px; font-weight: 600;
+  }
+  .drawer-body h4:first-child { margin-top: 0; }
+  .statline { display: flex; flex-wrap: wrap; gap: 7px; }
+  .stat { font-family: var(--font-mono); font-size: .82rem; padding: 4px 10px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); }
+  .stat b { font-variant-numeric: tabular-nums; }
+
+  /* per-function compile-chain lifeline */
+  .lifeline { position: relative; height: 46px; margin: 6px 2px 2px; }
+  .lifeline .track { position: absolute; top: 21px; left: 0; right: 0; height: 3px;
+    background: var(--line); border-radius: 2px; }
+  .lifeline .ev { position: absolute; top: 14px; width: 16px; height: 16px;
+    border-radius: 50%; transform: translateX(-8px); border: 2px solid var(--surface);
+    cursor: default; }
+  .lifeline .ev.sq { border-radius: 4px; }
+  .lifeline .tlabel { position: absolute; top: 30px; font-family: var(--font-mono);
+    font-size: .62rem; color: var(--faint); transform: translateX(-50%); white-space: nowrap; }
+
+  /* disassembly panel — the TriView payload */
+  .disasm {
+    font-family: var(--font-mono); font-size: .78rem; line-height: 1.5;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; white-space: pre;
+    tab-size: 2; margin: 0;
+  }
+  .disasm .c { color: var(--faint); }            /* comments */
+  .disasm .spec { color: var(--accent); font-weight: 600; }  /* speculation */
+  .disasm .op { color: var(--ink); }
+  .disasm .call { color: var(--k-osr); }
   .empty { color: var(--faint); font-style: italic; padding: 8px 2px; }
   footer { margin-top: 48px; color: var(--faint); font-size: .8rem;
     border-top: 1px solid var(--line); padding-top: 14px; }
@@ -243,6 +313,15 @@
   </footer>
 </div>
 <div id="tooltip" role="status" aria-live="polite"></div>
+<div id="backdrop"></div>
+<aside id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+  <div class="drawer-head">
+    <h3 id="drawer-title"></h3>
+    <span class="tierbadge" id="drawer-tier"></span>
+    <button class="drawer-close" id="drawer-close" aria-label="Close">×</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
 
 <script>
 // The build script (scripts/event-viewer.sh) replaces the object on the next
@@ -257,7 +336,7 @@ const EVENT_DATA = /*__EVENT_DATA__*/ {"events":[
   {"seq":5,"ns":6334200000,"kind":"deopt","name":"ADD1","reason":"guard","n":7},
   {"seq":6,"ns":6334600000,"kind":"deopt","name":"ADD1","reason":"blacklist","n":8},
   {"seq":7,"ns":6900000000,"kind":"gc-major","pause_us":9200,"regions_freed":3}
-],"dropped":0} /*__END__*/;
+],"functions":{"ADD1":{"disasm":"; disassembly of ADD1 — 1 arg(s), 1 local(s), 2 stack slot(s)  [tier: T0 (bytecode interpreter)]\n     0: LoadLocal(0)\n     1: Const(0)    ; 1\n     2: CallNamed { sym: 181, nargs: 2 }    ; (+ …) / 2 arg(s)  [profile fix:50 float:0 other:0 ⇒ speculate FIXNUM]\n     3: Return"}},"dropped":0} /*__END__*/;
 
 const KINDS = [
   {key:"compile-t1", label:"T1 compile", css:"--k-t1",   match:e=>e.kind==="compile"&&e.tier<2},
@@ -377,7 +456,8 @@ function renderTimeline(){
       s += `<rect class="marker" data-tt="${encodeURIComponent(tt)}" x="${cx}" y="${cy-9}" width="${w}" height="18" rx="2" fill="${col}" fill-opacity="0.75" stroke="${col}"></rect>`;
     } else {
       const fill = (e.kind==="deopt" && e.reason!=="guard") ? cssVar('--k-black') : col;
-      s += `<circle class="marker" data-tt="${encodeURIComponent(tt)}" cx="${cx}" cy="${cy}" r="5" fill="${fill}" fill-opacity="0.9" stroke="${fill}"></circle>`;
+      const nm = (e.name && e.name!=="<anonymous/top-level>") ? ` data-name="${encodeURIComponent(e.name)}"` : "";
+      s += `<circle class="marker" data-tt="${encodeURIComponent(tt)}"${nm} cx="${cx}" cy="${cy}" r="5" fill="${fill}" fill-opacity="0.9" stroke="${fill}"></circle>`;
     }
   });
 
@@ -385,6 +465,10 @@ function renderTimeline(){
   svg.querySelectorAll(".marker").forEach(m=>{
     m.addEventListener("mousemove", ev => showTip(decodeURIComponent(m.dataset.tt), ev.clientX, ev.clientY));
     m.addEventListener("mouseleave", hideTip);
+    if (m.dataset.name){
+      m.style.cursor = "pointer";
+      m.addEventListener("click", ()=>openDrawer(decodeURIComponent(m.dataset.name)));
+    }
   });
 }
 
@@ -408,7 +492,7 @@ function renderFnTable(){
   const body = document.getElementById("fn-body");
   if (!rows.length){ body.innerHTML = `<tr><td colspan="6" class="empty">No per-function events.</td></tr>`; return; }
   body.innerHTML = rows.map(r=>`
-    <tr>
+    <tr class="fnrow" tabindex="0" data-name="${escapeHtml(r.name)}">
       <td class="name">${escapeHtml(r.name)}${r.t2?'<span class="tier-dot" style="background:var(--k-t2)" title="reached T2"></span>':r.t1?'<span class="tier-dot" style="background:var(--k-t1)" title="reached T1"></span>':''}</td>
       <td class="num">${r.t1||'·'}</td>
       <td class="num">${r.t2||'·'}</td>
@@ -416,6 +500,11 @@ function renderFnTable(){
       <td class="num">${r.osr||'·'}</td>
       <td><div class="heatcell"><span class="num" style="color:var(--muted)">${r.total}</span><span class="heatbar" style="width:${Math.round(r.total/maxTotal*120)}px"></span></div></td>
     </tr>`).join("");
+  body.querySelectorAll("tr.fnrow").forEach(tr=>{
+    const open = ()=>openDrawer(tr.dataset.name);
+    tr.addEventListener("click", open);
+    tr.addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); open(); }});
+  });
 }
 
 /* ---- deopt log ---- */
@@ -433,6 +522,94 @@ function renderDeopts(){
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+/* ---- drill-down drawer: a function's compile chain + disassembly ---- */
+const funcs = EVENT_DATA.functions || {};
+const drawer = document.getElementById("drawer");
+const backdrop = document.getElementById("backdrop");
+let lastFocus = null;
+
+function tierOf(name){
+  const es = events.filter(e=>e.name===name);
+  if (es.some(e=>e.kind==="compile"&&e.tier>=2)) return {t:"T2", c:"var(--k-t2)"};
+  if (es.some(e=>e.kind==="compile"&&e.tier<2)) return {t:"T1", c:"var(--k-t1)"};
+  if (es.some(e=>e.kind==="osr")) return {t:"OSR", c:"var(--k-osr)"};
+  return {t:"T0", c:"var(--muted)"};
+}
+
+// Light syntax tinting for the disassembly text (comments / speculation / ops).
+function tintDisasm(text){
+  return text.split("\n").map(line=>{
+    let esc = escapeHtml(line);
+    // whole-line comment (tier header etc.)
+    if (/^\s*;/.test(line)) return `<span class="c">${esc}</span>`;
+    // trailing "; annotation" — split at the first "; "
+    const ci = esc.indexOf("; ");
+    if (ci >= 0){
+      let code = esc.slice(0,ci), cmt = esc.slice(ci);
+      cmt = cmt.replace(/(⇒ speculate [A-Z-]+)/g, '<span class="spec">$1</span>');
+      code = code.replace(/\b(CallNamed|LoadGlobal|StoreGlobal|Return|Br|BrIfFalse|BrIfTrue|Go|call|jmp|ret|mov|cmp|add|sub)\b/g,'<span class="op">$1</span>');
+      return code + `<span class="c">${cmt}</span>`;
+    }
+    return esc.replace(/\b(CallNamed|LoadGlobal|StoreGlobal|Return|Br|BrIfFalse|BrIfTrue|Go|call|jmp|ret|mov|cmp|add|sub)\b/g,'<span class="op">$1</span>');
+  }).join("\n");
+}
+
+function openDrawer(name){
+  if (!name || name==="<anonymous/top-level>") return;
+  const es = events.filter(e=>e.name===name).sort((a,b)=>a.ns-b.ns);
+  const tier = tierOf(name);
+  document.getElementById("drawer-title").textContent = name;
+  const badge = document.getElementById("drawer-tier");
+  badge.textContent = "reached " + tier.t; badge.style.background = tier.c;
+
+  const cnt = k => es.filter(k).length;
+  const stats = `<div class="statline">
+    <span class="stat">T1 compiles <b>${cnt(e=>e.kind==="compile"&&e.tier<2)}</b></span>
+    <span class="stat">T2 compiles <b>${cnt(e=>e.kind==="compile"&&e.tier>=2)}</b></span>
+    <span class="stat">deopts <b>${cnt(e=>e.kind==="deopt")}</b></span>
+    <span class="stat">OSR entries <b>${cnt(e=>e.kind==="osr")}</b></span></div>`;
+
+  // compile-chain lifeline across this function's own event span
+  const ns0 = es.length?es[0].ns:0, ns1 = es.length?es[es.length-1].ns:1;
+  const fspan = Math.max(1, ns1-ns0);
+  const dots = es.filter(e=>e.kind!=="gc-minor"&&e.kind!=="gc-major").map(e=>{
+    const left = ((e.ns-ns0)/fspan*100);
+    let col, sq=false, lab;
+    if (e.kind==="compile"){ col = e.tier>=2?"var(--k-t2)":"var(--k-t1)"; lab="T"+e.tier; }
+    else if (e.kind==="osr"){ col="var(--k-osr)"; sq=true; lab="OSR"; }
+    else { col = e.reason==="guard"?"var(--k-deopt)":"var(--k-black)"; lab="deopt"; }
+    return `<span class="ev ${sq?'sq':''}" style="left:${left}%;background:${col}" title="${escapeHtml(lab)} @ ${fmtMs(ms(e.ns))}"></span>
+            <span class="tlabel" style="left:${left}%">${lab}</span>`;
+  }).join("");
+  const lifeline = es.length>1
+    ? `<div class="lifeline"><div class="track"></div>${dots}</div>`
+    : `<p class="empty">Single event — no chain to plot.</p>`;
+
+  const disasm = funcs[name] && funcs[name].disasm
+    ? `<pre class="disasm">${tintDisasm(funcs[name].disasm)}</pre>`
+    : `<p class="empty">No disassembly captured for this function.</p>`;
+
+  document.getElementById("drawer-body").innerHTML =
+    `<h4>JIT activity</h4>${stats}
+     <h4>Compile chain</h4>${lifeline}
+     <h4>Disassembly <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">— annotated bytecode (T0) or native x86-64 (T1/T2), as finally installed</span></h4>${disasm}`;
+
+  lastFocus = document.activeElement;
+  backdrop.classList.add("open");
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden","false");
+  document.getElementById("drawer-close").focus();
+}
+function closeDrawer(){
+  backdrop.classList.remove("open");
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden","true");
+  if (lastFocus) lastFocus.focus();
+}
+document.getElementById("drawer-close").onclick = closeDrawer;
+backdrop.onclick = closeDrawer;
+document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeDrawer(); });
 
 renderChips(); renderLegend(); renderFnTable(); renderDeopts(); renderTimeline();
 let rt; window.addEventListener("resize", ()=>{ clearTimeout(rt); rt=setTimeout(renderTimeline,120); });
