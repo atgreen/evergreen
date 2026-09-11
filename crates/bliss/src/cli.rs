@@ -9,6 +9,7 @@ use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+pub mod events;
 use bliss_rt::object::{ComplexData, ConsCell, ObjectHeader, RatioData, type_id};
 use bliss_rt::runtime::parse_cli as parse_runtime_cli;
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
@@ -19285,6 +19286,38 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 write_trace_output(env, &out)?;
                 return Ok(NIL);
             }
+            // JFR-style unified event stream (bliss-ai8n). Recording is opt-in
+            // (also via BLISS_EVENTS=1); events are typed + allocation-free, so
+            // recording is GC-safe and near-free when off.
+            "BLISS-EXT:EVENTS-START" => {
+                let _ = eval_args(cdr, env)?;
+                events::set_enabled(true);
+                return Ok(T);
+            }
+            "BLISS-EXT:EVENTS-STOP" => {
+                let _ = eval_args(cdr, env)?;
+                events::set_enabled(false);
+                return Ok(NIL);
+            }
+            "BLISS-EXT:EVENTS-RESET" => {
+                let _ = eval_args(cdr, env)?;
+                events::reset();
+                return Ok(NIL);
+            }
+            "BLISS-EXT:EVENTS-COUNT" => {
+                let _ = eval_args(cdr, env)?;
+                return Ok(BlissVal::from_fixnum(events::len() as i64));
+            }
+            "BLISS-EXT:EVENTS-REPORT" => {
+                let _ = eval_args(cdr, env)?;
+                let mut out = String::new();
+                for line in events::report_lines() {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                write_trace_output(env, &out)?;
+                return Ok(NIL);
+            }
             "BLISS-EXT:FUNCTION-INVOKE-COUNT" => {
                 let (f_form, _) = cp(cdr);
                 let d = eval_form(f_form, env)?;
@@ -31297,6 +31330,10 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
 
     bliss_rt::install_signal_handlers()?;
     bliss_rt::set_current_execution_foreground();
+
+    // JFR-style event stream (bliss-ai8n): honor BLISS_EVENTS=1 so a plain
+    // `bliss-cli --load foo.lisp` run can be profiled without editing the code.
+    events::init_from_env();
 
     // Teach the image loader how to serialize/restore this crate's Rust-side
     // code registries (macros/setf) as a HostRegistries section (bliss-x0f2 M2).

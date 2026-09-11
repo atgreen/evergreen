@@ -13962,11 +13962,20 @@ fn dispatch_invoke_count_snapshot(sym: u32, fn_obj: Option<BlissVal>) -> u32 {
         .unwrap_or_else(|| INVOKE_COUNTS.with(|m| m.borrow().get(&sym).copied().unwrap_or(0)))
 }
 
-fn publish_native(fn_obj: Option<BlissVal>, nc: &NativeCode) {
+fn publish_native(sym: u32, fn_obj: Option<BlissVal>, nc: &NativeCode) {
     if let Some(f) = fn_obj {
         bliss_rt::function::set_entry(f, nc.entry as *mut u8);
         bliss_rt::function::set_tier(f, if nc.is_t2 { 2 } else { 1 });
     }
+    // JFR-style event stream (bliss-ai8n): a function reached native code. The
+    // single install choke point for both tiers, so every promotion is captured
+    // exactly once. Allocation-free — GC-safe (see cli::events).
+    super::events::record(
+        super::events::EventKind::Compile,
+        sym,
+        if nc.is_t2 { 2 } else { 1 },
+        0,
+    );
 }
 
 fn background_safe_body(body: &BytecodeFunction) -> bool {
@@ -14154,7 +14163,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let fn_obj = bliss_rt::symbols::symbol_function(done.sym)
         .filter(|&v| bliss_rt::function::is_interpreted_function(v));
     mark_fresh_promotion(done.sym);
-    publish_native(fn_obj, &nc);
+    publish_native(done.sym, fn_obj, &nc);
     t2_log_write(format_args!("{}: background T2 result published", bf.name));
     Some(nc)
 }
@@ -14248,7 +14257,7 @@ fn native_for_dispatch(
         }
         let nc = try_promote_to_t1(sym)?;
         mark_fresh_promotion(sym);
-        publish_native(fn_obj, &nc);
+        publish_native(sym, fn_obj, &nc);
         return Some(nc);
     };
 
@@ -14451,6 +14460,20 @@ fn run_native(
         }
         let threshold_hit = n >= deopt_blacklist_threshold();
         let phase_change = threshold_hit && supported_numeric_phase_change(sym);
+        // JFR-style event stream (bliss-ai8n): a speculation guard failed.
+        // Record the classified reason + running per-function count.
+        super::events::record(
+            super::events::EventKind::Deopt,
+            sym,
+            if phase_change {
+                super::events::DEOPT_PHASE_CHANGE
+            } else if threshold_hit {
+                super::events::DEOPT_BLACKLIST
+            } else {
+                super::events::DEOPT_GUARD
+            },
+            n as u64,
+        );
         if t2_log_target().is_some() {
             let nm = registry_get(sym)
                 .map(|b| b.name.clone())
@@ -14479,7 +14502,7 @@ fn run_native(
             let fn_obj = bliss_rt::symbols::symbol_function(sym)
                 .filter(|&value| bliss_rt::function::is_interpreted_function(value));
             if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
-                publish_native(fn_obj, &fallback);
+                publish_native(sym, fn_obj, &fallback);
                 trace("stale numeric specialization retired → generic T1");
             } else if let Some(function) = fn_obj {
                 bliss_rt::function::set_tier(function, 0);
