@@ -546,6 +546,47 @@ fn format_bytecode_listing(sym: u32, bf: &Rc<BytecodeFunction>) -> String {
     out
 }
 
+/// Resolve a native address to the name of the runtime (`c2i_*`) helper at that
+/// address, if it is one bliss's JIT calls. Compiled code reaches the
+/// interpreter and the runtime through these fixed `extern "C"` entry points; a
+/// native `mov reg, <addr>` / `call <addr>` to one is otherwise an opaque
+/// pointer. The map is built once from the same function items the emitter
+/// embeds, so it can never drift from reality.
+fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<Vec<(u64, &'static str)>> = OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        macro_rules! e {
+            ($f:path as $ty:ty, $name:literal) => {
+                ($f as $ty as usize as u64, $name)
+            };
+        }
+        vec![
+            e!(c2i_call as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64, "call (compiled→interpreter)"),
+            e!(c2i_call_slice as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64, "call (slice ABI)"),
+            e!(c2i_clear_mv as extern "C" fn(), "clear multiple-values"),
+            e!(c2i_load_global as extern "C" fn(u64) -> u64, "load-global (symbol-value)"),
+            e!(c2i_store_global as extern "C" fn(u64, u64), "store-global (set symbol-value)"),
+            e!(c2i_load_env as extern "C" fn(u64, u64) -> u64, "load lexical var"),
+            e!(c2i_store_env as extern "C" fn(u64, u64, u64), "store lexical var"),
+            e!(c2i_define_env as extern "C" fn(u64, u64, u64), "define lexical var"),
+            e!(c2i_push_env_child as extern "C" fn(), "push env frame"),
+            e!(c2i_pop_env_child as extern "C" fn(), "pop env frame"),
+            e!(c2i_eval_host as extern "C" fn(u64) -> u64, "eval host form"),
+            e!(c2i_make_closure as extern "C" fn(u64) -> u64, "make closure"),
+            e!(c2i_take_values as extern "C" fn(u64, *mut BlissVal, u64), "take multiple values"),
+            e!(c2i_values_to_list as extern "C" fn(u64) -> u64, "values→list"),
+            e!(c2i_deopt_state as extern "C" fn(u64, u64), "record deopt resume state"),
+            e!(c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64, "loop back-edge counter"),
+            e!(c2i_osr_backedge as extern "C" fn() -> u64, "OSR back-edge check"),
+            e!(c2i_deopt as extern "C" fn(), "deopt → T0"),
+            e!(c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64), "deopt → T0"),
+            e!(c2i_set_native_sigsegv_recovery as extern "C" fn(u64), "set SIGSEGV recovery IP"),
+        ]
+    });
+    map.iter().find(|(a, _)| *a == addr).map(|(_, n)| *n)
+}
+
 /// The first immediate operand of a decoded instruction, if any.
 fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
     use iced_x86::OpKind::*;
@@ -561,10 +602,16 @@ fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
 /// `0x7`. Only unambiguous cases are named (large immediates are code/heap
 /// addresses, not values, so they are left alone).
 fn decode_tagged_immediate(imm: u64) -> Option<String> {
-    if imm == bliss_rt::value::NIL_BITS {
+    use bliss_rt::value::{NIL_BITS, TAG_FIXNUM, TAG_MASK};
+    if imm == NIL_BITS {
         return Some("NIL".into());
     }
-    if imm != 0 && imm & bliss_rt::value::TAG_MASK == bliss_rt::value::TAG_FIXNUM && imm < (1 << 24) {
+    // A small tagged fixnum (n<<3). Only fixnum (tag 000) and NIL are decoded:
+    // the symbol/character tags (101/011) collide with common small call-ABI
+    // immediates (nargs, flags) and would misread them as CL values, so the
+    // callee at a call site is left to the runtime-symbol naming of the c2i
+    // helper instead. Large fixnum-tagged values are code/heap addresses.
+    if imm != 0 && imm & TAG_MASK == TAG_FIXNUM && imm < (1 << 24) {
         return Some(format!("fixnum {}", (imm >> 3) as i64));
     }
     None
@@ -620,13 +667,20 @@ fn native_insn_annotation(
             };
             return Some(format!("{kind}→ +{off:04x}{role}"));
         }
-        return None; // external target (a runtime/c2i call) — left bare
+        // External target: name it if it is a known runtime entry point.
+        return runtime_symbol_name(tgt).map(|n| format!("→ {n}"));
     }
     if is_tag_guard(insn) {
         return Some("tag check (low 3 bits select the type)".into());
     }
     if matches!(insn.mnemonic(), Mnemonic::Mov | Mnemonic::Cmp) {
-        return native_immediate(insn).and_then(decode_tagged_immediate);
+        if let Some(imm) = native_immediate(insn) {
+            // A loaded runtime-helper address (called indirectly below) → name it;
+            // otherwise decode a tagged CL value.
+            return runtime_symbol_name(imm)
+                .map(|n| format!("→ {n}"))
+                .or_else(|| decode_tagged_immediate(imm));
+        }
     }
     None
 }
