@@ -12,7 +12,13 @@
 #   scripts/flamegraph.sh [options] -- <bliss-cli command...>
 #
 # Options:
-#   --out FILE      output SVG (default: /tmp/bliss-flamegraph.svg)
+#   --out FILE      output path (default: /tmp/bliss-flamegraph.svg, or
+#                   /tmp/bliss-profile.perf for --speedscope)
+#   --speedscope    emit raw `perf script` data instead of an SVG, for
+#                   https://speedscope.app (drag-and-drop; keeps time-ordering,
+#                   Time Order / Left Heavy / Sandwich views). Needs no extra
+#                   tools. Equivalent to --format speedscope.
+#   --format M      svg (FlameGraph, default) | speedscope
 #   --freq N        perf sampling frequency in Hz (default: 999)
 #   --call-graph M  perf unwind mode: dwarf|fp|lbr (default: dwarf)
 #   --jitdump       also emit + `perf inject --jit` the jitdump (precise JIT
@@ -33,11 +39,12 @@
 # (no passwordless sudo here — ask the operator).
 set -euo pipefail
 
-OUT=/tmp/bliss-flamegraph.svg
+OUT=""
 FREQ=999
 CALLGRAPH=dwarf
 JITDUMP=0
 PIN_CORE=0
+FORMAT=svg   # svg (FlameGraph) | speedscope (raw perf script, speedscope.app)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +53,8 @@ while [[ $# -gt 0 ]]; do
     --call-graph) CALLGRAPH="$2"; shift 2 ;;
     --jitdump) JITDUMP=1; shift ;;
     --pin-core) PIN_CORE="$2"; shift 2 ;;
+    --format) FORMAT="$2"; shift 2 ;;
+    --speedscope) FORMAT=speedscope; shift ;;
     --) shift; break ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "flamegraph.sh: unknown option $1" >&2; exit 2 ;;
@@ -55,6 +64,14 @@ done
 if [[ $# -eq 0 ]]; then
   echo "flamegraph.sh: no command given (use: ... -- <bliss-cli ...>)" >&2
   exit 2
+fi
+
+# Default output path depends on the format.
+if [[ -z "$OUT" ]]; then
+  case "$FORMAT" in
+    speedscope) OUT=/tmp/bliss-profile.perf ;;
+    *) OUT=/tmp/bliss-flamegraph.svg ;;
+  esac
 fi
 
 command -v perf >/dev/null 2>&1 || { echo "flamegraph.sh: 'perf' not found" >&2; exit 1; }
@@ -80,6 +97,16 @@ if [[ "$JITDUMP" == 1 ]]; then
   else
     echo "[flamegraph] perf inject --jit unavailable; falling back to perf-map symbols" >&2
   fi
+fi
+
+# speedscope format: raw `perf script` output, imported natively by
+# https://speedscope.app — keeps per-sample time-ordering (Time Order / Left
+# Heavy / Sandwich views), unlike the aggregated flamegraph. No extra tools.
+if [[ "$FORMAT" == "speedscope" ]]; then
+  perf script -i "$SCRIPT_DATA" > "$OUT"
+  echo "[flamegraph] wrote $OUT" >&2
+  echo "             load it at https://speedscope.app (drag-and-drop)" >&2
+  exit 0
 fi
 
 # Locate FlameGraph tools: PATH, then $FLAMEGRAPH_DIR, then ~/FlameGraph.
