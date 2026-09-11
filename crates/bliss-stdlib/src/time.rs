@@ -111,10 +111,21 @@ pub fn get_universal_time() -> i64 {
 /// unspecified; a process-start origin keeps values small fixnums). Monotonic,
 /// so benchmark deltas are immune to wall-clock adjustments (bliss-jpd0).
 pub fn get_internal_real_time() -> i64 {
+    origin().elapsed().as_millis() as i64
+}
+
+fn origin() -> std::time::Instant {
     use std::sync::OnceLock;
     static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
-    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
-    origin.elapsed().as_millis() as i64
+    *ORIGIN.get_or_init(std::time::Instant::now)
+}
+
+/// Monotonic time in NANOSECONDS since process start (same origin as
+/// `get-internal-real-time`). The ms-resolution internal-time clock is too
+/// coarse for per-call deterministic profiling (bliss-xgr5); this exposes the
+/// full resolution of the underlying `Instant`. Wraps after ~292 years.
+pub fn get_real_time_nanos() -> i64 {
+    origin().elapsed().as_nanos() as i64
 }
 
 /// `get-internal-run-time`: CLHS 25.1.4.3 leaves the meaning

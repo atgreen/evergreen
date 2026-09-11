@@ -17149,6 +17149,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_stdlib::time::get_internal_run_time(),
                 ));
             }
+            // High-resolution monotonic nanoseconds for the deterministic
+            // profiler (bliss-xgr5); the CL ms clock is too coarse per call.
+            "BLISS-EXT:REAL-TIME-NANOSECONDS" => {
+                let _ = eval_args(cdr, env)?;
+                return Ok(BlissVal::from_fixnum(bliss_stdlib::time::get_real_time_nanos()));
+            }
             "TIME" => {
                 // (time form): evaluate FORM, print a real/run/GC-time + bytes-
                 // consed report to *trace-output*, and return FORM's values
