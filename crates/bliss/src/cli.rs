@@ -1660,6 +1660,14 @@ thread_local! {
     static GF_DISPATCH_CACHE: RefCell<HashMap<GfKey, GfDispatchEntry, bliss_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
 
+    /// Per-generic dispatch metadata memo (bliss-fy37 #3), keyed by the generic's
+    /// interned symbol index and stamped with the same GF_DISPATCH_GENERATION as
+    /// the effective-method cache. Avoids recomputing `(combination, cacheable)`
+    /// per call — the `cacheable` check ran `generic_has_eql_specializer`, which
+    /// iterates every method of the generic, on every dispatch.
+    static GF_META_CACHE: RefCell<HashMap<u32, GfMeta, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
+
     /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
     /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
     /// `(setf place)` defun is a *global* definition and must survive the
@@ -4808,6 +4816,17 @@ struct GfDispatchEntry {
     methods: Rc<GfEffective>,
 }
 
+/// Memoized per-generic dispatch metadata (bliss-fy37 #3). `combination` and
+/// `cacheable` depend only on the generic's definition and method set, both
+/// gen-invalidated; caching them avoids the per-call `env.generics` lookup and
+/// the `generic_has_eql_specializer` method scan.
+#[derive(Clone, Copy)]
+struct GfMeta {
+    generation: u64,
+    combination: bliss_stdlib::MethodCombinationType,
+    cacheable: bool,
+}
+
 /// Allocation-free dispatch-cache key (bliss-fy37): the generic's interned
 /// symbol index plus the `class_of` identity bits of up to `GF_KEY_MAX_ARGS`
 /// arguments. It is `Copy`, so building one and looking it up costs no heap
@@ -5006,21 +5025,66 @@ fn invoke_generic_function_inner(
         bytecode::record_generic_receiver_profile(name, receiver_class.0);
     }
 
-    let combination = env
-        .generics
-        .borrow()
-        .get(name)
-        .map(|generic| generic.combination)
-        .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
-    // Class-keyed effective-method cache for the common case (bliss-x5y.20).
-    let cacheable = matches!(combination, bliss_stdlib::MethodCombinationType::Standard)
-        && !generic_has_eql_specializer(env, name);
+    let gf_idx = bliss_rt::symbols::find_index(name);
+    let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
+    // Per-generic metadata memo (bliss-fy37 #3): (combination, cacheable) is a
+    // pure function of the generic's definition + its method set, both of which
+    // bump GF_DISPATCH_GENERATION when they change (defgeneric at ~28390,
+    // defmethod at ~28586). Computing it per call meant an env.generics lookup
+    // AND generic_has_eql_specializer iterating EVERY method on every dispatch —
+    // O(methods) per call, measurable on many-method generics (asdf). Memoize it,
+    // gen-stamped, keyed by the generic's interned symbol index.
+    let (combination, cacheable) = match gf_idx {
+        Some(idx) => {
+            let hit = GF_META_CACHE.with(|c| {
+                c.borrow()
+                    .get(&idx)
+                    .filter(|m| m.generation == generation)
+                    .map(|m| (m.combination, m.cacheable))
+            });
+            hit.unwrap_or_else(|| {
+                let combination = env
+                    .generics
+                    .borrow()
+                    .get(name)
+                    .map(|generic| generic.combination)
+                    .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+                let cacheable =
+                    matches!(combination, bliss_stdlib::MethodCombinationType::Standard)
+                        && !generic_has_eql_specializer(env, name);
+                GF_META_CACHE.with(|c| {
+                    c.borrow_mut().insert(
+                        idx,
+                        GfMeta {
+                            generation,
+                            combination,
+                            cacheable,
+                        },
+                    );
+                });
+                (combination, cacheable)
+            })
+        }
+        None => {
+            // Un-interned generic name (shouldn't happen for a defined GF): fall
+            // back to the per-call computation without memoizing.
+            let combination = env
+                .generics
+                .borrow()
+                .get(name)
+                .map(|generic| generic.combination)
+                .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+            let cacheable = matches!(combination, bliss_stdlib::MethodCombinationType::Standard)
+                && !generic_has_eql_specializer(env, name);
+            (combination, cacheable)
+        }
+    };
     // Build the allocation-free dispatch key (bliss-fy37): interned GF symbol
     // index + up to GF_KEY_MAX_ARGS `class_of` identity bits. `None` (bypass the
     // cache) if not cacheable, if the GF name is somehow un-interned, or if there
     // are more args than the inline key holds (truncating would be unsound).
     let dispatch_key = if cacheable && args.len() <= GF_KEY_MAX_ARGS {
-        bliss_rt::symbols::find_index(name).map(|gf| {
+        gf_idx.map(|gf| {
             let mut classes = [0u64; GF_KEY_MAX_ARGS];
             for (slot, a) in classes.iter_mut().zip(args.iter()) {
                 *slot = bliss_stdlib::class_of(*a).0;
@@ -5035,7 +5099,6 @@ fn invoke_generic_function_inner(
         None
     };
     if let Some(key) = dispatch_key {
-        let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
         // Cache HIT clones a single Rc (a refcount bump), not the four method-id
         // Vecs the old (String, Vec) entry cloned on every call.
         let cached = GF_DISPATCH_CACHE.with(|c| {
@@ -5117,7 +5180,6 @@ fn invoke_generic_function_inner(
                 after: after_ids,
             });
             if let Some(key) = dispatch_key {
-                let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
                 GF_DISPATCH_CACHE.with(|c| {
                     c.borrow_mut().insert(
                         key,
