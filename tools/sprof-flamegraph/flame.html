@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bliss Lisp Flamegraph</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap">
+<style>
+  :root{--bg:#eef1f5;--surface:#fff;--ink:#1b2027;--muted:#5c6672;--line:#dbe0e8;--accent:#d9541f;
+    --t-treewalk:#7a8699;--t-T0:#3f74c9;--t-T1:#1f8f86;--t-T2:#2f9e4e;
+    --font-ui:'IBM Plex Sans',system-ui,sans-serif;--font-mono:'IBM Plex Mono',ui-monospace,monospace}
+  @media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12151b;--surface:#1a1e26;--ink:#e7eaf0;--muted:#9aa4b1;--line:#2b323d;--accent:#f0743a;
+    --t-treewalk:#8b97aa;--t-T0:#5b93e6;--t-T1:#35b6ab;--t-T2:#4cc26d}}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-ui)}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
+  header{display:flex;align-items:baseline;gap:14px;border-bottom:2px solid var(--accent);padding-bottom:12px}
+  header .e{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}
+  header h1{font-size:1.5rem;font-weight:700;margin:0;letter-spacing:-.02em}
+  header .sub{color:var(--muted);font-size:.9rem;margin-left:auto}
+  .controls{display:flex;align-items:center;gap:12px;margin:16px 0 6px;flex-wrap:wrap}
+  #search{font:inherit;padding:6px 11px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink);width:240px}
+  .legend{display:flex;gap:10px;font-size:.8rem;color:var(--muted);align-items:center}
+  .legend .k{display:inline-flex;align-items:center;gap:5px}.legend .sw{width:11px;height:11px;border-radius:3px}
+  button.reset{font:inherit;font-size:.82rem;padding:5px 12px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink);cursor:pointer}
+  #chart{position:relative;margin-top:10px;width:100%;user-select:none}
+  .frame{position:absolute;height:19px;overflow:hidden;border-radius:2px;font-family:var(--font-mono);font-size:11px;line-height:19px;
+    padding:0 4px;white-space:nowrap;cursor:pointer;color:#fff;border:1px solid rgba(0,0,0,.12)}
+  .frame:hover{outline:2px solid var(--ink);outline-offset:-2px;z-index:5}
+  .frame.dim{opacity:.32}
+  #tip{position:fixed;pointer-events:none;opacity:0;transition:opacity .1s;z-index:20;max-width:340px;
+    background:var(--ink);color:var(--surface);border-radius:7px;padding:8px 11px;font-size:.8rem;line-height:1.45;box-shadow:0 6px 24px rgba(0,0,0,.28)}
+  #tip .n{font-family:var(--font-mono);font-weight:600}#tip .m{opacity:.82}
+  footer{margin-top:28px;color:var(--muted);font-size:.8rem;border-top:1px solid var(--line);padding-top:12px}
+  footer code{font-family:var(--font-mono)}
+</style></head><body><div class="wrap">
+<header><div><div class="e">bliss · lisp CPU profile</div><h1>Flamegraph</h1></div><span class="sub" id="sub">—</span></header>
+<div class="controls">
+  <button class="reset" id="reset">Reset zoom</button>
+  <input id="search" placeholder="highlight function…">
+  <div class="legend">
+    <span class="k"><span class="sw" style="background:var(--t-treewalk)"></span>treewalk</span>
+    <span class="k"><span class="sw" style="background:var(--t-T0)"></span>T0</span>
+    <span class="k"><span class="sw" style="background:var(--t-T1)"></span>T1</span>
+    <span class="k"><span class="sw" style="background:var(--t-T2)"></span>T2</span>
+  </div>
+</div>
+<div id="chart"></div>
+<footer>Sampled Lisp call stacks (<code>BLISS-EXT:SPROF</code> / <code>BLISS_SPROF</code>). Width = share of samples; color = tier. Click a frame to zoom, click Reset to return.</footer>
+</div>
+<div id="tip"></div>
+<script>
+// scripts/sprof-flamegraph.sh replaces the next line with the run's folded stacks.
+const FOLDED = /*__FOLDED__*/ `TOP [T0];MID [T0];LEAF [T0] 764
+TOP [T0];MID [T0] 733
+TOP [T0] 687
+MID [T0];LEAF [T0] 400
+main [treewalk];TOP [T2] 120` /*__END__*/;
+
+const ROWH = 20;
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const tierColor=t=>getComputedStyle(document.documentElement).getPropertyValue('--t-'+(t||'T0')).trim()||'#888';
+function frameTier(label){const m=label.match(/\[([^\]]+)\]\s*$/);return m?m[1]:'T0';}
+
+// Build a tree from folded stacks. Node: {name, value, children:Map, tier}
+function buildTree(folded){
+  const root={name:'all',value:0,children:new Map(),tier:null};
+  for(const line of folded.split('\n')){
+    const s=line.trim(); if(!s) continue;
+    const i=s.lastIndexOf(' '); if(i<0) continue;
+    const count=parseInt(s.slice(i+1),10); if(!count) continue;
+    const frames=s.slice(0,i).split(';');
+    let node=root; root.value+=count;
+    for(const f of frames){
+      let c=node.children.get(f);
+      if(!c){c={name:f,value:0,children:new Map(),tier:frameTier(f)};node.children.set(f,c);}
+      c.value+=count; node=c;
+    }
+  }
+  return root;
+}
+const root=buildTree(FOLDED);
+const total=root.value;
+document.getElementById('sub').textContent=`${total.toLocaleString()} samples · ${root.children.size} root function(s)`;
+
+const chart=document.getElementById('chart');
+const tip=document.getElementById('tip');
+let focus=root;
+
+function layout(){
+  chart.innerHTML='';
+  // depth of the focused subtree
+  const depth=(n)=>{let d=0;for(const c of n.children.values())d=Math.max(d,depth(c));return 1+d;};
+  const H=depth(focus)*ROWH;
+  chart.style.height=H+'px';
+  const W=chart.clientWidth||1000;
+  const q=document.getElementById('search').value.trim().toLowerCase();
+  // recursive placement: x,width in px; y from bottom
+  function place(node,x,w,d){
+    if(node!==root){
+      const el=document.createElement('div');
+      el.className='frame';
+      el.style.left=x+'px'; el.style.width=Math.max(0,w-1)+'px';
+      el.style.bottom=(d*ROWH)+'px';
+      el.style.background=tierColor(node.tier);
+      const pct=(node.value/total*100);
+      el.textContent = w>34 ? node.name : '';
+      if(q && !node.name.toLowerCase().includes(q)) el.classList.add('dim');
+      el.onmousemove=ev=>{tip.style.opacity=1;tip.innerHTML=`<div class="n">${esc(node.name)}</div><div class="m">${node.value.toLocaleString()} samples · ${pct.toFixed(2)}% of all</div>`;
+        tip.style.left=Math.min(ev.clientX+14,window.innerWidth-tip.offsetWidth-12)+'px';tip.style.top=(ev.clientY+14)+'px';};
+      el.onmouseleave=()=>tip.style.opacity=0;
+      el.onclick=()=>{focus=node;layout();};
+      chart.appendChild(el);
+    }
+    // children laid out across this node's width, ordered by value desc
+    let cx=x;
+    const kids=[...node.children.values()].sort((a,b)=>b.value-a.value);
+    const scale=w/(node.value||1);
+    for(const c of kids){const cw=c.value*scale;place(c,cx,cw,d-1);cx+=cw;}
+  }
+  // focus occupies full width at the bottom; its subtree stacks above
+  const fdepth=depth(focus);
+  place(focus,0,W,fdepth-1);
+}
+document.getElementById('reset').onclick=()=>{focus=root;layout();};
+document.getElementById('search').oninput=layout;
+let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(layout,120);});
+layout();
+</script></body></html>
