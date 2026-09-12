@@ -17154,8 +17154,12 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
         }
     }
 
-    // Any other form: compile a thunk, else fall back.
-    match compile_thunk(form, env, false) {
+    // Any other form: compile a thunk, else fall back. On an opportunistic bail
+    // (a capturing flet/labels or closure needs the heap-frame machinery) retry
+    // in portable mode before tree-walking — same rationale as lazy_compile_defun
+    // (bliss-mr4p). Only reached after the fast path already declined, so it
+    // never adds work to a form that compiles opportunistically.
+    match compile_thunk(form, env, false).or_else(|| compile_thunk(form, env, true)) {
         Some(bf) => {
             trace("compiled");
             let arc = Rc::new(bf);
