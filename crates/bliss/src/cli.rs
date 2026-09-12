@@ -9236,9 +9236,13 @@ fn find_symbol_in_package_cased(
     // FIND-SYMBOL is case-SENSITIVE (CLHS): the lookup folds to :upcase like the
     // reader, but with `exact_case` the found symbol's NAME must equal the query
     // VERBATIM — so (find-symbol "car") is NIL though CAR exists, while
-    // (find-symbol "CAR") finds it. bliss interns every symbol upcased, so this
-    // exact-name check is a complete case-sensitivity filter (bliss-961p).
-    if exact_case {
+    // (find-symbol "CAR") finds it (bliss-961p). Every bliss symbol is interned
+    // upcased, so when the query is ALREADY all-uppercase the folded lookup that
+    // succeeded already matched the exact name — skip the (allocating) name
+    // re-derivation on that hot path (UIOP's ensure-package calls FIND-SYMBOL
+    // once per inherited symbol with uppercase names). Only a query carrying
+    // lowercase can spuriously match an upcased symbol and needs the filter.
+    if exact_case && !already_upper {
         if let Some((sym, _)) = found {
             if symbol_bare_name(&sym_name(sym)) != bare_name {
                 return None;
