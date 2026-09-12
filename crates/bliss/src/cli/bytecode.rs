@@ -420,20 +420,6 @@ pub fn call_registered(
         sym_label(sym)
     );
     let native = native_for_dispatch(sym, fn_obj, count);
-    // Lisp-aware statistical profiler (bliss-sc4t): record this compiled call's
-    // Lisp frame + tier so a sample shows the function, not the interpreter.
-    let _sf = if super::sprof::enabled() {
-        let tier = match &native {
-            Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
-                if nc.is_t2 { super::sprof::T2 } else { super::sprof::T1 }
-            }
-            _ => super::sprof::T0,
-        };
-        super::sprof::maybe_sample();
-        Some(super::sprof::Frame::sym(sym, tier))
-    } else {
-        None
-    };
     // Dispatch: native if promoted and under the depth cap, else run the callee
     // as BYTECODE — the profiling warmup tier. This is what gathers the operand
     // -type profile a function needs before it can be speculated at T2, even when
@@ -13145,9 +13131,6 @@ extern "C" fn c2i_osr_backedge() -> u64 {
     // same discipline that already makes moving GC safe at any T1/OSR runtime
     // call — so parking and being scanned here is sound.
     bliss_rt::safepoint::poll_safepoint();
-    // Lisp-aware profiler (bliss-sc4t): a native loop's back-edge is a consistent
-    // sampling point, so native T2 loops aren't invisible to the profile.
-    super::sprof::maybe_sample();
     native_loop_should_exit()
 }
 
@@ -13164,8 +13147,6 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     if native_loop_should_exit() != 0 {
         return 1;
     }
-    // Lisp-aware profiler (bliss-sc4t): sample native loop back-edges too.
-    super::sprof::maybe_sample();
     // GC stop-the-world (bliss-eeyj): a call-free T1 loop reaches Rust only
     // here, so this is where it must be stoppable by another thread's GC. Safe
     // for the same reasons as any T1 runtime call: the frame is on the rt
