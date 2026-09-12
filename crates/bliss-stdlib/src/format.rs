@@ -2113,6 +2113,31 @@ fn format_impl(
                 }
             }
             'F' => {
+                // ~w,d,k,overflowchar,padcharF. Resolve the prefix params in
+                // left-to-right order (each `v`/`#` consumes the next arg) BEFORE
+                // reading the value, so `~v,vF` binds width and digit-count to the
+                // parameter args rather than mis-binding the value as a param
+                // (CLHS 22.3.1; bliss-8rs1). w = minimum width, d = fraction digits.
+                let w = params
+                    .first()
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))? as usize;
+                let d = match params.get(1) {
+                    Some(p) => {
+                        let dd = resolve_param(p, -1, arg_idx)?;
+                        if dd >= 0 {
+                            Some(dd as usize)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                // k (scale factor), overflowchar and padchar are not yet applied,
+                // but still resolve them so any `v` param consumes its arg and the
+                // value (and later directives) stay correctly aligned.
+                for p in params.iter().skip(2) {
+                    let _ = resolve_param(p, -1, arg_idx)?;
+                }
                 if *arg_idx >= args.len() {
                     return Err(BlissError::ControlError("too few args for ~F".into()));
                 }
@@ -2129,13 +2154,6 @@ fn format_impl(
                         datum: val,
                         expected: "number".into(),
                     });
-                };
-                // ~w,dF: d = digits after the decimal point, w = minimum width.
-                let d = if params.len() > 1 {
-                    let dd = resolve_param(&params[1], -1, arg_idx)?;
-                    if dd >= 0 { Some(dd as usize) } else { None }
-                } else {
-                    None
                 };
                 let shortest = if val.is_single_float() {
                     format!("{}", val.as_single_float())
@@ -2181,11 +2199,6 @@ fn format_impl(
                 if at_sign && f >= 0.0 {
                     s.insert(0, '+');
                 }
-                let w = if !params.is_empty() {
-                    resolve_param(&params[0], 0, arg_idx)? as usize
-                } else {
-                    0
-                };
                 if s.len() < w {
                     let pad: String = std::iter::repeat_n(' ', w - s.len()).collect();
                     s = format!("{pad}{s}");
@@ -2193,6 +2206,20 @@ fn format_impl(
                 output.push_str(&s);
             }
             'E' => {
+                // ~w,d,e,k,overflowchar,padchar,exponentcharE. Resolve params in
+                // left-to-right order (each `v` param consumes the next arg) BEFORE
+                // reading the value, so `~v,vE` binds the params to the parameter
+                // args rather than mis-binding the value (CLHS 22.3.1; bliss-8rs1).
+                let _w = params.first().map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let d = params.get(1).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let e = params.get(2).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let k = params.get(3).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                let _of = params.get(4).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let _pad = params.get(5).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let expc = params
+                    .get(6)
+                    .map_or(Ok('e' as i64), |p| resolve_param(p, 'e' as i64, arg_idx))?;
+                let exp_char = char::from_u32(expc as u32).unwrap_or('e');
                 if *arg_idx >= args.len() {
                     return Err(BlissError::ControlError("too few args for ~E".into()));
                 }
@@ -2210,18 +2237,6 @@ fn format_impl(
                         expected: "number".into(),
                     });
                 };
-                // ~w,d,e,k,overflowchar,padchar,exponentcharE. Resolve params in
-                // order (a `v` param consumes the next arg, so order matters).
-                let _w = params.first().map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                let d = params.get(1).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                let e = params.get(2).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                let k = params.get(3).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
-                let _of = params.get(4).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                let _pad = params.get(5).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                let expc = params
-                    .get(6)
-                    .map_or(Ok('e' as i64), |p| resolve_param(p, 'e' as i64, arg_idx))?;
-                let exp_char = char::from_u32(expc as u32).unwrap_or('e');
                 if d < 0 {
                     // No explicit fraction-digit count: shortest round-trip. Format
                     // a single-float from the f32 itself rather than its widened f64,
@@ -2264,6 +2279,27 @@ fn format_impl(
                 output.push_str(&s);
             }
             '$' => {
+                // ~d,n,w,padchar$: d = digits after the point (default 2), n = min
+                // digits before it (default 1, zero-padded), w = min field width.
+                // Resolve the params in left-to-right order (each `v` consumes the
+                // next arg) BEFORE reading the value, so `~v,v$` binds the params to
+                // the parameter args, not the value (CLHS 22.3.1; bliss-8rs1).
+                let d = params
+                    .first()
+                    .map_or(Ok(2), |p| resolve_param(p, 2, arg_idx))?
+                    .max(0) as usize;
+                let n = params
+                    .get(1)
+                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .max(1) as usize;
+                let w = params
+                    .get(2)
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let padchar = params.get(3).map_or(Ok(' '), |p| {
+                    resolve_param(p, ' ' as i64, arg_idx)
+                        .map(|c| char::from_u32(c as u32).unwrap_or(' '))
+                })?;
                 if *arg_idx >= args.len() {
                     return Err(BlissError::ControlError("too few args for ~$".into()));
                 }
@@ -2281,24 +2317,6 @@ fn format_impl(
                         expected: "number".into(),
                     });
                 };
-                // ~d,n,w,padchar$: d = digits after the point (default 2), n = min
-                // digits before it (default 1, zero-padded), w = min field width.
-                let d = params
-                    .first()
-                    .map_or(Ok(2), |p| resolve_param(p, 2, arg_idx))?
-                    .max(0) as usize;
-                let n = params
-                    .get(1)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
-                    .max(1) as usize;
-                let w = params
-                    .get(2)
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
-                    .max(0) as usize;
-                let padchar = params.get(3).map_or(Ok(' '), |p| {
-                    resolve_param(p, ' ' as i64, arg_idx)
-                        .map(|c| char::from_u32(c as u32).unwrap_or(' '))
-                })?;
                 let body = format!("{:.*}", d, f.abs());
                 let (int_part, frac_part) = match body.split_once('.') {
                     Some((i, fr)) => (i.to_string(), format!(".{fr}")),

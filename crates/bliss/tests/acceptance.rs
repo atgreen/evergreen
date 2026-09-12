@@ -4975,6 +4975,15 @@ fn format_fixed_float_directive() {
         ("(format nil \"~8,2f\" 3.14159)", "\"    3.14\""),
         ("(format nil \"~,0f\" 3.7)", "\"4.\""),
         ("(format nil \"~f\" 2.5)", "\"2.5\""),
+        // `v` prefix params consume args in directive order BEFORE the value, so
+        // ~v,vF binds width/digits to 6/2 and the value is 3.14159, not the other
+        // way round (previously errored "float is not integer"; bliss-8rs1).
+        ("(format nil \"~v,vf\" 6 2 3.14159)", "\"  3.14\""),
+        ("(format nil \"~vf\" 8 3.14159)", "\" 3.14159\""),
+        // Same fix for ~E and ~$.
+        ("(format nil \"~v,v$\" 2 8 3.5)", "\"00000003.50\""),
+        ("(format nil \"~v$\" 4 3.14159)", "\"3.1416\""),
+        ("(format nil \"~v,ve\" 10 3 31.4159)", "3.142e+1"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin()
