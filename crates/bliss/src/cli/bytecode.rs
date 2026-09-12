@@ -11597,7 +11597,7 @@ fn pending_signal_error_for_current_execution() -> Option<BlissError> {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "C" fn native_sigsegv_recovery_epilogue() {
-    core::arch::naked_asm!("mov rax, 7", "add rsp, 8", "pop r15", "pop r14", "ret",)
+    core::arch::naked_asm!("mov rax, 7", "pop r12", "pop r15", "pop r14", "ret",)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -14997,8 +14997,10 @@ fn run_native(
     bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(native_recovery);
     // SAFETY: `entry` is installed executable code from emit_native_x86 with the
     // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
-    let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(nc.entry) };
-    let ret = f(slots);
+    // rsi = *mut BlissStack, stashed into the reserved r12 by the prologue
+    // (bliss-zhvn Stage 1). Unused by the body yet; foundation for direct calls.
+    let f: extern "C" fn(*mut u64, *const u8) -> u64 = unsafe { std::mem::transmute(nc.entry) };
+    let ret = f(slots, std::ptr::from_ref(stack) as *const u8);
     bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(saved_null_recovery);
     bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
@@ -15473,8 +15475,9 @@ fn emit_native_x86(
     let emit_prologue = |c: &mut Asm| {
         c.extend_from_slice(&[0x41, 0x56]); // push r14
         c.extend_from_slice(&[0x41, 0x57]); // push r15
-        c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8 (16-align)
+        c.extend_from_slice(&[0x41, 0x54]); // push r12 (reserved: *mut BlissStack; 3 pushes keep rsp 16-aligned)
         c.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi (frame slots)
+        c.extend_from_slice(&[0x49, 0x89, 0xF4]); // mov r12, rsi (BlissStack ptr; bliss-zhvn)
         c.extend_from_slice(&[0x4D, 0x8D, 0xBE]); // lea r15, [r14 + 8*n_locals]
         c.extend_from_slice(&(8 * n_locals).to_le_bytes());
     };
@@ -15985,7 +15988,7 @@ fn emit_native_x86(
                     // used.
                     c.extend_from_slice(&[0x49, 0x8B, 0x86]);
                     c.extend_from_slice(&(8 * n_locals).to_le_bytes());
-                    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+                    c.extend_from_slice(&[0x41, 0x5C]); // pop r12 (bliss-zhvn)
                     c.extend_from_slice(&[0x41, 0x5F, 0x41, 0x5E, 0xC3]);
                     c.bind(keep);
                 }
@@ -16012,7 +16015,7 @@ fn emit_native_x86(
             }
             Instr::Return => {
                 pop_into(&mut c, 0, false); // rax = result
-                c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+                c.extend_from_slice(&[0x41, 0x5C]); // pop r12 (bliss-zhvn)
                 c.extend_from_slice(&[0x41, 0x5F]); // pop r15
                 c.extend_from_slice(&[0x41, 0x5E]); // pop r14
                 c.extend_from_slice(&[0xC3]); // ret
@@ -16095,7 +16098,7 @@ fn emit_native_x86(
         c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_deopt_state)
         c.extend_from_slice(&deopt_state_addr.to_le_bytes());
         emit_c2i_helper_call(&mut c);
-        c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+        c.extend_from_slice(&[0x41, 0x5C]); // pop r12 (bliss-zhvn)
         c.extend_from_slice(&[0x41, 0x5F]); // pop r15
         c.extend_from_slice(&[0x41, 0x5E]); // pop r14
         c.extend_from_slice(&[0xC3]); // ret
@@ -16815,8 +16818,10 @@ fn run_native_osr(
     let entry_addr = osr.entry as usize + stub_off;
     // SAFETY: `entry_addr` is inside the installed OSR buffer at a stub whose
     // contract is `fn(*mut u64) -> u64` (prologue + jump to the loop header).
-    let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry_addr) };
-    let ret = f(slots);
+    // rsi = *mut BlissStack for the reserved r12 (bliss-zhvn Stage 1); the OSR
+    // stub shares emit_prologue, so it expects the two-arg ABI.
+    let f: extern "C" fn(*mut u64, *const u8) -> u64 = unsafe { std::mem::transmute(entry_addr) };
+    let ret = f(slots, std::ptr::from_ref(bliss_rt::current_thread().stack()) as *const u8);
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
     NATIVE_OSR_BF.with(|c| c.set(saved_osr_bf));
