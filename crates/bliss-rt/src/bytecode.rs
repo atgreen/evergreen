@@ -90,6 +90,12 @@ pub enum Instr {
     /// Call `sym` with `nargs` operands. Resolves to a bytecode function
     /// (native frame push) or falls back to the tree-walker's `apply_function`.
     CallNamed { sym: u32, nargs: u16 },
+    /// Inline `(typep x '<simple-type>)`: pop one operand, push T if it is of
+    /// the type-class `u16` (a `TypeClass::*` code — string, symbol, cons, …),
+    /// else NIL. Emitted by the lowerer for `(typep x 'CONST)` on a small set
+    /// of tag-checkable types to avoid a c2i `CallNamed` to TYPEP on the hot
+    /// package-machinery path (bliss-gq5).
+    TypeP(u16),
     /// Return the top of the operand stack to the caller.
     Return,
 

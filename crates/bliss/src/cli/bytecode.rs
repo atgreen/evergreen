@@ -194,6 +194,95 @@ impl Drop for ActiveBytecodeRoot {
     }
 }
 
+/// Tag-checkable type-classes recognised by the lowerer for inline
+/// `(typep x 'CONST)` → [`Instr::TypeP`] (bliss-gq5). Deliberately small: only
+/// types decidable by an immediate tag / heap-type-id test with no allocation
+/// and no user-defined-type-graph lookup, so the check is a handful of branches
+/// instead of a c2i `CallNamed` to TYPEP. `find_typep_class` maps a constant
+/// type specifier to one of these; [`typep_class_matches`] executes it.
+mod typep_class {
+    pub const STRING: u16 = 1;
+    pub const SYMBOL: u16 = 2;
+    pub const PACKAGE: u16 = 3;
+    pub const LIST: u16 = 4;
+    pub const CONS: u16 = 5;
+    pub const NULL: u16 = 6;
+    pub const BOOLEAN: u16 = 7; // (member nil t) / the type BOOLEAN
+}
+
+/// Map a *constant* type specifier symbol name to a [`typep_class`] code, or
+/// `None` if it is not an inlinable simple type. Names arrive upcased (reader
+/// :upcase). Only names whose [`typep_class_matches`] result reproduces the
+/// TYPEP builtin ([`super::typep_matches`]) *bit for bit* appear here, so every
+/// tier agrees. Deliberately excluded: HASH-TABLE (the builtin's
+/// `hash_table_count().is_ok()` accepts any heap object, so a strict inline
+/// check would diverge), BASE-STRING (the builtin does not route it through
+/// `is_string_value`), and ATOM.
+fn find_typep_class(type_name: &str) -> Option<u16> {
+    Some(match type_name {
+        // TYPEP: "STRING" | "SIMPLE-STRING" => is_string_value(object).
+        "STRING" | "SIMPLE-STRING" => typep_class::STRING,
+        "SYMBOL" => typep_class::SYMBOL,
+        "PACKAGE" => typep_class::PACKAGE,
+        "LIST" => typep_class::LIST,
+        "CONS" => typep_class::CONS,
+        "NULL" => typep_class::NULL,
+        "BOOLEAN" => typep_class::BOOLEAN,
+        _ => return None,
+    })
+}
+
+/// Recognise `(typep <expr> (quote <SIMPLE-TYPE>))` — exactly two arguments,
+/// the second a quoted constant type naming a tag-checkable [`typep_class`].
+/// Returns the class code (the caller re-derives the value expression from the
+/// still-rooted arg list), or `None` to fall back to a full TYPEP call. Never
+/// allocates a cons — only walks the (already rooted) argument list.
+fn typep_inline_class(rest: BlissVal) -> Option<u16> {
+    if !rest.is_cons() {
+        return None;
+    }
+    let (_val_form, r1) = cp(rest);
+    if !r1.is_cons() {
+        return None;
+    }
+    let (type_form, r2) = cp(r1);
+    if !r2.is_nil() {
+        return None; // exactly two args (the 3-arg env form falls through)
+    }
+    // The type must be a literal `(QUOTE <sym>)`; a bare symbol would be a
+    // variable reference, not a type designator.
+    if !type_form.is_cons() {
+        return None;
+    }
+    let (q, qr) = cp(type_form);
+    if !q.is_symbol() || symbol_bare_name(&sym_name(q)) != "QUOTE" || !qr.is_cons() {
+        return None;
+    }
+    let (tsym, qr2) = cp(qr);
+    if !qr2.is_nil() || !tsym.is_symbol() {
+        return None;
+    }
+    find_typep_class(&symbol_bare_name(&sym_name(tsym)))
+}
+
+/// Execute an inline [`Instr::TypeP`] check of `v` against `class`, using the
+/// *exact* predicates the TYPEP builtin uses (`super::typep_matches`) so the T0
+/// inline and a c2i TYPEP call always agree. `stringp`/`packagep` are NOT used:
+/// they diverge from the builtin (e.g. `stringp` accepts an adjustable char
+/// array that `(typep x 'string)` rejects). No allocation, so no rooting.
+fn typep_class_matches(class: u16, v: BlissVal) -> bool {
+    match class {
+        typep_class::STRING => super::is_string_value(v),
+        typep_class::SYMBOL => v.is_symbol(),
+        typep_class::PACKAGE => super::is_package_object(v),
+        typep_class::LIST => v.is_list(),
+        typep_class::CONS => v.is_cons(),
+        typep_class::NULL => v.is_nil(),
+        typep_class::BOOLEAN => v.is_nil() || v.0 == T.0,
+        _ => false,
+    }
+}
+
 /// Build a proper list `(items...)` in the arena, for synthesising macro-style
 /// expansions during lowering (bliss-jtc.28, e.g. DOTIMES → block/tagbody).
 fn form_list(items: &[BlissVal]) -> BlissVal {
@@ -2121,6 +2210,25 @@ impl<'e> Lowerer<'e> {
             compiler_macroexpand::compiler_macroexpand_1(form, self.macro_env.as_ref().unwrap())
         {
             return self.lower_expr(expanded);
+        }
+        // Inline `(typep x 'SIMPLE-TYPE)` as a direct tag check instead of a c2i
+        // CallNamed to TYPEP — this is the hottest builtin on the package-
+        // machinery path (ensure-inherited/ensure-symbol call it ~8×/symbol,
+        // bliss-gq5). Only when TYPEP is the standard builtin: local/macro
+        // shadowing was resolved above, and a global redefinition (a `defun
+        // typep`) keeps the call so the user's semantics win.
+        if symbol_bare_name(name) == "TYPEP"
+            && !self.env.funs.borrow().contains_key(name)
+            && !self.env.generics.borrow().contains_key(name)
+        {
+            if let Some(class) = typep_inline_class(rest) {
+                // `rest` is rooted (above); its car is the value expression.
+                self.lower_expr(cp(rest).0)?;
+                self.emit(Instr::TypeP(class));
+                self.pop_n(1);
+                self.push_n(1);
+                return Ok(());
+            }
         }
         // An unhandled special operator is not a call.
         if is_bail_special(name) {
@@ -6944,6 +7052,7 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         // opcode + u32 global function index + u16 capture indicator.
         Instr::MakeClosure { .. } => 7,
         Instr::AllocCons => 1,
+        Instr::TypeP(_) => 3, // opcode byte + u16 type-class
         Instr::Pop | Instr::Dup => 1,
         Instr::Br(_) | Instr::BrIfFalse(_) | Instr::BrIfTrue(_) => 5,
         Instr::CallNamed { .. } => 7,
@@ -7107,6 +7216,10 @@ fn serialize_bbu_function(
             Instr::PushEnvChild => put_u8(&mut code, 0x36),
             Instr::PopEnvChild => put_u8(&mut code, 0x37),
             Instr::AllocCons => put_u8(&mut code, 0x30),
+            Instr::TypeP(class) => {
+                put_u8(&mut code, 0x42);
+                put_u16(&mut code, *class);
+            }
             Instr::Pop => put_u8(&mut code, 0x11),
             Instr::Dup => put_u8(&mut code, 0x12),
             Instr::Br(target) => {
@@ -9191,6 +9304,7 @@ fn decode_bbu_function(
             0x26 => Instr::CleanupReturn,
             0x27 => Instr::PopHandler,
             0x30 => Instr::AllocCons,
+            0x42 => Instr::TypeP(cursor.u16()?),
             0x28 => Instr::PushHandlerCase {
                 hc: cursor.u32()?,
                 sp_restore: cursor.u16()?,
@@ -10041,6 +10155,7 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), BlissE
             | Instr::NamedTag { .. }
             | Instr::PopRestartCase => Some((0, 0)),
             Instr::ValuesToList => Some((1, 1)),
+            Instr::TypeP(_) => Some((1, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
             Instr::AllocCons => Some((2, 1)),
             Instr::Dup => Some((1, 2)),
@@ -11666,6 +11781,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 bliss_rt::rooted_ref!(_cdr_root = &mut cdr);
                 bliss_rt::rooted_ref!(_car_root = &mut car);
                 acts[top_idx].push_op(arena_cons(car, cdr));
+            }
+            Instr::TypeP(class) => {
+                // Inline `(typep x '<simple-type>)`: a pure tag check, no
+                // allocation, so the popped value needs no rooting (bliss-gq5).
+                let v = acts[top_idx].pop_op();
+                acts[top_idx].push_op(if typep_class_matches(class, v) { T } else { NIL });
             }
             Instr::Pop => {
                 acts[top_idx].pop_op();
