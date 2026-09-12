@@ -518,8 +518,15 @@ impl Allocator for HeapAllocator {
         if size == 0 {
             return Err(BlissError::Internal("zero-size allocation".into()));
         }
-        // Large objects go through alloc_large.
-        if size > self.region_size / 2 {
+        // Anything that cannot fit a fresh TLAB goes through alloc_large. The old
+        // `size > region_size / 2` threshold stranded the "medium" range
+        // (tlab_size, region_size/2]: alloc_fast fails (footprint exceeds a TLAB),
+        // and refill_tlab only ever carves another tlab_size TLAB, so the retry
+        // Oom'd and alloc_typed panicked "GC heap unavailable" — e.g.
+        // (make-string 100000), a ~400 KiB character string, with the 256 KiB
+        // TLAB / 1 MiB region defaults (bliss-medobj). A fresh TLAB is exactly
+        // tlab_size, so route on the object's total footprint vs tlab_size.
+        if object_footprint(size).0 > self.tlab_size {
             return self.alloc_large(size);
         }
 

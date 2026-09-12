@@ -3336,6 +3336,46 @@ fn multi_function_labels_bodies_survive_gc() {
     );
 }
 
+/// bliss-hupm: a "medium" allocation whose total footprint falls in
+/// (tlab_size, region_size/2] — bigger than a TLAB (256 KiB) but not over the
+/// old `> region_size/2` (512 KiB) large-object routing threshold — used to
+/// panic "GC heap unavailable": alloc_fast couldn't fit it, refill only carved
+/// another same-size TLAB, and it was never routed to alloc_large. (make-string
+/// 100000) is a ~400 KiB character string right in that band; it blocked the
+/// whole ansi-test harness (gclload1.lsp). Exercise a range of medium sizes for
+/// strings AND vectors, and confirm one survives GC intact.
+#[test]
+fn medium_sized_objects_allocate_and_survive_gc() {
+    // The panic reproduced on a plain allocation (no GC stress needed): sizes in
+    // the gap band (footprint 256 KiB..512 KiB, ~65534..131072 chars/elements)
+    // returned None from alloc_typed. Larger objects use the already-tested
+    // large-object path. A modest cons churn after each alloc exercises a real
+    // minor GC over the medium object without the O(n)-per-GC cost of forced
+    // stress on many large objects.
+    let prog = "\
+        (dolist (n '(65540 100000 131000)) \
+          (let ((s (make-string n :initial-element #\\q)) \
+                (v (make-array n :initial-element 7))) \
+            (unless (and (= (length s) n) (char= (char s (1- n)) #\\q) \
+                         (= (length v) n) (= (aref v (1- n)) 7)) \
+              (error \"medium alloc wrong at ~D\" n)))) \
+        (princ :ok)";
+    let mut cmd = bliss_bin();
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "medium-sized allocations must not panic/crash (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-31x8: a large (>~512KB) string LITERAL read by the reader gets a
 /// 16-byte object header, so the reader's value pointer (gc_value) and the
 /// simple-string accessors must honour the large-object payload offset — the
