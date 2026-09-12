@@ -208,16 +208,15 @@ mod typep_class {
     pub const CONS: u16 = 5;
     pub const NULL: u16 = 6;
     pub const BOOLEAN: u16 = 7; // (member nil t) / the type BOOLEAN
+    pub const HASH_TABLE: u16 = 8;
 }
 
 /// Map a *constant* type specifier symbol name to a [`typep_class`] code, or
 /// `None` if it is not an inlinable simple type. Names arrive upcased (reader
 /// :upcase). Only names whose [`typep_class_matches`] result reproduces the
 /// TYPEP builtin ([`super::typep_matches`]) *bit for bit* appear here, so every
-/// tier agrees. Deliberately excluded: HASH-TABLE (the builtin's
-/// `hash_table_count().is_ok()` accepts any heap object, so a strict inline
-/// check would diverge), BASE-STRING (the builtin does not route it through
-/// `is_string_value`), and ATOM.
+/// tier agrees. Deliberately excluded: BASE-STRING (the builtin does not route
+/// it through `is_string_value`) and ATOM.
 fn find_typep_class(type_name: &str) -> Option<u16> {
     Some(match type_name {
         // TYPEP: "STRING" | "SIMPLE-STRING" => is_string_value(object).
@@ -228,8 +227,37 @@ fn find_typep_class(type_name: &str) -> Option<u16> {
         "CONS" => typep_class::CONS,
         "NULL" => typep_class::NULL,
         "BOOLEAN" => typep_class::BOOLEAN,
+        "HASH-TABLE" => typep_class::HASH_TABLE,
         _ => return None,
     })
+}
+
+/// Recognise the compound type designator `(MEMBER NIL T)` / `(MEMBER T NIL)`,
+/// which is exactly the BOOLEAN type. UIOP's ensure-symbol/ensure-inherited
+/// `(check-type x (member nil t))` expands to `(typep x '(member nil t))`, so
+/// this constant compound is worth inlining on the O(n²) package path.
+fn is_member_nil_t(form: BlissVal) -> bool {
+    if !form.is_cons() {
+        return false;
+    }
+    let (head, tail) = cp(form);
+    if !head.is_symbol() || symbol_bare_name(&sym_name(head)) != "MEMBER" {
+        return false;
+    }
+    let (mut saw_nil, mut saw_t, mut n, mut cur) = (false, false, 0u8, tail);
+    while cur.is_cons() {
+        let (e, rest) = cp(cur);
+        n += 1;
+        if e.is_nil() {
+            saw_nil = true;
+        } else if e.0 == T.0 {
+            saw_t = true;
+        } else {
+            return false;
+        }
+        cur = rest;
+    }
+    cur.is_nil() && n == 2 && saw_nil && saw_t
 }
 
 /// Recognise `(typep <expr> (quote <SIMPLE-TYPE>))` — exactly two arguments,
@@ -259,10 +287,17 @@ fn typep_inline_class(rest: BlissVal) -> Option<u16> {
         return None;
     }
     let (tsym, qr2) = cp(qr);
-    if !qr2.is_nil() || !tsym.is_symbol() {
+    if !qr2.is_nil() {
         return None;
     }
-    find_typep_class(&symbol_bare_name(&sym_name(tsym)))
+    if tsym.is_symbol() {
+        return find_typep_class(&symbol_bare_name(&sym_name(tsym)));
+    }
+    // A quoted compound type designator: only (MEMBER NIL T) is inlinable.
+    if is_member_nil_t(tsym) {
+        return Some(typep_class::BOOLEAN);
+    }
+    None
 }
 
 /// Execute an inline [`Instr::TypeP`] check of `v` against `class`, using the
@@ -279,6 +314,10 @@ fn typep_class_matches(class: u16, v: BlissVal) -> bool {
         typep_class::CONS => v.is_cons(),
         typep_class::NULL => v.is_nil(),
         typep_class::BOOLEAN => v.is_nil() || v.0 == T.0,
+        // (typep x 'hash-table): strings/other heap objects lack the hash-table
+        // type-id, so hash_table_p matches the builtin exactly (verified: heap
+        // string / sentinel string / hash table all agree) and never allocates.
+        typep_class::HASH_TABLE => bliss_rt::types::hash_table_p(v),
         _ => false,
     }
 }
