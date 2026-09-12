@@ -9930,7 +9930,23 @@ pub(super) fn lazy_compile_defun(
         return false;
     }
     reset_last_bail_reason();
-    match compile_function(name, params, body, env, false, false) {
+    // First try the fast opportunistic (non-portable) lowering: enclosing
+    // lexicals stay in activation slots and local calls use the gensym
+    // CallNamed fast path. It bails on a capturing flet/labels or a closure
+    // that reaches an enclosing lexical (needs the heap-frame closure
+    // machinery). Rather than tree-walk such a function forever, retry in
+    // PORTABLE mode — the same, more general lowering that produces the bundled
+    // .bfasl (so it already compiles this very function): captured lexicals are
+    // boxed into a heap frame and local functions become closures. Portable T0
+    // is a little slower per op than the slot path, but far faster than the
+    // tree-walker, and this is exactly the ASDF plan-traversal case
+    // (TRAVERSE-ACTION's `(labels ((visit-action …)))` captures the plan/status
+    // lexicals) that otherwise runs interpreted (bliss-mr4p). Only reached when
+    // the fast path already declined, so it never slows a function that compiles
+    // opportunistically; a genuinely unsupported form bails in both modes.
+    let compiled = compile_function(name, params, body, env, false, false)
+        .or_else(|| compile_function(name, params, body, env, true, false));
+    match compiled {
         Some(bf) => {
             registry_put(sym, Rc::new(bf));
             true
