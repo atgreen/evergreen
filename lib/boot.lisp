@@ -307,16 +307,34 @@
        (defclass ,name ,effective-parents ,slots)
        ',name)))
 
+;; Out-of-line failure handler for CHECK-TYPE (bliss-gq5). Establishing the
+;; STORE-VALUE restart-case (and its enclosing loop/block/tagbody) INLINE in
+;; every CHECK-TYPE cost a per-call restart-case setup even on the passing path,
+;; and — because PushRestartCase/PushBlock/PushTag opcodes make the T1 native
+;; compiler decline (native_would_lose_captured_control) — kept EVERY function
+;; that uses CHECK-TYPE pinned at T0. UIOP's ensure-inherited/ensure-symbol call
+;; CHECK-TYPE 6-8 times per package symbol, so this dominated ASDF/package load.
+;; Keeping the restart-case out of line makes CHECK-TYPE's fast path a bare TYPEP
+;; and lets its callers promote to native.
+(defun %check-type-fail (value typespec)
+  ;; Signal a correctable TYPE-ERROR with a STORE-VALUE restart; loop until the
+  ;; supplied value conforms; return the conforming value (the CHECK-TYPE
+  ;; expansion stores it back into PLACE).
+  (loop
+    (restart-case
+        (error 'type-error :datum value :expected-type typespec)
+      (store-value (v) (setf value v)))
+    (when (typep value typespec) (return value))))
+
 (defmacro check-type (place typespec &rest ignore)
   (declare (ignore ignore))
   ;; ANSI (CLHS 9.1): signal a correctable TYPE-ERROR with a STORE-VALUE restart
-  ;; that supplies a new value for PLACE; after STORE-VALUE, re-test PLACE and
-  ;; re-signal if it still does not conform. Always returns NIL.
+  ;; that supplies a new value for PLACE; re-test and re-signal until PLACE
+  ;; conforms. Always returns NIL. The fast (passing) path is a bare TYPEP; the
+  ;; restart-case machinery lives in %check-type-fail, off the hot path.
   `(progn
-     (loop until (typep ,place ',typespec)
-           do (restart-case
-                  (error 'type-error :datum ,place :expected-type ',typespec)
-                (store-value (value) (setf ,place value))))
+     (unless (typep ,place ',typespec)
+       (setf ,place (%check-type-fail ,place ',typespec)))
      nil))
 
 (defmacro assert (test-form &rest more)
