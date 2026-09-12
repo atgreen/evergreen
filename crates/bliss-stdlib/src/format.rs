@@ -2210,12 +2210,12 @@ fn format_impl(
                 // left-to-right order (each `v` param consumes the next arg) BEFORE
                 // reading the value, so `~v,vE` binds the params to the parameter
                 // args rather than mis-binding the value (CLHS 22.3.1; bliss-8rs1).
-                let _w = params.first().map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let w = params.first().map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
                 let d = params.get(1).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
                 let e = params.get(2).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
                 let k = params.get(3).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
                 let _of = params.get(4).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                let _pad = params.get(5).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let pad_param = params.get(5).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
                 let expc = params
                     .get(6)
                     .map_or(Ok('e' as i64), |p| resolve_param(p, 'e' as i64, arg_idx))?;
@@ -2237,34 +2237,56 @@ fn format_impl(
                         expected: "number".into(),
                     });
                 };
-                if d < 0 {
+                let mut s = if d < 0 {
                     // No explicit fraction-digit count: shortest round-trip. Format
                     // a single-float from the f32 itself rather than its widened f64,
                     // which exposed binary32 imprecision (bliss-8zrb).
-                    let s = if val.is_single_float() {
+                    let raw = if val.is_single_float() {
                         format!("{:E}", val.as_single_float())
                     } else {
                         format!("{:E}", f)
                     };
-                    output.push_str(&exp_with_decimal_point(&s, exp_char));
+                    exp_with_decimal_point(&raw, exp_char)
                 } else {
-                    output.push_str(&format_e_fixed(
+                    format_e_fixed(
                         f,
                         d as usize,
                         if e >= 0 { Some(e as usize) } else { None },
                         k,
                         exp_char,
-                    ));
+                    )
+                };
+                // ~w,…E: right-justify in a field of at least w chars, padding on the
+                // left with padchar (default space) (bliss-o30e).
+                if w > 0 && (s.chars().count() as i64) < w {
+                    let pad = char::from_u32(if pad_param >= 0 { pad_param as u32 } else { u32::from(b' ') })
+                        .unwrap_or(' ');
+                    let n = w as usize - s.chars().count();
+                    let prefix: String = std::iter::repeat_n(pad, n).collect();
+                    s = format!("{prefix}{s}");
                 }
+                output.push_str(&s);
             }
             'G' => {
+                // ~w,d,e,k,overflowchar,padcharG. Resolve the prefix params in order
+                // (each `v` consumes the next arg) BEFORE the value, so a `v` param
+                // binds to its arg and later directives stay aligned (bliss-o30e).
+                // Full ~G chooses ~F- vs ~E-style output by magnitude (CLHS 22.3.3.3);
+                // that selection is not yet implemented — this prints the shortest
+                // round-trip — but the params (and width) now apply.
+                let w = params.first().map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let _d = params.get(1).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let _e = params.get(2).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let _k = params.get(3).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                let _of = params.get(4).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let pad_param = params.get(5).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
                 if *arg_idx >= args.len() {
                     return Err(BlissError::ControlError("too few args for ~G".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
                 // Shortest round-trip from the f32 for single-floats (bliss-8zrb).
-                let s = if val.is_single_float() {
+                let mut s = if val.is_single_float() {
                     format!("{}", val.as_single_float())
                 } else if val.is_double_float() {
                     format!("{}", val.as_double_float())
@@ -2276,6 +2298,13 @@ fn format_impl(
                         expected: "number".into(),
                     });
                 };
+                if w > 0 && (s.chars().count() as i64) < w {
+                    let pad = char::from_u32(if pad_param >= 0 { pad_param as u32 } else { u32::from(b' ') })
+                        .unwrap_or(' ');
+                    let n = w as usize - s.chars().count();
+                    let prefix: String = std::iter::repeat_n(pad, n).collect();
+                    s = format!("{prefix}{s}");
+                }
                 output.push_str(&s);
             }
             '$' => {

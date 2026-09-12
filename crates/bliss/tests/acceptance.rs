@@ -4984,6 +4984,12 @@ fn format_fixed_float_directive() {
         ("(format nil \"~v,v$\" 2 8 3.5)", "\"00000003.50\""),
         ("(format nil \"~v$\" 4 3.14159)", "\"3.1416\""),
         ("(format nil \"~v,ve\" 10 3 31.4159)", "3.142e+1"),
+        // ~E/~G honour their width param, right-justified with space pad; ~G
+        // consumes its `v` prefix param rather than mis-binding the value
+        // (bliss-o30e).
+        ("(format nil \"~10,3e\" 31.4159)", "\"  3.142e+1\""),
+        ("(format nil \"~10g\" 31.4159)", "\"   31.4159\""),
+        ("(format nil \"~vg\" 10 31.4159)", "\"   31.4159\""),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin()
