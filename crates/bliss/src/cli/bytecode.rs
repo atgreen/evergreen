@@ -3059,8 +3059,21 @@ impl<'e> Lowerer<'e> {
                                 return Err(Bail);
                             }
                             let down = kw(forms[i + 2]).as_deref() == Some("DOWNFROM");
-                            let start = *forms.get(i + 3).ok_or(Bail)?;
-                            bindings.push(form_list(&[var, start]));
+                            let mut start = *forms.get(i + 3).ok_or(Bail)?;
+                            bliss_rt::rooted_ref!(_start_root = &mut start);
+                            // Step an internal COUNTER, not VAR itself. When the
+                            // counter passes the bound the loop exits with VAR still
+                            // holding the last IN-RANGE value — the last-in-range
+                            // FINALLY semantics the tree-walker (eval_loop) uses and
+                            // ansi-test LOOP.1.40-43 require, rather than the
+                            // stepped-past value (bliss-uj7m, an S5 tier-consistency
+                            // fix). LET* binds VAR from the counter (start evaluated
+                            // once) so a zero-iteration loop still gives FINALLY the
+                            // start value; `SETQ var ctr` at the top of each iteration
+                            // republishes the in-range value for the body and finally.
+                            let ctr = fresh("CTR", &mut nsym)?;
+                            bindings.push(form_list(&[ctr, start]));
+                            bindings.push(form_list(&[var, ctr]));
                             let mut adv = 4;
                             let mut limit: Option<(BlissVal, &str)> = None;
                             match kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() {
@@ -3114,15 +3127,19 @@ impl<'e> Lowerer<'e> {
                                 };
                                 top_tests.push(form_list(&[
                                     s("WHEN")?,
-                                    form_list(&[s(test_cmp)?, var, bound]),
+                                    form_list(&[s(test_cmp)?, ctr, bound]),
                                     form_list(&[s("GO")?, end]),
                                 ]));
                             }
+                            // Republish the in-range counter into VAR at the top of
+                            // the iteration (in driver source order), matching the
+                            // tree-walker's bind-then-step order.
+                            pre.push(form_list(&[s("SETQ")?, var, ctr]));
                             let op = if descending { "-" } else { "+" };
                             steps.push(form_list(&[
                                 s("SETQ")?,
-                                var,
-                                form_list(&[s(op)?, var, step]),
+                                ctr,
+                                form_list(&[s(op)?, ctr, step]),
                             ]));
                             i += adv;
                         }
