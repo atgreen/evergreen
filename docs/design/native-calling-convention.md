@@ -157,3 +157,57 @@ deopt.
 - **The deeper lever is call *count*.** asdf's dominant issue is the *number* of
   `ensure-inherited`/`ensure-symbol` calls (UIOP's O(n²)), which this does not
   touch. Direct calls reduce per-call cost; they do not change the algorithm.
+
+## Concrete implementation (derived while starting Stage 1)
+
+Register model & prereqs (confirmed against the codegen):
+- T1 emit uses only r14 (frame slots) and r15 (operand-stack top) among callee-
+  saved regs; **r12/r13/rbx are free**. Reserve **r12 = current `*mut BlissStack`**.
+- `NATIVE_ENV` is a `const`-init thread-local `Cell` — a ~few-ns read, NOT a
+  syscall. Dropping it (the doc's original "Stage 1") is ~0 gain AND unnecessary:
+  for native→native the callee reads the already-correct `NATIVE_ENV`, and the
+  restricted (non-closure) shape never touches `NATIVE_ENV_FRAME`. **Skip
+  env-in-register.** The register that IS needed is the BlissStack pointer.
+- GC scans a thread's frames from the **safepoint-published** `fp`/`sp` snapshot
+  (`BlissStack::publish`), not live `fp`/`sp_offset`. So the emitted frame push
+  MUST update `BlissStack.fp` and `sp_offset` (and pop must restore them), or a
+  GC while the callee runs won't scan the callee frame → live args/locals move →
+  stale pointers. Reference the field offsets via `core::mem::offset_of!`
+  (stable) so codegen tracks the real layout — no hardcoding.
+
+ABI surgery (the crash-on-mismatch step; do carefully, validate before commit):
+- Entry ABI `fn(*mut u64) -> u64` → `fn(*mut u64, *mut BlissStack) -> u64`
+  (rdi=slots, rsi=stack).
+- Prologue (bytecode.rs ~15473): `push r14; push r15; sub rsp,8; mov r14,rdi;
+  lea r15,[r14+8n]` → `push r14; push r15; push r12; mov r14,rdi; mov r12,rsi;
+  lea r15,[r14+8n]` (3 pushes keep rsp 16-aligned; the `sub rsp,8` is dropped).
+- EVERY epilogue `add rsp,8 (48 83 C4 08); pop r15; pop r14; ret` → `pop r12
+  (41 5C); pop r15; pop r14; ret`. Sites: Return (~16018), back-edge loop-exit
+  (~15988), OSR stub (~16101), naked recovery (11600). `pop r12` has the same
+  rsp effect as `add rsp,8`, so alignment is preserved.
+- Update the 4 transmute sites (13417, 15000 run_native, 16818, 17456) to pass
+  the stack pointer in rsi.
+- T2 (bliss-compiler/codegen.rs prologue ~232): mirror the r12 preservation and
+  exclude r12 from its allocator; until then, restrict direct-call EMISSION to
+  T1 callers (T2 entries still accept the extra rsi arg harmlessly).
+
+Direct-call emission (restricted shape: already-native, fixed-arity,
+non-variadic, non-closure, `NATIVE_DEPTH < cap`; else fall through to c2i):
+1. Depth guard: read/bump `NATIVE_DEPTH`; over cap → c2i fallback.
+2. Bounds-check `sp_offset + framebytes <= capacity` (via r12 + offset_of!);
+   overflow → c2i fallback (which raises the catchable STORAGE-CONDITION).
+3. Write the callee `Frame` header at `base+sp_offset`, zero its slots, copy the
+   nargs from the caller operand stack into the callee slots, set the callee's
+   r14; update `BlissStack.fp` = new frame and `sp_offset` += framebytes.
+4. Direct `CALL` the callee entry (native→native — NO set_recovery toggle, NO
+   catch_unwind; those are only for Rust c2i crossings). `NATIVE_ENV` already
+   correct; recovery IPs already `native_recovery` (set by the outer run_native).
+5. On return: restore `fp`/`sp_offset`, restore `NATIVE_DEPTH`; check
+   `NATIVE_ERROR`/`NATIVE_DEOPT` (thread-locals) — if set, bounce to a Rust
+   handler that runs the existing deopt/error path; else push the result.
+   (Stages 2–3 can later move error to unwinding and deopt to self-resume,
+   removing these post-checks; not required for a first working version.)
+
+Validation gates each step: acceptance, bytecode_differential (tier identity),
+t1_native, t1_deopt, bliss-rt lib single-threaded (SIGSEGV recovery), and
+BLISS_GC_STRESS=1/POISON on a native-call-heavy form + deep recursion (depth cap).
