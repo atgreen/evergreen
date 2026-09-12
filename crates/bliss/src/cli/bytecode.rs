@@ -14483,12 +14483,13 @@ pub(super) fn profiling_disabled() -> bool {
     *DISABLED.get_or_init(|| env_flag("BLISS_PROFILING_DISABLED") == Some(true))
 }
 
-/// bliss-zhvn Stage 2 (prototype): emit direct native→native calls for a
-/// stable restricted callee shape, behind BLISS_NN_DIRECT until hardened.
+/// Direct native→native calls (bliss-zhvn) — ON by default now that the fast
+/// path is hardened (stability + bounds guards, non-deopting callees only, c2i
+/// fallback). Set BLISS_NN_DIRECT=0 to disable (e.g. to A/B the win).
 fn nn_direct_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BLISS_NN_DIRECT").is_some())
+    *ON.get_or_init(|| std::env::var("BLISS_NN_DIRECT").as_deref() != Ok("0"))
 }
 
 /// T2 is part of normal tiering.  `BLISS_DISABLE_T2=1` is the explicit debug
