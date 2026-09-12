@@ -9140,7 +9140,17 @@ fn find_symbol_in_package(
     pkg_name: &str,
     bare_name: &str,
 ) -> Option<(BlissVal, &'static str)> {
-    let bare_upper = bare_name.to_uppercase();
+    // Symbol names are read with readtable-case :upcase, so `bare_name` is almost
+    // always already uppercase — and this is a hot primitive (UIOP's ensure-
+    // package calls FIND-SYMBOL once per inherited symbol, ~59% of a system load).
+    // Skip the per-call String allocation unless a lowercase letter forces it.
+    let already_upper =
+        bare_name.is_ascii() && !bare_name.bytes().any(|b| b.is_ascii_lowercase());
+    let bare_upper: std::borrow::Cow<str> = if already_upper {
+        std::borrow::Cow::Borrowed(bare_name)
+    } else {
+        std::borrow::Cow::Owned(bare_name.to_uppercase())
+    };
     let Some(root) = bliss_stdlib::find_package(&resolve_package_name_cow(env, pkg_name)) else {
         return None;
     };
