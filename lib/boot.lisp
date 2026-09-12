@@ -2361,7 +2361,6 @@
           ((= code 0) "Null")
           ((= code 7) "Bell")
           ((= code 27) "Escape")
-          ((= code 65533) "Rubout")
           (t nil))))
 
 (defun name-char (name)

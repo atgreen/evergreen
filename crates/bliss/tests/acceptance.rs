@@ -3336,6 +3336,26 @@ fn multi_function_labels_bodies_survive_gc() {
     );
 }
 
+/// bliss-rsur: CHAR-NAME/NAME-CHAR must round-trip. Char 65533 (U+FFFD) was
+/// wrongly named "Rubout" (which is char 127), so (name-char (char-name #\U+FFFD))
+/// gave 127, not 65533. U+FFFD has no CL standard name -> char-name returns nil.
+#[test]
+fn char_name_round_trips() {
+    let prog = "(let ((bad nil))
+        (dolist (c '(32 10 9 13 12 8 127 0 7 27 65533 65 200 1000))
+          (let* ((ch (code-char c)) (nm (char-name ch)))
+            (when (and nm (not (eql (name-char nm) ch))) (push (list c nm) bad))))
+        (prin1 (list (char-name (code-char 65533)) (char-name (code-char 127)) bad)))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // U+FFFD unnamed, 127 is Rubout, and no round-trip mismatches (bad = NIL).
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(NIL \"Rubout\" NIL)"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-gxe9: `(macro-function 'NAME)` must return an expander that expands as
 /// NAME regardless of the operator of the form it is applied to, so it can be
 /// installed elsewhere via (setf (macro-function OTHER) …) (CLHS 3.1.2.1.2.2;
