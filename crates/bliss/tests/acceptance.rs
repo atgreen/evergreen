@@ -3336,6 +3336,38 @@ fn multi_function_labels_bodies_survive_gc() {
     );
 }
 
+/// bliss-gxe9: `(macro-function 'NAME)` must return an expander that expands as
+/// NAME regardless of the operator of the form it is applied to, so it can be
+/// installed elsewhere via (setf (macro-function OTHER) …) (CLHS 3.1.2.1.2.2;
+/// ansi macro-function.15). The old synthesized expander re-expanded by the
+/// argument form's own operator, so installed on a gensym it never expanded and
+/// the evaluator looped on the unchanged form -> SIGSEGV. Also, (macroexpand
+/// form nil) must accept NIL as the null lexical environment (bliss-pmox-adjacent).
+#[test]
+fn macro_function_is_reinstallable_on_another_symbol() {
+    let prog = "(let ((s (gensym)))
+        (setf (macro-function s) (macro-function 'pop))
+        (prin1 (eval `(let ((x '(1 2 3))) (list (,s x) x)))))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(1 (2 3))"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // (macroexpand form nil): NIL is the null lexical environment, not an error.
+    let out2 = bliss_bin()
+        .args(["--eval", "(prin1 (macroexpand '(pop y) nil))"])
+        .output()
+        .expect("run bliss");
+    assert_eq!(out2.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out2.stderr));
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("PROG1"),
+        "macroexpand with nil env should expand POP: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+}
+
 /// bliss-pmox: top-level and nested EVAL-WHEN process in EXECUTE mode when a
 /// form is evaluated or a SOURCE file is loaded (CLHS 3.2.3.1): the body runs
 /// iff :EXECUTE is present. Firing on :LOAD-TOPLEVEL here was wrong — it ran

@@ -13459,7 +13459,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // VALUE-*/…-ERROR.1/2). Standard special OPERATORS that are not
                     // macros (IF, PROGN, LET, QUOTE, …) are excluded and return NIL.
                     if mdef.is_some() || is_ansi_standard_macro(&bare) {
-                        return synthesize_macro_expander(env);
+                        return synthesize_macro_expander(env, s);
                     }
                 }
                 return Ok(NIL);
@@ -25228,17 +25228,31 @@ fn is_ansi_standard_macro(bare: &str) -> bool {
 /// trips the lambda-list binder's PROGRAM-ERROR — and a valid call expands the
 /// form. Every freshly built piece is rooted across the allocating
 /// `vec_to_list` / `eval_form` (moving GC).
-fn synthesize_macro_expander(env: &mut Env) -> Result<BlissVal, BlissError> {
+fn synthesize_macro_expander(env: &mut Env, name: BlissVal) -> Result<BlissVal, BlissError> {
     let lam = resolve_sym("LAMBDA").unwrap_or(NIL);
     let mexp = resolve_sym("MACROEXPAND-1").unwrap_or(NIL);
     let decl = resolve_sym("DECLARE").unwrap_or(NIL);
     let ignore = resolve_sym("IGNORE").unwrap_or(NIL);
+    let quote = resolve_sym("QUOTE").unwrap_or(NIL);
+    let cons_op = resolve_sym("CONS").unwrap_or(NIL);
+    let cdr_op = resolve_sym("CDR").unwrap_or(NIL);
+    bliss_rt::rooted!(name = name);
     bliss_rt::rooted!(form_p = gensym_symbol("FORM"));
     bliss_rt::rooted!(env_p = gensym_symbol("ENV"));
     bliss_rt::rooted!(params = vec_to_list(&[*form_p, *env_p]));
     bliss_rt::rooted!(ign_clause = vec_to_list(&[ignore, *env_p]));
     bliss_rt::rooted!(decl_form = vec_to_list(&[decl, *ign_clause]));
-    bliss_rt::rooted!(body = vec_to_list(&[mexp, *form_p]));
+    // Expand as `NAME`, not as the operator of the argument form: rebuild the
+    // call as `(NAME . (cdr FORM))` before macroexpand-1. The naive
+    // `(macroexpand-1 FORM)` expanded by FORM's own operator, so an expander
+    // obtained with (macro-function 'NAME) and then installed elsewhere via
+    // (setf (macro-function OTHER) …) either did nothing (foreign operator) or
+    // recursed on itself — ansi macro-function.15 / bliss-gxe9. `(quote NAME)`
+    // and `(cdr FORM)` keep the reconstruction hygienic.
+    bliss_rt::rooted!(quoted_name = vec_to_list(&[quote, *name]));
+    bliss_rt::rooted!(cdr_form = vec_to_list(&[cdr_op, *form_p]));
+    bliss_rt::rooted!(rebuilt = vec_to_list(&[cons_op, *quoted_name, *cdr_form]));
+    bliss_rt::rooted!(body = vec_to_list(&[mexp, *rebuilt]));
     bliss_rt::rooted!(lambda_form = vec_to_list(&[lam, *params, *decl_form, *body]));
     eval_form(*lambda_form, env)
 }
@@ -28065,9 +28079,19 @@ fn eval_macroexpand(
     let mut macro_env = if rest.is_cons() {
         let (env_expr, _) = cp(rest);
         let env_value = eval_form(env_expr, env)?;
-        load_macroexpand_environment(env_value).ok_or_else(|| {
-            BlissError::Internal("MACROEXPAND: invalid lexical environment".into())
-        })?
+        if env_value.is_nil() {
+            // NIL is the NULL lexical environment (CLHS 3.1.1.4 / MACROEXPAND):
+            // resolve global macros only, no lexical ones. Rejecting it made
+            // (macroexpand form nil) an error — which crashed POP's
+            // `(macroexpand place env)` when POP's expander is invoked with a nil
+            // environment, e.g. after (setf (macro-function s) (macro-function
+            // 'pop)) then evaluating (s x) (ansi macro-function.15; bliss-gxe9).
+            cli_global_macro_env()
+        } else {
+            load_macroexpand_environment(env_value).ok_or_else(|| {
+                BlissError::Internal("MACROEXPAND: invalid lexical environment".into())
+            })?
+        }
     } else {
         macroexpand_environment_from_cli(env)
     };
