@@ -3950,6 +3950,38 @@ fn gc_stress_stride() -> u64 {
     })
 }
 
+/// `BLISS_GC_STRESS_SKIP=N` (0 = disabled): with `BLISS_GC_STRESS` active,
+/// suppress the forced collections until the per-thread allocation counter has
+/// passed N. Lets a bisection stress only a *suffix* of a run — pair a `SKIP`
+/// lower bound against runs at different N to bracket the allocation whose
+/// collection corrupts state (bliss-1uzt).
+fn gc_stress_skip() -> u64 {
+    static SKIP: OnceLock<u64> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("BLISS_GC_STRESS_SKIP")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `BLISS_GC_STRESS_AT=N` (0 = disabled): force a minor collection at *exactly*
+/// allocation index N and nowhere else, dumping the Rust allocation backtrace at
+/// that point. Binary-searching N pins the single allocation across which a live
+/// value is left unrooted: the run crashes iff the collection at N moves an
+/// object still reachable only from an unrooted Rust local. Independent of
+/// `BLISS_GC_STRESS`; combine with `BLISS_GC_POISON` so the later stale deref
+/// faults immediately (bliss-1uzt).
+fn gc_stress_at() -> u64 {
+    static AT: OnceLock<u64> = OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("BLISS_GC_STRESS_AT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
 thread_local! {
     static GC_STRESS_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -3957,18 +3989,34 @@ thread_local! {
 /// Run a minor collection every `BLISS_GC_STRESS` allocations, at a GC-safe
 /// point (before this allocation, mirroring the real TLAB-refill trigger — the
 /// caller is not yet holding a half-built object from this call).
+///
+/// The per-thread allocation counter advances whenever any stress mode is armed,
+/// so an allocation index is stable across runs of a deterministic program — the
+/// property the `BLISS_GC_STRESS_AT` / `BLISS_GC_STRESS_SKIP` bisector relies on.
 #[inline]
 fn maybe_gc_stress() {
     let stride = gc_stress_stride();
-    if stride == 0 {
+    let at = gc_stress_at();
+    if stride == 0 && at == 0 {
         return;
     }
-    let fire = GC_STRESS_COUNTER.with(|c| {
+    let n = GC_STRESS_COUNTER.with(|c| {
         let n = c.get().wrapping_add(1);
         c.set(n);
-        n % stride == 0
+        n
     });
-    if fire {
+    // Single forced collection at a pinpointed allocation index, with a
+    // backtrace naming the allocation site.
+    if at != 0 && n == at {
+        eprintln!(
+            "[gc-stress] BLISS_GC_STRESS_AT: forcing minor GC at allocation #{n}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        let _ = collect_t0_minor();
+        return;
+    }
+    // Strided stressing, optionally skipping the first `SKIP` allocations.
+    if stride != 0 && n > gc_stress_skip() && n % stride == 0 {
         let _ = collect_t0_minor();
     }
 }

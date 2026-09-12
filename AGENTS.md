@@ -131,6 +131,27 @@ An "already borrowed" panic, a segfault, or an abort under stress that passes
 without it means you have one of these. A clean run under `BLISS_GC_STRESS=1`
 is the cheapest evidence a change that allocates is GC-safe.
 
+**Bisecting a stress crash to one allocation (bliss-1uzt).** When
+`BLISS_GC_STRESS=1` crashes but you can't see *which* allocation orphaned the
+value, two knobs turn "segfault somewhere" into a bracket. They count every
+allocation on the thread (the index is stable across runs of a deterministic
+program):
+
+```bash
+# Only stress AFTER allocation index N — startup runs fast, and a GC fires on
+# every later allocation, so the corrupting one can't be missed. Binary-search N:
+# it crashes while N < (bad index) and goes clean once N passes it.
+BLISS_GC_STRESS=1 BLISS_GC_STRESS_SKIP=40000 BLISS_GC_POISON=1 ./…/bliss-cli …
+# Force ONE collection at exactly index N and print the Rust allocation
+# backtrace there. Precise, but sensitive to run-to-run index drift, so use it
+# to name the site once SKIP has bracketed the window (independent of
+# BLISS_GC_STRESS):
+BLISS_GC_STRESS_AT=40120 BLISS_GC_POISON=1 ./…/bliss-cli …
+```
+
+Prefer `SKIP` to localize (robust: it stresses the whole suffix) and `AT` to
+name the allocation site once the window is tight.
+
 ## Always cap bliss memory: `scripts/bliss-limited.sh`
 
 Runaway bliss runs (e.g. ASDF recursion-to-OOM bugs like bliss-hlsa) have
