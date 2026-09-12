@@ -9973,7 +9973,12 @@ pub(super) fn compile_and_reify_lambda(
     env: &super::Env,
 ) -> Option<BlissVal> {
     reset_last_bail_reason();
-    let bf = compile_function(label, lambda_list, body, env, false, false)?;
+    // Opportunistic lowering first; on a capture-related bail retry in portable
+    // mode (heap-frame closures), so a method body with a capturing flet/labels
+    // or closure compiles instead of tree-walking — same rationale as
+    // lazy_compile_defun (bliss-mr4p).
+    let bf = compile_function(label, lambda_list, body, env, false, false)
+        .or_else(|| compile_function(label, lambda_list, body, env, true, false))?;
     let sym = bliss_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
     registry_put(sym_idx, Rc::new(bf));
