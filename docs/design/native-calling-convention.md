@@ -211,3 +211,61 @@ non-variadic, non-closure, `NATIVE_DEPTH < cap`; else fall through to c2i):
 Validation gates each step: acceptance, bytecode_differential (tier identity),
 t1_native, t1_deopt, bliss-rt lib single-threaded (SIGSEGV recovery), and
 BLISS_GC_STRESS=1/POISON on a native-call-heavy form + deep recursion (depth cap).
+
+## Stage 2 — direct-call emission (concrete spec; measurement-prototype first)
+
+Prereq DONE: Stage 1 (c72eeaf) reserves r12 = *mut BlissStack in the native ABI.
+
+Emit-time gate (in emit_native_x86's `Instr::CallNamed { sym, nargs }` arm, behind
+BLISS_NN_DIRECT for the prototype): the callee `sym` is (a) currently in
+NATIVE_REGISTRY (native entry E, code_info CI, num_slots NS), (b) fixed-arity ==
+nargs and non-variadic (registry_get(sym)), (c) not a closure (absent from
+CLOSURE_ENV and CLOSURE_CONTROL). Else emit the existing c2i path.
+
+Offsets via `core::mem::offset_of!` (robust): Frame{prev_fp@0,return_pc@8,
+function@16,code_info@24,flags@32,num_locals@36}, HDR=size_of::<Frame>()=40;
+BlissStack{base,capacity,sp_offset(Cell),fp(Cell)}. FRAMEBYTES = HDR + 8*NS.
+
+Encoding notes: r12 and r15 as a base need a SIB byte (ModRM rm=100, SIB=0x24);
+r14 does not (rm=110). imm64 (E, CI) load via `mov r64, imm64`; NIL/FLAG_CALL fit
+imm32 (sign-extended store `C7`).
+
+Emitted sequence at the call site (rsp is 16-aligned here):
+```
+  mov  rcx, [r12+BASE]          ; base
+  mov  rdx, [r12+SPOFF]         ; old sp_offset (restore value)
+  lea  rax, [rcx+rdx]           ; frame_start = base + sp_offset
+  mov  r10, [r12+FP]            ; old fp (restore value + prev_fp)
+  mov  [rax+0],  r10            ; prev_fp
+  mov  q[rax+8], 0              ; return_pc
+  mov  q[rax+16],NIL            ; function
+  mov  r11, CI ; mov [rax+24],r11
+  mov  d[rax+32],FLAG_CALL
+  mov  w[rax+36],NS
+  ; copy nargs args: for i in 0..nargs: [rax+HDR+8i] = [r15-8*nargs+8i]
+  ; zero slots nargs..NS to NIL
+  mov  [r12+FP], rax            ; publish new fp (GC scans callee frame)
+  lea  r11, [rdx+FRAMEBYTES] ; mov [r12+SPOFF], r11
+  push r10 ; push rdx           ; spill restore values (keeps 16-align)
+  lea  rdi, [rax+HDR]           ; arg0 = callee slots
+  mov  rsi, r12                 ; arg1 = stack
+  mov  rax, E ; call rax        ; DIRECT native→native (no toggle/catch_unwind)
+  pop  rcx ; pop r10            ; old sp_offset, old fp
+  mov  [r12+FP], r10 ; mov [r12+SPOFF], rcx   ; pop callee frame
+  sub  r15, 8*nargs ; mov [r15],rax ; add r15,8   ; pop args, push result
+```
+The callee's prologue preserves r12/r14/r15 (push/pop), so they survive the call.
+
+Prototype limitations (measurement only; add before production):
+- No depth guard (deep recursion → C-stack overflow). Add: read NATIVE_DEPTH
+  (or rely on a C-stack guard page); over cap → c2i fallback.
+- No bounds check (sp_offset+FRAMEBYTES <= capacity). Add → c2i fallback / raise.
+- No error/deopt post-check. Add: after the call, test NATIVE_ERROR/NATIVE_DEOPT
+  and bounce to a Rust handler; else use rax.
+- No stability guard: E/NS baked at emit time. If the callee is redefined or
+  deopted, the baked entry is stale. Add a guard (compare the callee's current
+  entry to a stable per-fn cell) or invalidate the caller on callee change.
+
+Measure BLISS_NN_DIRECT on t0bench (expect ~0.52µs → ~0.2-0.3µs) to confirm the
+win before hardening. Then add the four guards, drop the flag, and extend to T2
+callers (exclude r12 from the T2 allocator first).
