@@ -13077,6 +13077,21 @@ extern "C" fn c2i_take_values(primary: u64, dst: *mut BlissVal, n: u64) {
 /// `primary`/`env.mv` are rooted before the allocation — the whole-function GC
 /// stack map covers the native operand slots, and `primary` (a caller-saved
 /// register argument, invisible to the scan) is rooted here in the helper frame.
+/// c2i helper for the `TypeP` opcode on the native (T1) path: a leaf type check
+/// with no allocation and no env access — far cheaper than a full CallNamed to
+/// TYPEP (no registry lookup / catch_unwind / apply_function name dispatch), and
+/// it lets typep-using functions still promote to T1 instead of being pinned to
+/// T0. Returns the raw bits of T or NIL. `class` is a `typep_class::*` code.
+/// Because it never allocates, no minor GC can fire inside it, so the caller
+/// needs no operand-stack spill beyond the standard helper-call prologue.
+extern "C" fn c2i_typep_class(v: u64, class: u64) -> u64 {
+    if typep_class_matches(class as u16, BlissVal(v)) {
+        T.0
+    } else {
+        NIL.0
+    }
+}
+
 extern "C" fn c2i_values_to_list(primary: u64) -> u64 {
     let env_ptr = NATIVE_ENV.with(|cell| cell.get());
     if env_ptr.is_null() {
@@ -15284,6 +15299,7 @@ fn emit_native_x86(
     let take_values_addr =
         c2i_take_values as extern "C" fn(u64, *mut BlissVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
+    let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
     let t2_backedge_addr =
         c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64 as usize as u64;
@@ -15959,6 +15975,19 @@ fn emit_native_x86(
                 pop_into(&mut c, 7, false); // rdi = primary
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
                 c.extend_from_slice(&values_to_list_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::TypeP(class) => {
+                // Inline type check via a leaf c2i helper. No allocation in the
+                // helper, so no GC can fire across the call. rdi = value,
+                // rsi = class code, rax = helper address (the ABI
+                // emit_c2i_helper_call preserves).
+                pop_into(&mut c, 7, false); // rdi = value (arg 0)
+                c.push(0xBE); // mov esi, imm32 (arg 1 = class; zero-extends rsi)
+                c.extend_from_slice(&(*class as u32).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+                c.extend_from_slice(&typep_class_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
