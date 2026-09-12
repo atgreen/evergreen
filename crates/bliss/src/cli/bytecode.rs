@@ -102,6 +102,20 @@ use bliss_rt::bytecode::{
 
 // ── Per-thread registry of compiled functions ─────────────────────
 
+/// Global invalidation generation for baked direct native→native call targets
+/// (bliss-zhvn). A direct call bakes the callee's entry + this generation; the
+/// emitted guard compares the live generation and falls back to c2i on any
+/// mismatch. Bumped whenever a native entry is removed/redefined so a baked
+/// (leaked-but-stale) entry is never called after its function changed. Coarse
+/// (any redefinition invalidates all baked sites until their callers recompile),
+/// which is fine — redefinition is rare on the hot path.
+static DIRECT_CALL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn bump_direct_call_gen() {
+    DIRECT_CALL_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 thread_local! {
     /// Bytecode functions keyed by symbol index. A `CallNamed` checks this
     /// first; a hit runs as a native frame on the `BlissStack`, a miss falls
@@ -473,6 +487,7 @@ fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
     // decline for the old body must not suppress compilation of the new one,
     // and no native entry compiled from the old bytecode may remain callable.
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
     INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
@@ -493,6 +508,7 @@ fn registry_remove(sym: u32) {
         clear_bytecode_profiles(Rc::as_ptr(&old) as usize);
     }
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
     INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
@@ -950,6 +966,7 @@ thread_local! {
 pub fn profile_pin(sym: u32) {
     PROFILE_PIN.with(|s| s.borrow_mut().insert(sym));
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
     if let Some(f) = bliss_rt::symbols::symbol_function(sym)
         .filter(|&v| bliss_rt::function::is_interpreted_function(v))
     {
@@ -13773,6 +13790,10 @@ struct NativeCode {
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
     /// pushes, so the collector scans compiled frames through the map.
     code_info: &'static CodeInfo,
+    /// True if the code contains a speculation-guard deopt point. A callee with
+    /// no deopt point is eligible for a direct native→native call (bliss-zhvn)
+    /// with no post-call deopt handling. Conservatively true when unknown.
+    has_deopt: bool,
 }
 
 /// Build and register validated GC stack-map metadata for a T1 native function
@@ -14756,6 +14777,9 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         osr_entries: artifact.osr_entries.into_iter().collect(),
         bcp_offsets: artifact.bcp_offsets, // sparse T2 bcp→native map (bliss-zmmb)
         code_info,
+        // Conservatively deopt-capable (T2 speculates); also excluded from
+        // direct-call by the is_t2 gate, so the value is not load-bearing.
+        has_deopt: true,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
     let fn_obj = bliss_rt::symbols::symbol_function(done.sym)
@@ -15095,6 +15119,7 @@ fn run_native(
             // subsequent calls stay native while dispatch queues a profile-led
             // replacement T2 version.
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
             T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
             DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
             PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
@@ -15109,6 +15134,7 @@ fn run_native(
             }
         } else if threshold_hit {
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
             DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
             if let Some(function) = bliss_rt::symbols::symbol_function(sym)
                 .filter(|&value| bliss_rt::function::is_interpreted_function(value))
@@ -15310,7 +15336,15 @@ fn resume_inlined_in_t0(
 /// NATIVE_DEOPT post-check — only sound for a callee that cannot recurse deeply,
 /// error, or deopt; the caller gates on that shape and the flag.
 #[cfg(target_arch = "x86_64")]
-fn emit_direct_native_call(c: &mut Asm, entry: u64, code_info: u64, num_slots: u16, nargs: u16) {
+fn emit_direct_native_call(
+    c: &mut Asm,
+    entry: u64,
+    code_info: u64,
+    num_slots: u16,
+    nargs: u16,
+    baked_gen: u64,
+    slow: Label,
+) {
     let bs_base = bliss_rt::BlissStack::OFFSET_BASE as i32;
     let bs_sp = bliss_rt::BlissStack::OFFSET_SP_OFFSET as i32;
     let bs_fp = bliss_rt::BlissStack::OFFSET_FP as i32;
@@ -15385,9 +15419,27 @@ fn emit_direct_native_call(c: &mut Asm, entry: u64, code_info: u64, num_slots: u
         c.extend_from_slice(&imm.to_le_bytes());
     };
     let nil = bliss_rt::value::NIL_BITS as i64;
-    // rcx=base, rdx=old_sp, rax=frame_start=base+old_sp, r10=old_fp
+    let bs_cap = bliss_rt::BlissStack::OFFSET_CAPACITY as i32;
+    // ── Guard 1: stability. Fall to c2i if the callee was redefined/uninstalled
+    //    since this site was baked (DIRECT_CALL_GEN bumped). rax = &gen; r11 =
+    //    baked; cmp [rax], r11; jne slow.
+    let gen_addr = std::ptr::addr_of!(DIRECT_CALL_GEN) as u64;
+    mov_imm64(c, RAX, gen_addr);
+    mov_imm64(c, R11, baked_gen);
+    c.extend_from_slice(&[0x4C, 0x39, 0x18]); // cmp [rax], r11
+    c.jcc(Cc::Ne, slow);
+    // rcx=base, rdx=old_sp
     mem(c, 0x8B, RCX, R12, bs_base);
     mem(c, 0x8B, RDX, R12, bs_sp);
+    // ── Guard 2: BlissStack bounds. r11 = old_sp + framebytes; if > capacity,
+    //    fall to c2i (which raises a catchable STORAGE-CONDITION). This also
+    //    bounds deep direct-call recursion (the BlissStack fills before the C
+    //    stack). sp_offset/capacity are small positive, so signed `jg` == `ja`.
+    mem(c, 0x8D, R11, RDX, framebytes); // lea r11, [rdx + framebytes]
+    c.extend_from_slice(&[0x4D, 0x3B, 0x9C, 0x24]); // cmp r11, [r12 + cap]
+    c.extend_from_slice(&bs_cap.to_le_bytes());
+    c.jcc(Cc::G, slow);
+    // rax = frame_start = base + old_sp ; r10 = old_fp
     c.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
     c.extend_from_slice(&[0x48, 0x01, 0xD0]); // add rax, rdx  (rax = frame_start)
     mem(c, 0x8B, R10, R12, bs_fp);
@@ -15457,7 +15509,7 @@ fn emit_native_x86(
     sym: u32,
     backedge_counter: u64,
     allow_traps: bool,
-) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>)> {
+) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>, bool)> {
     macro_rules! decline_t1 {
         ($($reason:tt)*) => {{
             // Unified logging (bliss-89rd): tag "compile".
@@ -15922,6 +15974,11 @@ fn emit_native_x86(
                 // native code of a stable restricted shape — fixed arity ==
                 // nargs, non-variadic, no declared param types, not a closure —
                 // emit a direct frame-push + CALL, skipping the c2i bounce.
+                // Direct native→native fast path with a runtime c2i fallback
+                // (bliss-zhvn). On a guard miss (stability / bounds) the emitted
+                // code jumps to `slow`, which falls into the c2i emission below;
+                // on success it jumps past c2i to `direct_after`.
+                let mut direct_after: Option<Label> = None;
                 if nn_direct_enabled() {
                     if let (Some(cnc), Some(cbf)) = (
                         NATIVE_REGISTRY.with(|r| r.borrow().get(sym).cloned()),
@@ -15934,17 +15991,29 @@ fn emit_native_x86(
                         let not_closure = !cbf.has_env
                             && CLOSURE_ENV.with(|m| !m.borrow().contains_key(sym))
                             && CLOSURE_CONTROL.with(|m| !m.borrow().contains_key(sym));
-                        if !cnc.is_t2 && fixed && no_types && not_closure {
-                            bliss_rt::blog!("compile", bliss_rt::log::TRACE,
-                                "[T1] {}: DIRECT call to sym {} ({} args)", bf.name, sym, nargs);
+                        // !has_deopt: a callee with no speculation-guard deopt
+                        // point never mid-flight resumes to T0, so a direct call
+                        // needs no post-call deopt handling (its errors still
+                        // propagate via NATIVE_ERROR, checked by the caller's
+                        // run_native — exactly as the c2i path does).
+                        if !cnc.is_t2 && !cnc.has_deopt && fixed && no_types && not_closure {
+                            let slow = c.label();
+                            let after = c.label();
+                            let baked_gen =
+                                DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed);
                             emit_direct_native_call(
                                 &mut c,
                                 cnc.entry as u64,
                                 cnc.code_info as *const CodeInfo as u64,
                                 cnc.num_slots,
                                 *nargs,
+                                baked_gen,
+                                slow,
                             );
-                            continue;
+                            c.jmp(after);
+                            c.bind(slow);
+                            direct_after = Some(after);
+                            // fall through to the c2i emission (the slow path)
                         }
                     }
                 }
@@ -15971,6 +16040,10 @@ fn emit_native_x86(
                 c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, 8*nargs
                 c.extend_from_slice(&(8_i32 * i32::from(*nargs)).to_le_bytes());
                 push_rax(&mut c);
+                // Direct-call success jumps here, past the c2i slow path.
+                if let Some(after) = direct_after {
+                    c.bind(after);
+                }
             }
             Instr::Br(target) => {
                 c.jmp(*bcp_labels.get(*target as usize)?);
@@ -16259,6 +16332,10 @@ fn emit_native_x86(
     // run_native resumes T0 at exactly that `CallNamed` instead of re-running the
     // whole function. rsp is 16-aligned here (as at any CallNamed), so the call
     // is well-formed. The value returned through the epilogue is ignored.
+    // Whether this code contains any speculation-guard deopt point. A callee
+    // with no deopt point can be direct-called (bliss-zhvn Stage 2) without a
+    // post-call deopt check, since it can never mid-flight resume to T0.
+    let has_deopt = !deopt_labels.is_empty();
     if !deopt_labels.is_empty() {
         let tail = c.label();
         c.bind(tail);
@@ -16308,7 +16385,7 @@ fn emit_native_x86(
         .iter()
         .map(|&l| c.label_offset(l).map_or(u32::MAX, |o| o as u32))
         .collect();
-    Some((c.finish()?, osr_entries, bcp_offsets))
+    Some((c.finish()?, osr_entries, bcp_offsets, has_deopt))
 }
 
 /// Whether `sym` names a primitive that is safe to re-execute from scratch — no
@@ -16451,7 +16528,7 @@ fn emit_native_x86(
     _sym: u32,
     _backedge_counter: u64,
     _allow_traps: bool,
-) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>)> {
+) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>, bool)> {
     None
 }
 
@@ -16498,7 +16575,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // unsupported opcode sits BEFORE any loop — trapping there would deopt
     // immediately every call. Decline instead, keeping such functions at T0 for
     // top-level calls (the OSR path below still traps to compile their loops).
-    let (code, _osr, bcp_offsets) =
+    let (code, _osr, bcp_offsets, has_deopt) =
         emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
@@ -16519,6 +16596,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         osr_entries: HashMap::new(),
         bcp_offsets,
         code_info,
+        has_deopt,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
@@ -16922,7 +17000,7 @@ fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> 
     if std::env::var_os("BLISS_OSR_DEBUG").is_some() && emitted.is_none() {
         eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
     }
-    let (code, osr, _bcp_offsets) = emitted?;
+    let (code, osr, _bcp_offsets, _has_deopt) = emitted?;
     if osr.is_empty() {
         if std::env::var_os("BLISS_OSR_DEBUG").is_some() {
             eprintln!("[osr] osr map empty (no loop entry) for sym {sym}");
@@ -17663,6 +17741,7 @@ mod jtc4_stack_map_tests {
             compiled_entry: 0,
             osr_entries: HashMap::new(),
             code_info,
+            has_deopt: false,
         };
         let mut env = Env::new(false);
 
@@ -17706,6 +17785,7 @@ mod jtc4_stack_map_tests {
             compiled_entry: 0,
             osr_entries: HashMap::new(),
             code_info,
+            has_deopt: false,
         };
         let mut env = Env::new(false);
 
