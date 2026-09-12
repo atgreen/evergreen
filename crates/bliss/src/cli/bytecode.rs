@@ -15126,8 +15126,22 @@ fn emit_native_x86(
             return None;
         }};
     }
-    if bf.arity > 6 {
-        decline_t1!("required arity {} exceeds entry ABI limit 6", bf.arity);
+    // The native entry ABI is `fn(*mut u64) -> u64`: its only register argument
+    // (rdi) is the frame-slots pointer, and run_native/bind_params pre-load ALL
+    // Lisp arguments into those frame slots before entry — regardless of count.
+    // Native→native calls route through c2i_call_args → run_native, the same
+    // frame-based path, so there is no register-argument ABI that would cap the
+    // arity at the 6 SysV integer registers. The old `arity > 6` decline was a
+    // stale leftover that pinned every wide-arity function at T0 — notably UIOP's
+    // ensure-inherited / ensure-symbol (8 params each), the dominant ASDF/package
+    // load hotspot (bliss-gq5). LoadLocal reads [r14 + 8*i] for any i, so a wide
+    // arity needs no codegen change. Bound only by the activation slot count.
+    if bf.arity > bf.num_slots() {
+        decline_t1!(
+            "required arity {} exceeds activation slots {}",
+            bf.arity,
+            bf.num_slots()
+        );
     }
     // The activation lives in the BlissStack frame passed in rdi. r14 = frame
     // slots pointer; local i at [r14 + 8*i]; r15 = operand-stack pointer
