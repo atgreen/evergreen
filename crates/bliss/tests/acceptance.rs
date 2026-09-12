@@ -3233,6 +3233,37 @@ fn large_simple_vector_is_usable_and_gc_safe() {
     );
 }
 
+/// bliss-9tcy: a freshly-made CLOS instance passed INLINE as a ~A/~S format arg
+/// must stay rooted across FORMAT's internal allocations. Under a moving GC the
+/// unrooted inline instance was collected mid-format and printed as "#" instead
+/// of "#<ZZZ …>". Loop many format calls under GC stress so a collection
+/// reliably lands during a format window if the rooting ever regresses.
+#[test]
+fn format_of_inline_fresh_instance_is_gc_safe() {
+    let prog = "\
+        (defclass zzz () ((a :initform 5))) \
+        (dotimes (i 50) \
+          (let ((s (format nil \"~A|~S\" (make-instance (quote zzz)) (make-instance (quote zzz))))) \
+            (unless (and (search \"#<ZZZ\" s) (search \"|\" s)) \
+              (error \"instance collected mid-format at ~D: ~A\" i s)))) \
+        (princ :ok)";
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_GC_STRESS", "100").env("BLISS_GC_POISON", "1");
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "inline instance format under GC must not abort/collect (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-31x8: a large (>~512KB) string LITERAL read by the reader gets a
 /// 16-byte object header, so the reader's value pointer (gc_value) and the
 /// simple-string accessors must honour the large-object payload offset — the
