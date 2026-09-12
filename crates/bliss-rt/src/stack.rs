@@ -105,6 +105,16 @@ impl BlissStack {
         self.base
     }
 
+    /// Byte offsets of the fields the T1 direct-call codegen reads/writes from
+    /// emitted x86 (bliss-zhvn). Derived with `offset_of!` so they track the
+    /// struct layout automatically — never hardcode these in the emitter.
+    /// `sp_offset`/`fp` are `Cell` (repr(transparent)), so the offset is the
+    /// value's offset. `base` is a plain `*mut u8`.
+    pub const OFFSET_BASE: usize = core::mem::offset_of!(BlissStack, base);
+    pub const OFFSET_SP_OFFSET: usize = core::mem::offset_of!(BlissStack, sp_offset);
+    pub const OFFSET_FP: usize = core::mem::offset_of!(BlissStack, fp);
+    pub const OFFSET_CAPACITY: usize = core::mem::offset_of!(BlissStack, capacity);
+
     /// Get the current stack pointer.
     pub fn sp(&self) -> *const u8 {
         unsafe { self.base.add(self.sp_offset.get()) }

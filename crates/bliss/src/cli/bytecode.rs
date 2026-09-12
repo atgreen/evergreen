@@ -14462,6 +14462,14 @@ pub(super) fn profiling_disabled() -> bool {
     *DISABLED.get_or_init(|| env_flag("BLISS_PROFILING_DISABLED") == Some(true))
 }
 
+/// bliss-zhvn Stage 2 (prototype): emit direct native→native calls for a
+/// stable restricted callee shape, behind BLISS_NN_DIRECT until hardened.
+fn nn_direct_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_NN_DIRECT").is_some())
+}
+
 /// T2 is part of normal tiering.  `BLISS_DISABLE_T2=1` is the explicit debug
 /// off-switch; `BLISS_T2=0` is accepted for compatibility with the old gate.
 fn t2_enabled() -> bool {
@@ -15290,6 +15298,140 @@ fn resume_inlined_in_t0(
     result
 }
 
+/// Emit a direct native→native call (bliss-zhvn Stage 2) at a `CallNamed` site:
+/// push the callee's BlissStack frame, bind `nargs` args from the caller operand
+/// stack into its slots, `CALL` its interpreter entry directly (native→native —
+/// no set_recovery toggle, no catch_unwind), then pop the frame and push the
+/// result. r12 = *mut BlissStack (Stage 1). The callee entry preserves
+/// r12/r14/r15 (its prologue), so they survive the call; NATIVE_ENV and the
+/// recovery IPs are already correct (set by the enclosing run_native).
+///
+/// PROTOTYPE (BLISS_NN_DIRECT): no depth/bounds guard and no NATIVE_ERROR/
+/// NATIVE_DEOPT post-check — only sound for a callee that cannot recurse deeply,
+/// error, or deopt; the caller gates on that shape and the flag.
+#[cfg(target_arch = "x86_64")]
+fn emit_direct_native_call(c: &mut Asm, entry: u64, code_info: u64, num_slots: u16, nargs: u16) {
+    let bs_base = bliss_rt::BlissStack::OFFSET_BASE as i32;
+    let bs_sp = bliss_rt::BlissStack::OFFSET_SP_OFFSET as i32;
+    let bs_fp = bliss_rt::BlissStack::OFFSET_FP as i32;
+    let f_prev = core::mem::offset_of!(Frame, prev_fp) as i32;
+    let f_ret = core::mem::offset_of!(Frame, return_pc) as i32;
+    let f_func = core::mem::offset_of!(Frame, function) as i32;
+    let f_ci = core::mem::offset_of!(Frame, code_info) as i32;
+    let f_flags = core::mem::offset_of!(Frame, flags) as i32;
+    let f_nloc = core::mem::offset_of!(Frame, num_locals) as i32;
+    let hdr = core::mem::size_of::<Frame>() as i32;
+    let framebytes = hdr + 8 * num_slots as i32;
+    let nargs = nargs as i32;
+    let nslots = num_slots as i32;
+    const RAX: u8 = 0;
+    const RCX: u8 = 1;
+    const RDX: u8 = 2;
+    const RDI: u8 = 7;
+    const R10: u8 = 10;
+    const R11: u8 = 11;
+    const R12: u8 = 12;
+    const R15: u8 = 15;
+    // mov/lea/store of a 64-bit reg vs [base+disp32]. op: 0x8B load, 0x89 store,
+    // 0x8D lea. r12/rsp (rm==4) need a SIB byte; r13/rbp (rm==5) are fine at mod=10.
+    let mem = |c: &mut Asm, op: u8, reg: u8, base: u8, disp: i32| {
+        let mut rex = 0x48u8;
+        if reg >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        c.push(rex);
+        c.push(op);
+        let rm = base & 7;
+        c.push(0b10_000_000 | ((reg & 7) << 3) | if rm == 4 { 4 } else { rm });
+        if rm == 4 {
+            c.push(0x24);
+        }
+        c.extend_from_slice(&disp.to_le_bytes());
+    };
+    // store an immediate to [base+disp32]. w=64-bit qword; word16=16-bit; else dword.
+    let store_imm = |c: &mut Asm, w: bool, word16: bool, base: u8, disp: i32, imm: i64| {
+        if word16 {
+            c.push(0x66);
+        }
+        let mut rex = 0x40u8;
+        if w {
+            rex |= 0x08;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        if rex != 0x40 {
+            c.push(rex);
+        }
+        c.push(0xC7);
+        let rm = base & 7;
+        c.push(0b10_000_000 | if rm == 4 { 4 } else { rm });
+        if rm == 4 {
+            c.push(0x24);
+        }
+        c.extend_from_slice(&disp.to_le_bytes());
+        if word16 {
+            c.extend_from_slice(&(imm as i16).to_le_bytes());
+        } else {
+            c.extend_from_slice(&(imm as i32).to_le_bytes());
+        }
+    };
+    let mov_imm64 = |c: &mut Asm, reg: u8, imm: u64| {
+        c.push(if reg >= 8 { 0x49 } else { 0x48 });
+        c.push(0xB8 + (reg & 7));
+        c.extend_from_slice(&imm.to_le_bytes());
+    };
+    let nil = bliss_rt::value::NIL_BITS as i64;
+    // rcx=base, rdx=old_sp, rax=frame_start=base+old_sp, r10=old_fp
+    mem(c, 0x8B, RCX, R12, bs_base);
+    mem(c, 0x8B, RDX, R12, bs_sp);
+    c.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+    c.extend_from_slice(&[0x48, 0x01, 0xD0]); // add rax, rdx  (rax = frame_start)
+    mem(c, 0x8B, R10, R12, bs_fp);
+    // Frame header at [rax]
+    mem(c, 0x89, R10, RAX, f_prev); // prev_fp = old_fp
+    store_imm(c, true, false, RAX, f_ret, 0); // return_pc = null
+    store_imm(c, true, false, RAX, f_func, nil); // function = NIL
+    mov_imm64(c, R11, code_info);
+    mem(c, 0x89, R11, RAX, f_ci); // code_info
+    store_imm(c, false, false, RAX, f_flags, FLAG_CALL as i64); // flags (dword)
+    store_imm(c, false, true, RAX, f_nloc, nslots as i64); // num_locals (word)
+    // bind args: slot i (0..nargs) = caller operand [r15 - 8*nargs + 8*i]
+    for i in 0..nargs {
+        mem(c, 0x8B, RCX, R15, -8 * nargs + 8 * i);
+        mem(c, 0x89, RCX, RAX, hdr + 8 * i);
+    }
+    // zero the remaining slots to NIL
+    for i in nargs..nslots {
+        store_imm(c, true, false, RAX, hdr + 8 * i, nil);
+    }
+    // publish fp = frame_start, sp_offset = old_sp + framebytes (for GC scanning)
+    mem(c, 0x89, RAX, R12, bs_fp);
+    mem(c, 0x8D, R11, RDX, framebytes); // lea r11, [rdx + framebytes]
+    mem(c, 0x89, R11, R12, bs_sp);
+    // spill restore values across the call (2 pushes keep rsp 16-aligned)
+    c.extend_from_slice(&[0x41, 0x52]); // push r10 (old_fp)
+    c.push(0x52); // push rdx (old_sp)
+    // rdi = callee slots, rsi = r12 (stack); CALL entry directly
+    mem(c, 0x8D, RDI, RAX, hdr); // lea rdi, [rax + hdr]
+    c.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    mov_imm64(c, RAX, entry);
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax   (result in rax)
+    // pop the callee frame: restore fp/sp_offset
+    c.push(0x59); // pop rcx (old_sp)
+    c.extend_from_slice(&[0x41, 0x5A]); // pop r10 (old_fp)
+    mem(c, 0x89, R10, R12, bs_fp);
+    mem(c, 0x89, RCX, R12, bs_sp);
+    // pop args off the caller operand stack, push the result
+    c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, imm32
+    c.extend_from_slice(&(8 * nargs).to_le_bytes());
+    c.extend_from_slice(&[0x49, 0x89, 0x07]); // mov [r15], rax
+    c.extend_from_slice(&[0x49, 0x83, 0xC7, 0x08]); // add r15, 8
+}
+
 /// Compile a bytecode function to native x86-64 T1 code, or `None` if it uses
 /// an opcode the baseline emitter does not handle.
 ///
@@ -15773,6 +15915,37 @@ fn emit_native_x86(
                             }
                         }
                         continue;
+                    }
+                }
+                // Direct native→native call (bliss-zhvn Stage 2, behind
+                // BLISS_NN_DIRECT): if the callee is already installed as T1
+                // native code of a stable restricted shape — fixed arity ==
+                // nargs, non-variadic, no declared param types, not a closure —
+                // emit a direct frame-push + CALL, skipping the c2i bounce.
+                if nn_direct_enabled() {
+                    if let (Some(cnc), Some(cbf)) = (
+                        NATIVE_REGISTRY.with(|r| r.borrow().get(sym).cloned()),
+                        registry_get(*sym),
+                    ) {
+                        let fixed = !cbf.variadic
+                            && cbf.max_args == Some(cbf.min_args)
+                            && cbf.min_args == *nargs;
+                        let no_types = cbf.param_types.iter().all(|t| matches!(t, DeclaredType::Any));
+                        let not_closure = !cbf.has_env
+                            && CLOSURE_ENV.with(|m| !m.borrow().contains_key(sym))
+                            && CLOSURE_CONTROL.with(|m| !m.borrow().contains_key(sym));
+                        if !cnc.is_t2 && fixed && no_types && not_closure {
+                            bliss_rt::blog!("compile", bliss_rt::log::TRACE,
+                                "[T1] {}: DIRECT call to sym {} ({} args)", bf.name, sym, nargs);
+                            emit_direct_native_call(
+                                &mut c,
+                                cnc.entry as u64,
+                                cnc.code_info as *const CodeInfo as u64,
+                                cnc.num_slots,
+                                *nargs,
+                            );
+                            continue;
+                        }
                     }
                 }
                 // c2i_call_slice(sym, n, args, profile): arguments are already
