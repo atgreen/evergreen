@@ -29601,6 +29601,37 @@ fn apply_function(
         if env.generics.borrow().contains_key(&*name) || env.methods.borrow().contains_key(&*name) {
             return invoke_generic_function(&name, args, env);
         }
+        // Fixed-arity builtin arg-count check on EVERY dispatch path, not only the
+        // tree-walker's eval_list: the direct/fast builtin dispatches below (the
+        // CAR/CONSP/… branch and apply_builtin_fast) otherwise silently ignore a
+        // wrong count, so a compiled `(consp 'a 'b)` reached through funcall / the
+        // c2i fallback returned NIL instead of signaling PROGRAM-ERROR (the
+        // bliss-30be guard lived only in eval_list; compiling more forms via the
+        // portable retry surfaced the gap, bliss-mr4p). Mirror eval_list's guard:
+        // only a genuine builtin not shadowed by a user/global/lexical function.
+        {
+            let bare = symbol_bare_name(&name);
+            if let Some((lo, hi)) = fixed_arity_builtin(&bare) {
+                if global_fn(&name).is_none()
+                    && !env.funs.borrow().contains_key(&*name)
+                    && local_fn_closure(env, &name).is_none()
+                {
+                    let argc = args.len();
+                    if argc < lo || argc > hi {
+                        let want = if hi == usize::MAX {
+                            format!("at least {lo}")
+                        } else if lo == hi {
+                            format!("{lo}")
+                        } else {
+                            format!("{lo} to {hi}")
+                        };
+                        return Err(BlissError::ProgramError(format!(
+                            "{name} called with {argc} argument(s); requires {want}"
+                        )));
+                    }
+                }
+            }
+        }
         // Faithful fast path: the hot numeric/comparison builtins dispatch
         // directly on the evaluated args through the SAME cores as operator
         // position (bliss-x5y.8). This is what every +/-/< a bytecode/native
