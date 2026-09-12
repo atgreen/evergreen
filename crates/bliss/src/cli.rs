@@ -6500,6 +6500,39 @@ fn install_suspended_frame_scanner() {
     INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_suspended_frames));
 }
 
+thread_local! {
+    /// FLET function-namespace maps that `eval_named_call_ex` has swapped OUT of
+    /// `env.funs` while a FLET function's body runs (a FLET body sees the parent
+    /// snapshot, not its siblings — bliss-ayq8). The swapped-out map still holds
+    /// the FLET `FunDef`s' body cons trees, but `env.funs` no longer points at it,
+    /// so without this a minor GC during the body would free those bodies —
+    /// a LATER call to the same FLET function then reads a poisoned body and
+    /// crashes (bliss-biol; e.g. COUNT's `(flet ((matchp …)) (loop … (matchp …)))`
+    /// under GC stress). Scan the swapped-out maps here for the extent of the call.
+    static SUSPENDED_FUNS: RefCell<Vec<Rc<RefCell<HashMap<String, FunDef>>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn scan_suspended_funs(visit: &mut dyn FnMut(*mut BlissVal)) {
+    SUSPENDED_FUNS.with(|s| {
+        for funs in s.borrow().iter() {
+            // The map is off `env.funs` for the call's extent, so the mutator is
+            // not holding a borrow; try_borrow_mut keeps the stop-the-world scan
+            // panic-free regardless.
+            if let Ok(mut map) = funs.try_borrow_mut() {
+                for def in map.values_mut() {
+                    visit_fun_def_roots(def, visit);
+                }
+            }
+        }
+    });
+}
+
+fn install_suspended_funs_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_suspended_funs));
+}
+
 fn with_child_frame<T>(
     env: &mut Env,
     parent: Rc<RefCell<EnvFrame>>,
@@ -6607,8 +6640,17 @@ fn eval_named_call_ex(
     };
     match def_scope {
         Some(scope_map) => {
+            install_suspended_funs_scanner();
             let saved = std::mem::replace(&mut env.funs, Rc::new(RefCell::new(scope_map)));
+            // Keep the swapped-out funs (holding this FLET function's FunDef body,
+            // no longer reachable via env.funs) GC-scanned for the call, or a minor
+            // GC during the body frees the body and a later call reads poison
+            // (bliss-biol).
+            SUSPENDED_FUNS.with(|s| s.borrow_mut().push(Rc::clone(&saved)));
             let r = eval_lambda_call_ex(env, params_form, body, args, parent, control);
+            SUSPENDED_FUNS.with(|s| {
+                s.borrow_mut().pop();
+            });
             env.funs = saved;
             r
         }

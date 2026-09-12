@@ -3264,6 +3264,41 @@ fn format_of_inline_fresh_instance_is_gc_safe() {
     );
 }
 
+/// bliss-biol: a FLET function's body must stay GC-scanned across calls. When a
+/// FLET function runs, eval_named_call_ex swaps env.funs to the parent snapshot
+/// (a FLET body sees neither its siblings nor itself); the swapped-out funs hold
+/// the FLET FunDef body cons trees, so a minor GC during the body freed them and
+/// a LATER call read a poisoned body -> "null guard SIGSEGV". COUNT (boot.lisp)
+/// is exactly this shape — (flet ((matchp ...)) (loop ... count (matchp ...))) —
+/// and crashed under GC stress before the fix. Exercise COUNT and a bare FLET
+/// under stress; both must survive and stay correct.
+#[test]
+fn flet_body_survives_gc_across_calls() {
+    let prog = "\
+        (dotimes (i 300) \
+          (unless (= 3 (count #\\a \"banana\")) (error \"count-str\")) \
+          (unless (= 2 (count 1 (list 1 2 1))) (error \"count-list\")) \
+          (let ((tf (function eql)) (item 5)) \
+            (flet ((m (e) (funcall tf item e))) \
+              (unless (and (m 5) (not (m 6))) (error \"flet\"))))) \
+        (princ :ok)";
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_GC_STRESS", "100").env("BLISS_GC_POISON", "1");
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "FLET body under GC must not crash (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-31x8: a large (>~512KB) string LITERAL read by the reader gets a
 /// 16-byte object header, so the reader's value pointer (gc_value) and the
 /// simple-string accessors must honour the large-object payload offset — the
