@@ -26038,6 +26038,18 @@ fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, 
         env.funs.borrow().clone()
     };
     let mut child_env = env.child();
+    // Root the forked child Env as a GC root BEFORE building the local functions,
+    // not just before the body: each `FunDef` we insert carries a freshly
+    // block-wrapped body cons tree, and building a LATER function's body allocates
+    // (arena_cons) — which can fire a relocating minor GC. Until child_env is a
+    // root, an already-inserted body is reachable from no scanner and gets freed;
+    // a later call to that function then evaluates a poisoned body and crashes
+    // (bliss-3ltr: subst's `match`/`rec`, `(count …)`'s `matchp`, any 2+-function
+    // FLET/LABELS under GC). `funs_mut`'s copy-on-write + HashMap::insert use the
+    // system allocator (no bliss GC) and hold no funs borrow across arena_cons, so
+    // rooting here is safe. `env.child()` forks a whole Env, so it needs its own
+    // guard (unlike with_child_frame, which mutates the already-registered env).
+    bliss_rt::rooted_ref!(_child_root = &mut child_env);
     let mut c = defs_form;
     bliss_rt::rooted_ref!(_defs_cursor_root = &mut c);
     while c.is_cons() {
@@ -26093,13 +26105,9 @@ fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, 
             );
         }
     }
-    // Register the forked child Env as a GC root for the extent of the body:
-    // its `funs` map holds the local functions' body cons trees, which are
-    // otherwise unreachable from any scanned root and would be freed by a
-    // relocating minor GC mid-body (bliss-6b2 #2). `env.child()` forks a whole
-    // Env struct, so — unlike `with_child_frame`, which mutates the already-
-    // registered env in place — the child needs its own guard.
-    bliss_rt::rooted_ref!(_child_root = &mut child_env);
+    // child_env was registered as a GC root above (before the defs loop), so its
+    // `funs` map — holding the local functions' body cons trees — stays scanned
+    // for the whole body too (bliss-6b2 #2, bliss-3ltr).
     let __r = eval_progn(body, &mut child_env);
     // Multiple values produced in the child body must propagate to the caller;
     // env.child() forks the value registers (bliss-lb6.22).

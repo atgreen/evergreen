@@ -3299,6 +3299,43 @@ fn flet_body_survives_gc_across_calls() {
     );
 }
 
+/// bliss-3ltr: eval_flet builds each local function's FunDef (with a freshly
+/// block-wrapped body cons tree) into child_env.funs, but only rooted child_env
+/// AFTER the whole defs loop. Building a LATER function's body (arena_cons) can
+/// fire a minor GC that frees an EARLIER, already-inserted body — a subsequent
+/// call then evaluated a poisoned body / walked a corrupted frame chain and
+/// crashed. SUBST/SUBLIS are (labels ((match ...) (rec ...)) ...); they crashed
+/// under GC stress. Exercise SUBST and a bare 2-function LABELS under stress.
+#[test]
+fn multi_function_labels_bodies_survive_gc() {
+    let prog = "\
+        (dotimes (i 300) \
+          (unless (equal (subst (quote x) (quote b) (quote (a b (c b)))) (quote (a x (c x)))) \
+            (error \"subst\")) \
+          (let ((new 9) (old 2)) \
+            (labels ((hit (e) (eql old e)) \
+                     (walk (l) (cond ((null l) nil) \
+                                     ((hit (car l)) (cons new (walk (cdr l)))) \
+                                     (t (cons (car l) (walk (cdr l))))))) \
+              (unless (equal (walk (list 1 2 3 2)) (list 1 9 3 9)) (error \"labels\"))))) \
+        (princ :ok)";
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_GC_STRESS", "100").env("BLISS_GC_POISON", "1");
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "multi-function LABELS/SUBST under GC must not crash (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-31x8: a large (>~512KB) string LITERAL read by the reader gets a
 /// 16-byte object header, so the reader's value pointer (gc_value) and the
 /// simple-string accessors must honour the large-object payload offset — the
