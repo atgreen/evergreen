@@ -8697,10 +8697,15 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
             .flat_map(|f| compile_file_load_forms(f, env))
             .collect(),
         "EVAL-WHEN" => {
+            // What COMPILE-FILE emits for LOAD time: a top-level eval-when's body
+            // is a load-time action iff :LOAD-TOPLEVEL is present (CLHS 3.2.3.1).
+            // An :EXECUTE-only top-level eval-when has NO load-time effect and must
+            // NOT be emitted — emitting it made a loaded fasl run :execute-only
+            // situations, which ansi eval-when.1 flags (bliss-pmox). The compile-
+            // time (:compile-toplevel) evaluation happens separately, via
+            // process_compile_toplevel_form under EvalContext::CompileFile.
             let (situations, body) = cp(cdr);
-            if eval_when_has_situation(situations, "LOAD-TOPLEVEL")
-                || eval_when_has_situation(situations, "EXECUTE")
-            {
+            if eval_when_has_situation(situations, "LOAD-TOPLEVEL") {
                 list_to_vec(body)
                     .into_iter()
                     .flat_map(|f| compile_file_load_forms(f, env))
@@ -11849,7 +11854,16 @@ fn eval_when_should_run(situations: BlissVal, env: &Env) -> bool {
 
     match env.eval_context {
         EvalContext::CompileFile => has_situation("COMPILE-TOPLEVEL"),
-        EvalContext::Load => has_situation("LOAD-TOPLEVEL") || has_situation("EXECUTE"),
+        // Loading SOURCE (not a compiled fasl) processes eval-when in EXECUTE
+        // mode: the body runs iff :EXECUTE is present (CLHS 3.2.3.1 — a
+        // non-compiling load, and every non-top-level eval-when, use the execute
+        // rule). :LOAD-TOPLEVEL-only forms have no effect on a source load; they
+        // take effect only when a COMPILE-FILE'd fasl is loaded, and COMPILE-FILE
+        // already resolves that by emitting their bodies (compile_file_load_forms),
+        // so a fasl load never re-processes an eval-when here. Firing on
+        // :LOAD-TOPLEVEL too made source loads (and nested eval-when) run
+        // load-only situations (bliss-pmox).
+        EvalContext::Load => has_situation("EXECUTE"),
         EvalContext::Eval | EvalContext::Repl => has_situation("EXECUTE"),
     }
 }

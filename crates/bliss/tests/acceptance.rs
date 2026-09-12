@@ -3336,6 +3336,35 @@ fn multi_function_labels_bodies_survive_gc() {
     );
 }
 
+/// bliss-pmox: top-level and nested EVAL-WHEN process in EXECUTE mode when a
+/// form is evaluated or a SOURCE file is loaded (CLHS 3.2.3.1): the body runs
+/// iff :EXECUTE is present. Firing on :LOAD-TOPLEVEL here was wrong — it ran
+/// load-only situations that have no :execute (ansi eval-when.1). :LOAD-TOPLEVEL
+/// takes effect only when a COMPILE-FILE'd fasl is loaded, which COMPILE-FILE
+/// resolves separately. (The compile/load-compiled columns are exercised by the
+/// ansi eval-when.1 test and by asdf+babel compiling under the same fix.)
+#[test]
+fn eval_when_execute_mode_on_eval_and_source() {
+    let prog = "(let ((r nil)) \
+        (eval-when (:execute) (push :e r)) \
+        (eval-when (:load-toplevel) (push :lt r)) \
+        (eval-when (:compile-toplevel) (push :ct r)) \
+        (eval-when (:load-toplevel :execute) (push :ltx r)) \
+        (eval-when (:compile-toplevel :load-toplevel) (push :ctlt r)) \
+        (let () (eval-when (:load-toplevel) (push :nested-lt r))) \
+        (let () (eval-when (:execute) (push :nested-e r))) \
+        (prin1 (reverse r)))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // Only situations containing :EXECUTE fire; :load-toplevel-/:compile-toplevel-
+    // only ones (top-level and nested) do not.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(:E :LTX :NESTED-E)"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-hupm: a "medium" allocation whose total footprint falls in
 /// (tlab_size, region_size/2] — bigger than a TLAB (256 KiB) but not over the
 /// old `> region_size/2` (512 KiB) large-object routing threshold — used to

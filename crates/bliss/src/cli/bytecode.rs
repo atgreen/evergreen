@@ -1562,12 +1562,18 @@ impl<'e> Lowerer<'e> {
         if !rest.is_cons() {
             return Err(Bail);
         }
+        // This lowers a NON-top-level eval-when (a top-level one is handled by
+        // eval_toplevel via eval_when_should_run before lowering). A nested
+        // eval-when is processed in EXECUTE mode: its body runs iff :EXECUTE is
+        // present (CLHS 3.2.3.1). Including :LOAD-TOPLEVEL here made a nested
+        // (e.g. LET-wrapped) eval-when run load-only situations that have no
+        // :execute — flagged by ansi eval-when.1 (bliss-pmox).
         let (situations, body) = cp(rest);
         let fires = list_to_vec(situations).iter().any(|s| {
             s.is_symbol()
                 && matches!(
                     symbol_bare_name(&sym_name(*s)).as_str(),
-                    "EXECUTE" | "EVAL" | "LOAD-TOPLEVEL" | "LOAD"
+                    "EXECUTE" | "EVAL"
                 )
         });
         if fires {
