@@ -730,14 +730,14 @@ pub fn post_sigsegv_null_guard() {
 }
 
 pub fn set_sigsegv_null_guard_recovery_ip(ip: usize) {
-    let tid = crate::syscall::gettid() as usize;
+    let tid = crate::syscall::cached_tid() as usize;
     if let Some(slot) = sigsegv_recovery_slot_for_tid(tid) {
         SIGSEGV_NULL_GUARD_RECOVERY_IPS[slot].store(ip, std::sync::atomic::Ordering::Release);
     }
 }
 
 pub fn current_sigsegv_null_guard_recovery_ip() -> usize {
-    sigsegv_null_guard_recovery_ip_for_tid(crate::syscall::gettid() as usize)
+    sigsegv_null_guard_recovery_ip_for_tid(crate::syscall::cached_tid() as usize)
 }
 
 /// Check whether a stack-guard SIGSEGV has been classified since the last check.
@@ -750,14 +750,14 @@ pub fn post_sigsegv_stack_guard() {
 }
 
 pub fn set_sigsegv_stack_guard_recovery_ip(ip: usize) {
-    let tid = crate::syscall::gettid() as usize;
+    let tid = crate::syscall::cached_tid() as usize;
     if let Some(slot) = sigsegv_recovery_slot_for_tid(tid) {
         SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot].store(ip, std::sync::atomic::Ordering::Release);
     }
 }
 
 pub fn current_sigsegv_stack_guard_recovery_ip() -> usize {
-    sigsegv_stack_guard_recovery_ip_for_tid(crate::syscall::gettid() as usize)
+    sigsegv_stack_guard_recovery_ip_for_tid(crate::syscall::cached_tid() as usize)
 }
 
 pub fn register_sigsegv_stack_guard_range(addr: usize, len: usize) {

@@ -286,6 +286,32 @@ pub fn gettid() -> i32 {
     unsafe { syscall0(nr::GETTID) as i32 }
 }
 
+thread_local! {
+    // A thread's kernel TID is fixed for the thread's lifetime, so cache it: the
+    // hot native-call path reads it several times per call (the SIGSEGV
+    // recovery-IP get/set functions), and an uncached gettid is a full syscall
+    // each time — measured as a large share of per-native-call cost (bliss-zhvn).
+    // 0 is not a valid TID, so it doubles as the "not yet cached" sentinel.
+    static CACHED_TID: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
+}
+
+/// `gettid(2)`, cached per thread. Correct because a thread's TID never changes.
+/// NOTE: do not call from a signal handler — a raw [`gettid`] is used there to
+/// avoid reading a Cell that a normal-context access could be mid-initialising.
+#[inline]
+pub fn cached_tid() -> i32 {
+    CACHED_TID.with(|c| {
+        let t = c.get();
+        if t != 0 {
+            t
+        } else {
+            let t = gettid();
+            c.set(t);
+            t
+        }
+    })
+}
+
 /// `getpid(2)`.
 #[inline]
 pub fn getpid() -> i32 {
