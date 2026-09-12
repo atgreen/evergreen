@@ -9187,6 +9187,22 @@ fn find_symbol_in_package(
     pkg_name: &str,
     bare_name: &str,
 ) -> Option<(BlissVal, &'static str)> {
+    // Default: fold to the reader's readtable-case (:upcase). Reader/intern
+    // callers rely on this; only the FIND-SYMBOL builtin opts out (case-exact).
+    find_symbol_in_package_cased(env, pkg_name, bare_name, false)
+}
+
+/// Look up `bare_name` accessible in `pkg_name`. With `exact_case`, match the
+/// name string VERBATIM — FIND-SYMBOL is case-SENSITIVE per CLHS (it does no
+/// readtable case folding; the READER upcases, FIND-SYMBOL does not), so
+/// `(find-symbol "car")` must be NIL while `(find-symbol "CAR")` finds CAR
+/// (bliss-961p). Without it, fold to uppercase as the reader does.
+fn find_symbol_in_package_cased(
+    env: &Env,
+    pkg_name: &str,
+    bare_name: &str,
+    exact_case: bool,
+) -> Option<(BlissVal, &'static str)> {
     // Symbol names are read with readtable-case :upcase, so `bare_name` is almost
     // always already uppercase — and this is a hot primitive (UIOP's ensure-
     // package calls FIND-SYMBOL once per inherited symbol, ~59% of a system load).
@@ -9205,25 +9221,31 @@ fn find_symbol_in_package(
     // handles once here rather than re-deriving a name per step.
     let cl = bliss_stdlib::find_package("COMMON-LISP");
     let keyword = bliss_stdlib::find_package("KEYWORD");
-    // A symbol present in (or specially owned by) the package itself.
-    if let Some(hit) = present_symbol_with_status(env, root, cl, keyword, &bare_upper) {
-        return Some(hit);
-    }
-    // CLHS 11.1.1.2.1: a package inherits only the EXTERNAL symbols of the
-    // packages it uses, and use is NOT transitive — PB using PA does not see
-    // PA's internal or inherited symbols (bliss-jnzb; previously this walked
-    // the whole use-graph and accepted any present symbol). Re-exporting an
-    // inherited symbol (UIOP's :use-reexport) records it in the re-exporting
-    // package's external table (`add_symbol` external=true), so one level over
-    // the direct use-list is the complete CLHS-visible set.
-    for used in bliss_stdlib::package_use_list(root) {
-        if let Some((sym, "EXTERNAL")) =
-            present_symbol_with_status(env, used, cl, keyword, &bare_upper)
-        {
-            return Some((sym, "INHERITED"));
+    // A symbol present in (or specially owned by) the package itself, else an
+    // EXTERNAL symbol of a directly-used package (inherited; CLHS 11.1.1.2.1 —
+    // use is one level, not transitive; :use-reexport re-homes into the external
+    // table so one hop covers the visible set).
+    let found = present_symbol_with_status(env, root, cl, keyword, &bare_upper).or_else(|| {
+        bliss_stdlib::package_use_list(root).into_iter().find_map(|used| {
+            match present_symbol_with_status(env, used, cl, keyword, &bare_upper) {
+                Some((sym, "EXTERNAL")) => Some((sym, "INHERITED")),
+                _ => None,
+            }
+        })
+    });
+    // FIND-SYMBOL is case-SENSITIVE (CLHS): the lookup folds to :upcase like the
+    // reader, but with `exact_case` the found symbol's NAME must equal the query
+    // VERBATIM — so (find-symbol "car") is NIL though CAR exists, while
+    // (find-symbol "CAR") finds it. bliss interns every symbol upcased, so this
+    // exact-name check is a complete case-sensitivity filter (bliss-961p).
+    if exact_case {
+        if let Some((sym, _)) = found {
+            if symbol_bare_name(&sym_name(sym)) != bare_name {
+                return None;
+            }
         }
     }
-    None
+    found
 }
 
 /// The symbol `bare_upper` names in `pkg` itself — present in its tables, or
@@ -20514,7 +20536,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "FIND-SYMBOL requires a name".into(),
                     ));
                 }
-                let name = symbol_bare_name(&val_as_str(args[0]));
+                // FIND-SYMBOL takes the name STRING verbatim (no readtable
+                // upcasing, no package-prefix parsing — the package is the second
+                // argument), and matches case-SENSITIVELY (CLHS): (find-symbol
+                // "car") is NIL, (find-symbol "CAR") finds CAR (bliss-961p). So do
+                // NOT run it through symbol_bare_name (which upcases + strips).
+                let name = val_as_str(args[0]);
                 // The package argument is optional and defaults to *PACKAGE*.
                 let pkg_name = if args.len() > 1 {
                     let pkg_raw = val_as_str(args[1]);
@@ -20522,7 +20549,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     effective_package_name(env)
                 };
-                if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &name) {
+                if let Some((sym, status)) =
+                    find_symbol_in_package_cased(env, &pkg_name, &name, true)
+                {
                     env.set_mv(vec![sym, package_status_symbol(status)]);
                     return Ok(sym);
                 }
@@ -29914,9 +29943,11 @@ fn apply_builtin_fast(
             Some(Ok(symbol_package_value(env, args[0])))
         }
         "FIND-SYMBOL" if args.len() == 2 => {
-            let bare = symbol_bare_name(&val_as_str(args[0]));
+            // Case-SENSITIVE, verbatim name (CLHS) — see the tree-walker arm and
+            // find_symbol_in_package_cased (bliss-961p).
+            let bare = val_as_str(args[0]);
             let pkg_name = resolve_package_name(env, &val_as_str(args[1]));
-            if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &bare) {
+            if let Some((sym, status)) = find_symbol_in_package_cased(env, &pkg_name, &bare, true) {
                 env.set_mv(vec![sym, package_status_symbol(status)]);
                 Some(Ok(sym))
             } else {

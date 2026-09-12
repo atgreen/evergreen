@@ -3336,6 +3336,30 @@ fn multi_function_labels_bodies_survive_gc() {
     );
 }
 
+/// bliss-961p: FIND-SYMBOL is case-SENSITIVE (CLHS 11.1.1.2.1 / the dictionary
+/// entry) — it matches the name string verbatim, doing no readtable case
+/// folding (the READER upcases; FIND-SYMBOL does not). (find-symbol "car") must
+/// be NIL even though CAR exists; (find-symbol "CAR") finds it. Covers both the
+/// 1-arg (*package*) and 2-arg (explicit package) paths.
+#[test]
+fn find_symbol_is_case_sensitive() {
+    let prog = "(prin1 (list
+        (nth-value 1 (find-symbol \"car\"))
+        (nth-value 1 (find-symbol \"CAR\"))
+        (nth-value 1 (find-symbol \"car\" :cl))
+        (nth-value 1 (find-symbol \"CAR\" :cl))
+        (nth-value 1 (find-symbol \"car\" :keyword))))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // lowercase -> NIL (not found); uppercase CAR -> INHERITED (via *package*) /
+    // EXTERNAL (in :cl); lowercase keyword -> NIL.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(NIL :INHERITED NIL :EXTERNAL NIL)"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-rsur: CHAR-NAME/NAME-CHAR must round-trip. Char 65533 (U+FFFD) was
 /// wrongly named "Rubout" (which is char 127), so (name-char (char-name #\U+FFFD))
 /// gave 127, not 65533. U+FFFD has no CL standard name -> char-name returns nil.
