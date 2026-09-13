@@ -1543,10 +1543,24 @@
          (adj-cell (member :adjustable keys))
          (fp (and fp-cell (car (cdr fp-cell))))
          (adjustable (and adj-cell (car (cdr adj-cell))))
+         (dt-cell (member :displaced-to keys))
+         (dio-cell (member :displaced-index-offset keys))
          ;; A dimension LIST of rank ≥ 2 ⇒ a real multidimensional array
          ;; (row-major storage). Rank-0/1 fall through to the vector paths.
          (mdp (and (consp dimensions) (consp (cdr dimensions)))))
     (cond
+      ;; :displaced-to (rank-1): a complex vector whose element i reads and
+      ;; writes BASE's row-major element (+ offset i) (bliss-7o4y). The
+      ;; element-type tag mirrors the request so a character displaced array
+      ;; answers STRINGP.
+      ((and dt-cell (car (cdr dt-cell)) (not mdp))
+       (let* ((base (car (cdr dt-cell)))
+              (offset (if dio-cell (car (cdr dio-cell)) 0))
+              (fpn (cond ((eq fp t) size)
+                         ((integerp fp) fp)
+                         (t size))))
+         (%make-displaced-array base offset size fpn (and adjustable t)
+                                (and stringp t) (and fp t))))
       (mdp
        (let ((arr (%make-md-array dimensions (if iel-cell (car (cdr iel-cell)) nil))))
          (when ic-cell

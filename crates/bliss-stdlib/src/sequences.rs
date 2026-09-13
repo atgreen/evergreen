@@ -179,11 +179,10 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         // them (bliss-w5t); a char-typed complex vector (a fill-pointer STRING)
         // stores CHARACTER values here, so collecting the storage prefix is
         // correct for both general and character complex vectors.
-        let storage = cvec_storage(sequence);
         let len = cvec_fill_pointer(sequence);
         let mut elems = Vec::with_capacity(len);
         for i in 0..len {
-            elems.push(vector_elt(storage, i));
+            elems.push(cvec_elt(sequence, i)?);
         }
         return Ok(elems);
     }
@@ -413,6 +412,134 @@ pub fn cvec_has_fill_pointer(v: BlissVal) -> bool {
         tag.is_fixnum() && tag.as_fixnum() == 1
     }
 }
+/// Displacement of a complex array (bliss-7o4y): `Some((base, offset, total))`
+/// when `v` was built displaced to `base` (`:displaced-to`), where `offset` is
+/// the row-major offset into `base` and `total` the displaced array's own
+/// total size. `None` for an ordinary complex array. Guarded on the header's
+/// recorded size so a legacy 5-word body (e.g. restored from an old image)
+/// never reads past its allocation.
+#[inline]
+pub fn cvec_displacement(v: BlissVal) -> Option<(BlissVal, usize, usize)> {
+    unsafe {
+        let header = *(v.as_ptr() as *const ObjectHeader);
+        if (header.size_units() as usize) < 8 {
+            return None;
+        }
+        let disp = *(v.as_ptr().add(48) as *const BlissVal);
+        if !disp.is_fixnum() {
+            return None;
+        }
+        let total = *(v.as_ptr().add(56) as *const BlissVal);
+        let total = if total.is_fixnum() {
+            total.as_fixnum().max(0) as usize
+        } else {
+            0
+        };
+        Some((cvec_storage(v), disp.as_fixnum().max(0) as usize, total))
+    }
+}
+
+/// Row-major element read on any array `base` a displaced array can target:
+/// simple vector, string, complex (possibly itself displaced — chains
+/// resolve), bit-vector, or multidimensional array. Indexes the TOTAL-SIZE
+/// domain (fill pointers of the base are ignored, per CLHS displacement).
+fn array_row_major_elt(base: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
+    if is_complex_vector(base) {
+        if let Some((inner, off, _)) = cvec_displacement(base) {
+            return array_row_major_elt(inner, off + index);
+        }
+        return Ok(vector_elt(cvec_storage(base), index));
+    }
+    if let Some(storage) = bliss_rt::types::md_array_storage(base) {
+        return Ok(vector_elt(storage, index));
+    }
+    if is_vector(base) {
+        return Ok(vector_elt(base, index));
+    }
+    elt(base, index)
+}
+
+/// Row-major element write matching [`array_row_major_elt`].
+fn array_row_major_set_elt(
+    base: BlissVal,
+    index: usize,
+    value: BlissVal,
+) -> Result<(), BlissError> {
+    if is_complex_vector(base) {
+        if let Some((inner, off, _)) = cvec_displacement(base) {
+            return array_row_major_set_elt(inner, off + index, value);
+        }
+        vector_set_elt(cvec_storage(base), index, value);
+        return Ok(());
+    }
+    if let Some(storage) = bliss_rt::types::md_array_storage(base) {
+        vector_set_elt(storage, index, value);
+        return Ok(());
+    }
+    if is_vector(base) {
+        vector_set_elt(base, index, value);
+        return Ok(());
+    }
+    set_elt(base, index, value)
+}
+
+/// Total size (row-major element count) of any array value this crate models —
+/// the domain a displaced array indexes: simple vector, complex vector (its
+/// capacity, ignoring fill pointers), string, bit-vector, or multidimensional
+/// array. `None` when `v` is not an array.
+pub fn array_total_size(v: BlissVal) -> Option<usize> {
+    if is_complex_vector(v) {
+        return Some(cvec_capacity(v));
+    }
+    if let Some(storage) = bliss_rt::types::md_array_storage(v) {
+        return Some(vector_length(storage));
+    }
+    if is_vector(v) {
+        return Some(vector_length(v));
+    }
+    if let Some(n) = bliss_rt::types::bit_vector_len(v) {
+        return Some(n);
+    }
+    string_char_count(v)
+}
+
+/// Clear a complex array's displacement words after its storage has been
+/// replaced by a grow/adjust: the array now owns word 0 as direct backing
+/// storage. No-op on a legacy 5-word body (which cannot be displaced).
+#[inline]
+fn cvec_clear_displacement(v: BlissVal) {
+    unsafe {
+        let header = *(v.as_ptr() as *const ObjectHeader);
+        if (header.size_units() as usize) >= 8 {
+            *(v.as_ptr().add(48) as *mut BlissVal) = NIL;
+            *(v.as_ptr().add(56) as *mut BlissVal) = NIL;
+        }
+    }
+}
+
+/// Displacement-aware element read of a complex vector: a displaced array
+/// reads through to its base; an ordinary one reads its own storage. `index`
+/// must already be bounds-checked by the caller.
+#[inline]
+fn cvec_elt(v: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
+    match cvec_displacement(v) {
+        Some((base, off, _)) => array_row_major_elt(base, off + index),
+        None => Ok(vector_elt(cvec_storage(v), index)),
+    }
+}
+
+/// Displacement-aware element write of a complex vector.
+#[inline]
+fn cvec_set_elt(v: BlissVal, index: usize, value: BlissVal) -> Result<(), BlissError> {
+    match cvec_displacement(v) {
+        Some((base, off, _)) => array_row_major_set_elt(base, off + index, value),
+        None => {
+            vector_set_elt(cvec_storage(v), index, value);
+            Ok(())
+        }
+    }
+}
+
 /// Materialise the active characters (0..fill-pointer) of a character-typed
 /// complex vector into a Rust `String`. Returns `None` if `v` is not a
 /// character-typed complex vector, or if any active slot is not a character
@@ -421,11 +548,10 @@ pub fn cvec_char_contents(v: BlissVal) -> Option<String> {
     if !is_complex_vector(v) || !cvec_is_string(v) {
         return None;
     }
-    let storage = cvec_storage(v);
     let n = cvec_fill_pointer(v);
     let mut s = String::with_capacity(n);
     for i in 0..n {
-        let e = elt(storage, i).ok()?;
+        let e = cvec_elt(v, i).ok()?;
         if e.is_character() {
             s.push(e.as_char());
         } else {
@@ -434,10 +560,14 @@ pub fn cvec_char_contents(v: BlissVal) -> Option<String> {
     }
     Some(s)
 }
-/// `array-total-size` — the capacity of the backing storage.
+/// `array-total-size` — the capacity of the backing storage, or a displaced
+/// array's own recorded total size (its base's size is not its own).
 #[inline]
 pub fn cvec_capacity(v: BlissVal) -> usize {
-    vector_length(cvec_storage(v))
+    match cvec_displacement(v) {
+        Some((_, _, total)) => total,
+        None => vector_length(cvec_storage(v)),
+    }
 }
 
 /// Build a COMPLEX_ARRAY. `capacity` is the backing array-total-size;
@@ -468,29 +598,79 @@ pub fn build_complex_vector(
     // Has-user-fill-pointer tag: immediate fixnum, 1 = yes, 0 = no.
     let hasfp = BlissVal::from_fixnum(if has_fill_pointer { 1 } else { 0 });
     // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL) |
-    //         element-type(fixnum) | has-fill-pointer(fixnum)]; only the storage
-    //         word is a heap reference (the GC's COMPLEX_ARRAY tracer visits
-    //         word 0 only), so the extra immediates are free of tracer changes.
-    let body_size = 5 * 8;
+    //         element-type(fixnum) | has-fill-pointer(fixnum) |
+    //         displaced-offset(NIL or fixnum) | displaced-total-size(NIL or
+    //         fixnum)]; only word 0 is a heap reference (the GC's
+    //         COMPLEX_ARRAY tracer visits word 0 only), so the extra
+    //         immediates are free of tracer changes. For a DISPLACED array
+    //         (bliss-7o4y) word 0 is the BASE array reference, word 5 the
+    //         row-major offset into it, and word 6 the array's own total size
+    //         (underivable from the base); a non-displaced array stores NIL in
+    //         words 5-6.
+    build_complex_array_body(*storage, fp, adj, elt, hasfp, NIL, NIL)
+}
+
+/// Build a COMPLEX_ARRAY displaced to `base` (CLHS `:displaced-to`):
+/// element `i` reads and writes `base`'s row-major element `offset + i`.
+/// `length` is the displaced array's own total size; `fill_pointer` is the
+/// active length (= `length` when `has_fill_pointer` is false). The caller
+/// validates `offset + length <= (array-total-size base)`.
+pub fn build_displaced_vector(
+    base: BlissVal,
+    offset: usize,
+    length: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    element_is_char: bool,
+    has_fill_pointer: bool,
+) -> BlissVal {
+    bliss_rt::rooted!(base = base);
+    let fp = BlissVal::from_fixnum(fill_pointer.min(length) as i64);
+    let adj = if adjustable { T } else { NIL };
+    let elt = BlissVal::from_fixnum(if element_is_char { 1 } else { 0 });
+    let hasfp = BlissVal::from_fixnum(if has_fill_pointer { 1 } else { 0 });
+    let disp = BlissVal::from_fixnum(offset as i64);
+    let total = BlissVal::from_fixnum(length as i64);
+    build_complex_array_body(*base, fp, adj, elt, hasfp, disp, total)
+}
+
+/// Allocate the 7-word COMPLEX_ARRAY body (see `build_complex_vector` for the
+/// layout). `word0` is the only heap reference and must be rooted by the
+/// caller across this call.
+fn build_complex_array_body(
+    word0: BlissVal,
+    fp: BlissVal,
+    adj: BlissVal,
+    elt: BlissVal,
+    hasfp: BlissVal,
+    disp: BlissVal,
+    total: BlissVal,
+) -> BlissVal {
+    bliss_rt::rooted!(word0 = word0);
+    let body_size = 7 * 8;
     if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::COMPLEX_ARRAY) {
         unsafe {
-            *(body as *mut u64) = (*storage).to_raw();
+            *(body as *mut u64) = (*word0).to_raw();
             *(body.add(8) as *mut u64) = fp.to_raw();
             *(body.add(16) as *mut u64) = adj.to_raw();
             *(body.add(24) as *mut u64) = elt.to_raw();
             *(body.add(32) as *mut u64) = hasfp.to_raw();
+            *(body.add(40) as *mut u64) = disp.to_raw();
+            *(body.add(48) as *mut u64) = total.to_raw();
             return BlissVal::from_heap_ptr(body.sub(8));
         }
     }
-    // OOM fallback: a leaked block (header + 5 body words).
-    let mut buf: Vec<u64> = Vec::with_capacity(6);
-    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 6);
+    // OOM fallback: a leaked block (header + 7 body words).
+    let mut buf: Vec<u64> = Vec::with_capacity(8);
+    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 8);
     buf.push(header.0);
-    buf.push((*storage).to_raw());
+    buf.push((*word0).to_raw());
     buf.push(fp.to_raw());
     buf.push(adj.to_raw());
     buf.push(elt.to_raw());
     buf.push(hasfp.to_raw());
+    buf.push(disp.to_raw());
+    buf.push(total.to_raw());
     let ptr = buf.as_mut_ptr() as *mut u8;
     std::mem::forget(buf);
     unsafe { BlissVal::from_heap_ptr(ptr) }
@@ -565,7 +745,7 @@ pub fn vector_push(v: BlissVal, value: BlissVal) -> Result<BlissVal, BlissError>
     if fp >= cvec_capacity(v) {
         return Ok(NIL);
     }
-    vector_set_elt(cvec_storage(v), fp, value);
+    cvec_set_elt(v, fp, value)?;
     cvec_set_fill_pointer_raw(v, fp + 1);
     Ok(BlissVal::from_fixnum(fp as i64))
 }
@@ -597,7 +777,7 @@ pub fn vector_push_extend(
         let new_cap = cap + grow.max(1);
         let mut store: Vec<BlissVal> = Vec::with_capacity(new_cap);
         for i in 0..cap {
-            store.push(vector_elt(cvec_storage(v), i));
+            store.push(cvec_elt(v, i)?);
         }
         store.resize(new_cap, NIL);
         // `build_vector` allocates and can fire a minor GC that relocates the
@@ -614,11 +794,14 @@ pub fn vector_push_extend(
         // pre-move address the rooting exists to avoid.
         let storage = build_vector(&store);
         cvec_set_storage(*v, storage);
+        // The array now owns fresh direct storage — a formerly displaced
+        // array stops being displaced (its elements were copied above).
+        cvec_clear_displacement(*v);
         vector_set_elt(storage, fp, *value);
         cvec_set_fill_pointer_raw(*v, fp + 1);
         return Ok(BlissVal::from_fixnum(fp as i64));
     }
-    vector_set_elt(cvec_storage(v), fp, value);
+    cvec_set_elt(v, fp, value)?;
     cvec_set_fill_pointer_raw(v, fp + 1);
     Ok(BlissVal::from_fixnum(fp as i64))
 }
@@ -646,7 +829,7 @@ pub fn adjust_complex_vector(
     if new_size > cap {
         let mut store: Vec<BlissVal> = Vec::with_capacity(new_size);
         for i in 0..cap {
-            store.push(vector_elt(cvec_storage(v), i));
+            store.push(cvec_elt(v, i)?);
         }
         store.resize(new_size, initial_element);
         // `build_vector` allocates and can fire a minor GC that relocates the
@@ -660,6 +843,9 @@ pub fn adjust_complex_vector(
         // `vector_push_extend` on argument-evaluation order.
         let storage = build_vector(&store);
         cvec_set_storage(*v, storage);
+        // Fresh direct storage: a formerly displaced array stops being
+        // displaced (ADJUST-ARRAY without :displaced-to, CLHS).
+        cvec_clear_displacement(*v);
         cvec_set_fill_pointer_raw(*v, fp);
         return Ok(*v);
     }
@@ -682,7 +868,7 @@ pub fn vector_pop(v: BlissVal) -> Result<BlissVal, BlissError> {
             expected: "non-empty vector".to_string(),
         });
     }
-    let val = vector_elt(cvec_storage(v), fp - 1);
+    let val = cvec_elt(v, fp - 1)?;
     cvec_set_fill_pointer_raw(v, fp - 1);
     Ok(val)
 }
@@ -1036,7 +1222,7 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
                 expected: format!("index {} in bounds (length {})", index, len),
             });
         }
-        return Ok(vector_elt(cvec_storage(sequence), index));
+        return cvec_elt(sequence, index);
     }
     if bliss_rt::types::bit_vector_p(sequence) {
         return match bliss_rt::types::bit_vector_ref(sequence, index) {
@@ -1093,7 +1279,7 @@ pub fn set_elt(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), 
                 expected: format!("index {} in bounds (length {})", index, len),
             });
         }
-        vector_set_elt(cvec_storage(sequence), index, value);
+        cvec_set_elt(sequence, index, value)?;
         return Ok(());
     }
     // A simple string is a mutable character vector: (SETF (ELT s i) c) stores a
@@ -1153,7 +1339,7 @@ pub fn aref(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
                 expected: format!("index {} in bounds (length {})", index, cap),
             });
         }
-        return Ok(vector_elt(cvec_storage(sequence), index));
+        return cvec_elt(sequence, index);
     }
     elt(sequence, index)
 }
@@ -1170,7 +1356,7 @@ pub fn set_aref(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(),
                 expected: format!("index {} in bounds (length {})", index, cap),
             });
         }
-        vector_set_elt(cvec_storage(sequence), index, value);
+        cvec_set_elt(sequence, index, value)?;
         return Ok(());
     }
     set_elt(sequence, index, value)

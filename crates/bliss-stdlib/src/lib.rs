@@ -102,10 +102,12 @@ pub use pathnames::{
     translate_pathname, truename, wild_pathname_p,
 };
 pub use sequences::{
-    adjust_complex_vector, aref, build_complex_vector, build_md_array, build_simple_vector,
+    adjust_complex_vector, aref, array_total_size, build_complex_vector, build_displaced_vector,
+    build_md_array, build_simple_vector,
     concatenate,
     copy_seq, count,
-    cvec_adjustable, cvec_capacity, cvec_char_contents, cvec_fill_pointer, cvec_has_fill_pointer,
+    cvec_adjustable, cvec_capacity, cvec_char_contents, cvec_displacement, cvec_fill_pointer,
+    cvec_has_fill_pointer,
     cvec_is_string, elt,
     find, is_complex_vector, length, map, nreverse,
     position, reduce, remove, reverse, set_aref, set_elt, set_fill_pointer, sort, stable_sort,

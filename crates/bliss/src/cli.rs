@@ -11763,6 +11763,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "READ-FROM-STRING"
             | "INTERN"
             | "FIND-SYMBOL"
+            | "ARRAY-DISPLACEMENT"
             | "MACROEXPAND"
             | "MACROEXPAND-1"
             | "GET-MACRO-CHARACTER"
@@ -16013,6 +16014,57 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     has_fill_pointer,
                 ));
             }
+            "BLISS-INTERNAL::%MAKE-DISPLACED-ARRAY"
+            | "BLISS-INTERNAL:%MAKE-DISPLACED-ARRAY"
+            | "%MAKE-DISPLACED-ARRAY" => {
+                // (%make-displaced-array base offset length fill-pointer
+                // adjustable-p element-is-char has-fill-pointer) — build a
+                // rank-1 array displaced to BASE (bliss-7o4y). Called by
+                // MAKE-ARRAY (boot.lisp) for :displaced-to.
+                let args = eval_args(cdr, env)?;
+                if args.len() < 3 {
+                    return Err(BlissError::Internal(
+                        "%MAKE-DISPLACED-ARRAY requires base, offset, length".into(),
+                    ));
+                }
+                let base = args[0];
+                let fix = |v: BlissVal| {
+                    if v.is_fixnum() { v.as_fixnum().max(0) as usize } else { 0 }
+                };
+                let offset = fix(args[1]);
+                let length = fix(args[2]);
+                let Some(base_total) = bliss_stdlib::array_total_size(base) else {
+                    return Err(BlissError::TypeError {
+                        datum: base,
+                        expected: "array (:displaced-to)".to_string(),
+                    });
+                };
+                if offset + length > base_total {
+                    return Err(BlissError::TypeError {
+                        datum: base,
+                        expected: format!(
+                            "displacement {offset}+{length} within array-total-size {base_total}"
+                        ),
+                    });
+                }
+                let fp = if args.len() > 3 && args[3].is_fixnum() {
+                    args[3].as_fixnum().max(0) as usize
+                } else {
+                    length
+                };
+                let adjustable = args.len() > 4 && !args[4].is_nil();
+                let element_is_char = args.len() > 5 && !args[5].is_nil();
+                let has_fill_pointer = args.len() > 6 && !args[6].is_nil();
+                return Ok(bliss_stdlib::build_displaced_vector(
+                    base,
+                    offset,
+                    length,
+                    fp,
+                    adjustable,
+                    element_is_char,
+                    has_fill_pointer,
+                ));
+            }
             "BLISS-INTERNAL::%ADJUST-ARRAY"
             | "BLISS-INTERNAL:%ADJUST-ARRAY"
             | "%ADJUST-ARRAY" => {
@@ -16152,9 +16204,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if has { T } else { NIL });
             }
             "ARRAY-DISPLACEMENT" => {
-                // bliss has no displaced arrays: (values nil 0).
+                // (values base offset) for a displaced array, (values nil 0)
+                // otherwise (bliss-7o4y).
                 let (af, _) = cp(cdr);
-                eval_form(af, env)?;
+                let v = eval_form(af, env)?;
+                if bliss_stdlib::is_complex_vector(v) {
+                    if let Some((base, offset, _)) = bliss_stdlib::cvec_displacement(v) {
+                        let off = BlissVal::from_fixnum(offset as i64);
+                        env.set_mv(vec![base, off]);
+                        return Ok(base);
+                    }
+                }
                 env.set_mv(vec![NIL, BlissVal::from_fixnum(0)]);
                 return Ok(NIL);
             }
@@ -29860,7 +29920,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "VECTORP" | "SIMPLE-VECTOR-P" | "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P"
             | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
-            | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR"
+            | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers
             | "+" | "-" | "*" | "/" | "1+" | "1-" | "=" | "/=" | "<" | ">" | "<=" | ">="
