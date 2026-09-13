@@ -296,6 +296,34 @@ extern "C" fn moving_gc_c2i(
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
 fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
+    const CHILD: &str = "BLISS_T2_ROOT_MOVE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // This fixture performs a process-global stop-the-world collection and
+        // needs the full framed register pool so it exercises both register and
+        // spill relocation. Run it in an isolated test process: parallel sibling
+        // tests otherwise race the safepoint handshake (bliss-reoy), while the
+        // production reduced pool legitimately spills every long-lived root and
+        // defeats the register-root coverage assertion (bliss-exvx).
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "moving_gc_relocates_t2_roots_in_registers_and_native_spills",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("BLISS_T2_FRAME_ENV", "full")
+            .output()
+            .expect("spawn isolated moving-GC fixture");
+        assert!(
+            output.status.success(),
+            "isolated moving-GC fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
     use bliss_compiler::t2::emit::emit_framed_with_activation_slots;
     use bliss_rt::CodeInfo;
     use bliss_rt::stack::StackMapEntry;
