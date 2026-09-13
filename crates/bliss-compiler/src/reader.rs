@@ -2731,12 +2731,7 @@ fn eval_feature_expression(feature: BlissVal) -> bool {
         return false;
     }
     if feature.is_symbol() {
-        let name = feature_symbol_name(feature);
-        let bare = name
-            .trim_start_matches("KEYWORD:")
-            .trim_start_matches(':')
-            .trim();
-        return runtime_feature_present(bare);
+        return runtime_feature_present(&feature_symbol_bare_name(feature));
     }
     if !feature.is_cons() {
         return false;
@@ -2747,7 +2742,7 @@ fn eval_feature_expression(feature: BlissVal) -> bool {
         return false;
     }
 
-    match feature_symbol_name(op).as_str() {
+    match feature_symbol_bare_name(op).as_str() {
         "OR" => {
             let mut rest = args;
             while rest.is_cons() {
@@ -2797,12 +2792,7 @@ fn runtime_feature_present(name: &str) -> bool {
     while list.is_cons() {
         let (item, next) = cons_parts(list);
         if item.tag() == bliss_rt::value::TAG_SYMBOL {
-            let iname = feature_symbol_name(item);
-            let bare = iname
-                .trim_start_matches("KEYWORD:")
-                .trim_start_matches(':')
-                .trim();
-            if bare.eq_ignore_ascii_case(name) {
+            if feature_symbol_bare_name(item).eq_ignore_ascii_case(name) {
                 return true;
             }
         }
@@ -2819,6 +2809,20 @@ fn feature_symbol_name(val: BlissVal) -> String {
             .unwrap_or_else(|| format!("SYM#{}", val.as_symbol_index())),
         _ => String::new(),
     }
+}
+
+/// The symbol-name component of a feature expression. Reader symbols retain
+/// their registry package qualifier (`PKG::NAME` / `KEYWORD:NAME`), but CL
+/// feature matching is by the feature symbol's own name, not its home package.
+fn feature_symbol_bare_name(val: BlissVal) -> String {
+    let name = feature_symbol_name(val);
+    let name = name.strip_prefix("KEYWORD:").unwrap_or(&name);
+    name.rsplit_once("::")
+        .map(|(_, bare)| bare)
+        .or_else(|| name.rsplit_once(':').map(|(_, bare)| bare))
+        .unwrap_or(name)
+        .trim()
+        .to_string()
 }
 
 fn cons_parts(val: BlissVal) -> (BlissVal, BlissVal) {

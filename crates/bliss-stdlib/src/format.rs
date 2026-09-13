@@ -5,7 +5,7 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 use bliss_rt::object::{ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_rt::value::{BlissVal, NIL, T, UNBOUND};
 
 // ── User print-object hook ────────────────────────────────────────
 //
@@ -104,6 +104,39 @@ pub fn apply_print_case(name: &str) -> String {
     }
 }
 
+/// A symbol's readable name relative to the current `*PACKAGE*`. Registry keys
+/// encode home identity as `PKG::NAME`, but that qualifier is omitted when the
+/// same symbol is accessible in the current package (CLHS 22.1.3.3). Keep the
+/// qualifier when omitting it would read back as a different symbol.
+pub fn symbol_name_for_print(symbol: BlissVal) -> String {
+    let Some(index) = symbol.symbol_index() else {
+        return if symbol.is_nil() { "NIL" } else { "T" }.to_string();
+    };
+    let name = bliss_compiler::reader::symbol_name(index)
+        .unwrap_or_else(|| format!("SYM#{index}"));
+    if name.starts_with("KEYWORD:") || bliss_compiler::reader::is_uninterned(index) {
+        return name;
+    }
+    let bare = name
+        .rsplit_once("::")
+        .map(|(_, bare)| bare)
+        .or_else(|| name.rsplit_once(':').map(|(_, bare)| bare))
+        .unwrap_or(&name);
+    let current_package = bliss_rt::symbols::find_index("*PACKAGE*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .filter(|package| crate::packages::is_package(*package));
+    if current_package.is_some_and(|package| {
+        crate::packages::find_symbol(bare, package)
+            .ok()
+            .flatten()
+            .is_some_and(|(visible, _)| visible == symbol)
+    }) {
+        bare.to_string()
+    } else {
+        name
+    }
+}
+
 /// `*PRINT-LENGTH*`: the max number of elements of a list/vector to print before
 /// `...`, or `None` (unbounded) when the variable is NIL/unset.
 pub fn print_length() -> Option<usize> {
@@ -127,7 +160,7 @@ pub fn print_level() -> Option<usize> {
 pub fn print_circle_active() -> bool {
     bliss_rt::symbols::find_index("*PRINT-CIRCLE*")
         .and_then(bliss_rt::symbols::symbol_value)
-        .map(|v| !v.is_nil())
+        .map(|v| v != UNBOUND && !v.is_nil())
         .unwrap_or(false)
 }
 
@@ -335,7 +368,7 @@ thread_local! {
 fn print_radix() -> bool {
     bliss_rt::symbols::find_index("*PRINT-RADIX*")
         .and_then(bliss_rt::symbols::symbol_value)
-        .map(|v| !v.is_nil())
+        .map(|v| v != UNBOUND && !v.is_nil())
         .unwrap_or(false)
 }
 
@@ -958,7 +991,7 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
                 name
             };
         }
-        return apply_print_case(name.trim_start_matches("KEYWORD:"));
+        return apply_print_case(&symbol_name_for_print(v));
     }
     // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not the data
     // list it is structurally — print it as #<FUNCTION> (matches cli print_val).

@@ -292,6 +292,23 @@ fn bundled_asdf_is_reachable_via_require_with_output_translations_and_t1_metadat
 }
 
 #[test]
+fn require_uses_symbol_designator_name_not_printed_package_prefix() {
+    // ANSI REQUIRE accepts a string designator.  A symbol designates its
+    // SYMBOL-NAME, regardless of its home package.  This is the installed-core
+    // startup path: ocicl-runtime.lisp says (require 'asdf), whose symbol is
+    // homed in COMMON-LISP-USER because ASDF is not an ANSI CL symbol.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (provide \"QUALIFIED-MODULE-PROBE\")
+               (defpackage :require-probe (:use :cl))
+               (require (intern \"QUALIFIED-MODULE-PROBE\" :require-probe)))"
+        ),
+        "NIL"
+    );
+}
+
+#[test]
 fn eval_when_body_runs_as_implicit_progn() {
     // eval-when must execute its body in the bootstrap evaluator (situations
     // are ignored); ASDF's top-level eval-when forms depend on this.
@@ -1407,6 +1424,23 @@ fn eval_ok(expr: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// Evaluate without loading the Lisp bootstrap, for cold-start invariants that
+/// must already hold when the Rust runtime hands control to `boot.lisp`.
+fn eval_no_bootstrap_ok(expr: &str) -> String {
+    let output = bliss()
+        .args(["--no-bootstrap", "--eval", expr])
+        .output()
+        .expect("run bliss --no-bootstrap --eval");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expr `{expr}` exited non-zero; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 #[test]
 fn clos_inherited_slot_initforms_are_evaluated_during_make_instance() {
     // R5.80: make-instance must evaluate :initform for every effective slot,
@@ -2213,6 +2247,271 @@ fn ansi_special_operators_are_external_in_common_lisp() {
         ),
         "(:EXTERNAL :EXTERNAL :EXTERNAL :INHERITED T)"
     );
+}
+
+#[test]
+fn common_lisp_bootstrap_exports_representative_ansi_symbols() {
+    // R5.01 / §5.2.2.1: COMMON-LISP is populated before Lisp boot, including
+    // special immediate symbols, directly implemented macros, functions, and
+    // names whose functions/types are not implemented yet. The table's exact
+    // 978-name size and uniqueness are checked in ansi_symbols.rs without
+    // requiring boot.lisp's package-iteration macros.
+    assert_eq!(
+        eval_no_bootstrap_ok(
+            "(list (multiple-value-list (find-symbol \"NIL\" :common-lisp))
+                     (multiple-value-list (find-symbol \"T\" :common-lisp))
+                     (multiple-value-list (find-symbol \"HANDLER-BIND\" :common-lisp))
+                     (multiple-value-list (find-symbol \"FIND-CLASS\" :common-lisp))
+                     (multiple-value-list (find-symbol \"ARRAY-TOTAL-SIZE-LIMIT\" :common-lisp))
+                     (eq nil (find-symbol \"NIL\" :common-lisp))
+                     (eq t (find-symbol \"T\" :common-lisp))
+                     (nth-value 1 (find-symbol \"FIND-CLASS\" :cl-user)))"
+        ),
+        "((NIL :EXTERNAL) (T :EXTERNAL) (HANDLER-BIND :EXTERNAL) (FIND-CLASS :EXTERNAL) (ARRAY-TOTAL-SIZE-LIMIT :EXTERNAL) T T :INHERITED)"
+    );
+}
+
+#[test]
+fn inaccessible_bare_ansi_name_is_interned_in_the_current_package() {
+    // R5.01 / CLHS 11.1.1.2.3: a bare token that is not accessible in the
+    // current package is interned there.  It must not reuse the same-named CL
+    // symbol merely because that name is canonical in COMMON-LISP.
+    let output = bliss()
+        .args([
+            "--no-init",
+            "--eval",
+            "(cl:defpackage :ansi-shadow-probe (:use))",
+            "--eval",
+            "(cl:in-package :ansi-shadow-probe)",
+            "--eval",
+            "(cl:defun find-class () 42)",
+            "--eval",
+            "(cl:in-package :cl-user)",
+            "--eval",
+            "(multiple-value-bind (local status)\
+                 (find-symbol \"FIND-CLASS\" :ansi-shadow-probe)\
+               (list status\
+                     (and local (package-name (symbol-package local)))\
+                     (eq local 'cl:find-class)\
+                     (and local (funcall local))\
+                     (handler-case (progn (cl:find-class 'standard-object) t)\
+                       (error () nil))))",
+        ])
+        .output()
+        .expect("run bare-symbol package identity probe");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "(:INTERNAL \"ANSI-SHADOW-PROBE\" NIL 42 T)"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unknown_bare_name_is_homed_in_the_current_package_without_leaking_into_cl() {
+    // bliss-55l8: reading a previously unknown bare name interns it in the
+    // current package. It must not acquire COMMON-LISP as its home merely
+    // because Bliss historically used bare registry keys for CL symbols.
+    let output = bliss()
+        .args([
+            "--no-init",
+            "--eval",
+            "(cl:defpackage :bare-home-probe (:use :cl))",
+            "--eval",
+            "(cl:in-package :bare-home-probe)",
+            "--eval",
+            "(cl:defparameter private-name 7)",
+            "--eval",
+            "(cl:in-package :cl-user)",
+            "--eval",
+            "(cl:multiple-value-bind (local status)\
+                 (cl:find-symbol \"PRIVATE-NAME\" :bare-home-probe)\
+               (cl:list status\
+                        (cl:package-name (cl:symbol-package local))\
+                        (cl:nth-value 1 (cl:find-symbol \"PRIVATE-NAME\" :common-lisp))\
+                        (cl:symbol-value local)))",
+        ])
+        .output()
+        .expect("run bare-symbol home-package probe");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "(:INTERNAL \"BARE-HOME-PROBE\" NIL 7)"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn feature_conditionals_match_package_qualified_feature_symbols() {
+    // Feature names are compared by SYMBOL-NAME, independent of the package in
+    // which the feature expression was read. A package with an empty use-list
+    // therefore still recognizes the runtime's :BLISS feature.
+    let output = bliss()
+        .args([
+            "--no-init",
+            "--eval",
+            "(cl:defpackage :feature-home-probe (:use))",
+            "--eval",
+            "(cl:in-package :feature-home-probe)",
+            "--eval",
+            "(cl:list #+bliss :yes #-bliss :no)",
+        ])
+        .output()
+        .expect("run package-qualified feature probe");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "(:YES)"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn core_restore_repairs_a_sparse_common_lisp_symbol_table() {
+    // A v1 core carries its package registry and replaces the cold-start seed.
+    // Old cores may therefore have the pre-R5.01 sparse CL table; loading one
+    // must restore the canonical 978-name inventory before user code runs.
+    let dir = temp_dir("sparse-ansi-core");
+    let core = dir.join("sparse.core");
+    let save_form = format!(
+        "(progn\
+           (unintern (find-symbol \"FIND-CLASS\" :common-lisp) :common-lisp)\
+           (save-lisp-and-die {:?}))",
+        core.to_string_lossy()
+    );
+    let saved = bliss()
+        .args(["--no-init", "--eval", &save_form])
+        .output()
+        .expect("save sparse COMMON-LISP core");
+    assert_eq!(
+        saved.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&saved.stdout),
+        String::from_utf8_lossy(&saved.stderr)
+    );
+
+    let loaded = bliss()
+        .arg("--no-init")
+        .arg("--image")
+        .arg(&core)
+        .args([
+            "--eval",
+            "(list (length (bliss-internal::package-symbols :common-lisp :external))\
+                   (multiple-value-list (find-symbol \"FIND-CLASS\" :common-lisp)))",
+        ])
+        .output()
+        .expect("load sparse COMMON-LISP core");
+    assert_eq!(
+        loaded.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&loaded.stdout)
+            .lines()
+            .any(|line| line.trim() == "(978 (FIND-CLASS :EXTERNAL))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn restored_core_init_require_uses_symbol_designator_name() {
+    // bliss-25in: the saved executable already PROVIDEs ASDF. While loading an
+    // init file, bare ASDF is a CL-USER symbol, but REQUIRE must compare its
+    // SYMBOL-NAME with the restored *MODULES* strings and remain a no-op.
+    let dir = temp_dir("core-init-require");
+    let core = dir.join("modules.core");
+    let init = dir.join("init.lisp");
+    write_file(
+        &init,
+        "(require 'asdf)\n(format t \"CORE-INIT-REQUIRE-PASSED~%\")\n",
+    );
+    let save_form = format!(
+        "(progn (provide \"ASDF\") (save-lisp-and-die {:?}))",
+        core.to_string_lossy()
+    );
+    let saved = bliss()
+        .args(["--no-init", "--eval", &save_form])
+        .output()
+        .expect("save core with feature marker");
+    assert_eq!(
+        saved.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&saved.stdout),
+        String::from_utf8_lossy(&saved.stderr)
+    );
+
+    let mut child = bliss()
+        .current_dir(&dir)
+        .env("BLISS_INIT_FILE", &init)
+        .arg("--image")
+        .arg(&core)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start REPL from restored core");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(b"(quit)\n")
+        .expect("stop restored-core REPL");
+    let output = child.wait_with_output().expect("wait for restored-core REPL");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("CORE-INIT-REQUIRE-PASSED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("error loading init file"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).ok();
 }
 
 #[test]

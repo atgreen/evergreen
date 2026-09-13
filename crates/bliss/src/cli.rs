@@ -629,9 +629,8 @@ fn seed_standard_packages_registry() {
     }
     reader::register_package("CL-USER");
     reader::register_package("BLISS-THREADS");
-    // ANSI special operators live present+external in the COMMON-LISP table
-    // (bliss-xmxf step a) — see seed_ansi_special_operators.
-    let _ = bliss_stdlib::seed_ansi_special_operators();
+    // All 978 ANSI names live present+external in COMMON-LISP before boot.
+    let _ = bliss_stdlib::seed_ansi_symbols();
 }
 
 /// Keep the *PACKAGE* global value cell in sync with `env.current_package`
@@ -1129,6 +1128,24 @@ fn callable_body_of_symbol(env: &Env, sym: BlissVal, name: &str) -> Option<(Blis
     callable_body_inner(env, name, sym_idx)
 }
 
+/// Function cell for a package-qualified name whose symbol was read BEFORE its
+/// package existed. The whole top-level form is read up front, so
+/// `(progn (defpackage :p …) … (p:f))` reads `P:F` while P is still unknown and
+/// the reader keeps the legacy qualified-string identity, which never receives
+/// the function cell that the later DEFUN installs (on the symbol
+/// `home_defined_symbol` registered in P). Re-resolving through the — by now
+/// live — package registry recovers that symbol and its function.
+fn late_resolved_function_cell(env: &Env, name: &str) -> Option<BlissVal> {
+    let (pkg, bare) = name
+        .rsplit_once("::")
+        .or_else(|| name.rsplit_once(':'))?;
+    if pkg.is_empty() || pkg == "KEYWORD" {
+        return None;
+    }
+    let (sym, _) = find_symbol_in_package(env, pkg, bare)?;
+    bliss_rt::symbols::symbol_function(sym.symbol_index()?)
+}
+
 fn callable_body_inner(
     env: &Env,
     name: &str,
@@ -1147,7 +1164,8 @@ fn callable_body_inner(
     }
     let f = match sym_idx {
         Some(idx) => {
-            let cell = bliss_rt::symbols::symbol_function(idx)?;
+            let cell = bliss_rt::symbols::symbol_function(idx)
+                .or_else(|| late_resolved_function_cell(env, name))?;
             bliss_rt::function::is_interpreted_function(cell).then_some(cell)?
         }
         None => global_fn(name)?,
@@ -1179,8 +1197,13 @@ fn maybe_lazy_compile(name: &str, params: BlissVal, body: BlissVal, env: &Env) {
     {
         return;
     }
-    if let Some(sym) = resolve_sym(name).map(|s| s.as_symbol_index()) {
-        bytecode::lazy_compile_defun(sym, name, params, body, env);
+    let name_symbol = bliss_rt::function::name(f);
+    if let Some(index) = name_symbol.symbol_index() {
+        // Compile under the function object's own symbol identity. Reparsing a
+        // package-local registry spelling here can create a single-colon
+        // lookalike when no reader environment is active, leaving the real hot
+        // function permanently at T0.
+        bytecode::lazy_compile_defun(index, name, params, body, env);
     }
 }
 
@@ -6884,6 +6907,11 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             {
                 out.push_str("#:");
             }
+            let name = if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
+                name
+            } else {
+                bliss_stdlib::format::symbol_name_for_print(val)
+            };
             out.push_str(&bliss_stdlib::format::apply_print_case(&name));
         }
     } else if is_closure_cons(val) {
@@ -7166,8 +7194,7 @@ fn princ_val(val: BlissVal, out: &mut String) {
     if val.is_symbol() {
         let name = sym_name(val);
         // For ~A, print symbol name without package prefix
-        let bare = name.trim_start_matches("KEYWORD:");
-        out.push_str(bare);
+        out.push_str(&symbol_name_string(&name));
         return;
     }
     // A pathname prints as its bare namestring under PRINC/~A (no `#P"…"`
@@ -7371,7 +7398,16 @@ fn symbol_package_value(env: &Env, sym: BlissVal) -> BlissVal {
 }
 
 fn resolve_sym(name: &str) -> Option<BlissVal> {
-    // `name` is always a known, delimiter-free symbol name (a Rust string
+    // An exact registry key resolves to that symbol directly. `name` is often
+    // the `sym_name` of an already-interned symbol, and since bare reads
+    // intern package-locally that spelling can be package-qualified
+    // (`PKG::NAME`); re-tokenizing it with no reader environment active mints
+    // a single-colon lookalike with none of the original's cells. The exact
+    // lookup is also cheaper than tokenizing (one hash probe).
+    if let Some(idx) = reader::find_symbol_index(name) {
+        return Some(BlissVal::from_symbol_index(idx));
+    }
+    // `name` is otherwise a known, delimiter-free symbol name (a Rust string
     // literal at every call site), so bypass the full reader — its
     // tokenizer/number-parser/nesting-scan showed up as dominant eval self-time
     // when invoked from find-symbol/keyword resolution paths (bliss-gq5.4).
@@ -7997,10 +8033,9 @@ fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
 thread_local! {
     static READ_EVAL_ENV: std::cell::Cell<*mut Env> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
-    // Re-entrancy guard for the package-aware symbol resolver. Resolving a token
-    // calls `intern_into_package`, which internally re-reads names via
-    // `resolve_sym`/`read-from-string`; those nested reads must take the reader's
-    // default name-keyed path, not recurse back into the resolver (bliss-lb6.12).
+    // Re-entrancy guard for the package-aware symbol resolver. Package lookup
+    // can reach name helpers that read symbols; nested reads must take the
+    // reader's default path rather than recurse into the resolver (bliss-lb6.12).
     static RESOLVING_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // False while the bootstrap prelude (lib/boot.lisp) is loading, true once it
     // finishes. The prelude defines the standard library with bare (nominally
@@ -8152,17 +8187,19 @@ fn stdlib_print_object_hook(val: BlissVal, escape: bool) -> Option<String> {
 /// with ONE value/function cell (bliss-lb6.12). `pkg` is the explicit package
 /// designator (`None` = the current `*PACKAGE*`).
 ///
-/// It resolves through the SAME read-only `find_symbol_in_package` that
-/// `FIND-SYMBOL` uses, so the two can never disagree. Crucially it does NOT
-/// intern/fabricate a symbol when the name is not yet accessible: it returns
-/// `None`, deferring to the reader's default name-keyed interning. Fabricating
-/// here would mint a package-qualified home symbol for names that are really
-/// inherited from COMMON-LISP but not present in its symbol table — e.g. special
-/// operators like `EVAL-WHEN` — and the interpreter dispatches those by bare
-/// name, so a qualified spelling would break them. `None` is also returned when
-/// no load environment is active (internal `read-from-string`) or for a bare
-/// read whose current package is COMMON-LISP / COMMON-LISP-USER, where the bare
-/// name is already the canonical key.
+/// The package registry's `intern` operation first returns any present or
+/// inherited symbol, then creates a distinct package-local symbol when the name
+/// is inaccessible. The complete ANSI COMMON-LISP table is seeded before any
+/// Lisp is read, so standard operators/macros always take the inherited path;
+/// an unknown bare token can therefore be homed at read time without mistaking
+/// an unseeded standard name for a new local symbol (bliss-55l8). Legacy runtime
+/// primitives are deliberately unhomed bare symbols; those retain their global
+/// identity in every package until the extension packages own the complete
+/// primitive surface. During the bootstrap prelude, unknown private helper names
+/// likewise retain the legacy bare identity expected by the Rust builtin table.
+///
+/// `None` is returned only when no load environment is active, resolution is
+/// already re-entered, the package is unknown, or package interning fails.
 fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
@@ -8177,16 +8214,54 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
         Some(p) => resolve_package_name_cow(env, p),
         None => std::borrow::Cow::Borrowed(env.current_package.as_str()),
     };
-    if pkg.is_none() && (pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER") {
-        return None;
-    }
-    // `find_symbol_in_package` may consult COMMON-LISP-USER / KEYWORD via
-    // `resolve_sym`, which re-reads a name and could re-enter this hook; the guard
-    // routes those nested reads to the reader's default path.
+    let cl_owns_name = bliss_stdlib::find_package("COMMON-LISP")
+        .is_some_and(|cl| bliss_stdlib::find_present_symbol(cl, name).is_some());
+    // Keep package/name helper reads from recursively entering this hook.
     RESOLVING_SYMBOL.with(|c| c.set(true));
-    let found = find_symbol_in_package(env, &pkg_name, name);
+    let found = if BOOT_COMPLETE.with(|c| c.get()) {
+        find_symbol_in_package(env, &pkg_name, name)
+            .map(|pair| pair.0)
+            .or_else(|| {
+                // Rust builtin/private bootstrap identities predate the package
+                // registry and intentionally have no home package. Keep those
+                // callable by their existing bare symbol rather than minting a
+                // package-local lookalike with no builtin/function cell.
+                reader::find_symbol_index(name)
+                    .filter(|idx| {
+                        bliss_rt::symbols::symbol_package(*idx)
+                            .is_some_and(|package| package.is_nil())
+                    })
+                    .map(BlissVal::from_symbol_index)
+            })
+            .or_else(|| {
+                // These image-control operators are Rust-dispatched and may not
+                // have been read/interned before their first user call. Keep the
+                // compatibility spellings on their legacy bare identities. Only
+                // a BARE read takes this path: an explicitly package-qualified
+                // read (e.g. BLISS-THREAD:MAKE-THREAD) must intern into that
+                // package below, since the interpreter dispatches those
+                // extension builtins by their qualified spelling.
+                (!cl_owns_name
+                    && pkg.is_none()
+                    && (is_builtin_function(name)
+                        || matches!(
+                            name,
+                            "SAVE-IMAGE"
+                                | "SAVE-LISP-AND-DIE"
+                                | "SAVE-IMAGE-AND-DIE"
+                                | "%SAVE-CORE"
+                        )))
+                .then(|| BlissVal::from_symbol_index(bliss_rt::symbols::intern(name)))
+            })
+            .or_else(|| {
+                let package = bliss_stdlib::find_package(&pkg_name)?;
+                bliss_stdlib::intern(name, package).ok().map(|pair| pair.0)
+            })
+    } else {
+        find_symbol_in_package(env, &pkg_name, name).map(|pair| pair.0)
+    };
     RESOLVING_SYMBOL.with(|c| c.set(false));
-    found.and_then(|(sym, _)| sym.symbol_index())
+    found.and_then(BlissVal::symbol_index)
 }
 
 /// Reader hook: build a `#P"…"` literal as the stdlib's registry-backed pathname
@@ -8562,18 +8637,15 @@ fn seed_compile_time_binding(env: &mut Env, symbol: BlissVal, value: BlissVal) {
     }
 }
 
-/// Home a top-level definition's name as a *present* INTERNAL symbol of the
-/// current package, so FIND-SYMBOL reports `:INTERNAL` (bliss-v15i). A bare
-/// DEFUN/DEFVAR in CL-USER creates the symbol there, but the reader mints it
-/// name-keyed in the global registry without homing it in the package map, so it
-/// was mis-reported as `:INHERITED` via the COMMON-LISP fallback in
-/// `find_symbol_in_package`. This homes the reader's exact handle (identity
-/// preserved) at *definition* time — never at read time, which would wrongly
-/// home every standard/library symbol read during boot.
+/// Make a definition's name present in the package active when the definition
+/// is established. Normally the reader has already interned a bare name there.
+/// The extra CL-USER-qualified case preserves Bliss's long-standing support for
+/// `(progn (in-package ...) (defun bare-name ...))`: the whole PROGN was read in
+/// CL-USER before IN-PACKAGE ran, but the definition is still made present in
+/// the new package under the same symbol identity. Genuinely explicit foreign
+/// qualifiers remain untouched.
 ///
-/// Scoped to COMMON-LISP-USER (the reported case) and to an unqualified name
-/// (`full == bare`), so a package-qualified or already-homed symbol is left
-/// alone. A standard symbol inherited from COMMON-LISP stays inherited (never
+/// A standard symbol inherited from COMMON-LISP stays inherited (never
 /// shadowed by a present copy). GC-safe: symbol handles are immediates and the
 /// package registry stores them directly — no Bliss allocation.
 fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
@@ -8592,9 +8664,19 @@ fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
     let full = sym_name(name_sym);
     let bare = symbol_bare_name(&full);
     if full != bare {
-        // A package-qualified (or keyword) print name: the symbol was interned
-        // by whoever qualified it; do not re-home it here.
-        return;
+        let qualifier = full
+            .rsplit_once("::")
+            .map(|(package, _)| package)
+            .or_else(|| full.rsplit_once(':').map(|(package, _)| package));
+        let read_before_in_package = qualifier.is_some_and(|package| {
+            normalize_package_name(package) == "COMMON-LISP-USER"
+                && pkg_name != "COMMON-LISP-USER"
+        });
+        if !read_before_in_package {
+            // A genuinely package-qualified (or keyword) name was interned by
+            // the package it names; do not make it present somewhere else.
+            return;
+        }
     }
     if let Some(cl) = bliss_stdlib::find_package("COMMON-LISP") {
         if bliss_stdlib::find_present_symbol(cl, &bare).is_some() {
@@ -8613,14 +8695,34 @@ fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
     // unregistered there, so a definition made inside a package looked inherited
     // from outside it.
     let _ = bliss_stdlib::intern_present(pkg, &bare, name_sym);
-    // NOTE: SYMBOL-PACKAGE still reports COMMON-LISP for such a symbol, because
-    // the reader defaults a bare name's home to COMMON-LISP (and even leaks it
-    // present there) before this runs — the same representation issue behind
-    // bliss-9fi3 (RENAME-PACKAGE). Correcting the home cell here is not reliable
-    // while the leak stands (the "stays inherited" check above cannot tell a
-    // genuine inherited CL symbol from a leaked one), so the home fix is left to
-    // that representation work. FIND-SYMBOL status — this bead's symptom — is
-    // now correct.
+    // When the package ALREADY had its own present symbol of this name —
+    // typically a DEFPACKAGE (:export …) that ran earlier in the same
+    // top-level form — intern_present keeps that symbol, while the definition
+    // just installed its function on `name_sym` (the pre-IN-PACKAGE read
+    // identity). Mirror the function object onto the package's own symbol so a
+    // qualified PKG:NAME call resolved through the registry reaches the
+    // definition. Same object, so tiering state stays shared.
+    if let Some(existing) = bliss_stdlib::find_present_symbol(pkg, &bare) {
+        if existing != name_sym {
+            if let (Some(existing_idx), Some(name_idx)) =
+                (existing.symbol_index(), name_sym.symbol_index())
+            {
+                // A never-defined symbol's cell is empty or holds the UNBOUND
+                // sentinel — anything that is not a live function object is
+                // safe to fill; a genuine function on the package's own symbol
+                // is never displaced.
+                let vacant = bliss_rt::symbols::symbol_function(existing_idx)
+                    .is_none_or(|cell| !bliss_rt::function::is_interpreted_function(cell));
+                if vacant {
+                    if let Some(f) = bliss_rt::symbols::symbol_function(name_idx) {
+                        if bliss_rt::function::is_interpreted_function(f) {
+                            bliss_rt::symbols::set_symbol_function(existing_idx, f);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn symbol_leaf_name(name: &str) -> &str {
@@ -8934,94 +9036,6 @@ fn rekey_renamed_symbols(env: &Env, renamed: &[(u32, String, String)]) {
     });
 }
 
-/// The home package encoded in a symbol's arena key. Mirrors the logic of the
-/// SYMBOL-PACKAGE builtin: `KEYWORD:x` → KEYWORD, `PKG::x`/`PKG:x` → PKG, and a
-/// bare name → COMMON-LISP.
-fn home_package_of_name(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix("KEYWORD:") {
-        let _ = rest;
-        "KEYWORD".to_string()
-    } else if let Some((pkg, _)) = name.rsplit_once("::") {
-        pkg.to_string()
-    } else if let Some((pkg, _)) = name.rsplit_once(':') {
-        pkg.to_string()
-    } else {
-        "COMMON-LISP".to_string()
-    }
-}
-
-/// True if some package OTHER than COMMON-LISP genuinely owns (homes) a symbol
-/// with this bare name.
-///
-/// The reader interns every bare symbol under a package-less arena key, so the
-/// COMMON-LISP package would otherwise appear to "contain" every bare symbol
-/// ever read — including internal symbols of user packages such as UIOP, whose
-/// names collide with nothing in ANSI CL but still get a bare arena entry.
-/// A symbol is only truly owned by package P when P's own symbol table maps the
-/// name to a symbol whose home package (per its arena key) is P itself; imported
-/// or inherited symbols don't count. If any non-CL package owns the name, then
-/// COMMON-LISP must NOT claim it — that is what keeps FIND-SYMBOL / DO-SYMBOLS
-/// over COMMON-LISP from fabricating membership and breaking package algorithms
-/// like UIOP's DEFINE-PACKAGE (which compares symbol home packages).
-/// The set of bare names homed in some non-CL package — the batch form of
-/// [`name_owned_by_noncl_package`], computed once so COMMON-LISP enumeration is
-/// O(all-package-symbols) instead of O(symbols × packages) (bliss-gq5.5).
-fn noncl_owned_names(_env: &Env) -> std::collections::HashSet<String> {
-    let cl = bliss_stdlib::find_package("COMMON-LISP");
-    let mut owned = std::collections::HashSet::new();
-    for pkg in bliss_stdlib::list_all_packages() {
-        let Some(pkg_name) = bliss_stdlib::package_name(pkg) else {
-            continue;
-        };
-        if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
-            continue;
-        }
-        for sym in bliss_stdlib::present_symbols(pkg) {
-            let name = sym_name(sym);
-            let bare = symbol_bare_name(&name);
-            if noncl_owns(cl, &pkg_name, &name, &bare) {
-                owned.insert(bare);
-            }
-        }
-    }
-    owned
-}
-
-/// Ownership test shared by [`noncl_owned_names`] / [`name_owned_by_noncl_package`]:
-/// package `pkg_name` (non-CL) owns a present symbol either when its registry
-/// key homes it there, or when the key is BARE and the name is not a genuine
-/// COMMON-LISP-table symbol — i.e. a definition made in that package that the
-/// reader mis-homed to COMMON-LISP (the bliss-xmxf representation leak).
-/// Without the second arm, such a symbol counts as CL's, so COMMON-LISP claims
-/// it external and every package using CL wrongly inherits it (bliss-jnzb).
-fn noncl_owns(cl: Option<BlissVal>, pkg_name: &str, full_name: &str, bare: &str) -> bool {
-    let home = home_package_of_name(full_name);
-    if home == pkg_name {
-        return true;
-    }
-    home == "COMMON-LISP"
-        && full_name == bare
-        && !cl.is_some_and(|cl| bliss_stdlib::find_present_symbol(cl, bare).is_some())
-}
-
-fn name_owned_by_noncl_package(_env: &Env, bare_name: &str) -> bool {
-    let cl = bliss_stdlib::find_package("COMMON-LISP");
-    for pkg in bliss_stdlib::list_all_packages() {
-        let Some(pkg_name) = bliss_stdlib::package_name(pkg) else {
-            continue;
-        };
-        if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
-            continue;
-        }
-        if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_name) {
-            if noncl_owns(cl, &pkg_name, &sym_name(sym), bare_name) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Resolve a package designator to a canonical package name, following
 /// nicknames. Returns the canonical name of the registered package whose name or
 /// nicknames match; if none match, returns the normalized designator unchanged
@@ -9238,17 +9252,16 @@ fn find_symbol_in_package_cased(
     let Some(root) = bliss_stdlib::find_package(&resolve_package_name_cow(env, pkg_name)) else {
         return None;
     };
-    // The special-cased packages are compared by IDENTITY, so resolve their
-    // handles once here rather than re-deriving a name per step.
-    let cl = bliss_stdlib::find_package("COMMON-LISP");
+    // KEYWORD is compared by identity, so resolve its handle once here rather
+    // than re-deriving a name per step.
     let keyword = bliss_stdlib::find_package("KEYWORD");
     // A symbol present in (or specially owned by) the package itself, else an
     // EXTERNAL symbol of a directly-used package (inherited; CLHS 11.1.1.2.1 —
     // use is one level, not transitive; :use-reexport re-homes into the external
     // table so one hop covers the visible set).
-    let found = present_symbol_with_status(env, root, cl, keyword, &bare_upper).or_else(|| {
+    let found = present_symbol_with_status(root, keyword, &bare_upper).or_else(|| {
         bliss_stdlib::package_use_list(root).into_iter().find_map(|used| {
-            match present_symbol_with_status(env, used, cl, keyword, &bare_upper) {
+            match present_symbol_with_status(used, keyword, &bare_upper) {
                 Some((sym, "EXTERNAL")) => Some((sym, "INHERITED")),
                 _ => None,
             }
@@ -9273,28 +9286,15 @@ fn find_symbol_in_package_cased(
     found
 }
 
-/// The symbol `bare_upper` names in `pkg` itself — present in its tables, or
-/// specially owned for COMMON-LISP / KEYWORD — with its :INTERNAL/:EXTERNAL
-/// status. Inheritance from used packages is the caller's job
+/// The symbol `bare_upper` names in `pkg` itself — present in its tables, or a
+/// dynamically interned KEYWORD — with its :INTERNAL/:EXTERNAL status.
+/// Inheritance from used packages is the caller's job
 /// ([`find_symbol_in_package`]); this never walks a use-list.
 fn present_symbol_with_status(
-    env: &Env,
     pkg: BlissVal,
-    cl: Option<BlissVal>,
     keyword: Option<BlissVal>,
     bare_upper: &str,
 ) -> Option<(BlissVal, &'static str)> {
-    if cl == Some(pkg) {
-        // COMMON-LISP owns a bare name only if it is an already-interned symbol
-        // that no user package homes. Never intern here: FIND-SYMBOL must have
-        // no side effects, and fabricating a symbol would make COMMON-LISP
-        // appear to export every name ever read.
-        if let Some(idx) = reader::find_symbol_index(bare_upper) {
-            if !name_owned_by_noncl_package(env, bare_upper) {
-                return Some((BlissVal::from_symbol_index(idx), "EXTERNAL"));
-            }
-        }
-    }
     // (COMMON-LISP-USER is NOT special-cased: it used resolve_sym, which INTERNS
     // the name — FIND-SYMBOL must have no side effects — and reported :EXTERNAL,
     // but CL-USER exports nothing by default. It now falls through to the general
@@ -11198,15 +11198,11 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
 /// package inherits (CLHS 11.1.1.2.1). Previously these enumerated every
 /// present symbol, so UIOP's ensure-package treated internal symbols of used
 /// packages as inheritable and its export bookkeeping broke once FIND-SYMBOL
-/// became external-only (bliss-jnzb). The special packages' externals are
-/// fabricated from the interned table (they have no external-table entries),
-/// so route them through [`package_symbols`], which models that set.
+/// became external-only (bliss-jnzb). KEYWORD remains derived from its qualified
+/// interned keys; every other package has an authoritative external table.
 fn package_external_symbols(env: &Env, package_name: &str) -> Vec<BlissVal> {
     let package_name = normalize_package_name(package_name);
-    if package_name == "COMMON-LISP"
-        || package_name == "COMMON-LISP-USER"
-        || package_name == "KEYWORD"
-    {
+    if package_name == "KEYWORD" {
         return package_symbols(env, &package_name, false);
     }
     bliss_stdlib::find_package(&package_name)
@@ -11220,39 +11216,15 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
     // inheritance — what DO-EXTERNAL-SYMBOLS drives on every ASDF DEFINE-PACKAGE.
     // Return the values directly: no PackageDef clone, no dedup map, no per-name
     // String clone. (Names within one package are already unique.)
-    if !include_inherited
-        && package_name != "COMMON-LISP"
-        && package_name != "COMMON-LISP-USER"
-        && package_name != "KEYWORD"
-    {
+    if !include_inherited && package_name != "KEYWORD" {
         return bliss_stdlib::find_package(&package_name)
             .map(bliss_stdlib::present_symbols)
             .unwrap_or_default();
     }
     let mut seen = HashMap::<String, BlissVal>::new();
-    // Enumerate the whole interned table once (one lock, no fixed 4096 cap — the
-    // old `0..4096` probe truncated large images and re-locked per index,
-    // bliss-gq5.5). COMMON-LISP/-USER are the bare-named symbols; KEYWORD the
-    // `:`-prefixed ones.
-    if package_name == "COMMON-LISP" {
-        // Only bare symbols that no user package homes belong to COMMON-LISP.
-        // Precompute the set of names owned by a non-CL package ONCE, rather than
-        // rescanning every package per symbol (was O(symbols × packages)).
-        let owned = noncl_owned_names(env);
-        for (idx, name) in bliss_rt::symbols::interned_names() {
-            if !name.contains(':') && !owned.contains(&name) {
-                seen.entry(name.clone())
-                    .or_insert(BlissVal::from_symbol_index(idx));
-            }
-        }
-    } else if package_name == "COMMON-LISP-USER" {
-        for (idx, name) in bliss_rt::symbols::interned_names() {
-            if !name.contains(':') {
-                seen.entry(name.clone())
-                    .or_insert(BlissVal::from_symbol_index(idx));
-            }
-        }
-    } else if package_name == "KEYWORD" {
+    // Keywords are interned under qualified registry keys before their package
+    // table is necessarily updated, so include those keys in the snapshot.
+    if package_name == "KEYWORD" {
         for (idx, name) in bliss_rt::symbols::interned_names() {
             // Keywords are interned under "KEYWORD:NAME" registry keys (see
             // read_symbol_token), not a bare ":" prefix — matching ':' here
@@ -11551,12 +11523,16 @@ fn record_module(env: &mut Env, name: &str) {
     }
 }
 
-fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let normalized = module
-        .trim_start_matches("KEYWORD:")
-        .trim_start_matches(':')
-        .trim_matches('"')
-        .to_uppercase();
+fn module_designator_name(module: BlissVal) -> String {
+    if module.is_symbol() {
+        symbol_bare_name(&sym_name_rc(module))
+    } else {
+        val_as_str(module).to_uppercase()
+    }
+}
+
+fn require_module(module: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let normalized = module_designator_name(module);
     // ANSI: REQUIRE does nothing if the module is already present (whether loaded
     // by a prior REQUIRE or a plain LOAD that PROVIDEd it). Re-loading asdf.lisp
     // over an already-loaded asdf re-defines its packages and errors.
@@ -18979,10 +18955,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     // Most-visible restart of this name whose :test (if any)
                     // accepts NIL (RESTART-CASE.6/19).
-                    let restart_name = val_as_str(*name_val).to_uppercase();
+                    let restart_name = symbol_bare_name(&val_as_str(*name_val));
                     let mut found = None;
                     for i in restart_visibility_order(&env.restarts) {
-                        if env.restarts[i].name == restart_name {
+                        if symbol_bare_name(&env.restarts[i].name) == restart_name {
                             let entry = env.restarts[i].clone();
                             if restart_applies(&entry, None, env)? {
                                 found = Some(i);
@@ -19027,7 +19003,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let restart_name = symbol_bare_name(&val_as_str(*restart_val)).to_uppercase();
                     restart_visibility_order(&env.restarts)
                         .into_iter()
-                        .find(|&i| env.restarts[i].name == restart_name)
+                        .find(|&i| symbol_bare_name(&env.restarts[i].name) == restart_name)
                 };
                 let Some(idx) = idx_opt else {
                     return Err(BlissError::ProgramError(format!(
@@ -19305,14 +19281,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "REQUIRE" => {
                 let (module_form, _) = cp(cdr);
                 let module_val = eval_form(module_form, env)?;
-                return require_module(&val_as_str(module_val), env);
+                return require_module(module_val, env);
             }
             "PROVIDE" => {
                 let (module_form, _) = cp(cdr);
                 let module_val = eval_form(module_form, env)?;
                 env.define_local("*LAST-PROVIDED-MODULE*", module_val);
                 // Register in *MODULES* so a later (require ...) is a no-op (ANSI).
-                let name = val_as_str(module_val).to_uppercase();
+                let name = module_designator_name(module_val);
                 record_module(env, &name);
                 return Ok(module_val);
             }
@@ -27877,6 +27853,18 @@ fn cli_global_macro_env() -> MacroexpandEnv {
     base
 }
 
+/// Recover the exact symbol used as a global macro-table key. Package-local
+/// symbols are stored under their registry spelling (`PKG::NAME`); reparsing
+/// that spelling without an active reader environment falls back to the
+/// single-colon key and silently creates a different symbol. Prefer the exact
+/// registry identity and only parse legacy keys that predate symbol interning.
+fn global_macro_name_symbol(name: &str) -> BlissVal {
+    reader::find_symbol_index(name)
+        .map(BlissVal::from_symbol_index)
+        .or_else(|| resolve_sym(name))
+        .unwrap_or(NIL)
+}
+
 /// Register each macro's expander (reusing `MACRO_FN_CACHE`) and augment
 /// `macro_env`'s function map with it. Extracted from
 /// `macroexpand_environment_from_cli` so the global-macro base can be built once
@@ -27946,7 +27934,7 @@ fn augment_env_with_macros(
                             apply_function(f, &[form, NIL], &mut macro_env)
                         }),
                     );
-                    let symbol = resolve_sym(name).unwrap_or(NIL);
+                    let symbol = global_macro_name_symbol(name);
                     // Cache keyed on the FUNCTION's identity (stored in
                     // body_bits — the source body is NIL for these), so a
                     // redefinition with a different expander re-registers.
@@ -27991,7 +27979,7 @@ fn augment_env_with_macros(
                             )
                         }),
                     );
-                    let symbol = resolve_sym(name).unwrap_or(NIL);
+                    let symbol = global_macro_name_symbol(name);
                     // resolve_sym interns (allocates) and can fire a relocating
                     // minor GC; the loop-top `params_bits`/`body_bits` copies are
                     // then stale. MACRO_FN_CACHE is a scanned GC root, so storing
@@ -28090,7 +28078,7 @@ fn augment_env_with_macros(
                         eval_progn(body, &mut macro_env)
                     }),
                 );
-                let symbol = resolve_sym(name).unwrap_or(NIL);
+                let symbol = global_macro_name_symbol(name);
                 // Same staleness hazard as the bytecode branch above: resolve_sym
                 // can GC, so re-read the rooted bits before storing them into the
                 // scanned MACRO_FN_CACHE root (bliss-wlf).
@@ -31545,6 +31533,10 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Blis
 fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), BlissError> {
     bliss_rt::gc::ensure_heap_initialized();
     bliss_rt::image::load_image_from_bytes(bytes)?;
+    // A core replaces the cold-start package registry wholesale. Older v1
+    // cores carry the former sparse COMMON-LISP table, so repair it before any
+    // restored/user code runs. This is idempotent for current complete cores.
+    bliss_stdlib::seed_ansi_symbols()?;
     // The per-thread symbol-name cache is keyed by symbol INDEX, and the
     // restore just replaced the whole index space: a pre-load entry aliases
     // whatever restored symbol now owns that index, so sym_name served stale
@@ -32049,8 +32041,14 @@ fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
 /// messages read `undefined function: FOO` instead of `... Symbol(147)`.
 pub fn describe_err(e: &BlissError) -> String {
     match e {
-        BlissError::UndefinedFunction(s) => format!("undefined function: {}", sym_name(*s)),
-        BlissError::UnboundVariable(s) => format!("unbound variable: {}", sym_name(*s)),
+        BlissError::UndefinedFunction(s) => format!(
+            "undefined function: {}",
+            bliss_stdlib::format::symbol_name_for_print(*s)
+        ),
+        BlissError::UnboundVariable(s) => format!(
+            "unbound variable: {}",
+            bliss_stdlib::format::symbol_name_for_print(*s)
+        ),
         _ => format!("{}", e),
     }
 }

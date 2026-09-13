@@ -582,7 +582,18 @@ fn fmt_const_val(v: BlissVal) -> String {
 
 /// The name for a symbol index, for annotations.
 fn sym_label(sym: u32) -> String {
-    bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("#{sym}"))
+    let raw = bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("#{sym}"));
+    display_fn_name(&raw).to_string()
+}
+
+/// Observability spelling of a function name (traces, perf map, jitdump,
+/// disassembly headers): a name homed in the default COMMON-LISP-USER package
+/// prints bare — matching the tooling and tests that predate package-local
+/// symbol identity — while any other package keeps its qualifier.
+fn display_fn_name(name: &str) -> &str {
+    name.strip_prefix("COMMON-LISP-USER::")
+        .or_else(|| name.strip_prefix("COMMON-LISP-USER:"))
+        .unwrap_or(name)
 }
 
 /// Shared header for every tier's listing: signature + any checked parameter
@@ -13491,7 +13502,7 @@ fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
     } else {
         format!("/tmp/perf-{}.map", std::process::id())
     };
-    let raw = bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("fn{sym}"));
+    let raw = sym_label(sym);
     // perf reads everything after the size as the symbol name; keep it a single
     // token so tools that split on whitespace stay happy.
     let name: String = raw
@@ -13589,7 +13600,7 @@ fn maybe_write_jitdump_code_load(tier: &str, addr: usize, code: &[u8], sym: u32)
     let Some(writer) = jitdump_writer() else {
         return;
     };
-    let raw = bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("fn{sym}"));
+    let raw = sym_label(sym);
     let cleaned: String = raw
         .chars()
         .map(|c| if c.is_whitespace() { '_' } else { c })
@@ -16055,8 +16066,8 @@ fn emit_native_x86(
                                 "compile",
                                 bliss_rt::log::TRACE,
                                 "[T1] {}: direct call to {} [T{}]",
-                                bf.name,
-                                cbf.name,
+                                display_fn_name(&bf.name),
+                                display_fn_name(&cbf.name),
                                 if cnc.is_t2 { 2 } else { 1 }
                             );
                             let slow = c.label();
@@ -17542,6 +17553,7 @@ fn trace_named(name: &str, what: &str, reason: Option<&str>) {
     if std::env::var_os("BLISS_BYTECODE_TRACE_NAMES").is_none() {
         return;
     }
+    let name = display_fn_name(name);
     match reason {
         Some(reason) => eprintln!("[bytecode] {name}: {what} ({reason})"),
         None => eprintln!("[bytecode] {name}: {what}"),
@@ -17621,8 +17633,18 @@ fn as_setf_expander_definition(form: BlissVal) -> Option<(String, BlissVal, Blis
     Some((sym_name(name_sym), params, body))
 }
 
-/// Resolve a symbol name to its interned index via the reader.
+/// Resolve a symbol name to its interned index. `name` is normally the
+/// registry spelling of an already-interned symbol (`sym_name` of a defun /
+/// defmacro name), so look the exact key up first: reparsing a package-local
+/// `PKG::NAME` spelling with no reader environment active mints a single-colon
+/// lookalike, and bytecode registered under that lookalike is invisible to the
+/// call sites dispatching on the real symbol (the function then never leaves
+/// the tree-walker). Only a name that is not an exact registry key falls back
+/// to the reader.
 fn symbol_index_of(name: &str) -> Option<u32> {
+    if let Some(index) = reader::find_symbol_index(name) {
+        return Some(index);
+    }
     match reader::read_from_string(name) {
         // `symbol_index()` (not `as_symbol_index`) so NIL/T — which read as
         // symbols but have no index — yield None instead of panicking (bliss-hkf).
