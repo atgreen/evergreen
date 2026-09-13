@@ -8244,13 +8244,18 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
             .or_else(|| {
                 // These image-control operators are Rust-dispatched and may not
                 // have been read/interned before their first user call. Keep the
-                // compatibility spellings on their legacy bare identities. Only
-                // a BARE read takes this path: an explicitly package-qualified
-                // read (e.g. BLISS-THREAD:MAKE-THREAD) must intern into that
-                // package below, since the interpreter dispatches those
+                // compatibility spellings on their legacy bare identities. A
+                // BARE read takes this path, as does a read explicitly
+                // qualified into COMMON-LISP-USER/COMMON-LISP (where the
+                // legacy builtins live bare — e.g. a script's
+                // cl-user::save-lisp-and-die). A read qualified into any OTHER
+                // package (e.g. BLISS-THREAD:MAKE-THREAD) must intern into
+                // that package below, since the interpreter dispatches those
                 // extension builtins by their qualified spelling.
                 (!cl_owns_name
-                    && pkg.is_none()
+                    && (pkg.is_none()
+                        || pkg_name == "COMMON-LISP-USER"
+                        || pkg_name == "COMMON-LISP")
                     && (is_builtin_function(name)
                         || matches!(
                             name,

@@ -5173,24 +5173,30 @@ pub fn full_gc() -> Result<(), BlissError> {
 pub fn serialize_heap_objects() -> Vec<u8> {
     let mut out = Vec::new();
     let _ = walk_heap(|ptr, type_id, size| {
-        // Skip objects with OFF-HEAP bodies that cannot be snapshotted: a STREAM's
-        // body word 0 is a raw pointer to a process-local Rust block (file handle +
-        // buffers) that dies with the saving process. Serializing it would restore
-        // a heap object whose custom GC trace (STREAM_TRACE_FN) dereferences that
-        // freed block — a segfault the first time a minor GC traces it in the new
-        // process (bliss-x0f2 M3). Streams are re-opened on load instead; a core
-        // must not retain open streams other than the standard ones the loader
-        // re-creates. (Hash-tables also box their bodies off-heap, but their GC
-        // trace visits nothing, so they survive tracing and only a *use* faults —
-        // a separate off-heap-body follow-up, not a GC-safety hazard here.)
-        if type_id == crate::object::type_id::STREAM {
-            return true;
-        }
         out.extend_from_slice(&(ptr as u64).to_le_bytes());
         out.push(type_id);
         out.extend_from_slice(&(size as u32).to_le_bytes());
         let data = unsafe { std::slice::from_raw_parts(ptr, size) };
-        out.extend_from_slice(data);
+        // A STREAM's body word 0 is a raw pointer to a process-local Rust
+        // block (file handle + buffers) that dies with the saving process, so
+        // serialize the HANDLE with that word NULLED: the restored object is a
+        // finalized/closed stream (get_stream_alloc errors, STREAM_TRACE_FN
+        // and the finalizer no-op on null), while every heap reference to it
+        // remaps like any other object. The handle used to be SKIPPED
+        // entirely, which left each such reference dangling at its pre-save
+        // address — the first dereference in the restored process (e.g. the
+        // ansi-test *mini-universe* stream element under a type probe)
+        // segfaulted (bliss-agmi). Streams are re-opened on load; the loader
+        // re-creates the standard ones.
+        if type_id == crate::object::type_id::STREAM {
+            let zeros = [0u8; 8];
+            out.extend_from_slice(&zeros[..size.min(8)]);
+            if size > 8 {
+                out.extend_from_slice(&data[8..]);
+            }
+        } else {
+            out.extend_from_slice(data);
+        }
         true
     });
     out
