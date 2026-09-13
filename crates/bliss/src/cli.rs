@@ -6818,6 +6818,21 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             .unwrap_or_else(|| "INSTANCE".to_string());
         out.push_str("#<");
         out.push_str(&name);
+        // Restart objects are first-class designators, and their printed
+        // representation should retain the name that makes them useful at the
+        // debugger/repl (bliss-0i56). The NAME slot is part of the private
+        // restart class installed by `ensure_restart_class`.
+        if name == "RESTART" {
+            let name_slot = bliss_stdlib::effective_slots(class)
+                .into_iter()
+                .find(|slot| symbol_bare_name(&sym_name_rc(*slot)) == "NAME");
+            if let Some(name_slot) = name_slot {
+                if let Ok(restart_name) = bliss_stdlib::slot_value(val, name_slot) {
+                    out.push(' ');
+                    print_val_inner(restart_name, out);
+                }
+            }
+        }
         out.push('>');
     } else if val.is_fixnum() {
         // Honour *PRINT-BASE* so tree-walked PRINT/PRIN1 matches the stdlib
@@ -7080,16 +7095,20 @@ fn print_list_body(val: BlissVal, out: &mut String) {
     // *PRINT-LENGTH*: after this many elements, print `...` and stop.
     let limit = bliss_stdlib::format::print_length();
     let circle = bliss_stdlib::format::circle_active();
-    let mut cur = val;
+    // Printing an element may dispatch PRINT-OBJECT, which allocates a stream
+    // and can relocate the surrounding list. Keep the cursor rooted and advance
+    // it before recursively printing the car so neither half is read through a
+    // stale ConsCell pointer after a collection.
+    bliss_rt::rooted!(cur = val);
     let mut count = 0usize;
     let mut first = true;
     while cur.is_cons() {
         // *PRINT-CIRCLE*: a shared/circular cons in the cdr position prints as a
         // dotted tail so its own #N=/#N# label appears (the head cons, `first`,
         // was already labelled by the caller).
-        if !first && circle && bliss_stdlib::format::circle_is_shared(cur) {
+        if !first && circle && bliss_stdlib::format::circle_is_shared(*cur) {
             out.push_str(" . ");
-            print_val(cur, out);
+            print_val(*cur, out);
             return;
         }
         if limit.is_some_and(|n| count >= n) {
@@ -7102,17 +7121,16 @@ fn print_list_body(val: BlissVal, out: &mut String) {
         if count > 0 {
             out.push(' ');
         }
-        unsafe {
-            let c = cur.as_ptr() as *const ConsCell;
-            print_val((*c).car, out);
-            cur = (*c).cdr;
-        }
+        let (car, cdr) = cp(*cur);
+        bliss_rt::rooted!(car = car);
+        *cur = cdr;
+        print_val(*car, out);
         count += 1;
         first = false;
     }
     if !cur.is_nil() {
         out.push_str(" . ");
-        print_val(cur, out);
+        print_val(*cur, out);
     }
 }
 
@@ -8034,8 +8052,11 @@ fn dispatch_print_object(val: BlissVal, escape: bool) -> Option<String> {
     // printing is single-threaded and the outer borrow is dormant for the span of
     // this call (mirrors READ_EVAL_ENV / read_time_eval).
     let env = unsafe { &mut *ptr };
-    let stream = bliss_stdlib::make_string_output_stream(NIL).ok()?;
-    if !has_applicable_method(env, "PRINT-OBJECT", &[val, stream]) {
+    // Stream creation and method dispatch both allocate. Root the candidate
+    // object and the new stream before either can become a stale nursery pointer.
+    bliss_rt::rooted!(val = val);
+    bliss_rt::rooted!(stream = bliss_stdlib::make_string_output_stream(NIL).ok()?);
+    if !has_applicable_method(env, "PRINT-OBJECT", &[*val, *stream]) {
         return None;
     }
     PRINTING_OBJECT.with(|c| c.set(true));
@@ -8044,11 +8065,11 @@ fn dispatch_print_object(val: BlissVal, escape: bool) -> Option<String> {
     let result = (|| {
         let _esc = resolve_sym("*PRINT-ESCAPE*")
             .map(|s| DynBind::establish(s, if escape { T } else { NIL }));
-        invoke_generic_function("PRINT-OBJECT", &[val, stream], env)
+        invoke_generic_function("PRINT-OBJECT", &[*val, *stream], env)
     })();
     PRINTING_OBJECT.with(|c| c.set(false));
     result.ok()?;
-    let s = bliss_stdlib::get_output_stream_string(stream).ok()?;
+    let s = bliss_stdlib::get_output_stream_string(*stream).ok()?;
     Some(val_as_str(s))
 }
 

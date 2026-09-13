@@ -9,8 +9,8 @@ use bliss_stdlib::clos::{
     slot_boundp, slot_value,
 };
 use bliss_stdlib::conditions::{
-    RestartSpec, compute_restarts, find_restart, handler_case, make_simple_error, make_type_error,
-    restart_bind,
+    RestartSpec, SYMBOL_CONDITION, compute_restarts, find_restart, handler_case,
+    initialize_condition_runtime_support, make_simple_error, make_type_error, restart_bind,
 };
 use bliss_stdlib::format::{format, formatter};
 use bliss_stdlib::hashtable::{
@@ -186,13 +186,20 @@ fn intern_multiple_symbols_in_same_package() {
 #[test]
 fn define_condition_class_and_handle() {
     bootstrap_clos().expect("bootstrap_clos");
+    initialize_condition_runtime_support().expect("condition runtime support");
 
-    let t_class = find_class(T).expect("T class must exist after bootstrap");
+    let condition_class = find_class(BlissVal::from_symbol_index(*SYMBOL_CONDITION))
+        .expect("CONDITION class must exist after condition bootstrap");
 
-    let condition_class_name = BlissVal::from_fixnum(-100);
-    let condition_class_val = BlissVal::from_fixnum(-101);
-    define_class(condition_class_name, condition_class_val, &[t_class], &[])
-        .expect("define_class should register the condition class");
+    let condition_class_name = BlissVal::from_symbol_index(100_100);
+    let condition_class_val = BlissVal::from_meta_handle(100_101);
+    define_class(
+        condition_class_name,
+        condition_class_val,
+        &[condition_class],
+        &[],
+    )
+    .expect("define_class should register the condition class");
 
     let found_class = find_class(condition_class_name)
         .expect("condition class should be findable after registration");
@@ -208,14 +215,14 @@ fn define_condition_class_and_handle() {
         "condition instance must not be NIL"
     );
 
-    // Also create a condition via the condition system
-    let condition = make_simple_error("something went wrong", &[]);
-
     // Signal the condition and handle it via handler_case
     // Use the CLOS-registered condition class as the handler type — proving
     // CLOS class lookup feeds into condition dispatch.
     let handler_result_val = BlissVal::from_fixnum(42);
-    let result = handler_case(condition, &[(condition_class_val, handler_result_val)]);
+    let result = handler_case(
+        condition_instance,
+        &[(condition_class_val, handler_result_val)],
+    );
     assert!(result.is_ok(), "handler_case should succeed");
     // handler_case returns the handler value when a condition matches
     let handled = result.unwrap();
@@ -312,8 +319,8 @@ fn clos_make_instance_and_slots() {
     bootstrap_clos().expect("bootstrap_clos");
 
     let t_class = find_class(T).expect("T must exist");
-    let user_class_name = BlissVal::from_fixnum(-200);
-    let user_class = BlissVal::from_fixnum(-201);
+    let user_class_name = BlissVal::from_symbol_index(100_200);
+    let user_class = BlissVal::from_meta_handle(100_201);
     // Instances have a fixed inline slot layout: declare the slot (reusing the
     // same BlissVal so layout keying by identity resolves it on access).
     let slot_name = make_lisp_string("X");
