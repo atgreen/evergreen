@@ -1729,6 +1729,13 @@ fn parse_token_with_base(
     read_base: u32,
 ) -> Result<BlissVal, BlissError> {
     if name.is_empty() {
+        if has_escape {
+            // `||` — the multiple-escaped empty token IS a symbol whose name is
+            // the empty string (CLHS 2.4.5). Resolve like any bare symbol so it
+            // interns into the current package.
+            let idx = resolve_symbol_via_hook(None, name).unwrap_or_else(|| intern_symbol(name));
+            return Ok(BlissVal::from_symbol_index(idx));
+        }
         return Err(BlissError::StreamError("empty token".into()));
     }
 

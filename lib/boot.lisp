@@ -745,11 +745,12 @@
                 (unless (member s present) (push (list s :inherited p) result))))))))))
 
 (defmacro with-package-iterator ((name package-list-form &rest symbol-types) &body body)
+  ;; CLHS 11.2: omitted or invalid symbol-types signal PROGRAM-ERROR.
   (unless symbol-types
-    (error "WITH-PACKAGE-ITERATOR requires at least one symbol-type (:internal, :external, or :inherited)"))
+    (error 'program-error))
   (dolist (st symbol-types)
     (unless (member st '(:internal :external :inherited))
-      (error "WITH-PACKAGE-ITERATOR: invalid symbol-type ~S" st)))
+      (error 'program-error)))
   (let ((tuples (gensym "TUPLES"))
         (tup (gensym "TUP")))
     `(let ((,tuples (bliss-internal::%package-iterator-tuples

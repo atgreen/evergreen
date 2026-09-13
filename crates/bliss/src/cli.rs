@@ -8652,12 +8652,6 @@ fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
     if !name_sym.is_symbol() {
         return;
     }
-    // The bootstrap prelude defines the standard library in the CL-USER context
-    // with bare symbols; those must stay inherited, so home nothing until boot is
-    // complete.
-    if !BOOT_COMPLETE.with(|c| c.get()) {
-        return;
-    }
     // The package the definition (DEFUN/DEFVAR/DEFMACRO/…) is being established
     // in — canonicalized, since `current_package` may be a nickname ("CL-USER").
     let pkg_name = resolve_package_name_cow(env, &env.current_package).into_owned();
@@ -8673,10 +8667,30 @@ fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
                 && pkg_name != "COMMON-LISP-USER"
         });
         if !read_before_in_package {
-            // A genuinely package-qualified (or keyword) name was interned by
-            // the package it names; do not make it present somewhere else.
+            // An explicitly qualified definition name belongs present in the
+            // package it names. This matters DURING boot: the prelude's
+            // (defun bliss-internal::%helper …) reads keep legacy
+            // qualified-string identities with no package-table entry, so a
+            // post-boot qualified read would miss them and mint a fresh
+            // functionless symbol — "%PACKAGE-ITERATOR-TUPLES is undefined"
+            // (the WITH-PACKAGE-ITERATOR.* ansi failures). Idempotent after
+            // boot, where the reader already interned into that package.
+            if let Some(qualifier) = qualifier {
+                let qpkg = normalize_package_name(qualifier);
+                if qpkg != "KEYWORD" {
+                    if let Some(pkg) = bliss_stdlib::find_package(&qpkg) {
+                        let _ = bliss_stdlib::intern_present(pkg, &bare, name_sym);
+                    }
+                }
+            }
             return;
         }
+    }
+    // The bootstrap prelude defines the standard library in the CL-USER context
+    // with bare symbols; those must stay inherited, so home nothing until boot is
+    // complete. (Explicitly qualified prelude names are handled above.)
+    if !BOOT_COMPLETE.with(|c| c.get()) {
+        return;
     }
     if let Some(cl) = bliss_stdlib::find_package("COMMON-LISP") {
         if bliss_stdlib::find_present_symbol(cl, &bare).is_some() {
@@ -9194,9 +9208,21 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissV
     }
     let mut sym = symbol_for_package(&pkg_name, &bare_name)
         .or_else(|| resolve_sym(&bare_name))
-        .unwrap_or_else(|| arena_str(&bare_name));
-    // Root across the allocating package creation below: the `arena_str`
-    // fallback yields a heap string (moving GC; bliss-8qf).
+        .unwrap_or_else(|| {
+            // Names the tokenizer cannot read back — empty (`(intern "")`,
+            // `'||`), all-digit, or delimiter-containing names — must still
+            // intern as REAL symbols, keyed by their package-qualified
+            // registry spelling. The old `arena_str` fallback leaked a bare
+            // STRING into the package tables (SYMBOLP nil), which broke
+            // WITH-PACKAGE-ITERATOR.1-4 over a universe-loaded CL-USER.
+            let key = if pkg_name == "KEYWORD" {
+                format!("KEYWORD:{bare_name}")
+            } else {
+                format!("{pkg_name}::{bare_name}")
+            };
+            BlissVal::from_symbol_index(bliss_rt::symbols::intern(&key))
+        });
+    // Root across the allocating package creation below (moving GC; bliss-8qf).
     bliss_rt::rooted_ref!(_sym_root = &mut sym);
     ensure_package_available(env, &pkg_name, &[]);
     // Record the symbol's home package in its heap cell, pointing at the shared
