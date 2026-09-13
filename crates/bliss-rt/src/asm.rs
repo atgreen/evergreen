@@ -169,6 +169,15 @@ impl Asm {
         self.labels[l.0]
     }
 
+    /// Return whether emitted control flow references `l`.
+    ///
+    /// This lets an emitter distinguish an allocated cold stub from one the
+    /// generated hot path can actually reach.
+    #[inline]
+    pub fn label_is_referenced(&self, l: Label) -> bool {
+        self.fixups.iter().any(|fixup| fixup.label == l)
+    }
+
     /// Bind a label to the current buffer position. A label must be bound
     /// exactly once before [`finish`](Self::finish); binding twice is a codegen
     /// bug and panics rather than silently resolving to the wrong site.
@@ -267,6 +276,19 @@ mod tests {
         assert_eq!(&code[0..2], &[0x0F, 0x80]);
         // target = 7 (6-byte jcc + 1 nop); rel = 7 - (2 + 4) = 1.
         assert_eq!(rel32_at(&code, 2), 1);
+    }
+
+    #[test]
+    fn label_reference_tracks_emitted_control_flow() {
+        let mut a = Asm::new();
+        let referenced = a.label();
+        let unreferenced = a.label();
+        a.jcc(Cc::Ne, referenced);
+        assert!(a.label_is_referenced(referenced));
+        assert!(!a.label_is_referenced(unreferenced));
+        a.bind(referenced);
+        a.bind(unreferenced);
+        assert!(a.finish().is_some());
     }
 
     #[test]

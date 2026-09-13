@@ -572,6 +572,9 @@ pub struct FramedCode {
     pub emitted_safepoints: usize,
     /// Emitted native offsets and live-root counts for installation validation.
     pub root_sync_sites: Vec<RootSyncSite>,
+    /// True iff the code contains a speculation-guard deopt point (bliss-zhvn):
+    /// a non-deopting T2 function is eligible for a direct native→native call.
+    pub has_deopt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3305,6 +3308,15 @@ fn emit_framed_inner(
         osr_entries.push((osr.bcp, offset));
     }
 
+    // A deopt stub can be allocated and emitted without any hot-path branch to
+    // it (for example, range inference can prove an overflow guard redundant).
+    // Conversely, pure functions use the shared whole-function `deopt` stub and
+    // have no entries in `inst_deopt`. Derive the capability from actual label
+    // references, not from which kind of stub happened to be allocated.
+    let has_deopt = a.label_is_referenced(deopt)
+        || inst_deopt
+            .values()
+            .any(|&label| a.label_is_referenced(label));
     let code = a.finish().ok_or(EmitError::BadBranch)?;
     // Per-bcp native offset map (bliss-zmmb): the earliest native offset carrying
     // each bytecode position. Sparse — only bcps with a frame-state instruction
@@ -3332,6 +3344,10 @@ fn emit_framed_inner(
         shadow_root_slots,
         emitted_safepoints,
         root_sync_sites,
+        // True iff emitted control flow can reach a speculation-deopt stub; lets
+        // the caller direct-call a non-deopting T2 function with no post-call
+        // deopt handling (bliss-zhvn).
+        has_deopt,
     })
 }
 
@@ -3652,6 +3668,14 @@ mod tests {
         );
 
         let code = emit(&mf).expect("spill-capable emission");
+        assert!(
+            contains(&code, &[0x41, 0x54]),
+            "register pressure must exercise push r12"
+        );
+        assert!(
+            contains(&code, &[0x41, 0x5C]),
+            "every return must restore r12 with pop r12"
+        );
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap exec");
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         assert_eq!(f(), (1..=N as u64).sum::<u64>());
@@ -3924,7 +3948,7 @@ mod tests {
     fn framed_fixnum_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = speculated_mul5();
-        let code = emit_framed(
+        let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
             0,
@@ -3934,8 +3958,12 @@ mod tests {
             0,
             None,
         )
-        .expect("emit_framed")
-        .code;
+        .expect("emit_framed");
+        assert!(
+            framed.has_deopt,
+            "a speculative fixnum guard must make the artifact deopt-capable"
+        );
+        let code = framed.code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
         // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
@@ -4030,7 +4058,7 @@ mod tests {
     fn strength_reduces_to_lea_when_range_is_safe() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let code = emit_framed(
+        let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
             0,
@@ -4040,8 +4068,12 @@ mod tests {
             0,
             None,
         )
-        .expect("emit")
-        .code;
+        .expect("emit");
+        assert!(
+            framed.has_deopt,
+            "range proof removes overflow deopt, but the argument tag guard remains"
+        );
+        let code = framed.code;
         // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
         assert!(code.contains(&0x8D), "must emit lea for a range-safe *5");
         assert!(
@@ -4065,7 +4097,7 @@ mod tests {
     fn keeps_imul_and_overflow_check_when_range_unknown() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, None);
-        let code = emit_framed(
+        let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
             0,
@@ -4075,8 +4107,12 @@ mod tests {
             0,
             None,
         )
-        .expect("emit")
-        .code;
+        .expect("emit");
+        assert!(
+            framed.has_deopt,
+            "the emitted overflow edge must make the artifact deopt-capable"
+        );
+        let code = framed.code;
         assert!(code.contains(&0x69), "unknown range → imul r64,r64,5");
         assert!(
             contains(&code, &[0x0F, 0x80]),
@@ -4089,6 +4125,42 @@ mod tests {
             BlissVal(func(frame.as_mut_ptr())).as_fixnum(),
             35,
             "imul *5 of 7 = 35"
+        );
+    }
+
+    /// A genuinely total T2 body has no edge to either deopt stub and is safe
+    /// for a native caller that cannot process a callee deopt mid-flight.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn identity_has_no_deopt_edge() {
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, ValueRepresentation,
+        };
+
+        let mut f = Function::new("identity");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![x],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+
+        let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit identity");
+        assert!(
+            !framed.has_deopt,
+            "identity has no guard branch and must be direct-call eligible"
         );
     }
 

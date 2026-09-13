@@ -14320,6 +14320,7 @@ struct T2Artifact {
     shadow_root_slots: u16,
     emitted_safepoints: usize,
     root_sync_sites: Vec<bliss_compiler::t2::emit::RootSyncSite>,
+    has_deopt: bool,
 }
 
 /// Validate the emitter's native-root synchronization contract before any T2
@@ -14778,9 +14779,9 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         osr_entries: artifact.osr_entries.into_iter().collect(),
         bcp_offsets: artifact.bcp_offsets, // sparse T2 bcp→native map (bliss-zmmb)
         code_info,
-        // Conservatively deopt-capable (T2 speculates); also excluded from
-        // direct-call by the is_t2 gate, so the value is not load-bearing.
-        has_deopt: true,
+        // Real value from the T2 emitter: a non-deopting T2 function is eligible
+        // for a direct native→native call (bliss-zhvn).
+        has_deopt: artifact.has_deopt,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
     let fn_obj = bliss_rt::symbols::symbol_function(done.sym)
@@ -15333,9 +15334,10 @@ fn resume_inlined_in_t0(
 /// r12/r14/r15 (its prologue), so they survive the call; NATIVE_ENV and the
 /// recovery IPs are already correct (set by the enclosing run_native).
 ///
-/// PROTOTYPE (BLISS_NN_DIRECT): no depth/bounds guard and no NATIVE_ERROR/
-/// NATIVE_DEOPT post-check — only sound for a callee that cannot recurse deeply,
-/// error, or deopt; the caller gates on that shape and the flag.
+/// A generation guard falls back after redefinition/uninstallation, and the
+/// BlissStack bounds guard caps direct recursion before the C stack fills.
+/// Errors propagate through the enclosing `run_native`'s `NATIVE_ERROR`; the
+/// emit-time `has_deopt` gate excludes callees that could resume T0 mid-call.
 #[cfg(target_arch = "x86_64")]
 fn emit_direct_native_call(
     c: &mut Asm,
@@ -15970,9 +15972,9 @@ fn emit_native_x86(
                         continue;
                     }
                 }
-                // Direct native→native call (bliss-zhvn Stage 2, behind
-                // BLISS_NN_DIRECT): if the callee is already installed as T1
-                // native code of a stable restricted shape — fixed arity ==
+                // Direct native→native call (bliss-zhvn): if the callee is
+                // already installed as native code of a stable restricted
+                // shape — fixed arity ==
                 // nargs, non-variadic, no declared param types, not a closure —
                 // emit a direct frame-push + CALL, skipping the c2i bounce.
                 // Direct native→native fast path with a runtime c2i fallback
@@ -15988,7 +15990,10 @@ fn emit_native_x86(
                         let fixed = !cbf.variadic
                             && cbf.max_args == Some(cbf.min_args)
                             && cbf.min_args == *nargs;
-                        let no_types = cbf.param_types.iter().all(|t| matches!(t, DeclaredType::Any));
+                        let no_types = cbf
+                            .param_types
+                            .iter()
+                            .all(|t| matches!(t, DeclaredType::Any));
                         let not_closure = !cbf.has_env
                             && CLOSURE_ENV.with(|m| !m.borrow().contains_key(sym))
                             && CLOSURE_CONTROL.with(|m| !m.borrow().contains_key(sym));
@@ -15997,7 +16002,20 @@ fn emit_native_x86(
                         // needs no post-call deopt handling (its errors still
                         // propagate via NATIVE_ERROR, checked by the caller's
                         // run_native — exactly as the c2i path does).
-                        if !cnc.is_t2 && !cnc.has_deopt && fixed && no_types && not_closure {
+                        // T2 callees are eligible too: the T2 codegen is SysV-
+                        // compliant (saves/restores r12/r14/r15) and uses the
+                        // same rdi=slots run_native frame ABI. Only the real
+                        // has_deopt gates them (a deopting callee would mid-flight
+                        // resume to T0, which the direct path can't handle).
+                        if !cnc.has_deopt && fixed && no_types && not_closure {
+                            bliss_rt::blog!(
+                                "compile",
+                                bliss_rt::log::TRACE,
+                                "[T1] {}: direct call to {} [T{}]",
+                                bf.name,
+                                cbf.name,
+                                if cnc.is_t2 { 2 } else { 1 }
+                            );
                             let slow = c.label();
                             let after = c.label();
                             let baked_gen =
@@ -16839,6 +16857,7 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
         shadow_root_slots: framed.shadow_root_slots,
         emitted_safepoints: framed.emitted_safepoints,
         root_sync_sites: framed.root_sync_sites,
+        has_deopt: framed.has_deopt,
     })
 }
 
@@ -17577,6 +17596,7 @@ mod jtc4_stack_map_tests {
             code: vec![0x90; 8],
             compiled_entry: 0,
             osr_entries: vec![],
+            bcp_offsets: vec![],
             shadow_root_slots: 2,
             emitted_safepoints: 1,
             root_sync_sites: vec![bliss_compiler::t2::emit::RootSyncSite {
@@ -17585,6 +17605,7 @@ mod jtc4_stack_map_tests {
                 register_roots: 1,
                 spill_roots: 1,
             }],
+            has_deopt: false,
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 
@@ -17704,7 +17725,7 @@ mod jtc4_stack_map_tests {
         let code = [
             0x41, 0x56, // push r14
             0x41, 0x57, // push r15
-            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x41, 0x54, // push r12 (matches the native recovery epilogue)
             0x31, 0xC0, // xor eax, eax
             0x48, 0x89, 0x00, // mov [rax], rax => null-guard SIGSEGV
         ];
@@ -17727,7 +17748,7 @@ mod jtc4_stack_map_tests {
         let code = [
             0x41, 0x56, // push r14
             0x41, 0x57, // push r15
-            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x41, 0x54, // push r12 (matches the native recovery epilogue)
             0x31, 0xC0, // xor eax, eax
             0x48, 0x89, 0x00, // mov [rax], rax => null-guard SIGSEGV
         ];
@@ -17741,6 +17762,7 @@ mod jtc4_stack_map_tests {
             num_slots: 1,
             compiled_entry: 0,
             osr_entries: HashMap::new(),
+            bcp_offsets: vec![],
             code_info,
             has_deopt: false,
         };
@@ -17770,7 +17792,7 @@ mod jtc4_stack_map_tests {
         let mut code = vec![
             0x41, 0x56, // push r14
             0x41, 0x57, // push r15
-            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x41, 0x54, // push r12 (matches the native recovery epilogue)
             0x48, 0xB8, // mov rax, guard
         ];
         code.extend_from_slice(&guard.to_le_bytes());
@@ -17785,6 +17807,7 @@ mod jtc4_stack_map_tests {
             num_slots: 1,
             compiled_entry: 0,
             osr_entries: HashMap::new(),
+            bcp_offsets: vec![],
             code_info,
             has_deopt: false,
         };

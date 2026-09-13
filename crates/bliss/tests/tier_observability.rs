@@ -7,11 +7,11 @@
 //! the promotion, then confirm the observed result is unchanged from pure
 //! interpretation.
 
-use std::process::Command;
+use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
 
-fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
+fn run_output(program: &str, envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.args(["--eval", program]);
     // Tier controls are per-test inputs, not ambient developer-shell state.
@@ -31,6 +31,8 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
         "BLISS_DEOPT_BLACKLIST_THRESHOLD",
         "BLISS_PROFILING_DISABLED",
         "BLISS_LAZY_COMPILE",
+        "BLISS_LOG",
+        "BLISS_NN_DIRECT",
     ] {
         cmd.env_remove(name);
     }
@@ -46,7 +48,11 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("spawn bliss-cli");
+    cmd.output().expect("spawn bliss-cli")
+}
+
+fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
+    let out = run_output(program, envs);
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success() {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -606,6 +612,88 @@ fn native_caller_continues_warming_callee_to_t2() {
         out.lines().next(),
         Some("1 2 35"),
         "callee must reach T2: {out}"
+    );
+}
+
+/// Once a total callee reaches T2, a subsequently compiled T1 caller can bake
+/// its frame-ABI entry directly. The compile trace makes the selected path
+/// observable; result/tier checks ensure this is the real installed T2 code.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t1_direct_calls_non_deopting_t2_callee() {
+    let program = "\
+        (defun t2-direct-leaf (x) x) \
+        (dotimes (i 20) (t2-direct-leaf i)) \
+        (dotimes (i 2000) \
+          (when (eql (bliss-ext:function-tier (quote t2-direct-leaf)) 2) (return)) \
+          (t2-direct-leaf i)) \
+        (defun t2-direct-driver (x) (t2-direct-leaf x)) \
+        (t2-direct-driver 1) (t2-direct-driver 2) \
+        (format t \"~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote t2-direct-leaf)) \
+          (bliss-ext:function-tier (quote t2-direct-driver)) \
+          (t2-direct-driver 9))";
+    let out = run_output(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("BLISS_LOG", "compile=trace"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "T2 direct-call run failed:\n{stderr}");
+    assert_eq!(
+        stdout.lines().next(),
+        Some("2 1 9"),
+        "wrong tiers/result: {stdout}"
+    );
+    assert!(
+        stderr.contains("[T1] T2-DIRECT-DRIVER: direct call to T2-DIRECT-LEAF [T2]"),
+        "caller did not select the T2 direct-call path:\n{stderr}"
+    );
+}
+
+/// A speculative T2 callee must retain the c2i path: its deopt resumes inside
+/// `run_native`, a transition the direct caller deliberately cannot process.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t1_does_not_direct_call_deopting_t2_callee() {
+    let program = "\
+        (defun t2-deopt-leaf (x) (* x 5)) \
+        (dotimes (i 20) (t2-deopt-leaf i)) \
+        (dotimes (i 2000) \
+          (when (eql (bliss-ext:function-tier (quote t2-deopt-leaf)) 2) (return)) \
+          (t2-deopt-leaf i)) \
+        (defun t2-deopt-driver (x) (t2-deopt-leaf x)) \
+        (t2-deopt-driver 1) (t2-deopt-driver 2) \
+        (format t \"~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote t2-deopt-leaf)) \
+          (bliss-ext:function-tier (quote t2-deopt-driver)) \
+          (= (t2-deopt-driver 2.0) 10.0))";
+    let out = run_output(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("BLISS_LOG", "compile=trace"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "T2 deopt boundary run failed:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().next(),
+        Some("2 1 T"),
+        "wrong tiers/result: {stdout}"
+    );
+    assert!(
+        !stderr.contains("[T1] T2-DEOPT-DRIVER: direct call to T2-DEOPT-LEAF [T2]"),
+        "deopt-capable T2 callee was unsafely direct-called:\n{stderr}"
     );
 }
 
