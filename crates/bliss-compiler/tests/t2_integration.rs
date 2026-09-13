@@ -52,6 +52,91 @@ fn bytecode_fn(
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
+fn emitted_heap_literal_is_loaded_from_its_constant_pool_slot() {
+    use bliss_compiler::t2::emit::emit_framed;
+
+    let first = BlissVal(0x1001);
+    let second = BlissVal(0x2002);
+    let mut bf = bytecode_fn(
+        "heap-literal-slot",
+        vec![Instr::Const(0), Instr::Return],
+        vec![first],
+        0,
+        1,
+        0,
+    );
+    let f = build_from_bytecode(&bf).expect("build heap literal");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit heap literal");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let mut frame = [0u64];
+
+    assert_eq!(BlissVal(run(frame.as_mut_ptr())), first);
+    bf.constants[0] = second;
+    assert_eq!(BlissVal(run(frame.as_mut_ptr())), second);
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn inlined_heap_literal_uses_the_saved_body_constant_slot() {
+    use bliss_compiler::t2::build::build_from_bytecode_with_inline_options;
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::inlining::InlineOptions;
+    use bliss_compiler::t2::ir::Opcode;
+    use std::sync::Arc;
+
+    let helper = bliss_rt::symbols::intern("INLINE-HEAP-LITERAL-HELPER");
+    let caller = bliss_rt::symbols::intern("INLINE-HEAP-LITERAL-CALLER");
+    let first = BlissVal(0x3001);
+    let second = BlissVal(0x4002);
+    let mut helper_body = Arc::new(bytecode_fn(
+        "INLINE-HEAP-LITERAL-HELPER",
+        vec![Instr::Const(0), Instr::Return],
+        vec![first],
+        0,
+        1,
+        0,
+    ));
+    let caller_body = bytecode_fn(
+        "INLINE-HEAP-LITERAL-CALLER",
+        vec![
+            Instr::CallNamed {
+                sym: helper,
+                nargs: 0,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        0,
+        1,
+        0,
+    );
+    let options = InlineOptions::default()
+        .with_root_symbol(caller)
+        .with_body(helper, Arc::clone(&helper_body));
+    let f = build_from_bytecode_with_inline_options(&caller_body, options)
+        .expect("inline heap-literal helper");
+    assert!(f.block_order().iter().all(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .all(|&inst| f.inst(inst).opcode != Opcode::Call)
+    }));
+    let framed =
+        emit_framed(&f, 0, 0, 0, 0, 0, 0, Some(caller)).expect("emit inlined heap literal");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let mut frame = [0u64];
+
+    assert_eq!(BlissVal(run(frame.as_mut_ptr())), first);
+    Arc::get_mut(&mut helper_body)
+        .expect("options dropped")
+        .constants[0] = second;
+    assert_eq!(BlissVal(run(frame.as_mut_ptr())), second);
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
 fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
     use bliss_compiler::t2::emit::emit_framed;
     use bliss_compiler::t2::ir::Opcode;
@@ -763,12 +848,12 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     use bliss_compiler::t2::emit::emit_framed;
     use bliss_compiler::t2::inlining::InlineOptions;
     use bliss_compiler::t2::ir::{AuxData, Opcode};
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     let first_char = bliss_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
     let helper = bliss_rt::symbols::intern("GENERAL-GUARDED-LEAF");
     let caller = bliss_rt::symbols::intern("GENERAL-GUARDED-CALLER");
-    let helper_body = Rc::new(bytecode_fn(
+    let helper_body = Arc::new(bytecode_fn(
         "GENERAL-GUARDED-LEAF",
         vec![
             Instr::LoadLocal(0),

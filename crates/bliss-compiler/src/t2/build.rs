@@ -1421,11 +1421,12 @@ impl<'a> Builder<'a> {
 
     /// Classify a constant-pool `BlissVal` and emit the matching `Const*`.
     fn emit_const(&mut self, block: Block, idx: u16) -> Result<Value, BuildError> {
-        let val = *self
+        let slot = self
             .bf
             .constants
             .get(idx as usize)
             .ok_or(BuildError::Unsupported("constant index out of range"))?;
+        let val = *slot;
 
         let (opcode, aux, ty) = if val.is_nil() {
             (Opcode::ConstNil, AuxData::None, IRType::of(TypeBits::NULL))
@@ -1456,8 +1457,14 @@ impl<'a> Builder<'a> {
                 IRType::of(TypeBits::SYMBOL),
             )
         } else {
-            // Cons / heap object / function / other immediate: carry the literal.
-            (Opcode::ConstHeapObj, AuxData::HeapLiteral(val), IRType::TOP)
+            // Cons / heap object / function: retain its GC-rewritten pool slot.
+            (
+                Opcode::ConstHeapObj,
+                AuxData::HeapLiteral {
+                    slot: slot as *const _ as usize,
+                },
+                IRType::TOP,
+            )
         };
 
         Ok(self
@@ -1557,7 +1564,7 @@ mod tests {
     use crate::t2::inlining::{InlineConfig, InlineOptions, InlinePolicy};
     use crate::t2::ir::Opcode;
     use bliss_rt::value::BlissVal;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     fn bf(
         name: &str,
@@ -1949,7 +1956,7 @@ mod tests {
     fn saved_body_clones_cfg_binds_arguments_and_merges_returns() {
         let helper = bliss_rt::symbols::intern("BODY-INLINE-HELPER");
         let caller = bliss_rt::symbols::intern("BODY-INLINE-CALLER");
-        let body = Rc::new(bf(
+        let body = Arc::new(bf(
             "BODY-INLINE-HELPER",
             vec![
                 Instr::LoadLocal(0),
@@ -2001,7 +2008,7 @@ mod tests {
         let helper = bliss_rt::symbols::intern("BODY-INLINE-FIRST-CHAR");
         let caller = bliss_rt::symbols::intern("BODY-INLINE-FIRST-CHAR-CALLER");
         let first_char = bliss_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
-        let body = Rc::new(bf(
+        let body = Arc::new(bf(
             "BODY-INLINE-FIRST-CHAR",
             vec![
                 Instr::LoadLocal(0),
@@ -2064,7 +2071,7 @@ mod tests {
             leaf_code.push(Instr::Pop);
         }
         leaf_code.extend([Instr::LoadLocal(0), Instr::Return]);
-        let leaf = Rc::new(bf(
+        let leaf = Arc::new(bf(
             "PROFILED-LARGE-INLINE-HELPER",
             leaf_code,
             vec![],
@@ -2134,7 +2141,7 @@ mod tests {
     fn body_limits_recursion_and_notinline_retain_calls() {
         let helper = bliss_rt::symbols::intern("BODY-INLINE-LIMITED");
         let caller = bliss_rt::symbols::intern("BODY-INLINE-LIMITED-CALLER");
-        let leaf = Rc::new(bf(
+        let leaf = Arc::new(bf(
             "BODY-INLINE-LIMITED",
             vec![Instr::LoadLocal(0), Instr::Return],
             vec![],
@@ -2159,7 +2166,7 @@ mod tests {
         );
         let base = InlineOptions::default()
             .with_root_symbol(caller)
-            .with_body(helper, Rc::clone(&leaf));
+            .with_body(helper, Arc::clone(&leaf));
 
         let mut budget = base.clone();
         budget.config.node_budget = 0;
@@ -2178,7 +2185,7 @@ mod tests {
                 .any(|&b| has_opcode(&f, b, Opcode::Call))
         );
 
-        let recursive = Rc::new(bf(
+        let recursive = Arc::new(bf(
             "BODY-INLINE-LIMITED",
             vec![
                 Instr::LoadLocal(0),

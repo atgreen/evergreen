@@ -13794,6 +13794,9 @@ struct NativeCode {
     /// no deopt point is eligible for a direct native→native call (bliss-zhvn)
     /// with no post-call deopt handling. Conservatively true when unknown.
     has_deopt: bool,
+    /// Owns the rooted constant-pool bodies whose slots T2 code loads
+    /// indirectly. `None` for T1, which loads registry-owned slots.
+    _t2_constants: Option<bliss_rt::CrossThreadRoot<T2InstalledConstants>>,
 }
 
 /// Build and register validated GC stack-map metadata for a T1 native function
@@ -14296,7 +14299,7 @@ thread_local! {
 #[derive(Clone)]
 struct T2BodySnapshot {
     symbol: u32,
-    body: BytecodeFunction,
+    body: std::sync::Arc<BytecodeFunction>,
     invocations: u32,
     call_sites: Vec<(u32, u32)>,
 }
@@ -14305,7 +14308,7 @@ struct T2CompileInput {
     sym: u32,
     generation: u64,
     priority: u64,
-    body: BytecodeFunction,
+    body: std::sync::Arc<BytecodeFunction>,
     type_profiles: HashMap<u32, TypeProfile>,
     receiver_profiles: Vec<(String, Vec<ReceiverTypeProfileEntrySnapshot>)>,
     inline_bodies: Vec<T2BodySnapshot>,
@@ -14313,9 +14316,44 @@ struct T2CompileInput {
 
 impl bliss_rt::gc::TraceHostRoots for T2CompileInput {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
-        unsafe { trace_bytecode_function(&mut self.body, visit) };
+        // The GC's world-stop/write gate excludes the background compiler's
+        // read gate, and every installed-code mutator is stopped. It is thus
+        // safe to rewrite BlissVal fields through these otherwise shared Arcs.
+        unsafe {
+            trace_bytecode_function(
+                std::sync::Arc::as_ptr(&self.body) as *mut BytecodeFunction,
+                visit,
+            )
+        };
         for saved in &mut self.inline_bodies {
-            unsafe { trace_bytecode_function(&mut saved.body, visit) };
+            unsafe {
+                trace_bytecode_function(
+                    std::sync::Arc::as_ptr(&saved.body) as *mut BytecodeFunction,
+                    visit,
+                )
+            };
+        }
+    }
+}
+
+/// The minimal rooted ownership retained by installed T2 code. Keeping only
+/// bodies whose slots were actually emitted avoids pinning the full inlining
+/// snapshot for every compiled function.
+struct T2InstalledConstants {
+    bodies: Vec<std::sync::Arc<BytecodeFunction>>,
+}
+
+impl bliss_rt::gc::TraceHostRoots for T2InstalledConstants {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for body in &self.bodies {
+            // See T2CompileInput::trace_host_roots: collection excludes both
+            // compiler reads and mutator execution of these slots.
+            unsafe {
+                trace_bytecode_function(
+                    std::sync::Arc::as_ptr(body) as *mut BytecodeFunction,
+                    visit,
+                )
+            };
         }
     }
 }
@@ -14330,6 +14368,7 @@ struct T2Artifact {
     emitted_safepoints: usize,
     root_sync_sites: Vec<bliss_compiler::t2::emit::RootSyncSite>,
     has_deopt: bool,
+    constant_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
 }
 
 /// Validate the emitter's native-root synchronization contract before any T2
@@ -14358,6 +14397,7 @@ struct T2Completion {
     sym: u32,
     generation: u64,
     artifact: Option<T2Artifact>,
+    input: bliss_rt::CrossThreadRoot<T2CompileInput>,
 }
 
 struct T2Job {
@@ -14445,6 +14485,7 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
                             sym,
                             generation,
                             artifact,
+                            input: job.input,
                         });
                     }
                 });
@@ -14640,7 +14681,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
                 Some(T2BodySnapshot {
                     symbol,
-                    body: (**body).clone(),
+                    body: std::sync::Arc::new((**body).clone()),
                     invocations,
                     call_sites,
                 })
@@ -14652,7 +14693,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         sym,
         generation,
         priority,
-        body: (*root).clone(),
+        body: std::sync::Arc::new((*root).clone()),
         type_profiles,
         receiver_profiles,
         inline_bodies,
@@ -14715,6 +14756,9 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
 }
 
 fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
+    // Bridge rooting from the worker through construction of the smaller
+    // installed-code root below. The completion owns this handle until return.
+    let _compilation_root = &done.input;
     let current_generation =
         REGISTRY_GENERATION.with(|g| g.borrow().get(&done.sym).copied().unwrap_or(0));
     if current_generation != done.generation {
@@ -14726,13 +14770,20 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
             queued.remove(&done.sym);
         }
     });
-    let Some(artifact) = done.artifact else {
+    let Some(mut artifact) = done.artifact else {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
     };
     let bf = registry_get(done.sym)?;
     let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
     let code_info = install_stack_map(total_slots)?;
+    let rooted_constants = if artifact.constant_bodies.is_empty() {
+        None
+    } else {
+        Some(bliss_rt::CrossThreadRoot::new(T2InstalledConstants {
+            bodies: std::mem::take(&mut artifact.constant_bodies),
+        }))
+    };
     let buf = bliss_rt::jit::JitBuffer::new(&artifact.code)?;
     let entry = buf.leak();
     maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
@@ -14778,6 +14829,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         // Real value from the T2 emitter: a non-deopting T2 function is eligible
         // for a direct native→native call (bliss-zhvn).
         has_deopt: artifact.has_deopt,
+        _t2_constants: rooted_constants,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
     let fn_obj = bliss_rt::symbols::symbol_function(done.sym)
@@ -16612,6 +16664,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         bcp_offsets,
         code_info,
         has_deopt,
+        _t2_constants: None,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
@@ -16668,7 +16721,7 @@ macro_rules! t2_log {
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let sym = input.sym;
-    let bf = &input.body;
+    let bf = input.body.as_ref();
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
     // compiled body, filling every frame *slot* param — &optional/&rest/&key
     // included — so T2's entry (build.rs::seed_entry, now seeding 0..slot-params)
@@ -16747,7 +16800,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let mut inline_options =
         bliss_compiler::t2::inlining::InlineOptions::default().with_root_symbol(sym);
     for saved in &input.inline_bodies {
-        inline_options = inline_options.with_body(saved.symbol, Rc::new(saved.body.clone()));
+        inline_options = inline_options.with_body(saved.symbol, std::sync::Arc::clone(&saved.body));
         for &(bcp, calls) in &saved.call_sites {
             inline_options =
                 inline_options.with_call_site_profile(saved.symbol, bcp, calls, saved.invocations);
@@ -16824,6 +16877,22 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             return None;
         }
     };
+    let mut constant_bodies = Vec::new();
+    for &slot in &framed.heap_constant_slots {
+        let owner = std::iter::once(&input.body)
+            .chain(input.inline_bodies.iter().map(|saved| &saved.body))
+            .find(|body| bytecode_body_owns_constant_slot(body, slot));
+        let Some(owner) = owner else {
+            t2_log!("{name}: emitted heap constant has no rooted owner => stay T1");
+            return None;
+        };
+        if !constant_bodies
+            .iter()
+            .any(|body| std::sync::Arc::ptr_eq(body, owner))
+        {
+            constant_bodies.push(std::sync::Arc::clone(owner));
+        }
+    }
     let code = framed.code;
     t2_log!(
         "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}, osr_entries={}",
@@ -16849,7 +16918,25 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         emitted_safepoints: framed.emitted_safepoints,
         root_sync_sites: framed.root_sync_sites,
         has_deopt: framed.has_deopt,
+        constant_bodies,
     })
+}
+
+fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> bool {
+    let start = body.constants.as_ptr() as usize;
+    let Some(bytes) = body
+        .constants
+        .len()
+        .checked_mul(std::mem::size_of::<BlissVal>())
+    else {
+        return false;
+    };
+    let Some(end) = start.checked_add(bytes) else {
+        return false;
+    };
+    slot >= start
+        && slot < end
+        && (slot - start).is_multiple_of(std::mem::size_of::<BlissVal>())
 }
 
 /// Installed OSR code for a function (bliss-izt.1): a non-speculating native
@@ -17597,6 +17684,7 @@ mod jtc4_stack_map_tests {
                 spill_roots: 1,
             }],
             has_deopt: false,
+            constant_bodies: vec![],
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 
@@ -17756,6 +17844,7 @@ mod jtc4_stack_map_tests {
             bcp_offsets: vec![],
             code_info,
             has_deopt: false,
+            _t2_constants: None,
         };
         let mut env = Env::new(false);
 
@@ -17801,6 +17890,7 @@ mod jtc4_stack_map_tests {
             bcp_offsets: vec![],
             code_info,
             has_deopt: false,
+            _t2_constants: None,
         };
         let mut env = Env::new(false);
 

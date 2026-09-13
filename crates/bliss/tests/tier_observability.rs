@@ -559,13 +559,12 @@ fn automatic_t2_decline_retains_t1() {
     );
 }
 
-/// A movable literal in the compiler snapshot is no longer an admission-level
-/// rejection: CrossThreadRoot keeps it live while the background worker reads
-/// the body. Until bliss-8nl teaches emitted code to load a GC-visible constant
-/// slot, the emitter itself still declines safely and leaves the function at T1.
+/// A movable literal remains rooted from the background snapshot through the
+/// installed code's lifetime. T2 loads it indirectly from that GC-rewritten
+/// constant slot, so a moving collection never leaves a stale pointer in code.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn background_t2_compiler_accepts_a_rooted_movable_literal_snapshot() {
+fn background_t2_loads_a_rooted_movable_literal_from_its_constant_slot() {
     let program = "\
         (defun rooted-literal (x) (if x (quote (11 22)) nil)) \
         (dotimes (i 20) (rooted-literal t)) \
@@ -585,14 +584,14 @@ fn background_t2_compiler_accepts_a_rooted_movable_literal_snapshot() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "rooted-literal run failed:\n{stderr}");
-    assert_eq!(stdout.lines().next(), Some("1 (11 22)"), "{stdout}");
+    assert_eq!(stdout.lines().next(), Some("2 (11 22)"), "{stdout}");
     assert!(
         stderr.contains("ROOTED-LITERAL: queued for background T2 compilation"),
         "movable snapshot never reached the background compiler:\n{stderr}"
     );
     assert!(
-        stderr.contains("ROOTED-LITERAL: emit_framed failed: UnsupportedOp"),
-        "heap literal did not reach the emitter's safe fallback:\n{stderr}"
+        stderr.contains("ROOTED-LITERAL: background T2 result published"),
+        "heap literal did not reach installed T2 code:\n{stderr}"
     );
     assert!(
         !stderr.contains("movable literal cannot be rooted"),

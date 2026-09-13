@@ -44,10 +44,10 @@
 //!   allocates a `double-float` when reboxing an `UnboxedF64`. That allocator is
 //!   a runtime service, not compiler state, so `reconstruct` obtains it through
 //!   the `MachineState::box_double` hook (mocked in tests).
-//! * **Const GC roots.** A4.14 only sets the live-ref bit for a `Value` in
-//!   `Tagged` representation. A `Const` heap literal is also a GC root, but it is
-//!   an immortal one interned in the function's constant pool (§4.3 `AuxData::
-//!   HeapLiteral`) and rooted there, so it is intentionally not flagged here.
+//! * **Heap-literal GC roots.** Moving heap literals remain ordinary `Value`
+//!   sources loaded through their rooted function constant-pool slots. They are
+//!   therefore covered by the same tagged-value liveness rule as other values;
+//!   `Const` sources are restricted to non-moving tagged immediates.
 
 use crate::t2::frame_state::{FrameState, RematOp, RematRecipeId, ValueSource};
 use crate::t2::ir::{Value, ValueRepresentation};
@@ -160,6 +160,9 @@ pub enum LowerError {
     RematTooDeep,
     /// A deopt `StackMap` named a `FrameStateId` out of range for the table.
     BadFrameStateId(u32),
+    /// A moving heap reference was presented as an immediate constant. Such a
+    /// value must remain a located SSA value loaded from a rooted pool slot.
+    MovingConst(BlissVal),
 }
 
 // ── A4.14 — FrameState lowering ─────────────────────────────────────────────
@@ -213,11 +216,10 @@ pub fn lower_one(
             let (desc, _) = lower_source(&spec.source, fs, loc_of, 0)?;
             slots.push(desc);
             // A4.14 sets the live-ref bit only for a `Value` that is `Tagged`.
-            // Representation alone is NOT the rule: a `Const` heap literal is
-            // tagged but is rooted immortally in the constant pool, and a
-            // `Remat` slot is recomputed cold rather than scanned (see the
-            // module header). The representation half of the test comes from
-            // `slot_map`, so it agrees with the OSR import's conversion choice.
+            // Representation alone is NOT the rule: a `Remat` slot is
+            // recomputed cold rather than scanned (see the module header). The
+            // representation half of the test comes from `slot_map`, so it
+            // agrees with the OSR import's conversion choice.
             live_ref_bitmap.push(
                 matches!(spec.source, ValueSource::Value { .. })
                     && spec.repr == ValueRepresentation::Tagged,
@@ -254,7 +256,12 @@ fn lower_source(
             let is_ref = matches!(repr, ValueRepresentation::Tagged);
             Ok((SlotDescriptor::InLocation(loc, rebox), is_ref))
         }
-        ValueSource::Const(k) => Ok((SlotDescriptor::MaterializeConst(*k), false)),
+        ValueSource::Const(k) => {
+            if k.is_cons() || k.is_heap_object() || k.is_function() {
+                return Err(LowerError::MovingConst(*k));
+            }
+            Ok((SlotDescriptor::MaterializeConst(*k), false))
+        }
         ValueSource::Unbound => Ok((SlotDescriptor::Unbound, false)),
         ValueSource::Remat(id) => {
             if depth >= REMAT_MAX_DEPTH {
@@ -612,6 +619,26 @@ mod tests {
         };
         let loc_of = |_: Value| None;
         assert_eq!(lower_one(0, &fs, &loc_of), Err(LowerError::Unallocated(v)));
+    }
+
+    #[test]
+    fn moving_reference_cannot_be_lowered_as_a_constant() {
+        let moving = BlissVal(0x1001);
+        let fs = FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![ValueSource::Const(moving)],
+                stack: vec![],
+            }],
+            remat: vec![],
+        };
+        let loc_of = |_: Value| None;
+
+        assert_eq!(
+            lower_one(0, &fs, &loc_of),
+            Err(LowerError::MovingConst(moving))
+        );
     }
 
     #[test]

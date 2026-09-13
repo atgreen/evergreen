@@ -7,7 +7,7 @@
 //! cloned as CFGs through the same legality, depth, and growth policy.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use bliss_rt::bytecode::{BytecodeFunction, Instr};
 
@@ -260,7 +260,7 @@ impl CallSiteProfile {
 pub struct InlineOptions {
     pub config: InlineConfig,
     policies: HashMap<u32, InlinePolicy>,
-    bodies: HashMap<u32, Rc<BytecodeFunction>>,
+    bodies: HashMap<u32, Arc<BytecodeFunction>>,
     call_sites: HashMap<(u32, u32), CallSiteProfile>,
     root_symbol: Option<u32>,
 }
@@ -303,7 +303,7 @@ impl InlineOptions {
     /// Make a saved bytecode body available to the body inliner.  Merely being
     /// registered is not enough: [`body_cost`] still applies the conservative
     /// fixed-arity/purity/effect filter before the body may be cloned.
-    pub fn with_body(mut self, symbol: u32, body: Rc<BytecodeFunction>) -> Self {
+    pub fn with_body(mut self, symbol: u32, body: Arc<BytecodeFunction>) -> Self {
         self.bodies.insert(symbol, body);
         self
     }
@@ -315,7 +315,7 @@ impl InlineOptions {
         self
     }
 
-    pub(crate) fn body(&self, symbol: u32) -> Option<Rc<BytecodeFunction>> {
+    pub(crate) fn body(&self, symbol: u32) -> Option<Arc<BytecodeFunction>> {
         self.bodies.get(&symbol).cloned()
     }
 
@@ -458,8 +458,8 @@ mod tests {
     use super::*;
     use bliss_rt::value::NIL;
 
-    fn saved_body(code: Vec<Instr>) -> Rc<BytecodeFunction> {
-        Rc::new(BytecodeFunction {
+    fn saved_body(code: Vec<Instr>) -> Arc<BytecodeFunction> {
+        Arc::new(BytecodeFunction {
             code,
             constants: vec![],
             handler_cases: vec![],
@@ -594,10 +594,10 @@ mod tests {
             bliss_rt::symbols::intern("INLINE-DECLARED"),
         ];
         let mut variadic = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
-        Rc::get_mut(&mut variadic).unwrap().variadic = true;
-        Rc::get_mut(&mut variadic).unwrap().max_args = None;
+        Arc::get_mut(&mut variadic).unwrap().variadic = true;
+        Arc::get_mut(&mut variadic).unwrap().max_args = None;
         let mut declared = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
-        Rc::get_mut(&mut declared).unwrap().param_types =
+        Arc::get_mut(&mut declared).unwrap().param_types =
             vec![bliss_rt::bytecode::DeclaredType::Fixnum];
         let options = InlineOptions::default()
             .with_body(

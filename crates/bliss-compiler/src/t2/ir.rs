@@ -264,7 +264,12 @@ pub enum AuxData {
     FloatImm(f32),
     CharImm(char),
     SymbolRef(u32),
-    HeapLiteral(bliss_rt::value::BlissVal),
+    /// Address of the moving-GC value's owning constant-pool slot. Generated
+    /// code loads through this slot; the compiler client must keep it rooted
+    /// and alive with the native code.
+    HeapLiteral {
+        slot: usize,
+    },
     FieldOffset(u32),
     CallTarget(u32),
     TypeTag(IRType),

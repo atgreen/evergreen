@@ -228,9 +228,7 @@ fn is_removable(f: &Function, live: &[bool], v: Value) -> bool {
 fn remat_op(op: Opcode) -> Option<RematOp> {
     use Opcode::*;
     Some(match op {
-        ConstFixnum | ConstFloat | ConstChar | ConstSymbol | ConstNil | ConstT | ConstHeapObj => {
-            RematOp::Const
-        }
+        ConstFixnum | ConstFloat | ConstChar | ConstSymbol | ConstNil | ConstT => RematOp::Const,
         BoxFixnum => RematOp::BoxFixnum,
         UnboxFixnum => RematOp::UnboxFixnum,
         BoxFloat => RematOp::BoxFloat,
@@ -283,7 +281,6 @@ fn resolve(
             (Opcode::ConstSymbol, AuxData::SymbolRef(sym)) => {
                 Some(BlissVal::from_symbol_index(*sym))
             }
-            (Opcode::ConstHeapObj, AuxData::HeapLiteral(value)) => Some(*value),
             (Opcode::ConstNil, _) => Some(NIL),
             (Opcode::ConstT, _) => Some(T),
             _ => None,
@@ -440,6 +437,31 @@ mod tests {
                 if value == bliss_rt::value::BlissVal::from_fixnum(7)
         ));
         assert!(fs.remat.is_empty());
+    }
+
+    /// A heap literal cannot become a raw immediate in deopt metadata: moving
+    /// GC rewrites its owning slot, not already-generated machine code.
+    #[test]
+    fn deopt_only_heap_literal_stays_live() {
+        let mut f = Function::new("heap-literal");
+        let entry = f.entry();
+        let mut constant = inst(Opcode::ConstHeapObj, vec![], InstFlags::default());
+        constant.aux = AuxData::HeapLiteral { slot: 0x1234 };
+        let (cinst, cres) = f.push_inst(entry, constant, &[(IRType::TOP, VR::Tagged)]);
+        let c = cres[0];
+        f.set_terminator(entry, ret(vec![]));
+        let fsid = f.frame_states.add(frame(vec![ValueSource::Value {
+            value: c,
+            repr: VR::Tagged,
+        }]));
+
+        run(&mut f);
+
+        assert!(f.block(entry).insts.contains(&cinst));
+        assert!(matches!(
+            f.frame_states.get(fsid).scopes[0].locals[0],
+            ValueSource::Value { value, .. } if value == c
+        ));
     }
 
     /// A value with a real (fast-path) use survives DCE untouched.

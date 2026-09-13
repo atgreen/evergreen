@@ -572,6 +572,9 @@ pub struct FramedCode {
     pub emitted_safepoints: usize,
     /// Emitted native offsets and live-root counts for installation validation.
     pub root_sync_sites: Vec<RootSyncSite>,
+    /// Constant-pool slot addresses loaded by emitted heap-literal instructions.
+    /// The compiler client must keep their owning rooted bodies alive.
+    pub heap_constant_slots: Vec<usize>,
     /// True iff the code contains a speculation-guard deopt point (bliss-zhvn):
     /// a non-deopting T2 function is eligible for a direct native→native call.
     pub has_deopt: bool,
@@ -1412,7 +1415,12 @@ fn emit_deopt_source(
                 );
             }
         }
-        ValueSource::Const(value) => mov_imm64(a, RAX, value.0 as i64),
+        ValueSource::Const(value) => {
+            if is_moving_gc_reference(*value) {
+                return Err(EmitError::UnsupportedOp(0xF8));
+            }
+            mov_imm64(a, RAX, value.0 as i64);
+        }
         ValueSource::Unbound => mov_imm64(a, RAX, bliss_rt::value::UNBOUND.0 as i64),
         ValueSource::Remat(id) => {
             let recipe = fs
@@ -2020,14 +2028,18 @@ fn is_fixnum_producing_op(op: crate::t2::ir::Opcode) -> bool {
     )
 }
 
-/// A constant-producing opcode (no register, no runtime work — its tagged value
-/// is materialised where used).
+/// A constant-producing opcode. Non-moving constants are materialised where
+/// used; `ConstHeapObj` is recognized here but emitted as a rooted slot load.
 fn is_const_opcode(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
     matches!(
         op,
         ConstFixnum | ConstFloat | ConstChar | ConstSymbol | ConstNil | ConstT | ConstHeapObj
     )
+}
+
+fn is_moving_gc_reference(value: bliss_rt::value::BlissVal) -> bool {
+    value.is_cons() || value.is_heap_object() || value.is_function()
 }
 
 /// Emit `f` (a speculated function, straight-line or branching) as native code.
@@ -2212,11 +2224,13 @@ fn emit_framed_inner(
     }
 
     // Record every constant. `consts` (raw fixnum) drives immediate folding,
-    // `float_consts` (f32 bits) the XMM path, and `const_tagged` (the tagged
-    // BlissVal) the general materialisation of any constant into a register.
+    // `float_consts` (f32 bits) the XMM path, `const_tagged` (the tagged
+    // BlissVal) the general materialisation of non-moving constants, and
+    // `heap_const_slots` the stable, GC-rewritten slots for moving constants.
     let mut consts: HashMap<Value, i64> = HashMap::new();
     let mut float_consts: HashMap<Value, u32> = HashMap::new();
     let mut const_tagged: HashMap<Value, u64> = HashMap::new();
+    let mut heap_const_slots: HashMap<Value, usize> = HashMap::new();
     for &b in &blocks {
         for &inst in &f.block(b).insts {
             let d = f.inst(inst);
@@ -2239,28 +2253,8 @@ fn emit_framed_inner(
                 (Opcode::ConstSymbol, AuxData::SymbolRef(idx)) => {
                     const_tagged.insert(r, bliss_rt::value::BlissVal::from_symbol_index(*idx).0);
                 }
-                (Opcode::ConstHeapObj, AuxData::HeapLiteral(_)) => {
-                    // FAIL-SAFE, not dead code (bliss-8nl). Baking a heap
-                    // literal's tagged pointer as an imm64 is a CORRUPTION bug:
-                    // the moving minor GC rewrites the registry-rooted
-                    // `BytecodeFunction.constants` slots but cannot patch
-                    // emitted code, so the function would later read freed
-                    // nursery — zeroed (values like `(0 . 0)`) or, with
-                    // poisoning, a segfault. T1 had the identical bug
-                    // (bliss-d0b).
-                    //
-                    // Background snapshots are now held by CrossThreadRoot, so
-                    // movable literals survive compilation (bliss-u1x). This
-                    // arm remains the second, post-compilation safety boundary:
-                    // the generated code itself still needs an indirection to a
-                    // GC-rewritten constant slot.
-                    //
-                    // Declining turns any such regression into a T1 fallback
-                    // (slow, correct) instead of heap corruption. Remove this
-                    // only together with a GC-visible constant slot — load
-                    // through the stable `&bf.constants[k]` address the way T1
-                    // does — under bliss-8nl.
-                    return Err(EmitError::UnsupportedOp(op_tag(Opcode::ConstHeapObj)));
+                (Opcode::ConstHeapObj, AuxData::HeapLiteral { slot }) => {
+                    heap_const_slots.insert(r, *slot);
                 }
                 (Opcode::ConstNil, _) => {
                     const_tagged.insert(r, bliss_rt::value::NIL.0);
@@ -2745,7 +2739,10 @@ fn emit_framed_inner(
         proven.extend(fixnum_valued.iter().copied());
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
-            if is_const_opcode(d.opcode) || d.opcode.is_terminator() || fused.contains(&inst) {
+            if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
+                || d.opcode.is_terminator()
+                || fused.contains(&inst)
+            {
                 continue;
             }
             let roots = if activation_slots.is_some() && is_call_like(d.opcode) {
@@ -2805,7 +2802,17 @@ fn emit_framed_inner(
             let (mut inst_reg, result_stores) =
                 prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?;
             let mut inst_pool = Vec::new();
-            if d.opcode == Opcode::Call {
+            if d.opcode == Opcode::ConstHeapObj {
+                let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let dst = *inst_reg
+                    .get(&result)
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let slot = *heap_const_slots
+                    .get(&result)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::ConstHeapObj)))?;
+                mov_imm64(&mut a, RAX, slot as i64);
+                load_mem64_disp(&mut a, dst, RAX, 0);
+            } else if d.opcode == Opcode::Call {
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
                 emit_call(
                     &mut a,
@@ -3144,7 +3151,12 @@ fn emit_framed_inner(
                             return Err(EmitError::UnsupportedOp(0xF6));
                         }
                     }
-                    ValueSource::Const(bv) => SlotSrc::Imm(bv.0),
+                    ValueSource::Const(bv) => {
+                        if is_moving_gc_reference(*bv) {
+                            return Err(EmitError::UnsupportedOp(0xF8));
+                        }
+                        SlotSrc::Imm(bv.0)
+                    }
                     ValueSource::Unbound => SlotSrc::Imm(bliss_rt::value::UNBOUND.0),
                     ValueSource::Remat(id) => SlotSrc::Remat(*id),
                 };
@@ -3330,6 +3342,9 @@ fn emit_framed_inner(
         }
         m
     };
+    let mut heap_constant_slots: Vec<usize> = heap_const_slots.values().copied().collect();
+    heap_constant_slots.sort_unstable();
+    heap_constant_slots.dedup();
     Ok(FramedCode {
         code,
         compiled_entry,
@@ -3341,6 +3356,7 @@ fn emit_framed_inner(
         shadow_root_slots,
         emitted_safepoints,
         root_sync_sites,
+        heap_constant_slots,
         // True iff emitted control flow can reach a speculation-deopt stub; lets
         // the caller direct-call a non-deopting T2 function with no post-call
         // deopt handling (bliss-zhvn).

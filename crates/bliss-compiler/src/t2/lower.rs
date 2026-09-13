@@ -406,9 +406,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
     let defs = lo.vregs(&data.results);
     let uses = lo.vregs(&data.args);
 
-    // Constants materialise a tagged immediate the emitter can move directly
-    // (spec §4.7). Populate `MachInst.imm` from the IR constant's AuxData; a
-    // fixnum/char/nil/t reaching a function boundary is its tagged BlissVal bits.
+    // Non-moving constants materialise a tagged immediate the emitter can move
+    // directly (spec §4.7). Heap literals instead define an allocated value and
+    // are loaded from their rooted pool slot by the rich emitter.
     // (Unboxed-representation materialisation + box/unbox insertion is future
     // work; a bare constant feeding a Return is naturally tagged.)
     {
