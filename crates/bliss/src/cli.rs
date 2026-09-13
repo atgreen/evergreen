@@ -7386,9 +7386,17 @@ fn symbol_package_value(env: &Env, sym: BlissVal) -> BlissVal {
     }
     if sym != NIL && sym != T {
         if let Some(idx) = sym.symbol_index() {
-            // Uninterned symbols (make-symbol / gensym / copy-symbol) and symbols
-            // made homeless by UNINTERN both have SYMBOL-PACKAGE = NIL.
-            if symbol_is_homeless(idx) || reader::is_uninterned(idx) {
+            // Symbols made homeless by UNINTERN have SYMBOL-PACKAGE = NIL, as
+            // do uninterned symbols (make-symbol / gensym / copy-symbol) —
+            // UNLESS the uninterned symbol was later IMPORTed, which sets its
+            // heap package cell and gives it a real home (CLHS IMPORT; ansi
+            // IMPORT.5).
+            if symbol_is_homeless(idx) {
+                return NIL;
+            }
+            if reader::is_uninterned(idx)
+                && bliss_rt::symbols::symbol_package(idx).is_none_or(|p| p.is_nil())
+            {
                 return NIL;
             }
         }
@@ -9108,6 +9116,21 @@ fn symbol_bare_name(name: &str) -> String {
     base.to_uppercase()
 }
 
+/// A CLHS string designator's designated string: a symbol designates its
+/// SYMBOL-NAME (the BARE name — a package-locally interned symbol's registry
+/// spelling is qualified, and leaking that spelling into package names /
+/// nicknames mints garbage like "COMMON-LISP-USER::M"); a string designates
+/// itself verbatim; a character its one-character string.
+fn string_designator_name(v: BlissVal) -> String {
+    if v.is_symbol() {
+        symbol_bare_name(&sym_name_rc(v))
+    } else if v.is_character() {
+        v.as_char().to_string()
+    } else {
+        val_as_str(v)
+    }
+}
+
 /// Map an alien-type designator keyword (e.g. `:int`, `:pointer`, `:double`) to
 /// a [`bliss_rt::ffi::AlienType`], for the `%ffi-call` primitive. Integer widths
 /// follow the LP64 C ABI. `:string`/`:pointer` marshal as a raw address.
@@ -9285,9 +9308,15 @@ fn find_symbol_in_package_cased(
     // EXTERNAL symbol of a directly-used package (inherited; CLHS 11.1.1.2.1 —
     // use is one level, not transitive; :use-reexport re-homes into the external
     // table so one hop covers the visible set).
-    let found = present_symbol_with_status(root, keyword, &bare_upper).or_else(|| {
+    // Case-exact lookups probe with the VERBATIM query: a symbol with an
+    // escaped lowercase name (`:|f|`, a (:shadow "foo") entry) is keyed by
+    // that exact spelling in the keyword registry / package tables, so the
+    // upcased probe can never find it — and an upcased hit would be filtered
+    // out below anyway (bliss-961p).
+    let probe: &str = if exact_case { bare_name } else { &bare_upper };
+    let found = present_symbol_with_status(root, keyword, probe).or_else(|| {
         bliss_stdlib::package_use_list(root).into_iter().find_map(|used| {
-            match present_symbol_with_status(used, keyword, &bare_upper) {
+            match present_symbol_with_status(used, keyword, probe) {
                 Some((sym, "EXTERNAL")) => Some((sym, "INHERITED")),
                 _ => None,
             }
@@ -9304,7 +9333,17 @@ fn find_symbol_in_package_cased(
     // lowercase can spuriously match an upcased symbol and needs the filter.
     if exact_case && !already_upper {
         if let Some((sym, _)) = found {
-            if symbol_bare_name(&sym_name(sym)) != bare_name {
+            // Compare CASE-PRESERVED bare names: `symbol_bare_name` upcases,
+            // which would wrongly reject a verbatim match on an escaped
+            // lowercase name (`:|f|`, "foo").
+            let raw = sym_name(sym);
+            let without_kw = raw.strip_prefix("KEYWORD:").unwrap_or(&raw);
+            let bare = without_kw
+                .rsplit_once("::")
+                .map(|(_, tail)| tail)
+                .or_else(|| without_kw.rsplit_once(':').map(|(_, tail)| tail))
+                .unwrap_or(without_kw);
+            if bare != bare_name {
                 return None;
             }
         }
@@ -20528,16 +20567,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "RENAME-PACKAGE requires package and new name".into(),
                     ));
                 }
-                let old_raw = val_as_str(args[0]);
+                let old_raw = string_designator_name(args[0]);
                 let old_name = resolve_package_name(env, &old_raw);
-                let new_name = normalize_package_name(&val_as_str(args[1]));
+                let new_name = normalize_package_name(&string_designator_name(args[1]));
                 // Optional new nicknames (3rd arg); default: keep the package's
                 // current nicknames (bliss has always preserved them on rename).
                 if let Some(pkg) = bliss_stdlib::find_package(&old_name) {
                     let new_nicks: Vec<String> = if args.len() > 2 {
                         list_to_vec(args[2])
                             .iter()
-                            .map(|n| normalize_package_name(&val_as_str(*n)))
+                            .map(|n| normalize_package_name(&string_designator_name(*n)))
                             .collect()
                     } else {
                         bliss_stdlib::package_nicknames(pkg)
@@ -20714,6 +20753,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     } else {
                         for (name, sym) in resolved {
                             let _ = bliss_stdlib::add_symbol(pkg, &name, sym, export_mode);
+                            // IMPORT of an UNINTERNED symbol also sets its home
+                            // package (CLHS IMPORT; ansi IMPORT.5): the symbol
+                            // becomes owned by the importing package, so
+                            // SYMBOL-PACKAGE reports it.
+                            if !export_mode {
+                                if let Some(idx) = sym.symbol_index() {
+                                    if bliss_rt::symbols::symbol_package(idx)
+                                        .is_none_or(|p| p.is_nil())
+                                    {
+                                        bliss_rt::symbols::set_symbol_package(
+                                            idx,
+                                            bliss_rt::packages::find_or_create(&pkg_name),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }

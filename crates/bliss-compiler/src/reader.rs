@@ -1566,8 +1566,8 @@ fn read_atom_with_base(
     pos: usize,
     read_base: u32,
 ) -> Result<(BlissVal, usize), BlissError> {
-    let (token, end, has_escape) = collect_token(chars, pos)?;
-    parse_token_with_base(&token, has_escape, read_base).map(|v| (v, end))
+    let (token, end, has_escape, leading_colon) = collect_token(chars, pos)?;
+    parse_token_with_base(&token, has_escape, leading_colon, read_base).map(|v| (v, end))
 }
 
 /// Scan one token, returning its readtable-cased name (`:upcase`: escaped chars
@@ -1576,7 +1576,10 @@ fn read_atom_with_base(
 /// than via an intermediate `Vec<(char, escaped)>` — every caller only ever
 /// wanted this string, and tokenizing dominates the load-time allocation profile
 /// (bliss-gq5.9).
-fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool), BlissError> {
+fn collect_token(
+    chars: &[char],
+    mut pos: usize,
+) -> Result<(String, usize, bool, bool), BlissError> {
     let case_mode = current_readtable_case_mode();
     // When SET-SYNTAX-FROM-CHAR has customised any readtable, the tokenizer must
     // consult per-character syntax (escape/constituent/delimiter) instead of the
@@ -1589,6 +1592,10 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
     let mut invert_eligible: Vec<bool> = Vec::new();
     let mut in_multiple_escape = false;
     let mut had_escape = false;
+    // True when the token's FIRST character is an unescaped ':' — the one
+    // package-marker fact an escaped token still needs: `:|A|` is the keyword
+    // A (the colon keeps its syntactic meaning; only escaped chars lose it).
+    let mut leading_unescaped_colon = false;
 
     while pos < chars.len() {
         let c = chars[pos];
@@ -1642,6 +1649,9 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
                             "invalid constituent character".into(),
                         ));
                     }
+                    if name.is_empty() && c == ':' {
+                        leading_unescaped_colon = true;
+                    }
                     name.push(fold_case_char(c, case_mode));
                     if case_mode == 3 {
                         invert_eligible.push(true);
@@ -1671,6 +1681,9 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
             }
             c if is_delimiter(c) => break,
             c => {
+                if name.is_empty() && c == ':' {
+                    leading_unescaped_colon = true;
+                }
                 name.push(fold_case_char(c, case_mode));
                 if case_mode == 3 {
                     invert_eligible.push(true);
@@ -1717,7 +1730,7 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
             name = inverted;
         }
     }
-    Ok((name, pos, had_escape))
+    Ok((name, pos, had_escape, leading_unescaped_colon))
 }
 
 /// Interpret an already readtable-cased token `name` as a number, keyword,
@@ -1726,6 +1739,7 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool)
 fn parse_token_with_base(
     name: &str,
     has_escape: bool,
+    leading_colon: bool,
     read_base: u32,
 ) -> Result<BlissVal, BlissError> {
     if name.is_empty() {
@@ -1739,6 +1753,18 @@ fn parse_token_with_base(
         return Err(BlissError::StreamError("empty token".into()));
     }
 
+    // An escaped token whose FIRST character is an unescaped ':' is still a
+    // KEYWORD — the package marker keeps its syntactic meaning, only the
+    // escaped characters lose theirs: `:|A|` is :A, `:|foo bar|` a keyword
+    // with a lowercase spaced name (ansi PACKAGE-NICKNAMES.3/UNUSE-PACKAGE.3,
+    // which pass ':|A|'-style designators).
+    if has_escape && leading_colon {
+        if let Some(kw_name) = name.strip_prefix(':') {
+            let full = format!("KEYWORD:{}", kw_name);
+            let idx = intern_symbol(&full);
+            return Ok(BlissVal::from_symbol_index(idx));
+        }
+    }
     // Don't try numeric interpretation if there are escape chars
     if !has_escape {
         // Check for package-qualified symbols first
@@ -2360,7 +2386,7 @@ fn read_sharpsign_with_base(
         }
         ':' => {
             // Uninterned symbol
-            let (name, end, _) = collect_token(chars, pos)?;
+            let (name, end, _, _) = collect_token(chars, pos)?;
             Ok((make_uninterned_symbol(&name), end))
         }
         'P' | 'p' => read_pathname_literal(chars, pos),
@@ -2895,7 +2921,7 @@ fn skip_string(chars: &[char], mut pos: usize) -> Result<usize, BlissError> {
 }
 
 fn skip_atom(chars: &[char], pos: usize) -> Result<usize, BlissError> {
-    let (_token, end, _escaped) = collect_token(chars, pos)?;
+    let (_token, end, _escaped, _) = collect_token(chars, pos)?;
     Ok(end)
 }
 

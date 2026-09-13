@@ -708,13 +708,21 @@
 (defmacro do-all-symbols (binding &rest body)
   (let ((var (car binding))
         (result (if (cdr binding) (car (cdr binding)) nil))
-        (pkg (gensym)))
-    ;; CLHS: the result-form is evaluated with VAR bound to NIL after the loop.
-    `(progn
-       (dolist (,pkg (list-all-packages))
-         (dolist (,var (bliss-internal::package-symbols ,pkg t))
-           ,@body))
-       (let ((,var nil)) (declare (ignorable ,var)) ,result))))
+        (pkg (gensym))
+        (all (gensym))
+        (s (gensym)))
+    ;; ONE flat DOLIST over the concatenated per-package symbol lists, so a
+    ;; RETURN in the body targets the implicit BLOCK NIL of this form (CLHS
+    ;; do-all-symbols) — the old nested per-package DOLIST captured it and
+    ;; merely advanced to the next package (ansi DO-ALL-SYMBOLS.5/6/12).
+    ;; DOLIST also evaluates the result-form with VAR bound to NIL (CLHS).
+    `(dolist (,var (let ((,all nil))
+                     (dolist (,pkg (list-all-packages))
+                       (dolist (,s (bliss-internal::package-symbols ,pkg t))
+                         (push ,s ,all)))
+                     (nreverse ,all))
+             ,result)
+       ,@body)))
 
 ;;; WITH-PACKAGE-ITERATOR / FIND-ALL-SYMBOLS
 ;;;
