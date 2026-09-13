@@ -2249,20 +2249,17 @@ fn emit_framed_inner(
                     // poisoning, a segfault. T1 had the identical bug
                     // (bliss-d0b).
                     //
-                    // Today `background_safe_body` keeps such bodies at T1, so
-                    // this arm is unreachable: a probe here counted ZERO hits
-                    // across the whole test suite, an ASDF load, and a
-                    // deliberate caller/callee inlining case. But that guard
-                    // inspects only the ROOT body's constants, while T2 inlines
-                    // callee bodies whose constants it never examines — so the
-                    // guard is not structurally airtight, and it is exactly the
-                    // kind of hole that reopens silently.
+                    // Background snapshots are now held by CrossThreadRoot, so
+                    // movable literals survive compilation (bliss-u1x). This
+                    // arm remains the second, post-compilation safety boundary:
+                    // the generated code itself still needs an indirection to a
+                    // GC-rewritten constant slot.
                     //
                     // Declining turns any such regression into a T1 fallback
                     // (slow, correct) instead of heap corruption. Remove this
                     // only together with a GC-visible constant slot — load
                     // through the stable `&bf.constants[k]` address the way T1
-                    // does — under bliss-u1x.
+                    // does — under bliss-8nl.
                     return Err(EmitError::UnsupportedOp(op_tag(Opcode::ConstHeapObj)));
                 }
                 (Opcode::ConstNil, _) => {

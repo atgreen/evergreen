@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use std::thread::ThreadId;
 // ── Region model ───────────────────────────────────────────────────
 
@@ -1969,6 +1969,9 @@ impl Collector for HeapCollector {
     /// or promotes to old-gen based on gen_age vs promotion_threshold.
     fn minor_gc(&mut self) -> Result<(), BlissError> {
         let needs_major = {
+            let _exclude_cross_thread_readers = cross_thread_root_gc_gate()
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
             let _gc_cycle = gc_cycle_lock()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -2014,6 +2017,9 @@ impl Collector for HeapCollector {
     /// 3. Evacuation: copy live objects from selected regions to fresh old-gen
     ///    regions, install forwarding pointers, and free evacuated regions.
     fn major_gc(&mut self) -> Result<(), BlissError> {
+        let _exclude_cross_thread_readers = cross_thread_root_gc_gate()
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         let _gc_cycle = gc_cycle_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -2913,6 +2919,125 @@ impl TraceHostRoots for BlissError {
             | BlissError::SandboxViolation(_)
             | BlissError::ControlError(_) => {}
         }
+    }
+}
+
+// Cross-thread roots use a reader/writer gate in addition to their per-value
+// mutex. A moving collection owns the write side for its whole mark/relocate
+// cycle; a background reader owns the read side while inspecting the rooted
+// value. Merely locking during each external-root scan would leave a race in
+// the interval between marking the old address and rewriting the slot.
+fn cross_thread_root_gc_gate() -> &'static RwLock<()> {
+    static GATE: OnceLock<RwLock<()>> = OnceLock::new();
+    GATE.get_or_init(|| RwLock::new(()))
+}
+
+#[derive(Clone, Copy)]
+struct CrossThreadRootEntry {
+    address: usize,
+    trace: unsafe fn(usize, &mut dyn FnMut(*mut BlissVal)),
+}
+
+fn cross_thread_roots() -> &'static OrderedMutex<HashMap<usize, CrossThreadRootEntry>> {
+    static ROOTS: OnceLock<OrderedMutex<HashMap<usize, CrossThreadRootEntry>>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            6,
+            "GC cross-thread roots",
+            HashMap::new(),
+        )
+    })
+}
+
+struct CrossThreadRootInner<T: TraceHostRoots + Send + 'static> {
+    value: Mutex<T>,
+}
+
+unsafe fn trace_cross_thread_root<T: TraceHostRoots + Send + 'static>(
+    address: usize,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    // SAFETY: the Arc allocation is stable, and CrossThreadRootInner::drop
+    // removes the entry under the registry lock before the allocation is freed.
+    let inner = unsafe { &*(address as *const CrossThreadRootInner<T>) };
+    inner
+        .value
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .trace_host_roots(visit);
+}
+
+fn scan_cross_thread_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let roots = cross_thread_roots()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for entry in roots.values() {
+        // SAFETY: the registry lock excludes the last Arc's unregister/drop.
+        unsafe { (entry.trace)(entry.address, visit) };
+    }
+}
+
+fn install_cross_thread_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| register_root_scanner(scan_cross_thread_roots));
+}
+
+impl<T: TraceHostRoots + Send + 'static> Drop for CrossThreadRootInner<T> {
+    fn drop(&mut self) {
+        let address = self as *mut Self as usize;
+        let removed = cross_thread_roots()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&address);
+        debug_assert!(removed.is_some(), "cross-thread root missing from registry");
+    }
+}
+
+/// A cloneable precise root for data handed to a non-mutator worker thread.
+///
+/// Moving GC rewrites every [`BlissVal`] reached through `T` in place. Use
+/// [`CrossThreadRoot::with_gc_stable`] to inspect the value: its closure excludes
+/// moving collections, so the worker cannot observe an address halfway through
+/// a mark/relocate cycle. The closure must not allocate on the Lisp heap or
+/// otherwise trigger GC, because collection waits for all such readers to exit;
+/// its return value must not retain a `BlissVal` copied out of the rooted data.
+#[derive(Clone)]
+pub struct CrossThreadRoot<T: TraceHostRoots + Send + 'static> {
+    inner: Arc<CrossThreadRootInner<T>>,
+}
+
+impl<T: TraceHostRoots + Send + 'static> CrossThreadRoot<T> {
+    pub fn new(value: T) -> Self {
+        install_cross_thread_root_scanner();
+        let inner = Arc::new(CrossThreadRootInner {
+            value: Mutex::new(value),
+        });
+        let address = Arc::as_ptr(&inner) as usize;
+        let previous = cross_thread_roots()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                address,
+                CrossThreadRootEntry {
+                    address,
+                    trace: trace_cross_thread_root::<T>,
+                },
+            );
+        debug_assert!(previous.is_none(), "duplicate cross-thread root address");
+        Self { inner }
+    }
+
+    pub fn with_gc_stable<R>(&self, inspect: impl FnOnce(&T) -> R) -> R {
+        let _gc_stable = cross_thread_root_gc_gate()
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let value = self
+            .inner
+            .value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        inspect(&value)
     }
 }
 

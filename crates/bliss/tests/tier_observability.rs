@@ -559,6 +559,47 @@ fn automatic_t2_decline_retains_t1() {
     );
 }
 
+/// A movable literal in the compiler snapshot is no longer an admission-level
+/// rejection: CrossThreadRoot keeps it live while the background worker reads
+/// the body. Until bliss-8nl teaches emitted code to load a GC-visible constant
+/// slot, the emitter itself still declines safely and leaves the function at T1.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn background_t2_compiler_accepts_a_rooted_movable_literal_snapshot() {
+    let program = "\
+        (defun rooted-literal (x) (if x (quote (11 22)) nil)) \
+        (dotimes (i 20) (rooted-literal t)) \
+        (dotimes (i 2000) \
+          (bliss-ext:function-tier (quote rooted-literal))) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote rooted-literal)) (rooted-literal t))";
+    let out = run_output(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("BLISS_T2_THREADS", "1"),
+            ("BLISS_T2_LOG", "-"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "rooted-literal run failed:\n{stderr}");
+    assert_eq!(stdout.lines().next(), Some("1 (11 22)"), "{stdout}");
+    assert!(
+        stderr.contains("ROOTED-LITERAL: queued for background T2 compilation"),
+        "movable snapshot never reached the background compiler:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("ROOTED-LITERAL: emit_framed failed: UnsupportedOp"),
+        "heap literal did not reach the emitter's safe fallback:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("movable literal cannot be rooted"),
+        "obsolete admission guard rejected the rooted snapshot:\n{stderr}"
+    );
+}
+
 /// T2 can be disabled for differential/debug runs without restoring the old
 /// opt-in model: normal operation is automatic, while the explicit switch pins
 /// an otherwise-hot function at its working T1 entry.

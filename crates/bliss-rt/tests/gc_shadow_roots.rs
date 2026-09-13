@@ -2,8 +2,8 @@
 
 use bliss_rt::value::{BlissVal, TAG_MASK};
 use bliss_rt::{
-    Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, ShadowRootScope, alloc_typed,
-    full_gc, init_heap, walk_heap,
+    Allocator, Collector, CrossThreadRoot, GcConfig, HeapAllocator, HeapCollector, ShadowRootScope,
+    alloc_typed, full_gc, init_heap, walk_heap,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -83,6 +83,31 @@ fn scalar_and_vector_temporaries_are_rewritten_after_minor_gc() {
         );
         assert_eq!(marker(root.get()), 0xA11C_E002 + index as u64);
     }
+}
+
+#[test]
+fn cross_thread_root_is_rewritten_before_a_worker_reads_it() {
+    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&config()).expect("init_heap");
+    let mut allocator = HeapAllocator::new().expect("allocator");
+
+    let original = allocate(&mut allocator, 0xA11C_E005);
+    let root = CrossThreadRoot::new(original);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        release_rx.recv().expect("release worker");
+        root.with_gc_stable(|value| {
+            assert_ne!(*value, original, "cross-thread root should be relocated");
+            marker(*value)
+        })
+    });
+
+    HeapCollector::new().minor_gc().expect("minor_gc");
+    release_tx.send(()).expect("release worker");
+    let relocated_marker = worker.join().expect("worker exits cleanly");
+
+    assert_eq!(relocated_marker, 0xA11C_E005);
 }
 
 #[test]

@@ -14311,6 +14311,15 @@ struct T2CompileInput {
     inline_bodies: Vec<T2BodySnapshot>,
 }
 
+impl bliss_rt::gc::TraceHostRoots for T2CompileInput {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        unsafe { trace_bytecode_function(&mut self.body, visit) };
+        for saved in &mut self.inline_bodies {
+            unsafe { trace_bytecode_function(&mut saved.body, visit) };
+        }
+    }
+}
+
 struct T2Artifact {
     code: Vec<u8>,
     compiled_entry: usize,
@@ -14352,7 +14361,10 @@ struct T2Completion {
 }
 
 struct T2Job {
-    input: T2CompileInput,
+    sym: u32,
+    generation: u64,
+    priority: u64,
+    input: bliss_rt::CrossThreadRoot<T2CompileInput>,
     completion: std::sync::mpsc::Sender<T2Completion>,
 }
 
@@ -14389,7 +14401,7 @@ impl T2CompileQueue {
                 .jobs
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, job)| job.input.priority)
+                .max_by_key(|(_, job)| job.priority)
             {
                 return state.jobs.swap_remove(index);
             }
@@ -14419,13 +14431,13 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
                 .spawn(move || {
                     loop {
                         let job = worker_queue.take();
-                        let sym = job.input.sym;
-                        let generation = job.input.generation;
+                        let sym = job.sym;
+                        let generation = job.generation;
                         // A compiler bug must fail this request, not silently kill
                         // a worker and strand force/debug callers waiting forever.
                         let artifact =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                compile_t2_artifact(job.input)
+                                job.input.with_gc_stable(compile_t2_artifact)
                             }))
                             .ok()
                             .flatten();
@@ -14598,16 +14610,6 @@ fn publish_native(sym: u32, fn_obj: Option<BlissVal>, nc: &NativeCode) {
     capture_tier_disasm(sym, nc);
 }
 
-fn background_safe_body(body: &BytecodeFunction) -> bool {
-    // A raw heap/cons literal can move while a worker is reading its snapshot.
-    // Arguments and globals are not embedded in the job, and immediate
-    // constants are inherently stable. Bodies with movable literals retain T1
-    // until the GC exposes a cross-thread compilation-root handle.
-    body.constants
-        .iter()
-        .all(|v| !v.is_cons() && !v.is_heap_object())
-}
-
 fn t2_completion_sender() -> std::sync::mpsc::Sender<T2Completion> {
     T2_COMPLETIONS.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -14620,13 +14622,6 @@ fn t2_completion_sender() -> std::sync::mpsc::Sender<T2Completion> {
 
 fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let root = registry_get(sym)?;
-    if !background_safe_body(&root) {
-        t2_log_write(format_args!(
-            "{}: movable literal cannot be rooted by background compiler => stay T1",
-            root.name
-        ));
-        return None;
-    }
     let root_ptr = Rc::as_ptr(&root) as usize;
     let type_profiles = TYPE_PROFILE.with(|profiles| {
         profiles
@@ -14641,9 +14636,6 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             .borrow()
             .iter()
             .filter_map(|(&symbol, body)| {
-                if !background_safe_body(body) {
-                    return None;
-                }
                 let ptr = Rc::as_ptr(body) as usize;
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
                 Some(T2BodySnapshot {
@@ -14697,8 +14689,12 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
         return false;
     };
     let generation = input.generation;
+    let priority = input.priority;
     let job = T2Job {
-        input,
+        sym,
+        generation,
+        priority,
+        input: bliss_rt::CrossThreadRoot::new(input),
         completion: t2_completion_sender(),
     };
     if !t2_compile_queue().submit(job) {
@@ -16670,7 +16666,7 @@ macro_rules! t2_log {
     ($($a:tt)*) => { t2_log_write(format_args!($($a)*)) };
 }
 
-fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
+fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let sym = input.sym;
     let bf = &input.body;
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
@@ -16750,16 +16746,11 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
 
     let mut inline_options =
         bliss_compiler::t2::inlining::InlineOptions::default().with_root_symbol(sym);
-    for saved in input.inline_bodies {
-        let T2BodySnapshot {
-            symbol,
-            body,
-            invocations,
-            call_sites,
-        } = saved;
-        inline_options = inline_options.with_body(symbol, Rc::new(body));
-        for (bcp, calls) in call_sites {
-            inline_options = inline_options.with_call_site_profile(symbol, bcp, calls, invocations);
+    for saved in &input.inline_bodies {
+        inline_options = inline_options.with_body(saved.symbol, Rc::new(saved.body.clone()));
+        for &(bcp, calls) in &saved.call_sites {
+            inline_options =
+                inline_options.with_call_site_profile(saved.symbol, bcp, calls, saved.invocations);
         }
     }
     let mut f = match bliss_compiler::t2::build::build_from_bytecode_with_inline_options(
