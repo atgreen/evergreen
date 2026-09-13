@@ -97,7 +97,7 @@ pub fn backend_is_bytecode() -> bool {
 // interpreter, and the T1 native emitter that operate on these types.
 use bliss_rt::bytecode::{
     BytecodeFunction, ClauseInfo, DeclaredType, HandlerBindInfo, HandlerCaseInfo, Instr,
-    RestartCaseInfo, RestartClauseInfo, VarLoc,
+    RestartCaseInfo, RestartClauseInfo, VarLoc, typep_class,
 };
 
 // ── Per-thread registry of compiled functions ─────────────────────
@@ -206,23 +206,6 @@ impl Drop for ActiveBytecodeRoot {
             active.remove(index);
         });
     }
-}
-
-/// Tag-checkable type-classes recognised by the lowerer for inline
-/// `(typep x 'CONST)` → [`Instr::TypeP`] (bliss-gq5). Deliberately small: only
-/// types decidable by an immediate tag / heap-type-id test with no allocation
-/// and no user-defined-type-graph lookup, so the check is a handful of branches
-/// instead of a c2i `CallNamed` to TYPEP. `find_typep_class` maps a constant
-/// type specifier to one of these; [`typep_class_matches`] executes it.
-mod typep_class {
-    pub const STRING: u16 = 1;
-    pub const SYMBOL: u16 = 2;
-    pub const PACKAGE: u16 = 3;
-    pub const LIST: u16 = 4;
-    pub const CONS: u16 = 5;
-    pub const NULL: u16 = 6;
-    pub const BOOLEAN: u16 = 7; // (member nil t) / the type BOOLEAN
-    pub const HASH_TABLE: u16 = 8;
 }
 
 /// Map a *constant* type specifier symbol name to a [`typep_class`] code, or
@@ -13147,6 +13130,18 @@ extern "C" fn c2i_take_values(primary: u64, dst: *mut BlissVal, n: u64) {
     }
 }
 
+/// T2 uses one runtime address for both multiple-value operations so the
+/// compiler-facing emitter API stays independent of interpreter internals.
+/// A zero count clears MV state; a positive count copies the tuple into the
+/// supplied activation-frame slots.
+extern "C" fn c2i_t2_mv(primary: u64, dst: *mut BlissVal, n: u64) {
+    if n == 0 {
+        c2i_clear_mv();
+    } else {
+        c2i_take_values(primary, dst, n);
+    }
+}
+
 /// `ValuesToList`: collect the current multiple-values into a fresh list. When
 /// `mv_active`, the values are `env.mv`; otherwise the single `primary` value.
 /// Mirrors the T0 `Instr::ValuesToList` arm exactly (bliss-rwiv) so the compiled
@@ -16854,9 +16849,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     let deopt_t2_addr = c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64) as usize as u64;
     let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    let call_slice_addr =
+        c2i_call_slice as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64 as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
-    let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    let mv_addr = c2i_t2_mv as extern "C" fn(u64, *mut BlissVal, u64) as usize as u64;
     let recovery_toggle_addr =
         c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
     let framed = match bliss_compiler::t2::emit::emit_framed_with_activation_slots(
@@ -16864,9 +16861,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         deopt_addr,
         deopt_t2_addr,
         call_addr,
+        call_slice_addr,
         load_global_addr,
         store_global_addr,
-        clear_mv_addr,
+        mv_addr,
         recovery_toggle_addr,
         bf.num_slots(),
         Some(sym),

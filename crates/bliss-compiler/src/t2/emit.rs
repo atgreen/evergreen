@@ -1126,18 +1126,23 @@ fn emit_call_arg_moves(a: &mut Asm, mut pending: Vec<(u8, ArgMoveSrc)>) -> Resul
     Ok(())
 }
 
-/// Emit a `Call` as a c2i call into the interpreter: move ≤3 arguments into the
-/// c2i argument registers (rdx, rcx, r8), set rdi=sym / rsi=nargs, and call.
-/// Values live across the call are in callee-saved registers, so the call cannot
-/// clobber them; the result comes back in rax and is moved to its register.
+/// Emit a `Call` through the interpreter adapter. Up to three arguments use the
+/// c2i argument registers (rdx, rcx, r8); wider calls use a GC-scanned slice in
+/// the owning activation. Values live across the call are in callee-saved
+/// registers, so the call cannot clobber them; the result returns in rax.
 #[allow(clippy::too_many_arguments)]
 fn emit_call(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
     c2i_call_addr: u64,
+    c2i_call_slice_addr: u64,
     c2i_recovery_toggle_addr: u64,
+    frame_base: Option<FramedHome>,
+    activation_slots: Option<u16>,
+    call_arg_base: u16,
     self_sym: Option<u32>,
     self_entry: Option<bliss_rt::asm::Label>,
 ) -> Result<(), EmitError> {
@@ -1175,7 +1180,36 @@ fn emit_call(
     // T2 does not gather another inlining profile after installation, so r9=0.
     const C2I_ARGS: [u8; 3] = [2, 1, 8];
     if nargs > C2I_ARGS.len() {
-        return Err(EmitError::UnsupportedOp(0xF9));
+        let frame_base = frame_base.ok_or(EmitError::UnsupportedOp(0xF9))?;
+        let activation_slots = activation_slots.ok_or(EmitError::UnsupportedOp(0xF9))?;
+        load_home(a, SCRATCH, frame_base, 0);
+        for (index, &arg) in data.args.iter().enumerate() {
+            if let Some(&bits) = const_tagged.get(&arg) {
+                mov_imm64(a, RAX, bits as i64);
+            } else {
+                let home = *homes.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                load_home(a, RAX, home, 0);
+            }
+            let slot = i32::from(activation_slots) + i32::from(call_arg_base) + index as i32;
+            store_mem64_disp(a, SCRATCH, slot * 8, RAX);
+        }
+        mov_imm64(a, 7, sym as i64); // rdi = sym
+        mov_imm64(a, 6, nargs as i64); // rsi = nargs
+        mov_rr(a, 2, SCRATCH); // rdx = frame base
+        alu_r_imm(
+            a,
+            0,
+            2,
+            (i32::from(activation_slots) + i32::from(call_arg_base)) * 8,
+        );
+        mov_imm32(a, 1, 0); // rcx = profile site (T2 does not gather one)
+        mov_imm64(a, 0, c2i_call_slice_addr as i64);
+        emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+        if let Some(&result) = data.results.first() {
+            let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            store_home(a, home, RAX, 0);
+        }
+        return Ok(());
     }
     let mut moves = Vec::with_capacity(nargs);
     for (i, &arg) in data.args.iter().enumerate() {
@@ -1660,6 +1694,7 @@ fn emit_type_check(
 ) -> Result<(), EmitError> {
     use crate::t2::ir::TypeBits;
     use crate::t2::ir::{AuxData, Opcode};
+    use bliss_rt::bytecode::typep_class;
     if data.results.is_empty() || data.args.is_empty() {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
     }
@@ -1669,8 +1704,9 @@ fn emit_type_check(
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
     }
     let xr = *reg.get(&x).ok_or(EmitError::UnsupportedOp(0xF2))?;
-    let bits = match &data.aux {
-        AuxData::TypeTag(t) => t.bits,
+    let (bits, class) = match &data.aux {
+        AuxData::TypeTag(t) => (t.bits, None),
+        AuxData::TypepClass(class) => (TypeBits::BOTTOM, Some(*class)),
         _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck))),
     };
     // ext codes for `alu_r_imm`: 4 = AND, 7 = CMP. Tag values are the low 3 bits.
@@ -1685,13 +1721,26 @@ fn emit_type_check(
         alu_r_imm(a, AND, SCRATCH, 7); // scratch = x & 7
         alu_r_imm(a, CMP, SCRATCH, tag);
     };
-    if bits == TypeBits::FIXNUM {
-        single_tag(a, 0);
+    if class == Some(typep_class::BOOLEAN) {
+        alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32);
         a.jcc(Cc::E, found);
-    } else if bits == TypeBits::CONS {
+        alu_r_imm(a, CMP, xr, bliss_rt::value::T.0 as i32);
+        a.jcc(Cc::E, found);
+    } else if class == Some(typep_class::NULL) {
+        alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32);
+        a.jcc(Cc::E, found);
+    } else if class == Some(typep_class::LIST) {
+        alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32);
+        a.jcc(Cc::E, found);
         single_tag(a, 1);
         a.jcc(Cc::E, found);
-    } else if bits == TypeBits::SYMBOL {
+    } else if bits == TypeBits::FIXNUM {
+        single_tag(a, 0);
+        a.jcc(Cc::E, found);
+    } else if bits == TypeBits::CONS || class == Some(typep_class::CONS) {
+        single_tag(a, 1);
+        a.jcc(Cc::E, found);
+    } else if bits == TypeBits::SYMBOL || class == Some(typep_class::SYMBOL) {
         single_tag(a, 5); // TAG_SYMBOL
         a.jcc(Cc::E, found);
         alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32); // NIL is a symbol
@@ -1711,7 +1760,7 @@ fn emit_type_check(
         // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, bliss_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
-    } else if bits == TypeBits::STRING {
+    } else if bits == TypeBits::STRING || class == Some(typep_class::STRING) {
         // A string predicate must prove the heap tag before reading the header.
         // Both simple UTF-8 string layouts share the same length/data offsets.
         single_tag(a, bliss_rt::value::TAG_HEAP_OBJECT as i32);
@@ -1731,6 +1780,21 @@ fn emit_type_check(
             0x07,
             bliss_rt::object::type_id::SIMPLE_CHARACTER_STRING,
         ]);
+        a.jcc(Cc::E, found);
+    } else if matches!(
+        class,
+        Some(typep_class::PACKAGE) | Some(typep_class::HASH_TABLE)
+    ) {
+        single_tag(a, bliss_rt::value::TAG_HEAP_OBJECT as i32);
+        a.jcc(Cc::Ne, not_found);
+        mov_rr(a, SCRATCH, xr);
+        alu_r_imm(a, AND, SCRATCH, -8);
+        let type_id = if class == Some(typep_class::PACKAGE) {
+            bliss_rt::object::type_id::PACKAGE
+        } else {
+            bliss_rt::object::type_id::HASH_TABLE
+        };
+        a.extend_from_slice(&[0x80, 0x7A, 0x07, type_id]);
         a.jcc(Cc::E, found);
     } else {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
@@ -2043,17 +2107,21 @@ fn is_moving_gc_reference(value: bliss_rt::value::BlissVal) -> bool {
 }
 
 /// Emit `f` (a speculated function, straight-line or branching) as native code.
-/// `c2i_deopt_addr`/`c2i_call_addr` are the interpreter's `c2i_deopt`/`c2i_call`
-/// routine addresses. A function that contains a `Call` uses callee-saved value
-/// registers (so the call cannot clobber live values) and a small frame.
+/// `c2i_deopt_addr`, `c2i_call_addr`, and `c2i_call_slice_addr` are the
+/// interpreter's deopt and fixed-/wide-arity call adapters. `c2i_mv_addr` clears
+/// multiple values when called with a zero count and copies them to an
+/// activation-frame destination otherwise. A function that contains a `Call`
+/// uses callee-saved value registers (so the call cannot clobber live values)
+/// and a small frame.
 pub fn emit_framed(
     f: &Function,
     c2i_deopt_addr: u64,
     c2i_deopt_t2_addr: u64,
     c2i_call_addr: u64,
+    c2i_call_slice_addr: u64,
     c2i_load_global_addr: u64,
     c2i_store_global_addr: u64,
-    c2i_clear_mv_addr: u64,
+    c2i_mv_addr: u64,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
     emit_framed_inner(
@@ -2061,9 +2129,10 @@ pub fn emit_framed(
         c2i_deopt_addr,
         c2i_deopt_t2_addr,
         c2i_call_addr,
+        c2i_call_slice_addr,
         c2i_load_global_addr,
         c2i_store_global_addr,
-        c2i_clear_mv_addr,
+        c2i_mv_addr,
         0,
         None,
         self_sym,
@@ -2077,9 +2146,10 @@ pub fn emit_framed_with_activation_slots(
     c2i_deopt_addr: u64,
     c2i_deopt_t2_addr: u64,
     c2i_call_addr: u64,
+    c2i_call_slice_addr: u64,
     c2i_load_global_addr: u64,
     c2i_store_global_addr: u64,
-    c2i_clear_mv_addr: u64,
+    c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
     activation_slots: u16,
     self_sym: Option<u32>,
@@ -2089,9 +2159,10 @@ pub fn emit_framed_with_activation_slots(
         c2i_deopt_addr,
         c2i_deopt_t2_addr,
         c2i_call_addr,
+        c2i_call_slice_addr,
         c2i_load_global_addr,
         c2i_store_global_addr,
-        c2i_clear_mv_addr,
+        c2i_mv_addr,
         c2i_recovery_toggle_addr,
         Some(activation_slots),
         self_sym,
@@ -2103,9 +2174,10 @@ fn emit_framed_inner(
     c2i_deopt_addr: u64,
     c2i_deopt_t2_addr: u64,
     c2i_call_addr: u64,
+    c2i_call_slice_addr: u64,
     c2i_load_global_addr: u64,
     c2i_store_global_addr: u64,
-    c2i_clear_mv_addr: u64,
+    c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
     activation_slots: Option<u16>,
     self_sym: Option<u32>,
@@ -2149,7 +2221,11 @@ fn emit_framed_inner(
     let is_call_like = |op: Opcode| {
         matches!(
             op,
-            Opcode::Call | Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::ClearMv
+            Opcode::Call
+                | Opcode::SymbolValue
+                | Opcode::SetSymbolValue
+                | Opcode::ClearMv
+                | Opcode::TakeValuesToLocals
         )
     };
     let has_ir_calls = f.block_order().iter().any(|&b| {
@@ -2558,10 +2634,39 @@ fn emit_framed_inner(
             }
         }
     }
-    let shadow_root_slots = safepoint_roots.values().map(Vec::len).max().unwrap_or(0);
-    let shadow_root_slots =
-        u16::try_from(shadow_root_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-    let frame_base_home = if shadow_root_slots == 0 {
+    let root_shadow_slots = safepoint_roots.values().map(Vec::len).max().unwrap_or(0);
+    let root_shadow_slots =
+        u16::try_from(root_shadow_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    // Wide c2i calls pass a contiguous slice. Reserve that slice inside the
+    // owning BlissStack activation so the precise GC scans and rewrites every
+    // argument while the Rust adapter/callee runs.
+    let call_arg_slots = f
+        .block_order()
+        .iter()
+        .flat_map(|&block| f.block(block).insts.iter().copied())
+        .map(|inst| f.inst(inst))
+        .filter(|data| data.opcode == Opcode::Call && data.args.len() > 3)
+        .map(|data| data.args.len())
+        .max()
+        .unwrap_or(0);
+    let call_arg_slots =
+        u16::try_from(call_arg_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    let shadow_root_slots = root_shadow_slots
+        .checked_add(call_arg_slots)
+        .ok_or(EmitError::UnsupportedOp(0xFD))?;
+    let needs_activation_frame = f.block_order().iter().any(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| f.inst(inst).opcode == Opcode::TakeValuesToLocals)
+    });
+    if needs_activation_frame && activation_slots.is_none() {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)));
+    }
+    if call_arg_slots != 0 && activation_slots.is_none() {
+        return Err(EmitError::UnsupportedOp(0xF9));
+    }
+    let frame_base_home = if shadow_root_slots == 0 && !needs_activation_frame {
         None
     } else {
         let home = FramedHome::Stack(next_stack);
@@ -2606,6 +2711,7 @@ fn emit_framed_inner(
                             | Opcode::SymbolValue
                             | Opcode::SetSymbolValue
                             | Opcode::ClearMv
+                            | Opcode::TakeValuesToLocals
                     )
                 {
                     continue;
@@ -2799,8 +2905,13 @@ fn emit_framed_inner(
                     }
                 }
             }
+            let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
             let (mut inst_reg, result_stores) =
-                prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?;
+                if d.opcode == Opcode::TakeValuesToLocals || wide_call {
+                    (HashMap::new(), Vec::new())
+                } else {
+                    prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?
+                };
             let mut inst_pool = Vec::new();
             if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
@@ -2818,9 +2929,14 @@ fn emit_framed_inner(
                     &mut a,
                     &d,
                     &inst_reg,
+                    &homes,
                     &const_tagged,
                     c2i_call_addr,
+                    c2i_call_slice_addr,
                     c2i_recovery_toggle_addr,
+                    frame_base_home,
+                    activation_slots,
+                    root_shadow_slots,
                     self_sym,
                     self_entry,
                 )?;
@@ -2891,9 +3007,53 @@ fn emit_framed_inner(
                     c2i_recovery_toggle_addr,
                 )?;
             } else if d.opcode == Opcode::ClearMv {
-                // Reset multiple-values state: a bare c2i_clear_mv() call.
-                mov_imm64(&mut a, 0, c2i_clear_mv_addr as i64); // mov rax, c2i_clear_mv
+                // A zero count selects the clear operation in the shared T2 MV
+                // helper. Initialise every argument because the same ABI also
+                // serves TakeValuesToLocals.
+                mov_imm32(&mut a, 7, 0); // edi = primary (unused)
+                mov_imm32(&mut a, 6, 0); // esi = destination (null)
+                mov_imm32(&mut a, 2, 0); // edx = count (clear)
+                mov_imm64(&mut a, 0, c2i_mv_addr as i64);
                 emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
+            } else if d.opcode == Opcode::TakeValuesToLocals {
+                let (nvars, slot_base) = match d.aux {
+                    AuxData::ValuesLocals { nvars, slot_base } => (nvars, slot_base),
+                    _ => {
+                        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)));
+                    }
+                };
+                let primary = *d
+                    .args
+                    .first()
+                    .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
+                if let Some(&bits) = const_tagged.get(&primary) {
+                    mov_imm64(&mut a, 7, bits as i64);
+                } else {
+                    let home = *homes.get(&primary).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    load_home(&mut a, 7, home, 0);
+                }
+                let frame_base = frame_base_home
+                    .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
+                load_home(&mut a, 6, frame_base, 0);
+                alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
+                mov_imm64(&mut a, 2, i64::from(nvars));
+                mov_imm64(&mut a, 0, c2i_mv_addr as i64);
+                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
+
+                // The helper writes the activation slots. Materialise each SSA
+                // result into its stable home one at a time; this also handles
+                // arbitrarily many bindings without exhausting temp registers.
+                load_home(&mut a, SCRATCH, frame_base, 0);
+                for (offset, &result) in d.results.iter().enumerate() {
+                    load_mem64_disp(
+                        &mut a,
+                        RAX,
+                        SCRATCH,
+                        (i32::from(slot_base) + offset as i32) * 8,
+                    );
+                    let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    store_home(&mut a, home, RAX, 0);
+                }
             } else {
                 // In precise mode this inst has its own reconstruction stub (built
                 // above); route its guards there instead of the whole-rerun stub.
@@ -3519,6 +3679,7 @@ fn emit_inst(
 
     use crate::t2::lower::op;
     match mi.op {
+        op::LIVENESS => {}
         op::MOV_IMM | op::MOV_TAGGED => {
             // Both materialise a 64-bit immediate into a GPR; MOV_TAGGED's is a
             // tagged BlissVal, MOV_IMM's a raw/tagged integer — identical encoding.
@@ -3881,6 +4042,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
         )
         .expect("emit string byte length")
@@ -3916,6 +4078,7 @@ mod tests {
         let char_code = emit_framed(
             &char_ir,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -3964,6 +4127,7 @@ mod tests {
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4079,6 +4243,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
         )
         .expect("emit");
@@ -4113,6 +4278,7 @@ mod tests {
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4170,7 +4336,7 @@ mod tests {
             },
         );
 
-        let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit identity");
+        let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit identity");
         assert!(
             !framed.has_deopt,
             "identity has no guard branch and must be direct-call eligible"
@@ -4189,6 +4355,7 @@ mod tests {
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4304,6 +4471,7 @@ mod tests {
         let code = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,

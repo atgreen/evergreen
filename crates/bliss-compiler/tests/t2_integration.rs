@@ -16,7 +16,7 @@ use bliss_compiler::t2::opt_licm::Licm;
 use bliss_compiler::t2::pass::PassManager;
 use bliss_compiler::t2::regalloc::allocate;
 use bliss_compiler::t2::verify::verify;
-use bliss_rt::bytecode::{BytecodeFunction, Instr};
+use bliss_rt::bytecode::{BytecodeFunction, Instr, typep_class};
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, T};
 
@@ -66,7 +66,7 @@ fn emitted_heap_literal_is_loaded_from_its_constant_pool_slot() {
         0,
     );
     let f = build_from_bytecode(&bf).expect("build heap literal");
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit heap literal");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit heap literal");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [0u64];
@@ -123,7 +123,7 @@ fn inlined_heap_literal_uses_the_saved_body_constant_slot() {
             .all(|&inst| f.inst(inst).opcode != Opcode::Call)
     }));
     let framed =
-        emit_framed(&f, 0, 0, 0, 0, 0, 0, Some(caller)).expect("emit inlined heap literal");
+        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, Some(caller)).expect("emit inlined heap literal");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [0u64];
@@ -205,7 +205,7 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
             .any(|&i| typep_f.inst(i).opcode == Opcode::Call)
     }));
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit INTEGERP intrinsic");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit INTEGERP intrinsic");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: BlissVal| {
@@ -223,6 +223,128 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
     let string = Box::new(ObjectHeader::new(type_id::SIMPLE_BASE_STRING, 1));
     let string = unsafe { BlissVal::from_heap_ptr(Box::into_raw(string).cast::<u8>()) };
     assert_eq!(run(string), NIL);
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn bytecode_typep_boolean_executes_without_a_call_or_deopt() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::ir::{AuxData, Opcode};
+
+    let bf = bytecode_fn(
+        "boolean-typep-opcode",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::TypeP(typep_class::BOOLEAN),
+            Instr::Return,
+        ],
+        vec![],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&bf).expect("build TypeP BOOLEAN");
+    let check = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| f.block(b).insts.iter())
+        .map(|&i| f.inst(i))
+        .find(|d| d.opcode == Opcode::TypeCheck)
+        .expect("TypeP must become TypeCheck");
+    assert!(matches!(
+        check.aux,
+        AuxData::TypepClass(typep_class::BOOLEAN)
+    ));
+    assert!(!check.flags.effectful);
+    assert!(!check.flags.guard);
+    assert!(check.frame_state.is_none());
+
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit TypeP BOOLEAN");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let run = |value: BlissVal| {
+        let mut frame = [value.0, 0];
+        BlissVal(func(frame.as_mut_ptr()))
+    };
+
+    assert_eq!(run(NIL), T);
+    assert_eq!(run(T), T);
+    assert_eq!(run(BlissVal::from_fixnum(0)), NIL);
+    assert_eq!(
+        run(BlissVal::from_symbol_index(bliss_rt::symbols::intern(
+            "NOT-A-BOOLEAN"
+        ))),
+        NIL
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn take_values_to_locals_materializes_secondary_ssa_results() {
+    use bliss_compiler::t2::emit::emit_framed_with_activation_slots;
+    use bliss_compiler::t2::ir::Opcode;
+
+    extern "C" fn take_values(primary: u64, dst: *mut BlissVal, n: u64) {
+        assert_eq!(n, 3);
+        unsafe {
+            dst.write(BlissVal(primary));
+            dst.add(1).write(T);
+            dst.add(2).write(NIL);
+        }
+    }
+
+    let bf = bytecode_fn(
+        "take-three-values",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::TakeValuesToLocals {
+                nvars: 3,
+                slot_base: 1,
+            },
+            Instr::LoadLocal(2),
+            Instr::Return,
+        ],
+        vec![],
+        4,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&bf).expect("build TakeValuesToLocals");
+    assert!(f.block_order().iter().any(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| f.inst(inst).opcode == Opcode::TakeValuesToLocals)
+    }));
+
+    let framed = emit_framed_with_activation_slots(
+        &f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        take_values as *const () as usize as u64,
+        0,
+        bf.num_slots(),
+        None,
+    )
+    .expect("emit TakeValuesToLocals");
+    assert_eq!(
+        framed.compiled_entry, 0,
+        "MV copy requires its frame pointer"
+    );
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let primary = BlissVal::from_fixnum(42);
+    let mut frame = vec![NIL.0; bf.num_slots() as usize + framed.shadow_root_slots as usize];
+    frame[0] = primary.0;
+
+    assert_eq!(BlissVal(func(frame.as_mut_ptr())), T);
+    assert_eq!(BlissVal(frame[1]), primary);
+    assert_eq!(BlissVal(frame[2]), T);
+    assert_eq!(BlissVal(frame[3]), NIL);
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -263,7 +385,7 @@ fn stringp_reaches_string_typecheck_through_inline_metadata() {
             .any(|&i| f.inst(i).opcode == Opcode::Call)
     }));
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit STRINGP");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit STRINGP");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: BlissVal| {
@@ -462,6 +584,7 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
         0,
         0,
         0,
+        0,
         activation_slots,
         None,
     )
@@ -629,6 +752,7 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
             0,
             0,
             0,
+            0,
             None,
         )
         .expect("emit guarded cons accessor");
@@ -685,6 +809,7 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     let framed = emit_framed(
         &f,
         cons_access_deopt as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -797,6 +922,7 @@ fn first_char_metadata_expands_to_guarded_string_layout_ir() {
     let framed = emit_framed(
         &f,
         first_char_deopt as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -920,7 +1046,7 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
         "the dominating proof eliminates the guard cloned by the second call"
     );
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, Some(caller))
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, Some(caller))
         .expect("emit caller after general guard elimination");
     let base_layout_cmp = [0x80, 0x7a, 0x07, type_id::SIMPLE_BASE_STRING];
     assert_eq!(
@@ -1153,7 +1279,7 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit branching function");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit branching function");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -1213,7 +1339,7 @@ fn call_containing_function_emits() {
     let n = speculate(&mut f, &|bcp| (bcp == 3).then_some(SpecType::Fixnum));
     assert_eq!(n, 1, "the multiply is speculated; the call is not");
     let framed =
-        emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("a call-containing function must emit");
+        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("a call-containing function must emit");
     assert!(!framed.code.is_empty());
     // A call function with ≤4 params gets a register entry (for direct self-calls),
     // so its compiled entry sits past the interpreter (frame-loading) entry.
@@ -1221,6 +1347,144 @@ fn call_containing_function_emits() {
         framed.compiled_entry > 0,
         "call function should expose a register entry"
     );
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn wide_call_uses_a_gc_visible_activation_slice() {
+    const CHILD: &str = "BLISS_T2_WIDE_CALL_GC_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // This fixture invokes the process-global moving collector. Isolate it
+        // from parallel sibling tests so their mutator threads cannot race its
+        // safepoint handshake.
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "wide_call_uses_a_gc_visible_activation_slice",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn isolated wide-call GC fixture");
+        assert!(
+            output.status.success(),
+            "isolated wide-call GC fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    use bliss_compiler::t2::emit::emit_framed_with_activation_slots;
+    use bliss_rt::CodeInfo;
+    use bliss_rt::stack::StackMapEntry;
+
+    extern "C" fn call_slice(_sym: u64, n: u64, args: *const BlissVal, profile: u64) -> u64 {
+        assert_eq!(n, 4);
+        assert_eq!(profile, 0);
+        bliss_rt::gc::collect_t0_minor().expect("move wide-call arguments");
+        unsafe { (*args.add(3)).0 }
+    }
+
+    let callee = bliss_rt::symbols::intern("wide-callee");
+    let bf = bytecode_fn(
+        "wide-caller",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::LoadLocal(1),
+            Instr::LoadLocal(2),
+            Instr::LoadLocal(3),
+            Instr::CallNamed {
+                sym: callee,
+                nargs: 4,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        4,
+        4,
+        4,
+    );
+    let f = build_from_bytecode(&bf).expect("build wide call");
+    let framed = emit_framed_with_activation_slots(
+        &f,
+        0,
+        0,
+        0,
+        call_slice as *const () as usize as u64,
+        0,
+        0,
+        0,
+        0,
+        bf.num_slots(),
+        None,
+    )
+    .expect("emit wide call");
+    assert_eq!(
+        framed.compiled_entry, 0,
+        "slice calls require an owning frame"
+    );
+    assert!(
+        framed.shadow_root_slots >= 4,
+        "argument slice must be GC-visible"
+    );
+
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+
+    let total_slots = bf.num_slots() + framed.shadow_root_slots;
+    let mut bitmap = vec![0u8; (total_slots as usize).div_ceil(8)];
+    for i in 0..total_slots as usize {
+        bitmap[i / 8] |= 1 << (i % 8);
+    }
+    let bitmap: &'static [u8] = Box::leak(bitmap.into_boxed_slice());
+    let maps: &'static [StackMapEntry] = Box::leak(
+        vec![StackMapEntry {
+            pc_offset: 0,
+            bytes: bitmap.as_ptr() as usize,
+            len: bitmap.len(),
+        }]
+        .into_boxed_slice(),
+    );
+    let code_info = CodeInfo::new(&[], maps);
+    let stack = bliss_rt::current_stack();
+    let frame = stack
+        .push_frame(NIL, code_info as *const CodeInfo, total_slots, 0)
+        .expect("BlissStack frame");
+
+    // Drain the pinned compiler metadata, then put a movable object in the
+    // fourth argument. The callback collects before reading that argument, so
+    // its return value proves the GC rewrote the wide-call slice in place.
+    bliss_rt::gc::collect_t0_minor().expect("isolate pinned compiler metadata");
+    let body = bliss_rt::gc::alloc_typed(16, type_id::STANDARD_OBJECT).expect("GC test object");
+    let object = unsafe { BlissVal::from_heap_ptr(body.sub(8)) };
+    unsafe {
+        let slots = bliss_rt::BlissStack::frame_slots_mut(frame);
+        for (slot, value) in [
+            BlissVal::from_fixnum(11),
+            BlissVal::from_fixnum(22),
+            BlissVal::from_fixnum(33),
+            object,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            slots[slot] = value;
+        }
+    }
+
+    let slots = unsafe { frame.add(1) as *mut u64 };
+    let relocated = BlissVal(func(slots));
+    assert_ne!(
+        relocated, object,
+        "minor GC must relocate the wide argument"
+    );
+    assert_eq!(
+        bliss_rt::gc::heap_object_type_id(relocated),
+        Some(type_id::STANDARD_OBJECT)
+    );
+    stack.pop_frame();
 }
 
 /// Bitwise ops reach T2: `(x) -> (logand x 255)` speculates LogAnd and emits a
@@ -1260,7 +1524,7 @@ fn bitwise_logand_speculates_and_runs() {
             .any(|&i| f.inst(i).opcode == Opcode::LogAnd)),
         "a LogAnd op must be present"
     );
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit bitwise");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit bitwise");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [BlissVal::from_fixnum(0x3E7).0, 0u64, 0u64];

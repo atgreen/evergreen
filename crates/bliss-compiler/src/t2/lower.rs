@@ -45,7 +45,8 @@
 //!   carries its `[start,end)` inst range, param VRegs, and `succs` edges with
 //!   per-edge VReg args. Individual `MachInst`s still have no successor field,
 //!   so the branch *mnemonic* (`JMP`/`BR_COND`/`BR_TABLE`) records only the
-//!   condition use; the actual targets are on the owning block's `succs`, in
+//!   condition is held by a zero-code `LIVENESS` anchor immediately before the
+//!   mnemonic; the actual targets are on the owning block's `succs`, in
 //!   `Function::block_order` position order. The terminator's `targets[k]` maps
 //!   1:1 to `succs[k]`, so P6/emit can recover which mnemonic operand selects
 //!   which successor edge.
@@ -75,6 +76,9 @@ pub mod op {
     pub const MOV: u32 = 0x0001;
     /// XMM register-register move (float parallel move).
     pub const FMOV: u32 = 0x0002;
+    /// Zero-code allocation anchor. Keeps branch conditions live through edge
+    /// moves while leaving the branch mnemonic operand-free for regalloc2.
+    pub const LIVENESS: u32 = 0x0003;
 
     // ── 0x10 constants (immediate materialisation) ───────────────────
     /// Load an integer immediate into a GPR (`mov r, imm`).
@@ -387,6 +391,45 @@ pub fn lower(f: &Function) -> MachFunc {
         });
     }
 
+    // regalloc2 requires critical CFG edges to be split. Keep this mechanical
+    // at the machine layer: the synthetic block has no params, and forwards
+    // the original SSA edge arguments on its sole outgoing jump. Thus the
+    // conditional predecessor carries no block arguments, while the merge's
+    // block parameters retain exactly their original incoming values.
+    let mut pred_counts = vec![0usize; blocks.len()];
+    for block in &blocks {
+        for succ in &block.succs {
+            pred_counts[succ.target.0 as usize] += 1;
+        }
+    }
+    let mut critical_edges = Vec::new();
+    for (pred, block) in blocks.iter().enumerate() {
+        if block.succs.len() <= 1 {
+            continue;
+        }
+        for (succ_index, succ) in block.succs.iter().enumerate() {
+            if pred_counts[succ.target.0 as usize] > 1 {
+                critical_edges.push((pred, succ_index));
+            }
+        }
+    }
+    for (pred, succ_index) in critical_edges {
+        let forwarded = blocks[pred].succs[succ_index].clone();
+        let edge_id = MachBlockId(blocks.len() as u32);
+        blocks[pred].succs[succ_index] = MachSucc {
+            target: edge_id,
+            args: Vec::new(),
+        };
+        let start = lo.insts.len();
+        lo.emit(op::JMP, Vec::new(), Vec::new());
+        blocks.push(MachBlock {
+            params: Vec::new(),
+            start,
+            end: lo.insts.len(),
+            succs: vec![forwarded],
+        });
+    }
+
     MachFunc {
         insts: lo.insts,
         blocks,
@@ -530,7 +573,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         WriteBarrier => lo.emit_annotated(inst, op::WRITE_BARRIER, defs, uses),
 
         // ── multiple-values reset → runtime helper (no defs/uses) ──
-        ClearMv => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
+        ClearMv | TakeValuesToLocals => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
 
         // ── allocation (safepoint-bearing) ──
         Alloc | AllocCons => lo.emit_annotated(inst, op::ALLOC, defs, uses),
@@ -574,14 +617,16 @@ fn lower_terminator(lo: &mut Lowering, inst: Inst) {
             for t in &data.targets.clone() {
                 lo.emit_edge_moves(t.block, &t.args);
             }
-            lo.emit_for(inst, op::BR_COND, vec![], cond);
+            lo.emit_for(inst, op::LIVENESS, vec![], cond);
+            lo.emit_for(inst, op::BR_COND, vec![], vec![]);
         }
         BrTable => {
             let idx = lo.vregs(&data.args);
             for t in &data.targets.clone() {
                 lo.emit_edge_moves(t.block, &t.args);
             }
-            lo.emit_for(inst, op::BR_TABLE, vec![], idx);
+            lo.emit_for(inst, op::LIVENESS, vec![], idx);
+            lo.emit_for(inst, op::BR_TABLE, vec![], vec![]);
         }
         Return => {
             // Return values are uses of the ret; no successors.
@@ -1049,5 +1094,65 @@ mod tests {
         assert_eq!(left_moves.len(), 1);
         assert_eq!(left_moves[0].defs[0].num, p.0);
         assert_eq!(left_moves[0].uses[0].num, x[0].0);
+    }
+
+    #[test]
+    fn critical_merge_edge_is_split_for_regalloc() {
+        let mut f = Function::new("critical-edge");
+        let entry = f.entry();
+        let left = f.make_block();
+        let merge = f.make_block();
+        let p = f.add_block_param(
+            merge,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
+        let (_, cond) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+            &[ufix()],
+        );
+        let (_, x) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(10)),
+            &[ufix()],
+        );
+        let (_, y) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(20)),
+            &[ufix()],
+        );
+        let mut branch = inst(Opcode::Brif, vec![cond[0]], AuxData::None);
+        branch.targets = vec![
+            BlockCall {
+                block: left,
+                args: vec![],
+            },
+            BlockCall {
+                block: merge,
+                args: vec![y[0]],
+            },
+        ];
+        f.set_terminator(entry, branch);
+        let mut jump = inst(Opcode::Jump, vec![], AuxData::None);
+        jump.targets = vec![BlockCall {
+            block: merge,
+            args: vec![x[0]],
+        }];
+        f.set_terminator(left, jump);
+        f.set_terminator(merge, inst(Opcode::Return, vec![p], AuxData::None));
+
+        let mut mf = lower(&f);
+        assert_eq!(mf.blocks.len(), 4, "one synthetic edge block is appended");
+        let edge = &mf.blocks[3];
+        assert_eq!(mf.blocks[0].succs[1].target, MachBlockId(3));
+        assert!(mf.blocks[0].succs[1].args.is_empty());
+        assert_eq!(edge.succs[0].target, MachBlockId(2));
+        assert_eq!(edge.succs[0].args[0].num, y[0].0);
+        assert!(mf.insts[mf.blocks[0].end - 1].uses.is_empty());
+        assert_eq!(mf.insts[mf.blocks[0].end - 2].op, op::LIVENESS);
+        assert_eq!(mf.insts[mf.blocks[0].end - 2].uses[0].num, cond[0].0);
+        crate::t2::regalloc::allocate_framed(&mut mf)
+            .expect("split edge and operand-free branch allocate");
     }
 }

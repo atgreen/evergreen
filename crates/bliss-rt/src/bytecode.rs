@@ -16,6 +16,20 @@
 
 use crate::value::BlissVal;
 
+/// Stable payload values for [`Instr::TypeP`].  The bytecode producer and all
+/// execution tiers share these constants so a serialized class code cannot
+/// silently acquire different semantics in T0, T1, and T2.
+pub mod typep_class {
+    pub const STRING: u16 = 1;
+    pub const SYMBOL: u16 = 2;
+    pub const PACKAGE: u16 = 3;
+    pub const LIST: u16 = 4;
+    pub const CONS: u16 = 5;
+    pub const NULL: u16 = 6;
+    pub const BOOLEAN: u16 = 7;
+    pub const HASH_TABLE: u16 = 8;
+}
+
 /// A single bytecode instruction. Operand-stack based; the frame's value-slot
 /// area holds `n_locals` lexical slots followed by `max_stack` operand slots
 /// (spec D2.03).
@@ -91,7 +105,7 @@ pub enum Instr {
     /// (native frame push) or falls back to the tree-walker's `apply_function`.
     CallNamed { sym: u32, nargs: u16 },
     /// Inline `(typep x '<simple-type>)`: pop one operand, push T if it is of
-    /// the type-class `u16` (a `TypeClass::*` code — string, symbol, cons, …),
+    /// the type-class `u16` (a [`typep_class`] code — string, symbol, cons, …),
     /// else NIL. Emitted by the lowerer for `(typep x 'CONST)` on a small set
     /// of tag-checkable types to avoid a c2i `CallNamed` to TYPEP on the hot
     /// package-machinery path (bliss-gq5).

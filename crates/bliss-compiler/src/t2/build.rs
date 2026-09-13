@@ -35,7 +35,7 @@ use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
 };
-use bliss_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc};
+use bliss_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc, typep_class};
 
 /// Why the builder could not produce IR for a function (e.g. an opcode not yet
 /// modelled). The caller keeps such a function at T1 (spec R4.28).
@@ -419,6 +419,9 @@ impl<'a> Builder<'a> {
                 Instr::Const(_) | Instr::LoadLocal(_) | Instr::LoadGlobal(_) | Instr::Dup => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
+                Instr::TypeP(_) => {
+                    push(i + 1, d, &mut depth_at, &mut work);
+                }
                 Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
@@ -427,6 +430,9 @@ impl<'a> Builder<'a> {
                 }
                 Instr::SetValues(n) => {
                     push(i + 1, d - (*n as i32) + 1, &mut depth_at, &mut work);
+                }
+                Instr::TakeValuesToLocals { .. } => {
+                    push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::ClearMv => {
                     push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
@@ -702,6 +708,39 @@ impl<'a> Builder<'a> {
                     let fs = self.build_frame_state(block, &stack, i as u32);
                     self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
                 }
+                Instr::TakeValuesToLocals { nvars, slot_base } => {
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let primary = stack.pop().ok_or(BuildError::Unsupported(
+                        "stack underflow (TakeValuesToLocals)",
+                    ))?;
+                    if slot_base.saturating_add(*nvars) > self.bf.n_locals {
+                        return Err(BuildError::Unsupported(
+                            "TakeValuesToLocals destination out of range",
+                        ));
+                    }
+                    let result_types =
+                        vec![(IRType::TOP, ValueRepresentation::Tagged); *nvars as usize];
+                    let (_inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::TakeValuesToLocals,
+                            args: vec![primary],
+                            results: vec![],
+                            aux: AuxData::ValuesLocals {
+                                nvars: *nvars,
+                                slot_base: *slot_base,
+                            },
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &result_types,
+                    );
+                    for (offset, result) in results.into_iter().enumerate() {
+                        self.write_var(Var::Local(*slot_base + offset as u16), block, result);
+                    }
+                }
                 Instr::SetValues(n) => {
                     let n = *n as usize;
                     if stack.len() < n {
@@ -798,6 +837,36 @@ impl<'a> Builder<'a> {
                     );
                     let _ = inst;
                     stack.push(results[0]);
+                }
+                Instr::TypeP(class) => {
+                    if !matches!(
+                        *class,
+                        typep_class::STRING
+                            | typep_class::SYMBOL
+                            | typep_class::PACKAGE
+                            | typep_class::LIST
+                            | typep_class::CONS
+                            | typep_class::NULL
+                            | typep_class::BOOLEAN
+                            | typep_class::HASH_TABLE
+                    ) {
+                        return Err(BuildError::Unsupported("unknown TypeP class"));
+                    }
+                    let value = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (TypeP)"))?;
+                    let result = self
+                        .emit(
+                            block,
+                            Opcode::TypeCheck,
+                            vec![value],
+                            AuxData::TypepClass(*class),
+                            InstFlags::default(),
+                            None,
+                            IRType::TOP,
+                        )
+                        .ok_or(BuildError::Unsupported("TypeP has a result"))?;
+                    stack.push(result);
                 }
                 Instr::Br(t) => {
                     let s = self.block_of[&(*t as usize)];
@@ -1930,6 +1999,34 @@ mod tests {
             .find(|d| d.opcode == Opcode::Call)
             .expect("dynamic TYPEP must stay a call");
         assert!(call.frame_state.is_some());
+    }
+
+    #[test]
+    fn bytecode_typep_boolean_builds_as_a_pure_type_check() {
+        let input = bf(
+            "boolean-typep-opcode",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::TypeP(typep_class::BOOLEAN),
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+
+        let f = build_from_bytecode(&input).expect("TypeP bytecode must reach T2");
+        let check = f
+            .block(f.entry())
+            .insts
+            .iter()
+            .map(|&i| f.inst(i))
+            .find(|d| d.opcode == Opcode::TypeCheck)
+            .expect("TypeP must become a TypeCheck");
+        assert!(!check.flags.effectful);
+        assert!(!check.flags.guard);
+        assert!(check.frame_state.is_none());
     }
 
     #[test]

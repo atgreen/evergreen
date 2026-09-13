@@ -206,6 +206,10 @@ pub enum Opcode {
     /// after SETQ/SETF and in statement position). No operands, no result;
     /// lowers to a `c2i_clear_mv` call (bliss-mzp).
     ClearMv,
+    /// Consume a primary value and copy the current multiple-value tuple into
+    /// lexical locals. Results correspond positionally to `slot_base..` and
+    /// are NIL-padded by the runtime helper.
+    TakeValuesToLocals,
     // Cat 5a — non-terminator control: calls & guards
     Call,
     Guard,
@@ -273,6 +277,14 @@ pub enum AuxData {
     FieldOffset(u32),
     CallTarget(u32),
     TypeTag(IRType),
+    /// Exact class code for the pure bytecode `TypeP` predicate. Unlike a
+    /// `TypeTag`, classes such as BOOLEAN and LIST are not equivalent to their
+    /// broad type-lattice union.
+    TypepClass(u16),
+    ValuesLocals {
+        nvars: u16,
+        slot_base: u16,
+    },
     /// Refines a tagged value to the simple string layouts supported by direct
     /// T2 loads.  Kept distinct from `TypeTag(STRING)`: the latter includes
     /// string representations whose layout still requires generic dispatch.
