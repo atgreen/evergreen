@@ -1155,7 +1155,7 @@ fn body_inlining_eliminates_redundant_layout_guards() {
     let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
     assert!(ok, "general post-inline guard elimination failed: {out}");
     assert_eq!(out.lines().next().unwrap_or(""), "a NIL");
-    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(out.contains("; T2 — profile-guided native"), "{out}");
     assert_eq!(
         out.matches("cmp byte [rdx+7],5").count(),
         1,
@@ -1193,7 +1193,7 @@ fn hot_call_site_inlines_body_above_small_threshold() {
     let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
     assert!(ok, "profile-guided large-body inline failed: {out}");
     assert_eq!(out.lines().next().unwrap_or(""), "B");
-    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(out.contains("; T2 — profile-guided native"), "{out}");
     assert!(
         out.contains("cmp byte [rdx+7],5") && out.contains("cmp byte [rdx+7],6"),
         "HOT-CALLER has no string operation of its own; its native layout checks prove LARGE-LEAF was inlined:\n{out}"
@@ -1224,7 +1224,7 @@ fn declared_fixnum_parameter_removes_arithmetic_type_guard() {
     let (out, ok) = run(program, &[("BLISS_T2", "1")]);
     assert!(ok, "declared T2 function failed: {out}");
     assert_eq!(out.lines().next().unwrap_or(""), "45");
-    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(out.contains("; T2 — profile-guided native"), "{out}");
     assert!(
         out.contains("checked parameter declarations: X: FIXNUM"),
         "{out}"
@@ -1305,7 +1305,7 @@ fn t2_regalloc_spills_high_pressure_loop() {
         out.lines().any(|line| line == "3458764513820540931"),
         "overflow deopt did not reconstruct spilled state: {out}"
     );
-    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(out.contains("; T2 — profile-guided native"), "{out}");
     assert!(
         out.lines().any(|line| line.contains("[rsp")),
         "expected native spill/reload addressing in T2 output:\n{out}"
@@ -1863,6 +1863,15 @@ fn common_shapes_reach_t2() {
     for (_, _, call) in T2_SHAPES {
         program.push_str(call);
         program.push(' ');
+    }
+    program.push_str(") ");
+    // FUNCTION-TIER is also the owner-thread publication safepoint for
+    // background T2 results. Drain every queued shape once before recording
+    // the ratchet: otherwise the first line can observe T1 while its result is
+    // still behind another shape in the shared completion channel (bliss-wiwb).
+    program.push_str("(progn ");
+    for (name, _, _) in T2_SHAPES {
+        program.push_str(&format!("(bliss-ext:function-tier (quote {name})) "));
     }
     program.push_str(") ");
     // One line per shape: "NAME tier".
