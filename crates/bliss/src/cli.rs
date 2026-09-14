@@ -9220,10 +9220,20 @@ fn symbol_bare_name(name: &str) -> String {
 /// SYMBOL-NAME (the BARE name — a package-locally interned symbol's registry
 /// spelling is qualified, and leaking that spelling into package names /
 /// nicknames mints garbage like "COMMON-LISP-USER::M"); a string designates
-/// itself verbatim; a character its one-character string.
+/// itself verbatim; a character its one-character string. CASE-PRESERVING:
+/// string designators are case-sensitive per CLHS (a (:shadow "foo") entry
+/// names |foo|, not FOO), so this must never upcase — `symbol_bare_name`
+/// does and is only for case-folded lookups.
 fn string_designator_name(v: BlissVal) -> String {
     if v.is_symbol() {
-        symbol_bare_name(&sym_name_rc(v))
+        let full = sym_name_rc(v);
+        let without_keyword = full.strip_prefix("KEYWORD:").unwrap_or(&full);
+        without_keyword
+            .rsplit_once("::")
+            .map(|(_, tail)| tail)
+            .or_else(|| without_keyword.rsplit_once(':').map(|(_, tail)| tail))
+            .unwrap_or(without_keyword)
+            .to_string()
     } else if v.is_character() {
         v.as_char().to_string()
     } else {
@@ -20858,6 +20868,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 "symbol {name} is not accessible in package {pkg_name}"
                             )));
                         }
+                        // Name-conflict check (CLHS EXPORT; ansi EXPORT.5): a
+                        // package USING this one must not already see a
+                        // DISTINCT same-named symbol (present or inherited),
+                        // unless it shadows the name.
+                        if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+                            for other in bliss_stdlib::list_all_packages() {
+                                if other == pkg
+                                    || !bliss_stdlib::package_use_list(other)
+                                        .iter()
+                                        .any(|used| *used == pkg)
+                                {
+                                    continue;
+                                }
+                                let shadowed = bliss_stdlib::package_shadowing_symbols(other)
+                                    .iter()
+                                    .any(|s| {
+                                        string_designator_name(*s).eq_ignore_ascii_case(name)
+                                    });
+                                if shadowed {
+                                    continue;
+                                }
+                                let other_name = bliss_stdlib::package_name(other)
+                                    .unwrap_or_default();
+                                if let Some((existing, _)) =
+                                    find_symbol_in_package(env, &other_name, name)
+                                {
+                                    if existing != *sym {
+                                        return Err(BlissError::PackageError(format!(
+                                            "exporting {name} from {pkg_name} conflicts with \
+                                             a distinct {name} visible in {other_name}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // Make each symbol present in the package (EXPORT → external, so
@@ -20872,6 +20917,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // stdlib name-lookup succeeds; then shadowing-import it.
                         let _ = bliss_stdlib::shadowing_import(&syms, pkg);
                     } else {
+                        // Name-conflict check (CLHS IMPORT; ansi
+                        // IMPORT.ERROR.3): importing a symbol DISTINCT from a
+                        // same-named symbol already PRESENT in the package is
+                        // a PACKAGE-ERROR (SHADOWING-IMPORT is the resolving
+                        // variant and takes the branch above).
+                        if !export_mode {
+                            for (name, sym) in &resolved {
+                                if let Some(existing) =
+                                    bliss_stdlib::find_present_symbol(pkg, name)
+                                {
+                                    if existing != *sym {
+                                        return Err(BlissError::PackageError(format!(
+                                            "importing {name} into {pkg_name} conflicts with \
+                                             a distinct present {name}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
                         for (name, sym) in resolved {
                             let _ = bliss_stdlib::add_symbol(pkg, &name, sym, export_mode);
                             // IMPORT of an UNINTERNED symbol also sets its home
@@ -20950,12 +21014,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 ensure_package_available(env, &pkg_name, &[]);
                 let mut names = Vec::new();
+                // Case-preserving designators: (shadow "foo") shadows |foo|
+                // (CLHS; the old symbol_bare_name upcased and shadowed FOO).
                 if names_val.is_cons() {
                     for name in list_to_vec(names_val) {
-                        names.push(symbol_bare_name(&val_as_str(name)));
+                        names.push(string_designator_name(name));
                     }
                 } else {
-                    names.push(symbol_bare_name(&val_as_str(names_val)));
+                    names.push(string_designator_name(names_val));
                 }
                 // SHADOW forks a distinct present symbol shadowing any inherited
                 // same-named one (bliss-b1o) — not a plain intern.
@@ -20980,6 +21046,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
                     return Ok(NIL);
                 };
+                // Shadowing-reveal conflict (CLHS UNINTERN; ansi UNINTERN.8/9):
+                // uninterning a SHADOWING symbol uncovers the inherited
+                // same-named externals of the use list. If those are TWO OR
+                // MORE distinct symbols, the reveal creates a name conflict —
+                // a PACKAGE-ERROR; a single symbol (even via several used
+                // packages) is fine.
+                if bliss_stdlib::package_shadowing_symbols(pkg)
+                    .iter()
+                    .any(|s| string_designator_name(*s).eq_ignore_ascii_case(&name))
+                {
+                    let mut revealed: Vec<BlissVal> = Vec::new();
+                    for used in bliss_stdlib::package_use_list(pkg) {
+                        if let Some(ext) = bliss_stdlib::find_present_symbol(used, &name) {
+                            if bliss_stdlib::is_external_symbol(used, &name)
+                                && !revealed.contains(&ext)
+                            {
+                                revealed.push(ext);
+                            }
+                        }
+                    }
+                    if revealed.len() > 1 {
+                        return Err(BlissError::PackageError(format!(
+                            "uninterning shadowing symbol {name} from {pkg_name} would \
+                             reveal {} conflicting inherited symbols",
+                            revealed.len()
+                        )));
+                    }
+                }
                 let removed = match bliss_stdlib::find_present_symbol(pkg, &name) {
                     Some(sym) => {
                         // Read the home BEFORE removing the symbol: once it is
@@ -31241,8 +31335,10 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     }
                 }
                 "SHADOW" => {
+                    // Case-preserving: (:shadow "foo") names |foo| (CLHS
+                    // string designators are case-sensitive; DEFPACKAGE.5).
                     for v in list_to_vec(val_list) {
-                        shadows.push(symbol_bare_name(&val_as_str(v)));
+                        shadows.push(string_designator_name(v));
                     }
                 }
                 "IMPORT-FROM" | "SHADOWING-IMPORT-FROM" => {
