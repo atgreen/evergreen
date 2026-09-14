@@ -1218,6 +1218,15 @@ fn maybe_lazy_compile(name: &str, params: BlissVal, body: BlissVal, env: &Env) {
     {
         return;
     }
+    // A SOURCE-FREE function (installed from a fasl: its object carries a NIL
+    // body, the real code lives in the bytecode registry) must never be
+    // "lazily compiled" from that empty body — doing so registered a
+    // do-nothing bytecode entry over the callable one once the invoke count
+    // crossed the threshold, so e.g. a fasl-loaded closure-maker suddenly
+    // returned capture-less garbage from its 4th call on (bliss-t9o1).
+    if body.is_nil() {
+        return;
+    }
     let name_symbol = bliss_rt::function::name(f);
     if let Some(index) = name_symbol.symbol_index() {
         // Compile under the function object's own symbol identity. Reparsing a
