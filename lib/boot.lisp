@@ -179,11 +179,32 @@
            ,place
            (setf ,place (cons ,v ,place))))))
 
-(defmacro incf (place &rest delta)
-  `(setf ,place (+ ,place ,(if delta (car delta) 1))))
+;; INCF/DECF: read and write the PLACE with its subforms evaluated exactly ONCE,
+;; left to right (CLHS 5.1.3). The naive `(setf place (+ place delta))` mentions
+;; PLACE twice, so a place with a side-effecting subform ran it twice — e.g.
+;; (incf (car (progn (incf n) v))) incremented N twice where SBCL increments it
+;; once (bliss-pbp8). Use the setf-expansion, like PUSH/POP above, so the
+;; subforms are lifted into temporaries and the getter is read once.
+;; DELTA is bound after the place temporaries to preserve left-to-right order.
+(defmacro incf (place &rest delta &environment env)
+  (let ((place (macroexpand place env)))
+    (multiple-value-bind (dummies vals newval setter getter)
+        (get-setf-expansion place env)
+      (declare (ignore newval setter))
+      (let ((d (gensym)))
+        `(let* (,@(mapcar (function list) dummies vals)
+                (,d ,(if delta (car delta) 1)))
+           (setf ,getter (+ ,getter ,d)))))))
 
-(defmacro decf (place &rest delta)
-  `(setf ,place (- ,place ,(if delta (car delta) 1))))
+(defmacro decf (place &rest delta &environment env)
+  (let ((place (macroexpand place env)))
+    (multiple-value-bind (dummies vals newval setter getter)
+        (get-setf-expansion place env)
+      (declare (ignore newval setter))
+      (let ((d (gensym)))
+        `(let* (,@(mapcar (function list) dummies vals)
+                (,d ,(if delta (car delta) 1)))
+           (setf ,getter (- ,getter ,d)))))))
 
 ;; with-hash-table-iterator: (with-hash-table-iterator (name table) . body)
 ;; Within BODY, calling (name) returns (values more-p key value), advancing over
