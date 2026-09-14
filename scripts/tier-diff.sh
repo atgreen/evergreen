@@ -20,6 +20,21 @@
 # Environment:
 #   BLISS_BIN    bliss binary (default: the musl debug bliss-cli)
 #   TIERS        tiers to compare (default: "interp t0 t1 t2")
+#   TIER_STRESS  1 = also force tier TRANSITIONS, not just tier states
+#
+# About TIER_STRESS: BLISS_FORCE_TIER pins which tier code ENDS UP in, but a
+# corpus can sit entirely in that tier and never exercise the crossings between
+# them. Measured on this corpus, the default run performs ZERO OSR native loop
+# entries (bliss-ext:profile-report "OSR: 0 native loop entries") — so the
+# T1->T2 back-edge transfer is completely uncovered. That is precisely the path
+# bliss-kqdr corrupted: it handed T2 code a T1-sized frame, and no corpus run
+# could see it. TIER_STRESS=1 lowers the back-edge and OSR thresholds so short
+# corpus loops cross them.
+#
+# Note the invocation thresholds are deliberately NOT set here: under
+# BLISS_FORCE_TIER the T0->T1 and T1->T2 invocation thresholds are already
+# forced to 1, so setting them would be a no-op. Only the back-edge/OSR
+# thresholds still bite.
 #
 # Each tier runs under scripts/bliss-limited.sh (memory cap; see AGENTS.md).
 
@@ -50,8 +65,19 @@ oracle="$1"
 status=0
 
 for tier in $TIERS; do
-    BLISS_FORCE_TIER="$tier" scripts/bliss-limited.sh "$BLISS_BIN" \
-        --no-init --load "$CORPUS" >"$work/$tier.raw" 2>&1
+    # The oracle runs unstressed: it is the pure tree-walker and has no tiers to
+    # cross, so stressing it would only slow the run down.
+    if [ "${TIER_STRESS:-0}" = "1" ] && [ "$tier" != "$oracle" ]; then
+        BLISS_FORCE_TIER="$tier" \
+        BLISS_T1_T2_BACKEDGE_THRESHOLD=5 \
+        BLISS_OSR_THRESHOLD=10 \
+        BLISS_ANON_OSR_THRESHOLD=10 \
+            scripts/bliss-limited.sh "$BLISS_BIN" \
+            --no-init --load "$CORPUS" >"$work/$tier.raw" 2>&1
+    else
+        BLISS_FORCE_TIER="$tier" scripts/bliss-limited.sh "$BLISS_BIN" \
+            --no-init --load "$CORPUS" >"$work/$tier.raw" 2>&1
+    fi
     rc=$?
     # Drop "; ..." progress/banner lines — timing noise, not results.
     grep -v '^; ' "$work/$tier.raw" >"$work/$tier.out"
