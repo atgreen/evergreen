@@ -7026,24 +7026,20 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
                     out.push(')');
                 }
                 type_id::COMPLEX_ARRAY => {
-                    // A fill-pointer / adjustable vector prints as #(...) over its
-                    // active elements (0..fill-pointer) from the backing storage.
+                    // A fill-pointer / adjustable vector prints as #(...) over
+                    // its active elements (0..fill-pointer). Read them through
+                    // the displacement-aware accessor — word 0 of a DISPLACED
+                    // array is the BASE array reference, not element storage,
+                    // and walking a bit-vector/string base's internal words as
+                    // values printed garbage and segfaulted (bliss-v9nb).
                     let fp = bliss_stdlib::cvec_fill_pointer(val);
-                    let storage = *(ptr.add(8) as *const BlissVal);
-                    let sptr = storage.as_ptr();
-                    // The backing SIMPLE_VECTOR may itself be a large object
-                    // with a 16-byte header (bliss-tjru).
-                    let soff = if (*(sptr as *const ObjectHeader)).is_large_object() {
-                        16
-                    } else {
-                        8
-                    };
                     out.push_str("#(");
                     for i in 0..fp {
                         if i > 0 {
                             out.push(' ');
                         }
-                        print_val(*(sptr.add(soff + 8 + i * 8) as *const BlissVal), out);
+                        let e = bliss_stdlib::cvec_element(val, i).unwrap_or(NIL);
+                        print_val(e, out);
                     }
                     out.push(')');
                 }

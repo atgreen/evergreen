@@ -517,6 +517,17 @@ fn cvec_clear_displacement(v: BlissVal) {
     }
 }
 
+/// Public displacement-aware element read for the printers (bliss-v9nb): a
+/// printer must NOT index a complex array's word 0 raw — for a displaced
+/// array that word is the BASE array reference, not element storage, and
+/// walking a bit-vector/string base's internal words as BlissVals prints
+/// garbage and dereferences near-null junk (universe.lsp's displaced
+/// bit-vector segfaulted every printer touch, including error-condition
+/// datum rendering). `index` must already be bounds-checked by the caller.
+pub fn cvec_element(v: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
+    cvec_elt(v, index)
+}
+
 /// Displacement-aware element read of a complex vector: a displaced array
 /// reads through to its base; an ordinary one reads its own storage. `index`
 /// must already be bounds-checked by the caller.

@@ -603,15 +603,29 @@ fn heap_vector_string(v: BlissVal, escapep: bool) -> Option<String> {
             let (nested, _) = md_render(storage.as_ptr(), &dims, 0, escapep);
             return Some(format!("#{rank}A{nested}"));
         }
+        // A complex vector reads its elements through the displacement-aware
+        // accessor: word 0 of a DISPLACED array is the BASE array reference,
+        // not element storage, and walking a bit-vector/string base's internal
+        // words as values printed garbage and segfaulted (bliss-v9nb; keep in
+        // sync with cli print_val's COMPLEX_ARRAY branch — the two printers).
+        if (*(ptr as *const ObjectHeader)).type_id() == type_id::COMPLEX_ARRAY {
+            let count = crate::sequences::cvec_fill_pointer(v);
+            let mut s = String::from("#(");
+            for i in 0..count {
+                if i > 0 {
+                    s.push(' ');
+                }
+                let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
+                s.push_str(&blissval_to_print_string(e, escapep));
+            }
+            s.push(')');
+            return Some(s);
+        }
         let (base, count) = match (*(ptr as *const ObjectHeader)).type_id() {
             type_id::SIMPLE_VECTOR => (
                 ptr,
                 *(ptr.add(object_payload_offset(ptr)) as *const u64) as usize,
             ),
-            type_id::COMPLEX_ARRAY => {
-                let storage = *(ptr.add(8) as *const BlissVal);
-                (storage.as_ptr(), crate::sequences::cvec_fill_pointer(v))
-            }
             _ => return None,
         };
         let boff = object_payload_offset(base);
