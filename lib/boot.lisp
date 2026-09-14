@@ -2603,15 +2603,8 @@
 (defun cis (radians)
   (complex (cos radians) (sin radians)))
 
-(defun integer-length (n)
-  (cond ((< n 0) (integer-length (lognot n)))
-        ((= n 0) 0)
-        (t (1+ (integer-length (floor n 2))))))
-
-(defun logcount (n)
-  (cond ((< n 0) (logcount (lognot n)))
-        ((= n 0) 0)
-        (t (+ (rem n 2) (logcount (floor n 2))))))
+;; INTEGER-LENGTH and LOGCOUNT are native builtins (cli.rs
+;; apply_intlen_or_logcount, bliss-gvkz).
 
 ;;; --- byte specifiers: LDB / DPB / ... --------------------------------------
 

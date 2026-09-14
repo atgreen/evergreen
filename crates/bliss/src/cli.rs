@@ -12404,6 +12404,8 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "LOGNOT" => Some((1, 1)),
         // (logbitp index integer) — exactly two (ansi logbitp.error.1-3).
         "LOGBITP" => Some((2, 2)),
+        // (integer-length n) / (logcount n) — exactly one.
+        "INTEGER-LENGTH" | "LOGCOUNT" => Some((1, 1)),
         "GET" => Some((2, 3)),
         "COPY-SYMBOL" => Some((1, 2)),
         "GENSYM" => Some((0, 1)),
@@ -18331,6 +18333,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 return apply_logbitp(args[0], args[1]);
+            }
+            "INTEGER-LENGTH" | "LOGCOUNT" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires exactly one argument"
+                    )));
+                }
+                return apply_intlen_or_logcount(&name, args[0]);
             }
             "EXPT" => {
                 let args = eval_args(cdr, env)?;
@@ -30076,6 +30087,40 @@ fn apply_logbitp(index: BlissVal, n: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(if bit { T } else { NIL })
 }
 
+/// INTEGER-LENGTH / LOGCOUNT on an evaluated arg (bliss-gvkz): native limb
+/// scans replacing boot.lisp's per-bit recursive defuns (O(bits²) bignum
+/// divisions per call). For negative n both reduce through lognot:
+/// integer-length(n) = integer-length(-n-1), logcount(n) = logcount(-n-1),
+/// and -n-1's magnitude is mag-1. Allocation-free.
+fn apply_intlen_or_logcount(name: &str, v: BlissVal) -> Result<BlissVal, BlissError> {
+    let count_only = name == "LOGCOUNT";
+    if v.is_fixnum() {
+        let n = v.as_fixnum();
+        let u = (if n < 0 { !n } else { n }) as u64;
+        let r = if count_only {
+            u.count_ones() as i64
+        } else {
+            (64 - u.leading_zeros()) as i64
+        };
+        return Ok(BlissVal::from_fixnum(r));
+    }
+    let b = bigint_from_val(v).ok_or_else(|| BlissError::TypeError {
+        datum: v,
+        expected: "integer".into(),
+    })?;
+    let mag = if b.sign < 0 {
+        mag_sub(&b.mag, &[1])
+    } else {
+        b.mag
+    };
+    let r = if count_only {
+        mag.iter().map(|l| l.count_ones() as i64).sum()
+    } else {
+        mag_bitlen(&mag) as i64
+    };
+    Ok(BlissVal::from_fixnum(r))
+}
+
 fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, BlissError>> {
     // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
     // fast-path the 2-arg shape so other arities match the general path exactly.
@@ -30414,7 +30459,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "FLOATP" | "RATIONALP" | "REALP" | "NUMERATOR" | "DENOMINATOR"
             | "COMPLEXP" | "REALPART" | "IMAGPART"
             | "LOGAND" | "LOGIOR" | "LOGXOR" | "LOGNOT" | "ASH" | "LOGBITP" | "BOOLE"
-            | "INTEGER-LENGTH" | "RANDOM" | "EXP" | "LOG" | "SIN" | "COS" | "TAN"
+            | "INTEGER-LENGTH" | "LOGCOUNT" | "RANDOM" | "EXP" | "LOG" | "SIN" | "COS" | "TAN"
             // Inverse / hyperbolic trig and exact rationals: callable via the
             // evaluator but were missing from this table, so #'/FBOUNDP/FDEFINITION
             // reported them as non-functions (bliss-dnst).
@@ -30525,6 +30570,10 @@ fn apply_builtin_fast(
         "LOGBITP" if args.len() == 2 => {
             env.clear_mv();
             Some(apply_logbitp(args[0], args[1]))
+        }
+        "INTEGER-LENGTH" | "LOGCOUNT" if args.len() == 1 => {
+            env.clear_mv();
+            Some(apply_intlen_or_logcount(name, args[0]))
         }
         // Rank-1 array element read/write, on already-evaluated args. Without
         // this a compiled loop's CallNamed for e.g. SET-AREF fell through to
