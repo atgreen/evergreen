@@ -1572,7 +1572,7 @@
                          ((integerp fp) fp)
                          (t size))))
          (%make-displaced-array base offset size fpn (and adjustable t)
-                                (and stringp t) (and fp t))))
+                                (and stringp (not bitp) t) (and fp t) (and bitp t))))
       (mdp
        (let ((arr (%make-md-array dimensions (if iel-cell (car (cdr iel-cell)) nil))))
          (when ic-cell
@@ -1590,15 +1590,17 @@
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
       ((or fp adjustable)
-       (let* ((iel (if iel-cell (car (cdr iel-cell)) nil))
+       (let* ((iel (if iel-cell (car (cdr iel-cell)) (if bitp 0 nil)))
               (fpn (cond ((eq fp t) size)
                          ((integerp fp) fp)
                          (t size)))
               ;; A fill pointer exists only if the user passed a non-NIL
               ;; :fill-pointer; :adjustable alone gives a plain adjustable
-              ;; array with no fill pointer (bliss-0x9y).
+              ;; array with no fill pointer (bliss-0x9y). A BIT element-type
+              ;; tags the complex vector as a bit vector (bliss-65nx).
               (v (%make-complex-vector size fpn (and adjustable t) iel
-                                       (and stringp t) (and fp t))))
+                                       (and stringp (not bitp) t) (and fp t)
+                                       (and bitp t))))
          (when ic-cell
            (let ((i 0))
              (dolist (e (coerce (car (cdr ic-cell)) 'list))

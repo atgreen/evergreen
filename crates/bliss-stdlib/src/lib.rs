@@ -106,7 +106,7 @@ pub use sequences::{
     build_md_array, build_simple_vector,
     concatenate,
     copy_seq, count,
-    cvec_adjustable, cvec_capacity, cvec_char_contents, cvec_displacement, cvec_element,
+    cvec_adjustable, cvec_capacity, cvec_char_contents, cvec_displacement, cvec_element, cvec_is_bit,
     cvec_fill_pointer,
     cvec_has_fill_pointer,
     cvec_is_string, elt,

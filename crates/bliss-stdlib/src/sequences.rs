@@ -392,6 +392,32 @@ pub fn cvec_adjustable(v: BlissVal) -> bool {
 /// character, 0/absent = general T). Words 3 and 4 are only present on the
 /// 5-word COMPLEX_ARRAYs built by `build_complex_vector`; the readers are safe
 /// because every COMPLEX_ARRAY this crate allocates now carries them.
+/// The immediate element-type tag stored in COMPLEX_ARRAY word 3:
+/// 1 = CHARACTER (string), 2 = BIT (bit vector), 0 = general. `char` wins if
+/// both are set (a string is never also a bit vector).
+#[inline]
+fn element_type_code(element_is_char: bool, element_is_bit: bool) -> i64 {
+    if element_is_char {
+        1
+    } else if element_is_bit {
+        2
+    } else {
+        0
+    }
+}
+
+/// Whether a complex vector has element-type BIT — a (fill-pointer /
+/// adjustable / displaced) bit vector — so it answers BIT-VECTOR-P / TYPEP
+/// BIT-VECTOR / ARRAY-ELEMENT-TYPE BIT and compares EQUAL to a simple bit
+/// vector of the same bits (bliss-65nx). Tag 2 in body word 3.
+#[inline]
+pub fn cvec_is_bit(v: BlissVal) -> bool {
+    unsafe {
+        let tag = *(v.as_ptr().add(32) as *const BlissVal);
+        tag.is_fixnum() && tag.as_fixnum() == 2
+    }
+}
+
 #[inline]
 pub fn cvec_is_string(v: BlissVal) -> bool {
     unsafe {
@@ -594,6 +620,7 @@ pub fn build_complex_vector(
     fill_pointer: usize,
     adjustable: bool,
     element_is_char: bool,
+    element_is_bit: bool,
     has_fill_pointer: bool,
 ) -> BlissVal {
     let cap = capacity.max(elements.len());
@@ -604,8 +631,9 @@ pub fn build_complex_vector(
     bliss_rt::rooted!(storage = storage);
     let fp = BlissVal::from_fixnum(fill_pointer.min(cap) as i64);
     let adj = if adjustable { T } else { NIL };
-    // Element-type tag: immediate fixnum, 1 = CHARACTER (a string), 0 = general.
-    let elt = BlissVal::from_fixnum(if element_is_char { 1 } else { 0 });
+    // Element-type tag: immediate fixnum — 1 = CHARACTER (a string),
+    // 2 = BIT (a bit vector), 0 = general (bliss-65nx).
+    let elt = BlissVal::from_fixnum(element_type_code(element_is_char, element_is_bit));
     // Has-user-fill-pointer tag: immediate fixnum, 1 = yes, 0 = no.
     let hasfp = BlissVal::from_fixnum(if has_fill_pointer { 1 } else { 0 });
     // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL) |
@@ -633,12 +661,13 @@ pub fn build_displaced_vector(
     fill_pointer: usize,
     adjustable: bool,
     element_is_char: bool,
+    element_is_bit: bool,
     has_fill_pointer: bool,
 ) -> BlissVal {
     bliss_rt::rooted!(base = base);
     let fp = BlissVal::from_fixnum(fill_pointer.min(length) as i64);
     let adj = if adjustable { T } else { NIL };
-    let elt = BlissVal::from_fixnum(if element_is_char { 1 } else { 0 });
+    let elt = BlissVal::from_fixnum(element_type_code(element_is_char, element_is_bit));
     let hasfp = BlissVal::from_fixnum(if has_fill_pointer { 1 } else { 0 });
     let disp = BlissVal::from_fixnum(offset as i64);
     let total = BlissVal::from_fixnum(length as i64);

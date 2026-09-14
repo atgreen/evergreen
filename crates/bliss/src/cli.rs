@@ -11054,7 +11054,8 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             // (type-of #*1011) => (SIMPLE-BIT-VECTOR 4) both agreed it was one
             // (bliss-65nx). bliss builds bit-vectors immutable, so every one is
             // simple — SIMPLE-BIT-VECTOR matches the same set.
-            "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => bliss_rt::types::bit_vector_p(object),
+            "BIT-VECTOR" => is_bit_vector_value(object),
+            "SIMPLE-BIT-VECTOR" => bliss_rt::types::bit_vector_p(object),
             // BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base strings —
             // every character a BASE-CHAR — not the 32-bit character strings a
             // STRING can also be (bliss-ajb3).
@@ -11197,7 +11198,14 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
         // length matches SIZE (or `*`). Element type is fixed (BIT), so only
         // the optional size argument is checked (bliss-65nx).
         "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => {
-            if !bliss_rt::types::bit_vector_p(object) {
+            // A fill-pointer/adjustable/displaced bit vector satisfies
+            // BIT-VECTOR but not SIMPLE-BIT-VECTOR (bliss-65nx).
+            let ok = if op == "SIMPLE-BIT-VECTOR" {
+                bliss_rt::types::bit_vector_p(object)
+            } else {
+                is_bit_vector_value(object)
+            };
+            if !ok {
                 return Ok(false);
             }
             Ok(vector_length_matches(&list_to_vec(args), object))
@@ -16210,6 +16218,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // array is a COMPLEX_ARRAY too but has no fill pointer
                 // (bliss-0x9y). Absent ⇒ NIL, matching the old callers.
                 let has_fill_pointer = args.len() > 5 && !args[5].is_nil();
+                // 7th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
+                let element_is_bit = args.len() > 6 && !args[6].is_nil();
                 let elems = vec![iel; size];
                 return Ok(bliss_stdlib::build_complex_vector(
                     &elems,
@@ -16217,6 +16227,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     fp,
                     adjustable,
                     element_is_char,
+                    element_is_bit,
                     has_fill_pointer,
                 ));
             }
@@ -16261,6 +16272,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let adjustable = args.len() > 4 && !args[4].is_nil();
                 let element_is_char = args.len() > 5 && !args[5].is_nil();
                 let has_fill_pointer = args.len() > 6 && !args[6].is_nil();
+                // 8th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
+                let element_is_bit = args.len() > 7 && !args[7].is_nil();
                 return Ok(bliss_stdlib::build_displaced_vector(
                     base,
                     offset,
@@ -16268,6 +16281,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     fp,
                     adjustable,
                     element_is_char,
+                    element_is_bit,
                     has_fill_pointer,
                 ));
             }
@@ -16364,7 +16378,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if bliss_rt::types::bit_vector_p(v) { T } else { NIL });
+                // BIT-VECTOR-P is true of a complex (fill-pointer/adjustable/
+                // displaced) bit vector too; SIMPLE-BIT-VECTOR-P only of a truly
+                // simple one (bliss-65nx).
+                let simple_only = symbol_bare_name(&sym_name(car)) == "SIMPLE-BIT-VECTOR-P";
+                let ok = if simple_only {
+                    bliss_rt::types::bit_vector_p(v)
+                } else {
+                    is_bit_vector_value(v)
+                };
+                return Ok(if ok { T } else { NIL });
             }
             "%BIT-VECTOR-FROM-BITS" => {
                 // (%bit-vector-from-bits list) — build a SIMPLE bit-vector from a
@@ -16427,10 +16450,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "ARRAY-ELEMENT-TYPE" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                // Strings hold CHARACTER; bit-vectors hold BIT; everything else T.
+                // Strings hold CHARACTER; bit-vectors (simple OR a
+                // fill-pointer/adjustable/displaced complex bit vector, bliss-
+                // 65nx) hold BIT; everything else T.
                 let ty = if is_string_value(v) {
                     "CHARACTER"
-                } else if bliss_rt::types::bit_vector_p(v) {
+                } else if is_bit_vector_value(v) {
                     "BIT"
                 } else {
                     "T"
@@ -31633,6 +31658,36 @@ fn next_random_u64() -> u64 {
     })
 }
 
+/// Whether `v` is a bit vector — a simple SIMPLE-BIT-VECTOR or a
+/// fill-pointer/adjustable/displaced complex vector tagged BIT (bliss-65nx).
+fn is_bit_vector_value(v: BlissVal) -> bool {
+    bliss_rt::types::bit_vector_p(v)
+        || (bliss_stdlib::is_complex_vector(v) && bliss_stdlib::cvec_is_bit(v))
+}
+
+/// The active bit length of a bit vector (simple or complex-bit).
+fn bit_vector_bit_len(v: BlissVal) -> Option<usize> {
+    if let Some(n) = bliss_rt::types::bit_vector_len(v) {
+        return Some(n);
+    }
+    (bliss_stdlib::is_complex_vector(v) && bliss_stdlib::cvec_is_bit(v))
+        .then(|| bliss_stdlib::cvec_fill_pointer(v))
+}
+
+/// Bit `i` of a bit vector (simple or complex-bit): 0 or 1. A complex bit
+/// vector stores its bits as fixnum elements, so read through the
+/// displacement-aware accessor and take the value.
+fn bit_vector_bit(v: BlissVal, i: usize) -> u8 {
+    if let Some(bit) = bliss_rt::types::bit_vector_ref(v, i) {
+        return bit;
+    }
+    bliss_stdlib::cvec_element(v, i)
+        .ok()
+        .filter(|e| e.is_fixnum())
+        .map(|e| (e.as_fixnum() & 1) as u8)
+        .unwrap_or(0)
+}
+
 fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     if a == b {
         return true;
@@ -31655,13 +31710,10 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     // unlike general arrays which EQUAL treats as EQ. Two bit-vectors of equal
     // length with the same bits are EQUAL even if distinct objects — e.g.
     // (equal #*1011 (copy-seq #*1011)). No allocation, so GC-safe (bliss-8z5f).
-    if let (Some(la), Some(lb)) = (
-        bliss_rt::types::bit_vector_len(a),
-        bliss_rt::types::bit_vector_len(b),
-    ) {
-        return la == lb
-            && (0..la)
-                .all(|i| bliss_rt::types::bit_vector_ref(a, i) == bliss_rt::types::bit_vector_ref(b, i));
+    if let (Some(la), Some(lb)) = (bit_vector_bit_len(a), bit_vector_bit_len(b)) {
+        // Compares SIMPLE and COMPLEX (fill-pointer/adjustable/displaced) bit
+        // vectors uniformly, so (equal #*1011 <complex 1011>) holds (bliss-65nx).
+        return la == lb && (0..la).all(|i| bit_vector_bit(a, i) == bit_vector_bit(b, i));
     }
     // Pathnames: EQUAL when their components match. Comparing namestrings is the
     // faithful proxy and matches the EQUAL hash-table's `cl_equal`. ASDF compares

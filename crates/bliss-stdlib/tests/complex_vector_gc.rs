@@ -46,7 +46,7 @@ fn grow_paths_survive_a_minor_gc_fired_by_their_own_storage_allocation() {
 
     // ── A complex vector really does relocate on the first minor GC that
     //    reaches it. If this stops holding, the rest of the test is vacuous. ──
-    let probe = bliss_stdlib::build_complex_vector(&[], 4, 0, true, false, true);
+    let probe = bliss_stdlib::build_complex_vector(&[], 4, 0, true, false, false, true);
     let probe_before = unsafe { probe.as_ptr() } as usize;
     bliss_rt::rooted!(probe = probe);
     bliss_rt::gc::collect_t0_minor().expect("minor gc");
@@ -59,7 +59,7 @@ fn grow_paths_survive_a_minor_gc_fired_by_their_own_storage_allocation() {
 
     // ── VECTOR-PUSH-EXTEND on a full (capacity 0) vector: the grow calls
     //    build_vector, whose allocation collects and moves `v`. ──
-    let v = bliss_stdlib::build_complex_vector(&[], 0, 0, true, false, true);
+    let v = bliss_stdlib::build_complex_vector(&[], 0, 0, true, false, false, true);
     bliss_rt::rooted!(v = v);
     let elem = BlissVal::from_fixnum(42);
     bliss_stdlib::vector_push_extend(*v, elem, None).expect("vector-push-extend");
@@ -80,7 +80,7 @@ fn grow_paths_survive_a_minor_gc_fired_by_their_own_storage_allocation() {
     );
 
     // ── ADJUST-ARRAY's grow path has the same shape. ──
-    let a = bliss_stdlib::build_complex_vector(&[BlissVal::from_fixnum(7)], 1, 1, true, false, false);
+    let a = bliss_stdlib::build_complex_vector(&[BlissVal::from_fixnum(7)], 1, 1, true, false, false, false);
     bliss_rt::rooted!(a = a);
     let grown = bliss_stdlib::adjust_complex_vector(*a, 64, None, NIL).expect("adjust-array");
     bliss_rt::rooted!(grown = grown);
