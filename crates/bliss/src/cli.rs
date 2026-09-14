@@ -12399,6 +12399,9 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         | "SYMBOL-FUNCTION" | "SYMBOLP" | "KEYWORDP" | "BOUNDP" | "MAKUNBOUND"
         | "SPECIAL-OPERATOR-P" | "MAKE-SYMBOL" => Some((1, 1)),
         "SET" | "REMPROP" => Some((2, 2)),
+        // (lognot integer) — exactly one (ansi lognot.error.*); the n-ary
+        // LOGAND/LOGIOR/LOGXOR accept any count and need no entry.
+        "LOGNOT" => Some((1, 1)),
         "GET" => Some((2, 3)),
         "COPY-SYMBOL" => Some((1, 2)),
         "GENSYM" => Some((0, 1)),
@@ -18304,6 +18307,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 return eval_int_div(args[0], args.get(1).copied(), RoundMode::Round, env);
+            }
+            "LOGAND" | "LOGIOR" | "LOGXOR" => {
+                let args = eval_args(cdr, env)?;
+                return apply_logop(&name, &args);
+            }
+            "LOGNOT" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(BlissError::ProgramError(
+                        "LOGNOT requires exactly one argument".into(),
+                    ));
+                }
+                return apply_logop("LOGNOT", &args);
             }
             "EXPT" => {
                 let args = eval_args(cdr, env)?;
@@ -24800,6 +24816,44 @@ fn big_mul(a: &BigInt, b: &BigInt) -> BigInt {
     BigInt::from_mag(a.sign * b.sign, mag_mul(&a.mag, &b.mag))
 }
 
+/// Materialize `a` as an `n`-limb little-endian two's-complement vector.
+/// `n` must be large enough that the magnitude fits with a spare sign limb.
+fn twos_limbs(a: &BigInt, n: usize) -> Vec<u64> {
+    let mut v = vec![0u64; n];
+    v[..a.mag.len()].copy_from_slice(&a.mag);
+    if a.sign < 0 {
+        let mut carry = true;
+        for x in v.iter_mut() {
+            let (y, c) = (!*x).overflowing_add(carry as u64);
+            *x = y;
+            carry = c;
+        }
+    }
+    v
+}
+
+/// Bitwise `op` over the (conceptually infinite) two's-complement forms of `a`
+/// and `b` — the LOGAND/LOGIOR/LOGXOR kernel (bliss-gvkz). One extra limb
+/// beyond both magnitudes keeps a genuine sign limb, so the result's top bit
+/// decides its sign; a negative result is negated back to sign-magnitude.
+fn big_bitop(a: &BigInt, b: &BigInt, op: fn(u64, u64) -> u64) -> BigInt {
+    let n = a.mag.len().max(b.mag.len()) + 1;
+    let av = twos_limbs(a, n);
+    let bv = twos_limbs(b, n);
+    let mut r: Vec<u64> = av.iter().zip(&bv).map(|(&x, &y)| op(x, y)).collect();
+    if r[n - 1] >> 63 != 0 {
+        let mut carry = true;
+        for x in r.iter_mut() {
+            let (y, c) = (!*x).overflowing_add(carry as u64);
+            *x = y;
+            carry = c;
+        }
+        BigInt::from_mag(-1, r)
+    } else {
+        BigInt::from_mag(1, r)
+    }
+}
+
 fn big_cmp(a: &BigInt, b: &BigInt) -> Ordering {
     if a.sign != b.sign {
         return a.sign.cmp(&b.sign);
@@ -29929,6 +29983,51 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
 /// apply_function) skip the synthesize-`(name 'a 'b)`-and-re-evaluate detour
 /// (bliss-x5y.8) without the float-arithmetic divergence that ruled out
 /// `apply_builtin` (bliss-x5y.9).
+/// LOGAND/LOGIOR/LOGXOR (n-ary fold) and LOGNOT (unary) on evaluated args.
+/// Native limb-wise two's-complement kernels (big_bitop) replaced boot.lisp's
+/// bit-at-a-time recursive kernels, which cost O(bits² · limbs) bignum work per
+/// call and made the ansi numbers LOG* family run for hours (bliss-gvkz).
+/// GC-safe by construction: all operands are read into Rust-native BigInts
+/// before the single result allocation in to_val — no BlissVal is held across
+/// an allocation.
+fn apply_logop(name: &str, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    let int_of = |v: BlissVal| -> Result<BigInt, BlissError> {
+        bigint_from_val(v).ok_or_else(|| BlissError::TypeError {
+            datum: v,
+            expected: "integer".into(),
+        })
+    };
+    if name == "LOGNOT" {
+        let a = args[0];
+        if a.is_fixnum() {
+            // !n = -n-1 stays inside the 61-bit fixnum range for every fixnum.
+            return Ok(BlissVal::from_fixnum(!a.as_fixnum()));
+        }
+        let a = int_of(a)?;
+        return Ok(big_sub(&big_neg(&a), &BigInt::one()).to_val());
+    }
+    let (op, ident): (fn(u64, u64) -> u64, i64) = match name {
+        "LOGAND" => (|a, b| a & b, -1),
+        "LOGIOR" => (|a, b| a | b, 0),
+        _ => (|a, b| a ^ b, 0), // LOGXOR
+    };
+    // All-fixnum fast path: &/|/^ of two 61-bit two's-complement values is
+    // itself 61-bit (bits above the sign position are copies of the sign),
+    // so plain i64 bit ops are exact and never leave fixnum range.
+    if args.iter().all(|v| v.is_fixnum()) {
+        let mut acc = ident;
+        for v in args {
+            acc = op(acc as u64, v.as_fixnum() as u64) as i64;
+        }
+        return Ok(BlissVal::from_fixnum(acc));
+    }
+    let mut acc = BigInt::from_i64(ident);
+    for &v in args {
+        acc = big_bitop(&acc, &int_of(v)?, op);
+    }
+    Ok(acc.to_val())
+}
+
 fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, BlissError>> {
     // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
     // fast-path the 2-arg shape so other arities match the general path exactly.
@@ -30364,6 +30463,16 @@ fn apply_builtin_fast(
         "EQ" if args.len() == 2 => {
             env.clear_mv();
             Some(Ok(if args[0] == args[1] { T } else { NIL }))
+        }
+        // Bitwise builtins on already-evaluated args (bliss-gvkz): same kernel
+        // as operator position, so tiers stay bit-identical.
+        "LOGAND" | "LOGIOR" | "LOGXOR" => {
+            env.clear_mv();
+            Some(apply_logop(name, args))
+        }
+        "LOGNOT" if args.len() == 1 => {
+            env.clear_mv();
+            Some(apply_logop(name, args))
         }
         // Rank-1 array element read/write, on already-evaluated args. Without
         // this a compiled loop's CallNamed for e.g. SET-AREF fell through to

@@ -2532,37 +2532,15 @@
         ((>= (- count) (integer-length n)) (if (minusp n) -1 0))
         (t (values (floor n (expt 2 (- count)))))))
 
-(defun lognot (n) (- (- n) 1))
+;; LOGNOT/LOGAND/LOGIOR/LOGXOR are native builtins (limb-wise two's-complement
+;; kernels in cli.rs, bliss-gvkz); the old bit-at-a-time recursive Lisp kernels
+;; here cost O(bits^2) bignum divisions per call and made the ansi numbers LOG*
+;; family pathologically slow.
 
 ;; Low bit of N, computed via floor so it is correct for negative (two's
 ;; complement) operands: N - 2*floor(N/2) is 0 or 1 for any integer.
 (defun %lowbit (n) (- n (* 2 (floor n 2))))
 
-;; The two-argument bitwise kernels recurse on floor(N/2) — an arithmetic shift
-;; that realises two's-complement semantics for negatives — with base cases at 0
-;; (all zero bits above) and -1 (all one bits above).
-(defun %logand2 (a b)
-  (cond ((= a 0) 0) ((= b 0) 0)
-        ((= a -1) b) ((= b -1) a)
-        (t (+ (* 2 (%logand2 (floor a 2) (floor b 2)))
-              (if (and (= (%lowbit a) 1) (= (%lowbit b) 1)) 1 0)))))
-(defun %logior2 (a b)
-  (cond ((= a 0) b) ((= b 0) a)
-        ((= a -1) -1) ((= b -1) -1)
-        (t (+ (* 2 (%logior2 (floor a 2) (floor b 2)))
-              (if (or (= (%lowbit a) 1) (= (%lowbit b) 1)) 1 0)))))
-(defun %logxor2 (a b)
-  (cond ((= a 0) b) ((= b 0) a)
-        ((= a -1) (lognot b)) ((= b -1) (lognot a))
-        (t (+ (* 2 (%logxor2 (floor a 2) (floor b 2)))
-              (if (= (%lowbit a) (%lowbit b)) 0 1)))))
-
-(defun logand (&rest ints)
-  (if (null ints) -1 (reduce (function %logand2) ints)))
-(defun logior (&rest ints)
-  (if (null ints) 0 (reduce (function %logior2) ints)))
-(defun logxor (&rest ints)
-  (if (null ints) 0 (reduce (function %logxor2) ints)))
 (defun logeqv (&rest ints)
   (if (null ints) -1 (lognot (apply (function logxor) ints))))
 (defun lognand (a b) (lognot (logand a b)))
