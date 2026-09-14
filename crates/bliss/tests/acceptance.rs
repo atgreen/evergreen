@@ -15,20 +15,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("repo root")
-}
-
-fn cargo_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 fn bliss_bin_path() -> &'static Path {
     // Cargo builds the bin as a prerequisite of this integration test and sets
@@ -3126,25 +3114,6 @@ fn typep_not_and_string_length_compounds() {
     }
 }
 
-/// bliss-bjue: defstruct's generated constructor/accessor/predicate/copier were
-/// built from movable cons intermediates left unrooted across allocating
-/// sym()/quote()/vec_to_list() calls, so under a minor GC (BLISS_GC_STRESS) the
-/// forms were corrupted — (make-NAME …) aborted with "undefined function: &REST".
-/// This exercises the whole defstruct surface under GC stress; it must not abort.
-#[test]
-/// bliss-tjru: a large SIMPLE-VECTOR (body >= the large-object threshold, ~65534
-/// elements) has a 16-byte object header, so its value pointer, element
-/// accessors, and the GC's field-tracing must all honour the large-object
-/// payload offset. Before the fix aref/setf saw it as "not a vector", and the
-/// GC scanned its element slots 8 bytes off (reading the size-extension word as
-/// the element count). This exercises usability AND that heap references held
-/// only by a large vector survive collection.
-/// bliss-2r5: the core list functions (copy-list, copy-tree, nthcdr, and
-/// therefore last/butlast) were non-tail recursive in boot.lisp, so a long flat
-/// list — e.g. the ~22000-entry flexi-streams code-page tables — recursed one
-/// BlissStack frame per element and overflowed the default 512 KiB stack
-/// (needing BLISS_STACK_SIZE=64MB). They are now iterative and run on the
-/// default stack.
 /// bliss-tjrb: RPLACA/RPLACD (CLHS 14.2) destructively set a cons's car/cdr and
 /// return THE CONS (not the value, unlike setf), erroring on a non-cons.
 #[test]
@@ -3168,6 +3137,12 @@ fn rplaca_rplacd_mutate_and_return_the_cons() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("OK"), "got: {}", String::from_utf8_lossy(&out.stdout));
 }
 
+/// bliss-2r5: the core list functions (copy-list, copy-tree, nthcdr, and
+/// therefore last/butlast) were non-tail recursive in boot.lisp, so a long flat
+/// list — e.g. the ~22000-entry flexi-streams code-page tables — recursed one
+/// BlissStack frame per element and overflowed the default 512 KiB stack
+/// (needing BLISS_STACK_SIZE=64MB). They are now iterative and run on the
+/// default stack.
 #[test]
 fn long_list_ops_do_not_overflow_the_stack() {
     // Build a 40k-element list at runtime and exercise the rewritten functions;
@@ -3201,6 +3176,13 @@ fn long_list_ops_do_not_overflow_the_stack() {
     );
 }
 
+/// bliss-tjru: a large SIMPLE-VECTOR (body >= the large-object threshold, ~65534
+/// elements) has a 16-byte object header, so its value pointer, element
+/// accessors, and the GC's field-tracing must all honour the large-object
+/// payload offset. Before the fix aref/setf saw it as "not a vector", and the
+/// GC scanned its element slots 8 bytes off (reading the size-extension word as
+/// the element count). This exercises usability AND that heap references held
+/// only by a large vector survive collection.
 #[test]
 fn large_simple_vector_is_usable_and_gc_safe() {
     // Fire a minor GC roughly every 8000 allocations so several collections
@@ -3520,6 +3502,12 @@ fn large_string_literal_is_usable_and_gc_safe() {
     );
 }
 
+/// bliss-bjue: defstruct's generated constructor/accessor/predicate/copier were
+/// built from movable cons intermediates left unrooted across allocating
+/// sym()/quote()/vec_to_list() calls, so under a minor GC (BLISS_GC_STRESS) the
+/// forms were corrupted — (make-NAME …) aborted with "undefined function: &REST".
+/// This exercises the whole defstruct surface under GC stress; it must not abort.
+#[test]
 fn defstruct_is_gc_safe_under_stress() {
     let prog = "\
         (defstruct box a b) \
