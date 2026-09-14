@@ -2517,6 +2517,48 @@ fn emit_framed_inner(
         };
         homes.insert(value, home);
     }
+    // `BLISS_RA_DBG` dump of the three facts a deopt-clobber bug is diagnosed
+    // from (bliss-x9c9): each value's stable home, which MachInsts carry a
+    // FrameState (and therefore contribute `deopt_uses` liveness), and what
+    // each FrameState names. A deopt reading a value whose home is a register
+    // the carrying instruction writes is the bug signature.
+    if std::env::var_os("BLISS_RA_DBG").is_some() {
+        let mut sorted: Vec<_> = homes.iter().collect();
+        sorted.sort_by_key(|(value, _)| value.0);
+        for (value, home) in sorted {
+            eprintln!(
+                "[homes] {} v{} -> {home:?} ranges={:?}",
+                f.name(),
+                value.0,
+                ranges.get(value)
+            );
+        }
+        for (mi, inst) in machine.insts.iter().enumerate() {
+            if inst.frame_state.is_none() {
+                continue;
+            }
+            eprintln!(
+                "[fsinst] {} mi={mi} op={} defs={:?} uses={:?} deopt={:?} fs={:?}",
+                f.name(),
+                inst.op,
+                inst.defs.iter().map(|v| v.num).collect::<Vec<_>>(),
+                inst.uses.iter().map(|v| v.num).collect::<Vec<_>>(),
+                inst.deopt_uses.iter().map(|v| v.num).collect::<Vec<_>>(),
+                inst.frame_state,
+            );
+        }
+        for (id, fs) in f.frame_states.iter() {
+            for scope in &fs.scopes {
+                eprintln!(
+                    "[fs] {} fs={id:?} bcp={} locals={:?} stack={:?}",
+                    f.name(),
+                    scope.bcp,
+                    scope.locals,
+                    scope.stack
+                );
+            }
+        }
+    }
     // Convert regalloc2's split-aware live ranges into exact tagged roots for
     // each runtime safepoint. The rich emitter uses stable `homes`, so these are
     // the locations that must be synchronized, not regalloc2's transient edit

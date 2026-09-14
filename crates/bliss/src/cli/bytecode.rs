@@ -54,6 +54,53 @@ use bliss_rt::asm::{Asm, Cc, Label};
 
 // ── Backend selection ──────────────────────────────────────────────
 
+/// Process-wide tier pin for differential testing (bliss-19tm).
+///
+/// With `BLISS_FORCE_TIER` set, the tiering knobs below all derive from it so
+/// one corpus run executes at a single pinned tier — the external switch that
+/// turns any existing suite into a tier-A/B test unmodified:
+///
+/// - `interp`: the pure tree-walker (the differential oracle).
+/// - `t0`: bytecode, promotion and OSR disabled.
+/// - `t1`: eager compile, immediate T0→T1 promotion, T2 off.
+/// - `t2`: eager compile, immediate promotion through T2, and the requesting
+///   dispatch waits for T2 publication so execution deterministically runs T2.
+///
+/// Pinning is best-effort per function: a shape the pinned tier's compiler
+/// declines falls back to the tier below, which is exactly what the
+/// byte-identical output diff is meant to exercise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForcedTier {
+    Interp,
+    T0,
+    T1,
+    T2,
+}
+
+pub(super) fn forced_tier() -> Option<ForcedTier> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Option<ForcedTier>> = OnceLock::new();
+    *T.get_or_init(|| match std::env::var("BLISS_FORCE_TIER") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "interp" | "tree-walker" | "treewalker" | "treewalk" | "tw" => {
+                Some(ForcedTier::Interp)
+            }
+            "t0" | "bytecode" => Some(ForcedTier::T0),
+            "t1" => Some(ForcedTier::T1),
+            "t2" => Some(ForcedTier::T2),
+            "" => None,
+            other => {
+                eprintln!(
+                    "bliss: unrecognized BLISS_FORCE_TIER={other:?} \
+                     (use interp|t0|t1|t2); ignoring"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    })
+}
+
 /// Whether the bytecode backend is enabled.
 ///
 /// The bytecode backend is the **default** (nmq.6); it compiles what it can and
@@ -64,25 +111,29 @@ use bliss_rt::asm::{Asm, Cc, Label};
 pub fn backend_is_bytecode() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("BLISS_BACKEND") {
-        Ok(v) => {
-            let lower = v.to_ascii_lowercase();
-            match lower.as_str() {
-                // "treewalk" included: its absence silently selected the
-                // bytecode backend, which cost a debugging session (bliss-8qf).
-                "tree-walker" | "treewalker" | "treewalk" | "tree_walker" | "tw" | "interp"
-                | "walker" => false,
-                "bytecode" | "bc" => true,
-                other => {
-                    eprintln!(
-                        "bliss: unrecognized BLISS_BACKEND={other:?}; defaulting to \
-                         bytecode (use \"bytecode\" or \"tree-walker\")"
-                    );
-                    true
+    *ENABLED.get_or_init(|| match forced_tier() {
+        Some(ForcedTier::Interp) => false,
+        Some(_) => true,
+        None => match std::env::var("BLISS_BACKEND") {
+            Ok(v) => {
+                let lower = v.to_ascii_lowercase();
+                match lower.as_str() {
+                    // "treewalk" included: its absence silently selected the
+                    // bytecode backend, which cost a debugging session (bliss-8qf).
+                    "tree-walker" | "treewalker" | "treewalk" | "tree_walker" | "tw" | "interp"
+                    | "walker" => false,
+                    "bytecode" | "bc" => true,
+                    other => {
+                        eprintln!(
+                            "bliss: unrecognized BLISS_BACKEND={other:?}; defaulting to \
+                             bytecode (use \"bytecode\" or \"tree-walker\")"
+                        );
+                        true
+                    }
                 }
             }
-        }
-        Err(_) => true,
+            Err(_) => true,
+        },
     })
 }
 
@@ -6059,6 +6110,12 @@ fn is_bail_special(name: &str) -> bool {
             | "PROGV"
             | "MULTIPLE-VALUE-CALL"
             | "MULTIPLE-VALUE-PROG1"
+            // Absent, its variable list `(a b)` was lowered as a CallNamed and
+            // the form died with "undefined function: A" under every bytecode
+            // tier while the tree-walker ran it correctly (bliss-h7e0). The
+            // tree-walker owns the semantics — including symbol-macro places —
+            // so bailing is the fix, not a second implementation here.
+            | "MULTIPLE-VALUE-SETQ"
             | "TYPECASE"
             | "ECASE"
             | "DO"
@@ -9705,6 +9762,11 @@ fn make_bytecode_closure(
 pub(super) fn lazy_compile_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
+    // A pinned tier compiles eagerly: definition-time compilation makes "which
+    // tier ran this call" deterministic from the first invocation (bliss-19tm).
+    if forced_tier().is_some() {
+        return false;
+    }
     // DEFAULT ON (bliss-x5y.24). Deferred compilation removes the definition-time
     // cost that made the bytecode backend load asdf slower than the tree-walker,
     // while hot functions and loop-containing defuns still tier (the hybrid policy
@@ -14561,6 +14623,11 @@ fn positive_env(names: &[&str], default: u32) -> u32 {
 /// T0→T1 promotion threshold (invocations).  The stage-5 spec name is
 /// preferred; `BLISS_T1_THRESHOLD` remains as a compatibility alias.
 fn t1_threshold() -> u32 {
+    match forced_tier() {
+        Some(ForcedTier::T0) => return u32::MAX, // never promote
+        Some(ForcedTier::T1 | ForcedTier::T2) => return 1, // promote on first call
+        _ => {}
+    }
     positive_env(&["BLISS_T0_T1_THRESHOLD", "BLISS_T1_THRESHOLD"], 10)
 }
 
@@ -14594,6 +14661,11 @@ fn t2_enabled() -> bool {
     if profiling_disabled() {
         return false;
     }
+    match forced_tier() {
+        Some(ForcedTier::T2) => return true,
+        Some(_) => return false,
+        None => {}
+    }
     if env_flag("BLISS_DISABLE_T2") == Some(true) {
         return false;
     }
@@ -14604,6 +14676,9 @@ fn t2_enabled() -> bool {
 /// as a force/debug shorthand: absent an explicit threshold it makes T2 eligible
 /// immediately after T1 has been observed.  Normal, unset operation uses 5000.
 fn t2_invoke_threshold() -> u32 {
+    if forced_tier() == Some(ForcedTier::T2) {
+        return 1;
+    }
     let explicit = [
         "BLISS_T1_T2_INVOKE_THRESHOLD",
         "BLISS_T1_T2_THRESHOLD",
@@ -14987,7 +15062,7 @@ fn native_for_dispatch(
     // Legacy BLISS_T2=1 remains a deterministic force/debug mode for tests and
     // disassembly sessions. Compilation still runs on a compiler thread; only
     // this requesting dispatch waits for publication.
-    if env_flag("BLISS_T2") == Some(true)
+    if (env_flag("BLISS_T2") == Some(true) || forced_tier() == Some(ForcedTier::T2))
         && (requested || T2_QUEUED.with(|queued| queued.borrow().contains_key(&sym)))
     {
         return wait_for_t2(sym).or(Some(current));
@@ -17038,6 +17113,10 @@ fn osr_threshold() -> u32 {
     use std::sync::OnceLock;
     static T: OnceLock<u32> = OnceLock::new();
     *T.get_or_init(|| {
+        // A T0 pin means "stay at T0": OSR must not promote a hot loop either.
+        if forced_tier() == Some(ForcedTier::T0) {
+            return u32::MAX;
+        }
         std::env::var("BLISS_OSR_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -17055,6 +17134,9 @@ fn anon_osr_threshold() -> u32 {
     use std::sync::OnceLock;
     static T: OnceLock<u32> = OnceLock::new();
     *T.get_or_init(|| {
+        if forced_tier() == Some(ForcedTier::T0) {
+            return u32::MAX;
+        }
         std::env::var("BLISS_ANON_OSR_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())

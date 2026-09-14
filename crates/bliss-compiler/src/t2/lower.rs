@@ -278,7 +278,14 @@ impl<'f> Lowering<'f> {
         // instruction (bliss-ad1e): without an explicit operand, regalloc2 may
         // free or reuse their registers before the guard, and a deopt would
         // reconstruct the interpreter frame from stale slots. Dedup against
-        // the real defs/uses so a value isn't double-declared on the inst.
+        // the defs and against repeats — but NOT against the instruction's own
+        // `uses`: a normal use is an Early-position operand, which lets the
+        // allocator coalesce the destination onto it, and a destructive
+        // sequence before the deopting `jo` (e.g. FixnumMul's `sar dst,3;
+        // imul dst,y`) then clobbers the very register the frame state reads.
+        // The extra Late-position Any operand keeps such a value alive PAST
+        // the instruction's writes, which is the whole bliss-ad1e guarantee
+        // (bliss-x9c9: deopt-resume returned sign-flipped/garbage numbers).
         let mut deopt_uses: Vec<VReg> = Vec::new();
         if let Some(fsid) = frame_state {
             let fs = self.f.frame_states.get(fsid);
@@ -286,7 +293,7 @@ impl<'f> Lowering<'f> {
                 for src in scope.locals.iter().chain(scope.stack.iter()) {
                     if let crate::t2::frame_state::ValueSource::Value { value, .. } = src {
                         let v = self.vreg(*value);
-                        if !defs.contains(&v) && !uses.contains(&v) && !deopt_uses.contains(&v) {
+                        if !defs.contains(&v) && !deopt_uses.contains(&v) {
                             deopt_uses.push(v);
                         }
                     }
@@ -479,22 +486,34 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
     }
 
     // A binary-op emitter: `op def, use0, use1`.
+    //
+    // These go through `emit_annotated`, not `emit_for` (bliss-x9c9): a
+    // SPECULATED arithmetic op is a deopt point — the emitter's template ends
+    // in `jo deopt` and its FrameState reconstructs the T0 frame — so its
+    // MachInst must carry that FrameState or regalloc2 never learns the
+    // deopt-live values have to survive the instruction's own writes. Without
+    // it the allocator coalesced the result onto an operand register that the
+    // destructive `sar dst,3; imul dst,y` sequence clobbers before the `jo`,
+    // and the deopt read the wrecked register (wrong numeric results at T2).
+    // For a non-deopting op `emit_annotated` records nothing extra.
     macro_rules! bin {
         ($op:expr) => {{
-            lo.emit_for(inst, $op, defs, uses);
+            lo.emit_annotated(inst, $op, defs, uses);
         }};
     }
     // A unary-op emitter: `op def, use0`.
     macro_rules! un {
         ($op:expr) => {{
-            lo.emit_for(inst, $op, defs, uses);
+            lo.emit_annotated(inst, $op, defs, uses);
         }};
     }
-    // A comparison: flag-setting compare then SETcc into the GPR result.
+    // A comparison: flag-setting compare then SETcc into the GPR result. The
+    // SETcc half carries the state: it writes the result register, which is
+    // where a coalesced operand would be lost before the guard's deopt.
     macro_rules! cmp {
         ($cmpop:expr, $setcc:expr) => {{
             lo.emit_for(inst, $cmpop, vec![], uses);
-            lo.emit_for(inst, $setcc, defs, vec![]);
+            lo.emit_annotated(inst, $setcc, defs, vec![]);
         }};
     }
 
