@@ -2537,10 +2537,6 @@
 ;; here cost O(bits^2) bignum divisions per call and made the ansi numbers LOG*
 ;; family pathologically slow.
 
-;; Low bit of N, computed via floor so it is correct for negative (two's
-;; complement) operands: N - 2*floor(N/2) is 0 or 1 for any integer.
-(defun %lowbit (n) (- n (* 2 (floor n 2))))
-
 (defun logeqv (&rest ints)
   (if (null ints) -1 (lognot (apply (function logxor) ints))))
 (defun lognand (a b) (lognot (logand a b)))
@@ -2591,8 +2587,7 @@
     (t (error "BOOLE: invalid operation ~a" op))))
 
 (defun logtest (a b) (not (zerop (logand a b))))
-(defun logbitp (index n)
-  (= 1 (%lowbit (floor n (expt 2 index)))))
+;; LOGBITP is a native builtin (cli.rs apply_logbitp, bliss-gvkz).
 
 ;;; Complex-number helpers built on REALPART/IMAGPART/COMPLEX (CLHS 12.2).
 ;; CONJUGATE negates the imaginary part; a real is its own conjugate.

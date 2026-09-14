@@ -12402,6 +12402,8 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // (lognot integer) — exactly one (ansi lognot.error.*); the n-ary
         // LOGAND/LOGIOR/LOGXOR accept any count and need no entry.
         "LOGNOT" => Some((1, 1)),
+        // (logbitp index integer) — exactly two (ansi logbitp.error.1-3).
+        "LOGBITP" => Some((2, 2)),
         "GET" => Some((2, 3)),
         "COPY-SYMBOL" => Some((1, 2)),
         "GENSYM" => Some((0, 1)),
@@ -18320,6 +18322,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 return apply_logop("LOGNOT", &args);
+            }
+            "LOGBITP" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(
+                        "LOGBITP requires exactly two arguments".into(),
+                    ));
+                }
+                return apply_logbitp(args[0], args[1]);
             }
             "EXPT" => {
                 let args = eval_args(cdr, env)?;
@@ -30028,6 +30039,43 @@ fn apply_logop(name: &str, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
     Ok(acc.to_val())
 }
 
+/// (logbitp index integer) — bit `index` of the two's-complement form of
+/// `integer` (bliss-gvkz). The old boot.lisp defun computed two bignum
+/// divisions per call, which made the ansi LOG* `.7` verification loops
+/// (1000 reps × 210 logbitp probes) take minutes each. Allocation-free.
+fn apply_logbitp(index: BlissVal, n: BlissVal) -> Result<BlissVal, BlissError> {
+    let idx = bigint_from_val(index).ok_or_else(|| BlissError::TypeError {
+        datum: index,
+        expected: "unsigned-byte".into(),
+    })?;
+    if idx.sign < 0 {
+        return Err(BlissError::TypeError {
+            datum: index,
+            expected: "unsigned-byte".into(),
+        });
+    }
+    let nn = bigint_from_val(n).ok_or_else(|| BlissError::TypeError {
+        datum: n,
+        expected: "integer".into(),
+    })?;
+    let bitlen = 64 * nn.mag.len() as u64;
+    let bit = if idx.mag.len() > 1 || idx.mag.first().copied().unwrap_or(0) >= bitlen {
+        // At or beyond the magnitude's top: every higher bit is the sign bit.
+        nn.sign < 0
+    } else {
+        let i = idx.mag.first().copied().unwrap_or(0);
+        let (limb, off) = ((i / 64) as usize, i % 64);
+        if nn.sign >= 0 {
+            (nn.mag[limb] >> off) & 1 == 1
+        } else {
+            // Two's complement of a negative: bit_i(-m) = !bit_i(m - 1).
+            let m1 = mag_sub(&nn.mag, &[1]);
+            m1.get(limb).map_or(0, |&l| (l >> off) & 1) == 0
+        }
+    };
+    Ok(if bit { T } else { NIL })
+}
+
 fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, BlissError>> {
     // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
     // fast-path the 2-arg shape so other arities match the general path exactly.
@@ -30473,6 +30521,10 @@ fn apply_builtin_fast(
         "LOGNOT" if args.len() == 1 => {
             env.clear_mv();
             Some(apply_logop(name, args))
+        }
+        "LOGBITP" if args.len() == 2 => {
+            env.clear_mv();
+            Some(apply_logbitp(args[0], args[1]))
         }
         // Rank-1 array element read/write, on already-evaluated args. Without
         // this a compiled loop's CallNamed for e.g. SET-AREF fell through to
