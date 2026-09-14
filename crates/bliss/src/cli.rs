@@ -11028,6 +11028,13 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "SYMBOL" => object.is_symbol(),
             "KEYWORD" => is_keyword_arg(object),
             "STRING" | "SIMPLE-STRING" => is_string_value(object),
+            // BIT-VECTOR / SIMPLE-BIT-VECTOR: keyed off the runtime predicate,
+            // which BIT-VECTOR-P and TYPE-OF already use. Without these arms
+            // typep fell through to NIL even though (bit-vector-p #*1011) and
+            // (type-of #*1011) => (SIMPLE-BIT-VECTOR 4) both agreed it was one
+            // (bliss-65nx). bliss builds bit-vectors immutable, so every one is
+            // simple — SIMPLE-BIT-VECTOR matches the same set.
+            "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => bliss_rt::types::bit_vector_p(object),
             // BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base strings —
             // every character a BASE-CHAR — not the 32-bit character strings a
             // STRING can also be (bliss-ajb3).
@@ -11162,6 +11169,15 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             // (simple-vector size): a general vector whose length matches SIZE
             // (or `*`). Used e.g. by ASDF's MATCH-CONDITION-P etypecase.
             if !is_simple_vector_value(object) {
+                return Ok(false);
+            }
+            Ok(vector_length_matches(&list_to_vec(args), object))
+        }
+        // (bit-vector size) / (simple-bit-vector size): a bit-vector whose
+        // length matches SIZE (or `*`). Element type is fixed (BIT), so only
+        // the optional size argument is checked (bliss-65nx).
+        "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => {
+            if !bliss_rt::types::bit_vector_p(object) {
                 return Ok(false);
             }
             Ok(vector_length_matches(&list_to_vec(args), object))
