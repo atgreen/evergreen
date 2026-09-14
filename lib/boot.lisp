@@ -1035,15 +1035,24 @@
     (loop for i from start below stop
           count (not (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e)))))))
 
+;; Walked with ENDP, not `loop for l on list` (bliss-b9dr). LOOP's `on` driver
+;; terminates via ATOM, which is right for LOOP but wrong here: MEMBER-IF
+;; requires a LIST, so a non-list — or an improper tail actually reached
+;; because no element matched — is a TYPE-ERROR. ENDP signals in exactly those
+;; cases and stays quiet when a match is found before the bad tail, matching
+;; SBCL: (member-if #'identity '(1 . 2)) => (1 . 2) but
+;; (member-if #'null '(1 . 2)) and (member-if #'identity 7) both signal.
 (defun member-if (pred list &key key)
-  (loop for l on list
-        when (funcall pred (if key (funcall key (car l)) (car l)))
-          return l))
+  (do ((l list (cdr l)))
+      ((endp l) nil)
+    (when (funcall pred (if key (funcall key (car l)) (car l)))
+      (return l))))
 
 (defun member-if-not (pred list &key key)
-  (loop for l on list
-        unless (funcall pred (if key (funcall key (car l)) (car l)))
-          return l))
+  (do ((l list (cdr l)))
+      ((endp l) nil)
+    (unless (funcall pred (if key (funcall key (car l)) (car l)))
+      (return l))))
 
 ;; Each alist entry must be a cons or NIL; NIL entries are skipped, but a
 ;; non-NIL atom is a type-error (ansi-test assoc-if.error.12). The DOLIST
