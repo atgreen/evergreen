@@ -3221,11 +3221,15 @@ impl<'e> Lowerer<'e> {
                                     form_list(&[s("CDR")?, lst])
                                 };
                             bliss_rt::rooted_ref!(_step_expr_root = &mut step_expr);
-                            top_tests.push(form_list(&[
-                                s("WHEN")?,
-                                form_list(&[s("NULL")?, lst]),
-                                form_list(&[s("GO")?, end]),
-                            ]));
+                            // Root each sub-list before the next allocates
+                            // (bliss-sqpi): argument expressions are evaluated
+                            // left to right, so the outer form_list's rooting
+                            // comes too late for an earlier sibling.
+                            let mut null_form = form_list(&[s("NULL")?, lst]);
+                            bliss_rt::rooted_ref!(_null_form_root = &mut null_form);
+                            let mut go_form = form_list(&[s("GO")?, end]);
+                            bliss_rt::rooted_ref!(_go_form_root = &mut go_form);
+                            top_tests.push(form_list(&[s("WHEN")?, null_form, go_form]));
                             let cur = if on {
                                 lst
                             } else {
@@ -3260,11 +3264,17 @@ impl<'e> Lowerer<'e> {
                                 let mut step = *forms.get(i + 5).ok_or(Bail)?;
                                 bliss_rt::rooted_ref!(_step_root = &mut step);
                                 bindings.push(form_list(&[var, NIL]));
+                                // Root each branch before the other allocates
+                                // (bliss-sqpi).
+                                let mut init_setq = form_list(&[s("SETQ")?, var, init]);
+                                bliss_rt::rooted_ref!(_init_setq_root = &mut init_setq);
+                                let mut step_setq = form_list(&[s("SETQ")?, var, step]);
+                                bliss_rt::rooted_ref!(_step_setq_root = &mut step_setq);
                                 pre.push(form_list(&[
                                     s("IF")?,
                                     first_flag,
-                                    form_list(&[s("SETQ")?, var, init]),
-                                    form_list(&[s("SETQ")?, var, step]),
+                                    init_setq,
+                                    step_setq,
                                 ]));
                                 has_then = true;
                                 i += 6;
@@ -3347,11 +3357,20 @@ impl<'e> Lowerer<'e> {
                                 } else {
                                     "<="
                                 };
-                                top_tests.push(form_list(&[
-                                    s("WHEN")?,
-                                    form_list(&[s(test_cmp)?, ctr, bound]),
-                                    form_list(&[s("GO")?, end]),
-                                ]));
+                                // Both inner lists must be ROOTED before the
+                                // outer form_list (bliss-sqpi). Rust evaluates
+                                // the argument array left to right, so building
+                                // the `(GO end)` list allocates — and can fire a
+                                // minor GC — while the just-built `(cmp ctr
+                                // bound)` list is live only in that temporary
+                                // array, where the collector cannot see it. The
+                                // outer form_list roots its slice, but only
+                                // after every element has already been computed.
+                                let mut test_form = form_list(&[s(test_cmp)?, ctr, bound]);
+                                bliss_rt::rooted_ref!(_test_form_root = &mut test_form);
+                                let mut go_form = form_list(&[s("GO")?, end]);
+                                bliss_rt::rooted_ref!(_go_form_root = &mut go_form);
+                                top_tests.push(form_list(&[s("WHEN")?, test_form, go_form]));
                             }
                             // Republish the in-range counter into VAR at the top of
                             // the iteration (in driver source order), matching the
@@ -3373,11 +3392,13 @@ impl<'e> Lowerer<'e> {
                     bliss_rt::rooted_ref!(_n_root = &mut n);
                     let counter = fresh("REP", &mut nsym)?;
                     bindings.push(form_list(&[counter, n]));
-                    top_tests.push(form_list(&[
-                        s("WHEN")?,
-                        form_list(&[s("<=")?, counter, BlissVal::from_fixnum(0)]),
-                        form_list(&[s("GO")?, end]),
-                    ]));
+                    // Root each sub-list before the next allocates (bliss-sqpi).
+                    let mut done_test =
+                        form_list(&[s("<=")?, counter, BlissVal::from_fixnum(0)]);
+                    bliss_rt::rooted_ref!(_done_test_root = &mut done_test);
+                    let mut go_form = form_list(&[s("GO")?, end]);
+                    bliss_rt::rooted_ref!(_go_form_root = &mut go_form);
+                    top_tests.push(form_list(&[s("WHEN")?, done_test, go_form]));
                     steps.push(form_list(&[
                         s("SETQ")?,
                         counter,
@@ -3396,11 +3417,12 @@ impl<'e> Lowerer<'e> {
                     // slurp-stream-forms appended its EOF marker).
                     let mut test = *forms.get(i + 1).ok_or(Bail)?;
                     bliss_rt::rooted_ref!(_test_root = &mut test);
-                    pre.push(form_list(&[
-                        s("WHEN")?,
-                        form_list(&[s("NOT")?, test]),
-                        form_list(&[s("GO")?, end]),
-                    ]));
+                    // Root each sub-list before the next allocates (bliss-sqpi).
+                    let mut not_form = form_list(&[s("NOT")?, test]);
+                    bliss_rt::rooted_ref!(_not_form_root = &mut not_form);
+                    let mut go_form = form_list(&[s("GO")?, end]);
+                    bliss_rt::rooted_ref!(_go_form_root = &mut go_form);
+                    pre.push(form_list(&[s("WHEN")?, not_form, go_form]));
                     i += 2;
                 }
                 Some("UNTIL") => {
@@ -3701,13 +3723,18 @@ impl<'e> Lowerer<'e> {
         let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
         bliss_rt::rooted_ref!(_tagbody_form_root = &mut tagbody_form);
 
-        bliss_rt::rooted!(
-            binding_items = vec![
-                form_list(&[var, start]),
-                form_list(&[end_v, end]),
-                form_list(&[step_v, step]),
-            ]
-        );
+        // Root the vector FIRST, then build into it one element at a time
+        // (bliss-sqpi). `rooted!(v = vec![form_list(..), form_list(..), ..])`
+        // evaluates the whole vec! — every form_list allocating in turn — and
+        // only roots the result afterwards, so the earlier bindings are live
+        // only in the vector-under-construction while the later ones allocate.
+        // A minor GC there dropped the `(var start)` binding and the loop died
+        // with "unbound variable: I". Pushing into an already-rooted vector
+        // keeps each finished element visible to the collector.
+        bliss_rt::rooted!(binding_items = Vec::<BlissVal>::new());
+        binding_items.push(form_list(&[var, start]));
+        binding_items.push(form_list(&[end_v, end]));
+        binding_items.push(form_list(&[step_v, step]));
         if uses_acc {
             binding_items.push(form_list(&[acc, acc_init]));
         }
