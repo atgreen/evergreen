@@ -152,6 +152,22 @@ BLISS_GC_STRESS_AT=40120 BLISS_GC_POISON=1 ./…/bliss-cli …
 Prefer `SKIP` to localize (robust: it stresses the whole suffix) and `AT` to
 name the allocation site once the window is tight.
 
+**A `SKIP` above the program's allocation count is silently a no-op** — it
+disables stressing entirely and reports a *clean run that proves nothing*
+(bliss-sqpi: an early bracketing of that bug concluded "the fault is in
+startup" purely from this artifact; the real corrupting GC was ~70
+allocations from the *end*). Before trusting any clean `SKIP` result, confirm
+the probe actually fires — `BLISS_GC_STRESS_AT=N` prints
+`[gc-stress] … forcing minor GC at allocation #N` when `N` is in range, so
+bisecting `AT` on that line first tells you the total and the usable range.
+
+**A clean `BLISS_GC_POISON=1` run does not mean "no GC bug".** Poison only
+catches a *stale pointer being dereferenced*. A value orphaned before it is
+stored — e.g. a sub-list left in a Rust temporary while a sibling argument
+allocates — makes the program compute a quietly wrong answer with no
+segfault at all. Diff the program's *output* against a non-stress run;
+don't wait for a crash.
+
 ## Always cap bliss memory: `scripts/bliss-limited.sh`
 
 Runaway bliss runs (e.g. ASDF recursion-to-OOM bugs like bliss-hlsa) have
