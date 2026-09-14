@@ -176,3 +176,37 @@ fn osr_error_inside_hot_loop_is_catchable() {
        (format t \"~a~%\" (f 10000000))";
     assert_osr_matches(prog);
 }
+
+/// bliss-kqdr: the T1→T2 back-edge OSR transfer handed T2 code the *T1* frame,
+/// which is sized for the bytecode's slot count. T2 code that syncs its native
+/// roots through shadow slots addresses `num_slots + shadow_root_slots`, so it
+/// stored past the end of that activation and into the adjacent frame's header
+/// — silently overwriting the caller's own parameter with a raw pointer. A hot
+/// `(dotimes (i n r) (setq r (f o)))` then returned a garbage FIXNUM instead of
+/// `o`, at T2 only, with interp/T0/T1 all correct.
+///
+/// The shape matters: the result must feed a loop-carried variable (discarding
+/// it needs no post-call reload), the call must be to a user function (a builtin
+/// pushes no activation), and the value must come from a parameter (a global is
+/// re-read from its symbol cell). The tier-differential corpus cannot catch this
+/// — its loops never reach the T2 promotion threshold.
+#[test]
+fn t2_osr_does_not_clobber_the_callers_parameter() {
+    // Identity callee: whatever `h` returns must be exactly what was passed in.
+    let program = "(progn \
+         (defun pf (x) x) \
+         (defun h (o n) (let ((r nil)) (dotimes (i n r) (setq r (pf o))))) \
+         (print (h 42 30000)))";
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let out = Command::new(BIN)
+            .args(["--no-init", "--eval", program])
+            .env("BLISS_FORCE_TIER", tier)
+            .output()
+            .expect("spawn bliss");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("42"),
+            "tier {tier}: identity through a hot loop must return 42, got: {stdout}"
+        );
+    }
+}

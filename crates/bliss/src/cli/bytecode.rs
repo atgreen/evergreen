@@ -13577,6 +13577,23 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     let Some(&offset) = t2.osr_entries.get(&header_bcp) else {
         return 0;
     };
+    // The T1 activation we are about to hand to T2 was sized for the BYTECODE's
+    // slot count. T2 code that synchronizes its native roots through shadow
+    // slots needs `num_slots + shadow_root_slots` (see validate_t2_root_sync),
+    // and writes them by absolute index — so entering such code on a
+    // T1-sized frame stores past the end of this activation and into the
+    // adjacent frame's header. That silently corrupted a caller's own
+    // parameter: a hot `(dotimes (i n r) (setq r (f o)))` returned the next
+    // frame's raw pointer instead of `o` (bliss-kqdr).
+    //
+    // Decline the OSR entry when the live frame is too small, exactly as
+    // validate_t2_root_sync already refuses to install shadow-root code with a
+    // compiled entry, and as the emitter declines an OSR entry it cannot
+    // transfer soundly. The loop keeps running at T1 and still promotes on its
+    // next full call, so this costs a fast path, never a correct result.
+    if t2.num_slots > body.num_slots() {
+        return 0;
+    }
     let entry = t2.entry as usize + offset;
     // SAFETY: the T2 emitter records only alternate entries having the same
     // `fn(*mut u64)->u64` ABI. `slots` is r14 from the still-live T1 frame.
