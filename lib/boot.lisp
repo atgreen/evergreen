@@ -1545,7 +1545,11 @@
          (ic-cell (member :initial-contents keys))
          (et-cell (member :element-type keys))
          (et (if et-cell (car (cdr et-cell)) t))
-         (stringp (member et '(character base-char standard-char)))
+         ;; A (VECTOR NIL) is a STRING subtype (CLHS 15.1.2.2): an
+         ;; :element-type of NIL holds no elements, so a length-0 one is
+         ;; SXHASH-similar to "" (ansi sxhash.8). Classify it as a string so
+         ;; MAKE-ARRAY builds string storage, not a general NIL-filled vector.
+         (stringp (member et '(character base-char standard-char nil)))
          (bitp (eq et 'bit))
          (fp-cell (member :fill-pointer keys))
          (adj-cell (member :adjustable keys))
