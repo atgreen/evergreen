@@ -6972,8 +6972,10 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
         let name = sym_name(val);
         if let Some(bare) = name.strip_prefix("KEYWORD:") {
             out.push(':');
-            // *PRINT-CASE* applies to symbol names (CLHS 22.1.3.3).
-            out.push_str(&bliss_stdlib::format::apply_print_case(bare));
+            // *PRINT-CASE* applies to symbol names, and a name that would not
+            // read back is wrapped in bars (CLHS 22.1.3.3). print_val_inner is
+            // the escaping (prin1) printer; princ goes through print_val_env.
+            out.push_str(&bliss_stdlib::format::print_symbol_name(bare, true));
         } else {
             // Uninterned symbols (make-symbol/gensym) print with the `#:` prefix
             // under prin1/~S so they read back as fresh uninterned symbols, unless
@@ -6988,7 +6990,7 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             } else {
                 bliss_stdlib::format::symbol_name_for_print(val)
             };
-            out.push_str(&bliss_stdlib::format::apply_print_case(&name));
+            out.push_str(&bliss_stdlib::format::print_symbol_name(&name, true));
         }
     } else if is_closure_cons(val) {
         // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not data.

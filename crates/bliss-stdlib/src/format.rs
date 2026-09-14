@@ -104,6 +104,91 @@ pub fn apply_print_case(name: &str) -> String {
     }
 }
 
+/// Would `name` read back as a number rather than a symbol? Such a name must be
+/// printed inside bars (CLHS 2.3.4). Recognises integer, ratio and float syntax
+/// — `123`, `-7.`, `1/2`, `1.5`, `1E5` — but not names that merely contain
+/// digits or exponent markers, so `E5`, `ABC1` and `A-B` stay unescaped.
+fn reads_as_number(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let body = name.strip_prefix(['+', '-']).unwrap_or(name);
+    if body.is_empty() {
+        return false;
+    }
+    // Integer, with CLHS's optional trailing decimal point: 123 or 123.
+    if digits(body.strip_suffix('.').unwrap_or(body)) {
+        return true;
+    }
+    // Ratio: digits / digits.
+    if let Some((num, den)) = body.split_once('/') {
+        return digits(num) && digits(den);
+    }
+    // Float: split a trailing exponent off first, then check the mantissa. An
+    // exponent alone is not enough (`E5` is a symbol); the mantissa must be
+    // numeric, and a float needs either a decimal point or an exponent.
+    let (mantissa, has_exponent) = body
+        .char_indices()
+        .find(|(_, c)| matches!(c, 'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L'))
+        .and_then(|(i, _)| {
+            let exp = &body[i + 1..];
+            let exp_digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            digits(exp_digits).then(|| (&body[..i], true))
+        })
+        .unwrap_or((body, false));
+    match mantissa.split_once('.') {
+        Some((int, frac)) => {
+            // `1.5`, `.5`, `1.` — at least one digit, both halves numeric.
+            (int.is_empty() || digits(int))
+                && (frac.is_empty() || digits(frac))
+                && mantissa.bytes().any(|b| b.is_ascii_digit())
+        }
+        None => has_exponent && digits(mantissa),
+    }
+}
+
+/// Whether a symbol name must be printed inside `|…|` bars so it reads back as
+/// the same symbol (CLHS 22.1.3.3). A name needs bars when it is empty, is all
+/// dots, contains a character the reader would treat specially (whitespace, a
+/// macro or terminating character, a package marker, or the escape characters
+/// themselves), contains lowercase the standard `:upcase` readtable would fold,
+/// or would read as a number.
+pub fn symbol_name_needs_bars(name: &str) -> bool {
+    if name.is_empty() || name.chars().all(|c| c == '.') {
+        return true;
+    }
+    if name.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_lowercase()
+            || matches!(
+                c,
+                '(' | ')' | '\'' | '"' | ';' | '`' | ',' | '|' | '\\' | '#' | ':'
+            )
+    }) {
+        return true;
+    }
+    reads_as_number(name)
+}
+
+/// A symbol name as the printer should render it. Under `*print-escape*`
+/// (prin1/~S) a name that would not read back is wrapped in bars, with any
+/// embedded `|` or `\` backslash-escaped, and *print-case* deliberately does
+/// NOT apply inside bars — the name is reproduced verbatim. princ/~A never
+/// adds bars (bliss-4m85).
+pub fn print_symbol_name(name: &str, escapep: bool) -> String {
+    if escapep && symbol_name_needs_bars(name) {
+        let mut out = String::with_capacity(name.len() + 2);
+        out.push('|');
+        for c in name.chars() {
+            if c == '|' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('|');
+        return out;
+    }
+    apply_print_case(name)
+}
+
 /// A symbol's readable name relative to the current `*PACKAGE*`. Registry keys
 /// encode home identity as `PKG::NAME`, but that qualifier is omitted when the
 /// same symbol is accessible in the current package (CLHS 22.1.3.3). Keep the
@@ -1002,7 +1087,7 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
             .or_else(|| name.strip_prefix("KEYWORD:"))
         {
             // prin1/~S prints the readable `:FOO`; princ/~A drops the marker.
-            let bare = apply_print_case(bare);
+            let bare = print_symbol_name(bare, escapep);
             return if escapep {
                 format!(":{}", bare)
             } else {
@@ -1015,14 +1100,14 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         // slynk's UNPARSE-NAME relies on this: `(subseq (prin1-to-string
         // (make-symbol s)) 2)` strips the `#:` — without it that subseq errors.
         if bliss_compiler::reader::is_uninterned(idx) {
-            let name = apply_print_case(&name);
+            let name = print_symbol_name(&name, escapep);
             return if escapep && print_gensym() {
                 format!("#:{}", name)
             } else {
                 name
             };
         }
-        return apply_print_case(&symbol_name_for_print(v));
+        return print_symbol_name(&symbol_name_for_print(v), escapep);
     }
     // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not the data
     // list it is structurally — print it as #<FUNCTION> (matches cli print_val).
