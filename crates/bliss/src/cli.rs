@@ -8315,7 +8315,27 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     // Borrow rather than clone: this runs once per symbol token read.
     let pkg_name = match pkg {
         Some(p) => resolve_package_name_cow(env, p),
-        None => std::borrow::Cow::Borrowed(env.current_package.as_str()),
+        // A BARE read homes into the CURRENT package — which is the live
+        // *PACKAGE* value, not just env.current_package. IN-PACKAGE keeps the
+        // two in sync, but a dynamic `(let ((*package* p)) …)` binds only the
+        // value cell, and the reader used to ignore it — homing a symbol read
+        // under such a binding into CL-USER instead of P (bliss-lfy6). Mirror
+        // effective_package_name (which intern/find-symbol already use), but
+        // over `&Env`: consult the *PACKAGE* cell, then a lexical binding,
+        // else current_package.
+        None => {
+            let cell = reader::find_symbol_index("*PACKAGE*")
+                .and_then(global_value_cell)
+                .or_else(|| env.lookup_var("*PACKAGE*"))
+                .and_then(|v| {
+                    let n = resolve_package_name(env, &val_as_str(v));
+                    (!n.is_empty()).then_some(n)
+                });
+            match cell {
+                Some(n) => std::borrow::Cow::Owned(n),
+                None => std::borrow::Cow::Borrowed(env.current_package.as_str()),
+            }
+        }
     };
     let cl_owns_name = bliss_stdlib::find_package("COMMON-LISP")
         .is_some_and(|cl| bliss_stdlib::find_present_symbol(cl, name).is_some());
