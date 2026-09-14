@@ -175,7 +175,9 @@ fn reader_acceptance_resolves_package_qualified_keyword_and_uninterned_symbols()
     register_package("APP");
 
     let (pkg, _) = read_from_string("app:thing").unwrap();
-    assert_eq!(symbol_text(pkg).as_deref(), Some("APP:THING"));
+    // Canonical qualified registry spelling is "PKG::NAME" (bliss-nc3b);
+    // single-colon keys are legacy.
+    assert_eq!(symbol_text(pkg).as_deref(), Some("APP::THING"));
 
     let (keyword, _) = read_from_string(":flag").unwrap();
     assert_eq!(symbol_text(keyword).as_deref(), Some("KEYWORD:FLAG"));

@@ -17581,11 +17581,11 @@ fn as_defun(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
         if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SETF" && tail.is_cons() {
             let (place, _) = cp(tail);
             if place.is_symbol() {
-                return Some((
-                    super::setf_writer_symbol_name(&sym_name(place)),
-                    params,
-                    body,
-                ));
+                let writer = super::setf_writer_symbol_name(&sym_name(place));
+                if std::env::var_os("BLISS_DEBUG_SETF").is_some() {
+                    eprintln!("[setf-dbg] as_defun writer install name: {writer}");
+                }
+                return Some((writer, params, body));
             }
         }
     }

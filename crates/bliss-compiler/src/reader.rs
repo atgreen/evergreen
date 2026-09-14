@@ -1887,8 +1887,40 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
                 // system so it shares identity with the bare-read symbol and with
                 // FIND-SYMBOL's result (bliss-lb6.12); fall back to name-keyed
                 // interning when no load environment is active.
-                let idx = resolve_symbol_via_hook(Some(pkg), sym_name)
-                    .unwrap_or_else(|| intern_symbol(&format!("{}:{}", pkg, sym_name)));
+                let idx = resolve_symbol_via_hook(Some(pkg), sym_name).unwrap_or_else(|| {
+                    // No resolver environment (e.g. deserializing a fasl
+                    // constant pool, or an internal read_symbol_token). The old
+                    // fallback interned the RAW designator spelling
+                    // ("nickname:NAME", single colon), which forked a second
+                    // identity for a symbol whose registry key is the
+                    // canonical "PACKAGE::NAME" — trivial-indent's setf writer
+                    // and documentation-utils' FORMAT-DOCUMENTATION generic
+                    // both went missing across that split (bliss-nc3b).
+                    // Canonicalize: probe every plausible existing spelling
+                    // (canonical and designator, "::" and ":"), and mint fresh
+                    // only under the canonical double-colon key that the
+                    // package layer's alloc_symbol also uses.
+                    let canon = bliss_rt::packages::find(pkg)
+                        .and_then(bliss_rt::packages::package_name)
+                        .unwrap_or_else(|| pkg.to_string());
+                    bliss_rt::symbols::find_index(&format!("{canon}::{sym_name}"))
+                        .or_else(|| bliss_rt::symbols::find_index(&format!("{canon}:{sym_name}")))
+                        .or_else(|| {
+                            (canon != pkg)
+                                .then(|| {
+                                    bliss_rt::symbols::find_index(&format!(
+                                        "{pkg}::{sym_name}"
+                                    ))
+                                    .or_else(|| {
+                                        bliss_rt::symbols::find_index(&format!(
+                                            "{pkg}:{sym_name}"
+                                        ))
+                                    })
+                                })
+                                .flatten()
+                        })
+                        .unwrap_or_else(|| intern_symbol(&format!("{canon}::{sym_name}")))
+                });
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
             _ => Err(BlissError::StreamError(format!(

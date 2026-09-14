@@ -1093,6 +1093,27 @@ pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
     )
 }
 
+/// The alternate qualified spelling of a symbol name: `PKG::NAME` ⇄
+/// `PKG:NAME`. The reader, `resolve_sym`, package-plan interning, and the
+/// bfasl constant pool do not yet agree on one canonical spelling, so the
+/// SAME conceptual symbol can exist under both registry keys (bliss-nc3b:
+/// trivial-indent's `(setf indentation)` writer registered under the
+/// single-colon identity while the SETF site resolved the double-colon one).
+/// Name-keyed lookups that must work across that split try both spellings.
+/// Keywords are excluded — `KEYWORD:NAME` is canonical.
+fn alternate_qualified_spelling(name: &str) -> Option<String> {
+    if name.starts_with("KEYWORD:") || name.starts_with(':') {
+        return None;
+    }
+    if let Some((pkg, bare)) = name.split_once("::") {
+        return Some(format!("{pkg}:{bare}"));
+    }
+    if let Some((pkg, bare)) = name.split_once(':') {
+        return Some(format!("{pkg}::{bare}"));
+    }
+    None
+}
+
 /// Whether `place_name` (an accessor's `sym_name`) has a user `(defun (setf
 /// place) …)` writer known at compile time (registered as a global setf writer).
 /// Used by the portable SETF lowering to recognize a user setf-function place.
@@ -15528,15 +15549,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         *val,
                                         env,
                                     )?;
-                                } else if let Some(writer_sym) =
+                                } else if let Some(writer_sym) = {
+                                    // Probe the mangled writer symbol under BOTH
+                                    // qualified spellings of the place — install
+                                    // and use sites can disagree on `:` vs `::`
+                                    // (bliss-nc3b; see alternate_qualified_spelling).
+                                    let usable = |idx: u32| {
+                                        bytecode::is_registered(idx)
+                                            || bliss_rt::symbols::symbol_function(idx)
+                                                .is_some_and(|f| f != bliss_rt::value::UNBOUND)
+                                    };
                                     bliss_rt::symbols::find_index(&setf_writer_symbol_name(other))
-                                        .filter(|&idx| {
-                                            bytecode::is_registered(idx)
-                                                || bliss_rt::symbols::symbol_function(idx)
-                                                    .is_some_and(|f| f != bliss_rt::value::UNBOUND)
+                                        .filter(|&idx| usable(idx))
+                                        .or_else(|| {
+                                            alternate_qualified_spelling(other).and_then(|alt| {
+                                                bliss_rt::symbols::find_index(
+                                                    &setf_writer_symbol_name(&alt),
+                                                )
+                                                .filter(|&idx| usable(idx))
+                                            })
                                         })
                                         .map(BlissVal::from_symbol_index)
-                                {
+                                } {
                                     // A source-free `(defun (setf place) …)` writer
                                     // installed from a .bfasl on the mangled
                                     // %SETF-WRITER-place symbol. It may be bytecode
@@ -15554,7 +15588,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     }
                                     apply_function(writer_sym, &args, env)?;
                                 } else if let Some((params_form, body)) =
-                                    callable_body(env, &format!("(SETF {})", other))
+                                    callable_body(env, &format!("(SETF {})", other)).or_else(
+                                        || {
+                                            // Same `:`/`::` spelling split as the
+                                            // mangled-writer probe above (bliss-nc3b).
+                                            alternate_qualified_spelling(other).and_then(|alt| {
+                                                callable_body(env, &format!("(SETF {alt})"))
+                                            })
+                                        },
+                                    )
                                 {
                                     // A user-defined writer: (defun (setf place) …).
                                     // Call it as (funcall #'(setf place) NEW args…):
@@ -26146,6 +26188,9 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // particular from a different file loaded later (bliss-d0b). A per-Env
         // `funs` entry was lost across the throwaway compile/load Envs.
         let name = function_name_key(name_form);
+        if std::env::var_os("BLISS_DEBUG_SETF").is_some() {
+            eprintln!("[setf-dbg] eval_defun registers GLOBAL_SETF_FNS key: {name}");
+        }
         let params = extract_params(params_form);
         GLOBAL_SETF_FNS.with(|m| {
             m.borrow_mut().insert(name, FunDef::plain(params, params_form, body))

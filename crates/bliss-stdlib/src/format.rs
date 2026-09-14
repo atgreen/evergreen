@@ -131,10 +131,27 @@ pub fn symbol_name_for_print(symbol: BlissVal) -> String {
             .flatten()
             .is_some_and(|(visible, _)| visible == symbol)
     }) {
-        bare.to_string()
-    } else {
-        name
+        return bare.to_string();
     }
+    // Keep the qualifier, spelled by ACCESSIBILITY per CLHS 22.1.3.3.1: an
+    // EXTERNAL symbol of its home package prints "PKG:NAME", anything else
+    // "PKG::NAME" — independent of which spelling the registry key happens to
+    // carry (canonical keys are "::"; legacy single-colon keys still exist).
+    let qualifier = name
+        .rsplit_once("::")
+        .map(|(package, _)| package)
+        .or_else(|| name.rsplit_once(':').map(|(package, _)| package));
+    if let Some(package_name) = qualifier {
+        if let Some(home) = crate::packages::find_package(package_name) {
+            let marker = if crate::packages::is_external_symbol(home, bare) {
+                ":"
+            } else {
+                "::"
+            };
+            return format!("{package_name}{marker}{bare}");
+        }
+    }
+    name
 }
 
 /// `*PRINT-LENGTH*`: the max number of elements of a list/vector to print before
