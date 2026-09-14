@@ -16,6 +16,12 @@ value — even after loop-invariant code motion, GVN, dead-code elimination,
 unboxing, and register allocation have rewritten the fast path beyond
 recognition.
 
+> **Physical layout.** This chapter specifies the *IR-level* FrameState.
+> The concrete native frame it is reconstructed from — the BlissStack
+> `Frame` header, the activation slot area, shadow root slots, and the
+> rule that T2 code may only be entered on a frame large enough to hold
+> them — is documented in `docs/design/t2-frame-layout.md`.
+
 This chapter specifies that mapping — the **FrameState** — as a first-class IR
 artefact, the **deopt-preservation invariant** every pass obeys, the
 **rematerialisation** mechanism that lets dead-on-the-fast-path values still be
