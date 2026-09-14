@@ -5839,7 +5839,7 @@ fn install_evaluator_global_root_scanner() {
 /// `reset_clos=true` would wipe the parent thread's classes and packages.
 fn thread_entry_runner(mut entry: BlissVal) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted_ref!(_entry_root = &mut entry);
-    let mut env = Env::new_impl(false, false);
+    let mut env = Env::new_impl(false, false, false);
     // Root the worker's whole Env in place, exactly as the main thread does at
     // `read_eval_all_env` (bliss-bw3t). Without this the worker's environment —
     // and every lexical value reachable from it (e.g. a list being consed up in
@@ -5961,7 +5961,7 @@ impl Env {
     /// each independent program (and each test) starts from a clean class
     /// registry.
     fn new(sandbox: bool) -> Self {
-        Self::new_impl(sandbox, true)
+        Self::new_impl(sandbox, true, false)
     }
 
     /// A transient environment for macro / compiler-macro expansion. Unlike
@@ -5970,11 +5970,17 @@ impl Env {
     /// every user class defined before a later macro expansion, which corrupted
     /// the ASDF load: `make-instance` of an early class (e.g. `system`) failed
     /// with "no slot layout" because the class had been erased (bliss-lb6).
+    /// It also ADOPTS the live environment's definitional registries (funs /
+    /// classes / generics / methods / setf-expanders / symbol-macros): a
+    /// fasl-compiled macro expander calling a generic function — e.g.
+    /// documentation-utils' DEFINE-DOCS expander funcalling
+    /// FORMAT-DOCUMENTATION — otherwise dispatched against this env's EMPTY
+    /// tables and died "undefined function" mid-expansion (bliss-nc3b).
     fn new_for_macro_expansion(sandbox: bool) -> Self {
-        Self::new_impl(sandbox, false)
+        Self::new_impl(sandbox, false, true)
     }
 
-    fn new_impl(sandbox: bool, reset_clos: bool) -> Self {
+    fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = bliss_stdlib::bootstrap_clos();
@@ -6020,6 +6026,34 @@ impl Env {
             method_context: Vec::new(),
             eval_context: EvalContext::Repl,
         };
+        // Definitional-registry sharing (bliss-nc3b): a macro-expansion env
+        // ADOPTS the live top-level env's tables so expanders see the loading
+        // world's defuns/classes/generics; a real env RECORDS its tables as
+        // the live set. Thread-local, so a worker thread (whose Rcs must not
+        // cross threads) simply finds no record and keeps its own fresh maps.
+        if for_macro_expansion {
+            LIVE_DEFINITIONAL_REGISTRIES.with(|cell| {
+                if let Some(regs) = cell.borrow().as_ref() {
+                    env.funs = Rc::clone(&regs.funs);
+                    env.setf_expanders = Rc::clone(&regs.setf_expanders);
+                    env.symbol_macros = Rc::clone(&regs.symbol_macros);
+                    env.classes = Rc::clone(&regs.classes);
+                    env.generics = Rc::clone(&regs.generics);
+                    env.methods = Rc::clone(&regs.methods);
+                }
+            });
+        } else {
+            LIVE_DEFINITIONAL_REGISTRIES.with(|cell| {
+                *cell.borrow_mut() = Some(DefinitionalRegistries {
+                    funs: Rc::clone(&env.funs),
+                    setf_expanders: Rc::clone(&env.setf_expanders),
+                    symbol_macros: Rc::clone(&env.symbol_macros),
+                    classes: Rc::clone(&env.classes),
+                    generics: Rc::clone(&env.generics),
+                    methods: Rc::clone(&env.methods),
+                });
+            });
+        }
         // Root the under-construction Env for the rest of new_impl: the
         // seeding below allocates repeatedly (resolve_sym interning, stream
         // construction, the STORAGE-CONDITION pool), and a relocating minor GC
@@ -7420,6 +7454,24 @@ fn symbol_package_value(env: &Env, sym: BlissVal) -> BlissVal {
     }
     let pkg = symbol_home_package_name(sym);
     package_object(&resolve_package_name(env, &pkg))
+}
+
+/// The live top-level environment's definitional registries, recorded by the
+/// non-macro [`Env::new_impl`] and ADOPTED by macro-expansion envs so a
+/// compiled expander can call the loading world's generics/defuns
+/// (bliss-nc3b). Thread-local: the `Rc` tables must never cross threads.
+struct DefinitionalRegistries {
+    funs: Rc<RefCell<HashMap<String, FunDef>>>,
+    setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
+    symbol_macros: Rc<RefCell<HashMap<u32, BlissVal>>>,
+    classes: Rc<RefCell<HashMap<String, ClassDef>>>,
+    generics: Rc<RefCell<HashMap<String, GenericDef>>>,
+    methods: Rc<RefCell<HashMap<String, Vec<MethodDef>>>>,
+}
+
+thread_local! {
+    static LIVE_DEFINITIONAL_REGISTRIES: RefCell<Option<DefinitionalRegistries>> =
+        const { RefCell::new(None) };
 }
 
 fn resolve_sym(name: &str) -> Option<BlissVal> {
