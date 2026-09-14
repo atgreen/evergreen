@@ -21472,6 +21472,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // to the global registry entry of the same name.
             let is_local_fn = env.funs.borrow().contains_key(&name);
             let mut call_parent = Rc::clone(&env.frame);
+            if std::env::var_os("BLISS_DEBUG_DISPATCH").is_some() && name.contains("MK-CLOSURE") {
+                eprintln!("[disp] operator path name={name} local={is_local_fn} body_nil={}", body.is_nil());
+            }
             if !is_local_fn {
                 maybe_lazy_compile(&name, *params_form, *body, env);
                 // Dispatch through the resolved function OBJECT, mirroring the

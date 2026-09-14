@@ -528,6 +528,13 @@ pub fn call_registered(
     fn_val: BlissVal,
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
+    if std::env::var_os("BLISS_DEBUG_DISPATCH").is_some() {
+        eprintln!(
+            "[disp] call_registered sym={} registered={}",
+            sym_label(sym),
+            registry_get(sym).is_some()
+        );
+    }
     let callee = registry_get(sym)?;
     if !arity_accepts(&callee, args.len()) {
         return None; // arg count outside the lambda list's range: tree-walker binds it
@@ -5939,17 +5946,46 @@ fn handler_lambda_parts(
 }
 
 fn collect_symbol_names(form: BlissVal, out: &mut std::collections::HashSet<String>) {
+    collect_symbol_names_qq(form, out, 0);
+}
+
+/// [`collect_symbol_names`] with quasiquote awareness (bliss-t9o1). `qq` is the
+/// quasiquote nesting depth. At depth 0 a QUOTE is opaque data — but inside a
+/// quasiquote template QUOTE does NOT stop substitution: `',x` reads as
+/// `(QUOTE (UNQUOTE X))`, and skipping it hid X from the free-variable scan.
+/// A closure like ``(lambda (form) `(doc ',form ',type))`` was then judged
+/// NON-capturing and lowered to EvalHost, evaluating the lambda source outside
+/// its activation — every reference to the enclosing TYPE died "unbound"
+/// (documentation-utils' translator closures via their fasl's lazy compile).
+/// Inside a template (`qq > 0`) bare symbols are DATA (not collected), every
+/// cons is scanned structurally, QUASIQUOTE deepens, and UNQUOTE /
+/// UNQUOTE-SPLICING return to evaluated code one level up.
+fn collect_symbol_names_qq(form: BlissVal, out: &mut std::collections::HashSet<String>, qq: u32) {
     if form.is_symbol() {
-        out.insert(sym_name(form));
+        if qq == 0 {
+            out.insert(sym_name(form));
+        }
         return;
     }
     if form.is_cons() {
         let (car, cdr) = cp(form);
-        if car.is_symbol() && sym_name(car) == "QUOTE" {
-            return;
+        if car.is_symbol() {
+            let head = symbol_bare_name(&sym_name(car));
+            match head.as_str() {
+                "QUASIQUOTE" => {
+                    collect_symbol_names_qq(cdr, out, qq + 1);
+                    return;
+                }
+                "UNQUOTE" | "UNQUOTE-SPLICING" if qq > 0 => {
+                    collect_symbol_names_qq(cdr, out, qq - 1);
+                    return;
+                }
+                "QUOTE" if qq == 0 => return,
+                _ => {}
+            }
         }
-        collect_symbol_names(car, out);
-        collect_symbol_names(cdr, out);
+        collect_symbol_names_qq(car, out, qq);
+        collect_symbol_names_qq(cdr, out, qq);
     }
 }
 
