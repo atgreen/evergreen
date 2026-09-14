@@ -30365,6 +30365,51 @@ fn apply_builtin_fast(
             env.clear_mv();
             Some(Ok(if args[0] == args[1] { T } else { NIL }))
         }
+        // Rank-1 array element read/write, on already-evaluated args. Without
+        // this a compiled loop's CallNamed for e.g. SET-AREF fell through to
+        // apply_function, which synthesized `(SET-AREF 'a 'i 'v)` — allocating
+        // quoted-arg conses — and re-entered eval_form PER ITERATION, making a
+        // 100k (setf (aref a i) i) loop take ~50s even as T0 bytecode
+        // (bliss-3o0r). Only the fast rank-1/fixnum-index case is handled here;
+        // a multidimensional array or a bad index returns None so the slow path
+        // keeps the exact CLHS semantics and error messages.
+        "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" | "ELT"
+            if args.len() == 2
+                && args[1].is_fixnum()
+                && args[1].as_fixnum() >= 0
+                && !bliss_rt::types::md_array_p(args[0]) =>
+        {
+            env.clear_mv();
+            let i = args[1].as_fixnum() as usize;
+            // ELT bounds against the fill pointer; AREF and friends against the
+            // total size (CLHS). Mirror the operator handlers exactly.
+            Some(if name == "ELT" {
+                bliss_stdlib::elt(args[0], i)
+            } else {
+                bliss_stdlib::aref(args[0], i)
+            })
+        }
+        "BLISS::SET-AREF" | "BLISS::SET-ELT"
+            if args.len() == 3
+                && args[1].is_fixnum()
+                && args[1].as_fixnum() >= 0
+                && bliss_rt::types::md_array_storage(args[0]).is_none()
+                // Simple strings and cons places have their own store shapes in
+                // the operator handler; keep them on the slow path so this
+                // fast-path only handles the vector/complex-vector case.
+                && !args[0].is_cons()
+                && !(is_string_value(args[0]) && !bliss_stdlib::is_complex_vector(args[0])) =>
+        {
+            env.clear_mv();
+            let i = args[1].as_fixnum() as usize;
+            let val = args[2];
+            let r = if name == "BLISS::SET-ELT" {
+                bliss_stdlib::set_elt(args[0], i, val)
+            } else {
+                bliss_stdlib::set_aref(args[0], i, val)
+            };
+            Some(r.map(|_| val))
+        }
         "GETHASH" if args.len() == 2 || args.len() == 3 => {
             let default = if args.len() >= 3 { args[2] } else { NIL };
             Some(
