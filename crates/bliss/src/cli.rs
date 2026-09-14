@@ -6034,23 +6034,35 @@ impl Env {
         if for_macro_expansion {
             LIVE_DEFINITIONAL_REGISTRIES.with(|cell| {
                 if let Some(regs) = cell.borrow().as_ref() {
-                    env.funs = Rc::clone(&regs.funs);
-                    env.setf_expanders = Rc::clone(&regs.setf_expanders);
-                    env.symbol_macros = Rc::clone(&regs.symbol_macros);
-                    env.classes = Rc::clone(&regs.classes);
-                    env.generics = Rc::clone(&regs.generics);
-                    env.methods = Rc::clone(&regs.methods);
+                    if let Some(t) = regs.funs.upgrade() {
+                        env.funs = t;
+                    }
+                    if let Some(t) = regs.setf_expanders.upgrade() {
+                        env.setf_expanders = t;
+                    }
+                    if let Some(t) = regs.symbol_macros.upgrade() {
+                        env.symbol_macros = t;
+                    }
+                    if let Some(t) = regs.classes.upgrade() {
+                        env.classes = t;
+                    }
+                    if let Some(t) = regs.generics.upgrade() {
+                        env.generics = t;
+                    }
+                    if let Some(t) = regs.methods.upgrade() {
+                        env.methods = t;
+                    }
                 }
             });
         } else {
             LIVE_DEFINITIONAL_REGISTRIES.with(|cell| {
                 *cell.borrow_mut() = Some(DefinitionalRegistries {
-                    funs: Rc::clone(&env.funs),
-                    setf_expanders: Rc::clone(&env.setf_expanders),
-                    symbol_macros: Rc::clone(&env.symbol_macros),
-                    classes: Rc::clone(&env.classes),
-                    generics: Rc::clone(&env.generics),
-                    methods: Rc::clone(&env.methods),
+                    funs: Rc::downgrade(&env.funs),
+                    setf_expanders: Rc::downgrade(&env.setf_expanders),
+                    symbol_macros: Rc::downgrade(&env.symbol_macros),
+                    classes: Rc::downgrade(&env.classes),
+                    generics: Rc::downgrade(&env.generics),
+                    methods: Rc::downgrade(&env.methods),
                 });
             });
         }
@@ -7461,12 +7473,17 @@ fn symbol_package_value(env: &Env, sym: BlissVal) -> BlissVal {
 /// compiled expander can call the loading world's generics/defuns
 /// (bliss-nc3b). Thread-local: the `Rc` tables must never cross threads.
 struct DefinitionalRegistries {
-    funs: Rc<RefCell<HashMap<String, FunDef>>>,
-    setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
-    symbol_macros: Rc<RefCell<HashMap<u32, BlissVal>>>,
-    classes: Rc<RefCell<HashMap<String, ClassDef>>>,
-    generics: Rc<RefCell<HashMap<String, GenericDef>>>,
-    methods: Rc<RefCell<HashMap<String, Vec<MethodDef>>>>,
+    // Weak: several Env registries copy-on-write when their Rc strong count
+    // exceeds 1 (`funs_mut` etc.), so holding STRONG clones here would make
+    // every definition deep-clone its map and silently decouple the live env
+    // from this record. Weak handles observe without inflating the count; a
+    // macro-expansion env upgrades them only for its (short) lifetime.
+    funs: std::rc::Weak<RefCell<HashMap<String, FunDef>>>,
+    setf_expanders: std::rc::Weak<RefCell<HashMap<String, SetfExpander>>>,
+    symbol_macros: std::rc::Weak<RefCell<HashMap<u32, BlissVal>>>,
+    classes: std::rc::Weak<RefCell<HashMap<String, ClassDef>>>,
+    generics: std::rc::Weak<RefCell<HashMap<String, GenericDef>>>,
+    methods: std::rc::Weak<RefCell<HashMap<String, Vec<MethodDef>>>>,
 }
 
 thread_local! {
