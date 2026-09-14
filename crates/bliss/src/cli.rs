@@ -7712,6 +7712,14 @@ fn is_simple_vector_value(v: BlissVal) -> bool {
 
 // ── Collect a list into a Vec of elements ─────────────────────────
 fn list_to_vec(val: BlissVal) -> Vec<BlissVal> {
+    list_to_vec_with_tail(val).0
+}
+
+/// Walk a list into a `Vec`, also returning the final cdr. A proper list ends
+/// in NIL; any other tail means the argument was improper (dotted) or not a
+/// list at all. Callers that must honour ENDP semantics — DOLIST, LOOP's `in`
+/// driver — check that tail and signal a TYPE-ERROR (bliss-p9qk).
+fn list_to_vec_with_tail(val: BlissVal) -> (Vec<BlissVal>, BlissVal) {
     let mut result = Vec::new();
     let mut c = val;
     while c.is_cons() {
@@ -7719,7 +7727,7 @@ fn list_to_vec(val: BlissVal) -> Vec<BlissVal> {
         result.push(car);
         c = cdr;
     }
-    result
+    (result, c)
 }
 
 fn vec_to_list(elems: &[BlissVal]) -> BlissVal {
@@ -21432,12 +21440,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // `(dolist (x (return 1)))` returns from DOLIST's OWN block
                     // (DOLIST.11), not an outer one.
                     let list = eval_form(*list_form, env)?;
-                    bliss_rt::rooted!(elems = list_to_vec(list));
+                    // CLHS 6.1.2.1.3: DOLIST terminates via ENDP, so a dotted
+                    // list (or a non-list) is a TYPE-ERROR — and the error is
+                    // signalled only after the proper prefix has been visited,
+                    // which is what SBCL does and what the body's side effects
+                    // must reflect. Rooted because the body allocates
+                    // (bliss-p9qk).
+                    let (elems_vec, tail) = list_to_vec_with_tail(list);
+                    bliss_rt::rooted!(elems = elems_vec);
+                    bliss_rt::rooted!(tail = tail);
                     for i in 0..elems.len() {
                         with_child_frame(env, Rc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, elems[i]);
                             eval_tagbody(*body, env)
                         })?;
+                    }
+                    if !tail.is_nil() {
+                        return Err(BlissError::TypeError {
+                            datum: *tail,
+                            expected: "list".into(),
+                        });
                     }
                     if result_rest.is_cons() {
                         let (result_form, _) = cp(*result_rest);
@@ -22398,9 +22420,18 @@ impl ForState {
     /// the loop's allocating body.
     fn visit_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
         match self {
-            ForState::In { pat, items, .. }
-            | ForState::Across { pat, items, .. }
-            | ForState::Being { pat, items, .. } => {
+            ForState::In {
+                pat, items, tail, ..
+            } => {
+                visit(pat as *mut BlissVal);
+                for it in items.iter_mut() {
+                    visit(it as *mut BlissVal);
+                }
+                // The retained tail spans the loop's allocating body, so it is
+                // a root like any other cursor (bliss-p9qk).
+                visit(tail as *mut BlissVal);
+            }
+            ForState::Across { pat, items, .. } | ForState::Being { pat, items, .. } => {
                 visit(pat as *mut BlissVal);
                 for it in items.iter_mut() {
                     visit(it as *mut BlissVal);
@@ -22940,6 +22971,10 @@ enum ForState {
         pat: BlissVal,
         items: Vec<BlissVal>,
         idx: usize,
+        /// The list's final cdr. NIL for a proper list; anything else means the
+        /// driver ran off an improper list, which ENDP must report as a
+        /// TYPE-ERROR once the proper prefix has been consumed (bliss-p9qk).
+        tail: BlissVal,
     },
     On {
         pat: BlissVal,
@@ -23547,7 +23582,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     // items across the allocating step-fn calls (moving GC;
                     // bliss-4bp): `for x in plist by #'cddr` is common in uiop.
                     bliss_rt::rooted!(list = eval_form(*list_form, env)?);
-                    let items = match step {
+                    let (items, in_tail) = match step {
                         // `for x in list by fn`: x takes the car of each stepped
                         // tail (list, (fn list), (fn (fn list)), …).
                         Some(step_form) => {
@@ -23558,14 +23593,15 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                 items.push(cp(*tail).0);
                                 *tail = apply_function(*step_fn, &[*tail], env)?;
                             }
-                            std::mem::take(&mut *items)
+                            (std::mem::take(&mut *items), *tail)
                         }
-                        None => list_to_vec(*list),
+                        None => list_to_vec_with_tail(*list),
                     };
                     states.push(ForState::In {
                         pat: *pat,
                         items,
                         idx: 0,
+                        tail: in_tail,
                     });
                     has_stepping_driver = true;
                 }
@@ -23740,6 +23776,8 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             pat: *uvar,
                             items: paired,
                             idx: 0,
+                            // Built internally from the hash table; always proper.
+                            tail: NIL,
                         });
                     }
                     has_stepping_driver = true;
@@ -23761,8 +23799,23 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
             let mut exhausted = false;
             for st in &mut states {
                 match st {
-                    ForState::In { pat, items, idx } => {
+                    ForState::In {
+                        pat,
+                        items,
+                        idx,
+                        tail,
+                    } => {
                         if *idx >= items.len() {
+                            // CLHS 6.1.2.1.1: the `in` driver tests with ENDP, so
+                            // running off an improper list is a TYPE-ERROR rather
+                            // than a normal exit — signalled here, after the body
+                            // has seen every element of the proper prefix.
+                            if !tail.is_nil() {
+                                return Err(BlissError::TypeError {
+                                    datum: *tail,
+                                    expected: "list".into(),
+                                });
+                            }
                             exhausted = true;
                             break;
                         }
