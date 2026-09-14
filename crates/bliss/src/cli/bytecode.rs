@@ -3221,15 +3221,26 @@ impl<'e> Lowerer<'e> {
                                     form_list(&[s("CDR")?, lst])
                                 };
                             bliss_rt::rooted_ref!(_step_expr_root = &mut step_expr);
+                            // Termination test (bliss-p9qk). CLHS 6.1.2.1: `on`
+                            // steps by CDR and tests with ATOM, so a dotted list
+                            // simply ends — (loop for l on '(1 2 . 3)) yields
+                            // (1 2 . 3) and (2 . 3), matching SBCL. `in` tests
+                            // with ENDP, which signals a TYPE-ERROR on a non-list
+                            // tail. Both used NULL, which is wrong twice over: on
+                            // an atom tail NULL is false, so `on` ran the body and
+                            // then stepped (CDR atom) — signalling where the
+                            // standard says terminate — while `in` only errored
+                            // incidentally, via (CAR atom) in the body.
+                            //
                             // Root each sub-list before the next allocates
                             // (bliss-sqpi): argument expressions are evaluated
                             // left to right, so the outer form_list's rooting
                             // comes too late for an earlier sibling.
-                            let mut null_form = form_list(&[s("NULL")?, lst]);
-                            bliss_rt::rooted_ref!(_null_form_root = &mut null_form);
+                            let mut end_test = form_list(&[s(if on { "ATOM" } else { "ENDP" })?, lst]);
+                            bliss_rt::rooted_ref!(_end_test_root = &mut end_test);
                             let mut go_form = form_list(&[s("GO")?, end]);
                             bliss_rt::rooted_ref!(_go_form_root = &mut go_form);
-                            top_tests.push(form_list(&[s("WHEN")?, null_form, go_form]));
+                            top_tests.push(form_list(&[s("WHEN")?, end_test, go_form]));
                             let cur = if on {
                                 lst
                             } else {
@@ -4048,7 +4059,14 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted!(per_iter = per_iter);
         bliss_rt::rooted_ref!(_result_root = &mut result);
 
-        bliss_rt::rooted!(when_items = vec![s("WHEN")?, var]);
+        // CLHS 6.1.2.1: `for VAR on LIST` steps by CDR and tests with ATOM, so
+        // a dotted list terminates cleanly — (loop for l on '(1 2 . 3)) yields
+        // (1 2 . 3) and (2 . 3), as SBCL does. A bare truthiness guard let the
+        // atom tail through, ran the body on it, and then signalled from
+        // (CDR 3) — an error exactly where the standard says stop (bliss-p9qk).
+        let mut on_guard = form_list(&[s("CONSP")?, var]);
+        bliss_rt::rooted_ref!(_on_guard_root = &mut on_guard);
+        bliss_rt::rooted!(when_items = vec![s("WHEN")?, on_guard]);
         when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CDR")?, var])]));
         when_items.push(form_list(&[s("GO")?, top]));
