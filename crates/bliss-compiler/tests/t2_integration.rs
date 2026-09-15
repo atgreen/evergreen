@@ -66,7 +66,7 @@ fn emitted_heap_literal_is_loaded_from_its_constant_pool_slot() {
         0,
     );
     let f = build_from_bytecode(&bf).expect("build heap literal");
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit heap literal");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit heap literal");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [0u64];
@@ -123,7 +123,7 @@ fn inlined_heap_literal_uses_the_saved_body_constant_slot() {
             .all(|&inst| f.inst(inst).opcode != Opcode::Call)
     }));
     let framed =
-        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, Some(caller)).expect("emit inlined heap literal");
+        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, Some(caller)).expect("emit inlined heap literal");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [0u64];
@@ -205,7 +205,7 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
             .any(|&i| typep_f.inst(i).opcode == Opcode::Call)
     }));
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit INTEGERP intrinsic");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit INTEGERP intrinsic");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: BlissVal| {
@@ -259,7 +259,7 @@ fn bytecode_typep_boolean_executes_without_a_call_or_deopt() {
     assert!(!check.flags.guard);
     assert!(check.frame_state.is_none());
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit TypeP BOOLEAN");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit TypeP BOOLEAN");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: BlissVal| {
@@ -319,6 +319,7 @@ fn take_values_to_locals_materializes_secondary_ssa_results() {
 
     let framed = emit_framed_with_activation_slots(
         &f,
+        0,
         0,
         0,
         0,
@@ -385,7 +386,7 @@ fn stringp_reaches_string_typecheck_through_inline_metadata() {
             .any(|&i| f.inst(i).opcode == Opcode::Call)
     }));
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit STRINGP");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit STRINGP");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: BlissVal| {
@@ -585,6 +586,7 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
         0,
         0,
         0,
+        0,
         activation_slots,
         None,
     )
@@ -753,6 +755,7 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
             0,
             0,
             0,
+            0,
             None,
         )
         .expect("emit guarded cons accessor");
@@ -809,6 +812,7 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     let framed = emit_framed(
         &f,
         cons_access_deopt as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -922,6 +926,7 @@ fn first_char_metadata_expands_to_guarded_string_layout_ir() {
     let framed = emit_framed(
         &f,
         first_char_deopt as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -1046,7 +1051,7 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
         "the dominating proof eliminates the guard cloned by the second call"
     );
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, Some(caller))
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, Some(caller))
         .expect("emit caller after general guard elimination");
     let base_layout_cmp = [0x80, 0x7a, 0x07, type_id::SIMPLE_BASE_STRING];
     assert_eq!(
@@ -1279,7 +1284,7 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit branching function");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit branching function");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -1339,7 +1344,7 @@ fn call_containing_function_emits() {
     let n = speculate(&mut f, &|bcp| (bcp == 3).then_some(SpecType::Fixnum));
     assert_eq!(n, 1, "the multiply is speculated; the call is not");
     let framed =
-        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("a call-containing function must emit");
+        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("a call-containing function must emit");
     assert!(!framed.code.is_empty());
     // A call function with ≤4 params gets a register entry (for direct self-calls),
     // so its compiled entry sits past the interpreter (frame-loading) entry.
@@ -1413,6 +1418,7 @@ fn wide_call_uses_a_gc_visible_activation_slice() {
         0,
         0,
         call_slice as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -1524,7 +1530,7 @@ fn bitwise_logand_speculates_and_runs() {
             .any(|&i| f.inst(i).opcode == Opcode::LogAnd)),
         "a LogAnd op must be present"
     );
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit bitwise");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit bitwise");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [BlissVal::from_fixnum(0x3E7).0, 0u64, 0u64];

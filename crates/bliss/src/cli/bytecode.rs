@@ -573,13 +573,26 @@ fn arity_accepts(callee: &BytecodeFunction, n: usize) -> bool {
     n >= callee.min_args as usize && callee.max_args.is_none_or(|m| n <= m as usize)
 }
 
+/// `BLISS_DEBUG_DISPATCH` — cached (bliss-jtc.9 perf).
+///
+/// `call_registered` runs on EVERY call that goes through bytecode dispatch, and
+/// this check was its first statement as an uncached `env::var_os`. Under musl,
+/// `getenv` is a linear `strncmp` scan of `environ`, so a debug flag nobody had
+/// set was costing roughly a third of main-thread time in call-heavy code
+/// (measured: `getenv`+`strncmp`+`__strchrnul` ~= 35% of samples in a generic
+/// dispatch loop). Read it once.
+fn debug_dispatch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_DEBUG_DISPATCH").is_some())
+}
+
 pub fn call_registered(
     sym: u32,
     args: &[BlissVal],
     fn_val: BlissVal,
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
-    if std::env::var_os("BLISS_DEBUG_DISPATCH").is_some() {
+    if debug_dispatch_enabled() {
         eprintln!(
             "[disp] call_registered sym={} registered={}",
             sym_label(sym),
@@ -13650,11 +13663,15 @@ struct InlinedResumeScope {
 /// Cap on native (T1) call-stack depth before the dispatcher falls back to the
 /// flat T0 interpreter path (bliss-x5y.4). Env-overridable for tests.
 fn native_depth_cap() -> u32 {
-    std::env::var("BLISS_NATIVE_DEPTH_CAP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(64)
+    use std::sync::OnceLock;
+    static CAP: OnceLock<u32> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("BLISS_NATIVE_DEPTH_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64)
+    })
 }
 
 /// Decrements `NATIVE_DEPTH` on drop, so every exit from `run_native` (Ok, Err,
@@ -14692,11 +14709,15 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
 /// Per-function deopt count before a function's speculative code is uninstalled
 /// and blacklisted (bliss-jtc.27). Env-overridable for tests; default 8.
 fn deopt_blacklist_threshold() -> u32 {
-    std::env::var("BLISS_DEOPT_BLACKLIST_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(8)
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BLISS_DEOPT_BLACKLIST_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8)
+    })
 }
 
 fn positive_env(names: &[&str], default: u32) -> u32 {
@@ -14719,7 +14740,17 @@ fn t1_threshold() -> u32 {
         Some(ForcedTier::T1 | ForcedTier::T2) => return 1, // promote on first call
         _ => {}
     }
-    positive_env(&["BLISS_T0_T1_THRESHOLD", "BLISS_T1_THRESHOLD"], 10)
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| positive_env(&["BLISS_T0_T1_THRESHOLD", "BLISS_T1_THRESHOLD"], 10))
+}
+
+/// `BLISS_T2=1`, cached. Read on the per-call tiering decision path, where an
+/// uncached `getenv` is a linear scan of `environ` under musl (bliss-jtc.9).
+fn bliss_t2_forced() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag("BLISS_T2") == Some(true))
 }
 
 fn env_flag(name: &str) -> Option<bool> {
@@ -14757,10 +14788,14 @@ fn t2_enabled() -> bool {
         Some(_) => return false,
         None => {}
     }
-    if env_flag("BLISS_DISABLE_T2") == Some(true) {
-        return false;
-    }
-    env_flag("BLISS_T2") != Some(false)
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if env_flag("BLISS_DISABLE_T2") == Some(true) {
+            return false;
+        }
+        env_flag("BLISS_T2") != Some(false)
+    })
 }
 
 /// T1→T2 invocation threshold.  The old `BLISS_T2=1` opt-in is retained only
@@ -14770,6 +14805,9 @@ fn t2_invoke_threshold() -> u32 {
     if forced_tier() == Some(ForcedTier::T2) {
         return 1;
     }
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
     let explicit = [
         "BLISS_T1_T2_INVOKE_THRESHOLD",
         "BLISS_T1_T2_THRESHOLD",
@@ -14795,18 +14833,23 @@ fn t2_invoke_threshold() -> u32 {
             256
         }
     })
+    })
 }
 
 /// T1→T2 loop-hotness threshold.  Both spellings used by the stage-5 specs
 /// are accepted; this is independent of the lower OSR threshold machinery.
 fn t2_backedge_threshold() -> u32 {
-    positive_env(
-        &[
-            "BLISS_T1_T2_BACKEDGE_THRESHOLD",
-            "BLISS_LOOP_HEAT_THRESHOLD",
-        ],
-        10_000,
-    )
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        positive_env(
+            &[
+                "BLISS_T1_T2_BACKEDGE_THRESHOLD",
+                "BLISS_LOOP_HEAT_THRESHOLD",
+            ],
+            10_000,
+        )
+    })
 }
 
 /// Return the current invocation count. Named functions have already had their
@@ -15153,7 +15196,7 @@ fn native_for_dispatch(
     // Legacy BLISS_T2=1 remains a deterministic force/debug mode for tests and
     // disassembly sessions. Compilation still runs on a compiler thread; only
     // this requesting dispatch waits for publication.
-    if (env_flag("BLISS_T2") == Some(true) || forced_tier() == Some(ForcedTier::T2))
+    if (bliss_t2_forced() || forced_tier() == Some(ForcedTier::T2))
         && (requested || T2_QUEUED.with(|queued| queued.borrow().contains_key(&sym)))
     {
         return wait_for_t2(sym).or(Some(current));
