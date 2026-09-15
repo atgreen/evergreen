@@ -1175,6 +1175,7 @@ fn is_known_special_operator(val: BlissVal) -> bool {
                 | "MACROLET"
                 | "MULTIPLE-VALUE-CALL"
                 | "MULTIPLE-VALUE-PROG1"
+                | "MULTIPLE-VALUE-SETQ"
                 | "PROGN"
                 | "PROGV"
                 | "QUOTE"
@@ -1256,6 +1257,7 @@ fn expand_special_form(
         "RETURN-FROM" => expand_return_from(form, env),
         "TAGBODY" => expand_tagbody(form, env),
         "SETQ" => expand_setq(form, env),
+        "MULTIPLE-VALUE-SETQ" => expand_multiple_value_setq(form, env),
         "THE" => expand_the(form, env),
         "EVAL-WHEN" => expand_eval_when(form, env),
         "FUNCTION" => expand_function_special(form, env),
@@ -1412,6 +1414,66 @@ fn expand_tagbody(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Bli
     } else {
         Ok(alloc_cons(operator, vec_to_cons(&expanded_items)))
     }
+}
+
+/// Expand MULTIPLE-VALUE-SETQ: (multiple-value-setq (var*) form)
+///
+/// A var that names a SYMBOL MACRO is assigned as a PLACE, not as a variable —
+/// CLHS defines the form as `(values (setf (values var*) form))`. Without this,
+/// MULTIPLE-VALUE-SETQ was not in the special-form list at all, so its var LIST
+/// was walked as if it were a call and the symbol macros in it were never
+/// substituted. SYMBOL-MACROLET expands its body eagerly through this
+/// macroexpander (see eval_symbol_macrolet), so nothing downstream could
+/// recover the binding: the assignment silently went to a variable named by the
+/// symbol instead of to the place, and the place kept its old value with no
+/// error (ansi MULTIPLE-VALUE-SETQ.3/.4/.6/.7). A GLOBAL DEFINE-SYMBOL-MACRO
+/// already worked, because that table survives to the tree-walker.
+///
+/// Vars that are NOT symbol macros are left alone, exactly as SETQ leaves them.
+fn expand_multiple_value_setq(
+    mut form: BlissVal,
+    env: &Environment,
+) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    bliss_rt::rooted_ref!(_form_root = &mut form);
+    let mut operator = unsafe { cons_car(form) };
+    bliss_rt::rooted_ref!(_operator_root = &mut operator);
+    let args = unsafe { cons_cdr(form) };
+    bliss_rt::rooted!(items = cons_to_vec(args));
+    if items.is_empty() {
+        return Ok(form);
+    }
+    bliss_rt::rooted!(vars = cons_to_vec(items[0]));
+    let val_form = items.get(1).copied().unwrap_or(bliss_rt::value::NIL);
+    bliss_rt::rooted!(expanded_val = macroexpand_all(val_form, env)?);
+
+    bliss_rt::rooted!(places = Vec::<BlissVal>::new());
+    let mut any_symbol_macro = false;
+    for i in 0..vars.len() {
+        let var = vars[i];
+        if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(var) {
+            any_symbol_macro = true;
+            places.push(expansion);
+        } else {
+            places.push(var);
+        }
+    }
+
+    if !any_symbol_macro {
+        // Rebuild with the expanded value form; the var list is untouched.
+        bliss_rt::rooted!(rebuilt = vec_to_cons(&[items[0], *expanded_val]));
+        return Ok(alloc_cons(operator, *rebuilt));
+    }
+
+    // (values (setf (values place*) expanded-value)) — the VALUES wrapper
+    // truncates to the primary value, which is what MULTIPLE-VALUE-SETQ returns.
+    let values_sym = make_symbol("VALUES");
+    bliss_rt::rooted!(values_place = alloc_cons(values_sym, vec_to_cons(&places)));
+    bliss_rt::rooted!(
+        setf_form = vec_to_cons(&[make_symbol("SETF"), *values_place, *expanded_val])
+    );
+    bliss_rt::rooted!(wrapped = vec_to_cons(&[make_symbol("VALUES"), *setf_form]));
+    macroexpand_all(*wrapped, env)
 }
 
 /// Expand SETQ: (setq {var value}*)
