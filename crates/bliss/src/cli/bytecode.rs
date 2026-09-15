@@ -171,10 +171,12 @@ thread_local! {
     /// Bytecode functions keyed by symbol index. A `CallNamed` checks this
     /// first; a hit runs as a native frame on the `BlissStack`, a miss falls
     /// back to `apply_function` (builtins, generics, tree-walker functions).
-    static REGISTRY: RefCell<HashMap<u32, Rc<BytecodeFunction>>> = RefCell::new(HashMap::new());
+    static REGISTRY: RefCell<HashMap<u32, Rc<BytecodeFunction>, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Definition generations reject background compilations that finish after
     /// a DEFUN has replaced their bytecode snapshot.
-    static REGISTRY_GENERATION: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
+    static REGISTRY_GENERATION: RefCell<HashMap<u32, u64, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Bytecode bodies currently executing but not necessarily present in the
     /// global registry (top-level thunks, nested closures, and macro expanders).
     static ACTIVE_BYTECODE_FUNCTIONS: RefCell<Vec<usize>> = RefCell::new(Vec::new());
@@ -14343,6 +14345,16 @@ impl ReceiverTypeProfile {
 }
 
 fn generic_receiver_profile(name: &str) -> &'static ReceiverTypeProfile {
+    // Look up by &str FIRST (bliss-jtc.9 perf). `entry()` needs an owned key, so
+    // the previous `entry(name.to_string())` allocated — and freed — a String on
+    // EVERY generic dispatch, including the overwhelmingly common case where the
+    // profile already exists. That showed up in the profile as a malloc/free pair
+    // plus a SipHash and a memcmp per call. `get()` borrows the &str, so the
+    // steady-state path now allocates nothing; only a first-ever dispatch of a
+    // given generic takes the owned-key insert below.
+    if let Some(profile) = GENERIC_RECEIVER_PROFILE.with(|m| m.borrow().get(name).copied()) {
+        return profile;
+    }
     GENERIC_RECEIVER_PROFILE.with(|m| {
         let mut profiles = m.borrow_mut();
         *profiles.entry(name.to_string()).or_insert_with(|| {
@@ -14462,25 +14474,32 @@ fn clear_bytecode_profiles(func_ptr: usize) {
 
 thread_local! {
     /// Operand-type profiles keyed by (bytecode-function pointer, CallNamed bcp).
-    static TYPE_PROFILE: RefCell<HashMap<(usize, u32), TypeProfile>> = RefCell::new(HashMap::new());
+    static TYPE_PROFILE: RefCell<HashMap<(usize, u32), TypeProfile, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// T0/T1 entries per saved bytecode body. This is the denominator for
     /// call-site frequency and advances in the same sampling window as calls.
-    static FUNCTION_SAMPLE_PROFILE: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+    static FUNCTION_SAMPLE_PROFILE: RefCell<HashMap<usize, u32, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Executions per `(saved bytecode body, CallNamed bcp)`.
-    static CALL_SITE_PROFILE: RefCell<HashMap<(usize, u32), &'static RuntimeCallSiteProfile>> =
-        RefCell::new(HashMap::new());
+    static CALL_SITE_PROFILE:
+        RefCell<HashMap<(usize, u32), &'static RuntimeCallSiteProfile, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Receiver class/type profiles keyed by generic function name.
-    static GENERIC_RECEIVER_PROFILE: RefCell<HashMap<String, &'static ReceiverTypeProfile>> =
-        RefCell::new(HashMap::new());
+    static GENERIC_RECEIVER_PROFILE:
+        RefCell<HashMap<String, &'static ReceiverTypeProfile, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Installed T1/T2 code keyed by the same symbol index as the bytecode registry.
-    static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>>> = RefCell::new(HashMap::new());
+    static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Per-function invocation counters driving T0→T1 promotion.
-    static INVOKE_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    static INVOKE_COUNTS: RefCell<HashMap<u32, u32, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Per-function speculative-deopt counters (bliss-jtc.27). When a function
     /// deopts more than the backoff threshold, its speculative native code is
     /// uninstalled and it is blacklisted from re-promotion — HotSpot's policy of
     /// not repeatedly recompiling code that keeps deoptimizing.
-    static DEOPT_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    static DEOPT_COUNTS: RefCell<HashMap<u32, u32, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Functions whose speculation proved unprofitable; kept in T0 thereafter.
     static DEOPT_BLACKLIST: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
@@ -14499,7 +14518,8 @@ thread_local! {
         RefCell::new(std::collections::HashSet::new());
     /// Symbols with one outstanding background T2 request.  Coalescing here
     /// prevents a hot dispatch/back-edge from flooding the global queue.
-    static T2_QUEUED: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
+    static T2_QUEUED: RefCell<HashMap<u32, u64, bliss_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
     /// Each mutator owns its completion channel. Workers return relocatable
     /// code bytes; executable-memory and tier publication remain on the owner.
     static T2_COMPLETIONS: RefCell<Option<(
