@@ -15915,6 +15915,33 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         return Ok(f);
                     }
                 }
+                // `#'(setf place)` — the writer registered by
+                // `(defun (setf place) …)`. Those live in GLOBAL_SETF_FNS keyed
+                // by the `"(SETF PLACE)"` string that `function_name_key` builds
+                // (with PLACE fully qualified), and `callable_body_of_symbol`
+                // already resolves a symbol carrying that name. So interning the
+                // key and returning that symbol makes the writer a first-class
+                // function designator for FUNCALL/APPLY, where `#'(setf place)`
+                // previously returned the bare `(SETF PLACE)` cons — not a
+                // function at all (bliss-0qd8).
+                if name_form.is_cons() {
+                    let (sh, st) = cp(name_form);
+                    if sh.is_symbol()
+                        && symbol_bare_name(&sym_name_rc(sh)) == "SETF"
+                        && st.is_cons()
+                    {
+                        // Intern the key VERBATIM: it contains parens and a
+                        // package marker, so resolve_sym's tokenizer rejects it
+                        // and the registry holds no such symbol until we make one.
+                        let key = function_name_key(name_form);
+                        let writer = BlissVal::from_symbol_index(
+                            bliss_compiler::reader::intern_symbol(&key),
+                        );
+                        if callable_body_of_symbol(env, writer, &key).is_some() {
+                            return Ok(writer);
+                        }
+                    }
+                }
                 // (function (lambda (params) body...)) — create a closure
                 if name_form.is_cons() {
                     let (lh, lr) = cp(name_form);
