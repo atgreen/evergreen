@@ -416,7 +416,11 @@ impl<'a> Builder<'a> {
                     }
                 };
             match &code[i] {
-                Instr::Const(_) | Instr::LoadLocal(_) | Instr::LoadGlobal(_) | Instr::Dup => {
+                Instr::Const(_)
+                | Instr::LoadLocal(_)
+                | Instr::LoadGlobal(_)
+                | Instr::LoadFunction(_)
+                | Instr::Dup => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
                 Instr::TypeP(_) => {
@@ -684,6 +688,24 @@ impl<'a> Builder<'a> {
                         IRType::TOP,
                     );
                     stack.push(v.expect("SymbolValue has a result"));
+                }
+                Instr::LoadFunction(sym) => {
+                    // `#'f`: a runtime read of the symbol's function cell, with
+                    // the same shape as LoadGlobal above (bliss-m285). Without
+                    // this the whole function was rejected, which is why any
+                    // code mentioning #'f — (mapcar #'f …) and friends — could
+                    // never reach T2.
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let v = self.emit(
+                        block,
+                        Opcode::SymbolFunction,
+                        vec![],
+                        AuxData::SymbolRef(*sym),
+                        runtime_call_flags(),
+                        Some(fs),
+                        IRType::TOP,
+                    );
+                    stack.push(v.expect("SymbolFunction has a result"));
                 }
                 Instr::StoreGlobal(sym) => {
                     let fs = self.build_frame_state(block, &stack, i as u32);

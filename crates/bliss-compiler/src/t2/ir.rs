@@ -187,6 +187,11 @@ pub enum Opcode {
     Cdr,
     VecRef,
     SymbolValue,
+    /// `#'f` for a global function name — a RUNTIME load of the symbol's
+    /// function cell, not a constant: the function may be redefined between
+    /// compile and call. Lowered like `SymbolValue`, through a c2i helper
+    /// (bliss-m285).
+    SymbolFunction,
     /// Direct UTF-8 byte-length load from a value refined by a preceding
     /// `Guard` carrying `AuxData::StringLayout`.
     StringByteLength,

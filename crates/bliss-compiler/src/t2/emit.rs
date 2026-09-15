@@ -2120,6 +2120,7 @@ pub fn emit_framed(
     c2i_call_addr: u64,
     c2i_call_slice_addr: u64,
     c2i_load_global_addr: u64,
+    c2i_load_function_addr: u64,
     c2i_store_global_addr: u64,
     c2i_mv_addr: u64,
     self_sym: Option<u32>,
@@ -2131,6 +2132,7 @@ pub fn emit_framed(
         c2i_call_addr,
         c2i_call_slice_addr,
         c2i_load_global_addr,
+        c2i_load_function_addr,
         c2i_store_global_addr,
         c2i_mv_addr,
         0,
@@ -2148,6 +2150,7 @@ pub fn emit_framed_with_activation_slots(
     c2i_call_addr: u64,
     c2i_call_slice_addr: u64,
     c2i_load_global_addr: u64,
+    c2i_load_function_addr: u64,
     c2i_store_global_addr: u64,
     c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
@@ -2161,6 +2164,7 @@ pub fn emit_framed_with_activation_slots(
         c2i_call_addr,
         c2i_call_slice_addr,
         c2i_load_global_addr,
+        c2i_load_function_addr,
         c2i_store_global_addr,
         c2i_mv_addr,
         c2i_recovery_toggle_addr,
@@ -2176,6 +2180,7 @@ fn emit_framed_inner(
     c2i_call_addr: u64,
     c2i_call_slice_addr: u64,
     c2i_load_global_addr: u64,
+    c2i_load_function_addr: u64,
     c2i_store_global_addr: u64,
     c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
@@ -2223,6 +2228,7 @@ fn emit_framed_inner(
             op,
             Opcode::Call
                 | Opcode::SymbolValue
+                | Opcode::SymbolFunction
                 | Opcode::SetSymbolValue
                 | Opcode::ClearMv
                 | Opcode::TakeValuesToLocals
@@ -2751,6 +2757,7 @@ fn emit_framed_inner(
                             | Opcode::Car
                             | Opcode::Cdr
                             | Opcode::SymbolValue
+                            | Opcode::SymbolFunction
                             | Opcode::SetSymbolValue
                             | Opcode::ClearMv
                             | Opcode::TakeValuesToLocals
@@ -3037,6 +3044,16 @@ fn emit_framed_inner(
                     &d,
                     &inst_reg,
                     c2i_load_global_addr,
+                    c2i_recovery_toggle_addr,
+                )?;
+            } else if d.opcode == Opcode::SymbolFunction {
+                // Same shape as a global read, different helper: it reads the
+                // symbol's FUNCTION cell rather than its value cell.
+                emit_symbol_value(
+                    &mut a,
+                    &d,
+                    &inst_reg,
+                    c2i_load_function_addr,
                     c2i_recovery_toggle_addr,
                 )?;
             } else if d.opcode == Opcode::SetSymbolValue {
@@ -4085,6 +4102,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
         )
         .expect("emit string byte length")
@@ -4120,6 +4138,7 @@ mod tests {
         let char_code = emit_framed(
             &char_ir,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4169,6 +4188,7 @@ mod tests {
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4286,6 +4306,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
         )
         .expect("emit");
@@ -4320,6 +4341,7 @@ mod tests {
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4378,7 +4400,7 @@ mod tests {
             },
         );
 
-        let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, None).expect("emit identity");
+        let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit identity");
         assert!(
             !framed.has_deopt,
             "identity has no guard branch and must be direct-call eligible"
@@ -4397,6 +4419,7 @@ mod tests {
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,
@@ -4513,6 +4536,7 @@ mod tests {
         let code = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            0,
             0,
             0,
             0,

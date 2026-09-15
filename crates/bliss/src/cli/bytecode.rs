@@ -5055,7 +5055,13 @@ impl<'e> Lowerer<'e> {
         if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
             return self.lower_expr(target);
         }
-        if target.is_symbol() && self.portable {
+        // `#'globalname` is just that symbol's function cell — no host eval is
+        // needed, and emitting EvalHost here capped EVERY function mentioning
+        // `#'f` at T1, since T2's builder rejects EvalHost. That excluded
+        // idiomatic higher-order code like (mapcar #'f …) from the top tier
+        // (bliss-m285). This was already the portable-mode lowering; it is
+        // correct in both modes.
+        if target.is_symbol() {
             self.emit(Instr::LoadFunction(target.as_symbol_index()));
             self.push_n(1);
             return Ok(());
@@ -11826,9 +11832,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // and CLOS dispatches it to the FUNCTION class (bliss-5ir). Fall
                 // back to the bare symbol designator (builtins/generics/macros with
                 // no reified cell), which funcall/apply still accept.
-                let v = bliss_rt::symbols::symbol_function(sym)
-                    .filter(|c| bliss_rt::function::is_interpreted_function(*c))
-                    .unwrap_or_else(|| BlissVal::from_symbol_index(sym));
+                // Go through the SAME reifier the tree-walker's FUNCTION form
+                // uses, so `#'car` yields a FUNCTIONP builtin wrapper rather than
+                // the bare symbol. `#'f` used to lower to EvalHost (which ran that
+                // tree-walker path); once it lowers to LoadFunction, this arm owns
+                // the semantics and must match, or (functionp #'car) => NIL
+                // (bliss-m285).
+                let name_sym = BlissVal::from_symbol_index(sym);
+                let v = super::symbol_function_object(env, name_sym).unwrap_or(name_sym);
                 acts[top_idx].push_op(v);
             }
             Instr::BindSpecial(sym) => {
@@ -13030,6 +13041,24 @@ extern "C" fn c2i_load_global(sym: u64) -> u64 {
 /// Write a global/special symbol's dynamic value cell (bliss-x5y.15). A side
 /// effect, so a function containing `StoreGlobal` opts out of speculation (see
 /// `deopt_safe`) — a whole-function deopt-rerun must never re-run the store.
+/// `#'f` from T2 code: read the symbol's FUNCTION cell (bliss-m285). Mirrors
+/// the T0 `Instr::LoadFunction` semantics exactly — the heap function object
+/// when the symbol names an interpreted/compiled function (so it is FUNCTIONP
+/// and CLOS dispatches it), else the bare symbol designator, which funcall and
+/// apply still accept.
+extern "C" fn c2i_load_function(sym: u64) -> u64 {
+    let name_sym = BlissVal::from_symbol_index(sym as u32);
+    let env_ptr = NATIVE_ENV.with(|e| e.get());
+    if env_ptr.is_null() {
+        return name_sym.0;
+    }
+    // SAFETY: `run_native` parks a live `&mut Env` for the duration of the
+    // native call and native code calls this synchronously within that window
+    // — the same contract as every other c2i helper here.
+    let env = unsafe { &mut *env_ptr };
+    super::symbol_function_object(env, name_sym).unwrap_or(name_sym).0
+}
+
 extern "C" fn c2i_store_global(sym: u64, val: u64) {
     bliss_rt::symbols::set_symbol_value(sym as u32, BlissVal(val));
 }
@@ -15774,6 +15803,7 @@ fn emit_native_x86(
         c2i_call_slice as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
+    let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let load_env_addr = c2i_load_env as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let store_env_addr = c2i_store_env as extern "C" fn(u64, u64, u64) as usize as u64;
@@ -16415,6 +16445,20 @@ fn emit_native_x86(
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c); // result → operand stack
             }
+            // `#'f` — identical shape to LoadGlobal, reading the symbol's
+            // FUNCTION cell instead of its value cell (bliss-m285). T1 must
+            // handle this or it declines the whole function: `#'f` used to lower
+            // to EvalHost, which T1 accepted and T2 rejected, so moving to
+            // LoadFunction without this arm would merely move the cap from T2
+            // down to T1 (measured: deriv fell back to T0 and got slower).
+            Instr::LoadFunction(sym) => {
+                c.extend_from_slice(&[0xBF]); // mov edi, imm32 (sym)
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_load_function)
+                c.extend_from_slice(&load_function_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
             // Pop the value, write it to the global/special cell (bliss-x5y.15).
             // Consumes the operand and pushes nothing (SETQ then reloads for its
             // value). A side effect, so the function is not speculated.
@@ -17036,6 +17080,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let call_slice_addr =
         c2i_call_slice as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64 as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
+    let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let mv_addr = c2i_t2_mv as extern "C" fn(u64, *mut BlissVal, u64) as usize as u64;
     let recovery_toggle_addr =
@@ -17047,6 +17092,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         call_addr,
         call_slice_addr,
         load_global_addr,
+        load_function_addr,
         store_global_addr,
         mv_addr,
         recovery_toggle_addr,
