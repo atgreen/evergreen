@@ -27947,9 +27947,12 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                 }
             }
         }
-        // Default expansion for a function place with a `(setf f)` writer: bind
-        // each argument to a temporary, then store via `((setf f) new t1 t2 …)`
-        // and access via `(f t1 t2 …)`. Everything below allocates (gensym /
+        // Default expansion for a function place: bind each argument to a
+        // temporary and access via `(f t1 t2 …)`. Known built-in places store
+        // through SETF because many intentionally have no callable `(setf f)`
+        // writer. Otherwise ANSI requires the canonical `#'(setf f)` form so
+        // portable code walkers can recognize an otherwise-undefined function
+        // place. Everything below allocates (gensym /
         // vec_to_list can fire a minor GC), so root the accessor, argument forms,
         // temporaries, store gensym and each freshly built form — otherwise a
         // relocation leaves a stale pointer in the returned expansion, which for
@@ -27969,21 +27972,77 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
         access_items.extend_from_slice(&temps);
         bliss_rt::rooted_ref!(_ai = &mut access_items);
         bliss_rt::rooted!(access_form = vec_to_list(&access_items));
-        // `#'(setf accessor)`, NOT the bare `(setf accessor)` list: the store
-        // form is EVALUATED by whoever uses the expansion, so an unwrapped name
-        // would be evaluated as a SETF form (yielding NIL) and the FUNCALL would
-        // then fail with "undefined function: NIL" (bliss-0qd8).
-        bliss_rt::rooted!(
-            setf_name = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *accessor])
-        );
-        bliss_rt::rooted!(
-            setf_fn = vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), *setf_name])
-        );
-        let mut store_items =
-            vec![resolve_sym("FUNCALL").unwrap_or(NIL), *setf_fn, *store];
-        store_items.extend_from_slice(&temps);
-        bliss_rt::rooted_ref!(_si = &mut store_items);
-        let store_form = vec_to_list(&store_items);
+        let bare_acc = symbol_bare_name(&acc);
+        let common_lisp_builtin_setf_place = accessor.symbol_index().is_some_and(|index| {
+            !reader::is_uninterned(index) && !symbol_is_homeless(index)
+        })
+            && symbol_home_package_name(*accessor) == "COMMON-LISP"
+            && (matches!(
+                bare_acc.as_str(),
+                "CAR"
+                | "FIRST"
+                | "CDR"
+                | "REST"
+                | "SECOND"
+                | "THIRD"
+                | "FOURTH"
+                | "FIFTH"
+                | "SIXTH"
+                | "SEVENTH"
+                | "EIGHTH"
+                | "NINTH"
+                | "TENTH"
+                | "NTH"
+                | "SUBSEQ"
+                | "GETHASH"
+                | "LOGICAL-PATHNAME-TRANSLATIONS"
+                | "GET"
+                | "SYMBOL-PLIST"
+                | "SLOT-VALUE"
+                | "SYMBOL-VALUE"
+                | "SYMBOL-FUNCTION"
+                | "FDEFINITION"
+                | "MACRO-FUNCTION"
+                | "CHAR"
+                | "SCHAR"
+                | "AREF"
+                | "SVREF"
+                | "ROW-MAJOR-AREF"
+                | "ELT"
+                | "BIT"
+                | "SBIT"
+                | "FILL-POINTER"
+                | "DOCUMENTATION"
+            ) || bare_acc
+                .strip_prefix('C')
+                .and_then(|name| name.strip_suffix('R'))
+                .is_some_and(|middle| {
+                    middle.len() >= 2 && middle.chars().all(|ch| ch == 'A' || ch == 'D')
+                }));
+        let store_form = if common_lisp_builtin_setf_place {
+            // ACCESS-FORM contains only fresh temporaries, so SETF cannot
+            // re-evaluate any original place subform (bliss-42iv).
+            vec_to_list(&[
+                resolve_sym("SETF").unwrap_or(NIL),
+                *access_form,
+                *store,
+            ])
+        } else {
+            // Preserve the ANSI default for an otherwise-undefined function
+            // place: `(funcall #'(setf accessor) new t1 t2 …)`. This is also the
+            // path for a real `(defun (setf f) …)` writer.
+            bliss_rt::rooted!(
+                setf_name = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *accessor])
+            );
+            bliss_rt::rooted!(
+                setf_fn = vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), *setf_name])
+            );
+            let mut store_items =
+                vec![resolve_sym("FUNCALL").unwrap_or(NIL), *setf_fn, *store];
+            store_items.extend_from_slice(&temps);
+            bliss_rt::rooted_ref!(_si = &mut store_items);
+            vec_to_list(&store_items)
+        };
         return Ok(SetfExpansion {
             temps: temps.clone(),
             vals: arg_forms.clone(),

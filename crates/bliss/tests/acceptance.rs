@@ -1081,6 +1081,89 @@ fn plist_places_and_nconc_conform() {
 }
 
 #[test]
+fn get_setf_expansion_store_form_handles_standard_places() {
+    // GET-SETF-EXPANSION's fourth value must be an executable storing form,
+    // including for standard places whose writers are implemented directly by
+    // SETF rather than exposed as functions named (SETF accessor) (bliss-42iv).
+    let expr = "(progn
+                  (defmacro store-through-expansion (place value &environment env)
+                    (multiple-value-bind (temps vals stores store access)
+                        (get-setf-expansion place env)
+                      (declare (ignore access))
+                      `(let* (,@(mapcar #'list temps vals)
+                               (,(car stores) ,value))
+                         ,store)))
+                  (defun custom-place (cell) (car cell))
+                  (defun (setf custom-place) (new cell)
+                    (setf (car cell) new))
+                  (let* ((bits (make-array 4 :element-type 'bit :initial-element 0))
+                         (text (copy-seq \"abc\"))
+                         (items (list 1 2 3 4))
+                         (nested (list (list 'a 'b) (list 'c 'd)))
+                         (custom-cell (list 0))
+                         (sym (gensym))
+                         (fp (make-array 4 :fill-pointer 2 :initial-element 0))
+                         (matrix (make-array '(2 2) :initial-element 0))
+                         (unknown (gensym))
+                         (unknown-store
+                           (nth-value 3 (get-setf-expansion (list unknown))))
+                         (foreign-package (make-package (symbol-name (gensym))))
+                         (foreign-bit (intern \"BIT\" foreign-package))
+                         (foreign-store
+                           (nth-value 3 (get-setf-expansion (list foreign-bit))))
+                         (uninterned-bit (make-symbol \"BIT\"))
+                         (uninterned-store
+                           (nth-value 3 (get-setf-expansion (list uninterned-bit))))
+                         (nonsymbol-accessor (list 'lambda (list 'x) 'x))
+                         (nonsymbol-store
+                           (nth-value 3
+                                      (get-setf-expansion
+                                        (list nonsymbol-accessor)))))
+                    (store-through-expansion (bit bits 1) 1)
+                    (store-through-expansion (char text 2) #\\z)
+                    (store-through-expansion (subseq text 0 2) \"XY\")
+                    (store-through-expansion (nth 2 items) 9)
+                    (store-through-expansion (fourth items) 5)
+                    (store-through-expansion (cadar nested) 6)
+                    (store-through-expansion (custom-place custom-cell) 11)
+                    (store-through-expansion (get sym 'k) 7)
+                    (store-through-expansion (fill-pointer fp) 3)
+                    (store-through-expansion (row-major-aref matrix 3) 8)
+                    (store-through-expansion (symbol-plist sym) '(:p 4 k 7))
+                    (princ (list (bit bits 1) text items (cadar nested)
+                                 (custom-place custom-cell)
+                                 (get sym 'k) (fill-pointer fp)
+                                 (row-major-aref matrix 3) (symbol-plist sym)
+                                 (labels ((contains-writer (tree name)
+                                            (or (equal tree
+                                                       (list 'function
+                                                             (list 'setf name)))
+                                                (and (consp tree)
+                                                     (or (contains-writer (car tree) name)
+                                                         (contains-writer (cdr tree) name))))))
+                                   (list (contains-writer unknown-store unknown)
+                                         (contains-writer foreign-store foreign-bit)
+                                         (contains-writer uninterned-store uninterned-bit)
+                                         (contains-writer nonsymbol-store
+                                                          nonsymbol-accessor)))))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "GET-SETF-EXPANSION store form failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(1 \"XYz\" (1 2 9 5) 6 11 7 3 8 (:P 4 K 7) (T T T T))"),
+        "GET-SETF-EXPANSION store forms produced wrong values: '{stdout}'"
+    );
+}
+
+#[test]
 fn nth_wrong_arg_count_is_catchable() {
     // (nth) with too few args signals a catchable PROGRAM-ERROR, not an
     // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).

@@ -2663,11 +2663,11 @@
   (+ (- integer (mask-field bytespec integer))
      (mask-field bytespec newbyte)))
 
-;; The standard `(setf ACCESSOR)` FUNCTIONS (CLHS 5.1.2.9). These exist so that
-;; #'(setf car) and friends are real, callable functions — which is what
-;; GET-SETF-EXPANSION's setter form assumes (it emits
-;; `(funcall #'(setf car) new obj)`), and what portable code that builds its own
-;; setf macros on GET-SETF-EXPANSION needs (bliss-0qd8).
+;; The standard `(setf ACCESSOR)` FUNCTIONS (CLHS 5.1.2.9). These make
+;; #'(setf car) and friends real callable functions for portable code. Bliss's
+;; GET-SETF-EXPANSION uses SETF directly for known built-in places that lack a
+;; writer, while retaining the canonical callable-writer form for other function
+;; places (bliss-0qd8, bliss-42iv).
 ;;
 ;; They are written against the STORE PRIMITIVES (RPLACA/RPLACD/BLISS::SET-AREF/
 ;; …), never against SETF itself: routing them through `(setf (car o) v)` would
@@ -2718,11 +2718,9 @@
       (values (cons btemp dummies)
               (cons bytespec vals)
               (list store)
-              ;; Store through SETF on the GETTER rather than through the
-              ;; expansion's own setter form: that setter is
-              ;; `(funcall #'(setf car) ...)`, and the `(setf car)` function is
-              ;; not fbound here, so using it breaks nested places. PUSH/POP
-              ;; above ignore the setter for the same reason.
+              ;; The GETTER mentions only expansion temporaries, so this SETF
+              ;; neither re-evaluates the inner place nor depends on its concrete
+              ;; writer representation.
               `(progn (setf ,getter (dpb ,store ,btemp ,getter)) ,store)
               `(ldb ,btemp ,getter)))))
 
@@ -2807,8 +2805,9 @@
         (let ((vtemp (gensym)))
           (push (list vtemp (cadr p)) binds)
           ;; Store through the ACCESS form: it mentions only the temporaries, so
-          ;; nothing is re-evaluated, and SETF handles every accessor (the
-          ;; expansion's own store form does not — bliss-42iv).
+          ;; nothing is re-evaluated, and SETF handles every accessor. The
+          ;; expansion's own store form now takes the same route for built-in
+          ;; places (bliss-42iv).
           (push (list 'setf getter vtemp) assigns)))
       (setq p (cddr p)))
     `(let* ,(reverse binds) ,@(reverse assigns) nil)))
@@ -2829,14 +2828,10 @@
 ;; Collect the setf expansions of PLACES into
 ;;   (values reversed-let*-bindings store-vars store-forms access-forms)
 ;; with the per-place temporaries bound left to right.
-;; Store through (SETF <access-form> <temp>) rather than through the expansion's
-;; own store form. The access form mentions only the temporaries, so nothing is
-;; re-evaluated, and SETF's place machinery handles every standard accessor.
-;; The store form GET-SETF-EXPANSION returns is `(funcall #'(setf acc) …)`, and
-;; no writer function exists for BIT/SBIT/CHAR/SCHAR/NTH/GET/FILL-POINTER/
-;; ROW-MAJOR-AREF/SUBSEQ/SYMBOL-PLIST/FOURTH/CADAR/… — using it turned
-;; `(rotatef (bit x 1) (bit y 3) z)` into a TYPE-ERROR. INCF/DECF above take
-;; the same (setf getter …) route for the same reason. See bliss-42iv.
+;; Store through (SETF <access-form> <temp>). The access form mentions only the
+;; temporaries, so nothing is re-evaluated, and SETF's place machinery handles
+;; every standard accessor. GET-SETF-EXPANSION's own store form now uses this
+;; same representation for built-in places (bliss-42iv).
 (defun %setf-expansions (places env)
   (let ((binds nil) (getters nil))
     (dolist (raw places)
