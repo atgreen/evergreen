@@ -12586,7 +12586,17 @@ fn order_sensitive_setf_accessor(mut place: BlissVal) -> Option<String> {
     let bare = symbol_bare_name(&sym_name_rc(acc));
     if matches!(
         bare.as_str(),
-        "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT" | "BIT" | "SBIT"
+        "CHAR"
+            | "SCHAR"
+            | "AREF"
+            | "SVREF"
+            | "ROW-MAJOR-AREF"
+            | "ELT"
+            | "BIT"
+            | "SBIT"
+            // VALUES holds arbitrary sub-PLACES, each of whose subforms must run
+            // before the value form too (bliss-dj5k).
+            | "VALUES"
     ) {
         Some(bare)
     } else {
@@ -15232,26 +15242,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         let (tgt_form, _) = cp(*aargs);
                         match acc.as_str() {
                             "VALUES" => {
-                                // (setf (values p1 p2 …) form) — distribute the
-                                // values FORM produced (captured in env.mv by the
-                                // eval above) across the places, defaulting missing
-                                // values to NIL.
-                                let values = if env.mv_active {
-                                    env.mv.clone()
-                                } else {
-                                    vec![*val]
-                                };
-                                let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
-                                for (i, pf) in list_to_vec(*aargs).into_iter().enumerate() {
-                                    let v = values.get(i).copied().unwrap_or(NIL);
-                                    let quoted = arena_cons(quote_sym, arena_cons(v, NIL));
-                                    let setf_form = vec_to_list(&[
-                                        resolve_sym("SETF").unwrap_or(NIL),
-                                        pf,
-                                        quoted,
-                                    ]);
-                                    eval_form(setf_form, env)?;
-                                }
+                                // (setf (values p1 p2 …) form) — CLHS 5.1.2.3.
+                                // Every place's SUBFORMS must be evaluated, left
+                                // to right, BEFORE the value form; the old code
+                                // ran the value first (it is `deferred` now) and
+                                // then evaluated each place's subforms at store
+                                // time, so `(setf (values (car (progn (incf i) x)))
+                                // i)` saw the pre-increment I (bliss-dj5k).
+                                // Delegate to the boot.lisp macro: the sub-places
+                                // are arbitrary, so lifting their subforms into
+                                // temporaries needs GET-SETF-EXPANSION, which is
+                                // far cleaner expressed in Lisp than re-implemented
+                                // here. The places list is passed UNEVALUATED —
+                                // %SETF-VALUES is a macro.
+                                let helper =
+                                    resolve_sym("BLISS::%SETF-VALUES").unwrap_or(NIL);
+                                bliss_rt::rooted!(
+                                    call = vec_to_list(&[helper, *aargs, *val_form])
+                                );
+                                result = eval_form(*call, env)?;
+                                *c = *r2;
+                                continue;
                             }
                             "CAR" | "FIRST" => {
                                 let tgt = eval_form(tgt_form, env)?;

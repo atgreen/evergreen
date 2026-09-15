@@ -2840,13 +2840,26 @@
 (defun %setf-expansions (places env)
   (let ((binds nil) (getters nil))
     (dolist (raw places)
-      (multiple-value-bind (dummies vals newvars setter getter)
-          (get-setf-expansion (macroexpand raw env) env)
-        (declare (ignore newvars setter))
-        (do ((d dummies (cdr d)) (v vals (cdr v)))
-            ((null d))
-          (push (list (car d) (car v)) binds))
-        (push getter getters)))
+      (let ((place (macroexpand raw env)))
+        (if (and (consp place) (eq (car place) 'values))
+            ;; A nested (VALUES …) place: its arguments are PLACES, not value
+            ;; subforms, so they must NOT be lifted into temporaries.
+            ;; GET-SETF-EXPANSION treats VALUES as an ordinary accessor and does
+            ;; lift them, which stored into the temporary and left the real
+            ;; places untouched — `(setf (values a (values b c)) …)` never
+            ;; assigned B or C (ansi VALUES.20). Recurse and rebuild a VALUES
+            ;; access form out of the sub-places' own access forms.
+            (multiple-value-bind (sub-binds sub-getters)
+                (%setf-expansions (cdr place) env)
+              (dolist (b sub-binds) (push b binds))
+              (push (cons 'values sub-getters) getters))
+            (multiple-value-bind (dummies vals newvars setter getter)
+                (get-setf-expansion place env)
+              (declare (ignore newvars setter))
+              (do ((d dummies (cdr d)) (v vals (cdr v)))
+                  ((null d))
+                (push (list (car d) (car v)) binds))
+              (push getter getters)))))
     (values (reverse binds) (reverse getters))))
 
 ;; ROTATEF: each place receives the (old) value of the next; last gets first.
@@ -2864,6 +2877,33 @@
                             (append (cdr getters) (list (car getters)))))
              ,@(mapcar (lambda (g v) (list 'setf g v)) getters vals)
              nil)))))
+
+;; (setf (values p1 … pn) form) — CLHS 5.1.2.3. The SUBFORMS of every place are
+;; evaluated, left to right, BEFORE the value form; then FORM's values are
+;; distributed across the places (a missing value is NIL) and the PRIMARY value
+;; is returned. The interpreter's SETF evaluates the value form up front for
+;; every place in its generic branch, which reversed the order, so the VALUES
+;; place defers and delegates here — expressing it in Lisp reuses
+;; GET-SETF-EXPANSION rather than re-implementing setf expansion in Rust
+;; (bliss-dj5k).
+(defmacro bliss::%setf-values (places form &environment env)
+  (if (null places)
+      (list 'progn form nil)
+      (multiple-value-bind (binds getters)
+          (%setf-expansions places env)
+        (let ((vals (mapcar (lambda (g) (declare (ignore g)) (gensym)) getters)))
+          ;; Yields ALL the stored values, one per top-level place — SBCL
+          ;; returns (1 2) for (setf (values a b) (values 1 2)) and 0 1 2 3 for
+          ;; ansi VALUES.21. NOTE: the interpreter's SETF arm currently
+          ;; truncates this back to the primary on the way out, so VALUES.21
+          ;; still fails; that is bliss-prdk, not this macro. Written as
+          ;; (VALUES …) here so it comes right for free once SETF propagates
+          ;; multiple values. MULTIPLE-VALUE-SETQ wraps this in its own
+          ;; (VALUES …) to truncate deliberately.
+          `(let* ,binds
+             (multiple-value-bind ,vals ,form
+               ,@(mapcar (lambda (g v) (list 'setf g v)) getters vals)
+               (values ,@vals)))))))
 
 ;; SHIFTF: return the old value of the first place; shift the rest leftward and
 ;; store NEWVALUE (the final argument) into the last place.
