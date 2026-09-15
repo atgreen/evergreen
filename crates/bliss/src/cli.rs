@@ -27860,8 +27860,15 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
         access_items.extend_from_slice(&temps);
         bliss_rt::rooted_ref!(_ai = &mut access_items);
         bliss_rt::rooted!(access_form = vec_to_list(&access_items));
+        // `#'(setf accessor)`, NOT the bare `(setf accessor)` list: the store
+        // form is EVALUATED by whoever uses the expansion, so an unwrapped name
+        // would be evaluated as a SETF form (yielding NIL) and the FUNCALL would
+        // then fail with "undefined function: NIL" (bliss-0qd8).
         bliss_rt::rooted!(
-            setf_fn = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *accessor])
+            setf_name = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *accessor])
+        );
+        bliss_rt::rooted!(
+            setf_fn = vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), *setf_name])
         );
         let mut store_items =
             vec![resolve_sym("FUNCALL").unwrap_or(NIL), *setf_fn, *store];

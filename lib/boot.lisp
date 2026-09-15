@@ -2663,6 +2663,47 @@
   (+ (- integer (mask-field bytespec integer))
      (mask-field bytespec newbyte)))
 
+;; The standard `(setf ACCESSOR)` FUNCTIONS (CLHS 5.1.2.9). These exist so that
+;; #'(setf car) and friends are real, callable functions — which is what
+;; GET-SETF-EXPANSION's setter form assumes (it emits
+;; `(funcall #'(setf car) new obj)`), and what portable code that builds its own
+;; setf macros on GET-SETF-EXPANSION needs (bliss-0qd8).
+;;
+;; They are written against the STORE PRIMITIVES (RPLACA/RPLACD/BLISS::SET-AREF/
+;; …), never against SETF itself: routing them through `(setf (car o) v)` would
+;; make each writer's correctness depend on SETF continuing to prefer its builtin
+;; place handling over the writer we are defining here, which is exactly the kind
+;; of mutual dependency that turns into unbounded recursion the day that
+;; precedence changes.
+;;
+;; Defining these does NOT slow the `(setf (car x) v)` FORM down: SETF's builtin
+;; place handling still wins (measured — no change beyond run-to-run noise), so
+;; these are used for the function designator, not the common path.
+;; Each returns NEW, as CLHS requires of a setf function.
+(defun (setf car) (new cons) (rplaca cons new) new)
+(defun (setf cdr) (new cons) (rplacd cons new) new)
+(defun (setf first) (new cons) (rplaca cons new) new)
+(defun (setf rest) (new cons) (rplacd cons new) new)
+(defun (setf caar) (new x) (rplaca (car x) new) new)
+(defun (setf cadr) (new x) (rplaca (cdr x) new) new)
+(defun (setf cdar) (new x) (rplacd (car x) new) new)
+(defun (setf cddr) (new x) (rplacd (cdr x) new) new)
+(defun (setf second) (new x) (rplaca (cdr x) new) new)
+(defun (setf third) (new x) (rplaca (cddr x) new) new)
+;; BLISS::SET-AREF takes a single ROW-MAJOR index, so a multidimensional store
+;; must flatten the subscripts first — passing them through verbatim silently
+;; stored nothing and broke (setf (aref a 1 2) 99).
+(defun (setf aref) (new array &rest subscripts)
+  (bliss::set-aref array (apply (function array-row-major-index) array subscripts) new)
+  new)
+(defun (setf svref) (new v i) (bliss::set-aref v i new) new)
+(defun (setf elt) (new seq i) (bliss::set-elt seq i new) new)
+(defun (setf gethash) (new key table &optional default)
+  (declare (ignore default))
+  (bliss::put-gethash new key table)
+  new)
+(defun (setf symbol-value) (new sym) (set sym new) new)
+
 ;; (setf (ldb bytespec place) new) — CLHS 5.1.2.2 / the LDB dictionary entry.
 ;; LDB is a read-modify-write place: it reads the whole integer out of PLACE,
 ;; replaces just the BYTESPEC field via DPB, and writes the integer back. The
