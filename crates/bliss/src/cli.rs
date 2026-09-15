@@ -12311,6 +12311,21 @@ fn symbol_function_object(env: &mut Env, name_sym: BlissVal) -> Option<BlissVal>
     if fn_bound(env, &fn_name) {
         return Some(name_sym);
     }
+    // A GENERIC function is a function — CLHS makes STANDARD-GENERIC-FUNCTION a
+    // subtype of FUNCTION — so `#'gf` must be FUNCTIONP. Generics live in
+    // env.generics/env.methods rather than in a function cell, so they reached
+    // the `None` below and `#'gf` came back as the bare symbol, making
+    // (functionp #'gf) NIL where SBCL says T. Reify the same apply-by-name
+    // wrapper used for builtins; dispatch still happens per call, so a method
+    // added later is still picked up.
+    let is_generic = env.generics.borrow().contains_key(&fn_name)
+        || env.methods.borrow().contains_key(&fn_name);
+    if is_generic {
+        // Key the wrapper by the FULL name, not the bare one: that is the
+        // env.generics/env.methods key, so builtin_wrapper_name() round-trips
+        // the wrapper back to a generic-function designator (see FIND-METHOD).
+        return Some(builtin_fn_wrapper(env, name_sym, &fn_name));
+    }
     None
 }
 
@@ -19065,6 +19080,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
                 let gf_name = if gf.is_symbol() {
                     Some(sym_name(gf))
+                } else if let Some(n) = builtin_wrapper_name(gf).filter(|n| {
+                    env.generics.borrow().contains_key(n) || env.methods.borrow().contains_key(n)
+                }) {
+                    // `#'gf` reifies a FUNCTIONP wrapper rather than the bare
+                    // name symbol; map it back to the generic it stands for.
+                    Some(n)
                 } else {
                     env.generics
                         .borrow()

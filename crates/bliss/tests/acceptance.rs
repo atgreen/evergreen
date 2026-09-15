@@ -724,8 +724,9 @@ fn setf_unsupported_place_is_catchable() {
 fn find_method_locates_by_qualifiers_and_specializers() {
     // FIND-METHOD returns the method with the given qualifiers and specializers
     // (CLHS 7.6.2; bliss-7y1s: ansi-test universe.lsp builds *methods* with it).
-    // `#'gf` on a generic function yields the name symbol, which FIND-METHOD
-    // accepts as a designator. errorp NIL returns NIL when no method matches.
+    // `#'gf` on a generic function reifies a FUNCTIONP wrapper closure, which
+    // FIND-METHOD maps back to the generic it names. errorp NIL returns NIL
+    // when no method matches.
     let expr = "(progn
                   (defgeneric g30be (x y z))
                   (defmethod g30be ((x fixnum) (y fixnum) (z fixnum)) (+ x y z))
