@@ -11965,6 +11965,24 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 /// return values come from its own body (eval_lambda_call clears the caller's
 /// argument values before evaluating it), and a macro's from its expansion.
 fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
+    // `eval_list` dispatches on the EXTERNAL spelling (`BLISS-EXT:X`), but a
+    // symbol's identity string is the INTERNAL one (`BLISS-EXT::X`) whenever the
+    // symbol is not exported. Apply the same normalization eval_list does, or
+    // the allowlist below misses every BLISS-EXT/BLISS-INTERNAL multiple-value
+    // producer and their secondary values get cleared: `bliss-ext:run-program`
+    // returned only its exit code, dropping the captured stdout/stderr, so
+    // UIOP:RUN-PROGRAM's `:output '(:string)` came back NIL and ocicl's version
+    // check died on `(subseq NIL 0 39)` (bliss-rpxk).
+    let normalized;
+    let name = if let Some(rest) = name.strip_prefix("BLISS-EXT::") {
+        normalized = format!("BLISS-EXT:{rest}");
+        normalized.as_str()
+    } else if let Some(rest) = name.strip_prefix("BLISS-INTERNAL::") {
+        normalized = format!("BLISS-INTERNAL:{rest}");
+        normalized.as_str()
+    } else {
+        name
+    };
     let bare = name.rsplit(':').next().unwrap_or(name);
     if fn_bound(env, name)
         || macro_defined(env, name)
