@@ -12025,6 +12025,9 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
             | "BLISS-EXT:RUN-PROGRAM"
+            // COMPILE sets (values result warnings-p failure-p) but was absent
+            // here, so the allowlist truncated it to one value (bliss-p14j).
+            | "COMPILE"
             | "COMPILE-FILE"
             | "ENSURE-DIRECTORIES-EXIST"
             | "RENAME-FILE"
