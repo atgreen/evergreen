@@ -16043,6 +16043,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         });
                     }
                 } else {
+                    // A generic function is already callable and must NOT be
+                    // replaced: this check has to come BEFORE
+                    // symbol_function_object(), which reifies a callable wrapper
+                    // for a generic (bliss-icu5) so that `#'gf` is FUNCTIONP.
+                    // Installing that wrapper into the name's function cell
+                    // swaps the generic's dispatch out for a plain function,
+                    // which broke FIND-METHOD and with it every ansi-test
+                    // chapter that loads universe.lsp — it does exactly
+                    // `(compile 'a-defgeneric)` (bliss-30be). SBCL leaves the
+                    // generic intact and returns (values NAME nil nil).
+                    let gname = if name.is_symbol() {
+                        sym_name(*name)
+                    } else {
+                        val_as_str(*name)
+                    };
+                    let is_generic = env.generics.borrow().contains_key(&gname)
+                        || env.methods.borrow().contains_key(&gname);
+                    if is_generic {
+                        let primary = if name.is_nil() { NIL } else { *name };
+                        env.set_mv(vec![primary, NIL, NIL]);
+                        return Ok(primary);
+                    }
                     match symbol_function_object(env, *name) {
                         Some(f) => f,
                         None => {

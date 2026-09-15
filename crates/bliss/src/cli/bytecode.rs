@@ -6167,6 +6167,16 @@ fn is_bail_special(name: &str) -> bool {
             | "SETF"
             | "DEFUN"
             | "DEFMACRO"
+            // DEFSETF / DEFINE-SETF-EXPANDER exist only in the tree-walker, so
+            // lowering one produces a CallNamed that evaluates the access-fn
+            // name as a variable: `(multiple-value-list (defsetf acc setter))`
+            // reported "unbound variable: ACC". Every other definitional form
+            // (DEFCLASS/DEFGENERIC/DEFMETHOD/DEFSTRUCT/DEFPACKAGE/
+            // DEFINE-SYMBOL-MACRO/DEFINE-COMPILER-MACRO) IS lowered and is
+            // correctly absent here — verified by probing each nested in a
+            // MULTIPLE-VALUE-LIST (bliss-pbp8).
+            | "DEFSETF"
+            | "DEFINE-SETF-EXPANDER"
             | "DEFVAR"
             | "DEFPARAMETER"
             | "DEFCONSTANT"
