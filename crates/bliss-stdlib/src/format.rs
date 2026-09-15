@@ -1035,7 +1035,7 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         if let Some(s) = dispatch_print_object(v, escapep) {
             return s;
         }
-        return format_instance(v);
+        return format_instance(v, escapep);
     }
     if v.is_fixnum() {
         let base = print_base();
@@ -1200,11 +1200,19 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
     format!("#<object {:?}>", v)
 }
 
-/// Print a CLOS instance. Conditions carrying a `format-control` slot render as
-/// their report message (the standard `princ`/`~A` behaviour for conditions);
-/// every other instance renders as `#<CLASS-NAME>`. Guarded against unbounded
-/// re-entry in case a report control string references its own condition.
-fn format_instance(v: BlissVal) -> String {
+/// Print a CLOS instance. Under `princ`/`~A` a condition carrying a
+/// `format-control` slot renders as its report message; every other instance
+/// renders as `#<CLASS-NAME>`. Guarded against unbounded re-entry in case a
+/// report control string references its own condition.
+///
+/// `escapep` matters: CLHS 9.1.3 gives the bare report ONLY when
+/// *print-escape* is nil. Under prin1/~S a condition must print unreadably, so
+/// the report is wrapped as `#<CLASS-NAME "report">` — SBCL prints
+/// `#<SIMPLE-ERROR "boom" {addr}>`, and this is that minus the address. This
+/// argument used not to exist, so prin1 of a condition returned the bare report
+/// and `(ignore-errors (error "x"))` printed its second value as `x` rather
+/// than as a condition object (bliss-egj6 sweep).
+fn format_instance(v: BlissVal, escapep: bool) -> String {
     use std::cell::Cell;
     thread_local! {
         static DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -1233,13 +1241,24 @@ fn format_instance(v: BlissVal) -> String {
                     .ok()
                     .map(cons_list_to_vec)
                     .unwrap_or_default();
-                if args.is_empty() {
+                let report = if args.is_empty() {
                     control_str
                 } else {
                     match format(NIL, &control_str, &args) {
                         Ok(formatted) => extract_bliss_string(formatted).unwrap_or(control_str),
                         Err(_) => control_str,
                     }
+                };
+                if escapep {
+                    let tag = instance_class_tag(v);
+                    // instance_class_tag is `#<CLASS-NAME>`; splice the report in
+                    // before the closing bracket.
+                    match tag.strip_suffix('>') {
+                        Some(head) => format!("{head} {:?}>", report),
+                        None => tag,
+                    }
+                } else {
+                    report
                 }
             }
             None => instance_class_tag(v),
