@@ -513,9 +513,14 @@ fn lookup_compiler_macro(name: BlissVal) -> Option<CompilerMacroFn> {
 /// accepted by returning a non-EQ form, leaving recursive expansion/lowering
 /// to the caller.
 pub fn compiler_macroexpand_1(
-    form: BlissVal,
+    mut form: BlissVal,
     env: &Environment,
 ) -> Result<(BlissVal, bool), BlissError> {
+    // The expander may allocate and relocate FORM. Besides keeping the call
+    // live, updating this local is essential for the EQ decline check below:
+    // comparing against its stale nursery address can mistake a newly allocated
+    // expansion that reuses the old slot for the unchanged original form.
+    bliss_rt::rooted_ref!(_form_root = &mut form);
     if !form.is_cons() {
         return Ok((form, false));
     }

@@ -805,15 +805,22 @@ fn macroexpansion_is_package_neutral() {
     // *PACKAGE* (bliss-cpm9): a macro expander runs in a fresh expansion env, and
     // its package must not leak into the global cell — else a following relative
     // LOAD (which resolves bare symbols against *PACKAGE*) breaks. Define a macro
-    // in CL-USER, switch to a fresh package that inherits it, macroexpand it, and
-    // confirm *PACKAGE* is still that package (not reset to CL-USER).
+    // and compiler macro in CL-USER, switch to a fresh package that inherits
+    // them, expand both, and confirm each expander sees its definition package
+    // while the caller remains in the fresh package.
     let expr = "(progn
                   (defmacro pkgtest-m30 () (list '+ 1 2))
-                  (export 'pkgtest-m30)
+                  (defun pkgtest-cm30 (x) x)
+                  (define-compiler-macro pkgtest-cm30 (x)
+                    (declare (ignore x))
+                    (list 'quote (package-name *package*)))
+                  (export '(pkgtest-m30 pkgtest-cm30))
                   (make-package :pkgtest30 :use '(:common-lisp :common-lisp-user))
                   (in-package :pkgtest30)
-                  (macroexpand-1 '(pkgtest-m30))
-                  (cl:format t \"~A\" (cl:package-name cl:*package*)))";
+                  (let ((definition-package (pkgtest-cm30 nil)))
+                    (macroexpand-1 '(pkgtest-m30))
+                    (cl:format t \"~A/~A\" definition-package
+                               (cl:package-name cl:*package*))))";
     let output = bliss_bin()
         .args(["--eval", expr])
         .output()
@@ -821,8 +828,8 @@ fn macroexpansion_is_package_neutral() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PKGTEST30"),
-        "macroexpand must leave *PACKAGE* unchanged (PKGTEST30), got: '{}'",
+        stdout.contains("COMMON-LISP-USER/PKGTEST30"),
+        "macro expansion must use its definition package and restore PKGTEST30, got: '{}'",
         stdout
     );
 }
@@ -3504,6 +3511,87 @@ fn eval_when_execute_mode_on_eval_and_source() {
         String::from_utf8_lossy(&out.stdout).contains("(:E :LTX :NESTED-E)"),
         "got: {}",
         String::from_utf8_lossy(&out.stdout)
+    );
+
+    // CLHS 3.2.3.1 retains COMPILE, LOAD, and EVAL as deprecated aliases for
+    // :COMPILE-TOPLEVEL, :LOAD-TOPLEVEL, and :EXECUTE (bliss-wne9.1).
+    let short = bliss_bin()
+        .args([
+            "--eval",
+            "(progn (eval-when (compile load eval) (defun eval-when-short () 42))
+                    (princ (eval-when-short)))",
+        ])
+        .output()
+        .expect("run bliss with short EVAL-WHEN situations");
+    assert_eq!(
+        short.status.code(),
+        Some(0),
+        "short EVAL-WHEN situations failed: {}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&short.stdout).contains("42"),
+        "short EVAL-WHEN situations did not execute: {}",
+        String::from_utf8_lossy(&short.stdout)
+    );
+
+    for (invalid, printed_name) in [
+        (":not-a-situation", "NOT-A-SITUATION"),
+        ("#:eval", "EVAL"),
+        (":eval", "EVAL"),
+        ("nil", "NIL"),
+        ("t", "T"),
+    ] {
+        let program = format!("(eval-when (:execute {invalid}) 1)");
+        let invalid_result = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("run bliss with invalid EVAL-WHEN situation");
+        assert_ne!(
+            invalid_result.status.code(),
+            Some(0),
+            "{invalid} is not an ANSI EVAL-WHEN situation and must signal"
+        );
+        let stderr = String::from_utf8_lossy(&invalid_result.stderr);
+        assert!(
+            stderr.contains("EVAL-WHEN") && stderr.contains(printed_name),
+            "invalid-situation error must identify EVAL-WHEN and {invalid}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn macro_lambda_list_defaults_are_gc_safe_and_package_neutral_on_error() {
+    let expr = "(progn
+                  (defpackage :macro-root-test (:use :common-lisp))
+                  (in-package :macro-root-test)
+                  (defmacro rooted-ll
+                      ((&optional (x (list 4 5)))
+                       &key (y (list 6 7)))
+                    (list 'quote (list x y (append x y))))
+                  (defmacro failing-ll
+                      (&optional (x (progn (in-package :common-lisp-user)
+                                           (error \"expected\"))))
+                    x)
+                  (let ((value (eval '(rooted-ll ()))))
+                    (ignore-errors (macroexpand-1 '(failing-ll)))
+                    (cl:format t \"~S/~A\" value
+                               (package-name *package*))))";
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "macro lambda-list expansion failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("((4 5) (6 7) (4 5 6 7))/MACRO-ROOT-TEST"),
+        "macro lambda-list values or package restore were wrong: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

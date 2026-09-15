@@ -1399,6 +1399,7 @@ struct TagScope {
 /// already-compiled `restart_cases` / `nested_functions` (bliss-wlf).
 impl bliss_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        bliss_rt::gc::TraceHostRoots::trace_host_roots(&mut self.macro_env, visit);
         for constant in &mut self.constants {
             visit(constant as *mut BlissVal);
         }
@@ -1781,13 +1782,14 @@ impl<'e> Lowerer<'e> {
         // (e.g. LET-wrapped) eval-when run load-only situations that have no
         // :execute — flagged by ansi eval-when.1 (bliss-pmox).
         let (situations, body) = cp(rest);
-        let fires = list_to_vec(situations).iter().any(|s| {
-            s.is_symbol()
-                && matches!(
-                    symbol_bare_name(&sym_name(*s)).as_str(),
-                    "EXECUTE" | "EVAL"
-                )
-        });
+        // Decode through the shared validator. On an invalid situation, bail
+        // to the tree-walker so it can report the PROGRAM-ERROR with the
+        // offending name rather than compiling the form as NIL.
+        let fires = super::eval_when_has_situation(
+            situations,
+            super::EvalWhenSituation::Execute,
+        )
+        .map_err(|_| Bail)?;
         if fires {
             self.lower_progn(body)
         } else {
@@ -6998,7 +7000,7 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // clause body PC, var slot) serialize in a new auxiliary table (kind 9).
 // A BBU is authoritative: an unsupported version is rejected, never replaced
 // by executing source text from the container.
-const BBU_BYTECODE_VERSION: u16 = 0x0108;
+const BBU_BYTECODE_VERSION: u16 = 0x0109;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -7963,10 +7965,14 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
 /// source-only artifact (CLHS: COMPILE-FILE always produces loadable output).
 pub fn build_bbu_from_forms(
     forms: &[BlissVal],
+    definition_packages: &[String],
     src_path: &str,
     source: &str,
     env: &Env,
 ) -> Result<Option<Vec<u8>>, BlissError> {
+    if forms.len() != definition_packages.len() {
+        return Err(bbu_error("compile-file form/package metadata mismatch"));
+    }
     let mut forms = forms.to_vec();
     bliss_rt::rooted_ref!(_forms_root = &mut forms);
     let mut pool = BbuConstPool::default();
@@ -8028,12 +8034,17 @@ pub fn build_bbu_from_forms(
                                 &mut pool,
                                 &mut functions,
                             ) {
+                                let definition_package_ref = if compiler_macro {
+                                    pool.string(&definition_packages[form_index])
+                                } else {
+                                    BBU_NO_INDEX
+                                };
                                 load_actions.push((
                                     if compiler_macro { 5 } else { 4 },
                                     0,
                                     function_index,
                                     name_ref,
-                                    BBU_NO_INDEX,
+                                    definition_package_ref,
                                 ));
                                 done = true;
                             }
@@ -10861,21 +10872,15 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                     _ => return Err(bbu_error("InstallFunction name is not a symbol")),
                 }
             }
-            4 | 5 | 8 => {
+            4 | 8 => {
                 if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
                     return Err(bbu_error("macro installation has unsupported arguments"));
                 }
                 let function = &encoded_functions
                     [bbu_index(action.arg0, encoded_functions.len(), "macro function")?];
-                // A setf-expander (kind 8) and a macro (kind 4) both serialize as
-                // BBU_FUNC_MACRO expander functions; a compiler macro (kind 5) as
-                // BBU_FUNC_COMPILER_MACRO.
-                let expected = if action.kind == 5 {
-                    BBU_FUNC_COMPILER_MACRO
-                } else {
-                    BBU_FUNC_MACRO
-                };
-                if function.flags & expected == 0 {
+                // A setf-expander (kind 8) and a macro (kind 4) both serialize
+                // as BBU_FUNC_MACRO expander functions.
+                if function.flags & BBU_FUNC_MACRO == 0 {
                     return Err(bbu_error("macro action references the wrong function role"));
                 }
                 match encoded_constants.get(bbu_index(
@@ -10885,6 +10890,38 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 )?) {
                     constant if bbu_is_symbol_constant(constant) => {}
                     _ => return Err(bbu_error("macro name is not a symbol")),
+                }
+            }
+            5 => {
+                if action.flags != 0 {
+                    return Err(bbu_error(
+                        "compiler-macro installation has unsupported flags",
+                    ));
+                }
+                let function = &encoded_functions[bbu_index(
+                    action.arg0,
+                    encoded_functions.len(),
+                    "compiler macro function",
+                )?];
+                if function.flags & BBU_FUNC_COMPILER_MACRO == 0 {
+                    return Err(bbu_error(
+                        "compiler-macro action references the wrong function role",
+                    ));
+                }
+                match encoded_constants.get(bbu_index(
+                    action.arg1,
+                    encoded_constants.len(),
+                    "compiler macro name",
+                )?) {
+                    constant if bbu_is_symbol_constant(constant) => {}
+                    _ => return Err(bbu_error("compiler macro name is not a symbol")),
+                }
+                if bytecode_version >= 0x0109 {
+                    bbu_string(&encoded_constants, action.arg2)?;
+                } else if action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error(
+                        "legacy compiler-macro action has unexpected package metadata",
+                    ));
                 }
             }
             7 => {
@@ -11084,9 +11121,17 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut symbol =
                     constants[bbu_index(action.arg1, constants.len(), "compiler macro name")?];
                 bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
+                let definition_package = if action.arg2 == BBU_NO_INDEX {
+                    // Compatibility with pre-0x0109 artifacts, which did not
+                    // preserve definition-package metadata.
+                    super::symbol_home_package_name(symbol)
+                } else {
+                    bbu_string(&encoded_constants, action.arg2)?.to_string()
+                };
                 super::install_loaded_compiler_macro(
                     symbol,
                     Rc::clone(&functions[action.arg0 as usize]),
+                    definition_package,
                 );
                 last = symbol;
             }
@@ -17732,7 +17777,7 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
         let (op, cdr) = cp(form);
         if op.is_symbol() && sym_name(op) == "EVAL-WHEN" && cdr.is_cons() {
             let (situations, body) = cp(cdr);
-            if super::eval_when_should_run(situations, env) {
+            if super::eval_when_should_run(situations, env)? {
                 let mut last = NIL;
                 bliss_rt::rooted!(forms = list_to_vec(body));
                 for index in 0..forms.len() {

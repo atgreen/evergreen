@@ -1583,7 +1583,8 @@ fn compile_file_prepass_handles_eval_when_and_read_time_constants() {
     let out = dir.join("e.bfasl");
     fs::write(
         &src,
-        "(eval-when (:compile-toplevel) (defparameter +cf-read+ 12))
+        "(eval-when (compile) (defparameter +cf-read+ 12))
+         (eval-when (load) (defun cf-load-short () 23))
          (defun cf-readtime () #.(+ +cf-read+ 5))
          (defun cf-limit () #.most-positive-fixnum)\n",
     )
@@ -1603,13 +1604,25 @@ fn compile_file_prepass_handles_eval_when_and_read_time_constants() {
     let bytes = fs::read(&out).unwrap();
     let (_, function_count, load_action_count) = bbu_counts(&bytes);
     assert!(
-        function_count >= 2,
-        "expected both functions in BYTECODE_UNIT"
+        function_count >= 3,
+        "expected all three functions in BYTECODE_UNIT"
     );
     assert!(
-        load_action_count >= 2,
-        "expected load actions for both functions"
+        load_action_count >= 3,
+        "expected load actions for all three functions"
     );
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (list (cf-readtime) (cf-load-short)))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "short-form EVAL-WHEN bfasl failed to load: stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(17 23)");
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1769,7 +1782,60 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
     );
     assert_eq!(
         String::from_utf8_lossy(&loaded.stdout).trim(),
-        "(18 14 15 12)"
+        "(18 14 15 12)",
+        "compile diagnostics: {}\nload diagnostics: {}",
+        String::from_utf8_lossy(&compiled.stderr),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_compiler_macro_uses_definition_package_without_leaking_it() {
+    let dir = workdir("compiler-macro-package");
+    let src = dir.join("package-macro.lisp");
+    let out = dir.join("package-macro.bfasl");
+    fs::write(
+        &src,
+        "(defpackage :bbu-cm-target (:use :common-lisp) (:export #:target))
+         (defpackage :bbu-cm-def (:use :common-lisp))
+         (progn
+           (in-package :bbu-cm-def)
+           (defun bbu-cm-target:target () :ordinary)
+           (define-compiler-macro bbu-cm-target:target ()
+             (list 'quote (package-name *package*))))\n",
+    )
+    .unwrap();
+
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "compiler-macro package fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let loaded = run(&format!(
+        "(progn
+           (load \"{}\")
+           (list (eval (read-from-string \"(bbu-cm-target:target)\"))
+                 (package-name *package*)))",
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "loaded compiler macro failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(\"BBU-CM-DEF\" \"COMMON-LISP-USER\")"
     );
 
     let _ = fs::remove_dir_all(&dir);

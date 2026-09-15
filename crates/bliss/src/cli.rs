@@ -3074,6 +3074,7 @@ fn install_loaded_setf_expander(
 fn install_loaded_compiler_macro(
     name: BlissVal,
     function: Rc<bliss_rt::bytecode::BytecodeFunction>,
+    definition_package: String,
 ) {
     install_evaluator_global_root_scanner();
     let function = Arc::new(Mutex::new((*function).clone()));
@@ -3084,13 +3085,35 @@ fn install_loaded_compiler_macro(
     compiler_macroexpand::define_compiler_macro(
         name,
         Arc::new(move |form, _macro_env| {
-            let (_, args) = cp(form);
+            // The callback's FORM copy and argument vector must survive Env
+            // construction, which can allocate and relocate nursery objects.
+            bliss_rt::rooted!(form = form);
+            bliss_rt::rooted!(args = list_to_vec(cp(*form).1));
+            let package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
+                BlissError::Internal("compiler macro: *PACKAGE* is unavailable".into())
+            })?;
+            bliss_rt::rooted!(definition_package_value = package_object(&definition_package));
+            // Save the caller's dynamic package before Env construction resets
+            // the global cell; the rooted guard restores it on Ok or Err.
+            bliss_rt::rooted!(_package_binding = DynBind::establish(
+                package_symbol,
+                *definition_package_value,
+            ));
+            let mut env = Env::new_for_macro_expansion(false);
+            bliss_rt::rooted_ref!(_env_root = &mut env);
+            env.current_package = definition_package.clone();
+            env.define_local("*PACKAGE*", *definition_package_value);
+            bliss_rt::symbols::set_symbol_value(
+                package_symbol.as_symbol_index(),
+                *definition_package_value,
+            );
+            // Clone the globally rooted bytecode only after Env construction;
+            // run_macro registers the clone before its first allocation.
             let function = function
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            let mut env = Env::new_for_macro_expansion(false);
-            bytecode::run_macro(Rc::new(function), &list_to_vec(args), &mut env)
+            bytecode::run_macro(Rc::new(function), &args, &mut env)
         }),
     );
 }
@@ -5517,6 +5540,12 @@ fn visit_macro_def_roots(
         }
     }
     visit_env_frame_roots(&def.captured_frame, state, visit);
+}
+
+impl bliss_rt::gc::TraceHostRoots for MacroDef {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        with_env_visit_state(|state| visit_macro_def_roots(self, state, visit));
+    }
 }
 
 fn visit_setf_expander_roots(
@@ -8704,7 +8733,10 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     Ok(last)
 }
 
-fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
+fn read_forms_for_compile(
+    source: &str,
+    env: &mut Env,
+) -> Result<(Vec<BlissVal>, Vec<String>), BlissError> {
     with_eval_context(env, EvalContext::CompileFile, |env| {
         reader::set_read_eval_hook(Some(read_time_eval));
         reader::set_macro_handler_invoker(Some(reader_macro_invoker));
@@ -8715,6 +8747,7 @@ fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, 
         let mut pos = 0;
         let mut forms = Vec::new();
         bliss_rt::rooted_ref!(_forms_root = &mut forms);
+        let mut definition_packages = Vec::new();
         loop {
             while pos < chars.len() && chars[pos].is_ascii_whitespace() {
                 pos += 1;
@@ -8731,6 +8764,11 @@ fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, 
             }
             let mut val = val;
             bliss_rt::rooted_ref!(_val_root = &mut val);
+            // Preserve the package in which this form was read. A compiler
+            // macro may name a function imported from or qualified in another
+            // package, so its target symbol's home package is not necessarily
+            // the package in which the expander was defined.
+            let definition_package = env.current_package.clone();
             seed_compile_time_definitions(val, env);
             if let Err(e) = process_compile_toplevel_form(val, env) {
                 if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
@@ -8738,10 +8776,18 @@ fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, 
                     eprintln!("[bfasl] ignored compile-time effect near line {line}: {e}");
                 }
             }
-            forms.extend(compile_file_load_forms(val, env));
+            let load_forms = compile_file_load_forms(val, env)?;
+            let mut effective_package = definition_package;
+            for load_form in &load_forms {
+                definition_packages.push(effective_package.clone());
+                if let Some(next_package) = compile_file_in_package_name(*load_form) {
+                    effective_package = next_package;
+                }
+            }
+            forms.extend(load_forms);
             pos = next_pos;
         }
-        Ok(forms)
+        Ok((forms, definition_packages))
     })
 }
 
@@ -8915,31 +8961,87 @@ fn symbol_leaf_name(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
-fn eval_when_has_situation(situations: BlissVal, target: &str) -> bool {
-    list_to_vec(situations)
-        .into_iter()
-        .any(|situation| situation.is_symbol() && symbol_leaf_name(&sym_name(situation)) == target)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvalWhenSituation {
+    CompileToplevel,
+    LoadToplevel,
+    Execute,
 }
 
-fn expand_compile_toplevel_form(mut form: BlissVal, env: &mut Env) -> BlissVal {
+fn eval_when_has_situation(
+    situations: BlissVal,
+    target: EvalWhenSituation,
+) -> Result<bool, BlissError> {
+    let (situations, tail) = list_to_vec_with_tail(situations);
+    if tail != NIL {
+        return Err(BlissError::ProgramError(
+            "EVAL-WHEN situations must be a proper list".into(),
+        ));
+    }
+
+    let mut found = false;
+    for situation in situations {
+        if !situation.is_symbol() {
+            return Err(BlissError::ProgramError(
+                "EVAL-WHEN situations must be symbols".into(),
+            ));
+        }
+        let name = sym_name(situation);
+        let Some(index) = situation.symbol_index() else {
+            return Err(BlissError::ProgramError(format!(
+                "EVAL-WHEN: unrecognized situation {name}"
+            )));
+        };
+        let package = if reader::is_uninterned(index) || symbol_is_homeless(index) {
+            None
+        } else {
+            bliss_rt::symbols::symbol_package(index)
+                .and_then(bliss_stdlib::package_name)
+                .or_else(|| Some(symbol_home_package_name(situation)))
+        };
+        let leaf = symbol_leaf_name(&name);
+        let decoded = match (package.as_deref(), leaf) {
+            (Some("KEYWORD"), "COMPILE-TOPLEVEL")
+            | (Some("COMMON-LISP"), "COMPILE") => EvalWhenSituation::CompileToplevel,
+            (Some("KEYWORD"), "LOAD-TOPLEVEL") | (Some("COMMON-LISP"), "LOAD") => {
+                EvalWhenSituation::LoadToplevel
+            }
+            (Some("KEYWORD"), "EXECUTE") | (Some("COMMON-LISP"), "EVAL") => {
+                EvalWhenSituation::Execute
+            }
+            _ => {
+                return Err(BlissError::ProgramError(format!(
+                    "EVAL-WHEN: unrecognized situation {name}"
+                )));
+            }
+        };
+        found |= decoded == target;
+    }
+    Ok(found)
+}
+
+fn expand_compile_toplevel_form(form: BlissVal, env: &mut Env) -> BlissVal {
+    // Macro expansion allocates. Keep the current expansion rooted so each
+    // iteration observes its post-GC address rather than a stale nursery copy.
+    bliss_rt::rooted!(form = form);
     for _ in 0..256 {
         if !form.is_cons() {
-            return form;
+            return *form;
         }
-        let (op, rest) = cp(form);
+        let (op, rest) = cp(*form);
         if !op.is_symbol() {
-            return form;
+            return *form;
         }
         let name = sym_name(op);
         let Some(mdef) = lookup_macro(env, &name) else {
-            return form;
+            return *form;
         };
-        match expand_macro(&mdef, rest, env, form) {
-            Ok(expanded) if expanded != form => form = expanded,
-            _ => return form,
+        match expand_macro(&mdef, rest, env, *form) {
+            Ok(expanded) if expanded != *form => *form = expanded,
+            _ => return *form,
         }
     }
-    form
+    *form
 }
 
 /// Format a UNIX timestamp as SBCL's compile-note date, e.g. "16 AUG 2026
@@ -8981,30 +9083,36 @@ fn format_compile_note_date(unix_secs: u64) -> String {
     )
 }
 
-fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
+fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
+    bliss_rt::rooted!(form = form);
     // DEFINE-CONDITION has a dedicated structural BFASL lowering. Expanding it
     // here would flatten the boot macro into SETQ/DEFCLASS source forms and
     // discard the boundary the portable load action needs.
     if form.is_cons() {
-        let (op, _) = cp(form);
+        let (op, _) = cp(*form);
         if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "DEFINE-CONDITION" {
-            return vec![form];
+            return Ok(vec![*form]);
         }
     }
-    let form = expand_compile_toplevel_form(form, env);
+    *form = expand_compile_toplevel_form(*form, env);
     if !form.is_cons() {
-        return vec![form];
+        return Ok(vec![*form]);
     }
-    let (op, cdr) = cp(form);
+    let (op, cdr) = cp(*form);
     if !op.is_symbol() {
-        return vec![form];
+        return Ok(vec![*form]);
     }
     let op_name = sym_name(op);
     match symbol_leaf_name(&op_name) {
-        "PROGN" => list_to_vec(cdr)
-            .into_iter()
-            .flat_map(|f| compile_file_load_forms(f, env))
-            .collect(),
+        "PROGN" => {
+            bliss_rt::rooted!(nested_forms = list_to_vec(cdr));
+            let mut result = Vec::new();
+            bliss_rt::rooted_ref!(_result_root = &mut result);
+            for index in 0..nested_forms.len() {
+                result.extend(compile_file_load_forms(nested_forms[index], env)?);
+            }
+            Ok(result)
+        }
         "EVAL-WHEN" => {
             // What COMPILE-FILE emits for LOAD time: a top-level eval-when's body
             // is a load-time action iff :LOAD-TOPLEVEL is present (CLHS 3.2.3.1).
@@ -9014,13 +9122,16 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
             // time (:compile-toplevel) evaluation happens separately, via
             // process_compile_toplevel_form under EvalContext::CompileFile.
             let (situations, body) = cp(cdr);
-            if eval_when_has_situation(situations, "LOAD-TOPLEVEL") {
-                list_to_vec(body)
-                    .into_iter()
-                    .flat_map(|f| compile_file_load_forms(f, env))
-                    .collect()
+            if eval_when_has_situation(situations, EvalWhenSituation::LoadToplevel)? {
+                bliss_rt::rooted!(nested_forms = list_to_vec(body));
+                let mut result = Vec::new();
+                bliss_rt::rooted_ref!(_result_root = &mut result);
+                for index in 0..nested_forms.len() {
+                    result.extend(compile_file_load_forms(nested_forms[index], env)?);
+                }
+                Ok(result)
             } else {
-                Vec::new()
+                Ok(Vec::new())
             }
         }
         // A top-level MACROLET establishes local macros for its body, which are
@@ -9029,7 +9140,12 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
         // restore the previous bindings so the macros do not leak past the form.
         "MACROLET" => {
             let (defs_form, body) = cp(cdr);
-            let mut saved: Vec<(String, Option<MacroDef>)> = Vec::new();
+            let mut saved_names = Vec::new();
+            let mut saved_definitions = Vec::<Option<MacroDef>>::new();
+            // A shadowed definition is removed from Env::macros while the body
+            // recursively expands. Keep its forms, optional function, bytecode,
+            // and captured frame rooted until it is restored.
+            bliss_rt::rooted_ref!(_saved_definitions_root = &mut saved_definitions);
             for def in list_to_vec(defs_form) {
                 if !def.is_cons() {
                     continue;
@@ -9048,13 +9164,21 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
                     function: None,
                 };
                 let prev = env.macros_mut().insert(name.clone(), mdef);
-                saved.push((name, prev));
+                saved_names.push(name);
+                saved_definitions.push(prev);
             }
-            let result: Vec<BlissVal> = list_to_vec(body)
-                .into_iter()
-                .flat_map(|f| compile_file_load_forms(f, env))
-                .collect();
-            for (name, prev) in saved.into_iter().rev() {
+            bliss_rt::rooted!(nested_forms = list_to_vec(body));
+            let mut result = Vec::new();
+            bliss_rt::rooted_ref!(_result_root = &mut result);
+            let nested_result = (|| {
+                for index in 0..nested_forms.len() {
+                    result.extend(compile_file_load_forms(nested_forms[index], env)?);
+                }
+                Ok::<(), BlissError>(())
+            })();
+            for index in (0..saved_names.len()).rev() {
+                let name = std::mem::take(&mut saved_names[index]);
+                let prev = saved_definitions[index].take();
                 match prev {
                     Some(p) => {
                         env.macros_mut().insert(name, p);
@@ -9064,10 +9188,38 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
                     }
                 }
             }
-            result
+            nested_result?;
+            Ok(result)
         }
-        _ => vec![form],
+        _ => Ok(vec![*form]),
     }
+}
+
+/// Return the package selected by a literal top-level IN-PACKAGE form. The
+/// compile-file load-form pass flattens PROGN/EVAL-WHEN/MACROLET, so walking its
+/// output in order preserves the effective definition context even when a
+/// compound reader form changes package before defining a compiler macro.
+fn compile_file_in_package_name(form: BlissVal) -> Option<String> {
+    if !form.is_cons() {
+        return None;
+    }
+    let (op, cdr) = cp(form);
+    if !op.is_symbol() || symbol_leaf_name(&sym_name(op)) != "IN-PACKAGE" {
+        return None;
+    }
+    let (designator, _) = cp(cdr);
+    let raw = if designator.is_symbol() {
+        symbol_bare_name(&sym_name_rc(designator))
+    } else if is_string_value(designator) {
+        val_as_str(designator)
+    } else {
+        return None;
+    };
+    Some(
+        raw.trim_start_matches("KEYWORD:")
+            .trim_start_matches(':')
+            .to_uppercase(),
+    )
 }
 
 fn compile_toplevel_form_has_effect(form: BlissVal, env: &Env) -> bool {
@@ -11709,7 +11861,7 @@ fn build_bfasl_from_source(
     // pre-read as forms. Downgrade to the source-only artifact: the loader
     // re-reads the text form-by-form WITH evaluation, so the compile-time
     // reader state exists when the custom syntax is reached (bliss-tzc2).
-    let mut forms = match read_forms_for_compile(source, env) {
+    let (mut forms, definition_packages) = match read_forms_for_compile(source, env) {
         Ok(forms) => forms,
         Err(e) => {
             if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
@@ -11729,7 +11881,13 @@ fn build_bfasl_from_source(
         }
     };
     bliss_rt::rooted_ref!(_forms_root = &mut forms);
-    match bytecode::build_bbu_from_forms(&forms, src_path, source, env)? {
+    match bytecode::build_bbu_from_forms(
+        &forms,
+        &definition_packages,
+        src_path,
+        source,
+        env,
+    )? {
         Some(bytecode_unit) => Ok(bliss_rt::bfasl::BfaslBuilder::new()
             .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
             .section(bliss_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)
@@ -12153,15 +12311,11 @@ fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result
     })
 }
 
-fn eval_when_should_run(situations: BlissVal, env: &Env) -> bool {
-    let has_situation = |target: &str| {
-        list_to_vec(situations).into_iter().any(|situation| {
-            situation.is_symbol() && symbol_leaf_name(&sym_name(situation)) == target
-        })
-    };
-
+fn eval_when_should_run(situations: BlissVal, env: &Env) -> Result<bool, BlissError> {
     match env.eval_context {
-        EvalContext::CompileFile => has_situation("COMPILE-TOPLEVEL"),
+        EvalContext::CompileFile => {
+            eval_when_has_situation(situations, EvalWhenSituation::CompileToplevel)
+        }
         // Loading SOURCE (not a compiled fasl) processes eval-when in EXECUTE
         // mode: the body runs iff :EXECUTE is present (CLHS 3.2.3.1 — a
         // non-compiling load, and every non-top-level eval-when, use the execute
@@ -12171,8 +12325,10 @@ fn eval_when_should_run(situations: BlissVal, env: &Env) -> bool {
         // so a fasl load never re-processes an eval-when here. Firing on
         // :LOAD-TOPLEVEL too made source loads (and nested eval-when) run
         // load-only situations (bliss-pmox).
-        EvalContext::Load => has_situation("EXECUTE"),
-        EvalContext::Eval | EvalContext::Repl => has_situation("EXECUTE"),
+        EvalContext::Load => eval_when_has_situation(situations, EvalWhenSituation::Execute),
+        EvalContext::Eval | EvalContext::Repl => {
+            eval_when_has_situation(situations, EvalWhenSituation::Execute)
+        }
     }
 }
 
@@ -12758,7 +12914,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "EVAL-WHEN" => {
                 let (situations, body) = cp(cdr);
-                return if eval_when_should_run(situations, env) {
+                return if eval_when_should_run(situations, env)? {
                     eval_progn(body, env)
                 } else {
                     Ok(NIL)
@@ -27273,7 +27429,13 @@ fn bind_lambda_list_ex(
     Ok(())
 }
 
-fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Result<(), BlissError> {
+fn bind_pattern_value(
+    mut pattern: BlissVal,
+    mut value: BlissVal,
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
+    bliss_rt::rooted_ref!(_value_root = &mut value);
     if pattern.is_nil() {
         if value.is_nil() {
             return Ok(());
@@ -27307,8 +27469,9 @@ fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Resu
 
     let (pcar, pcdr) = cp(pattern);
     let (vcar, vcdr) = cp(value);
-    bind_pattern_value(pcar, vcar, env)?;
-    bind_pattern_value(pcdr, vcdr, env)
+    bliss_rt::rooted!(parts = [pcar, pcdr, vcar, vcdr]);
+    bind_pattern_value(parts[0], parts[2], env)?;
+    bind_pattern_value(parts[1], parts[3], env)
 }
 
 /// True if a nested macro pattern is a destructuring lambda list — it contains a
@@ -27344,11 +27507,13 @@ fn contains_lambda_list_keyword(pattern: BlissVal) -> bool {
 /// (this is what lets e.g. ASDF's `(defmacro with-upgradability ((&optional) &body body) …)`
 /// expand). Every other cons pattern uses plain structural destructuring.
 fn bind_macro_param(
-    pattern: BlissVal,
-    value: BlissVal,
+    mut pattern: BlissVal,
+    mut value: BlissVal,
     env: &mut Env,
     macroexpand_env: Option<&MacroexpandEnv>,
 ) -> Result<(), BlissError> {
+    bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
+    bliss_rt::rooted_ref!(_value_root = &mut value);
     if pattern.is_nil() {
         if value.is_nil() {
             return Ok(());
@@ -27372,7 +27537,8 @@ fn bind_macro_param(
     // A sub-pattern that is a destructuring lambda list at *this* level goes to
     // the lambda-list binder (handles &optional/&rest/&key).
     if contains_lambda_list_keyword(pattern) {
-        let sub_args = list_to_vec(value);
+        let mut sub_args = list_to_vec(value);
+        bliss_rt::rooted_ref!(_sub_args_root = &mut sub_args);
         // Nested destructuring: `&whole` here binds the sub-list being
         // destructured (no operator to prepend), which is the default.
         return bind_macro_lambda_list(pattern, &sub_args, env, macroexpand_env, None);
@@ -27389,12 +27555,13 @@ fn bind_macro_param(
     }
     let (pcar, pcdr) = cp(pattern);
     let (vcar, vcdr) = cp(value);
-    bind_macro_param(pcar, vcar, env, macroexpand_env)?;
-    bind_macro_param(pcdr, vcdr, env, macroexpand_env)
+    bliss_rt::rooted!(parts = [pcar, pcdr, vcar, vcdr]);
+    bind_macro_param(parts[0], parts[2], env, macroexpand_env)?;
+    bind_macro_param(parts[1], parts[3], env, macroexpand_env)
 }
 
 fn bind_macro_lambda_list(
-    params_form: BlissVal,
+    mut params_form: BlissVal,
     args: &[BlissVal],
     env: &mut Env,
     macroexpand_env: Option<&MacroexpandEnv>,
@@ -27402,7 +27569,7 @@ fn bind_macro_lambda_list(
     // expander call this is the ENTIRE call form including the operator (CLHS
     // 3.4.4) — the caller supplies it because `args` holds only the arguments.
     // `None` (nested destructuring) defaults to the sub-list being destructured.
-    whole: Option<BlissVal>,
+    mut whole: Option<BlissVal>,
 ) -> Result<(), BlissError> {
     #[derive(PartialEq)]
     enum Mode {
@@ -27413,19 +27580,33 @@ fn bind_macro_lambda_list(
         Aux,
     }
 
+    // This binder evaluates default/init forms and constructs rest lists, so
+    // every copied cursor, pattern, value, and deferred key spec must remain a
+    // precise moving-GC root for the entire interval in which it is live.
+    bliss_rt::rooted_ref!(_params_form_root = &mut params_form);
+    let mut args = args.to_vec();
+    bliss_rt::rooted_ref!(_args_root = &mut args);
+    bliss_rt::rooted_ref!(_whole_option_root = &mut whole);
+
     let mut mode = Mode::Req;
     let mut arg_i = 0usize;
     let mut key_start: Option<usize> = None;
     let mut rest_bound = false;
     let mut saw_key = false;
     let mut allow_other_keys = false;
-    let mut key_specs: Vec<(String, BlissVal, BlissVal, Option<String>)> = Vec::new();
+    let mut key_specs: Vec<(String, Option<String>)> = Vec::new();
+    let mut key_values: Vec<(BlissVal, BlissVal)> = Vec::new();
+    bliss_rt::rooted_ref!(_key_values_root = &mut key_values);
     let mut whole_var: Option<BlissVal> = None;
-    let whole_form = whole.unwrap_or_else(|| vec_to_list(args));
+    bliss_rt::rooted_ref!(_whole_var_root = &mut whole_var);
+    let mut whole_form = whole.unwrap_or_else(|| vec_to_list(&args));
+    bliss_rt::rooted_ref!(_whole_form_root = &mut whole_form);
 
     let mut c = params_form;
+    bliss_rt::rooted_ref!(_cursor_root = &mut c);
     while c.is_cons() {
-        let (elem, rest) = cp(c);
+        let (mut elem, rest) = cp(c);
+        bliss_rt::rooted_ref!(_elem_root = &mut elem);
         c = rest;
 
         if elem.is_symbol() {
@@ -27437,13 +27618,18 @@ fn bind_macro_lambda_list(
                     continue;
                 }
                 "&ENVIRONMENT" => {
-                    let (var, rest_after_var) = cp(c);
-                    let env_value = macroexpand_env
+                    let (mut var, rest_after_var) = cp(c);
+                    bliss_rt::rooted_ref!(_var_root = &mut var);
+                    // Advance the rooted cursor before storing the environment:
+                    // that operation allocates, so retaining REST_AFTER_VAR as
+                    // an unrooted copy would leave the next cursor stale.
+                    c = rest_after_var;
+                    let mut env_value = macroexpand_env
                         .cloned()
                         .map(store_macroexpand_environment)
                         .unwrap_or(NIL);
+                    bliss_rt::rooted_ref!(_env_value_root = &mut env_value);
                     bind_pattern_value(var, env_value, env)?;
-                    c = rest_after_var;
                     continue;
                 }
                 "&OPTIONAL" => {
@@ -27474,17 +27660,18 @@ fn bind_macro_lambda_list(
 
         match mode {
             Mode::Req => {
-                let v = args.get(arg_i).copied().ok_or_else(|| {
+                let mut v = args.get(arg_i).copied().ok_or_else(|| {
                     BlissError::ProgramError(format!(
                         "too few arguments for macro lambda list: missing value for {}",
                         format_val(elem)
                     ))
                 })?;
+                bliss_rt::rooted_ref!(_value_root = &mut v);
                 arg_i += 1;
                 bind_macro_param(elem, v, env, macroexpand_env)?;
             }
             Mode::Opt => {
-                let (pattern, default_form, supp) = if elem.is_symbol() {
+                let (mut pattern, mut default_form, supp) = if elem.is_symbol() {
                     (elem, NIL, None)
                 } else if elem.is_cons() {
                     let (pat, r) = cp(elem);
@@ -27498,19 +27685,24 @@ fn bind_macro_lambda_list(
                 } else {
                     (elem, NIL, None)
                 };
+                bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
+                bliss_rt::rooted_ref!(_default_form_root = &mut default_form);
 
                 if arg_i < args.len() {
-                    bind_macro_param(pattern, args[arg_i], env, macroexpand_env)?;
+                    let mut value = args[arg_i];
+                    bliss_rt::rooted_ref!(_value_root = &mut value);
+                    bind_macro_param(pattern, value, env, macroexpand_env)?;
                     arg_i += 1;
                     if let Some(sp) = supp {
                         env.define_local(&sp, T);
                     }
                 } else {
-                    let dv = if default_form == NIL {
+                    let mut dv = if default_form == NIL {
                         NIL
                     } else {
                         eval_form(default_form, env)?
                     };
+                    bliss_rt::rooted_ref!(_default_value_root = &mut dv);
                     bind_macro_param(pattern, dv, env, macroexpand_env)?;
                     if let Some(sp) = supp {
                         env.define_local(&sp, NIL);
@@ -27523,7 +27715,8 @@ fn bind_macro_lambda_list(
                         "malformed macro lambda list: multiple &rest/&body variables".into(),
                     ));
                 }
-                let remaining = vec_to_list(args.get(arg_i..).unwrap_or(&[]));
+                let mut remaining = vec_to_list(args.get(arg_i..).unwrap_or(&[]));
+                bliss_rt::rooted_ref!(_remaining_root = &mut remaining);
                 bind_macro_param(elem, remaining, env, macroexpand_env)?;
                 key_start.get_or_insert(arg_i);
                 rest_bound = true;
@@ -27562,10 +27755,11 @@ fn bind_macro_lambda_list(
                 } else {
                     (String::new(), elem, NIL, None)
                 };
-                key_specs.push((kw_bare, pattern, default_form, supp));
+                key_specs.push((kw_bare, supp));
+                key_values.push((pattern, default_form));
             }
             Mode::Aux => {
-                let (pattern, default_form) = if elem.is_symbol() {
+                let (mut pattern, mut default_form) = if elem.is_symbol() {
                     (elem, NIL)
                 } else if elem.is_cons() {
                     let (pat, r) = cp(elem);
@@ -27574,17 +27768,21 @@ fn bind_macro_lambda_list(
                 } else {
                     (elem, NIL)
                 };
-                let dv = if default_form == NIL {
+                bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
+                bliss_rt::rooted_ref!(_default_form_root = &mut default_form);
+                let mut dv = if default_form == NIL {
                     NIL
                 } else {
                     eval_form(default_form, env)?
                 };
+                bliss_rt::rooted_ref!(_default_value_root = &mut dv);
                 bind_pattern_value(pattern, dv, env)?;
             }
         }
     }
 
-    if let Some(var) = whole_var {
+    if let Some(mut var) = whole_var {
+        bliss_rt::rooted_ref!(_whole_var_value_root = &mut var);
         bind_pattern_value(var, whole_form, env)?;
     }
 
@@ -27612,19 +27810,26 @@ fn bind_macro_lambda_list(
             }
         }
 
-        for (kw_bare, pattern, default_form, supp) in &key_specs {
+        for index in 0..key_specs.len() {
+            let (kw_bare, supp) = &key_specs[index];
+            let (mut pattern, mut default_form) = key_values[index];
+            bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
+            bliss_rt::rooted_ref!(_default_form_root = &mut default_form);
             if let Some(v) = find_key_arg(tail, kw_bare) {
-                bind_macro_param(*pattern, v, env, macroexpand_env)?;
+                let mut v = v;
+                bliss_rt::rooted_ref!(_value_root = &mut v);
+                bind_macro_param(pattern, v, env, macroexpand_env)?;
                 if let Some(sp) = supp {
                     env.define_local(sp, T);
                 }
             } else {
-                let dv = if *default_form == NIL {
+                let mut dv = if default_form == NIL {
                     NIL
                 } else {
-                    eval_form(*default_form, env)?
+                    eval_form(default_form, env)?
                 };
-                bind_macro_param(*pattern, dv, env, macroexpand_env)?;
+                bliss_rt::rooted_ref!(_default_value_root = &mut dv);
+                bind_macro_param(pattern, dv, env, macroexpand_env)?;
                 if let Some(sp) = supp {
                     env.define_local(sp, NIL);
                 }
@@ -27637,7 +27842,7 @@ fn bind_macro_lambda_list(
                 if bare == "ALLOW-OTHER-KEYS" {
                     continue;
                 }
-                if !key_specs.iter().any(|(kw, _, _, _)| kw == &bare) {
+                if !key_specs.iter().any(|(kw, _)| kw == &bare) {
                     return Err(BlissError::Internal(format!(
                         "unexpected macro keyword argument: {}",
                         bare
@@ -27869,8 +28074,12 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                     // values it returns via (values …). The expander body runs in
                     // a CHILD env, so the multiple values land on that child's mv —
                     // read them there, not on the caller's env.
+                    bliss_rt::rooted!(place = place);
+                    bliss_rt::rooted!(params_form = mdef.params_form);
+                    bliss_rt::rooted!(body = mdef.body);
+                    bliss_rt::rooted!(arg_list = list_to_vec(args));
                     let mut child = env.child_with_parent(Rc::clone(&mdef.captured_frame));
-                    let arg_list = list_to_vec(args);
+                    bliss_rt::rooted_ref!(_child_root = &mut child);
                     let first = if let Some(function) = &mdef.bytecode {
                         // A source-free bytecode expander (loaded from a .bfasl):
                         // run it like a macro; its (values …) land on the child mv.
@@ -27880,20 +28089,20 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                             &mut child,
                         )?
                     } else {
-                        let macroexpand_env = if params_form_uses_environment(mdef.params_form) {
+                        let macroexpand_env = if params_form_uses_environment(*params_form) {
                             Some(macroexpand_environment_from_cli(env))
                         } else {
                             None
                         };
                         bind_macro_lambda_list(
-                            mdef.params_form,
+                            *params_form,
                             &arg_list,
                             &mut child,
                             macroexpand_env.as_ref(),
                             // A setf expander's `&whole` binds the whole place form.
-                            Some(place),
+                            Some(*place),
                         )?;
-                        eval_progn(mdef.body, &mut child)?
+                        eval_progn(*body, &mut child)?
                     };
                     let mut values = if child.mv_active {
                         std::mem::take(&mut child.mv)
@@ -28127,6 +28336,29 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     compiler_macroexpand::define_compiler_macro(
         name_form,
         Arc::new(move |form, _macro_env| {
+            // FORM is a by-value copy owned by this callback. Root it across
+            // creation of the throwaway Env, then read the globally rooted
+            // capture so its local copies start with post-GC addresses.
+            bliss_rt::rooted!(form = form);
+            let package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
+                BlissError::Internal("compiler macro: *PACKAGE* is unavailable".into())
+            })?;
+            bliss_rt::rooted!(definition_package_value = package_object(&current_package));
+            // Env construction resets the global cell to CL-USER. Establish a
+            // rooted dynamic binding first so the caller's value is restored on
+            // every exit, then reinstall the definition package after creation.
+            bliss_rt::rooted!(_package_binding = DynBind::establish(
+                package_symbol,
+                *definition_package_value,
+            ));
+            let mut macro_env = Env::new_for_macro_expansion(sandbox);
+            bliss_rt::rooted_ref!(_macro_env_root = &mut macro_env);
+            macro_env.current_package = current_package.clone();
+            macro_env.define_local("*PACKAGE*", *definition_package_value);
+            bliss_rt::symbols::set_symbol_value(
+                package_symbol.as_symbol_index(),
+                *definition_package_value,
+            );
             let (params_form, body, captured_frame, funs, classes, methods, symbol_macros) = {
                 let capture = capture
                     .lock()
@@ -28141,34 +28373,29 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
                     capture.symbol_macros.clone(),
                 )
             };
-            let (_, args) = cp(form);
-            let mut macro_env = Env::new_for_macro_expansion(sandbox);
-            macro_env.frame = thaw_env_frame(&captured_frame);
-            macro_env.funs = Rc::new(RefCell::new(funs.clone()));
+            bliss_rt::rooted!(params_form = params_form);
+            bliss_rt::rooted!(body = body);
+            bliss_rt::rooted!(args = list_to_vec(cp(*form).1));
+            // Move every heap-capable registry snapshot into the rooted Env
+            // before thawing its frame, which allocates and may relocate their
+            // values. The frozen capture remains globally scanned, but these
+            // by-value HashMap copies would not be rewritten there.
+            macro_env.funs = Rc::new(RefCell::new(funs));
             macro_env.macros = Rc::new(RefCell::new(HashMap::new()));
-            macro_env.symbol_macros = Rc::new(RefCell::new(symbol_macros.clone()));
-            macro_env.classes = Rc::new(RefCell::new(classes.clone()));
-            macro_env.methods = Rc::new(RefCell::new(methods.clone()));
-            macro_env.current_package = current_package.clone();
+            macro_env.symbol_macros = Rc::new(RefCell::new(symbol_macros));
+            macro_env.classes = Rc::new(RefCell::new(classes));
+            macro_env.methods = Rc::new(RefCell::new(methods));
+            macro_env.frame = thaw_env_frame(&captured_frame);
             macro_env.eval_context = eval_context;
-            // Register the fresh macro-expansion Env as a GC root *before*
-            // binding: it holds the macro parameters (e.g. `&body body`) and
-            // every variable the body binds (e.g. a `case`/`typecase` gensym), on
-            // a frame chain a relocating minor GC would otherwise never scan. The
-            // guard must precede bind_macro_lambda_list — building a `&rest`/
-            // `&body` list allocates (arena_cons), which can fire a GC that would
-            // free the already-bound parameters if the env were still
-            // unregistered (bliss-6b2 #2). Same guard as eval_flet / eval_macrolet.
-            bliss_rt::rooted_ref!(_macro_env_root = &mut macro_env);
             bind_macro_lambda_list(
-                params_form,
-                &list_to_vec(args),
+                *params_form,
+                &args,
                 &mut macro_env,
                 Some(_macro_env),
                 // A compiler macro's `&whole` binds the whole call form.
-                Some(form),
+                Some(*form),
             )?;
-            eval_progn(body, &mut macro_env)
+            eval_progn(*body, &mut macro_env)
         }),
     );
 
@@ -28445,93 +28672,74 @@ fn expand_macro(
     // build below, both of which allocate and can fire a relocating minor GC;
     // root it so the bound form is not left dangling (bliss-6b2 #2).
     bliss_rt::rooted_ref!(_whole_root = &mut whole);
-    // Macro expansion must be *PACKAGE*-neutral: a compiled expander runs in a
-    // child env whose captured frame carries the macro's DEFINITION package, and
-    // the bytecode run path syncs the *PACKAGE* value cell to it — so expanding a
-    // macro defined in another package (e.g. regression-test's DEFTEST from
-    // ansi-test, whose home resolves to COMMON-LISP-USER) silently clobbered the
-    // caller's *PACKAGE*, corrupting subsequent reads and nested LOADs (bliss-cpm9:
-    // a macroexpand in :cl-test left *PACKAGE* = CL-USER, so a following
-    // `(load "cons.lsp")` read DEFTEST as an undefined function). Snapshot and
-    // restore both the field and the value cell around the whole expansion.
-    let saved_package = env.current_package.clone();
-    let saved_package_cell =
-        resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()));
-    let restore_package = |env: &mut Env| {
-        env.current_package = saved_package.clone();
-        if let Some(cell) = saved_package_cell {
-            if let Some(s) = resolve_sym("*PACKAGE*") {
-                bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), cell);
-            }
-        }
-    };
+    // Root the macro-call argument FORMS before the first operation that may
+    // allocate. Rooting `whole` alone cannot rewrite the separate `args` copy
+    // held in this Rust frame, so delaying this until after resolve_sym and the
+    // child-env fork left a stale nursery pointer window.
+    bliss_rt::rooted!(arg_list = list_to_vec(args));
     // `mdef` is a CLONE — lookup_macro / setf-expander lookup return `.cloned()`.
-    // Only the REGISTERED MacroDef is scanned by visit_macro_def_roots, so this
-    // clone's by-value BlissVal fields (params_form / body / function) go stale
-    // if any allocation below (the child-env fork, arg-list build,
-    // bind_macro_lambda_list, or the macroexpand-env build) fires a moving GC:
-    // reading mdef.body at eval_progn then derefs a poisoned form. Adding a few
-    // defuns to boot.lisp shifted the GC-stress stride onto exactly this window
-    // and SIGSEGV'd init deterministically (bliss-pjun). Root local copies
-    // BEFORE the first allocation and use them throughout. captured_frame and
-    // bytecode are shared Rc (scanned via the registry entry), so no copy needed.
+    // Only the REGISTERED MacroDef is scanned by visit_macro_def_roots, so root
+    // every by-value field before even resolving *PACKAGE* (which may intern and
+    // collect), and use the relocated copies throughout expansion.
     bliss_rt::rooted!(params_form = mdef.params_form);
     bliss_rt::rooted!(body = mdef.body);
     bliss_rt::rooted!(macro_function = mdef.function.unwrap_or(NIL));
-    let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
-    // Root the forked expansion Env for the WHOLE expansion — both branches:
-    // run_macro (bytecode expanders) and the tree-walked body below allocate
-    // heavily, and the fork's frame chain is otherwise unscanned (bliss-8qf;
-    // previously only the tree-walk branch was rooted).
-    bliss_rt::rooted_ref!(_child_root = &mut child_env);
-    // Root the macro-call argument FORMS: they are conses from the call site,
-    // held across every allocation below until bind_macro_lambda_list binds
-    // them. Unrooted, a stress-stride GC left them stale and the expansion was
-    // built from scrambled/cyclic forms — the bliss-8qf corruption (silently
-    // wrong dotimes/push results, "undefined function: I", eval spinning on a
-    // self-referential AND). This was gc-root-lint baseline finding
-    // `expand_macro:arg_list`.
-    bliss_rt::rooted!(arg_list = list_to_vec(args));
+    // Macro expansion must be *PACKAGE*-neutral: expansion may update both the
+    // Env field and the global special-variable cell. Keep the caller's cell in
+    // a rooted RAII binding so it is restored on every return path, including a
+    // lambda-list default/init form that signals. Restore the Rust field before
+    // propagating any error for the same reason (bliss-cpm9 / bliss-2dld).
+    let saved_package = env.current_package.clone();
+    let package_symbol = resolve_sym("*PACKAGE*")
+        .ok_or_else(|| BlissError::Internal("macro expansion: *PACKAGE* is unavailable".into()))?;
+    let saved_package_value = global_value_cell(package_symbol.as_symbol_index())
+        .unwrap_or(bliss_rt::value::UNBOUND);
+    bliss_rt::rooted!(_package_binding =
+        DynBind::establish(package_symbol, saved_package_value));
+
     // A first-class expander installed via (setf (macro-function name) fn):
     // CLHS 3.1.2.1.2.2 — apply it to the WHOLE macro call form and the
     // environment (we pass NIL; bliss expanders that need lexical context use
     // &environment macros instead).
-    if mdef.function.is_some() {
-        let r = apply_function(*macro_function, &[whole, NIL], env);
-        restore_package(env);
-        return r;
-    }
-    if let Some(function) = &mdef.bytecode {
-        let r = bytecode::run_macro(
-            Rc::new(function.borrow().clone()),
-            &arg_list,
-            &mut child_env,
-        );
-        restore_package(env);
-        return r;
-    }
-    // Building the macroexpand environment walks every frame and re-registers
-    // *all* global macros into bliss-compiler's macro table (with fresh handles
-    // and frozen frame snapshots). That is only needed to satisfy an
-    // `&ENVIRONMENT` parameter, which almost no macro has — doing it on every
-    // expansion made loading macro-heavy files (lib/asdf.lisp) blow up to
-    // multi-GB and never finish. Build it only when the lambda list uses it.
-    let macroexpand_env = if params_form_uses_environment(*params_form) {
-        Some(macroexpand_environment_from_cli(env))
+    let expansion = if mdef.function.is_some() {
+        apply_function(*macro_function, &[whole, NIL], env)
     } else {
-        None
+        let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
+        // Root the forked expansion Env for the WHOLE expansion — both branches:
+        // run_macro (bytecode expanders) and the tree-walked body below allocate
+        // heavily, and the fork's frame chain is otherwise unscanned (bliss-8qf;
+        // previously only the tree-walk branch was rooted).
+        bliss_rt::rooted_ref!(_child_root = &mut child_env);
+        if let Some(function) = &mdef.bytecode {
+            bytecode::run_macro(
+                Rc::new(function.borrow().clone()),
+                &arg_list,
+                &mut child_env,
+            )
+        } else {
+            // Building the macroexpand environment walks every frame and
+            // re-registers all global macros. Do that only for the uncommon
+            // &ENVIRONMENT lambda-list case.
+            let mut macroexpand_env = if params_form_uses_environment(*params_form) {
+                Some(macroexpand_environment_from_cli(env))
+            } else {
+                None
+            };
+            bliss_rt::rooted_ref!(_macroexpand_env_root = &mut macroexpand_env);
+            let binding = bind_macro_lambda_list(
+                *params_form,
+                &arg_list,
+                &mut child_env,
+                macroexpand_env.as_ref(),
+                Some(whole),
+            );
+            match binding {
+                Ok(()) => eval_progn(*body, &mut child_env),
+                Err(error) => Err(error),
+            }
+        }
     };
-    // (child_env is rooted above, before the arg-list build — the guard must
-    // precede every allocation, including building a `&rest`/`&body` list.)
-    bind_macro_lambda_list(
-        *params_form,
-        &arg_list,
-        &mut child_env,
-        macroexpand_env.as_ref(),
-        Some(whole),
-    )?;
-    let expansion = eval_progn(*body, &mut child_env);
-    restore_package(env);
+    env.current_package = saved_package;
     let expansion = expansion?;
     debug_validate_form("expand-result", "tree-walk-macro", expansion);
     Ok(expansion)
