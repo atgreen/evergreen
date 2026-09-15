@@ -2801,25 +2801,74 @@
         (setq p (cddr p))))
     `(let* ,(reverse rev-bindings) ,@(reverse rev-assigns) nil)))
 
+;; ROTATEF / SHIFTF go through GET-SETF-EXPANSION (CLHS 5.1.3), like INCF/DECF
+;; and PUSH/POP above. The previous definitions mentioned every PLACE TWICE —
+;; once to read it in the LET binding and once to write it in the SETF — so a
+;; place with a side-effecting subform ran that subform twice:
+;;   (shiftf (aref x (incf i)) (incf i))  advanced I twice and stored through
+;;                                        the wrong index
+;;   (rotatef (aref x (incf i)) (aref x (incf i)))
+;;                                        ran the index off the end of the
+;;                                        vector and signalled a TYPE-ERROR
+;; (ansi SHIFTF-ORDER.1/2, ROTATEF-ORDER.1/2; bliss-pbp8). Lifting the subforms
+;; into temporaries evaluates each exactly once, left to right, and every place
+;; is READ before any place is WRITTEN — which is what makes the rotate work.
+
+;; Collect the setf expansions of PLACES into
+;;   (values reversed-let*-bindings store-vars store-forms access-forms)
+;; with the per-place temporaries bound left to right.
+;; Store through (SETF <access-form> <temp>) rather than through the expansion's
+;; own store form. The access form mentions only the temporaries, so nothing is
+;; re-evaluated, and SETF's place machinery handles every standard accessor.
+;; The store form GET-SETF-EXPANSION returns is `(funcall #'(setf acc) …)`, and
+;; no writer function exists for BIT/SBIT/CHAR/SCHAR/NTH/GET/FILL-POINTER/
+;; ROW-MAJOR-AREF/SUBSEQ/SYMBOL-PLIST/FOURTH/CADAR/… — using it turned
+;; `(rotatef (bit x 1) (bit y 3) z)` into a TYPE-ERROR. INCF/DECF above take
+;; the same (setf getter …) route for the same reason. See bliss-42iv.
+(defun %setf-expansions (places env)
+  (let ((binds nil) (getters nil))
+    (dolist (raw places)
+      (multiple-value-bind (dummies vals newvars setter getter)
+          (get-setf-expansion (macroexpand raw env) env)
+        (declare (ignore newvars setter))
+        (do ((d dummies (cdr d)) (v vals (cdr v)))
+            ((null d))
+          (push (list (car d) (car v)) binds))
+        (push getter getters)))
+    (values (reverse binds) (reverse getters))))
+
 ;; ROTATEF: each place receives the (old) value of the next; last gets first.
-(defmacro rotatef (&rest places)
+(defmacro rotatef (&rest places &environment env)
   (if (or (null places) (null (cdr places)))
       nil
-      (let ((temps (mapcar (lambda (p) (declare (ignore p)) (gensym)) places)))
-        `(let ,(mapcar (function list) temps places)
-           ,@(mapcar (lambda (pl tp) (list 'setf pl tp))
-                     places (append (cdr temps) (list (car temps))))
-           nil))))
+      (multiple-value-bind (binds getters)
+          (%setf-expansions places env)
+        (let ((vals (mapcar (lambda (g) (declare (ignore g)) (gensym)) getters)))
+          ;; Read EVERY place (into VALS) before writing any of them — that is
+          ;; what makes the rotate work rather than propagating one value.
+          `(let* (,@binds
+                  ,@(mapcar (function list)
+                            vals
+                            (append (cdr getters) (list (car getters)))))
+             ,@(mapcar (lambda (g v) (list 'setf g v)) getters vals)
+             nil)))))
 
 ;; SHIFTF: return the old value of the first place; shift the rest leftward and
 ;; store NEWVALUE (the final argument) into the last place.
-(defmacro shiftf (&rest args)
-  (let* ((places (butlast args))
-         (newval (car (last args)))
-         (temps (mapcar (lambda (p) (declare (ignore p)) (gensym)) places)))
-    `(let ,(mapcar (function list) temps places)
-       (setf ,@(%zip-pairs places (append (cdr temps) (list newval))))
-       ,(car temps))))
+(defmacro shiftf (&rest args &environment env)
+  (let ((places (butlast args))
+        (newval (car (last args)))
+        (out (gensym)))
+    (multiple-value-bind (binds getters)
+        (%setf-expansions places env)
+      (let ((vals (mapcar (lambda (g) (declare (ignore g)) (gensym)) getters)))
+        `(let* (,@binds
+                (,out ,(car getters))
+                ,@(mapcar (function list)
+                          vals
+                          (append (cdr getters) (list newval))))
+           ,@(mapcar (lambda (g v) (list 'setf g v)) getters vals)
+           ,out)))))
 
 ;;; PROG / PROG*: LET (or LET*) plus an implicit BLOCK NIL and TAGBODY.
 (defmacro prog (bindings &rest body)
