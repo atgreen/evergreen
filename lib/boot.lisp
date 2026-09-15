@@ -2663,6 +2663,41 @@
   (+ (- integer (mask-field bytespec integer))
      (mask-field bytespec newbyte)))
 
+;; (setf (ldb bytespec place) new) — CLHS 5.1.2.2 / the LDB dictionary entry.
+;; LDB is a read-modify-write place: it reads the whole integer out of PLACE,
+;; replaces just the BYTESPEC field via DPB, and writes the integer back. The
+;; bytespec and the inner place's subforms are lifted into temporaries so each
+;; is evaluated exactly once, and the expansion returns NEW (not the stored
+;; integer), which is what SETF must yield (bliss-pbp8).
+(define-setf-expander ldb (bytespec place &environment env)
+  (multiple-value-bind (dummies vals newval setter getter)
+      (get-setf-expansion place env)
+    (declare (ignore newval setter))
+    (let ((btemp (gensym)) (store (gensym)))
+      (values (cons btemp dummies)
+              (cons bytespec vals)
+              (list store)
+              ;; Store through SETF on the GETTER rather than through the
+              ;; expansion's own setter form: that setter is
+              ;; `(funcall #'(setf car) ...)`, and the `(setf car)` function is
+              ;; not fbound here, so using it breaks nested places. PUSH/POP
+              ;; above ignore the setter for the same reason.
+              `(progn (setf ,getter (dpb ,store ,btemp ,getter)) ,store)
+              `(ldb ,btemp ,getter)))))
+
+;; (setf (mask-field bytespec place) new) — same shape, but NEW is taken in
+;; place rather than right-justified, so DEPOSIT-FIELD replaces DPB.
+(define-setf-expander mask-field (bytespec place &environment env)
+  (multiple-value-bind (dummies vals newval setter getter)
+      (get-setf-expansion place env)
+    (declare (ignore newval setter))
+    (let ((btemp (gensym)) (store (gensym)))
+      (values (cons btemp dummies)
+              (cons bytespec vals)
+              (list store)
+              `(progn (setf ,getter (deposit-field ,store ,btemp ,getter)) ,store)
+              `(mask-field ,btemp ,getter)))))
+
 ;;; --- misc numeric functions -------------------------------------------------
 
 ;; SIGNUM (CLHS 12.2): rational => -1/0/1 (integer); float => a float of the
