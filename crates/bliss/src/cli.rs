@@ -945,6 +945,40 @@ fn global_fn(name: &str) -> Option<BlissVal> {
 /// closure's environment — held in `CLOSURE_ENV` keyed by the object — is
 /// installed when its body runs). When no object resolves (e.g. a
 /// `GLOBAL_SETF_FNS` writer), fall back to the called name as its own symbol.
+/// `dispatch_target` for a callee we hold as an actual SYMBOL.
+///
+/// An UNINTERNED symbol cannot be recovered from its name: it is not in the
+/// name→index map, and two gensyms can share a print name. Resolving such a
+/// callee by string therefore found nothing, fell back to `resolve_sym(name)`,
+/// and dispatched against an unrelated (or freshly interned) symbol — so
+/// `(setf (symbol-function (gensym)) <a closure>)` followed by `(funcall g)`
+/// SILENTLY returned NIL instead of calling the closure, while
+/// `(funcall (symbol-function g))` on the same object returned the right value
+/// (ansi PSETF.25 / PSETF.28, which name their functions with GENSYM).
+/// Resolve through the symbol's own index and function cell instead
+/// (bliss-8my1).
+fn dispatch_target_of_symbol(sym: BlissVal, name: &str) -> (Option<u32>, BlissVal) {
+    if let Some(idx) = sym.symbol_index() {
+        if bliss_rt::symbols::is_uninterned(idx) {
+            let obj = bliss_rt::symbols::symbol_function(idx)
+                .filter(|&f| bliss_rt::function::is_interpreted_function(f));
+            return match obj {
+                Some(obj) => {
+                    let own = bliss_rt::function::name(obj);
+                    let own_idx = if own.is_symbol() {
+                        own.as_symbol_index()
+                    } else {
+                        idx
+                    };
+                    (Some(own_idx), obj)
+                }
+                None => (Some(idx), sym),
+            };
+        }
+    }
+    dispatch_target(name)
+}
+
 fn dispatch_target(name: &str) -> (Option<u32>, BlissVal) {
     match global_fn(name) {
         Some(obj) => {
@@ -21775,7 +21809,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // the object in CLOSURE_ENV) is installed when its body runs.
                 // Fall back to the called name when no global object resolves
                 // (e.g. a GLOBAL_SETF_FNS writer). bliss-57m / bliss-jtc.23.3.
-                let (dispatch_idx, fn_val) = dispatch_target(&name);
+                let (dispatch_idx, fn_val) = dispatch_target_of_symbol(car, &name);
                 if let Some(idx) = dispatch_idx {
                     if let Some(res) = bytecode::call_registered(idx, &rooted_args, fn_val, env) {
                         return res;
@@ -30311,7 +30345,7 @@ fn apply_function(
                 // function reached through funcall/apply or the c2i fallback from
                 // compiled code (e.g. a call inside a compiled top-level thunk).
                 maybe_lazy_compile(&name, params_form, body, env);
-                let (dispatch_idx, fn_val) = dispatch_target(&name);
+                let (dispatch_idx, fn_val) = dispatch_target_of_symbol(fn_val, &name);
                 if let Some(idx) = dispatch_idx {
                     if let Some(res) = bytecode::call_registered(idx, args, fn_val, env) {
                         return res;

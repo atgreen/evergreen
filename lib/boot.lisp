@@ -2780,26 +2780,38 @@
 ;; spliced into `(cdr cons)` (self-loop) instead of the old last-cdr, dropping a
 ;; sequence element (bliss-omw). We capture each accessor place's argument
 ;; subforms into fresh temps too, so the assignment targets the original cells.
-(defmacro psetf (&rest pairs)
-  (let ((rev-bindings nil) (rev-assigns nil) (p pairs))
+;; PSETF via GET-SETF-EXPANSION (CLHS 5.1.3), like ROTATEF/SHIFTF below.
+;; The previous version lifted each place ARGUMENT into a temporary and then
+;; stored through `(setf (op . temps) v)`. That is wrong whenever an argument is
+;; itself the thing being written: `(ldb (byte 5 1) x)` became
+;; `(setf (ldb #:t1 #:t2) v)`, storing into the temporary #:t2 rather than into
+;; X. It also never macroexpanded the place, so a SYMBOL-MACROLET place was
+;; treated as a plain variable, and it had no expansion at all for places like
+;; (FDEFINITION f) / (SYMBOL-FUNCTION f), which signalled UNBOUND-VARIABLE
+;; (ansi PSETF.7 .24 .25 .28; bliss-pbp8).
+;;
+;; Order matters and is per PAIR, not per phase: CLHS evaluates place1's
+;; subforms, then value1, then place2's subforms, then value2, … So the
+;; bindings are built pair by pair rather than through %setf-expansions (which
+;; collects every place first — correct for ROTATEF/SHIFTF, which have no value
+;; forms interleaved between the places).
+(defmacro psetf (&rest pairs &environment env)
+  (let ((binds nil) (assigns nil) (p pairs))
     (loop while (consp (cdr p)) do
-      (let ((place (car p)) (val (cadr p)) (vtemp (gensym)))
-        (if (consp place)
-            ;; (op arg...) : bind a temp for each argument (evaluated now), then
-            ;; assign through those temps so the place refers to the ORIGINAL
-            ;; locations regardless of other assignments.
-            (let* ((op (car place))
-                   (args (cdr place))
-                   (atemps (mapcar (lambda (a) (declare (ignore a)) (gensym)) args)))
-              (mapc (lambda (tp a) (setq rev-bindings (cons (list tp a) rev-bindings)))
-                    atemps args)
-              (setq rev-bindings (cons (list vtemp val) rev-bindings))
-              (setq rev-assigns (cons (list 'setf (cons op atemps) vtemp) rev-assigns)))
-            (progn
-              (setq rev-bindings (cons (list vtemp val) rev-bindings))
-              (setq rev-assigns (cons (list 'setq place vtemp) rev-assigns))))
-        (setq p (cddr p))))
-    `(let* ,(reverse rev-bindings) ,@(reverse rev-assigns) nil)))
+      (multiple-value-bind (dummies vals newvars setter getter)
+          (get-setf-expansion (macroexpand (car p) env) env)
+        (declare (ignore newvars setter))
+        (do ((d dummies (cdr d)) (v vals (cdr v)))
+            ((null d))
+          (push (list (car d) (car v)) binds))
+        (let ((vtemp (gensym)))
+          (push (list vtemp (cadr p)) binds)
+          ;; Store through the ACCESS form: it mentions only the temporaries, so
+          ;; nothing is re-evaluated, and SETF handles every accessor (the
+          ;; expansion's own store form does not — bliss-42iv).
+          (push (list 'setf getter vtemp) assigns)))
+      (setq p (cddr p)))
+    `(let* ,(reverse binds) ,@(reverse assigns) nil)))
 
 ;; ROTATEF / SHIFTF go through GET-SETF-EXPANSION (CLHS 5.1.3), like INCF/DECF
 ;; and PUSH/POP above. The previous definitions mentioned every PLACE TWICE —
