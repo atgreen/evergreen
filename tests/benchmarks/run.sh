@@ -17,7 +17,10 @@
 # published").  A ratio without that flag conflates codegen quality with
 # promotion coverage (a tak-style emitter bail looks like a codegen disaster).
 #
-# Env overrides: BLISS (binary), SBCL (binary), N (runs per benchmark).
+# Env overrides: BLISS (binary), SBCL (binary), N (runs per benchmark),
+# CHECK=1 (enforce tests/benchmarks/thresholds.toml and exit non-zero on a
+# regression — absolute bliss ms and T2-reached only; see that file for why the
+# SBCL ratio is deliberately not gated).
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -25,6 +28,8 @@ cd "$(dirname "$0")/../.." || exit 1
 BLISS=${BLISS:-target/x86_64-unknown-linux-musl/release/bliss-cli}
 SBCL=${SBCL:-sbcl}
 N=${N:-5}
+THRESHOLDS=tests/benchmarks/thresholds.toml
+status=0
 
 if [ ! -x "$BLISS" ]; then
     echo "error: bliss binary not found at $BLISS" >&2
@@ -81,4 +86,31 @@ for b in "${benches[@]}"; do
         fi
     fi
     printf "%-10s %10s %10s %8s %5s\n" "$b" "$bliss_ms" "$sbcl_ms" "$ratio" "$t2"
+
+    # Regression tripwire. Only runs under CHECK=1 so the plain report stays a
+    # report; thresholds and their rationale live in thresholds.toml.
+    if [ "${CHECK:-0}" = "1" ] && [ -f "$THRESHOLDS" ]; then
+        max_ms=$(awk -v b="[$b]" '$0==b{f=1;next} /^\[/{f=0} f&&/^max_ms/{print $3;exit}' "$THRESHOLDS")
+        want_t2=$(awk -v b="[$b]" '$0==b{f=1;next} /^\[/{f=0} f&&/^t2_required/{print $3;exit}' "$THRESHOLDS")
+        if [ "$bliss_ms" = FAIL ]; then
+            echo "  REGRESSION $b: benchmark FAILED to run" >&2
+            status=1
+        elif [ -n "$max_ms" ] && [ "$bliss_ms" -gt "$max_ms" ]; then
+            echo "  REGRESSION $b: ${bliss_ms}ms exceeds max_ms=${max_ms}" >&2
+            status=1
+        fi
+        if [ "$want_t2" = "true" ] && [ "$t2" != yes ]; then
+            echo "  REGRESSION $b: no longer reaches T2 (t2_required)" >&2
+            status=1
+        fi
+    fi
 done
+
+if [ "${CHECK:-0}" = "1" ]; then
+    if [ "$status" -eq 0 ]; then
+        echo "benchmarks: all within thresholds"
+    else
+        echo "benchmarks: THRESHOLD REGRESSION — see above" >&2
+    fi
+fi
+exit "$status"

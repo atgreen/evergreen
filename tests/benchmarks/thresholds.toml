@@ -1,0 +1,65 @@
+# Benchmark regression tripwires (bliss-jpd0).
+#
+# `max_ms` is a CEILING on bliss's own min-of-N time, not a target and not a
+# comparison with SBCL. Two deliberate choices:
+#
+#   * Gate on ABSOLUTE bliss milliseconds, never on the SBCL ratio. SBCL runs
+#     several of these in 0-2ms, which is timer resolution, so the ratio swings
+#     wildly on noise while the bliss number stays stable. A ratio-based gate
+#     would be flaky and would also drift silently if SBCL were upgraded.
+#
+#   * Headroom of roughly 3x the observed baseline, because the observed
+#     SPREAD is itself ~2x: deriv measured 284ms, 287ms and 592ms on the same
+#     binary within one session, at load average 6-9 (wall clock drifts ~2x
+#     under load; see scripts/icount.sh). Thresholds tighter than the noise
+#     would fail randomly and get ignored, which is worse than no gate.
+#
+# BE HONEST ABOUT WHAT max_ms CAN AND CANNOT CATCH. With ~2x run-to-run
+# spread, a ms ceiling only catches CATASTROPHIC changes — a tier falling out,
+# an accidental O(n^2), a hang. It cannot catch a 45% regression, and it is not
+# meant to. Use the trend series for that.
+#
+# `t2_required` IS THE PRECISE SIGNAL and is why this file is worth having: it
+# is deterministic, noise-free, and catches exactly the failure mode that
+# actually occurred. During the bliss-m285 work, lowering #'f to LoadFunction
+# without also teaching T1 the opcode made DERIV fall back to T0 and run 45%
+# slower (333ms -> 483ms). Every test passed; the ms ceiling would have been
+# well inside the noise band and missed it. But DERIV stopped reaching T2, so
+# `t2_required` would have flagged it immediately. A benchmark can also keep
+# its timing while silently losing top-tier coverage — DERIV did exactly that
+# for a long time before ad2117f.
+#
+# Update a threshold when a change legitimately shifts it, and say why in the
+# commit. Baseline captured 2026-09-14, release build, min-of-5.
+
+[fib]
+max_ms = 30
+t2_required = true
+
+[tak]
+max_ms = 30
+t2_required = true
+
+[sumloop]
+max_ms = 150
+# Not T2: a function called once with a 3M-iteration loop never trips
+# invocation-count tiering, so OSR is the only route in (bliss-izt).
+t2_required = false
+
+[takl]
+max_ms = 900
+t2_required = true
+
+[deriv]
+# Was 373ms and NOT reaching T2 before ad2117f closed the #'f/EvalHost hole.
+max_ms = 1000
+t2_required = true
+
+[ctak]
+# Capped at T0: catch/throw declines native compilation (bliss-yy9m).
+max_ms = 1100
+t2_required = false
+
+[div2]
+max_ms = 3000
+t2_required = true
