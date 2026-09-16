@@ -12354,7 +12354,9 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .filter(|idx| reader::is_uninterned(*idx))
                     .and_then(bliss_rt::symbols::symbol_function)
                     .is_some_and(bliss_rt::function::is_interpreted_function);
-                uninterned_fn || mv_form_preserves_values(&sym_name_rc(car), env)
+                uninterned_fn
+                    || setf_stores_into_values_place(form)
+                    || mv_form_preserves_values(&sym_name_rc(car), env)
             } else {
                 // Lambda application `((lambda ...) ...)` — dispatches through
                 // eval_lambda_call, which sets mv from the body's tail form.
@@ -12381,6 +12383,36 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 /// defined functions/macros/generics/methods always preserve — a function's
 /// return values come from its own body (eval_lambda_call clears the caller's
 /// argument values before evaluating it), and a macro's from its expansion.
+/// True when `form` is a SETF whose LAST place is a `(values …)` place.
+///
+/// CLHS 5.1.2.3 makes that store return ALL the stored values, so this one SETF
+/// form is value-transparent. SETF as a whole is NOT: it is a single-value
+/// context, and it must keep clearing, or a nested producer in the value
+/// position leaks — `(setf x (gethash k h))` must return one value, not the
+/// two GETHASH left in `env.mv`. That is why this is decided from the form
+/// rather than by adding "SETF" to the operator allowlist (bliss-prdk).
+fn setf_stores_into_values_place(form: BlissVal) -> bool {
+    let (op, mut rest) = cp(form);
+    if !(op.is_symbol() && symbol_bare_name(&sym_name_rc(op)) == "SETF") {
+        return false;
+    }
+    // SETF takes place/value pairs; only the last pair's value is returned.
+    let mut last_place = NIL;
+    while rest.is_cons() {
+        let (place, after_place) = cp(rest);
+        if !after_place.is_cons() {
+            return false; // malformed: odd number of forms
+        }
+        last_place = place;
+        rest = cp(after_place).1;
+    }
+    if !last_place.is_cons() {
+        return false;
+    }
+    let (accessor, _) = cp(last_place);
+    accessor.is_symbol() && symbol_bare_name(&sym_name_rc(accessor)) == "VALUES"
+}
+
 fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
     // `eval_list` dispatches on the EXTERNAL spelling (`BLISS-EXT:X`), but a
     // symbol's identity string is the INTERNAL one (`BLISS-EXT::X`) whenever the

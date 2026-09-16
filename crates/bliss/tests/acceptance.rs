@@ -8576,3 +8576,59 @@ fn wrong_arity_apply_and_get_setf_expansion_signal_program_error() {
         }
     }
 }
+
+/// CLHS 5.1.2.3: SETF of a VALUES place returns, as multiple values, everything
+/// it stored. bliss truncated to the primary — the store half was always right,
+/// and BLISS::%SETF-VALUES already yielded all the values deliberately; the
+/// evaluator discarded them on the way out, because SETF is not in the
+/// multiple-values operator allowlist and so counts as a single-value context.
+///
+/// Adding SETF to that allowlist would be wrong: `(setf x (gethash k h))` must
+/// return ONE value, not the two GETHASH leaves in env.mv. The decision is made
+/// from the form — only a SETF whose LAST place is a VALUES place is
+/// value-transparent. ansi SETF-VALUES.1/6 and VALUES.21; bliss-prdk.
+#[test]
+fn setf_of_values_place_returns_all_stored_values() {
+    let cases = [
+        ("(let ((x nil) (y nil) (z nil)) (multiple-value-list (setf (values x y z) (values 1 2 3))))", "(1 2 3)"),
+        // Storing still works, and a short value list fills with NIL.
+        ("(let ((x nil) (y nil) (z nil)) (setf (values x y z) (values 1 2 3)) (list x y z))", "(1 2 3)"),
+        ("(let ((x nil) (y nil)) (setf (values x y) (values 1)) (list x y))", "(1 NIL)"),
+        // (setf (values) form) returns NO values, not NIL.
+        ("(multiple-value-list (setf (values) (values)))", "NIL"),
+        // Only the LAST place decides: a VALUES place earlier in the form does
+        // not make a later plain place multi-valued.
+        ("(let ((a nil) (x nil) (y nil)) (multiple-value-list (setf a 1 (values x y) (values 8 9))))", "(8 9)"),
+        ("(let ((a nil) (x nil) (y nil)) (multiple-value-list (setf (values x y) (values 8 9) a (floor 7 2))))", "(3)"),
+        // The leak guards: SETF is otherwise a single-value context.
+        ("(let ((h (make-hash-table)) (x nil)) (setf (gethash 'k h) 7) (multiple-value-list (setf x (gethash 'k h))))", "(7)"),
+        ("(let ((x nil)) (multiple-value-list (setf x (floor 7 2))))", "(3)"),
+        ("(let ((x nil)) (multiple-value-list (setf x 5)))", "(5)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

@@ -2883,7 +2883,9 @@
 ;; (bliss-dj5k).
 (defmacro bliss::%setf-values (places form &environment env)
   (if (null places)
-      (list 'progn form nil)
+      ;; (setf (values) form) evaluates FORM and returns NO values -- not NIL.
+      ;; ansi SETF-VALUES.6 (bliss-prdk).
+      (list 'progn form '(values))
       (multiple-value-bind (binds getters)
           (%setf-expansions places env)
         (let ((vals (mapcar (lambda (g) (declare (ignore g)) (gensym)) getters)))
