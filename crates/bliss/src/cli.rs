@@ -15900,21 +15900,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         };
                         // A user SETF-expander (DEFINE-SETF-EXPANDER / DEFSETF)
                         // takes precedence over the built-in place handling below.
-                        // A place whose operator is a LEXICALLY bound macro
-                        // (MACROLET). `get_setf_expansion` already expands such a
-                        // place — which is why `(incf (%m y))` worked — but the
+                        // A place whose operator is a macro — MACROLET-bound or
+                        // global. `get_setf_expansion` already expands such a
+                        // place, which is why `(incf (%m y))` worked, but the
                         // direct SETF path had no branch for it and fell through
-                        // to "unsupported place" (bliss-vjfz). Delegate to the
-                        // same expansion the updating macros use. Global macros
-                        // are deliberately NOT routed here: they already work
-                        // through the existing branches, and rerouting them would
-                        // change a working path for no reason.
-                        let lexical_macro_place = env.macros.borrow().contains_key(&acc)
-                            || {
-                                let leaf = symbol_leaf_name(&acc);
-                                leaf != acc && env.macros.borrow().contains_key(leaf)
-                            };
-                        if lexical_macro_place {
+                        // to "unsupported place" (bliss-vjfz, bliss-w5wf).
+                        //
+                        // An earlier version of this comment claimed global macros
+                        // "already work through the existing branches". They do
+                        // not: `(setf (acc1 x) 2)` for a plain `(defmacro acc1 (x)
+                        // `(car ,x))` was a PROGRAM-ERROR. What misled me is that
+                        // ansi SETF-MACRO.2 passes — its accessor is a global macro
+                        // that ALSO has a DEFSETF, so the expander branch below
+                        // handles it and the macro never needs expanding.
+                        //
+                        // Which is also the ordering constraint: when a name has
+                        // both, the DEFSETF wins (CLHS 5.1.2.7; SETF-MACRO.2 exists
+                        // to check exactly that), so this branch must yield to the
+                        // expander branch below.
+                        let has_setf_expander =
+                            env.setf_expanders.borrow().contains_key(&acc);
+                        let macro_place = !has_setf_expander
+                            && (env.macros.borrow().contains_key(&acc)
+                                || {
+                                    let leaf = symbol_leaf_name(&acc);
+                                    leaf != acc && env.macros.borrow().contains_key(leaf)
+                                }
+                                || macro_defined(env, &acc));
+                        if macro_place {
                             // Expand the place and SETF the expansion, exactly as
                             // the symbol-macro place above does. Handing the
                             // unexpanded form to the expander machinery instead

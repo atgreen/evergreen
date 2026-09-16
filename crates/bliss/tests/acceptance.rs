@@ -8755,3 +8755,73 @@ fn long_form_defsetf_body_has_an_implicit_block() {
         );
     }
 }
+
+/// CLHS 5.1.2.7: a place whose operator is a macro is macroexpanded, and SETF
+/// tries again on the expansion. bliss handled only MACROLET-bound macros; a
+/// global macro place fell through to "unsupported place".
+///
+/// The ordering matters and is tested both ways: when a name has BOTH a macro
+/// definition and a DEFSETF, the DEFSETF wins. That case (ansi SETF-MACRO.2)
+/// passing on its own is what made the global-macro gap look like it did not
+/// exist. ansi SETF-MACRO.1/3, SETF.7; bliss-w5wf.
+#[test]
+fn setf_expands_a_macro_place() {
+    let cases = [
+        // A plain global macro place.
+        (
+            "(progn (defmacro sm-a (x) `(car ,x)) \
+               (let ((x (list 1))) (list (setf (sm-a x) 2) (1+ (car x)))))",
+            "(2 3)",
+        ),
+        // Expansion repeats: a macro whose expansion is another macro.
+        (
+            "(progn (defmacro sm-b (x) `(car ,x)) (defmacro sm-c (x) `(sm-b ,x)) \
+               (let ((x (list 1))) (list (setf (sm-c x) 2) (1+ (car x)))))",
+            "(2 3)",
+        ),
+        // A MACROLET place still works.
+        (
+            "(macrolet ((%m (y) `(car ,y))) \
+               (let ((x (list 1))) (list (setf (%m x) 2) (1+ (car x)))))",
+            "(2 3)",
+        ),
+        // A DEFSETF on a macro name overrides the macro expansion: the update
+        // function runs (observable through the special it sets), rather than
+        // the place expanding to (car x).
+        (
+            "(progn (defun sm-upd (x y) (declare (special *sm-x*)) \
+                       (setf (car x) y) (setf *sm-x* 'boo) y) \
+               (defmacro sm-d (x) `(car ,x)) (defsetf sm-d sm-upd) \
+               (let ((x (list 1)) (*sm-x* nil)) (declare (special *sm-x*)) \
+                 (list (setf (sm-d x) 2) *sm-x* (1+ (car x)))))",
+            "(2 BOO 3)",
+        ),
+        // A non-macro, non-place operator still errors rather than silently
+        // succeeding.
+        (
+            "(handler-case (eval '(setf (sm-not-a-place 1) 2)) (error () :error))",
+            ":ERROR",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case errored: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}
