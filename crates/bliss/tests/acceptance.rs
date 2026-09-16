@@ -8386,3 +8386,61 @@ fn special_binding_role_across_binding_forms() {
         );
     }
 }
+
+/// The bliss-9kww shadow rule, in the M-V-B lowering. An enclosing
+/// `(declare (special z))` puts Z in the lowerer's declared_special, so every
+/// reference compiles as a dynamic load; LET clears the entry for a name it
+/// binds lexically, but MULTIPLE-VALUE-BIND did not — so its own binding was
+/// written and the reference read the outer dynamic cell instead. bliss-7v68.
+///
+/// Bytecode-only: the tree-walker was already right, so the bare form and the
+/// `(eval '…)` form must both be checked.
+#[test]
+fn mvb_lexical_binding_shadows_enclosing_special_declaration() {
+    let cases = [
+        // The M-V-B does not declare Z special, so its binding is lexical.
+        ("(let ((z 0)) (declare (special z)) (multiple-value-bind (z) (values 3) z))", "3"),
+        // A declared one in the same form stays dynamic, and an undeclared
+        // sibling stays lexical.
+        (
+            "(progn (defun mvs-pk (s) (symbol-value s)) \
+               (let ((a 0) (b 0)) (declare (special a b)) \
+                 (multiple-value-bind (a b) (values 1 2) (declare (special a)) \
+                   (list a b (mvs-pk 'a) (mvs-pk 'b)))))",
+            "(1 2 1 0)",
+        ),
+        // The outer dynamic binding is untouched by the inner lexical one.
+        (
+            "(progn (defun mvs-pk2 (s) (symbol-value s)) \
+               (let ((z 0)) (declare (special z)) \
+                 (multiple-value-bind (z) (values 3) (list z (mvs-pk2 'z)))))",
+            "(3 0)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

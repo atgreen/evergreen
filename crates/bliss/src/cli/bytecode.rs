@@ -4839,7 +4839,20 @@ impl<'e> Lowerer<'e> {
         // Free declarations (a name the M-V-B did not bind) redirect references
         // in the body, exactly as in LET.
         self.push_declared_special(&decl_special);
+        // ...and a variable bound LEXICALLY here shadows an enclosing
+        // `(declare (special v))` for the body, the same rule lower_let follows:
+        // without this `(let ((z 0)) (declare (special z)) (m-v-b (z) (values 3)
+        // z))` compiled Z's reference as a dynamic load and read the outer 0
+        // instead of its own binding (bliss-7v68).
+        let mut shadowed = Vec::new();
+        for i in 0..vars.len() {
+            let name = sym_name(vars[i]);
+            if !(is_special_name(&name) || decl_special.contains(&name)) {
+                self.shadow_declared_special(&name, &mut shadowed);
+            }
+        }
         let lowered = self.lower_progn(body); // body value (+1)
+        self.unshadow_declared_special(shadowed);
         self.pop_declared_special(&decl_special);
         lowered?;
         self.exit_scope(saved_next_local);
