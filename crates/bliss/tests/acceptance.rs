@@ -3575,6 +3575,90 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// CLHS makes several package operations CORRECTABLE. bliss signalled the right
+/// condition type but established no restarts, so `(compute-restarts c)` never
+/// grew inside a handler — which is exactly what ansi MAKE-PACKAGE.ERROR.1-4,
+/// DELETE-PACKAGE.6 and IMPORT.ERROR.4/5 check, via a helper that looks for any
+/// restart not named ABORT (bliss-069a). Every expectation matches SBCL.
+#[test]
+fn package_errors_are_correctable() {
+    // The ansi helper's shape: succeed iff some restart is not ABORT.
+    let helper = "(defmacro non-abort-restart-p (&body body) \
+        `(catch 'handled \
+           (handler-bind ((error (lambda (c) \
+                                   (throw 'handled \
+                                     (if (some (lambda (r) \
+                                                 (not (eq (restart-name r) 'abort))) \
+                                               (compute-restarts c)) \
+                                         'success 'fail))))) \
+             ,@body)))";
+    let cases = [
+        // A name clash offers a non-ABORT restart...
+        (
+            "(progn (make-package \"PE-A\" :use '(\"CL\")) \
+               (non-abort-restart-p (make-package \"PE-A\")))",
+            "SUCCESS",
+        ),
+        // ...and continuing yields the EXISTING package.
+        (
+            "(progn (make-package \"PE-B\" :use '(\"CL\")) \
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (continue)))) \
+                 (package-name (make-package \"PE-B\"))))",
+            "\"PE-B\"",
+        ),
+        // DELETE-PACKAGE on a non-package is correctable...
+        (
+            "(non-abort-restart-p (delete-package \"PE-NO-SUCH-QQ\"))",
+            "SUCCESS",
+        ),
+        // ...and CLHS says correcting attempts no deletion and returns NIL.
+        (
+            "(handler-bind ((error (lambda (c) (declare (ignore c)) (continue)))) \
+               (delete-package \"PE-NO-SUCH-QQ\"))",
+            "NIL",
+        ),
+        // The condition is still a PACKAGE-ERROR...
+        (
+            "(handler-case (progn (make-package \"PE-C\" :use '(\"CL\")) \
+                                  (make-package \"PE-C\")) \
+               (package-error () :package-error))",
+            ":PACKAGE-ERROR",
+        ),
+        // ...and it now names the package rather than reporting bare
+        // "Package error." (the complaint in bliss-wne9.3).
+        (
+            "(progn (make-package \"PE-D\" :use '(\"CL\")) \
+               (handler-case (make-package \"PE-D\") \
+                 (package-error (c) (and (search \"PE-D\" (princ-to-string c)) t))))",
+            "T",
+        ),
+        // Unhandled, it must still be an error rather than silently continuing.
+        (
+            "(handler-case (delete-package \"PE-NO-SUCH-RR\") (error () :signalled))",
+            ":SIGNALLED",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {helper} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "package-error case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "wrong correctable-package-error behaviour for: {expr}"
+        );
+    }
+}
+
 /// A symbol registry key is `PACKAGE::NAME`, and NAME may itself contain
 /// colons. Ten sites split such a key at the LAST marker, which lands inside
 /// the name: SYMBOL-PACKAGE reported "COMMON-LISP-USER::PR2" — not even a well

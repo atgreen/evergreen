@@ -21001,9 +21001,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
                     )
                 {
-                    return Err(BlissError::PackageError(format!(
-                        "a package named {pkg_name} already exists"
-                    )));
+                    // Correctable: CONTINUE yields the EXISTING package, which
+                    // is the only correction that leaves the image consistent.
+                    let existing = package_object(&pkg_name);
+                    if signal_correctable_package_error(
+                        existing,
+                        &format!("a package named {pkg_name} already exists"),
+                        env,
+                    )? {
+                        return Ok(package_object(&pkg_name));
+                    }
+                    unreachable!("signal_correctable_package_error returns Err unless continued");
                 }
                 // Parse :nicknames and :use keyword options.
                 let mut nicknames = Vec::new();
@@ -21403,9 +21411,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
                 );
                 if bliss_stdlib::find_package(&pkg_name).is_none() && !is_standard {
-                    return Err(BlissError::PackageError(format!(
-                        "there is no package named {pkg_name} to delete"
-                    )));
+                    // CLHS DELETE-PACKAGE: correcting attempts no deletion and
+                    // returns NIL.
+                    if signal_correctable_package_error(
+                        arena_str(&pkg_name),
+                        &format!("there is no package named {pkg_name} to delete"),
+                        env,
+                    )? {
+                        return Ok(NIL);
+                    }
+                    unreachable!("signal_correctable_package_error returns Err unless continued");
                 }
                 let _ = bliss_stdlib::delete_package(&pkg_name);
                 return Ok(T);
@@ -32221,6 +32236,64 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 }
 
 // ── CERROR ───────────────────────────────────────────────────────
+/// Signal a CORRECTABLE `PACKAGE-ERROR`: establish a CONTINUE restart, signal
+/// the condition so handlers can see and invoke it, and report whether CONTINUE
+/// was chosen. `Ok(true)` means the caller should perform its documented
+/// correction; `Err` means the error stands.
+///
+/// CLHS makes several package operations correctable — DELETE-PACKAGE on a name
+/// that is not a package "signals a correctable error ... If correction is
+/// attempted, no deletion action is attempted; instead delete-package
+/// immediately returns nil". bliss signalled the right condition TYPE but with
+/// NO restarts at all, so `(compute-restarts c)` never grew inside a handler
+/// and a caller had no way to proceed (ansi MAKE-PACKAGE.ERROR.1-4,
+/// DELETE-PACKAGE.6, IMPORT.ERROR.4/5 all check exactly that; bliss-069a).
+///
+/// `package` fills the CLHS-defined `package-error-package` slot. Leaving it
+/// unset is why these reported as a bare, unactionable "Package error."
+/// (bliss-wne9.3).
+///
+/// The restart bookkeeping mirrors `eval_cerror`: push, signal, truncate — the
+/// truncate must happen whichever way the signal returns.
+fn signal_correctable_package_error(
+    package: BlissVal,
+    message: &str,
+    env: &mut Env,
+) -> Result<bool, BlissError> {
+    let package_kw = resolve_sym("PACKAGE").unwrap_or(NIL);
+    bliss_rt::rooted!(package = package);
+    bliss_rt::rooted!(
+        condition = build_condition_instance(env, "PACKAGE-ERROR", &[package_kw, *package])?
+    );
+
+    let base_len = env.restarts.len();
+    env.restarts.push(RestartEntry {
+        name: "CONTINUE".to_string(),
+        function: RestartFunction::ContinueNil,
+        interactive_function: None,
+        test_function: None,
+        unwind_on_invoke: true,
+        group_base: base_len,
+        id: next_restart_id(),
+        restart_obj: NIL,
+        report: NIL,
+    });
+
+    let result = signal_condition_object(*condition, env);
+    env.restarts.truncate(base_len);
+    match result {
+        // No handler transferred control: the error stands.
+        Ok(_) => Err(BlissError::PackageError(message.to_string())),
+        Err(error) => {
+            if restart_invoked_name(&error).as_deref() == Some("CONTINUE") {
+                Ok(true)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // CERROR needs at least a continue-format-control and a datum; a missing
     // required argument is a PROGRAM-ERROR (CLHS 3.5.1; CERROR.ERROR.1/2).
