@@ -3575,6 +3575,92 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// FLET/LABELS may bind a `(setf name)` WRITER, and it must shadow any global
+/// writer of the same name. Clauses were keyed with `sym_name`, which cannot
+/// produce the canonical "(SETF PLACE)" key the store path looks up, so a local
+/// writer was invisible; and the store path probed the GLOBAL mangled writer
+/// symbol before the lexical binding (bliss-gl15). Matches SBCL.
+#[test]
+fn local_setf_writers_work_and_shadow_globals() {
+    let globals = "(progn (defun gcell (x) (first x)) \
+                          (defun (setf gcell) (v x) (setf (first x) (list :global v)) v))";
+    let cases = [
+        // A writer bound by FLET is found at all.
+        (
+            "(let ((c (list 1 2))) \
+               (flet ((ch (x) (first x)) ((setf ch) (v x) (setf (first x) v) v)) \
+                 (setf (ch c) 99)) \
+               c)",
+            "(99 2)",
+        ),
+        // ...by LABELS too.
+        (
+            "(let ((c (list 1 2))) \
+               (labels ((ch2 (x) (first x)) ((setf ch2) (v x) (setf (first x) v) v)) \
+                 (setf (ch2 c) 7)) \
+               c)",
+            "(7 2)",
+        ),
+        // An updating macro reads through the local reader and writes through
+        // the local writer.
+        (
+            "(let ((c (list 1 2))) \
+               (flet ((ch3 (x) (first x)) ((setf ch3) (v x) (setf (first x) v) v)) \
+                 (incf (ch3 c) 10)) \
+               c)",
+            "(11 2)",
+        ),
+        // A local writer SHADOWS a global one of the same name...
+        (
+            "(let ((c (list 1 2))) \
+               (flet ((gcell (x) (first x)) \
+                      ((setf gcell) (v x) (setf (first x) (list :local v)) v)) \
+                 (setf (gcell c) 5)) \
+               c)",
+            "((:LOCAL 5) 2)",
+        ),
+        // ...and the global is intact again outside the FLET.
+        ("(let ((c (list 1 2))) (setf (gcell c) 6) c)", "((:GLOBAL 6) 2)"),
+        // A reader-only FLET must NOT be treated as defining a writer.
+        (
+            "(handler-case (let ((c (list 1 2))) \
+                             (flet ((ronly (x) (first x))) (setf (ronly c) 1) c)) \
+               (error () :errors))",
+            ":ERRORS",
+        ),
+        // #'(setf localname) is a callable value.
+        (
+            "(let ((c (list 1 2))) \
+               (flet (((setf wq) (v x) (setf (first x) v) v)) \
+                 (funcall #'(setf wq) 77 c)) \
+               c)",
+            "(77 2)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {globals} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "local setf writer case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong local setf writer behaviour for: {expr}"
+        );
+    }
+}
+
 /// CLHS 9.1.4.2: restart names are SYMBOLS, compared with EQ. Both sides were
 /// reduced to their bare names before comparing, throwing the package away, so
 /// `(find-restart 'cl:continue)` matched a restart named

@@ -1179,6 +1179,20 @@ fn fn_bound(env: &Env, name: &str) -> bool {
 /// `(defun (setf place) …)`) maps to the string `"(SETF PLACE)"`; a plain symbol
 /// maps to its symbol name. `SETF` builds the same key to find the writer
 /// function for a `(setf (place …) v)` form (CLHS 5.1.2.9).
+/// A `(setf place)` writer bound by an enclosing FLET/LABELS, if any.
+///
+/// Lexical bindings shadow global ones, so SETF must consult this BEFORE the
+/// global mangled `%SETF-WRITER-place` symbol; `callable_body` also searches
+/// globals, so it cannot be used to answer "is there a LOCAL writer?"
+/// (bliss-gl15).
+fn local_setf_writer(env: &Env, place_name: &str) -> Option<(BlissVal, BlissVal)> {
+    let key = format!("(SETF {place_name})");
+    env.funs
+        .borrow()
+        .get(&key)
+        .map(|fdef| (fdef.params_form, fdef.body))
+}
+
 fn function_name_key(name_form: BlissVal) -> String {
     if name_form.is_cons() {
         let (head, tail) = cp(name_form);
@@ -16174,6 +16188,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         *val,
                                         env,
                                     )?;
+                                } else if let Some((params_form, body)) =
+                                    local_setf_writer(env, other)
+                                {
+                                    // A writer bound by an enclosing FLET/LABELS
+                                    // shadows any global one of the same name, so
+                                    // it is probed BEFORE the global mangled
+                                    // %SETF-WRITER symbol below (bliss-gl15).
+                                    // Same calling convention as the global case:
+                                    // new value first, then the place's subforms
+                                    // (CLHS 5.1.2.9).
+                                    let mut args = RootedVals::new(vec![*val]);
+                                    for v in eval_args(*aargs, env)?.iter() {
+                                        args.push(*v);
+                                    }
+                                    eval_lambda_call(
+                                        env,
+                                        params_form,
+                                        body,
+                                        &args,
+                                        Rc::clone(&env.frame),
+                                    )?;
                                 } else if let Some(writer_sym) = {
                                     // Probe the mangled writer symbol under BOTH
                                     // qualified spellings of the place — install
@@ -27316,7 +27351,16 @@ fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, 
             bliss_rt::rooted_ref!(_name_root = &mut name_form);
             bliss_rt::rooted_ref!(_params_root = &mut params_form);
             bliss_rt::rooted_ref!(_fbody_root = &mut fbody);
-            let name = sym_name(name_form);
+            // A clause name may be `(setf place)`, not just a symbol. Keying it
+            // with `sym_name` cannot produce the canonical "(SETF PLACE)" key
+            // that the SETF store path looks up, so a locally-defined writer was
+            // invisible and `(setf (localname x) v)` was a PROGRAM-ERROR
+            // (bliss-gl15). `function_name_key` is the same spelling
+            // `defun (setf place)` registers globally, and the lookup helper
+            // consults `env.funs` before that global table, so a local writer
+            // now shadows a global one of the same name — which is what lexical
+            // scoping requires.
+            let name = function_name_key(name_form);
             let params = extract_params(params_form);
             // A local function's body is wrapped in an implicit block named after
             // the function (ANSI 3.1.2.1 / 6.1 flet-labels), so `(return-from
