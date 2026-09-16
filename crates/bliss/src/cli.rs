@@ -10351,6 +10351,7 @@ fn builtin_condition_supertypes(name: &str) -> Option<Vec<String>> {
 
 fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
     let chain: &'static [&'static str] = match name {
+        "COMPILED-FUNCTION" => &["FUNCTION", "ATOM", "T"],
         "FIXNUM" | "BIGNUM" => &["INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "INTEGER" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "RATIO" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
@@ -12423,6 +12424,9 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "DECODE-FLOAT"
             | "INTEGER-DECODE-FLOAT"
             | "MULTIPLE-VALUE-PROG1"
+            // Returns three values (lambda expression, closure-p, name);
+            // ansi FUNCTION-LAMBDA-EXPRESSION.1/2 count them.
+            | "FUNCTION-LAMBDA-EXPRESSION"
             // APROPOS is specified to return NO values (CLHS 25.1.1); without
             // this the allowlist classifies it single-value and
             // (multiple-value-list (apropos …)) yields (NIL) instead of ().
@@ -12855,6 +12859,9 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         | "PACKAGE-USE-LIST" | "PACKAGE-USED-BY-LIST" | "PACKAGE-SHADOWING-SYMBOLS"
         | "PACKAGE-ERROR-PACKAGE" | "DELETE-PACKAGE" => Some((1, 1)),
         "LIST-ALL-PACKAGES" => Some((0, 0)),
+        // Both take exactly one argument; ansi COMPILED-FUNCTION-P.ERROR.1/2 and
+        // FUNCTION-LAMBDA-EXPRESSION.ERROR.1/2 require a PROGRAM-ERROR otherwise.
+        "COMPILED-FUNCTION-P" | "FUNCTION-LAMBDA-EXPRESSION" => Some((1, 1)),
         // (find-symbol string &optional package) and the interning/using
         // functions all take one required argument and an optional package.
         "FIND-SYMBOL" | "INTERN" | "UNINTERN" | "USE-PACKAGE" | "UNUSE-PACKAGE"
@@ -14907,6 +14914,44 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
+            }
+            "COMPILED-FUNCTION-P" => {
+                // (compiled-function-p object) — the predicate for the
+                // COMPILED-FUNCTION type, which TYPEP already decides. Routing
+                // it through TYPEP rather than reimplementing the test keeps the
+                // two from disagreeing, which is exactly what ansi
+                // COMPILED-FUNCTION-P.1 checks over the whole test universe.
+                let args = eval_args(cdr, env)?;
+                let object = args.first().copied().unwrap_or(NIL);
+                let spec = resolve_sym("COMPILED-FUNCTION").unwrap_or(NIL);
+                return Ok(if typep_matches(env, object, spec)? { T } else { NIL });
+            }
+            "FUNCTION-LAMBDA-EXPRESSION" => {
+                // (function-lambda-expression fn) → three values: the defining
+                // lambda expression (an implementation MAY always return NIL —
+                // CLHS 3.1.2.1.2 — and bliss does not retain one), whether the
+                // function has a non-null lexical closure, and its name.
+                let args = eval_args(cdr, env)?;
+                let f = args.first().copied().unwrap_or(NIL);
+                // CLHS 3.1.2.1.2 constrains this value in ONE direction: it may
+                // be false only when the function is definitely known to have
+                // been defined in the null lexical environment, and an
+                // implementation is explicitly permitted to return true
+                // otherwise. bliss does not retain that fact reliably — the
+                // interpreted-function object's env cell is left NIL even for a
+                // genuine closure — so answering true for any function is both
+                // conforming and the safe direction. Claiming "not a closure"
+                // from missing information is the answer that would be wrong.
+                let closure_p = if is_function_value(f) { T } else { NIL };
+                let name = if bliss_rt::function::is_interpreted_function(f) {
+                    bliss_rt::function::name(f)
+                } else if f.is_symbol() {
+                    f
+                } else {
+                    NIL
+                };
+                env.set_mv(vec![NIL, closure_p, name]);
+                return Ok(NIL);
             }
             "KEYWORDP" => {
                 // A keyword is a symbol whose home package is KEYWORD. NIL is a

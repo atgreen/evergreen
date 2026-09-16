@@ -3575,6 +3575,81 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// COMPILED-FUNCTION-P and FUNCTION-LAMBDA-EXPRESSION were entirely
+/// unimplemented — 12 ansi failures between them — even though TYPEP already
+/// decided the COMPILED-FUNCTION type. Every expectation matches SBCL.
+#[test]
+fn compiled_function_p_and_function_lambda_expression() {
+    let cases = [
+        // COMPILED-FUNCTION-P agrees with TYPEP, which is what
+        // COMPILED-FUNCTION-P.1 checks across the whole test universe.
+        ("(compiled-function-p #'car)", "T"),
+        ("(compiled-function-p '(lambda (x y) (cons y x)))", "NIL"),
+        ("(and (compiled-function-p (compile nil '(lambda (y x) (cons x y)))) t)", "T"),
+        // Its argument is evaluated exactly once.
+        (
+            "(let ((i 0)) (list (compiled-function-p (progn (incf i) '(lambda () nil))) i))",
+            "(NIL 1)",
+        ),
+        // Exactly one argument; anything else is a PROGRAM-ERROR.
+        (
+            "(handler-case (compiled-function-p) (program-error () :pe))",
+            ":PE",
+        ),
+        (
+            "(handler-case (compiled-function-p nil nil) (program-error () :pe))",
+            ":PE",
+        ),
+        // The type is in the lattice, so SUBTYPEP is certain rather than unsure.
+        (
+            "(multiple-value-list (subtypep 'compiled-function 'function))",
+            "(T T)",
+        ),
+        // FUNCTION-LAMBDA-EXPRESSION returns exactly THREE values...
+        ("(length (multiple-value-list (function-lambda-expression #'cons)))", "3"),
+        // ...and reports a closure as one.
+        (
+            "(let ((x nil)) (flet ((%f () x)) \
+               (let ((r (multiple-value-list (function-lambda-expression #'%f)))) \
+                 (list (length r) (and (second r) t)))))",
+            "(3 T)",
+        ),
+        (
+            "(let ((i 0)) (function-lambda-expression (progn (incf i) #'cons)) i)",
+            "1",
+        ),
+        (
+            "(handler-case (function-lambda-expression) (program-error () :pe))",
+            ":PE",
+        ),
+        (
+            "(handler-case (function-lambda-expression #'cons nil) (program-error () :pe))",
+            ":PE",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "function-predicate case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong result for: {expr}"
+        );
+    }
+}
+
 /// A macro parameter the expander body declares SPECIAL must be bound
 /// DYNAMICALLY, not lexically (CLHS 3.3.4): the expander may call a closure that
 /// reads it, and a lexical binding leaves that closure seeing the outer value
