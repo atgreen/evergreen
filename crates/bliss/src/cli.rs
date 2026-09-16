@@ -3553,7 +3553,18 @@ fn bliss_error_to_condition(
             };
             build_condition_instance(env, type_name, &[])?
         }
-        BlissError::PackageError(_) => build_condition_instance(env, "PACKAGE-ERROR", &[])?,
+        BlissError::PackageError(msg) => {
+            // The message was DISCARDED here, which is the whole of the bare
+            // "Package error." report (bliss-wne9.3): every PackageError in the
+            // tree carries a description of what failed.
+            let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            bliss_rt::rooted!(control = arena_str(msg));
+            build_condition_instance(
+                env,
+                "SIMPLE-PACKAGE-ERROR",
+                &[control_kw, *control],
+            )?
+        }
         BlissError::StreamError(msg) => {
             // The reader funnels both genuine I/O failures and parse failures
             // through StreamError. ANSI distinguishes three condition classes,
@@ -9947,6 +9958,15 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         "PACKAGE-ERROR" => Some((
             vec!["ERROR".into()],
             vec![("PACKAGE".into(), "PACKAGE".into())],
+        )),
+        // PACKAGE-ERROR alone has nowhere to put a message, which is why every
+        // package failure reported as a bare "Package error." (bliss-wne9.3).
+        // Mixing in SIMPLE-CONDITION supplies FORMAT-CONTROL/FORMAT-ARGUMENTS,
+        // and the report logic prefers those over the type-specific branch.
+        // This mirrors SIMPLE-TYPE-ERROR above, and is what SBCL signals here.
+        "SIMPLE-PACKAGE-ERROR" => Some((
+            vec!["PACKAGE-ERROR".into(), "SIMPLE-CONDITION".into()],
+            vec![],
         )),
         "PARSE-ERROR" => Some((vec!["ERROR".into()], vec![])),
         "PRINT-NOT-READABLE" => Some((
@@ -32262,6 +32282,12 @@ fn signal_correctable_package_error(
 ) -> Result<bool, BlissError> {
     let package_kw = resolve_sym("PACKAGE").unwrap_or(NIL);
     bliss_rt::rooted!(package = package);
+    // Deliberately PACKAGE-ERROR, not the SIMPLE-PACKAGE-ERROR used for
+    // uncaught package failures: a condition class with two supers currently
+    // breaks restart lookup — FIND-RESTART returns NIL for a restart that
+    // COMPUTE-RESTARTS on the same condition lists (bliss-vqqb). Using the
+    // simple class here silently disabled the CONTINUE restart this function
+    // exists to provide. Switch once that is fixed.
     bliss_rt::rooted!(
         condition = build_condition_instance(env, "PACKAGE-ERROR", &[package_kw, *package])?
     );

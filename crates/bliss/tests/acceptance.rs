@@ -3575,6 +3575,57 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// Every `BlissError::PackageError` carries a description of what failed, but
+/// the condition builder discarded it (`PackageError(_)`), so ASDF loads died
+/// with a bare, unactionable "Package error." — no package, no operation, no
+/// symbol (bliss-wne9.3). The message now rides on a SIMPLE-PACKAGE-ERROR,
+/// which is also what SBCL signals.
+#[test]
+fn package_errors_report_what_failed() {
+    let cases = [
+        // The report names the symbol AND the package.
+        (
+            "(handler-case (export 'foo \"NO-SUCH-PKG-ZZ\") \
+               (package-error (c) (princ-to-string c)))",
+            "\"symbol FOO is not accessible in package NO-SUCH-PKG-ZZ\"",
+        ),
+        // It is no longer the bare string.
+        (
+            "(handler-case (export 'foo \"NO-SUCH-PKG-ZZ\") \
+               (package-error (c) (string= (princ-to-string c) \"Package error.\")))",
+            "NIL",
+        ),
+        // A SIMPLE-PACKAGE-ERROR is still a PACKAGE-ERROR...
+        (
+            "(handler-case (export 'foo \"NO-SUCH-PKG-ZZ\") (package-error () :pkg))",
+            ":PKG",
+        ),
+        // ...and still an ERROR.
+        (
+            "(handler-case (export 'foo \"NO-SUCH-PKG-ZZ\") (error () :err))",
+            ":ERR",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "package-error report case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "package error did not report what failed: {expr}"
+        );
+    }
+}
+
 /// CLHS makes several package operations CORRECTABLE. bliss signalled the right
 /// condition type but established no restarts, so `(compute-restarts c)` never
 /// grew inside a handler — which is exactly what ansi MAKE-PACKAGE.ERROR.1-4,
