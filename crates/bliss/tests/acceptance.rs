@@ -8700,3 +8700,58 @@ fn variable_documentation_is_retained() {
         }
     }
 }
+
+/// CLHS DEFSETF: the long form's body is enclosed in an implicit BLOCK named
+/// after the access-fn, like DEFUN's and DEFMACRO's. bliss established no block,
+/// so a RETURN-FROM in the body signalled CONTROL-ERROR. ansi DEFSETF.5A;
+/// bliss-ye6f.
+#[test]
+fn long_form_defsetf_body_has_an_implicit_block() {
+    let cases = [
+        // RETURN-FROM the access-fn exits the expander and its value is the
+        // store form.
+        (
+            "(progn (defun dsb (x) (car x)) \
+               (defsetf dsb (y) (val) (return-from dsb `(setf (car ,y) ,val))) \
+               (let ((x (cons 'a 'b))) (list (setf (dsb x) 'c) x)))",
+            "(C (C . B))",
+        ),
+        // A body that does not return early is unaffected.
+        (
+            "(progn (defun dsc (x) (car x)) \
+               (defsetf dsc (y) (val) `(setf (car ,y) ,val)) \
+               (let ((x (cons 'a 'b))) (list (setf (dsc x) 'c) x)))",
+            "(C (C . B))",
+        ),
+        // The block wraps the whole body, so forms after the RETURN-FROM are
+        // skipped rather than deciding the expansion.
+        (
+            "(progn (defun dsd (x) (car x)) \
+               (defsetf dsd (y) (val) (return-from dsd `(setf (car ,y) ,val)) \
+                 (error \"unreached\")) \
+               (let ((x (cons 'a 'b))) (setf (dsd x) 'c) x))",
+            "(C . B)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case errored: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}

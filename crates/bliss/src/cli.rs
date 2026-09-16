@@ -29024,7 +29024,20 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                             child.define_local(&sym_name(*name), *store);
                         }
                     }
-                    bliss_rt::rooted!(store_form = eval_progn(*body, &mut child)?);
+                    // CLHS DEFSETF: the long form's body is enclosed in an
+                    // implicit BLOCK named after the ACCESS-FN, so RETURN-FROM
+                    // that name exits the expander — the same implicit block
+                    // DEFUN and DEFMACRO establish. Without it the body's
+                    // RETURN-FROM found no block and signalled CONTROL-ERROR
+                    // (ansi DEFSETF.5A; bliss-ye6f).
+                    //
+                    // `resolve_sym` is evaluated before `*blk` is re-read, so the
+                    // interning it may do cannot leave a stale copy behind.
+                    bliss_rt::rooted!(blk = arena_cons(*accessor, *body));
+                    bliss_rt::rooted!(
+                        blk_form = arena_cons(resolve_sym("BLOCK").unwrap_or(NIL), *blk)
+                    );
+                    bliss_rt::rooted!(store_form = eval_form(*blk_form, &mut child)?);
 
                     let mut access_items = Vec::with_capacity(n + 1);
                     access_items.push(*accessor);
