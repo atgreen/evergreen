@@ -8825,3 +8825,68 @@ fn setf_expands_a_macro_place() {
         );
     }
 }
+
+/// FBOUNDP disagreed with FDEFINITION about what is fbound. FDEFINITION consults
+/// is_ansi_special_operator and is_ansi_standard_macro so `(fdefinition 'cond)`
+/// does not signal; FBOUNDP consulted neither, so `(fboundp 'defun)` was NIL
+/// while `(fdefinition 'defun)` succeeded. It also keyed a `(setf f)` name with
+/// val_as_str instead of the "(SETF f)" spelling the writer registry uses, so a
+/// `(defun (setf f) …)` writer was never found.
+///
+/// ansi DCF-FUNS and DCF-MACROS are the useful tests: each walks a whole
+/// section's worth of standard names, so they check the tables rather than one
+/// symbol. bliss-uy2q.
+#[test]
+fn fboundp_and_macro_function_see_evaluator_implemented_operators() {
+    let cases = [
+        // Standard macros implemented as evaluator arms.
+        ("(not (not (fboundp 'defun)))", "T"),
+        ("(not (not (fboundp 'defsetf)))", "T"),
+        ("(not (not (macro-function 'defsetf)))", "T"),
+        ("(not (not (macro-function 'define-setf-expander)))", "T"),
+        // Special operators are fbound but are NOT macros.
+        ("(not (not (fboundp 'if)))", "T"),
+        ("(macro-function 'if)", "NIL"),
+        // Builtins that FBOUNDP reported as unbound.
+        ("(not (not (fboundp 'function-lambda-expression)))", "T"),
+        ("(not (not (fboundp 'get-setf-expansion)))", "T"),
+        // A (setf f) writer is found under the registry's own key...
+        (
+            "(progn (defun (setf fbx) (v x) (setf (car x) v)) (not (not (fboundp '(setf fbx)))))",
+            "T",
+        ),
+        // ...and a (setf <gensym>) with no writer is still NIL (ansi FBOUNDP.7).
+        ("(let ((g (gensym))) (fboundp (list 'setf g)))", "NIL"),
+        // FBOUNDP and FDEFINITION must agree — the disagreement was the defect.
+        (
+            "(let ((names '(defun defsetf if cond get-setf-expansion car))) \
+               (list (remove-if #'fboundp names) \
+                     (remove-if (lambda (n) (ignore-errors (fdefinition n))) names)))",
+            "(NIL NIL)",
+        ),
+        // Undefined names stay unbound.
+        ("(fboundp (gensym))", "NIL"),
+        ("(macro-function (gensym))", "NIL"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case errored: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}

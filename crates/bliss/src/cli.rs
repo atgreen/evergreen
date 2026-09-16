@@ -15238,10 +15238,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (sf, _) = cp(cdr);
                 let sym = eval_form(sf, env)?;
                 check_function_name(sym)?;
+                // `function_name_key` produces the "(SETF place)" spelling that
+                // GLOBAL_SETF_FNS and the SETF store path use; `val_as_str` did
+                // not, so a `(defun (setf f) …)` writer was never found
+                // (ansi FBOUNDP.6; bliss-uy2q).
                 let name = if sym.is_symbol() {
                     sym_name(sym)
                 } else {
-                    val_as_str(sym)
+                    function_name_key(sym)
+                };
+                // A `(setf place)` writer may instead live on the mangled
+                // %SETF-WRITER symbol (a .bfasl-loaded writer); env_has_setf_writer
+                // covers both. A `(setf <gensym>)` with no writer stays NIL
+                // (ansi FBOUNDP.7).
+                let setf_writer_bound = !sym.is_symbol() && {
+                    let (_setf, tail) = cp(sym);
+                    let place = cp(tail).0;
+                    place.is_symbol() && env_has_setf_writer(&sym_name(place))
                 };
                 // A name is fbound if it resolves as an ordinary function,
                 // a generic function, or a macro.
@@ -15255,12 +15268,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .symbol_index()
                     .and_then(bliss_rt::symbols::symbol_function)
                     .is_some_and(|f| f != bliss_rt::value::UNBOUND);
+                let bare = symbol_bare_name(&name);
                 let bound = cell_bound
+                    || setf_writer_bound
                     || fn_bound(env, &name)
                     || env.methods.borrow().contains_key(&name)
                     || env.generics.borrow().contains_key(&name)
                     || macro_defined(env, &name)
-                    || is_builtin_function(&symbol_bare_name(&name));
+                    || is_builtin_function(&bare)
+                    // Standard special operators and standard macros that the
+                    // evaluator implements directly are fbound in the CL sense.
+                    // FDEFINITION already consults both — FBOUNDP did not, so the
+                    // two disagreed about the same name, which is the actual bug
+                    // (ansi DCF-FUNS, FBOUNDP.3; bliss-uy2q).
+                    || is_ansi_special_operator(&bare)
+                    || is_ansi_standard_macro(&bare);
                 return Ok(if bound { T } else { NIL });
             }
             "FMAKUNBOUND" => {
@@ -26745,6 +26767,11 @@ fn is_ansi_standard_macro(bare: &str) -> bool {
             | "DEFPARAMETER"
             | "DEFCONSTANT"
             | "DEFMACRO"
+            // Both are standard macros bliss implements as evaluator arms; ansi
+            // DCF-MACROS walks the whole section-5 macro list and named exactly
+            // these two as missing (bliss-uy2q).
+            | "DEFSETF"
+            | "DEFINE-SETF-EXPANDER"
             | "DOLIST"
             | "DOTIMES"
             | "DO"
@@ -31883,6 +31910,10 @@ fn is_builtin_function(name: &str) -> bool {
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
             | "COMPILE"
             | "CONSTANTLY" | "NOT" | "EQ" | "EQL" | "EQUAL" | "EQUALP"
+            // Both are real builtins that FBOUNDP reported as unbound; ansi
+            // DCF-FUNS walks the whole section-5 function list and named exactly
+            // these two as missing (bliss-uy2q).
+            | "FUNCTION-LAMBDA-EXPRESSION" | "GET-SETF-EXPANSION"
             // Conses / lists
             | "CONS" | "CAR" | "CDR" | "FIRST" | "REST" | "SECOND" | "THIRD" | "FOURTH"
             | "FIFTH" | "LAST" | "LIST" | "LIST*" | "APPEND" | "NCONC" | "REVERSE"
