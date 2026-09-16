@@ -668,7 +668,7 @@ fn effective_package_name(env: &mut Env) -> String {
         resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()));
     let pkg_val = cell_val.or_else(|| env.lookup_var("*PACKAGE*"));
     if let Some(pkg_val) = pkg_val {
-        let name = resolve_package_name(env, &val_as_str(pkg_val));
+        let name = resolve_package_name(env, &string_designator_name(pkg_val));
         if !name.is_empty() {
             return name;
         }
@@ -8475,7 +8475,7 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 .and_then(global_value_cell)
                 .or_else(|| env.lookup_var("*PACKAGE*"))
                 .and_then(|v| {
-                    let n = resolve_package_name(env, &val_as_str(v));
+                    let n = resolve_package_name(env, &string_designator_name(v));
                     (!n.is_empty()).then_some(n)
                 });
             match cell {
@@ -11670,7 +11670,7 @@ fn typep_matches(
             if predicate_name == "FIND-PACKAGE" {
                 let designator =
                     if object.is_character() || is_string_value(object) || object.is_symbol() {
-                        val_as_str(object)
+                        string_designator_name(object)
                     } else {
                         return Ok(false);
                     };
@@ -11856,7 +11856,7 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
             resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()));
         let pkg_val = cell_val.or_else(|| env.lookup_var("*PACKAGE*"));
         if let Some(pkg_val) = pkg_val {
-            let pkg_name = resolve_package_name(env, &val_as_str(pkg_val));
+            let pkg_name = resolve_package_name(env, &string_designator_name(pkg_val));
             if !pkg_name.is_empty() {
                 env.current_package = pkg_name;
                 sync_package_value_cell(&env.current_package);
@@ -20977,7 +20977,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // keys must be symbols, and only :NICKNAMES / :USE are accepted
                 // unless :ALLOW-OTHER-KEYS is true. ansi-test MAKE-PACKAGE.ERROR.*.
                 validate_builtin_keywords(&args[1..], &["NICKNAMES", "USE"])?;
-                let pkg_name = normalize_package_name(&val_as_str(args[0]));
+                let pkg_name = normalize_package_name(&string_designator_name(args[0]));
                 // MAKE-PACKAGE on a name (or nickname) that already names a
                 // package is a PACKAGE-ERROR (CLHS) — unlike DEFPACKAGE, which
                 // redefines in place.
@@ -21001,12 +21001,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     match key.as_str() {
                         "NICKNAMES" => {
                             for nick in list_to_vec(value) {
-                                nicknames.push(normalize_package_name(&val_as_str(nick)));
+                                nicknames.push(normalize_package_name(&string_designator_name(nick)));
                             }
                         }
                         "USE" => {
                             for used in list_to_vec(value) {
-                                uses.push(resolve_package_name(env, &val_as_str(used)));
+                                uses.push(resolve_package_name(env, &string_designator_name(used)));
                             }
                         }
                         _ => {}
@@ -21034,7 +21034,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() {
                     return Ok(NIL);
                 }
-                let raw = val_as_str(eval_form(args[0], env)?);
+                let raw = string_designator_name(eval_form(args[0], env)?);
                 let pkg_name = resolve_package_name(env, &raw);
                 return Ok(
                     if bliss_stdlib::find_package(&pkg_name).is_some()
@@ -21083,7 +21083,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // A string/char/symbol designator must name a live package;
                 // otherwise PACKAGE-NAME signals a PACKAGE-ERROR (CLHS).
-                let raw = val_as_str(v);
+                let raw = string_designator_name(v);
                 let pkg_name = resolve_package_name(env, &raw);
                 if bliss_stdlib::find_package(&pkg_name).is_some()
                     || matches!(
@@ -21102,7 +21102,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() {
                     return Ok(NIL);
                 }
-                let pkg = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let pkg = normalize_package_name(&string_designator_name(eval_form(args[0], env)?));
                 return Ok(vec_to_list(&[arena_str(&pkg)]));
             }
             "PACKAGE-NICKNAMES" => {
@@ -21114,7 +21114,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if !is_package_designator(v) {
                     return Err(package_designator_type_error(v));
                 }
-                let raw = val_as_str(v);
+                let raw = string_designator_name(v);
                 let pkg_name = resolve_package_name(env, &raw);
                 let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
                     // A designator that names no package is a PACKAGE-ERROR
@@ -21144,7 +21144,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if !is_package_designator(v) {
                     return Err(package_designator_type_error(v));
                 }
-                let raw = normalize_package_name(&val_as_str(v));
+                let raw = normalize_package_name(&string_designator_name(v));
                 let name = resolve_package_name(env, &raw);
                 let syms = match bliss_stdlib::find_package(&name) {
                     Some(pkg) => bliss_stdlib::package_shadowing_symbols(pkg),
@@ -21166,7 +21166,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if !is_package_designator(v) {
                     return Err(package_designator_type_error(v));
                 }
-                let raw = normalize_package_name(&val_as_str(v));
+                let raw = normalize_package_name(&string_designator_name(v));
                 let target = resolve_package_name(env, &raw);
                 // Resolve the target to its canonical handle once, then match
                 // use-list entries by identity — comparing package *handles* is
@@ -21197,7 +21197,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if !is_package_designator(v) {
                     return Err(package_designator_type_error(v));
                 }
-                let pkg_name = normalize_package_name(&val_as_str(v));
+                let pkg_name = normalize_package_name(&string_designator_name(v));
                 let uses = bliss_stdlib::find_package(&pkg_name)
                     .map(bliss_stdlib::package_use_list)
                     .unwrap_or_default();
@@ -21255,7 +21255,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let package = if args.is_empty() {
                     effective_package_name(env)
                 } else {
-                    normalize_package_name(&val_as_str(args[0]))
+                    normalize_package_name(&string_designator_name(args[0]))
                 };
                 // 2nd arg: NIL → present symbols, :EXTERNAL → external symbols
                 // only (DO-EXTERNAL-SYMBOLS), any other true value → accessible
@@ -21275,13 +21275,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkgs_val = args[0];
                 if pkgs_val.is_cons() {
                     for pkg in list_to_vec(pkgs_val) {
-                        names.push(resolve_package_name(env, &val_as_str(pkg)));
+                        names.push(resolve_package_name(env, &string_designator_name(pkg)));
                     }
                 } else {
-                    names.push(resolve_package_name(env, &val_as_str(pkgs_val)));
+                    names.push(resolve_package_name(env, &string_designator_name(pkgs_val)));
                 }
                 let target = if args.len() > 1 {
-                    let raw = val_as_str(args[1]);
+                    let raw = string_designator_name(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
                     effective_package_name(env)
@@ -21309,13 +21309,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     vec![pkgs_val]
                 };
                 for pv in names {
-                    let name = resolve_package_name(env, &val_as_str(pv));
+                    let name = resolve_package_name(env, &string_designator_name(pv));
                     if let Some(p) = bliss_stdlib::find_package(&name) {
                         used.push(p);
                     }
                 }
                 let target = if args.len() > 1 {
-                    let raw = val_as_str(args[1]);
+                    let raw = string_designator_name(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
                     effective_package_name(env)
@@ -21383,7 +21383,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // A string/symbol/char designator must name a live package;
                 // otherwise DELETE-PACKAGE signals a (correctable) PACKAGE-ERROR.
-                let pkg_name = resolve_package_name(env, &val_as_str(v));
+                let pkg_name = resolve_package_name(env, &string_designator_name(v));
                 let is_standard = matches!(
                     pkg_name.as_str(),
                     "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
@@ -21404,7 +21404,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // not be interpreted as a package marker.
                 let name_str = val_as_str(name_val);
                 let pkg_name = if args.len() > 1 {
-                    let raw = val_as_str(args[1]);
+                    let raw = string_designator_name(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
                     effective_package_name(env)
@@ -21442,7 +21442,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let name = val_as_str(args[0]);
                 // The package argument is optional and defaults to *PACKAGE*.
                 let pkg_name = if args.len() > 1 {
-                    let pkg_raw = val_as_str(args[1]);
+                    let pkg_raw = string_designator_name(args[1]);
                     resolve_package_name(env, &pkg_raw)
                 } else {
                     effective_package_name(env)
@@ -21463,7 +21463,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let symbols = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(args[1]))
+                    normalize_package_name(&string_designator_name(args[1]))
                 } else {
                     effective_package_name(env)
                 };
@@ -21607,7 +21607,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let symbols = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(args[1]))
+                    normalize_package_name(&string_designator_name(args[1]))
                 } else {
                     effective_package_name(env)
                 };
@@ -21649,7 +21649,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let names_val = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(args[1]))
+                    normalize_package_name(&string_designator_name(args[1]))
                 } else {
                     effective_package_name(env)
                 };
@@ -21679,7 +21679,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let symbol = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(args[1]))
+                    normalize_package_name(&string_designator_name(args[1]))
                 } else {
                     effective_package_name(env)
                 };
@@ -21777,7 +21777,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg_name = args
                     .get(1)
                     .filter(|v| !v.is_nil())
-                    .map(|v| resolve_package_name(env, &val_as_str(*v)))
+                    .map(|v| resolve_package_name(env, &string_designator_name(*v)))
                     .unwrap_or_else(|| effective_package_name(env));
                 let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
                     return Err(BlissError::PackageError(format!(
@@ -24262,17 +24262,17 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     let (items, paired): (Vec<BlissVal>, Vec<BlissVal>) = match source {
                         LoopBeingSource::Symbols(pkg_form) => {
                             let name =
-                                normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                                normalize_package_name(&string_designator_name(eval_form(*pkg_form, env)?));
                             (package_symbols(env, &name, true), Vec::new())
                         }
                         LoopBeingSource::OwnSymbols(pkg_form) => {
                             let name =
-                                normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                                normalize_package_name(&string_designator_name(eval_form(*pkg_form, env)?));
                             (package_symbols(env, &name, false), Vec::new())
                         }
                         LoopBeingSource::ExternalSymbols(pkg_form) => {
                             let name =
-                                normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                                normalize_package_name(&string_designator_name(eval_form(*pkg_form, env)?));
                             (package_external_symbols(env, &name), Vec::new())
                         }
                         LoopBeingSource::HashKeys(table_form) => {
@@ -31456,7 +31456,7 @@ fn apply_builtin_fast(
             // Case-SENSITIVE, verbatim name (CLHS) — see the tree-walker arm and
             // find_symbol_in_package_cased (bliss-961p).
             let bare = val_as_str(args[0]);
-            let pkg_name = resolve_package_name(env, &val_as_str(args[1]));
+            let pkg_name = resolve_package_name(env, &string_designator_name(args[1]));
             if let Some((sym, status)) = find_symbol_in_package_cased(env, &pkg_name, &bare, true) {
                 env.set_mv(vec![sym, package_status_symbol(status)]);
                 Some(Ok(sym))
@@ -32459,7 +32459,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             match key_bare {
                 "USE" | "MIX" => {
                     for v in list_to_vec(val_list) {
-                        uses.push(resolve_package_name(env, &val_as_str(v)));
+                        uses.push(resolve_package_name(env, &string_designator_name(v)));
                     }
                 }
                 "USE-REEXPORT" | "MIX-REEXPORT" | "REEXPORT" => {
@@ -32470,7 +32470,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     // package using this one only sees what is external HERE —
                     // the previous transitive use-graph walk masked this.
                     for v in list_to_vec(val_list) {
-                        let from = resolve_package_name(env, &val_as_str(v));
+                        let from = resolve_package_name(env, &string_designator_name(v));
                         push_reexports(env, &from, &mut exports);
                         uses.push(from);
                     }
@@ -32482,7 +32482,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 }
                 "NICKNAMES" => {
                     for v in list_to_vec(val_list) {
-                        nicknames.push(normalize_package_name(&val_as_str(v)));
+                        nicknames.push(normalize_package_name(&string_designator_name(v)));
                     }
                 }
                 "INTERN" => {
@@ -32500,7 +32500,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 "IMPORT-FROM" | "SHADOWING-IMPORT-FROM" => {
                     let vals = list_to_vec(val_list);
                     if let Some((pkg, syms)) = vals.split_first() {
-                        let from = resolve_package_name(env, &val_as_str(*pkg));
+                        let from = resolve_package_name(env, &string_designator_name(*pkg));
                         for s in syms {
                             import_from.push((from.clone(), symbol_bare_name(&val_as_str(*s))));
                         }

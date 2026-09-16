@@ -3575,6 +3575,96 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A package designator may be a SYMBOL, and only its name counts — the
+/// package it happens to be interned in is irrelevant (CLHS 11.1.1.1). These
+/// sites read the symbol with `val_as_str`, which yields the QUALIFIED
+/// spelling, so `(make-package 'foo)` evaluated inside package HOST created a
+/// package literally named "HOST::FOO" (bliss-43ad). Every expectation matches
+/// SBCL.
+#[test]
+fn package_designator_symbols_use_only_their_name() {
+    // Run each case from inside a non-CL package, which is what exposes the
+    // qualified spelling: from CL-USER the prefix happens to be elided.
+    let cases = [
+        // MAKE-PACKAGE: name, :nicknames and :use are all designators.
+        (
+            "(package-name (make-package 'dz-a))",
+            "\"DZ-A\"",
+        ),
+        (
+            "(package-nicknames (make-package 'dz-b :nicknames '(dz-nick)))",
+            "(\"DZ-NICK\")",
+        ),
+        (
+            "(mapcar #'package-name (package-use-list (make-package 'dz-c :use '(cl))))",
+            "(\"COMMON-LISP\")",
+        ),
+        // FIND-PACKAGE must agree with what MAKE-PACKAGE created — before the
+        // fix both were consistently wrong, which hid the bug.
+        (
+            "(progn (make-package 'dz-d) (package-name (find-package 'dz-d)))",
+            "\"DZ-D\"",
+        ),
+        // A nickname given as a symbol resolves as a designator too.
+        (
+            "(progn (make-package 'dz-e :nicknames '(dz-en)) (package-name (find-package 'dz-en)))",
+            "\"DZ-E\"",
+        ),
+        // INTERN / FIND-SYMBOL take a package designator as their 2nd argument.
+        (
+            "(progn (make-package 'dz-f) (package-name (symbol-package (intern \"ZED\" 'dz-f))))",
+            "\"DZ-F\"",
+        ),
+        (
+            "(progn (make-package 'dz-g) (intern \"ZED\" 'dz-g) \
+               (nth-value 1 (find-symbol \"ZED\" 'dz-g)))",
+            ":INTERNAL",
+        ),
+        // USE-PACKAGE / UNUSE-PACKAGE / DELETE-PACKAGE.
+        (
+            "(progn (make-package 'dz-h) (make-package 'dz-i) (use-package 'dz-h 'dz-i) \
+               (mapcar #'package-name (package-use-list 'dz-i)))",
+            "(\"DZ-H\")",
+        ),
+        (
+            "(progn (make-package 'dz-j) (make-package 'dz-k) (use-package 'dz-j 'dz-k) \
+               (unuse-package 'dz-j 'dz-k) (package-use-list 'dz-k))",
+            "NIL",
+        ),
+        (
+            "(progn (make-package 'dz-l) (delete-package 'dz-l) (find-package 'dz-l))",
+            "NIL",
+        ),
+        // (satisfies find-package) reads the designator the same way.
+        (
+            "(progn (make-package 'dz-m) (typep 'dz-m '(satisfies find-package)))",
+            "T",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let program = format!(
+            "(progn (defpackage :dz-host (:use :common-lisp)) (in-package :dz-host) \
+               (cl:format t \"~S\" {expr}))"
+        );
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "package designator case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "package designator symbol leaked its qualified spelling: {expr}"
+        );
+    }
+}
+
 /// OPEN, APROPOS and APROPOS-LIST were unbound (bliss-wne9.5). ASDF and UIOP
 /// call them, so their absence surfaced downstream as library bugs. Every
 /// expectation here matches SBCL.
