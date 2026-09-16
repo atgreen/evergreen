@@ -7122,12 +7122,19 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             {
                 out.push_str("#:");
             }
-            let name = if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
-                name
+            // An uninterned symbol's name is a bare TOKEN (it may legitimately
+            // contain a colon), so it is quoted whole. An interned symbol's
+            // spelling may be package-qualified, and there the marker must stay
+            // outside the bars — PKG::|has space|, not |PKG::has space|
+            // (bliss-10cf).
+            if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
+                out.push_str(&bliss_stdlib::format::print_symbol_name(&name, true));
             } else {
-                bliss_stdlib::format::symbol_name_for_print(val)
-            };
-            out.push_str(&bliss_stdlib::format::print_symbol_name(&name, true));
+                let spelling = bliss_stdlib::format::symbol_name_for_print(val);
+                out.push_str(&bliss_stdlib::format::print_qualified_symbol_name(
+                    &spelling, true,
+                ));
+            }
         }
     } else if is_closure_cons(val) {
         // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not data.

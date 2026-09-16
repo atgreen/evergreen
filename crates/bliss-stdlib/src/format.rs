@@ -189,6 +189,50 @@ pub fn print_symbol_name(name: &str, escapep: bool) -> String {
     apply_print_case(name)
 }
 
+/// Render a possibly package-qualified symbol spelling (as produced by
+/// `symbol_name_for_print`).
+///
+/// Bars quote a TOKEN, not a whole spelling: the package marker is printer
+/// syntax and belongs OUTSIDE them. A name needing escapes therefore prints as
+/// `PKG::|has space|`, never `|PKG::has space|` — the latter reads back as a
+/// single symbol whose name contains a colon, i.e. a different symbol
+/// (bliss-10cf). Each token is quoted independently, so a package whose own
+/// name needs bars is handled too.
+///
+/// Without `*print-escape*` (princ / `~A`) only the characters of the NAME are
+/// output: the package prefix is part of the escaped syntax, which is why
+/// `(format nil "~A" 'wq::zed)` is `"ZED"` (CLHS 22.1.3.3).
+///
+/// `spelling` must be a qualified-or-bare spelling, NOT a raw uninterned or
+/// keyword registry name — those are bare tokens and go to `print_symbol_name`.
+pub fn print_qualified_symbol_name(spelling: &str, escapep: bool) -> String {
+    // Split on the FIRST marker: later colons belong to the symbol's own name
+    // (bliss-wne9.2.3). A leading marker means there is no package token, so
+    // leave such a spelling alone rather than inventing an empty one.
+    let split = spelling
+        .split_once("::")
+        .map(|(package, bare)| (package, "::", bare))
+        .or_else(|| {
+            spelling
+                .split_once(':')
+                .map(|(package, bare)| (package, ":", bare))
+        })
+        .filter(|(package, _, _)| !package.is_empty());
+
+    let Some((package, marker, bare)) = split else {
+        return print_symbol_name(spelling, escapep);
+    };
+    if !escapep {
+        return print_symbol_name(bare, false);
+    }
+    format!(
+        "{}{}{}",
+        print_symbol_name(package, true),
+        marker,
+        print_symbol_name(bare, true)
+    )
+}
+
 /// A symbol's readable name relative to the current `*PACKAGE*`. Registry keys
 /// encode home identity as `PKG::NAME`, but that qualifier is omitted when the
 /// same symbol is accessible in the current package (CLHS 22.1.3.3). Keep the
@@ -1107,7 +1151,7 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
                 name
             };
         }
-        return print_symbol_name(&symbol_name_for_print(v), escapep);
+        return print_qualified_symbol_name(&symbol_name_for_print(v), escapep);
     }
     // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not the data
     // list it is structurally — print it as #<FUNCTION> (matches cli print_val).

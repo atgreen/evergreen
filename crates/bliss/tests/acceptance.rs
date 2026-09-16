@@ -3575,6 +3575,70 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// Bars quote a TOKEN, not a whole qualified spelling: the package marker is
+/// printer syntax and belongs outside them. bliss printed `|WQ::ZED|` for every
+/// qualified symbol — the colon in the spelling made the whole thing "need"
+/// escaping — and `~A` wrongly kept the package prefix (bliss-10cf). Both
+/// printers (cli print_val and stdlib blissval_to_print_inner) are covered
+/// here; they have drifted before. Every expectation matches SBCL.
+#[test]
+fn qualified_symbols_print_with_bars_around_the_name_only() {
+    let setup = "(progn (make-package \"PZ\" :use (list \"CL\")) \
+                        (export (intern \"EXT\" \"PZ\") \"PZ\"))";
+    let cases = [
+        // An internal symbol takes no bars at all.
+        ("(prin1-to-string (intern \"ZED\" \"PZ\"))", "\"PZ::ZED\""),
+        ("(format nil \"~S\" (intern \"ZED\" \"PZ\"))", "\"PZ::ZED\""),
+        // An external symbol prints with a single marker.
+        ("(prin1-to-string (intern \"EXT\" \"PZ\"))", "\"PZ:EXT\""),
+        // A name that needs escaping: bars around the NAME, not the spelling.
+        (
+            "(prin1-to-string (intern \"has space\" \"PZ\"))",
+            "\"PZ::|has space|\"",
+        ),
+        // A colon INSIDE the name must stay inside the bars.
+        ("(prin1-to-string (intern \"A:B\" \"PZ\"))", "\"PZ::|A:B|\""),
+        // princ / ~A print only the name — the prefix is escaped syntax.
+        ("(format nil \"~A\" (intern \"ZED\" \"PZ\"))", "\"ZED\""),
+        (
+            "(with-output-to-string (s) (princ (intern \"ZED\" \"PZ\") s))",
+            "\"ZED\"",
+        ),
+        // ~A and princ must agree — the two printers drifted here before.
+        (
+            "(string= (format nil \"~A\" (intern \"ZED\" \"PZ\")) \
+               (with-output-to-string (s) (princ (intern \"ZED\" \"PZ\") s)))",
+            "T",
+        ),
+        // An uninterned name is a bare token and is quoted whole, keeping its
+        // #: prefix outside the bars.
+        ("(prin1-to-string (make-symbol \"A:B\"))", "\"#:|A:B|\""),
+        ("(prin1-to-string (make-symbol \"GG\"))", "\"#:GG\""),
+        // Keywords and CL symbols are unaffected.
+        ("(prin1-to-string :kw)", "\":KW\""),
+        ("(prin1-to-string 'car)", "\"CAR\""),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "symbol printing case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "wrong printed representation for: {expr}"
+        );
+    }
+}
+
 /// A package designator may be a SYMBOL, and only its name counts — the
 /// package it happens to be interned in is irrelevant (CLHS 11.1.1.1). These
 /// sites read the symbol with `val_as_str`, which yields the QUALIFIED
