@@ -2020,3 +2020,75 @@ fn t2_reduce_from_end_folds_correctly() {
         "T2 REDUCE right-fold diverged (tier fold-cons fold-plus): {out}"
     );
 }
+
+/// A T1 decline is a property of the compiled bytecode — an unsupported opcode,
+/// a non-local GO/RETURN-FROM target, an over-wide arity — so it cannot change
+/// until the function is redefined. T1 had no memo (unlike T2), so every
+/// dispatch past the threshold re-ran the whole T1 front end just to fail at the
+/// same instruction: CTAK re-declined 127,213 times in a single benchmark run
+/// (bliss-yy9m). The decline must now be recorded once.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn structural_t1_decline_is_attempted_only_once() {
+    // THROW is not supported by the native emitter, so this declines at T1 and
+    // stays in the interpreter — where it must still compute the right answer.
+    let program = "\
+        (defun thrower (n) (catch 'tag (if (> n 3) (throw 'tag (* n 2)) n))) \
+        (dotimes (i 300) (thrower i)) \
+        (format t \"~a ~a~%\" (thrower 10) (bliss-ext:function-tier (quote thrower)))";
+    let out = run_output(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_LOG", "compile=trace"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "decline-memo run failed:\n{stderr}");
+    // Declining must not change the answer, and the function stays at T0.
+    assert_eq!(
+        stdout.lines().next(),
+        Some("20 0"),
+        "wrong result or tier for a T1-declined function: {stdout}"
+    );
+    let declines = stderr
+        .lines()
+        .filter(|l| l.contains("THROWER: declined"))
+        .count();
+    assert_eq!(
+        declines, 1,
+        "a structural T1 decline must be recorded once, not re-attempted on \
+         every dispatch (saw {declines}):\n{stderr}"
+    );
+}
+
+/// ...but the memo is keyed to the bytecode, so REDEFINING the function must
+/// clear it — otherwise a function that is fixed to be compilable would stay
+/// pinned at T0 for the life of the process.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn redefining_a_declined_function_allows_promotion_again() {
+    let program = "\
+        (defun redef-target (n) (catch 'tag (throw 'tag n))) \
+        (dotimes (i 50) (redef-target i)) \
+        (defun redef-target (n) (+ n 1)) \
+        (dotimes (i 300) (redef-target i)) \
+        (format t \"~a ~a~%\" (redef-target 5) \
+          (if (> (bliss-ext:function-tier (quote redef-target)) 0) :promoted :t0))";
+    let out = run_output(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_LOG", "compile=trace"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "redefinition run failed:\n{stderr}");
+    assert_eq!(
+        stdout.lines().next(),
+        Some("6 PROMOTED"),
+        "a redefined, now-compilable function stayed stuck at T0: {stdout}\n{stderr}"
+    );
+}

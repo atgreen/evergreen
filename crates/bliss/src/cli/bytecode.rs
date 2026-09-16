@@ -541,6 +541,7 @@ fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
     INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
     DEOPT_COUNTS.with(|m| m.borrow_mut().remove(&sym));
@@ -562,6 +563,7 @@ fn registry_remove(sym: u32) {
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
     INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
     DEOPT_COUNTS.with(|m| m.borrow_mut().remove(&sym));
@@ -1060,6 +1062,10 @@ pub fn profile_pin(sym: u32) {
 /// Release a profiler T0 pin (bliss-xgr5); the function may tier up again.
 pub fn profile_unpin(sym: u32) {
     PROFILE_PIN.with(|s| s.borrow_mut().remove(&sym));
+    // Belt and braces: the dispatch gate already refuses to memoize a
+    // pin-induced decline, so nothing should be recorded — but an unpinned
+    // function must be able to tier up, so clear any entry regardless.
+    T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
 }
 
 fn is_profile_pinned(sym: u32) -> bool {
@@ -14624,6 +14630,15 @@ thread_local! {
     /// invocation.  Redefining/removing the function clears this bit.
     static T2_DECLINED: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// Symbols whose T1 compilation was declined for a STRUCTURAL reason — an
+    /// unsupported opcode, a non-local GO/RETURN-FROM target, or an arity past
+    /// the activation slots. Those are properties of the compiled bytecode and
+    /// cannot change until the function is redefined, but T1 had no memo (unlike
+    /// T2 above), so every dispatch past the threshold re-ran the whole T1 front
+    /// end just to fail at the same instruction: CTAK re-declined 127,213 times
+    /// in one benchmark run (bliss-yy9m). Redefining the function clears this.
+    static T1_DECLINED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
     /// Symbols with one outstanding background T2 request.  Coalescing here
     /// prevents a hot dispatch/back-edge from flooding the global queue.
     static T2_QUEUED: RefCell<HashMap<u32, u64, bliss_rt::fxhash::FxBuildHasher>> =
@@ -15306,7 +15321,19 @@ fn native_for_dispatch(
         if invoke_count < t1_threshold() {
             return None;
         }
-        let nc = try_promote_to_t1(sym)?;
+        if T1_DECLINED.with(|s| s.borrow().contains(&sym)) {
+            return None;
+        }
+        let Some(nc) = try_promote_to_t1(sym) else {
+            // Remember only a decline the bytecode itself forces. A profiler pin
+            // also declines here, and `profile_unpin` promises the function may
+            // tier up again — memoizing that would silently make the pin
+            // permanent (bliss-yy9m).
+            if !is_profile_pinned(sym) {
+                T1_DECLINED.with(|s| s.borrow_mut().insert(sym));
+            }
+            return None;
+        };
         mark_fresh_promotion(sym);
         publish_native(sym, fn_obj, &nc);
         return Some(nc);
