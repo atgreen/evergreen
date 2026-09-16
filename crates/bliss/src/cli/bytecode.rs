@@ -6834,6 +6834,24 @@ fn compile_function_in(
         declared_parameter_types(*body, &param_names)?
     };
 
+    // `(declare (special v))` at the head of the body (CLHS 3.3.4; bliss-g97k).
+    // Computed here: after any macrolet/capture expansion, which can introduce
+    // declarations, but before the implicit-block wrap below would bury them one
+    // level deeper than `body_declared_special` looks.
+    //
+    // Two cases, and only one is expressible here. A *free* declaration (the
+    // name is not a parameter) merely redirects references in the body to the
+    // dynamic cell, which `declared_special` already does. A *bound* one (the
+    // name IS a parameter) must make the parameter a dynamic binding, saved and
+    // restored across every exit from the call — prologue/epilogue work the
+    // instruction set has no form for. Decline those to the tree-walker, which
+    // binds them correctly (bliss-g97k); bliss-fju9 tracks native support.
+    let decl_special = body_declared_special(super::body_through_implicit_block(*body));
+    if decl_special.iter().any(|n| param_names.contains(n)) {
+        let _ = record_bail(|| "declare:special-parameter".to_string());
+        return None;
+    }
+
     // A named DEFUN/DEFMACRO body runs inside an implicit block named after the
     // function, so `(return-from NAME …)` exits it (directly or from a nested
     // closure). Only establish it when the body actually uses RETURN-FROM, to
@@ -6848,8 +6866,12 @@ fn compile_function_in(
         }
     }
 
-    // Body as an implicit progn producing the return value.
-    if lower_body(&mut lo, *body).is_err() {
+    // Body as an implicit progn producing the return value, with any free
+    // special declarations in force over it (bliss-g97k).
+    lo.push_declared_special(&decl_special);
+    let lowered = lower_body(&mut lo, *body);
+    lo.pop_declared_special(&decl_special);
+    if lowered.is_err() {
         return None;
     }
     lo.emit(Instr::Return);

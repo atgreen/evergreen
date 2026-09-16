@@ -8219,3 +8219,92 @@ fn special_declaration_scope_versus_inner_lexical_binding() {
         }
     }
 }
+
+/// A `(declare (special v))` at the head of a *function* body was ignored
+/// entirely, in both of its CLHS 3.3.4 roles. When v is a parameter the
+/// declaration makes that binding DYNAMIC, which is the whole point — bliss
+/// bound it lexically, so a callee reading the variable signalled unbound. When
+/// v is not a parameter the declaration is *free* and applies to the body only,
+/// not to the lambda-list init-forms — so an `&aux`/`&optional`/`&key` default
+/// sees the enclosing lexical value while the body sees the dynamic one.
+/// ansi DEFUN.5/6/7; bliss-g97k.
+///
+/// The declaration is found through the implicit BLOCK that DEFUN wraps a body
+/// in at definition time. Without that, a DEFUN silently kept the old behaviour
+/// while a bare LAMBDA was fixed — which is how this looked half-fixed.
+#[test]
+fn special_declaration_in_a_function_body() {
+    let cases = [
+        // Bound declaration: the parameter is a dynamic binding, so a callee
+        // reached from the body sees it.
+        (
+            "(progn (defun g97-peek () (symbol-value 'g97v)) \
+               (defun g97-a (g97v) (declare (special g97v)) (g97-peek)) \
+               (g97-a 7))",
+            "7",
+        ),
+        // ...through a bare LAMBDA as well as a DEFUN (different code paths:
+        // only DEFUN bodies carry the implicit block).
+        (
+            "(progn (defun g97-peek2 () (symbol-value 'g97w)) \
+               (funcall (lambda (g97w) (declare (special g97w)) (g97-peek2)) 8))",
+            "8",
+        ),
+        // ...and it is unwound on exit.
+        (
+            "(progn (defun g97-b (g97x) (declare (special g97x)) g97x) \
+               (list (g97-b 3) (boundp 'g97x)))",
+            "(3 NIL)",
+        ),
+        // Free declaration: init-form sees the lexical binding, body sees the
+        // dynamic one. These are ansi DEFUN.5 / .6 / .7 — they differ only in
+        // which lambda-list keyword carries the init-form.
+        (
+            "(let ((x 1)) (declare (special x)) \
+               (let ((x 2)) (defun g97-aux (&aux (y x)) (declare (special x)) \
+                 (multiple-value-list (values y x))) (g97-aux)))",
+            "(2 1)",
+        ),
+        (
+            "(let ((x 1)) (declare (special x)) \
+               (let ((x 2)) (defun g97-opt (&optional (y x)) (declare (special x)) \
+                 (multiple-value-list (values y x))) (g97-opt)))",
+            "(2 1)",
+        ),
+        (
+            "(let ((x 1)) (declare (special x)) \
+               (let ((x 2)) (defun g97-key (&key (y x)) (declare (special x)) \
+                 (multiple-value-list (values y x))) (g97-key)))",
+            "(2 1)",
+        ),
+        // The minimal free case, with no lambda list at all.
+        (
+            "(let ((x 1)) (declare (special x)) \
+               (let ((x 2)) (funcall (lambda () (declare (special x)) x))))",
+            "1",
+        ),
+        // A body with no special declaration keeps ordinary lexical scoping.
+        ("(progn (defun g97-plain (v) (declare (ignorable v)) v) (g97-plain 4))", "4"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case errored: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}

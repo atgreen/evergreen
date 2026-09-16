@@ -6999,7 +6999,53 @@ fn eval_lambda_call_ex(
         // argument (or an &optional/&key default) must not leak its extra values
         // into the body. The body's tail form establishes this call's values.
         env.clear_mv();
-        eval_progn(*body, env)
+        // `(declare (special v))` at the head of the body (CLHS 3.3.4;
+        // bliss-g97k). A name this lambda list BOUND becomes a *dynamic*
+        // binding carrying the argument value, so a callee can see it; a name it
+        // did not bind is a *free* declaration that only redirects references.
+        // Either way the body's own references read the dynamic cell. The
+        // lambda-list init-forms have already run, above and outside this scope:
+        // a free declaration applies to the body, not to the init-forms, which
+        // is what makes `(defun f (&aux (y x)) (declare (special x)) …)` see the
+        // lexical X in Y's init and the dynamic X in the body (ansi DEFUN.5/6/7).
+        let specials = let_body_special_decls(body_through_implicit_block(*body));
+        if specials.is_empty() {
+            return eval_progn(*body, env);
+        }
+        // Resolve names *before* taking the frame borrow: `sym_name` can intern,
+        // and an allocation under a live borrow of GC-scanned state is the
+        // second GC invariant's failure mode (AGENTS.md).
+        let named: Vec<(u32, String)> = specials
+            .iter()
+            .map(|idx| (*idx, sym_name(BlissVal::from_symbol_index(*idx))))
+            .collect();
+        // Parameters bind by symbol index or by name depending on the lambda-list
+        // element; check both. Neither this read nor `DynBind::establish`
+        // allocates, so no GC can fire between reading the value and the dynamic
+        // binding taking ownership of it.
+        let mut bound: Vec<(u32, BlissVal)> = Vec::new();
+        {
+            let frame = env.frame.borrow();
+            for (idx, name) in &named {
+                if let Some(v) = frame.symbol_vars.get(idx) {
+                    bound.push((*idx, *v));
+                } else if let Some(v) = frame.vars.get(name.as_str()) {
+                    bound.push((*idx, *v));
+                }
+            }
+        }
+        // Rooted: each guard's saved cell must stay precise across the body
+        // evaluation so the restore on drop writes back a relocated — not stale
+        // — value (moving GC; bliss-8qf).
+        bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+        for (idx, val) in bound {
+            dyn_binds.push(DynBind::establish(BlissVal::from_symbol_index(idx), val));
+        }
+        let saved_locally = env.locally_specials.clone();
+        env.locally_specials.extend(specials);
+        let result = eval_progn(*body, env);
+        env.locally_specials = saved_locally;
+        result
     });
     if let Some((blocks, tags)) = saved {
         env.block_stack = blocks;
@@ -27162,6 +27208,24 @@ fn let_body_special_decls(body: BlissVal) -> Vec<u32> {
         cursor = rest;
     }
     specials
+}
+
+/// Look through the implicit `BLOCK` that DEFUN/DEFMACRO wrap a body in at
+/// definition time, so a body-head `(declare …)` is found one level in. A
+/// user-written `(block …)` as the sole body form is unwrapped too, which is
+/// harmless: CLHS does not allow declarations at the head of a BLOCK body, so
+/// nothing legal can be found there by mistake (bliss-g97k).
+fn body_through_implicit_block(body: BlissVal) -> BlissVal {
+    let (first, rest) = cp(body);
+    if !rest.is_nil() || !first.is_cons() {
+        return body;
+    }
+    let (op, block_rest) = cp(first);
+    if !(op.is_symbol() && symbol_bare_name(&sym_name_rc(op)) == "BLOCK") {
+        return body;
+    }
+    let (_name, block_body) = cp(block_rest);
+    block_body
 }
 
 /// True when a LET/LET* binding of `sym` must be dynamic: earmuffed/proclaimed
