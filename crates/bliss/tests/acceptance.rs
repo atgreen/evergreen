@@ -8632,3 +8632,71 @@ fn setf_of_values_place_returns_all_stored_values() {
         }
     }
 }
+
+/// Variable documentation was never stored: DEFVAR/DEFPARAMETER/DEFCONSTANT
+/// docstrings were swallowed by the definers' `&rest`, and DOCUMENTATION itself
+/// returned NIL unconditionally while `(setf (documentation …))` accepted the
+/// store and dropped it — in BOTH backends, the bytecode lowering carrying an
+/// explicit no-op branch mirroring the tree-walker's.
+///
+/// The store lives in boot.lisp, not cli.rs: it is one EQUAL-keyed table over
+/// (name . doc-type), so it is shared with the Lisp definers that record into
+/// it and covers every doc-type rather than just VARIABLE.
+/// ansi DEFVAR.4/5, DEFPARAMETER.4/5, DEFCONSTANT.4; bliss-61u1.
+#[test]
+fn variable_documentation_is_retained() {
+    let cases = [
+        ("(progn (defvar *doc-a* 200 \"Whatever.\") (documentation '*doc-a* 'variable))", "\"Whatever.\""),
+        ("(progn (defparameter *doc-b* 200 \"Param.\") (documentation '*doc-b* 'variable))", "\"Param.\""),
+        ("(progn (defconstant +doc-c+ 5 \"Const.\") (documentation '+doc-c+ 'variable))", "\"Const.\""),
+        // The writer, which previously accepted the store and discarded it.
+        (
+            "(progn (defvar *doc-d* 1) (setf (documentation '*doc-d* 'variable) \"Set.\") \
+               (documentation '*doc-d* 'variable))",
+            "\"Set.\"",
+        ),
+        // ...and it returns the assigned value.
+        ("(progn (defvar *doc-e* 1) (setf (documentation '*doc-e* 'variable) \"R\"))", "\"R\""),
+        // Absent documentation is NIL, and the doc-type is part of the key.
+        ("(progn (defvar *doc-f* 1) (documentation '*doc-f* 'variable))", "NIL"),
+        (
+            "(progn (defvar *doc-g* 1 \"V\") (list (documentation '*doc-g* 'variable) \
+               (documentation '*doc-g* 'function)))",
+            "(\"V\" NIL)",
+        ),
+        // DOCUMENTATION returns exactly one value (it reads through GETHASH,
+        // which returns two).
+        ("(progn (defvar *doc-h* 1 \"V\") (multiple-value-list (documentation '*doc-h* 'variable)))", "(\"V\")"),
+        // The definers keep their own semantics: DEFVAR returns the name, does
+        // not reassign an already-bound variable, and still binds the value.
+        ("(progn (defvar *doc-i* 1 \"D\") (defvar *doc-i* 99 \"D2\") *doc-i*)", "1"),
+        ("(progn (makunbound '*doc-j*) (defvar *doc-j* 200 \"D\"))", "*DOC-J*"),
+        ("(progn (defparameter *doc-k* 1 \"D\") (defparameter *doc-k* 2 \"D\") *doc-k*)", "2"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

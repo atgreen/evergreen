@@ -15174,13 +15174,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let values = eval_forms(forms, env)?;
                 return define_condition_portable(values[0], values[1], values[2], values[3], env);
             }
-            "DOCUMENTATION" => {
-                // (documentation object &optional doc-type) — the interpreter
-                // does not retain documentation strings; always NIL. Arguments
-                // are still evaluated for their side effects/arity.
-                let _ = eval_args(cdr, env)?;
-                return Ok(NIL);
-            }
             "FDEFINITION" | "SYMBOL-FUNCTION" => {
                 let argc = form_arg_count(cdr);
                 if argc != 1 {
@@ -16427,12 +16420,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     });
                                 }
                                 bliss_stdlib::set_fill_pointer(vec, val.as_fixnum() as usize)?;
-                            }
-                            "DOCUMENTATION" => {
-                                // (setf (documentation object doc-type) val) — the
-                                // interpreter does not retain documentation
-                                // strings, so accept and ignore. SETF still
-                                // returns the assigned value.
                             }
                             other => {
                                 // Match the accessor by symbol identity, not the

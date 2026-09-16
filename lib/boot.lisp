@@ -23,6 +23,28 @@
 ;; same function then returned different values cold vs hot, a tier inconsistency
 ;; (bliss-av5). The %proclaim-special registry (bliss-7na) is consulted by
 ;; is_special_var (tree-walker) and is_special_name (compiler).
+;;; Documentation strings (CLHS 4.4). One EQUAL-keyed table over (name . doc-type)
+;;; so every doc-type shares a single store. Defined BEFORE DEFVAR because
+;;; DEFVAR's expansion records its docstring through it — and set up with plain
+;;; SETQ rather than DEFVAR for the same reason (bliss-61u1).
+(bliss-internal::%proclaim-special (list 'bliss-internal::*documentation*))
+(setq bliss-internal::*documentation* (make-hash-table :test 'equal))
+
+(defun documentation (object &optional doc-type)
+  ;; GETHASH returns two values; DOCUMENTATION returns one.
+  (values (gethash (cons object doc-type) bliss-internal::*documentation*)))
+
+(defun (setf documentation) (new object &optional doc-type)
+  (setf (gethash (cons object doc-type) bliss-internal::*documentation*) new)
+  new)
+
+;;; Record DOC for NAME under DOC-TYPE, ignoring a NIL docstring so the definers
+;;; can pass their optional one unconditionally.
+(defun bliss-internal::%set-documentation (name doc-type doc)
+  (when doc
+    (setf (documentation name doc-type) doc))
+  name)
+
 (defmacro defvar (name &rest value)
   ;; (defvar name) with no initial value only proclaims NAME special; it must
   ;; NOT assign a value (NAME stays unbound if it was unbound). Only
@@ -32,22 +54,28 @@
      ,@(when value
          `((unless (boundp ',name)
              (setq ,name ,(car value)))))
+     ,@(when (cdr value)
+         `((bliss-internal::%set-documentation ',name 'variable ,(cadr value))))
      ',name))
 
 (defmacro defparameter (name &rest value)
   `(progn
      (bliss-internal::%proclaim-special (list ',name))
      (setq ,name ,(if value (car value) nil))
+     ,@(when (cdr value)
+         `((bliss-internal::%set-documentation ',name 'variable ,(cadr value))))
      ',name))
 
 ;; defconstant: this interpreter has no separate constant cell; model it as a
 ;; global binding, like defparameter.
 (defmacro defconstant (name value &rest doc)
-  (declare (ignore doc))
   ;; No separate constant cell: model as a global binding, but record the name
   ;; so CONSTANTP recognises it (alexandria's DEFINE-CONSTANT, used by babel,
   ;; asks CONSTANTP whether a re-defined constant is already constant).
-  `(progn (setq ,name ,value) (%mark-constant ',name) ',name))
+  `(progn (setq ,name ,value) (%mark-constant ',name)
+          ,@(when doc
+              `((bliss-internal::%set-documentation ',name 'variable ,(car doc))))
+          ',name))
 
 ;; Fixnums are 61-bit signed (BlissVal tags the low 3 bits): the value is
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].

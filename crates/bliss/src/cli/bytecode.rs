@@ -2620,17 +2620,6 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
-            } else if self.documentation_place_args(place).is_some() {
-                // Bliss currently treats documentation metadata as advisory:
-                // the tree-walker accepts the store without retaining metadata
-                // or evaluating the ignored place arguments, then returns the
-                // assigned value. Preserve those existing semantics here.
-                self.lower_expr(items[2 * i + 1])?;
-                self.emit(Instr::ClearMv);
-                if !last {
-                    self.emit(Instr::Pop);
-                    self.pop_n(1);
-                }
             } else if let Some((prim, mut seq, mut index)) = aref_setf_place(place) {
                 // `(setf (aref|svref|char|schar|row-major-aref|elt seq i) val)` →
                 // the internal store primitive (seq, index, value). ELT lowers to
@@ -2739,19 +2728,6 @@ impl<'e> Lowerer<'e> {
             return None;
         }
         Some((items[1], items[2]))
-    }
-
-    /// Recognise `(documentation object [doc-type])`, whose setter is an
-    /// intentionally metadata-only no-op in the current runtime.
-    fn documentation_place_args(&self, place: BlissVal) -> Option<Vec<BlissVal>> {
-        if !place.is_cons() {
-            return None;
-        }
-        let items = list_to_vec(place);
-        if !(2..=3).contains(&items.len()) || !items[0].is_symbol() {
-            return None;
-        }
-        (symbol_bare_name(&sym_name(items[0])) == "DOCUMENTATION").then(|| items[1..].to_vec())
     }
 
     // ── Non-local control flow lowering (nmq.4) ────────────────────
