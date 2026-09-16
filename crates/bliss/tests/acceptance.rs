@@ -8308,3 +8308,81 @@ fn special_declaration_in_a_function_body() {
         );
     }
 }
+
+/// The `special` declaration's *binding* role, in the forms bliss-g97k did not
+/// reach. Surveying every binding form turned up four gaps — and one of them was
+/// worse than a missing declaration: MULTIPLE-VALUE-BIND discarded special
+/// bindings ENTIRELY. TakeValuesToLocals puts every value in a local slot, but a
+/// reference to a special name compiles as a dynamic load, so the slot was
+/// written and never read and `(multiple-value-bind (*v*) (values 42) *v*)`
+/// quietly returned the global value. No declaration required. bliss-ge3g.
+///
+/// PROG was a different fault: its macroexpansion left the body's declarations
+/// inside the TAGBODY, where CLHS puts them on the LET instead — so they were
+/// not declarations at all.
+///
+/// DO, DO*, DOLIST, DOTIMES and DESTRUCTURING-BIND were already correct (they
+/// expand into LET) and are included to keep them that way.
+#[test]
+fn special_binding_role_across_binding_forms() {
+    let peek = "(defun sbr-pk (s) (symbol-value s))";
+    let cases = [
+        // The silent wrong answer: an earmuffed special bound by M-V-B.
+        (
+            "(progn (defvar *sbr-v* 0) (defun sbr-g () *sbr-v*) \
+               (multiple-value-bind (*sbr-v*) (values 42) (list *sbr-v* (sbr-g))))",
+            "(42 42)",
+        ),
+        // ...and it is unwound on exit.
+        (
+            "(progn (defvar *sbr-w* 0) (multiple-value-bind (*sbr-w*) (values 42) nil) *sbr-w*)",
+            "0",
+        ),
+        // A declared-special M-V-B variable binds dynamically...
+        (
+            "(multiple-value-bind (mv) (values 3) (declare (special mv)) \
+               (list mv (sbr-pk 'mv)))",
+            "(3 3)",
+        ),
+        // ...while an undeclared one in the same form stays lexical.
+        (
+            "(multiple-value-bind (ma mb) (values 1 2) (declare (special ma)) \
+               (list ma mb (sbr-pk 'ma)))",
+            "(1 2 1)",
+        ),
+        // FLET and LABELS parameters.
+        ("(flet ((ff (fv) (declare (special fv)) (sbr-pk 'fv))) (ff 8))", "8"),
+        ("(labels ((lf (lv) (declare (special lv)) (sbr-pk 'lv))) (lf 9))", "9"),
+        // PROG / PROG*: the declaration belongs to the LET, not the TAGBODY.
+        ("(prog ((pv 10)) (declare (special pv)) (return (list pv (sbr-pk 'pv))))", "(10 10)"),
+        ("(prog* ((pw 11)) (declare (special pw)) (return (list pw (sbr-pk 'pw))))", "(11 11)"),
+        // A PROG with no declarations still runs its body as a tagbody.
+        ("(prog ((a 1)) (go skip) (return :wrong) skip (return a))", "1"),
+        // Already correct; must stay correct.
+        ("(destructuring-bind (db) '(4) (declare (special db)) (list db (sbr-pk 'db)))", "(4 4)"),
+        ("(do ((dv 5 (1+ dv))) (nil) (declare (special dv)) (return (list dv (sbr-pk 'dv))))", "(5 5)"),
+        ("(dolist (dl '(7)) (declare (special dl)) (return (list dl (sbr-pk 'dl))))", "(7 7)"),
+        ("(dotimes (dt 1) (declare (special dt)) (return (list dt (sbr-pk 'dt))))", "(0 0)"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(progn {peek} (cl:format t \"~S~%\" {expr}))")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case errored: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}

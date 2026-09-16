@@ -2918,10 +2918,26 @@
            ,out)))))
 
 ;;; PROG / PROG*: LET (or LET*) plus an implicit BLOCK NIL and TAGBODY.
+;;; A leading (declare ...) belongs to the LET, not to the TAGBODY: CLHS 6.1.1.4
+;;; puts PROG's declarations on its variable bindings, and a DECLARE left inside
+;;; the tagbody is neither a declaration nor a valid statement there — so
+;;; (prog ((v 1)) (declare (special v)) ...) bound V lexically (bliss-ge3g).
+(defun %prog-split-declarations (body)
+  "Return (values leading-declarations remaining-forms) for a PROG body."
+  (let ((decls '()) (forms body))
+    (do () ((not (and (consp forms)
+                      (consp (car forms))
+                      (eq (car (car forms)) 'declare))))
+      (push (car forms) decls)
+      (setq forms (cdr forms)))
+    (values (nreverse decls) forms)))
+
 (defmacro prog (bindings &rest body)
-  `(block nil (let ,bindings (tagbody ,@body))))
+  (multiple-value-bind (decls forms) (%prog-split-declarations body)
+    `(block nil (let ,bindings ,@decls (tagbody ,@forms)))))
 (defmacro prog* (bindings &rest body)
-  `(block nil (let* ,bindings (tagbody ,@body))))
+  (multiple-value-bind (decls forms) (%prog-split-declarations body)
+    `(block nil (let* ,bindings ,@decls (tagbody ,@forms)))))
 
 ;;; CCASE / CTYPECASE: like ECASE / ETYPECASE but the key is a place and a
 ;;; correctable STORE-VALUE restart lets the handler supply a fresh value.

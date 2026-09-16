@@ -4813,8 +4813,39 @@ impl<'e> Lowerer<'e> {
         });
         self.pop_n(1); // consumes the primary
 
-        self.lower_progn(body)?; // body value (+1)
+        // A variable that is special here — earmuffed, proclaimed, or named by a
+        // `(declare (special v))` at the head of the body — must be bound
+        // DYNAMICALLY. TakeValuesToLocals has just put every value in a slot,
+        // but a reference to a special name compiles as a dynamic load, so
+        // without this the slot is written and never read and the binding simply
+        // vanishes: `(multiple-value-bind (*v*) (values 42) *v*)` returned the
+        // global value, not 42 (bliss-ge3g). Re-load each such slot and bind it
+        // dynamically; UnbindSpecial after the body restores them.
+        let decl_special = body_declared_special(body);
+        let mut special_count: u16 = 0;
+        for i in 0..vars.len() {
+            let name = sym_name(vars[i]);
+            if !(is_special_name(&name) || decl_special.contains(&name)) {
+                continue;
+            }
+            let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
+            self.emit(Instr::LoadLocal(slot_base + i as u16));
+            self.push_n(1);
+            self.emit(Instr::BindSpecial(symbol));
+            self.pop_n(1);
+            special_count += 1;
+        }
+
+        // Free declarations (a name the M-V-B did not bind) redirect references
+        // in the body, exactly as in LET.
+        self.push_declared_special(&decl_special);
+        let lowered = self.lower_progn(body); // body value (+1)
+        self.pop_declared_special(&decl_special);
+        lowered?;
         self.exit_scope(saved_next_local);
+        if special_count != 0 {
+            self.emit(Instr::UnbindSpecial(special_count));
+        }
         Ok(())
     }
 
@@ -5209,6 +5240,28 @@ impl<'e> Lowerer<'e> {
             let gname = next_control_token("__FLET__").replace(':', "_");
             let gensym = resolve_sym(&gname).ok_or(Bail)?.as_symbol_index();
             parsed.push((name, gensym));
+        }
+
+        // A local function whose body declares one of its OWN PARAMETERS special
+        // needs that parameter bound dynamically, saved and restored across every
+        // exit from the call — the prologue/epilogue work compile_function_in
+        // declines for the same reason (bliss-g97k). Defer the whole form to the
+        // tree-walker, which binds it correctly (bliss-ge3g). A *free* special
+        // declaration needs none of this and stays compiled.
+        for i in 0..defs.len() {
+            let (params_form, fbody) = flet_def_forms(defs[i]);
+            let decl_special = body_declared_special(super::body_through_implicit_block(fbody));
+            if decl_special.is_empty() {
+                continue;
+            }
+            let binds_a_declared_special = list_to_vec(params_form)
+                .iter()
+                .filter(|p| p.is_symbol())
+                .map(|p| sym_name(*p))
+                .any(|n| decl_special.contains(&n));
+            if binds_a_declared_special {
+                return Err(record_bail(|| "declare:special-parameter-flet".to_string()));
+            }
         }
 
         let local_names: std::collections::HashSet<String> =

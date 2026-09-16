@@ -7012,37 +7012,8 @@ fn eval_lambda_call_ex(
         if specials.is_empty() {
             return eval_progn(*body, env);
         }
-        // Resolve names *before* taking the frame borrow: `sym_name` can intern,
-        // and an allocation under a live borrow of GC-scanned state is the
-        // second GC invariant's failure mode (AGENTS.md).
-        let named: Vec<(u32, String)> = specials
-            .iter()
-            .map(|idx| (*idx, sym_name(BlissVal::from_symbol_index(*idx))))
-            .collect();
-        // Parameters bind by symbol index or by name depending on the lambda-list
-        // element; check both. Neither this read nor `DynBind::establish`
-        // allocates, so no GC can fire between reading the value and the dynamic
-        // binding taking ownership of it.
-        let mut bound: Vec<(u32, BlissVal)> = Vec::new();
-        {
-            let frame = env.frame.borrow();
-            for (idx, name) in &named {
-                if let Some(v) = frame.symbol_vars.get(idx) {
-                    bound.push((*idx, *v));
-                } else if let Some(v) = frame.vars.get(name.as_str()) {
-                    bound.push((*idx, *v));
-                }
-            }
-        }
-        // Rooted: each guard's saved cell must stay precise across the body
-        // evaluation so the restore on drop writes back a relocated — not stale
-        // — value (moving GC; bliss-8qf).
         bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
-        for (idx, val) in bound {
-            dyn_binds.push(DynBind::establish(BlissVal::from_symbol_index(idx), val));
-        }
-        let saved_locally = env.locally_specials.clone();
-        env.locally_specials.extend(specials);
+        let saved_locally = enter_body_special_decls(env, specials, &mut dyn_binds);
         let result = eval_progn(*body, env);
         env.locally_specials = saved_locally;
         result
@@ -27210,6 +27181,53 @@ fn let_body_special_decls(body: BlissVal) -> Vec<u32> {
     specials
 }
 
+/// Apply a body's leading `(declare (special v))` to bindings the enclosing form
+/// has just established in the current frame (CLHS 3.3.4; bliss-g97k).
+///
+/// A declared name the form BOUND becomes a *dynamic* binding carrying that
+/// value, so a callee can see it. A declared name it did not bind is a *free*
+/// declaration, which binds nothing. Either way the body's own references must
+/// read the dynamic cell, which is what the `locally_specials` extension does.
+///
+/// `dyn_binds` must be ROOTED by the caller and held for the whole body: each
+/// guard's saved cell has to stay precise across the body evaluation so the
+/// restore on drop writes back a relocated — not stale — value (bliss-8qf).
+/// Returns the previous `locally_specials`; assign it back after the body.
+fn enter_body_special_decls(
+    env: &mut Env,
+    specials: Vec<u32>,
+    dyn_binds: &mut Vec<DynBind>,
+) -> Vec<u32> {
+    // Resolve names BEFORE taking the frame borrow: `sym_name` can intern, and
+    // allocating under a live borrow of GC-scanned state is the second GC
+    // invariant's failure mode (AGENTS.md).
+    let named: Vec<(u32, String)> = specials
+        .iter()
+        .map(|idx| (*idx, sym_name(BlissVal::from_symbol_index(*idx))))
+        .collect();
+    // A binding form may bind by symbol index or by name depending on the
+    // lambda-list element; check both. Neither this read nor
+    // `DynBind::establish` allocates, so no GC can fire between reading a value
+    // and the dynamic binding taking ownership of it.
+    let mut bound: Vec<(u32, BlissVal)> = Vec::new();
+    {
+        let frame = env.frame.borrow();
+        for (idx, name) in &named {
+            if let Some(v) = frame.symbol_vars.get(idx) {
+                bound.push((*idx, *v));
+            } else if let Some(v) = frame.vars.get(name.as_str()) {
+                bound.push((*idx, *v));
+            }
+        }
+    }
+    for (idx, val) in bound {
+        dyn_binds.push(DynBind::establish(BlissVal::from_symbol_index(idx), val));
+    }
+    let saved = env.locally_specials.clone();
+    env.locally_specials.extend(specials);
+    saved
+}
+
 /// Look through the implicit `BLOCK` that DEFUN/DEFMACRO wrap a body in at
 /// definition time, so a body-head `(declare …)` is found one level in. A
 /// user-written `(block …)` as the sole body form is unwrapped too, which is
@@ -32245,12 +32263,19 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
     // Bind variables in a fresh frame on the SAME env (see eval_let) so that
     // global definitions in the body — e.g. INTERN inside UIOP's ENSURE-SYMBOL,
     // which runs under two nested MULTIPLE-VALUE-BINDs — persist to the caller.
-    let var_names: Vec<String> = list_to_vec(vars_form)
-        .iter()
-        .map(|v| sym_name(*v))
-        .collect();
+    let vars: Vec<BlissVal> = list_to_vec(vars_form);
+    let var_names: Vec<String> = vars.iter().map(|v| sym_name(*v)).collect();
+    // A variable that is special here — earmuffed, proclaimed, or named by a
+    // `(declare (special v))` at the head of the body — binds DYNAMICALLY, like
+    // the same variable in a LET (CLHS 3.3.4; bliss-ge3g). Binding it lexically
+    // loses it entirely: references to a special name read the value cell, so the
+    // lexical binding is written and never read.
+    let body_specials = let_body_special_decls(body);
     let parent = Rc::clone(&env.frame);
     with_child_frame(env, parent, move |env| {
+        // Rooted: each guard's saved cell must stay precise across the body
+        // evaluation (moving GC; bliss-8qf).
+        bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
         for (i, var_name) in var_names.iter().enumerate() {
             let val = if i == 0 {
                 *primary
@@ -32259,9 +32284,22 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
             } else {
                 NIL
             };
-            env.define_local(var_name, val);
+            if let_binding_is_dynamic(vars[i], &body_specials) {
+                dyn_binds.push(DynBind::establish(vars[i], val));
+            } else {
+                env.define_local(var_name, val);
+            }
         }
-        eval_progn(body, env)
+        if body_specials.is_empty() {
+            return eval_progn(body, env);
+        }
+        // A declared name the form did NOT bind is a free declaration: it only
+        // redirects references in the body.
+        let saved_locally = env.locally_specials.clone();
+        env.locally_specials.extend(body_specials);
+        let result = eval_progn(body, env);
+        env.locally_specials = saved_locally;
+        result
     })
 }
 
