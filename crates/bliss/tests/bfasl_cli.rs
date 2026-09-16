@@ -1684,6 +1684,97 @@ fn compile_file_round_trips_define_package_without_source() {
 }
 
 #[test]
+fn compile_file_preserves_shadowed_symbol_identity() {
+    let dir = workdir("package-shadow");
+    let src = dir.join("shadow.lisp");
+    let out = dir.join("shadow.bfasl");
+    fs::write(
+        &src,
+        "(defpackage :bf/shadow (:use :common-lisp) (:shadow #:car))
+         (in-package :bf/shadow)
+         (defun shadow-is-distinct ()
+           (list (not (eq 'car 'cl:car))
+                 (package-name (symbol-package 'car))))\n",
+    )
+    .unwrap();
+
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "shadow package fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let loaded = run(&format!(
+        "(progn (load \"{}\")
+                (eval (read-from-string \"(bf/shadow::shadow-is-distinct)\")))",
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "shadow package BFASL failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(T \"BF/SHADOW\")"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Generated data files such as cl-unicode contain quoted lists with tens of
+/// thousands of cons cells.  Constant-pool encoding must walk their spines
+/// without consuming one native stack frame per cons.
+#[test]
+fn compile_file_encodes_deep_list_constants_iteratively() {
+    let dir = workdir("deep-list-constant");
+    let src = dir.join("deep.lisp");
+    let out = dir.join("deep.bfasl");
+    let mut source = String::from("(defun deep-list-value () '(7");
+    for _ in 0..50_000 {
+        source.push_str(" 0");
+    }
+    source.push_str("))\n");
+    fs::write(&src, source).unwrap();
+
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "deep constant compilation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let loaded = run(&format!(
+        "(progn (load \"{}\") (list (length (deep-list-value)) (car (deep-list-value))))",
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "deep constant load failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(50001 7)"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn malformed_package_action_is_rejected_before_package_creation() {
     let dir = workdir("invalid-package-action");
     let src = dir.join("bad-package.lisp");
@@ -1742,7 +1833,10 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
                   (defun bbu-use-twice (x) (bbu-twice x))
                   (defun bbu-cm-target (x) (+ x 1))
                   (define-compiler-macro bbu-cm-target (x) (list '+ x 10))
-                  (defun bbu-cm-compiled () (bbu-cm-target 5))\n";
+                  (defun bbu-cm-compiled () (bbu-cm-target 5))
+                  (defun bbu-cm-decline (x) (+ x 1))
+                  (define-compiler-macro bbu-cm-decline (&whole whole x)
+                    (if (constantp x) (list '+ x 20) whole))\n";
     fs::write(&src, source).unwrap();
     let compiled = run(&format!(
         "(compile-file \"{}\" \"{}\")",
@@ -1768,10 +1862,12 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
         "(progn
            (load \"{}\")
            (defun bbu-cm-later () (bbu-cm-target 2))
+           (defun bbu-cm-declined-later (x) (bbu-cm-decline x))
            (list (bbu-twice 9)
                  (bbu-use-twice 7)
                  (bbu-cm-compiled)
-                 (bbu-cm-later)))",
+                 (bbu-cm-later)
+                 (bbu-cm-declined-later 5)))",
         out.display()
     ));
     assert!(
@@ -1782,7 +1878,7 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
     );
     assert_eq!(
         String::from_utf8_lossy(&loaded.stdout).trim(),
-        "(18 14 15 12)",
+        "(18 14 15 12 6)",
         "compile diagnostics: {}\nload diagnostics: {}",
         String::from_utf8_lossy(&compiled.stderr),
         String::from_utf8_lossy(&loaded.stderr)

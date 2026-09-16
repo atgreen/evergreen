@@ -3113,7 +3113,7 @@ fn install_loaded_compiler_macro(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            bytecode::run_macro(Rc::new(function), &args, &mut env)
+            bytecode::run_macro(Rc::new(function), &args, Some(*form), &mut env)
         }),
     );
 }
@@ -9425,9 +9425,9 @@ fn prompt_package_name(name: &str) -> &str {
 fn symbol_bare_name(name: &str) -> String {
     let without_keyword = name.trim_start_matches("KEYWORD:");
     let base = without_keyword
-        .rsplit_once("::")
+        .split_once("::")
         .map(|(_, tail)| tail)
-        .or_else(|| without_keyword.rsplit_once(':').map(|(_, tail)| tail))
+        .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
         .unwrap_or(without_keyword);
     base.to_uppercase()
 }
@@ -9445,9 +9445,9 @@ fn string_designator_name(v: BlissVal) -> String {
         let full = sym_name_rc(v);
         let without_keyword = full.strip_prefix("KEYWORD:").unwrap_or(&full);
         without_keyword
-            .rsplit_once("::")
+            .split_once("::")
             .map(|(_, tail)| tail)
-            .or_else(|| without_keyword.rsplit_once(':').map(|(_, tail)| tail))
+            .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
             .unwrap_or(without_keyword)
             .to_string()
     } else if v.is_character() {
@@ -9514,9 +9514,9 @@ unsafe fn c_string_to_lisp(ptr: u64) -> BlissVal {
 fn symbol_name_string(name: &str) -> String {
     let without_keyword = name.strip_prefix("KEYWORD:").unwrap_or(name);
     without_keyword
-        .rsplit_once("::")
+        .split_once("::")
         .map(|(_, tail)| tail)
-        .or_else(|| without_keyword.rsplit_once(':').map(|(_, tail)| tail))
+        .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
         .unwrap_or(without_keyword)
         .to_string()
 }
@@ -11144,7 +11144,16 @@ fn vector_length_matches(size_args: &[BlissVal], object: BlissVal) -> bool {
     true
 }
 
-fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
+fn typep_matches(
+    env: &mut Env,
+    mut object: BlissVal,
+    mut type_spec: BlissVal,
+) -> Result<bool, BlissError> {
+    // Resolving DEFTYPEs and compound type specifiers can allocate.  These
+    // callee-local copies must therefore be roots in their own right; a root in
+    // the caller updates only the caller's slot when the nursery moves.
+    bliss_rt::rooted_ref!(_object_root = &mut object);
+    bliss_rt::rooted_ref!(_type_spec_root = &mut type_spec);
     // A class metaobject used directly as a type specifier — e.g.
     // `(typep ht (find-class 'hash-table))` / `(typep cond (find-class 'foo))`.
     // Class handles are neither symbols nor conses; `class_name` is non-NIL only
@@ -11161,6 +11170,16 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                 Ok(cpl) => cpl.iter().any(|c| *c == type_spec),
                 Err(_) => false,
             });
+        }
+    }
+    // A closure's physical cons representation must not enter the CLOS
+    // instance/class-of path below, where it would inherit CONS and LIST.
+    // Resolve only unknown names later so DEFTYPE aliases still work.
+    if type_spec.is_symbol() && is_function_value(object) {
+        match symbol_bare_name(&sym_name_rc(type_spec)).as_str() {
+            "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => return Ok(true),
+            "CONS" | "LIST" => return Ok(false),
+            _ => {}
         }
     }
     // A CLOS instance matches any type name in its class precedence list,
@@ -11185,6 +11204,16 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
     let type_spec = resolve_type_spec(env, type_spec);
     if type_spec.is_symbol() {
         let type_name = symbol_bare_name(&sym_name_rc(type_spec));
+        // Interpreter closures are physically tagged cons cells, but their
+        // Common Lisp type is FUNCTION (and therefore ATOM), never CONS or
+        // LIST.  Handle them before the generic CLOS/class-of route, which can
+        // otherwise observe their representation and report the cons classes.
+        if is_function_value(object) {
+            return Ok(matches!(
+                type_name.as_str(),
+                "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION"
+            ));
+        }
         // A class metaobject tested against a metaclass type. bliss represents a
         // user/struct class as its name symbol, so `(find-class 'foo)` is that
         // symbol; recognise it via the class registry. STRUCTURE-CLASS matches a
@@ -11238,9 +11267,9 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
         let matches = match type_name.as_str() {
             "T" => true,
             "NIL" | "NULL" => object.is_nil(),
-            "ATOM" => !object.is_cons(),
-            "LIST" => object.is_list(),
-            "CONS" => object.is_cons(),
+            "ATOM" => !object.is_cons() || is_function_value(object),
+            "LIST" => object.is_list() && !is_function_value(object),
+            "CONS" => object.is_cons() && !is_function_value(object),
             "SYMBOL" => object.is_symbol(),
             "KEYWORD" => is_keyword_arg(object),
             "STRING" | "SIMPLE-STRING" => is_string_value(object),
@@ -12287,7 +12316,7 @@ fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result
         "NUMBER" => {
             value.is_fixnum() || value.is_single_float() || ratio_parts_val(value).is_some()
         }
-        "LIST" => value.is_list(),
+        "LIST" => value.is_list() && !is_function_value(value),
         // FUNCTION must agree with FUNCTIONP/TYPEP: an interpreter closure is
         // the cons `(BLISS::CLOSURE . id)`, so a plain `value.is_cons()` check
         // would wrongly reject it. babel's string-to-octets funcalls through
@@ -12874,6 +12903,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
             }
             "PROGN" => return eval_progn(cdr, env),
+            // Interpreted/source-fallback code has no compiled load-time cell.
+            // Evaluate the value form when the containing form is loaded or
+            // interpreted; READ-ONLY-P is declarative syntax, not an evaluated
+            // argument. Portable/native compilation owns the eventual cached
+            // cell representation (spec §4.2.7 / §4.4).
+            "LOAD-TIME-VALUE" => {
+                let (value_form, rest) = cp(cdr);
+                let valid_arity = rest.is_nil() || (rest.is_cons() && cp(rest).1.is_nil());
+                if cdr.is_nil() || !valid_arity {
+                    return Err(BlissError::ProgramError(
+                        "LOAD-TIME-VALUE requires one or two arguments".into(),
+                    ));
+                }
+                return eval_form(value_form, env);
+            }
             // LOCALLY evaluates its body forms in sequence; declarations are
             // not yet honoured by the tree-walker, and leading `(declare …)`
             // forms evaluate to NIL harmlessly, so it reduces to PROGN.
@@ -14388,7 +14432,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "ATOM" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if v.is_cons() { NIL } else { T });
+                return Ok(if v.is_cons() && !is_function_value(v) {
+                    NIL
+                } else {
+                    T
+                });
             }
             "NULL" | "NOT" => {
                 let n = form_arg_count(cdr);
@@ -14404,12 +14452,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "CONSP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if v.is_cons() { T } else { NIL });
+                return Ok(if v.is_cons() && !is_function_value(v) {
+                    T
+                } else {
+                    NIL
+                });
             }
             "LISTP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if v.is_list() { T } else { NIL });
+                return Ok(if v.is_list() && !is_function_value(v) {
+                    T
+                } else {
+                    NIL
+                });
             }
             "ENDP" => {
                 // (endp list) — CLHS: T at the end of a proper list (NIL), NIL
@@ -14418,7 +14474,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 if v.is_nil() {
                     return Ok(T);
-                } else if v.is_cons() {
+                } else if v.is_cons() && !is_function_value(v) {
                     return Ok(NIL);
                 } else {
                     return Err(BlissError::TypeError {
@@ -15394,6 +15450,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                         if place.is_symbol() {
                             env.set_var_symbol(*place, *val);
+                            result = *val;
                             *c = *r2;
                             continue;
                         }
@@ -21166,23 +21223,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "INTERN" => {
                 let args = eval_args(cdr, env)?;
                 let name_val = args.first().copied().unwrap_or(NIL);
-                let name_str = symbol_bare_name(&val_as_str(name_val));
+                // INTERN's first argument is a string, not reader input: a
+                // colon in it is an ordinary symbol-name character and must
+                // not be interpreted as a package marker.
+                let name_str = val_as_str(name_val);
                 let pkg_name = if args.len() > 1 {
                     let raw = val_as_str(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
                     effective_package_name(env)
                 };
-                // ANSI INTERN 2nd value: an EXISTING symbol reports its actual
-                // accessibility (:INTERNAL/:EXTERNAL/:INHERITED); a freshly created
-                // one reports NIL — it was not always :INTERNAL (bliss-6w2y). Read
-                // the status (a String, GC-safe) before interning allocates.
-                let existing_status =
-                    find_symbol_in_package(env, &pkg_name, &name_str).map(|(_, s)| s);
-                let sym = intern_into_package(env, &pkg_name, &name_str);
-                let status = match existing_status {
-                    Some(s) if sym.is_symbol() => package_status_symbol(&s),
-                    _ => NIL,
+                // Package behavior belongs to bliss-stdlib. Ensure the package
+                // exists, then let its registry perform the exact-case lookup,
+                // inherited-symbol handling, allocation, and insertion.
+                ensure_package_available(env, &pkg_name, &[]);
+                let package = bliss_stdlib::find_package(&pkg_name).ok_or_else(|| {
+                    BlissError::PackageError(format!("there is no package named {pkg_name}"))
+                })?;
+                let (mut sym, intern_status) = bliss_stdlib::intern(&name_str, package)?;
+                bliss_rt::rooted_ref!(_sym_root = &mut sym);
+                let status = match intern_status {
+                    bliss_stdlib::InternStatus::Internal => package_status_symbol("INTERNAL"),
+                    bliss_stdlib::InternStatus::External => package_status_symbol("EXTERNAL"),
+                    bliss_stdlib::InternStatus::Inherited => package_status_symbol("INHERITED"),
+                    bliss_stdlib::InternStatus::New => NIL,
                 };
                 env.set_mv(vec![sym, status]);
                 return Ok(sym);
@@ -28016,6 +28080,59 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
         } else {
             String::new()
         };
+        // THE's type specifier is syntax, not a place subform.  Treating THE
+        // like an ordinary function place lifts both arguments into value
+        // temporaries, producing `(let ((temp FIXNUM) ...))` for
+        // `(incf (the fixnum place))` and then trying to read FIXNUM as a
+        // variable.  Delegate the place mechanics to the wrapped place and
+        // retain THE only around the access and the values supplied to the
+        // storing form, as required by the standard SETF expansion.
+        if symbol_bare_name(&acc) == "THE" {
+            let (type_form, rest) = cp(args);
+            if !rest.is_cons() || !cp(rest).1.is_nil() {
+                return Err(BlissError::ProgramError(
+                    "GET-SETF-EXPANSION: THE place requires a type and place".into(),
+                ));
+            }
+            let inner_place = cp(rest).0;
+            bliss_rt::rooted!(type_form = type_form);
+            bliss_rt::rooted!(inner_place = inner_place);
+            let mut sub = get_setf_expansion(*inner_place, env)?;
+            bliss_rt::rooted_ref!(_sub_temps = &mut sub.temps);
+            bliss_rt::rooted_ref!(_sub_vals = &mut sub.vals);
+            bliss_rt::rooted_ref!(_sub_stores = &mut sub.stores);
+            bliss_rt::rooted!(sub_store_form = sub.store_form);
+            bliss_rt::rooted!(sub_access_form = sub.access_form);
+
+            let the = resolve_sym("THE").unwrap_or(NIL);
+            let values = resolve_sym("VALUES").unwrap_or(NIL);
+            let multiple_value_bind = resolve_sym("MULTIPLE-VALUE-BIND").unwrap_or(NIL);
+            let mut values_items = Vec::with_capacity(sub.stores.len() + 1);
+            values_items.push(values);
+            values_items.extend_from_slice(&sub.stores);
+            bliss_rt::rooted_ref!(_values_items = &mut values_items);
+            bliss_rt::rooted!(values_form = vec_to_list(&values_items));
+            bliss_rt::rooted!(typed_values = vec_to_list(&[
+                the,
+                *type_form,
+                *values_form,
+            ]));
+            bliss_rt::rooted!(store_vars = vec_to_list(&sub.stores));
+            bliss_rt::rooted!(store_form = vec_to_list(&[
+                multiple_value_bind,
+                *store_vars,
+                *typed_values,
+                *sub_store_form,
+            ]));
+            let access_form = vec_to_list(&[the, *type_form, *sub_access_form]);
+            return Ok(SetfExpansion {
+                temps: sub.temps.clone(),
+                vals: sub.vals.clone(),
+                stores: sub.stores.clone(),
+                store_form: *store_form,
+                access_form,
+            });
+        }
         // GETF is a place whose FIRST argument is itself a place that must be
         // written back: `(push x (getf p 'k))` / `(incf (getf p 'k))` must
         // update the variable (or place) P, not a copy of its value. The generic
@@ -28086,6 +28203,7 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                         bytecode::run_macro(
                             Rc::new(function.borrow().clone()),
                             &arg_list,
+                            Some(*place),
                             &mut child,
                         )?
                     } else {
@@ -28714,6 +28832,7 @@ fn expand_macro(
             bytecode::run_macro(
                 Rc::new(function.borrow().clone()),
                 &arg_list,
+                Some(whole),
                 &mut child_env,
             )
         } else {
@@ -28930,15 +29049,18 @@ fn augment_env_with_macros(
                     compiler_macroexpand::register_macro_function(
                         handle,
                         Arc::new(move |form, _call_macro_env| {
-                            let (_, args) = cp(form);
+                            bliss_rt::rooted!(form = form);
+                            bliss_rt::rooted!(args = list_to_vec(cp(*form).1));
                             let function = function
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .clone();
                             let mut macro_env = Env::new_for_macro_expansion(false);
+                            bliss_rt::rooted_ref!(_macro_env_root = &mut macro_env);
                             bytecode::run_macro(
                                 Rc::new(function),
-                                &list_to_vec(args),
+                                &args,
+                                Some(*form),
                                 &mut macro_env,
                             )
                         }),
@@ -31220,11 +31342,14 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
         } else {
             NIL
         }),
-        "CONSP" => Ok(if args.first().copied().unwrap_or(NIL).is_cons() {
-            T
-        } else {
-            NIL
-        }),
+        "CONSP" => {
+            let value = args.first().copied().unwrap_or(NIL);
+            Ok(if value.is_cons() && !is_function_value(value) {
+                T
+            } else {
+                NIL
+            })
+        }
         "ENDP" => {
             // (endp list) — T at the end of a proper list (NIL), NIL for a cons,
             // and a type error for a non-list (CLHS: endp is defined only on
@@ -31232,7 +31357,7 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
             let arg = args.first().copied().unwrap_or(NIL);
             if arg.is_nil() {
                 Ok(T)
-            } else if arg.is_cons() {
+            } else if arg.is_cons() && !is_function_value(arg) {
                 Ok(NIL)
             } else {
                 Err(BlissError::TypeError {
@@ -31241,16 +31366,22 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
                 })
             }
         }
-        "ATOM" => Ok(if args.first().copied().unwrap_or(NIL).is_cons() {
-            NIL
-        } else {
-            T
-        }),
-        "LISTP" => Ok(if args.first().copied().unwrap_or(NIL).is_list() {
-            T
-        } else {
-            NIL
-        }),
+        "ATOM" => {
+            let value = args.first().copied().unwrap_or(NIL);
+            Ok(if value.is_cons() && !is_function_value(value) {
+                NIL
+            } else {
+                T
+            })
+        }
+        "LISTP" => {
+            let value = args.first().copied().unwrap_or(NIL);
+            Ok(if value.is_list() && !is_function_value(value) {
+                T
+            } else {
+                NIL
+            })
+        }
         _ => Err(BlissError::UndefinedFunction(
             resolve_sym(name).unwrap_or(NIL),
         )),

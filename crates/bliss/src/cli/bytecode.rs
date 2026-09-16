@@ -360,8 +360,11 @@ fn typep_class_matches(class: u16, v: BlissVal) -> bool {
         typep_class::STRING => super::is_string_value(v),
         typep_class::SYMBOL => v.is_symbol(),
         typep_class::PACKAGE => super::is_package_object(v),
-        typep_class::LIST => v.is_list(),
-        typep_class::CONS => v.is_cons(),
+        // Interpreter closures are physically tagged conses but are FUNCTION
+        // atoms in the Lisp type system. Keep the inline opcode identical to
+        // the full TYPEP path rather than leaking that representation.
+        typep_class::LIST => v.is_list() && !super::is_function_value(v),
+        typep_class::CONS => v.is_cons() && !super::is_function_value(v),
         typep_class::NULL => v.is_nil(),
         typep_class::BOOLEAN => v.is_nil() || v.0 == T.0,
         // (typep x 'hash-table): strings/other heap objects lack the hash-table
@@ -7176,16 +7179,33 @@ impl BbuConstPool {
             return Some(self.intern_encoded(bytes));
         }
         if v.is_cons() {
-            let (mut car, mut cdr) = cp(v);
-            bliss_rt::rooted_ref!(_car_root = &mut car);
-            bliss_rt::rooted_ref!(_cdr_root = &mut cdr);
-            let car_ref = self.value(car)?;
-            let cdr_ref = self.value(cdr)?;
-            let mut bytes = Vec::new();
-            put_u8(&mut bytes, 13);
-            put_u32(&mut bytes, car_ref);
-            put_u32(&mut bytes, cdr_ref);
-            return Some(self.intern_encoded(bytes));
+            // Generated tables can contain proper lists tens of thousands of
+            // cells long.  Recursing through every CDR exhausts the native
+            // stack while writing their literal constants, so flatten the
+            // spine and rebuild its pool references from the tail upward.
+            // Root both the collected CARs and dotted tail: recursive value
+            // encoding may allocate Bliss objects for other literal kinds.
+            let mut cars: Vec<BlissVal> = Vec::new();
+            let mut tail = v;
+            bliss_rt::rooted_ref!(_cars_root = &mut cars);
+            bliss_rt::rooted_ref!(_tail_root = &mut tail);
+            while tail.is_cons() {
+                let (car, cdr) = cp(tail);
+                cars.push(car);
+                tail = cdr;
+            }
+
+            let mut cdr_ref = self.value(tail)?;
+            while let Some(mut car) = cars.pop() {
+                bliss_rt::rooted_ref!(_car_root = &mut car);
+                let car_ref = self.value(car)?;
+                let mut bytes = Vec::new();
+                put_u8(&mut bytes, 13);
+                put_u32(&mut bytes, car_ref);
+                put_u32(&mut bytes, cdr_ref);
+                cdr_ref = self.intern_encoded(bytes);
+            }
+            return Some(cdr_ref);
         }
         // A ratio (e.g. `1/2`): pool its numerator and denominator (fixnums or
         // bignums, themselves poolable) and reconstruct the RATIO heap object on
@@ -7918,7 +7938,16 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
             "USE" | "MIX" => Some(&mut plan.uses),
             "NICKNAMES" => Some(&mut plan.nicknames),
             "EXPORT" => Some(&mut plan.exports),
-            "INTERN" | "SHADOW" => Some(&mut plan.interns),
+            "INTERN" => Some(&mut plan.interns),
+            // SHADOW must create a fresh present symbol even when a used
+            // package exports the same name.  The current package action only
+            // encodes plain INTERN, which may return that inherited symbol and
+            // collapse the two identities (bliss-b1o).  Keep the definition as
+            // a source-form load action until the portable format has a
+            // dedicated shadow operation.
+            "SHADOW" => {
+                return Err(bbu_error("package option :SHADOW has no portable load action"));
+            }
             "IMPORT-FROM"
             | "SHADOWING-IMPORT-FROM"
             | "REEXPORT"
@@ -7934,7 +7963,7 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
         };
         if let Some(destination) = destination {
             for value in values {
-                let item = if matches!(key.as_str(), "EXPORT" | "INTERN" | "SHADOW") {
+                let item = if matches!(key.as_str(), "EXPORT" | "INTERN") {
                     if !value.is_symbol() && !value.is_string() {
                         return Err(bbu_error(format!(
                             "package option :{key} contains a non-literal designator"
@@ -11553,6 +11582,7 @@ fn bind_macro_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[BlissVal],
+    explicit_whole: Option<BlissVal>,
     env_frame: Option<&Rc<RefCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<(), BlissError> {
@@ -11568,9 +11598,9 @@ fn bind_macro_variadic(
         // failing to load bordeaux-threads with "too few arguments for macro
         // lambda list" (bliss-66ny). (Compiled macros CAN reach here with
         // `&whole`, contrary to the previous assumption.)
-        let mut whole_val = NIL;
+        let mut whole_val = explicit_whole.unwrap_or(NIL);
         let has_whole = macro_params_have_whole(func.params_form);
-        if has_whole {
+        if has_whole && explicit_whole.is_none() {
             let op = resolve_sym(&func.name).unwrap_or(NIL);
             let mut whole_items = Vec::with_capacity(args.len() + 1);
             whole_items.push(op);
@@ -11648,15 +11678,16 @@ pub(super) fn run_with_sym(
     sym: u32,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    run_with_binding(entry, args, entry_fn_val, sym, env, false)
+    run_with_binding(entry, args, entry_fn_val, sym, env, false, None)
 }
 
 pub(super) fn run_macro(
     entry: Rc<BytecodeFunction>,
     args: &[BlissVal],
+    whole: Option<BlissVal>,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    run_with_binding(entry, args, NIL, u32::MAX, env, true)
+    run_with_binding(entry, args, NIL, u32::MAX, env, true, whole)
 }
 
 fn run_with_binding(
@@ -11666,9 +11697,11 @@ fn run_with_binding(
     entry_sym: u32,
     env: &mut Env,
     macro_lambda_list: bool,
+    mut macro_whole: Option<BlissVal>,
 ) -> Result<BlissVal, BlissError> {
     let _active_bytecode_root = ActiveBytecodeRoot::new(&entry);
     bliss_rt::rooted!(args = args.to_vec());
+    bliss_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
     validate_declared_args(&entry, &args)?;
     record_profiled_invocation(Rc::as_ptr(&entry) as usize);
     // A callee's return values are determined by its own body — discard any
@@ -11705,7 +11738,14 @@ fn run_with_binding(
     let parent = closure_env.clone().unwrap_or_else(|| Rc::clone(&env.frame));
     let env_frame = make_env_frame(&entry, parent).or(closure_env);
     if macro_lambda_list {
-        if let Err(e) = bind_macro_variadic(&entry, frame, &args, env_frame.as_ref(), env) {
+        if let Err(e) = bind_macro_variadic(
+            &entry,
+            frame,
+            &args,
+            macro_whole,
+            env_frame.as_ref(),
+            env,
+        ) {
             stack.pop_frame();
             return Err(e);
         }

@@ -2254,6 +2254,18 @@ fn cl_ppcre_enabling_regressions() {
             "(let ((l (list 1 2 3 4))) (setf (the fixnum (third l)) 99) l)",
             "(1 2 99 4)",
         ),
+        // Updating macros use GET-SETF-EXPANSION rather than the evaluator's
+        // direct SETF path.  THE's type specifier is syntax and must not become
+        // a temporary value form (which would try to evaluate FIXNUM).
+        (
+            "(let ((n 2)) (list (incf (the fixnum n)) n))",
+            "(3 3)",
+        ),
+        (
+            "(let ((n 2)) (list (setf (the fixnum n) 7) n))",
+            "(7 7)",
+        ),
+        ("(load-time-value (+ 1 2) t)", "3"),
         (
             "(let ((l (list 1 2 3 4 5))) (setf (fourth l) 40) (setf (nth 4 l) 50) l)",
             "(1 2 3 40 50)",
@@ -2350,6 +2362,9 @@ fn find_symbol_intern_accessibility() {
         ("(multiple-value-list (find-symbol \"NEVER-SEEN-QQ\" :cl-user))", "(NIL NIL)"),
         // INTERN a brand-new symbol: second value NIL (freshly created).
         ("(nth-value 1 (intern \"BRAND-NEW-QQ\" :cl-user))", "NIL"),
+        // The STRING argument is an opaque symbol name.  Package-marker
+        // characters inside it are not reader syntax (CLHS INTERN).
+        ("(let ((s (intern \"BIDICLASS:L\" :cl-user))) (list (symbol-name s) (eq s (find-symbol \"BIDICLASS:L\" :cl-user))))", "(\"BIDICLASS:L\" T)"),
         // CL builtins are :EXTERNAL, consistently via FIND-SYMBOL and INTERN.
         ("(nth-value 1 (find-symbol \"CAR\" :cl))", ":EXTERNAL"),
         ("(nth-value 1 (intern \"CONS\" :common-lisp))", ":EXTERNAL"),
@@ -4347,6 +4362,7 @@ fn cl_ppcre_matcher_regressions() {
         ("(progn (defun ftest2 (x) x) (type-of #'ftest2))", "FUNCTION"),
         ("(typep (lambda (x) x) 'function)", "T"),
         ("(type-of (lambda (x) x))", "FUNCTION"),
+        ("(let ((f (lambda (x) x))) (list (atom f) (consp f) (listp f) (typep f 'atom) (typep f 'cons) (typep f 'list)))", "(T NIL NIL T NIL NIL)"),
         // A (function) method specializer must dispatch on a closure.
         (
             "(progn (defgeneric gg (x)) (defmethod gg ((f function)) :got-fn) \
