@@ -8135,3 +8135,87 @@ fn class_type_not_shadowed_by_same_name_deftype_in_other_package() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// CLHS 3.3.4: a `(declare (special v))` governs *references* only until an
+/// inner binding of `v` intervenes. bliss kept the name dynamic for the whole
+/// body, so an inner LET's lexical binding was invisible — even `(setq x 9)`
+/// inside it did not stick — and conversely a `LOCALLY` special declaration
+/// (which binds nothing and exists precisely to bypass a lexical binding) was
+/// discarded outright. ansi LET.6 / LET*.6; bliss-9kww.
+///
+/// Both evaluation paths are pinned: the bare form goes through the bytecode
+/// lowerer, the `(eval '…)` form through the tree-walker. The two carry
+/// independent implementations of this rule and only the tree-walker's is
+/// exercised by the ansi harness, which is how the bug outlived the first fix.
+#[test]
+fn special_declaration_scope_versus_inner_lexical_binding() {
+    let cases = [
+        // An inner LET binds lexically; the enclosing special declaration must
+        // not redirect the reference to the dynamic cell.
+        ("(let ((x 0)) (declare (special x)) (let ((x 1)) x))", "1"),
+        // ...and the lexical binding is assignable.
+        // ...and the lexical binding is assignable, without disturbing the
+        // dynamic one the outer reference still reads. (Deliberately avoids
+        // SYMBOL-VALUE, which has its own lexical-fallback bug — bliss-qui9.)
+        (
+            "(let ((x 0)) (declare (special x)) \
+               (list (let ((x 1)) (setq x 9) x) x))",
+            "(9 0)",
+        ),
+        // LOCALLY declares without binding: the reference reads the dynamic
+        // value even though a lexical binding is in scope. This is ansi LET.6.
+        (
+            "(let ((x 0)) (declare (special x)) \
+               (let ((x 1)) (multiple-value-list \
+                 (values x (locally (declare (special x)) x)))))",
+            "(1 0)",
+        ),
+        // The symmetric case: a lexical binding *inside* a LOCALLY body shadows
+        // that declaration in turn. Fixing the above without this regresses it.
+        (
+            "(let ((x 0)) (declare (special x)) \
+               (locally (declare (special x)) (let ((x 1)) x)))",
+            "1",
+        ),
+        // LET* differs from LET in whether a later init sees the new binding:
+        // in LET* it does (lexical 1), in parallel LET the inits run in the
+        // outer scope, where the declaration still governs (dynamic 0).
+        ("(let ((x 0)) (declare (special x)) (let* ((x 1) (y x)) y))", "1"),
+        ("(let ((x 0)) (declare (special x)) (let ((x 1) (y x)) y))", "0"),
+        // The binding really is dynamic when nothing shadows it: a callee sees
+        // it. (The behaviour the declaration exists for; must not regress.)
+        (
+            "(progn (defun spc-peek () (symbol-value 'sv)) \
+               (let ((sv 5)) (declare (special sv)) (spc-peek)))",
+            "5",
+        ),
+        // LOCALLY without a special declaration is still a plain progn.
+        ("(locally (declare (optimize speed)) 1 2 3)", "3"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

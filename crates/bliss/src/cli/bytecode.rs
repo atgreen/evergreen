@@ -1585,6 +1585,25 @@ impl<'e> Lowerer<'e> {
         }
     }
 
+    /// A *lexical* binding of a name that an enclosing `(declare (special n))`
+    /// made dynamic shadows that declaration for the binding's extent: per CLHS
+    /// 3.3.4 the declaration governs references only until an inner binding of
+    /// the same name intervenes, and an inner LET that does not itself declare
+    /// the name special binds it lexically. Drop the entry (returning the saved
+    /// nesting count) so references compile as lexical loads, and restore it
+    /// with [`unshadow_declared_special`] when the extent ends (bliss-9kww).
+    fn shadow_declared_special(&mut self, name: &str, saved: &mut Vec<(String, u32)>) {
+        if let Some(count) = self.declared_special.remove(name) {
+            saved.push((name.to_string(), count));
+        }
+    }
+
+    fn unshadow_declared_special(&mut self, saved: Vec<(String, u32)>) {
+        for (name, count) in saved {
+            self.declared_special.insert(name, count);
+        }
+    }
+
     // ── Expression lowering ────────────────────────────────────────
 
     /// Lower a form so its single value is left on the operand stack.
@@ -1729,7 +1748,7 @@ impl<'e> Lowerer<'e> {
                     }
                 }
                 // (locally decl... body...) — declarations lower to NIL no-ops.
-                "LOCALLY" => self.lower_progn(rest),
+                "LOCALLY" => self.lower_locally(rest),
                 "EVAL-WHEN" => self.lower_eval_when(rest),
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
@@ -2138,6 +2157,22 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// `(locally (declare (special v)) …)` — a progn whose body declarations are
+    /// in force. A `special` declaration here makes references to `v` in the body
+    /// *dynamic* even though no binding is established, which is how CLHS 3.3.4
+    /// says a lexical binding is bypassed to read the dynamic value. It also
+    /// re-exposes a name a nested lexical binding shadowed (bliss-9kww).
+    fn lower_locally(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let decl_special = body_declared_special(rest);
+        if decl_special.is_empty() {
+            return self.lower_progn(rest);
+        }
+        self.push_declared_special(&decl_special);
+        let result = self.lower_progn(rest);
+        self.pop_declared_special(&decl_special);
+        result
+    }
+
     fn lower_let(&mut self, rest: BlissVal, sequential: bool) -> LowerResult<()> {
         // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
         let (bindings, mut body) = cp(rest);
@@ -2195,6 +2230,9 @@ impl<'e> Lowerer<'e> {
             }
         };
 
+        // Enclosing `(declare (special n))` entries suppressed by a lexical
+        // binding made here; restored after the body (bliss-9kww).
+        let mut shadowed = Vec::new();
         if sequential {
             // LET*: each init sees prior bindings.
             self.enter_scope();
@@ -2207,6 +2245,9 @@ impl<'e> Lowerer<'e> {
                 } else {
                     let loc = self.alloc_local(&name);
                     store(self, &name, loc);
+                    // Shadow immediately: a *later* init in this LET* must see
+                    // this lexical binding, not the enclosing dynamic one.
+                    self.shadow_declared_special(&name, &mut shadowed);
                 }
                 self.pop_n(1);
             }
@@ -2230,6 +2271,10 @@ impl<'e> Lowerer<'e> {
             for (name, loc) in locs.into_iter().rev() {
                 if let Some(loc) = loc {
                     store(self, &name, loc);
+                    // The inits were lowered in the outer scope, where an
+                    // enclosing special declaration still governs; only the body
+                    // sees these lexical bindings.
+                    self.shadow_declared_special(&name, &mut shadowed);
                 } else {
                     let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
                     self.emit(Instr::BindSpecial(symbol));
@@ -2260,6 +2305,7 @@ impl<'e> Lowerer<'e> {
             }
         }
         self.pop_declared_special(&decl_special);
+        self.unshadow_declared_special(shadowed);
         self.exit_scope(saved_next_local);
         if special_count != 0 {
             self.emit(Instr::UnbindSpecial(special_count));

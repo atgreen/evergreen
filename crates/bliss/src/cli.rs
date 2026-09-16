@@ -1473,6 +1473,13 @@ struct Env {
     tag_stack: Vec<(String, String)>,
     method_context: Vec<MethodContext>,
     eval_context: EvalContext,
+    /// Symbol indices a lexically enclosing `(locally (declare (special v)) …)`
+    /// declared special. Such a declaration establishes no binding; it only
+    /// makes *references* to `v` in its body read the dynamic value, bypassing
+    /// any lexical binding in scope (CLHS 3.3.4). Carried on the Env — not a
+    /// thread-local — so it is lexical: a function called from the body builds
+    /// its Env from its own closure env and is unaffected (bliss-9kww).
+    locally_specials: Vec<u32>,
 }
 
 /// A tiny insertion-ordered map backed by a `Vec`, for env-frame variable
@@ -6229,6 +6236,7 @@ impl Env {
             tag_stack: Vec::new(),
             method_context: Vec::new(),
             eval_context: EvalContext::Repl,
+            locally_specials: Vec::new(),
         };
         // Definitional-registry sharing (bliss-nc3b): a macro-expansion env
         // ADOPTS the live top-level env's tables so expanders see the loading
@@ -6510,6 +6518,7 @@ impl Env {
             tag_stack: self.tag_stack.clone(),
             method_context: self.method_context.clone(),
             eval_context: self.eval_context,
+            locally_specials: self.locally_specials.clone(),
         }
     }
 
@@ -6540,6 +6549,7 @@ impl Env {
             tag_stack: self.tag_stack.clone(),
             method_context: self.method_context.clone(),
             eval_context: self.eval_context,
+            locally_specials: self.locally_specials.clone(),
         }
     }
 
@@ -6567,7 +6577,9 @@ impl Env {
         // definition environment (e.g. a top-level defun loaded via a child `load`
         // env) shadows the live dynamic value, so callers see the DEFVAR default
         // instead of the LET-bound value (broke slynk's `*emacs-connection*`).
-        if is_special_var(symbol) {
+        // A LOCALLY-declared special reference is dynamic for the same reason,
+        // even though the name is neither earmuffed nor proclaimed (bliss-9kww).
+        if is_special_var(symbol) || self.locally_specials.contains(&idx) {
             if let Some(val) = global_value_cell(idx) {
                 return Some(val);
             }
@@ -13165,7 +13177,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // LOCALLY evaluates its body forms in sequence; declarations are
             // not yet honoured by the tree-walker, and leading `(declare …)`
             // forms evaluate to NIL harmlessly, so it reduces to PROGN.
-            "LOCALLY" => return eval_progn(cdr, env),
+            "LOCALLY" => {
+                // `(declare (special v))` here binds nothing; it redirects
+                // references in the body to the dynamic value (bliss-9kww).
+                let names = let_body_special_decls(cdr);
+                if names.is_empty() {
+                    return eval_progn(cdr, env);
+                }
+                let saved = env.locally_specials.clone();
+                env.locally_specials.extend(names);
+                // Restore on every exit path, including an error unwinding out
+                // of the body.
+                let result = eval_progn(cdr, env);
+                env.locally_specials = saved;
+                return result;
+            }
             "DECLARE" => return Ok(NIL),
             "THE" => {
                 let (type_form, r) = cp(cdr);
@@ -27179,6 +27205,17 @@ impl bliss_rt::gc::TraceHostRoots for DynBind {
     }
 }
 
+/// A lexical binding of `sym` shadows an enclosing `(locally (declare (special
+/// sym)) …)` for its extent: that declaration redirects *references* only until
+/// an inner binding of the same name intervenes (CLHS 3.3.4; bliss-9kww).
+/// Mirrors the bytecode lowerer's `shadow_declared_special`.
+fn shadow_locally_special(env: &mut Env, sym: BlissVal) {
+    if sym.is_symbol() && !env.locally_specials.is_empty() {
+        let idx = sym.as_symbol_index();
+        env.locally_specials.retain(|i| *i != idx);
+    }
+}
+
 fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
     let parent = Rc::clone(&env.frame);
@@ -27213,6 +27250,7 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                         dyn_binds.push(DynBind::establish(var_form, val));
                     } else if var_form.is_symbol() {
                         env.define_local_symbol(var_form, val);
+                        shadow_locally_special(env, var_form);
                     } else {
                         env.define_local(&sym_name(var_form), val);
                     }
@@ -27221,6 +27259,7 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                         dyn_binds.push(DynBind::establish(binding, NIL));
                     } else {
                         env.define_local_symbol(binding, NIL);
+                        shadow_locally_special(env, binding);
                     }
                 }
             }
@@ -27267,6 +27306,7 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                 dyn_binds.push(DynBind::establish(symbol, val));
             } else if symbol.is_symbol() {
                 env.define_local_symbol(symbol, val);
+                shadow_locally_special(env, symbol);
             } else {
                 env.define_local(&sym_name(symbol), val);
             }
