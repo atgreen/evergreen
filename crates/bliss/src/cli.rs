@@ -16238,8 +16238,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // (function (lambda (params) body...)) — create a closure
                 if name_form.is_cons() {
-                    let (lh, lr) = cp(name_form);
+                    let (lh, mut lr) = cp(name_form);
                     if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
+                        // As in the bare LAMBDA arm (bliss-35w7). `lr` is a
+                        // plain local derived from `name_form`, so root it
+                        // across the prune's full, moving GC.
+                        bliss_rt::rooted_ref!(_lr_root = &mut lr);
+                        maybe_prune_closure_registry();
                         let (params_form, body) = cp(lr);
                         // Capture the current lexical environment
                         let closure = Closure {
@@ -16259,7 +16264,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(name_form);
             }
             "LAMBDA" => {
-                // Bare (lambda (params) body...) — create a closure
+                // Bare (lambda (params) body...) — create a closure.
+                // Shed dead registry entries first (bliss-35w7): see
+                // `maybe_prune_closure_registry`. Safe here — only `car`/`cdr`
+                // are live, and both are rooted for the whole dispatch — but
+                // NOT after `cp(cdr)`, whose results are plain locals.
+                maybe_prune_closure_registry();
                 let (params_form, body) = cp(cdr);
                 let closure = Closure {
                     params_form,
@@ -26975,6 +26985,11 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 /// "undefined function" (notably `#'<gensym>` from library macros — babel's
 /// encoders). Returns `None` for non-local names.
 fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
+    // `#'localfn` inside a loop mints a fresh registry entry per evaluation, so
+    // this is an unbounded site too (bliss-35w7). Prune BEFORE reading the
+    // function's forms out of `env.funs` — those become plain locals that the
+    // prune's moving GC would leave stale.
+    maybe_prune_closure_registry();
     let (params_form, body) = env
         .funs
         .borrow()
