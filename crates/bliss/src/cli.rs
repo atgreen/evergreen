@@ -770,6 +770,80 @@ fn write_trace_output(env: &mut Env, s: &str) -> Result<(), BlissError> {
     }
 }
 
+/// Write `s` to `*STANDARD-OUTPUT*`, falling back to the process stdout when it
+/// is unbound. The `*TRACE-OUTPUT*` sibling above deliberately prefers the trace
+/// stream; APROPOS and friends are specified to print to standard output.
+fn write_standard_output(env: &mut Env, s: &str) -> Result<(), BlissError> {
+    let out = env
+        .lookup_var("*STANDARD-OUTPUT*")
+        .filter(|v| is_stream(*v) || is_gray_stream(*v))
+        .unwrap_or(NIL);
+    if out.is_nil() {
+        use std::io::Write;
+        print!("{s}");
+        let _ = std::io::stdout().flush();
+        return Ok(());
+    }
+    if is_gray_stream(out) {
+        let sv = arena_str(s);
+        invoke_generic_function(
+            "STREAM-WRITE-STRING",
+            &[out, sv, BlissVal::from_fixnum(0), NIL],
+            env,
+        )?;
+        Ok(())
+    } else {
+        write_str_to(out, s)
+    }
+}
+
+/// Symbols whose names contain `substring`, case-insensitively — the search
+/// shared by APROPOS and APROPOS-LIST (CLHS 25.1.1; bliss-wne9.5).
+///
+/// With a package, its accessible symbols (present + inherited). Without one,
+/// every package's PRESENT symbols: taking present-only means a symbol
+/// inherited by many packages is still reported once, at its home.
+///
+/// Sorted by name then home package so the output is deterministic — CLHS
+/// imposes no order, but an unstable one makes the function untestable.
+fn apropos_symbols(env: &mut Env, substring: &str, package: BlissVal) -> Vec<BlissVal> {
+    let needle = substring.to_uppercase();
+    // Dedupe on the raw value, NOT `as_symbol_index`: NIL and T satisfy
+    // `is_symbol` but carry their own bit patterns rather than a symbol tag, so
+    // asking them for an index panics — and both are present in CL.
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut found: Vec<BlissVal> = Vec::new();
+
+    let candidates: Vec<BlissVal> = if package.is_nil() {
+        let mut all = Vec::new();
+        for pkg in bliss_stdlib::list_all_packages() {
+            let Some(name) = bliss_stdlib::package_name(pkg) else { continue };
+            all.extend(package_symbols(env, &name, false));
+        }
+        all
+    } else {
+        let name = resolve_package_name(env, &string_designator_name(package));
+        package_symbols(env, &name, true)
+    };
+
+    for sym in candidates {
+        if !sym.is_symbol() {
+            continue;
+        }
+        if !seen.insert(sym.0) {
+            continue;
+        }
+        if symbol_name_string(&sym_name_rc(sym))
+            .to_uppercase()
+            .contains(&needle)
+        {
+            found.push(sym);
+        }
+    }
+    found.sort_by_key(|s| (symbol_name_string(&sym_name_rc(*s)), symbol_home_package_name(*s)));
+    found
+}
+
 fn claim_process_signal_flags_for_current_execution() {
     fn post(signal: bliss_rt::PendingSignal) {
         if bliss_rt::post_foreground_pending_signal(signal).is_err() {
@@ -12223,6 +12297,10 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "DECODE-FLOAT"
             | "INTEGER-DECODE-FLOAT"
             | "MULTIPLE-VALUE-PROG1"
+            // APROPOS is specified to return NO values (CLHS 25.1.1); without
+            // this the allowlist classifies it single-value and
+            // (multiple-value-list (apropos …)) yields (NIL) instead of ().
+            | "APROPOS"
             // ── value-transparent control / binding special forms ──
             | "IF"
             | "WHEN"
@@ -17914,6 +17992,40 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pathname = eval_form(pathname_form, env)?;
                 return Ok(bliss_stdlib::probe_file(pathname)?.unwrap_or(NIL));
             }
+            "OPEN" => {
+                // (open filespec &key direction element-type if-exists
+                // if-does-not-exist external-format) → a stream, or NIL when
+                // `:if-does-not-exist nil` and the file is missing (bliss-wne9.5).
+                // The caller owns the stream and must CLOSE it; WITH-OPEN-FILE is
+                // the same machinery with the close wired into an unwind.
+                // `eval_args` hands back a self-rooting RootedVals, so the
+                // filespec and option values stay traced without further work.
+                let args = eval_args(cdr, env)?;
+                let Some((path_val, opts)) = args.split_first() else {
+                    return Err(BlissError::ProgramError(
+                        "OPEN requires a filespec argument".into(),
+                    ));
+                };
+                let path_val = *path_val;
+                if env.sandbox {
+                    return Err(BlissError::SandboxViolation(format!(
+                        "File access denied in sandbox mode: {}",
+                        val_as_str(path_val)
+                    )));
+                }
+                let options = decode_open_options(opts);
+                // `options` copies out of the rooted `args`, and `bliss_stdlib::open`
+                // is the next thing that can allocate, so nothing needs re-rooting
+                // between here and the call.
+                return bliss_stdlib::open(
+                    path_val,
+                    options.direction,
+                    options.element_type,
+                    options.if_exists,
+                    options.if_does_not_exist,
+                    bliss_stdlib::ExternalFormat::Utf8,
+                );
+            }
             "DELETE-FILE" => {
                 // (delete-file pathspec) — delete the file, returning T.
                 let (path_form, _) = cp(cdr);
@@ -21093,6 +21205,50 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "LIST-ALL-PACKAGES" => {
                 return Ok(vec_to_list(&bliss_stdlib::list_all_packages()));
+            }
+            "APROPOS-LIST" => {
+                // (apropos-list string &optional package) → matching symbols.
+                let args = eval_args(cdr, env)?;
+                let needle = val_as_str(args.first().copied().unwrap_or(NIL));
+                let package = args.get(1).copied().unwrap_or(NIL);
+                let matches = apropos_symbols(env, &needle, package);
+                return Ok(vec_to_list(&matches));
+            }
+            "APROPOS" => {
+                // (apropos string &optional package) — print each match to
+                // *standard-output*; CLHS specifies no values are returned.
+                let args = eval_args(cdr, env)?;
+                let needle = val_as_str(args.first().copied().unwrap_or(NIL));
+                let package = args.get(1).copied().unwrap_or(NIL);
+                let matches = apropos_symbols(env, &needle, package);
+                // Render everything BEFORE writing: `symbol_function`/variable
+                // lookups below allocate, and the stream write can re-enter Lisp
+                // through a Gray stream. Neither may run while we hold a
+                // half-built view of the symbol list.
+                let mut report = String::new();
+                for sym in &matches {
+                    let full = sym_name_rc(*sym);
+                    let home = symbol_home_package_name(*sym);
+                    let bare = symbol_name_string(&full);
+                    // An uninterned symbol has no home package; CLHS prints
+                    // those as #:NAME.
+                    let mut line = if home.is_empty() {
+                        format!("#:{bare}")
+                    } else {
+                        format!("{}:{}", prompt_package_name(&home), bare)
+                    };
+                    if callable_body_of_symbol(env, *sym, &symbol_name_string(&full)).is_some() {
+                        line.push_str(" (function)");
+                    }
+                    if env.lookup_var_symbol(*sym).is_some() {
+                        line.push_str(" (value)");
+                    }
+                    line.push('\n');
+                    report.push_str(&line);
+                }
+                write_standard_output(env, &report)?;
+                env.set_mv(Vec::new());
+                return Ok(NIL);
             }
             "BLISS-INTERNAL::PACKAGE-SYMBOLS" | "BLISS-INTERNAL:PACKAGE-SYMBOLS" => {
                 let args = eval_args(cdr, env)?;
@@ -32104,6 +32260,79 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 // ── WITH-OPEN-FILE ──────────────────────────────────────────────
+/// The `OPEN` keyword options, shared by `OPEN` and `WITH-OPEN-FILE` so the two
+/// cannot drift (bliss-wne9.5).
+struct OpenOptions {
+    direction: bliss_stdlib::StreamDirection,
+    element_type: BlissVal,
+    if_exists: BlissVal,
+    if_does_not_exist: BlissVal,
+}
+
+/// Decode already-EVALUATED `key value` pairs into `OpenOptions`.
+///
+/// Values, not literals: `WITH-OPEN-FILE` is a macro whose options are ordinary
+/// forms (ASDF passes `:direction direction`, a variable), and `OPEN` is a
+/// function whose arguments are evaluated anyway. Callers evaluate first and
+/// hand the results here.
+///
+/// Allocation-free — it only inspects and copies `BlissVal`s — so it cannot
+/// trigger a GC and needs no roots of its own; the caller owns rooting the
+/// slice it passes and the options it gets back.
+fn decode_open_options(pairs: &[BlissVal]) -> OpenOptions {
+    let mut direction = bliss_stdlib::StreamDirection::Input;
+    let mut element_type = T;
+    let mut if_exists = T;
+    let mut if_does_not_exist = NIL;
+    let mut if_dne_supplied = false;
+
+    let mut i = 0;
+    while i + 1 < pairs.len() {
+        let value = pairs[i + 1];
+        match symbol_bare_name(&sym_name_rc(pairs[i])).as_str() {
+            "DIRECTION" => match symbol_bare_name(&sym_name_rc(value)).as_str() {
+                "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
+                "IO" => direction = bliss_stdlib::StreamDirection::Io,
+                "INPUT" => direction = bliss_stdlib::StreamDirection::Input,
+                _ => {}
+            },
+            "ELEMENT-TYPE" => {
+                // (unsigned-byte 8) or the fixnum 8 selects a byte stream.
+                let is_byte = value == BlissVal::from_fixnum(8)
+                    || (value.is_cons()
+                        && symbol_bare_name(&sym_name_rc(cp(value).0)) == "UNSIGNED-BYTE");
+                element_type = if is_byte { BlissVal::from_fixnum(8) } else { T };
+            }
+            "IF-EXISTS" => if_exists = value,
+            "IF-DOES-NOT-EXIST" => {
+                if_does_not_exist = value;
+                if_dne_supplied = true;
+            }
+            // :EXTERNAL-FORMAT is accepted and ignored — the stream layer is
+            // UTF-8 only for now.
+            _ => {}
+        }
+        i += 2;
+    }
+
+    // CLHS defaults for `:if-does-not-exist` when unsupplied: `:error` for input
+    // (and for output with `:if-exists :overwrite`/`:append`), `:create`
+    // otherwise. The stdlib `open` treats any non-NIL value as "signal", and
+    // creates missing files on output regardless — so the only default that
+    // matters here is input, where NIL must NOT be passed (it would suppress the
+    // error and hand the caller a NIL stream). Represent `:error` as T.
+    if !if_dne_supplied && matches!(direction, bliss_stdlib::StreamDirection::Input) {
+        if_does_not_exist = T;
+    }
+
+    OpenOptions {
+        direction,
+        element_type,
+        if_exists,
+        if_does_not_exist,
+    }
+}
+
 fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (binding, mut body) = cp(cdr);
     let (var_form, rest) = cp(binding);
@@ -32125,65 +32354,35 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         )));
     }
 
-    // Parse options. WITH-OPEN-FILE is a macro whose option VALUES are ordinary
-    // forms (e.g. ASDF passes `:direction direction`, a variable), so each value
-    // must be EVALUATED — not read as a literal keyword.
+    // Evaluate each option VALUE — the options are ordinary forms here (ASDF
+    // passes `:direction direction`, a variable), not literal keywords — then
+    // decode them with the same helper `OPEN` uses, so the two cannot drift.
     let mut opts = list_to_vec(opts_rest);
-    // Root the option forms and the evaluated option values across the
-    // allocating per-option evaluations below (moving GC; bliss-8qf).
+    // Root the option forms AND the evaluated values in place: each
+    // `eval_form` below can allocate and move the nursery (bliss-8qf).
     bliss_rt::rooted_ref!(_opts_vec_root = &mut opts);
-    let mut direction = bliss_stdlib::StreamDirection::Input;
-    let mut element_type = T;
-    bliss_rt::rooted_ref!(_element_type_root = &mut element_type);
-    let mut if_exists = T;
-    bliss_rt::rooted_ref!(_if_exists_root = &mut if_exists);
-    let mut if_does_not_exist = NIL;
-    bliss_rt::rooted_ref!(_if_dne_root = &mut if_does_not_exist);
-    let mut if_dne_supplied = false;
+    let mut opt_values: Vec<BlissVal> = Vec::with_capacity(opts.len());
+    bliss_rt::rooted_ref!(_opt_values_root = &mut opt_values);
     let mut i = 0;
     while i + 1 < opts.len() {
-        let opt_bare = symbol_bare_name(&sym_name_rc(opts[i]));
+        let keyword = opts[i];
         let value = eval_form(opts[i + 1], env)?;
-        match opt_bare.as_str() {
-            "DIRECTION" => match symbol_bare_name(&sym_name_rc(value)).as_str() {
-                "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
-                "IO" => direction = bliss_stdlib::StreamDirection::Io,
-                "INPUT" => direction = bliss_stdlib::StreamDirection::Input,
-                _ => {}
-            },
-            "ELEMENT-TYPE" => {
-                // (unsigned-byte 8) or the fixnum 8 selects a byte stream.
-                let is_byte = value == BlissVal::from_fixnum(8)
-                    || (value.is_cons()
-                        && symbol_bare_name(&sym_name_rc(cp(value).0)) == "UNSIGNED-BYTE");
-                element_type = if is_byte { BlissVal::from_fixnum(8) } else { T };
-            }
-            "IF-EXISTS" => if_exists = value,
-            "IF-DOES-NOT-EXIST" => {
-                if_does_not_exist = value;
-                if_dne_supplied = true;
-            }
-            _ => {}
-        }
+        opt_values.push(keyword);
+        opt_values.push(value);
         i += 2;
     }
-    // CLHS defaults for `:if-does-not-exist` when unsupplied: `:error` for input
-    // (and for output with `:if-exists :overwrite`/`:append`), `:create`
-    // otherwise. The stdlib `open` treats any non-NIL value as "signal", and
-    // creates missing files on output regardless — so the only default that
-    // matters here is input, where NIL must NOT be passed (it would suppress the
-    // error and hand the body a NIL stream). Represent `:error` as T.
-    if !if_dne_supplied && matches!(direction, bliss_stdlib::StreamDirection::Input) {
-        if_does_not_exist = T;
-    }
+    let mut options = decode_open_options(&opt_values);
+    bliss_rt::rooted_ref!(_element_type_root = &mut options.element_type);
+    bliss_rt::rooted_ref!(_if_exists_root = &mut options.if_exists);
+    bliss_rt::rooted_ref!(_if_dne_root = &mut options.if_does_not_exist);
 
     // Open the file via the standard-library stream machinery.
     let mut stream_val = bliss_stdlib::open(
         path_val,
-        direction,
-        element_type,
-        if_exists,
-        if_does_not_exist,
+        options.direction,
+        options.element_type,
+        options.if_exists,
+        options.if_does_not_exist,
         bliss_stdlib::ExternalFormat::Utf8,
     )?;
     // Root the stream (a heap object) across the allocating body evaluation:

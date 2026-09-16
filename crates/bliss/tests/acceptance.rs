@@ -3575,6 +3575,76 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// OPEN, APROPOS and APROPOS-LIST were unbound (bliss-wne9.5). ASDF and UIOP
+/// call them, so their absence surfaced downstream as library bugs. Every
+/// expectation here matches SBCL.
+#[test]
+fn open_and_apropos_entry_points() {
+    let setup = "(progn \
+        (with-open-file (s \"/tmp/bliss-open-acc.txt\" :direction :output \
+                           :if-exists :supersede) \
+          (write-string \"roundtrip\" s)) \
+        (defpackage :bliss-ap-acc (:use :cl)) \
+        (defvar bliss-ap-acc::alpha-widget 1) \
+        (defun bliss-ap-acc::make-alpha-widget () :x))";
+    let cases = [
+        // The bead's acceptance criterion: OPEN a file, READ-LINE it, CLOSE it.
+        (
+            "(let ((s (open \"/tmp/bliss-open-acc.txt\"))) (prog1 (read-line s) (close s)))",
+            "\"roundtrip\"",
+        ),
+        // :if-does-not-exist nil yields NIL rather than signalling.
+        ("(open \"/tmp/bliss-open-acc-missing-qq\" :if-does-not-exist nil)", "NIL"),
+        // ...and the default does signal.
+        (
+            "(handler-case (open \"/tmp/bliss-open-acc-missing-qq\") (error () :signalled))",
+            ":SIGNALLED",
+        ),
+        // A stream from OPEN is a real, open input stream, and CLOSE shuts it.
+        (
+            "(let ((s (open \"/tmp/bliss-open-acc.txt\"))) \
+               (list (streamp s) (input-stream-p s) (open-stream-p s) \
+                     (progn (close s) (open-stream-p s))))",
+            "(T T T NIL)",
+        ),
+        // APROPOS-LIST finds present and inherited symbols of a named package.
+        (
+            "(sort (mapcar #'symbol-name (apropos-list \"WIDGET\" :bliss-ap-acc)) #'string<)",
+            "(\"ALPHA-WIDGET\" \"MAKE-ALPHA-WIDGET\")",
+        ),
+        // Matching is case-insensitive.
+        (
+            "(sort (mapcar #'symbol-name (apropos-list \"widget\" :bliss-ap-acc)) #'string<)",
+            "(\"ALPHA-WIDGET\" \"MAKE-ALPHA-WIDGET\")",
+        ),
+        // No match is the empty list, not an error.
+        ("(apropos-list \"NO-SUCH-THING-QQQ\" :bliss-ap-acc)", "NIL"),
+        // CLHS: APROPOS returns NO values.
+        ("(multiple-value-list (apropos \"NO-SUCH-THING-QQQ\" :bliss-ap-acc))", "NIL"),
+        // NIL and T satisfy IS-SYMBOL but carry their own bit patterns rather
+        // than a symbol tag; scanning a package must not choke on them.
+        ("(not (null (member 'nil (apropos-list \"NIL\" :cl))))", "T"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(progn {setup} (cl:format t \"~S\" {expr}))")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "OPEN/APROPOS case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "wrong result for: {expr}"
+        );
+    }
+}
+
 /// CLHS 3.4.1: &AUX initforms are evaluated only after every other parameter
 /// is bound, and left to right so each sees the preceding &AUX bindings. The
 /// binder used to evaluate them during its lambda-list scan, before the
