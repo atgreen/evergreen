@@ -15168,7 +15168,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 // A name is fbound if it resolves as an ordinary function,
                 // a generic function, or a macro.
-                let bound = fn_bound(env, &name)
+                //
+                // The symbol's OWN function cell has to be consulted directly.
+                // Every other test here is keyed by NAME, and an uninterned
+                // symbol is not in the name registry — so a function installed
+                // with `(setf (symbol-function (gensym)) …)` was callable but
+                // reported NOT fbound (ansi FMAKUNBOUND.1/2/4).
+                let cell_bound = sym
+                    .symbol_index()
+                    .and_then(bliss_rt::symbols::symbol_function)
+                    .is_some_and(|f| f != bliss_rt::value::UNBOUND);
+                let bound = cell_bound
+                    || fn_bound(env, &name)
                     || env.methods.borrow().contains_key(&name)
                     || env.generics.borrow().contains_key(&name)
                     || macro_defined(env, &name)
@@ -15192,7 +15203,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 // Clear the global heap function cell and the lexical/name-map
                 // and macro entries, so the name is no longer fbound.
-                if let Some(idx) = bliss_rt::symbols::find_index(&name) {
+                // Clear the cell on the SYMBOL ITSELF when we have one: an
+                // uninterned symbol has no name-registry entry, so the
+                // find_index path could never unbind a gensym (the mirror of the
+                // FBOUNDP gap above).
+                if let Some(idx) = sym
+                    .symbol_index()
+                    .or_else(|| bliss_rt::symbols::find_index(&name))
+                {
                     bliss_rt::symbols::set_symbol_function(idx, bliss_rt::value::UNBOUND);
                 }
                 env.funs_mut().remove(&name);

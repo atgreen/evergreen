@@ -3575,6 +3575,75 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// FBOUNDP and FMAKUNBOUND consulted only NAME-keyed tables, and an uninterned
+/// symbol is not in the name registry. A function installed with
+/// `(setf (symbol-function (gensym)) …)` was therefore CALLABLE but reported
+/// not fbound, and could not be unbound at all (ansi FMAKUNBOUND.1/2/4).
+/// Matches SBCL.
+#[test]
+fn fboundp_and_fmakunbound_see_uninterned_symbols() {
+    let cases = [
+        // The gap: callable, but FBOUNDP said no.
+        (
+            "(let ((g (gensym))) (setf (symbol-function g) #'car) \
+               (list (and (fboundp g) t) (funcall g '(1 2))))",
+            "(T 1)",
+        ),
+        ("(let ((g (make-symbol \"U1\"))) (setf (symbol-function g) #'car) \
+            (and (fboundp g) t))", "T"),
+        // ...including a closure rather than a builtin.
+        (
+            "(let ((g (gensym))) (setf (symbol-function g) (lambda (x) (car x))) \
+               (list (and (fboundp g) t) (funcall g '(7 8))))",
+            "(T 7)",
+        ),
+        // FMAKUNBOUND must actually unbind it, and return the symbol.
+        (
+            "(let ((g (gensym))) (setf (symbol-function g) #'car) \
+               (list (eq (fmakunbound g) g) (fboundp g)))",
+            "(T NIL)",
+        ),
+        // The whole ansi FMAKUNBOUND.1 sequence.
+        (
+            "(let ((g (gensym))) \
+               (list (fboundp g) \
+                     (progn (setf (symbol-function g) #'car) (and (fboundp g) t)) \
+                     (eq (fmakunbound g) g) \
+                     (fboundp g)))",
+            "(NIL T T NIL)",
+        ),
+        // Interned symbols and DEFUN are unaffected.
+        (
+            "(progn (setf (symbol-function 'fb-i) #'car) (and (fboundp 'fb-i) t))",
+            "T",
+        ),
+        ("(progn (defun fb-d () 1) (list (and (fboundp 'fb-d) t) (fb-d)))", "(T 1)"),
+        // A name that was never bound is still not fbound.
+        ("(fboundp (gensym))", "NIL"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "fboundp case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong FBOUNDP/FMAKUNBOUND result for: {expr}"
+        );
+    }
+}
+
 /// COMPILED-FUNCTION-P and FUNCTION-LAMBDA-EXPRESSION were entirely
 /// unimplemented — 12 ansi failures between them — even though TYPEP already
 /// decided the COMPILED-FUNCTION type. Every expectation matches SBCL.
