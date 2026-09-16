@@ -394,6 +394,19 @@ fn registry_get(sym: u32) -> Option<Rc<BytecodeFunction>> {
     REGISTRY.with(|r| r.borrow().get(&sym).cloned())
 }
 
+/// Live entry counts for the process-wide bytecode registries, for leak
+/// triage: `(bliss::%bc-registry-sizes)` → (REGISTRY NATIVE_REGISTRY
+/// REGISTRY_GENERATION). A count that climbs with a workload's iteration
+/// count — rather than with the number of distinct definitions — means
+/// entries are being minted per execution and never reclaimed (bliss-5ndk).
+pub(super) fn registry_sizes() -> (usize, usize, usize) {
+    (
+        REGISTRY.with(|r| r.borrow().len()),
+        NATIVE_REGISTRY.with(|r| r.borrow().len()),
+        REGISTRY_GENERATION.with(|g| g.borrow().len()),
+    )
+}
+
 /// Serialize every interned-symbol bytecode-registry entry as a synthetic
 /// BYTECODE_UNIT (function records + kind-3 install actions) for a core image
 /// (bliss-zz6w). A world loaded from compiled `.bfasl` fasls installs

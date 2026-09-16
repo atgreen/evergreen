@@ -13692,6 +13692,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(a = BlissVal::from_fixnum(after as i64));
                 return Ok(vec_to_list(&[*b, *a]));
             }
+            "BLISS::%BC-REGISTRY-SIZES" => {
+                // (bliss::%bc-registry-sizes) → (bytecode native generations):
+                // live entry counts for the process-wide bytecode registries.
+                // Leak triage — see `bytecode::registry_sizes` (bliss-5ndk).
+                let (bc, native, generations) = bytecode::registry_sizes();
+                bliss_rt::rooted!(a = BlissVal::from_fixnum(bc as i64));
+                bliss_rt::rooted!(b = BlissVal::from_fixnum(native as i64));
+                bliss_rt::rooted!(c = BlissVal::from_fixnum(generations as i64));
+                return Ok(vec_to_list(&[*a, *b, *c]));
+            }
             "BLISS::%SYM-BY-INDEX" => {
                 let args = eval_args(cdr, env)?;
                 let idx = args.first().map(|v| v.as_fixnum() as u32).unwrap_or(0);
