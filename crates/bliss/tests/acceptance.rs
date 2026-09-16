@@ -3575,6 +3575,86 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A macro parameter the expander body declares SPECIAL must be bound
+/// DYNAMICALLY, not lexically (CLHS 3.3.4): the expander may call a closure that
+/// reads it, and a lexical binding leaves that closure seeing the outer value
+/// (ansi MACROLET.44/45). Matches SBCL.
+#[test]
+fn special_declared_macro_parameters_bind_dynamically() {
+    let cases = [
+        // A global macro whose parameter is declared special: the closure in *FG*
+        // must observe the value the expansion bound, not the outer NIL.
+        (
+            "(progn (defvar *xg* nil) (defvar *fg* nil) \
+               (defmacro %gm (*xg*) (declare (special *fg* *xg*)) (funcall *fg*)) \
+               (let ((*xg* nil)) \
+                 (declare (special *xg*)) \
+                 (let ((*fg* (lambda () *xg*))) \
+                   (declare (special *fg*)) \
+                   (eval '(%gm t)))))",
+            "T",
+        ),
+        // The MACROLET form ansi actually uses.
+        (
+            "(progn (defvar *x1* nil) (defvar *f1* nil) \
+               (let ((*x1* nil)) \
+                 (declare (special *x1*)) \
+                 (let ((*f1* (lambda () *x1*))) \
+                   (declare (special *f1*)) \
+                   (eval `(macrolet ((%m (*x1*) \
+                                       (declare (special *f1* *x1*)) \
+                                       (funcall *f1*))) \
+                            (%m t))))))",
+            "T",
+        ),
+        // ...and its destructuring variant.
+        (
+            "(progn (defvar *x2* nil) (defvar *f2* nil) \
+               (let ((*x2* nil)) \
+                 (declare (special *x2*)) \
+                 (let ((*f2* (lambda () *x2*))) \
+                   (declare (special *f2*)) \
+                   (eval `(macrolet ((%m ((*x2*)) \
+                                       (declare (special *f2* *x2*)) \
+                                       (funcall *f2*))) \
+                            (%m (t)))))))",
+            "T",
+        ),
+        // A parameter NOT declared special stays lexical and must not leak into
+        // the dynamic environment.
+        (
+            "(progn (defvar *x3* :outer) \
+               (defmacro %gm3 (*x3*) (declare (ignorable *x3*)) \
+                 (list 'quote (symbol-value '*x3*))) \
+               (%gm3 :inner))",
+            ":OUTER",
+        ),
+        // An ordinary macro is unaffected.
+        ("(progn (defmacro %gm4 (a b) `(+ ,a ,b)) (%gm4 2 3))", "5"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "special macro parameter case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "special-declared macro parameter was not bound dynamically: {expr}"
+        );
+    }
+}
+
 /// CLHS 3.4.4: the &ENVIRONMENT parameter is bound BEFORE every other
 /// parameter, wherever it appears in the lambda list, so an &OPTIONAL default
 /// or an &AUX initform may use it. Binding it when the scan reached it left the

@@ -29409,7 +29409,34 @@ fn expand_macro(
                 Some(whole),
             );
             match binding {
-                Ok(()) => eval_progn(*body, &mut child_env),
+                Ok(()) => {
+                    // A macro parameter the body declares SPECIAL must be bound
+                    // DYNAMICALLY, not lexically (CLHS 3.4.11 / 3.3.4): the
+                    // expander may call a closure that reads it, and a lexical
+                    // binding leaves that closure seeing the outer value
+                    // (ansi MACROLET.44/45). Establish the dynamic bindings from
+                    // the values the lambda list just bound, and hold them for
+                    // the whole body. Rooted: each guard holds the saved value
+                    // across the body's allocations, so the restore on drop
+                    // writes back a relocated — not stale — value.
+                    bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+                    for idx in let_body_special_decls(*body) {
+                        let sym = BlissVal::from_symbol_index(idx);
+                        // The lambda-list binder installs parameters under
+                        // their NAME, so look up by name first; the symbol-keyed
+                        // lookup would find the caller's dynamic value instead of
+                        // the parameter just bound.
+                        let looked = child_env
+                            .lookup_var(&sym_name(sym))
+                            .or_else(|| child_env.lookup_var_symbol(sym));
+                        if let Some(value) = looked {
+                            dyn_binds.push(DynBind::establish(sym, value));
+                        }
+                    }
+                    let result = eval_progn(*body, &mut child_env);
+                    dyn_binds.clear();
+                    result
+                }
                 Err(error) => Err(error),
             }
         }
