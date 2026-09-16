@@ -1775,6 +1775,18 @@ fn parse_token_with_base(
     // position, not by `has_escape`. `PY::|has space|` is package PY plus the
     // name "has space" (bliss-i83w).
     if let Some(colon) = marker.filter(|p| *p > 0) {
+        // A package marker must be followed by a symbol name (CLHS 2.3.4);
+        // `PKG::` and `PKG:` are malformed. `PKG::||` is NOT — bars make an
+        // empty name legitimate — so this rejects only an UNESCAPED empty
+        // remainder, which is exactly what `has_escape` distinguishes
+        // (bliss-gw2a). A bare `||` never reaches here: it has no unescaped
+        // marker, so `marker` is None.
+        let marker_len = if name[colon..].starts_with("::") { 2 } else { 1 };
+        if !has_escape && colon + marker_len >= name.len() {
+            return Err(BlissError::StreamError(format!(
+                "package marker with no symbol name after it: {name}"
+            )));
+        }
         if let Some(result) = try_package_qualified(name, colon)? {
             return Ok(result);
         }

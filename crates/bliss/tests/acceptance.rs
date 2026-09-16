@@ -3575,6 +3575,52 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A package marker must be followed by a symbol name (CLHS 2.3.4). bliss read
+/// `PKG::` as a symbol with the empty name instead of signalling (bliss-gw2a).
+/// The subtlety is that `PKG::||` IS a valid empty-named symbol, and so is a
+/// bare `||`, so only an UNESCAPED empty remainder may be rejected.
+#[test]
+fn a_trailing_package_marker_is_a_reader_error() {
+    let setup = "(progn (make-package \"GW\" :use (list \"CL\")) \
+                        (export (intern \"EXT\" \"GW\") \"GW\"))";
+    let cases = [
+        // Malformed: a marker with nothing after it.
+        ("(read-from-string \"GW::\")", ":SIGNALLED"),
+        ("(read-from-string \"GW:\")", ":SIGNALLED"),
+        // Valid: bars make an empty name legitimate.
+        ("(symbol-name (read-from-string \"GW::||\"))", "\"\""),
+        ("(symbol-name (read-from-string \"||\"))", "\"\""),
+        // Valid: ordinary qualified symbols, internal and external.
+        ("(symbol-name (read-from-string \"GW::X\"))", "\"X\""),
+        ("(symbol-name (read-from-string \"GW:EXT\"))", "\"EXT\""),
+    ];
+    for (expr, expected) in cases {
+        let program = format!(
+            "(progn {setup} \
+               (cl:format t \"~S\" (handler-case {expr} (error () :signalled))))"
+        );
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "trailing-marker case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong reading for: {expr}"
+        );
+    }
+}
+
 /// A HANDLER-BIND handler spec is a FORM that must be EVALUATED to produce the
 /// handler function (CLHS 9.1.4.1). The bytecode path stored it UNEVALUATED
 /// when the enclosing function had no boxed locals, which only looked correct
