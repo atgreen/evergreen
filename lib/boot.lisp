@@ -2939,6 +2939,16 @@
   (multiple-value-bind (decls forms) (%prog-split-declarations body)
     `(block nil (let* ,bindings ,@decls (tagbody ,@forms)))))
 
+;;; (SETF BIT) / (SETF SBIT) as real writer FUNCTIONS, not just SETF places.
+;;; (setf (apply #'bit bv 4 nil) 1) expands to (apply #'(setf bit) 1 bv 4 nil)
+;;; per CLHS 5.1.2.5, so the writer has to be callable and take its subscripts
+;;; spread. BIT and SBIT index a bit array exactly as AREF does, so AREF's
+;;; writer is the implementation (bliss-hzen).
+(defun (setf bit) (new bit-array &rest subscripts)
+  (setf (apply #'aref bit-array subscripts) new))
+(defun (setf sbit) (new bit-array &rest subscripts)
+  (setf (apply #'aref bit-array subscripts) new))
+
 ;;; CCASE / CTYPECASE: like ECASE / ETYPECASE but the key is a place and a
 ;;; correctable STORE-VALUE restart lets the handler supply a fresh value.
 (defmacro ccase (keyplace &rest clauses)

@@ -15615,6 +15615,53 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         };
                         let user_expander =
                             env.setf_expanders.borrow().contains_key(&pacc_name);
+                        // (setf (apply #'f a1 … an) v) => (apply #'(setf f) v a1 … an)
+                        // (CLHS 5.1.2.5; bliss-hzen). The last argument is the
+                        // spread list, which APPLY already handles, and the
+                        // `(setf f)` writers this needs — AREF, BIT, SBIT — are
+                        // already callable, so the whole feature is this rewrite.
+                        if !user_expander && pacc_name == "APPLY" && pargs.is_cons() {
+                            let (fn_form, call_args) = cp(pargs);
+                            // CLHS requires a literal #'name or 'name here.
+                            let fname = if fn_form.is_cons() {
+                                let (quoter, qrest) = cp(fn_form);
+                                let qn = if quoter.is_symbol() {
+                                    symbol_bare_name(&sym_name_rc(quoter))
+                                } else {
+                                    String::new()
+                                };
+                                if (qn == "FUNCTION" || qn == "QUOTE") && qrest.is_cons() {
+                                    let (n, _) = cp(qrest);
+                                    n.is_symbol().then_some(n)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(fname) = fname {
+                                // Root the source pieces BEFORE resolve_sym, which
+                                // interns and can therefore collect (bliss-8qf).
+                                bliss_rt::rooted!(fname = fname);
+                                bliss_rt::rooted!(call_args = call_args);
+                                let setf_sym = resolve_sym("SETF").unwrap_or(NIL);
+                                let function_sym = resolve_sym("FUNCTION").unwrap_or(NIL);
+                                let apply_sym = resolve_sym("APPLY").unwrap_or(NIL);
+                                // Build (apply #'(setf f) v . call_args) from the
+                                // inside out, rooting each partial list so the next
+                                // allocation cannot orphan it.
+                                bliss_rt::rooted!(nm1 = arena_cons(*fname, NIL));
+                                bliss_rt::rooted!(setf_name = arena_cons(setf_sym, *nm1));
+                                bliss_rt::rooted!(fn1 = arena_cons(*setf_name, NIL));
+                                bliss_rt::rooted!(writer = arena_cons(function_sym, *fn1));
+                                bliss_rt::rooted!(vargs = arena_cons(*val_form, *call_args));
+                                bliss_rt::rooted!(wargs = arena_cons(*writer, *vargs));
+                                bliss_rt::rooted!(form = arena_cons(apply_sym, *wargs));
+                                result = eval_form(*form, env)?;
+                                *c = *r2;
+                                continue;
+                            }
+                        }
                         if !user_expander && pacc_name == "NTH" && pargs.is_cons() {
                             bliss_rt::rooted!(pargs = pargs);
                             let (nform, rest) = cp(*pargs);

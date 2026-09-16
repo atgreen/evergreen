@@ -8444,3 +8444,67 @@ fn mvb_lexical_binding_shadows_enclosing_special_declaration() {
         }
     }
 }
+
+/// `(setf (apply #'f a1 … an) v)` — CLHS 5.1.2.5 — expands to
+/// `(apply #'(setf f) v a1 … an)`, where the last argument is the spread list.
+/// bliss signalled PROGRAM-ERROR for every such place. ansi SETF-APPLY.1/2/3/4.
+///
+/// The `(setf f)` writers were already callable for AREF, so the feature is the
+/// rewrite plus real `(setf bit)` / `(setf sbit)` functions — BIT and SBIT index
+/// a bit array exactly as AREF does. bliss-hzen.
+#[test]
+fn setf_of_apply() {
+    let cases = [
+        // Subscripts entirely in the spread list.
+        ("(let ((x (vector 0 1 2))) (setf (apply #'aref x '(0)) 10) x)", "#(10 1 2)"),
+        // ...and spread across fixed arguments with a trailing NIL.
+        (
+            "(let ((a (make-array '(2 2) :initial-element 0))) \
+               (setf (apply #'aref a 1 1 nil) 7) (aref a 1 1))",
+            "7",
+        ),
+        ("(let ((bv (copy-seq #*0000))) (setf (apply #'bit bv 2 nil) 1) bv)", "#*0010"),
+        ("(let ((bv (copy-seq #*0000))) (setf (apply #'sbit bv 2 nil) 1) bv)", "#*0010"),
+        // The quoted-name form CLHS also permits.
+        ("(let ((x (vector 0 1 2))) (setf (apply 'aref x '(2)) 5) x)", "#(0 1 5)"),
+        // A user-defined writer works the same way — nothing is special-cased.
+        (
+            "(progn (defun (setf sa-w) (new v i) (setf (aref v i) new)) \
+               (let ((x (vector 0 0))) (setf (apply #'sa-w x '(1)) 4) x))",
+            "#(0 4)",
+        ),
+        // SETF returns the stored value.
+        ("(let ((x (vector 0))) (setf (apply #'aref x '(0)) 3))", "3"),
+        // The ordinary (bit …) place still works, and still returns the value:
+        // defining a writer function must not divert it.
+        ("(let ((bv (copy-seq #*0000))) (setf (bit bv 2) 1) bv)", "#*0010"),
+        ("(let ((bv (copy-seq #*0000))) (setf (bit bv 2) 1))", "1"),
+        // ...with the CLHS 5.1.1.1 order: place subform before the new value.
+        (
+            "(let ((bv (copy-seq #*0000)) (log nil)) \
+               (setf (bit bv (progn (push :sub log) 2)) (progn (push :val log) 1)) log)",
+            "(:VAL :SUB)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "case errored: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}
