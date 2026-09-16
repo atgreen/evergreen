@@ -3575,6 +3575,73 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// Builtin condition classes register LAZILY — nothing materialises
+/// PACKAGE-ERROR until something signals one — so SUBTYPEP saw no class and
+/// answered "cannot determine" for relationships the standard defines, while
+/// SIMPLE-ERROR (registered during bootstrap) answered correctly (bliss-4bv3).
+/// Reading the builtin table directly makes the answer independent of whether
+/// anything has signalled. Every expectation matches SBCL.
+#[test]
+fn subtypep_knows_the_builtin_condition_lattice() {
+    let cases = [
+        // Positive relations, none of which had been signalled in this image.
+        ("(subtypep 'package-error 'error)", "(T T)"),
+        ("(subtypep 'simple-type-error 'type-error)", "(T T)"),
+        ("(subtypep 'stream-error 'error)", "(T T)"),
+        ("(subtypep 'end-of-file 'stream-error)", "(T T)"),
+        ("(subtypep 'reader-error 'parse-error)", "(T T)"),
+        ("(subtypep 'package-error 'condition)", "(T T)"),
+        ("(subtypep 'package-error 't)", "(T T)"),
+        // Negative relations must be CERTAIN — (NIL T), not (NIL NIL). A fix
+        // that only ever said "yes" would pass the positives and break these.
+        ("(subtypep 'error 'type-error)", "(NIL T)"),
+        ("(subtypep 'package-error 'stream-error)", "(NIL T)"),
+        // The two-parent class added for bliss-wne9.3 resolves through both.
+        ("(subtypep 'simple-package-error 'package-error)", "(T T)"),
+        ("(subtypep 'simple-package-error 'simple-condition)", "(T T)"),
+        // A user-defined condition still resolves through the CLOS path...
+        (
+            "(progn (define-condition sub-my-err (package-error) ()) \
+               (subtypep 'sub-my-err 'error))",
+            "(T T)",
+        ),
+        // ...and handler dispatch is unaffected.
+        (
+            "(progn (define-condition sub-my-err2 (package-error) ()) \
+               (handler-case (error 'sub-my-err2) (package-error () :caught)))",
+            ":CAUGHT",
+        ),
+        // A non-condition type is untouched.
+        ("(subtypep 'fixnum 'integer)", "(T T)"),
+    ];
+    for (expr, expected) in cases {
+        let wrapped = if expected.starts_with('(') {
+            format!("(multiple-value-list {expr})")
+        } else {
+            expr.to_string()
+        };
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S\" {wrapped})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "subtypep case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong subtypep answer for: {expr}"
+        );
+    }
+}
+
 /// A package marker must be followed by a symbol name (CLHS 2.3.4). bliss read
 /// `PKG::` as a symbol with the empty name instead of signalling (bliss-gw2a).
 /// The subtlety is that `PKG::||` IS a valid empty-named symbol, and so is a

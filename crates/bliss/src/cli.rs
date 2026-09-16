@@ -10269,6 +10269,37 @@ fn is_package_value(_env: &Env, value: BlissVal) -> bool {
 /// The chain of built-in supertypes for a type name (including the type itself),
 /// most-specific-first, used by SUBTYPEP. Returns `None` for names that are not
 /// built-in atomic types.
+/// Transitive supertypes of a BUILTIN condition class, from
+/// `builtin_condition_definition`'s parent chain.
+///
+/// These classes are registered LAZILY — nothing materialises PACKAGE-ERROR
+/// until something signals one — so `find_class` sees nothing and SUBTYPEP had
+/// to answer "cannot determine" for relationships the standard defines:
+/// `(subtypep 'package-error 'error)` was `(NIL NIL)` while
+/// `(subtypep 'simple-error 'error)`, whose class happens to be registered
+/// during bootstrap, was `(T T)`. Reading the table directly makes the answer
+/// independent of whether anything has signalled yet (bliss-4bv3).
+///
+/// Returns `None` for a name that is not a builtin condition class, so callers
+/// can tell "not a condition" from "a condition with no such supertype".
+fn builtin_condition_supertypes(name: &str) -> Option<Vec<String>> {
+    let (parents, _) = builtin_condition_definition(name)?;
+    let mut seen: Vec<String> = Vec::new();
+    let mut queue = parents;
+    while let Some(parent) = queue.pop() {
+        if seen.contains(&parent) {
+            continue;
+        }
+        if let Some((grandparents, _)) = builtin_condition_definition(&parent) {
+            queue.extend(grandparents);
+        }
+        seen.push(parent);
+    }
+    // Every condition is a T; CONDITION itself has no parents but is still one.
+    seen.push("T".to_string());
+    Some(seen)
+}
+
 fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
     let chain: &'static [&'static str] = match name {
         "FIXNUM" | "BIGNUM" => &["INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
@@ -11215,6 +11246,18 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
         }
         // Both are known built-ins with no relation → definitely not a subtype.
         if builtin_supertypes(&n2).is_some() {
+            return (false, true);
+        }
+    }
+    // Builtin condition classes, whose registration is lazy (see
+    // `builtin_condition_supertypes`). Consulted before the CLOS path so the
+    // answer does not depend on whether one has been signalled yet.
+    if let Some(supers) = builtin_condition_supertypes(&n1) {
+        if n1 == n2 || supers.contains(&n2) {
+            return (true, true);
+        }
+        // Both are known condition classes with no relation → definitely not.
+        if builtin_condition_supertypes(&n2).is_some() {
             return (false, true);
         }
     }
