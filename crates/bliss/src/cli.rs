@@ -15473,7 +15473,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // stays rooted across the sub-evaluation.
                     *c = r;
                     result = eval_form(f, env)?;
-                    if result.is_nil() {
+                    // A false form short-circuits to exactly NIL — one value — but
+                    // ONLY when it is not the last: AND returns ALL the values of
+                    // its LAST form even when that form is false or yields none.
+                    // `(and (values 1 nil) (values nil 2))` is NIL,2 and
+                    // `(and (values))` is no values at all, while
+                    // `(and (values nil t) t)` is just NIL. The cursor was advanced
+                    // before the call, so a still-cons `c` means more forms follow
+                    // (ansi AND.5/8/9; bliss-0xrp).
+                    if result.is_nil() && (*c).is_cons() {
+                        env.clear_mv();
                         return Ok(NIL);
                     }
                 }
@@ -15481,6 +15490,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "OR" => {
                 bliss_rt::rooted!(c = cdr);
+                // `(or)` evaluates nothing and is exactly NIL, so it must not
+                // inherit a caller's leftover value count.
+                if !(*c).is_cons() {
+                    env.clear_mv();
+                    return Ok(NIL);
+                }
+                bliss_rt::rooted!(last = NIL);
                 while c.is_cons() {
                     let (f, r) = cp(*c);
                     // Advance the rooted cursor first so the rest of the list
@@ -15488,10 +15504,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     *c = r;
                     let v = eval_form(f, env)?;
                     if !v.is_nil() {
+                        // CLHS: OR returns ALL values only when it reaches the
+                        // LAST form. A non-last form whose primary value is true
+                        // contributes just that value. The cursor was advanced
+                        // before the call, so a still-cons `c` means this form was
+                        // not the last (ansi OR.6; bliss-0xrp).
+                        if (*c).is_cons() {
+                            env.clear_mv();
+                        }
                         return Ok(v);
                     }
+                    *last = v;
                 }
-                return Ok(NIL);
+                // Every form was false: OR returns ALL the values of its LAST
+                // form — `(or (values))` yields none — so the last value is
+                // returned as-is rather than a fresh NIL (ansi OR.5).
+                return Ok(*last);
             }
             "WHEN" => {
                 let (test, body) = cp(cdr);
@@ -15543,6 +15571,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     *c = *rest;
                 }
+                // No clause matched: COND yields exactly one value, NIL. A test
+                // that produced ZERO values — `(cond ((values)))` — would
+                // otherwise leave that count visible and COND would return no
+                // values at all (ansi COND.12; bliss-0xrp).
+                env.clear_mv();
                 return Ok(NIL);
             }
             "VALUES" => {

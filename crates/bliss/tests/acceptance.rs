@@ -8890,3 +8890,71 @@ fn fboundp_and_macro_function_see_evaluator_implemented_operators() {
         );
     }
 }
+
+/// AND, OR and COND and the value count they yield (CLHS). The rule that governs
+/// all of it: ALL the values of the LAST form propagate, and only the last —
+/// a short-circuiting earlier form contributes exactly one value.
+///
+/// bliss leaked a non-last form's extra values out of OR, and returned the wrong
+/// value COUNT from COND: `(cond ((values)))` produced no values at all rather
+/// than NIL, and a bodiless clause passed its test's extra values through.
+///
+/// The last-form half is what makes this delicate, and my first attempt broke it:
+/// clearing unconditionally on a false form turned `(and (values 1 nil) (values
+/// nil 2))` from NIL,2 into NIL and `(and (values))` from no values into NIL.
+/// Both directions are therefore pinned here. ansi AND.5/8/9, OR.5/6, COND.12;
+/// bliss-0xrp.
+#[test]
+fn and_or_cond_value_counts() {
+    let cases = [
+        // Short-circuiting on a NON-last form yields exactly one value...
+        ("(multiple-value-list (and (values nil t) t))", "(NIL)"),
+        ("(multiple-value-list (or (values t nil) 'a))", "(T)"),
+        // ...but the LAST form's values all propagate, even when it is false...
+        ("(multiple-value-list (and (values 1 nil) (values nil 2)))", "(NIL 2)"),
+        ("(multiple-value-list (or nil (values nil 5)))", "(NIL 5)"),
+        // ...and even when it yields none.
+        ("(multiple-value-list (and (values)))", "NIL"),
+        ("(multiple-value-list (or (values)))", "NIL"),
+        // The ordinary tail cases.
+        ("(multiple-value-list (and t (values 1 2)))", "(1 2)"),
+        ("(multiple-value-list (or nil (values 1 2)))", "(1 2)"),
+        // No forms at all: exactly one value.
+        ("(multiple-value-list (and))", "(T)"),
+        ("(multiple-value-list (or))", "(NIL)"),
+        // COND: a test yielding no values is false, and COND itself yields NIL —
+        // one value, not zero.
+        ("(multiple-value-list (cond ((values))))", "(NIL)"),
+        ("(multiple-value-list (cond))", "(NIL)"),
+        // A clause with no forms returns the test's PRIMARY value...
+        ("(multiple-value-list (cond ((values 7 8))))", "(7)"),
+        // ...while a clause WITH forms propagates all of the body's values.
+        ("(multiple-value-list (cond (t (values 1 2))))", "(1 2)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

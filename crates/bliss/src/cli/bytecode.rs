@@ -1999,6 +1999,10 @@ impl<'e> Lowerer<'e> {
                 self.emit(Instr::BrIfFalse(0)); // pop the copy; if false, try next
                 let to_next = self.code.len() - 1;
                 self.pop_n(1);
+                // CLHS: OR propagates ALL values only from its LAST form. This
+                // form is not the last, so it contributes just its primary value
+                // (ansi OR.6; bliss-0xrp).
+                self.emit(Instr::ClearMv);
                 self.emit(Instr::Br(0)); // truthy: keep the value, done
                 end_jumps.push(self.code.len() - 1);
                 let next_pc = self.code.len() as u32;
@@ -2125,6 +2129,10 @@ impl<'e> Lowerer<'e> {
                 self.emit(Instr::BrIfFalse(0));
                 let to_next = self.code.len() - 1;
                 self.pop_n(1);
+                // CLHS: with no forms the test's PRIMARY value is returned, so a
+                // multiple-valued test contributes only its first value
+                // (bliss-0xrp).
+                self.emit(Instr::ClearMv);
                 self.emit(Instr::Br(0));
                 end_jumps.push(self.code.len() - 1);
                 let next_pc = self.code.len() as u32;
@@ -2142,8 +2150,12 @@ impl<'e> Lowerer<'e> {
                 self.code[to_next] = Instr::BrIfFalse(next_pc);
             }
         }
-        // No clause matched → NIL.
+        // No clause matched → NIL, and exactly one value: a test that produced
+        // ZERO values — `(cond ((values)))` — would otherwise leave that count
+        // visible and COND would return no values at all (ansi COND.12;
+        // bliss-0xrp). The clause-taken jumps target `end`, past this.
         self.cur_stack = base;
+        self.emit(Instr::ClearMv);
         let c = self.add_const(NIL);
         self.emit(Instr::Const(c));
         let end = self.code.len() as u32;
