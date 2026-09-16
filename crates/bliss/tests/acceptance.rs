@@ -9012,3 +9012,85 @@ fn an_empty_body_yields_exactly_nil() {
         }
     }
 }
+
+/// MAKE-ARRAY must return a FRESH array (CLHS). Its :initial-contents branch
+/// coerced the source to the target type, and COERCE legitimately returns its
+/// ARGUMENT when that is already of the type — SBCL's
+/// `(eq s (coerce s 'string))` is T too — so the "new" array WAS the source.
+/// When the source was an immutable literal, a later store died with "cannot
+/// modify an interned string literal".
+/// ansi EVERY.22, SOME.22, NOTANY.22, NOTEVERY.22; bliss-4fbq.
+///
+/// Tree-walker-only in effect, which is why the bare form passed and only
+/// `(eval '…)` failed — so every case runs on both backends.
+#[test]
+fn make_array_copies_its_initial_contents() {
+    let cases = [
+        // The array is not the source...
+        ("(let* ((s \"abcde\") (v (make-array '(5) :initial-contents s))) (eq s v))", "NIL"),
+        (
+            "(let* ((s \"abcde\") (v (make-array '(5) :initial-contents s :element-type 'base-char))) (eq s v))",
+            "NIL",
+        ),
+        ("(let* ((s (vector 1 2 3)) (v (make-array '(3) :initial-contents s))) (eq s v))", "NIL"),
+        // ...so storing into it works even when the source is a literal...
+        (
+            "(let ((v (make-array '(5) :initial-contents \"abcde\" :element-type 'base-char))) \
+               (setf (aref v 2) #\\0) v)",
+            "\"ab0de\"",
+        ),
+        (
+            "(let ((v (make-array '(5) :initial-contents \"abcde\" :element-type 'character))) \
+               (setf (aref v 2) #\\0) v)",
+            "\"ab0de\"",
+        ),
+        // ...and leaves the source untouched. Note the result is a general
+        // VECTOR of characters, not a string: :element-type defaults to T, so
+        // MAKE-ARRAY does not inherit the source's element type. Matches SBCL.
+        (
+            "(let* ((s (copy-seq \"abcde\")) (v (make-array '(5) :initial-contents s))) \
+               (setf (aref v 0) #\\z) (list v s))",
+            "(#(#\\z #\\b #\\c #\\d #\\e) \"abcde\")",
+        ),
+        // The contents are still correct, from every source type.
+        ("(make-array '(3) :initial-contents '(1 2 3))", "#(1 2 3)"),
+        ("(make-array '(3) :initial-contents (vector 1 2 3))", "#(1 2 3)"),
+        ("(make-array '(5) :initial-contents \"abcde\")", "#(#\\a #\\b #\\c #\\d #\\e)"),
+        ("(make-array '(5) :initial-contents \"abcde\" :element-type 'character)", "\"abcde\""),
+        ("(make-array '(3) :initial-contents '(1 0 1) :element-type 'bit)", "#*101"),
+        // Other MAKE-ARRAY paths are unaffected.
+        ("(let ((v (make-array '(3) :initial-element 0))) (setf (aref v 0) 9) v)", "#(9 0 0)"),
+        ("(make-array 3 :initial-element 7)", "#(7 7 7)"),
+        (
+            "(let ((v (make-array 3 :initial-contents '(1 2 3) :fill-pointer 2))) \
+               (list v (fill-pointer v)))",
+            "(#(1 2) 2)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

@@ -1666,9 +1666,17 @@
                (setq i (+ i 1)))))
          v))
       (ic-cell
+       ;; COERCE legitimately returns its ARGUMENT when it is already of the
+       ;; target type (SBCL does the same), so coercing a string to 'string --
+       ;; or a vector to 'vector -- would alias the :initial-contents. MAKE-ARRAY
+       ;; must return a FRESH array (CLHS), and the source is often an immutable
+       ;; literal, so a later (setf (aref v i) ...) died with "cannot modify an
+       ;; interned string literal" (ansi EVERY/SOME/NOTANY/NOTEVERY.22;
+       ;; bliss-4fbq). COPY-SEQ guarantees a new array. The bit-vector branch
+       ;; already constructs a fresh one.
        (cond (bitp (%bit-vector-from-bits (coerce (car (cdr ic-cell)) 'list)))
-             (stringp (coerce (car (cdr ic-cell)) 'string))
-             (t (coerce (car (cdr ic-cell)) 'vector))))
+             (stringp (copy-seq (coerce (car (cdr ic-cell)) 'string)))
+             (t (copy-seq (coerce (car (cdr ic-cell)) 'vector)))))
       (stringp
        (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
       ;; A BIT array is a real SIMPLE-BIT-VECTOR (bliss builds these immutably,
