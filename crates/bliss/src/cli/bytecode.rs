@@ -12712,16 +12712,28 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     // the handler form now into a closure that captures them, so
                     // a handler run at signal time (in the tree-walker, where
                     // env.frame is global) still sees the lexical bindings.
-                    let handler = if let Some(ef) = &env_frame {
+                    // A handler spec is a FORM that must be EVALUATED to produce
+                    // the handler function (CLHS 9.1.4.1). Storing it unevaluated
+                    // when the function had no boxed locals only LOOKED like it
+                    // worked, because applying a raw `(LAMBDA …)` form happens to
+                    // succeed — every other spelling was applied as a literal
+                    // list and died with "Cons is not of type FUNCTION":
+                    // `#'h` applied `(FUNCTION H)`, `'h` applied `(QUOTE H)`,
+                    // and a call form applied the call itself (bliss-ddpl).
+                    // With boxed locals the form is evaluated against this
+                    // activation's heap frame so the handler closes over them;
+                    // without, the current environment is the right one.
+                    let evaluated = if let Some(ef) = &env_frame {
                         let saved = std::mem::replace(&mut env.frame, ef.clone());
                         let v = eval_form(*handler_form, env);
                         env.frame = saved;
-                        match v {
-                            Ok(val) => HandlerImpl::Function(val),
-                            Err(_) => HandlerImpl::Function(*handler_form),
-                        }
+                        v
                     } else {
-                        HandlerImpl::Function(*handler_form)
+                        eval_form(*handler_form, env)
+                    };
+                    let handler = match evaluated {
+                        Ok(val) => HandlerImpl::Function(val),
+                        Err(_) => HandlerImpl::Function(*handler_form),
                     };
                     let handler_value = match &handler {
                         HandlerImpl::Function(value) => *value,

@@ -3575,6 +3575,80 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A HANDLER-BIND handler spec is a FORM that must be EVALUATED to produce the
+/// handler function (CLHS 9.1.4.1). The bytecode path stored it UNEVALUATED
+/// when the enclosing function had no boxed locals, which only looked correct
+/// because applying a raw `(LAMBDA …)` form happens to succeed — every other
+/// spelling was applied as a literal list and died with "Cons is not of type
+/// FUNCTION" the moment the handler transferred control (bliss-ddpl).
+#[test]
+fn handler_bind_evaluates_its_handler_spec() {
+    let setup = "(defun ddpl-h (c) (declare (ignore c)) (throw 'done :thrown))";
+    // Every spelling of "the function DDPL-H", plus an inline lambda.
+    for spec in [
+        "#'ddpl-h",
+        "'ddpl-h",
+        "(symbol-function 'ddpl-h)",
+        "(lambda (c) (ddpl-h c))",
+    ] {
+        let program = format!(
+            "(progn {setup} \
+               (cl:format t \"~S\" (catch 'done (handler-bind ((error {spec})) (error \"x\")))))"
+        );
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "handler spec {spec} failed:\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            ":THROWN",
+            "handler spec {spec} did not run the handler"
+        );
+    }
+
+    // The shape ansi-test actually uses (has-non-abort-restart): a NAMED handler
+    // that throws out of the handler. This gates MAKE-PACKAGE.ERROR.1-4,
+    // DELETE-PACKAGE.6 and IMPORT.ERROR.4/5.
+    let program = "(progn \
+        (defun ddpl-probe (c) \
+          (throw 'handled (if (some (lambda (r) (not (eq (restart-name r) 'abort))) \
+                                    (compute-restarts c)) \
+                              'success 'fail))) \
+        (make-package \"DDPL-P\" :use '(\"CL\")) \
+        (cl:format t \"~S\" \
+          (catch 'handled \
+            (handler-bind ((error #'ddpl-probe)) (make-package \"DDPL-P\")))))";
+    let output = bliss_bin()
+        .args(["--eval", program])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "ansi handler shape failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim(),
+        "SUCCESS",
+        "the ansi handle-non-abort-restart shape did not work"
+    );
+}
+
 /// Every `BlissError::PackageError` carries a description of what failed, but
 /// the condition builder discarded it (`PackageError(_)`), so ASDF loads died
 /// with a bare, unactionable "Package error." — no package, no operation, no
