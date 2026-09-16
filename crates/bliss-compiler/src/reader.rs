@@ -1566,8 +1566,8 @@ fn read_atom_with_base(
     pos: usize,
     read_base: u32,
 ) -> Result<(BlissVal, usize), BlissError> {
-    let (token, end, has_escape, leading_colon) = collect_token(chars, pos)?;
-    parse_token_with_base(&token, has_escape, leading_colon, read_base).map(|v| (v, end))
+    let (token, end, has_escape, marker) = collect_token(chars, pos)?;
+    parse_token_with_base(&token, has_escape, marker, read_base).map(|v| (v, end))
 }
 
 /// Scan one token, returning its readtable-cased name (`:upcase`: escaped chars
@@ -1579,7 +1579,7 @@ fn read_atom_with_base(
 fn collect_token(
     chars: &[char],
     mut pos: usize,
-) -> Result<(String, usize, bool, bool), BlissError> {
+) -> Result<(String, usize, bool, Option<usize>), BlissError> {
     let case_mode = current_readtable_case_mode();
     // When SET-SYNTAX-FROM-CHAR has customised any readtable, the tokenizer must
     // consult per-character syntax (escape/constituent/delimiter) instead of the
@@ -1592,10 +1592,13 @@ fn collect_token(
     let mut invert_eligible: Vec<bool> = Vec::new();
     let mut in_multiple_escape = false;
     let mut had_escape = false;
-    // True when the token's FIRST character is an unescaped ':' — the one
-    // package-marker fact an escaped token still needs: `:|A|` is the keyword
-    // A (the colon keeps its syntactic meaning; only escaped chars lose it).
-    let mut leading_unescaped_colon = false;
+    // Byte offset in `name` of the first UNESCAPED ':'. A package marker is
+    // located among the unescaped characters only (CLHS 2.3.4) — a colon that
+    // came from inside bars or after a backslash is ordinary name text. Tracking
+    // the position, rather than merely "the token starts with one", is what lets
+    // `PY::|has space|` split into package PY and name "has space" instead of
+    // collapsing into one symbol named "PY::has space" (bliss-i83w).
+    let mut first_unescaped_colon: Option<usize> = None;
 
     while pos < chars.len() {
         let c = chars[pos];
@@ -1649,8 +1652,8 @@ fn collect_token(
                             "invalid constituent character".into(),
                         ));
                     }
-                    if name.is_empty() && c == ':' {
-                        leading_unescaped_colon = true;
+                    if c == ':' && first_unescaped_colon.is_none() {
+                        first_unescaped_colon = Some(name.len());
                     }
                     name.push(fold_case_char(c, case_mode));
                     if case_mode == 3 {
@@ -1681,8 +1684,8 @@ fn collect_token(
             }
             c if is_delimiter(c) => break,
             c => {
-                if name.is_empty() && c == ':' {
-                    leading_unescaped_colon = true;
+                if c == ':' && first_unescaped_colon.is_none() {
+                    first_unescaped_colon = Some(name.len());
                 }
                 name.push(fold_case_char(c, case_mode));
                 if case_mode == 3 {
@@ -1730,7 +1733,7 @@ fn collect_token(
             name = inverted;
         }
     }
-    Ok((name, pos, had_escape, leading_unescaped_colon))
+    Ok((name, pos, had_escape, first_unescaped_colon))
 }
 
 /// Interpret an already readtable-cased token `name` as a number, keyword,
@@ -1739,7 +1742,9 @@ fn collect_token(
 fn parse_token_with_base(
     name: &str,
     has_escape: bool,
-    leading_colon: bool,
+    // Byte offset of the first UNESCAPED ':' — the package marker, if any.
+    // Escaped colons are ordinary name characters (CLHS 2.3.4).
+    marker: Option<usize>,
     read_base: u32,
 ) -> Result<BlissVal, BlissError> {
     if name.is_empty() {
@@ -1758,19 +1763,24 @@ fn parse_token_with_base(
     // escaped characters lose theirs: `:|A|` is :A, `:|foo bar|` a keyword
     // with a lowercase spaced name (ansi PACKAGE-NICKNAMES.3/UNUSE-PACKAGE.3,
     // which pass ':|A|'-style designators).
-    if has_escape && leading_colon {
+    if has_escape && marker == Some(0) {
         if let Some(kw_name) = name.strip_prefix(':') {
             let full = format!("KEYWORD:{}", kw_name);
             let idx = intern_symbol(&full);
             return Ok(BlissVal::from_symbol_index(idx));
         }
     }
-    // Don't try numeric interpretation if there are escape chars
-    if !has_escape {
-        // Check for package-qualified symbols first
-        if let Some(result) = try_package_qualified(name)? {
+    // A package marker keeps its meaning even in an escaped token — only the
+    // ESCAPED characters lose theirs — so this is decided by the marker
+    // position, not by `has_escape`. `PY::|has space|` is package PY plus the
+    // name "has space" (bliss-i83w).
+    if let Some(colon) = marker.filter(|p| *p > 0) {
+        if let Some(result) = try_package_qualified(name, colon)? {
             return Ok(result);
         }
+    }
+    // Don't try numeric interpretation if there are escape chars
+    if !has_escape {
         // Check for keyword symbols
         if let Some(kw_name) = name.strip_prefix(':') {
             if kw_name.is_empty() {
@@ -1822,7 +1832,12 @@ pub fn read_symbol_token(name: &str) -> Result<Option<BlissVal>, BlissError> {
     }
     // Same decision order as the reader's non-escaped token path:
     // package-qualified, keyword, numeric, then NIL/T, then bare symbol.
-    if let Some(result) = try_package_qualified(&upper)? {
+    if let Some(result) = upper
+        .find(':')
+        .map(|colon| try_package_qualified(&upper, colon))
+        .transpose()?
+        .flatten()
+    {
         return Ok(Some(result));
     }
     if let Some(kw_name) = upper.strip_prefix(':') {
@@ -1847,12 +1862,15 @@ pub fn read_symbol_token(name: &str) -> Result<Option<BlissVal>, BlissError> {
     Ok(Some(BlissVal::from_symbol_index(idx)))
 }
 
-fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
+/// `colon_pos` is the byte offset of the token's package marker — the first
+/// UNESCAPED ':'. Callers that have no escape information pass `name.find(':')`,
+/// which is the same thing for an unescaped token.
+fn try_package_qualified(name: &str, colon_pos: usize) -> Result<Option<BlissVal>, BlissError> {
     // Check for PKG::SYM or PKG:SYM (but not :keyword which starts with :)
     if name.starts_with(':') {
         return Ok(None);
     }
-    if let Some(colon_pos) = name.find(':') {
+    {
         let pkg = &name[..colon_pos];
         let rest = &name[colon_pos + 1..];
         let (sym_name, _internal) = if let Some(stripped) = rest.strip_prefix(':') {
@@ -1928,8 +1946,6 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
                 pkg
             ))),
         }
-    } else {
-        Ok(None)
     }
 }
 

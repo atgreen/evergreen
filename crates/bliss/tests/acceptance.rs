@@ -3575,6 +3575,89 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A package marker is located among the UNESCAPED characters only (CLHS
+/// 2.3.4). The reader scanned the whole token first and only remembered whether
+/// *some* escape occurred, so an escaped token never got package treatment:
+/// "PY::|has space|" read as a CL-USER symbol NAMED "PY::has space"
+/// (bliss-i83w). With the printer half (bliss-10cf) this closes the print/read
+/// round trip. Every expectation matches SBCL.
+#[test]
+fn package_marker_is_found_among_unescaped_characters() {
+    let setup = "(progn (make-package \"PW\" :use (list \"CL\")) \
+                        (export (intern \"EX\" \"PW\") \"PW\"))";
+    let cases = [
+        // The bug: a bar-quoted NAME after a package marker.
+        (
+            "(let ((s (read-from-string \"PW::|has space|\"))) \
+               (list (symbol-name s) (package-name (symbol-package s))))",
+            "(\"has space\" \"PW\")",
+        ),
+        // A colon INSIDE the bars is name text, not a second marker.
+        (
+            "(symbol-name (read-from-string \"PW::|A:B|\"))",
+            "\"A:B\"",
+        ),
+        // A backslash-escaped colon is likewise ordinary name text.
+        (
+            "(symbol-name (read-from-string \"PW::a\\:b\"))",
+            "\"A:B\"",
+        ),
+        // Bars around the PACKAGE token still name the package.
+        (
+            "(package-name (symbol-package (read-from-string \"|PW|::ZED\")))",
+            "\"PW\"",
+        ),
+        // Unescaped markers keep working: internal, external, keyword, bare.
+        (
+            "(package-name (symbol-package (read-from-string \"PW::ZED\")))",
+            "\"PW\"",
+        ),
+        (
+            "(package-name (symbol-package (read-from-string \"PW:EX\")))",
+            "\"PW\"",
+        ),
+        ("(symbol-name (read-from-string \":|foo bar|\"))", "\"foo bar\""),
+        ("(read-from-string \":|A|\")", ":A"),
+        ("(symbol-name (read-from-string \"|foo|\"))", "\"foo\""),
+        ("(symbol-name (read-from-string \"||\"))", "\"\""),
+        // A wholly bar-quoted spelling has NO marker — one symbol whose name
+        // contains colons.
+        (
+            "(symbol-name (read-from-string \"|PW::ZED|\"))",
+            "\"PW::ZED\"",
+        ),
+        // Numbers must still read as numbers, not symbols.
+        ("(+ (read-from-string \"123\") 1)", "124"),
+        // The point of the exercise: print then read yields the SAME symbol,
+        // including for names that need escaping.
+        (
+            "(every (lambda (s) (eq s (read-from-string (prin1-to-string s)))) \
+               (list (intern \"ZED\" \"PW\") (intern \"EX\" \"PW\") \
+                     (intern \"has space\" \"PW\") (intern \"A:B\" \"PW\")))",
+            "T",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "reader case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "wrong read result for: {expr}"
+        );
+    }
+}
+
 /// Bars quote a TOKEN, not a whole qualified spelling: the package marker is
 /// printer syntax and belongs outside them. bliss printed `|WQ::ZED|` for every
 /// qualified symbol — the colon in the spelling made the whole thing "need"
