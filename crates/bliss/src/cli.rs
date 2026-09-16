@@ -12974,6 +12974,39 @@ fn check_function_name(spec: BlissVal) -> Result<(), BlissError> {
 /// evaluates the new value up-front for every other place, so this predicate
 /// lets that one branch defer it. Returns the bare accessor name when the
 /// place is one of these accessors, else None. THE wrappers are unwrapped.
+/// Is `place` a function-style place handled by a USER setf expander
+/// (DEFINE-SETF-EXPANDER or either DEFSETF form)?
+///
+/// Such a place must defer its new-value form: CLHS 5.1.1.1 evaluates the
+/// place's subforms left to right FIRST and the new value LAST, and the
+/// expansion's value forms are those subforms (bliss-gdom). Decided from the
+/// place alone, using the same `setf_expanders` lookup the store path uses, so
+/// the flag and the branch cannot disagree.
+fn place_has_user_setf_expander(mut place: BlissVal, env: &Env) -> bool {
+    if !place.is_cons() {
+        return false;
+    }
+    // Unwrap THE exactly as the store path does.
+    loop {
+        let (head, _) = cp(place);
+        if head.is_symbol() && sym_name(head) == "THE" {
+            place = cp(cp(cp(place).1).1).0;
+            if !place.is_cons() {
+                return false;
+            }
+        } else {
+            break;
+        }
+    }
+    let (acc, _) = cp(place);
+    if !acc.is_symbol() {
+        return false;
+    }
+    // The registry is keyed by the accessor's FULL name, exactly as the store
+    // path's `contains_key(&acc)` computes it — a bare name misses entirely.
+    env.setf_expanders.borrow().contains_key(&sym_name(acc))
+}
+
 fn order_sensitive_setf_accessor(mut place: BlissVal) -> Option<String> {
     if !place.is_cons() {
         return None;
@@ -15628,8 +15661,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // so defer the value eval here (CHAR.ORDER.2/SCHAR.ORDER.2).
                     // A user SETF-expander for one of these names is respected
                     // by evaluating the value before delegating to it.
-                    let deferred_setf_value =
-                        place.is_cons() && order_sensitive_setf_accessor(*place).is_some();
+                    let deferred_setf_value = place.is_cons()
+                        && (order_sensitive_setf_accessor(*place).is_some()
+                            // A user setf expander's value forms ARE the place's
+                            // subforms, so they must run before the new value
+                            // (bliss-gdom).
+                            || place_has_user_setf_expander(*place, env));
                     bliss_rt::rooted!(val = if deferred_setf_value {
                         NIL
                     } else {
@@ -15677,12 +15714,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // A user SETF-expander (DEFINE-SETF-EXPANDER / DEFSETF)
                         // takes precedence over the built-in place handling below.
                         if env.setf_expanders.borrow().contains_key(&acc) {
-                            // A deferred value (element-accessor place shadowed by
-                            // a user expander) must be evaluated before delegating.
-                            if deferred_setf_value {
-                                *val = eval_form(*val_form, env)?;
-                            }
-                            result = apply_setf_expansion(*place, *val, env)?;
+                            // Hand over the unevaluated FORM when deferred so the
+                            // expansion can run the place's subforms first and the
+                            // new value last (bliss-gdom).
+                            let new_value = if deferred_setf_value {
+                                SetfNewValue::Form(*val_form)
+                            } else {
+                                SetfNewValue::Value(*val)
+                            };
+                            result = apply_setf_expansion(*place, new_value, env)?;
                             *c = *r2;
                             continue;
                         }
@@ -28824,9 +28864,17 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
 /// Store NEW_VALUE into PLACE using its setf-expansion: bind the temporaries to
 /// their value forms (sequentially, like LET*), bind the store variable to
 /// NEW_VALUE, then evaluate the storing form. Returns NEW_VALUE.
+/// The new value SETF is storing: either already evaluated, or still a form to
+/// be evaluated at the CLHS-mandated moment — after the place's subforms
+/// (bliss-gdom).
+enum SetfNewValue {
+    Value(BlissVal),
+    Form(BlissVal),
+}
+
 fn apply_setf_expansion(
     place: BlissVal,
-    new_value: BlissVal,
+    new_value: SetfNewValue,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
     let ex = get_setf_expansion(place, env)?;
@@ -28838,6 +28886,13 @@ fn apply_setf_expansion(
                 env.define_local_symbol(*temp, v);
             }
         }
+        // AFTER the subforms. The only extra bindings in scope are the
+        // expansion's temporaries, which are uninterned gensyms and so cannot
+        // capture anything the value form refers to.
+        let new_value = match new_value {
+            SetfNewValue::Value(v) => v,
+            SetfNewValue::Form(form) => eval_form(form, env)?,
+        };
         if let Some(store) = ex.stores.first() {
             if store.is_symbol() {
                 env.define_local_symbol(*store, new_value);

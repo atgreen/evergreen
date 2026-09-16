@@ -3575,6 +3575,76 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// CLHS 5.1.1.1: a place's subforms are evaluated left to right, then the
+/// new-value form LAST. For a place handled by a USER setf expander the new
+/// value was evaluated FIRST (bliss-gdom), which the ansi DEFSETF.4C test
+/// detects by counting evaluations. Builtin places were already correct.
+#[test]
+fn setf_evaluates_user_place_subforms_before_the_value() {
+    // i counts every evaluation; j and k record when each subform ran. Correct
+    // order leaves j=1, k=2 and i=3 — value last.
+    let setup = "(progn \
+        (defun dse (n s) (nth n s)) \
+        (define-setf-expander dse (n s &environment e) \
+          (declare (ignore e)) \
+          (let ((tn (gensym)) (ts (gensym)) (v (gensym))) \
+            (values (list tn ts) (list n s) (list v) \
+                    `(progn (setf (nth ,tn ,ts) ,v) ,v) `(nth ,tn ,ts)))) \
+        (defun sfa (n s) (nth n s)) \
+        (defun set-sfa (n s v) (setf (nth n s) v) v) \
+        (defsetf sfa set-sfa) \
+        (defun lfa (n s) (nth n s)) \
+        (defsetf lfa (n s) (v) `(progn (setf (nth ,n ,s) ,v) ,v)))";
+    let order = |place: &str| {
+        format!(
+            "(let ((x (list 1 2 3)) (i 0) (j nil) (k nil)) \
+               (setf ({place} (progn (setf j (incf i)) 1) (progn (setf k (incf i)) x)) \
+                     (progn (incf i) 'a)) \
+               (list i j k))"
+        )
+    };
+    let cases = [
+        (order("dse"), "(3 1 2)"),
+        (order("sfa"), "(3 1 2)"),
+        (order("lfa"), "(3 1 2)"),
+        // A builtin place was already correct and must stay so.
+        (order("nth"), "(3 1 2)"),
+        // Deferring the value must not change WHAT is stored, or the result.
+        (
+            "(let ((x (list 1 2 3))) (list (setf (lfa 1 x) 'z) x))".to_string(),
+            "(Z (1 Z 3))",
+        ),
+        // ...including through an updating macro, which must still read and
+        // write the place exactly once.
+        (
+            "(let ((x (list 1 5 3))) (incf (lfa 1 x) 10) x)".to_string(),
+            "(1 15 3)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "setf order case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong SETF evaluation order for: {expr}"
+        );
+    }
+}
+
 /// Long-form DEFSETF `(defsetf access-fn (arg…) (store…) body…)` was accepted
 /// and DISCARDED, so `(setf (access-fn …) …)` fell through to the
 /// `(setf access-fn)` writer path and signalled a PROGRAM-ERROR with no such
