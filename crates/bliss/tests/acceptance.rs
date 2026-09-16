@@ -8958,3 +8958,57 @@ fn and_or_cond_value_counts() {
         }
     }
 }
+
+/// An implicit progn with NO forms yields exactly NIL — one value. bliss left
+/// `env.mv` holding whatever the enclosing form had produced, so those values
+/// escaped as the body's own: `(multiple-value-bind () (values 1 2 3 4 5))`
+/// returned all five. ansi MULTIPLE-VALUE-BIND.12/13; bliss-p3gu.
+///
+/// Fixed in eval_progn / lower_progn rather than in M-V-B, because the rule
+/// holds for every empty body — which is also why the non-empty cases are pinned
+/// here: that path is used by nearly every binding and control form.
+#[test]
+fn an_empty_body_yields_exactly_nil() {
+    let cases = [
+        ("(multiple-value-list (multiple-value-bind () (values)))", "(NIL)"),
+        ("(multiple-value-list (multiple-value-bind () (values 1 2 3 4 5)))", "(NIL)"),
+        // Other forms with an empty body, same rule.
+        ("(multiple-value-list (let () ))", "(NIL)"),
+        ("(multiple-value-list (progn))", "(NIL)"),
+        ("(multiple-value-list (when t))", "(NIL)"),
+        ("(multiple-value-list (let ((x (values 1 2)))))", "(NIL)"),
+        // Non-empty bodies must still propagate the tail form's values.
+        ("(multiple-value-list (multiple-value-bind (a) (values 1 2) (values a 9)))", "(1 9)"),
+        ("(multiple-value-list (progn (values 1 2)))", "(1 2)"),
+        ("(multiple-value-list (let () (values 1 2)))", "(1 2)"),
+        ("(multiple-value-list (when t (values 1 2)))", "(1 2)"),
+        // ...and a non-final form's values are still discarded.
+        ("(multiple-value-list (progn (values 1 2) 3))", "(3)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

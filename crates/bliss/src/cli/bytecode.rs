@@ -1876,6 +1876,10 @@ impl<'e> Lowerer<'e> {
         // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
         bliss_rt::rooted!(forms = list_to_vec(rest));
         if forms.is_empty() {
+            // No forms: exactly NIL, one value. Without the clear, whatever the
+            // enclosing form left in mv escapes as this body's values
+            // (bliss-p3gu).
+            self.emit(Instr::ClearMv);
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
             self.push_n(1);

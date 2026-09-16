@@ -22903,6 +22903,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_progn(forms: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    if !forms.is_cons() {
+        // An implicit progn with NO forms yields exactly NIL — one value.
+        // Without clearing, whatever the enclosing form left in `env.mv` escapes
+        // as this body's values: `(multiple-value-bind () (values 1 2 3))`
+        // returned 1,2,3 because M-V-B evaluates its values form (setting mv),
+        // binds nothing, then runs an empty body that neither sets nor clears it
+        // (ansi MULTIPLE-VALUE-BIND.12/13; bliss-p3gu).
+        env.clear_mv();
+        return Ok(NIL);
+    }
     bliss_rt::rooted!(remaining = forms);
     let mut r = NIL;
     while remaining.is_cons() {
