@@ -32283,11 +32283,14 @@ fn signal_correctable_package_error(
     let package_kw = resolve_sym("PACKAGE").unwrap_or(NIL);
     bliss_rt::rooted!(package = package);
     // Deliberately PACKAGE-ERROR, not the SIMPLE-PACKAGE-ERROR used for
-    // uncaught package failures: a condition class with two supers currently
-    // breaks restart lookup — FIND-RESTART returns NIL for a restart that
-    // COMPUTE-RESTARTS on the same condition lists (bliss-vqqb). Using the
-    // simple class here silently disabled the CONTINUE restart this function
-    // exists to provide. Switch once that is fixed.
+    // uncaught package failures. Signalling a SIMPLE-PACKAGE-ERROR through this
+    // hand-rolled restart path silently disables the CONTINUE restart this
+    // function exists to provide: INVOKE-RESTART then fails to map the restart
+    // object back to its entry ("Restart #<INSTANCE> not found"). The cause is
+    // not yet understood — it is NOT simply a two-parent class, since
+    // SIMPLE-TYPE-ERROR behaves identically here and works — so the narrowing
+    // lives in bliss-hpqo. Switch once that is fixed; the cost meanwhile is
+    // that these reports cannot carry a message.
     bliss_rt::rooted!(
         condition = build_condition_instance(env, "PACKAGE-ERROR", &[package_kw, *package])?
     );
