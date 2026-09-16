@@ -27686,6 +27686,14 @@ fn bind_macro_lambda_list(
     let mut key_specs: Vec<(String, Option<String>)> = Vec::new();
     let mut key_values: Vec<(BlissVal, BlissVal)> = Vec::new();
     bliss_rt::rooted_ref!(_key_values_root = &mut key_values);
+    // &AUX initforms are evaluated only after EVERY parameter is bound (CLHS
+    // 3.4.1), so they are collected here during the scan and evaluated below —
+    // alongside the &key defaults, which are likewise deferred. Evaluating them
+    // in the scan made `(&key (y 1) &aux (z y))` read Y before the deferred
+    // keyword pass had bound it (bliss-65c4). Rooted: these patterns and
+    // initforms stay live across every later allocation and evaluation.
+    let mut aux_specs: Vec<(BlissVal, BlissVal)> = Vec::new();
+    bliss_rt::rooted_ref!(_aux_specs_root = &mut aux_specs);
     let mut whole_var: Option<BlissVal> = None;
     bliss_rt::rooted_ref!(_whole_var_root = &mut whole_var);
     let mut whole_form = whole.unwrap_or_else(|| vec_to_list(&args));
@@ -27848,7 +27856,7 @@ fn bind_macro_lambda_list(
                 key_values.push((pattern, default_form));
             }
             Mode::Aux => {
-                let (mut pattern, mut default_form) = if elem.is_symbol() {
+                let (pattern, default_form) = if elem.is_symbol() {
                     (elem, NIL)
                 } else if elem.is_cons() {
                     let (pat, r) = cp(elem);
@@ -27857,15 +27865,9 @@ fn bind_macro_lambda_list(
                 } else {
                     (elem, NIL)
                 };
-                bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
-                bliss_rt::rooted_ref!(_default_form_root = &mut default_form);
-                let mut dv = if default_form == NIL {
-                    NIL
-                } else {
-                    eval_form(default_form, env)?
-                };
-                bliss_rt::rooted_ref!(_default_value_root = &mut dv);
-                bind_pattern_value(pattern, dv, env)?;
+                // Deferred, not evaluated here — see `aux_specs`. Pushing into
+                // an already-rooted Vec keeps both values traced.
+                aux_specs.push((pattern, default_form));
             }
         }
     }
@@ -27945,6 +27947,24 @@ fn bind_macro_lambda_list(
             arg_i,
             args.len()
         )));
+    }
+
+    // &AUX last, once every required/optional/rest/key parameter is bound, and
+    // strictly left to right: each initform sees the preceding &aux bindings as
+    // well (CLHS 3.4.1, LET* semantics). Re-read each spec out of the rooted
+    // `aux_specs` per iteration — evaluating an earlier initform can allocate
+    // and move the nursery, so a copy taken before the loop would go stale.
+    for index in 0..aux_specs.len() {
+        let (mut pattern, mut default_form) = aux_specs[index];
+        bliss_rt::rooted_ref!(_pattern_root = &mut pattern);
+        bliss_rt::rooted_ref!(_default_form_root = &mut default_form);
+        let mut dv = if default_form == NIL {
+            NIL
+        } else {
+            eval_form(default_form, env)?
+        };
+        bliss_rt::rooted_ref!(_default_value_root = &mut dv);
+        bind_pattern_value(pattern, dv, env)?;
     }
 
     Ok(())

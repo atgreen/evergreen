@@ -3575,6 +3575,71 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// CLHS 3.4.1: &AUX initforms are evaluated only after every other parameter
+/// is bound, and left to right so each sees the preceding &AUX bindings. The
+/// binder used to evaluate them during its lambda-list scan, before the
+/// deferred &KEY pass, so `(&key (y 1) &aux (z y))` signalled "unbound
+/// variable: Y" (bliss-65c4). Every expectation below matches SBCL exactly.
+#[test]
+fn macro_aux_params_bind_after_key_defaults() {
+    let cases = [
+        // &aux reads a &key default, and an explicitly supplied &key value.
+        (
+            "(progn (defmacro m1 (&key (y 1) &aux (z y)) (list 'quote (list y z))) (m1))",
+            "(1 1)",
+        ),
+        (
+            "(progn (defmacro m1b (&key (y 1) &aux (z y)) (list 'quote (list y z))) (m1b :y 42))",
+            "(42 42)",
+        ),
+        // &aux reads an &optional default computed from a required parameter.
+        (
+            "(progn (defmacro m2 (a &optional (b (* a 2)) &aux (c (+ a b))) \
+               (list 'quote (list a b c))) (m2 3))",
+            "(3 6 9)",
+        ),
+        // &aux reads the &rest list.
+        (
+            "(progn (defmacro m3 (&rest r &aux (n (length r))) (list 'quote (list r n))) \
+               (m3 1 2 3))",
+            "((1 2 3) 3)",
+        ),
+        // Sequential: each &aux initform sees the earlier ones (LET* order),
+        // and a bare &aux variable is NIL.
+        (
+            "(progn (defmacro m4 (&key (y 2) &aux (a (* y 10)) (b (+ a 1)) c) \
+               (list 'quote (list y a b c))) (m4 :y 5))",
+            "(5 50 51 NIL)",
+        ),
+        // &aux after a supplied-p variable, &rest and &key together.
+        (
+            "(progn (defmacro m5 (a &optional (b 0 bp) &rest r &key k &aux (tot (list a b bp r k))) \
+               (list 'quote tot)) (m5 1 2 :k 9))",
+            "(1 2 T (:K 9) 9)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "&aux macro case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // --eval echoes the form's own value (NIL from FORMAT) on a later
+        // line; the first line is what FORMAT wrote.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "wrong &aux binding for: {expr}"
+        );
+    }
+}
+
 #[test]
 fn macro_lambda_list_defaults_are_gc_safe_and_package_neutral_on_error() {
     let expr = "(progn
