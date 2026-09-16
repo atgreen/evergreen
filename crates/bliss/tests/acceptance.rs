@@ -3575,6 +3575,85 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// CLHS 9.1.4.2: restart names are SYMBOLS, compared with EQ. Both sides were
+/// reduced to their bare names before comparing, throwing the package away, so
+/// `(find-restart 'cl:continue)` matched a restart named
+/// `other-package::continue` — a genuinely different symbol (bliss-iom5).
+#[test]
+fn restart_names_compare_by_symbol_identity() {
+    // RI uses nothing, so ri::continue is its OWN symbol, not CL's.
+    let setup = "(defpackage :ri (:use))";
+    let cases = [
+        // The premise: these really are different symbols.
+        ("(not (eq 'ri::continue 'cl:continue))", "T"),
+        // A restart named ri::continue must NOT answer to cl:continue.
+        (
+            "(restart-case (and (find-restart 'cl:continue) t) (ri::continue () :x))",
+            "NIL",
+        ),
+        // ...but must answer to its own name, and report that name.
+        (
+            "(restart-case (and (find-restart 'ri::continue) t) (ri::continue () :x))",
+            "T",
+        ),
+        (
+            "(restart-case (eq (restart-name (find-restart 'ri::continue)) 'ri::continue) \
+               (ri::continue () :x))",
+            "T",
+        ),
+        // Invoking by the CL name must not fire the differently-named restart.
+        (
+            "(restart-case (handler-case (invoke-restart 'cl:continue) (error () :not-found)) \
+               (ri::continue () :wrongly-fired))",
+            ":NOT-FOUND",
+        ),
+        // A symbol INHERITED from CL is the SAME symbol, so it still matches.
+        // Resolved with INTERN at run time: writing ri2::continue literally here
+        // would be read before the DEFPACKAGE in the same form had run, creating
+        // a fresh symbol instead of finding the inherited one.
+        (
+            "(progn (defpackage :ri2 (:use :cl)) \
+               (restart-case (and (find-restart (intern \"CONTINUE\" :ri2)) t) \
+                 (continue () :x)))",
+            "T",
+        ),
+        // The standard restarts keep working.
+        (
+            "(handler-bind ((error (lambda (c) (declare (ignore c)) (continue)))) \
+               (cerror \"go\" \"boom\") :continued)",
+            ":CONTINUED",
+        ),
+        ("(restart-case (abort) (abort () :aborted))", ":ABORTED"),
+        (
+            "(handler-bind ((warning (lambda (c) (muffle-warning c)))) (warn \"w\") :muffled)",
+            ":MUFFLED",
+        ),
+        ("(restart-case (invoke-restart 'my-r) (my-r () :fired))", ":FIRED"),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "restart identity case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "restart name matched by bare name instead of identity: {expr}"
+        );
+    }
+}
+
 /// Builtin condition classes register LAZILY — nothing materialises
 /// PACKAGE-ERROR until something signals one — so SUBTYPEP saw no class and
 /// answered "cannot determine" for relationships the standard defines, while

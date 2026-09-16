@@ -4757,6 +4757,23 @@ fn make_restart_object(
 }
 
 /// If `obj` is a RESTART object, return the id of the restart it names.
+/// Does `entry_name` name the same SYMBOL as the restart-name designator
+/// `designator`?
+///
+/// CLHS 9.1.4.2: restart names are symbols, compared with EQ. Both sides were
+/// reduced to their BARE names before comparing, which threw the package away —
+/// so `(find-restart 'cl:continue)` matched a restart named
+/// `other-package::continue`, a genuinely different symbol (bliss-iom5).
+///
+/// A restart entry already stores the symbol's full registry key, and
+/// `intern(registry_key(idx)) == idx`, so comparing the FULL names is exactly
+/// symbol identity. CL symbols key as a bare "CONTINUE", which is also how the
+/// builtin CONTINUE/ABORT/MUFFLE-WARNING entries are spelled, so those keep
+/// matching `'cl:continue` and friends.
+fn restart_name_matches(entry_name: &str, designator: BlissVal) -> bool {
+    entry_name == val_as_str(designator).to_uppercase()
+}
+
 fn restart_object_id(obj: BlissVal, env: &Env) -> Option<u64> {
     if !bliss_stdlib::is_instance(obj) {
         return None;
@@ -19826,10 +19843,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     return Ok(NIL);
                 }
-                let restart_name = symbol_bare_name(&val_as_str(*name_val));
                 for idx in restart_visibility_order(&env.restarts) {
                     let entry = env.restarts[idx].clone();
-                    if symbol_bare_name(&entry.name) == restart_name
+                    if restart_name_matches(&entry.name, *name_val)
                         && restart_applies(&entry, cond_opt, env)?
                     {
                         return restart_obj_for(env, idx);
@@ -19878,10 +19894,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     // Most-visible restart of this name whose :test (if any)
                     // accepts NIL (RESTART-CASE.6/19).
-                    let restart_name = symbol_bare_name(&val_as_str(*name_val));
                     let mut found = None;
                     for i in restart_visibility_order(&env.restarts) {
-                        if symbol_bare_name(&env.restarts[i].name) == restart_name {
+                        if restart_name_matches(&env.restarts[i].name, *name_val) {
                             let entry = env.restarts[i].clone();
                             if restart_applies(&entry, None, env)? {
                                 found = Some(i);
@@ -19923,10 +19938,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let idx_opt = if let Some(id) = restart_object_id(*restart_val, env) {
                     env.restarts.iter().position(|r| r.id == id)
                 } else {
-                    let restart_name = symbol_bare_name(&val_as_str(*restart_val)).to_uppercase();
                     restart_visibility_order(&env.restarts)
                         .into_iter()
-                        .find(|&i| symbol_bare_name(&env.restarts[i].name) == restart_name)
+                        .find(|&i| restart_name_matches(&env.restarts[i].name, *restart_val))
                 };
                 let Some(idx) = idx_opt else {
                     return Err(BlissError::ProgramError(format!(
