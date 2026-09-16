@@ -8508,3 +8508,71 @@ fn setf_of_apply() {
         );
     }
 }
+
+/// A wrong-argument-count call to a builtin is a PROGRAM-ERROR (CLHS 3.5.1).
+/// Neither APPLY nor GET-SETF-EXPANSION was in `fixed_arity_builtin`, so both
+/// accepted any count. `(apply)` was the worst: with no arguments it took the
+/// missing first one as the function name and reported *that* undefined, so the
+/// diagnostic pointed somewhere unrelated to the mistake.
+/// ansi APPLY.ERROR.1, GET-SETF-EXPANSION.ERROR.1/2; bliss-g5pa.
+#[test]
+fn wrong_arity_apply_and_get_setf_expansion_signal_program_error() {
+    // `apply function &rest args+` requires at least one argument after the
+    // function, so one argument is an error too — confirmed against SBCL.
+    let errors = [
+        "(apply)",
+        "(apply #'list)",
+        "(get-setf-expansion)",
+        "(get-setf-expansion 'x nil nil)",
+    ];
+    for expr in errors {
+        let output = bliss_bin()
+            .args([
+                "--eval",
+                &format!(
+                    "(cl:format t \"~S~%\" (handler-case (progn (eval '{expr}) :no-error) \
+                       (program-error () :program-error) (error (c) (type-of c))))"
+                ),
+            ])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            ":PROGRAM-ERROR",
+            "expected PROGRAM-ERROR from: {expr}"
+        );
+    }
+    // Well-formed calls must keep working: the spread list may be empty, and
+    // arguments may be split between fixed positions and the list.
+    let ok = [
+        ("(apply #'+ (list 1 2))", "3"),
+        ("(apply #'+ 1 2 (list 3))", "6"),
+        ("(apply #'list nil)", "NIL"),
+        ("(multiple-value-list (get-setf-expansion 'x))", "(NIL NIL (#:NEW) (SETQ X #:NEW) X)"),
+    ];
+    for (expr, expected) in ok {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        let got = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if expr.starts_with("(multiple-value-list") {
+            // The store variable is a gensym, so only its shape is stable.
+            assert!(
+                got.starts_with("(NIL NIL (") && got.contains("SETQ X") && got.ends_with(" X)"),
+                "get-setf-expansion shape: {expr} gave {got}"
+            );
+        } else {
+            assert_eq!(got, expected, "case: {expr}");
+        }
+    }
+}

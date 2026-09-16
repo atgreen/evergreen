@@ -12891,6 +12891,15 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // Both take exactly one argument; ansi COMPILED-FUNCTION-P.ERROR.1/2 and
         // FUNCTION-LAMBDA-EXPRESSION.ERROR.1/2 require a PROGRAM-ERROR otherwise.
         "COMPILED-FUNCTION-P" | "FUNCTION-LAMBDA-EXPRESSION" => Some((1, 1)),
+        // (get-setf-expansion place &optional environment) — ansi
+        // GET-SETF-EXPANSION.ERROR.1/2 (bliss-g5pa).
+        "GET-SETF-EXPANSION" => Some((1, 2)),
+        // `apply function &rest args+` (CLHS): at least one argument must follow
+        // the function, so (apply) and (apply #'list) are both PROGRAM-ERRORs —
+        // confirmed against SBCL. Without this (apply) took the missing first
+        // argument as the function name and reported it undefined, pointing the
+        // diagnostic somewhere unrelated to the mistake. ansi APPLY.ERROR.1.
+        "APPLY" => Some((2, usize::MAX)),
         // (find-symbol string &optional package) and the interning/using
         // functions all take one required argument and an optional package.
         "FIND-SYMBOL" | "INTERN" | "UNINTERN" | "USE-PACKAGE" | "UNUSE-PACKAGE"
