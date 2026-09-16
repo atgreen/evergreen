@@ -185,9 +185,9 @@ const KNOWN: &[InlineMetadata] = &[
 /// other package is not the CL function and must remain a normal call.
 pub fn metadata_for_symbol(sym: u32) -> Option<&'static InlineMetadata> {
     let name = crate::reader::symbol_name(sym)?;
-    let (package, bare) = match name.rsplit_once(':') {
+    let (package, bare) = match bliss_rt::symbols::split_registry_key(&name) {
         None => (None, name.as_str()),
-        Some((package, bare)) => (Some(package.trim_end_matches(':')), bare),
+        Some((package, bare)) => (Some(package), bare),
     };
     KNOWN.iter().find(|m| {
         if m.name != bare {

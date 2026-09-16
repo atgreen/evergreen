@@ -205,6 +205,27 @@ pub fn print_symbol_name(name: &str, escapep: bool) -> String {
 ///
 /// `spelling` must be a qualified-or-bare spelling, NOT a raw uninterned or
 /// keyword registry name — those are bare tokens and go to `print_symbol_name`.
+/// Render `symbol` as the printer should emit it.
+///
+/// Bars quote a TOKEN: a qualifier's package and name are quoted separately so
+/// the marker stays outside them (`PW::|has space|`), while a symbol printing
+/// bare is a single token quoted whole (`|PR2::ZED|`). Without `*print-escape*`
+/// only the name's characters are output (CLHS 22.1.3.3).
+pub fn print_symbol_for_output(symbol: BlissVal, escapep: bool) -> String {
+    let (qualifier, name) = symbol_print_parts(symbol);
+    match qualifier {
+        None => print_symbol_name(&name, escapep),
+        // princ/~A drops the qualifier entirely.
+        Some(_) if !escapep => print_symbol_name(&name, false),
+        Some((package, marker)) => format!(
+            "{}{}{}",
+            print_symbol_name(&package, true),
+            marker,
+            print_symbol_name(&name, true)
+        ),
+    }
+}
+
 pub fn print_qualified_symbol_name(spelling: &str, escapep: bool) -> String {
     // Split on the FIRST marker: later colons belong to the symbol's own name
     // (bliss-wne9.2.3). A leading marker means there is no package token, so
@@ -238,18 +259,33 @@ pub fn print_qualified_symbol_name(spelling: &str, escapep: bool) -> String {
 /// same symbol is accessible in the current package (CLHS 22.1.3.3). Keep the
 /// qualifier when omitting it would read back as a different symbol.
 pub fn symbol_name_for_print(symbol: BlissVal) -> String {
+    let (qualifier, name) = symbol_print_parts(symbol);
+    match qualifier {
+        Some((package, marker)) => format!("{package}{marker}{name}"),
+        None => name,
+    }
+}
+
+/// How a symbol should be spelled, split into its optional `(package, marker)`
+/// qualifier and its NAME.
+///
+/// The printer needs the split rather than a joined spelling: when the
+/// qualifier is `None` the name is a single TOKEN and must be quoted as one,
+/// even though it may itself contain colons. Re-deriving the split from a
+/// joined string cannot tell `|PR2::ZED|` — one symbol, accessible bare, whose
+/// NAME is "PR2::ZED" — from the qualified spelling `PR2::ZED`, and printing
+/// the former as the latter reads back as a different symbol (bliss-lgml).
+pub fn symbol_print_parts(symbol: BlissVal) -> (Option<(String, &'static str)>, String) {
     let Some(index) = symbol.symbol_index() else {
-        return if symbol.is_nil() { "NIL" } else { "T" }.to_string();
+        return (None, if symbol.is_nil() { "NIL" } else { "T" }.to_string());
     };
     let name = bliss_compiler::reader::symbol_name(index)
         .unwrap_or_else(|| format!("SYM#{index}"));
     if name.starts_with("KEYWORD:") || bliss_compiler::reader::is_uninterned(index) {
-        return name;
+        return (None, name);
     }
-    let bare = name
-        .rsplit_once("::")
+    let bare = bliss_rt::symbols::split_registry_key(&name)
         .map(|(_, bare)| bare)
-        .or_else(|| name.rsplit_once(':').map(|(_, bare)| bare))
         .unwrap_or(&name);
     let current_package = bliss_rt::symbols::find_index("*PACKAGE*")
         .and_then(bliss_rt::symbols::symbol_value)
@@ -260,16 +296,13 @@ pub fn symbol_name_for_print(symbol: BlissVal) -> String {
             .flatten()
             .is_some_and(|(visible, _)| visible == symbol)
     }) {
-        return bare.to_string();
+        return (None, bare.to_string());
     }
     // Keep the qualifier, spelled by ACCESSIBILITY per CLHS 22.1.3.3.1: an
     // EXTERNAL symbol of its home package prints "PKG:NAME", anything else
     // "PKG::NAME" — independent of which spelling the registry key happens to
     // carry (canonical keys are "::"; legacy single-colon keys still exist).
-    let qualifier = name
-        .rsplit_once("::")
-        .map(|(package, _)| package)
-        .or_else(|| name.rsplit_once(':').map(|(package, _)| package));
+    let qualifier = bliss_rt::symbols::split_registry_key(&name).map(|(package, _)| package);
     if let Some(package_name) = qualifier {
         if let Some(home) = crate::packages::find_package(package_name) {
             let marker = if crate::packages::is_external_symbol(home, bare) {
@@ -277,10 +310,10 @@ pub fn symbol_name_for_print(symbol: BlissVal) -> String {
             } else {
                 "::"
             };
-            return format!("{package_name}{marker}{bare}");
+            return (Some((package_name.to_string(), marker)), bare.to_string());
         }
     }
-    name
+    (None, name)
 }
 
 /// `*PRINT-LENGTH*`: the max number of elements of a list/vector to print before
@@ -1151,7 +1184,7 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
                 name
             };
         }
-        return print_qualified_symbol_name(&symbol_name_for_print(v), escapep);
+        return print_symbol_for_output(v, escapep);
     }
     // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not the data
     // list it is structurally — print it as #<FUNCTION> (matches cli print_val).

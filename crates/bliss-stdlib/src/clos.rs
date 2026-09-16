@@ -283,10 +283,8 @@ fn bare_symbol_name(sym: BlissVal) -> Option<String> {
     // which is_symbol() accepts but which have no table index — return None
     // instead of panicking (seen via a NIL in a slot layout under GC stress).
     let key = bliss_rt::symbols::symbol_name(sym.symbol_index()?)?;
-    let bare = key
-        .rsplit_once("::")
+    let bare = bliss_rt::symbols::split_registry_key(&key)
         .map(|(_, n)| n)
-        .or_else(|| key.rsplit_once(':').map(|(_, n)| n))
         .unwrap_or(key.as_str());
     Some(bare.to_string())
 }

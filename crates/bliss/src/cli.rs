@@ -1265,9 +1265,7 @@ fn callable_body_of_symbol(env: &Env, sym: BlissVal, name: &str) -> Option<(Blis
 /// `home_defined_symbol` registered in P). Re-resolving through the — by now
 /// live — package registry recovers that symbol and its function.
 fn late_resolved_function_cell(env: &Env, name: &str) -> Option<BlissVal> {
-    let (pkg, bare) = name
-        .rsplit_once("::")
-        .or_else(|| name.rsplit_once(':'))?;
+    let (pkg, bare) = bliss_rt::symbols::split_registry_key(name)?;
     if pkg.is_empty() || pkg == "KEYWORD" {
         return None;
     }
@@ -7130,10 +7128,7 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
                 out.push_str(&bliss_stdlib::format::print_symbol_name(&name, true));
             } else {
-                let spelling = bliss_stdlib::format::symbol_name_for_print(val);
-                out.push_str(&bliss_stdlib::format::print_qualified_symbol_name(
-                    &spelling, true,
-                ));
+                out.push_str(&bliss_stdlib::format::print_symbol_for_output(val, true));
             }
         }
     } else if is_closure_cons(val) {
@@ -7410,9 +7405,8 @@ fn princ_val(val: BlissVal, out: &mut String) {
         return;
     }
     if val.is_symbol() {
-        let name = sym_name(val);
-        // For ~A, print symbol name without package prefix
-        out.push_str(&symbol_name_string(&name));
+        // For ~A, print the symbol name without its package prefix.
+        out.push_str(&symbol_name_of(val));
         return;
     }
     // A pathname prints as its bare namestring under PRINC/~A (no `#P"…"`
@@ -7531,7 +7525,7 @@ fn symbol_home_package_name(sym: BlissVal) -> String {
     if name.starts_with("KEYWORD:") {
         return "KEYWORD".to_string();
     }
-    if let Some((pkg, _)) = name.rsplit_once("::").or_else(|| name.rsplit_once(':')) {
+    if let Some((pkg, _)) = bliss_rt::symbols::split_registry_key(&name) {
         return pkg.to_string();
     }
     for pkg in bliss_stdlib::list_all_packages() {
@@ -8957,10 +8951,8 @@ fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
     let full = sym_name(name_sym);
     let bare = symbol_bare_name(&full);
     if full != bare {
-        let qualifier = full
-            .rsplit_once("::")
-            .map(|(package, _)| package)
-            .or_else(|| full.rsplit_once(':').map(|(package, _)| package));
+        let qualifier =
+            bliss_rt::symbols::split_registry_key(&full).map(|(package, _)| package);
         let read_before_in_package = qualifier.is_some_and(|package| {
             normalize_package_name(package) == "COMMON-LISP-USER"
                 && pkg_name != "COMMON-LISP-USER"
@@ -9602,6 +9594,23 @@ fn symbol_name_string(name: &str) -> String {
         .to_string()
 }
 
+/// `SYMBOL-NAME` of a symbol VALUE.
+///
+/// `symbol_name_string` works on a registry key, where everything before the
+/// first marker is the package. An UNINTERNED symbol has no registry key and so
+/// no package prefix — its name is the whole string, colons and all, which is
+/// why `(symbol-name (make-symbol "A:B"))` is "A:B" and not "B" (bliss-lgml).
+fn symbol_name_of(sym: BlissVal) -> String {
+    let raw = sym_name_rc(sym);
+    if sym
+        .symbol_index()
+        .is_some_and(bliss_compiler::reader::is_uninterned)
+    {
+        return raw.to_string();
+    }
+    symbol_name_string(&raw)
+}
+
 fn package_status_symbol(status: &str) -> BlissVal {
     resolve_sym(&format!(":{}", status)).unwrap_or(NIL)
 }
@@ -9745,10 +9754,8 @@ fn find_symbol_in_package_cased(
             // lowercase name (`:|f|`, "foo").
             let raw = sym_name(sym);
             let without_kw = raw.strip_prefix("KEYWORD:").unwrap_or(&raw);
-            let bare = without_kw
-                .rsplit_once("::")
+            let bare = bliss_rt::symbols::split_registry_key(without_kw)
                 .map(|(_, tail)| tail)
-                .or_else(|| without_kw.rsplit_once(':').map(|(_, tail)| tail))
                 .unwrap_or(without_kw);
             if bare != bare_name {
                 return None;
@@ -18562,7 +18569,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let s = if v.is_character() {
                     v.as_char().to_string()
                 } else if v.is_symbol() || v.is_nil() || v == T {
-                    symbol_name_string(&sym_name_rc(v))
+                    symbol_name_of(v)
                 } else {
                     val_as_str(v)
                 };
@@ -21887,7 +21894,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     false
                 };
-                let name = symbol_name_string(&sym_name_rc(*sym));
+                let name = symbol_name_of(*sym);
                 bliss_rt::rooted!(fresh = reader::make_uninterned_symbol(&name));
                 if copy_props {
                     // Copy the property list (a fresh list with the same entries).

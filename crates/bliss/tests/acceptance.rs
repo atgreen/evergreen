@@ -3575,6 +3575,69 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A symbol registry key is `PACKAGE::NAME`, and NAME may itself contain
+/// colons. Ten sites split such a key at the LAST marker, which lands inside
+/// the name: SYMBOL-PACKAGE reported "COMMON-LISP-USER::PR2" — not even a well
+/// formed package name — for a symbol named "PR2::ZED" (bliss-lgml). Every
+/// expectation matches SBCL.
+#[test]
+fn registry_keys_split_at_the_first_package_marker() {
+    let setup = "(make-package \"PV\" :use (list \"CL\"))";
+    let cases = [
+        // A symbol whose NAME contains a marker still belongs to CL-USER.
+        (
+            "(package-name (symbol-package (read-from-string \"|PV::ZED|\")))",
+            "\"COMMON-LISP-USER\"",
+        ),
+        ("(symbol-name (read-from-string \"|PV::ZED|\"))", "\"PV::ZED\""),
+        // ...and it prints as ONE bar-quoted token, so it reads back unchanged.
+        (
+            "(prin1-to-string (read-from-string \"|PV::ZED|\"))",
+            "\"|PV::ZED|\"",
+        ),
+        (
+            "(let ((s (read-from-string \"|PV::ZED|\"))) \
+               (eq s (read-from-string (prin1-to-string s))))",
+            "T",
+        ),
+        // A leading colon inside an escaped name is likewise name text.
+        (
+            "(package-name (symbol-package (read-from-string \"\\\\:notkw\")))",
+            "\"COMMON-LISP-USER\"",
+        ),
+        // An UNINTERNED symbol has no registry key, so its name is never split.
+        ("(symbol-name (make-symbol \"A:B\"))", "\"A:B\""),
+        ("(symbol-name (copy-symbol (make-symbol \"A:B\")))", "\"A:B\""),
+        // Ordinary symbols are unaffected.
+        (
+            "(package-name (symbol-package (intern \"ZED\" \"PV\")))",
+            "\"PV\"",
+        ),
+        ("(symbol-name (intern \"A:B\" \"PV\"))", "\"A:B\""),
+        ("(package-name (symbol-package 'car))", "\"COMMON-LISP\""),
+        ("(package-name (symbol-package :kw))", "\"KEYWORD\""),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "registry key case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().next().unwrap_or("").trim(),
+            expected,
+            "registry key split at the wrong marker for: {expr}"
+        );
+    }
+}
+
 /// A package marker is located among the UNESCAPED characters only (CLHS
 /// 2.3.4). The reader scanned the whole token first and only remembered whether
 /// *some* escape occurred, so an escaped token never got package treatment:

@@ -2898,9 +2898,8 @@ fn feature_symbol_name(val: BlissVal) -> String {
 fn feature_symbol_bare_name(val: BlissVal) -> String {
     let name = feature_symbol_name(val);
     let name = name.strip_prefix("KEYWORD:").unwrap_or(&name);
-    name.rsplit_once("::")
+    bliss_rt::symbols::split_registry_key(name)
         .map(|(_, bare)| bare)
-        .or_else(|| name.rsplit_once(':').map(|(_, bare)| bare))
         .unwrap_or(name)
         .trim()
         .to_string()

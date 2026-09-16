@@ -267,6 +267,23 @@ pub fn rename_package_prefix(old_pkg: &str, new_pkg: &str) -> Vec<(u32, String, 
     renamed
 }
 
+/// Split a symbol REGISTRY KEY into its package and name parts at the package
+/// marker.
+///
+/// A key is `PACKAGE::NAME` (or legacy `PACKAGE:NAME`), and NAME may itself
+/// contain colons — `CL-USER::PR2::ZED` is the symbol named `PR2::ZED` in
+/// COMMON-LISP-USER, not a symbol named `ZED`. The marker is therefore the
+/// FIRST colon run, never the last: splitting at the last one lands inside the
+/// name and reports a package that does not exist (bliss-lgml). Callers that
+/// want only one half still go through here so the rule stays in one place.
+///
+/// Returns `None` for an unqualified key (no marker at all).
+pub fn split_registry_key(key: &str) -> Option<(&str, &str)> {
+    let colon = key.find(':')?;
+    let marker_len = if key[colon..].starts_with("::") { 2 } else { 1 };
+    Some((&key[..colon], &key[colon + marker_len..]))
+}
+
 /// The exact registry key an interned symbol was created under (bliss-jtc.23).
 /// `intern(registry_key(idx))` returns `idx`, so this is a faithful,
 /// round-trippable identity for cross-process bytecode references. Returns

@@ -7125,12 +7125,15 @@ impl BbuConstPool {
             put_u32(&mut bytes, name_ref);
             return Some(self.intern_encoded(bytes));
         }
-        let (package, name, kind) = if let Some((package, name)) = key.rsplit_once("::") {
-            (Some(package), name, 0u8)
-        } else if let Some((package, name)) = key.rsplit_once(':') {
-            (Some(package), name, 3u8)
-        } else {
-            (None, key.as_str(), 0u8)
+        // Marker WIDTH still distinguishes the two encodings (`::` internal vs
+        // `:` external), but it is read at the FIRST marker — the name after it
+        // may contain colons of its own (bliss-lgml).
+        let (package, name, kind) = match bliss_rt::symbols::split_registry_key(&key) {
+            Some((package, name)) => {
+                let internal = key.len() - package.len() - name.len() == 2;
+                (Some(package), name, if internal { 0u8 } else { 3u8 })
+            }
+            None => (None, key.as_str(), 0u8),
         };
         let package_ref = package
             .map(|package| self.package(package, &[]))
@@ -8353,10 +8356,7 @@ fn image_class_symbol(bare: &str) -> Option<BlissVal> {
 #[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
 fn image_home_package(sym: BlissVal) -> Option<String> {
     let key = bliss_rt::symbols::registry_key(sym.as_symbol_index())?;
-    let pkg = key
-        .rsplit_once("::")
-        .or_else(|| key.rsplit_once(':'))
-        .map(|(p, _)| p)?;
+    let pkg = bliss_rt::symbols::split_registry_key(&key).map(|(p, _)| p)?;
     if pkg.is_empty() {
         None
     } else {
