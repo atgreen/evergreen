@@ -1660,6 +1660,15 @@ enum SetfExpander {
     /// Short-form DEFSETF `(defsetf access-fn update-fn)`: store the new value
     /// via `(update-fn arg… new)`.
     ShortUpdate(BlissVal),
+    /// Long-form DEFSETF `(defsetf access-fn (arg…) (store…) body…)`. Unlike
+    /// `Expander`, the body yields only the STORE FORM, not the five expansion
+    /// values — the temporaries, value forms, store variables and access form
+    /// are synthesised around it (CLHS 5.5.5).
+    LongUpdate {
+        lambda_list: BlissVal,
+        store_vars: BlissVal,
+        body: BlissVal,
+    },
 }
 
 #[allow(dead_code)]
@@ -5670,6 +5679,15 @@ fn visit_setf_expander_roots(
     match expander {
         SetfExpander::Expander(def) => visit_macro_def_roots(def, state, visit),
         SetfExpander::ShortUpdate(function) => visit(function),
+        SetfExpander::LongUpdate {
+            lambda_list,
+            store_vars,
+            body,
+        } => {
+            visit(lambda_list);
+            visit(store_vars);
+            visit(body);
+        }
     }
 }
 
@@ -28369,14 +28387,29 @@ fn eval_defsetf_short(
 
 fn eval_defsetf_long(
     name_form: BlissVal,
-    _lambda_list: BlissVal,
-    _rest: BlissVal,
-    _env: &mut Env,
+    lambda_list: BlissVal,
+    rest: BlissVal,
+    env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    // The long form `(defsetf access-fn (args…) (store) body…)` is accepted but
-    // not registered; `(setf (access-fn …) …)` then falls through to the default
-    // `(setf access-fn)` writer path. DEFINE-SETF-EXPANDER covers the cases we
-    // actually need (e.g. alexandria's assoc-value).
+    // `(defsetf access-fn (arg…) (store…) body…)`. This was previously accepted
+    // and DISCARDED, so `(setf (access-fn …) …)` fell through to the
+    // `(setf access-fn)` writer path and, with no such writer, signalled a
+    // PROGRAM-ERROR (bliss-pbp8).
+    let (store_vars, body) = if rest.is_cons() {
+        cp(rest)
+    } else {
+        return Err(BlissError::ProgramError(
+            "DEFSETF long form requires a store-variable list".into(),
+        ));
+    };
+    env.setf_expanders.borrow_mut().insert(
+        sym_name(name_form),
+        SetfExpander::LongUpdate {
+            lambda_list,
+            store_vars,
+            body,
+        },
+    );
     Ok(name_form)
 }
 
@@ -28587,6 +28620,59 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                         stores: list_to_vec(values[2]),
                         store_form: values[3],
                         access_form: values[4],
+                    });
+                }
+                SetfExpander::LongUpdate {
+                    lambda_list,
+                    store_vars,
+                    body,
+                } => {
+                    // CLHS 5.5.5: the body is macro-like and yields the STORE
+                    // FORM. Bind its arg lambda list to the place's TEMPORARIES
+                    // (not the subforms — each must be evaluated once) and its
+                    // store variables to fresh store gensyms, then evaluate.
+                    // Everything here allocates, so each built value is rooted.
+                    bliss_rt::rooted!(accessor = accessor);
+                    bliss_rt::rooted!(lambda_list = lambda_list);
+                    bliss_rt::rooted!(store_vars = store_vars);
+                    bliss_rt::rooted!(body = body);
+                    bliss_rt::rooted!(arg_forms = list_to_vec(args));
+                    let n = arg_forms.len();
+                    bliss_rt::rooted!(temps = Vec::<BlissVal>::with_capacity(n));
+                    for _ in 0..n {
+                        let g = gensym_symbol("A");
+                        temps.push(g);
+                    }
+                    bliss_rt::rooted!(store_names = list_to_vec(*store_vars));
+                    bliss_rt::rooted!(stores = Vec::<BlissVal>::with_capacity(
+                        store_names.len().max(1)
+                    ));
+                    for _ in 0..store_names.len().max(1) {
+                        let g = gensym_symbol("NEW");
+                        stores.push(g);
+                    }
+
+                    let mut child = env.child();
+                    bliss_rt::rooted_ref!(_child_root = &mut child);
+                    bind_macro_lambda_list(*lambda_list, &temps, &mut child, None, Some(place))?;
+                    for (name, store) in store_names.iter().zip(stores.iter()) {
+                        if name.is_symbol() {
+                            child.define_local(&sym_name(*name), *store);
+                        }
+                    }
+                    bliss_rt::rooted!(store_form = eval_progn(*body, &mut child)?);
+
+                    let mut access_items = Vec::with_capacity(n + 1);
+                    access_items.push(*accessor);
+                    access_items.extend_from_slice(&temps);
+                    bliss_rt::rooted_ref!(_ai = &mut access_items);
+                    bliss_rt::rooted!(access_form = vec_to_list(&access_items));
+                    return Ok(SetfExpansion {
+                        temps: temps.clone(),
+                        vals: arg_forms.clone(),
+                        stores: stores.clone(),
+                        store_form: *store_form,
+                        access_form: *access_form,
                     });
                 }
                 SetfExpander::ShortUpdate(update_fn) => {

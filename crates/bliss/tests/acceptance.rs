@@ -3575,6 +3575,67 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// Long-form DEFSETF `(defsetf access-fn (arg…) (store…) body…)` was accepted
+/// and DISCARDED, so `(setf (access-fn …) …)` fell through to the
+/// `(setf access-fn)` writer path and signalled a PROGRAM-ERROR with no such
+/// writer (bliss-pbp8). Unlike DEFINE-SETF-EXPANDER the body yields only the
+/// STORE FORM, so the temporaries, value forms, store variables and access form
+/// are synthesised around it (CLHS 5.5.5). Matches SBCL.
+#[test]
+fn defsetf_long_form_defines_a_place() {
+    let setup = "(progn \
+        (defun cellv (x) (second x)) \
+        (defsetf cellv (x) (v) `(progn (setf (second ,x) ,v) ,v)) \
+        (defun nth2 (i x) (nth i x)) \
+        (defsetf nth2 (i x) (v) `(progn (setf (nth ,i ,x) ,v) ,v)) \
+        (defun shv (x) (first x)) \
+        (defun set-shv (x v) (setf (first x) v) v) \
+        (defsetf shv set-shv) \
+        (defvar *n* 0))";
+    let cases = [
+        // The long form now defines a usable place...
+        ("(let ((c (list 1 2))) (setf (cellv c) 7) c)", "(1 7)"),
+        // ...and SETF returns the stored value.
+        ("(let ((c (list 1 2))) (setf (cellv c) 42))", "42"),
+        // Multiple place arguments are bound in order.
+        ("(let ((c (list 1 2 3))) (setf (nth2 1 c) 9) c)", "(1 9 3)"),
+        // An updating macro reads and writes through it, evaluating the place's
+        // subforms EXACTLY ONCE — the whole point of the temporaries.
+        (
+            "(progn (setf *n* 0) \
+               (let ((c (list 1 5))) \
+                 (flet ((get-c () (incf *n*) c)) (incf (cellv (get-c)) 10)) \
+                 (list c *n*)))",
+            "((1 15) 1)",
+        ),
+        ("(let ((c (list 1 nil))) (push 5 (cellv c)) c)", "(1 (5))"),
+        // The SHORT form keeps working.
+        ("(let ((c (list 1 2))) (setf (shv c) 5) c)", "(5 2)"),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "defsetf case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong long-form DEFSETF behaviour for: {expr}"
+        );
+    }
+}
+
 /// FLET/LABELS may bind a `(setf name)` WRITER, and it must shadow any global
 /// writer of the same name. Clauses were keyed with `sym_name`, which cannot
 /// produce the canonical "(SETF PLACE)" key the store path looks up, so a local
