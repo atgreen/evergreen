@@ -15713,6 +15713,40 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         };
                         // A user SETF-expander (DEFINE-SETF-EXPANDER / DEFSETF)
                         // takes precedence over the built-in place handling below.
+                        // A place whose operator is a LEXICALLY bound macro
+                        // (MACROLET). `get_setf_expansion` already expands such a
+                        // place — which is why `(incf (%m y))` worked — but the
+                        // direct SETF path had no branch for it and fell through
+                        // to "unsupported place" (bliss-vjfz). Delegate to the
+                        // same expansion the updating macros use. Global macros
+                        // are deliberately NOT routed here: they already work
+                        // through the existing branches, and rerouting them would
+                        // change a working path for no reason.
+                        let lexical_macro_place = env.macros.borrow().contains_key(&acc)
+                            || {
+                                let leaf = symbol_leaf_name(&acc);
+                                leaf != acc && env.macros.borrow().contains_key(leaf)
+                            };
+                        if lexical_macro_place {
+                            // Expand the place and SETF the expansion, exactly as
+                            // the symbol-macro place above does. Handing the
+                            // unexpanded form to the expander machinery instead
+                            // makes it look for a `(setf %m)` WRITER, which is not
+                            // what a macro place means.
+                            if let Some(mdef) = lookup_macro(env, &acc) {
+                                bliss_rt::rooted!(expanded =
+                                    expand_macro(&mdef, aargs, env, *place)?);
+                                bliss_rt::rooted!(setf_form = arena_cons(*val_form, NIL));
+                                *setf_form = arena_cons(*expanded, *setf_form);
+                                *setf_form = arena_cons(
+                                    resolve_sym("SETF").unwrap_or(NIL),
+                                    *setf_form,
+                                );
+                                result = eval_form(*setf_form, env)?;
+                                *c = *r2;
+                                continue;
+                            }
+                        }
                         if env.setf_expanders.borrow().contains_key(&acc) {
                             // Hand over the unevaluated FORM when deferred so the
                             // expansion can run the place's subforms first and the

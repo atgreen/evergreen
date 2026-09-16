@@ -3575,6 +3575,84 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// A macro bound by MACROLET is a valid SETF PLACE. The direct SETF path had no
+/// branch for a lexically bound macro place, so it fell through to "unsupported
+/// place" — while the SAME place worked through an updating macro, because
+/// GET-SETF-EXPANSION does expand it (bliss-vjfz). It only showed up in a
+/// COMPILED context; at toplevel it happened to work.
+#[test]
+fn macrolet_defined_places_work_with_setf() {
+    let cases = [
+        // Inside a DEFUN — the context that failed.
+        (
+            "(progn (defun mlp1 () (macrolet ((%m (x) `(car ,x))) \
+                                     (let ((y (list 1 2))) (setf (%m y) 6) y))) \
+               (mlp1))",
+            "(6 2)",
+        ),
+        // Through EVAL — likewise.
+        (
+            "(eval '(macrolet ((%m (x) `(car ,x))) \
+                      (let ((y (list 1 2))) (setf (%m y) 6) y)))",
+            "(6 2)",
+        ),
+        // An inner MACROLET shadows an outer one (ansi MACROLET.3's shape).
+        (
+            "(progn (defun mlp2 () \
+                      (macrolet ((%m (w) `(cadr ,w))) \
+                        (macrolet ((%m (w) `(car ,w))) \
+                          (let ((x (list 1 2))) (setf (%m x) 7) x)))) \
+               (mlp2))",
+            "(7 2)",
+        ),
+        // The place's subforms are evaluated exactly ONCE.
+        (
+            "(progn (defvar *mlp-n* 0) \
+               (defun mlp3 () (macrolet ((%m (x) `(car ,x))) \
+                                (let ((y (list 1 2))) \
+                                  (flet ((g () (incf *mlp-n*) y)) (setf (%m (g)) 9)) \
+                                  (list y *mlp-n*)))) \
+               (mlp3))",
+            "((9 2) 1)",
+        ),
+        // Updating macros through a MACROLET place keep working.
+        (
+            "(progn (defun mlp4 () (macrolet ((%m (x) `(car ,x))) \
+                                     (let ((y (list 1 2))) (incf (%m y) 5) y))) \
+               (mlp4))",
+            "(6 2)",
+        ),
+        // A GLOBAL macro place is deliberately left on its existing path.
+        (
+            "(progn (defmacro gmp (x) `(car ,x)) \
+               (defun mlp5 () (let ((y (list 1 2))) (setf (gmp y) 6) y)) \
+               (mlp5))",
+            "(6 2)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "macrolet place case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "wrong MACROLET place behaviour for: {expr}"
+        );
+    }
+}
+
 /// CLHS 5.1.1.1: a place's subforms are evaluated left to right, then the
 /// new-value form LAST. For a place handled by a USER setf expander the new
 /// value was evaluated FIRST (bliss-gdom), which the ansi DEFSETF.4C test
