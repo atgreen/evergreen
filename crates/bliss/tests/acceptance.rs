@@ -3575,6 +3575,62 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// CLHS 3.4.4: the &ENVIRONMENT parameter is bound BEFORE every other
+/// parameter, wherever it appears in the lambda list, so an &OPTIONAL default
+/// or an &AUX initform may use it. Binding it when the scan reached it left the
+/// variable unbound in those forms (bliss-vjfz / ansi MACROLET.38). Same class
+/// as the &AUX ordering fix in 526745d. Every expectation matches SBCL.
+#[test]
+fn macro_environment_parameter_is_bound_first() {
+    let cases = [
+        // The failing shape: &environment declared AFTER the &optional that uses it.
+        (
+            "(macrolet ((foo () 9)) \
+               (macrolet ((%g (&optional (x (macroexpand '(foo) e)) &environment e) x)) \
+                 (%g)))",
+            "9",
+        ),
+        // ...and in an &aux initform.
+        (
+            "(macrolet ((foo () 10)) \
+               (macrolet ((%g (&aux (x (macroexpand '(foo) e)) &environment e) x)) \
+                 (%g)))",
+            "10",
+        ),
+        // The ordinary trailing position keeps working.
+        (
+            "(macrolet ((foo () 7)) \
+               (macrolet ((%g (&environment e) (macroexpand '(foo) e))) (%g)))",
+            "7",
+        ),
+        // A lambda list with no &environment is unaffected.
+        ("(macrolet ((%g (a) a)) (%g 42))", "42"),
+        // A macro lambda list with ordinary parameters still binds them.
+        ("(macrolet ((%g (a b &environment e) (declare (ignore e)) (+ a b))) (%g 2 3))", "5"),
+    ];
+    for (expr, expected) in cases {
+        let output = bliss_bin()
+            .args(["--eval", &format!("(cl:format t \"~S~%\" {expr})")])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "&environment case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "&environment was not bound first for: {expr}"
+        );
+    }
+}
+
 /// A macro bound by MACROLET is a valid SETF PLACE. The direct SETF path had no
 /// branch for a lexically bound macro place, so it fell through to "unsupported
 /// place" — while the SAME place worked through an updating macro, because

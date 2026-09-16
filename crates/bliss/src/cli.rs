@@ -28092,6 +28092,36 @@ fn bind_macro_lambda_list(
     // initforms stay live across every later allocation and evaluation.
     let mut aux_specs: Vec<(BlissVal, BlissVal)> = Vec::new();
     bliss_rt::rooted_ref!(_aux_specs_root = &mut aux_specs);
+
+    // CLHS 3.4.4: the &ENVIRONMENT parameter is bound BEFORE every other
+    // parameter, wherever it appears in the lambda list — so an &optional
+    // default may use it, as in
+    //   (%f (&optional (x (macroexpand '(foo) env)) &environment env) x)
+    // Binding it when the scan reached it left ENV unbound in that default
+    // (bliss-vjfz / ansi MACROLET.38). Bind it up front here; the &ENVIRONMENT
+    // arm in the scan below rebinds the same value, which is harmless.
+    {
+        let mut scan = params_form;
+        bliss_rt::rooted_ref!(_env_scan_root = &mut scan);
+        while scan.is_cons() {
+            let (marker, rest) = cp(scan);
+            scan = rest;
+            if marker.is_symbol()
+                && symbol_bare_name(&sym_name_rc(marker)) == "&ENVIRONMENT"
+                && scan.is_cons()
+            {
+                let (mut var, _) = cp(scan);
+                bliss_rt::rooted_ref!(_var_root = &mut var);
+                let mut env_value = macroexpand_env
+                    .cloned()
+                    .map(store_macroexpand_environment)
+                    .unwrap_or(NIL);
+                bliss_rt::rooted_ref!(_env_value_root = &mut env_value);
+                bind_pattern_value(var, env_value, env)?;
+                break;
+            }
+        }
+    }
     let mut whole_var: Option<BlissVal> = None;
     bliss_rt::rooted_ref!(_whole_var_root = &mut whole_var);
     let mut whole_form = whole.unwrap_or_else(|| vec_to_list(&args));
