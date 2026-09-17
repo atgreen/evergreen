@@ -1860,6 +1860,17 @@ enum NextMethod {
 #[derive(Clone)]
 struct RestartEntry {
     name: String,
+    /// The BLOCK / TAGBODY exits visible where this restart was ESTABLISHED.
+    /// A restart body runs after unwinding to the establishing construct's
+    /// dynamic extent, so a `(go tag)` in it targets a tag that is lexically
+    /// visible there — which is how CCASE/CTYPECASE/ASSERT retry: their
+    /// STORE-VALUE clause assigns the place and jumps back. The body was running
+    /// with whatever exits the HANDLER had captured (a handler-bind lambda is
+    /// written outside the tagbody, so it has none of them), and the GO failed
+    /// with a PROGRAM-ERROR (ansi CCASE.31 / CTYPECASE.12; bliss-jf2b).
+    /// Mirrors `Closure::captured_blocks` / `captured_tags`.
+    captured_blocks: Vec<(String, String)>,
+    captured_tags: Vec<(String, String)>,
     function: RestartFunction,
     interactive_function: Option<RestartFunction>,
     test_function: Option<RestartFunction>,
@@ -4774,12 +4785,36 @@ fn invoke_restart_function(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    invoke_restart_function_in(function, args, env, None)
+}
+
+/// [`invoke_restart_function`] with the BLOCK/TAGBODY exits visible where the
+/// restart was ESTABLISHED. A restart body runs after unwinding to the
+/// establishing construct, so a `(go tag)` in it targets a tag lexically visible
+/// there — which is how CCASE/CTYPECASE/ASSERT retry: STORE-VALUE assigns the
+/// place and jumps back. Without this the body ran with whatever exits the
+/// HANDLER carried, and a handler-bind lambda is written outside the tagbody, so
+/// the GO signalled a PROGRAM-ERROR (ansi CCASE.31 / CTYPECASE.12; bliss-jf2b).
+fn invoke_restart_function_in(
+    function: &RestartFunction,
+    args: &[BlissVal],
+    env: &mut Env,
+    scope: Option<(&[(String, String)], &[(String, String)])>,
+) -> Result<BlissVal, BlissError> {
     match function {
         RestartFunction::FunctionForm {
             function_form,
             captured_frame,
         } => {
             let mut restart_env = env.child_with_parent(Rc::clone(captured_frame));
+            // Run the body against the exits visible where the restart was
+            // ESTABLISHED, not those the handler happened to carry: a
+            // handler-bind lambda is written outside the tagbody, so its captured
+            // scope has none of the tags a `(go tag)` here needs (bliss-jf2b).
+            if let Some((blocks, tags)) = scope {
+                restart_env.block_stack = blocks.to_vec();
+                restart_env.tag_stack = tags.to_vec();
+            }
             let function = eval_form(*function_form, &mut restart_env)?;
             let r = apply_function(function, args, &mut restart_env)?;
             // The clause body runs in a CHILD env, so a `(values …)` in it set
@@ -4795,7 +4830,19 @@ fn invoke_restart_function(
         } => {
             let function = Rc::new(function.borrow().clone());
             let saved = std::mem::replace(&mut env.frame, Rc::clone(captured_frame));
+            // Same reasoning as the FunctionForm arm: the body's exits are the
+            // ones visible where the restart was established (bliss-jf2b).
+            let saved_scope = scope.map(|(blocks, tags)| {
+                (
+                    std::mem::replace(&mut env.block_stack, blocks.to_vec()),
+                    std::mem::replace(&mut env.tag_stack, tags.to_vec()),
+                )
+            });
             let result = bytecode::run(function, args, NIL, env);
+            if let Some((blocks, tags)) = saved_scope {
+                env.block_stack = blocks;
+                env.tag_stack = tags;
+            }
             env.frame = saved;
             result
         }
@@ -19979,6 +20026,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // signal so a handler can suppress the default warning message.
                 let base_len = env.restarts.len();
                 env.restarts.push(RestartEntry {
+                captured_blocks: env.block_stack.clone(),
+                captured_tags: env.tag_stack.clone(),
                     name: "MUFFLE-WARNING".to_string(),
                     function: RestartFunction::ContinueNil,
                     interactive_function: None,
@@ -20484,7 +20533,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // the clause body, so a body that re-invokes the same name
                         // does not re-find itself (restart-case.12).
                         env.restarts.truncate(restart.group_base);
-                        let result = invoke_restart_function(&restart.function, &args, env)?;
+                        let result = invoke_restart_function_in(
+                            &restart.function,
+                            &args,
+                            env,
+                            Some((&restart.captured_blocks, &restart.captured_tags)),
+                        )?;
                         store_restart_result(&restart_name, result, env);
                         return Err(BlissError::Internal(format!(
                             "__RESTART_INVOKED__:{}",
@@ -20493,7 +20547,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     // RESTART-BIND: the function runs in the dynamic environment of
                     // the INVOKE-RESTART call; no unwinding.
-                    return Ok(invoke_restart_function(&restart.function, &args, env)?);
+                    return Ok(invoke_restart_function_in(
+                        &restart.function,
+                        &args,
+                        env,
+                        Some((&restart.captured_blocks, &restart.captured_tags)),
+                    )?);
                 }
                 return Err(BlissError::ProgramError(format!(
                     "Restart {} not found",
@@ -33202,6 +33261,8 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
             eval_form(report_form, &mut report_env)?
         });
         env.restarts.push(RestartEntry {
+                captured_blocks: env.block_stack.clone(),
+                captured_tags: env.tag_stack.clone(),
             name: sym_name(name_form).to_uppercase(),
             function: RestartFunction::FunctionForm {
                 function_form,
@@ -33318,6 +33379,8 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
             captured_frame: captured_frame.clone(),
         });
         env.restarts.push(RestartEntry {
+                captured_blocks: env.block_stack.clone(),
+                captured_tags: env.tag_stack.clone(),
             name: sym_name(name_form).to_uppercase(),
             function: RestartFunction::FunctionForm {
                 function_form: arena_cons(
@@ -33410,6 +33473,8 @@ fn signal_correctable_package_error(
 
     let base_len = env.restarts.len();
     env.restarts.push(RestartEntry {
+                captured_blocks: env.block_stack.clone(),
+                captured_tags: env.tag_stack.clone(),
         name: "CONTINUE".to_string(),
         function: RestartFunction::ContinueNil,
         interactive_function: None,
@@ -33464,6 +33529,8 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
     let base_len = env.restarts.len();
     env.restarts.push(RestartEntry {
+                captured_blocks: env.block_stack.clone(),
+                captured_tags: env.tag_stack.clone(),
         name: "CONTINUE".to_string(),
         function: RestartFunction::ContinueNil,
         interactive_function: None,
@@ -35219,6 +35286,8 @@ mod env_gc_root_tests {
             .insert("ROOT-METHOD".into(), vec![method(15)]);
 
         env.restarts.push(RestartEntry {
+                captured_blocks: env.block_stack.clone(),
+                captured_tags: env.tag_stack.clone(),
             name: "ROOT-RESTART".into(),
             function: RestartFunction::FunctionForm {
                 function_form: marker(19),

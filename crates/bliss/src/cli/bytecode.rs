@@ -12915,6 +12915,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 for restart in &info.restarts {
                     env.restarts.push(RestartEntry {
                         name: restart.name.clone(),
+                        // The exits visible where this restart is established, so
+                        // a (go tag) in its body reaches the enclosing tagbody
+                        // (bliss-jf2b).
+                        captured_blocks: env.block_stack.clone(),
+                        captured_tags: env.tag_stack.clone(),
                         function: RestartFunction::Bytecode {
                             function: Rc::new(RefCell::new((*restart.function).clone())),
                             captured_frame: Rc::clone(&captured_frame),

@@ -10123,3 +10123,94 @@ fn equalp_compares_arrays_across_element_types() {
         }
     }
 }
+
+/// A restart body runs after unwinding to the establishing construct's dynamic
+/// extent, so a `(go tag)` in it targets a tag that is lexically visible THERE.
+/// That is exactly how the correctable macros retry: CCASE/CTYPECASE/ASSERT's
+/// STORE-VALUE clause assigns the place and jumps back to re-dispatch.
+///
+/// bliss ran the body with whatever exits the HANDLER carried — and a
+/// handler-bind lambda is written outside the tagbody, so it has none of them —
+/// and the GO signalled a PROGRAM-ERROR. RestartEntry now records the exits
+/// visible where the restart was established. ansi CCASE.31 / CTYPECASE.12;
+/// bliss-jf2b.
+///
+/// The restart mechanism itself was never broken, which is what made this look
+/// like a missing restart at first: plain RESTART-CASE + INVOKE-RESTART works,
+/// and so does a restart body that simply returns a value. Only the GO failed.
+#[test]
+fn a_restart_body_can_go_to_its_establishing_tagbody() {
+    let cases = [
+        // ansi CCASE.31: STORE-VALUE supplies a matching key and the CCASE retries.
+        (
+            "(handler-bind ((type-error (lambda (c) (store-value 7 c)))) \
+               (let ((x 0)) (ccase x (1 :bad) (7 :good) (2 nil))))",
+            ":GOOD",
+        ),
+        // ansi CTYPECASE.12, same shape through a type dispatch.
+        (
+            "(let ((x 1)) (handler-bind ((type-error (lambda (c) (store-value 'a c)))) \
+               (ctypecase x (symbol x))))",
+            "A",
+        ),
+        // The underlying shape, isolated: a GO out of a restart body.
+        (
+            "(let ((n 0)) \
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart 'r 7)))) \
+                 (block nil (tagbody top \
+                   (return (if (> n 0) :good \
+                               (restart-case (error \"x\") (r (v) (setq n v) (go top)))))))))",
+            ":GOOD",
+        ),
+        // A restart body that just returns a value still works.
+        (
+            "(handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart 'r 7)))) \
+               (block nil (tagbody top (return (restart-case (error \"x\") (r (v) v))))))",
+            "7",
+        ),
+        // The general restart machinery is unchanged.
+        (
+            "(restart-case (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart 'my-r 5)))) \
+               (error \"boom\")) (my-r (v) v))",
+            "5",
+        ),
+        (
+            "(restart-case (handler-bind ((error (lambda (c) (invoke-restart (find-restart 'my-r c) 5)))) \
+               (error \"boom\")) (my-r (v) v))",
+            "5",
+        ),
+        (
+            "(restart-case (handler-bind ((error (lambda (c) (declare (ignore c)) (continue)))) \
+               (error \"boom\")) (continue () :continued))",
+            ":CONTINUED",
+        ),
+        // A normal CCASE hit does not go near the restart.
+        ("(let ((x 7)) (ccase x (1 :bad) (7 :good)))", ":GOOD"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
