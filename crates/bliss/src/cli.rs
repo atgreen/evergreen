@@ -1701,6 +1701,13 @@ enum SetfExpander {
         lambda_list: BlissVal,
         store_vars: BlissVal,
         body: BlissVal,
+        /// The frame the DEFSETF appeared in. CLHS: the long form's expander is
+        /// defined in that lexical environment, so its body may close over the
+        /// surrounding bindings — `(let ((z 'car)) (defsetf f (y) (v) `(setf
+        /// (,z ,y) ,v)))` must see Z. Evaluating the body in the CALLER's
+        /// environment instead made Z unbound (ansi DEFSETF.6A; bliss-30i6).
+        /// MacroDef captures `captured_frame` for the same reason.
+        captured_frame: Rc<RefCell<EnvFrame>>,
     },
 }
 
@@ -5745,7 +5752,9 @@ fn visit_setf_expander_roots(
             lambda_list,
             store_vars,
             body,
+            captured_frame,
         } => {
+            visit_env_frame_roots(captured_frame, state, visit);
             visit(lambda_list);
             visit(store_vars);
             visit(body);
@@ -29045,6 +29054,7 @@ fn eval_defsetf_long(
             lambda_list,
             store_vars,
             body,
+            captured_frame: Rc::clone(&env.frame),
         },
     );
     Ok(name_form)
@@ -29264,6 +29274,7 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                     lambda_list,
                     store_vars,
                     body,
+                    captured_frame,
                 } => {
                     // CLHS 5.5.5: the body is macro-like and yields the STORE
                     // FORM. Bind its arg lambda list to the place's TEMPORARIES
@@ -29290,7 +29301,11 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                         stores.push(g);
                     }
 
-                    let mut child = env.child();
+                    // Run the expander in the environment the DEFSETF appeared
+                    // in, so its body can close over the surrounding bindings
+                    // (bliss-30i6). `child_with_parent` keeps the caller's
+                    // definitional registries while reparenting the lexical frame.
+                    let mut child = env.child_with_parent(Rc::clone(&captured_frame));
                     bliss_rt::rooted_ref!(_child_root = &mut child);
                     bind_macro_lambda_list(*lambda_list, &temps, &mut child, None, Some(place), None)?;
                     for (name, store) in store_names.iter().zip(stores.iter()) {
@@ -29500,17 +29515,25 @@ fn apply_setf_expansion(
         // AFTER the subforms. The only extra bindings in scope are the
         // expansion's temporaries, which are uninterned gensyms and so cannot
         // capture anything the value form refers to.
-        let new_value = match new_value {
-            SetfNewValue::Value(v) => v,
-            SetfNewValue::Form(form) => eval_form(form, env)?,
+        // A place whose expansion declares SEVERAL store variables takes them
+        // from the value form's MULTIPLE VALUES (CLHS 5.5.5). Binding only the
+        // first left the rest unbound, so the expansion referenced a gensym
+        // nothing had bound (ansi DEFSETF.7A; bliss-669r).
+        let (new_value, values) = match new_value {
+            SetfNewValue::Value(v) => (v, vec![v]),
+            SetfNewValue::Form(form) => eval_form_collecting_values(form, env)?,
         };
-        if let Some(store) = ex.stores.first() {
+        for (index, store) in ex.stores.iter().enumerate() {
             if store.is_symbol() {
-                env.define_local_symbol(*store, new_value);
+                env.define_local_symbol(*store, values.get(index).copied().unwrap_or(NIL));
             }
         }
-        eval_form(ex.store_form, env)?;
-        Ok(new_value)
+        let stored = eval_form(ex.store_form, env)?;
+        // The STORE FORM's value, not the primary new value: with several store
+        // variables there is no single "the" new value, and for the ordinary
+        // one-variable case the store form yields that value anyway. Matches SBCL
+        // on both shapes.
+        Ok(if ex.stores.len() > 1 { stored } else { new_value })
     })
 }
 

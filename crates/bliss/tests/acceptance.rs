@@ -9484,3 +9484,94 @@ fn define_modify_macro_evaluates_place_subforms_once() {
         }
     }
 }
+
+/// Two independent long-form DEFSETF gaps, both reproducing on both backends.
+///
+/// The expander must be defined in the LEXICAL environment the DEFSETF appears
+/// in — the ansi test file says so in a comment — so its body may close over the
+/// surrounding bindings. SetfExpander::LongUpdate stored no environment and the
+/// body ran in the CALLER's, leaving such a reference unbound (DEFSETF.6A,
+/// bliss-30i6). MacroDef already captured a frame for the same reason.
+///
+/// And a place whose expansion declares SEVERAL store variables takes them from
+/// the value form's MULTIPLE VALUES (CLHS 5.5.5). Only the first was bound, so
+/// the expansion referenced a gensym nothing had bound (DEFSETF.7A, bliss-669r).
+#[test]
+fn long_form_defsetf_environment_and_multiple_store_variables() {
+    let cases = [
+        // 6A: the expander closes over Z from its defining LET.
+        (
+            "(progn (defun dsf-a (x) (car x)) \
+               (let ((z 'car)) (eval `(defsetf dsf-a (y) (val) (list 'setf (list ',z y) val)))) \
+               (let ((x (cons 'a 'b))) (list (setf (dsf-a x) 'c) x)))",
+            "(C (C . B))",
+        ),
+        // 7B: two store variables, fed from the value form's two values.
+        (
+            "(progn (eval '(defsetf dsf-b (x) (v1 v2) `(list ,x ,v1 ,v2))) \
+               (eval '(setf (dsf-b 1) (values 2 3))))",
+            "(1 2 3)",
+        ),
+        // ...and a missing second value fills with NIL rather than erroring.
+        (
+            "(progn (eval '(defsetf dsf-c (x) (v1 v2) `(list ,x ,v1 ,v2))) \
+               (eval '(setf (dsf-c 1) (values 2))))",
+            "(1 2 NIL)",
+        ),
+        // The ordinary shapes must keep working: long form, short form, the
+        // implicit block, INCF over a long-form place, and subform-once order.
+        (
+            "(progn (defun dsf-d (x) (car x)) (defsetf dsf-d (y) (val) `(setf (car ,y) ,val)) \
+               (let ((x (cons 1 2))) (list (setf (dsf-d x) 9) x)))",
+            "(9 (9 . 2))",
+        ),
+        (
+            "(progn (defun dsf-e (x) (car x)) (defun dsf-e-set (x v) (setf (car x) v) v) \
+               (defsetf dsf-e dsf-e-set) (let ((x (cons 1 2))) (list (setf (dsf-e x) 9) x)))",
+            "(9 (9 . 2))",
+        ),
+        (
+            "(progn (defun dsf-f (x) (car x)) \
+               (defsetf dsf-f (y) (val) (return-from dsf-f `(setf (car ,y) ,val))) \
+               (let ((x (cons 1 2))) (list (setf (dsf-f x) 9) x)))",
+            "(9 (9 . 2))",
+        ),
+        (
+            "(progn (defun dsf-g (x) (car x)) (defsetf dsf-g (y) (val) `(setf (car ,y) ,val)) \
+               (let ((x (cons 1 2))) (incf (dsf-g x)) x))",
+            "(2 . 2)",
+        ),
+        (
+            "(progn (defun dsf-h (v i) (aref v i)) \
+               (defsetf dsf-h (v i) (val) `(setf (aref ,v ,i) ,val)) \
+               (let ((v (vector 0 0 0)) (i 0)) (setf (dsf-h v (incf i)) 7) (list v i)))",
+            "(#(0 7 0) 1)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
