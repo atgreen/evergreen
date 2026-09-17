@@ -2365,8 +2365,10 @@ impl<'e> Lowerer<'e> {
             Ok(expanded) => expanded,
             Err(_) => return Err(record_bail(|| "macroexpand:macrolet".to_string())),
         };
+        // Rooted across the lowering below, which allocates (moving GC).
+        bliss_rt::rooted!(expanded = expanded);
         self.push_declared_special(&decl_special);
-        let lowered = self.lower_expr(expanded);
+        let lowered = self.lower_expr(*expanded);
         self.pop_declared_special(&decl_special);
         lowered
     }

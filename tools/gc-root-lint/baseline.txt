@@ -4,5 +4,9 @@ crates/bliss/src/cli.rs:eval_handler_case:result
 crates/bliss/src/cli.rs:eval_restart_case:result
 crates/bliss/src/cli.rs:eval_tagbody:result
 crates/bliss/src/cli/bytecode.rs:c2i_eval_form_with_frame:result
+# lower_macrolet:decl_special is a HashSet<String> of declared-special NAMES --
+# it holds no BlissVal, so a collection cannot make it stale. The lint keys on
+# the variable name and cannot see the type (bliss-vmge).
+crates/bliss/src/cli/bytecode.rs:lower_macrolet:decl_special
 crates/bliss/src/cli/bytecode.rs:lower_flet:is_capturing
 crates/bliss/src/cli/bytecode.rs:lower_function:captured

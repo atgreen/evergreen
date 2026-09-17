@@ -10429,3 +10429,75 @@ fn psetq_behaves_as_psetf_for_symbol_macros() {
         }
     }
 }
+
+/// CLHS DEFINE-SETF-EXPANDER: the body is enclosed in an implicit BLOCK named
+/// after the ACCESS-FN, so `(return-from access-fn …)` exits the expander — the
+/// same block DEFUN, DEFMACRO and long-form DEFSETF establish. bliss established
+/// none, so such a body signalled CONTROL-ERROR.
+///
+/// The same gap bliss-ye6f fixed for DEFSETF, one construct over. An expander
+/// that does not return early was unaffected, which is why only the ansi test
+/// using RETURN-FROM caught it. ansi DEFINE-SETF-EXPANDER.5; bliss-0f76.
+#[test]
+fn define_setf_expander_body_has_an_implicit_block() {
+    let cases = [
+        // RETURN-FROM the access-fn exits the expander with its five values.
+        (
+            "(progn (defun dsx-a (x) (car x)) \
+               (define-setf-expander dsx-a (x) \
+                 (let ((s (gensym)) (tmp (gensym))) \
+                   (return-from dsx-a \
+                     (values (list tmp) (list x) (list s) \
+                             `(setf (car ,tmp) ,s) `(car ,tmp))))) \
+               (let ((c (cons 1 2))) (list (setf (dsx-a c) 9) c)))",
+            "(9 (9 . 2))",
+        ),
+        // An expander that simply returns its values is unaffected.
+        (
+            "(progn (defun dsx-b (x) (car x)) \
+               (define-setf-expander dsx-b (x) \
+                 (let ((s (gensym)) (tmp (gensym))) \
+                   (values (list tmp) (list x) (list s) \
+                           `(setf (car ,tmp) ,s) `(car ,tmp)))) \
+               (let ((c (cons 1 2))) (list (setf (dsx-b c) 9) c)))",
+            "(9 (9 . 2))",
+        ),
+        // The expander also drives the updating macros.
+        (
+            "(progn (defun dsx-c (x) (car x)) \
+               (define-setf-expander dsx-c (x) \
+                 (let ((s (gensym)) (tmp (gensym))) \
+                   (return-from dsx-c \
+                     (values (list tmp) (list x) (list s) \
+                             `(setf (car ,tmp) ,s) `(car ,tmp))))) \
+               (let ((c (cons 1 2))) (incf (dsx-c c)) c))",
+            "(2 . 2)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

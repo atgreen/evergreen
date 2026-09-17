@@ -29243,14 +29243,31 @@ fn eval_define_setf_expander(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, B
     // (define-setf-expander access-fn lambda-list . body) — register a macro-like
     // expander keyed by ACCESS-FN. It is called with the place's subforms and
     // returns the five setf-expansion values.
-    let (name_form, rest) = cp(cdr);
-    let (params_form, body) = cp(rest);
+    let (mut name_form, rest) = cp(cdr);
+    let (mut params_form, mut body) = cp(rest);
+    // The wrap below allocates, so keep the source pieces precise across it
+    // (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_name_root = &mut name_form);
+    bliss_rt::rooted_ref!(_params_root = &mut params_form);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
+    // CLHS: the body is enclosed in an implicit BLOCK named after the ACCESS-FN,
+    // so RETURN-FROM that name exits the expander — the same block DEFUN,
+    // DEFMACRO and long-form DEFSETF establish. Without it such a body signalled
+    // CONTROL-ERROR (ansi DEFINE-SETF-EXPANDER.5; bliss-0f76, the same gap
+    // bliss-ye6f fixed for DEFSETF). Wrapped once here, at registration, rather
+    // than on every expansion.
+    //
+    // `resolve_sym` runs before the rooted partial list is re-read, so the
+    // interning it may do cannot leave a stale copy behind.
+    bliss_rt::rooted!(block_body = arena_cons(name_form, body));
+    bliss_rt::rooted!(block_form = arena_cons(resolve_sym("BLOCK").unwrap_or(NIL), *block_body));
+    bliss_rt::rooted!(wrapped_body = arena_cons(*block_form, NIL));
     let name = sym_name(name_form);
     env.setf_expanders.borrow_mut().insert(
         name,
         SetfExpander::Expander(MacroDef {
             params_form,
-            body,
+            body: *wrapped_body,
             captured_frame: Rc::clone(&env.frame),
             bytecode: None,
             function: None,
