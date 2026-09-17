@@ -9416,3 +9416,71 @@ fn an_escaped_local_function_keeps_its_function_namespace() {
         }
     }
 }
+
+/// DEFINE-MODIFY-MACRO expanded to `(setf PLACE (fn PLACE args…))`, putting the
+/// place in TWICE — once for the read and once for the write — so its subforms
+/// were evaluated twice and any side effect ran twice:
+///
+///     (define-modify-macro new-incf (&optional (delta 1)) +)
+///     (let ((a (vector 0 0 0 0 0)) (i 1)) (new-incf (aref a (incf i))) i)
+///       =>  3, must be 2
+///
+/// The stored value was correct, so this was a silent wrong answer rather than
+/// an error. The expansion now goes through GET-SETF-EXPANSION and binds the
+/// temporaries first, which also gives CLHS 5.1.1.1's order: place subforms left
+/// to right, then the argument forms. ansi DEFINE-MODIFY-MACRO.3/4; bliss-v8f3.
+#[test]
+fn define_modify_macro_evaluates_place_subforms_once() {
+    let setup = "(progn (define-modify-macro dmm-incf (&optional (delta 1)) +) \
+                        (define-modify-macro dmm-app (&rest xs) append))";
+    let cases = [
+        // The ansi cases: I must advance once per mention, not twice.
+        (
+            "(let ((a (vector 0 0 0 0 0)) (i 1)) (list (dmm-incf (aref a (incf i))) a i))",
+            "(1 #(0 0 1 0 0) 2)",
+        ),
+        (
+            "(let ((a (vector 0 0 0 0 0)) (i 1)) (list (dmm-incf (aref a (incf i)) (incf i)) a i))",
+            "(3 #(0 0 3 0 0) 3)",
+        ),
+        // Ordinary uses keep working: symbol place, explicit argument, &rest.
+        ("(let ((x 5)) (dmm-incf x) x)", "6"),
+        ("(let ((x 5)) (dmm-incf x 3) x)", "8"),
+        ("(let ((x (list 1))) (dmm-app x (list 2) (list 3)) x)", "(1 2 3)"),
+        // The built-in modify macros share this machinery and must also evaluate
+        // a place subform exactly once.
+        ("(let ((a (vector 0 0 0)) (i 0)) (incf (aref a (incf i))) (list a i))", "(#(0 1 0) 1)"),
+        ("(let ((a (vector 5 5 5)) (i 0)) (decf (aref a (incf i))) (list a i))", "(#(5 4 5) 1)"),
+        ("(let ((a (vector nil nil nil)) (i 0)) (push 9 (aref a (incf i))) (list a i))", "(#(NIL (9) NIL) 1)"),
+        ("(let ((a (vector nil nil nil)) (i 0)) (pushnew 9 (aref a (incf i))) (list a i))", "(#(NIL (9) NIL) 1)"),
+        // Other place kinds still store correctly.
+        ("(let ((pl (list :a 1))) (incf (getf pl :a)) pl)", "(:A 2)"),
+        ("(let ((c (cons 1 2))) (incf (car c)) c)", "(2 . 2)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(progn {setup} (cl:format t \"~S~%\" {form}))")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

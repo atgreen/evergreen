@@ -261,18 +261,40 @@
 ;; LAMBDA-LIST, which covers the standard uses (appendf, etc.).
 (defmacro define-modify-macro (name lambda-list function &rest doc)
   (declare (ignore doc))
-  (let ((vars '()) (rest-var nil) (mode :req) (place (gensym)))
+  ;; The generated macro must expand through GET-SETF-EXPANSION, not simply put
+  ;; the place in twice as `(setf PLACE (fn PLACE args...))`. That older form
+  ;; evaluated the place's SUBFORMS twice -- once for the read and once for the
+  ;; write -- so any subform with a side effect ran twice:
+  ;;   (new-incf (aref a (incf i)))  incremented I twice (ansi
+  ;;   DEFINE-MODIFY-MACRO.3/4; bliss-v8f3). The stored value was right, so it
+  ;;   was a silent wrong answer rather than an error.
+  ;; CLHS 5.1.1.1: the subforms are evaluated once, left to right, before the
+  ;; argument forms. Binding the expansion's temporaries first gives exactly
+  ;; that order.
+  (let ((vars '()) (rest-var nil) (mode :req)
+        (place (gensym "PLACE")) (env (gensym "ENV"))
+        ;; Gensyms, not plain symbols: these are bound inside the GENERATED
+        ;; macro's body, where a user lambda-list variable of the same name
+        ;; would otherwise shadow them.
+        (temps (gensym "TEMPS")) (vals (gensym "VALS")) (stores (gensym "STORES"))
+        (store-form (gensym "STORE")) (access (gensym "ACCESS")))
     (dolist (item lambda-list)
       (cond ((eq item '&rest) (setq mode :rest))
             ((eq item '&optional) (setq mode :opt))
             ((eq mode :rest) (setq rest-var item))
             (t (push (if (consp item) (car item) item) vars))))
     (setq vars (reverse vars))
-    `(defmacro ,name (,place ,@lambda-list)
-       (list 'setf ,place
-             (cons ',function
-                   (cons ,place
-                         (append (list ,@vars) ,(or rest-var 'nil))))))))
+    `(defmacro ,name (,place ,@lambda-list &environment ,env)
+       (multiple-value-bind (,temps ,vals ,stores ,store-form ,access)
+           (get-setf-expansion ,place ,env)
+         (list 'let*
+               (append (mapcar #'list ,temps ,vals)
+                       (list (list (car ,stores)
+                                   (cons ',function
+                                         (cons ,access
+                                               (append (list ,@vars)
+                                                       ,(or rest-var 'nil)))))))
+               ,store-form)))))
 
 
 ;;; ---------------------------------------------------------------------------
