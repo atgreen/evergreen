@@ -2854,19 +2854,30 @@
 (defmacro psetf (&rest pairs &environment env)
   (let ((binds nil) (assigns nil) (p pairs))
     (loop while (consp (cdr p)) do
-      (multiple-value-bind (dummies vals newvars setter getter)
-          (get-setf-expansion (macroexpand (car p) env) env)
-        (declare (ignore newvars setter))
-        (do ((d dummies (cdr d)) (v vals (cdr v)))
-            ((null d))
-          (push (list (car d) (car v)) binds))
-        (let ((vtemp (gensym)))
-          (push (list vtemp (cadr p)) binds)
+      ;; Via %SETF-EXPANSIONS, not GET-SETF-EXPANSION directly: a nested (VALUES
+      ;; …) place needs its sub-places kept as places rather than lifted into
+      ;; temporaries, which is what that helper exists to do. Calling
+      ;; GET-SETF-EXPANSION here stored into the lifted temporaries and left the
+      ;; real places untouched, so `(psetf (values a b c) (values 1 2 3))`
+      ;; assigned nothing at all (ansi PSETF.41; bliss-hsn7).
+      (multiple-value-bind (place-binds place-getters)
+          (%setf-expansions (list (car p)) env)
+        (dolist (b place-binds) (push b binds))
+        (let ((getter (car place-getters))
+              (vtemp (gensym)))
           ;; Store through the ACCESS form: it mentions only the temporaries, so
           ;; nothing is re-evaluated, and SETF handles every accessor. The
           ;; expansion's own store form now takes the same route for built-in
           ;; places (bliss-42iv).
-          (push (list 'setf getter vtemp) assigns)))
+          (if (%values-place-p getter)
+              ;; A VALUES place consumes SEVERAL values, but a LET* binding keeps
+              ;; only the primary — round-trip them through a list so all of them
+              ;; reach the places (CLHS 5.5.5). Only for VALUES places, so the
+              ;; ordinary single-value case costs nothing extra.
+              (progn (push (list vtemp (list 'multiple-value-list (cadr p))) binds)
+                     (push (list 'setf getter (list 'values-list vtemp)) assigns))
+              (progn (push (list vtemp (cadr p)) binds)
+                     (push (list 'setf getter vtemp) assigns)))))
       (setq p (cddr p)))
     `(let* ,(reverse binds) ,@(reverse assigns) nil)))
 
@@ -2890,6 +2901,11 @@
 ;; temporaries, so nothing is re-evaluated, and SETF's place machinery handles
 ;; every standard accessor. GET-SETF-EXPANSION's own store form now uses this
 ;; same representation for built-in places (bliss-42iv).
+;; True for an access form that denotes several places at once, so it consumes
+;; (and yields) MULTIPLE VALUES rather than one (bliss-hsn7).
+(defun %values-place-p (getter)
+  (and (consp getter) (eq (car getter) 'values)))
+
 (defun %setf-expansions (places env)
   (let ((binds nil) (getters nil))
     (dolist (raw places)
@@ -2921,14 +2937,24 @@
       nil
       (multiple-value-bind (binds getters)
           (%setf-expansions places env)
-        (let ((vals (mapcar (lambda (g) (declare (ignore g)) (gensym)) getters)))
+        (let* ((vals (mapcar (lambda (g) (declare (ignore g)) (gensym)) getters))
+               (sources (append (cdr getters) (list (car getters)))))
           ;; Read EVERY place (into VALS) before writing any of them — that is
-          ;; what makes the rotate work rather than propagating one value.
+          ;; what makes the rotate work rather than propagating one value. A
+          ;; VALUES place reads and writes SEVERAL values, and a LET* binding
+          ;; keeps only the primary, so those round-trip through a list
+          ;; (bliss-hsn7).
           `(let* (,@binds
-                  ,@(mapcar (function list)
-                            vals
-                            (append (cdr getters) (list (car getters)))))
-             ,@(mapcar (lambda (g v) (list 'setf g v)) getters vals)
+                  ,@(mapcar (lambda (v src)
+                              (list v (if (%values-place-p src)
+                                          (list 'multiple-value-list src)
+                                          src)))
+                            vals sources))
+             ,@(mapcar (lambda (g v)
+                         (list 'setf g (if (%values-place-p g)
+                                           (list 'values-list v)
+                                           v)))
+                       getters vals)
              nil)))))
 
 ;; (setf (values p1 … pn) form) — CLHS 5.1.2.3. The SUBFORMS of every place are

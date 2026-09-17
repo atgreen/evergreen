@@ -9575,3 +9575,73 @@ fn long_form_defsetf_environment_and_multiple_store_variables() {
         }
     }
 }
+
+/// PSETF and ROTATEF assumed ONE store variable per place, so a `(values …)`
+/// place — whose expansion declares one per sub-place — kept only the primary:
+///
+///     (psetf (values a b c) (values 1 2 3))   stored nothing at all
+///     (rotatef (values a b) (values c d))     gave (3 NIL 1 NIL), not (3 4 1 2)
+///
+/// Two causes. PSETF called GET-SETF-EXPANSION directly, which treats VALUES as
+/// an ordinary accessor and lifts its sub-places into temporaries, so the stores
+/// landed in the temporaries; it now goes through %SETF-EXPANSIONS, which keeps
+/// them as places. And a LET* binding keeps only the primary value, so a VALUES
+/// place's values now round-trip through a list — only for VALUES places, so the
+/// ordinary single-value path is unchanged. ansi PSETF.41; bliss-hsn7.
+#[test]
+fn psetf_and_rotatef_handle_values_places() {
+    let cases = [
+        // ansi PSETF.41: two VALUES places, both fed from multiple values.
+        (
+            "(let ((y 2) (z 3) u x a b c) \
+               (psetf (values a b c) (values 1 2 3) (values u x) (values y z)) (list a b c u x))",
+            "(1 2 3 2 3)",
+        ),
+        // ROTATEF across VALUES places, two-way and three-way.
+        ("(let ((a 1) (b 2) (c 3) (d 4)) (rotatef (values a b) (values c d)) (list a b c d))", "(3 4 1 2)"),
+        (
+            "(let ((a 1) (b 2) (c 3) (d 4) (e 5) (f 6)) \
+               (rotatef (values a b) (values c d) (values e f)) (list a b c d e f))",
+            "(3 4 5 6 1 2)",
+        ),
+        // Plain uses unchanged: PSETF is parallel, ROTATEF rotates.
+        ("(let ((a 1) (b 2)) (psetf a b b a) (list a b))", "(2 1)"),
+        ("(let ((a 1) (b 2) (c 3)) (psetf a b b c c a) (list a b c))", "(2 3 1)"),
+        ("(let ((a 1) (b 2) (c 3)) (rotatef a b c) (list a b c))", "(2 3 1)"),
+        // Other place kinds still store, and still evaluate a subform once.
+        ("(let ((v (vector 1 2 3))) (psetf (aref v 0) 9 (aref v 1) 8) v)", "#(9 8 3)"),
+        ("(let ((v (vector 0 0 0)) (i 0)) (psetf (aref v (incf i)) 7) (list v i))", "(#(0 7 0) 1)"),
+        ("(let ((v (vector 1 2 3))) (rotatef (aref v 0) (aref v 2)) v)", "#(3 2 1)"),
+        ("(let ((v (vector 1 2 3)) (i 0)) (rotatef (aref v (incf i)) (aref v 0)) (list v i))", "(#(2 1 3) 1)"),
+        ("(let ((pl (list :a 1 :b 2))) (psetf (getf pl :a) 9 (getf pl :b) 8) pl)", "(:A 9 :B 8)"),
+        // SHIFTF and nested VALUES places share the helper; must not regress.
+        ("(let ((a 1) (b 2)) (list (shiftf a b 9) a b))", "(1 2 9)"),
+        ("(let (a b c) (setf (values a (values b c)) (values 1 2 3)) (list a b c))", "(1 2 NIL)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
