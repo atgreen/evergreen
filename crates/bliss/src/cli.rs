@@ -28313,6 +28313,14 @@ fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, 
                 }
                 _ => fbody,
             };
+            // FLET/LABELS functions and MACROLET macros share ONE lexical
+            // namespace, so the INNERMOST binding of a name wins. bliss keeps
+            // them in two maps with no ordering between them, so shadowing is
+            // modelled at BINDING time: binding a function here drops any lexical
+            // MACRO of that name, and eval_macrolet does the converse. Without
+            // it `(macrolet ((%f () :bad)) (flet ((%f () :good)) (%f)))` expanded
+            // the outer macro (ansi MACROLET.37; bliss-9pqw).
+            child_env.macros_mut().remove(&name);
             child_env.funs_mut().insert(
                 name,
                 FunDef {
@@ -30766,6 +30774,9 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         bliss_rt::rooted_ref!(_params_root = &mut params_form);
         bliss_rt::rooted_ref!(_macro_body_root = &mut macro_body);
         let name = sym_name(name_form);
+        // The converse of eval_flet's removal: an inner MACROLET shadows an outer
+        // FLET/LABELS binding of the same name (bliss-9pqw).
+        child_env.funs_mut().remove(&name);
         child_env.macros_mut().insert(
             name,
             MacroDef {

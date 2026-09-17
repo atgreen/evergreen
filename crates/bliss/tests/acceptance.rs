@@ -10696,3 +10696,57 @@ fn a_lexical_binding_shadows_a_global_macro() {
         }
     }
 }
+
+/// FLET/LABELS functions and MACROLET macros share ONE lexical namespace, so the
+/// INNERMOST binding of a name wins:
+///
+///     (macrolet ((%f () :bad)) (flet ((%f () :good)) (%f)))   =>  :BAD, must be :GOOD
+///
+/// bliss keeps the two in separate maps with no ordering between them, so
+/// whichever was consulted first won regardless of nesting. Shadowing is now
+/// modelled at BINDING time — binding a function drops any lexical macro of that
+/// name and vice versa — so "innermost wins" falls out of the maps and the lookup
+/// order stops mattering. ansi MACROLET.37; bliss-9pqw.
+#[test]
+fn the_innermost_lexical_binding_wins() {
+    let cases = [
+        // Either nesting: the inner one wins.
+        ("(macrolet ((%f () :bad)) (flet ((%f () :good)) (%f)))", ":GOOD"),
+        ("(macrolet ((%f () :bad)) (labels ((%f () :good)) (%f)))", ":GOOD"),
+        ("(flet ((%g () :bad)) (macrolet ((%g () :good)) (%g)))", ":GOOD"),
+        // The outer binding applies again outside the inner one.
+        ("(macrolet ((%h () :outer)) (list (flet ((%h () :inner)) (%h)) (%h)))", "(:INNER :OUTER)"),
+        ("(flet ((%i () :outer)) (list (macrolet ((%i () :inner)) (%i)) (%i)))", "(:INNER :OUTER)"),
+        // And both still shadow their global counterparts (bliss-k2ia).
+        ("(progn (defmacro tilb-a () :bad) (flet ((tilb-a () :good)) (tilb-a)))", ":GOOD"),
+        ("(progn (defun tilb-b () :bad) (macrolet ((tilb-b () :good)) (tilb-b)))", ":GOOD"),
+        // Ordinary nesting of distinct names is unaffected.
+        ("(macrolet ((%m (x) `(list ,x))) (flet ((%n (y) (* y 2))) (%m (%n 3))))", "(6)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
