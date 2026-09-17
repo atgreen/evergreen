@@ -9923,3 +9923,68 @@ fn sharp_quote_of_a_setf_name_is_a_function_object() {
         }
     }
 }
+
+/// CLHS 3.1.2.1.2.2: a SYMBOL used as a function DESIGNATOR denotes the symbol's
+/// GLOBAL function. FLET/LABELS bindings are lexical and reachable only through
+/// `#'name`, so `(funcall 'f …)` calls the global even when a local `f` is in
+/// scope. The tree-walker resolved the designator through the lexical map:
+///
+///     (defun xc (x y) (cons x y))
+///     (flet ((xc (x y) (list y x))) (funcall 'xc 1 2))
+///       =>  (2 1), must be (1 . 2)
+///
+/// The bytecode backend was already right — another single-backend divergence,
+/// where the bare form passes and only `(eval '…)` fails. SYMBOL-FUNCTION and
+/// FDEFINITION name the global definition for the same reason and had the same
+/// gap. ansi FUNCALL.7; bliss-c1dr.
+///
+/// Operator position is the opposite rule and must NOT change, so it is pinned
+/// here: `(flet ((xc …)) (xc 1 2))` and `#'xc` both call the LOCAL.
+#[test]
+fn a_symbol_designator_denotes_the_global_function() {
+    let setup = "(defun sdg (x y) (cons x y))";
+    let cases = [
+        // Designators see the global...
+        ("(flet ((sdg (x y) (list y x))) (funcall 'sdg 1 2))", "(1 . 2)"),
+        ("(flet ((sdg (x y) (list y x))) (apply 'sdg '(1 2)))", "(1 . 2)"),
+        ("(labels ((sdg (x y) (list y x))) (funcall 'sdg 1 2))", "(1 . 2)"),
+        ("(flet ((sdg (x y) (list y x))) (funcall (symbol-function 'sdg) 1 2))", "(1 . 2)"),
+        ("(flet ((sdg (x y) (list y x))) (funcall (fdefinition 'sdg) 1 2))", "(1 . 2)"),
+        ("(flet ((sdg (x y) (list y x))) (car (mapcar 'sdg '(1) '(2))))", "(1 . 2)"),
+        // ...while operator position and #' see the LOCAL.
+        ("(flet ((sdg (x y) (list y x))) (sdg 1 2))", "(2 1)"),
+        ("(flet ((sdg (x y) (list y x))) (funcall #'sdg 1 2))", "(2 1)"),
+        ("(flet ((sdg (x y) (list y x))) (car (mapcar #'sdg '(1) '(2))))", "(2 1)"),
+        // Recursion through LABELS still resolves to the local.
+        ("(labels ((f (n) (if (<= n 1) 1 (* n (f (- n 1)))))) (f 5))", "120"),
+        // With no local in scope, all spellings agree.
+        ("(funcall 'sdg 1 2)", "(1 . 2)"),
+        ("(funcall #'sdg 1 2)", "(1 . 2)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(progn {setup} (cl:format t \"~S~%\" {form}))")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

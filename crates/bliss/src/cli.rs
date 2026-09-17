@@ -1280,6 +1280,21 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
 /// [`callable_body`] for a call whose callee is a SYMBOL: identical resolution
 /// order, but the global-function step is reached from the symbol's registry
 /// INDEX instead of re-hashing its name.
+/// [`callable_body_of_symbol`] for a symbol used as a FUNCTION DESIGNATOR rather
+/// than in operator position. CLHS 3.1.2.1.2.2: a symbol designator denotes the
+/// symbol's GLOBAL function, so an enclosing FLET/LABELS binding of that name is
+/// NOT consulted — `(flet ((f …)) (funcall 'f …))` calls the global f, while
+/// `(flet ((f …)) (f …))` and `#'f` call the local one (ansi FUNCALL.7;
+/// bliss-c1dr).
+fn global_callable_body_of_symbol(
+    env: &Env,
+    sym: BlissVal,
+    name: &str,
+) -> Option<(BlissVal, BlissVal)> {
+    let sym_idx = (sym.is_symbol() && sym != NIL && sym != T).then(|| sym.as_symbol_index());
+    callable_body_inner_ex(env, name, sym_idx, true)
+}
+
 fn callable_body_of_symbol(env: &Env, sym: BlissVal, name: &str) -> Option<(BlissVal, BlissVal)> {
     // NIL and T report is_symbol() true but carry the SPECIAL tag, not TAG_SYMBOL,
     // so as_symbol_index() would panic; they never name an interpreted function,
@@ -1309,7 +1324,20 @@ fn callable_body_inner(
     name: &str,
     sym_idx: Option<u32>,
 ) -> Option<(BlissVal, BlissVal)> {
-    if let Some(fdef) = env.funs.borrow().get(name) {
+    callable_body_inner_ex(env, name, sym_idx, false)
+}
+
+fn callable_body_inner_ex(
+    env: &Env,
+    name: &str,
+    sym_idx: Option<u32>,
+    skip_lexical: bool,
+) -> Option<(BlissVal, BlissVal)> {
+    // `skip_lexical` is the function-DESIGNATOR lookup: `env.funs` holds only
+    // lexical FLET/LABELS locals, and a symbol designator must not see them
+    // (bliss-c1dr). Globals live in the symbol table and GLOBAL_SETF_FNS below,
+    // so skipping this map loses nothing else.
+    if !skip_lexical && let Some(fdef) = env.funs.borrow().get(name) {
         return Some((fdef.params_form, fdef.body));
     }
     // Global `(setf place)` writers registered by a top-level defun (any file).
@@ -12875,12 +12903,28 @@ fn function_designator_name(v: BlissVal) -> Option<String> {
 /// (generic/macro/setf) — the bare symbol designator. `None` when `name_sym` is
 /// not a symbol or names no function. Shared by the FUNCTION special form and
 /// `(coerce sym 'function)` (bliss-v304).
+/// [`symbol_function_object`] for SYMBOL-FUNCTION / FDEFINITION, which CLHS
+/// defines as the symbol's GLOBAL function definition — a lexical FLET/LABELS
+/// binding of the same name is not consulted, unlike for `#'name`
+/// (ansi FUNCALL.7's neighbourhood; bliss-c1dr).
+fn symbol_global_function_object(env: &mut Env, name_sym: BlissVal) -> Option<BlissVal> {
+    symbol_function_object_ex(env, name_sym, true)
+}
+
 fn symbol_function_object(env: &mut Env, name_sym: BlissVal) -> Option<BlissVal> {
+    symbol_function_object_ex(env, name_sym, false)
+}
+
+fn symbol_function_object_ex(
+    env: &mut Env,
+    name_sym: BlissVal,
+    skip_lexical: bool,
+) -> Option<BlissVal> {
     if !name_sym.is_symbol() {
         return None;
     }
     let fn_name = sym_name(name_sym);
-    if let Some(c) = local_fn_closure(env, &fn_name) {
+    if !skip_lexical && let Some(c) = local_fn_closure(env, &fn_name) {
         return Some(c);
     }
     // An UNINTERNED symbol's function cell is keyed only by its registry index
@@ -15304,12 +15348,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                 }
                 if spec.is_symbol() {
+                    // GLOBAL definition: both operators name the symbol's global
+                    // function, so an enclosing FLET/LABELS of that name must not
+                    // be returned (bliss-c1dr).
                     // Return the SAME first-class function object `#'name` yields
                     // (bliss-dnst): a builtin is reified to its FUNCTIONP wrapper,
                     // not the bare symbol, so (functionp (fdefinition 'car)) is T
                     // and it behaves like #'car. symbol_function_object covers
                     // local flet/labels closures, global functions, and builtins.
-                    if let Some(f) = symbol_function_object(env, spec) {
+                    if let Some(f) = symbol_global_function_object(env, spec) {
                         return Ok(f);
                     }
                     // Generic functions, methods, and macros are fbound but have
@@ -31978,7 +32025,9 @@ fn apply_function(
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name_rc(fn_val);
-        if let Some((mut params_form, mut body)) = callable_body_of_symbol(env, fn_val, &name) {
+        if let Some((mut params_form, mut body)) =
+            global_callable_body_of_symbol(env, fn_val, &name)
+        {
             // Root across a possible lazy compile below (compile_function
             // allocates/GCs), since these locals feed eval_lambda_call later.
             bliss_rt::rooted_ref!(_params_form_root = &mut params_form);
