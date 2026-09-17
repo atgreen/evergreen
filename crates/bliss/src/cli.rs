@@ -1187,10 +1187,27 @@ fn fn_bound(env: &Env, name: &str) -> bool {
 /// (bliss-gl15).
 fn local_setf_writer(env: &Env, place_name: &str) -> Option<(BlissVal, BlissVal)> {
     let key = format!("(SETF {place_name})");
-    env.funs
-        .borrow()
-        .get(&key)
-        .map(|fdef| (fdef.params_form, fdef.body))
+    let funs = env.funs.borrow();
+    if let Some(fdef) = funs.get(&key) {
+        return Some((fdef.params_form, fdef.body));
+    }
+    // The SETF store path knows the accessor by its BARE name, while eval_flet
+    // registers the writer under `function_name_key`, which uses the symbol's
+    // full name — so a qualified symbol registers as "(SETF PKG::F)" and is never
+    // found by "(SETF F)". `#'(setf f)` matched because it keys both sides the
+    // same way, which is why the binding worked through FUNCALL but not through a
+    // SETF place (ansi FLET.51 / LABELS.26; bliss-n0dc).
+    //
+    // env.funs holds only lexical locals, so this scan is over a handful of
+    // entries at most.
+    funs.iter()
+        .find(|(candidate, _)| {
+            candidate
+                .strip_prefix("(SETF ")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .is_some_and(|name| symbol_bare_name(name) == place_name)
+        })
+        .map(|(_, fdef)| (fdef.params_form, fdef.body))
 }
 
 fn function_name_key(name_form: BlissVal) -> String {
@@ -16834,13 +16851,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     for v in eval_args(*aargs, env)?.iter() {
                                         args.push(*v);
                                     }
-                                    eval_lambda_call(
+                                    // SETF yields the STORE FORM's value, which for a writer is
+                                    // the writer's own return. Discarding it and falling through
+                                    // to the new value made `(flet (((setf f) …) 'a)) (setf (f) 10)`
+                                    // answer 10 instead of A, even though the writer ran correctly
+                                    // (ansi FLET.51 / LABELS.26; bliss-n0dc).
+                                    result = eval_lambda_call(
                                         env,
                                         params_form,
                                         body,
                                         &args,
                                         Rc::clone(&env.frame),
                                     )?;
+                                    *c = *r2;
+                                    continue;
                                 } else if let Some(writer_sym) = {
                                     // Probe the mangled writer symbol under BOTH
                                     // qualified spellings of the place — install
@@ -16878,7 +16902,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     for v in eval_args(*aargs, env)?.iter() {
                                         args.push(*v);
                                     }
-                                    apply_function(writer_sym, &args, env)?;
+                                    // SETF yields the store form's value — here the writer's own
+                                    // return — so it must not be discarded (bliss-9298).
+                                    result = apply_function(writer_sym, &args, env)?;
+                                    *c = *r2;
+                                    continue;
                                 } else if let Some((params_form, body)) =
                                     callable_body(env, &format!("(SETF {})", other)).or_else(
                                         || {

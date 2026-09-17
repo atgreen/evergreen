@@ -10567,3 +10567,71 @@ fn setf_of_fdefinition_accepts_a_setf_name() {
         }
     }
 }
+
+/// SETF yields the STORE FORM's value, which for a `(setf f)` writer is the
+/// writer's own return. The branch that calls a LEXICAL writer from FLET/LABELS
+/// discarded that value and fell through to the new value:
+///
+///     (flet (((setf f) (&rest args) (declare (ignore args)) 'a)) (setf (f) 10))
+///       =>  10, must be A
+///
+/// The writer ran correctly all along — a logging writer showed the right
+/// arguments — so only the result was wrong, which is why this reads as "SETF
+/// ignored the binding" until you look. ansi FLET.51 / LABELS.26; bliss-n0dc.
+#[test]
+fn setf_yields_a_lexical_writers_value() {
+    let cases = [
+        ("(flet (((setf lw-a) (&rest args) (declare (ignore args)) 'a)) (setf (lw-a) 10))", "A"),
+        ("(labels (((setf lw-b) (&rest args) (declare (ignore args)) 'a)) (setf (lw-b) 10))", "A"),
+        ("(flet (((setf lw-c) (v x) (list :local v x))) (setf (lw-c 'p) 'q))", "(:LOCAL Q P)"),
+        // The writer still runs, with the new value first then the subforms.
+        (
+            "(let ((log nil)) \
+               (flet (((setf lw-d) (v x) (push (list :called v x) log) :writer-val)) \
+                 (list (setf (lw-d 'p) 'q) log)))",
+            "(:WRITER-VAL ((:CALLED Q P)))",
+        ),
+        // A lexical writer shadows a global one of the same name.
+        (
+            "(progn (defun (setf lw-e) (v x) (list :global v x)) \
+               (flet (((setf lw-e) (v x) (list :local v x))) (setf (lw-e 'p) 'q)))",
+            "(:LOCAL Q P)",
+        ),
+        // ...and outside the FLET the global one is used again.
+        (
+            "(progn (defun (setf lw-f) (v x) (list :global v x)) \
+               (flet (((setf lw-f) (v x) (list :local v x))) (setf (lw-f 'p) 'q)) \
+               (setf (lw-f 'p) 'q))",
+            "(:GLOBAL Q P)",
+        ),
+        // Ordinary local functions and ordinary places are unaffected.
+        ("(flet ((f (x) (* x 2))) (f 4))", "8"),
+        ("(let ((c (cons 1 2))) (setf (car c) 9) c)", "(9 . 2)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
