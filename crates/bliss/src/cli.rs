@@ -13370,8 +13370,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
         };
 
-        // Check for macro expansion first (lexical MACROLET macro, else global).
-        if let Some(mdef) = lookup_macro(env, &name) {
+        // Check for macro expansion first (lexical MACROLET macro, else global) —
+        // EXCEPT when an FLET/LABELS binding of the same name is in scope and the
+        // macro is a GLOBAL one. CLHS 3.1.2.1.2.2 consults the lexical function
+        // namespace first, so such a binding shadows a global macro just as it
+        // shadows a global function; expanding the macro instead made
+        // `(defmacro f () :bad) (flet ((f () :good)) (f))` answer :BAD (ansi
+        // FLET.73 / LABELS.51; bliss-k2ia).
+        //
+        // A MACROLET macro lives in that same lexical namespace, so it still
+        // wins — only a global macro yields to the binding.
+        let shadowed_by_lexical_function = {
+            let bare = symbol_bare_name(&name);
+            let funs = env.funs.borrow();
+            let macros = env.macros.borrow();
+            (funs.contains_key(&name) || funs.contains_key(&bare))
+                && !(macros.contains_key(&name) || macros.contains_key(&bare))
+        };
+        if !shadowed_by_lexical_function
+            && let Some(mdef) = lookup_macro(env, &name)
+        {
             let expanded = expand_macro(&mdef, cdr, env, form)?;
             return eval_form(expanded, env);
         }

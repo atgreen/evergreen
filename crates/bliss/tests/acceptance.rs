@@ -10635,3 +10635,64 @@ fn setf_yields_a_lexical_writers_value() {
         }
     }
 }
+
+/// CLHS 3.1.2.1.2.2: operator position consults the LEXICAL function namespace
+/// first, so an FLET/LABELS binding shadows a global macro of the same name just
+/// as it shadows a global function. The tree-walker expanded the macro instead:
+///
+///     (defmacro f () :bad) (flet ((f () :good)) (f))   =>  :BAD, must be :GOOD
+///
+/// A MACROLET macro lives in that same lexical namespace, so it still wins — only
+/// a GLOBAL macro yields to the binding. ansi FLET.73 / LABELS.51; bliss-k2ia.
+///
+/// These two pass standalone and failed only in the chapter, because the ansi
+/// file defines the shadowed macro immediately before the test — a probe without
+/// that DEFMACRO cannot reproduce them.
+#[test]
+fn a_lexical_binding_shadows_a_global_macro() {
+    let cases = [
+        ("(progn (defmacro shm-a () :bad) (flet ((shm-a () :good)) (shm-a)))", ":GOOD"),
+        ("(progn (defmacro shm-b () :bad) (labels ((shm-b () :good)) (shm-b)))", ":GOOD"),
+        // A MACROLET macro still shadows a global macro.
+        ("(progn (defmacro shm-c () :bad) (macrolet ((shm-c () :good)) (shm-c)))", ":GOOD"),
+        // A lexical binding still shadows a global FUNCTION.
+        ("(progn (defun shm-d () :bad) (flet ((shm-d () :good)) (shm-d)))", ":GOOD"),
+        // Outside the binding the global macro applies again.
+        (
+            "(progn (defmacro shm-e () :bad) (flet ((shm-e () :good)) (shm-e)) (shm-e))",
+            ":BAD",
+        ),
+        // A global macro with no lexical binding still expands, and ordinary
+        // macros keep working — this edits the hot operator dispatch.
+        ("(progn (defmacro shm-f (x) `(list ,x ,x)) (shm-f 3))", "(3 3)")
+        ,
+        ("(let ((x 5)) (incf x) x)", "6"),
+        ("(when t :yes)", ":YES"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
