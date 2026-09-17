@@ -1628,6 +1628,16 @@ struct FunDef {
     /// `env.funs` holds only lexical local functions (globals live in the symbol
     /// table), so this snapshot is typically empty or tiny.
     def_funs: Option<Box<HashMap<String, FunDef>>>,
+    /// The `#'name` value for THIS binding instance, minted on first reference
+    /// and reused. CLHS 5.3: within the scope of one FLET/LABELS binding, `#'name`
+    /// denotes the single function that binding established, so `(eq #'f #'f)` is
+    /// true. Minting a fresh closure per reference made it false (bliss-1e8t).
+    ///
+    /// Per binding INSTANCE, not per name: `eval_flet` builds fresh `FunDef`s on
+    /// every entry, so re-entering the same FLET correctly yields a different
+    /// object. GC-traced by `visit_fun_def_roots`, which also keeps the closure
+    /// registry entry alive through `prune_closure_registry`'s heap walk.
+    closure_ref: Option<BlissVal>,
 }
 
 impl FunDef {
@@ -1640,6 +1650,7 @@ impl FunDef {
             params_form,
             body,
             def_funs: None,
+            closure_ref: None,
         }
     }
 }
@@ -5630,6 +5641,12 @@ fn visit_env_frame_roots(
 fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut BlissVal)) {
     visit(&mut def.params_form);
     visit(&mut def.body);
+    // The cached `#'name` cons (bliss-1e8t). Visiting it is what keeps its
+    // closure-registry entry live: prune_closure_registry decides liveness by
+    // walking the heap for reachable `(BLISS::CLOSURE . id)` conses.
+    if let Some(closure_ref) = &mut def.closure_ref {
+        visit(closure_ref);
+    }
     // A FLET function captures its enclosing funs (bliss-ayq8); those FunDefs'
     // bodies are cons trees the moving GC must root if this FunDef outlives the
     // defining env (an escaped FLET closure). def_funs always points to a
@@ -27732,11 +27749,19 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
     // function's forms out of `env.funs` — those become plain locals that the
     // prune's moving GC would leave stale.
     maybe_prune_closure_registry();
-    let (params_form, body) = env
+    // `#'name` must denote ONE function per binding instance, so the first
+    // reference mints the closure and the rest reuse it — otherwise `(eq #'f #'f)`
+    // is false (CLHS 5.3; ansi LABELS.37-40; bliss-1e8t). Read the cache under a
+    // SHORT borrow and drop it before allocating: holding a borrow of GC-scanned
+    // state across an allocation is the second GC invariant's failure mode.
+    let (params_form, body, cached) = env
         .funs
         .borrow()
         .get(name)
-        .map(|f| (f.params_form, f.body))?;
+        .map(|f| (f.params_form, f.body, f.closure_ref))?;
+    if let Some(existing) = cached {
+        return Some(existing);
+    }
     let closure = Closure {
         params_form,
         body,
@@ -27747,7 +27772,16 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
     let id = next_closure_id();
     env.closures.borrow_mut().insert(id, closure);
     let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
-    Some(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)))
+    // Rooted across the store below. The intervening map lookup allocates no
+    // Bliss memory, so this is belt-and-braces rather than a known hazard — but
+    // an unrooted local read after an allocating call is exactly the smell
+    // gc-root-lint exists to catch, and rooting costs nothing here.
+    bliss_rt::rooted!(reference = arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
+    // Store it back so the next `#'name` in this scope is EQ to this one.
+    if let Some(def) = env.funs.borrow_mut().get_mut(name) {
+        def.closure_ref = Some(*reference);
+    }
+    Some(*reference)
 }
 
 fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, BlissError> {
@@ -27835,6 +27869,9 @@ fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, 
                     } else {
                         Some(Box::new(parent_snapshot.clone()))
                     },
+                    // Minted lazily on the first `#'name` in this scope, then
+                    // reused so the reference is EQ-stable (bliss-1e8t).
+                    closure_ref: None,
                 },
             );
         }

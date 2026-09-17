@@ -9094,3 +9094,78 @@ fn make_array_copies_its_initial_contents() {
         }
     }
 }
+
+/// CLHS 5.3: within the scope of one FLET/LABELS binding, `#'name` denotes the
+/// single function that binding established, so `(eq #'f #'f)` is true. The
+/// tree-walker minted a fresh closure object on every `#'` evaluation.
+/// ansi LABELS.37/38/39; bliss-1e8t.
+///
+/// Tree-walker-only — the bytecode path was already correct — which is why these
+/// were on a "context-dependent, passes standalone" list for most of the session:
+/// the bare form compiles and passes. Every case runs on both backends.
+///
+/// The cache is per binding INSTANCE, not per name, and the risk is that it
+/// wrongly aliases, so the tests pin what must STILL differ: separate FLET forms,
+/// separate invocations, and closures over different captured values.
+#[test]
+fn sharp_quote_of_a_local_function_is_eq_stable() {
+    let cases = [
+        // The identity the ansi tests check.
+        ("(labels ((%f () nil)) (eq #'%f #'%f))", "T"),
+        ("(labels ((%f () nil)) (eq #'%f (car (list #'%f))))", "T"),
+        ("(labels ((%f () #'%f)) (eq #'%f (%f)))", "T"),
+        ("(flet ((%f () nil)) (eq #'%f #'%f))", "T"),
+        // A global DEFUN was already stable; must stay so.
+        ("(progn (defun eqs-g () nil) (eq #'eqs-g #'eqs-g))", "T"),
+        // Separate binding forms are separate functions.
+        ("(let ((a (flet ((%f () 1)) #'%f)) (b (flet ((%f () 2)) #'%f))) (eq a b))", "NIL"),
+        // Separate invocations of the same form, likewise — the cache must not
+        // leak across calls.
+        ("(progn (defun eqs-mk () (flet ((%f () 1)) #'%f)) (eq (eqs-mk) (eqs-mk)))", "NIL"),
+        // ...and each closure keeps its own captured value.
+        (
+            "(progn (defun eqs-mk2 (n) (flet ((%f () n)) #'%f)) \
+               (let ((f1 (eqs-mk2 1)) (f2 (eqs-mk2 2))) \
+                 (list (funcall f1) (funcall f2) (eq f1 f2))))",
+            "(1 2 NIL)",
+        ),
+        // An inner binding shadows an outer one of the same name.
+        (
+            "(flet ((%f () 1)) (let ((outer #'%f)) \
+               (flet ((%f () 2)) (list (funcall outer) (funcall #'%f) (eq outer #'%f)))))",
+            "(1 2 NIL)",
+        ),
+        // Calling through the cached reference still works, including recursion
+        // within the scope.
+        (
+            "(labels ((fact (n) (if (<= n 1) 1 (* n (funcall #'fact (- n 1)))))) (fact 5))",
+            "120",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
