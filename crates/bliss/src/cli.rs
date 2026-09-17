@@ -15509,11 +15509,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (sf, _) = cp(cdr);
                 let sym = eval_form(sf, env)?;
                 check_function_name(sym)?;
+                // `function_name_key` for a cons name: the writer registry is
+                // keyed by the "(SETF place)" spelling, which val_as_str does not
+                // produce, so FMAKUNBOUND could not find a writer at all
+                // (ansi FMAKUNBOUND.4; bliss-xg1x).
                 let name = if sym.is_symbol() {
                     sym_name(sym)
                 } else {
-                    val_as_str(sym)
+                    function_name_key(sym)
                 };
+                // A `(setf place)` writer lives in TWO places — GLOBAL_SETF_FNS
+                // under that key, and a function object on the mangled
+                // %SETF-WRITER-place symbol installed for the compiled SETF path.
+                // Clear both, or FBOUNDP keeps finding whichever was left, which
+                // is the same false-positive trap as clearing one of two tables
+                // for a plain symbol.
+                if sym.is_cons() {
+                    let (_setf, tail) = cp(sym);
+                    if tail.is_cons() {
+                        let place = cp(tail).0;
+                        if place.is_symbol() {
+                            GLOBAL_SETF_FNS.with(|m| {
+                                m.borrow_mut().remove(&name);
+                            });
+                            if let Some(index) =
+                                resolve_sym(&setf_writer_symbol_name(&sym_name(place)))
+                                    .and_then(|writer| writer.symbol_index())
+                            {
+                                bliss_rt::symbols::set_symbol_function(
+                                    index,
+                                    bliss_rt::value::UNBOUND,
+                                );
+                            }
+                        }
+                    }
+                }
                 // Clear the global heap function cell and the lexical/name-map
                 // and macro entries, so the name is no longer fbound.
                 // Clear the cell on the SYMBOL ITSELF when we have one: an

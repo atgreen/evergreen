@@ -10284,3 +10284,77 @@ fn macrolet_bodies_honour_a_free_special_declaration() {
         }
     }
 }
+
+/// FMAKUNBOUND could not unbind a `(setf place)` name: it keyed the lookup with
+/// val_as_str rather than the "(SETF place)" spelling the writer registry uses,
+/// so it found nothing to remove.
+///
+///     (defun (setf g) (v x) …) (fmakunbound '(setf g)) (fboundp '(setf g))
+///       =>  T, must be NIL
+///
+/// A writer lives in TWO places — GLOBAL_SETF_FNS under that key, and a function
+/// object on the mangled %SETF-WRITER-place symbol installed for the compiled
+/// SETF path — so both are cleared. Clearing one would trade a false negative for
+/// a false positive, the same trap as the plain-symbol case.
+/// ansi FMAKUNBOUND.4; bliss-xg1x.
+#[test]
+fn fmakunbound_unbinds_a_setf_name() {
+    let cases = [
+        (
+            "(let* ((g (gensym)) (n (list 'setf g))) \
+               (eval (list 'defun n '(v x) '(setf (car x) v))) \
+               (list (not (not (fboundp n))) (progn (fmakunbound n) (fboundp n))))",
+            "(T NIL)",
+        ),
+        // Plain names, gensyms and the return value are unaffected.
+        (
+            "(progn (defun fmu-a () 1) \
+               (list (not (not (fboundp 'fmu-a))) (progn (fmakunbound 'fmu-a) (fboundp 'fmu-a))))",
+            "(T NIL)",
+        ),
+        (
+            "(let ((g (gensym))) (setf (symbol-function g) #'car) \
+               (list (not (not (fboundp g))) (progn (fmakunbound g) (fboundp g))))",
+            "(T NIL)",
+        ),
+        ("(progn (defun fmu-b () 1) (eq (fmakunbound 'fmu-b) 'fmu-b))", "T"),
+        // A writer that was never unbound still works as a SETF place.
+        (
+            "(progn (defun (setf fmu-c) (v x) (setf (car x) v)) \
+               (let ((c (cons 1 2))) (setf (fmu-c c) 9) c))",
+            "(9 . 2)",
+        ),
+        // ...and after FMAKUNBOUND the place no longer has a writer.
+        (
+            "(progn (defun (setf fmu-d) (v x) (setf (car x) v)) (fmakunbound '(setf fmu-d)) \
+               (fboundp '(setf fmu-d)))",
+            "NIL",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
