@@ -9988,3 +9988,70 @@ fn a_symbol_designator_denotes_the_global_function() {
         }
     }
 }
+
+/// BLOCK and RETURN-FROM are LEXICAL: a local function's `(return-from name …)`
+/// exits the block it was WRITTEN inside, regardless of which same-named block
+/// happens to be active when it runs.
+///
+///     (block done
+///       (flet ((%f (x) (return-from done x)))
+///         (block done (mapcar #'%f '(good bad bad))))
+///       'bad)
+///       =>  BAD in the tree-walker, must be GOOD
+///
+/// `local_fn_closure` captured the block stack as it stood when `#'%f` was
+/// EVALUATED — inside the inner `done` — rather than where %f was DEFINED. The
+/// FunDef now records its defining exits. ansi BLOCK.10; bliss-wfxx.
+///
+/// Bytecode was already correct, so each case runs on both backends.
+#[test]
+fn return_from_in_a_local_function_is_lexical() {
+    let cases = [
+        // ansi BLOCK.10: the inner same-named block must not capture it.
+        (
+            "(block done (flet ((%f (x) (return-from done x))) \
+               (block done (mapcar #'%f '(good bad bad)))) 'bad)",
+            "GOOD",
+        ),
+        // The bliss-4u5u shape: a (return) in a closure invoked inside another
+        // LOOP's implicit `block nil` must still exit the outer one.
+        (
+            "(block nil (flet ((%g () (return :outer))) \
+               (loop for i in '(1 2 3) do (funcall #'%g)) :not-reached))",
+            ":OUTER",
+        ),
+        // Ordinary exits still work.
+        ("(block b (flet ((%h () (return-from b :ok))) (funcall #'%h) :no))", ":OK"),
+        ("(flet ((%i () (block b (return-from b :inner)))) (funcall #'%i))", ":INNER"),
+        ("(labels ((%j (n) (if (< n 0) (return-from %j :neg) n))) (list (%j 5) (%j -1)))", "(5 :NEG)"),
+        ("(progn (defun rfl-db () (return-from rfl-db :done)) (rfl-db))", ":DONE"),
+        // TAGBODY exits travel with the same capture.
+        ("(flet ((%k () (block nil (tagbody (go done) done (return :tagged))))) (funcall #'%k))", ":TAGGED"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

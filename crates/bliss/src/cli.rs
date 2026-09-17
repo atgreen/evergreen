@@ -1698,6 +1698,18 @@ struct FunDef {
     /// object. GC-traced by `visit_fun_def_roots`, which also keeps the closure
     /// registry entry alive through `prune_closure_registry`'s heap walk.
     closure_ref: Option<BlissVal>,
+    /// The BLOCK / TAGBODY exits visible where this local function was DEFINED.
+    /// BLOCK and RETURN-FROM are lexical, so the body's `(return-from name …)`
+    /// must target the block the FLET/LABELS was written inside — not whichever
+    /// same-named block happens to be active when the function is referenced or
+    /// called. `local_fn_closure` used the block stack at `#'name` time, so
+    ///
+    ///     (block done (flet ((%f (x) (return-from done x)))
+    ///                   (block done (mapcar #'%f '(good bad bad)))) 'bad)
+    ///
+    /// captured the INNER `done` and returned BAD (ansi BLOCK.10; bliss-wfxx).
+    /// `None` for a global defun, which inherits the caller's as before.
+    defining_blocks: Option<(Vec<(String, String)>, Vec<(String, String)>)>,
 }
 
 impl FunDef {
@@ -1711,6 +1723,7 @@ impl FunDef {
             body,
             def_funs: None,
             closure_ref: None,
+            defining_blocks: None,
         }
     }
 }
@@ -27985,7 +27998,7 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
     // the recursive scope this `#'` is being taken in. Capturing the right one
     // is what lets the closure still resolve its own name after it escapes the
     // binding form (bliss-5q20).
-    let (params_form, body, cached, flet_scope) = env
+    let (params_form, body, cached, flet_scope, defining_blocks) = env
         .funs
         .borrow()
         .get(name)
@@ -27995,6 +28008,7 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
                 f.body,
                 f.closure_ref,
                 f.def_funs.as_ref().map(|scope| (**scope).clone()),
+                f.defining_blocks.clone(),
             )
         })?;
     if let Some(existing) = cached {
@@ -28008,8 +28022,16 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
         params_form,
         body,
         captured_frame: Rc::clone(&env.frame),
-        captured_blocks: env.block_stack.clone(),
-        captured_tags: env.tag_stack.clone(),
+        // The exits visible where the function was DEFINED, falling back to the
+        // current ones for a function with no recorded scope (bliss-wfxx).
+        captured_blocks: defining_blocks
+            .as_ref()
+            .map(|(blocks, _)| blocks.clone())
+            .unwrap_or_else(|| env.block_stack.clone()),
+        captured_tags: defining_blocks
+            .as_ref()
+            .map(|(_, tags)| tags.clone())
+            .unwrap_or_else(|| env.tag_stack.clone()),
         captured_funs,
     };
     let id = next_closure_id();
@@ -28115,6 +28137,9 @@ fn eval_flet(cdr: BlissVal, env: &mut Env, recursive: bool) -> Result<BlissVal, 
                     // Minted lazily on the first `#'name` in this scope, then
                     // reused so the reference is EQ-stable (bliss-1e8t).
                     closure_ref: None,
+                    // The exits visible HERE, where the function is written —
+                    // not where a later `#'name` is evaluated (bliss-wfxx).
+                    defining_blocks: Some((env.block_stack.clone(), env.tag_stack.clone())),
                 },
             );
         }
