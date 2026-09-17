@@ -10750,3 +10750,69 @@ fn the_innermost_lexical_binding_wins() {
         }
     }
 }
+
+/// MULTIPLE-VALUE-SETQ assigned by NAME, so an uninterned (gensym) variable was
+/// never written: LET binds such a variable by symbol INDEX, and a gensym is not
+/// in the name registry.
+///
+///     (let ((g (gensym))) (eval `(let (,g) (multiple-value-setq (,g) (values 7)) ,g)))
+///       =>  NIL, must be 7
+///
+/// The form RETURNED the right value the whole time, so the assignment was lost
+/// silently. SETQ, LET and MULTIPLE-VALUE-BIND all handled gensyms already — this
+/// was specific to M-V-SETQ's store, which now uses the same by-symbol setter
+/// SETQ does. ansi MULTIPLE-VALUE-SETQ.12; bliss-4rot.
+#[test]
+fn multiple_value_setq_assigns_to_an_uninterned_variable() {
+    let cases = [
+        ("(let ((g (gensym))) (eval `(let (,g) (multiple-value-setq (,g) (values 7)) ,g)))", "7"),
+        // The ansi shape: several gensym variables at once.
+        (
+            "(let ((a (gensym)) (b (gensym))) \
+               (eval `(let (,a ,b) \
+                        (and (eql (multiple-value-setq (,a ,b) (values-list '(2 1))) 2) \
+                             (equal (list ,a ,b) '(2 1))))))",
+            "T",
+        ),
+        // Ordinary variables, extra and missing values, and the returned value.
+        ("(let (a b) (list (multiple-value-setq (a b) (values 1 2)) a b))", "(1 1 2)"),
+        ("(let (a b) (list (multiple-value-setq (a b) (values 1)) a b))", "(1 1 NIL)"),
+        ("(let (a) (list (multiple-value-setq (a) (values 1 2 3)) a))", "(1 1)"),
+        ("(let (a) (list (multiple-value-setq (a) (values)) a))", "(NIL NIL)"),
+        ("(multiple-value-setq nil :good)", ":GOOD"),
+        // A symbol-macro variable is still assigned through its expansion, and a
+        // special variable through its value cell.
+        (
+            "(symbol-macrolet ((sm (car c))) (let ((c (cons 1 2))) \
+               (multiple-value-setq (sm) (values 9)) c))",
+            "(9 . 2)",
+        ),
+        ("(progn (defvar *mvsu* 0) (multiple-value-setq (*mvsu*) (values 5)) *mvsu*)", "5"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

@@ -20050,6 +20050,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             setf_form = vec_to_list(&[setf_sym, *expansion, *quoted])
                         );
                         eval_form(*setf_form, env)?;
+                    } else if var_form.is_symbol() {
+                        // By SYMBOL, not by name: an uninterned variable is not in
+                        // the name registry, so a name-keyed store silently missed
+                        // the binding LET had made by index — M-V-SETQ returned the
+                        // right value while assigning nothing (ansi
+                        // MULTIPLE-VALUE-SETQ.12; bliss-4rot). This is the setter
+                        // SETQ itself uses.
+                        env.set_var_symbol(var_form, v);
                     } else {
                         let name = sym_name(var_form);
                         env.set_var(&name, v);
