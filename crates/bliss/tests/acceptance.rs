@@ -9714,3 +9714,89 @@ fn setf_get_updates_an_existing_property_in_place() {
         }
     }
 }
+
+/// `(setf (find-class name) class)` had no SETF place at all — reading a class
+/// worked, writing one signalled PROGRAM-ERROR. CLHS makes this the standard way
+/// to give a class a second name, and ansi PSETF.35 / ROTATEF.35 build places out
+/// of gensym-named classes with it. bliss-3ypy.
+///
+/// It binds the NAME only: the class keeps the name it was defined with. Wiring
+/// this to the existing set_find_class instead renamed the class in its own
+/// metaobject, which silently broke `(typep (make-instance 'c) 'c)` for the
+/// original name — hence the CLASS-NAME and TYPEP cases here.
+#[test]
+fn setf_of_find_class_binds_a_second_name() {
+    let cases = [
+        // The alias resolves to the very same class object...
+        (
+            "(let ((n1 (gensym)) (n3 (gensym))) (eval `(defclass ,n1 () ())) \
+               (setf (find-class n3) (find-class n1)) (eq (find-class n1) (find-class n3)))",
+            "T",
+        ),
+        // ...and the class is NOT renamed by acquiring one.
+        (
+            "(progn (defclass sfc-a () ()) (setf (find-class 'sfc-b) (find-class 'sfc-a)) \
+               (class-name (find-class 'sfc-a)))",
+            "SFC-A",
+        ),
+        // ...so instances of the original still answer TYPEP under their OWN
+        // name. (TYPEP against the ALIAS is a separate gap this feature makes
+        // observable for the first time — it matches the class-precedence list by
+        // name, and the class keeps its own name. Filed as bliss-34cr; not
+        // asserted here, since pinning the current answer would pin a bug.)
+        (
+            "(progn (defclass sfc-c () ()) (setf (find-class 'sfc-d) (find-class 'sfc-c)) \
+               (typep (make-instance 'sfc-c) 'sfc-c))",
+            "T",
+        ),
+        // ansi PSETF.35: the place works under the updating macros.
+        (
+            "(let ((n1 (gensym)) (n2 (gensym)) (n3 (gensym)) (n4 (gensym))) \
+               (eval `(defclass ,n1 () ())) (eval `(defclass ,n2 () ())) \
+               (psetf (find-class n3) (find-class n1) (find-class n4) (find-class n2)) \
+               (list (eq (find-class n1) (find-class n3)) (eq (find-class n2) (find-class n4))))",
+            "(T T)",
+        ),
+        (
+            "(let ((a (gensym)) (b (gensym))) (eval `(defclass ,a () ())) (eval `(defclass ,b () ())) \
+               (let ((ca (find-class a)) (cb (find-class b))) \
+                 (rotatef (find-class a) (find-class b)) \
+                 (list (eq (find-class a) cb) (eq (find-class b) ca))))",
+            "(T T)",
+        ),
+        // Reading is unchanged, including the errorp=NIL form, and DEFCLASS with
+        // slots and accessors still works.
+        ("(find-class 'no-such-class-xyz nil)", "NIL"),
+        (
+            "(progn (defclass sfc-e () ((s :initarg :s :accessor sfc-e-s))) \
+               (sfc-e-s (make-instance 'sfc-e :s 7)))",
+            "7",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

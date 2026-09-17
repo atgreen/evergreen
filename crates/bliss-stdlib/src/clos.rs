@@ -1385,6 +1385,34 @@ pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError>
     })
 }
 
+/// Bind NAME to an EXISTING class in the class namespace, WITHOUT renaming the
+/// class. This is what CLHS `(setf (find-class symbol) class)` does: it
+/// associates the symbol with the class, so the class gains a second name while
+/// CLASS-NAME still answers the one it was defined with.
+///
+/// Distinct from [`set_find_class`], which also rewrites the class's own `name`
+/// in its metaobject — correct when registering a class under its OWN name,
+/// wrong for an alias. Using that here renamed the original class and broke
+/// `(typep (make-instance 'c) 'c)` for it (bliss-3ypy).
+///
+/// A NIL class removes the association (CLHS).
+pub fn bind_class_name(name: BlissVal, class: BlissVal) -> Result<(), BlissError> {
+    with_state_mut(|st| {
+        if class == NIL {
+            st.class_registry.remove(&name);
+            if let Some(key) = class_name_key(name) {
+                st.class_by_name.remove(&key);
+            }
+            return Ok(());
+        }
+        st.class_registry.insert(name, class);
+        if let Some(key) = class_name_key(name) {
+            st.class_by_name.insert(key, class);
+        }
+        Ok(())
+    })
+}
+
 /// Define a class with explicit name, superclasses, and slots.
 ///
 /// This is the proper API for class definition, replacing the heuristic-based

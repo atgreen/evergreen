@@ -16557,6 +16557,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     bliss_stdlib::set_aref(seq, i, *val)?;
                                 }
                             }
+                            "FIND-CLASS" => {
+                                // (setf (find-class name) class) — associate NAME
+                                // with CLASS in the class namespace (CLHS), which
+                                // is the standard way to give a class a second
+                                // name. bliss could READ a class but had no place
+                                // to write one (ansi PSETF.35 / ROTATEF.35 build
+                                // places out of gensym-named classes; bliss-3ypy).
+                                //
+                                // FIND-CLASS takes optional errorp/environment
+                                // arguments; as a PLACE only the name is used, and
+                                // the extras are evaluated for effect and ignored,
+                                // as they are on the read side.
+                                let name = eval_form(tgt_form, env)?;
+                                bliss_rt::rooted!(name = name);
+                                bliss_stdlib::bind_class_name(*name, *val)?;
+                            }
                             "FILL-POINTER" => {
                                 // (setf (fill-pointer vector) n) — set the active
                                 // length of a fill-pointer vector.
