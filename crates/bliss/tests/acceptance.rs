@@ -9335,3 +9335,84 @@ fn destructuring_handles_dotted_tails_with_lambda_list_keywords() {
         }
     }
 }
+
+/// FLET/LABELS are LEXICAL, so a local function that ESCAPES its binding form
+/// must still see the function namespace it was written in. The tree-walker's
+/// Closure captured the lexical frame and the block/tag exits but not the
+/// function namespace, so an escaped local function could not even recurse:
+///
+///     (funcall (labels ((f (n) (if (<= n 1) 1 (* n (f (- n 1)))))) #'f) 5)
+///       =>  "The function F is undefined"   (SBCL and bliss's bytecode: 120)
+///
+/// Returning a recursive local function is an ordinary idiom, so this was a
+/// real-code bug, not only ansi LABELS.40. bliss-5q20.
+///
+/// The namespace to capture differs by form and is the easy thing to get wrong:
+/// a FLET function's body may NOT see itself or its siblings, a LABELS function's
+/// body must see both. Every case is therefore checked escaped AND unescaped, on
+/// both backends.
+#[test]
+fn an_escaped_local_function_keeps_its_function_namespace() {
+    let setup = "(defun eln-g () :global)";
+    let cases = [
+        // Escaped LABELS: recurses by name, and via #'name.
+        (
+            "(funcall (labels ((f (n) (if (<= n 1) 1 (* n (f (- n 1)))))) #'f) 5)",
+            "120",
+        ),
+        (
+            "(funcall (labels ((f (n) (if (<= n 1) 1 (* n (funcall #'f (- n 1)))))) #'f) 5)",
+            "120",
+        ),
+        // ansi LABELS.40: #'f inside the escaped body is the same object.
+        ("(let ((x (labels ((f () #'f)) #'f))) (eql x (funcall x)))", "T"),
+        // Escaped LABELS sees its siblings.
+        ("(funcall (labels ((a () :a) (b () (a))) #'b))", ":A"),
+        // Escaped FLET must NOT see itself — (eln-g) in the body is the GLOBAL.
+        ("(funcall (flet ((eln-g () (eln-g))) #'eln-g))", ":GLOBAL"),
+        // ...nor its siblings.
+        (
+            "(handler-case (funcall (flet ((a () :a) (b () (a))) #'b)) (error () :undefined))",
+            ":UNDEFINED",
+        ),
+        // The same rules unescaped, so a regression says which half broke.
+        ("(flet ((eln-g () :local)) (funcall #'eln-g))", ":LOCAL"),
+        ("(flet ((eln-g () (eln-g))) (funcall #'eln-g))", ":GLOBAL"),
+        ("(labels ((a () :a) (b () (a))) (funcall #'b))", ":A"),
+        ("(labels ((f (n) (if (<= n 1) 1 (* n (f (- n 1)))))) (funcall #'f 5))", "120"),
+        // Invoking an escaped closure must not disturb the CALLER's namespace.
+        (
+            "(let ((esc (labels ((f () :inner)) #'f))) \
+               (flet ((f () :outer)) (list (funcall esc) (f))))",
+            "(:INNER :OUTER)",
+        ),
+        // A closure that captures no local functions still calls globals.
+        ("(funcall (lambda () (eln-g)))", ":GLOBAL"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(progn {setup} (cl:format t \"~S~%\" {form}))")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

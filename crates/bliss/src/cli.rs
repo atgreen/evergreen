@@ -1420,6 +1420,21 @@ struct Closure {
     /// invoking an escaped upward closure's return-from is undefined in CL.
     captured_blocks: Vec<(String, String)>,
     captured_tags: Vec<(String, String)>,
+    /// The FUNCTION namespace this closure was written in, captured like the
+    /// block/tag exits above and for the same reason: FLET/LABELS are LEXICAL.
+    /// Without it a local function that ESCAPES its binding form could not see
+    /// itself — `(funcall (labels ((f (n) … (f (- n 1)))) #'f) 5)` signalled
+    /// "The function F is undefined", and `#'f` inside such a body evaluated to
+    /// the bare symbol (ansi LABELS.40; bliss-5q20).
+    ///
+    /// `Rc` because `Env::funs_mut` is copy-on-write: a later mutation in any
+    /// descendant env forks its own map rather than disturbing this snapshot.
+    /// `None` means "inherit the caller's namespace", which is right for a
+    /// lambda written outside any FLET/LABELS — and is what a core-restored
+    /// closure gets, since this is deliberately not serialized (the image format
+    /// is unversioned; restoring one loses its local-function scope exactly as
+    /// it did before this field existed).
+    captured_funs: Option<Rc<RefCell<HashMap<String, FunDef>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2977,6 +2992,10 @@ fn host_restore_registries(data: &[u8]) -> Result<(), BlissError> {
                     params_form: BlissVal::from_raw(remap(params)),
                     body: BlissVal::from_raw(remap(body)),
                     captured_frame,
+                    // Not serialized (see the field's comment): a restored
+                    // closure inherits the caller's function namespace, exactly
+                    // as it did before the field existed.
+                    captured_funs: None,
                     captured_blocks,
                     captured_tags,
                 },
@@ -5638,6 +5657,25 @@ fn visit_env_frame_roots(
     }
 }
 
+/// Walk a shared function-namespace map once per collection pass.
+fn visit_fun_map_roots(
+    funs: &Rc<RefCell<HashMap<String, FunDef>>>,
+    _state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    // Deliberately NOT deduplicated by map address, and `try_borrow_mut` rather
+    // than `borrow_mut`: both match `scan_suspended_funs`, the existing scanner
+    // for the same kind of map. An earlier version here skipped a map it had
+    // already seen this pass, which measured no faster (tracing cost 557s vs
+    // 558s on an identical workload) and is exactly the kind of cleverness that
+    // makes a root scanner wrong. A map reachable twice is simply walked twice.
+    if let Ok(mut map) = funs.try_borrow_mut() {
+        for def in map.values_mut() {
+            visit_fun_def_roots(def, visit);
+        }
+    }
+}
+
 fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut BlissVal)) {
     visit(&mut def.params_form);
     visit(&mut def.body);
@@ -6127,9 +6165,7 @@ impl Env {
     ) {
         visit_env_frame_roots(&self.frame, state, visit);
 
-        for def in self.funs.borrow_mut().values_mut() {
-            visit_fun_def_roots(def, visit);
-        }
+        visit_fun_map_roots(&self.funs, state, visit);
         for def in self.macros.borrow_mut().values_mut() {
             visit_macro_def_roots(def, state, visit);
         }
@@ -6176,6 +6212,12 @@ impl Env {
             visit(&mut closure.params_form);
             visit(&mut closure.body);
             visit_env_frame_roots(&closure.captured_frame, state, visit);
+            // The captured namespace holds FunDefs whose lambda lists and bodies
+            // are heap cons trees; unvisited they would go stale under the moving
+            // collector (bliss-5q20).
+            if let Some(funs) = &closure.captured_funs {
+                visit_fun_map_roots(funs, state, visit);
+            }
         }
         for context in &mut self.method_context {
             for arg in &mut context.args {
@@ -12757,6 +12799,7 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
         captured_frame: Rc::clone(&env.frame),
         captured_blocks: env.block_stack.clone(),
         captured_tags: env.tag_stack.clone(),
+        captured_funs: Some(Rc::clone(&env.funs)),
     };
     // Once inserted, params_form/body are rooted via the GC scan of env.closures.
     env.closures.borrow_mut().insert(id, closure);
@@ -16839,6 +16882,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             captured_frame: Rc::clone(&env.frame),
                             captured_blocks: env.block_stack.clone(),
                             captured_tags: env.tag_stack.clone(),
+                            captured_funs: Some(Rc::clone(&env.funs)),
                         };
                         let id = next_closure_id();
                         env.closures.borrow_mut().insert(id, closure);
@@ -16863,6 +16907,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     captured_frame: Rc::clone(&env.frame),
                     captured_blocks: env.block_stack.clone(),
                     captured_tags: env.tag_stack.clone(),
+                    captured_funs: Some(Rc::clone(&env.funs)),
                 };
                 let id = next_closure_id();
                 env.closures.borrow_mut().insert(id, closure);
@@ -27801,20 +27846,37 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
     // is false (CLHS 5.3; ansi LABELS.37-40; bliss-1e8t). Read the cache under a
     // SHORT borrow and drop it before allocating: holding a borrow of GC-scanned
     // state across an allocation is the second GC invariant's failure mode.
-    let (params_form, body, cached) = env
+    // `def_funs` is the ENCLOSING namespace a FLET function's body must see (it
+    // may not see its siblings or itself); `None` means LABELS, whose body sees
+    // the recursive scope this `#'` is being taken in. Capturing the right one
+    // is what lets the closure still resolve its own name after it escapes the
+    // binding form (bliss-5q20).
+    let (params_form, body, cached, flet_scope) = env
         .funs
         .borrow()
         .get(name)
-        .map(|f| (f.params_form, f.body, f.closure_ref))?;
+        .map(|f| {
+            (
+                f.params_form,
+                f.body,
+                f.closure_ref,
+                f.def_funs.as_ref().map(|scope| (**scope).clone()),
+            )
+        })?;
     if let Some(existing) = cached {
         return Some(existing);
     }
+    let captured_funs = Some(match flet_scope {
+        Some(scope) => Rc::new(RefCell::new(scope)),
+        None => Rc::clone(&env.funs),
+    });
     let closure = Closure {
         params_form,
         body,
         captured_frame: Rc::clone(&env.frame),
         captured_blocks: env.block_stack.clone(),
         captured_tags: env.tag_stack.clone(),
+        captured_funs,
     };
     let id = next_closure_id();
     env.closures.borrow_mut().insert(id, closure);
@@ -32002,7 +32064,24 @@ fn apply_function(
                 // points, not the caller's dynamic ones (bliss-4u5u): a
                 // `(return-from tag …)` in the body must target the block the
                 // lambda was written inside.
-                return eval_lambda_call_ex(
+                // ...and against its captured FUNCTION namespace, for the same
+                // lexical reason: a local function that escaped its FLET/LABELS
+                // must still resolve its own name, or it cannot even recurse
+                // (bliss-5q20). Swapped in around the call and restored after,
+                // so the caller's namespace is untouched.
+                // Swapping `env.funs` takes the CALLER's map off the scanned
+                // `env.funs`, leaving its FunDef body cons trees reachable only
+                // from this Rust frame — a minor GC during the body then frees
+                // them and a later call reads a freed body. SUSPENDED_FUNS exists
+                // for exactly this (bliss-biol); the same hazard, reached from the
+                // closure path (bliss-5q20).
+                let saved_funs = closure.captured_funs.as_ref().map(|funs| {
+                    install_suspended_funs_scanner();
+                    let saved = std::mem::replace(&mut env.funs, Rc::clone(funs));
+                    SUSPENDED_FUNS.with(|s| s.borrow_mut().push(Rc::clone(&saved)));
+                    saved
+                });
+                let result = eval_lambda_call_ex(
                     env,
                     closure.params_form,
                     closure.body,
@@ -32013,6 +32092,13 @@ fn apply_function(
                         closure.captured_tags.clone(),
                     ),
                 );
+                if let Some(previous) = saved_funs {
+                    SUSPENDED_FUNS.with(|s| {
+                        s.borrow_mut().pop();
+                    });
+                    env.funs = previous;
+                }
+                return result;
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
