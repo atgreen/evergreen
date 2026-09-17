@@ -9645,3 +9645,72 @@ fn psetf_and_rotatef_handle_values_places() {
         }
     }
 }
+
+/// `(setf (get sym key) val)` prepended a fresh pair instead of updating the
+/// property already there, so a symbol's plist grew without bound as a property
+/// was re-set:
+///
+///     (setf (get s :a) 1) (setf (get s :a) 2) (symbol-plist s)
+///       =>  (:A 2 :A 1), must be (:A 2)
+///
+/// GET returns the FIRST match, so the value read back correctly and nothing
+/// looked wrong until the plist itself was inspected — which is what ansi
+/// ROTATEF.32 does. REMPROP then removed only one of the copies. bliss-vy96.
+#[test]
+fn setf_get_updates_an_existing_property_in_place() {
+    let cases = [
+        ("(let ((s (gensym))) (setf (get s :a) 1) (setf (get s :a) 2) (symbol-plist s))", "(:A 2)"),
+        // Other properties are preserved, and the updated one keeps its position.
+        (
+            "(let ((s (gensym))) (setf (get s :a) 1) (setf (get s :b) 2) (setf (get s :a) 9) \
+               (symbol-plist s))",
+            "(:B 2 :A 9)",
+        ),
+        // The value still reads back, and INCF over the place behaves.
+        ("(let ((s (gensym))) (setf (get s :a) 1) (setf (get s :a) 2) (get s :a))", "2"),
+        ("(let ((s (gensym))) (setf (get s :a) 1) (incf (get s :a)) (symbol-plist s))", "(:A 2)"),
+        // REMPROP now clears the property completely rather than one duplicate.
+        (
+            "(let ((s (gensym))) (setf (get s :a) 1) (setf (get s :a) 2) \
+               (list (not (not (remprop s :a))) (symbol-plist s)))",
+            "(T NIL)",
+        ),
+        // A fresh indicator still prepends, and a missing one still defaults.
+        ("(let ((s (gensym))) (setf (get s :a) 1) (symbol-plist s))", "(:A 1)"),
+        ("(let ((s (gensym))) (get s :missing :none))", ":NONE"),
+        // ansi ROTATEF.32: rotating through GET places leaves single entries.
+        (
+            "(let* ((x (gensym)) (y (gensym)) (z 17)) \
+               (setf (get x :foo) 1 (get y :bar) 2) \
+               (rotatef (get x :foo) (get y :bar) z) \
+               (list (symbol-plist x) (symbol-plist y) z))",
+            "((:FOO 2) (:BAR 17) 1)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

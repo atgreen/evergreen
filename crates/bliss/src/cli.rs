@@ -26986,7 +26986,35 @@ fn symbol_plist_put(sym: BlissVal, key: BlissVal, val: BlissVal) {
     let Some(idx) = sym.symbol_index() else {
         return;
     };
-    bliss_rt::rooted!(plist = bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL));
+    let existing = bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
+    // Update an EXISTING property in place. CLHS compares indicators with EQ, and
+    // GET returns the FIRST match — so unconditionally prepending still read back
+    // the right value while leaving the old pair behind. A property re-set in a
+    // loop grew the plist without bound, and REMPROP then removed only one copy
+    // (ansi ROTATEF.32 inspects the plist via SYMBOL-PLIST; bliss-vy96).
+    //
+    // The scan allocates nothing, so no GC can fire inside it and the bare
+    // cursor cannot go stale.
+    let mut cursor = existing;
+    while cursor.is_cons() {
+        let (indicator, after_key) = cp(cursor);
+        if !after_key.is_cons() {
+            break; // malformed plist: odd number of entries
+        }
+        if indicator == key {
+            // Through the write barrier: storing a YOUNG value into an OLD cons
+            // must be recorded in the remembered set, or the minor GC frees the
+            // young referent (bliss-6b2 #2).
+            unsafe {
+                let cell = after_key.as_ptr() as *mut ConsCell;
+                bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
+            }
+            return;
+        }
+        cursor = cp(after_key).1;
+    }
+    // Absent: prepend a fresh pair.
+    bliss_rt::rooted!(plist = existing);
     bliss_rt::rooted!(key_r = key);
     bliss_rt::rooted!(inner = arena_cons(val, *plist));
     bliss_rt::rooted!(new_plist = arena_cons(*key_r, *inner));
