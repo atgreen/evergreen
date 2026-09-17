@@ -10358,3 +10358,74 @@ fn fmakunbound_unbinds_a_setf_name() {
         }
     }
 }
+
+/// CLHS: if any variable in a PSETQ refers to a SYMBOL MACRO, PSETQ behaves as
+/// PSETF. bliss expanded to `(let ((tmp val)…) (setq var tmp)…)`, which assigns
+/// without lifting the PLACE's subforms first, so a symbol-macro variable such as
+/// `(aref a (incf i))` ran its subform at assignment time and the parallel
+/// semantics came out wrong. ansi PSETQ.7; bliss-t00q.
+///
+/// Only the symbol-macro case delegates, deliberately: PSETF's expansion uses
+/// DOLIST, which expands through DO to PSETQ, so delegating unconditionally makes
+/// the two macros expand each other forever — that blew the control stack on the
+/// first test that used one. The DO family is pinned here for that reason.
+#[test]
+fn psetq_behaves_as_psetf_for_symbol_macros() {
+    let cases = [
+        (
+            "(symbol-macrolet ((x (aref a (incf i))) (y (aref a (incf i)))) \
+               (let ((a (copy-seq #(0 1 2 3 4 5 6 7 8 9))) (i 0)) \
+                 (psetq x (aref a (incf i)) y (aref a (incf i))) (list a i)))",
+            "(#(0 2 2 4 4 5 6 7 8 9) 4)",
+        ),
+        // PSETF with the same places already agreed with SBCL; it must still.
+        (
+            "(symbol-macrolet ((x (aref a (incf i))) (y (aref a (incf i)))) \
+               (let ((a (copy-seq #(0 1 2 3 4 5 6 7 8 9))) (i 0)) \
+                 (psetf x (aref a (incf i)) y (aref a (incf i))) (list a i)))",
+            "(#(0 2 2 4 4 5 6 7 8 9) 4)",
+        ),
+        // Ordinary PSETQ is parallel, and SETQ on a symbol macro is unchanged.
+        ("(let ((p 1) (q 2)) (psetq p q q p) (list p q))", "(2 1)"),
+        (
+            "(symbol-macrolet ((x (aref a (incf i)))) \
+               (let ((a (copy-seq #(0 1 2 3))) (i 0)) (setq x 9) (list a i)))",
+            "(#(0 9 2 3) 1)",
+        ),
+        // PSETQ still rejects a non-variable, unlike PSETF.
+        ("(handler-case (eval '(psetq (car x) 1)) (error () :error))", ":ERROR"),
+        // The DO family expands through PSETQ — the recursion hazard.
+        ("(do ((i 0 (1+ i)) (acc nil (cons i acc))) ((= i 3) (reverse acc)))", "(0 1 2)"),
+        ("(do ((a 1 b) (b 2 a) (n 0 (1+ n))) ((> n 3) (list a b)))", "(1 2)"),
+        ("(do* ((i 0 (1+ i)) (j i (1+ j))) ((= i 3) (list i j)))", "(3 3)"),
+        ("(let ((n 0)) (dotimes (i 4 n) (incf n i)))", "6"),
+        ("(let ((acc nil)) (dolist (x '(1 2 3) (reverse acc)) (push x acc)))", "(1 2 3)"),
+        ("(loop for i from 1 to 3 collect i)", "(1 2 3)"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

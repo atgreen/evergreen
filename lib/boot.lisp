@@ -1238,14 +1238,34 @@
 ;;; ---------------------------------------------------------------------------
 
 ;; Parallel assignment: evaluate every value form, then assign (via temporaries).
-(defmacro psetq (&rest pairs)
-  (let ((bindings nil) (assigns nil) (p pairs))
-    (loop while (consp (cdr p)) do
-      (let ((var (car p)) (tmp (gensym)))
-        (setq bindings (cons (list tmp (cadr p)) bindings))
-        (setq assigns (cons (list 'setq var tmp) assigns))
-        (setq p (cddr p))))
-    `(let ,(reverse bindings) ,@(reverse assigns) nil)))
+(defmacro psetq (&rest pairs &environment env)
+  ;; CLHS: if any var refers to a SYMBOL MACRO, PSETQ behaves as PSETF. The plain
+  ;; expansion below -- (let ((tmp val)...) (setq var tmp)...) -- assigns without
+  ;; lifting the PLACE's subforms first, so with a symbol-macro var such as
+  ;; (aref a (incf i)) the subform ran at assignment time and the parallel
+  ;; semantics came out wrong (ansi PSETQ.7; bliss-t00q).
+  ;;
+  ;; Only that case delegates to PSETF, and deliberately so: PSETF's own
+  ;; expansion uses DOLIST, which expands through DO to PSETQ, so delegating
+  ;; UNCONDITIONALLY makes the two macros expand each other forever -- it blew
+  ;; the control stack on the first test that used one.
+  (let ((uses-symbol-macro nil) (p pairs))
+    (loop while (consp p) do
+      (unless (symbolp (car p))
+        (error "PSETQ: ~S is not a variable name" (car p)))
+      (multiple-value-bind (expansion expanded) (macroexpand-1 (car p) env)
+        (declare (ignore expansion))
+        (when expanded (setq uses-symbol-macro t)))
+      (setq p (cddr p)))
+    (if uses-symbol-macro
+        `(psetf ,@pairs)
+        (let ((bindings nil) (assigns nil) (q pairs))
+          (loop while (consp (cdr q)) do
+            (let ((var (car q)) (tmp (gensym)))
+              (setq bindings (cons (list tmp (cadr q)) bindings))
+              (setq assigns (cons (list 'setq var tmp) assigns))
+              (setq q (cddr q))))
+          `(let ,(reverse bindings) ,@(reverse assigns) nil)))))
 
 ;; Interleave two lists: (a b) (x y) => (a x b y). Helper for DO's step forms.
 (defun %zip-pairs (a b)
