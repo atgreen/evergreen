@@ -2679,11 +2679,21 @@ impl<'e> Lowerer<'e> {
                 }
             } else if let Some(mut sym_form) = symbol_function_setf_place(place) {
                 // `(setf (symbol-function|fdefinition sym) fn)` → the internal
-                // store primitive BLISS::SET-SYMBOL-FUNCTION (sym, value).
+                // store primitive. FDEFINITION gets its own, because it accepts a
+                // `(setf place)` function name that SYMBOL-FUNCTION must still
+                // reject (bliss-rg32).
                 bliss_rt::rooted_ref!(_sym_form_root = &mut sym_form);
-                let setter = resolve_sym("BLISS::SET-SYMBOL-FUNCTION")
-                    .ok_or(Bail)?
-                    .as_symbol_index();
+                let is_fdefinition = {
+                    let (head, _) = cp(place);
+                    head.is_symbol() && symbol_bare_name(&sym_name(head)) == "FDEFINITION"
+                };
+                let setter = resolve_sym(if is_fdefinition {
+                    "BLISS::SET-FDEFINITION"
+                } else {
+                    "BLISS::SET-SYMBOL-FUNCTION"
+                })
+                .ok_or(Bail)?
+                .as_symbol_index();
                 self.lower_expr(sym_form)?; // symbol
                 self.lower_expr(items[2 * i + 1])?; // value
                 self.emit(Instr::CallNamed {
@@ -5669,6 +5679,10 @@ fn compile_capturing_local(
 /// Recognize a single-index element SETF place `(aref|svref|char|schar|
 /// row-major-aref|elt SEQ INDEX)`, returning the sequence and index subforms.
 /// `(symbol-function SYM)` or `(fdefinition SYM)` as a SETF place → `Some(SYM)`.
+/// The place's argument form, plus whether the accessor was FDEFINITION.
+/// FDEFINITION names any FUNCTION NAME — `(setf place)` included — while
+/// SYMBOL-FUNCTION takes only a symbol, so the two cannot share one store
+/// primitive without losing SYMBOL-FUNCTION's type check (bliss-rg32).
 fn symbol_function_setf_place(place: BlissVal) -> Option<BlissVal> {
     if !place.is_cons() {
         return None;

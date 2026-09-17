@@ -10501,3 +10501,69 @@ fn define_setf_expander_body_has_an_implicit_block() {
         }
     }
 }
+
+/// FDEFINITION names any FUNCTION NAME, which includes `(setf place)`, so
+/// `(setf (fdefinition '(setf f)) fn)` installs a writer. bliss's place accepted
+/// only a symbol and signalled a TYPE-ERROR, and a writer installed that way was
+/// invisible to FBOUNDP because writer discovery consulted GLOBAL_SETF_FNS and
+/// the bytecode registry but not the mangled symbol's function cell.
+/// ansi FDEFINITION.5 (partly — see below); bliss-rg32.
+///
+/// SYMBOL-FUNCTION keeps rejecting a non-symbol, which is the reason the two
+/// accessors could not simply share one path.
+#[test]
+fn setf_of_fdefinition_accepts_a_setf_name() {
+    let cases = [
+        // The place accepts the name and FBOUNDP sees the result.
+        (
+            "(let* ((s (gensym)) (n (list 'setf s))) \
+               (list (fboundp n) (progn (setf (fdefinition n) (fdefinition 'cons)) \
+                                        (not (not (fboundp n))))))",
+            "(NIL T)",
+        ),
+        ("(progn (setf (fdefinition '(setf sfd-a)) (fdefinition 'cons)) (not (not (fboundp '(setf sfd-a)))))", "T"),
+        // Plain symbols are unaffected.
+        ("(let ((g (gensym))) (setf (fdefinition g) #'car) (funcall g '(1 2)))", "1"),
+        ("(let ((g (gensym))) (setf (symbol-function g) #'car) (funcall g '(3 4)))", "3"),
+        // SYMBOL-FUNCTION still refuses a non-symbol.
+        (
+            "(handler-case (eval '(setf (symbol-function '(setf sfd-b)) #'cons)) (error () :error))",
+            ":ERROR",
+        ),
+        // An ordinary (defun (setf f) …) writer is untouched by the discovery
+        // change: it still runs and still writes. (What SETF RETURNS through a
+        // writer is shape-dependent in bliss and tracked separately as
+        // bliss-9298; not asserted here, since pinning today's answer would pin
+        // a bug.)
+        (
+            "(progn (defun (setf sfd-c) (v x) (setf (car x) v))                (let ((c (cons 1 2))) (setf (sfd-c c) 9) c))",
+            "(9 . 2)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

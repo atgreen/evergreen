@@ -1268,9 +1268,20 @@ pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
     // source-free unit (e.g. alexandria's `(setf lastcar)` from lists.lisp) is
     // still lowered to the portable writer call. Mirrors the acceptance test in
     // the tree-walker's SETF `other =>` branch.
-    resolve_sym(&setf_writer_symbol_name(place_name))
-        .map(|s| bytecode::is_registered(s.as_symbol_index()))
-        .unwrap_or(false)
+    // ...or a function object sitting on that mangled symbol. A writer installed
+    // through `(setf (fdefinition '(setf place)) fn)` lands there and in neither
+    // of the two tables above, so without this it was invisible to FBOUNDP and to
+    // the SETF store path (ansi FDEFINITION.5; bliss-rg32).
+    let Some(symbol) = resolve_sym(&setf_writer_symbol_name(place_name)) else {
+        return false;
+    };
+    let Some(index) = symbol.symbol_index() else {
+        return false;
+    };
+    if bytecode::is_registered(index) {
+        return true;
+    }
+    bliss_rt::symbols::symbol_function(index).is_some_and(|f| f != bliss_rt::value::UNBOUND)
 }
 
 fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
@@ -16593,17 +16604,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // sequences.lisp aliases functions this way
                                 // (`(setf (symbol-function 'emptyp) …)`).
                                 let sym = eval_form(tgt_form, env)?;
-                                if !sym.is_symbol() {
-                                    // (setf (symbol-function x)) on a non-symbol is a
-                                    // TYPE-ERROR (symbol-function.error.4).
-                                    return Err(BlissError::TypeError {
-                                        datum: sym,
-                                        expected: "SYMBOL".to_string(),
-                                    });
-                                }
-                                let fnval = coerce_installed_function(env, *val);
-                                if let Some(idx) = sym.symbol_index() {
-                                    bliss_rt::symbols::set_symbol_function(idx, fnval);
+                                // FDEFINITION names any FUNCTION NAME, which
+                                // includes `(setf place)`; SYMBOL-FUNCTION takes
+                                // only a symbol (symbol-function.error.4). A
+                                // writer goes on the mangled %SETF-WRITER-place
+                                // symbol — where the compiled SETF path calls it
+                                // and FBOUNDP / #'(setf f) / FMAKUNBOUND look
+                                // (ansi FDEFINITION.5; bliss-rg32).
+                                if acc == "FDEFINITION" && sym.is_cons() {
+                                    check_function_name(sym)?;
+                                    let (_setf, tail) = cp(sym);
+                                    let place = cp(tail).0;
+                                    let fnval = coerce_installed_function(env, *val);
+                                    if let Some(index) =
+                                        resolve_sym(&setf_writer_symbol_name(&sym_name(place)))
+                                            .and_then(|writer| writer.symbol_index())
+                                    {
+                                        bliss_rt::symbols::set_symbol_function(index, fnval);
+                                    }
+                                } else {
+                                    if !sym.is_symbol() {
+                                        // (setf (symbol-function x)) on a non-symbol is a
+                                        // TYPE-ERROR (symbol-function.error.4).
+                                        return Err(BlissError::TypeError {
+                                            datum: sym,
+                                            expected: "SYMBOL".to_string(),
+                                        });
+                                    }
+                                    let fnval = coerce_installed_function(env, *val);
+                                    if let Some(idx) = sym.symbol_index() {
+                                        bliss_rt::symbols::set_symbol_function(idx, fnval);
+                                    }
                                 }
                             }
                             "MACRO-FUNCTION" => {
@@ -17962,6 +17993,33 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // Re-read from the rooted args: the store may have allocated.
                 return Ok(args.get(2).copied().unwrap_or(NIL));
+            }
+            "BLISS::SET-FDEFINITION" => {
+                // Store primitive for bytecode-lowered
+                // `(setf (fdefinition name) fn)`. Unlike SYMBOL-FUNCTION,
+                // FDEFINITION names any FUNCTION NAME, so a `(setf place)` cons
+                // is legal and installs the writer on the mangled
+                // %SETF-WRITER-place symbol — where the compiled SETF path calls
+                // it and FBOUNDP / #'(setf f) / FMAKUNBOUND look (bliss-rg32).
+                let args = eval_args(cdr, env)?;
+                let name = args.first().copied().unwrap_or(NIL);
+                let val = args.get(1).copied().unwrap_or(NIL);
+                check_function_name(name)?;
+                let fnval = coerce_installed_function(env, val);
+                if name.is_symbol() {
+                    if let Some(index) = name.symbol_index() {
+                        bliss_rt::symbols::set_symbol_function(index, fnval);
+                    }
+                } else {
+                    let (_setf, tail) = cp(name);
+                    let place = cp(tail).0;
+                    if let Some(index) = resolve_sym(&setf_writer_symbol_name(&sym_name(place)))
+                        .and_then(|writer| writer.symbol_index())
+                    {
+                        bliss_rt::symbols::set_symbol_function(index, fnval);
+                    }
+                }
+                return Ok(val);
             }
             "BLISS::SET-SYMBOL-FUNCTION" => {
                 // Store primitive for bytecode-lowered `(setf (symbol-function|
