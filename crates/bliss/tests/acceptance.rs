@@ -10214,3 +10214,73 @@ fn a_restart_body_can_go_to_its_establishing_tagbody() {
         }
     }
 }
+
+/// MACROLET and SYMBOL-MACROLET take body declarations, and a free
+/// `(declare (special v))` there redirects references in the body to the dynamic
+/// value — bypassing an intervening lexical binding, exactly as in LOCALLY:
+///
+///     (let ((x :good)) (declare (special x))
+///       (let ((x :bad)) (macrolet () (declare (special x)) x)))
+///       =>  :BAD, must be :GOOD
+///
+/// LOCALLY already did this (bliss-9kww); these two did not. Both lose the
+/// declaration the same way — the wrapper is macroexpanded away and its
+/// declarations go with it — so the fix is to read them off the wrapper first
+/// and keep them in force over the expansion. ansi MACROLET.47; bliss-vmge.
+#[test]
+fn macrolet_bodies_honour_a_free_special_declaration() {
+    let cases = [
+        ("(let ((x :good)) (declare (special x)) (let ((x :bad)) (macrolet () (declare (special x)) x)))", ":GOOD"),
+        (
+            "(let ((x :good)) (declare (special x)) \
+               (let ((x :bad)) (symbol-macrolet () (declare (special x)) x)))",
+            ":GOOD",
+        ),
+        // LOCALLY, which already worked, must keep working.
+        ("(let ((x :good)) (declare (special x)) (let ((x :bad)) (locally (declare (special x)) x)))", ":GOOD"),
+        // A lexical binding INSIDE the body still shadows the declaration.
+        (
+            "(let ((x :good)) (declare (special x)) \
+               (macrolet () (declare (special x)) (let ((x :inner)) x)))",
+            ":INNER",
+        ),
+        // Nested with LOCALLY, both reading the dynamic value.
+        (
+            "(let ((x :good)) (declare (special x)) \
+               (let ((x :bad)) (macrolet () (declare (special x)) \
+                 (list x (locally (declare (special x)) x)))))",
+            "(:GOOD :GOOD)",
+        ),
+        // The macros themselves still work, and a body with no declaration keeps
+        // ordinary lexical scoping.
+        ("(macrolet ((%m (a) `(list ,a ,a))) (%m 3))", "(3 3)"),
+        ("(symbol-macrolet ((v 42)) (+ v 1))", "43"),
+        ("(let ((x :lex)) (macrolet () x))", ":LEX"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

@@ -2348,14 +2348,27 @@ impl<'e> Lowerer<'e> {
     fn lower_macrolet(&mut self, mut form: BlissVal) -> LowerResult<()> {
         // Root across the allocating macro-env build (moving GC; bliss-wlf).
         bliss_rt::rooted_ref!(_form_root = &mut form);
+        // `macroexpand_all` strips the MACROLET wrapper, and its BODY
+        // DECLARATIONS with it, so a free `(declare (special v))` would simply
+        // vanish. Read it off the wrapper first and keep it in force over the
+        // expansion, exactly as lower_locally does (ansi MACROLET.47; bliss-vmge).
+        let decl_special = {
+            let (_operator, rest) = cp(form);
+            let (_definitions, body) = cp(rest);
+            body_declared_special(body)
+        };
         if self.macro_env.is_none() {
             self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
         }
         let menv = self.macro_env.as_ref().unwrap();
-        match compiler_macroexpand::macroexpand_all(form, menv) {
-            Ok(expanded) => self.lower_expr(expanded),
-            Err(_) => Err(record_bail(|| "macroexpand:macrolet".to_string())),
-        }
+        let expanded = match compiler_macroexpand::macroexpand_all(form, menv) {
+            Ok(expanded) => expanded,
+            Err(_) => return Err(record_bail(|| "macroexpand:macrolet".to_string())),
+        };
+        self.push_declared_special(&decl_special);
+        let lowered = self.lower_expr(expanded);
+        self.pop_declared_special(&decl_special);
+        lowered
     }
 
     fn lower_call(&mut self, name: &str, mut op: BlissVal, mut rest: BlissVal) -> LowerResult<()> {

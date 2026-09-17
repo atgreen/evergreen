@@ -30633,7 +30633,16 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // is otherwise invisible to the relocating minor GC and would be freed
     // mid-body (bliss-6b2 #2). Same guard as eval_flet.
     bliss_rt::rooted_ref!(_child_root = &mut child_env);
+    // A free `(declare (special v))` at the head of the body redirects references
+    // in it to the dynamic value, exactly as in LOCALLY — MACROLET and
+    // SYMBOL-MACROLET take body declarations too, and ignoring them made
+    // `(let ((x :bad)) (macrolet () (declare (special x)) x))` read the lexical
+    // :BAD instead of the enclosing special (ansi MACROLET.47; bliss-vmge).
+    let body_specials = let_body_special_decls(body);
+    let saved_locally = child_env.locally_specials.clone();
+    child_env.locally_specials.extend(body_specials);
     let __r = eval_progn(body, &mut child_env);
+    child_env.locally_specials = saved_locally;
     // Multiple values produced in the child body must propagate to the caller;
     // env.child() forks the value registers (bliss-lb6.22).
     env.mv = std::mem::take(&mut child_env.mv);
@@ -30654,7 +30663,18 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
         bliss_rt::rooted!(form = arena_cons(sm_sym, *cdr));
         let menv = macroexpand_environment_from_cli(env);
         if let Ok(expanded) = bliss_compiler::macroexpand::macroexpand_all(*form, &menv) {
-            return eval_form(expanded, env);
+            // Expanding away the wrapper discards its BODY DECLARATIONS, so a
+            // free `(declare (special v))` would vanish here just as it did in
+            // the lowerer. Keep it in force over the expansion (bliss-vmge).
+            let body_specials = let_body_special_decls(cp(*cdr).1);
+            if body_specials.is_empty() {
+                return eval_form(expanded, env);
+            }
+            let saved_locally = env.locally_specials.clone();
+            env.locally_specials.extend(body_specials);
+            let result = eval_form(expanded, env);
+            env.locally_specials = saved_locally;
+            return result;
         }
     }
     let (mut bindings_form, mut body) = cp(*cdr);
@@ -30680,7 +30700,16 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
     // Root the forked child Env for the body's extent so variables bound inside
     // the symbol-macrolet body survive a relocating minor GC (bliss-6b2 #2).
     bliss_rt::rooted_ref!(_child_root = &mut child_env);
+    // A free `(declare (special v))` at the head of the body redirects references
+    // in it to the dynamic value, exactly as in LOCALLY — MACROLET and
+    // SYMBOL-MACROLET take body declarations too, and ignoring them made
+    // `(let ((x :bad)) (macrolet () (declare (special x)) x))` read the lexical
+    // :BAD instead of the enclosing special (ansi MACROLET.47; bliss-vmge).
+    let body_specials = let_body_special_decls(body);
+    let saved_locally = child_env.locally_specials.clone();
+    child_env.locally_specials.extend(body_specials);
     let __r = eval_progn(body, &mut child_env);
+    child_env.locally_specials = saved_locally;
     // Multiple values produced in the child body must propagate to the caller;
     // env.child() forks the value registers (bliss-lb6.22).
     env.mv = std::mem::take(&mut child_env.mv);
