@@ -593,14 +593,19 @@
     (dolist (clause (reverse clauses))
       (let ((keys (car clause))
             (body (cdr clause)))
-        (if (consp keys)
-            (progn
-              (dolist (k keys) (push k all-keys))
-              (push `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys)) ,@(or body '(nil)))
-                    expanded))
-            (progn
-              (push keys all-keys)
-              (push `((eql ,value ',keys) ,@(or body '(nil))) expanded)))))
+        (cond
+          ;; A NIL keys designator is the EMPTY key list (CLHS): the clause can
+          ;; never match, and contributes no keys to the expected type. Treating
+          ;; it as the single key NIL made `(ecase nil (nil …))` match instead of
+          ;; signalling (ansi ECASE.9; bliss-gm4h). `(nil)` still matches NIL.
+          ((null keys))
+          ((consp keys)
+           (dolist (k keys) (push k all-keys))
+           (push `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys)) ,@(or body '(nil)))
+                 expanded))
+          (t
+           (push keys all-keys)
+           (push `((eql ,value ',keys) ,@(or body '(nil))) expanded)))))
     ;; ECASE signals a (non-correctable) TYPE-ERROR whose datum is the value and
     ;; whose expected type is the set of keys (ansi ECASE.ERROR.*/ECASE.4/.5).
     `(let ((,value ,keyform))
@@ -3042,22 +3047,26 @@
         (all-keys nil))
     (dolist (clause clauses)
       (let ((keys (car clause)))
-        (if (consp keys)
-            (dolist (k keys) (push k all-keys))
-            (push keys all-keys))))
+        ;; NIL designates the EMPTY key list, so it contributes no keys to the
+        ;; expected type and its clause can never match (CLHS; bliss-gm4h).
+        (cond ((null keys))
+              ((consp keys) (dolist (k keys) (push k all-keys)))
+              (t (push keys all-keys)))))
     `(block nil
        (tagbody
           ,top
           (return
             (let ((,value ,keyplace))
               (cond
-                ,@(mapcar (lambda (clause)
-                            (let ((keys (car clause)) (body (cdr clause)))
-                              (if (consp keys)
-                                  `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys))
-                                    ,@(or body '(nil)))
-                                  `((eql ,value ',keys) ,@(or body '(nil))))))
-                          clauses)
+                ,@(remove nil
+                    (mapcar (lambda (clause)
+                              (let ((keys (car clause)) (body (cdr clause)))
+                                (cond ((null keys) nil)
+                                      ((consp keys)
+                                       `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys))
+                                         ,@(or body '(nil))))
+                                      (t `((eql ,value ',keys) ,@(or body '(nil)))))))
+                            clauses))
                 ;; CCASE signals a correctable TYPE-ERROR whose expected type is
                 ;; the set of keys (not T) — ansi CCASE.4/.5 require the datum to
                 ;; NOT satisfy the expected type. STORE-VALUE retries.

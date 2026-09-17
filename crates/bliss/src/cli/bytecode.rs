@@ -2058,8 +2058,14 @@ impl<'e> Lowerer<'e> {
                 end_jumps.push(self.code.len() - 1);
                 break; // default is terminal
             }
-            // Designator is a single object or a list of objects.
-            let keys = if designator.is_cons() {
+            // Designator is a single object or a list of objects — except NIL,
+            // which is the EMPTY list of keys and so can never match (CLHS). To
+            // match the object NIL you write `(nil)`. Treating it as a single key
+            // made `(case nil (nil …))` match, which the tree-walker already got
+            // right (bliss-gm4h).
+            let keys = if designator.is_nil() {
+                Vec::new()
+            } else if designator.is_cons() {
                 list_to_vec(designator)
             } else {
                 vec![designator]

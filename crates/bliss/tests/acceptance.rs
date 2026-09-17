@@ -9800,3 +9800,67 @@ fn setf_of_find_class_binds_a_second_name() {
         }
     }
 }
+
+/// CLHS: in `(case key (KEYS form…))` a KEYS designator of NIL is the EMPTY list
+/// of keys, so that clause can never match — to match the object NIL you write
+/// `(nil)`. bliss treated it as the single key NIL:
+///
+///     (case nil (nil 'matched) (t 'fell-through))   =>  MATCHED, must fall through
+///     (ecase nil (nil 'matched))                    =>  MATCHED, must signal
+///
+/// The tree-walker already handled CASE correctly and the bytecode lowering did
+/// not — another backend divergence — while ECASE and CCASE were wrong on both
+/// paths, which is what ansi CCASE.9 / ECASE.9 exercise. bliss-gm4h.
+#[test]
+fn nil_keys_designator_is_an_empty_key_list() {
+    let cases = [
+        // NIL as the designator never matches...
+        ("(case nil (nil 'matched) (t 'fell-through))", "FELL-THROUGH"),
+        ("(case 1 (nil 'matched) (t 'fell-through))", "FELL-THROUGH"),
+        // ...but (nil) matches the object NIL.
+        ("(case nil ((nil) 'matched) (t 'fell-through))", "MATCHED"),
+        // ECASE/CCASE signal, since no clause can match and NIL contributes no
+        // key to the expected type.
+        ("(handler-case (ecase nil (nil 'matched)) (type-error () :type-error))", ":TYPE-ERROR"),
+        // CCASE needs a real PLACE as its keyform (its STORE-VALUE restart
+        // assigns to it), so this uses a variable as ansi CCASE.9 does.
+        (
+            "(let ((x nil)) (handler-case (ccase x (nil 'matched)) (type-error () :type-error)))",
+            ":TYPE-ERROR",
+        ),
+        ("(ecase nil ((nil) 'matched))", "MATCHED"),
+        // Everything else is unchanged: single keys, key lists, OTHERWISE/T,
+        // and a normal ECASE hit and miss.
+        ("(case 2 (1 'one) (2 'two) (t 'other))", "TWO"),
+        ("(case 3 ((1 2) 'low) ((3 4) 'high))", "HIGH"),
+        ("(case 99 (1 'one) (otherwise 'other))", "OTHER"),
+        ("(ecase 2 (1 'one) (2 'two))", "TWO"),
+        ("(handler-case (ecase 9 (1 'one) (2 'two)) (type-error () :type-error))", ":TYPE-ERROR"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
