@@ -9169,3 +9169,99 @@ fn sharp_quote_of_a_local_function_is_eq_stable() {
         }
     }
 }
+
+/// Three coupled rules about which binding a reference sees, all in the
+/// tree-walker (the bytecode backend was already right on every case here).
+///
+///  1. A binding established DYNAMICALLY redirects the body's OWN references to
+///     the value cell. eval_let wrote the cell but left the name out of
+///     locally_specials, so the frame walk found an OUTER LEXICAL binding of the
+///     same name and won — visible only when such an outer binding exists, which
+///     is why `(let (x) (declare (special x)) x)` alone looked fine.
+///     ansi LET.11 / LET*.11.
+///  2. A binding established LEXICALLY shadows an enclosing declaration, in
+///     M-V-B as well as LET. Adding rule 1 without this broke
+///     `(let ((z 0)) (declare (special z)) (multiple-value-bind (z) (values 3) z))`.
+///  3. SYMBOL-VALUE reads the DYNAMIC value only; a lexical binding is not a
+///     symbol value. It resolved through the full lexical-then-global lookup, so
+///     it saw an M-V-B's lexical binding. ansi MULTIPLE-VALUE-BIND.7.
+///
+/// bliss-s2y9 / bliss-qui9. Rules 1 and 2 are exact opposites, so both
+/// directions and the interaction are pinned; `with_child_frame` restores only
+/// the frame, so the leak cases check that neither edit escapes its form.
+#[test]
+fn dynamic_and_lexical_bindings_shadow_each_other_correctly() {
+    let setup = "(defun dls-pk (s) (symbol-value s))";
+    let cases = [
+        // (1) the body's own reference reads the dynamic binding...
+        ("(let ((x 1)) (list x (let (x) (declare (special x)) x) x))", "(1 NIL 1)"),
+        ("(let* ((x 1)) (list x (let* (x) (declare (special x)) x) x))", "(1 NIL 1)"),
+        // ...and a callee sees it too.
+        ("(let ((v 1)) (let ((v 7)) (declare (special v)) (dls-pk 'v)))", "7"),
+        // (2) a lexical binding shadows an enclosing declaration, in LET...
+        ("(let ((x 0)) (declare (special x)) (let ((x 1)) x))", "1"),
+        // ...and in MULTIPLE-VALUE-BIND.
+        ("(let ((z 0)) (declare (special z)) (multiple-value-bind (z) (values 3) z))", "3"),
+        // ...while the outer dynamic binding is untouched by it.
+        (
+            "(let ((z 0)) (declare (special z)) \
+               (multiple-value-bind (z) (values 3) (list z (dls-pk 'z))))",
+            "(3 0)",
+        ),
+        // (3) SYMBOL-VALUE never sees a lexical binding. This is the core of
+        // ansi MULTIPLE-VALUE-BIND.7: X and Y are declared special in the M-V-B
+        // so %x/%y read 1 and 2, while Z is bound lexically so %z reads the
+        // OUTER dynamic 0.
+        (
+            "(let ((z 0) x y) (declare (special z)) \
+               (flet ((%x () (symbol-value 'x)) (%y () (symbol-value 'y)) \
+                      (%z () (symbol-value 'z))) \
+                 (multiple-value-bind (x y z) (values 1 2 3) (declare (special x y)) \
+                   (list (%x) (%y) (%z)))))",
+            "(1 2 0)",
+        ),
+        // Neither edit may leak past its form (with_child_frame restores only
+        // the frame, so both are undone explicitly).
+        ("(let ((v 1)) (list (let ((v 2)) (declare (special v)) (dls-pk 'v)) v))", "(2 1)"),
+        ("(let ((v 9)) (declare (special v)) (list (let ((v 3)) v) (dls-pk 'v)))", "(3 9)"),
+        // Nested dynamic rebinding still unwinds.
+        (
+            "(let ((v 1)) (declare (special v)) \
+               (list (let ((v 2)) (declare (special v)) (dls-pk 'v)) (dls-pk 'v)))",
+            "(2 1)",
+        ),
+        // A free LOCALLY declaration still bypasses a lexical binding.
+        (
+            "(let ((x 0)) (declare (special x)) \
+               (let ((x 1)) (multiple-value-list \
+                 (values x (locally (declare (special x)) x)))))",
+            "(1 0)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(progn {setup} (cl:format t \"~S~%\" {form}))")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

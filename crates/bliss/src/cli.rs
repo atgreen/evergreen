@@ -14970,8 +14970,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         expected: "SYMBOL".to_string(),
                     });
                 }
-                // By-index resolution for symbols — see BOUNDP (bliss-o2da).
-                let resolved = env.lookup_var_symbol(sym);
+                // SYMBOL-VALUE reads the DYNAMIC value only (CLHS): a lexical
+                // binding is not a symbol value at all. Going through
+                // lookup_var_symbol also consulted the lexical frames, so
+                //
+                //   (let ((z 0)) (declare (special z))
+                //     (multiple-value-bind (z) (values 3) (symbol-value 'z)))
+                //
+                // returned the M-V-B's LEXICAL 3 instead of the dynamic 0
+                // (bliss-qui9, resurfaced by bliss-s2y9). Resolution is still
+                // BY INDEX, which is what bliss-o2da actually needed — a
+                // package-qualified symbol must not be looked up by bare name.
+                let idx = sym.symbol_index();
+                let resolved = idx.and_then(global_value_cell);
                 return match resolved {
                     Some(v) => Ok(v),
                     None => Err(BlissError::UnboundVariable(sym)),
@@ -27466,6 +27477,20 @@ impl bliss_rt::gc::TraceHostRoots for DynBind {
 /// sym)) …)` for its extent: that declaration redirects *references* only until
 /// an inner binding of the same name intervenes (CLHS 3.3.4; bliss-9kww).
 /// Mirrors the bytecode lowerer's `shadow_declared_special`.
+/// The converse of [`shadow_locally_special`]: a binding established DYNAMICALLY
+/// makes references to that name in its body read the value cell, so the name
+/// joins `locally_specials` for the extent. Without it the frame walk can find an
+/// outer LEXICAL binding of the same name and shadow the dynamic one that this
+/// form just established (bliss-s2y9).
+fn expose_locally_special(env: &mut Env, sym: BlissVal) {
+    if sym.is_symbol() {
+        let idx = sym.as_symbol_index();
+        if !env.locally_specials.contains(&idx) {
+            env.locally_specials.push(idx);
+        }
+    }
+}
+
 fn shadow_locally_special(env: &mut Env, sym: BlissVal) {
     if sym.is_symbol() && !env.locally_specials.is_empty() {
         let idx = sym.as_symbol_index();
@@ -27494,6 +27519,10 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
             // scope exit. Held for the whole body so later inits see earlier
             // special bindings, matching lexical ones.
             bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+            // `with_child_frame` restores only `env.frame`, so the
+            // expose/shadow edits below must be undone explicitly or they leak
+            // past this LET (bliss-s2y9).
+            let saved_locally = env.locally_specials.clone();
             while c.is_cons() {
                 let (binding, rest) = cp(*c);
                 // Advance the rooted cursor first so the rest of the list stays
@@ -27505,6 +27534,13 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                     let val = eval_form(val_form, env)?;
                     if let_binding_is_dynamic(var_form, &body_specials) {
                         dyn_binds.push(DynBind::establish(var_form, val));
+                        // The body's OWN references must read the dynamic cell.
+                        // DynBind writes the cell, but lookup_var_symbol only
+                        // redirects for an earmuffed/proclaimed name or one in
+                        // locally_specials — so without this the frame walk finds
+                        // an OUTER LEXICAL binding of the same name and wins
+                        // (ansi LET.11/LET*.11; bliss-s2y9).
+                        expose_locally_special(env, var_form);
                     } else if var_form.is_symbol() {
                         env.define_local_symbol(var_form, val);
                         shadow_locally_special(env, var_form);
@@ -27514,13 +27550,16 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                 } else if binding.is_symbol() {
                     if let_binding_is_dynamic(binding, &body_specials) {
                         dyn_binds.push(DynBind::establish(binding, NIL));
+                        expose_locally_special(env, binding);
                     } else {
                         env.define_local_symbol(binding, NIL);
                         shadow_locally_special(env, binding);
                     }
                 }
             }
-            eval_progn(*body, env)
+            let result = eval_progn(*body, env);
+            env.locally_specials = saved_locally;
+            result
         });
     }
 
@@ -27557,10 +27596,16 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         // are lexical frame bindings. Rooted: the guards' saved cells stay
         // precise across the body evaluation (moving GC; bliss-8qf).
         bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+        // Restored after the body: `with_child_frame` restores only the frame
+        // (bliss-s2y9).
+        let saved_locally = env.locally_specials.clone();
         for i in 0..evaluated.len() {
             let (symbol, val) = evaluated[i];
             if let_binding_is_dynamic(symbol, &body_specials) {
                 dyn_binds.push(DynBind::establish(symbol, val));
+                // See the LET* branch: the body's own references must read the
+                // dynamic cell, not an outer lexical binding (bliss-s2y9).
+                expose_locally_special(env, symbol);
             } else if symbol.is_symbol() {
                 env.define_local_symbol(symbol, val);
                 shadow_locally_special(env, symbol);
@@ -27568,7 +27613,9 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                 env.define_local(&sym_name(symbol), val);
             }
         }
-        eval_progn(body, env)
+        let result = eval_progn(body, env);
+        env.locally_specials = saved_locally;
+        result
     })
 }
 
@@ -32488,6 +32535,8 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
         // Rooted: each guard's saved cell must stay precise across the body
         // evaluation (moving GC; bliss-8qf).
         bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+        // Restored after the body: `with_child_frame` restores only the frame.
+        let saved_locally = env.locally_specials.clone();
         for (i, var_name) in var_names.iter().enumerate() {
             let val = if i == 0 {
                 *primary
@@ -32498,17 +32547,22 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
             };
             if let_binding_is_dynamic(vars[i], &body_specials) {
                 dyn_binds.push(DynBind::establish(vars[i], val));
+                expose_locally_special(env, vars[i]);
             } else {
                 env.define_local(var_name, val);
+                // Bound LEXICALLY here, so it shadows any enclosing declaration
+                // that made the name dynamic — the same rule lower_mvb follows
+                // (bliss-7v68). Without it an enclosing `(let ((z 0)) (declare
+                // (special z)) …)` leaves Z dynamic and the M-V-B's own binding
+                // is invisible (bliss-s2y9).
+                shadow_locally_special(env, vars[i]);
             }
-        }
-        if body_specials.is_empty() {
-            return eval_progn(body, env);
         }
         // A declared name the form did NOT bind is a free declaration: it only
         // redirects references in the body.
-        let saved_locally = env.locally_specials.clone();
-        env.locally_specials.extend(body_specials);
+        for idx in &body_specials {
+            expose_locally_special(env, BlissVal::from_symbol_index(*idx));
+        }
         let result = eval_progn(body, env);
         env.locally_specials = saved_locally;
         result
