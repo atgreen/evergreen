@@ -103,7 +103,7 @@ pub use pathnames::{
 };
 pub use sequences::{
     adjust_complex_vector, aref, array_total_size, build_complex_vector, build_displaced_vector,
-    build_md_array, build_simple_vector,
+    build_filled_simple_vector, build_md_array, build_simple_vector,
     concatenate,
     copy_seq, count,
     cvec_adjustable, cvec_capacity, cvec_char_contents, cvec_displacement, cvec_element, cvec_is_bit,

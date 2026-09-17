@@ -10816,3 +10816,132 @@ fn multiple_value_setq_assigns_to_an_uninterned_variable() {
         }
     }
 }
+
+/// MAKE-ARRAY's plain simple-vector branch built an n-element LIST with
+/// MAKE-LIST and then `(apply #'vector …)` it, which cost one Lisp-level CONS
+/// call per element and spread the whole list as arguments: `(make-array
+/// 100000)` took ~980ms, about 11x the 100k-iteration `(setf (aref a i) i)`
+/// loop that fills it, and was what actually blew the ansi sequences chapter's
+/// time budget (bliss-3o0r). It now allocates the storage in one step.
+///
+/// This pins the SHAPE, which is what a one-step allocator could plausibly get
+/// wrong: the result must be indistinguishable from the vector the old
+/// list-then-apply path produced.
+#[test]
+fn make_array_builds_a_plain_simple_vector() {
+    let cases = [
+        ("(make-array 3)", "#(NIL NIL NIL)"),
+        ("(make-array 0)", "#()"),
+        ("(make-array 3 :initial-element 7)", "#(7 7 7)"),
+        // A list dimension of rank 1 takes the same branch.
+        ("(make-array '(3) :initial-element 'a)", "#(A A A)"),
+        ("(length (make-array 5))", "5"),
+        ("(array-dimensions (make-array 5))", "(5)"),
+        ("(array-rank (make-array 5))", "1"),
+        ("(list (simple-vector-p (make-array 4)) (vectorp (make-array 4)) (arrayp (make-array 4)))", "(T T T)"),
+        // Not adjustable and no fill pointer, exactly like `(vector …)`.
+        ("(list (adjustable-array-p (make-array 4)) (array-has-fill-pointer-p (make-array 4)))", "(NIL NIL)"),
+        ("(eq (type-of (make-array 4)) (type-of (vector nil nil nil nil)))", "T"),
+        // Writable, and every cell holds the SAME initial element (CLHS).
+        ("(let ((a (make-array 3))) (setf (aref a 1) 9) a)", "#(NIL 9 NIL)"),
+        ("(let* ((c (cons 1 2)) (a (make-array 2 :initial-element c))) (eq (aref a 0) (aref a 1)))", "T"),
+        // A big one, to exercise the large-object allocation path.
+        ("(let ((a (make-array 5000 :initial-element 3))) (list (length a) (aref a 4999)))", "(5000 3)"),
+        // The other branches must be untouched.
+        ("(make-array 3 :initial-contents '(1 2 3))", "#(1 2 3)"),
+        ("(make-array 3 :element-type 'character)", "\"   \""),
+        ("(length (make-array 4 :fill-pointer 2))", "2"),
+        ("(make-array '(2 2) :initial-element 0)", "#2A((0 0) (0 0))"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}
+
+/// CONS and 1+/1- reached through FUNCALL/APPLY/MAPCAR — i.e. every call a
+/// compiled function makes through the c2i adapter — used to be synthesized
+/// back into `(CONS 'a 'b)` and re-evaluated, costing ~4.3us and ~5.1us a call
+/// against ~2.9us for a builtin already on the fast path (bliss-3o0r). They now
+/// dispatch on the already-evaluated arguments through the SAME kernels
+/// operator position uses (`arena_cons`, `fold_arith_vals`, `sub_vals`), so the
+/// tiers must stay bit-identical — including the numeric tower and the
+/// arity/type errors, which is what this pins.
+#[test]
+fn cons_and_unary_arithmetic_match_operator_position() {
+    let cases = [
+        ("(list (cons 1 2) (funcall #'cons 1 2) (apply #'cons '(1 2)))", "((1 . 2) (1 . 2) (1 . 2))"),
+        ("(mapcar #'cons '(1 2) '(3 4))", "((1 . 3) (2 . 4))"),
+        ("(list (1+ 5) (funcall #'1+ 5) (1- 5) (funcall #'1- 5))", "(6 6 4 4)"),
+        // The numeric tower: fixnum->bignum at the boundary, ratios, floats,
+        // complex — a fixnum-only fast path would diverge here.
+        ("(funcall #'1+ 4611686018427387903)", "4611686018427387904"),
+        ("(funcall #'1- -4611686018427387904)", "-4611686018427387905"),
+        ("(list (funcall #'1+ 1/2) (funcall #'1- 1/2))", "(3/2 -1/2)"),
+        ("(funcall #'1+ 2.5)", "3.5"),
+        ("(funcall #'1- #c(1 2))", "#C(0 2)"),
+        // CONS is exactly binary; 1+/1- are exactly unary and reject non-numbers.
+        ("(handler-case (funcall #'cons 1) (program-error () :pe))", ":PE"),
+        ("(handler-case (funcall #'cons 1 2 3) (program-error () :pe))", ":PE"),
+        ("(handler-case (funcall #'1+ 'a) (type-error () :te))", ":TE"),
+        // A user redefinition must still win over the fast path.
+        ("(progn (defun my1+ (x) (funcall #'1+ x)) (my1+ 10))", "11"),
+        // A lexical function whose name is NOT a CL symbol still wins, and the
+        // fast path is not consulted for it. (FLET-binding CL:CONS itself is
+        // undefined consequences per CLHS 11.1.2.1.2, and the two backends
+        // disagree about it — filed separately, not pinned here.)
+        ("(flet ((my-cons (a b) (list :shadowed a b))) (my-cons 1 2))", "(:SHADOWED 1 2)"),
+        ("(progn (defun my-cons (a b) (cons b a)) (list (my-cons 1 2) (funcall #'my-cons 1 2)))", "((2 . 1) (2 . 1))"),
+        // MAKE-LIST, the heaviest CONS caller in the stdlib.
+        ("(make-list 3 :initial-element 'x)", "(X X X)"),
+        ("(length (make-list 500))", "500"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

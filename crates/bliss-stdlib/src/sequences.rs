@@ -277,6 +277,43 @@ fn build_vector(vals: &[BlissVal]) -> BlissVal {
     unsafe { BlissVal::from_heap_ptr(ptr) }
 }
 
+/// Build a simple-vector of `len` elements all EQ to `fill`, without first
+/// materializing the elements.
+///
+/// `(make-array n)` — the most common array constructor there is — used to
+/// build an n-element LIST with MAKE-LIST and then `(apply #'vector …)` it
+/// (boot.lisp). That spent one Lisp-level CONS call per element, each one
+/// reaching the interpreter through the slow synthesize-and-evaluate path in
+/// `apply_function`, and then spread a 100k-element list as function arguments:
+/// `(make-array 100000)` took ~980ms, ~9.8us per element, which is ~11x the
+/// cost of the 100k-iteration `(setf (aref a i) i)` loop that fills it
+/// (bliss-3o0r). Allocating the storage once in Rust removes the list entirely.
+///
+/// GC safety: `fill` is rooted across the single `alloc_typed`, which is the
+/// only allocation here — the element loop writes an already-rooted immediate
+/// into freshly allocated storage and cannot itself collect. Writing the young
+/// `fill` into a brand-new object needs no write barrier: the object is in the
+/// nursery, so the minor collector scans it regardless.
+pub fn build_filled_simple_vector(len: usize, fill: BlissVal) -> BlissVal {
+    bliss_rt::rooted!(fill = fill);
+    let body_size = 8 + len * 8;
+    if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::SIMPLE_VECTOR) {
+        unsafe {
+            *(body as *mut u64) = len as u64;
+            let raw = fill.to_raw();
+            for i in 0..len {
+                *(body.add(8 + i * 8) as *mut u64) = raw;
+            }
+            let header_off = bliss_rt::gc::body_header_offset(body_size);
+            return BlissVal::from_heap_ptr(body.sub(header_off));
+        }
+    }
+    // OOM fallback: mirror `build_vector`'s leaked-block path so vector
+    // allocation never fails.
+    let vals = vec![*fill; len];
+    build_vector(&vals)
+}
+
 /// Build a fresh simple bit-vector from a slice of element values (each a
 /// fixnum 0 or 1). Used by SUBSEQ/COPY-SEQ/REVERSE so a bit-vector input yields
 /// a bit-vector result (ANSI: the result of these on a bit-vector is a

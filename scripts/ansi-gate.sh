@@ -23,7 +23,7 @@
 set -u
 
 # Chapters currently at 100%. Add a chapter here once it passes completely.
-ENABLED_CHAPTERS=(cons)
+ENABLED_CHAPTERS=(cons data-and-control-flow)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 BLISS_BIN="${BLISS_BIN:-target/x86_64-unknown-linux-musl/debug/bliss-cli}"

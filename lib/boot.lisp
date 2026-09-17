@@ -1731,9 +1731,14 @@
       (bitp
        (%bit-vector-from-bits
         (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) 0))))
+      ;; The plain simple-vector case — by far the most common MAKE-ARRAY —
+      ;; allocates its storage in one step. It used to build a SIZE-element
+      ;; list with MAKE-LIST and then `(apply #'vector …)` it, which cost a
+      ;; Lisp-level CONS per element and spread the whole list as arguments:
+      ;; (make-array 100000) took ~980ms, ~11x the 100k-iteration loop that
+      ;; fills it (bliss-3o0r).
       (t
-       (apply (function vector)
-              (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) nil)))))))
+       (%make-simple-vector size (if iel-cell (car (cdr iel-cell)) nil))))))
 
 ;; ADJUST-ARRAY array new-dimensions &key fill-pointer initial-element — grow (or
 ;; shrink) a rank-1 fill-pointer/adjustable vector in place. cl-ppcre grows its

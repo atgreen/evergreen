@@ -17413,6 +17413,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let elems = eval_args(cdr, env)?;
                 return Ok(bliss_stdlib::build_simple_vector(&elems));
             }
+            // (%make-simple-vector size initial-element) — allocate a rank-1
+            // simple-vector of SIZE elements all EQ to INITIAL-ELEMENT.
+            // MAKE-ARRAY's plain-vector branch (boot.lisp) used to build an
+            // n-element list with MAKE-LIST and `(apply #'vector …)` it, paying
+            // one Lisp-level CONS call per element and then spreading the whole
+            // list as arguments — `(make-array 100000)` cost ~980ms against
+            // ~88ms for the 100k-iteration loop that fills it (bliss-3o0r).
+            "BLISS-INTERNAL::%MAKE-SIMPLE-VECTOR"
+            | "BLISS-INTERNAL:%MAKE-SIMPLE-VECTOR"
+            | "%MAKE-SIMPLE-VECTOR" => {
+                let args = eval_args(cdr, env)?;
+                let size = args.first().copied().unwrap_or(NIL);
+                if !size.is_fixnum() || size.as_fixnum() < 0 {
+                    return Err(BlissError::TypeError {
+                        datum: size,
+                        expected: "non-negative array dimension".into(),
+                    });
+                }
+                let fill = args.get(1).copied().unwrap_or(NIL);
+                return Ok(bliss_stdlib::build_filled_simple_vector(
+                    size.as_fixnum() as usize,
+                    fill,
+                ));
+            }
             // (%make-md-array dims-list initial-element) — build a rank ≥ 2
             // multidimensional array with row-major storage seeded with
             // initial-element. MAKE-ARRAY (boot.lisp) routes list dimensions of
@@ -32286,6 +32310,20 @@ fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, Bl
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
         "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
         "-" => sub_vals(args),
+        // 1+/1- were the only hot unary arithmetic missing here, so a compiled
+        // loop's `(1- i)` fell through to synthesize-and-re-evaluate: ~5.1us a
+        // call against ~2.9us for `+` (bliss-3o0r). Same shared-numeric-tower
+        // kernels the operator handler uses, so bignums/ratios/complex behave
+        // identically and the tiers stay bit-identical.
+        "1+" if args.len() == 1 => fold_arith_vals(
+            &[args[0], BlissVal::from_fixnum(1)],
+            0,
+            0.0,
+            |a, b| a + b,
+            bigrat_add,
+            |a, b| a + b,
+        ),
+        "1-" if args.len() == 1 => sub_vals(&[args[0], BlissVal::from_fixnum(1)]),
         "<" if args.len() == 2 => cmp(|o| o == Ordering::Less),
         ">" if args.len() == 2 => cmp(|o| o == Ordering::Greater),
         "<=" if args.len() == 2 => cmp(|o| o != Ordering::Greater),
@@ -32430,7 +32468,24 @@ fn apply_function(
         // consume memory in proportion to total calls (bliss-jql).
         if matches!(
             &*name,
-            "CAR" | "FIRST" | "CDR" | "REST" | "NULL" | "NOT" | "CONSP" | "ATOM" | "LISTP"
+            "CAR"
+                | "FIRST"
+                | "CDR"
+                | "REST"
+                | "NULL"
+                | "NOT"
+                | "CONSP"
+                | "ATOM"
+                | "LISTP"
+                // CONS is the hottest allocating builtin there is, and every
+                // call reaching here from compiled code (MAKE-LIST's collect,
+                // any list built in a hot loop) was paying the
+                // synthesize-`(CONS 'a 'b)`-and-re-evaluate detour below —
+                // ~4.3us per cons against ~2.9us for a builtin already on this
+                // path (bliss-3o0r). `apply_builtin` uses the SAME `arena_cons`
+                // kernel and the same exactly-two-arguments PROGRAM-ERROR as
+                // operator position, so tiers stay bit-identical.
+                | "CONS"
         ) {
             env.clear_mv();
             return apply_builtin(&name, args, env);
@@ -32631,6 +32686,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
+            | "%MAKE-SIMPLE-VECTOR"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers
             | "+" | "-" | "*" | "/" | "1+" | "1-" | "=" | "/=" | "<" | ">" | "<=" | ">="
