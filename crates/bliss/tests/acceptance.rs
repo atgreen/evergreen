@@ -10055,3 +10055,71 @@ fn return_from_in_a_local_function_is_lexical() {
         }
     }
 }
+
+/// CLHS: two ARRAYS are EQUALP when they have the same dimensions and
+/// corresponding elements are EQUALP — the element TYPE is irrelevant. bliss
+/// excluded strings from its vector comparison, so a string never compared equal
+/// to a general vector:
+///
+///     (equalp "ab" #(#\a #\b))                        =>  NIL, must be T
+///     (equalp (make-array '(0) :element-type nil) #()) =>  NIL, must be T
+///
+/// The second is ansi EQUALP.5; the first shows the gap was not only about empty
+/// arrays. Two strings still take the case-insensitive fast path above the
+/// vector branch. bliss-4gcm.
+#[test]
+fn equalp_compares_arrays_across_element_types() {
+    let cases = [
+        ("(equalp \"ab\" #(#\\a #\\b))", "T"),
+        ("(equalp \"\" #())", "T"),
+        ("(equalp (make-array '(0) :element-type nil) #())", "T"),
+        ("(equalp #*10 #(1 0))", "T"),
+        // Case-insensitivity survives the element-wise route.
+        ("(equalp \"AB\" #(#\\a #\\b))", "T"),
+        // Still NIL where it should be: a list is not an array, and lengths must
+        // match.
+        ("(equalp #(1 2) '(1 2))", "NIL"),
+        ("(equalp #(1) #(1 2))", "NIL"),
+        ("(equalp #\\a 97)", "NIL"),
+        // The neighbouring EQUALP behaviours are unchanged.
+        ("(list (equalp \"AB\" \"ab\") (equal \"AB\" \"ab\"))", "(T NIL)"),
+        ("(list (equalp #*101 #*101) (equalp #*101 #*100))", "(T NIL)"),
+        ("(equalp (vector \"ab\" 1) (vector \"AB\" 1.0))", "T"),
+        (
+            "(let ((v (make-array 4 :fill-pointer 2 :initial-contents '(1 2 3 4)))) (equalp v #(1 2)))",
+            "T",
+        ),
+        ("(equalp (make-array '(2 2) :initial-element 0) (make-array '(2 2) :initial-element 0))", "T"),
+        // EQUALP hash tables use the same predicate.
+        (
+            "(let ((h (make-hash-table :test 'equalp))) (setf (gethash \"ab\" h) 1) (gethash \"AB\" h))",
+            "1",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

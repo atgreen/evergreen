@@ -34136,7 +34136,16 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
         };
     }
     // Vectors / arrays (simple and fill-pointer): same length, EQUALP elements.
-    if is_vector_value(a) && is_vector_value(b) && !is_string_value(a) && !is_string_value(b) {
+    //
+    // Deliberately NOT excluding strings. CLHS compares two ARRAYS by dimensions
+    // and elements; the element TYPE is irrelevant, so a string and a general
+    // vector holding the same characters are EQUALP — `(equalp "ab" #(#\a #\b))`
+    // is true, and so is `(equalp (make-array '(0) :element-type nil) #())`
+    // (ansi EQUALP.5; bliss-4gcm). Two strings never reach here: the
+    // case-insensitive string fast path above already returned. Element
+    // comparison recurses through vals_equalp, so characters stay
+    // case-insensitive.
+    if is_vector_value(a) && is_vector_value(b) {
         let la = bliss_stdlib::length(a).unwrap_or(usize::MAX);
         let lb = bliss_stdlib::length(b).unwrap_or(usize::MAX);
         if la == usize::MAX || la != lb {
