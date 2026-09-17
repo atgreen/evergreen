@@ -9864,3 +9864,62 @@ fn nil_keys_designator_is_an_empty_key_list() {
         }
     }
 }
+
+/// `#'(setf place)` returned the designator SYMBOL rather than the writer's
+/// function object, so it was callable but failed FUNCTIONP and
+/// `(typep … 'function)`:
+///
+///     (defun (setf sfa) (v x) (setf (car x) v))
+///     (functionp #'(setf sfa))   =>  NIL, must be T
+///     (type-of #'(setf sfa))     =>  SYMBOL, must be a function type
+///
+/// `(defun (setf place) …)` already installs a real function object on the
+/// mangled %SETF-WRITER-place symbol (for the compiled SETF path), so both
+/// `#'(setf place)` and `(fdefinition '(setf place))` now answer with it. The
+/// designator symbol stays as the fallback for writers that live only in
+/// GLOBAL_SETF_FNS. ansi FUNCTION.7 / FUNCTIONP.7; bliss-sqvh.
+#[test]
+fn sharp_quote_of_a_setf_name_is_a_function_object() {
+    let setup = "(defun (setf sqs) (v x) (setf (car x) v))";
+    let cases = [
+        ("(not (not (functionp #'(setf sqs))))", "T"),
+        ("(not (not (typep #'(setf sqs) 'function)))", "T"),
+        ("(not (not (functionp (fdefinition '(setf sqs)))))", "T"),
+        // Still callable, and still actually writes.
+        ("(let ((c (cons 1 2))) (funcall #'(setf sqs) 9 c) c)", "(9 . 2)"),
+        ("(let ((c (cons 1 2))) (apply #'(setf sqs) 9 (list c)) c)", "(9 . 2)"),
+        // The SETF place itself keeps working through the writer.
+        ("(let ((c (cons 1 2))) (setf (sqs c) 7) c)", "(7 . 2)"),
+        // Ordinary function names are unaffected.
+        ("(not (not (functionp #'car)))", "T"),
+        ("(not (not (functionp (fdefinition 'car))))", "T"),
+        // A (setf name) with no writer defined is still not fbound.
+        ("(fboundp '(setf sqs-undefined))", "NIL"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(progn {setup} (cl:format t \"~S~%\" {form}))")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

@@ -1208,6 +1208,23 @@ fn function_name_key(name_form: BlissVal) -> String {
 /// the compile-file installer and the SETF store path compute it the same way,
 /// so the same symbol identity is used at install and at call. Colons are
 /// sanitized so the whole thing reads back as one symbol in BLISS-INTERNAL.
+/// The function OBJECT a `(defun (setf place) …)` installed, if any. That defun
+/// puts a real interpreted-function object on the mangled `%SETF-WRITER-place`
+/// symbol, so `#'(setf place)` and `(fdefinition '(setf place))` can answer with
+/// it instead of a designator symbol — which is what makes them satisfy FUNCTIONP
+/// and `(typep … 'function)` rather than merely being callable (ansi
+/// FUNCTION.7 / FUNCTIONP.7; bliss-sqvh).
+fn setf_writer_function_object(place: BlissVal) -> Option<BlissVal> {
+    if !place.is_symbol() {
+        return None;
+    }
+    let symbol = resolve_sym(&setf_writer_symbol_name(&sym_name(place)))?;
+    let function = bliss_rt::symbols::symbol_function(symbol.symbol_index()?)?;
+    (function != bliss_rt::value::UNBOUND
+        && bliss_rt::function::is_interpreted_function(function))
+    .then_some(function)
+}
+
 pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
     format!(
         "BLISS-INTERNAL::%SETF-WRITER-{}",
@@ -15275,6 +15292,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 if name == "FDEFINITION" {
                     check_function_name(spec)?;
+                    // `(fdefinition '(setf place))` answers with the writer's
+                    // function object for the same reason `#'(setf place)` does
+                    // (bliss-sqvh).
+                    if spec.is_cons()
+                        && let (_setf, tail) = cp(spec)
+                        && tail.is_cons()
+                        && let Some(object) = setf_writer_function_object(cp(tail).0)
+                    {
+                        return Ok(object);
+                    }
                 }
                 if spec.is_symbol() {
                     // Return the SAME first-class function object `#'name` yields
@@ -16881,6 +16908,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // Intern the key VERBATIM: it contains parens and a
                         // package marker, so resolve_sym's tokenizer rejects it
                         // and the registry holds no such symbol until we make one.
+                        // The real function OBJECT when one exists, so the
+                        // result satisfies FUNCTIONP (bliss-sqvh); the designator
+                        // symbol remains the fallback for writers that live only
+                        // in GLOBAL_SETF_FNS.
+                        if let Some(object) = setf_writer_function_object(cp(st).0) {
+                            return Ok(object);
+                        }
                         let key = function_name_key(name_form);
                         let writer = BlissVal::from_symbol_index(
                             bliss_compiler::reader::intern_symbol(&key),
