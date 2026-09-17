@@ -11768,7 +11768,7 @@ fn bind_macro_variadic(
             None
         };
         if let Err(error) =
-            super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole)
+            super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole, None)
         {
             return Err(error);
         }

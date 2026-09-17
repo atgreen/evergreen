@@ -9265,3 +9265,73 @@ fn dynamic_and_lexical_bindings_shadow_each_other_correctly() {
         }
     }
 }
+
+/// `(destructuring-bind (&whole (a . b) c . d) '(1 . 2) (list a b c d))` left D
+/// unbound. Every ingredient worked alone — dotted tails, dotted values, `&whole`
+/// with a plain symbol, `&whole` with a pattern — only the combination failed.
+/// ansi DESTRUCTURING-BIND.20; bliss-8st5.
+///
+/// Two losses, both of the dotted tail. `bind_macro_param` delegates any pattern
+/// containing a lambda-list keyword to the lambda-list binder, which (a) rebuilt
+/// the value with `vec_to_list(args)`, dropping a dotted tail before `&whole`
+/// ever saw it, and (b) iterates `while c.is_cons()`, so a dotted tail in the
+/// LAMBDA LIST was never bound at all.
+///
+/// The binder needs the argument list separately from `&whole`'s form: for a
+/// macro call the latter is `(operator . args)`, so walking it is off by one —
+/// an intermediate version of this fix bound D to the whole list for
+/// `(defmacro m (a . d) …)`, which is why that case is pinned here too.
+#[test]
+fn destructuring_handles_dotted_tails_with_lambda_list_keywords() {
+    let cases = [
+        // The ansi case: &whole pattern + dotted lambda list + dotted value.
+        ("(destructuring-bind (&whole (a . b) c . d) '(1 . 2) (list a b c d))", "(1 2 1 2)"),
+        // Each ingredient alone, so a regression says which half broke.
+        ("(destructuring-bind (c . d) '(1 . 2) (list c d))", "(1 2)"),
+        ("(destructuring-bind (a b . d) '(1 2 3 4) (list a b d))", "(1 2 (3 4))"),
+        ("(destructuring-bind (&whole w a b) '(1 2) (list w a b))", "((1 2) 1 2)"),
+        ("(destructuring-bind (&whole (a . b) c) '(1) (list a b c))", "(1 NIL 1)"),
+        // A dotted tail alongside the other lambda-list keywords.
+        ("(destructuring-bind (&whole w a . d) '(1 2 3) (list w a d))", "((1 2 3) 1 (2 3))"),
+        ("(destructuring-bind (a (b . c) . d) '(1 (2 3 4) 5 6) (list a b c d))", "(1 2 (3 4) (5 6))"),
+        // Unaffected shapes.
+        ("(destructuring-bind (a &rest r) '(1 2 3) (list a r))", "(1 (2 3))"),
+        ("(destructuring-bind (a &optional (b 'z)) '(1) (list a b))", "(1 Z)"),
+        ("(destructuring-bind (a &key b) '(1 :b 2) (list a b))", "(1 2)"),
+        ("(destructuring-bind (&whole w a &key b) '(1 :b 2) (list w a b))", "((1 :B 2) 1 2)"),
+        // A MACRO lambda list shares this binder, and there `&whole` is the whole
+        // CALL form — so the dotted tail must be walked from the arguments, not
+        // from that form. With one argument, D binds to NIL, not to the call.
+        ("(progn (defmacro dtl-m (a . d) `(list ',a ',d)) (dtl-m 1))", "(1 NIL)"),
+        // ...and the surplus arguments a dotted tail exists to collect must not
+        // trip the binder's "too many arguments" check (bliss-4ab5).
+        ("(progn (defmacro dtl-m2 (a . d) `(list ',a ',d)) (dtl-m2 1 2 3))", "(1 (2 3))"),
+        ("(progn (defmacro dtl-w (&whole w a) (declare (ignore w)) `',a) (dtl-w 7))", "7"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

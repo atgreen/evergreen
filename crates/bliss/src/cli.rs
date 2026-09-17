@@ -28454,8 +28454,18 @@ fn bind_macro_param(
         let mut sub_args = list_to_vec(value);
         bliss_rt::rooted_ref!(_sub_args_root = &mut sub_args);
         // Nested destructuring: `&whole` here binds the sub-list being
-        // destructured (no operator to prepend), which is the default.
-        return bind_macro_lambda_list(pattern, &sub_args, env, macroexpand_env, None);
+        // destructured (no operator to prepend). Pass it EXPLICITLY rather than
+        // letting the binder default to `vec_to_list(args)` — that rebuild drops
+        // a DOTTED tail, so `(&whole (a . b) …)` against `(1 . 2)` saw `(1)` and
+        // bound B to NIL (ansi DESTRUCTURING-BIND.20; bliss-8st5).
+        return bind_macro_lambda_list(
+            pattern,
+            &sub_args,
+            env,
+            macroexpand_env,
+            Some(value),
+            Some(value),
+        );
     }
     // Otherwise destructure structurally, recursing through this function so a
     // keyword-bearing lambda list nested *deeper* is still detected. A symbol in
@@ -28484,6 +28494,11 @@ fn bind_macro_lambda_list(
     // 3.4.4) — the caller supplies it because `args` holds only the arguments.
     // `None` (nested destructuring) defaults to the sub-list being destructured.
     mut whole: Option<BlissVal>,
+    // The actual argument list this lambda list destructures, with a DOTTED tail
+    // intact — `args` is a slice and cannot represent one. Distinct from `whole`:
+    // for a macro call `whole` is `(operator . args)` while this is just `args`.
+    // `None` reconstructs it from `args`, correct whenever it is a proper list.
+    arg_list: Option<BlissVal>,
 ) -> Result<(), BlissError> {
     #[derive(PartialEq)]
     enum Mode {
@@ -28725,6 +28740,35 @@ fn bind_macro_lambda_list(
                 aux_specs.push((pattern, default_form));
             }
         }
+    }
+
+    // A DOTTED lambda list — `(a b . rest)` — binds its tail to whatever of the
+    // value the fixed parameters did not consume, exactly like &REST.
+    // `bind_macro_param` destructures that case itself, but a pattern containing
+    // a lambda-list keyword is delegated HERE instead, and the loop above stops
+    // at the first non-cons — so the tail was silently dropped and the variable
+    // left unbound (ansi DESTRUCTURING-BIND.20; bliss-8st5).
+    if c.is_symbol() && !c.is_nil() {
+        // Walk the ARGUMENT list, not `whole_form`: for a top-level macro call
+        // whole_form is the entire call form `(operator . args)`, so walking it
+        // is off by one and `(defmacro m (a . d) …)` bound D to the whole list.
+        // `arg_list` is the real argument list, dotted tail intact — which
+        // `args` cannot express, being a slice.
+        let mut unconsumed = arg_list.unwrap_or_else(|| vec_to_list(&args.to_vec()));
+        bliss_rt::rooted_ref!(_unconsumed_root = &mut unconsumed);
+        for _ in 0..arg_i {
+            if !unconsumed.is_cons() {
+                break;
+            }
+            unconsumed = cp(unconsumed).1;
+        }
+        bind_pattern_value(c, unconsumed, env)?;
+        // A dotted tail IS a rest binding, so the surplus arguments it exists to
+        // collect must not trip the "too many arguments" check below. Without
+        // this, `(&whole w a . d)` against `(1 2 3)` was a PROGRAM-ERROR even
+        // though D had just been bound to (2 3) — and the same for a dotted
+        // MACRO lambda list (bliss-4ab5).
+        rest_bound = true;
     }
 
     if let Some(mut var) = whole_var {
@@ -29134,6 +29178,7 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                             macroexpand_env.as_ref(),
                             // A setf expander's `&whole` binds the whole place form.
                             Some(*place),
+                            None,
                         )?;
                         eval_progn(*body, &mut child)?
                     };
@@ -29185,7 +29230,7 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
 
                     let mut child = env.child();
                     bliss_rt::rooted_ref!(_child_root = &mut child);
-                    bind_macro_lambda_list(*lambda_list, &temps, &mut child, None, Some(place))?;
+                    bind_macro_lambda_list(*lambda_list, &temps, &mut child, None, Some(place), None)?;
                     for (name, store) in store_names.iter().zip(stores.iter()) {
                         if name.is_symbol() {
                             child.define_local(&sym_name(*name), *store);
@@ -29508,6 +29553,7 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
                 Some(_macro_env),
                 // A compiler macro's `&whole` binds the whole call form.
                 Some(*form),
+                None,
             )?;
             eval_progn(*body, &mut macro_env)
         }),
@@ -29847,6 +29893,7 @@ fn expand_macro(
                 &mut child_env,
                 macroexpand_env.as_ref(),
                 Some(whole),
+                None,
             );
             match binding {
                 Ok(()) => {
@@ -30183,6 +30230,7 @@ fn augment_env_with_macros(
                             Some(call_macro_env),
                             // A macrolet macro's `&whole` binds the whole call form.
                             Some(form),
+                            None,
                         )?;
                         eval_progn(body, &mut macro_env)
                     }),
