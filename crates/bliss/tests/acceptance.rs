@@ -11014,3 +11014,78 @@ fn search_finds_the_same_positions_after_the_walk_rewrite() {
         }
     }
 }
+
+/// Operator dispatch memoizes a symbol's BARE (qualifier-stripped, upcased)
+/// name by symbol index, because `symbol_bare_name` allocates a fresh String
+/// every call and dispatch called it twice per evaluated form plus once more
+/// per `apply_function` — 18% of all instructions on dispatch-heavy interpreted
+/// code (bliss-edzd).
+///
+/// A cache is only safe with its invalidation, so this pins the two things that
+/// can change what a symbol's name resolves to: RENAME-PACKAGE (which rewrites
+/// the qualifier) and a symbol reached under several spellings. The
+/// arity/shadowing decisions that dispatch makes from the bare name must come
+/// out the same before and after.
+#[test]
+fn dispatch_sees_the_right_bare_name_across_package_renames() {
+    let cases = [
+        // The bare name survives a package rename, and the symbol keeps its
+        // identity, so dispatch decisions are unchanged.
+        (
+            "(progn (defpackage :bnc1 (:use :cl)) \
+               (let ((s (intern \"MYSYM\" :bnc1))) \
+                 (rename-package :bnc1 :bnc2) \
+                 (list (symbol-name s) (package-name (symbol-package s)) \
+                       (eq s (intern \"MYSYM\" :bnc2)))))",
+            "(\"MYSYM\" \"BNC2\" T)",
+        ),
+        // A function defined in a package still dispatches after the rename.
+        (
+            "(progn (defpackage :bnc3 (:use :cl)) (in-package :bnc3) \
+               (defun bnc-f (x) (* x 2)) \
+               (let ((before (bnc-f 4))) \
+                 (rename-package :bnc3 :bnc4) \
+                 (list before (bnc-f 5))) )",
+            "(8 10)",
+        ),
+        // The fixed-arity builtin guard reads the bare name: it must still fire
+        // for a genuine builtin, and still stand down for a shadowing
+        // definition, on both the operator and the funcall path.
+        ("(handler-case (cons 1) (program-error () :pe))", ":PE"),
+        ("(handler-case (funcall #'cons 1) (program-error () :pe))", ":PE"),
+        ("(handler-case (consp 'a 'b) (program-error () :pe))", ":PE"),
+        ("(progn (defun bnc-cons (a b) (cons b a)) (bnc-cons 1 2))", "(2 . 1)"),
+        // Qualified spellings of one symbol reach the same dispatch decision.
+        ("(list (cl:car '(1 2)) (car '(1 2)) (funcall #'cl:car '(1 2)))", "(1 1 1)"),
+        // A gensym has no interned index; its name must not be cached under a
+        // colliding slot.
+        ("(let ((g (gensym))) (eval (list 'let (list (list g 7)) g)))", "7"),
+        ("(let ((g (gensym \"PFX\"))) (eq g (car (list g))))", "T"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

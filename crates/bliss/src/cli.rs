@@ -7734,6 +7734,52 @@ thread_local! {
     /// Indices are dense and small for interned symbols, so a Vec is the right
     /// shape; uninterned indices (the high range) are not cached.
     static SYM_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> = const { RefCell::new(Vec::new()) };
+
+    /// The BARE (package-qualifier-stripped, upcased) name, memoized the same
+    /// way and invalidated at the same two points as `SYM_NAME_CACHE`.
+    ///
+    /// `symbol_bare_name` allocates a fresh String on every call — it upcases
+    /// unconditionally, and `trim_start_matches` showed up as the single
+    /// hottest symbol in two unrelated profiles. Operator dispatch called it
+    /// TWICE per evaluated form (the lexical-shadowing test and the
+    /// fixed-arity-builtin guard), and `apply_function` once more per call, so
+    /// an interpreted loop minted several Strings per operator. Under musl,
+    /// whose allocator does not return freed spans to the OS, that churn shows
+    /// up as unbounded RSS growth (bliss-7x7o, bliss-edzd).
+    static SYM_BARE_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The bare name of a SYMBOL value, memoized by symbol index.
+///
+/// Equivalent to `symbol_bare_name(&sym_name(val))`, including for the
+/// `BLISS-EXT::`/`BLISS-INTERNAL::` spellings operator dispatch normalizes:
+/// stripping the qualifier yields the same tail whether it was written with one
+/// colon or two.
+fn sym_bare_name_rc(val: BlissVal) -> std::rc::Rc<str> {
+    if !val.is_symbol() || val.is_nil() || val == T {
+        return std::rc::Rc::from(symbol_bare_name(&sym_name_uncached(val)).as_str());
+    }
+    let idx = val.as_symbol_index();
+    // Uninterned symbols live at the top of the index space; caching them would
+    // size the Vec by the raw index (same rule as SYM_NAME_CACHE).
+    if bliss_rt::symbols::is_uninterned(idx) {
+        return std::rc::Rc::from(symbol_bare_name(&sym_name_uncached(val)).as_str());
+    }
+    SYM_BARE_NAME_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = idx as usize;
+        if i >= c.len() {
+            c.resize(i + 1, None);
+        }
+        if let Some(hit) = &c[i] {
+            return std::rc::Rc::clone(hit);
+        }
+        let computed: std::rc::Rc<str> =
+            std::rc::Rc::from(symbol_bare_name(&sym_name_rc(val)).as_str());
+        c[i] = Some(std::rc::Rc::clone(&computed));
+        computed
+    })
 }
 
 /// [`sym_name`] without the allocation: a shared, cached handle to the name.
@@ -9705,6 +9751,14 @@ fn rekey_renamed_symbols(env: &Env, renamed: &[(u32, String, String)]) {
         return;
     }
     SYM_NAME_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        for (idx, _, _) in renamed {
+            if let Some(slot) = c.get_mut(*idx as usize) {
+                *slot = None;
+            }
+        }
+    });
+    SYM_BARE_NAME_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         for (idx, _, _) in renamed {
             if let Some(slot) = c.get_mut(*idx as usize) {
@@ -13381,11 +13435,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // A MACROLET macro lives in that same lexical namespace, so it still
         // wins — only a global macro yields to the binding.
         let shadowed_by_lexical_function = {
-            let bare = symbol_bare_name(&name);
+            let bare = sym_bare_name_rc(car);
             let funs = env.funs.borrow();
             let macros = env.macros.borrow();
-            (funs.contains_key(&name) || funs.contains_key(&bare))
-                && !(macros.contains_key(&name) || macros.contains_key(&bare))
+            (funs.contains_key(&name) || funs.contains_key(&*bare))
+                && !(macros.contains_key(&name) || macros.contains_key(&*bare))
         };
         if !shadowed_by_lexical_function
             && let Some(mdef) = lookup_macro(env, &name)
@@ -13401,7 +13455,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // Only fires when the operator is a genuine builtin (not shadowed by a
         // user/lexical function); boot.lisp functions are global_fns and validate
         // their own lambda lists, so they are skipped here.
-        if let Some((lo, hi)) = fixed_arity_builtin(&symbol_bare_name(&name)) {
+        if let Some((lo, hi)) = fixed_arity_builtin(&sym_bare_name_rc(car)) {
             if global_fn(&name).is_none()
                 && !env.funs.borrow().contains_key(&name)
                 && local_fn_closure(env, &name).is_none()
@@ -32425,7 +32479,7 @@ fn apply_function(
         // portable retry surfaced the gap, bliss-mr4p). Mirror eval_list's guard:
         // only a genuine builtin not shadowed by a user/global/lexical function.
         {
-            let bare = symbol_bare_name(&name);
+            let bare = sym_bare_name_rc(fn_val);
             if let Some((lo, hi)) = fixed_arity_builtin(&bare) {
                 if global_fn(&name).is_none()
                     && !env.funs.borrow().contains_key(&*name)
@@ -34650,6 +34704,7 @@ fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), BlissError> 
     // pre-load names (SYMBOL-PACKAGE derived COMMON-LISP for restored
     // package-interned symbols — bliss-xi01). Flush it wholesale.
     SYM_NAME_CACHE.with(|c| c.borrow_mut().clear());
+    SYM_BARE_NAME_CACHE.with(|c| c.borrow_mut().clear());
     // Install the restored macros/setf-fns (stashed by the restore hook) into the
     // global tables, bound to the fresh top-level frame.
     drain_pending_host_registries(&env.frame);
