@@ -9,6 +9,7 @@ fn main() {
     let result = cli::run(&args);
     // JFR-style event stream (bliss-3gme): dump the recording if BLISS_EVENTS_DUMP
     // is set, whichever way the run ended, before we exit the process.
+    cli::events::maybe_report_direct_builtin_stats();
     cli::events::maybe_dump_on_exit();
     // bliss-jitrec: finalize the NDJSON stream (symbol + function records) and
     // close it, if BLISS_EVENTS_STREAM was set.

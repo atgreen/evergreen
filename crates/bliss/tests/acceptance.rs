@@ -12254,3 +12254,71 @@ fn concatenate_and_map_return_fresh_sequences() {
     ];
     run_expression_cases(&cases);
 }
+
+/// Compiled and interpreted call sites dispatch known builtins DIRECTLY,
+/// skipping apply_function's resolve-the-callee-by-name preamble
+/// (bliss-x5y.27). The shortcut is only sound while the name still means the
+/// builtin, so pin the invalidation paths and the results themselves.
+///
+/// Lexical FLET/LABELS shadowing of a builtin is NOT asserted here: it is
+/// broken independently of this work (bliss-xnrm), and behaves identically on
+/// binaries built before and after it. Asserting it either way would bake a
+/// pre-existing bug into the suite.
+#[test]
+fn direct_builtin_dispatch_respects_shadowing() {
+    let cases = [
+        // The unshadowed results, including VARIADIC arities. These have no
+        // declared arity range, so an arity gate would silently exclude exactly
+        // the builtins this table exists to speed up.
+        ("(list (car (list 1 2)) (cdr (list 1 2)) (cons 1 2))", "(1 (2) (1 . 2))"),
+        ("(list (+ 1 2 3) (- 10 1) (* 2 3) (1+ 5) (1- 5))", "(6 9 6 6 4)"),
+        ("(list (< 1 2 3) (= 2 2) (/= 1 2) (eq 'a 'a))", "(T T T T)"),
+        (
+            "(list (aref (vector 9 8 7) 1) (elt (list 1 2 3) 1) (mod -7 3) (rem -7 3))",
+            "(8 2 2 -1)",
+        ),
+        ("(multiple-value-list (floor -7 2))", "(-4 1)"),
+        ("(list (logand 12 10) (logior 12 10) (lognot 0) (null nil) (not 1))", "(8 14 -1 T NIL)"),
+        // A hot loop must compute the same answer as a cold one.
+        (
+            "(let ((v (make-array 16 :initial-element 3)))
+               (list (let ((s 0)) (dotimes (i 10 s) (setq s (+ s (aref v (mod i 16))))))
+                     (let ((s 0)) (dotimes (i 200000 s) (setq s (+ s (aref v (mod i 16))))))))",
+            "(30 600000)",
+        ),
+        // Wrong argument counts must still signal rather than reaching a kernel
+        // that ignores the extras.
+        ("(handler-case (car 1 2) (error () :err))", ":ERR"),
+        ("(handler-case (cons 1) (error () :err))", ":ERR"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// Redefining a builtin must take effect even after it has been dispatched
+/// directly tens of thousands of times (bliss-x5y.27). Separate top-level
+/// forms, because a redefinition nested inside ONE top-level form is not
+/// picked up by that same form — pre-existing behaviour, identical on binaries
+/// built before and after this work, and not what this test is about.
+#[test]
+fn redefining_a_directly_dispatched_builtin_takes_effect() {
+    let out = bliss_bin()
+        .args([
+            "--eval",
+            "(defun hot3 (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s (car (list 1 2)))))))",
+            // Run it hot enough to memoize CAR as a direct builtin many times.
+            "--eval",
+            "(cl:format t \"before=~a \" (hot3 50000))",
+            "--eval",
+            "(defun car (x) (declare (ignore x)) 99)",
+            // Both the hot function and a fresh call site must see the new one.
+            "--eval",
+            "(cl:format t \"after=~a direct=~a~%\" (hot3 10) (car (list 1 2)))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("before=50000") && stdout.contains("after=990") && stdout.contains("direct=99"),
+        "redefinition did not take effect; got: {stdout}"
+    );
+}

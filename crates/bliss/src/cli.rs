@@ -32635,6 +32635,237 @@ fn apply_intlen_or_logcount(name: &str, v: BlissVal) -> Result<BlissVal, BlissEr
     Ok(BlissVal::from_fixnum(r))
 }
 
+// ── Direct builtin calls from compiled code (bliss-x5y.27) ────────
+//
+// A native (T1) call to a builtin goes out through `c2i_call_slice` into
+// `apply_function`, which RESOLVES THE CALLEE BY NAME on every single call:
+// `sym_name_rc`, `global_callable_body_of_symbol`, `sym_bare_name_rc`,
+// `fixed_arity_builtin`, then three shadowing lookups — `global_fn` (which
+// round-trips the name back to an index through the package system),
+// `env.funs`, `local_fn_closure` — before any work happens. Profiling a loop
+// that really is running natively (60M iterations, well past the OSR
+// threshold) put ~31% of it in that name resolution and much of the ~19%
+// malloc/free it causes.
+//
+// None of that is necessary when the compiler already knows which builtin the
+// call site names. These entries let an emitted site bake a table INDEX and go
+// straight to the same kernels `apply_function` would have reached.
+//
+// MEMBERSHIP RULE — only builtins that are BOTH:
+//   * LEAF: they never re-enter Lisp. That is what makes a direct call safe
+//     without the invocation counting, native depth cap and panic barrier that
+//     `c2i_call_args` owns for a Lisp callee (the hazards recorded on
+//     bliss-x5y.27). MAPCAR/SORT/REDUCE/FUNCALL and friends are excluded for
+//     exactly this reason.
+//   * dispatched by `apply_function` on ALREADY-EVALUATED arguments, so the
+//     direct call reaches an identical kernel and the tiers stay bit-identical
+//     (the bliss-x5y.9 rule). Anything that would take the
+//     synthesize-`(op 'a 'b)`-and-re-evaluate detour is excluded, because that
+//     detour is a different implementation.
+//
+// `call_direct_builtin` below therefore replicates `apply_function`'s dispatch
+// ORDER exactly; it skips only the steps whose purpose is to resolve the name.
+
+/// Builtins reached through `apply_numeric_op` — the shared numeric-tower
+/// kernels, identical to operator position.
+const DIRECT_NUMERIC: &[&str] = &[
+    "+", "-", "*", "1+", "1-", "<", ">", "<=", ">=", "=", "/=",
+];
+
+/// Builtins `apply_function` hands to `apply_builtin` on evaluated arguments.
+const DIRECT_STRUCTURAL: &[&str] = &[
+    "CAR", "FIRST", "CDR", "REST", "NULL", "NOT", "CONSP", "ATOM", "LISTP", "CONS",
+];
+
+/// Builtins `apply_builtin_fast` handles on evaluated arguments.
+const DIRECT_FAST: &[&str] = &[
+    "AREF", "SVREF", "ROW-MAJOR-AREF", "BIT", "SBIT", "ELT", "EQ", "TYPEP",
+    "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
+    "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
+];
+
+/// The direct-call table. The index into this slice is what a compiled call
+/// site bakes, so the order must stay stable within a process — it is rebuilt
+/// from these constants on every run, never persisted.
+fn direct_builtin_table() -> &'static [&'static str] {
+    use std::sync::OnceLock;
+    static T: OnceLock<Vec<&'static str>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut v = Vec::new();
+        v.extend_from_slice(DIRECT_NUMERIC);
+        v.extend_from_slice(DIRECT_STRUCTURAL);
+        v.extend_from_slice(DIRECT_FAST);
+        v
+    })
+    .as_slice()
+}
+
+/// EMIT TIME: the table slot for calling `sym` with `nargs` arguments, or
+/// `None` if this site must go the general way.
+///
+/// Refuses whenever the name could mean anything other than the builtin:
+/// a global function cell on the symbol (`(setf (symbol-function 'aref) …)`),
+/// an interpreted global definition, or a registered bytecode body all mean a
+/// user has taken the name over. A later redefinition is caught separately, by
+/// the generation guard the call site bakes.
+fn direct_builtin_slot(sym: u32, nargs: usize) -> Option<u32> {
+    if bliss_rt::symbols::symbol_function(sym)
+        .is_some_and(bliss_rt::function::is_interpreted_function)
+    {
+        return None;
+    }
+    let full = sym_name_uncached(BlissVal::from_symbol_index(sym));
+    let bare = symbol_bare_name(&full);
+    let slot = direct_builtin_table().iter().position(|&n| n == bare)?;
+    // Arity must be one this builtin actually accepts, so a wrong-count call
+    // still raises the PROGRAM-ERROR `apply_function`'s guard would raise
+    // rather than reaching a kernel that ignores the extra arguments.
+    let (lo, hi) = fixed_arity_builtin(&bare).unwrap_or((0, usize::MAX));
+    if nargs < lo || nargs > hi {
+        return None;
+    }
+    if global_fn(&full).is_some() {
+        return None;
+    }
+    Some(slot as u32)
+}
+
+/// What `direct_builtin_slot` found for a symbol, kept so the interpreter does
+/// not repeat the name resolution on every call at the same site.
+#[derive(Clone, Copy)]
+enum BuiltinMemo {
+    /// Not directly callable — always take the general path.
+    No,
+    /// Directly callable at these arities.
+    Yes { slot: u32, lo: usize, hi: usize },
+}
+
+thread_local! {
+    /// Per-symbol memo of `direct_builtin_slot`, indexed by symbol index and
+    /// valid only for the generation it was built in. Any redefinition bumps
+    /// that generation (bliss-zhvn) and the whole memo is dropped, so a symbol
+    /// that stops being a plain builtin is never dispatched as one.
+    static DIRECT_BUILTIN_MEMO: RefCell<(u64, Vec<Option<BuiltinMemo>>)> =
+        RefCell::new((0, Vec::new()));
+}
+
+/// `direct_builtin_slot` with the name resolution memoized per symbol.
+///
+/// This is what makes the INTERPRETER's builtin calls cheap. Without it every
+/// `(aref v i)` in a T0 loop hands a symbol to `apply_function`, which resolves
+/// it by name from scratch — `sym_name_rc`, `symbol_bare_name`,
+/// `fixed_arity_builtin`, `global_fn` (round-tripping the name back through the
+/// package system) and two more shadowing lookups — before doing any work.
+fn direct_builtin_slot_memoized(sym: u32, nargs: usize) -> Option<u32> {
+    if bliss_rt::symbols::is_uninterned(sym) {
+        return None;
+    }
+    // Per-call re-check, one index lookup: a user function installed on the
+    // symbol wins over the builtin. Builtins carry a function object of their
+    // own so `#'aref` works, so the discriminator is the SAME one
+    // `global_fn` applies — is the cell an INTERPRETED function — not merely
+    // whether a cell exists.
+    if bliss_rt::symbols::symbol_function(sym)
+        .is_some_and(bliss_rt::function::is_interpreted_function)
+    {
+        return None;
+    }
+    let generation = bytecode::direct_call_gen();
+    DIRECT_BUILTIN_MEMO.with(|cell| {
+        let mut memo = cell.borrow_mut();
+        if memo.0 != generation {
+            memo.0 = generation;
+            memo.1.clear();
+        }
+        let i = sym as usize;
+        if i >= memo.1.len() {
+            memo.1.resize(i + 1, None);
+        }
+        let entry = match memo.1[i] {
+            Some(e) => e,
+            None => {
+                // Resolve once. `direct_builtin_slot` answers for a specific
+                // arity, so ask it for one this builtin certainly accepts and
+                // record the accepted range alongside.
+                let e = direct_builtin_resolve(sym);
+                memo.1[i] = Some(e);
+                e
+            }
+        };
+        match entry {
+            BuiltinMemo::No => None,
+            BuiltinMemo::Yes { slot, lo, hi } if nargs >= lo && nargs <= hi => Some(slot),
+            BuiltinMemo::Yes { .. } => None,
+        }
+    })
+}
+
+/// Diagnostic: why each table entry does or does not resolve, for
+/// `BLISS_DIRECT_BUILTIN_STATS`.
+pub(super) fn direct_builtin_report() -> Vec<String> {
+    direct_builtin_table()
+        .iter()
+        .map(|&name| {
+            let Some(idx) = bliss_rt::symbols::find_index(name) else {
+                return format!("{name}: no symbol");
+            };
+            let interp = bliss_rt::symbols::symbol_function(idx)
+                .is_some_and(bliss_rt::function::is_interpreted_function);
+            let gf = global_fn(name).is_some();
+            let arity = fixed_arity_builtin(name);
+            let ok = matches!(direct_builtin_resolve(idx), BuiltinMemo::Yes { .. });
+            format!(
+                "{name}: direct={ok} interpreted_fn={interp} global_fn={gf} arity={arity:?}"
+            )
+        })
+        .collect()
+}
+
+/// The arity-independent half of `direct_builtin_slot`, for the memo.
+fn direct_builtin_resolve(sym: u32) -> BuiltinMemo {
+    let full = sym_name_uncached(BlissVal::from_symbol_index(sym));
+    let bare = symbol_bare_name(&full);
+    let Some(slot) = direct_builtin_table().iter().position(|&n| n == bare) else {
+        return BuiltinMemo::No;
+    };
+    // Arity range only where one is declared. `apply_function` applies its
+    // PROGRAM-ERROR arity guard on exactly the same condition, so gating on a
+    // declared arity would refuse the variadic builtins (+, AREF, EQ, MOD, …)
+    // that this table exists to make fast, while changing nothing about which
+    // calls are legal.
+    let (lo, hi) = fixed_arity_builtin(&bare).unwrap_or((0, usize::MAX));
+    if global_fn(&full).is_some() {
+        return BuiltinMemo::No;
+    }
+    BuiltinMemo::Yes {
+        slot: slot as u32,
+        lo,
+        hi,
+    }
+}
+
+/// RUNTIME: dispatch a pre-resolved builtin on already-evaluated arguments, in
+/// exactly the order `apply_function` uses for them. `None` means this call is
+/// not handled here and the caller must fall back to the full path — which is
+/// always correct, just slower.
+fn call_direct_builtin(
+    slot: u32,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Option<Result<BlissVal, BlissError>> {
+    let name = *direct_builtin_table().get(slot as usize)?;
+    if let Some(res) = apply_numeric_op(name, args) {
+        // Single-valued, so reset MV state exactly as apply_function does.
+        env.clear_mv();
+        return Some(res);
+    }
+    if DIRECT_STRUCTURAL.contains(&name) {
+        env.clear_mv();
+        return Some(apply_builtin(name, args, env));
+    }
+    apply_builtin_fast(name, args, env)
+}
+
 fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, BlissError>> {
     // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
     // fast-path the 2-arg shape so other arities match the general path exactly.
@@ -35199,6 +35430,10 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     // simply sits below the real bottom and never triggers, which is the
     // behaviour that existed before this guard — never worse.
     bliss_rt::stack::set_native_stack_limit(6 * 1024 * 1024);
+    // Let compiled code call builtins directly instead of resolving them by
+    // name through apply_function on every call (bliss-x5y.27). The table lives
+    // in this crate, so the T2 emitter cannot reach it without being told.
+    bytecode::install_direct_builtin_hooks();
     let ca = CliArgs::parse(args)?;
     if ca.help {
         print_help();

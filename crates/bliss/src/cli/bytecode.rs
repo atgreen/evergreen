@@ -162,6 +162,12 @@ use bliss_rt::bytecode::{
 /// which is fine — redefinition is rare on the hot path.
 static DIRECT_CALL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// The live direct-call invalidation generation. Read by the interpreter's
+/// per-symbol builtin memo so a redefinition drops it (bliss-x5y.27).
+pub(super) fn direct_call_gen() -> u64 {
+    DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[inline]
 fn bump_direct_call_gen() {
     DIRECT_CALL_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12479,7 +12485,27 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
 
                 // Fallback: tree-walker apply (builtins, generics, functions).
                 let fn_val = BlissVal::from_symbol_index(sym);
-                match apply_function(fn_val, &args, env) {
+                // Direct builtin dispatch (bliss-x5y.27). When this site names
+                // an unshadowed leaf builtin, run its kernel on the
+                // already-evaluated arguments instead of handing a SYMBOL to
+                // apply_function to be resolved BY NAME on every single call.
+                // The resolution is memoized per symbol and dropped whenever a
+                // redefinition bumps the invalidation generation, so a name that
+                // stops being a plain builtin stops being dispatched as one.
+                // `None` from either step falls through to the general path,
+                // which is always correct.
+                let direct = match super::direct_builtin_slot_memoized(sym, nargs as usize) {
+                    Some(slot) => super::call_direct_builtin(slot, &args, env),
+                    None => None,
+                };
+                if direct_builtin_stats_enabled() {
+                    if direct.is_some() {
+                        DIRECT_BUILTIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        DIRECT_BUILTIN_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                match direct.unwrap_or_else(|| apply_function(fn_val, &args, env)) {
                     Ok(result) => acts[top_idx].push_op(result),
                     Err(e) => {
                         // Route the error through the bytecode unwind so
@@ -13680,6 +13706,40 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64, profile_site
     c2i_call_args(sym, &storage[..n as usize], profile_site)
 }
 
+/// Register-ABI direct builtin call, the T2 counterpart of `c2i_call_builtin`
+/// (bliss-x5y.27). Mirrors `c2i_call`'s shape — up to three arguments in
+/// registers — but takes a compile-time-resolved table slot packed into the
+/// high 32 bits of `idx_and_sym`, and the baked invalidation generation in
+/// place of `c2i_call`'s profile token.
+extern "C" fn c2i_call_builtin_regs(
+    idx_and_sym: u64,
+    n: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    baked_gen: u64,
+) -> u64 {
+    if n > 3 {
+        return NIL.0;
+    }
+    let storage = [BlissVal(a0), BlissVal(a1), BlissVal(a2)];
+    c2i_call_builtin(idx_and_sym, n, storage.as_ptr(), baked_gen)
+}
+
+/// Install the direct-builtin hooks into the T2 emitter. The builtin table
+/// lives in this crate, which depends on bliss-compiler, so the compiler cannot
+/// reach it directly (bliss-x5y.27).
+pub(super) fn install_direct_builtin_hooks() {
+    bliss_compiler::t2::emit::install_direct_builtin_hooks(
+        bliss_compiler::t2::emit::DirectBuiltinHooks {
+            addr: c2i_call_builtin_regs
+                as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64,
+            resolve: |sym, nargs| super::direct_builtin_slot(sym, nargs),
+            generation: || DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed),
+        },
+    );
+}
+
 /// T1's unbounded-arity c2i adapter. Arguments remain contiguous in the native
 /// activation's BlissStack operand area, so passing a slice avoids the old
 /// three-register ceiling without copying or using the host call stack as a
@@ -13692,6 +13752,101 @@ extern "C" fn c2i_call_slice(sym: u64, n: u64, args: *const BlissVal, profile_si
     // adapter synchronously. The frame cannot disappear during this call.
     let args = unsafe { std::slice::from_raw_parts(args, n as usize) };
     c2i_call_args(sym, args, profile_site)
+}
+
+/// Direct builtin call from compiled code (bliss-x5y.27).
+///
+/// The call site resolved the callee to a builtin AT COMPILE TIME and baked its
+/// table slot, so this does no name resolution at all — none of the
+/// `sym_name_rc` / `symbol_bare_name` / `global_fn` / `env.funs` /
+/// `local_fn_closure` preamble that `apply_function` runs on every ordinary
+/// builtin call, and none of the package-system round trip inside `global_fn`.
+///
+/// `idx_and_sym` packs the table slot in the high 32 bits and the callee symbol
+/// index in the low 32, because the emitted sequence has only four argument
+/// registers and both are needed — the symbol to fall back with, the slot to
+/// dispatch on.
+///
+/// Safe without the machinery `c2i_call_args` owns for a Lisp callee (invocation
+/// counting, the native depth cap, tier transitions) because every builtin in
+/// the table is a LEAF: it cannot re-enter Lisp, so it cannot recurse, cannot
+/// warm up, and cannot deoptimize. The panic barrier IS kept — a panic must
+/// never unwind across this `extern "C"` frame (bliss-011).
+/// Diagnostic counters for direct builtin calls, reported when
+/// `BLISS_DIRECT_BUILTIN_STATS` is set. `.0` counts calls that took the direct
+/// path, `.1` those that fell back to the general one.
+pub(super) static DIRECT_BUILTIN_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(super) static DIRECT_BUILTIN_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to count at all. Read once — an unconditional atomic increment per
+/// builtin call is itself measurable on the path this work exists to speed up.
+pub(super) fn direct_builtin_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_DIRECT_BUILTIN_STATS").is_some())
+}
+
+extern "C" fn c2i_call_builtin(
+    idx_and_sym: u64,
+    n: u64,
+    args: *const BlissVal,
+    baked_gen: u64,
+) -> u64 {
+    let sym = idx_and_sym & 0xFFFF_FFFF;
+    let slot = (idx_and_sym >> 32) as u32;
+    // Two invalidations, both cheap. The generation catches any redefinition
+    // since this site was baked (bliss-zhvn); the function cell catches a user
+    // taking the name over directly, e.g. (setf (symbol-function 'aref) …).
+    // Either way fall back to the general path, which is always correct.
+    if DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed) != baked_gen
+        || bliss_rt::symbols::symbol_function(sym as u32)
+            .is_some_and(bliss_rt::function::is_interpreted_function)
+    {
+        if direct_builtin_stats_enabled() {
+            DIRECT_BUILTIN_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return c2i_call_slice(sym, n, args, 0);
+    }
+    if direct_builtin_stats_enabled() {
+        DIRECT_BUILTIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if n != 0 && args.is_null() {
+        return NIL.0;
+    }
+    let env_ptr = NATIVE_ENV.with(|e| e.get());
+    if env_ptr.is_null() {
+        return NIL.0;
+    }
+    // SAFETY: identical to c2i_call_slice — T1 passes a pointer into its live
+    // BlissStack frame and invokes this synchronously, so the frame (which the
+    // collector scans) cannot disappear or move underneath the call.
+    let args = unsafe { std::slice::from_raw_parts(args, n as usize) };
+    let result = guard_c2i(|| {
+        let env = unsafe { &mut *env_ptr };
+        match super::call_direct_builtin(slot, args, env) {
+            Some(res) => res,
+            // The kernel declined this shape after all (an arity it does not
+            // take). Take the same general dispatch c2i_call_args would.
+            None => super::apply_function(BlissVal::from_symbol_index(sym as u32), args, env),
+        }
+    });
+    match result {
+        Ok(v) => v.0,
+        // First-error-wins, exactly as c2i_call_args does: a raw error cannot
+        // unwind native code, so stash it and return NIL for run_native to
+        // re-raise on exit, without overwriting an earlier pending error.
+        Err(e) => {
+            NATIVE_ERROR.with(|c| {
+                let mut slot = c.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(e);
+                }
+            });
+            NIL.0
+        }
+    }
 }
 
 fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
@@ -16177,6 +16332,8 @@ fn emit_native_x86(
     let local_disp = |i: i32| 8 * i;
     let c2i_addr =
         c2i_call_slice as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64 as usize as u64;
+    let builtin_addr = c2i_call_builtin
+        as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
@@ -16673,21 +16830,40 @@ fn emit_native_x86(
                 // contiguous below r15 in the activation's BlissStack operand
                 // area. This supports arbitrary CL arity without copying values
                 // into a fixed set of host ABI registers.
-                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, imm64 (sym)
-                c.extend_from_slice(&(*sym as u64).to_le_bytes());
+                // Direct builtin call (bliss-x5y.27): when the callee names an
+                // unshadowed leaf builtin, bake its table slot and call the
+                // kernel directly instead of sending a SYMBOL through
+                // apply_function to be resolved by NAME on every call. Same
+                // register convention and stack discipline as the c2i sequence
+                // below, so only the target and two arguments differ: rdi
+                // carries (slot << 32 | sym) and rcx the invalidation
+                // generation rather than a profile token (builtins do not tier,
+                // so there is nothing to profile).
+                let direct_builtin = super::direct_builtin_slot(*sym, *nargs as usize);
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, imm64
+                match direct_builtin {
+                    Some(slot) => c.extend_from_slice(
+                        &(((slot as u64) << 32) | (*sym as u64)).to_le_bytes(),
+                    ),
+                    None => c.extend_from_slice(&(*sym as u64).to_le_bytes()),
+                }
                 c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, imm64 (nargs)
                 c.extend_from_slice(&(*nargs as u64).to_le_bytes());
                 c.extend_from_slice(&[0x49, 0x8D, 0x97]); // lea rdx,[r15 - 8*nargs]
                 c.extend_from_slice(&(-8_i32 * i32::from(*nargs)).to_le_bytes());
-                let profile_site = if registry_get(*sym).is_some() {
+                let profile_site = if direct_builtin.is_some() {
+                    DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed)
+                } else if registry_get(*sym).is_some() {
                     call_site_profile_token(bf as *const BytecodeFunction as usize, bcp as u32)
                 } else {
                     0
                 };
-                c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (profile site)
+                c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (profile site / baked gen)
                 c.extend_from_slice(&profile_site.to_le_bytes());
-                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i)
-                c.extend_from_slice(&c2i_addr.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (target)
+                c.extend_from_slice(
+                    &if direct_builtin.is_some() { builtin_addr } else { c2i_addr }.to_le_bytes(),
+                );
                 emit_c2i_helper_call(&mut c);
                 c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, 8*nargs
                 c.extend_from_slice(&(8_i32 * i32::from(*nargs)).to_le_bytes());

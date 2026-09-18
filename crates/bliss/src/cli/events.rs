@@ -88,6 +88,22 @@ pub fn finalize_stream() {
 /// workload — `--load`, `--eval`, a REPL session — can be captured without
 /// appending a dump form to it. Errors are reported but never fatal.
 /// scripts/event-viewer.sh relies on this to build the HTML viewer.
+/// Report direct-builtin-call counts when `BLISS_DIRECT_BUILTIN_STATS` is set
+/// (bliss-x5y.27). Diagnostic only: it says whether emitted call sites actually
+/// took the direct path, which is otherwise invisible.
+pub fn maybe_report_direct_builtin_stats() {
+    if std::env::var_os("BLISS_DIRECT_BUILTIN_STATS").is_none() {
+        return;
+    }
+    let hits = super::bytecode::DIRECT_BUILTIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let fallbacks =
+        super::bytecode::DIRECT_BUILTIN_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[direct-builtin] direct={hits} fallback={fallbacks}");
+    for line in super::direct_builtin_report() {
+        eprintln!("[direct-builtin]   {line}");
+    }
+}
+
 pub fn maybe_dump_on_exit() {
     let Ok(path) = std::env::var("BLISS_EVENTS_DUMP") else {
         return;

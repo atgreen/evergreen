@@ -1131,6 +1131,39 @@ fn emit_call_arg_moves(a: &mut Asm, mut pending: Vec<(u8, ArgMoveSrc)>) -> Resul
 /// the owning activation. Values live across the call are in callee-saved
 /// registers, so the call cannot clobber them; the result returns in rax.
 #[allow(clippy::too_many_arguments)]
+// ── Direct builtin calls (bliss-x5y.27) ───────────────────────────
+//
+// A compiled call to a builtin otherwise goes out through c2i and has its
+// callee resolved BY NAME on every call. The table of directly-callable
+// builtins lives in the interpreter crate, which depends on THIS one, so the
+// runtime installs these hooks at startup rather than the compiler reaching
+// upward for them.
+
+/// Installed by the runtime: the direct-call adapter's address, an emit-time
+/// resolver from (symbol, argument count) to a table slot, and a reader for the
+/// invalidation generation the call site bakes.
+pub struct DirectBuiltinHooks {
+    pub addr: u64,
+    pub resolve: fn(u32, usize) -> Option<u32>,
+    pub generation: fn() -> u64,
+}
+
+static DIRECT_BUILTIN: std::sync::OnceLock<DirectBuiltinHooks> = std::sync::OnceLock::new();
+
+/// Install the direct-builtin hooks. Idempotent; later calls are ignored.
+pub fn install_direct_builtin_hooks(hooks: DirectBuiltinHooks) {
+    let _ = DIRECT_BUILTIN.set(hooks);
+}
+
+/// `(adapter address, table slot, generation to bake)` when this call site may
+/// call a builtin directly, else `None`. `None` whenever the hooks are not
+/// installed, so a compiler used without the runtime simply emits c2i.
+fn direct_builtin_for(sym: u32, nargs: usize) -> Option<(u64, u32, u64)> {
+    let hooks = DIRECT_BUILTIN.get()?;
+    let slot = (hooks.resolve)(sym, nargs)?;
+    Some((hooks.addr, slot, (hooks.generation)()))
+}
+
 fn emit_call(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
@@ -1301,10 +1334,24 @@ fn emit_call(
         moves.push((C2I_ARGS[i], src));
     }
     emit_call_arg_moves(a, moves)?;
-    mov_imm64(a, 7, sym as i64); // mov rdi, sym
-    mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
-    mov_imm64(a, 9, 0); // mov r9, no call-site profile
-    mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
+    // Direct builtin call when the callee resolves to one: identical register
+    // convention, so only rdi (which also carries the table slot), r9 (the
+    // baked invalidation generation instead of a profile token — builtins do
+    // not tier, so there is nothing to profile) and the target differ.
+    match direct_builtin_for(sym, nargs) {
+        Some((addr, slot, generation)) => {
+            mov_imm64(a, 7, (((slot as u64) << 32) | sym as u64) as i64); // rdi
+            mov_imm64(a, 6, nargs as i64); // rsi = nargs
+            mov_imm64(a, 9, generation as i64); // r9 = baked generation
+            mov_imm64(a, 0, addr as i64); // rax = direct builtin adapter
+        }
+        None => {
+            mov_imm64(a, 7, sym as i64); // mov rdi, sym
+            mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
+            mov_imm64(a, 9, 0); // mov r9, no call-site profile
+            mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
+        }
+    }
     emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
     if let Some(&r0) = data.results.first() {
         let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
