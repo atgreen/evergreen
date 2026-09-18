@@ -1868,6 +1868,11 @@
 ;; checkable.
 (defun %check-sequence-result-type (rt head declared size original)
   (declare (ignore rt))
+  ;; A DEFTYPE alias names a sequence type just as well as a built-in name
+  ;; does (CLHS make-sequence takes any type specifier). Expand it before
+  ;; matching, or e.g. babel's UNICODE-STRING is rejected as not a sequence.
+  (let ((expanded (%expand-type-spec head)))
+    (setq head (if (consp expanded) (car expanded) expanded)))
   (unless (member head '(list cons null sequence vector simple-vector
                          array simple-array string simple-string
                          base-string simple-base-string
@@ -1890,10 +1895,15 @@
                                             allow-other-keys)
   (declare (ignore allow-other-keys))
   (%check-nonneg-index size)
-  (let* ((rt (if (and result-type (not (consp result-type)) (not (symbolp result-type)))
-                 ;; A CLASS object designates its name (MAKE-SEQUENCE.57/58).
-                 (or (ignore-errors (class-name result-type)) result-type)
-                 result-type))
+  (let* ((rt0 (if (and result-type (not (consp result-type)) (not (symbolp result-type)))
+                  ;; A CLASS object designates its name (MAKE-SEQUENCE.57/58).
+                  (or (ignore-errors (class-name result-type)) result-type)
+                  result-type))
+         ;; Expand a DEFTYPE alias BEFORE deriving HEAD and ELT, so the element
+         ;; type it carries is seen: babel's
+         ;; (deftype unicode-string () '(simple-array character (*)))
+         ;; must build a STRING, not a general vector.
+         (rt (%expand-type-spec rt0))
          (head (if (consp rt) (car rt) rt))
          (elt (if (consp rt) (car (cdr rt)) nil))
          (iel initial-element)
@@ -2636,9 +2646,11 @@
 (defun merge (result-type seq1 seq2 predicate &key key)
   (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list)) (res nil)
          (total (+ (length l1) (length l2)))
-         (head (if (consp result-type) (car result-type) result-type)))
-    (%check-sequence-result-type result-type head
-                                 (%sequence-type-length result-type)
+         ;; Same DEFTYPE expansion MAKE-SEQUENCE does, for the same reason.
+         (rt (%expand-type-spec result-type))
+         (head (if (consp rt) (car rt) rt)))
+    (%check-sequence-result-type rt head
+                                 (%sequence-type-length rt)
                                  total result-type)
     (block nil
       (loop
@@ -2649,7 +2661,9 @@
                         (if key (funcall key (car l1)) (car l1)))
                (push (car l2) res) (setq l2 (cdr l2)))
               (t (push (car l1) res) (setq l1 (cdr l1))))))
-    (coerce res result-type)))
+    ;; RT, not RESULT-TYPE: the expanded specifier is what carries the
+    ;; representation, so a DEFTYPE alias builds the sequence it names.
+    (coerce res rt)))
 
 ;;; --- character predicates and naming ---------------------------------------
 

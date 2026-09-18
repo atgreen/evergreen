@@ -656,6 +656,15 @@ pub fn set_symbol_value(idx: u32, value: BlissVal) {
     write_cell(idx, |s| s.value = value);
 }
 
+/// The printed name of `v` when it is a symbol whose name is known, for error
+/// messages that would otherwise show the raw `Symbol(index)` Debug form.
+pub fn symbol_name_of(v: crate::value::BlissVal) -> Option<String> {
+    if v.tag() != crate::value::TAG_SYMBOL {
+        return None;
+    }
+    symbol_name(v.as_symbol_index())
+}
+
 /// The global function cell (`UNBOUND` if undefined).
 pub fn symbol_function(idx: u32) -> Option<BlissVal> {
     read_cell(idx, |s| s.function)

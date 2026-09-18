@@ -100,7 +100,14 @@ impl core::fmt::Display for BlissError {
             BlissError::Internal(msg) => write!(f, "internal error: {}", msg),
             BlissError::ProgramError(msg) => write!(f, "program error: {}", msg),
             BlissError::TypeError { datum, expected } => {
-                write!(f, "type error: {:?} is not of type {}", datum, expected)
+                // A symbol datum prints by NAME. The Debug form is
+                // "Symbol(4941)", which told a user reporting a failed
+                // (asdf:load-system :babel) nothing at all about which type
+                // specifier was rejected; the answer was BABEL::UNICODE-STRING.
+                match crate::symbols::symbol_name_of(*datum) {
+                    Some(name) => write!(f, "type error: {} is not of type {}", name, expected),
+                    None => write!(f, "type error: {:?} is not of type {}", datum, expected),
+                }
             }
             BlissError::UnboundVariable(sym) => {
                 write!(f, "unbound variable: {}", describe_symbol(*sym))

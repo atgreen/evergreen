@@ -12322,3 +12322,82 @@ fn redefining_a_directly_dispatched_builtin_takes_effect() {
         "redefinition did not take effect; got: {stdout}"
     );
 }
+
+/// CLHS lets any type specifier denoting a sequence subtype be a result type,
+/// DEFTYPE aliases included. The sequence-result classifier only knew the
+/// BUILT-IN names, so a user type was rejected outright as "not a sequence
+/// type specifier" — which broke (asdf:load-system :babel), since babel defines
+/// (deftype unicode-string () '(simple-array character (*))) and uses it.
+/// Expand the alias first, in every function that takes a result type.
+#[test]
+fn sequence_result_types_accept_deftype_aliases() {
+    let prelude = "(progn (deftype ustr () '(simple-array character (*)))
+                          (deftype ubits () '(simple-array bit (*)))
+                          (deftype ulist () 'list)";
+    let cases = [
+        // The alias must build what it EXPANDS to, not be rejected.
+        (format!("{prelude} (map 'ustr #'identity \"ab\"))"), "\"ab\"".to_string()),
+        (format!("{prelude} (concatenate 'ustr \"ab\" \"cd\"))"), "\"abcd\"".to_string()),
+        (
+            format!("{prelude} (make-sequence 'ustr 2 :initial-element #\\a))"),
+            "\"aa\"".to_string(),
+        ),
+        (format!("{prelude} (make-sequence 'ubits 3))"), "#*000".to_string()),
+        (format!("{prelude} (map 'ulist #'identity \"ab\"))"), "(#\\a #\\b)".to_string()),
+        // MERGE through an alias must agree with MERGE through the expansion
+        // itself. (Neither yields a STRING here: COERCE does not recognize
+        // (simple-array character (*)) as a string type — a pre-existing gap,
+        // tracked separately. What this fix guarantees is that the alias and
+        // its expansion behave the SAME.)
+        (
+            format!(
+                "{prelude} (equalp (merge 'ustr (list #\\a #\\c) (list #\\b) #'char<)
+                                   (merge '(simple-array character (*))
+                                          (list #\\a #\\c) (list #\\b) #'char<)))"
+            ),
+            "T".to_string(),
+        ),
+        (format!("{prelude} (coerce \"ab\" 'ulist))"), "(#\\a #\\b)".to_string()),
+        // An alias for a NON-sequence type must still be rejected, so the
+        // expansion did not simply turn the check off.
+        (
+            format!("{prelude} (deftype unum () 'integer)
+                       (handler-case (concatenate 'unum \"ab\") (error () :type-error)))"),
+            ":TYPE-ERROR".to_string(),
+        ),
+        (
+            format!("{prelude} (handler-case (make-sequence 'symbol 2) (error () :type-error)))"),
+            ":TYPE-ERROR".to_string(),
+        ),
+        // Built-in spellings are unchanged.
+        (format!("{prelude} (concatenate 'string \"ab\" \"cd\"))"), "\"abcd\"".to_string()),
+        (format!("{prelude} (make-sequence 'list 2))"), "(NIL NIL)".to_string()),
+        (format!("{prelude} (merge 'string (list #\\a) (list #\\b) #'char<))"), "\"ab\"".to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = cases.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    run_expression_cases(&refs);
+}
+
+/// A rejected type specifier must be named in the error. The Debug form
+/// "Symbol(4941)" is what a user saw when (asdf:load-system :babel) failed, and
+/// it identified nothing; the answer was BABEL::UNICODE-STRING.
+#[test]
+fn type_error_names_a_symbol_datum() {
+    let out = bliss_bin()
+        .args(["--eval", "(concatenate 'some-undefined-type \"ab\")"])
+        .output()
+        .expect("failed to run bliss");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("SOME-UNDEFINED-TYPE"),
+        "the rejected symbol must be named; got: {text}"
+    );
+    assert!(
+        !text.contains("Symbol("),
+        "a symbol datum must not print as its Debug form; got: {text}"
+    );
+}

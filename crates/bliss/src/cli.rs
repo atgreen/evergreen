@@ -17656,6 +17656,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // one Lisp-level CONS call per element and then spreading the whole
             // list as arguments — `(make-array 100000)` cost ~980ms against
             // ~88ms for the 100k-iteration loop that fills it (bliss-3o0r).
+            // Expand a DEFTYPE alias to the specifier it stands for, so Lisp
+            // code that classifies a type specifier can see through user types.
+            // MAKE-SEQUENCE needs it: its result-type check knows only the
+            // built-in sequence names, so babel's
+            // `(deftype unicode-string () '(simple-array character (*)))` was
+            // rejected as not naming a sequence at all.
+            "BLISS-INTERNAL::%EXPAND-TYPE-SPEC"
+            | "BLISS-INTERNAL:%EXPAND-TYPE-SPEC"
+            | "%EXPAND-TYPE-SPEC" => {
+                let args = eval_args(cdr, env)?;
+                let spec = args.first().copied().unwrap_or(NIL);
+                return Ok(resolve_type_spec(env, spec));
+            }
             "BLISS-INTERNAL::%MAKE-SIMPLE-VECTOR"
             | "BLISS-INTERNAL:%MAKE-SIMPLE-VECTOR"
             | "%MAKE-SIMPLE-VECTOR" => {
@@ -18652,7 +18665,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // MAP.38-47, MAP.FILL.5). Duplicating stdlib classification in
                 // the interpreter is what AGENTS.md's architecture rule forbids,
                 // and this is precisely how the two drifted apart.
-                return bliss_stdlib::build_result_sequence(result_type, &results);
+                // Expand a DEFTYPE alias first — see the CONCATENATE arm.
+                let expanded = resolve_type_spec(env, result_type);
+                bliss_rt::rooted!(expanded = expanded);
+                return bliss_stdlib::build_result_sequence(*expanded, &results);
             }
             // FIND / POSITION / COUNT are defined in lib/boot.lisp over
             // ELT/LENGTH/FUNCALL so their :key/:test can be any interpreter
@@ -18803,7 +18819,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(rest = rest);
                 bliss_rt::rooted!(result_type = eval_form(type_form, env)?);
                 let sequences = eval_args(*rest, env)?;
-                return bliss_stdlib::concatenate(*result_type, &sequences);
+                // Expand a DEFTYPE alias before stdlib classifies it. The
+                // classifier only knows the built-in sequence type names, so a
+                // user type — babel's `(deftype unicode-string () '(simple-array
+                // character (*)))` is the case that surfaced this — was rejected
+                // outright as "not a sequence type specifier". CLHS allows any
+                // type specifier denoting a sequence subtype, DEFTYPE included.
+                let expanded = resolve_type_spec(env, *result_type);
+                bliss_rt::rooted!(expanded = expanded);
+                return bliss_stdlib::concatenate(*expanded, &sequences);
             }
             "SUBSEQ" => {
                 // Root the sequence and pending arg forms across the index
@@ -18871,7 +18895,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (moving GC; bliss-4bp).
                 bliss_rt::rooted!(type_form = type_form);
                 bliss_rt::rooted!(value = eval_form(val_form, env)?);
-                let type_val = eval_form(*type_form, env)?;
+                // Expand a DEFTYPE alias: CLHS COERCE takes any type specifier,
+                // and only the expansion carries the representation, so
+                // `(coerce '(#\a #\b) 'babel::unicode-string)` must build a
+                // STRING rather than fall through to the identity case.
+                let raw_type = eval_form(*type_form, env)?;
+                let type_val = resolve_type_spec(env, raw_type);
                 // COERCE to FUNCTION: a symbol coerces to the function it NAMES
                 // (fdefinition), not the symbol itself, so the result is FUNCTIONP
                 // (bliss-v304). A lambda expression `(lambda …)` coerces to the
@@ -33257,6 +33286,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
             | "%MAKE-SIMPLE-VECTOR"
+            | "%EXPAND-TYPE-SPEC"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers
             | "+" | "-" | "*" | "/" | "1+" | "1-" | "=" | "/=" | "<" | ">" | "<=" | ">="
