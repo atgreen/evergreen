@@ -98,7 +98,12 @@ pub fn maybe_report_direct_builtin_stats() {
     let hits = super::bytecode::DIRECT_BUILTIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
     let fallbacks =
         super::bytecode::DIRECT_BUILTIN_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[direct-builtin] direct={hits} fallback={fallbacks}");
+    let t0 = super::bytecode::DIRECT_BUILTIN_T0.load(std::sync::atomic::Ordering::Relaxed);
+    let t0_fb =
+        super::bytecode::DIRECT_BUILTIN_T0_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "[direct-builtin] native: direct={hits} fallback={fallbacks} | interpreter: direct={t0} fallback={t0_fb}"
+    );
     for line in super::direct_builtin_report() {
         eprintln!("[direct-builtin]   {line}");
     }

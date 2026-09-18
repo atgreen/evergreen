@@ -12500,9 +12500,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 };
                 if direct_builtin_stats_enabled() {
                     if direct.is_some() {
-                        DIRECT_BUILTIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        DIRECT_BUILTIN_T0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
-                        DIRECT_BUILTIN_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        DIRECT_BUILTIN_T0_FALLBACKS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 match direct.unwrap_or_else(|| apply_function(fn_val, &args, env)) {
@@ -13778,6 +13779,13 @@ extern "C" fn c2i_call_slice(sym: u64, n: u64, args: *const BlissVal, profile_si
 pub(super) static DIRECT_BUILTIN_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(super) static DIRECT_BUILTIN_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Calls that took the direct path from the INTERPRETER's CallNamed, as opposed
+/// to from emitted native code. Separating the two is what distinguishes "the
+/// loop is not running natively" from "it is, and its calls go direct".
+pub(super) static DIRECT_BUILTIN_T0: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(super) static DIRECT_BUILTIN_T0_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Whether to count at all. Read once — an unconditional atomic increment per
