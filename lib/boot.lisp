@@ -1942,8 +1942,13 @@
 
 ;; Return a fresh sequence of the same type as ORIG holding the elements of the
 ;; list LIST.  Used to keep REMOVE/SUBSTITUTE/FILL/... type-preserving.
+;; Rebuild LIST in ORIG's representation. A BIT VECTOR must come back as one:
+;; without this clause (substitute 1 0 #*0101010101 ...) answered the general
+;; vector #(0 1 1 1 ...) instead of #*0101011111 (ansi SUBSTITUTE-BIT-VECTOR.24/25
+;; and the NSUBSTITUTE pairs, which are built on this).
 (defun %coerce-like (list orig)
   (cond ((stringp orig) (coerce list 'string))
+        ((bit-vector-p orig) (coerce list 'bit-vector))
         ((listp orig) list)
         (t (coerce list 'vector))))
 
@@ -1963,9 +1968,15 @@
       (incf i))
     (setq positions (reverse positions))
     (if count
-        (if from-end
-            (last positions count)
-            (subseq positions 0 (min count (length positions))))
+        ;; A NEGATIVE :count means no matches at all (CLHS: the behaviour is as
+        ;; if count were 0). Unclamped it reached LAST and SUBSEQ with a
+        ;; negative argument — (substitute 1 0 #*0101 :count -1) substituted
+        ;; everything or errored instead of doing nothing (ansi
+        ;; SUBSTITUTE-*.14, REMOVE-*, and the N- variants built on them).
+        (let ((n (max count 0)))
+          (if from-end
+              (last positions n)
+              (subseq positions 0 (min n (length positions)))))
         positions)))
 
 ;; Membership test honouring KEY/TESTFN/NEG (KEY is applied to each element of

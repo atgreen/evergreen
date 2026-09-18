@@ -11670,3 +11670,37 @@ fn bit_vector_ness_survives_subseq_copy_and_reverse() {
     ];
     run_expression_cases(&cases);
 }
+
+/// Two things SUBSTITUTE and everything built on it got wrong.
+///
+/// A BIT VECTOR must come back as one: `%coerce-like` had no bit-vector clause,
+/// so `(substitute 1 0 #*0101010101 …)` answered a general vector (ansi
+/// SUBSTITUTE-BIT-VECTOR.24/25 and the NSUBSTITUTE pairs built on it).
+///
+/// A NEGATIVE :count means no matches at all — CLHS says the behaviour is as if
+/// count were 0. Unclamped it reached LAST and SUBSEQ with a negative argument
+/// and substituted everything instead of nothing (ansi SUBSTITUTE-*.14).
+#[test]
+fn substitute_keeps_bit_vectors_and_clamps_a_negative_count() {
+    let cases = [
+        ("(substitute 1 0 #*0101)", "#*1111"),
+        ("(substitute 1 0 #*0101010101 :count 3 :from-end t)", "#*0101111111"),
+        ("(bit-vector-p (substitute 1 0 #*0101))", "T"),
+        // Negative counts do nothing, on every sequence kind.
+        ("(substitute 1 0 #*0101 :count -1)", "#*0101"),
+        ("(substitute 'x 'a '(a a) :count -1)", "(A A)"),
+        ("(substitute #\\x #\\a \"aa\" :count -1)", "\"aa\""),
+        ("(substitute 'x 'a #(a a) :count -1)", "#(A A)"),
+        // Zero behaves the same, which is the rule the clamp appeals to.
+        ("(substitute 'x 'a '(a a) :count 0)", "(A A)"),
+        // And the ordinary cases are unmoved, including which end :count takes.
+        ("(substitute 'x 'a '(a b a))", "(X B X)"),
+        ("(substitute 'x 'a '(a b a) :count 1)", "(X B A)"),
+        ("(substitute 'x 'a '(a b a) :count 1 :from-end t)", "(A B X)"),
+        ("(substitute #\\x #\\a \"aba\")", "\"xbx\""),
+        ("(substitute 'x 'a #(a b a))", "#(X B X)"),
+        // The destructive variant inherits both fixes.
+        ("(let ((x (copy-seq #*0101))) (nsubstitute 1 0 x :count -1) x)", "#*0101"),
+    ];
+    run_expression_cases(&cases);
+}
