@@ -168,6 +168,30 @@ allocates — makes the program compute a quietly wrong answer with no
 segfault at all. Diff the program's *output* against a non-stress run;
 don't wait for a crash.
 
+## Benchmarking a tiered loop: run 1M+ iterations, not 100k
+
+`osr_threshold()` (crates/bliss/src/cli/bytecode.rs) defaults to **100,000
+back-edges**, so a 100k-iteration loop sits *exactly on* the OSR promotion
+point: roughly half its iterations run at T0 and half natively. Such a
+benchmark measures warmup, not steady state, and is **bimodal** — an unchanged
+binary will hand you wildly different numbers run to run, which reads as noise
+or as a regression and is neither. Scaling one empty `DOTIMES` loop:
+
+```
+     50k   2.080 us/iter        100k   0.960 us/iter   <- on the threshold
+    500k   0.014 us/iter          4M   0.012 us/iter   <- ~150x, fully promoted
+```
+
+Use **1M+ iterations** for anything meant to measure tiered steady state, and
+say which regime a number came from. (`BLISS_OSR_THRESHOLD` overrides it.)
+
+**`DISASSEMBLE` does not tell you whether a loop promoted.** It reports the
+*function's* installed tier, so a loop-hot function still prints `T0` long
+after OSR has compiled and entered its loop natively — a 2M-iteration call
+reports T0 while running ~150x faster than T0. To check promotion, scale the
+iteration count and compare us/iter; use `DISASSEMBLE` for invocation-hot
+functions, where it is accurate.
+
 ## Always cap bliss memory: `scripts/bliss-limited.sh`
 
 Runaway bliss runs (e.g. ASDF recursion-to-OOM bugs like bliss-hlsa) have
