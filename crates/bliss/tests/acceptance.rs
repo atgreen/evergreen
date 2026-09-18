@@ -11746,3 +11746,31 @@ fn from_end_reverses_the_order_the_test_is_applied_in() {
     ];
     run_expression_cases(&cases);
 }
+
+/// A string result type can be named through its ELEMENT TYPE as well as its
+/// head: `(vector character)`, and `(array nil (*))` — an element type of NIL
+/// holds no elements and is a STRING subtype (CLHS 15.1.2.2), which MAKE-ARRAY
+/// already treats that way. CONCATENATE and MAP looked only at the head, so
+/// `(concatenate '(array nil (*)))` answered NIL rather than "" (ansi
+/// CONCATENATE.32).
+#[test]
+fn a_string_result_type_can_be_named_by_its_element_type() {
+    let cases = [
+        ("(concatenate '(array nil (*)))", "\"\""),
+        ("(concatenate '(vector nil))", "\"\""),
+        ("(concatenate '(vector character) \"ab\" \"cd\")", "\"abcd\""),
+        ("(concatenate '(vector base-char) \"ab\")", "\"ab\""),
+        ("(map '(vector character) #'identity \"ab\")", "\"ab\""),
+        // A non-character element type is still what it was: BIT stays a bit
+        // vector and T stays a general vector, so the new clause cannot
+        // over-reach.
+        ("(concatenate '(vector bit) '(0 1))", "#*01"),
+        ("(concatenate '(vector t) '(1 2))", "#(1 2)"),
+        ("(map '(vector bit) #'identity '(1 0))", "#*10"),
+        // The head-named forms are unchanged.
+        ("(concatenate 'string \"ab\" \"cd\")", "\"abcd\""),
+        ("(concatenate 'vector '(1 2))", "#(1 2)"),
+        ("(concatenate 'list '(1 2))", "(1 2)"),
+    ];
+    run_expression_cases(&cases);
+}

@@ -1652,9 +1652,37 @@ fn result_type_is_string(result_type: BlissVal) -> bool {
     // "abcdef" (ansi CONCATENATE.35-40). `result_type_is_vector` right above
     // already dispatches on the car this way.
     if result_type.is_cons() {
-        let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
-        if car.tag() == bliss_rt::value::TAG_SYMBOL {
-            return name_is_string(car.as_symbol_index());
+        let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
+        let car = cell.car;
+        if car.tag() != bliss_rt::value::TAG_SYMBOL {
+            return false;
+        }
+        if name_is_string(car.as_symbol_index()) {
+            return true;
+        }
+        // A string can also be named through its ELEMENT TYPE: (vector
+        // character), and (array nil (*)) — an element type of NIL holds no
+        // elements and is a STRING subtype (CLHS 15.1.2.2), which MAKE-ARRAY
+        // already treats that way. Without this, (concatenate '(array nil (*)))
+        // answered NIL rather than "" (ansi CONCATENATE.32).
+        let head_takes_element_type = matches!(
+            bliss_compiler::reader::symbol_name(car.as_symbol_index()).as_deref(),
+            Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY" | "SIMPLE-VECTOR")
+        );
+        if head_takes_element_type && cell.cdr.is_cons() {
+            let elt = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
+            // NIL is its own immediate, not a TAG_SYMBOL value, so it has to be
+            // tested for directly — `(array nil (*))` reaches here with the
+            // element type as the NIL immediate.
+            if elt.is_nil() {
+                return true;
+            }
+            if elt.tag() == bliss_rt::value::TAG_SYMBOL {
+                return matches!(
+                    bliss_compiler::reader::symbol_name(elt.as_symbol_index()).as_deref(),
+                    Some("CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR")
+                );
+            }
         }
     }
     false
