@@ -2521,16 +2521,47 @@
 ;; FILL and REPLACE are DESTRUCTIVE: they mutate SEQ/SEQ1 in place (via
 ;; SETF ELT, which now works on strings, vectors and lists) and return it.
 ;; Callers such as UIOP's REDUCE/STRCAT rely on the in-place mutation.
+;; :START and :END are bounding INDEX DESIGNATORS, so a negative one — or one
+;; past the sequence, or a start after the end — is a TYPE-ERROR, not something
+;; to silently clamp. (fill a 'x :end -1) quietly did nothing (ansi
+;; ARRAY-FILL-9 and the FIXNUM / UNSIGNED-BYTE8 variants).
+(defun %check-bounding-indices (seq start end)
+  (let ((len (length seq)))
+    (unless (and (integerp start) (<= 0 start len))
+      (error 'type-error :datum start :expected-type (list 'integer 0 len)))
+    (when end
+      (unless (and (integerp end) (<= 0 end len))
+        (error 'type-error :datum end :expected-type (list 'integer 0 len)))
+      (unless (<= start end)
+        (error 'type-error :datum start :expected-type (list 'integer 0 end))))
+    t))
+
 (defun fill (seq item &key (start 0) end)
+  (%check-bounding-indices seq start end)
   (let ((stop (or end (length seq))) (i start))
     (loop while (< i stop) do (setf (elt seq i) item) (incf i)))
   seq)
 
+;; When SEQ1 and SEQ2 are the same object with OVERLAPPING ranges, the result
+;; must be as if the source were copied first (CLHS replace). Writing straight
+;; through clobbered the source as it went:
+;;
+;;   (replace x x :start1 1 :end1 4 :start2 0 :end2 3)  on (A B C D E F)
+;;     =>  (A A A A E F)      want (A A B C E F)
+;;
+;; Snapshotting the source range is the whole fix, and it costs only the range
+;; actually copied (ansi REPLACE-LIST.20, REPLACE-VECTOR/STRING/BIT-VECTOR.21).
 (defun replace (seq1 seq2 &key (start1 0) end1 (start2 0) end2)
   (let* ((e1 (or end1 (length seq1))) (e2 (or end2 (length seq2)))
-         (n (min (- e1 start1) (- e2 start2))) (k 0))
+         (n (min (- e1 start1) (- e2 start2)))
+         (src (make-array n))
+         (k 0))
     (loop while (< k n) do
-      (setf (elt seq1 (+ start1 k)) (elt seq2 (+ start2 k)))
+      (setf (aref src k) (elt seq2 (+ start2 k)))
+      (incf k))
+    (setq k 0)
+    (loop while (< k n) do
+      (setf (elt seq1 (+ start1 k)) (aref src k))
       (incf k)))
   seq1)
 

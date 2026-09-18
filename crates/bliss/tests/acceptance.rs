@@ -11837,3 +11837,43 @@ fn merge_validates_its_result_type() {
     ];
     run_expression_cases(&cases);
 }
+
+/// REPLACE on OVERLAPPING ranges of the same object must behave as if the source
+/// were copied first (CLHS replace). Writing straight through clobbered the
+/// source as it went (ansi REPLACE-LIST.20, REPLACE-VECTOR/STRING/BIT-VECTOR.21).
+///
+/// FILL's :START and :END are bounding index designators, so a negative one, one
+/// past the sequence, or a start after the end is a TYPE-ERROR rather than
+/// something to silently clamp — `(fill a 'x :end -1)` quietly did nothing
+/// (ansi ARRAY-FILL-9 and its FIXNUM / UNSIGNED-BYTE8 variants).
+#[test]
+fn replace_handles_overlap_and_fill_checks_its_bounds() {
+    let cases = [
+        // The destination range starts one past the source range, so a forward
+        // copy would smear the first element across all of it.
+        ("(let* ((x (copy-seq (list 'a 'b 'c 'd 'e 'f))) \
+                 (r (replace x x :start1 1 :end1 4 :start2 0 :end2 3))) \
+            (list (eq x r) r))", "(T (A A B C E F))"),
+        ("(let ((x (copy-seq \"abcdef\"))) (replace x x :start1 1 :end1 4 :start2 0 :end2 3))",
+         "\"aabcef\""),
+        ("(let ((x (copy-seq #(a b c d e f)))) (replace x x :start1 1 :end1 4 :start2 0 :end2 3))",
+         "#(A A B C E F)"),
+        // Overlap the other way round, where a forward copy happens to be safe.
+        ("(let ((x (copy-seq (list 'a 'b 'c 'd)))) (replace x x :start1 0 :end1 2 :start2 2))",
+         "(C D C D)"),
+        // FILL's bounds.
+        ("(handler-case (fill (make-array 5) 'x :end -1) (type-error () :te))", ":TE"),
+        ("(handler-case (fill (make-array 5) 'x :start -1) (type-error () :te))", ":TE"),
+        ("(handler-case (fill (make-array 5) 'x :end 99) (type-error () :te))", ":TE"),
+        ("(handler-case (fill (make-array 5) 'x :start 3 :end 1) (type-error () :te))", ":TE"),
+        // Ordinary uses of both are unchanged.
+        ("(replace (list 1 2 3) (list 9 9))", "(9 9 3)"),
+        ("(replace (copy-seq \"abc\") \"xy\")", "\"xyc\""),
+        ("(replace (list 1 2 3) (list 9) :start1 2)", "(1 2 9)"),
+        ("(fill (list 1 2 3) 0)", "(0 0 0)"),
+        ("(fill (copy-seq \"abc\") #\\z :start 1)", "\"azz\""),
+        ("(fill (make-array 3 :initial-element 1) 7 :end 2)", "#(7 7 1)"),
+        ("(fill (make-array 3 :initial-element 1) 7 :start 3)", "#(1 1 1)"),
+    ];
+    run_expression_cases(&cases);
+}
