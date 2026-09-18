@@ -12028,3 +12028,50 @@ fn integer_division_rounding_modes_are_exact() {
     ];
     run_expression_cases(&cases);
 }
+
+/// MOD, REM and the four rounding operators reached through FUNCALL/APPLY (and
+/// so through the c2i fallback from compiled code) take apply_builtin_fast's
+/// direct arms rather than the synthesize-`(MOD 'a 'b)`-and-re-evaluate detour
+/// (bliss-mwpb). They must stay bit-identical to operator position, including
+/// the second value, so pin both spellings against each other.
+#[test]
+fn integer_division_through_funcall_matches_operator_position() {
+    let cases = [
+        ("(list (mod -7 3) (funcall #'mod -7 3) (apply #'mod '(-7 3)))", "(2 2 2)"),
+        ("(list (rem -7 3) (funcall #'rem -7 3) (apply #'rem '(-7 3)))", "(-1 -1 -1)"),
+        ("(list (mod 7 -3) (funcall #'mod 7 -3))", "(-2 -2)"),
+        // The rounding operators must carry their SECOND value through funcall.
+        (
+            "(list (multiple-value-list (floor -7 2)) (multiple-value-list (funcall #'floor -7 2)))",
+            "((-4 1) (-4 1))",
+        ),
+        (
+            "(list (multiple-value-list (round 7 2)) (multiple-value-list (funcall #'round 7 2)))",
+            "((4 -1) (4 -1))",
+        ),
+        (
+            "(list (multiple-value-list (ceiling -7 2)) (multiple-value-list (funcall #'ceiling -7 2)))",
+            "((-3 -1) (-3 -1))",
+        ),
+        // One-argument FLOOR family through funcall divides by 1.
+        ("(multiple-value-list (funcall #'truncate 7/2))", "(3 1/2)"),
+        // MAPCAR routes through the same dispatch.
+        ("(mapcar #'mod '(-7 7 6) '(3 -3 3))", "(2 -2 0)"),
+        // Bignum and ratio operands still reach the general rational path.
+        ("(funcall #'mod (expt 10 30) 7)", "1"),
+        ("(multiple-value-list (funcall #'floor 7/2))", "(3 1/2)"),
+        // CL MOD takes the sign of the DIVISOR for floats too (CLHS 12.1.4.1);
+        // this answered 2.0 and 1.0 before bliss-mwpb.
+        ("(mod -7.0 -3.0)", "-1.0"),
+        ("(mod 7.0 -3.0)", "-2.0"),
+        ("(mod -7.0 3.0)", "2.0"),
+        ("(funcall #'mod -7.0 -3.0)", "-1.0"),
+        // REM keeps the sign of the dividend.
+        ("(rem -7.0 3.0)", "-1.0"),
+        ("(funcall #'rem -7.0 3.0)", "-1.0"),
+        // Division by zero still signals on the fast path.
+        ("(handler-case (funcall #'mod 1 0) (arithmetic-error () :ae))", ":AE"),
+        ("(handler-case (funcall #'floor 1 0) (arithmetic-error () :ae))", ":AE"),
+    ];
+    run_expression_cases(&cases);
+}

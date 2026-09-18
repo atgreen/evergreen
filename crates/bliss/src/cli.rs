@@ -19848,7 +19848,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if bv == 0.0 {
                     return Err(BlissError::ArithmeticError("division by zero".into()));
                 }
-                return Ok(BlissVal::from_single_float(av.rem_euclid(bv) as f32));
+                return Ok(BlissVal::from_single_float(float_mod(av, bv) as f32));
             }
             "TRUNCATE" => {
                 let args = eval_args(cdr, env)?;
@@ -26677,6 +26677,18 @@ fn bigrat_round_to_int(r: &BigRat, mode: RoundMode) -> BigInt {
     }
 }
 
+/// CL `MOD` on floats: the remainder of FLOOR, which takes the sign of the
+/// DIVISOR (CLHS 12.1.4.1), i.e. `a - b*floor(a/b)`.
+///
+/// This used to be `a.rem_euclid(b)`, whose result is always non-negative and
+/// so disagrees with CL whenever the divisor is negative: `(mod -7.0 -3.0)`
+/// answered 2.0 where ANSI requires -1.0, and `(mod 7.0 -3.0)` answered 1.0
+/// where ANSI requires -2.0. The integer path was already correct, so only
+/// float operands were affected (bliss-mwpb).
+fn float_mod(a: f64, b: f64) -> f64 {
+    a - b * (a / b).floor()
+}
+
 /// `BlissVal` fixnum for `n`, or `None` when `n` leaves the 61-bit fixnum range.
 fn fixnum_from_i128(n: i128) -> Option<BlissVal> {
     if n >= FIXNUM_MIN as i128 && n <= FIXNUM_MAX as i128 {
@@ -33231,6 +33243,57 @@ fn apply_builtin_fast(
                 env.set_mv(vec![NIL, NIL]);
                 Some(Ok(NIL))
             }
+        }
+        // Integer division reached through funcall/apply or the c2i fallback.
+        // Without these arms the general path below synthesizes `(MOD 'a 'b)`
+        // and re-enters eval_form, which costs ~7 cons allocations and a full
+        // re-dispatch per call; perf attributed ~14% of a MOD loop to
+        // malloc/free through c2i_call_slice -> Arena::alloc_cons /
+        // vec_to_list_with_tail (bliss-mwpb). These call the SAME kernels as
+        // operator position -- exact_int_div for MOD/REM, eval_int_div for the
+        // four rounding operators, which also owns their second value -- so the
+        // tiers stay bit-identical (the bliss-x5y.9 rule).
+        //
+        // The arity checks mirror the operator-position handlers exactly,
+        // including that MOD/REM accept (and ignore) extra arguments while
+        // FLOOR/CEILING/TRUNCATE/ROUND reject more than two.
+        "MOD" | "REM" if args.len() >= 2 => {
+            env.clear_mv();
+            let mode = if name == "MOD" {
+                RoundMode::Floor
+            } else {
+                RoundMode::Truncate
+            };
+            if let Some(res) = exact_int_div(args[0], args[1], mode) {
+                return Some(res.map(|(_, rem)| rem));
+            }
+            // Float fallback, using the same kernels as operator position.
+            let av = match num_val(args[0]) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let bv = match num_val(args[1]) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            if bv == 0.0 {
+                return Some(Err(BlissError::ArithmeticError("division by zero".into())));
+            }
+            let r = if name == "MOD" {
+                float_mod(av, bv)
+            } else {
+                av % bv
+            };
+            Some(Ok(BlissVal::from_single_float(r as f32)))
+        }
+        "FLOOR" | "CEILING" | "TRUNCATE" | "ROUND" if !args.is_empty() && args.len() <= 2 => {
+            let mode = match name {
+                "FLOOR" => RoundMode::Floor,
+                "CEILING" => RoundMode::Ceiling,
+                "TRUNCATE" => RoundMode::Truncate,
+                _ => RoundMode::Round,
+            };
+            Some(eval_int_div(args[0], args.get(1).copied(), mode, env))
         }
         _ => None,
     }
