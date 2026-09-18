@@ -13211,6 +13211,15 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
     }
     match bare {
         "CONS" | "RPLACA" | "RPLACD" => Some((2, 2)),
+        // Sequence functions with a fixed shape. Calling a standard function
+        // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
+        // were reaching their bodies and answering a TYPE-ERROR about NIL, or
+        // nothing at all (ansi ELT.ERROR.1/2/3, LENGTH.ERROR.1/2,
+        // REVERSE.ERROR.1/2, SUBSEQ.ERROR.2/3, CONCATENATE.ERROR.3).
+        "ELT" => Some((2, 2)),
+        "LENGTH" | "REVERSE" | "NREVERSE" => Some((1, 1)),
+        "SUBSEQ" => Some((2, 3)),
+        "CONCATENATE" => Some((1, usize::MAX)),
         "CONSP" | "ATOM" | "LISTP" | "ENDP" => Some((1, 1)),
         // (rest list) — exactly one; (nth n list) — exactly two.
         "REST" => Some((1, 1)),

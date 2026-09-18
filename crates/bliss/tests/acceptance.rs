@@ -11234,6 +11234,46 @@ fn concatenate_and_map_honour_every_result_type() {
         // Too few arguments to MAP is a PROGRAM-ERROR, not an internal error.
         ("(handler-case (map 'list) (program-error () :pe))", ":PE"),
         ("(handler-case (map 'list #'null) (program-error () :pe))", ":PE"),
+        // A result type that names no concrete sequence representation is an
+        // error. SEQUENCE is a valid type specifier but does not determine a
+        // representation, so it is rejected too.
+        ("(handler-case (concatenate 'sequence '(a b c)) (error () :err))", ":ERR"),
+        ("(handler-case (concatenate 'fixnum '(a b c)) (error () :err))", ":ERR"),
+        ("(handler-case (map 'symbol #'identity '(a b c)) (type-error () :te))", ":TE"),
+        // A length the specifier DECLARES must match what was produced.
+        ("(handler-case (concatenate '(vector * 3) '(a b c d e)) (type-error () :te))", ":TE"),
+        ("(handler-case (map '(vector * 8) #'identity '(a b c)) (type-error () :te))", ":TE"),
+        ("(concatenate '(vector * 2) '(1 2))", "#(1 2)"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// Calling a standard function with the wrong number of arguments is a
+/// PROGRAM-ERROR (CLHS). These sequence functions had no arity entry, so the
+/// call reached the body and answered a TYPE-ERROR about NIL — or nothing at
+/// all (ansi ELT.ERROR.1/2/3, LENGTH.ERROR.1/2, REVERSE.ERROR.1/2,
+/// SUBSEQ.ERROR.2/3, CONCATENATE.ERROR.3).
+#[test]
+fn sequence_functions_signal_program_error_on_bad_arity() {
+    let cases = [
+        ("(handler-case (elt) (program-error () :pe))", ":PE"),
+        ("(handler-case (elt nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (elt nil 0 nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (length) (program-error () :pe))", ":PE"),
+        ("(handler-case (length nil nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (reverse nil nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (nreverse nil nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (subseq nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (subseq nil 0 0 0) (program-error () :pe))", ":PE"),
+        ("(handler-case (concatenate) (program-error () :pe))", ":PE"),
+        // The well-formed calls must be untouched, including SUBSEQ's optional
+        // end and CONCATENATE with a single argument.
+        (r#"(length "ab")"#, "2"),
+        ("(elt '(1 2) 1)", "2"),
+        ("(reverse '(1 2))", "(2 1)"),
+        (r#"(subseq "abcd" 1)"#, r#""bcd""#),
+        (r#"(subseq "abcd" 1 3)"#, r#""bc""#),
+        ("(concatenate 'list '(1))", "(1)"),
     ];
     run_expression_cases(&cases);
 }

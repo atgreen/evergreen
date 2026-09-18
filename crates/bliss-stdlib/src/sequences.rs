@@ -1701,10 +1701,107 @@ fn result_type_is_bit_vector(result_type: BlissVal) -> bool {
 ///
 /// A `result_type` this does not recognize builds a list, which is what both
 /// callers did before.
+/// The LENGTH a compound sequence type specifier declares, or `None` when it
+/// leaves it unspecified. The position differs per head: `(vector [et [size]])`
+/// puts it third, while `(string [size])` and the other one-parameter vector
+/// heads put it second.
+fn declared_sequence_length(result_type: BlissVal) -> Option<usize> {
+    if !result_type.is_cons() {
+        return None;
+    }
+    let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
+    if cell.car.tag() != bliss_rt::value::TAG_SYMBOL {
+        return None;
+    }
+    let head = bliss_compiler::reader::symbol_name(cell.car.as_symbol_index())?;
+    let rest = cell.cdr;
+    let slot = match head.as_str() {
+        "VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
+            if !rest.is_cons() {
+                return None;
+            }
+            let after_elt = unsafe { (*(rest.as_ptr() as *const ConsCell)).cdr };
+            if !after_elt.is_cons() {
+                return None;
+            }
+            unsafe { (*(after_elt.as_ptr() as *const ConsCell)).car }
+        }
+        "SIMPLE-VECTOR" | "STRING" | "SIMPLE-STRING" | "BASE-STRING"
+        | "SIMPLE-BASE-STRING" | "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => {
+            if !rest.is_cons() {
+                return None;
+            }
+            unsafe { (*(rest.as_ptr() as *const ConsCell)).car }
+        }
+        _ => return None,
+    };
+    if slot.is_fixnum() && slot.as_fixnum() >= 0 {
+        Some(slot.as_fixnum() as usize)
+    } else {
+        None
+    }
+}
+
+/// Whether `result_type` names a concrete sequence representation.
+///
+/// SEQUENCE itself deliberately does NOT: it is a valid type specifier but does
+/// not determine a representation, and CLHS makes it an error for CONCATENATE
+/// (ansi CONCATENATE.ERROR.1). Neither do FIXNUM, SYMBOL and friends
+/// (CONCATENATE.ERROR.2, MAP.ERROR.1).
+fn is_sequence_result_type(result_type: BlissVal) -> bool {
+    let head = if result_type.tag() == bliss_rt::value::TAG_SYMBOL {
+        result_type.as_symbol_index()
+    } else if result_type.is_cons() {
+        let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
+        if car.tag() != bliss_rt::value::TAG_SYMBOL {
+            return false;
+        }
+        car.as_symbol_index()
+    } else {
+        return false;
+    };
+    matches!(
+        bliss_compiler::reader::symbol_name(head).as_deref(),
+        Some(
+            "LIST"
+                | "CONS"
+                | "NULL"
+                | "NIL"
+                | "VECTOR"
+                | "SIMPLE-VECTOR"
+                | "ARRAY"
+                | "SIMPLE-ARRAY"
+                | "STRING"
+                | "SIMPLE-STRING"
+                | "BASE-STRING"
+                | "SIMPLE-BASE-STRING"
+                | "BIT-VECTOR"
+                | "SIMPLE-BIT-VECTOR"
+        )
+    )
+}
+
 pub fn build_result_sequence(
     result_type: BlissVal,
     elems: &[BlissVal],
 ) -> Result<BlissVal, BlissError> {
+    if !is_sequence_result_type(result_type) {
+        return Err(BlissError::TypeError {
+            datum: result_type,
+            expected: "sequence type specifier".to_string(),
+        });
+    }
+    // A length the specifier declares must match what was actually produced —
+    // `(concatenate '(vector * 3) '(a b c d e))` is a TYPE-ERROR, not a
+    // five-element vector (ansi CONCATENATE.ERROR.4, MAP.ERROR.2).
+    if let Some(declared) = declared_sequence_length(result_type)
+        && declared != elems.len()
+    {
+        return Err(BlissError::TypeError {
+            datum: result_type,
+            expected: format!("sequence type specifier matching length {}", elems.len()),
+        });
+    }
     if result_type_is_string(result_type) {
         let mut out = String::with_capacity(elems.len());
         for &elem in elems {
