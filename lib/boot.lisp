@@ -1849,6 +1849,31 @@
                           (t nil))))
          (and (integerp slot) slot))))
 
+;; Signal unless RESULT-TYPE names a sequence type that can hold SIZE elements.
+;; Shared by MAKE-SEQUENCE and MERGE, which have the same obligation.
+;;
+;; The DATUM is the SIZE, not the result type. ansi-test's SIGNALS-ERROR
+;; additionally asserts that (typep datum expected-type) is FALSE — a TYPE-ERROR
+;; whose datum satisfies its own expected-type is a bogus error — and a compound
+;; specifier like (VECTOR * 4) is a LIST, hence itself a SEQUENCE, so reporting
+;; it against SEQUENCE was exactly that bogus pairing (ansi MAKE-SEQUENCE.ERROR.3-6).
+;; The size against the length the specifier demands is both truthful and
+;; checkable.
+(defun %check-sequence-result-type (rt head declared size original)
+  (declare (ignore rt))
+  (unless (member head '(list cons null sequence vector simple-vector
+                         array simple-array string simple-string
+                         base-string simple-base-string
+                         bit-vector simple-bit-vector))
+    (error 'type-error :datum original :expected-type 'sequence))
+  (when (and declared (/= declared size))
+    (error 'type-error :datum size :expected-type (list 'eql declared)))
+  (when (and (eq head 'null) (/= size 0))
+    (error 'type-error :datum size :expected-type '(eql 0)))
+  (when (and (eq head 'cons) (= size 0))
+    (error 'type-error :datum size :expected-type '(integer 1)))
+  t)
+
 ;; MAKE-SEQUENCE's result-type must name a SEQUENCE type, and a length it
 ;; declares must agree with SIZE; otherwise the consequences are a TYPE-ERROR
 ;; (CLHS make-sequence). None of this was checked, so (make-sequence 'symbol 10)
@@ -1872,28 +1897,7 @@
          (bitp (or (member head '(bit-vector simple-bit-vector))
                    (and (member head '(vector array simple-array simple-vector))
                         (eq elt 'bit)))))
-    (unless (member head '(list cons null sequence vector simple-vector
-                           array simple-array string simple-string
-                           base-string simple-base-string
-                           bit-vector simple-bit-vector))
-      (error 'type-error :datum result-type :expected-type 'sequence))
-    ;; A declared length that disagrees with SIZE is a type error, as is NULL
-    ;; with a non-empty size or CONS with an empty one — those heads pin the
-    ;; length by themselves.
-    ;;
-    ;; The DATUM here is the SIZE, not the result type. ansi-test's SIGNALS-ERROR
-    ;; additionally asserts that (typep datum expected-type) is FALSE — a
-    ;; TYPE-ERROR whose datum satisfies its own expected-type is a bogus error —
-    ;; and a compound specifier like (VECTOR * 4) is a LIST, hence itself a
-    ;; SEQUENCE, so reporting it against SEQUENCE was exactly that bogus pairing
-    ;; (ansi MAKE-SEQUENCE.ERROR.3-6). The size against the length the specifier
-    ;; demands is both truthful and checkable.
-    (when (and declared (/= declared size))
-      (error 'type-error :datum size :expected-type (list 'eql declared)))
-    (when (and (eq head 'null) (/= size 0))
-      (error 'type-error :datum size :expected-type '(eql 0)))
-    (when (and (eq head 'cons) (= size 0))
-      (error 'type-error :datum size :expected-type '(integer 1)))
+    (%check-sequence-result-type rt head declared size result-type)
     (cond
       ((member head '(list cons null))
        (make-list size :initial-element iel))
@@ -2587,8 +2591,17 @@
                 (incf i)))
             (if (and (= i n1) (= i n2)) nil (+ start1 i)))))))
 
+;; MERGE must reject a result type that cannot hold the merged elements — most
+;; visibly (merge 'null (list 1 2 3) (list 4 5 6) #'<), which quietly answered
+;; the six-element list instead of signalling (ansi MERGE.ERROR.1/6). Same
+;; obligation and same checker as MAKE-SEQUENCE.
 (defun merge (result-type seq1 seq2 predicate &key key)
-  (let ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list)) (res nil))
+  (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list)) (res nil)
+         (total (+ (length l1) (length l2)))
+         (head (if (consp result-type) (car result-type) result-type)))
+    (%check-sequence-result-type result-type head
+                                 (%sequence-type-length result-type)
+                                 total result-type)
     (block nil
       (loop
         (cond ((null l1) (setq res (append (reverse res) l2)) (return))

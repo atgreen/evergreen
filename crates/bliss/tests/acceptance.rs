@@ -11806,3 +11806,34 @@ fn remove_if_honours_its_keywords() {
     ];
     run_expression_cases(&cases);
 }
+
+/// MERGE must reject a result type that cannot hold the merged elements. Most
+/// visibly `(merge 'null (list 1 2 3) (list 4 5 6) #'<)`, which quietly answered
+/// the six-element list instead of signalling (ansi MERGE.ERROR.1/6).
+///
+/// It is the same obligation MAKE-SEQUENCE has, so both now call one checker —
+/// including the part that makes the TYPE-ERROR truthful, reporting the SIZE
+/// against the length the specifier demands rather than the specifier against
+/// SEQUENCE (a compound specifier is a list, hence itself a sequence).
+#[test]
+fn merge_validates_its_result_type() {
+    let cases = [
+        ("(handler-case (merge 'null (list 1 2 3) (list 4 5 6) #'<) (type-error () :te))", ":TE"),
+        ("(handler-case (merge 'symbol (list 1) (list 2) #'<) (type-error () :te))", ":TE"),
+        ("(handler-case (merge '(vector * 3) (list 1 2) (list 3 4) #'<) (type-error () :te))", ":TE"),
+        // An agreeing declared length is fine, and so is NULL for nothing at all.
+        ("(merge '(vector * 4) (list 1 3) (list 2 4) #'<)", "#(1 2 3 4)"),
+        ("(merge 'null nil nil #'<)", "NIL"),
+        // The ordinary merges are unchanged.
+        ("(merge 'list (list 1 3) (list 2 4) #'<)", "(1 2 3 4)"),
+        ("(merge 'vector (list 1 3) (list 2 4) #'<)", "#(1 2 3 4)"),
+        ("(merge 'string \"ac\" \"bd\" #'char<)", "\"abcd\""),
+        ("(merge 'list (list 1) nil #'<)", "(1)"),
+        ("(merge 'list (list '(2 b)) (list '(1 a)) #'< :key #'car)", "((1 A) (2 B))"),
+        // MAKE-SEQUENCE, which now shares the checker, is unmoved.
+        ("(handler-case (make-sequence '(vector * 4) 3) (type-error () :te))", ":TE"),
+        ("(handler-case (make-sequence 'symbol 10) (type-error () :te))", ":TE"),
+        ("(make-sequence 'list 3 :initial-element 7)", "(7 7 7)"),
+    ];
+    run_expression_cases(&cases);
+}
