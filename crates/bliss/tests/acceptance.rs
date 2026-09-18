@@ -11636,3 +11636,37 @@ fn the_nsubstitute_family_modifies_in_place() {
     ];
     run_expression_cases(&cases);
 }
+
+/// SUBSEQ, COPY-SEQ and REVERSE of a bit vector answer a BIT VECTOR. The test
+/// for that only recognized the SIMPLE representation, so a fill-pointer,
+/// adjustable or displaced bit vector fell through to the general-vector branch
+/// and `(copy-seq …)` gave #(0 0 1) instead of #*001 (ansi COPY-SEQ.12/13/14).
+#[test]
+fn bit_vector_ness_survives_subseq_copy_and_reverse() {
+    let cases = [
+        // Simple — this already worked and must keep working.
+        ("(copy-seq (make-array '(4) :initial-contents '(0 0 1 0) :element-type 'bit))", "#*0010"),
+        // Fill-pointer: the copy is the fill-pointer's worth, still bits.
+        ("(copy-seq (make-array '(4) :initial-contents '(0 0 1 0) \
+                                :element-type 'bit :fill-pointer 3))", "#*001"),
+        // Displaced.
+        ("(let ((a (make-array '(6) :initial-contents '(0 1 0 1 1 1) :element-type 'bit))) \
+            (copy-seq (make-array 4 :element-type 'bit :displaced-to a)))", "#*0101"),
+        // SUBSEQ and REVERSE take the same path.
+        ("(subseq (make-array '(4) :initial-contents '(0 0 1 0) \
+                             :element-type 'bit :fill-pointer 4) 1 3)", "#*01"),
+        ("(reverse (make-array '(3) :initial-contents '(0 1 1) \
+                              :element-type 'bit :fill-pointer 3))", "#*110"),
+        ("(bit-vector-p (copy-seq (make-array '(2) :initial-contents '(1 0) \
+                                              :element-type 'bit :fill-pointer 2)))", "T"),
+        // Sequences that are not bit vectors are untouched.
+        ("(copy-seq '(1 2))", "(1 2)"),
+        ("(copy-seq #(1 2))", "#(1 2)"),
+        ("(copy-seq \"ab\")", "\"ab\""),
+        ("(reverse #(1 2 3))", "#(3 2 1)"),
+        ("(subseq \"abcd\" 1 3)", "\"bc\""),
+        // A fill-pointer vector of non-bits stays a general vector.
+        ("(copy-seq (make-array 3 :initial-contents '(a b c) :fill-pointer 2))", "#(A B)"),
+    ];
+    run_expression_cases(&cases);
+}

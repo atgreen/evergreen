@@ -1301,7 +1301,7 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
         }
         return cvec_elt(sequence, index);
     }
-    if bliss_rt::types::bit_vector_p(sequence) {
+    if is_bit_seq(sequence) {
         return match bliss_rt::types::bit_vector_ref(sequence, index) {
             Some(bit) => Ok(BlissVal::from_fixnum(bit as i64)),
             None => Err(BlissError::TypeError {
@@ -1378,7 +1378,7 @@ pub fn set_elt(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), 
     }
     // Bit-vectors store 0/1 in place (bliss-27f5): (SETF (AREF bv i)) /
     // (SETF (SBIT bv i)). No allocation — GC-safe.
-    if bliss_rt::types::bit_vector_p(sequence) {
+    if is_bit_seq(sequence) {
         let len = bliss_rt::types::bit_vector_len(sequence).unwrap_or(0);
         if index >= len {
             return Err(BlissError::TypeError {
@@ -1452,7 +1452,7 @@ pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
         let elems = collect_elements(sequence)?;
         return Ok(build_vector(&elems));
     }
-    if bliss_rt::types::bit_vector_p(sequence) {
+    if is_bit_seq(sequence) {
         // COPY-SEQ of a bit-vector is a bit-vector, not a general vector
         // (bliss-8z5f). (This direct entry point is normally shadowed by boot's
         // `(subseq seq 0)`, but keep it correct.)
@@ -1479,6 +1479,17 @@ pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
 }
 
 /// Get a subsequence (CL `SUBSEQ`).
+/// Whether `v` is a BIT vector of any kind — simple, or a complex vector
+/// (fill-pointer / adjustable / displaced) tagged as holding bits.
+///
+/// `bliss_rt::types::bit_vector_p` only recognizes the SIMPLE representation, so
+/// SUBSEQ, COPY-SEQ and REVERSE of a fill-pointer or displaced bit vector
+/// answered a general vector — `(copy-seq <fp bit vector>)` gave #(0 0 1)
+/// instead of #*001 (ansi COPY-SEQ.12/13/14).
+fn is_bit_seq(v: BlissVal) -> bool {
+    bliss_rt::types::bit_vector_p(v) || (is_complex_vector(v) && cvec_is_bit(v))
+}
+
 pub fn subseq(
     sequence: BlissVal,
     start: usize,
@@ -1531,7 +1542,7 @@ pub fn subseq(
     let sub = &elems[start..actual_end];
     if is_list(sequence) {
         Ok(build_list(sub))
-    } else if bliss_rt::types::bit_vector_p(sequence) {
+    } else if is_bit_seq(sequence) {
         // SUBSEQ of a bit-vector is a bit-vector (and COPY-SEQ = (subseq x 0)),
         // not a general vector (bliss-8z5f).
         Ok(build_bit_vector_from_vals(sub))
@@ -1553,7 +1564,7 @@ pub fn reverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
         // REVERSE of a string is a string (ANSI): same element type as input.
         let s: String = elems.iter().map(|&c| c.as_char()).collect();
         Ok(crate::streams::make_lisp_string_fresh(&s))
-    } else if bliss_rt::types::bit_vector_p(sequence) {
+    } else if is_bit_seq(sequence) {
         // REVERSE of a bit-vector is a bit-vector (bliss-8z5f).
         Ok(build_bit_vector_from_vals(&elems))
     } else {
