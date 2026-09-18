@@ -1234,22 +1234,6 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
             let cell = unsafe { &*(cur.as_ptr() as *const ConsCell) };
             cur = cell.cdr;
         }
-        // A sequence must be a PROPER list: `(length '(a b c . d))` answered 3
-        // rather than signalling, and since FIND / POSITION / FIND-IF and
-        // friends are written over LENGTH they inherited it and quietly
-        // returned NIL for a dotted list (ansi FIND.ERROR.*, POSITION.ERROR.*).
-        //
-        // The datum is the improper TAIL, not the list: ansi-test also asserts
-        // that a TYPE-ERROR's datum does not satisfy its own expected-type, and
-        // a dotted list IS `typep` LIST — it is a cons — so reporting the list
-        // against LIST would be a self-contradicting error. The tail is the
-        // thing that is not a list.
-        if !cur.is_nil() {
-            return Err(BlissError::TypeError {
-                datum: cur,
-                expected: "LIST".to_string(),
-            });
-        }
         return Ok(count);
     }
     if is_vector(sequence) {

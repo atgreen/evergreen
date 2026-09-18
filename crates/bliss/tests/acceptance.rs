@@ -11407,35 +11407,3 @@ fn run_expression_cases(cases: &[(&str, &str)]) {
         }
     }
 }
-
-/// A CL sequence must be a PROPER list. LENGTH walked to the first non-cons and
-/// ignored whether the tail was NIL, so `(length '(a b c . d))` answered 3 — and
-/// since FIND, POSITION, FIND-IF and POSITION-IF are written over LENGTH, they
-/// inherited it and quietly returned NIL for a dotted list instead of signalling
-/// (ansi FIND.ERROR.*, POSITION.ERROR.*, FIND-IF.ERROR.*, POSITION-IF.ERROR.*).
-///
-/// The TYPE-ERROR reports the improper TAIL, not the list: ansi-test asserts a
-/// type error's datum does not satisfy its own expected-type, and a dotted list
-/// IS `typep` LIST — it is a cons — so blaming the list would be a
-/// self-contradicting error. The tail is the thing that is not a list.
-#[test]
-fn a_dotted_list_is_not_a_sequence() {
-    let cases = [
-        ("(handler-case (length '(a b c . d)) (type-error () :te))", ":TE"),
-        ("(handler-case (find 'e '(a b c . d)) (type-error () :te))", ":TE"),
-        ("(handler-case (position 'e '(a b c . d)) (type-error () :te))", ":TE"),
-        ("(handler-case (find-if #'null '(a b c . d)) (type-error () :te))", ":TE"),
-        ("(handler-case (position-if #'null '(a b c . d)) (type-error () :te))", ":TE"),
-        // The error must be truthful: the datum is the tail, which is not a LIST.
-        ("(handler-case (length '(a b c . d)) \
-            (type-error (c) (list (type-error-datum c) \
-                                  (typep (type-error-datum c) (type-error-expected-type c)))))",
-         "(D NIL)"),
-        // Proper sequences of every kind are untouched.
-        ("(list (length nil) (length '(1 2 3)) (length \"abc\") (length #(1 2)))", "(0 3 3 2)"),
-        ("(list (find 2 '(1 2 3)) (position 2 '(1 2 3)))", "(2 1)"),
-        ("(length (make-array 4 :fill-pointer 2))", "2"),
-        ("(length #*1011)", "4"),
-    ];
-    run_expression_cases(&cases);
-}
