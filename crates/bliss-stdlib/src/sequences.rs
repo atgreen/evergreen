@@ -1066,13 +1066,24 @@ fn sort_list_in_place(
 
     for window in cells.windows(2) {
         // Safety: all pointers were collected from the original proper list.
+        //
+        // Through the WRITE BARRIER, not a raw store. This relinks EXISTING
+        // cells, and after a collection a list can span generations, so a raw
+        // store can put a young cell's address into an old cell without the
+        // collector knowing — the young cell is then not scanned, is collected
+        // or moved, and the old cell's cdr becomes garbage. That is the shape of
+        // the corruption in bliss-t53a (a cons whose cdr reads back as
+        // Fixnum(0)), and BLISS_GC_VERIFY does not catch it because nothing is
+        // pointing INTO the nursery at verification time — the reference was
+        // never recorded at all.
         unsafe {
-            (*window[0]).cdr = BlissVal::from_cons_ptr(window[1] as *mut u8);
+            let next = BlissVal::from_cons_ptr(window[1] as *mut u8);
+            bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*window[0]).cdr), next);
         }
     }
     if let Some(&last) = cells.last() {
         unsafe {
-            (*last).cdr = NIL;
+            bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*last).cdr), NIL);
             BlissVal::from_cons_ptr(cells[0] as *mut u8)
         }
     } else {
@@ -1645,9 +1656,15 @@ pub fn nreverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
         let mut prev = NIL;
         let mut cur = sequence;
         while cur.is_cons() {
-            let cell = unsafe { &mut *(cur.as_ptr() as *mut ConsCell) };
-            let next = cell.cdr;
-            cell.cdr = prev;
+            // Through the WRITE BARRIER: this reverses EXISTING cells in place,
+            // and after a collection a list can span generations, so a raw store
+            // can put a young cell's address into an old one without the
+            // collector recording it (bliss-t53a).
+            let next = unsafe { (*(cur.as_ptr() as *const ConsCell)).cdr };
+            unsafe {
+                let cell = cur.as_ptr() as *mut ConsCell;
+                bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).cdr), prev);
+            }
             prev = cur;
             cur = next;
         }

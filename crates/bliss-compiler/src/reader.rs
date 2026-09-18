@@ -2336,10 +2336,15 @@ fn read_sharpsign_with_base(
                 // If the result is a cons, copy its car/cdr into the placeholder
                 if val.is_cons() {
                     unsafe {
+                        // Through the WRITE BARRIER: the placeholder is an
+                        // EXISTING cons and the values copied into it may be
+                        // younger than it, which a raw store would not record
+                        // (bliss-t53a).
                         let ph_ptr = placeholder.as_ptr() as *mut ConsCell;
                         let val_ptr = val.as_ptr() as *const ConsCell;
-                        (*ph_ptr).car = (*val_ptr).car;
-                        (*ph_ptr).cdr = (*val_ptr).cdr;
+                        let (vcar, vcdr) = ((*val_ptr).car, (*val_ptr).cdr);
+                        bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*ph_ptr).car), vcar);
+                        bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*ph_ptr).cdr), vcdr);
                     }
                     return Ok((placeholder, p));
                 }
