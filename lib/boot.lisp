@@ -704,36 +704,30 @@
       (incf i))
     (%coerce-like (reverse result) seq)))
 
-;; REMOVE-IF / REMOVE-IF-NOT over any sequence, returning a sequence of the SAME
-;; type (ANSI): a list yields a list (O(n) via dolist), a vector/string yields a
-;; vector/string (O(n) via length/elt). Previously these used dolist only, so a
-;; vector argument errored "not of type list" (bliss-rmv). (:key/:count/:start/
-;; :end are still ignored — a separate gap.)
-(defun remove-if (pred seq &rest keys)
-  (declare (ignore keys))
-  (if (listp seq)
-      (let ((result nil))
-        (dolist (x seq)
-          (unless (funcall pred x) (push x result)))
-        (nreverse result))
-      (let ((result nil))
-        (dotimes (i (length seq))
-          (let ((x (elt seq i)))
-            (unless (funcall pred x) (push x result))))
-        (coerce (nreverse result) (if (stringp seq) 'string 'vector)))))
+;; REMOVE-IF / REMOVE-IF-NOT honour the full keyword set. They used to take
+;; `&rest keys` and `(declare (ignore keys))` — so :KEY, :COUNT, :START, :END and
+;; :FROM-END were all silently dropped and every match was removed. The old
+;; comment here admitted it ("a separate gap"); this closes it (ansi
+;; REMOVE-IF.ORDER.1 and the DELETE-IF pair that delegates here).
+;;
+;; Built on the same %match-positions picker REMOVE uses, so the keyword
+;; semantics — including that :FROM-END selects the TRAILING matches and applies
+;; the predicate back-to-front — cannot drift between the two.
+(defun remove-if (pred seq &key key (start 0) end count from-end)
+  (let* ((items (coerce seq 'list))
+         (chosen (%match-positions
+                  (lambda (x) (funcall pred (if key (funcall key x) x)))
+                  items start end count from-end))
+         (result nil)
+         (i 0))
+    (dolist (x items)
+      (unless (member i chosen) (push x result))
+      (incf i))
+    (%coerce-like (reverse result) seq)))
 
-(defun remove-if-not (pred seq &rest keys)
-  (declare (ignore keys))
-  (if (listp seq)
-      (let ((result nil))
-        (dolist (x seq)
-          (when (funcall pred x) (push x result)))
-        (nreverse result))
-      (let ((result nil))
-        (dotimes (i (length seq))
-          (let ((x (elt seq i)))
-            (when (funcall pred x) (push x result))))
-        (coerce (nreverse result) (if (stringp seq) 'string 'vector)))))
+(defun remove-if-not (pred seq &key key (start 0) end count from-end)
+  (remove-if (lambda (x) (not (funcall pred x))) seq
+             :key key :start start :end end :count count :from-end from-end))
 
 (defun set-difference (a b &rest keys)
   (declare (ignore keys))

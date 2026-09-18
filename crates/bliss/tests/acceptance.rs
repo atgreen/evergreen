@@ -11774,3 +11774,35 @@ fn a_string_result_type_can_be_named_by_its_element_type() {
     ];
     run_expression_cases(&cases);
 }
+
+/// REMOVE-IF and REMOVE-IF-NOT honour their full keyword set. They took
+/// `&rest keys` with `(declare (ignore keys))`, so :KEY, :COUNT, :START, :END
+/// and :FROM-END were silently dropped and every match was removed — the old
+/// comment in boot.lisp admitted it as "a separate gap" (ansi REMOVE-IF.ORDER.1,
+/// and the DELETE-IF pair that delegates here).
+#[test]
+fn remove_if_honours_its_keywords() {
+    let cases = [
+        // :FROM-END with :COUNT takes the TRAILING match, not the leading one.
+        ("(remove-if (lambda (x) (eq x 'a)) '(a b c d a f) :from-end t :count 1)", "(A B C D F)"),
+        ("(remove-if (lambda (x) (eq x 'a)) '(a b a) :count 1)", "(B A)"),
+        ("(remove-if (lambda (x) (eq x 'a)) '(a b a) :count 1 :from-end t)", "(A B)"),
+        // Bounding indices.
+        ("(remove-if #'evenp '(1 2 3 4) :start 2)", "(1 2 3)"),
+        ("(remove-if #'evenp '(1 2 3 4) :end 2)", "(1 3 4)"),
+        // :KEY is applied before the predicate.
+        ("(remove-if #'zerop '(1 2) :key (lambda (x) (- x 1)))", "(2)"),
+        ("(remove-if-not #'evenp '(1 2 3 4) :count 1)", "(2 3 4)"),
+        ("(remove-if-not #'zerop '(1 2) :key (lambda (x) (- x 1)))", "(1)"),
+        // The keywordless behaviour, on every sequence kind, is unchanged.
+        ("(remove-if #'evenp '(1 2 3 4))", "(1 3)"),
+        ("(remove-if #'evenp #(1 2 3 4))", "#(1 3)"),
+        ("(remove-if (lambda (c) (eql c #\\a)) \"aba\")", "\"b\""),
+        ("(remove-if-not #'evenp '(1 2 3 4))", "(2 4)"),
+        // DELETE-IF / DELETE-IF-NOT delegate here and inherit the fix.
+        ("(delete-if #'evenp (list 1 2 3 4))", "(1 3)"),
+        ("(delete-if-not #'evenp (list 1 2 3 4))", "(2 4)"),
+        ("(delete-if (lambda (x) (eq x 'a)) (list 'a 'b 'a) :count 1 :from-end t)", "(A B)"),
+    ];
+    run_expression_cases(&cases);
+}
