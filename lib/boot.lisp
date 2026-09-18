@@ -1101,15 +1101,24 @@
           (loop for i from start below stop
                 when (matchp (elt seq i)) return i)))))
 
-(defun count-if (pred seq &key key (start 0) end)
-  (let ((stop (or end (length seq))))
-    (loop for i from start below stop
-          count (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e))))))
+(defun count-if (pred seq &key key (start 0) end from-end)
+  (let ((stop (or end (length seq))) (n 0))
+    (flet ((hit (i) (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e)))))
+      (if from-end
+          (do ((i (1- stop) (1- i))) ((< i start) n)
+            (when (hit i) (setq n (1+ n))))
+          (do ((i start (1+ i))) ((>= i stop) n)
+            (when (hit i) (setq n (1+ n))))))))
 
-(defun count-if-not (pred seq &key key (start 0) end)
-  (let ((stop (or end (length seq))))
-    (loop for i from start below stop
-          count (not (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e)))))))
+(defun count-if-not (pred seq &key key (start 0) end from-end)
+  (let ((stop (or end (length seq))) (n 0))
+    (flet ((miss (i)
+             (not (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e))))))
+      (if from-end
+          (do ((i (1- stop) (1- i))) ((< i start) n)
+            (when (miss i) (setq n (1+ n))))
+          (do ((i start (1+ i))) ((>= i stop) n)
+            (when (miss i) (setq n (1+ n))))))))
 
 ;; Walked with ENDP, not `loop for l on list` (bliss-b9dr). LOOP's `on` driver
 ;; terminates via ATOM, which is right for LOOP but wrong here: MEMBER-IF
@@ -1182,15 +1191,24 @@
           (loop for i from start below stop
                 when (matchp (elt seq i)) return i)))))
 
-(defun count (item seq &key key test test-not (start 0) end)
+;; COUNT and friends accept :FROM-END. The COUNT itself cannot depend on
+;; direction, but the ORDER in which :KEY and the test are applied does, and
+;; ansi checks it (COUNT-*.7/.9/.12, COUNT*.ORDER.1 and the COUNT-IF* .16/.17
+;; family). Omitting the keyword made every one of those a PROGRAM-ERROR for an
+;; unrecognized keyword argument — 32 tests from one missing parameter.
+(defun count (item seq &key key test test-not (start 0) end from-end)
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
-        (stop (or end (length seq))))
+        (stop (or end (length seq)))
+        (n 0))
     (flet ((matchp (e)
              (let ((r (funcall testfn item (if key (funcall key e) e))))
                (if neg (not r) r))))
-      (loop for i from start below stop
-            count (matchp (elt seq i))))))
+      (if from-end
+          (do ((i (1- stop) (1- i))) ((< i start) n)
+            (when (matchp (elt seq i)) (setq n (1+ n))))
+          (do ((i start (1+ i))) ((>= i stop) n)
+            (when (matchp (elt seq i)) (setq n (1+ n))))))))
 
 (defun delete-if (pred seq &rest keys) (apply #'remove-if pred seq keys))
 (defun delete-if-not (pred seq &rest keys) (apply #'remove-if-not pred seq keys))

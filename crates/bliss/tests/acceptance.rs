@@ -11572,3 +11572,38 @@ fn map_into_fills_to_capacity_and_sets_the_fill_pointer() {
     ];
     run_expression_cases(&cases);
 }
+
+/// COUNT, COUNT-IF and COUNT-IF-NOT accept :FROM-END. The count itself cannot
+/// depend on direction, but the ORDER in which :KEY and the test are applied
+/// does, and ansi checks it — so omitting the keyword was not a harmless
+/// simplification: every such call was a PROGRAM-ERROR for an unrecognized
+/// keyword argument, 32 tests from one missing parameter (ansi COUNT-*.7/.9/.12,
+/// COUNT*.ORDER.1, and the COUNT-IF* .16/.17 family).
+#[test]
+fn the_count_family_accepts_from_end() {
+    let cases = [
+        // Same answer either way, across every sequence kind.
+        ("(count 1 '(2 1 1 2 3 1 4 1 7 6 1 8) :from-end t)", "5"),
+        ("(count 1 #(2 1 1 2 3 1 4 1 7 6 1 8) :from-end t)", "5"),
+        ("(count 1 #*00101100011011000 :from-end t)", "7"),
+        ("(count #\\1 \"00101100011011000\" :from-end t)", "7"),
+        ("(count-if #'evenp #(0 1 2 3 4) :from-end t)", "3"),
+        ("(count-if-not #'oddp #(0 1 2 3 4) :from-end t)", "3"),
+        // The visible difference: :KEY is applied back-to-front. Pushing onto a
+        // list reverses it, so a forward walk leaves (3 2 1) and :from-end (1 2 3).
+        ("(let ((acc nil)) (count 1 '(1 2 3) :key (lambda (x) (push x acc) x)) acc)", "(3 2 1)"),
+        ("(let ((acc nil)) (count 1 '(1 2 3) :from-end t :key (lambda (x) (push x acc) x)) acc)", "(1 2 3)"),
+        ("(let ((acc nil)) (count-if #'evenp '(1 2 3) :from-end t :key (lambda (x) (push x acc) x)) acc)", "(1 2 3)"),
+        // :from-end composes with the bounding indices.
+        ("(count 1 '(1 1 1 1) :start 1 :end 3 :from-end t)", "2"),
+        ("(count-if #'evenp #(0 2 4 6) :start 1 :end 3 :from-end t)", "2"),
+        // Everything that worked before still does.
+        ("(count 1 '(1 2 1))", "2"),
+        ("(count 1 '(1 2 1) :start 1)", "1"),
+        ("(count-if #'evenp '(1 2 4))", "2"),
+        ("(count-if-not #'evenp '(1 2 4))", "1"),
+        ("(count 'a '(a b a) :test #'eq)", "2"),
+        ("(count 'a '(a b a) :test-not #'eq)", "1"),
+    ];
+    run_expression_cases(&cases);
+}
