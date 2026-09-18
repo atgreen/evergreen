@@ -1158,7 +1158,22 @@ fn emit_call(
     // registers, so our live values survive).
     if let (Some(ss), Some(entry)) = (self_sym, self_entry) {
         const ARG_REGS: [u8; 4] = [1, 8, 9, 10]; // rcx, r8, r9, r10
-        if sym == ss && nargs <= ARG_REGS.len() {
+        // BLISS_NO_DIRECT_SELF_CALL routes self-calls back through c2i.
+        //
+        // The direct self-call skips c2i_call_args, and with it the
+        // native_depth_cap() check that is the ONLY bound on recursion depth in
+        // compiled code — the T2 prologue has no stack guard. A deeply
+        // self-recursive function therefore runs off the C stack and returns a
+        // WRONG ANSWER rather than signalling: (deep 400000) answers 30, and
+        // (deep 200000) answers a raw stack address. T0 and T1 both raise the
+        // STORAGE-CONDITION they should (bliss-b4fd).
+        //
+        // This flag is the workaround and the bisection tool, not the fix. The
+        // fix is a stack guard in the prologue, because the optimization is
+        // worth far too much to simply drop: without it fib(30) goes from 3ms to
+        // 498ms, a 166x regression.
+        let self_call_disabled = std::env::var_os("BLISS_NO_DIRECT_SELF_CALL").is_some();
+        if !self_call_disabled && sym == ss && nargs <= ARG_REGS.len() {
             let mut moves = Vec::with_capacity(nargs);
             for (i, &arg) in data.args.iter().enumerate() {
                 let src = if let Some(&bits) = const_tagged.get(&arg) {

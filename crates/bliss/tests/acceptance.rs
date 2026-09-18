@@ -11407,3 +11407,56 @@ fn run_expression_cases(cases: &[(&str, &str)]) {
         }
     }
 }
+
+/// Deep self-recursion must raise a catchable STORAGE-CONDITION, not run off the
+/// C stack. T2's direct self-call skips c2i_call_args and with it the
+/// native_depth_cap() check that is the only bound on recursion depth in
+/// compiled code — the T2 prologue has no stack guard — so a deeply recursive
+/// function returns a WRONG ANSWER instead of signalling: `(deep 400000)`
+/// answers 30, and `(deep 200000)` answers a raw stack address (bliss-b4fd).
+///
+/// The real fix is a prologue stack guard; dropping the optimization is not an
+/// option, since it is worth 166x on fib(30). Until then
+/// BLISS_NO_DIRECT_SELF_CALL is the workaround, and this pins that it works —
+/// so the escape hatch cannot silently stop working before the fix lands.
+#[test]
+fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
+    let program = "(progn \
+        (defun deep (n) (if (= n 0) 0 (1+ (deep (1- n))))) \
+        (dotimes (i 200) (deep 50)) \
+        (cl:format t \"~S~%\" (handler-case (deep 400000) \
+                                (storage-condition () :storage-condition) \
+                                (error () :error))))";
+    for (label, extra_env) in [
+        // Every tier that does NOT take the direct self-call gets this right.
+        ("t0", vec![("BLISS_FORCE_TIER", "t0")]),
+        ("t1", vec![("BLISS_FORCE_TIER", "t1")]),
+        ("no-t2", vec![("BLISS_DISABLE_T2", "1")]),
+        // ... and so does T2 with the direct self-call routed through c2i.
+        ("no-direct-self-call", vec![("BLISS_NO_DIRECT_SELF_CALL", "1")]),
+    ] {
+        let mut cmd = bliss_bin();
+        for (k, v) in &extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd
+            .args(["--eval", program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label}: bliss did not exit cleanly\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            ":STORAGE-CONDITION",
+            "{label}: deep recursion must signal, not return a value"
+        );
+    }
+}
