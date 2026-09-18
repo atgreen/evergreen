@@ -9953,13 +9953,46 @@ fn prompt_package_name(name: &str) -> &str {
     }
 }
 
+/// The package-qualified part stripped from a symbol's registry spelling, upcased.
+///
+/// This is on the dispatch path for every builtin call, and it used to cost two
+/// two-way substring searches (`trim_start_matches("KEYWORD:")` and
+/// `split_once("::")` each construct a `StrSearcher`) plus an unconditional
+/// Unicode `to_uppercase`. That put ~5% of a hot loop in `StrSearcher::new`
+/// alone (bliss-mwpb profiling). Symbol names are short and almost always
+/// already-uppercase ASCII, so scan bytes directly.
+///
+/// The result is identical to the old expression, including its edge cases:
+/// a `"::"` anywhere wins over an earlier single `':'` (so `"A:B::C"` still
+/// yields `"C"`), and `"KEYWORD:KEYWORD:FOO"` still yields `"FOO"` — the old
+/// `trim_start_matches` stripped both prefixes, and stripping only the first
+/// leaves `"KEYWORD:FOO"`, whose single `':'` split removes the rest.
 fn symbol_bare_name(name: &str) -> String {
-    let without_keyword = name.trim_start_matches("KEYWORD:");
-    let base = without_keyword
-        .split_once("::")
-        .map(|(_, tail)| tail)
-        .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
-        .unwrap_or(without_keyword);
+    let without_keyword = name.strip_prefix("KEYWORD:").unwrap_or(name);
+    let bytes = without_keyword.as_bytes();
+    // One pass: remember the first ':' and stop at the first "::".
+    let (mut first_single, mut first_double) = (None, None);
+    for i in 0..bytes.len() {
+        if bytes[i] == b':' {
+            if first_single.is_none() {
+                first_single = Some(i);
+            }
+            if bytes.get(i + 1) == Some(&b':') {
+                first_double = Some(i);
+                break;
+            }
+        }
+    }
+    let base = match (first_double, first_single) {
+        (Some(i), _) => &without_keyword[i + 2..],
+        (None, Some(i)) => &without_keyword[i + 1..],
+        (None, None) => without_keyword,
+    };
+    // Pure-ASCII with no lowercase is already its own uppercasing, so skip the
+    // Unicode conversion (the overwhelmingly common case for symbol names).
+    if base.bytes().all(|b| b.is_ascii() && !b.is_ascii_lowercase()) {
+        return base.to_string();
+    }
     base.to_uppercase()
 }
 
@@ -35749,7 +35782,7 @@ mod env_gc_root_tests {
     use super::*;
 
     const BASE: i64 = 900_000_000;
-    const ROOT_COUNT: i64 = 36;
+    const ROOT_COUNT: i64 = 41;
     const RELOCATION_DELTA: i64 = 10_000;
 
     fn marker(offset: i64) -> BlissVal {
@@ -35889,6 +35922,28 @@ mod env_gc_root_tests {
                 captured_frame: Rc::clone(&parent),
                 captured_blocks: Vec::new(),
                 captured_tags: Vec::new(),
+                // A closure's captured function namespace holds FunDefs whose
+                // lambda lists, bodies and cached `#'name` conses are heap
+                // values the moving collector must rewrite (bliss-5q20 /
+                // bliss-1e8t), and a FLET FunDef nests ANOTHER namespace in
+                // `def_funs` (bliss-ayq8). Seed all four so this test covers
+                // visit_fun_map_roots and visit_fun_def_roots' recursion —
+                // adding the field as `None` would have left that path unowned
+                // by any test.
+                captured_funs: Some(Rc::new(RefCell::new(HashMap::from([(
+                    "CAPTURED".to_string(),
+                    FunDef {
+                        params: Vec::new(),
+                        params_form: marker(36),
+                        body: marker(37),
+                        closure_ref: Some(marker(38)),
+                        def_funs: Some(Box::new(HashMap::from([(
+                            "NESTED".to_string(),
+                            FunDef::plain(Vec::new(), marker(39), marker(40)),
+                        )]))),
+                        defining_blocks: None,
+                    },
+                )])))),
             },
         );
         env.method_context.push(MethodContext {
@@ -36498,5 +36553,71 @@ mod jtc5mf_storage_condition_pool_tests {
             pool.contains(&mapped),
             "stack overflow must signal one of the preallocated STORAGE-CONDITION instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod symbol_bare_name_tests {
+    use super::symbol_bare_name;
+
+    /// The original expression `symbol_bare_name` was rewritten from. The
+    /// rewrite is a pure optimization (bliss-mwpb), so the two must agree on
+    /// every input.
+    fn reference(name: &str) -> String {
+        let without_keyword = name.trim_start_matches("KEYWORD:");
+        let base = without_keyword
+            .split_once("::")
+            .map(|(_, tail)| tail)
+            .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
+            .unwrap_or(without_keyword);
+        base.to_uppercase()
+    }
+
+    #[test]
+    fn matches_the_reference_implementation() {
+        let corpus = [
+            // The ordinary cases: bare, qualified, internal-qualified.
+            "CAR",
+            "COMMON-LISP:CAR",
+            "COMMON-LISP::CAR",
+            "BLISS-EXT::FOO",
+            // Keyword spellings, including the doubled prefix that the old
+            // `trim_start_matches` stripped repeatedly.
+            "KEYWORD:FOO",
+            "KEYWORD:KEYWORD:FOO",
+            "KEYWORD::FOO",
+            // A single ':' appearing BEFORE a "::" — "::" must still win.
+            "A:B::C",
+            "A:B:C",
+            // Degenerate colon placements.
+            "",
+            ":",
+            "::",
+            ":::",
+            "A:",
+            "A::",
+            ":A",
+            "::A",
+            "KEYWORD:",
+            // Case folding, including non-ASCII which needs the Unicode path.
+            "car",
+            "Car",
+            "cl-user::mixedCase",
+            "\u{e9}t\u{e9}",
+            "P::\u{e9}t\u{e9}",
+            "\u{130}",
+            "STRASSE-\u{df}",
+            // Characters adjacent to ':' in ASCII, to catch an off-by-one in
+            // the byte scan ('9' is 0x39, ';' is 0x3B, ':' is 0x3A).
+            "9;9",
+            "A9::B;",
+        ];
+        for name in corpus {
+            assert_eq!(
+                symbol_bare_name(name),
+                reference(name),
+                "symbol_bare_name disagreed with the reference on {name:?}"
+            );
+        }
     }
 }
