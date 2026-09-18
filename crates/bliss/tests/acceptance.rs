@@ -11922,3 +11922,32 @@ fn a_function_is_not_a_sequence_and_a_dotted_list_is_not_either() {
     ];
     run_expression_cases(&cases);
 }
+
+/// `(setf (elt list n))` past the end must signal, not silently do nothing.
+///
+/// The list branch had NO else at all: the store was skipped and the value
+/// returned as if it had worked, which is the worst shape a bug can take —
+/// the call looks successful and the data is unchanged (ansi ELT.10).
+///
+/// The datum is the INDEX against the valid range rather than the list, so the
+/// error is checkable: ansi asserts a type error's datum does not satisfy its
+/// own expected-type, and the list would satisfy LIST.
+#[test]
+fn setf_elt_past_the_end_signals() {
+    let cases = [
+        ("(handler-case (let ((x (list 'a 'b 'c))) (setf (elt x 4) 'd)) \
+            (type-error (c) (list (type-error-datum c) \
+                                  (typep (type-error-datum c) (type-error-expected-type c)))))",
+         "(4 NIL)"),
+        ("(handler-case (let ((x (list 1))) (setf (elt x 1) 9)) (type-error () :te))", ":TE"),
+        ("(handler-case (let ((x (vector 1))) (setf (elt x 4) 9)) (type-error () :te))", ":TE"),
+        ("(handler-case (let ((x (copy-seq \"ab\"))) (setf (elt x 5) #\\z)) (type-error () :te))", ":TE"),
+        // Stores that are in range are untouched, at both ends and in the middle.
+        ("(let ((x (list 1 2 3))) (setf (elt x 0) 9) x)", "(9 2 3)"),
+        ("(let ((x (list 1 2 3))) (setf (elt x 1) 9) x)", "(1 9 3)"),
+        ("(let ((x (list 1 2 3))) (setf (elt x 2) 9) x)", "(1 2 9)"),
+        ("(let ((x (vector 1 2))) (setf (elt x 1) 9) x)", "#(1 9)"),
+        ("(let ((x (copy-seq \"ab\"))) (setf (elt x 1) #\\z) x)", "\"az\""),
+    ];
+    run_expression_cases(&cases);
+}

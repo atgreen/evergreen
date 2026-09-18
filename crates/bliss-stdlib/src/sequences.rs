@@ -44,9 +44,14 @@ pub fn string_set_char(s: BlissVal, index: usize, ch: BlissVal) -> Result<BlissV
         let ptr = s.as_ptr();
         let len = bliss_rt::object::simple_string_char_count(ptr);
         if index >= len {
-            return Err(BlissError::Internal(format!(
-                "index {index} out of bounds for string of length {len}"
-            )));
+            // An out-of-range index is a TYPE-ERROR, not an internal one. The
+            // datum is the INDEX against the valid range so the error is
+            // checkable — ansi asserts a type error's datum does not satisfy
+            // its own expected-type (ansi ELT.10's string case).
+            return Err(BlissError::TypeError {
+                datum: BlissVal::from_fixnum(index as i64),
+                expected: format!("(integer 0 {})", len.saturating_sub(1)),
+            });
         }
         // O(1) in-place store (SBCL model, spec §1.6.3). A CHARACTER string
         // (the default) holds any code point; storing a code point >= 256 into

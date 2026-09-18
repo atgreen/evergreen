@@ -16951,9 +16951,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                             );
                                         }
                                     } else {
-                                        return Err(BlissError::Internal(
-                                            "SETF ELT: index past end of list".into(),
-                                        ));
+                                        // An index past the end is a TYPE-ERROR,
+                                        // not an internal one — and the datum is
+                                        // the INDEX against the valid range, so
+                                        // the error is checkable: ansi asserts a
+                                        // type error's datum does not satisfy its
+                                        // own expected-type (ansi ELT.10).
+                                        let len = list_to_vec(seq).len();
+                                        return Err(BlissError::TypeError {
+                                            datum: BlissVal::from_fixnum(i as i64),
+                                            expected: format!(
+                                                "(integer 0 {})",
+                                                len.saturating_sub(1)
+                                            ),
+                                        });
                                     }
                                 } else if acc == "ELT" {
                                     // (setf (elt v i)) respects the fill pointer.
@@ -18232,6 +18243,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             let cell = cursor.as_ptr() as *mut ConsCell;
                             bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
                         }
+                    } else {
+                        // Past the end. This had NO else at all, so the store
+                        // silently did nothing and the value was returned as if
+                        // it had worked — the worst shape for a bug (ansi
+                        // ELT.10). The datum is the INDEX against the valid
+                        // range, so the error is checkable: ansi asserts a type
+                        // error's datum does not satisfy its own expected-type.
+                        let len = list_to_vec(seq).len();
+                        return Err(BlissError::TypeError {
+                            datum: BlissVal::from_fixnum(i as i64),
+                            expected: format!("(integer 0 {})", len.saturating_sub(1)),
+                        });
                     }
                 } else if is_elt {
                     bliss_stdlib::set_elt(seq, i, val)?;
