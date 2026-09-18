@@ -18463,9 +18463,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // evaluated source forms.
                 bliss_rt::rooted!(src = list_to_vec(cdr));
                 if src.len() < 3 {
-                    return Err(BlissError::Internal(
-                        "MAP requires a result type, function, and sequence".into(),
-                    ));
+                    // Too few arguments to a standard function is a
+                    // PROGRAM-ERROR (CLHS), not an internal error — ansi
+                    // MAP.ERROR.5/6 call (map 'list) and (map 'list #'null) and
+                    // expect one.
+                    return Err(BlissError::ProgramError(format!(
+                        "MAP called with {} argument(s); requires at least 3",
+                        src.len()
+                    )));
                 }
                 bliss_rt::rooted!(result_type = eval_form(src[0], env)?);
                 bliss_rt::rooted!(fn_val = eval_form(src[1], env)?);
@@ -18483,23 +18488,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     results.push(apply_function(*fn_val, &call_args, env)?);
                 }
                 let result_type = *result_type;
-                let result_name = if result_type.is_symbol() {
-                    symbol_bare_name(&sym_name_rc(result_type))
-                } else {
-                    val_as_str(result_type).to_uppercase()
-                };
-                return Ok(match result_name.as_str() {
-                    "NIL" => NIL,
-                    "LIST" => vec_to_list(&results),
-                    "STRING" | "SIMPLE-STRING" | "BASE-STRING" => {
-                        let s = results.iter().map(|v| v.as_char()).collect::<String>();
-                        arena_str(&s)
-                    }
-                    "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
-                        bliss_stdlib::build_simple_vector(&results)
-                    }
-                    _ => vec_to_list(&results),
-                });
+                // `(map nil …)` is called for effect and returns NIL — the only
+                // case the shared builder cannot express, since NIL also names
+                // the empty list.
+                if result_type.is_nil() {
+                    return Ok(NIL);
+                }
+                // Everything else goes through the SAME classification
+                // CONCATENATE uses. This arm used to carry its own smaller copy,
+                // which recognized neither compound specifiers like
+                // `(simple-string 3)` nor SIMPLE-BASE-STRING nor any bit-vector
+                // type, and silently answered a LIST for all of them (ansi
+                // MAP.38-47, MAP.FILL.5). Duplicating stdlib classification in
+                // the interpreter is what AGENTS.md's architecture rule forbids,
+                // and this is precisely how the two drifted apart.
+                return bliss_stdlib::build_result_sequence(result_type, &results);
             }
             // FIND / POSITION / COUNT are defined in lib/boot.lisp over
             // ELT/LENGTH/FUNCALL so their :key/:test can be any interpreter

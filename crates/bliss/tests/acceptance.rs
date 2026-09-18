@@ -11182,3 +11182,114 @@ fn environment_objects_survive_the_expansion_that_uses_them() {
         }
     }
 }
+
+/// CONCATENATE and MAP classify their result type independently — MAP carried
+/// its own smaller copy inline in the interpreter, which recognized neither
+/// compound specifiers like `(simple-string 3)`, nor SIMPLE-BASE-STRING, nor any
+/// bit-vector type, and silently answered a LIST for all of them (ansi
+/// CONCATENATE.10-15/35-40, MAP.38-47, MAP.FILL.5). They now share one stdlib
+/// builder, so the two cannot drift apart again.
+#[test]
+fn concatenate_and_map_honour_every_result_type() {
+    let cases = [
+        // Bit-vector result types, bare and compound, including the empty case.
+        ("(concatenate 'bit-vector nil)", "#*"),
+        ("(concatenate 'bit-vector)", "#*"),
+        ("(concatenate 'bit-vector '(0 1 1) nil #(1 0 1) #())", "#*011101"),
+        ("(concatenate 'simple-bit-vector '(0 1 1) nil #(1 0 1) #())", "#*011101"),
+        ("(map 'bit-vector #'identity '(0 1 1))", "#*011"),
+        ("(map 'simple-bit-vector #'identity '(0 0 0))", "#*000"),
+        // A non-bit element is a TYPE-ERROR, not a silently coerced 1.
+        ("(handler-case (concatenate 'bit-vector '(0 2)) (type-error () :te))", ":TE"),
+        // Compound string specifiers, with and without a length.
+        ("(concatenate '(simple-string) \"abc\" \"def\")", "\"abcdef\""),
+        ("(concatenate '(simple-string *) \"abc\" \"def\")", "\"abcdef\""),
+        ("(concatenate '(simple-string 6) \"abc\" \"def\")", "\"abcdef\""),
+        ("(concatenate '(string) \"abc\" \"def\")", "\"abcdef\""),
+        ("(concatenate '(string 6) \"abc\" \"def\")", "\"abcdef\""),
+        ("(map '(simple-string 3) #'identity '(#\\a #\\b #\\c))", "\"abc\""),
+        ("(map '(base-string) #'identity '(#\\a #\\b #\\c))", "\"abc\""),
+        ("(map 'simple-base-string #'identity '(#\\a #\\b #\\c))", "\"abc\""),
+        ("(map '(simple-base-string *) #'identity '(#\\a #\\b #\\c))", "\"abc\""),
+        // The cases that already worked must not move.
+        ("(concatenate 'list \"ab\" '(1))", "(#\\a #\\b 1)"),
+        ("(concatenate 'vector '(1 2))", "#(1 2)"),
+        ("(concatenate 'string \"ab\" \"cd\")", "\"abcd\""),
+        ("(map 'list #'1+ '(1 2))", "(2 3)"),
+        ("(map 'vector #'1+ '(1 2))", "#(2 3)"),
+        ("(map 'string #'identity \"ab\")", "\"ab\""),
+        // (map nil …) is for effect and returns NIL — the one case the shared
+        // builder cannot express, since NIL also names the empty list.
+        ("(map nil #'identity '(1 2))", "NIL"),
+        // Too few arguments to MAP is a PROGRAM-ERROR, not an internal error.
+        ("(handler-case (map 'list) (program-error () :pe))", ":PE"),
+        ("(handler-case (map 'list #'null) (program-error () :pe))", ":PE"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// MAKE-SEQUENCE never checked its result type: `(make-sequence 'symbol 10)`
+/// built a vector, and a length the specifier declared was ignored, so
+/// `(make-sequence '(string 4) 3)` built a 3-character string. CLHS makes both a
+/// TYPE-ERROR (ansi MAKE-SEQUENCE.ERROR.1-16).
+#[test]
+fn make_sequence_validates_its_result_type() {
+    let cases = [
+        ("(handler-case (make-sequence 'symbol 10) (type-error () :te))", ":TE"),
+        ("(handler-case (make-sequence 'null 1) (type-error () :te))", ":TE"),
+        ("(handler-case (make-sequence 'cons 0) (type-error () :te))", ":TE"),
+        // A declared length must agree with SIZE, in either direction, and in
+        // both the (vector et size) and (string size) positions.
+        ("(handler-case (make-sequence '(vector * 4) 3) (type-error () :te))", ":TE"),
+        ("(handler-case (make-sequence '(vector * 2) 3) (type-error () :te))", ":TE"),
+        ("(handler-case (make-sequence '(string 4) 3) (type-error () :te))", ":TE"),
+        ("(handler-case (make-sequence '(simple-string 2) 3) (type-error () :te))", ":TE"),
+        // An agreeing or unspecified length is fine.
+        ("(make-sequence '(vector * 3) 3 :initial-element 0)", "#(0 0 0)"),
+        ("(make-sequence '(string 3) 3 :initial-element #\\z)", "\"zzz\""),
+        ("(make-sequence '(vector *) 2 :initial-element 1)", "#(1 1)"),
+        // The ordinary cases.
+        ("(make-sequence 'list 3 :initial-element 'x)", "(X X X)"),
+        ("(make-sequence 'vector 3 :initial-element 1)", "#(1 1 1)"),
+        ("(make-sequence 'string 3 :initial-element #\\a)", "\"aaa\""),
+        ("(make-sequence 'null 0)", "NIL"),
+        ("(make-sequence 'cons 2 :initial-element 5)", "(5 5)"),
+        ("(make-sequence 'bit-vector 4)", "#*0000"),
+        // A CLASS object designates its name.
+        ("(make-sequence (find-class 'cons) 4 :initial-element 'x)", "(X X X X)"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// Run `(expr, expected-printed-form)` pairs through BOTH backends: compiled as
+/// written, and tree-walked via EVAL. Nine of the fixes in the
+/// data-and-control-flow grind were single-backend divergences, so every case
+/// has to be checked twice.
+fn run_expression_cases(cases: &[(&str, &str)]) {
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", (*expr).to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                *expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

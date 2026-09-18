@@ -1624,16 +1624,100 @@ fn result_type_is_vector(result_type: BlissVal) -> bool {
 
 /// Check whether CONCATENATE requested a string result type.
 fn result_type_is_string(result_type: BlissVal) -> bool {
-    if result_type.tag() != bliss_rt::value::TAG_SYMBOL {
-        return false;
+    fn name_is_string(idx: u32) -> bool {
+        matches!(
+            bliss_compiler::reader::symbol_name(idx).as_deref(),
+            Some("STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING")
+        )
     }
-    match bliss_compiler::reader::symbol_name(result_type.as_symbol_index()) {
-        Some(name) => matches!(
-            name.as_str(),
-            "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING"
-        ),
-        None => false,
+    if result_type.tag() == bliss_rt::value::TAG_SYMBOL {
+        return name_is_string(result_type.as_symbol_index());
     }
+    // A COMPOUND specifier — `(STRING 6)`, `(SIMPLE-STRING *)` — designates the
+    // same representation as the bare symbol, with an element count that
+    // CONCATENATE's result already satisfies by construction. Only the bare
+    // symbol was recognized, so `(concatenate '(string 6) "abc" "def")` fell all
+    // the way through to the list branch and answered (# # ...) instead of
+    // "abcdef" (ansi CONCATENATE.35-40). `result_type_is_vector` right above
+    // already dispatches on the car this way.
+    if result_type.is_cons() {
+        let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
+        if car.tag() == bliss_rt::value::TAG_SYMBOL {
+            return name_is_string(car.as_symbol_index());
+        }
+    }
+    false
+}
+
+/// Check whether CONCATENATE requested a bit-vector result type.
+///
+/// Nothing recognized these, so `(concatenate 'bit-vector '(0 1 1))` answered
+/// the LIST (0 1 1) instead of #*011 (ansi CONCATENATE.10-15).
+fn result_type_is_bit_vector(result_type: BlissVal) -> bool {
+    fn name_is_bit_vector(idx: u32) -> bool {
+        matches!(
+            bliss_compiler::reader::symbol_name(idx).as_deref(),
+            Some("BIT-VECTOR" | "SIMPLE-BIT-VECTOR")
+        )
+    }
+    if result_type.tag() == bliss_rt::value::TAG_SYMBOL {
+        return name_is_bit_vector(result_type.as_symbol_index());
+    }
+    if result_type.is_cons() {
+        let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
+        if car.tag() == bliss_rt::value::TAG_SYMBOL {
+            return name_is_bit_vector(car.as_symbol_index());
+        }
+    }
+    false
+}
+
+/// Build a sequence of `elems` in the representation `result_type` designates.
+///
+/// Shared by CONCATENATE and by the interpreter's MAP, which used to carry its
+/// OWN inline copy of this classification in cli.rs — and a smaller one, so MAP
+/// mishandled every compound specifier, SIMPLE-BASE-STRING, and every
+/// bit-vector type, answering a LIST instead (ansi MAP.38-47, MAP.FILL.5).
+/// Duplicated classification is exactly what AGENTS.md's architecture rule
+/// forbids; one implementation cannot drift from itself.
+///
+/// A `result_type` this does not recognize builds a list, which is what both
+/// callers did before.
+pub fn build_result_sequence(
+    result_type: BlissVal,
+    elems: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    if result_type_is_string(result_type) {
+        let mut out = String::with_capacity(elems.len());
+        for &elem in elems {
+            if !elem.is_character() {
+                return Err(BlissError::TypeError {
+                    datum: elem,
+                    expected: "character".to_string(),
+                });
+            }
+            out.push(elem.as_char());
+        }
+        return Ok(crate::streams::make_lisp_string(&out));
+    }
+    if result_type_is_bit_vector(result_type) {
+        // Every element must be a BIT; the generic builder maps any non-zero to
+        // 1, which would silently accept a bad element. Mirror the string
+        // branch's type check instead.
+        for &elem in elems {
+            if !(elem.is_fixnum() && matches!(elem.as_fixnum(), 0 | 1)) {
+                return Err(BlissError::TypeError {
+                    datum: elem,
+                    expected: "bit".to_string(),
+                });
+            }
+        }
+        return Ok(build_bit_vector_from_vals(elems));
+    }
+    if result_type_is_vector(result_type) {
+        return Ok(build_vector(elems));
+    }
+    Ok(build_list(elems))
 }
 
 /// Concatenate sequences (CL `CONCATENATE`). R5.30.
@@ -1643,23 +1727,7 @@ pub fn concatenate(result_type: BlissVal, sequences: &[BlissVal]) -> Result<Blis
         let elems = collect_elements(seq)?;
         all_elems.extend(elems);
     }
-    if result_type_is_string(result_type) {
-        let mut out = String::with_capacity(all_elems.len());
-        for elem in all_elems {
-            if !elem.is_character() {
-                return Err(BlissError::TypeError {
-                    datum: elem,
-                    expected: "character".to_string(),
-                });
-            }
-            out.push(elem.as_char());
-        }
-        Ok(crate::streams::make_lisp_string(&out))
-    } else if result_type_is_vector(result_type) {
-        Ok(build_vector(&all_elems))
-    } else {
-        Ok(build_list(&all_elems))
-    }
+    build_result_sequence(result_type, &all_elems)
 }
 
 // ── Search and comparison ──────────────────────────────────────────

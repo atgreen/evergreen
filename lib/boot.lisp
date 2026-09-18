@@ -1802,19 +1802,64 @@
 ;; MAKE-SEQUENCE result-type size &key initial-element — a fresh sequence of the
 ;; given type. Dispatches on the type's head: list types build a list, string
 ;; types (or (vector character …)) a string, everything else a general vector.
+;; The LENGTH a compound sequence type specifier declares, or NIL when it
+;; leaves it unspecified. The length sits in a different position per head:
+;; (VECTOR [element-type [size]]) puts it third, while (STRING [size]) and the
+;; other one-parameter vector heads put it second. `*` means unspecified.
+(defun %sequence-type-length (result-type)
+  (and (consp result-type)
+       (let* ((head (car result-type))
+              (tail (cdr result-type))
+              (slot (cond ((member head '(vector array simple-array))
+                           (car (cdr tail)))
+                          ((member head '(simple-vector string simple-string
+                                          base-string simple-base-string
+                                          bit-vector simple-bit-vector))
+                           (car tail))
+                          (t nil))))
+         (and (integerp slot) slot))))
+
+;; MAKE-SEQUENCE's result-type must name a SEQUENCE type, and a length it
+;; declares must agree with SIZE; otherwise the consequences are a TYPE-ERROR
+;; (CLHS make-sequence). None of this was checked, so (make-sequence 'symbol 10)
+;; happily built a vector and (make-sequence '(string 4) 3) built a 3-character
+;; string (ansi MAKE-SEQUENCE.ERROR.1-16).
 (defun make-sequence (result-type size &rest keys)
-  (let* ((head (if (consp result-type) (car result-type) result-type))
-         (elt (if (consp result-type) (car (cdr result-type)) nil))
+  (%check-nonneg-index size)
+  (let* ((rt (if (and result-type (not (consp result-type)) (not (symbolp result-type)))
+                 ;; A CLASS object designates its name (MAKE-SEQUENCE.57/58).
+                 (or (ignore-errors (class-name result-type)) result-type)
+                 result-type))
+         (head (if (consp rt) (car rt) rt))
+         (elt (if (consp rt) (car (cdr rt)) nil))
          (iel-cell (member :initial-element keys))
          (iel (if iel-cell (car (cdr iel-cell)) nil))
+         (declared (%sequence-type-length rt))
          (stringp (or (member head '(string simple-string base-string simple-base-string))
                       (and (member head '(vector array simple-array simple-vector))
-                           (member elt '(character base-char standard-char))))))
+                           (member elt '(character base-char standard-char)))))
+         (bitp (or (member head '(bit-vector simple-bit-vector))
+                   (and (member head '(vector array simple-array simple-vector))
+                        (eq elt 'bit)))))
+    (unless (member head '(list cons null sequence vector simple-vector
+                           array simple-array string simple-string
+                           base-string simple-base-string
+                           bit-vector simple-bit-vector))
+      (error 'type-error :datum result-type :expected-type 'sequence))
+    ;; A declared length that disagrees with SIZE is a type error, as is NULL
+    ;; with a non-empty size or CONS with an empty one — those heads pin the
+    ;; length by themselves.
+    (when (or (and declared (/= declared size))
+              (and (eq head 'null) (/= size 0))
+              (and (eq head 'cons) (= size 0)))
+      (error 'type-error :datum result-type :expected-type 'sequence))
     (cond
       ((member head '(list cons null))
        (make-list size :initial-element iel))
       (stringp
        (if iel-cell (make-string size :initial-element iel) (make-string size)))
+      (bitp
+       (make-array size :element-type 'bit :initial-element (if iel-cell iel 0)))
       (t
        (if iel-cell (make-array size :initial-element iel) (make-array size))))))
 ;; STRING-EQUAL is case-insensitive STRING=; forward the ANSI bounding keywords
