@@ -22,7 +22,7 @@ const SYMBOL_ADDITION: u32 = 4;
 /// stores it back if it still fits the allocated buffer (true for the common
 /// same-byte-width case, e.g. ASCII), updating the length header.
 pub fn string_set_char(s: BlissVal, index: usize, ch: BlissVal) -> Result<BlissVal, BlissError> {
-    if crate::pathnames::registered_string(s).is_some() {
+    if crate::pathnames::is_registered_string(s) {
         return Err(BlissError::Internal(
             "cannot modify an interned string literal".into(),
         ));
@@ -78,12 +78,21 @@ fn is_vector(v: BlissVal) -> bool {
     if !v.is_heap_object() {
         return false;
     }
-    // A registry-backed string sentinel is heap-tagged but its bits are a hash,
-    // not a real pointer — recognise it via the registry rather than
-    // dereferencing (which would segfault). A string is never a vector.
-    if crate::pathnames::registered_string(v).is_some() {
-        return false;
-    }
+    // No registry consultation here, deliberately. This used to ask the
+    // pathname string registry first, because a registry-backed string was once
+    // a FNV hash sitting behind a heap-object tag, and dereferencing it would
+    // fault. That representation is gone: make_string_bv now allocates an
+    // ordinary Lisp string (its own comment says so), arena_str registers a real
+    // arena allocation, and the remaining registration in the evaluator checks
+    // the object header first. The `keyword_hash` sentinels that ARE raw bits
+    // carry TAG_SYMBOL (0b101), not TAG_HEAP_OBJECT (0b010), so they never reach
+    // this branch.
+    //
+    // So every registered value is a real object and the header read below is
+    // safe — and it gives the same answer the registry did, since a string's
+    // type id is not SIMPLE_VECTOR either way. The check was pure cost: a global
+    // mutex, a hash and a String clone on EVERY element access, which made
+    // (aref v 3) cost ~17x (car c) in a hot loop (bliss-edzd).
     let header = unsafe { *(v.as_ptr() as *const ObjectHeader) };
     header.type_id() == type_id::SIMPLE_VECTOR
 }
@@ -118,7 +127,7 @@ fn string_content(v: BlissVal) -> Option<String> {
 pub fn string_char_at(v: BlissVal, index: usize) -> Option<char> {
     // O(1) for a real simple-string heap object; registry-backed sentinels and
     // fill-pointer char vectors fall back to the decoded content.
-    if v.is_heap_object() && crate::pathnames::registered_string(v).is_none() {
+    if v.is_heap_object() && !crate::pathnames::is_registered_string(v) {
         let ptr = unsafe { v.as_ptr() };
         let tid = unsafe { (*(ptr as *const ObjectHeader)).type_id() };
         if tid == type_id::SIMPLE_BASE_STRING || tid == type_id::SIMPLE_CHARACTER_STRING {
@@ -447,9 +456,9 @@ pub fn is_complex_vector(v: BlissVal) -> bool {
     if !v.is_heap_object() {
         return false;
     }
-    if crate::pathnames::registered_string(v).is_some() {
-        return false;
-    }
+    // Same reasoning as `is_vector`: every registered value is a real object, so
+    // the header read is safe and answers identically without a registry
+    // lookup (bliss-edzd).
     let header = unsafe { *(v.as_ptr() as *const ObjectHeader) };
     header.type_id() == type_id::COMPLEX_ARRAY
 }

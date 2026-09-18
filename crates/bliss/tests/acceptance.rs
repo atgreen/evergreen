@@ -12401,3 +12401,45 @@ fn type_error_names_a_symbol_datum() {
         "a symbol datum must not print as its Debug form; got: {text}"
     );
 }
+
+/// `is_vector` / `is_complex_vector` no longer consult the pathname string
+/// registry to decide whether a heap value is safe to dereference (bliss-edzd).
+/// That guard dated from when a registered string was an FNV hash behind a
+/// heap-object tag; registered values are real objects now. Pin the behaviour
+/// it was protecting, so removing it cannot regress silently: registered
+/// strings, pathnames, and every vector shape must still classify correctly.
+#[test]
+fn vector_predicates_classify_without_the_string_registry() {
+    let cases = [
+        // Plain vectors and strings.
+        ("(aref (vector 1 2 3) 1)", "2"),
+        ("(aref \"abc\" 1)", "#\\b"),
+        ("(elt \"abc\" 1)", "#\\b"),
+        ("(length \"abc\")", "3"),
+        ("(vectorp (vector 1 2))", "T"),
+        ("(vectorp \"ab\")", "T"),
+        ("(vectorp (list 1 2))", "NIL"),
+        ("(simple-vector-p (vector 1 2))", "T"),
+        // NOTE: (simple-vector-p "ab") wrongly answers T, on binaries built
+        // before AND after this change -- a pre-existing conformance bug
+        // (bliss-3snc), not something the removed registry lookup was
+        // preventing. Deliberately not asserted either way here.
+        // Fill-pointer / adjustable vectors take the complex-array path.
+        (
+            "(let ((v (make-array 3 :fill-pointer 2 :adjustable t :initial-element 7)))
+               (list (aref v 2) (length v) (vectorp v)))",
+            "(7 2 T)",
+        ),
+        // Pathnames and pathname-derived strings are registry-backed values and
+        // must still behave — a pathname is not a sequence, its name is.
+        ("(namestring (make-pathname :name \"foo\" :type \"lisp\"))", "\"foo.lisp\""),
+        ("(pathname-name (pathname \"/tmp/x.lisp\"))", "\"x\""),
+        ("(vectorp (pathname \"/tmp/x.lisp\"))", "NIL"),
+        ("(length (pathname-name (pathname \"/tmp/xy.lisp\")))", "2"),
+        ("(aref (pathname-name (pathname \"/tmp/xy.lisp\")) 0)", "#\\x"),
+        // Bit vectors keep their own classification.
+        ("(aref (make-array 3 :element-type 'bit :initial-element 1) 2)", "1"),
+        ("(subseq (vector 1 2 3) 1)", "#(2 3)"),
+    ];
+    run_expression_cases(&cases);
+}

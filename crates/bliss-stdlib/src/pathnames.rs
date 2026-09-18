@@ -213,6 +213,7 @@ fn component_string(val: BlissVal) -> Option<String> {
 }
 
 pub fn register_string(val: BlissVal, s: &str) {
+    ANY_REGISTERED_STRING.store(true, std::sync::atomic::Ordering::Relaxed);
     install_pathname_global_root_scanner();
     with_string_registry(|reg| {
         reg.insert(val.0, s.to_string());
@@ -223,7 +224,39 @@ pub fn register_string(val: BlissVal, s: &str) {
 }
 
 pub fn registered_string(val: BlissVal) -> Option<String> {
+    if !any_registered_string() {
+        return None;
+    }
     lookup_string(val)
+}
+
+/// Has any string sentinel ever been registered? Set on the first
+/// `register_string` and never cleared, so `false` is a sound "definitely not
+/// registered" and the caller can skip the registry entirely.
+fn any_registered_string() -> bool {
+    ANY_REGISTERED_STRING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static ANY_REGISTERED_STRING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is `val` a registry-backed string sentinel?
+///
+/// This is the question the sequence type predicates actually ask, and they ask
+/// it on EVERY element access: `is_vector` and `is_complex_vector` must not
+/// dereference a sentinel, whose bits are a hash rather than a pointer. Going
+/// through `registered_string` to answer it locked a global mutex, hashed the
+/// value, and CLONED a String — to compute a boolean. On a 20M-iteration loop
+/// that made `(aref v 3)` cost 0.239 us/iter against `(car c)`'s 0.026, i.e.
+/// ~17x, with lookup_string/hash_one/__lock plainly visible in the profile.
+///
+/// Answer it without allocating, and without touching the registry at all in
+/// the overwhelmingly common case where no sentinel has ever been made.
+pub fn is_registered_string(val: BlissVal) -> bool {
+    if !any_registered_string() {
+        return false;
+    }
+    with_string_registry(|reg| reg.contains_key(&val.0))
 }
 
 fn is_keyword(val: BlissVal, name: &str) -> bool {
