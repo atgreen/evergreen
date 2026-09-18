@@ -13291,6 +13291,12 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "SUBSEQ" => Some((2, 3)),
         "CONCATENATE" => Some((1, usize::MAX)),
         "CONSP" | "ATOM" | "LISTP" | "ENDP" => Some((1, 1)),
+        // NOT and NULL take exactly one argument. The operator-position handlers
+        // check this themselves, but nothing did on the funcall/apply path, so
+        // `(funcall #'not 1 2)` quietly answered NIL — which matters because a
+        // :test-not of #'NOT is called with TWO arguments and must be a
+        // PROGRAM-ERROR (ansi POSITION.ERROR.13 and its FIND/COUNT siblings).
+        "NOT" | "NULL" => Some((1, 1)),
         // (rest list) — exactly one; (nth n list) — exactly two.
         "REST" => Some((1, 1)),
         "NTH" => Some((2, 2)),

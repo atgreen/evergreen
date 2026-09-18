@@ -11951,3 +11951,31 @@ fn setf_elt_past_the_end_signals() {
     ];
     run_expression_cases(&cases);
 }
+
+/// NOT and NULL take exactly one argument. The operator-position handlers check
+/// that themselves, but nothing did on the funcall/apply path, so
+/// `(funcall #'not 1 2)` quietly answered NIL.
+///
+/// That is not academic: a :TEST-NOT of #'NOT is called with TWO arguments, so
+/// it has to be a PROGRAM-ERROR — which is exactly what ansi checks
+/// (POSITION.ERROR.13 and its FIND / COUNT siblings).
+#[test]
+fn not_and_null_take_exactly_one_argument_on_every_path() {
+    let cases = [
+        ("(handler-case (funcall #'not 1 2) (program-error () :pe))", ":PE"),
+        ("(handler-case (funcall #'null 1 2) (program-error () :pe))", ":PE"),
+        ("(handler-case (apply #'not '(1 2)) (program-error () :pe))", ":PE"),
+        ("(handler-case (not 1 2) (program-error () :pe))", ":PE"),
+        ("(handler-case (funcall #'not) (program-error () :pe))", ":PE"),
+        // The case that motivated it: a two-argument call through :TEST-NOT.
+        ("(handler-case (position 'b '(a b c d) :test-not #'not) (program-error () :pe))", ":PE"),
+        ("(handler-case (find 'b '(a b c d) :test-not #'not) (program-error () :pe))", ":PE"),
+        ("(handler-case (count 'b '(a b c d) :test-not #'not) (program-error () :pe))", ":PE"),
+        // One-argument uses are untouched, on every path.
+        ("(list (not nil) (not 1) (null nil) (null 1))", "(T NIL T NIL)"),
+        ("(list (funcall #'not nil) (funcall #'null 1))", "(T NIL)"),
+        ("(mapcar #'not '(nil 1))", "(T NIL)"),
+        ("(remove-if #'null '(1 nil 2))", "(1 2)"),
+    ];
+    run_expression_cases(&cases);
+}
