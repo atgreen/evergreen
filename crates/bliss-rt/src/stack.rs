@@ -553,3 +553,39 @@ impl Iterator for FrameWalker {
         Some(frame)
     }
 }
+
+/// Lowest stack address compiled code may recurse to before it must stop taking
+/// direct (non-c2i) calls. Read by JIT-emitted code at the address
+/// [`native_stack_limit_addr`] reports.
+///
+/// Zero means "no limit known", and compiled code then behaves exactly as it did
+/// before this existed — so a runtime that never calls [`set_native_stack_limit`]
+/// is unaffected.
+///
+/// This exists because T2's direct self-call skips `c2i_call_args`, and with it
+/// the `native_depth_cap()` check that is the only bound on recursion depth in
+/// compiled code — the T2 prologue has no stack guard. Without a limit a deeply
+/// self-recursive function runs off the C stack and returns a WRONG ANSWER:
+/// `(deep 400000)` answered 30, and `(deep 200000)` answered a raw stack address
+/// (bliss-b4fd).
+pub static NATIVE_STACK_LIMIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Address of [`NATIVE_STACK_LIMIT`], for the code emitter to bake into a load.
+pub fn native_stack_limit_addr() -> u64 {
+    (&NATIVE_STACK_LIMIT as *const std::sync::atomic::AtomicU64) as u64
+}
+
+/// Publish the limit. `reserve_bytes` is how much of the stack below the current
+/// frame compiled code may use; the remainder is headroom for the interpreter to
+/// unwind and signal in.
+///
+/// Called once, early, from a frame near the base of the thread's stack. A
+/// too-low estimate only costs performance (self-calls take the c2i path
+/// sooner); the limit is never allowed to exceed the current stack pointer, so a
+/// bad reservation cannot push it above live frames.
+pub fn set_native_stack_limit(reserve_bytes: u64) {
+    let here = &reserve_bytes as *const u64 as u64;
+    let limit = here.saturating_sub(reserve_bytes);
+    NATIVE_STACK_LIMIT.store(limit, std::sync::atomic::Ordering::Release);
+}

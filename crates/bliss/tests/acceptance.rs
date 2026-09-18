@@ -11415,10 +11415,14 @@ fn run_expression_cases(cases: &[(&str, &str)]) {
 /// function returns a WRONG ANSWER instead of signalling: `(deep 400000)`
 /// answers 30, and `(deep 200000)` answers a raw stack address (bliss-b4fd).
 ///
-/// The real fix is a prologue stack guard; dropping the optimization is not an
-/// option, since it is worth 166x on fib(30). Until then
-/// BLISS_NO_DIRECT_SELF_CALL is the workaround, and this pins that it works —
-/// so the escape hatch cannot silently stop working before the fix lands.
+/// Fixed by guarding the self-call against a published stack limit: past it the
+/// call takes the c2i path, which enforces the cap and drops to a flat T0 `run()`.
+/// Dropping the optimization was not an option — without it fib(30) goes from
+/// 3ms to 540ms — and the guard costs about 10% on tight self-recursion.
+///
+/// The `default` row is the regression test proper; the others pin that every
+/// path which never took the direct self-call still behaves, so a future change
+/// cannot quietly fix one and break another.
 #[test]
 fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
     let program = "(progn \
@@ -11428,11 +11432,14 @@ fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
                                 (storage-condition () :storage-condition) \
                                 (error () :error))))";
     for (label, extra_env) in [
-        // Every tier that does NOT take the direct self-call gets this right.
+        // T2 with its direct self-call ACTIVE — the case that used to answer 30,
+        // or a raw stack address, or segfault. The stack guard now sends it to
+        // c2i once the stack runs low, which enforces the depth cap.
+        ("default", vec![]),
+        // And every tier that never took the direct self-call in the first place.
         ("t0", vec![("BLISS_FORCE_TIER", "t0")]),
         ("t1", vec![("BLISS_FORCE_TIER", "t1")]),
         ("no-t2", vec![("BLISS_DISABLE_T2", "1")]),
-        // ... and so does T2 with the direct self-call routed through c2i.
         ("no-direct-self-call", vec![("BLISS_NO_DIRECT_SELF_CALL", "1")]),
     ] {
         let mut cmd = bliss_bin();
@@ -11459,4 +11466,24 @@ fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
             "{label}: deep recursion must signal, not return a value"
         );
     }
+    // The guard must not disturb recursion that fits: these are the depths real
+    // code uses, and they must still compute, not signal.
+    let shallow = "(progn \
+        (defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) \
+        (defun deep (n) (if (= n 0) 0 (1+ (deep (1- n))))) \
+        (dotimes (i 300) (fib 15) (deep 100)) \
+        (cl:format t \"~S~%\" (list (fib 25) (deep 1000) (deep 50000))))";
+    let output = bliss_bin()
+        .args(["--eval", shallow])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim(),
+        "(75025 1000 50000)",
+        "recursion that fits on the stack must still compute"
+    );
 }

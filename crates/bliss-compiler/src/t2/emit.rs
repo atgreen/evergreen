@@ -1174,6 +1174,31 @@ fn emit_call(
         // 498ms, a 166x regression.
         let self_call_disabled = std::env::var_os("BLISS_NO_DIRECT_SELF_CALL").is_some();
         if !self_call_disabled && sym == ss && nargs <= ARG_REGS.len() {
+            // Stack guard. The direct call below takes a REAL C frame and does
+            // not reach c2i_call_args, so it never sees native_depth_cap() —
+            // and the T2 prologue has no guard of its own. Unbounded, a deeply
+            // self-recursive function runs off the stack and returns a wrong
+            // answer (bliss-b4fd). Compare rsp against the published limit and
+            // fall back to the c2i sequence below once the stack runs low; that
+            // path enforces the depth cap and drops to a flat T0 `run()`, which
+            // raises a catchable STORAGE-CONDITION.
+            //
+            // A zero limit (never published) compares false, so the guard is
+            // inert and behaviour is exactly as before. The compare happens
+            // BEFORE any argument move, because the moves clobber registers and
+            // the c2i path needs the untouched inputs; SCRATCH is rdx, which is
+            // not one of ARG_REGS.
+            const RSP: u8 = 4;
+            let limit_addr = bliss_rt::stack::native_stack_limit_addr();
+            let slow = a.label();
+            let join = a.label();
+            mov_imm64(a, SCRATCH, limit_addr as i64);
+            load_mem64_disp(a, SCRATCH, SCRATCH, 0);
+            cmp_rr(a, RSP, SCRATCH);
+            // Signed compare is right: stack addresses are canonical and
+            // positive, and a zero limit takes the direct path.
+            a.jcc(bliss_rt::asm::Cc::Le, slow);
+
             let mut moves = Vec::with_capacity(nargs);
             for (i, &arg) in data.args.iter().enumerate() {
                 let src = if let Some(&bits) = const_tagged.get(&arg) {
@@ -1185,6 +1210,46 @@ fn emit_call(
             }
             emit_call_arg_moves(a, moves)?;
             a.call(entry);
+            a.jmp(join);
+
+            // Slow path: the ordinary three-register c2i dispatch, emitted
+            // inline so the guard has somewhere to go.
+            a.bind(slow);
+            const C2I_ARGS_SELF: [u8; 3] = [2, 1, 8];
+            if nargs <= C2I_ARGS_SELF.len() {
+                let mut moves = Vec::with_capacity(nargs);
+                for (i, &arg) in data.args.iter().enumerate() {
+                    let src = if let Some(&bits) = const_tagged.get(&arg) {
+                        ArgMoveSrc::Imm(bits)
+                    } else {
+                        ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+                    };
+                    moves.push((C2I_ARGS_SELF[i], src));
+                }
+                emit_call_arg_moves(a, moves)?;
+                mov_imm64(a, 7, sym as i64); // rdi = sym
+                mov_imm64(a, 6, nargs as i64); // rsi = nargs
+                mov_imm64(a, 9, 0); // r9 = no call-site profile
+                mov_imm64(a, 0, c2i_call_addr as i64);
+                emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+            } else {
+                // Four self-call arguments do not fit c2i's register ABI. Keep
+                // the direct call rather than emit a wrong dispatch — the guard
+                // simply does not apply at this arity.
+                let mut moves = Vec::with_capacity(nargs);
+                for (i, &arg) in data.args.iter().enumerate() {
+                    let src = if let Some(&bits) = const_tagged.get(&arg) {
+                        ArgMoveSrc::Imm(bits)
+                    } else {
+                        ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+                    };
+                    moves.push((ARG_REGS[i], src));
+                }
+                emit_call_arg_moves(a, moves)?;
+                a.call(entry);
+            }
+
+            a.bind(join);
             if let Some(&r0) = data.results.first() {
                 mov_rr(a, *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?, 0);
             }

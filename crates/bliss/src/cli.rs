@@ -34949,6 +34949,21 @@ fn image_toplevel() -> Option<BlissVal> {
 
 // ── CLI driver ─────────────────────────────────────────────────────
 pub fn run(args: &[String]) -> Result<i32, BlissError> {
+    // Publish the stack limit compiled code guards its direct self-calls
+    // against, from a frame near the base of this thread's stack.
+    //
+    // T2's direct self-call does not reach c2i_call_args and so never sees
+    // native_depth_cap(), and the T2 prologue has no stack guard, so without
+    // this a deeply self-recursive function runs off the C stack and returns a
+    // WRONG ANSWER rather than signalling (bliss-b4fd). Past the limit the
+    // self-call takes the c2i path, which enforces the cap and drops to a flat
+    // T0 `run()` — a catchable STORAGE-CONDITION.
+    //
+    // 6 MiB of a Linux thread's default 8 MiB leaves ~2 MiB of headroom for the
+    // interpreter to unwind and signal in. Under a SMALLER stack the limit
+    // simply sits below the real bottom and never triggers, which is the
+    // behaviour that existed before this guard — never worse.
+    bliss_rt::stack::set_native_stack_limit(6 * 1024 * 1024);
     let ca = CliArgs::parse(args)?;
     if ca.help {
         print_help();
