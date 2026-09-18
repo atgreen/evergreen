@@ -12261,7 +12261,7 @@ fn concatenate_and_map_return_fresh_sequences() {
 /// builtin, so pin the invalidation paths and the results themselves.
 ///
 /// Lexical FLET/LABELS shadowing of a builtin is NOT asserted here: it is
-/// broken independently of this work (bliss-xnrm), and behaves identically on
+/// broken independently of this work (bliss-ccgu), and behaves identically on
 /// binaries built before and after it. Asserting it either way would bake a
 /// pre-existing bug into the suite.
 #[test]
