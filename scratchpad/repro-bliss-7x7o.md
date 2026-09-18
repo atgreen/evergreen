@@ -1,55 +1,75 @@
-# bliss-7x7o reproducer — SEARCH-STRING.8 consumes unbounded memory
+# bliss-7x7o — the ansi sequences chapter exhausts memory
 
-Minimal repro (release binary, ~200s to hit a 4G cap):
+## Correction
 
-1. Copy ansi-test somewhere private (the gate deletes fasls, so don't share a tree):
+An earlier version of this file blamed **SEARCH-STRING.8**. That was wrong, and
+the mistake is worth recording because it is easy to repeat: rt.lsp's
+`do-entries` prints a test's name *after* it finishes, and only when it passed
 
-       cp -r ~/git/ansi-test /tmp/at && find /tmp/at -name '*.fasl' -delete
+    (format s "~@[~<~%~:; ~:@(~S~)~>~]" success?)
 
-2. Replace `/tmp/at/sequences/load.lsp` with just:
+so the last name in the log is the last test that PASSED. The culprit is the
+test *after* it: **SEARCH-STRING.9**.
 
-       (compile-and-load* "search-aux.lsp")
-       (in-package #:cl-test)
-       (let ((*default-pathname-defaults*
-              (make-pathname :directory (pathname-directory *load-pathname*))))
-         (load "search-string.lsp") nil)
+## Reproducer
 
-3. Run the chapter harness:
+Smallest form, no harness, no ansi-test load order — the same expression is fine
+compiled and runs away under `eval`:
 
-       ANSI_TEST_DIR=/tmp/at BLISS_MEM_MAX=4G BLISS_TIMEOUT=500 \
-         scripts/ansi-gate.sh sequences
+```lisp
+(load "<ansi-test>/auxiliary/search-aux.lsp")
 
-   => SEARCH-STRING.1-7 pass, then SEARCH-STRING.8 grows without bound and the
-   cgroup kills it (exit 137).
+;; fine — returns NIL in a few seconds
+(flet ((%f (x) (case x ((#\0 a) 'c) ((#\1 b) 'd) (t nil))))
+  (let ((target *searched-string*))
+    (loop for pat in *pattern-sublists*
+          for pos = (search pat target :start2 20 :key #'%f)
+          unless (search-check pat target pos :start2 20 :key #'%f)
+          collect pat)))
+
+;; same form under EVAL — what rt.lsp does — grows without bound, OOM at 3G in ~100s
+(eval '(flet ((%f (x) ...)) ...))          ; identical body
+```
 
 ## What is established
 
-- It is SEARCH-STRING.8 specifically. RSS is flat at ~0.4G for the entire
-  sequences chapter (2600+ tests) and then climbs ~1.1G/30s from the moment .8
-  starts, to 13.4G, until the cap kills it.
-- It is NOT a tiering bug: `BLISS_FORCE_TIER=T0` still OOMs.
-- It is NOT test 8 on its own: a load.lsp with ONLY `deftest search-string.8`
-  passes (1 passed, 0 failed). The preceding tests in the file matter.
-- It is NOT the computation on its own: a harness-free script that loads
-  search-aux.lsp and calls the .2/.3/.4/.7/.8 bodies as plain defuns, in that
-  order and with .8 both first and last, completes fine.
-- So the trigger needs the rt.lsp harness — `(eval (form entry))` per test with
-  a compile-and-load'ed search-aux — plus the earlier tests having run.
-- Under a HEAD-built binary the same site instead signalled
-  `type error: Cons(0x...) is not of type FUNCTION`, and that same error also
-  aborts the ansi CONS chapter at NSET-EXCLUSIVE.KEYWORDS.9. Two symptoms, one
-  site: a value that should be a function read back as a cons, or unbounded
-  consing. That pairing is what a rooting bug looks like.
+- The cost is in `SEARCH` **with a `:key`**, under the interpreter. 40 calls:
+  peak RSS 0.89G with `:key`, 0.23G without.
+- It is not a Lisp-heap leak. `(room)` after a dozen such searches reports a
+  nursery of ~3MB and an old generation of ~5MB while process RSS is over 1G,
+  and `total consed` rises only ~2.25MB per search. The growth is host-side, and
+  the GC never calls `madvise`/`MADV_DONTNEED`, so RSS is a high-water mark.
+- Not a tiering bug: `BLISS_FORCE_TIER=T0` still OOMs. (Env vars do survive
+  `scripts/bliss-limited.sh`'s `systemd-run` scope — verified with a deliberately
+  bogus value, which printed the "unrecognized" warning through the wrapper.)
+- Not closure creation: 40 `eval`s of the FLET that never call the closure stay
+  flat at 0.23G. Nor plain closure calls: 200k funcalls of an `eval`-created
+  closure from a compiled global defun cost nothing measurable.
+- Under a HEAD binary the same site instead signalled
+  `type error: Cons(0x...) is not of type FUNCTION`, and that identical error
+  aborts the ansi CONS chapter at NSET-EXCLUSIVE.KEYWORDS.9.
 
-## Next steps
+## Where the time goes
 
-- Bisect which of SEARCH-STRING.2-7 is required. NOTE: search-string.1 is
-  inside a `#| ... |#` block comment, so a naive by-`deftest` splitter produces
-  an unbalanced file — split on the comment too, or just delete tests from a
-  copy of the real file.
-- Then run that pair under `BLISS_GC_STRESS=1 BLISS_GC_POISON=1`, and bisect
-  with `BLISS_GC_STRESS_SKIP` / `BLISS_GC_STRESS_AT` per AGENTS.md. Remember a
-  SKIP above the program's allocation count is a silent no-op: confirm the
-  `forcing minor GC at allocation #N` line actually fires.
-- Use the RELEASE binary for the bisect. In the debug build, compiling
-  search-aux.lsp alone takes ~6 minutes and will eat the whole timeout.
+`perf` on the reproducer is dominated by symbol-NAME machinery, not by anything
+in SEARCH: `StrSearcher::new` (6.3%, from `symbol_bare_name`'s
+`trim_start_matches`), `HashMap::insert` (6.1%), `symbols::find_index` (4.0%),
+`strncmp`, sip hashing, malloc/free, plus
+`bliss_compiler::macroexpand::Environment::visit_gc_roots` (3.4%).
+
+That is the interpreter resolving functions by NAME STRING on every call.
+Tracked separately as the real "direct builtin calls" work item.
+
+## Fixed so far
+
+`%match-at` (boot.lisp) called `(nth i list)` for every pattern element,
+re-traversing from the head each time — O(plen * n^2) cdr steps per SEARCH. It
+now walks with one `nthcdr` plus `cdr`. Roughly halves the time on the
+reproducer; does not fix the memory growth.
+
+## Next
+
+Attach a native heap profiler (valgrind/massif is present; the binary is
+musl-static, so expect it to be slow) to the `eval` reproducer above and find
+what the `:key` path retains per call. The 27MB-per-call figure is host memory,
+so it is Rust-side bookkeeping, not conses.

@@ -10945,3 +10945,72 @@ fn cons_and_unary_arithmetic_match_operator_position() {
         }
     }
 }
+
+/// `%match-at`, SEARCH's inner loop, called `(nth i list)` for EVERY pattern
+/// element, re-traversing the list from its head each time — so one SEARCH cost
+/// O(plen * n^2) cdr steps instead of O(plen * n). SEARCH coerces both
+/// arguments to lists, so every SEARCH on a string or vector paid it
+/// (bliss-3o0r). It now walks with a single NTHCDR plus CDR.
+///
+/// The rewrite has to keep SEARCH's exact answers, including which end wins,
+/// the empty-pattern cases, a pattern longer than what remains, and the
+/// bounding/`:key`/`:test` keywords.
+#[test]
+fn search_finds_the_same_positions_after_the_walk_rewrite() {
+    let cases = [
+        ("(search \"ab\" \"xxabyyab\")", "2"),
+        ("(search \"ab\" \"xxabyyab\" :from-end t)", "6"),
+        // Empty pattern: START2 normally, END2 from the end (CLHS).
+        ("(search \"\" \"abc\")", "0"),
+        ("(search \"\" \"abc\" :from-end t)", "3"),
+        ("(search \"\" \"abc\" :start2 1)", "1"),
+        // Pattern longer than the target, and longer than the remaining tail —
+        // the walk must run out of list and fail, not error.
+        ("(search \"abc\" \"ab\")", "NIL"),
+        ("(search \"bcd\" \"abcd\" :start2 2)", "NIL"),
+        ("(search '(1 2 3) '(1 2))", "NIL"),
+        // Lists and vectors, both ends.
+        ("(search '(1 2) '(0 1 2 3 1 2))", "1"),
+        ("(search '(1 2) '(0 1 2 3 1 2) :from-end t)", "4"),
+        ("(search #(1 2) #(0 1 2 3 1 2))", "1"),
+        // Bounding indices on both sequences.
+        ("(search \"ab\" \"xxabyy\" :start2 3)", "NIL"),
+        ("(search \"ab\" \"xxabyyab\" :end2 4)", "2"),
+        ("(search \"bc\" \"abcd\" :start1 1)", "2"),
+        ("(search \"xbc\" \"abcd\" :start1 1)", "1"),
+        // :test and :key.
+        ("(search \"AB\" \"xxabyy\" :test #'char-equal)", "2"),
+        ("(search '(a) \"0\" :key (lambda (x) (if (eql x #\\0) 'a x)))", "0"),
+        ("(search '(1 2) '(9 1 2) :test-not #'eql)", "0"),
+        // A match at the very last position, which an off-by-one in the walk
+        // would drop.
+        ("(search \"cd\" \"abcd\")", "2"),
+        ("(search '(3) '(1 2 3))", "2"),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

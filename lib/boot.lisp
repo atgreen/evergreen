@@ -2399,14 +2399,21 @@
       (incf k)))
   seq1)
 
+;; Walk LIST from START with CDR. This used to call (nth i list) for EVERY
+;; pattern element, re-traversing the list from its head each time, which made
+;; one SEARCH O(plen * n^2) in cdr steps instead of O(plen * n) — and SEARCH
+;; coerces both arguments to lists, so every SEARCH on a string paid it
+;; (bliss-3o0r: the ansi sequences chapter's SEARCH-STRING tests).
+;; TAIL is the caller's list advanced to START; a pattern longer than the
+;; remaining tail simply fails to match, as before.
 (defun %match-at (pat list start key testfn neg)
-  (let ((ok t) (i start))
+  (let ((ok t) (tail (nthcdr start list)))
     (block nil
       (dolist (p pat ok)
-        (let ((x (nth i list)))
-          (unless (%seq-match (if key (funcall key p) p) x key testfn neg)
-            (setq ok nil) (return)))
-        (incf i)))))
+        (when (null tail) (setq ok nil) (return))
+        (unless (%seq-match (if key (funcall key p) p) (car tail) key testfn neg)
+          (setq ok nil) (return))
+        (setq tail (cdr tail))))))
 
 (defun search (seq1 seq2 &key key (test (function eql)) test-not
                               (start1 0) end1 (start2 0) end2 from-end)
