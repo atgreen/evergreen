@@ -13551,6 +13551,9 @@ fn order_sensitive_setf_accessor(mut place: BlissVal) -> Option<String> {
             // VALUES holds arbitrary sub-PLACES, each of whose subforms must run
             // before the value form too (bliss-dj5k).
             | "VALUES"
+            // (setf (subseq seq start end) new): the sequence, start and end
+            // subforms all precede the new value (ansi SUBSEQ.ORDER.3/4).
+            | "SUBSEQ"
     ) {
         Some(bare)
     } else {
@@ -16670,6 +16673,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 } else {
                                     None
                                 };
+                                // ANSI order: the new value is evaluated after the
+                                // sequence, start and end subforms (SUBSEQ.ORDER.3/4).
+                                // `seq_r` is rooted, so this eval may safely GC.
+                                if deferred_setf_value {
+                                    *val = eval_form(*val_form, env)?;
+                                }
                                 let seq = *seq_r;
                                 let dst_len = bliss_stdlib::length(seq)?;
                                 let src_len = bliss_stdlib::length(*val)?;

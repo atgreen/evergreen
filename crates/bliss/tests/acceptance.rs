@@ -12075,3 +12075,55 @@ fn integer_division_through_funcall_matches_operator_position() {
     ];
     run_expression_cases(&cases);
 }
+
+/// CLHS 5.1.1.1: a place's subforms are evaluated left-to-right and the new
+/// value LAST. `(setf (subseq ...) ...)` evaluated the value form first, so
+/// ansi SUBSEQ.ORDER.3/4 saw the value's side effect happen before the
+/// sequence, start and end subforms.
+#[test]
+fn setf_subseq_evaluates_value_form_last() {
+    let cases = [
+        // SUBSEQ.ORDER.3: with an explicit end, the order is seq, start, end,
+        // then value -- so a=1 b=2 c=3 d=4, not d=1.
+        (
+            "(let ((i 0) a b c d (s (copy-seq \"abcdefgh\")))
+               (list (setf (subseq (progn (setf a (incf i)) s)
+                                   (progn (setf b (incf i)) 1)
+                                   (progn (setf c (incf i)) 4))
+                           (progn (setf d (incf i)) \"xyz\"))
+                     s i a b c d))",
+            "(\"xyz\" \"axyzefgh\" 4 1 2 3 4)",
+        ),
+        // SUBSEQ.ORDER.4: without an end, the order is seq, start, then value.
+        (
+            "(let ((i 0) a b c (s (copy-seq \"abcd\")))
+               (list (setf (subseq (progn (setf a (incf i)) s)
+                                   (progn (setf b (incf i)) 1))
+                           (progn (setf c (incf i)) \"xyz\"))
+                     s i a b c))",
+            "(\"xyz\" \"axyz\" 3 1 2 3)",
+        ),
+        // The store itself must be unchanged: strings with and without an end,
+        // lists, vectors, and a package-qualified spelling of the accessor
+        // (deferring the value relies on the bare name, while the store path
+        // matches the symbol's full name -- if those disagreed the value would
+        // silently store as NIL).
+        (
+            "(let ((s (copy-seq \"abcdef\"))) (setf (cl:subseq s 1 4) \"XYZ\") s)",
+            "\"aXYZef\"",
+        ),
+        (
+            "(let ((s (copy-seq \"abcdef\"))) (setf (subseq s 2) \"PQ\") s)",
+            "\"abPQef\"",
+        ),
+        (
+            "(let ((l (list 1 2 3 4 5))) (setf (subseq l 1 3) (list 9 9)) l)",
+            "(1 9 9 4 5)",
+        ),
+        (
+            "(let ((v (vector 1 2 3 4 5))) (setf (subseq v 0 2) (vector 7 7)) v)",
+            "#(7 7 3 4 5)",
+        ),
+    ];
+    run_expression_cases(&cases);
+}
