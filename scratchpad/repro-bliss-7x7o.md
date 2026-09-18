@@ -60,16 +60,50 @@ in SEARCH: `StrSearcher::new` (6.3%, from `symbol_bare_name`'s
 That is the interpreter resolving functions by NAME STRING on every call.
 Tracked separately as the real "direct builtin calls" work item.
 
-## Fixed so far
+## Resolved
 
-`%match-at` (boot.lisp) called `(nth i list)` for every pattern element,
-re-traversing from the head each time — O(plen * n^2) cdr steps per SEARCH. It
-now walks with one `nthcdr` plus `cdr`. Roughly halves the time on the
-reproducer; does not fix the memory growth.
+Root cause: `MACROEXPAND_ENVIRONMENTS` (cli.rs) only ever GREW. Every macro
+expansion binding an `&environment` parameter minted a fresh id and stored a
+`MacroexpandEnv`; nothing ever removed one. Two costs compounded — the entries
+were never freed, and `scan_evaluator_global_roots` walks every entry on every
+collection, so each expansion made all later GCs slower.
 
-## Next
+Fixed in 17ed9d5 by giving them the dynamic extent CLHS 3.1.1.4 already
+specifies: a scope guard in `expand_macro` drops the ids minted during that
+expansion when it returns. On the reproducer above, 40 calls:
 
-Attach a native heap profiler (valgrind/massif is present; the binary is
-musl-static, so expect it to be slow) to the `eval` reproducer above and find
-what the `:key` path retains per call. The 27MB-per-call figure is host memory,
-so it is Rust-side bookkeeping, not conses.
+    peak RSS   1.33G -> 0.26G      (5x less)
+    time      11720 -> 6605 ms     (44% faster)
+
+Two smaller fixes found on the way: `%match-at` walked the list with `nth` per
+pattern element (35e702b), and `symbol_bare_name` rebuilt a String on every
+dispatch (3175c24, a separate 17.5% instruction win — measured but NOT the cause
+of this bug).
+
+## What cost the most time, so the next person skips it
+
+`(room)` reported a ~3MB nursery and ~5MB old generation the entire time, so
+every instinct to look at the Lisp heap or at GC tuning was wasted — enlarging
+the nursery from 64MB to 512MB moved peak RSS by nothing at all. The growth was
+host-side the whole time.
+
+`valgrind --tool=massif --pages-as-heap=yes` is what located it, by showing the
+growth under `__libc_malloc_impl` rather than under `gc::init_heap`. Plain
+massif shows nothing useful here, because the GC mmaps its heap instead of
+mallocing it. Add `--detailed-freq=1` or every snapshot comes back
+`heap_tree=empty`.
+
+Eliminated first, all by measurement rather than argument: tiering
+(`BLISS_FORCE_TIER=T0` still OOMed), closure creation, plain closure calls,
+per-GC forwarding-map churn, and symbol-name String churn.
+
+Two measurement traps worth repeating:
+
+- Wall-clock on this machine varies about 2x run to run and hid a real 17.5%
+  improvement completely. `perf stat -e instructions` settled it in one run.
+- Full `BLISS_GC_STRESS=1` from startup exceeds a 10-minute timeout in the debug
+  build without being a hang: this program makes 30k-60k allocations, so that is
+  30k-60k collections. Use `BLISS_GC_STRESS_SKIP` to stress only the tail, and
+  confirm with `BLISS_GC_STRESS_AT=N` that the probe actually fires — a SKIP or
+  AT above the allocation count is a silent no-op that reports a clean run
+  proving nothing.
