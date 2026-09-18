@@ -11248,6 +11248,40 @@ fn concatenate_and_map_honour_every_result_type() {
     run_expression_cases(&cases);
 }
 
+/// REMOVE-DUPLICATES, DELETE-DUPLICATES and MAKE-SEQUENCE took `&rest keys` and
+/// read them with GETF, which silently accepts an odd-length keyword list, a
+/// non-keyword in a keyword position, and an unrecognized keyword — all three
+/// are PROGRAM-ERRORs per CLHS. They now declare real `&key` lambda lists, and
+/// the binder (which already gets this right) does the checking (ansi
+/// REMOVE-DUPLICATES.ERROR.2/4/5/6, DELETE-DUPLICATES.ERROR.*,
+/// MAKE-SEQUENCE.ERROR.9-12).
+#[test]
+fn keyword_argument_lists_are_validated() {
+    let cases = [
+        ("(handler-case (remove-duplicates nil :start) (program-error () :pe))", ":PE"),
+        ("(handler-case (remove-duplicates nil 'bad t) (program-error () :pe))", ":PE"),
+        ("(handler-case (remove-duplicates nil 1 2) (program-error () :pe))", ":PE"),
+        ("(handler-case (delete-duplicates nil :start) (program-error () :pe))", ":PE"),
+        ("(handler-case (delete-duplicates nil 'bad t) (program-error () :pe))", ":PE"),
+        ("(handler-case (make-sequence 'list 10 :bad t) (program-error () :pe))", ":PE"),
+        ("(handler-case (make-sequence 'list 10 :initial-element) (program-error () :pe))", ":PE"),
+        ("(handler-case (make-sequence 'list 10 0 0) (program-error () :pe))", ":PE"),
+        // :ALLOW-OTHER-KEYS still suppresses the unknown-keyword check.
+        ("(handler-case (make-sequence 'list 2 :bad t :allow-other-keys t) (error () :err))", "(NIL NIL)"),
+        // Every keyword these functions actually accept must still work, and
+        // REMOVE-DUPLICATES keeps the LAST of each duplicate unless :from-end.
+        ("(remove-duplicates '(1 2 1 3))", "(2 1 3)"),
+        ("(remove-duplicates '(1 2 1 3) :from-end t)", "(1 2 3)"),
+        ("(remove-duplicates '(1 2 1 3) :key #'identity)", "(2 1 3)"),
+        ("(remove-duplicates '(1 2 1 3) :start 1)", "(1 2 1 3)"),
+        ("(remove-duplicates '(1 2 1 3) :test #'eql)", "(2 1 3)"),
+        ("(delete-duplicates (list 1 2 1))", "(2 1)"),
+        ("(make-sequence 'list 3 :initial-element 7)", "(7 7 7)"),
+        ("(make-sequence 'vector 2)", "#(NIL NIL)"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// Calling a standard function with the wrong number of arguments is a
 /// PROGRAM-ERROR (CLHS). These sequence functions had no arity entry, so the
 /// call reached the body and answered a TYPE-ERROR about NIL — or nothing at

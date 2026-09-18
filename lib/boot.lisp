@@ -1824,7 +1824,9 @@
 ;; (CLHS make-sequence). None of this was checked, so (make-sequence 'symbol 10)
 ;; happily built a vector and (make-sequence '(string 4) 3) built a 3-character
 ;; string (ansi MAKE-SEQUENCE.ERROR.1-16).
-(defun make-sequence (result-type size &rest keys)
+(defun make-sequence (result-type size &key (initial-element nil iel-cell)
+                                            allow-other-keys)
+  (declare (ignore allow-other-keys))
   (%check-nonneg-index size)
   (let* ((rt (if (and result-type (not (consp result-type)) (not (symbolp result-type)))
                  ;; A CLASS object designates its name (MAKE-SEQUENCE.57/58).
@@ -1832,8 +1834,7 @@
                  result-type))
          (head (if (consp rt) (car rt) rt))
          (elt (if (consp rt) (car (cdr rt)) nil))
-         (iel-cell (member :initial-element keys))
-         (iel (if iel-cell (car (cdr iel-cell)) nil))
+         (iel initial-element)
          (declared (%sequence-type-length rt))
          (stringp (or (member head '(string simple-string base-string simple-base-string))
                       (and (member head '(vector array simple-array simple-vector))
@@ -2412,13 +2413,17 @@
 ;; bliss-qxfg). Uses &rest+GETF, not &key, and avoids any inner LAMBDA, so the
 ;; hot function bytecode-compiles instead of falling back to the tree-walker.
 ;; A custom :test/:test-not or a :start/:end window takes the general path above.
-(defun remove-duplicates (seq &rest keys)
-  (let ((test (getf keys :test))
-        (test-not (getf keys :test-not))
-        (key (getf keys :key))
-        (from-end (getf keys :from-end))
-        (start (or (getf keys :start) 0))
-        (end (getf keys :end)))
+;; A real &key lambda list, not `&rest keys` + GETF. The binder already rejects
+;; an odd-length keyword list, a non-keyword in a keyword position, and an
+;; unrecognized keyword (unless :allow-other-keys) with a PROGRAM-ERROR, exactly
+;; as CLHS requires — GETF silently accepted all three, so (remove-duplicates
+;; nil :start), (remove-duplicates nil 'bad t) and (remove-duplicates nil 1 2)
+;; returned NIL instead of signalling (ansi REMOVE-DUPLICATES.ERROR.2/4/5/6 and
+;; the DELETE-DUPLICATES ones).
+(defun remove-duplicates (seq &key test test-not key from-end (start 0) end
+                                   allow-other-keys)
+  (declare (ignore allow-other-keys))
+  (let ()
     (if (and (null test) (null test-not) (eql start 0) (null end))
         (let ((items (coerce seq 'list))
               (seen (make-hash-table :test 'eql))
@@ -2433,8 +2438,11 @@
           (%coerce-like (if from-end (reverse out) out) seq))
         (%remove-duplicates-general seq key test test-not from-end start end))))
 
-(defun delete-duplicates (seq &rest keys)
-  (apply (function remove-duplicates) seq keys))
+(defun delete-duplicates (seq &key test test-not key from-end (start 0) end
+                                   allow-other-keys)
+  (declare (ignore allow-other-keys))
+  (remove-duplicates seq :test test :test-not test-not :key key
+                         :from-end from-end :start start :end end))
 
 ;;; --- FILL / REPLACE / SEARCH / MISMATCH / MERGE ----------------------------
 
