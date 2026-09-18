@@ -1932,7 +1932,16 @@ pub fn build_result_sequence(
             }
             out.push(elem.as_char());
         }
-        return Ok(crate::streams::make_lisp_string(&out));
+        // FRESH, not interned. make_lisp_string interns by content, so two
+        // CONCATENATE (or MAP) calls producing the same characters answered the
+        // SAME object — `(eq (concatenate 'string "ab" "cd")
+        //                    (concatenate 'string "ab" "cd"))` was T. CLHS
+        // requires a fresh sequence, and sharing one is worse than a wrong
+        // answer: mutating either result corrupts the other, so a test that
+        // builds a string this way can break an unrelated later one. SUBSEQ,
+        // COPY-SEQ and REVERSE already use the fresh constructor for exactly
+        // this reason (bliss-9kxg); this path did not.
+        return Ok(crate::streams::make_lisp_string_fresh(&out));
     }
     if result_type_is_bit_vector(result_type) {
         // Every element must be a BIT; the generic builder maps any non-zero to

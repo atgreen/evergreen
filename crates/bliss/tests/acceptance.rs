@@ -12219,3 +12219,38 @@ fn radix_prefixed_ratio_literals_read_as_ratios() {
     ];
     run_expression_cases(&cases);
 }
+
+/// CONCATENATE and MAP must return a FRESH sequence.
+///
+/// The string result path used the interning constructor, so two calls producing
+/// the same characters answered the SAME object — `(eq (concatenate 'string "ab"
+/// "cd") (concatenate 'string "ab" "cd"))` was T. Sharing is worse than a wrong
+/// answer here: mutating either result corrupts the other, so code that builds a
+/// string this way can break something unrelated much later. That is how it
+/// surfaced — running the ansi search-string tests made a later
+/// SUBSTITUTE-STRING test fail, and the two have nothing to do with each other.
+///
+/// SUBSEQ, COPY-SEQ and REVERSE already used the fresh constructor for exactly
+/// this reason; this path did not.
+#[test]
+fn concatenate_and_map_return_fresh_sequences() {
+    let cases = [
+        ("(eq (concatenate 'string \"ab\" \"cd\") (concatenate 'string \"ab\" \"cd\"))", "NIL"),
+        ("(eq (map 'string #'identity \"ab\") (map 'string #'identity \"ab\"))", "NIL"),
+        // Mutating one result must not touch another with the same contents.
+        ("(let ((a (concatenate 'string \"ab\" \"cd\")) (b (concatenate 'string \"ab\" \"cd\"))) \
+            (setf (char a 0) #\\Q) (list a b))", "(\"Qbcd\" \"abcd\")"),
+        ("(let ((a (map 'string #'identity \"ab\")) (b (map 'string #'identity \"ab\"))) \
+            (setf (char a 0) #\\Q) (list a b))", "(\"Qb\" \"ab\")"),
+        // ... nor the literal it was built from.
+        ("(let ((a (concatenate 'string \"ab\"))) (setf (char a 0) #\\Q) (list a (concatenate 'string \"ab\")))",
+         "(\"Qb\" \"ab\")"),
+        // The values themselves are unchanged.
+        ("(concatenate 'string \"ab\" \"cd\")", "\"abcd\""),
+        ("(concatenate 'list '(1) '(2))", "(1 2)"),
+        ("(concatenate 'vector '(1 2))", "#(1 2)"),
+        ("(map 'string #'char-upcase \"ab\")", "\"AB\""),
+        ("(equal (concatenate 'string \"ab\" \"cd\") \"abcd\")", "T"),
+    ];
+    run_expression_cases(&cases);
+}
