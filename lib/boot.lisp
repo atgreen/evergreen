@@ -1450,14 +1450,32 @@
 ;; applying FUNCTION to successive elements of the argument SEQUENCES, up to the
 ;; shortest length (or the whole result when there are no sequences). Returns
 ;; RESULT-SEQUENCE.
+;; MAP-INTO ignores a result vector's FILL POINTER when deciding how many
+;; elements to store — the limit is the vector's capacity — and sets the fill
+;; pointer to the number actually stored (CLHS map-into). Both halves were
+;; missing: LENGTH of a fill-pointer vector is its fill pointer, so a result with
+;; fill-pointer 3 could never take more than 3 elements, and the pointer was left
+;; wherever it started (ansi MAP-INTO-ARRAY.8/9/10).
+;;
+;; Elements go in through AREF for a vector rather than ELT, because ELT bounds
+;; against the fill pointer and would refuse the very indices past it that this
+;; is meant to fill.
 (defun map-into (result-sequence function &rest sequences)
-  (let ((n (if sequences
-               (apply (function min) (length result-sequence)
-                      (mapcar (function length) sequences))
-               (length result-sequence))))
+  (let* ((fp (and (vectorp result-sequence)
+                  (array-has-fill-pointer-p result-sequence)))
+         (capacity (if fp
+                       (array-dimension result-sequence 0)
+                       (length result-sequence)))
+         (n (if sequences
+                (apply (function min) capacity
+                       (mapcar (function length) sequences))
+                capacity)))
     (dotimes (i n)
-      (setf (elt result-sequence i)
-            (apply function (mapcar (lambda (s) (elt s i)) sequences))))
+      (let ((v (apply function (mapcar (lambda (s) (elt s i)) sequences))))
+        (if (vectorp result-sequence)
+            (setf (aref result-sequence i) v)
+            (setf (elt result-sequence i) v))))
+    (when fp (setf (fill-pointer result-sequence) n))
     result-sequence))
 (defun getf (plist key &optional default)
   (do ((p plist (cddr p)))

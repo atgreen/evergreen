@@ -11539,3 +11539,36 @@ fn a_callee_redefined_after_warmup_is_picked_up_by_its_caller() {
         "a warmed caller must follow its callee's redefinition; got:\n{stdout}"
     );
 }
+
+/// MAP-INTO ignores a result vector's FILL POINTER when deciding how many
+/// elements to store — the limit is the vector's capacity — and sets the fill
+/// pointer to the number actually stored (CLHS map-into).
+///
+/// Both halves were missing. LENGTH of a fill-pointer vector is its fill
+/// pointer, so a result with fill-pointer 3 could never take more than three
+/// elements; and the pointer was left wherever it started, so mapping two
+/// elements into it still showed three (ansi MAP-INTO-ARRAY.8/9/10).
+#[test]
+fn map_into_fills_to_capacity_and_sets_the_fill_pointer() {
+    let cases = [
+        // Fewer elements than the starting fill pointer: it moves DOWN to 2.
+        ("(let ((a (make-array 6 :initial-element 'x :fill-pointer 3))) \
+            (map-into a #'identity '(1 2)))", "#(1 2)"),
+        // More than the starting fill pointer but within capacity: it moves UP.
+        ("(let ((a (make-array 6 :initial-element 'x :fill-pointer 3))) \
+            (map-into a #'identity '(1 2 3 4 5)))", "#(1 2 3 4 5)"),
+        // No source sequences: fill the whole capacity.
+        ("(let ((a (make-array 6 :initial-element 'x :fill-pointer 3))) \
+            (map-into a (lambda () 'y)))", "#(Y Y Y Y Y Y)"),
+        // The result is still the same object, now with the new fill pointer.
+        ("(let ((a (make-array 4 :initial-element 0 :fill-pointer 4))) \
+            (list (eq a (map-into a #'identity '(9))) (fill-pointer a)))", "(T 1)"),
+        // Sequences without fill pointers are unaffected.
+        ("(map-into (list 0 0 0) #'1+ '(1 2 3))", "(2 3 4)"),
+        ("(map-into (vector 0 0) #'1+ '(5 6))", "#(6 7)"),
+        ("(map-into (make-string 3) #'identity \"abc\")", "\"abc\""),
+        // Shortest input still wins, and multiple sequences still work.
+        ("(map-into (vector 0 0 0) #'+ '(1 2 3) '(10 20))", "#(11 22 0)"),
+    ];
+    run_expression_cases(&cases);
+}
