@@ -168,6 +168,34 @@ allocates — makes the program compute a quietly wrong answer with no
 segfault at all. Diff the program's *output* against a non-stress run;
 don't wait for a crash.
 
+## The debug bliss-cli is ~9x slower after `cargo build` than after `cargo test`
+
+`Cargo.toml` sets `[profile.test] opt-level = 3` (all crates) but
+`[profile.dev.package.bliss-cli] opt-level = 2` (**that package only**). So
+`cargo build` leaves `bliss-rt`, `bliss-stdlib` and `bliss-compiler` — the GC,
+the sequence library, the lowerer, i.e. most of the hot code — at opt-level 0,
+while `cargo test` optimizes everything at 3. **Both write the same path**,
+`target/<target>/debug/bliss-cli`, so whichever ran last silently decides the
+binary's speed. Measured on one commit, identical source,
+`(remove-duplicates <300 short strings> :test #'equalp)`:
+
+```
+last written by `cargo build --workspace`    99,975,040 bytes   42,990 ms
+last written by `cargo test --no-run`       112,184,088 bytes    4,675 ms
+```
+
+`scripts/ansi-gate.sh` defaults to this binary, so a sequences chapter run takes
+~13 min after `cargo test` and **blows the 2400s cap** after `cargo build`.
+
+- Before a timed gate run, run `cargo test --no-run` first, or check the size
+  (~112MB fast, ~100MB slow).
+- **Never compare timings of two debug binaries** unless you know the same cargo
+  command produced both — snapshotting the binary does not capture this.
+- Use the **release** binary for real perf numbers; it is unaffected.
+- Treat a sudden gate slowdown as this trap until proven otherwise. It has
+  already produced one confidently-reported, entirely fictitious "regression"
+  (bliss-em8x).
+
 ## Benchmarking a tiered loop: run 1M+ iterations, not 100k
 
 `osr_threshold()` (crates/bliss/src/cli/bytecode.rs) defaults to **100,000
