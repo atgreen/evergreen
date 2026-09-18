@@ -1959,20 +1959,31 @@
 
 ;; Indices (ascending) in ITEMS where PREDFN holds, restricted to [START,STOP);
 ;; when COUNT is supplied keep only COUNT of them, trailing ones if FROM-END.
+;;
+;; FROM-END changes the ORDER PREDFN IS APPLIED IN, not just which matches are
+;; kept. ansi tests this with a stateful :test — one that decrements a counter on
+;; every call, so which element matches depends on the order it is called in
+;; (SUBSTITUTE-*.21/.23, and the REMOVE/POSITION families built on this). Walking
+;; forward and then taking the last COUNT gave the right SHAPE and the wrong
+;; ELEMENT.
+;;
+;; The elements are indexed through a vector rather than NTH so a backward walk
+;; does not re-traverse the list per step (the %match-at lesson, bliss-3o0r).
 (defun %match-positions (predfn items start end count from-end)
-  (let* ((len (length items)) (stop (or end len))
-         (positions nil) (i 0))
-    (dolist (x items)
-      (when (and (>= i start) (< i stop) (funcall predfn x))
-        (push i positions))
-      (incf i))
-    (setq positions (reverse positions))
+  (let* ((v (coerce items 'vector))
+         (len (length v))
+         (stop (or end len))
+         (positions nil))
+    (if from-end
+        ;; Pushing while descending leaves POSITIONS ascending.
+        (do ((i (1- stop) (1- i))) ((< i start))
+          (when (funcall predfn (aref v i)) (push i positions)))
+        (do ((i start (1+ i))) ((>= i stop))
+          (when (funcall predfn (aref v i)) (push i positions))))
+    (unless from-end (setq positions (reverse positions)))
     (if count
-        ;; A NEGATIVE :count means no matches at all (CLHS: the behaviour is as
-        ;; if count were 0). Unclamped it reached LAST and SUBSEQ with a
-        ;; negative argument — (substitute 1 0 #*0101 :count -1) substituted
-        ;; everything or errored instead of doing nothing (ansi
-        ;; SUBSTITUTE-*.14, REMOVE-*, and the N- variants built on them).
+        ;; A NEGATIVE :count means no matches at all (CLHS: as if count were 0).
+        ;; Unclamped it reached LAST and SUBSEQ with a negative argument.
         (let ((n (max count 0)))
           (if from-end
               (last positions n)

@@ -11704,3 +11704,45 @@ fn substitute_keeps_bit_vectors_and_clamps_a_negative_count() {
     ];
     run_expression_cases(&cases);
 }
+
+/// :FROM-END changes the ORDER the test is applied in, not just which matches
+/// are kept.
+///
+/// ansi checks this with a STATEFUL :test — one that decrements a counter on
+/// every call — so which element matches depends on the order it was called in.
+/// Walking forward and then taking the last COUNT gave the right shape and the
+/// wrong element (ansi SUBSTITUTE-*.21/.23, and the REMOVE/POSITION families
+/// built on the same position picker).
+#[test]
+fn from_end_reverses_the_order_the_test_is_applied_in() {
+    let cases = [
+        // The ansi case itself: c starts at 5 and the test decrements it per
+        // call, so only a back-to-front walk matches the 8.
+        ("(let* ((orig '(1 2 3 4 5 6 7 8 9)) (x (copy-seq orig)) (c 5) \
+                 (result (substitute 'x 9 x :test (lambda (a b) (incf c -2) (= (+ b c) a)) \
+                                     :from-end t))) \
+            (list (equal orig x) result))",
+         "(T (1 2 3 4 5 6 7 X 9))"),
+        // Directly observable: pushing each element the test sees reverses it,
+        // so a forward walk leaves (3 2 1) and :from-end leaves (1 2 3).
+        ("(let ((acc nil)) \
+            (substitute 0 9 '(1 2 3) :test (lambda (a b) (declare (ignore a)) (push b acc) nil)) acc)",
+         "(3 2 1)"),
+        ("(let ((acc nil)) \
+            (substitute 0 9 '(1 2 3) :test (lambda (a b) (declare (ignore a)) (push b acc) nil) \
+                        :from-end t) acc)",
+         "(1 2 3)"),
+        // Which matches are kept is still right, in both directions.
+        ("(substitute 'x 'a '(a b a) :count 1)", "(X B A)"),
+        ("(substitute 'x 'a '(a b a) :count 1 :from-end t)", "(A B X)"),
+        ("(substitute 'x 'a '(a b a))", "(X B X)"),
+        // The families that share the position picker are unmoved.
+        ("(remove 'a '(a b a))", "(B)"),
+        ("(remove 'a '(a b a) :count 1)", "(B A)"),
+        ("(remove 'a '(a b a) :count 1 :from-end t)", "(A B)"),
+        ("(position 'a '(a b a) :from-end t)", "2"),
+        ("(position 'a '(a b a))", "0"),
+        ("(substitute 1 0 #*0101)", "#*1111"),
+    ];
+    run_expression_cases(&cases);
+}
