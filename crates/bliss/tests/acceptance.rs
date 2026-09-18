@@ -12152,3 +12152,70 @@ fn integer_division_is_exact_at_the_fixnum_boundary() {
     )];
     run_expression_cases(&cases);
 }
+
+/// A ratio literal's components must become BIGNUMs when they leave the 61-bit
+/// fixnum range. `BlissVal::from_fixnum` shifts left by 3 without checking, so
+/// the reader used to wrap them into the sign bit -- silently, with no error:
+/// `1152921504606846976/7` (numerator 2^60) READ AS `-1152921504606846976/7`,
+/// and `7/1152921504606846976` read with a negative, unnormalized denominator
+/// (bliss-mwpb). CLHS 2.3.2.3 also requires the literal to be reduced with a
+/// positive denominator.
+#[test]
+fn big_ratio_literals_read_without_wrapping() {
+    let cases = [
+        // 2^60 and above in either component: previously sign-flipped.
+        ("1152921504606846976/7", "1152921504606846976/7"),
+        ("7/1152921504606846976", "7/1152921504606846976"),
+        ("-1152921504606846976/7", "-1152921504606846976/7"),
+        // The denominator must be positive and the value reduced.
+        ("(denominator 7/1152921504606846976)", "1152921504606846976"),
+        ("(numerator -1152921504606846976/7)", "-1152921504606846976"),
+        // Just inside the fixnum range still reduces to a fixnum integer.
+        ("1152921504606846975/7", "164703072086692425"),
+        ("7/1152921504606846975", "1/164703072086692425"),
+        // A big numerator that reduces to an integer must still collapse.
+        ("2305843009213693952/4", "576460752303423488"),
+        // Ordinary reduction and sign normalization are unchanged.
+        ("6/4", "3/2"),
+        ("4/2", "2"),
+        ("-6/4", "-3/2"),
+        ("6/-4", "-3/2"),
+        // The value must equal numerator/denominator, computed.
+        ("(= 1152921504606846976/7 (/ 1152921504606846976 7))", "T"),
+        ("(= 7/1152921504606846976 (/ 7 1152921504606846976))", "T"),
+        // And arithmetic on it must work.
+        ("(floor (- 1152921504606846976/7) 1152921504606846976/7)", "-1"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// CLHS 2.3.2.3: a radix prefix applies to a RATIO as well as an integer, so
+/// `#x1F/2` is the rational 31/2. read_radix_integer scanned only alphanumeric
+/// characters, so it stopped at the `/`, read the numerator alone and left
+/// `/2` in the stream -- `#x1F/2` silently read as 31 (bliss-mwpb).
+#[test]
+fn radix_prefixed_ratio_literals_read_as_ratios() {
+    let cases = [
+        ("#x1F/2", "31/2"),
+        ("#b101/11", "5/3"),
+        ("#o17/4", "15/4"),
+        ("#16rFF/3", "85"),
+        ("#x-1F/2", "-31/2"),
+        // Reduction matches the unprefixed path. (A sign on the DENOMINATOR is
+        // not valid ratio syntax per CLHS 2.3.2.3 -- `sign` appears only at the
+        // front -- and `#x1F/-2` is a reader error here. The base-10 path is
+        // more lenient and accepts `6/-4`; that inconsistency is pre-existing
+        // and deliberately not changed by this test.)
+        ("#xFF/3", "85"),
+        // A 2^60 numerator must become a bignum here too, not wrap negative.
+        ("#x1000000000000000/7", "1152921504606846976/7"),
+        // Plain radix integers, including bignums, are unaffected.
+        ("#x1F", "31"),
+        ("#b1011", "11"),
+        ("#xFFFFFFFFFFFFFFFF", "18446744073709551615"),
+        ("#36rZZ", "1295"),
+        // An out-of-range radix is still a reader error.
+        ("(handler-case (read-from-string \"#37rZ\") (error () :err))", ":ERR"),
+    ];
+    run_expression_cases(&cases);
+}

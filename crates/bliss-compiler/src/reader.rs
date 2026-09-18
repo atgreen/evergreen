@@ -2014,13 +2014,24 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
                     n = -n;
                     d = -d;
                 }
+                // A component that does not fit the 61-bit fixnum range must
+                // become a BIGNUM. `from_fixnum` shifts left by 3 without
+                // checking, so feeding it an i64 outside that range silently
+                // wrapped into the sign bit: `1152921504606846976/7` (numerator
+                // 2^60) READ AS `-1152921504606846976/7`, and
+                // `7/1152921504606846976` read with a NEGATIVE, unnormalized
+                // denominator. Both are silently wrong values, not errors
+                // (bliss-mwpb). The integer path below already gets this right;
+                // use the same rule here.
                 if d == 1 {
-                    return Ok(Some(BlissVal::from_fixnum(n)));
+                    return Ok(Some(int_from_i64(n)));
                 }
-                return Ok(Some(alloc_ratio(
-                    BlissVal::from_fixnum(n),
-                    BlissVal::from_fixnum(d),
-                )));
+                // GC: `int_from_i64` allocates for a bignum component, so the
+                // numerator must be rooted across the denominator's allocation
+                // or a relocating minor GC leaves it stale (bliss-wlf).
+                bliss_rt::rooted!(num = int_from_i64(n));
+                let den = int_from_i64(d);
+                return Ok(Some(alloc_ratio(*num, den)));
             }
         }
         return Ok(None);
@@ -2071,6 +2082,17 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
         return Ok(Some(b));
     }
     Ok(None)
+}
+
+/// An integer `BlissVal` for `n`: a fixnum immediate when it fits the 61-bit
+/// range, otherwise a BIGNUM. `BlissVal::from_fixnum` does NOT range-check, so
+/// every path that turns a parsed i64 into a value must go through this.
+fn int_from_i64(n: i64) -> BlissVal {
+    if fits_fixnum(n) {
+        BlissVal::from_fixnum(n)
+    } else {
+        alloc_bignum_from_i64(n)
+    }
 }
 
 /// True when `n` fits the 61-bit signed fixnum range.
@@ -2703,8 +2725,26 @@ fn read_radix_integer(
     } else {
         false
     };
-    while pos < chars.len() && chars[pos].is_ascii_alphanumeric() && !is_delimiter(chars[pos]) {
+    // `/` is part of the token: CLHS 2.3.2.3 allows a RATIO after a radix
+    // prefix, so `#x1F/2` is the rational 31/2. Stopping at the `/` read the
+    // numerator alone and left `/2` in the stream, so `#x1F/2` silently read as
+    // 31 and `#b101/11` as 5 (bliss-mwpb).
+    while pos < chars.len()
+        && (chars[pos].is_ascii_alphanumeric() || chars[pos] == '/')
+        && !is_delimiter(chars[pos])
+    {
         pos += 1;
+    }
+    let token: String = chars[start..pos].iter().collect();
+    if token.contains('/') {
+        // Reuse the shared ratio parser so reduction, sign normalization and
+        // the fixnum/bignum choice are identical to the unprefixed path.
+        return match try_parse_number_with_base(&token, radix)? {
+            Some(v) => Ok((v, pos)),
+            None => Err(BlissError::StreamError(format!(
+                "invalid radix-{radix} ratio"
+            ))),
+        };
     }
     let digits: String = chars[start..pos].iter().collect();
     let digits = digits.trim_start_matches('+').trim_start_matches('-');
