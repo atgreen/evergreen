@@ -11607,3 +11607,32 @@ fn the_count_family_accepts_from_end() {
     ];
     run_expression_cases(&cases);
 }
+
+/// NSUBSTITUTE, NSUBSTITUTE-IF and NSUBSTITUTE-IF-NOT are DESTRUCTIVE: they
+/// modify the sequence and return it. All three delegated to the
+/// non-destructive version, so they answered a fresh sequence and left the
+/// original untouched (ansi NSUBSTITUTE-LIST.2, NSUBSTITUTE-VECTOR.3 and the
+/// -IF / -IF-NOT pairs).
+#[test]
+fn the_nsubstitute_family_modifies_in_place() {
+    let cases = [
+        ("(let ((x (copy-seq '(a b a c)))) (nsubstitute 'b 'a x) x)", "(B B B C)"),
+        ("(let ((x (copy-seq #(a b a c)))) (nsubstitute 'b 'a x) x)", "#(B B B C)"),
+        ("(let ((x (copy-seq \"abac\"))) (nsubstitute #\\b #\\a x) x)", "\"bbbc\""),
+        ("(let ((x (copy-seq '(a b a c)))) (nsubstitute-if 'b (lambda (e) (eq e 'a)) x) x)", "(B B B C)"),
+        ("(let ((x (copy-seq #(a b a c)))) (nsubstitute-if 'b (lambda (e) (eq e 'a)) x) x)", "#(B B B C)"),
+        ("(let ((x (copy-seq '(a b a c)))) \
+            (nsubstitute-if-not 'b (lambda (e) (not (eq e 'a))) x) x)", "(B B B C)"),
+        // The sequence returned is the very object passed in.
+        ("(let ((x (list 1 2))) (eq x (nsubstitute 9 1 x)))", "T"),
+        // The keyword semantics are unchanged, since one implementation still
+        // computes the answer.
+        ("(let ((x (copy-seq '(a a a)))) (nsubstitute 'b 'a x :count 2) x)", "(B B A)"),
+        ("(let ((x (copy-seq '(a a a)))) (nsubstitute 'b 'a x :start 1) x)", "(A B B)"),
+        ("(let ((x (copy-seq '(a a a)))) (nsubstitute 'b 'a x :count 1 :from-end t) x)", "(A A B)"),
+        ("(let ((x (copy-seq '(1 2 3)))) (nsubstitute 9 2 x :test #'eql) x)", "(1 9 3)"),
+        // The non-destructive versions must NOT have become destructive.
+        ("(let ((x (copy-seq '(a b a c)))) (list (substitute 'b 'a x) x))", "((B B B C) (A B A C))"),
+    ];
+    run_expression_cases(&cases);
+}

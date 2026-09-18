@@ -2413,9 +2413,25 @@
 (defun substitute-if-not (new pred seq &rest keys)
   (apply (function substitute-if) new (lambda (x) (not (funcall pred x))) seq keys))
 
-(defun nsubstitute (new old seq &rest keys) (apply (function substitute) new old seq keys))
-(defun nsubstitute-if (new pred seq &rest keys) (apply (function substitute-if) new pred seq keys))
-(defun nsubstitute-if-not (new pred seq &rest keys) (apply (function substitute-if-not) new pred seq keys))
+;; The N- variants are DESTRUCTIVE: they modify SEQ and return it. All three
+;; simply delegated to the non-destructive version, so they answered a fresh
+;; sequence and left the original untouched — (let ((x (copy-seq '(a b a c))))
+;; (nsubstitute 'b 'a x) x) stayed (A B A C) instead of becoming (B B B C)
+;; (ansi NSUBSTITUTE-LIST.2, NSUBSTITUTE-VECTOR.3 and the -IF / -IF-NOT pairs).
+;;
+;; Computing the answer with SUBSTITUTE and writing it back keeps one
+;; implementation of the keyword semantics (:count, :from-end, :start/:end,
+;; :key, :test/:test-not) rather than a second copy that can drift.
+(defun %nsubstitute-into (seq result)
+  (let ((n (min (length seq) (length result))))
+    (dotimes (i n) (setf (elt seq i) (elt result i))))
+  seq)
+(defun nsubstitute (new old seq &rest keys)
+  (%nsubstitute-into seq (apply (function substitute) new old seq keys)))
+(defun nsubstitute-if (new pred seq &rest keys)
+  (%nsubstitute-into seq (apply (function substitute-if) new pred seq keys)))
+(defun nsubstitute-if-not (new pred seq &rest keys)
+  (%nsubstitute-into seq (apply (function substitute-if-not) new pred seq keys)))
 
 ;;; --- REMOVE-DUPLICATES (spec-faithful: default keeps last occurrence) ------
 
