@@ -11089,3 +11089,96 @@ fn dispatch_sees_the_right_bare_name_across_package_renames() {
         }
     }
 }
+
+/// `&environment` objects are registered in a side table so a handle can travel
+/// through Lisp as a value, and that table used to only ever GROW — every macro
+/// expansion with an `&environment` parameter minted an entry and nothing ever
+/// removed one. Two costs compounded: the entries were never freed, and the GC's
+/// root scan walks EVERY entry on EVERY collection, so each expansion made all
+/// later collections slower. On the ansi sequences workload that was 1.33G of
+/// host RSS against a nearly empty Lisp heap (bliss-7x7o).
+///
+/// CLHS 3.1.1.4 gives environment objects dynamic extent, so they are now
+/// dropped when the expander returns. What must keep working is everything an
+/// expander legitimately does with one WHILE it runs — including a nested
+/// expansion, whose own scope must not reclaim the outer environment.
+#[test]
+fn environment_objects_survive_the_expansion_that_uses_them() {
+    let cases = [
+        // MACROEXPAND-1 through the passed environment sees a MACROLET macro.
+        (
+            "(progn (defmacro me (x &environment e) (list 'quote (macroexpand-1 x e))) \
+               (macrolet ((inner () :from-macrolet)) (me (inner))))",
+            ":FROM-MACROLET",
+        ),
+        // ... and a SYMBOL-MACROLET expansion.
+        (
+            "(progn (defmacro me (x &environment e) (list 'quote (macroexpand-1 x e))) \
+               (symbol-macrolet ((s 9)) (me s)))",
+            "9",
+        ),
+        // Two MACROLET macros expanded through one environment.
+        (
+            "(progn (defmacro me (x &environment e) (list 'quote (macroexpand-1 x e))) \
+               (macrolet ((a () :a)) (macrolet ((b () :b)) (list (me (a)) (me (b))))))",
+            "(:A :B)",
+        ),
+        // A NESTED expansion: the inner macro's own scope must not reclaim the
+        // environment the outer expander is still using.
+        (
+            "(progn (defmacro inner-m (x &environment e) (list 'quote (macroexpand-1 x e))) \
+               (defmacro outer-m (x &environment e) \
+                 (list 'list (list 'quote (macroexpand-1 x e)) (list 'inner-m x))) \
+               (macrolet ((q () :deep)) (outer-m (q))))",
+            "(:DEEP :DEEP)",
+        ),
+        // Repeated expansions all still resolve — a stale-id bug would make a
+        // later one miss.
+        (
+            "(progn (defmacro me (x &environment e) (list 'quote (macroexpand-1 x e))) \
+               (macrolet ((r () :r)) (list (me (r)) (me (r)) (me (r)) (me (r)))))",
+            "(:R :R :R :R)",
+        ),
+        // An expander that never touches its environment still works.
+        (
+            "(progn (defmacro ign (x &environment e) (declare (ignore e)) (list 'quote x)) (ign (a b)))",
+            "(A B)",
+        ),
+        // MACROEXPAND (not -1) and a non-macro form through the environment.
+        (
+            "(progn (defmacro me2 (x &environment e) (list 'quote (macroexpand x e))) \
+               (macrolet ((c () '(d))) (macrolet ((d () :d)) (me2 (c)))))",
+            ":D",
+        ),
+        (
+            "(progn (defmacro me (x &environment e) (list 'quote (macroexpand-1 x e))) (me (+ 1 2)))",
+            "(+ 1 2)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        for (path, form) in [
+            ("compiled", expr.to_string()),
+            ("tree-walked", format!("(eval '{expr})")),
+        ] {
+            let output = bliss_bin()
+                .args(["--eval", &format!("(cl:format t \"~S~%\" {form})")])
+                .output()
+                .expect("failed to run bliss");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{path} case errored: {expr}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim(),
+                expected,
+                "{path} case: {expr}"
+            );
+        }
+    }
+}

@@ -3423,6 +3423,50 @@ fn macroexpand_environment_handle_symbol() -> BlissVal {
     resolve_sym("BLISS::MACROEXPAND-ENV").unwrap_or(NIL)
 }
 
+/// Reclaim the macroexpand environments created inside one macro expansion.
+///
+/// `MACROEXPAND_ENVIRONMENTS` used to only ever GROW: every `&environment`
+/// parameter minted a fresh id and a retained `MacroexpandEnv`, and nothing
+/// removed them. Two costs compounded — the entries themselves were never
+/// freed, and `scan_evaluator_global_roots` walks EVERY entry on EVERY
+/// collection, so each expansion made all later GCs slower. On the ansi
+/// sequences workload that showed up as unbounded host-side RSS growth with a
+/// nearly empty Lisp heap, and `Environment::visit_gc_roots` high in the
+/// profile (bliss-7x7o).
+///
+/// CLHS 3.1.1.4 gives environment objects DYNAMIC EXTENT — referring to one
+/// outside the dynamic extent of the macro expander has undefined consequences
+/// — so dropping them when the expander returns is exactly the permitted
+/// lifetime. A handle that escapes anyway simply fails to resolve
+/// (`load_macroexpand_environment` returns None), which is the same answer it
+/// gives for any other unrecognized handle.
+struct MacroexpandEnvScope {
+    first_id: u64,
+}
+
+impl MacroexpandEnvScope {
+    fn new() -> Self {
+        Self {
+            first_id: NEXT_MACROEXPAND_ENVIRONMENT_ID.with(|c| *c.borrow()),
+        }
+    }
+}
+
+impl Drop for MacroexpandEnvScope {
+    fn drop(&mut self) {
+        let first = self.first_id;
+        // Nested expansions each establish their own scope, so the inner one
+        // has already removed its ids by the time this runs; retaining by id
+        // keeps that correct without tracking which scope made which entry.
+        MACROEXPAND_ENVIRONMENTS.with(|envs| {
+            let mut envs = envs.borrow_mut();
+            if envs.len() > 0 {
+                envs.retain(|&id, _| id < first);
+            }
+        });
+    }
+}
+
 fn store_macroexpand_environment(env: MacroexpandEnv) -> BlissVal {
     let id = NEXT_MACROEXPAND_ENVIRONMENT_ID.with(|counter| {
         let id = *counter.borrow();
@@ -30371,6 +30415,10 @@ fn expand_macro(
     // build below, both of which allocate and can fire a relocating minor GC;
     // root it so the bound form is not left dangling (bliss-6b2 #2).
     bliss_rt::rooted_ref!(_whole_root = &mut whole);
+    // Environments bound to an `&environment` parameter live only as long as
+    // this expansion (CLHS 3.1.1.4 dynamic extent); without this the registry
+    // grew without bound and every later GC had to scan it (bliss-7x7o).
+    let _macroexpand_env_scope = MacroexpandEnvScope::new();
     // Root the macro-call argument FORMS before the first operation that may
     // allocate. Rooting `whole` alone cannot rewrite the separate `args` copy
     // held in this Rust frame, so delaying this until after resolve_sym and the
