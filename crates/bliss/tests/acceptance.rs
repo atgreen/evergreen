@@ -11307,6 +11307,20 @@ fn make_sequence_validates_its_result_type() {
         ("(make-sequence 'bit-vector 4)", "#*0000"),
         // A CLASS object designates its name.
         ("(make-sequence (find-class 'cons) 4 :initial-element 'x)", "(X X X X)"),
+        // The TYPE-ERROR must be truthful: its datum must NOT satisfy its own
+        // expected-type. Reporting the result type against SEQUENCE failed this
+        // — a compound specifier like (VECTOR * 4) is a list, hence itself a
+        // sequence — so the size is reported against the length demanded.
+        ("(handler-case (make-sequence '(vector * 4) 3)             (type-error (c) (list (type-error-datum c) (type-error-expected-type c))))",
+         "(3 (EQL 4))"),
+        ("(handler-case (make-sequence '(vector * 4) 3)             (type-error (c) (typep (type-error-datum c) (type-error-expected-type c))))",
+         "NIL"),
+        ("(handler-case (make-sequence 'null 1)             (type-error (c) (typep (type-error-datum c) (type-error-expected-type c))))",
+         "NIL"),
+        ("(handler-case (make-sequence 'cons 0)             (type-error (c) (typep (type-error-datum c) (type-error-expected-type c))))",
+         "NIL"),
+        ("(handler-case (make-sequence 'symbol 10)             (type-error (c) (typep (type-error-datum c) (type-error-expected-type c))))",
+         "NIL"),
     ];
     run_expression_cases(&cases);
 }

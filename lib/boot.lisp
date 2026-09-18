@@ -1849,10 +1849,20 @@
     ;; A declared length that disagrees with SIZE is a type error, as is NULL
     ;; with a non-empty size or CONS with an empty one — those heads pin the
     ;; length by themselves.
-    (when (or (and declared (/= declared size))
-              (and (eq head 'null) (/= size 0))
-              (and (eq head 'cons) (= size 0)))
-      (error 'type-error :datum result-type :expected-type 'sequence))
+    ;;
+    ;; The DATUM here is the SIZE, not the result type. ansi-test's SIGNALS-ERROR
+    ;; additionally asserts that (typep datum expected-type) is FALSE — a
+    ;; TYPE-ERROR whose datum satisfies its own expected-type is a bogus error —
+    ;; and a compound specifier like (VECTOR * 4) is a LIST, hence itself a
+    ;; SEQUENCE, so reporting it against SEQUENCE was exactly that bogus pairing
+    ;; (ansi MAKE-SEQUENCE.ERROR.3-6). The size against the length the specifier
+    ;; demands is both truthful and checkable.
+    (when (and declared (/= declared size))
+      (error 'type-error :datum size :expected-type (list 'eql declared)))
+    (when (and (eq head 'null) (/= size 0))
+      (error 'type-error :datum size :expected-type '(eql 0)))
+    (when (and (eq head 'cons) (= size 0))
+      (error 'type-error :datum size :expected-type '(integer 1)))
     (cond
       ((member head '(list cons null))
        (make-list size :initial-element iel))
