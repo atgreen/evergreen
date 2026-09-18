@@ -11979,3 +11979,52 @@ fn not_and_null_take_exactly_one_argument_on_every_path() {
     ];
     run_expression_cases(&cases);
 }
+
+/// FLOOR/CEILING/TRUNCATE/ROUND/MOD/REM on two fixnums take a native-integer
+/// fast path (bliss-mwpb) instead of building reduced `BigRat`s. It must agree
+/// with the general rational path exactly, so pin the cases that distinguish
+/// the four rounding modes — sign of the quotient, MOD taking the sign of the
+/// divisor while REM takes the dividend's, and ROUND breaking a tie toward the
+/// even neighbour — plus bignum/ratio/float operands, which still go the
+/// general way.
+#[test]
+fn integer_division_rounding_modes_are_exact() {
+    let cases = [
+        // FLOOR rounds toward -inf, CEILING toward +inf, TRUNCATE toward zero.
+        ("(floor -7 2)", "-4"),
+        ("(ceiling -7 2)", "-3"),
+        ("(truncate -7 2)", "-3"),
+        ("(floor 7 2)", "3"),
+        ("(ceiling 7 2)", "4"),
+        ("(truncate 7 2)", "3"),
+        // The second value is the remainder a - q*b in every mode.
+        ("(multiple-value-list (floor -7 2))", "(-4 1)"),
+        ("(multiple-value-list (ceiling -7 2))", "(-3 -1)"),
+        ("(multiple-value-list (truncate -7 2))", "(-3 -1)"),
+        // ROUND is round-half-to-EVEN, not half-away-from-zero.
+        ("(round 5 2)", "2"),
+        ("(round 7 2)", "4"),
+        ("(round -5 2)", "-2"),
+        ("(round -7 2)", "-4"),
+        ("(round 3 2)", "2"),
+        // MOD takes the sign of the divisor, REM the sign of the dividend.
+        ("(mod -7 3)", "2"),
+        ("(rem -7 3)", "-1"),
+        ("(mod 7 -3)", "-2"),
+        ("(rem 7 -3)", "1"),
+        ("(mod 6 3)", "0"),
+        ("(rem 6 3)", "0"),
+        // An exact division must not round away from the exact quotient.
+        ("(multiple-value-list (floor -6 3))", "(-2 0)"),
+        ("(multiple-value-list (ceiling -6 3))", "(-2 0)"),
+        // Bignum, ratio and float operands keep the general path.
+        ("(floor (expt 10 30) 7)", "142857142857142857142857142857"),
+        ("(mod (expt 10 30) 7)", "1"),
+        ("(floor 7/2)", "3"),
+        ("(mod 7.5 2)", "1.5"),
+        // Division by zero still signals rather than dividing natively.
+        ("(handler-case (mod 1 0) (arithmetic-error () :ae))", ":AE"),
+        ("(handler-case (floor 1 0) (arithmetic-error () :ae))", ":AE"),
+    ];
+    run_expression_cases(&cases);
+}

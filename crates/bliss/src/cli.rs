@@ -26644,6 +26644,76 @@ fn bigrat_round_to_int(r: &BigRat, mode: RoundMode) -> BigInt {
     }
 }
 
+/// `BlissVal` fixnum for `n`, or `None` when `n` leaves the 61-bit fixnum range.
+fn fixnum_from_i128(n: i128) -> Option<BlissVal> {
+    if n >= FIXNUM_MIN as i128 && n <= FIXNUM_MAX as i128 {
+        Some(BlissVal::from_fixnum(n as i64))
+    } else {
+        None
+    }
+}
+
+/// Fixnum/fixnum fast path for FLOOR/CEILING/TRUNCATE/ROUND (and so MOD/REM).
+///
+/// The general `exact_int_div` path builds a reduced `BigRat` per operand — a
+/// heap-allocated limb vector each, plus a gcd loop in `BigRat::new` — then does
+/// a rational divide, round, multiply and subtract. That made `(mod i 16)` on
+/// two fixnums ~18x more expensive than `(aref v 3)`, and put ~15% of a hot
+/// loop's time in malloc/free (bliss-mwpb). Small integers are the common case,
+/// so divide them natively; nothing here allocates.
+///
+/// The semantics are transcribed from `bigrat_round_to_int` and MUST stay
+/// identical to it: `BigRat::new` normalizes the denominator positive, so its
+/// `neg` is the sign of the exact QUOTIENT (not of `a`); the ROUND tie compares
+/// `2*|rem|` against the denominator and breaks toward the even neighbour; and
+/// the returned remainder is `a - q*b`. Reducing by the gcd scales `|rem|` and
+/// the denominator by the same factor, so comparing against the unreduced `|b|`
+/// gives the same ordering.
+///
+/// Arithmetic is in `i128` so no intermediate can overflow a fixnum operand
+/// pair; `None` defers to the general path if a result leaves fixnum range.
+fn fixnum_int_div(a: i64, b: i64, mode: RoundMode) -> Option<(BlissVal, BlissVal)> {
+    debug_assert!(b != 0, "caller must reject a zero divisor");
+    let (a, b) = (a as i128, b as i128);
+    let tq = a / b; // truncates toward zero
+    let trem = a % b; // carries the sign of `a`
+    let q = if trem == 0 {
+        tq
+    } else {
+        let neg = (a < 0) != (b < 0);
+        let away = if neg { tq - 1 } else { tq + 1 };
+        match mode {
+            RoundMode::Truncate => tq,
+            RoundMode::Floor => {
+                if neg {
+                    away
+                } else {
+                    tq
+                }
+            }
+            RoundMode::Ceiling => {
+                if neg {
+                    tq
+                } else {
+                    away
+                }
+            }
+            RoundMode::Round => match (2 * trem.abs()).cmp(&b.abs()) {
+                Ordering::Less => tq,
+                Ordering::Greater => away,
+                Ordering::Equal => {
+                    if tq % 2 == 0 {
+                        tq
+                    } else {
+                        away
+                    }
+                }
+            },
+        }
+    };
+    Some((fixnum_from_i128(q)?, fixnum_from_i128(a - q * b)?))
+}
+
 /// Exact FLOOR/CEILING/TRUNCATE/ROUND of `a`/`b` for rational operands (fixnum,
 /// bignum, ratio). Returns the (quotient, remainder = a − quotient·b) as
 /// BlissVals, or `None` if either operand is a float (the caller then uses the
@@ -26656,6 +26726,16 @@ fn exact_int_div(
 ) -> Option<Result<(BlissVal, BlissVal), BlissError>> {
     if a.is_single_float() || b.is_single_float() {
         return None;
+    }
+    // Fixnum/fixnum without touching BigRat or the allocator (bliss-mwpb).
+    if a.is_fixnum() && b.is_fixnum() {
+        let bi = b.as_fixnum();
+        if bi == 0 {
+            return Some(Err(BlissError::ArithmeticError("division by zero".into())));
+        }
+        if let Some(pair) = fixnum_int_div(a.as_fixnum(), bi, mode) {
+            return Some(Ok(pair));
+        }
     }
     let ra = as_bigrat(a)?;
     let rb = as_bigrat(b)?;
