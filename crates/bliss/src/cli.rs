@@ -1432,6 +1432,76 @@ fn maybe_lazy_compile(name: &str, params: BlissVal, body: BlissVal, env: &Env) {
 
 /// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
 /// tell an optional positional stream argument apart from &key start/end.
+/// Validate and read SORT/STABLE-SORT's trailing keyword arguments.
+///
+/// Both arms used to hand-parse these and silently IGNORE anything malformed, so
+/// `(sort nil #'< :key)`, `(sort nil #'< 'bad t)` and `(sort nil #'< 1 2)` all
+/// sorted happily instead of signalling. CLHS makes an odd-length keyword list,
+/// a non-keyword in a keyword position, and an unrecognized keyword (without
+/// :allow-other-keys) a PROGRAM-ERROR (ansi SORT.ERROR.3-6, STABLE-SORT.ERROR.3-6).
+///
+/// Shared by both arms, which were otherwise identical copies of each other.
+fn eval_sort_key_argument(
+    mut rest: BlissVal,
+    env: &mut Env,
+    name: &str,
+) -> Result<Option<BlissVal>, BlissError> {
+    bliss_rt::rooted_ref!(_rest_root = &mut rest);
+    bliss_rt::rooted!(key = NIL);
+    let mut have_key = false;
+    let mut allow_other_keys = false;
+    // Collect first so an unrecognized keyword is reported only after
+    // :allow-other-keys anywhere in the list has been seen (CLHS 3.4.1.4).
+    bliss_rt::rooted!(pairs = Vec::<(BlissVal, BlissVal)>::new());
+    while rest.is_cons() {
+        let (kw, after_kw) = cp(rest);
+        if !is_keyword_arg(kw) {
+            return Err(BlissError::ProgramError(format!(
+                "{name}: a keyword argument name must be a keyword"
+            )));
+        }
+        if !after_kw.is_cons() {
+            return Err(BlissError::ProgramError(format!(
+                "{name}: odd number of keyword arguments"
+            )));
+        }
+        let (value_form, tail) = cp(after_kw);
+        let value = eval_form(value_form, env)?;
+        pairs.push((kw, value));
+        rest = tail;
+    }
+    for i in 0..pairs.len() {
+        let (kw, value) = pairs[i];
+        if symbol_bare_name(&sym_name_rc(kw)) == "ALLOW-OTHER-KEYS" && !value.is_nil() {
+            allow_other_keys = true;
+        }
+    }
+    for i in 0..pairs.len() {
+        let (kw, value) = pairs[i];
+        match symbol_bare_name(&sym_name_rc(kw)).as_str() {
+            "KEY" => {
+                if !have_key {
+                    *key = value;
+                    have_key = true;
+                }
+            }
+            "ALLOW-OTHER-KEYS" => {}
+            other => {
+                if !allow_other_keys {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name}: unknown keyword argument :{other}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(if have_key && !key.is_nil() {
+        Some(*key)
+    } else {
+        None
+    })
+}
+
 fn is_keyword_arg(val: BlissVal) -> bool {
     val.is_symbol() && sym_name_rc(val).starts_with("KEYWORD:")
 }
@@ -18761,7 +18831,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return coerce_value(*value, type_val);
             }
-            "SORT" => {
+            "SORT" | "STABLE-SORT" => {
+                // SEQUENCE and PREDICATE are required; too few is a
+                // PROGRAM-ERROR, not a silent sort of NIL (ansi SORT.ERROR.1/2).
+                if !cdr.is_cons() || !cp(cdr).1.is_cons() {
+                    return Err(BlissError::ProgramError(format!(
+                        "{name} requires a sequence and a predicate"
+                    )));
+                }
                 // Root the sequence, predicate, and pending arg forms across
                 // the later argument evaluations (moving GC; bliss-4bp).
                 let (seq_form, rest) = cp(cdr);
@@ -18770,43 +18847,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(rest2 = rest2);
                 bliss_rt::rooted!(seq = eval_form(seq_form, env)?);
                 bliss_rt::rooted!(predicate = eval_form(*pred_form, env)?);
-                let key = if rest2.is_cons() {
-                    let (kw_form, rest3) = cp(*rest2);
-                    if kw_form.is_symbol()
-                        && symbol_bare_name(&sym_name_rc(kw_form)).eq_ignore_ascii_case("KEY")
-                        && rest3.is_cons()
-                    {
-                        Some(eval_form(cp(rest3).0, env)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                return sort_sequence(*seq, *predicate, key, env);
-            }
-            "STABLE-SORT" => {
-                // Root the sequence, predicate, and pending arg forms across
-                // the later argument evaluations (moving GC; bliss-4bp).
-                let (seq_form, rest) = cp(cdr);
-                let (pred_form, rest2) = cp(rest);
-                bliss_rt::rooted!(pred_form = pred_form);
-                bliss_rt::rooted!(rest2 = rest2);
-                bliss_rt::rooted!(seq = eval_form(seq_form, env)?);
-                bliss_rt::rooted!(predicate = eval_form(*pred_form, env)?);
-                let key = if rest2.is_cons() {
-                    let (kw_form, rest3) = cp(*rest2);
-                    if kw_form.is_symbol()
-                        && symbol_bare_name(&sym_name_rc(kw_form)).eq_ignore_ascii_case("KEY")
-                        && rest3.is_cons()
-                    {
-                        Some(eval_form(cp(rest3).0, env)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let key = eval_sort_key_argument(*rest2, env, &name)?;
                 return sort_sequence(*seq, *predicate, key, env);
             }
             "PATHNAMEP" => {

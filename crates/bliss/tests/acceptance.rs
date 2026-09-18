@@ -11278,6 +11278,22 @@ fn keyword_argument_lists_are_validated() {
         ("(delete-duplicates (list 1 2 1))", "(2 1)"),
         ("(make-sequence 'list 3 :initial-element 7)", "(7 7 7)"),
         ("(make-sequence 'vector 2)", "#(NIL NIL)"),
+        // SORT and STABLE-SORT hand-parsed their trailing arguments and
+        // silently IGNORED anything malformed, so these all sorted happily.
+        // Both also require a sequence AND a predicate.
+        ("(handler-case (sort) (program-error () :pe))", ":PE"),
+        ("(handler-case (sort nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (stable-sort) (program-error () :pe))", ":PE"),
+        ("(handler-case (stable-sort nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (sort nil #'< :key) (program-error () :pe))", ":PE"),
+        ("(handler-case (sort nil #'< 'bad t) (program-error () :pe))", ":PE"),
+        ("(handler-case (sort nil #'< 1 2) (program-error () :pe))", ":PE"),
+        ("(handler-case (stable-sort nil #'< :key) (program-error () :pe))", ":PE"),
+        ("(sort (list 3 1 2) #'<)", "(1 2 3)"),
+        ("(sort (list 3 1 2) #'< :key #'identity)", "(1 2 3)"),
+        ("(stable-sort (list 3 1 2) #'<)", "(1 2 3)"),
+        ("(sort (vector 2 1) #'<)", "#(1 2)"),
+        ("(sort (list 3 1 2) #'< :bad t :allow-other-keys t)", "(1 2 3)"),
     ];
     run_expression_cases(&cases);
 }
