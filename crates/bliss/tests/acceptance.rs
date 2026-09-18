@@ -11487,3 +11487,55 @@ fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
         "recursion that fits on the stack must still compute"
     );
 }
+
+/// A callee redefined AFTER its caller has been compiled and warmed must be
+/// picked up by that caller.
+///
+/// This is the invariant any direct compiled-to-compiled call has to preserve:
+/// once a caller stops going through c2i_call_args and calls a callee's entry
+/// itself, a stale entry means jumping into code the program has replaced — or
+/// freed. None of the existing suites exercise redefinition after warm-up, so a
+/// missed invalidation would be invisible until a program did exactly this
+/// (bliss-x5y.27).
+///
+/// All three ways a function can change identity are covered: DEFUN over it,
+/// SETF of SYMBOL-FUNCTION, and FMAKUNBOUND.
+#[test]
+fn a_callee_redefined_after_warmup_is_picked_up_by_its_caller() {
+    // Each form must be its OWN top-level form — a redefinition nested inside
+    // the same form as the caller is not in effect when that form runs, which
+    // is a property of evaluation order, not of the call path under test.
+    let output = bliss_bin()
+        .args([
+            "--eval", "(defun g (n) (* n 2))",
+            "--eval", "(defun f (n) (g n))",
+            // Warm f (and with it the call to g) well past every tier threshold.
+            "--eval", "(let ((acc 0)) (dotimes (i 300000) (setq acc (f 3))) acc)",
+            "--eval", "(defvar *before* (f 3))",
+            "--eval", "(defun g (n) (* n 100))",
+            "--eval", "(defvar *after-defun* (f 3))",
+            "--eval", "(setf (symbol-function 'g) (lambda (n) (* n 1000)))",
+            "--eval", "(defvar *after-setf* (f 3))",
+            "--eval", "(fmakunbound 'g)",
+            "--eval", "(defvar *after-fmakunbound* \
+                         (handler-case (f 3) \
+                           (undefined-function () :undefined) \
+                           (error () :error)))",
+            "--eval", "(cl:format t \"~S~%\" (list *before* *after-defun* \
+                                                  *after-setf* *after-fmakunbound*))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "redefinition-after-warmup errored\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Each --eval echoes its value, so the printed list is the LAST line.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(6 300 3000 :UNDEFINED)"),
+        "a warmed caller must follow its callee's redefinition; got:\n{stdout}"
+    );
+}
