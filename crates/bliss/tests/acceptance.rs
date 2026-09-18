@@ -11199,6 +11199,16 @@ fn concatenate_and_map_honour_every_result_type() {
         ("(concatenate 'simple-bit-vector '(0 1 1) nil #(1 0 1) #())", "#*011101"),
         ("(map 'bit-vector #'identity '(0 1 1))", "#*011"),
         ("(map 'simple-bit-vector #'identity '(0 0 0))", "#*000"),
+        // A bit vector named through the ELEMENT TYPE rather than the head.
+        ("(map '(vector bit) #'identity '(0 0 0 0 0 1))", "#*000001"),
+        ("(map '(vector bit 6) #'identity '(0 0 0 0 0 1))", "#*000001"),
+        ("(map '(vector bit *) #'identity '(0 0 0 0 0 1))", "#*000001"),
+        ("(map '(bit-vector 6) #'identity '(0 0 0 0 0 1))", "#*000001"),
+        ("(map '(simple-bit-vector *) #'identity '(0 0 0 0 0 1))", "#*000001"),
+        // ... but a non-BIT element type is still a general vector.
+        ("(map '(simple-vector *) #'identity '(0 0 0 0 0 1))", "#(0 0 0 0 0 1)"),
+        ("(map '(simple-vector 6) #'identity '(0 0 0 0 0 1))", "#(0 0 0 0 0 1)"),
+        ("(map '(vector t) #'identity '(1 2))", "#(1 2)"),
         // A non-bit element is a TYPE-ERROR, not a silently coerced 1.
         ("(handler-case (concatenate 'bit-vector '(0 2)) (type-error () :te))", ":TE"),
         // Compound string specifiers, with and without a length.

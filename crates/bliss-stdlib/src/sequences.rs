@@ -1664,9 +1664,27 @@ fn result_type_is_bit_vector(result_type: BlissVal) -> bool {
         return name_is_bit_vector(result_type.as_symbol_index());
     }
     if result_type.is_cons() {
-        let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
-        if car.tag() == bliss_rt::value::TAG_SYMBOL {
-            return name_is_bit_vector(car.as_symbol_index());
+        let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
+        let car = cell.car;
+        if car.tag() != bliss_rt::value::TAG_SYMBOL {
+            return false;
+        }
+        if name_is_bit_vector(car.as_symbol_index()) {
+            return true;
+        }
+        // `(vector bit)` / `(vector bit 6)` / `(simple-array bit (6))` name a
+        // bit vector through their ELEMENT TYPE rather than their head (ansi
+        // MAP-BIT-VECTOR.17/23/24).
+        let head_takes_element_type = matches!(
+            bliss_compiler::reader::symbol_name(car.as_symbol_index()).as_deref(),
+            Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")
+        );
+        if head_takes_element_type && cell.cdr.is_cons() {
+            let elt = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
+            if elt.tag() == bliss_rt::value::TAG_SYMBOL {
+                return bliss_compiler::reader::symbol_name(elt.as_symbol_index()).as_deref()
+                    == Some("BIT");
+            }
         }
     }
     false
