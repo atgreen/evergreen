@@ -148,10 +148,65 @@ fn is_char_seq(v: BlissVal) -> bool {
 }
 
 /// Collect all elements of a sequence into a Vec.
+/// True iff `v` is the interpreter's closure representation
+/// `(BLISS::CLOSURE . <id>)` — structurally a cons, but a FUNCTION, not a list.
+///
+/// Sequence traversals must never walk one. ansi's CHECK-TYPE-ERROR applies each
+/// sequence function to every non-sequence in its universe and asserts the
+/// signalled TYPE-ERROR's DATUM is the argument it passed, so walking a closure
+/// and blaming its cdr reports the wrong datum.
+fn is_closure_cons(v: BlissVal) -> bool {
+    if !v.is_cons() {
+        return false;
+    }
+    let cell = unsafe { &*(v.as_ptr() as *const ConsCell) };
+    if cell.car.tag() != bliss_rt::value::TAG_SYMBOL || !cell.cdr.is_fixnum() {
+        return false;
+    }
+    matches!(
+        bliss_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(),
+        Some("BLISS::CLOSURE")
+    )
+}
+
+/// A closure is a FUNCTION, not a sequence, however cons-shaped it is.
+fn reject_function_value(v: BlissVal) -> Result<(), BlissError> {
+    if is_closure_cons(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "SEQUENCE".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A CL sequence must be a PROPER list.
+///
+/// The datum is the improper TAIL, not the list: ansi's SIGNALS-ERROR asserts a
+/// TYPE-ERROR's datum does NOT satisfy its own expected-type, and a dotted list
+/// IS `typep` LIST — it is a cons — so blaming the list would be a
+/// self-contradicting error. The tail is the thing that is not a list, which is
+/// also what SBCL reports.
+fn reject_improper_tail(tail: BlissVal) -> Result<(), BlissError> {
+    if !tail.is_nil() {
+        return Err(BlissError::TypeError {
+            datum: tail,
+            expected: "LIST".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     if sequence.is_nil() {
         return Ok(Vec::new());
     }
+    // Both guards live HERE, in the one traversal every sequence function shares,
+    // rather than in each caller. Putting them in LENGTH alone was net zero on
+    // the chapter — it fixed the functions written over LENGTH and broke REVERSE,
+    // SORT, REDUCE and the duplicate-removers, which carry their own walks
+    // (bliss-hvfe, reverted in b1f8073).
+    reject_function_value(sequence)?;
     if sequence.is_cons() {
         let mut elems = Vec::new();
         let mut cur = sequence;
@@ -160,6 +215,7 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
             elems.push(cell.car);
             cur = cell.cdr;
         }
+        reject_improper_tail(cur)?;
         return Ok(elems);
     }
     if is_vector(sequence) {
@@ -1226,6 +1282,7 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
     if sequence.is_nil() {
         return Ok(0);
     }
+    reject_function_value(sequence)?;
     if sequence.is_cons() {
         let mut count = 0usize;
         let mut cur = sequence;
@@ -1234,6 +1291,7 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
             let cell = unsafe { &*(cur.as_ptr() as *const ConsCell) };
             cur = cell.cdr;
         }
+        reject_improper_tail(cur)?;
         return Ok(count);
     }
     if is_vector(sequence) {

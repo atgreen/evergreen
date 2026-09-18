@@ -27811,7 +27811,28 @@ fn sort_sequence(
     if seq.is_nil() {
         return Ok(NIL);
     }
+    // SORT walks the sequence itself rather than through the stdlib's shared
+    // collector, so it needs the same two guards: a closure is structurally a
+    // cons but is a FUNCTION, and a sequence must be a PROPER list. Without them
+    // (sort <closure> #'<) answered (|BLISS::CLOSURE|) (bliss-hvfe).
+    if is_function_value(seq) {
+        return Err(BlissError::TypeError {
+            datum: seq,
+            expected: "SEQUENCE".to_string(),
+        });
+    }
     let is_list = seq.is_cons();
+    if is_list {
+        let (_, tail) = list_to_vec_with_tail(seq);
+        if !tail.is_nil() {
+            // The improper TAIL is the datum: a dotted list is itself `typep`
+            // LIST, so blaming the list would be a self-contradicting error.
+            return Err(BlissError::TypeError {
+                datum: tail,
+                expected: "LIST".to_string(),
+            });
+        }
+    }
     let mut elems: Vec<BlissVal> = if is_list {
         list_to_vec(seq)
     } else {

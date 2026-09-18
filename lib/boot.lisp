@@ -1041,6 +1041,13 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun reduce (fn seq &key key from-end (start 0) end (initial-value nil ivp))
+  ;; A FUNCTION is not a sequence. REDUCE reaches its elements through
+  ;; (coerce seq 'list), and COERCE hands a function straight back rather than
+  ;; rejecting it, so the closure — structurally a cons — was then walked and
+  ;; the error blamed its cdr instead of the function (ansi REDUCE.ERROR.1).
+  ;; The COERCE gap itself is wider than this one caller; see bliss-hvfe.
+  (when (functionp seq)
+    (error 'type-error :datum seq :expected-type 'sequence))
   ;; NB: distinguish an explicit `:initial-value nil` from an omitted one via the
   ;; supplied-p flag IVP — otherwise (reduce f seq :initial-value nil) on an empty
   ;; sequence wrongly calls (f) with zero args (bliss-lb6.14: UIOP timestamps).

@@ -11877,3 +11877,48 @@ fn replace_handles_overlap_and_fill_checks_its_bounds() {
     ];
     run_expression_cases(&cases);
 }
+
+/// A sequence must be a PROPER list, and a FUNCTION is never a sequence however
+/// cons-shaped the interpreter's closure representation is.
+///
+/// Both guards live in the ONE traversal every sequence function shares, plus
+/// the two that walk for themselves (LENGTH and SORT). Putting them in LENGTH
+/// alone was net zero on the chapter — it fixed the functions written over
+/// LENGTH and broke REVERSE, SORT, REDUCE and the duplicate-removers, which
+/// carry their own walks (reverted in b1f8073, redone here).
+///
+/// The datum differs by case ON PURPOSE, because ansi checks both: for a
+/// non-sequence it must BE the argument passed (CHECK-TYPE-ERROR), and for a
+/// dotted list it must be the improper TAIL, since a dotted list is itself
+/// `typep` LIST and blaming it would be self-contradicting (SIGNALS-ERROR).
+#[test]
+fn a_function_is_not_a_sequence_and_a_dotted_list_is_not_either() {
+    let cases = [
+        // Dotted lists: the datum is the tail.
+        ("(handler-case (length '(a b c . d)) \
+            (type-error (c) (list (type-error-datum c) \
+                                  (typep (type-error-datum c) (type-error-expected-type c)))))",
+         "(D NIL)"),
+        ("(handler-case (find 'e '(a b c . d)) (type-error () :te))", ":TE"),
+        ("(handler-case (position 'e '(a b c . d)) (type-error () :te))", ":TE"),
+        ("(handler-case (find-if #'null '(a b c . d)) (type-error () :te))", ":TE"),
+        ("(handler-case (reverse '(a b . c)) (type-error () :te))", ":TE"),
+        ("(handler-case (sort '(3 1 . d) #'<) (type-error () :te))", ":TE"),
+        // Closures: the datum is the function itself, across every walk.
+        ("(handler-case (length (lambda (x) x)) (type-error (c) (functionp (type-error-datum c))))", "T"),
+        ("(handler-case (reverse (lambda (x) x)) (type-error (c) (functionp (type-error-datum c))))", "T"),
+        ("(handler-case (sort (lambda (x) x) #'<) (type-error (c) (functionp (type-error-datum c))))", "T"),
+        ("(handler-case (stable-sort (lambda (x) x) #'<) \
+            (type-error (c) (functionp (type-error-datum c))))", "T"),
+        ("(handler-case (reduce #'cons (lambda (x) x)) \
+            (type-error (c) (functionp (type-error-datum c))))", "T"),
+        ("(handler-case (remove-duplicates (lambda (x) x)) \
+            (type-error (c) (functionp (type-error-datum c))))", "T"),
+        ("(handler-case (find 1 (lambda (x) x)) (type-error (c) (functionp (type-error-datum c))))", "T"),
+        // Proper sequences of every kind are untouched.
+        ("(list (length nil) (length '(1 2 3)) (length \"abc\") (length #(1 2)) (length #*101))", "(0 3 3 2 3)"),
+        ("(list (reverse '(1 2)) (sort (list 2 1) #'<) (reduce #'+ '(1 2 3)))", "((2 1) (1 2) 6)"),
+        ("(length (make-array 4 :fill-pointer 2))", "2"),
+    ];
+    run_expression_cases(&cases);
+}
