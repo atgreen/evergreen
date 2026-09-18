@@ -12127,3 +12127,28 @@ fn setf_subseq_evaluates_value_form_last() {
     ];
     run_expression_cases(&cases);
 }
+
+/// The fixnum division fast path (bliss-mwpb) computes in i128 and falls back
+/// to the general BigRat path when a result leaves the 61-bit fixnum range.
+/// Exercise the extremes, where that fallback is what keeps the answer right:
+/// check the defining identity a = q*b + r in exact arithmetic, and cross-check
+/// against the same division scaled by 2^70, which is quotient-preserving and
+/// forces the general path.
+#[test]
+fn integer_division_is_exact_at_the_fixnum_boundary() {
+    let cases = [(
+        "(let* ((mx (1- (expt 2 60))) (mn (- (expt 2 60))) (k (expt 2 70))
+                (bad 0) (n 0))
+           (dolist (a (list mx mn (1- mx) (1+ mn) (expt 2 59) (- (expt 2 59)) 0 1 -1))
+             (dolist (b (list 1 -1 2 -2 3 -3 mx mn))
+               (dolist (op (list #'floor #'ceiling #'truncate #'round))
+                 (incf n)
+                 (multiple-value-bind (q r) (funcall op a b)
+                   (unless (= a (+ (* q b) r)) (incf bad))
+                   (multiple-value-bind (bq br) (funcall op (* a k) (* b k))
+                     (unless (and (= q bq) (= (* r k) br)) (incf bad)))))))
+           (list n bad))",
+        "(288 0)",
+    )];
+    run_expression_cases(&cases);
+}
