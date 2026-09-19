@@ -11,9 +11,11 @@ use bliss_rt::error::BlissError;
 // bignum components could not be reduced here (bliss-0dtf). Re-exported at
 // `pub(super)` because cli/bytecode.rs reaches several of these via `super::`.
 pub(super) use bliss_rt::bignum::{
-    alloc_ratio_cli, as_bigrat, big_add, big_bitop, big_cmp, big_divmod, big_mul, big_neg,
+    alloc_ratio_cli, as_bigrat, big_abs, big_add, big_bitop, big_cmp, big_divmod, big_mul,
+    big_neg,
     big_sub, bigint_from_val, bigrat_add, bigrat_cmp, bigrat_div, bigrat_floor_pos, bigrat_mul,
-    bigrat_neg, bigrat_pow, bigrat_recip, bigrat_sub, exact_int_div, float_mod, mag_bitlen,
+    bigrat_neg, bigrat_pow, bigrat_recip, bigrat_sub, exact_int_div, fixnum_from_i128, float_mod,
+    mag_bitlen,
     mag_sub, ratio_parts_val, BigInt, BigRat, RoundMode, FIXNUM_MAX, FIXNUM_MIN,
 };
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
@@ -3836,6 +3838,10 @@ fn bliss_error_to_condition(
         BlissError::ArithmeticError(msg) => {
             let type_name = if msg.contains("division") {
                 "DIVISION-BY-ZERO"
+            } else if msg.contains("overflow") {
+                "FLOATING-POINT-OVERFLOW"
+            } else if msg.contains("underflow") {
+                "FLOATING-POINT-UNDERFLOW"
             } else {
                 "ARITHMETIC-ERROR"
             };
@@ -4421,7 +4427,18 @@ fn nth_element(idx: usize, list: BlissVal) -> Result<BlissVal, BlissError> {
 /// preservation below is easy to get subtly wrong twice.
 fn abs_value(v: BlissVal) -> Result<BlissVal, BlissError> {
     if v.is_fixnum() {
-        return Ok(BlissVal::from_fixnum(v.as_fixnum().abs()));
+        let n = v.as_fixnum();
+        // |MOST-NEGATIVE-FIXNUM| does NOT fit the fixnum range: negating
+        // -(2^60) gives 2^60, one past FIXNUM_MAX. `from_fixnum` shifts left
+        // by 3 without checking, so `(abs most-negative-fixnum)` wrapped into
+        // the sign bit and answered a NEGATIVE number -- a silently wrong
+        // value, not an error (ansi ABS.1 requires (abs x) be real and never
+        // MINUSP for every x). Unary minus already got this right; promote to
+        // a bignum the same way.
+        if let Some(r) = fixnum_from_i128((n as i128).abs()) {
+            return Ok(r);
+        }
+        return Ok(big_abs(&BigInt::from_i64(n)).to_val());
     }
     if v.is_single_float() {
         return Ok(BlissVal::from_single_float(v.as_single_float().abs()));
@@ -4448,6 +4465,48 @@ fn abs_value(v: BlissVal) -> Result<BlissVal, BlissError> {
         datum: v,
         expected: "number".into(),
     })
+}
+
+/// CLHS 12.1.4.3: a float operation on finite operands that produces an
+/// INFINITY has overflowed, and one whose exact result is nonzero but which
+/// produces ZERO has underflowed. Both are conditions, not values -- bliss
+/// returned `inf` and `0.0` instead (ansi EXP.ERROR.4-11, EXPT.ERROR.4-11).
+///
+/// `exact_is_nonzero` says the true result is known to be nonzero: e^x is never
+/// 0, and neither is a nonzero base raised to a power. It is a parameter rather
+/// than an assumption because functions with legitimate zeros (SIN at 0) would
+/// otherwise be reported as underflowing.
+///
+/// Only EXP and EXPT route through this. The other transcendentals have genuine
+/// singularities -- `(atanh 1.0)` is mathematically +inf, not an overflow -- so
+/// applying it there would turn correct answers into errors. No ansi test
+/// covers them; see the bead for the wider question.
+fn check_float_range(
+    r: f64,
+    kind: FloatKind,
+    inputs_finite: bool,
+    exact_is_nonzero: bool,
+) -> Result<f64, BlissError> {
+    // Test the value AS IT WILL BE STORED. The arithmetic runs in f64, where
+    // most-positive-SINGLE-float squared is still finite -- it only becomes an
+    // infinity when box_float narrows to f32. Checking the f64 intermediate
+    // caught every double-float case and silently missed every single-float
+    // one, which is exactly half of the ansi tests here.
+    let r = match kind {
+        FloatKind::Double => r,
+        _ => (r as f32) as f64,
+    };
+    if inputs_finite && r.is_infinite() {
+        return Err(BlissError::ArithmeticError(
+            "floating-point overflow".into(),
+        ));
+    }
+    if exact_is_nonzero && r == 0.0 {
+        return Err(BlissError::ArithmeticError(
+            "floating-point underflow".into(),
+        ));
+    }
+    Ok(r)
 }
 
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
@@ -20149,7 +20208,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let av = num_val(a)?;
                 let bv = num_val(b)?;
                 let kind = widen_float(real_float_kind(a), real_float_kind(b));
-                return Ok(box_float(av.powf(bv), kind));
+                // A nonzero base cannot raise to an exact zero, so a zero
+                // result is underflow; finite operands cannot give a true
+                // infinity, so that is overflow (CLHS 12.1.4.3).
+                let pow = check_float_range(
+                    av.powf(bv),
+                    kind,
+                    av.is_finite() && bv.is_finite(),
+                    av != 0.0,
+                )?;
+                return Ok(box_float(pow, kind));
             }
             "SQRT" => {
                 let af = expect_one_arg(cdr, "SQRT")?;
@@ -20339,6 +20407,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "ACOSH" => x.acosh(),
                     "ATANH" => x.atanh(),
                     _ => unreachable!(),
+                };
+                // EXP only: e^x is never zero and never infinite for finite
+                // x, so either outcome is a range condition (CLHS 12.1.4.3).
+                let r = if name.as_str() == "EXP" {
+                    check_float_range(r, real_float_kind(v), x.is_finite(), true)?
+                } else {
+                    r
                 };
                 return Ok(box_float(r, real_float_kind(v)));
             }

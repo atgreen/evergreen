@@ -13063,6 +13063,19 @@ fn abs_preserves_exact_type_on_both_dispatch_paths() {
         ("(handler-case (abs nil) (type-error () :te))", ":TE"),
         ("(handler-case (abs) (program-error () :pe))", ":PE"),
         ("(handler-case (abs 1 2) (program-error () :pe))", ":PE"),
+        // ansi ABS.1 requires (abs x) be REAL and never MINUSP for every x.
+        // |MOST-NEGATIVE-FIXNUM| is 2^60, one PAST fixnum range, and
+        // `from_fixnum` shifts left without checking -- so this wrapped into
+        // the sign bit and answered a NEGATIVE number. Unary minus already
+        // promoted to a bignum here; ABS now does too.
+        ("(minusp (abs most-negative-fixnum))", "NIL"),
+        ("(realp (abs most-negative-fixnum))", "T"),
+        ("(= (abs most-negative-fixnum) (- most-negative-fixnum))", "T"),
+        ("(abs (1+ most-negative-fixnum))", "1152921504606846975"),
+        ("(abs most-positive-fixnum)", "1152921504606846975"),
+        ("(loop for x in (list 0 1 -1 most-positive-fixnum most-negative-fixnum
+                               -5.5 1/2 -1/2 -100000000000000000000)
+            for a = (abs x) always (and (realp a) (not (minusp a))))", "T"),
     ];
     run_expression_cases(&cases);
 }
@@ -13168,6 +13181,51 @@ fn transcendentals_accept_complex_arguments() {
         // log/sqrt with principal-value branch cuts, so a complex argument
         // still takes the real path rather than being silently mis-answered.
         ("(handler-case (asin (complex 1.0 1.0)) (type-error () :te))", ":TE"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi EXP.ERROR.4-11 / EXPT.ERROR.4-11: CLHS 12.1.4.3 makes a float
+/// operation that overflows to an infinity, or underflows to zero from a
+/// nonzero exact result, signal a condition rather than return inf/0.0.
+///
+/// The subtle part is WHERE to test: the arithmetic runs in f64, so
+/// most-positive-SINGLE-float squared is still finite and only becomes an
+/// infinity when the result is narrowed to f32. Checking the f64 intermediate
+/// caught every double-float case and missed every single-float one.
+#[test]
+fn exp_and_expt_signal_float_range_conditions() {
+    let cases = [
+        // Overflow, both float formats.
+        ("(handler-case (exp (+ (log most-positive-single-float) 100))
+            (floating-point-overflow () :ovf))", ":OVF"),
+        ("(handler-case (exp (+ (log most-positive-double-float) 100))
+            (floating-point-overflow () :ovf))", ":OVF"),
+        ("(handler-case (expt most-positive-single-float 2)
+            (floating-point-overflow () :ovf))", ":OVF"),
+        ("(handler-case (expt most-positive-double-float 2)
+            (floating-point-overflow () :ovf))", ":OVF"),
+        // Underflow, both float formats.
+        ("(handler-case (exp (- (log least-positive-single-float) 100))
+            (floating-point-underflow () :unf))", ":UNF"),
+        ("(handler-case (expt least-positive-single-float 2)
+            (floating-point-underflow () :unf))", ":UNF"),
+        ("(handler-case (expt least-positive-double-float 2)
+            (floating-point-underflow () :unf))", ":UNF"),
+        // Both are ARITHMETIC-ERRORs.
+        ("(handler-case (expt most-positive-single-float 2)
+            (arithmetic-error () :ae))", ":AE"),
+        // Ordinary results are untouched, including the integer EXPT path and
+        // (expt 0.0 2), whose exact result IS zero and so is not an underflow.
+        ("(exp 1)", "2.7182817"),
+        ("(exp 0)", "1.0"),
+        ("(exp -1)", "0.36787945"),
+        ("(exp 1.0d0)", "2.718281828459045d0"),
+        ("(expt 2 10)", "1024"),
+        ("(expt 2.0 10)", "1024.0"),
+        ("(expt 0.0 2)", "0.0"),
+        ("(expt 2 0.5)", "1.4142135"),
+        ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
     ];
     run_expression_cases(&cases);
 }
