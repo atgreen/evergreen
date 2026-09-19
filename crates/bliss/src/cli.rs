@@ -15174,6 +15174,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if v.is_nil() {
                     return Ok(NIL);
                 }
+                // A closure is physically `(BLISS::CLOSURE . id)`, but its
+                // Common Lisp type is FUNCTION, never CONS -- CONSP, LISTP
+                // and TYPEP all already say so. Without this CAR/CDR walked
+                // into that representation and answered BLISS::CLOSURE or
+                // the id instead of signalling (ansi CAR.ERROR.1/CDR.ERROR.1).
+                if is_closure_cons(v) {
+                    return Err(BlissError::TypeError {
+                        datum: v,
+                        expected: "list".into(),
+                    });
+                }
                 if v.is_cons() {
                     let (a, _) = cp(v);
                     return Ok(a);
@@ -15188,6 +15199,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 if v.is_nil() {
                     return Ok(NIL);
+                }
+                // A closure is physically `(BLISS::CLOSURE . id)`, but its
+                // Common Lisp type is FUNCTION, never CONS -- CONSP, LISTP
+                // and TYPEP all already say so. Without this CAR/CDR walked
+                // into that representation and answered BLISS::CLOSURE or
+                // the id instead of signalling (ansi CAR.ERROR.1/CDR.ERROR.1).
+                if is_closure_cons(v) {
+                    return Err(BlissError::TypeError {
+                        datum: v,
+                        expected: "list".into(),
+                    });
                 }
                 if v.is_cons() {
                     let (_, d) = cp(v);
@@ -33729,6 +33751,14 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
             if v.is_nil() {
                 return Ok(NIL);
             }
+            // Same as the operator-position handler: a closure is a
+            // FUNCTION, not the cons it is physically (ansi CAR.ERROR.1).
+            if is_closure_cons(v) {
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "list".into(),
+                });
+            }
             if v.is_cons() {
                 let (a, _) = cp(v);
                 return Ok(a);
@@ -33745,6 +33775,14 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
             let v = args[0];
             if v.is_nil() {
                 return Ok(NIL);
+            }
+            // Same as the operator-position handler: a closure is a
+            // FUNCTION, not the cons it is physically (ansi CAR.ERROR.1).
+            if is_closure_cons(v) {
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "list".into(),
+                });
             }
             if v.is_cons() {
                 let (_, d) = cp(v);

@@ -12591,3 +12591,41 @@ fn nth_matches_operator_position_including_index_validation() {
     ];
     run_expression_cases(&cases);
 }
+
+/// CAR and CDR must reject a closure. The interpreter represents one as the
+/// cons `(BLISS::CLOSURE . id)`, and CONSP, LISTP, ATOM and TYPEP all already
+/// report it as a FUNCTION rather than a CONS -- but CAR/CDR walked into the
+/// representation and answered BLISS::CLOSURE or the raw id instead of
+/// signalling (ansi cons CAR.ERROR.1, CDR.ERROR.1, which are two of the four
+/// failures on the gate's only enabled chapter, bliss-s0tc).
+#[test]
+fn car_and_cdr_reject_a_closure() {
+    let cases = [
+        ("(handler-case (car (lambda (x) x)) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (cdr (lambda (x) x)) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (car #'car) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (cdr #'car) (type-error () :type-error))", ":TYPE-ERROR"),
+        // FIRST/REST share the arms and must agree.
+        ("(handler-case (first (lambda (x) x)) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (rest (lambda (x) x)) (type-error () :type-error))", ":TYPE-ERROR"),
+        // Reached through FUNCALL, i.e. the evaluated-args path, which needed
+        // the same guard as operator position.
+        (
+            "(handler-case (funcall #'car (lambda (x) x)) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
+        (
+            "(handler-case (mapcar #'cdr (list (lambda (x) x))) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
+        // The predicates were already right and must stay right.
+        ("(let ((f (lambda (x) x))) (list (consp f) (listp f) (atom f) (functionp f) (typep f 'cons)))",
+         "(NIL NIL T T NIL)"),
+        // Ordinary CAR/CDR behaviour is untouched, including on NIL.
+        ("(list (car (list 1 2)) (cdr (list 1 2)) (car nil) (cdr nil))", "(1 (2) NIL NIL)"),
+        ("(list (first (list 9 8)) (rest (list 9 8)))", "(9 (8))"),
+        ("(car (cons 1 2))", "1"),
+        ("(cdr (cons 1 2))", "2"),
+    ];
+    run_expression_cases(&cases);
+}
