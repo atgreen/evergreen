@@ -38,8 +38,29 @@ if [ ! -d "$ANSI_TEST_DIR" ]; then
 fi
 if [ ! -x "$BLISS_BIN" ]; then
     echo "ansi-gate: ERROR: bliss binary not found at $BLISS_BIN" >&2
-    echo "ansi-gate: build it with: cargo build -p bliss-cli --bin bliss-cli" >&2
+    echo "ansi-gate: build it with: cargo test --workspace --no-run" >&2
+    echo "ansi-gate: (NOT 'cargo build' — see the profile note below / bliss-em8x)" >&2
     exit 2
+fi
+
+# Which binary is this, and is it the fast one? Cargo.toml gives profile.test
+# opt-level 3 for ALL crates but profile.dev opt-level 2 for the bliss-cli
+# package ONLY, so `cargo build` leaves bliss-rt/bliss-stdlib/bliss-compiler —
+# where the hot code lives — at opt-level 0. Both write this same path, so the
+# binary can be ~9x slower with nothing to show for it, which is enough to turn
+# a passing chapter into a wall-clock timeout (bliss-em8x).
+#
+# The size split is a HEURISTIC, not a guarantee: measured ~112MB for the
+# cargo-test build and ~100MB for the cargo-build one. It is advisory only —
+# the gate still runs either way.
+bliss_bin_size="$(stat -c%s "$BLISS_BIN" 2>/dev/null || echo 0)"
+echo "ansi-gate: binary $BLISS_BIN (${bliss_bin_size} bytes)"
+if [ "$bliss_bin_size" -gt 0 ] && [ "$bliss_bin_size" -lt 106000000 ]; then
+    echo "ansi-gate: WARNING: this looks like a 'cargo build' binary, whose"
+    echo "ansi-gate:   dependencies are unoptimized and which has measured ~9x"
+    echo "ansi-gate:   slower than a 'cargo test --workspace --no-run' build."
+    echo "ansi-gate:   Timings from it are not comparable, and a chapter may"
+    echo "ansi-gate:   time out that would otherwise pass. See bliss-em8x."
 fi
 
 chapters=("${ENABLED_CHAPTERS[@]}")
@@ -76,6 +97,13 @@ EOF
     if [ -z "$passed" ] || [ -z "$failed" ]; then
         # No tally = the run died (crash, timeout, load error) — ERRORED.
         echo "ansi-gate: $chapter: ERRORED (exit $status, no tally; log: $log)"
+        if [ "$status" = 124 ]; then
+            echo "ansi-gate:   exit 124 = wall-clock timeout after ${BLISS_TIMEOUT}s."
+            echo "ansi-gate:   Before treating this as a code problem, check the"
+            echo "ansi-gate:   binary note above: an unoptimized-dependency build"
+            echo "ansi-gate:   is ~9x slower and times out on chapters that pass"
+            echo "ansi-gate:   otherwise (bliss-em8x)."
+        fi
         tail -5 "$log" | sed 's/^/ansi-gate:   /'
         overall=1
     elif [ "$failed" -ne 0 ] || [ "$passed" -eq 0 ]; then
