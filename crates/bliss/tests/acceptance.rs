@@ -12746,6 +12746,21 @@ fn closure_is_not_a_cons_for_predicates_or_destructive_stores() {
             (handler-case (setf (nth 0 f) 1) (error () nil))
             (handler-case (setf (elt f 0) 1) (error () nil))
             (funcall f 21))", "42"),
+        // List-walking builtins must reject a closure BEFORE the walk: driven
+        // by a raw is_cons() they descended into `(BLISS::CLOSURE . id)`,
+        // compared against the symbol, and then reported the fixnum id as the
+        // offending datum (ansi MEMBER.ERROR.1 checks the datum is the
+        // argument; leaking an internal symbol or id is wrong regardless).
+        ("(let ((f (lambda (x) x)))
+            (handler-case (member 'a f) (type-error (e) (eq (type-error-datum e) f))))", "T"),
+        ("(let ((f (lambda (x) x)))
+            (handler-case (assoc 'a f) (type-error (e) (eq (type-error-datum e) f))))", "T"),
+        // ... while ordinary walks, keywords and improper tails are unchanged.
+        ("(member 3 (list 1 2 3 4))", "(3 4)"),
+        ("(member 2 (list 1 2 3) :key #'1+)", "(1 2 3)"),
+        ("(member \"a\" (list \"a\") :test #'equal)", "(\"a\")"),
+        ("(cdr (assoc 'b (list (cons 'a 1) (cons 'b 2))))", "2"),
+        ("(handler-case (member 'z (cons 1 2)) (type-error (e) (type-error-datum e)))", "2"),
         // Real conses are unaffected: every place form still mutates.
         ("(let ((l (list 1 2 3))) (rplaca l :a) (rplacd (cdr l) (list :c)) l)", "(:A 2 :C)"),
         ("(let ((l (list 1 2 3))) (setf (car l) :a) (setf (cdr (cdr l)) nil) l)", "(:A 2)"),

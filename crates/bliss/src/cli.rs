@@ -4358,6 +4358,24 @@ fn store_cons_field(target: BlissVal, val: BlissVal, car: bool) -> Result<(), Bl
     Ok(())
 }
 
+/// A list-walking builtin's LIST argument, rejected if it is a closure.
+///
+/// A closure is physically `(BLISS::CLOSURE . id)` (bliss-74rl), so a walk
+/// driven by a raw `is_cons()` test happily descends into it: it compares the
+/// item against the symbol BLISS::CLOSURE, then steps to the fixnum id, and the
+/// final "not a proper list" error reports THAT as the offending datum. ansi
+/// MEMBER.ERROR.1 checks the datum is the argument itself, and leaking an
+/// internal symbol or id into user-visible error data is wrong regardless.
+fn reject_closure_as_list(v: BlissVal) -> Result<(), BlissError> {
+    if is_closure_cons(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "list".into(),
+        });
+    }
+    Ok(())
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -18733,6 +18751,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
                 ];
                 bliss_rt::rooted_ref!(_fns_root = &mut fns);
+                reject_closure_as_list(*c)?;
                 while c.is_cons() {
                     let (car, _) = cp(*c);
                     let probe = if has_key {
@@ -18794,6 +18813,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
                 ];
                 bliss_rt::rooted_ref!(_fns_root = &mut fns);
+                reject_closure_as_list(*c)?;
                 while c.is_cons() {
                     let (pair, _) = cp(*c);
                     // Skip NIL entries; only compare against real (cons) pairs.
