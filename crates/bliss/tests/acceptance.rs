@@ -13229,3 +13229,34 @@ fn exp_and_expt_signal_float_range_conditions() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi CL-CONSTANT-SYMBOLS.1: every symbol in *CL-CONSTANT-SYMBOLS* must be
+/// both BOUNDP and CONSTANTP. MULTIPLE-VALUES-LIMIT and
+/// INTERNAL-TIME-UNITS-PER-SECOND were seeded into their value cells by
+/// cli.rs's seed_standard_constant but never marked constant, so they were
+/// bound yet not CONSTANTP -- the only two the test collected.
+///
+/// The DEFCONSTANT literals must match the cli.rs seeds, which is what the
+/// value assertions here are for.
+#[test]
+fn standard_limit_constants_are_constantp() {
+    let cases = [
+        ("(constantp 'multiple-values-limit)", "T"),
+        ("(constantp 'internal-time-units-per-second)", "T"),
+        ("(boundp 'multiple-values-limit)", "T"),
+        ("(boundp 'internal-time-units-per-second)", "T"),
+        // Values must still agree with the interpreter's seeds.
+        ("internal-time-units-per-second", "1000"),
+        ("(= multiple-values-limit most-positive-fixnum)", "T"),
+        // The neighbouring constants are unaffected.
+        ("(constantp 'call-arguments-limit)", "T"),
+        ("(constantp 'lambda-parameters-limit)", "T"),
+        ("(constantp 'most-positive-fixnum)", "T"),
+        ("(constantp 'pi)", "T"),
+        // The ansi clause itself, over the four seeded limits.
+        ("(loop for s in '(internal-time-units-per-second multiple-values-limit
+                           call-arguments-limit lambda-parameters-limit)
+            when (or (not (boundp s)) (not (constantp s))) collect s)", "NIL"),
+    ];
+    run_expression_cases(&cases);
+}

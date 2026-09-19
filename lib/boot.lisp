@@ -142,6 +142,13 @@
 ;; values in cli.rs (bliss-1i3q).
 (defconstant call-arguments-limit 1152921504606846975)
 (defconstant lambda-parameters-limit 1152921504606846975)
+;; Seeded in the value cell by cli.rs (seed_standard_constant) like the two
+;; above, but never marked CONSTANTP -- so they were BOUNDP yet not CONSTANTP,
+;; which is exactly what ansi CL-CONSTANT-SYMBOLS.1 collects. The literals MUST
+;; match the cli.rs seeds: MULTIPLE-VALUES-LIMIT is (1<<60)-1 and
+;; INTERNAL-TIME-UNITS-PER-SECOND is 1000.
+(defconstant multiple-values-limit 1152921504606846975)
+(defconstant internal-time-units-per-second 1000)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sequencing
