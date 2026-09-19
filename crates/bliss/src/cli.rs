@@ -13364,7 +13364,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         return Some((1, 1));
     }
     match bare {
-        "CONS" | "RPLACA" | "RPLACD" => Some((2, 2)),
+        "CONS" | "RPLACA" | "RPLACD" | "SET-CAR" | "SET-CDR" => Some((2, 2)),
         // Sequence functions with a fixed shape. Calling a standard function
         // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
         // were reaching their bodies and answering a TYPE-ERROR about NIL, or
@@ -32742,6 +32742,10 @@ const DIRECT_FAST: &[&str] = &[
     "EQL", "EQUAL", "EQUALP", "MIN", "MAX", "NTH",
     "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
+    // The car/cdr store primitives `(setf (car|cdr x) v)` lowers to. Leaf
+    // builtins: they never re-enter Lisp and take evaluated arguments, so they
+    // need no invocation counting, depth cap or panic barrier (bliss-fdny).
+    "SET-CAR", "SET-CDR",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
@@ -33445,6 +33449,19 @@ fn apply_builtin_fast(
         "EQ" if args.len() == 2 => {
             env.clear_mv();
             Some(Ok(if args[0] == args[1] { T } else { NIL }))
+        }
+        // `(setf (car|cdr place) v)` lowers to a CallNamed of these, so without
+        // a fast arm every destructive list update paid apply_function's
+        // synthesize-and-re-evaluate detour -- it rebuilt `(BLISS::SET-CAR 'c
+        // 'v)` and ran eval_form on it, ~4.6us/iter against CAR's 0.025
+        // (bliss-fdny). They share `store_cons_field` with the operator-position
+        // handler, so the fast path is the SAME kernel, including the closure
+        // exclusion that keeps a function from being overwritten (bliss-74rl) --
+        // bit-identical to the tree-walker, per the bliss-x5y.9 rule.
+        "SET-CAR" | "SET-CDR" if args.len() == 2 => {
+            env.clear_mv();
+            let val = args[1];
+            Some(store_cons_field(args[0], val, name == "SET-CAR").map(|()| val))
         }
         // Bitwise builtins on already-evaluated args (bliss-gvkz): same kernel
         // as operator position, so tiers stay bit-identical.

@@ -12773,16 +12773,27 @@ fn promoted_cons_predicates_and_guards_match_the_interpreter() {
            (defun o-rpa (c) (i-rpa c))
            (defun i-rpd (c) (handler-case (progn (rplacd c 1) :mut) (type-error () :te)))
            (defun o-rpd (c) (i-rpd c))
-           (let ((cold (list (o-consp *f*) (o-typep *f*) (o-rpa *f*) (o-rpd *f*))))
+           ;; Direct (setf (car|cdr x) v): since bliss-fdny these dispatch
+           ;; through the SET-CAR/SET-CDR direct-builtin arm rather than
+           ;; apply_function's synthesize path, so the hot answer here is what
+           ;; proves that arm kept the closure exclusion.
+           (defun i-sca (c) (handler-case (progn (setf (car c) 1) :mut) (type-error () :te)))
+           (defun o-sca (c) (i-sca c))
+           (defun i-scd (c) (handler-case (progn (setf (cdr c) 1) :mut) (type-error () :te)))
+           (defun o-scd (c) (i-scd c))
+           (let ((cold (list (o-consp *f*) (o-typep *f*) (o-rpa *f*) (o-rpd *f*)
+                             (o-sca *f*) (o-scd *f*))))
              ;; Drive past the OSR/T2 promotion thresholds.
              (dotimes (i 600000)
                (o-consp (list 1 2)) (o-typep (list 1 2))
-               (o-rpa (list 1 2)) (o-rpd (list 1 2)))
-             (let ((hot (list (o-consp *f*) (o-typep *f*) (o-rpa *f*) (o-rpd *f*))))
+               (o-rpa (list 1 2)) (o-rpd (list 1 2))
+               (o-sca (list 1 2)) (o-scd (list 1 2)))
+             (let ((hot (list (o-consp *f*) (o-typep *f*) (o-rpa *f*) (o-rpd *f*)
+                              (o-sca *f*) (o-scd *f*))))
                (list (equal cold hot) cold
                      ;; still a working function, and real conses still answer T
                      (funcall *f* 7) (o-consp (list 1)) (o-typep (list 1))))))",
-        "(T (NIL NIL :TE :TE) 7 T T)",
+        "(T (NIL NIL :TE :TE :TE :TE) 7 T T)",
     )];
     run_expression_cases(&cases);
 }
