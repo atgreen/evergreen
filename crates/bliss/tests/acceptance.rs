@@ -12852,3 +12852,63 @@ fn nth_walks_the_spine_with_unchanged_edge_cases() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi CHARACTER.1: a symbol character designator is defined by its
+/// SYMBOL-NAME. COERCE-to-character used `symbol_bare_name`, which upper-cases
+/// AND strips a package prefix at a colon -- so `(character (make-symbol "a"))`
+/// answered #\A, and an uninterned symbol whose NAME is ":" was reduced to the
+/// empty string and type-errored instead of yielding #\:.
+#[test]
+fn character_designator_uses_symbol_name_exactly() {
+    let cases = [
+        // Uninterned symbols: the name is taken verbatim, case and colons.
+        ("(character (make-symbol \":\"))", "#\\:"),
+        ("(character (make-symbol \"a\"))", "#\\a"),
+        ("(character (make-symbol \"Q\"))", "#\\Q"),
+        ("(handler-case (character (make-symbol \"ab\")) (type-error () :te))", ":TE"),
+        // Interned: the READER upper-cases, so 'a designates #\A -- but an
+        // escaped |b| keeps its case, and |:| is a one-character name.
+        ("(character '|:|)", "#\\:"),
+        ("(character 'a)", "#\\A"),
+        ("(character '|b|)", "#\\b"),
+        // The other designators, and non-designators, are unchanged.
+        ("(character \"x\")", "#\\x"),
+        ("(character #\\y)", "#\\y"),
+        ("(handler-case (character 65) (type-error () :te))", ":TE"),
+        ("(handler-case (character \"xy\") (type-error () :te))", ":TE"),
+        ("(handler-case (character (list 1)) (type-error () :te))", ":TE"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi STRING=.4: the string-comparison family takes string DESIGNATORS, and
+/// a symbol designates its SYMBOL-NAME. `string_compare_bounds` used
+/// `val_as_str`, which returns a symbol's registry key -- so an interned symbol
+/// stringified to "COMMON-LISP-USER::ABC" and `(string= 'abc "ABC")` was NIL
+/// while `(string= 'abc "COMMON-LISP-USER::ABC")` was T. An UNINTERNED symbol
+/// has no prefix, which is why that case already worked and hid the bug, and
+/// STRING/STRING-EQUAL resolve the name correctly -- the family had drifted.
+#[test]
+fn string_comparison_takes_symbol_name_as_the_designator() {
+    let cases = [
+        ("(string= 'abc \"ABC\")", "T"),
+        ("(string= (make-symbol \"xY\") \"xY\")", "T"),
+        ("(string= #\\a \"a\")", "T"),
+        // The registry key must no longer compare equal.
+        ("(string= 'abc \"COMMON-LISP-USER::ABC\")", "NIL"),
+        // The ansi case itself: an escaped symbol keeps its case.
+        ("(not (string= '|abc| (copy-seq \"abc\")))", "NIL"),
+        // Ordering predicates share the same designator path.
+        ("(string< 'abc \"ABD\")", "2"),
+        ("(string> 'abd \"ABC\")", "2"),
+        ("(string<= 'abc \"ABC\")", "3"),
+        ("(string/= 'abc \"ABC\")", "NIL"),
+        // Regressions: plain strings and the bounding keywords are unchanged.
+        ("(string= \"abc\" \"abc\")", "T"),
+        ("(string= \"abc\" \"abd\")", "NIL"),
+        ("(string= \"xabcy\" \"abc\" :start1 1 :end1 4)", "T"),
+        ("(string-equal 'abc \"ABC\")", "T"),
+        ("(string 'abc)", "\"ABC\""),
+    ];
+    run_expression_cases(&cases);
+}

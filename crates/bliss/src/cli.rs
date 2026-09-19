@@ -27956,7 +27956,16 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
             let s_opt: Option<String> = if is_string_value(value) {
                 Some(val_as_str(value))
             } else if value.is_symbol() {
-                Some(symbol_bare_name(&sym_name_rc(value)))
+                // CLHS: a symbol character designator uses its SYMBOL-NAME
+                // exactly. `symbol_bare_name` is the wrong accessor here on two
+                // counts -- it UPPER-CASES, so `(character (make-symbol "a"))`
+                // answered #\A instead of #\a, and it splits off a package
+                // prefix at a colon, so an uninterned symbol NAMED ":" was
+                // reduced to the empty string and type-errored instead of
+                // yielding #\: (ansi CHARACTER.1). `symbol_name_of` preserves
+                // case and returns an uninterned symbol's whole name, colons
+                // and all (bliss-lgml).
+                Some(symbol_name_of(value))
             } else {
                 None
             };
@@ -28936,6 +28945,23 @@ fn find_key_arg(plist: &[BlissVal], kw_bare: &str) -> Option<BlissVal> {
 /// they add `start1` back to the substring-relative index. GC-safe: `eval_args`
 /// returns rooted values and no Bliss allocation happens after the string
 /// contents are copied into owned Rust `String`s (bliss-cnzs).
+/// A CLHS string designator: a string denotes itself, a character denotes a
+/// one-character string, and a SYMBOL denotes its SYMBOL-NAME.
+///
+/// `val_as_str` is not that conversion for symbols -- it returns the registry
+/// key, so an interned symbol stringified to "COMMON-LISP-USER::ABC". That made
+/// `(string= 'abc "ABC")` answer NIL while `(string= 'abc
+/// "COMMON-LISP-USER::ABC")` answered T (ansi STRING=.4). It went unnoticed
+/// because an UNINTERNED symbol has no prefix, so `(string= (make-symbol "xY")
+/// "xY")` was already correct, and because STRING and STRING-EQUAL resolve the
+/// name correctly -- the comparison family had simply drifted apart.
+fn string_designator(v: BlissVal) -> String {
+    if v.is_symbol() {
+        return symbol_name_of(v);
+    }
+    val_as_str(v)
+}
+
 fn string_compare_bounds(
     cdr: BlissVal,
     env: &mut Env,
@@ -28946,8 +28972,8 @@ fn string_compare_bounds(
             "string comparison requires two string designators".into(),
         ));
     }
-    let s1: Vec<char> = val_as_str(args[0]).chars().collect();
-    let s2: Vec<char> = val_as_str(args[1]).chars().collect();
+    let s1: Vec<char> = string_designator(args[0]).chars().collect();
+    let s2: Vec<char> = string_designator(args[1]).chars().collect();
     let kw = &args[2..];
     // ANSI keyword validation (catchable PROGRAM-ERROR): an odd number of
     // keyword arguments, a non-symbol in keyword position, or an unknown
