@@ -13113,3 +13113,61 @@ fn ratio_literals_with_bignum_components_read_as_rationals() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-bd9c: the transcendental functions ran their argument through
+/// `num_val`, which rejects a COMPLEX -- so `(sin #C(0 1))` answered
+/// "#C(0 1) is not of type number". Complex arguments now take a dedicated
+/// branch for the seven functions with direct, branch-cut-free formulas.
+///
+/// Values are checked against the closed forms: sin(i) = i*sinh(1),
+/// cos(i) = cosh(1), tan(i) = i*tanh(1), tanh(i) = i*tan(1).
+#[test]
+fn transcendentals_accept_complex_arguments() {
+    let cases = [
+        ("(realpart (exp (complex 1.0 0.0)))", "2.7182817"),
+        // sin(i) = i sinh 1 = 1.1752012i
+        ("(imagpart (sin (complex 0.0 1.0)))", "1.1752012"),
+        ("(realpart (sin (complex 0.0 1.0)))", "0.0"),
+        // cos(i) = cosh 1 = 1.5430807
+        ("(realpart (cos (complex 0.0 1.0)))", "1.5430807"),
+        // sinh(i) = i sin 1 ; cosh(i) = cos 1
+        ("(imagpart (sinh (complex 0.0 1.0)))", "0.84147096"),
+        ("(realpart (cosh (complex 0.0 1.0)))", "0.5403023"),
+        // tan(i) = i tanh 1 ; tanh(i) = i tan 1
+        ("(imagpart (tan (complex 0.0 1.0)))", "0.7615942"),
+        ("(imagpart (tanh (complex 0.0 1.0)))", "1.5574077"),
+        // A general argument: sin(1+i) = 1.2984576 + 0.6349639i
+        ("(realpart (sin (complex 1.0 1.0)))", "1.2984576"),
+        ("(imagpart (sin (complex 1.0 1.0)))", "0.6349639"),
+        // Each returns a COMPLEX, and reals are untouched.
+        ("(complexp (sin (complex 0.0 1.0)))", "T"),
+        ("(sin 0)", "0.0"),
+        ("(cos 0)", "1.0"),
+        ("(exp 1)", "2.7182817"),
+        ("(tan 0)", "0.0"),
+        ("(sinh 0)", "0.0"),
+        ("(cosh 0)", "1.0"),
+        ("(tanh 0)", "0.0"),
+        // ZEROP accepts any number, a complex included. That alone was
+        // blocking SIGNUM, whose boot.lisp definition opens with
+        // `(if (zerop n) n (/ n (abs n)))` -- ABS and `/` already worked.
+        ("(zerop (complex 0.0 0.0))", "T"),
+        ("(zerop (complex 0.0 -0.0))", "T"),
+        ("(zerop (complex 1.0 1.0))", "NIL"),
+        ("(signum (complex 3.0 4.0))", "#C(0.6 0.8)"),
+        ("(zerop (signum (complex 0.0 0.0)))", "T"),
+        ("(signum 5)", "1"),
+        ("(signum -2.5)", "-1.0"),
+        ("(zerop 0)", "T"),
+        ("(zerop 1)", "NIL"),
+        // PLUSP/MINUSP stay real-only: CLHS defines them by comparison with
+        // zero, which a complex has no ordering for.
+        ("(handler-case (plusp (complex 1.0 1.0)) (type-error () :te))", ":TE"),
+        ("(handler-case (minusp (complex 1.0 1.0)) (type-error () :te))", ":TE"),
+        // The inverse functions are a documented follow-up: they need complex
+        // log/sqrt with principal-value branch cuts, so a complex argument
+        // still takes the real path rather than being silently mis-answered.
+        ("(handler-case (asin (complex 1.0 1.0)) (type-error () :te))", ":TE"),
+    ];
+    run_expression_cases(&cases);
+}

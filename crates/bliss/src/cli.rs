@@ -19867,7 +19867,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "{name} requires exactly one argument"
                     )));
                 }
-                let n = num_val(eval_form(af, env)?)?;
+                let v = eval_form(af, env)?;
+                // ZEROP accepts ANY number, a complex included -- (zerop #C(0 0))
+                // is true. `num_val` rejects a complex, so ZEROP signalled, and
+                // with it SIGNUM, whose boot.lisp definition opens with
+                // `(if (zerop n) n (/ n (abs n)))` -- ABS and `/` already handled
+                // complex, so ZEROP alone was blocking it (bliss-bd9c).
+                //
+                // PLUSP and MINUSP stay real-only: CLHS defines them by
+                // comparison with zero, which a complex has no ordering for.
+                if name.as_str() == "ZEROP" {
+                    if let Some(re) = bliss_rt::types::complex_realpart(v) {
+                        let imag = bliss_rt::types::complex_imagpart(v).unwrap_or(NIL);
+                        let is_zero = num_val(re)? == 0.0 && num_val(imag)? == 0.0;
+                        return Ok(if is_zero { T } else { NIL });
+                    }
+                }
+                let n = num_val(v)?;
                 let result = match name.as_str() {
                     "ZEROP" => n == 0.0,
                     "PLUSP" => n > 0.0,
@@ -20256,6 +20272,58 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             | "ASINH" | "ACOSH" | "ATANH" => {
                 let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
+                // A COMPLEX argument (bliss-bd9c). `num_val` below rejects one,
+                // so these used to answer "#C(..) is not of type number" -- the
+                // single largest family left in the numbers chapter. Only the
+                // functions with direct, branch-cut-free formulas are handled
+                // here; the inverse ones (ASIN/ACOS/ATAN/ASINH/ACOSH/ATANH) need
+                // complex log and sqrt with principal-value branch cuts and are
+                // deliberately left to fall through to the real path.
+                if let Some(re) = bliss_rt::types::complex_realpart(v) {
+                    let imag = bliss_rt::types::complex_imagpart(v).unwrap_or(NIL);
+                    let a = num_val(re)?;
+                    let b = num_val(imag)?;
+                    // (p+qi)/(r+si), used for TAN and TANH.
+                    let cdiv = |p: f64, q: f64, r: f64, s: f64| {
+                        let d = r * r + s * s;
+                        ((p * r + q * s) / d, (q * r - p * s) / d)
+                    };
+                    let parts = match name.as_str() {
+                        // e^(a+bi) = e^a (cos b + i sin b)
+                        "EXP" => Some((a.exp() * b.cos(), a.exp() * b.sin())),
+                        // sin(a+bi) = sin a cosh b + i cos a sinh b
+                        "SIN" => Some((a.sin() * b.cosh(), a.cos() * b.sinh())),
+                        // cos(a+bi) = cos a cosh b - i sin a sinh b
+                        "COS" => Some((a.cos() * b.cosh(), -(a.sin() * b.sinh()))),
+                        // sinh(a+bi) = sinh a cos b + i cosh a sin b
+                        "SINH" => Some((a.sinh() * b.cos(), a.cosh() * b.sin())),
+                        // cosh(a+bi) = cosh a cos b + i sinh a sin b
+                        "COSH" => Some((a.cosh() * b.cos(), a.sinh() * b.sin())),
+                        // tan = sin/cos, tanh = sinh/cosh, as complex quotients.
+                        "TAN" => Some(cdiv(
+                            a.sin() * b.cosh(),
+                            a.cos() * b.sinh(),
+                            a.cos() * b.cosh(),
+                            -(a.sin() * b.sinh()),
+                        )),
+                        "TANH" => Some(cdiv(
+                            a.sinh() * b.cos(),
+                            a.cosh() * b.sin(),
+                            a.cosh() * b.cos(),
+                            a.sinh() * b.sin(),
+                        )),
+                        _ => None,
+                    };
+                    if let Some((re_out, im_out)) = parts {
+                        let kind = widen_float(real_float_kind(re), real_float_kind(imag));
+                        // box_float may allocate (double); root the real part
+                        // across the imaginary allocation and the COMPLEX build,
+                        // exactly as SQRT's complex branch does.
+                        bliss_rt::rooted!(re_v = box_float(re_out, kind));
+                        let im_v = box_float(im_out, kind);
+                        return make_complex(*re_v, im_v);
+                    }
+                }
                 let x = num_val(v)?;
                 let r = match name.as_str() {
                     "EXP" => x.exp(),
