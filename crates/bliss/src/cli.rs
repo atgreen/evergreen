@@ -32709,6 +32709,7 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 /// Builtins `apply_builtin_fast` handles on evaluated arguments.
 const DIRECT_FAST: &[&str] = &[
     "AREF", "SVREF", "ROW-MAJOR-AREF", "BIT", "SBIT", "ELT", "LENGTH", "EQ", "TYPEP",
+    "SYMBOLP", "NUMBERP", "STRINGP", "VECTORP", "SIMPLE-VECTOR-P", "KEYWORDP", "ARRAYP",
     "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
 ];
@@ -33435,6 +33436,41 @@ fn apply_builtin_fast(
             } else {
                 bliss_stdlib::aref(args[0], i)
             })
+        }
+        // Type predicates on already-evaluated arguments. Each fell through to
+        // the synthesize-and-re-evaluate detour, so a tag test cost 1.4-1.8us
+        // against 0.022us for CAR -- 64-80x (bliss-edzd). Each arm uses the
+        // SAME predicate its operator-position handler uses, so the tiers stay
+        // bit-identical (the bliss-x5y.9 rule); a wrong argument count is left
+        // to the general path, which raises the PROGRAM-ERROR.
+        "SYMBOLP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if args[0].is_symbol() { T } else { NIL }))
+        }
+        "NUMBERP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if is_number_value(args[0]) { T } else { NIL }))
+        }
+        "STRINGP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if is_string_value(args[0]) { T } else { NIL }))
+        }
+        // VECTORP and SIMPLE-VECTOR-P share the operator-position arm, which is
+        // why (simple-vector-p "ab") wrongly answers T (bliss-3snc). Reproduce
+        // that faithfully rather than fixing it here: a fast path that disagreed
+        // with operator position would be a worse bug than the one it fixed.
+        "VECTORP" | "SIMPLE-VECTOR-P" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if is_vector_value(args[0]) { T } else { NIL }))
+        }
+        "KEYWORDP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if is_keyword_arg(args[0]) { T } else { NIL }))
+        }
+        "ARRAYP" if args.len() == 1 => {
+            env.clear_mv();
+            let is_array = is_vector_value(args[0]) || bliss_rt::types::md_array_p(args[0]);
+            Some(Ok(if is_array { T } else { NIL }))
         }
         // LENGTH on already-evaluated arguments. Without this it fell all the
         // way through to the synthesize-`(LENGTH 'seq)`-and-re-evaluate detour:

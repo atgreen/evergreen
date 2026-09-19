@@ -12478,3 +12478,41 @@ fn length_is_correct_on_every_sequence_representation() {
     ];
     run_expression_cases(&cases);
 }
+
+/// Type predicates dispatch on already-evaluated arguments (bliss-edzd). They
+/// used to fall through to the synthesize-and-re-evaluate detour, so a tag test
+/// cost 1.4-1.8us against CAR's 0.022us. Each fast arm must use the SAME
+/// predicate as its operator-position handler, so assert the two spellings
+/// agree across a spread of representations rather than just spot values.
+#[test]
+fn type_predicates_agree_between_operator_position_and_funcall() {
+    let vals = "(list 1 1.5 \"ab\" 'a :kw nil t (list 1) (vector 1) \
+                 (make-array '(2 2)) #\\a #'car (make-hash-table))";
+    let agree = |op: &str| {
+        format!(
+            "(let ((vals {vals}))
+               (equal (mapcar #'{op} vals) (mapcar (lambda (v) (funcall #'{op} v)) vals)))"
+        )
+    };
+    let cases: Vec<(String, String)> = ["symbolp", "numberp", "stringp", "vectorp", "keywordp", "arrayp"]
+        .iter()
+        .map(|op| (agree(op), "T".to_string()))
+        .chain([
+            // Spot values, so agreement cannot be vacuous.
+            ("(list (symbolp 'a) (symbolp 1) (symbolp nil))".to_string(), "(T NIL T)".to_string()),
+            ("(list (numberp 1) (numberp 1.5) (numberp \"a\"))".to_string(), "(T T NIL)".to_string()),
+            ("(list (stringp \"a\") (stringp 'a) (stringp 1))".to_string(), "(T NIL NIL)".to_string()),
+            ("(list (vectorp (vector 1)) (vectorp (list 1)))".to_string(), "(T NIL)".to_string()),
+            ("(list (keywordp :k) (keywordp 'a))".to_string(), "(T NIL)".to_string()),
+            (
+                "(list (arrayp (vector 1)) (arrayp (make-array '(2 2))) (arrayp 1))".to_string(),
+                "(T T NIL)".to_string(),
+            ),
+            // Wrong arity still signals, since the fast arms decline it.
+            ("(handler-case (numberp) (program-error () :pe))".to_string(), ":PE".to_string()),
+            ("(handler-case (stringp 1 2) (program-error () :pe))".to_string(), ":PE".to_string()),
+        ])
+        .collect();
+    let refs: Vec<(&str, &str)> = cases.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    run_expression_cases(&refs);
+}
