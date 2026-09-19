@@ -13260,3 +13260,40 @@ fn standard_limit_constants_are_constantp() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi LOGEQV.2-4: LOGEQV was defined as a flat `(lognot (logxor ...))`, which
+/// is right for TWO arguments and off by a complement for every ODD count --
+/// `(logeqv 1231)` answered -1232. EQV is associative and the complement
+/// cancels pairwise:
+///
+///   (logeqv a b)     = ~(a^b)
+///   (logeqv a b c)   = ~(~(a^b) ^ c) = a^b^c
+///   (logeqv a b c d) = ~(a^b^c^d)
+///
+/// so it is LOGXOR of everything, complemented only on an even count. The
+/// two-argument case being correct is exactly why this survived; each arity is
+/// pinned here rather than inferred from it.
+#[test]
+fn logeqv_is_correct_at_every_arity() {
+    let cases = [
+        ("(logeqv)", "-1"),
+        ("(logeqv 1231)", "1231"),
+        ("(logeqv -198)", "-198"),
+        ("(logeqv 0)", "0"),
+        ("(logeqv 12 10)", "-7"),
+        ("(= (logeqv 12 10) (lognot (logxor 12 10)))", "T"),
+        ("(= (logeqv 12 10 6) (logxor 12 10 6))", "T"),
+        ("(= (logeqv 12 10 6 3) (lognot (logxor 12 10 6 3)))", "T"),
+        // A bignum argument goes through the same path.
+        ("(logeqv 123456789012345678901234567890)", "123456789012345678901234567890"),
+        // BOOLE-EQV passes two arguments and is unaffected; so are the other
+        // derived log ops.
+        ("(= (boole boole-eqv 12 10) (lognot (logxor 12 10)))", "T"),
+        ("(lognand 12 10)", "-9"),
+        ("(lognor 12 10)", "-15"),
+        ("(logand 5)", "5"),
+        ("(logior 5)", "5"),
+        ("(logxor 5)", "5"),
+    ];
+    run_expression_cases(&cases);
+}

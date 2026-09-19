@@ -2865,8 +2865,18 @@
 ;; here cost O(bits^2) bignum divisions per call and made the ansi numbers LOG*
 ;; family pathologically slow.
 
+;; LOGEQV is associative, and the complement CANCELS on every second argument:
+;;   (logeqv a b)     = ~(a^b)
+;;   (logeqv a b c)   = ~(~(a^b) ^ c) = a^b^c
+;;   (logeqv a b c d) = ~(a^b^c^d)
+;; so it is LOGXOR of everything, complemented only when the argument count is
+;; EVEN. Defining it as a flat (lognot (logxor ...)) was right for two
+;; arguments and off by a complement for every odd count -- (logeqv 1231)
+;; answered -1232 instead of 1231 (ansi LOGEQV.2-4). Identity is -1.
 (defun logeqv (&rest ints)
-  (if (null ints) -1 (lognot (apply (function logxor) ints))))
+  (cond ((null ints) -1)
+        (t (let ((x (apply (function logxor) ints)))
+             (if (evenp (length ints)) (lognot x) x)))))
 (defun lognand (a b) (lognot (logand a b)))
 (defun lognor (a b) (lognot (logior a b)))
 (defun logandc1 (a b) (logand (lognot a) b))
