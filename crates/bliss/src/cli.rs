@@ -32708,7 +32708,7 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 
 /// Builtins `apply_builtin_fast` handles on evaluated arguments.
 const DIRECT_FAST: &[&str] = &[
-    "AREF", "SVREF", "ROW-MAJOR-AREF", "BIT", "SBIT", "ELT", "EQ", "TYPEP",
+    "AREF", "SVREF", "ROW-MAJOR-AREF", "BIT", "SBIT", "ELT", "LENGTH", "EQ", "TYPEP",
     "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
 ];
@@ -33435,6 +33435,16 @@ fn apply_builtin_fast(
             } else {
                 bliss_stdlib::aref(args[0], i)
             })
+        }
+        // LENGTH on already-evaluated arguments. Without this it fell all the
+        // way through to the synthesize-`(LENGTH 'seq)`-and-re-evaluate detour:
+        // 3.33us per call, against 0.35us for AREF and 0.02us for CAR -- 148x
+        // CAR for what is a header read on a vector (bliss-edzd). Identical to
+        // the operator-position handler, which is just `bliss_stdlib::length`
+        // boxed as a fixnum.
+        "LENGTH" if args.len() == 1 => {
+            env.clear_mv();
+            Some(bliss_stdlib::length(args[0]).map(|n| BlissVal::from_fixnum(n as i64)))
         }
         "BLISS::SET-AREF" | "BLISS::SET-ELT"
             if args.len() == 3

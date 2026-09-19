@@ -12443,3 +12443,38 @@ fn vector_predicates_classify_without_the_string_registry() {
     ];
     run_expression_cases(&cases);
 }
+
+/// LENGTH dispatches on already-evaluated arguments (bliss-edzd). It used to
+/// fall through to the synthesize-`(LENGTH 'seq)`-and-re-evaluate detour, which
+/// cost 3.33us per call against 0.35us for AREF and 0.02us for CAR -- 148x CAR
+/// for what is a header read on a vector. The fast path must agree with the
+/// operator-position handler on every sequence representation, and must keep
+/// signalling where a sequence is required.
+#[test]
+fn length_is_correct_on_every_sequence_representation() {
+    let cases = [
+        ("(length nil)", "0"),
+        ("(length (list 1 2 3))", "3"),
+        ("(length (vector 1 2 3))", "3"),
+        ("(length \"abcd\")", "4"),
+        ("(length (make-array 3 :element-type 'bit :initial-element 1))", "3"),
+        // A fill-pointer vector's LENGTH is its fill pointer, not its capacity.
+        ("(length (make-array 5 :fill-pointer 2 :initial-element 0))", "2"),
+        ("(length (make-array 3 :adjustable t :initial-element 0))", "3"),
+        // Reached through FUNCALL/APPLY/MAPCAR, i.e. the same dispatch the
+        // direct path serves.
+        ("(funcall #'length (list 1 2))", "2"),
+        ("(apply #'length (list (list 1 2 3)))", "3"),
+        ("(mapcar #'length (list (list 1) \"ab\" (vector 1 2 3)))", "(1 2 3)"),
+        // Still signals for non-sequences, a dotted list, and a closure --
+        // the guards the detour used to provide.
+        ("(handler-case (length (cons 1 2)) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (length #'car) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (length 'foo) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (length 5) (type-error () :type-error))", ":TYPE-ERROR"),
+        // Wrong arity is still a PROGRAM-ERROR.
+        ("(handler-case (length) (program-error () :pe))", ":PE"),
+        ("(handler-case (length nil nil) (program-error () :pe))", ":PE"),
+    ];
+    run_expression_cases(&cases);
+}
