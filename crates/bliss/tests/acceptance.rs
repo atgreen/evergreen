@@ -12665,3 +12665,44 @@ fn builtin_function_objects_dispatch_correctly() {
     ];
     run_expression_cases(&cases);
 }
+
+/// FUNCALL and APPLY dispatch on already-evaluated arguments (bliss-edzd).
+/// Without that they took the synthesize-and-re-evaluate detour on every call
+/// reached through apply_function -- which is every FUNCALL in compiled code,
+/// and so every :test, :key and higher-order sequence call. FUNCALL went from
+/// 16x a direct call to 1.3x.
+///
+/// Neither is in the direct-builtin table, deliberately: both re-enter Lisp and
+/// so fail the leaf rule. Reached from native code they still go out through
+/// c2i, which owns the depth cap and panic barrier.
+#[test]
+fn funcall_and_apply_dispatch_on_evaluated_arguments() {
+    let cases = [
+        // FUNCALL over every designator shape.
+        ("(funcall #'+ 1 2)", "3"),
+        ("(funcall #'car (list 9 8))", "9"),
+        ("(funcall 'car (list 7 6))", "7"),
+        ("(funcall (lambda (x) (* x 2)) 21)", "42"),
+        ("(funcall #'funcall #'car (list 5 4))", "5"),
+        ("(mapcar (lambda (f) (funcall f (list 1 2))) (list #'car #'cdr #'length))", "(1 (2) 2)"),
+        // APPLY spreads only its LAST argument.
+        ("(apply #'+ (list 1 2 3))", "6"),
+        ("(apply #'+ 1 2 (list 3 4))", "10"),
+        ("(apply #'+ nil)", "0"),
+        ("(apply #'list 1 (list 2 3))", "(1 2 3)"),
+        ("(apply (lambda (a b) (list :l a b)) 1 (list 2))", "(:L 1 2)"),
+        ("(apply '+ 1 (list 2))", "3"),
+        // Errors still signal.
+        ("(handler-case (funcall) (program-error () :pe))", ":PE"),
+        ("(handler-case (apply) (program-error () :pe))", ":PE"),
+        ("(handler-case (funcall 'no-such-fn-xyz 1) (error () :undefined))", ":UNDEFINED"),
+        ("(handler-case (funcall 'quote 1) (error () :not-a-function))", ":NOT-A-FUNCTION"),
+        // NOTE: (apply #'+ 1 2) answers 1 rather than signalling on a non-list
+        // last argument. That is pre-existing -- identical on a binary built
+        // before this change, because the operator-position handler does the
+        // same list_to_vec -- and is tracked separately (bliss-0qbf). Asserted
+        // only to catch a DIVERGENCE between the two paths, not as correct.
+        ("(apply #'+ 1 2)", "1"),
+    ];
+    run_expression_cases(&cases);
+}

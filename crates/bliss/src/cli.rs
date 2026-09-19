@@ -33497,6 +33497,47 @@ fn apply_builtin_fast(
                 bliss_stdlib::aref(args[0], i)
             })
         }
+        // FUNCALL on already-evaluated arguments. Without this it fell through
+        // to the synthesize-`(FUNCALL 'f 'a 'b)`-and-re-evaluate detour on
+        // every call reached through apply_function -- which is every FUNCALL
+        // in compiled code, and so every :test, :key and higher-order sequence
+        // call (bliss-edzd). Identical to the operator-position handler, which
+        // evaluates the designator and the arguments and then calls
+        // apply_function on them; here they are already evaluated.
+        //
+        // NOT added to the direct-builtin table on purpose: FUNCALL re-enters
+        // Lisp, so it fails the leaf rule. Reached from native code it still
+        // goes out through c2i, which owns the native depth cap and the panic
+        // barrier. This arm only shortcuts the INTERPRETER's path.
+        "FUNCALL" if !args.is_empty() => {
+            env.clear_mv();
+            Some(apply_function(args[0], &args[1..], env))
+        }
+        // APPLY on already-evaluated arguments, for the same reason as FUNCALL
+        // above and with the same leaf-rule exclusion from the direct table.
+        // CLHS: only the LAST argument is a list and gets spread; the ones
+        // between the function and it are passed through, which is exactly what
+        // the operator-position handler does.
+        "APPLY" if !args.is_empty() => {
+            env.clear_mv();
+            let callee = args[0];
+            let rest = &args[1..];
+            let mut spread: Vec<BlissVal> = Vec::with_capacity(rest.len());
+            for (i, &v) in rest.iter().enumerate() {
+                if i + 1 == rest.len() {
+                    spread.extend(list_to_vec(v));
+                } else {
+                    spread.push(v);
+                }
+            }
+            // GC: `spread` must be a scanned root across apply_function, which
+            // allocates and can relocate every value in it (AGENTS.md rooting
+            // invariant 1; the operator-position arm roots its vector the same
+            // way).
+            bliss_rt::rooted_ref!(_spread_root = &mut spread);
+            bliss_rt::rooted!(callee = callee);
+            Some(apply_function(*callee, &spread, env))
+        }
         // NTH on already-evaluated arguments -- the worst remaining leaf
         // builtin on the detour at ~140x a CAR call (bliss-edzd). Transcribed
         // from the operator-position handler, including its ANSI index
