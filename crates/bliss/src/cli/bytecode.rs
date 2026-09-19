@@ -16642,18 +16642,6 @@ fn emit_native_x86(
                                 );
                                 0x44 // cmove: x == NIL
                             }
-                            TotalUnaryPred::Consp => {
-                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
-                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
-                                c.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
-                                0x44 // cmove: tag == cons
-                            }
-                            TotalUnaryPred::Atom => {
-                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
-                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
-                                c.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
-                                0x45 // cmovne: tag != cons
-                            }
                         };
                         c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
                         c.extend_from_slice(&bliss_rt::value::NIL_BITS.to_le_bytes());
@@ -17346,18 +17334,31 @@ fn inlinable_cons_accessor(sym: u32) -> Option<i8> {
 
 /// Total unary type/nil predicates (bliss-jtc.27): correct for every value, so
 /// they inline as a compare + cmov with no guard and no deopt.
+///
+/// CONSP and ATOM USED TO BE HERE AND ARE NOT TOTAL. They inlined as a raw tag
+/// test (`and edx,7; cmp edx,1`), but bliss represents a closure as the cons
+/// `(BLISS::CLOSURE . id)`, which IS tag 001 while its Common Lisp type is
+/// FUNCTION -- the interpreter's CONSP, LISTP, ATOM and TYPEP all say so. So a
+/// promoted CONSP answered T for a closure where the interpreter answered NIL.
+///
+/// That is not merely a wrong predicate. RPLACA's guard is written in Lisp as
+/// `(unless (consp cons) (error 'type-error ...))`, so a hot RPLACA passed the
+/// guard and MUTATED a live function object, overwriting its car (bliss-74rl;
+/// ansi cons RPLACA.ERROR.1, one of the two remaining failures on the gate's
+/// only enabled chapter). It is exactly the tier divergence the bliss-x5y.9
+/// rule exists to prevent: a fast path must be bit-identical to the
+/// tree-walker, not merely close.
+///
+/// NULL and NOT stay: NIL is NIL under any representation, so they really are
+/// total.
 #[derive(Clone, Copy)]
 enum TotalUnaryPred {
-    Null,  // null / not: x is NIL
-    Consp, // x is a cons (tag 001)
-    Atom,  // x is not a cons
+    Null, // null / not: x is NIL
 }
 
 fn inlinable_total_unary(sym: u32) -> Option<TotalUnaryPred> {
     match bliss_rt::symbols::symbol_name(sym).as_deref() {
         Some("NULL") | Some("NOT") => Some(TotalUnaryPred::Null),
-        Some("CONSP") => Some(TotalUnaryPred::Consp),
-        Some("ATOM") => Some(TotalUnaryPred::Atom),
         _ => None,
     }
 }

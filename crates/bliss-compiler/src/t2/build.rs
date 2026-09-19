@@ -1332,7 +1332,15 @@ impl<'a> Builder<'a> {
         }
 
         let type_bits = match intrinsic {
-            IntrinsicId::Consp => Some(TypeBits::CONS),
+            // NOT inlinable (bliss-74rl).  A TypeBits::CONS test is a raw tag
+            // test, but bliss represents a closure as the cons
+            // `(BLISS::CLOSURE . id)`: it carries the cons tag while its Common
+            // Lisp type is FUNCTION.  The interpreter's CONSP answers NIL for
+            // one; an inlined tag test answers T, so a T2-promoted CONSP
+            // silently disagreed with every other tier.  Fall back to a real
+            // call -- correctness outranks the saved call (the bliss-x5y.9
+            // rule: a fast path must be bit-identical to the tree-walker).
+            IntrinsicId::Consp => return Ok(false),
             IntrinsicId::Symbolp => Some(TypeBits::SYMBOL),
             IntrinsicId::Integerp => Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM)),
             IntrinsicId::Stringp => Some(TypeBits::STRING),
@@ -1355,7 +1363,9 @@ impl<'a> Builder<'a> {
                 };
                 match type_name.rsplit(':').next().unwrap_or(&type_name) {
                     "FIXNUM" => Some(TypeBits::FIXNUM),
-                    "CONS" => Some(TypeBits::CONS),
+                    // (TYPEP x 'CONS) is the same unsound tag test as CONSP
+                    // above -- a closure would answer T.  See bliss-74rl.
+                    "CONS" => return Ok(false),
                     "SYMBOL" => Some(TypeBits::SYMBOL),
                     "INTEGER" => Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM)),
                     _ => return Ok(false),

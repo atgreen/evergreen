@@ -121,15 +121,6 @@ const KNOWN: &[InlineMetadata] = &[
         expansion: IntrinsicId::Cdr,
     },
     InlineMetadata {
-        function: KnownFunction::Consp,
-        namespace: FunctionNamespace::CommonLisp,
-        name: "CONSP",
-        fixed_arity: 1,
-        effects: EffectSummary::PURE_TOTAL,
-        cost: 1,
-        expansion: IntrinsicId::Consp,
-    },
-    InlineMetadata {
         function: KnownFunction::Symbolp,
         namespace: FunctionNamespace::CommonLisp,
         name: "SYMBOLP",

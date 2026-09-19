@@ -12706,3 +12706,83 @@ fn funcall_and_apply_dispatch_on_evaluated_arguments() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-74rl: a closure is physically the cons `(BLISS::CLOSURE . id)`, so
+/// every *raw tag test* mistakes it for a CONS. The readers already excluded it
+/// (CAR/CDR/CONSP/...), but the destructive stores did not, and neither did the
+/// T2 emitter -- so a promoted CONSP answered T where the interpreter answered
+/// NIL, RPLACA's `(unless (consp cons) (error ...))` guard let the store
+/// through, and a live function object was overwritten in place.
+///
+/// Two properties are asserted: the predicates are correct, and the mutators
+/// signal instead of corrupting. The promotion half lives in the test below.
+#[test]
+fn closure_is_not_a_cons_for_predicates_or_destructive_stores() {
+    let cases = [
+        // Predicates: a closure is a FUNCTION, never a CONS or a LIST.
+        ("(consp (lambda (x) x))", "NIL"),
+        ("(atom (lambda (x) x))", "T"),
+        ("(listp (lambda (x) x))", "NIL"),
+        ("(typep (lambda (x) x) 'cons)", "NIL"),
+        ("(typep (lambda (x) x) 'list)", "NIL"),
+        ("(functionp (lambda (x) x))", "T"),
+        // Readers signal rather than exposing the representation.
+        ("(handler-case (car (lambda (x) x)) (type-error () :te))", ":TE"),
+        ("(handler-case (cdr (lambda (x) x)) (type-error () :te))", ":TE"),
+        // Destructive stores signal rather than overwriting the closure.
+        ("(handler-case (rplaca (lambda (x) x) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (rplacd (lambda (x) x) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (setf (car (lambda (x) x)) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (setf (cdr (lambda (x) x)) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (setf (first (lambda (x) x)) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (setf (rest (lambda (x) x)) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (setf (elt (lambda (x) x) 0) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (bliss::set-car (lambda (x) x) 1) (type-error () :te))", ":TE"),
+        ("(handler-case (bliss::set-cdr (lambda (x) x) 1) (type-error () :te))", ":TE"),
+        // The closure SURVIVES a rejected store -- the point of the bug.
+        ("(let ((f (lambda (x) (* x 2))))
+            (handler-case (rplaca f 1) (error () nil))
+            (handler-case (setf (car f) 1) (error () nil))
+            (handler-case (setf (nth 0 f) 1) (error () nil))
+            (handler-case (setf (elt f 0) 1) (error () nil))
+            (funcall f 21))", "42"),
+        // Real conses are unaffected: every place form still mutates.
+        ("(let ((l (list 1 2 3))) (rplaca l :a) (rplacd (cdr l) (list :c)) l)", "(:A 2 :C)"),
+        ("(let ((l (list 1 2 3))) (setf (car l) :a) (setf (cdr (cdr l)) nil) l)", "(:A 2)"),
+        ("(let ((l (list 1 2 3))) (setf (nth 1 l) :b) (setf (elt l 2) :c) l)", "(1 :B :C)"),
+        ("(let ((l (list 1 2 3))) (setf (second l) :x) l)", "(1 :X 3)"),
+        ("(let ((l (list 1 2 3))) (setf (subseq l 0 1) (list :y)) l)", "(:Y 2 3)"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// bliss-74rl, the tiering half: the same predicates and guards must answer
+/// IDENTICALLY once the code is promoted. Each `inner`/`outer` pair is hot
+/// enough to reach T2 (where CONSP was inlined as a bare `x & 7 == 1`), and a
+/// closure is then fed to the promoted code. This is the stage-5 gate property
+/// -- a hot loop promoted through tiers with identical results at each tier --
+/// applied to the one value whose representation lies about its type.
+#[test]
+fn promoted_cons_predicates_and_guards_match_the_interpreter() {
+    let cases = [(
+        "(progn
+           (defvar *f* (lambda (x) x))
+           (defun i-consp (c) (consp c))            (defun o-consp (c) (i-consp c))
+           (defun i-typep (c) (typep c 'cons))      (defun o-typep (c) (i-typep c))
+           (defun i-rpa (c) (handler-case (progn (rplaca c 1) :mut) (type-error () :te)))
+           (defun o-rpa (c) (i-rpa c))
+           (defun i-rpd (c) (handler-case (progn (rplacd c 1) :mut) (type-error () :te)))
+           (defun o-rpd (c) (i-rpd c))
+           (let ((cold (list (o-consp *f*) (o-typep *f*) (o-rpa *f*) (o-rpd *f*))))
+             ;; Drive past the OSR/T2 promotion thresholds.
+             (dotimes (i 600000)
+               (o-consp (list 1 2)) (o-typep (list 1 2))
+               (o-rpa (list 1 2)) (o-rpd (list 1 2)))
+             (let ((hot (list (o-consp *f*) (o-typep *f*) (o-rpa *f*) (o-rpd *f*))))
+               (list (equal cold hot) cold
+                     ;; still a working function, and real conses still answer T
+                     (funcall *f* 7) (o-consp (list 1)) (o-typep (list 1))))))",
+        "(T (NIL NIL :TE :TE) 7 T T)",
+    )];
+    run_expression_cases(&cases);
+}

@@ -4323,6 +4323,41 @@ fn is_closure_cons(v: BlissVal) -> bool {
     h.is_symbol() && t.is_fixnum() && sym_name(h) == "BLISS::CLOSURE"
 }
 
+/// The target of a destructive car/cdr store, validated.
+///
+/// `is_cons()` alone is NOT a sufficient check (bliss-74rl): an interpreter
+/// closure is physically the cons `(BLISS::CLOSURE . id)`, so it carries the
+/// cons tag while its Common Lisp type is FUNCTION. Every reader already
+/// excludes it (CAR, CDR, CONSP, LISTP, ATOM, TYPEP), but the *stores* were
+/// each written with a bare `is_cons()` and so overwrote a live function
+/// object in place -- silently corrupting it, and only later failing as
+/// "Cons(..) is not of type FUNCTION" when it was next called.
+///
+/// Route every user-reachable cons mutation through this so the exclusion
+/// cannot be forgotten in a new place form. Retiring the cons representation
+/// of closures (bliss-fju9) is what would make the bare tag test sound.
+fn store_cons_field(target: BlissVal, val: BlissVal, car: bool) -> Result<(), BlissError> {
+    if !target.is_cons() || is_closure_cons(target) {
+        return Err(BlissError::TypeError {
+            datum: target,
+            expected: "cons".into(),
+        });
+    }
+    // No allocation between the check and the store, so the raw pointer cannot
+    // go stale. The write goes through the GC barrier: mutating an OLD cons to
+    // point at a YOUNG value must enter the remembered set or the minor GC
+    // frees the young referent (bliss-6b2 root cause #2).
+    unsafe {
+        let cell = target.as_ptr() as *mut ConsCell;
+        if car {
+            bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
+        } else {
+            bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).cdr), val);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -16323,7 +16358,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         break;
                                     }
                                 }
-                                if tgt.is_cons() {
+                                if tgt.is_cons() && !is_closure_cons(tgt) {
                                     unsafe {
                                         let cell = tgt.as_ptr() as *mut ConsCell;
                                         bliss_rt::gc::store_ref(
@@ -16590,42 +16625,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             }
                             "CAR" | "FIRST" => {
                                 let tgt = eval_form(tgt_form, env)?;
-                                if tgt.is_cons() {
-                                    unsafe {
-                                        // Route through the write barrier: mutating
-                                        // an OLD cons's car to a YOUNG value must be
-                                        // recorded in the remembered set, else the
-                                        // minor GC frees the young referent
-                                        // (bliss-6b2 root cause #2).
-                                        let cell = tgt.as_ptr() as *mut ConsCell;
-                                        bliss_rt::gc::store_ref(
-                                            std::ptr::addr_of_mut!((*cell).car),
-                                            *val,
-                                        );
-                                    }
-                                } else {
-                                    return Err(BlissError::TypeError {
-                                        datum: tgt,
-                                        expected: "cons".into(),
-                                    });
-                                }
+                                store_cons_field(tgt, *val, true)?;
                             }
                             "CDR" | "REST" => {
                                 let tgt = eval_form(tgt_form, env)?;
-                                if tgt.is_cons() {
-                                    unsafe {
-                                        let cell = tgt.as_ptr() as *mut ConsCell;
-                                        bliss_rt::gc::store_ref(
-                                            std::ptr::addr_of_mut!((*cell).cdr),
-                                            *val,
-                                        );
-                                    }
-                                } else {
-                                    return Err(BlissError::TypeError {
-                                        datum: tgt,
-                                        expected: "cons".into(),
-                                    });
-                                }
+                                store_cons_field(tgt, *val, false)?;
                             }
                             "SECOND" | "THIRD" | "FOURTH" | "FIFTH" | "SIXTH"
                             | "SEVENTH" | "EIGHTH" | "NINTH" | "TENTH" => {
@@ -16647,7 +16651,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 for _ in 0..k {
                                     tgt = cp(tgt).1;
                                 }
-                                if tgt.is_cons() {
+                                if tgt.is_cons() && !is_closure_cons(tgt) {
                                     unsafe {
                                         let cell = tgt.as_ptr() as *mut ConsCell;
                                         bliss_rt::gc::store_ref(
@@ -16676,7 +16680,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 for _ in 0..k {
                                     tgt = cp(tgt).1;
                                 }
-                                if tgt.is_cons() {
+                                if tgt.is_cons() && !is_closure_cons(tgt) {
                                     unsafe {
                                         let cell = tgt.as_ptr() as *mut ConsCell;
                                         bliss_rt::gc::store_ref(
@@ -16737,7 +16741,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         cursor = cp(cursor).1;
                                     }
                                     for i in 0..n {
-                                        if !cursor.is_cons() {
+                                        if !cursor.is_cons() || is_closure_cons(cursor) {
                                             break;
                                         }
                                         let e = bliss_stdlib::elt(*val, i)?;
@@ -17028,7 +17032,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     for _ in 0..i {
                                         cursor = cp(cursor).1;
                                     }
-                                    if cursor.is_cons() {
+                                    if cursor.is_cons() && !is_closure_cons(cursor) {
                                         unsafe {
                                             let cell = cursor.as_ptr() as *mut ConsCell;
                                             bliss_rt::gc::store_ref(
@@ -17263,7 +17267,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         *tf,
                                     ]);
                                     let inner_cons = eval_form(inner_form, env)?;
-                                    if inner_cons.is_cons() {
+                                    if inner_cons.is_cons() && !is_closure_cons(inner_cons) {
                                         // No allocation between eval and the store,
                                         // so the raw cons pointer stays valid; *val
                                         // is rooted. Write through the GC barrier.
@@ -18337,7 +18341,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     for _ in 0..i {
                         cursor = cp(cursor).1;
                     }
-                    if cursor.is_cons() {
+                    if cursor.is_cons() && !is_closure_cons(cursor) {
                         unsafe {
                             let cell = cursor.as_ptr() as *mut ConsCell;
                             bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
@@ -18429,20 +18433,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let target = args[0];
                 let val = args[1];
-                if !target.is_cons() {
-                    return Err(BlissError::TypeError {
-                        datum: target,
-                        expected: "cons".into(),
-                    });
-                }
-                unsafe {
-                    let cell = target.as_ptr() as *mut ConsCell;
-                    if set_car {
-                        bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
-                    } else {
-                        bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).cdr), val);
-                    }
-                }
+                store_cons_field(target, val, set_car)?;
                 return Ok(val);
             }
             "REMHASH" => {

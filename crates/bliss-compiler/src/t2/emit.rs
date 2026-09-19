@@ -1848,6 +1848,18 @@ fn emit_type_check(
         alu_r_imm(a, AND, SCRATCH, 7); // scratch = x & 7
         alu_r_imm(a, CMP, SCRATCH, tag);
     };
+    // NOTE (bliss-74rl): CONS and LIST are deliberately absent from this chain
+    // and fall through to the `else` that declines the op.  A cons test here
+    // would be the tag test `x & 7 == 1`, but bliss represents an interpreter
+    // closure as the cons `(BLISS::CLOSURE . id)`: it carries the cons tag while
+    // its Common Lisp type is FUNCTION.  T0's `typep_class_matches` gets this
+    // right (`v.is_cons() && !is_function_value(v)`), so emitting the bare tag
+    // test made a T2-promoted CONSP / (TYPEP x 'CONS) disagree with every other
+    // tier -- and since RPLACA's guard is `(unless (consp cons) (error ...))`,
+    // a hot RPLACA sailed past its type check and overwrote a live function
+    // object.  Declining costs a call and keeps the tiers bit-identical, which
+    // is the bliss-x5y.9 rule.  Retiring the cons representation of closures
+    // (bliss-fju9) is what would make an inline test sound again.
     if class == Some(typep_class::BOOLEAN) {
         alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32);
         a.jcc(Cc::E, found);
@@ -1856,16 +1868,8 @@ fn emit_type_check(
     } else if class == Some(typep_class::NULL) {
         alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32);
         a.jcc(Cc::E, found);
-    } else if class == Some(typep_class::LIST) {
-        alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32);
-        a.jcc(Cc::E, found);
-        single_tag(a, 1);
-        a.jcc(Cc::E, found);
     } else if bits == TypeBits::FIXNUM {
         single_tag(a, 0);
-        a.jcc(Cc::E, found);
-    } else if bits == TypeBits::CONS || class == Some(typep_class::CONS) {
-        single_tag(a, 1);
         a.jcc(Cc::E, found);
     } else if bits == TypeBits::SYMBOL || class == Some(typep_class::SYMBOL) {
         single_tag(a, 5); // TAG_SYMBOL
