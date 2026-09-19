@@ -12985,3 +12985,47 @@ fn ordinal_accessors_share_the_nth_kernel() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-7kmw: STRING is a UNION type -- CLHS defines it as the union of
+/// (vector character), (vector base-char) and (vector nil) -- but the array
+/// lattice modelled it as a single specialized array type with element type
+/// CHARACTER, the same one BASE-STRING got. Element types are compared by
+/// equality (correct: arrays are invariant in their upgraded element type), so
+/// STRING and BASE-STRING came out as MUTUAL subtypes, and an element type of
+/// NIL had no representation at all.
+///
+/// Note the second value was T in every one of the seven ansi failures, i.e.
+/// SUBTYPEP claimed certainty while answering wrongly.
+#[test]
+fn string_types_form_a_union_not_one_specialized_array() {
+    let cases = [
+        // STRING is NOT a subtype of the narrower base-char types.
+        ("(multiple-value-list (subtypep 'string 'base-string))", "(NIL T)"),
+        ("(multiple-value-list (subtypep 'simple-string 'simple-base-string))", "(NIL T)"),
+        ("(multiple-value-list (subtypep 'simple-string '(simple-array character (*))))", "(NIL T)"),
+        ("(multiple-value-list (subtypep 'simple-string '(simple-array base-char (*))))", "(NIL T)"),
+        // ... but each arm of the union IS a subtype of it, including (array nil).
+        ("(multiple-value-list (subtypep '(array nil (*)) 'string))", "(T T)"),
+        ("(multiple-value-list (subtypep '(array nil 1) 'string))", "(T T)"),
+        ("(multiple-value-list (subtypep '(simple-array nil (*)) 'simple-string))", "(T T)"),
+        ("(multiple-value-list (subtypep 'base-string 'string))", "(T T)"),
+        ("(multiple-value-list (subtypep 'simple-base-string 'simple-string))", "(T T)"),
+        ("(multiple-value-list (subtypep '(vector character) 'string))", "(T T)"),
+        // Ordinary relations are unchanged.
+        ("(multiple-value-list (subtypep 'simple-string 'string))", "(T T)"),
+        ("(multiple-value-list (subtypep 'string 'string))", "(T T)"),
+        ("(multiple-value-list (subtypep 'string 'vector))", "(T T)"),
+        ("(multiple-value-list (subtypep 'string 'array))", "(T T)"),
+        ("(multiple-value-list (subtypep 'string 'sequence))", "(T T)"),
+        ("(multiple-value-list (subtypep '(vector bit) 'bit-vector))", "(T T)"),
+        ("(multiple-value-list (subtypep 'simple-vector 'vector))", "(T T)"),
+        // The empty element type is NOT a universal bottom: arrays stay
+        // invariant in their upgraded element type outside the string union.
+        ("(multiple-value-list (subtypep '(array nil (*)) '(array bit (*))))", "(NIL T)"),
+        // TYPEP is unaffected -- only the SUBTYPEP lattice changed.
+        ("(typep \"abc\" 'string)", "T"),
+        ("(typep \"abc\" 'simple-string)", "T"),
+        ("(typep 5 'string)", "NIL"),
+    ];
+    run_expression_cases(&cases);
+}

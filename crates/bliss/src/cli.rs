@@ -11312,6 +11312,14 @@ fn numeric_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
 enum EltU {
     T,
     Character,
+    /// BASE-CHAR is a DISTINCT specialized representation from CHARACTER --
+    /// bliss really does store base strings 8 bits per character. Collapsing
+    /// the two made STRING and BASE-STRING mutual subtypes (bliss-7kmw).
+    BaseChar,
+    /// The empty element type, `(array nil (*))`. It has no representation of
+    /// its own; it exists so a nil-array can be recognised as one of the three
+    /// arms of the STRING union below.
+    Nil,
     Bit,
 }
 
@@ -11319,6 +11327,12 @@ enum EltU {
 enum Elt {
     Star,
     Up(EltU),
+    /// STRING and SIMPLE-STRING. CLHS defines STRING as the UNION of
+    /// `(vector character)`, `(vector base-char)` and `(vector nil)` -- it is
+    /// not a specialized array type of its own. Modelling it as one
+    /// (`Up(Character)`) is what made `(subtypep 'string 'base-string)` answer
+    /// T, since both sides landed on the same element type (bliss-7kmw).
+    AnyString,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -11338,7 +11352,11 @@ struct ArrType {
 fn upgrade_elt(spec: BlissVal) -> EltU {
     if spec.is_symbol() {
         return match symbol_bare_name(&sym_name_rc(spec)).as_str() {
-            "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => EltU::Character,
+            "CHARACTER" | "EXTENDED-CHAR" => EltU::Character,
+            // STANDARD-CHAR is a subtype of BASE-CHAR, so it upgrades the same
+            // way (bliss stores both 8 bits per character).
+            "BASE-CHAR" | "STANDARD-CHAR" => EltU::BaseChar,
+            "NIL" => EltU::Nil,
             "BIT" => EltU::Bit,
             _ => EltU::T,
         };
@@ -11455,10 +11473,10 @@ fn parse_arr_type(t: BlissVal) -> Option<ArrType> {
         "SIMPLE-VECTOR" => mk(true, Elt::Up(EltU::T), parse_single_dim(a0)?),
         "BIT-VECTOR" => mk(false, Elt::Up(EltU::Bit), parse_single_dim(a0)?),
         "SIMPLE-BIT-VECTOR" => mk(true, Elt::Up(EltU::Bit), parse_single_dim(a0)?),
-        "STRING" | "BASE-STRING" => mk(false, Elt::Up(EltU::Character), parse_single_dim(a0)?),
-        "SIMPLE-STRING" | "SIMPLE-BASE-STRING" => {
-            mk(true, Elt::Up(EltU::Character), parse_single_dim(a0)?)
-        }
+        "STRING" => mk(false, Elt::AnyString, parse_single_dim(a0)?),
+        "BASE-STRING" => mk(false, Elt::Up(EltU::BaseChar), parse_single_dim(a0)?),
+        "SIMPLE-STRING" => mk(true, Elt::AnyString, parse_single_dim(a0)?),
+        "SIMPLE-BASE-STRING" => mk(true, Elt::Up(EltU::BaseChar), parse_single_dim(a0)?),
         _ => None,
     }
 }
@@ -11494,10 +11512,26 @@ fn array_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
     let b = parse_arr_type(t2)?;
     // simple-array is the simple subtype: if B requires simple, A must be simple.
     let simple_ok = !b.simple || a.simple;
-    // Arrays are invariant in the upgraded element type.
-    let elt_ok = match b.elt {
-        Elt::Star => true,
-        Elt::Up(be) => matches!(a.elt, Elt::Up(ae) if ae == be),
+    // Arrays are invariant in the upgraded element type -- EXCEPT that STRING
+    // and SIMPLE-STRING are unions, so each of their three arms is a subtype of
+    // them (bliss-7kmw).
+    //
+    // EltU::Nil is deliberately NOT a universal bottom. `(array nil (*))` holds
+    // no elements, but its upgraded element type is still its own, so it is not
+    // a subtype of `(array bit (*))`; it is only admitted here as one arm of
+    // the string union, which is all CLHS actually requires.
+    let elt_ok = match (a.elt, b.elt) {
+        (_, Elt::Star) => true,
+        (
+            Elt::AnyString
+            | Elt::Up(EltU::Character)
+            | Elt::Up(EltU::BaseChar)
+            | Elt::Up(EltU::Nil),
+            Elt::AnyString,
+        ) => true,
+        (_, Elt::AnyString) | (Elt::AnyString, _) => false,
+        (Elt::Up(ae), Elt::Up(be)) => ae == be,
+        (Elt::Star, Elt::Up(_)) => false,
     };
     let dims_ok = arr_dims_subtype(&a.dims, &b.dims);
     Some((simple_ok && elt_ok && dims_ok, true))

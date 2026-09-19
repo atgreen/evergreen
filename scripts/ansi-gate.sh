@@ -26,9 +26,13 @@ set -u
 # hash-tables added 2026-09-19: measured ok (158/158).
 # characters added 2026-09-19: ok (259/259) once bliss-l3d7 (non-ASCII symbol
 # names stored as Latin-1 mojibake) was fixed -- that was its only failure.
+# strings added 2026-09-19: ok (509/509) once bliss-7kmw (STRING modelled as a
+# specialized array type rather than a union) was fixed -- that one lattice
+# change cleared all 7 of its failures.
 # Remaining survey from that day, for whoever enables the next one:
-# strings 502/7 (one SUBTYPEP family), symbols 1135/10, iteration 794/49.
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters)
+# symbols 1135/10 (one is bliss-0dtf, the ratio-literal reader bug),
+# iteration 794/49, types-and-classes 565/58.
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 BLISS_BIN="${BLISS_BIN:-target/x86_64-unknown-linux-musl/debug/bliss-cli}"
