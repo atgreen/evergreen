@@ -13066,3 +13066,50 @@ fn abs_preserves_exact_type_on_both_dispatch_paths() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-0dtf: a ratio literal whose numerator OR denominator exceeded i64 was
+/// not parsed at all -- the token fell through and came back as a SYMBOL, so
+/// `(numberp <literal>)` was NIL and SYMBOLP answered T. Reducing such a
+/// literal to lowest terms with a positive denominator (CLHS 2.3.2.3) needs
+/// bignum GCD and exact division, which lived in the interpreter where the
+/// reader could not reach them; 63bdc4c moved them to bliss-rt.
+#[test]
+fn ratio_literals_with_bignum_components_read_as_rationals() {
+    let cases = [
+        // The literal from the ansi failures: a number, not a symbol.
+        ("(numberp (read-from-string
+            \"189729874978126783786123/1234678123487612347896123467851234671234\"))", "T"),
+        ("(symbolp (read-from-string
+            \"189729874978126783786123/1234678123487612347896123467851234671234\"))", "NIL"),
+        ("(rationalp (read-from-string
+            \"189729874978126783786123/1234678123487612347896123467851234671234\"))", "T"),
+        ("(numerator (read-from-string
+            \"189729874978126783786123/1234678123487612347896123467851234671234\"))",
+         "189729874978126783786123"),
+        ("(denominator (read-from-string
+            \"189729874978126783786123/1234678123487612347896123467851234671234\"))",
+         "1234678123487612347896123467851234671234"),
+        // Reduced to lowest terms, collapsing to an integer when the
+        // denominator reduces to 1.
+        ("(read-from-string
+            \"246913578024691357802469135780/123456789012345678901234567890\")", "2"),
+        // The sign is normalised onto the numerator.
+        ("(read-from-string \"1/-123456789012345678901234567890\")",
+         "-1/123456789012345678901234567890"),
+        // A zero denominator is still an error, not a symbol.
+        ("(handler-case (read-from-string \"5/0\") (error () :err))", ":ERR"),
+        // Everything the i64 path already handled is unchanged.
+        ("1/2", "1/2"),
+        ("-3/4", "-3/4"),
+        ("6/4", "3/2"),
+        ("4/2", "2"),
+        ("#x1F/2", "31/2"),
+        // The 61-bit fixnum boundary cases that bliss-mwpb fixed stay fixed.
+        ("1152921504606846976/7", "1152921504606846976/7"),
+        ("7/1152921504606846976", "7/1152921504606846976"),
+        // And such a literal is usable as a number, not just readable.
+        ("(* 2 (read-from-string \"1/123456789012345678901234567890\"))",
+         "1/61728394506172839450617283945"),
+    ];
+    run_expression_cases(&cases);
+}

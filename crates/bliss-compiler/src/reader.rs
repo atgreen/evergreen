@@ -2033,6 +2033,28 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
                 let den = int_from_i64(d);
                 return Ok(Some(alloc_ratio(*num, den)));
             }
+            // A component beyond i64. Until bliss-0dtf moved the numeric tower
+            // into bliss-rt this fell through to Ok(None) and the whole token
+            // became a SYMBOL -- ~98 numbers-chapter failures plus SYMBOLP.3,
+            // because universe.lsp seeds the shared test sets with such
+            // literals. Reducing to lowest terms with a positive denominator
+            // (CLHS 2.3.2.3) needs bignum GCD and exact division, which now
+            // exist somewhere the reader can reach.
+            // GC: parse_bignum ALLOCATES, so the numerator must be rooted
+            // across the denominator's parse. Written as a tuple
+            // `(parse_bignum(num), parse_bignum(den))` the first result sits
+            // unrooted in a Rust temporary while the second allocates; a minor
+            // GC there relocates it and the stale copy silently yields the
+            // WRONG RATIO -- reducing 246913578024691357802469135780/
+            // 123456789012345678901234567890 gave 1 instead of 2 under
+            // BLISS_GC_STRESS, with no crash to point at it (AGENTS.md: poison
+            // only catches a stale DEREFERENCE, so diff the output).
+            if let Some(nv) = parse_bignum(num_str, read_base) {
+                bliss_rt::rooted!(nv = nv);
+                if let Some(dv) = parse_bignum(den_str, read_base) {
+                    return reduced_ratio(*nv, dv).map(Some);
+                }
+            }
         }
         return Ok(None);
     }
@@ -2087,6 +2109,46 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
 /// An integer `BlissVal` for `n`: a fixnum immediate when it fits the 61-bit
 /// range, otherwise a BIGNUM. `BlissVal::from_fixnum` does NOT range-check, so
 /// every path that turns a parsed i64 into a value must go through this.
+/// Build the rational `nv/dv` from two already-parsed integers, reduced to
+/// lowest terms with a POSITIVE denominator, collapsing to an integer when the
+/// denominator reduces to 1 (CLHS 2.3.2.3). Either component may be a bignum.
+///
+/// This is the bignum counterpart of the i64 path above; it exists separately
+/// only because that path can do the whole thing in registers.
+fn reduced_ratio(nv: BlissVal, dv: BlissVal) -> Result<BlissVal, BlissError> {
+    use bliss_rt::bignum::{big_cmp, big_divexact, big_gcd, bigint_from_val, BigInt};
+    let (Some(n), Some(d)) = (bigint_from_val(nv), bigint_from_val(dv)) else {
+        // Unreachable: parse_bignum only ever yields an integer. Internal
+        // rather than a reader error, because reaching it means a runtime
+        // invariant broke, not that the source was malformed.
+        return Err(BlissError::Internal(
+            "parse_bignum produced a non-integer ratio component".into(),
+        ));
+    };
+    if d.sign == 0 {
+        return Err(BlissError::ArithmeticError(
+            "division by zero in ratio".into(),
+        ));
+    }
+    let g = big_gcd(&n, &d);
+    let mut n = big_divexact(&n, &g);
+    let mut d = big_divexact(&d, &g);
+    // Normalise the sign onto the numerator.
+    if d.sign < 0 {
+        n.sign = -n.sign;
+        d.sign = -d.sign;
+    }
+    if big_cmp(&d, &BigInt::from_i64(1)) == std::cmp::Ordering::Equal {
+        return Ok(n.to_val());
+    }
+    // GC: `to_val` allocates for a bignum component, so the numerator must be
+    // rooted across the denominator's allocation or a relocating minor GC
+    // leaves it stale (bliss-wlf) -- the same rule the i64 path follows.
+    bliss_rt::rooted!(num = n.to_val());
+    let den = d.to_val();
+    Ok(alloc_ratio(*num, den))
+}
+
 fn int_from_i64(n: i64) -> BlissVal {
     if fits_fixnum(n) {
         BlissVal::from_fixnum(n)
