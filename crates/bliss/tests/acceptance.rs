@@ -12516,3 +12516,78 @@ fn type_predicates_agree_between_operator_position_and_funcall() {
     let refs: Vec<(&str, &str)> = cases.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     run_expression_cases(&refs);
 }
+
+/// EQL/EQUAL/EQUALP and MIN/MAX dispatch on already-evaluated arguments
+/// (bliss-edzd), instead of taking the synthesize-and-re-evaluate detour that
+/// cost EQUAL 103x and MIN 142x a CAR call. The fast arms must use the same
+/// kernels as operator position, so assert the two spellings agree and pin the
+/// behaviours that distinguish the three equalities.
+#[test]
+fn equality_and_extrema_match_operator_position() {
+    let pairs = "(list (list 1 1) (list 1 1.0) (list \"a\" \"a\") (list \"a\" \"A\") \
+                  (list (list 1 2) (list 1 2)) (list (vector 1) (vector 1)) \
+                  (list #\\a #\\A) (list 'a 'a) (list 1/2 0.5))";
+    let agree = |op: &str| {
+        format!(
+            "(let ((pairs {pairs}))
+               (equal (mapcar (lambda (p) (funcall #'{op} (first p) (second p))) pairs)
+                      (mapcar (lambda (p) (apply #'{op} p)) pairs)))"
+        )
+    };
+    let cases: Vec<(String, String)> = ["eql", "equal", "equalp"]
+        .iter()
+        .map(|op| (agree(op), "T".to_string()))
+        .chain([
+            // EQL is not EQUAL is not EQUALP, and the differences are the point.
+            ("(list (eql 1 1) (eql 1 1.0) (eql \"a\" \"a\") (eql 'a 'a))".to_string(),
+             "(T NIL NIL T)".to_string()),
+            ("(list (equal \"a\" \"a\") (equal \"a\" \"A\") (equal (list 1 2) (list 1 2)) (equal (vector 1) (vector 1)))".to_string(),
+             "(T NIL T NIL)".to_string()),
+            ("(list (equalp \"a\" \"A\") (equalp 1 1.0) (equalp (vector 1) (vector 1)) (equalp #\\a #\\A))".to_string(),
+             "(T T T T)".to_string()),
+            // MIN/MAX return the extreme ARGUMENT with its exact type intact.
+            ("(list (min 3) (min 3 1 2) (max 3 1 2) (min 1 1.5) (max 1/2 1/3))".to_string(),
+             "(3 1 3 1 1/2)".to_string()),
+            ("(min (expt 10 30) 5)".to_string(), "5".to_string()),
+            ("(max 5 (expt 10 30))".to_string(), "1000000000000000000000000000000".to_string()),
+            // A single argument is still type-checked, and no arguments is a
+            // PROGRAM-ERROR -- both are operator-position behaviours.
+            ("(handler-case (min) (program-error () :pe))".to_string(), ":PE".to_string()),
+            ("(handler-case (min \"a\") (error () :type-error))".to_string(), ":TYPE-ERROR".to_string()),
+            ("(handler-case (equal 1) (program-error () :pe))".to_string(), ":PE".to_string()),
+        ])
+        .collect();
+    let refs: Vec<(&str, &str)> = cases.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    run_expression_cases(&refs);
+}
+
+/// NTH dispatches on already-evaluated arguments (bliss-edzd). It was the worst
+/// remaining leaf builtin on the detour at ~140x a CAR call. Its ANSI index
+/// validation must be reproduced exactly: a negative or non-integer index is a
+/// TYPE-ERROR rather than a saturated 0, and a non-negative BIGNUM index is
+/// past the end of any real list and reads as NIL.
+#[test]
+fn nth_matches_operator_position_including_index_validation() {
+    let cases = [
+        ("(let ((l (list 10 20 30))) (list (nth 0 l) (nth 2 l) (nth 5 l)))", "(10 30 NIL)"),
+        ("(nth 0 nil)", "NIL"),
+        // Operator position and FUNCALL must agree.
+        (
+            "(let ((l (list 10 20 30)))
+               (equal (list (nth 0 l) (nth 1 l) (nth 9 l))
+                      (list (funcall #'nth 0 l) (funcall #'nth 1 l) (funcall #'nth 9 l))))",
+            "T",
+        ),
+        // A negative or non-integer index is a TYPE-ERROR, not element 0.
+        ("(handler-case (nth -1 (list 1 2)) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (nth \"a\" (list 1 2)) (type-error () :type-error))", ":TYPE-ERROR"),
+        ("(handler-case (nth 1.5 (list 1 2)) (type-error () :type-error))", ":TYPE-ERROR"),
+        // A huge but valid index is simply past the end.
+        ("(nth (expt 10 30) (list 1 2))", "NIL"),
+        // Wrong arity is a PROGRAM-ERROR.
+        ("(handler-case (nth 1) (program-error () :pe))", ":PE"),
+        // A dotted tail stops the walk rather than erroring.
+        ("(nth 1 (cons 1 (cons 2 3)))", "2"),
+    ];
+    run_expression_cases(&cases);
+}

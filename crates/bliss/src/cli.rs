@@ -32710,6 +32710,7 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 const DIRECT_FAST: &[&str] = &[
     "AREF", "SVREF", "ROW-MAJOR-AREF", "BIT", "SBIT", "ELT", "LENGTH", "EQ", "TYPEP",
     "SYMBOLP", "NUMBERP", "STRINGP", "VECTORP", "SIMPLE-VECTOR-P", "KEYWORDP", "ARRAYP",
+    "EQL", "EQUAL", "EQUALP", "MIN", "MAX", "NTH",
     "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
 ];
@@ -33436,6 +33437,76 @@ fn apply_builtin_fast(
             } else {
                 bliss_stdlib::aref(args[0], i)
             })
+        }
+        // NTH on already-evaluated arguments -- the worst remaining leaf
+        // builtin on the detour at ~140x a CAR call (bliss-edzd). Transcribed
+        // from the operator-position handler, including its ANSI index
+        // validation: a negative or non-integer index is a TYPE-ERROR rather
+        // than a saturated 0, and a non-negative BIGNUM index is past the end
+        // of any real list and so reads as NIL.
+        //
+        // list_to_vec materialises the whole list per call, which is its own
+        // cost; it is kept here so this arm stays bit-identical to operator
+        // position, and reducing it is tracked separately.
+        "NTH" if args.len() >= 2 => {
+            env.clear_mv();
+            let nidx = args[0];
+            Some((|| {
+                if !bliss_rt::types::integerp(nidx) || num_val(nidx)? < 0.0 {
+                    return Err(BlissError::TypeError {
+                        datum: nidx,
+                        expected: "(integer 0)".into(),
+                    });
+                }
+                let idx = if nidx.is_fixnum() {
+                    nidx.as_fixnum() as usize
+                } else {
+                    usize::MAX
+                };
+                let elems = list_to_vec(args[1]);
+                Ok(if idx < elems.len() { elems[idx] } else { NIL })
+            })())
+        }
+        // Equality and numeric extrema on already-evaluated arguments. Each
+        // fell through to the synthesize-and-re-evaluate detour: EQUAL cost
+        // 2.30us and MIN 3.16us against CAR's 0.022us (bliss-edzd). Each uses
+        // the SAME kernel as its operator-position handler, so the tiers stay
+        // bit-identical (the bliss-x5y.9 rule), and a wrong argument count is
+        // declined so the general path raises the PROGRAM-ERROR.
+        "EQL" if args.len() == 2 => {
+            env.clear_mv();
+            Some(Ok(if eql_values(args[0], args[1]) { T } else { NIL }))
+        }
+        "EQUAL" if args.len() == 2 => {
+            env.clear_mv();
+            Some(Ok(if vals_equal(args[0], args[1]) { T } else { NIL }))
+        }
+        "EQUALP" if args.len() == 2 => {
+            env.clear_mv();
+            Some(Ok(if vals_equalp(args[0], args[1]) { T } else { NIL }))
+        }
+        // MIN/MAX return the extreme ARGUMENT, preserving its exact type, and
+        // type-check the first argument even when it is the only one -- both
+        // behaviours are the operator handler's and both matter (bliss-05hy).
+        "MIN" | "MAX" if !args.is_empty() => {
+            env.clear_mv();
+            let want_min = name == "MIN";
+            Some((|| {
+                let mut best = args[0];
+                numeric_cmp(best, best)?; // type-check the first argument
+                for &a in &args[1..] {
+                    let ord = numeric_cmp(a, best)?;
+                    let take = if want_min {
+                        ord == Ordering::Less
+                    } else {
+                        ord == Ordering::Greater
+                    };
+                    if take {
+                        best = a;
+                    }
+                }
+                Ok(best)
+            })())
         }
         // Type predicates on already-evaluated arguments. Each fell through to
         // the synthesize-and-re-evaluate detour, so a tag test cost 1.4-1.8us
