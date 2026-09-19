@@ -13029,3 +13029,40 @@ fn string_types_form_a_union_not_one_specialized_array() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-ljmk: ABS had no evaluated-args kernel, so every call through
+/// FUNCALL/APPLY or a compiled call site paid apply_function's
+/// synthesize-and-re-evaluate detour. Its four branches are now extracted into
+/// `abs_value` and shared with the operator-position handler -- extracted
+/// rather than transcribed, because the exact-type preservation below is easy
+/// to get subtly wrong in a second copy.
+#[test]
+fn abs_preserves_exact_type_on_both_dispatch_paths() {
+    let cases = [
+        ("(abs 5)", "5"),
+        ("(abs -5)", "5"),
+        ("(abs 0)", "0"),
+        ("(abs -5.5)", "5.5"),
+        ("(abs -5.5d0)", "5.5d0"),
+        // A ratio stays a ratio and a bignum stays a bignum -- the generic
+        // compare/subtract cores exist to preserve that (bliss-apr).
+        ("(abs -1/2)", "1/2"),
+        ("(abs 1/2)", "1/2"),
+        ("(abs -100000000000000000000)", "100000000000000000000"),
+        ("(type-of (abs -5))", "FIXNUM"),
+        ("(type-of (abs -5.5d0))", "DOUBLE-FLOAT"),
+        // ABS of a complex is its magnitude (bliss-dhrx).
+        ("(abs (complex 3 4))", "5.0"),
+        ("(abs (complex -3 -4))", "5.0"),
+        // The evaluated-args path must agree with operator position.
+        ("(funcall #'abs -7)", "7"),
+        ("(funcall #'abs -1/2)", "1/2"),
+        ("(mapcar #'abs (list -1 -2.5 -1/2))", "(1 2.5 1/2)"),
+        // Non-numbers and wrong arity still signal.
+        ("(handler-case (abs \"x\") (type-error () :te))", ":TE"),
+        ("(handler-case (abs nil) (type-error () :te))", ":TE"),
+        ("(handler-case (abs) (program-error () :pe))", ":PE"),
+        ("(handler-case (abs 1 2) (program-error () :pe))", ":PE"),
+    ];
+    run_expression_cases(&cases);
+}

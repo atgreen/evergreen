@@ -4405,6 +4405,41 @@ fn nth_element(idx: usize, list: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(if cursor.is_cons() { cp(cursor).0 } else { NIL })
 }
 
+/// ABS's kernel, shared by the operator-position handler and the
+/// evaluated-args fast arm (bliss-ljmk). Four branches, which is exactly why it
+/// is extracted rather than transcribed into a second place -- the exact-type
+/// preservation below is easy to get subtly wrong twice.
+fn abs_value(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if v.is_fixnum() {
+        return Ok(BlissVal::from_fixnum(v.as_fixnum().abs()));
+    }
+    if v.is_single_float() {
+        return Ok(BlissVal::from_single_float(v.as_single_float().abs()));
+    }
+    // Any other REAL (bignum, ratio, double-float): |x| = x if x>=0 else -x,
+    // via the generic compare/subtract cores so the exact type is preserved
+    // (bliss-apr).
+    if bliss_rt::types::realp(v) {
+        let zero = BlissVal::from_fixnum(0);
+        if numeric_cmp(v, zero)? == std::cmp::Ordering::Less {
+            return sub_vals(&[zero, v]);
+        }
+        return Ok(v);
+    }
+    // ABS of a complex number is its magnitude, sqrt(re^2+im^2), returned as a
+    // (single) float — this used to type-error (bliss-dhrx).
+    if bliss_rt::types::complexp(v) {
+        let zero = BlissVal::from_fixnum(0);
+        let re = num_val(bliss_rt::types::complex_realpart(v).unwrap_or(zero))?;
+        let im = num_val(bliss_rt::types::complex_imagpart(v).unwrap_or(zero))?;
+        return Ok(BlissVal::from_single_float((re * re + im * im).sqrt() as f32));
+    }
+    Err(BlissError::TypeError {
+        datum: v,
+        expected: "number".into(),
+    })
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -13517,7 +13552,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // (logbitp index integer) — exactly two (ansi logbitp.error.1-3).
         "LOGBITP" => Some((2, 2)),
         // (integer-length n) / (logcount n) — exactly one.
-        "INTEGER-LENGTH" | "LOGCOUNT" => Some((1, 1)),
+        "INTEGER-LENGTH" | "LOGCOUNT" | "ABS" => Some((1, 1)),
         "GET" => Some((2, 3)),
         "COPY-SYMBOL" => Some((1, 2)),
         "GENSYM" => Some((0, 1)),
@@ -19851,35 +19886,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "ABS" => {
                 let af = expect_one_arg(cdr, "ABS")?;
                 let v = eval_form(af, env)?;
-                if v.is_fixnum() {
-                    return Ok(BlissVal::from_fixnum(v.as_fixnum().abs()));
-                }
-                if v.is_single_float() {
-                    return Ok(BlissVal::from_single_float(v.as_single_float().abs()));
-                }
-                // Any other REAL (bignum, ratio, double-float): |x| = x if x>=0
-                // else -x, via the generic compare/subtract cores so the exact
-                // type is preserved (bliss-apr).
-                if bliss_rt::types::realp(v) {
-                    let zero = BlissVal::from_fixnum(0);
-                    if numeric_cmp(v, zero)? == std::cmp::Ordering::Less {
-                        return sub_vals(&[zero, v]);
-                    }
-                    return Ok(v);
-                }
-                // ABS of a complex number is its magnitude, sqrt(re^2+im^2),
-                // returned as a (single) float — previously this type-errored
-                // (bliss-dhrx).
-                if bliss_rt::types::complexp(v) {
-                    let zero = BlissVal::from_fixnum(0);
-                    let re = num_val(bliss_rt::types::complex_realpart(v).unwrap_or(zero))?;
-                    let im = num_val(bliss_rt::types::complex_imagpart(v).unwrap_or(zero))?;
-                    return Ok(BlissVal::from_single_float((re * re + im * im).sqrt() as f32));
-                }
-                return Err(BlissError::TypeError {
-                    datum: v,
-                    expected: "number".into(),
-                });
+                return abs_value(v);
             }
             // NUMERATOR/DENOMINATOR of a rational: an integer is n/1; a ratio
             // stores numerator@8 / denominator@16 (RatioData) (bliss-apr).
@@ -32851,7 +32858,7 @@ const DIRECT_FAST: &[&str] = &[
     // builtins: they never re-enter Lisp and take evaluated arguments, so they
     // need no invocation counting, depth cap or panic barrier (bliss-fdny).
     "SET-CAR", "SET-CDR",
-    "SECOND", "THIRD",
+    "SECOND", "THIRD", "ABS",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
@@ -33665,6 +33672,10 @@ fn apply_builtin_fast(
         // The ordinal accessors that ARE builtins (FOURTH..TENTH are boot.lisp
         // defuns and cannot reach the direct table). Same kernel as operator
         // position (bliss-ljmk).
+        "ABS" if args.len() == 1 => {
+            env.clear_mv();
+            Some(abs_value(args[0]))
+        }
         "SECOND" | "THIRD" if args.len() == 1 => {
             env.clear_mv();
             let k = if name == "SECOND" { 1 } else { 2 };
