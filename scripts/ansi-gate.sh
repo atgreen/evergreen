@@ -23,10 +23,12 @@
 set -u
 
 # Chapters currently at 100%. Add a chapter here once it passes completely.
-# hash-tables added 2026-09-19: measured ok (158/158). Survey of the other
-# candidates that day, for whoever enables the next one: characters 258/1,
-# strings 501/8, symbols 1135/10, iteration 794/49.
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables)
+# hash-tables added 2026-09-19: measured ok (158/158).
+# characters added 2026-09-19: ok (259/259) once bliss-l3d7 (non-ASCII symbol
+# names stored as Latin-1 mojibake) was fixed -- that was its only failure.
+# Remaining survey from that day, for whoever enables the next one:
+# strings 502/7 (one SUBTYPEP family), symbols 1135/10, iteration 794/49.
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 BLISS_BIN="${BLISS_BIN:-target/x86_64-unknown-linux-musl/debug/bliss-cli}"

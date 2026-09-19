@@ -78,15 +78,36 @@ static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
 /// Pinned + immortal because a symbol's name must never move out from under the
 /// object reference cached in the registry.
 fn alloc_pinned_name(s: &str) -> BlissVal {
-    let bytes = s.as_bytes();
-    let body = crate::gc::alloc_pinned_typed(8 + bytes.len(), type_id::SIMPLE_BASE_STRING)
+    // A SIMPLE_BASE_STRING's payload is one BYTE PER CHARACTER (code points
+    // below 256), so copying a Rust string's UTF-8 BYTES into one is correct
+    // only for ASCII. For anything else the name decoded back as Latin-1
+    // mojibake: `(symbol-name (make-symbol "\u{3bb}"))` answered a 2-character
+    // string, and FIND-SYMBOL could not match the key it had just interned
+    // under (bliss-l3d7).
+    //
+    // Pick the narrowest width that actually holds the code points -- the same
+    // choice the reader makes for string literals, which is why those were
+    // always right -- and write code points, not UTF-8 bytes.
+    let (tid, padded) = crate::object::narrowest_string_alloc(s);
+    let char_len = s.chars().count();
+    let body = crate::gc::alloc_pinned_typed(padded - header_size(), tid)
         .expect("OOM allocating symbol name string");
-    // SAFETY: `body` points past a freshly written header at `body - header`.
+    // SAFETY: `body` points past a freshly written header at `body - header`,
+    // and `padded` was sized for exactly `char_len` characters at this width.
     unsafe {
-        *(body as *mut u64) = bytes.len() as u64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
+        *(body as *mut u64) = char_len as u64;
+        let data = body.add(8);
+        if tid == type_id::SIMPLE_CHARACTER_STRING {
+            let d = data as *mut u32;
+            for (i, c) in s.chars().enumerate() {
+                *d.add(i) = c as u32;
+            }
+        } else {
+            for (i, c) in s.chars().enumerate() {
+                *data.add(i) = c as u8;
+            }
+        }
         let header = body.sub(header_size());
-        
         BlissVal::from_heap_ptr(header)
     }
 }

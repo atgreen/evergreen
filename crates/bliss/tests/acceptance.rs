@@ -12912,3 +12912,40 @@ fn string_comparison_takes_symbol_name_as_the_designator() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-l3d7: a SIMPLE_BASE_STRING's payload is one BYTE per character, but
+/// `alloc_pinned_name` copied a symbol name's UTF-8 BYTES into one. Every
+/// non-ASCII symbol name therefore decoded back as Latin-1 mojibake -- two
+/// characters for a 2-byte code point, three for a 3-byte one -- and
+/// FIND-SYMBOL could not match the key it had just interned under, so package
+/// lookups on such names were broken, not merely cosmetic.
+///
+/// Names are now stored at the narrowest width that actually HOLDS the code
+/// points, which is what the reader already did for string literals (which is
+/// why those were always correct while symbol names were not).
+#[test]
+fn symbol_names_preserve_non_ascii_characters() {
+    let cases = [
+        // 2-byte, 3-byte and mixed code points: the name length is in
+        // CHARACTERS, not bytes.
+        ("(length (symbol-name (make-symbol (string (code-char 955)))))", "1"),
+        ("(length (symbol-name (make-symbol (string (code-char 8364)))))", "1"),
+        ("(length (symbol-name (make-symbol \"a\u{3bb}b\")))", "3"),
+        ("(length (symbol-name (make-symbol \"\u{3bb}\u{3bc}\u{20ac}\")))", "3"),
+        // The character round-trips, not just the count.
+        ("(char (symbol-name (make-symbol (string (code-char 955)))) 0)", "#\\\u{3bb}"),
+        // A symbol read from source agrees with one built by MAKE-SYMBOL.
+        ("(length (symbol-name '|\u{3bb}|))", "1"),
+        ("(string= (symbol-name '|\u{3bb}|) (string (code-char 955)))", "T"),
+        // The key actually interned under: FIND-SYMBOL must locate it.
+        ("(progn (intern (string (code-char 955)))
+                 (not (null (find-symbol (string (code-char 955))))))", "T"),
+        ("(let ((s (string (code-char 955)))) (eq (intern s) (find-symbol s)))", "T"),
+        // ASCII names are unchanged (still the compact base-string width).
+        ("(length (symbol-name (make-symbol \"abc\")))", "3"),
+        ("(symbol-name (make-symbol \"abc\"))", "\"abc\""),
+        ("(progn (intern \"FOOBAR\") (not (null (find-symbol \"FOOBAR\"))))", "T"),
+        ("(find-symbol \"no-such-symbol-xyz\")", "NIL"),
+    ];
+    run_expression_cases(&cases);
+}
