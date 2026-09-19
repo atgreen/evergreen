@@ -13111,12 +13111,25 @@ thread_local! {
     /// everywhere for the life of the session.
     static BUILTIN_FN_WRAPPERS: RefCell<std::collections::HashMap<String, u64>> =
         RefCell::new(std::collections::HashMap::new());
+    /// Reverse of [`BUILTIN_FN_WRAPPERS`]: wrapper closure id -> the symbol the
+    /// wrapper dispatches to. `builtin_wrapper_name` answers the same question
+    /// but linear-scans and clones a String, which is far too slow for a call
+    /// path; this is the O(1) form used to shortcut `#'<builtin>` calls.
+    static BUILTIN_WRAPPER_SYMS: RefCell<std::collections::HashMap<u64, u32>> =
+        RefCell::new(std::collections::HashMap::new());
 }
 
 /// Reify (and cache) a callable, FUNCTIONP wrapper closure for the builtin named
 /// `bare` (interned symbol `name_sym`). See [`BUILTIN_FN_WRAPPERS`] (bliss-uuh).
 fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal {
     let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
+    if let Some(sym) = name_sym.symbol_index() {
+        // Recorded on BOTH paths: a wrapper minted before this map existed (or
+        // by another route) must still be shortcuttable.
+        if let Some(id) = BUILTIN_FN_WRAPPERS.with(|c| c.borrow().get(bare).copied()) {
+            BUILTIN_WRAPPER_SYMS.with(|m| m.borrow_mut().insert(id, sym));
+        }
+    }
     if let Some(id) = BUILTIN_FN_WRAPPERS.with(|c| c.borrow().get(bare).copied()) {
         return arena_cons(closure_sym, BlissVal::from_fixnum(id as i64));
     }
@@ -13147,6 +13160,9 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
     // Once inserted, params_form/body are rooted via the GC scan of env.closures.
     env.closures.borrow_mut().insert(id, closure);
     BUILTIN_FN_WRAPPERS.with(|c| c.borrow_mut().insert(bare.to_string(), id));
+    if let Some(sym) = name_sym.symbol_index() {
+        BUILTIN_WRAPPER_SYMS.with(|m| m.borrow_mut().insert(id, sym));
+    }
     arena_cons(closure_sym, BlissVal::from_fixnum(id as i64))
 }
 
@@ -33169,6 +33185,27 @@ fn apply_function(
         // Check for closure: (BLISS::CLOSURE . id)
         if lh.is_symbol() && sym_name(lh) == "BLISS::CLOSURE" && lr.is_fixnum() {
             let id = lr.as_fixnum() as u64;
+            // `#'<builtin>` is a reified wrapper whose body is literally
+            // `(apply 'NAME %args)`. Interpreting that trampoline -- binding a
+            // &rest list, evaluating the body, then re-dispatching by NAME --
+            // made (funcall #'equalp a b) cost 9.74us against 0.614us for a
+            // direct (equalp a b), i.e. 16x, and that cost is paid by every
+            // :test, :key and higher-order sequence call (bliss-edzd).
+            //
+            // Dispatch straight to the builtin instead. This PRESERVES the
+            // wrapper's dispatch-by-name semantics: direct_builtin_slot_memoized
+            // re-checks per call that the symbol still has no interpreted
+            // function cell and that the invalidation generation is unchanged,
+            // so a redefinition still takes effect -- and anything it declines
+            // (a generic's wrapper, a shadowed name, an arity the kernel does
+            // not take) falls through to the trampoline below, which is always
+            // correct.
+            if let Some(sym) = BUILTIN_WRAPPER_SYMS.with(|m| m.borrow().get(&id).copied())
+                && let Some(slot) = direct_builtin_slot_memoized(sym, args.len())
+                && let Some(res) = call_direct_builtin(slot, args, env)
+            {
+                return res;
+            }
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
                 // Run the body against the closure's LEXICAL block/tagbody exit

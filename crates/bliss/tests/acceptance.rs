@@ -12629,3 +12629,39 @@ fn car_and_cdr_reject_a_closure() {
     ];
     run_expression_cases(&cases);
 }
+
+/// `#'<builtin>` is a reified wrapper closure whose body is literally
+/// `(apply 'NAME %args)`. Interpreting that trampoline made (funcall #'equalp
+/// a b) cost 9.74us against 0.61us for a direct call, a cost paid by every
+/// :test, :key and higher-order sequence call. apply_function now dispatches
+/// such a wrapper straight to the builtin (bliss-edzd) -- which must not change
+/// any observable behaviour, including that a redefinition is still picked up.
+#[test]
+fn builtin_function_objects_dispatch_correctly() {
+    let cases = [
+        ("(list (funcall #'equalp \"a\" \"A\") (funcall #'car (list 1 2)) (funcall #'length \"abc\"))",
+         "(T 1 3)"),
+        ("(list (apply #'equal (list \"a\" \"a\")) (apply #'min (list 3 1 2)))", "(T 1)"),
+        ("(mapcar #'length (list (list 1) \"ab\" (vector 1 2 3)))", "(1 2 3)"),
+        ("(sort (list 3 1 2) #'<)", "(1 2 3)"),
+        ("(remove-duplicates (list \"a\" \"A\" \"b\") :test #'equalp)", "(\"A\" \"b\")"),
+        ("(member 2 (list 1 2 3) :test #'eql)", "(2 3)"),
+        ("(find 2 (list (list 1) (list 2)) :key #'car)", "(2)"),
+        // The wrapper is still a FUNCTION and still not a CONS.
+        ("(list (functionp #'car) (consp #'car) (functionp #'equalp))", "(T NIL T)"),
+        // The shortcut must decline anything that is not a plain builtin: a
+        // real lambda, and a name a user has taken over.
+        ("(funcall (lambda (x y) (list :mine x y)) 1 2)", "(:MINE 1 2)"),
+        // Dispatch-by-name semantics: a captured #'f must see a LATER redefinition,
+        // because the wrapper dispatches at call time rather than capturing code.
+        (
+            "(progn (defun redefme (x) (* x 2))
+                    (let ((f #'redefme)) (defun redefme (x) (* x 3)) (funcall f 5)))",
+            "15",
+        ),
+        // Arities the kernel declines still reach the general path and signal.
+        ("(handler-case (funcall #'car 1 2) (error () :err))", ":ERR"),
+        ("(handler-case (funcall #'length) (error () :err))", ":ERR"),
+    ];
+    run_expression_cases(&cases);
+}
