@@ -4376,6 +4376,35 @@ fn reject_closure_as_list(v: BlissVal) -> Result<(), BlissError> {
     Ok(())
 }
 
+/// `(nth idx list)`'s kernel, shared by the operator-position handler and the
+/// evaluated-args fast arm so the two cannot drift (the bliss-x5y.9 rule).
+///
+/// Walks the spine rather than materialising it. Both sites previously called
+/// `list_to_vec(list)`, allocating a Vec of the ENTIRE list on every access,
+/// which is what left NTH at 22x CAR when MIN was 3.7x (bliss-0goy). The walk
+/// stops at a non-cons exactly where `list_to_vec` stopped, so a dotted tail
+/// reads identically -- `(nth 1 (cons 1 (cons 2 3)))` is still 2, `(nth 1
+/// (cons 1 2))` is still NIL -- and an index past the end is still NIL rather
+/// than an error. A bignum index arrives as `usize::MAX` and terminates on the
+/// first non-cons, so it stays O(length), not O(index).
+///
+/// A closure is rejected up front: it is physically `(BLISS::CLOSURE . id)`,
+/// so a raw walk answered the symbol BLISS::CLOSURE for `(nth 0 f)` and leaked
+/// an internal name into user code (bliss-74rl family).
+///
+/// No allocation, so nothing here needs rooting.
+fn nth_element(idx: usize, list: BlissVal) -> Result<BlissVal, BlissError> {
+    reject_closure_as_list(list)?;
+    let mut cursor = list;
+    for _ in 0..idx {
+        if !cursor.is_cons() {
+            return Ok(NIL);
+        }
+        cursor = cp(cursor).1;
+    }
+    Ok(if cursor.is_cons() { cp(cursor).0 } else { NIL })
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -18247,8 +18276,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     usize::MAX
                 };
-                let elems = list_to_vec(args[1]);
-                return Ok(if idx < elems.len() { elems[idx] } else { NIL });
+                return nth_element(idx, args[1]);
             }
             "MAKE-HASH-TABLE" => {
                 // (make-hash-table &key test size ...) — honor :test, evaluate
@@ -33591,8 +33619,7 @@ fn apply_builtin_fast(
                 } else {
                     usize::MAX
                 };
-                let elems = list_to_vec(args[1]);
-                Ok(if idx < elems.len() { elems[idx] } else { NIL })
+                nth_element(idx, args[1])
             })())
         }
         // Equality and numeric extrema on already-evaluated arguments. Each

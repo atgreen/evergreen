@@ -12812,3 +12812,43 @@ fn promoted_cons_predicates_and_guards_match_the_interpreter() {
     )];
     run_expression_cases(&cases);
 }
+
+/// bliss-0goy: NTH walked the spine via `list_to_vec`, materialising the WHOLE
+/// list on every access. The kernel is now a walk, shared by the
+/// operator-position handler and the evaluated-args fast arm so the two cannot
+/// drift (the bliss-x5y.9 rule). These cases pin the behaviour the walk has to
+/// reproduce exactly -- the dotted-tail and past-the-end answers in particular,
+/// which are where a walk could plausibly differ from indexing a vector.
+#[test]
+fn nth_walks_the_spine_with_unchanged_edge_cases() {
+    let cases = [
+        // Ordinary indexing, both dispatch paths (FUNCALL takes the fast arm).
+        ("(nth 0 (list 1 2 3))", "1"),
+        ("(nth 2 (list 1 2 3))", "3"),
+        ("(funcall #'nth 1 (list 1 2 3))", "2"),
+        // Past the end is NIL, not an error.
+        ("(nth 5 (list 1 2 3))", "NIL"),
+        ("(nth 0 nil)", "NIL"),
+        // Dotted tails: the walk must stop exactly where list_to_vec stopped.
+        ("(nth 0 (cons 1 2))", "1"),
+        ("(nth 1 (cons 1 2))", "NIL"),
+        ("(nth 1 (cons 1 (cons 2 3)))", "2"),
+        ("(nth 2 (cons 1 (cons 2 3)))", "NIL"),
+        // A bignum index arrives as usize::MAX; it must terminate on the first
+        // non-cons (O(length)), not attempt to count to the index.
+        ("(nth 100000000000000000000 (list 1 2))", "NIL"),
+        // Index type errors are unchanged and still precede the walk.
+        ("(handler-case (nth -1 (list 1 2)) (type-error () :te))", ":TE"),
+        ("(handler-case (nth 1.0 (list 1 2)) (type-error () :te))", ":TE"),
+        // A closure is not a list. Walking one used to answer the internal
+        // symbol BLISS::CLOSURE for index 0 (bliss-74rl family).
+        ("(let ((f (lambda (x) x)))
+            (handler-case (nth 0 f) (type-error (e) (eq (type-error-datum e) f))))", "T"),
+        ("(let ((f (lambda (x) x)))
+            (handler-case (funcall #'nth 0 f) (type-error (e) (eq (type-error-datum e) f))))", "T"),
+        // Long list: correct element, and the walk is the only way this stays
+        // cheap enough to run in a test.
+        ("(nth 9999 (let ((l nil)) (dotimes (i 10000) (push i l)) l))", "0"),
+    ];
+    run_expression_cases(&cases);
+}
