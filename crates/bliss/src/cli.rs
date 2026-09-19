@@ -15318,29 +15318,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     expected: "list".into(),
                 });
             }
+            // SECOND/THIRD are `(nth 1 x)` / `(nth 2 x)`, so they share NTH's
+            // kernel rather than each open-coding a walk (bliss-ljmk asked for
+            // the kernel to be EXTRACTED, not transcribed -- a second copy is
+            // how the interpreter and stdlib drifted apart before). THIRD in
+            // particular called `list_to_vec`, materialising the whole list to
+            // read one element, exactly the cost bliss-0goy removed from NTH.
+            //
+            // This also makes `(second <closure>)` signal instead of answering
+            // NIL. SECOND is `(car (cdr x))` and bliss's own CDR already
+            // signals for a function, so the old NIL disagreed with its own
+            // primitives (bliss-74rl family).
             "SECOND" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                if v.is_nil() {
-                    return Ok(NIL);
-                }
-                if v.is_cons() {
-                    let (_, d) = cp(v);
-                    if d.is_cons() {
-                        let (a, _) = cp(d);
-                        return Ok(a);
-                    }
-                }
-                return Ok(NIL);
+                return nth_element(1, v);
             }
             "THIRD" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                if v.is_nil() {
-                    return Ok(NIL);
-                }
-                let elems = list_to_vec(v);
-                return Ok(if elems.len() >= 3 { elems[2] } else { NIL });
+                return nth_element(2, v);
             }
             "ATOM" => {
                 let (af, _) = cp(cdr);
@@ -32820,6 +32817,7 @@ const DIRECT_FAST: &[&str] = &[
     // builtins: they never re-enter Lisp and take evaluated arguments, so they
     // need no invocation counting, depth cap or panic barrier (bliss-fdny).
     "SET-CAR", "SET-CDR",
+    "SECOND", "THIRD",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
@@ -33630,6 +33628,14 @@ fn apply_builtin_fast(
         // list_to_vec materialises the whole list per call, which is its own
         // cost; it is kept here so this arm stays bit-identical to operator
         // position, and reducing it is tracked separately.
+        // The ordinal accessors that ARE builtins (FOURTH..TENTH are boot.lisp
+        // defuns and cannot reach the direct table). Same kernel as operator
+        // position (bliss-ljmk).
+        "SECOND" | "THIRD" if args.len() == 1 => {
+            env.clear_mv();
+            let k = if name == "SECOND" { 1 } else { 2 };
+            Some(nth_element(k, args[0]))
+        }
         "NTH" if args.len() >= 2 => {
             env.clear_mv();
             let nidx = args[0];

@@ -12949,3 +12949,39 @@ fn symbol_names_preserve_non_ascii_characters() {
     ];
     run_expression_cases(&cases);
 }
+
+/// bliss-ljmk: SECOND and THIRD each open-coded their own access -- and THIRD
+/// called `list_to_vec`, materialising the entire list to read one element,
+/// the same cost bliss-0goy removed from NTH. Both now route to `nth_element`,
+/// the kernel NTH uses, so there is one walk rather than three copies of one.
+///
+/// Every answer below is unchanged from before that refactor EXCEPT the two
+/// closure cases: `(second f)` answered NIL, which disagreed with bliss's own
+/// CDR (SECOND is `(car (cdr x))`, and `(cdr <function>)` signals).
+#[test]
+fn ordinal_accessors_share_the_nth_kernel() {
+    let cases = [
+        ("(second (list 1 2 3))", "2"),
+        ("(third (list 1 2 3))", "3"),
+        ("(funcall #'second (list 1 2))", "2"),
+        ("(funcall #'third (list 1 2 3))", "3"),
+        // Short lists and NIL answer NIL rather than signalling.
+        ("(second (list 1))", "NIL"),
+        ("(third (list 1 2))", "NIL"),
+        ("(second nil)", "NIL"),
+        ("(third nil)", "NIL"),
+        // Dotted tails stop where the walk stops.
+        ("(second (cons 1 2))", "NIL"),
+        ("(third (cons 1 (cons 2 (cons 3 4))))", "3"),
+        // Non-lists answer NIL, as they did before.
+        ("(second 5)", "NIL"),
+        ("(third \"abc\")", "NIL"),
+        // ... but a closure is a FUNCTION, and CDR of one signals.
+        ("(handler-case (second (lambda (x) x)) (type-error () :te))", ":TE"),
+        ("(handler-case (third (lambda (x) x)) (type-error () :te))", ":TE"),
+        // FOURTH..TENTH are boot.lisp defuns and are unaffected.
+        ("(fourth (list 1 2 3 4))", "4"),
+        ("(tenth (list 1 2 3 4 5 6 7 8 9 10))", "10"),
+    ];
+    run_expression_cases(&cases);
+}
