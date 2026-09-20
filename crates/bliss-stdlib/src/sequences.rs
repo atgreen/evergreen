@@ -1723,7 +1723,15 @@ fn result_type_is_vector(result_type: BlissVal) -> bool {
 }
 
 /// Check whether CONCATENATE requested a string result type.
-fn result_type_is_string(result_type: BlissVal) -> bool {
+/// Does this sequence result-type specifier designate a STRING?
+///
+/// Public because COERCE needs the SAME rule (bliss-wzfm). It reduced a type
+/// spec to its head symbol, so `(simple-array character (*))` dispatched on
+/// SIMPLE-ARRAY and built a general vector -- `#(#\a #\b)` where SBCL answers
+/// `"ab"`. Sharing this predicate rather than restating the rule keeps COERCE,
+/// CONCATENATE and MAKE-SEQUENCE from drifting; the element-type clause below
+/// already exists here for CONCATENATE and was simply out of COERCE's reach.
+pub fn result_type_is_string(result_type: BlissVal) -> bool {
     fn name_is_string(idx: u32) -> bool {
         matches!(
             bliss_compiler::reader::symbol_name(idx).as_deref(),

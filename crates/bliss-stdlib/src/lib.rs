@@ -103,6 +103,7 @@ pub use pathnames::{
     translate_pathname, truename, wild_pathname_p,
 };
 pub use sequences::{
+    result_type_is_string,
     adjust_complex_vector, aref, array_total_size, build_complex_vector, build_displaced_vector,
     build_filled_simple_vector, build_md_array, build_result_sequence, build_simple_vector,
     concatenate,

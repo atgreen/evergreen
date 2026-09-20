@@ -27963,6 +27963,25 @@ fn coerce_check_array_length(type_val: BlissVal, len: usize) -> Result<(), Bliss
     Ok(())
 }
 
+/// COERCE's string result, shared by the bare-symbol arm (`'string`) and the
+/// compound-specifier pre-check (`'(vector character)`) so the two cannot
+/// diverge (bliss-wzfm).
+fn coerce_to_string_value(value: BlissVal) -> Result<BlissVal, BlissError> {
+    if bliss_stdlib::registered_string(value).is_some() {
+        return Ok(value);
+    }
+    let mut s = String::new();
+    for e in seq_elements(value)? {
+        if e.is_character() {
+            s.push(e.as_char());
+        }
+    }
+    // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
+    // :element-type character :initial-contents) must be MUTABLE — an
+    // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
+    Ok(bliss_stdlib::make_lisp_string_fresh(&s))
+}
+
 fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissError> {
     // Reduce the type spec to a bare head-symbol name.
     let head = if type_val.is_cons() {
@@ -27986,6 +28005,20 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
             symbol_bare_name(&sym_name_rc(cn))
         }
     };
+    // A COMPOUND specifier can name a string through its ELEMENT TYPE rather
+    // than its head: `(simple-array character (*))`, `(vector base-char)`,
+    // `(array nil (*))`. The dispatch below reduces the spec to its HEAD
+    // symbol, so those landed on the SIMPLE-ARRAY/VECTOR arm and built a
+    // general vector -- `(coerce '(#\a #\b) '(simple-array character (*)))`
+    // answered `#(#\a #\b)` where SBCL answers `"ab"` (bliss-wzfm).
+    //
+    // The rule is not restated here: `result_type_is_string` is the one
+    // CONCATENATE already uses, and boot.lisp's MAKE-SEQUENCE has the same
+    // test, so sharing it is what stops the three drifting apart. A bare
+    // symbol spec is left to the match, which already handles those names.
+    if type_val.is_cons() && bliss_stdlib::result_type_is_string(type_val) {
+        return coerce_to_string_value(value);
+    }
     match tname.as_str() {
         "T" => Ok(value),
         // A cons is not built from a sequence; COERCE to CONS only accepts an
@@ -28072,19 +28105,7 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
             }
         }
         "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
-            if bliss_stdlib::registered_string(value).is_some() {
-                return Ok(value);
-            }
-            let mut s = String::new();
-            for e in seq_elements(value)? {
-                if e.is_character() {
-                    s.push(e.as_char());
-                }
-            }
-            // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
-            // :element-type character :initial-contents) must be MUTABLE — an
-            // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
-            Ok(bliss_stdlib::make_lisp_string_fresh(&s))
+            coerce_to_string_value(value)
         }
         "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => {
             if value.is_character() {

@@ -12998,6 +12998,49 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-wzfm: COERCE reduced a type specifier to its HEAD symbol, so a
+/// compound spec naming a string through its ELEMENT TYPE --
+/// `(simple-array character (*))`, `(vector base-char)` -- dispatched on
+/// SIMPLE-ARRAY/VECTOR and built a general vector: `#(#\a #\b)` where SBCL
+/// answers `"ab"`.
+///
+/// The rule was not restated for COERCE. `result_type_is_string` in
+/// bliss-stdlib already had it (CONCATENATE needed the same thing), so COERCE
+/// now shares that predicate -- which is the point: COERCE, CONCATENATE and
+/// MAKE-SEQUENCE agreeing is what keeps this from regressing one function at a
+/// time. The last three cases check the siblings still agree.
+///
+/// Expectations verified against SBCL.
+#[test]
+fn coerce_recognizes_a_string_named_by_its_element_type() {
+    let cases = [
+        ("(coerce '(#\\a #\\b) '(simple-array character (*)))", "\"ab\""),
+        ("(coerce '(#\\a #\\b) '(vector character))", "\"ab\""),
+        ("(coerce '(#\\a #\\b) '(array character (*)))", "\"ab\""),
+        ("(coerce '(#\\a #\\b) '(simple-array base-char (*)))", "\"ab\""),
+        ("(coerce '(#\\a #\\b) '(vector base-char))", "\"ab\""),
+        ("(coerce '(#\\a #\\b) '(simple-array standard-char (*)))", "\"ab\""),
+        ("(coerce '(#\\a #\\b) '(vector character 2))", "\"ab\""),
+        // Bare symbol specs were already right and must stay so.
+        ("(coerce '(#\\a #\\b) 'string)", "\"ab\""),
+        ("(coerce '(#\\a #\\b) 'simple-string)", "\"ab\""),
+        // A NON-character element type must NOT be treated as a string.
+        ("(coerce '(1 2) '(vector t))", "#(1 2)"),
+        ("(coerce '(1 2) '(simple-array t (*)))", "#(1 2)"),
+        ("(coerce '(1 2) 'vector)", "#(1 2)"),
+        ("(coerce '(#\\a #\\b) 'list)", "(#\\a #\\b)"),
+        // Already a string, and other sequence inputs.
+        ("(coerce \"ab\" '(vector character))", "\"ab\""),
+        ("(coerce #(#\\a #\\b) '(vector character))", "\"ab\""),
+        ("(coerce nil '(vector character))", "\"\""),
+        ("(stringp (coerce '(#\\a #\\b) '(simple-array character (*))))", "T"),
+        // The siblings that share the predicate must still agree.
+        ("(concatenate '(vector character) \"ab\" \"cd\")", "\"abcd\""),
+        ("(make-sequence '(vector character) 2 :initial-element #\\x)", "\"xx\""),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-w0ae: MEMBER and ASSOC were the two worst builtins left on the
 /// synthesize-and-re-evaluate detour (6.3us and 5.9us against 0.23us for CAR).
 /// They are excluded from the direct-builtin table because :test/:key take
