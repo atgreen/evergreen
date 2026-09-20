@@ -12152,6 +12152,31 @@ fn typep_matches(
                 bliss_rt::types::rationalp(object) && !bliss_rt::types::integerp(object)
             }
             "COMPLEX" => bliss_rt::types::complexp(object),
+            // A random state is bliss's placeholder `(:RANDOM-STATE)` list (see
+            // lib/boot.lisp, which documents the single-global-PRNG choice).
+            // RANDOM-STATE-P recognised it but TYPEP had no arm at all, so
+            // `(typep *random-state* 'random-state)` was NIL for bliss's OWN
+            // random state -- a type predicate disagreeing with the type it
+            // tests. ansi MAKE-RANDOM-STATE.ERROR.4 sees it as the mismatch it
+            // is: its TYPEF says the value is not a RANDOM-STATE and so expects
+            // MAKE-RANDOM-STATE to reject it, while MAKE-RANDOM-STATE accepts
+            // it via RANDOM-STATE-P.
+            //
+            // This makes the two agree. That the representation is a plain list
+            // -- so any `(:RANDOM-STATE)` list IS one -- is a separate design
+            // question (bliss-0ju0).
+            // GC: compare the car by NAME rather than calling resolve_sym.
+            // resolve_sym INTERNS, which can allocate and relocate `object`,
+            // and holding `object` across it is exactly the unrooted-across-
+            // allocation smell scripts/gc-root-lint.sh flags (it flagged this).
+            // sym_name_rc/symbol_bare_name touch no Lisp heap, so nothing can
+            // move here.
+            "RANDOM-STATE" => {
+                object.is_cons() && {
+                    let car = cp(object).0;
+                    is_keyword_arg(car) && symbol_bare_name(&sym_name_rc(car)) == "RANDOM-STATE"
+                }
+            }
             // UNSIGNED-BYTE with no size == (integer 0 *); SIGNED-BYTE with no
             // size == any integer; BIT == (integer 0 1). UNSIGNED-BYTE must accept
             // a POSITIVE BIGNUM, not just a non-negative fixnum — else e.g.

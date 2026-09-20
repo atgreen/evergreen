@@ -13519,6 +13519,19 @@ fn integer_builtins_signal_the_right_conditions() {
         ("(handler-case (make-random-state 0) (type-error () :te))", ":TE"),
         ("(handler-case (make-random-state \"x\") (type-error () :te))", ":TE"),
         ("(random-state-p (make-random-state))", "T"),
+        // TYPEP had NO arm for RANDOM-STATE, so it answered NIL for bliss's own
+        // random state while RANDOM-STATE-P answered T -- a predicate
+        // disagreeing with the type it tests. ansi MAKE-RANDOM-STATE.ERROR.4
+        // sees the mismatch: its TYPEF (which uses TYPEP) says the value is not
+        // a RANDOM-STATE and expects a rejection, while MAKE-RANDOM-STATE
+        // accepts it via RANDOM-STATE-P.
+        ("(typep *random-state* 'random-state)", "T"),
+        ("(let ((r (make-random-state)))
+            (and (typep r 'random-state) (random-state-p r)))", "T"),
+        ("(typep 0 'random-state)", "NIL"),
+        ("(typep \"x\" 'random-state)", "NIL"),
+        ("(typep (list 1 2) 'random-state)", "NIL"),
+        ("(typep nil 'random-state)", "NIL"),
         ("(random-state-p (make-random-state t))", "T"),
         ("(random-state-p (make-random-state *random-state*))", "T"),
         // RANDOM: count vs type, no longer swapped.
