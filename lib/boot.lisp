@@ -1379,34 +1379,19 @@
 ;; monotonic sequence, CHAR= that all args are equal, CHAR/= that all are
 ;; pairwise distinct. cl-ppcre's char-class matcher relies on (char<= lo c hi)
 ;; range tests (3 args) (bliss-omw).
-(defun char= (c &rest more)
-  (dolist (x more t) (unless (= (char-code c) (char-code x)) (return nil))))
-(defun char/= (&rest cs)
-  (when (null cs) (error 'program-error)) ; requires >=1 arg (char-compare-no-args)
-  (do ((tail cs (cdr tail))) ((null tail) t)
-    (dolist (y (cdr tail))
-      (when (= (char-code (car tail)) (char-code y)) (return-from char/= nil)))))
-(defun char< (c &rest more)
-  (let ((prev (char-code c)))
-    (dolist (x more t)
-      (let ((cur (char-code x))) (unless (< prev cur) (return nil)) (setq prev cur)))))
-(defun char> (c &rest more)
-  (let ((prev (char-code c)))
-    (dolist (x more t)
-      (let ((cur (char-code x))) (unless (> prev cur) (return nil)) (setq prev cur)))))
-(defun char<= (c &rest more)
-  (let ((prev (char-code c)))
-    (dolist (x more t)
-      (let ((cur (char-code x))) (unless (<= prev cur) (return nil)) (setq prev cur)))))
-(defun char>= (c &rest more)
-  (let ((prev (char-code c)))
-    (dolist (x more t)
-      (let ((cur (char-code x))) (unless (>= prev cur) (return nil)) (setq prev cur)))))
+;; CHAR=, CHAR/=, CHAR<, CHAR>, CHAR<= and CHAR>= are Rust builtins wired to
+;; bliss-stdlib::characters (bliss-7oa5). They were defuns here, which made
+;; every 2-argument call allocate a rest list, run an interpreted DOLIST,
+;; dispatch CHAR-CODE twice and then generic `=` -- 9.8us against 0.27us for
+;; EQ. A defun here would SHADOW the builtin (the function cell wins over the
+;; operator-position arm), so this must stay a comment, not a definition.
 
 (defun upper-case-p (c) (and (>= (char-code c) 65) (<= (char-code c) 90)))
 (defun lower-case-p (c) (and (>= (char-code c) 97) (<= (char-code c) 122)))
-(defun char-upcase (c) (if (lower-case-p c) (code-char (- (char-code c) 32)) c))
-(defun char-downcase (c) (if (upper-case-p c) (code-char (+ (char-code c) 32)) c))
+;; CHAR-UPCASE / CHAR-DOWNCASE are Rust builtins (bliss-7oa5). The definitions
+;; here did ASCII +/-32 arithmetic, which was both slow (three builtin
+;; dispatches per call, 16us) and wrong for every non-ASCII cased character;
+;; the builtin uses the real Unicode 1:1 mapping.
 (defun alpha-char-p (c) (or (upper-case-p c) (lower-case-p c)))
 (defun digit-char-p (c &optional (radix 10))
   ;; Weight of C as a digit in RADIX (0-9, then A-Z / a-z = 10-35), or NIL.
@@ -2714,39 +2699,10 @@
   (let ((code (char-code c)))
     (or (= code 32) (and (> code 32) (< code 127)) (>= code 160))))
 
-(defun %char-key (c) (char-code (char-upcase c)))
-
-;; Case-insensitive character comparisons.  EQUAL/NOT-EQUAL require all/none of
-;; the arguments equal; the ordered comparisons require a monotonic chain.
-(defun %char-chain (fn cs)
-  ;; All CLHS character comparisons require at least one argument; a no-argument
-  ;; call is a PROGRAM-ERROR (char-compare-no-args). The recursion never reaches
-  ;; a null CS (it stops at one element), so this fires only on the top-level
-  ;; zero-argument call.
-  (when (null cs) (error 'program-error))
-  (if (null (cdr cs))
-      t
-      (and (funcall fn (car cs) (cadr cs)) (%char-chain fn (cdr cs)))))
-
-(defun char-equal (&rest cs)
-  (%char-chain (lambda (a b) (= (%char-key a) (%char-key b))) cs))
-(defun char-lessp (&rest cs)
-  (%char-chain (lambda (a b) (< (%char-key a) (%char-key b))) cs))
-(defun char-greaterp (&rest cs)
-  (%char-chain (lambda (a b) (> (%char-key a) (%char-key b))) cs))
-(defun char-not-greaterp (&rest cs)
-  (%char-chain (lambda (a b) (<= (%char-key a) (%char-key b))) cs))
-(defun char-not-lessp (&rest cs)
-  (%char-chain (lambda (a b) (>= (%char-key a) (%char-key b))) cs))
-(defun char-not-equal (&rest cs)
-  ;; every pair must differ (case-insensitively).  RETURN-FROM (not RETURN)
-  ;; because the inner DOLIST establishes its own BLOCK NIL.
-  (when (null cs) (error 'program-error)) ; requires >=1 arg (char-compare-no-args)
-  (block done
-    (loop for tail on cs do
-      (dolist (o (cdr tail))
-        (when (= (%char-key (car tail)) (%char-key o)) (return-from done nil))))
-    t))
+;; The case-insensitive family is likewise a Rust builtin (bliss-7oa5). These
+;; consed a FRESH CLOSURE per call and drove %char-chain recursively, which is
+;; why CHAR-EQUAL measured 54us -- 204x EQ, the worst builtin on the character
+;; path.
 
 (defun digit-char (weight &optional (radix 10))
   (if (and (integerp weight) (>= weight 0) (< weight radix) (< weight 36))

@@ -12998,6 +12998,117 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-7oa5: the character comparison family moved from boot.lisp `&rest`
+/// defuns to Rust builtins over bliss-stdlib::characters (37-200x faster).
+/// These assert the SEMANTICS the move had to preserve exactly -- the arity
+/// rules are the easy part to get wrong, and every expectation here was checked
+/// against SBCL first.
+#[test]
+fn character_comparisons_keep_their_arity_and_type_rules() {
+    let cases = [
+        // One argument is T; zero is a PROGRAM-ERROR, not NIL and not T.
+        ("(char= #\\a)", "T"),
+        ("(char/= #\\a)", "T"),
+        ("(handler-case (char/=) (program-error () :pe))", ":PE"),
+        ("(handler-case (char-equal) (program-error () :pe))", ":PE"),
+        // Monotonic predicates compare ADJACENT pairs.
+        ("(char= #\\a #\\a #\\a)", "T"),
+        ("(char= #\\a #\\a #\\b)", "NIL"),
+        ("(char<= #\\a #\\b #\\c)", "T"),
+        ("(char<= #\\a #\\c #\\b)", "NIL"),
+        // cl-ppcre's char-class matcher needs the 3-argument range test (bliss-omw).
+        ("(char<= #\\a #\\m #\\z)", "T"),
+        ("(char<= #\\a #\\Z #\\z)", "NIL"),
+        // /= is PAIRWISE distinct, NOT the negation of = beyond two arguments:
+        // no two NEIGHBOURS match here, yet the answer is NIL.
+        ("(char/= #\\a #\\b #\\a)", "NIL"),
+        ("(char/= #\\a #\\b #\\c)", "T"),
+        // Case-insensitive family.
+        ("(char-equal #\\a #\\A)", "T"),
+        ("(char-equal #\\a #\\A #\\a)", "T"),
+        ("(char-equal #\\a #\\b)", "NIL"),
+        ("(char-lessp #\\a #\\B)", "T"),
+        // Case-folded, so B > A is T -- NOT the code-point answer, where
+        // #\B (66) < #\a (97) would give NIL.
+        ("(char-greaterp #\\B #\\a)", "T"),
+        ("(char-greaterp #\\a #\\B)", "NIL"),
+        ("(char-not-equal #\\a #\\A)", "NIL"),
+        // A non-character argument is a TYPE-ERROR in every position, including
+        // one an early answer might have let it skip.
+        ("(handler-case (char= #\\a 5) (type-error () :te))", ":TE"),
+        ("(handler-case (char= 5 #\\a) (type-error () :te))", ":TE"),
+        ("(handler-case (char= #\\a #\\b 5) (type-error () :te))", ":TE"),
+        ("(handler-case (char-equal #\\a 5) (type-error () :te))", ":TE"),
+        ("(handler-case (char-upcase 5) (type-error () :te))", ":TE"),
+        // Case conversion, including a caseless character.
+        ("(char-upcase #\\a)", "#\\A"),
+        ("(char-upcase #\\A)", "#\\A"),
+        ("(char-upcase #\\1)", "#\\1"),
+        ("(char-downcase #\\A)", "#\\a"),
+        // Wrong arity is a PROGRAM-ERROR. As boot.lisp defuns the lambda-list
+        // binder gave this for free; as builtins nothing did until an explicit
+        // fixed_arity entry was added (ansi CHAR-UPCASE.ERROR.1/2).
+        ("(handler-case (char-upcase) (program-error () :pe))", ":PE"),
+        ("(handler-case (char-upcase #\\a #\\a) (program-error () :pe))", ":PE"),
+        ("(handler-case (char-downcase) (program-error () :pe))", ":PE"),
+        ("(handler-case (char-downcase #\\a #\\a) (program-error () :pe))", ":PE"),
+        // Case handling is ASCII-only and must stay CONSISTENT with
+        // LOWER-CASE-P: ansi CHAR-UPCASE.2 walks all 65536 code points
+        // asserting that anything CHAR-UPCASE changes is a character
+        // LOWER-CASE-P calls lower. A Unicode CHAR-UPCASE over an ASCII
+        // LOWER-CASE-P breaks that (see the separate Unicode-case bead).
+        ("(char-upcase (code-char 233))", "#\\\u{e9}"),
+        ("(lower-case-p (code-char 233))", "NIL"),
+        ("(char-code #\\a)", "97"),
+        ("(code-char 97)", "#\\a"),
+        // Reachable as functions, not just in operator position -- these are
+        // FBOUNDP-visible and funcallable, which moving them out of boot.lisp
+        // initially broke for the case-insensitive names.
+        ("(funcall #'char= #\\a #\\a)", "T"),
+        ("(funcall #'char-equal #\\a #\\A)", "T"),
+        ("(and (fboundp 'char-lessp) (fboundp 'char-not-greaterp)\
+               (fboundp 'char-not-lessp) (fboundp 'char-greaterp)\
+               (fboundp 'char-not-equal) t)", "T"),
+        ("(apply #'char< (list #\\a #\\b))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// bliss-7efw: a class-allocated slot's `:initarg` was silently dropped unless
+/// the slot-name symbol already had a BARE internal name.
+///
+/// `eval_defclass` stored the slot name as `sym_name` gave it -- package
+/// qualified -- while `lookup_slot_def` compared against the bare name callers
+/// pass. The lookup missed, the initarg was treated as an instance initarg, the
+/// shared class cell was never written, and the slot read back UNBOUND.
+///
+/// This hid behind an accident for a long time: it only bites names that
+/// boot.lisp does not itself mention, and the older test for this area used a
+/// slot named CS while boot.lisp had `&rest cs` parameters interning CS bare.
+/// Every slot name below is deliberately one boot.lisp never uses, so the test
+/// cannot pass on that coincidence again.
+#[test]
+fn class_allocated_initargs_work_for_unfamiliar_slot_names() {
+    let cases = [
+        ("(progn (defclass q1 () ((zebra :allocation :class :reader q1z :initarg :zebra)))\
+           (make-instance 'q1 :zebra 99) (q1z (make-instance 'q1)))", "99"),
+        // Value is shared with a subclass instance.
+        ("(progn (defclass q2 () ((quokka :allocation :class :reader q2q :initarg :quokka)))\
+           (defclass q2sub (q2) ()) (make-instance 'q2 :quokka 'shared)\
+           (q2q (make-instance 'q2sub)))", "SHARED"),
+        // An instance-allocated initarg with an equally unfamiliar name still works.
+        ("(progn (defclass q3 () ((narwhal :initarg :narwhal :reader q3n)))\
+           (q3n (make-instance 'q3 :narwhal 7)))", "7"),
+        // A class slot with an initform and no initarg is unaffected.
+        ("(progn (defclass q4 () ((platypus :allocation :class :initform 5 :reader q4p)))\
+           (q4p (make-instance 'q4)))", "5"),
+        // An explicit initarg overrides the initform on a class slot.
+        ("(progn (defclass q5 () ((wombat :allocation :class :initform 1 :initarg :wombat :reader q5w)))\
+           (make-instance 'q5 :wombat 42) (q5w (make-instance 'q5)))", "42"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-3snc: SIMPLE-VECTOR-P shared VECTORP's dispatch arm, so it inherited
 /// VECTORP's answer and reported T for everything rank-1 -- strings, bit
 /// vectors, fill-pointer and adjustable arrays. CLHS scopes it to a SIMPLE

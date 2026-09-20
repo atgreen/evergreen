@@ -4415,6 +4415,54 @@ fn require_list(v: BlissVal) -> Result<(), BlissError> {
     Ok(())
 }
 
+/// Bridge `bliss_stdlib::characters` errors onto the interpreter's conditions.
+///
+/// Zero arguments is a PROGRAM-ERROR (not a TYPE-ERROR and not NIL) for every
+/// one of these, which is what CHAR-COMPARE-NO-ARGS in the ansi suite checks
+/// and what SBCL signals.
+fn char_cmp_err(e: bliss_stdlib::characters::CharCmpError) -> BlissError {
+    match e {
+        bliss_stdlib::characters::CharCmpError::NotACharacter(v) => BlissError::TypeError {
+            datum: v,
+            expected: "character".into(),
+        },
+        bliss_stdlib::characters::CharCmpError::NoArguments => BlissError::ProgramError(
+            "character comparison requires at least one argument".to_string(),
+        ),
+    }
+}
+
+/// Name -> (key, comparison) for the whole CHAR= / CHAR-EQUAL family.
+///
+/// Both the operator-position handler and the evaluated-args fast path consult
+/// this ONE table, so the two cannot drift (the bliss-x5y.9 rule) -- which
+/// matters here because the family is twelve names differing only in two
+/// parameters, and transcribing that twice is how a single wrong pairing hides.
+fn char_cmp_spec(
+    name: &str,
+) -> Option<(
+    bliss_stdlib::characters::CharKey,
+    bliss_stdlib::characters::CharCmp,
+)> {
+    use bliss_stdlib::characters::{CharCmp, CharKey};
+    Some(match name {
+        "CHAR=" => (CharKey::Exact, CharCmp::Eq),
+        "CHAR/=" => (CharKey::Exact, CharCmp::Ne),
+        "CHAR<" => (CharKey::Exact, CharCmp::Lt),
+        "CHAR>" => (CharKey::Exact, CharCmp::Gt),
+        "CHAR<=" => (CharKey::Exact, CharCmp::Le),
+        "CHAR>=" => (CharKey::Exact, CharCmp::Ge),
+        "CHAR-EQUAL" => (CharKey::Folded, CharCmp::Eq),
+        "CHAR-NOT-EQUAL" => (CharKey::Folded, CharCmp::Ne),
+        "CHAR-LESSP" => (CharKey::Folded, CharCmp::Lt),
+        "CHAR-GREATERP" => (CharKey::Folded, CharCmp::Gt),
+        "CHAR-NOT-GREATERP" => (CharKey::Folded, CharCmp::Le),
+        "CHAR-NOT-LESSP" => (CharKey::Folded, CharCmp::Ge),
+        _ => return None,
+    })
+}
+
+
 /// `(nth idx list)`'s kernel, shared by the operator-position handler and the
 /// evaluated-args fast arm so the two cannot drift (the bliss-x5y.9 rule).
 ///
@@ -4670,7 +4718,23 @@ fn class_name_for_instance_class(class: BlissVal) -> String {
 
 fn lookup_slot_def(env: &Env, class_name: &str, slot_name: &str) -> Option<SlotDef> {
     let class_def = env.classes.borrow().get(class_name).cloned()?;
-    if let Some(slot) = class_def.slots.iter().find(|slot| slot.name == slot_name) {
+    // Compare BARE names. `eval_defclass` stores whatever `sym_name` gave it,
+    // which is package-qualified ("COMMON-LISP-USER::CS") for a symbol interned
+    // in a package, while callers pass a bare name ("CS") -- so an exact
+    // comparison silently missed every qualified slot. Class-allocated slots
+    // then took the instance-initarg path, the shared cell was never written,
+    // and the slot read back UNBOUND (bliss-x4p keys the value cells by bare
+    // name for exactly this reason; the lookup had not been brought along).
+    //
+    // This was masked by accident: it only bit slots whose name symbol was not
+    // already interned bare during boot, and boot.lisp happened to intern `cs`
+    // as a `&rest` parameter -- the very name the regression test uses.
+    let bare = symbol_bare_name(slot_name);
+    if let Some(slot) = class_def
+        .slots
+        .iter()
+        .find(|slot| slot.name == slot_name || symbol_bare_name(&slot.name) == bare)
+    {
         return Some(slot.clone());
     }
     for super_name in &class_def.supers {
@@ -13800,6 +13864,12 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // (char-code char) / (code-char code) take exactly one argument
         // (ansi-test char-code.error/code-char.error).
         "CHAR-CODE" | "CODE-CHAR" => Some((1, 1)),
+        // CHAR-UPCASE / CHAR-DOWNCASE likewise. They were boot.lisp defuns, so
+        // the lambda-list binder rejected a wrong count for free; as builtins
+        // nothing did, and `(char-upcase)` / `(char-upcase #\a #\a)` quietly
+        // answered instead of signalling (ansi CHAR-UPCASE.ERROR.1/2 and the
+        // CHAR-DOWNCASE pair). bliss-7oa5.
+        "CHAR-UPCASE" | "CHAR-DOWNCASE" => Some((1, 1)),
         // (member item list &key ...) / (assoc item alist &key ...) — two
         // required, then an unbounded keyword tail (max == usize::MAX). bliss-l6y9.
         "MEMBER" | "ASSOC" => Some((2, usize::MAX)),
@@ -16321,6 +16391,33 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 env.macros_mut().remove(&name);
                 global_macro_remove(&name);
                 return Ok(sym);
+            }
+            // The CHAR= / CHAR-EQUAL family. These were boot.lisp `&rest` defuns,
+            // so a 2-argument call allocated a rest list, ran an interpreted
+            // DOLIST, dispatched CHAR-CODE twice and then generic `=` -- 9.8us
+            // against 0.27us for EQ, and CHAR-EQUAL consed a closure per call
+            // for 54us (bliss-7oa5). A character is an immediate, so this is a
+            // tag check and an integer compare.
+            n if char_cmp_spec(n).is_some() => {
+                let (key, cmp) = char_cmp_spec(n).expect("guarded by the arm");
+                // Arguments are evaluated left to right, as everywhere else.
+                let mut vals: Vec<BlissVal> = Vec::new();
+                bliss_rt::rooted_ref!(_g = &mut vals);
+                let mut rest = cdr;
+                while rest.is_cons() {
+                    let (a, next) = cp(rest);
+                    vals.push(eval_form(a, env)?);
+                    rest = next;
+                }
+                let ok = bliss_stdlib::characters::compare(&vals, key, cmp)
+                    .map_err(char_cmp_err)?;
+                return Ok(if ok { T } else { NIL });
+            }
+            "CHAR-UPCASE" | "CHAR-DOWNCASE" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return bliss_stdlib::characters::convert_case(v, name == "CHAR-UPCASE")
+                    .map_err(char_cmp_err);
             }
             "CHAR-CODE" => {
                 let (af, _) = cp(cdr);
@@ -32748,6 +32845,11 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 const DIRECT_FAST: &[&str] = &[
     "AREF", "SVREF", "ROW-MAJOR-AREF", "BIT", "SBIT", "ELT", "LENGTH", "EQ", "TYPEP",
     "SYMBOLP", "NUMBERP", "STRINGP", "VECTORP", "SIMPLE-VECTOR-P", "KEYWORDP", "ARRAYP",
+    // The character comparison family and case conversion (bliss-7oa5).
+    "CHAR=", "CHAR/=", "CHAR<", "CHAR>", "CHAR<=", "CHAR>=",
+    "CHAR-EQUAL", "CHAR-NOT-EQUAL", "CHAR-LESSP", "CHAR-GREATERP",
+    "CHAR-NOT-GREATERP", "CHAR-NOT-LESSP", "CHAR-UPCASE", "CHAR-DOWNCASE",
+    "CHAR-CODE", "CODE-CHAR",
     "EQL", "EQUAL", "EQUALP", "MIN", "MAX", "NTH",
     "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
@@ -33374,6 +33476,13 @@ fn is_builtin_function(name: &str) -> bool {
             | "CHARACTERP" | "CHAR=" | "CHAR<" | "CHAR>" | "CHAR<=" | "CHAR>=" | "CHAR/="
             | "ALPHA-CHAR-P" | "DIGIT-CHAR-P" | "ALPHANUMERICP" | "UPPER-CASE-P"
             | "LOWER-CASE-P" | "CHAR-EQUAL" | "DIGIT-CHAR" | "CHAR-INT"
+            // The case-insensitive comparisons. These were boot.lisp defuns,
+            // so they were fbound via their function cells and never needed an
+            // entry here; moving them to builtins (bliss-7oa5) left them
+            // funcallable but FBOUNDP-false, which is incoherent -- a function
+            // you can call but that reports it does not exist.
+            | "CHAR-NOT-EQUAL" | "CHAR-LESSP" | "CHAR-GREATERP"
+            | "CHAR-NOT-GREATERP" | "CHAR-NOT-LESSP"
             // Strings
             | "STRING" | "STRING=" | "STRING<" | "STRING>" | "STRING<=" | "STRING>="
             | "STRING/=" | "STRING-EQUAL" | "STRING-UPCASE" | "STRING-DOWNCASE"
@@ -33654,6 +33763,58 @@ fn apply_builtin_fast(
         "STRINGP" if args.len() == 1 => {
             env.clear_mv();
             Some(Ok(if is_string_value(args[0]) { T } else { NIL }))
+        }
+        // Mirrors the operator-position arm via the SAME spec table and the
+        // same stdlib kernel, so the two paths cannot disagree (bliss-x5y.9).
+        // The 2-argument shape -- overwhelmingly the common one, and the shape
+        // char-compare.lsp drives O(n^2) times -- skips the Vec entirely.
+        n if char_cmp_spec(n).is_some() => {
+            env.clear_mv();
+            let (key, cmp) = char_cmp_spec(n).expect("guarded by the arm");
+            let r = if args.len() == 2 {
+                bliss_stdlib::characters::compare2(args[0], args[1], key, cmp)
+            } else {
+                bliss_stdlib::characters::compare(args, key, cmp)
+            };
+            Some(match r {
+                Ok(ok) => Ok(if ok { T } else { NIL }),
+                Err(e) => Err(char_cmp_err(e)),
+            })
+        }
+        // CHAR-CODE and CODE-CHAR were already Rust builtins but were absent
+        // from DIRECT_FAST, so every call from compiled code still paid the
+        // synthesize-`(CHAR-CODE 'c)`-and-re-evaluate detour below: 4.1us for
+        // what is a tag check and a shift. Same kernels as operator position.
+        "CHAR-CODE" if args.len() == 1 => {
+            env.clear_mv();
+            let v = args[0];
+            if !v.is_character() {
+                return Some(Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "character".into(),
+                }));
+            }
+            Some(Ok(BlissVal::from_fixnum(v.as_char() as i64)))
+        }
+        "CODE-CHAR" if args.len() == 1 => {
+            env.clear_mv();
+            // Mirrors operator position exactly, including that an out-of-range
+            // or surrogate code answers NIL rather than signalling.
+            let code = match num_val(args[0]) {
+                Ok(n) => n as u32,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(Ok(match char::from_u32(code) {
+                Some(c) => BlissVal::from_char(c),
+                None => NIL,
+            }))
+        }
+        "CHAR-UPCASE" | "CHAR-DOWNCASE" if args.len() == 1 => {
+            env.clear_mv();
+            Some(
+                bliss_stdlib::characters::convert_case(args[0], name == "CHAR-UPCASE")
+                    .map_err(char_cmp_err),
+            )
         }
         "VECTORP" if args.len() == 1 => {
             env.clear_mv();
