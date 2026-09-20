@@ -12998,6 +12998,52 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-h21k: the two gaps left open by bliss-wzfm, both the same shape as it.
+///
+/// `(vector bit)` names a bit vector through its ELEMENT TYPE, and COERCE's
+/// head-symbol dispatch sent it to the general VECTOR arm -- `#(1 0)` where
+/// SBCL answers `#*10`. `result_type_is_bit_vector` already had the rule (MAP
+/// and CONCATENATE use it); COERCE now shares it, exactly as it now shares the
+/// string predicate.
+///
+/// And an element type of NIL holds NO elements, so only an empty sequence can
+/// be coerced to it. `result_type_is_string` counts `(array nil (*))` as a
+/// string subtype -- right for classification (CLHS 15.1.2.2), but it must not
+/// let a non-empty sequence through. bliss-wzfm moved that case from one wrong
+/// answer to another; this is the guard it needed.
+///
+/// Verified against SBCL.
+#[test]
+fn coerce_builds_bit_vectors_and_rejects_a_nil_element_type() {
+    let cases = [
+        ("(coerce '(1 0) '(vector bit))", "#*10"),
+        ("(coerce '(1 0) '(simple-array bit (*)))", "#*10"),
+        ("(coerce '(1 0) '(array bit (*)))", "#*10"),
+        ("(coerce '(1 0) '(vector bit 2))", "#*10"),
+        // Bare-symbol specs were already right and must stay so.
+        ("(coerce '(1 0) 'bit-vector)", "#*10"),
+        ("(coerce '(1 0) 'simple-bit-vector)", "#*10"),
+        ("(bit-vector-p (coerce '(1 0) '(vector bit)))", "T"),
+        ("(coerce nil '(vector bit))", "#*"),
+        ("(coerce #*10 '(vector bit))", "#*10"),
+        // A non-bit element still signals, and a declared length still checked.
+        ("(handler-case (coerce '(1 2) '(vector bit)) (type-error () :te))", ":TE"),
+        ("(handler-case (coerce '(1 0) '(vector bit 5)) (error () :err))", ":ERR"),
+        // A T element type is NOT a bit vector.
+        ("(coerce '(1 0) '(vector t))", "#(1 0)"),
+        // Element type NIL: empty is fine, non-empty signals.
+        ("(handler-case (coerce '(#\\a #\\b) '(array nil (*))) (type-error () :te))", ":TE"),
+        ("(coerce nil '(array nil (*)))", "\"\""),
+        // The siblings sharing these predicates must still agree.
+        ("(concatenate 'bit-vector '(0 1 1))", "#*011"),
+        ("(concatenate '(vector bit) '(0 1))", "#*01"),
+        ("(make-sequence 'bit-vector 2)", "#*00"),
+        // And the string half of the shared machinery is untouched.
+        ("(coerce '(#\\a #\\b) '(vector character))", "\"ab\""),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-wzfm: COERCE reduced a type specifier to its HEAD symbol, so a
 /// compound spec naming a string through its ELEMENT TYPE --
 /// `(simple-array character (*))`, `(vector base-char)` -- dispatched on

@@ -27963,6 +27963,44 @@ fn coerce_check_array_length(type_val: BlissVal, len: usize) -> Result<(), Bliss
     Ok(())
 }
 
+/// Is this compound type specifier's ELEMENT TYPE the symbol NIL?
+///
+/// `(array nil (*))` names a type that can hold no elements. NIL is its own
+/// immediate rather than a TAG_SYMBOL value, so it is tested directly -- the
+/// same care `result_type_is_string` takes.
+fn compound_element_type_is_nil(type_val: BlissVal) -> bool {
+    if !type_val.is_cons() {
+        return false;
+    }
+    let (_, rest) = cp(type_val);
+    rest.is_cons() && cp(rest).0.is_nil()
+}
+
+/// COERCE's bit-vector result, shared by the bare-symbol arm (`'bit-vector`)
+/// and the compound-specifier pre-check (`'(vector bit)`) so the two cannot
+/// diverge (bliss-h21k).
+fn coerce_to_bit_vector_value(
+    value: BlissVal,
+    type_val: BlissVal,
+) -> Result<BlissVal, BlissError> {
+    let elems = seq_elements(value)?;
+    coerce_check_array_length(type_val, elems.len())?;
+    let mut bits = Vec::with_capacity(elems.len());
+    for e in &elems {
+        match e.is_fixnum().then(|| e.as_fixnum()) {
+            Some(0) => bits.push(0u8),
+            Some(1) => bits.push(1u8),
+            _ => {
+                return Err(BlissError::TypeError {
+                    datum: *e,
+                    expected: "bit".into(),
+                })
+            }
+        }
+    }
+    Ok(bliss_compiler::reader::make_bit_vector(&bits))
+}
+
 /// COERCE's string result, shared by the bare-symbol arm (`'string`) and the
 /// compound-specifier pre-check (`'(vector character)`) so the two cannot
 /// diverge (bliss-wzfm).
@@ -28017,7 +28055,28 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
     // test, so sharing it is what stops the three drifting apart. A bare
     // symbol spec is left to the match, which already handles those names.
     if type_val.is_cons() && bliss_stdlib::result_type_is_string(type_val) {
+        // An element type of NIL holds NO elements, so only an empty sequence
+        // can be coerced to it; SBCL signals otherwise. `result_type_is_string`
+        // counts `(array nil (*))` as a string subtype (CLHS 15.1.2.2), which
+        // is right for classification but must not let a non-empty sequence
+        // through (bliss-h21k).
+        if compound_element_type_is_nil(type_val) {
+            let n = seq_elements(value)?.len();
+            if n != 0 {
+                return Err(BlissError::TypeError {
+                    datum: value,
+                    expected: "(array nil (*))".into(),
+                });
+            }
+        }
         return coerce_to_string_value(value);
+    }
+    // Same gap, one type over: `(vector bit)` / `(simple-array bit (*))` name a
+    // bit vector through their ELEMENT TYPE, and the head-symbol dispatch below
+    // sent them to the general VECTOR arm. Shares the stdlib predicate MAP and
+    // CONCATENATE use rather than restating the rule (bliss-h21k).
+    if type_val.is_cons() && bliss_stdlib::result_type_is_bit_vector(type_val) {
+        return coerce_to_bit_vector_value(value, type_val);
     }
     match tname.as_str() {
         "T" => Ok(value),
@@ -28040,24 +28099,7 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
                 Ok(vec_to_list(&seq_elements(value)?))
             }
         }
-        "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => {
-            let elems = seq_elements(value)?;
-            coerce_check_array_length(type_val, elems.len())?;
-            let mut bits = Vec::with_capacity(elems.len());
-            for e in &elems {
-                match e.is_fixnum().then(|| e.as_fixnum()) {
-                    Some(0) => bits.push(0u8),
-                    Some(1) => bits.push(1u8),
-                    _ => {
-                        return Err(BlissError::TypeError {
-                            datum: *e,
-                            expected: "bit".into(),
-                        })
-                    }
-                }
-            }
-            Ok(bliss_compiler::reader::make_bit_vector(&bits))
-        }
+        "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => coerce_to_bit_vector_value(value, type_val),
         "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
             let elems = seq_elements(value)?;
             coerce_check_array_length(type_val, elems.len())?;

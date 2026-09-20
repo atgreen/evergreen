@@ -1789,7 +1789,13 @@ pub fn result_type_is_string(result_type: BlissVal) -> bool {
 ///
 /// Nothing recognized these, so `(concatenate 'bit-vector '(0 1 1))` answered
 /// the LIST (0 1 1) instead of #*011 (ansi CONCATENATE.10-15).
-fn result_type_is_bit_vector(result_type: BlissVal) -> bool {
+/// Does this sequence result-type specifier designate a BIT-VECTOR?
+///
+/// Public for the same reason as `result_type_is_string`: COERCE reduces a
+/// spec to its head symbol, so `(vector bit)` built a general vector -- `#(1 0)`
+/// where SBCL answers `#*10` (bliss-h21k). The element-type clause below was
+/// already here for MAP; COERCE simply could not reach it.
+pub fn result_type_is_bit_vector(result_type: BlissVal) -> bool {
     fn name_is_bit_vector(idx: u32) -> bool {
         matches!(
             bliss_compiler::reader::symbol_name(idx).as_deref(),
