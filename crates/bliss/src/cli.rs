@@ -15696,8 +15696,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     });
                 }
                 if is_number_value(v) {
+                    // CLHS: (imagpart real) is (* 0 real), so the zero takes
+                    // the argument's FORMAT. The double-float case fell into
+                    // the rational branch and answered the integer 0 rather
+                    // than 0.0d0 (ansi IMAGPART.4 compares against (* 0 x)).
                     return Ok(if want_real {
                         v
+                    } else if v.is_double_float() {
+                        bliss_rt::gc::alloc_double_float(0.0)
                     } else if v.is_single_float() {
                         BlissVal::from_single_float(0.0)
                     } else {
@@ -20370,7 +20376,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // does want #C(1.0 0.0), so complex_expt stays correct there.
                 let exponent_zero = !bliss_rt::types::complexp(b)
                     && num_val(b).map(|x| x == 0.0).unwrap_or(false);
+                // A COMPLEX EXPONENT also needs the complex path -- `num_val`
+                // below rejects it, so `(expt 0 #C(2 2))` and
+                // `(expt 2.0 #C(2 2))` type-errored (ansi EXPT.29, which pairs
+                // every zero with every base including complex ones).
                 if bliss_rt::types::complexp(a)
+                    || bliss_rt::types::complexp(b)
                     || (base_negative && !b.is_fixnum() && !exponent_zero)
                 {
                     return complex_expt(a, b);
@@ -33854,12 +33865,19 @@ fn string_mismatch(a: &str, b: &str) -> (usize, std::cmp::Ordering) {
 
 /// Round to nearest integer, ties to even — ANSI CL ROUND semantics, unlike
 /// Rust's `f64::round` (ties away from zero). `(round 5 2)` = 2, `(round 7 2)` = 4.
-fn round_half_even(x: f64) -> i64 {
+fn round_half_even(x: f64) -> f64 {
+    // Stays in f64: the caller may be rounding a value far outside i64, and an
+    // `as i64` here SATURATES -- (round 2^70) came back as 2^63 even after the
+    // caller learned to promote large quotients to a bignum.
     if (x - x.trunc()).abs() == 0.5 {
-        let lower = x.floor() as i64;
-        if lower % 2 == 0 { lower } else { lower + 1 }
+        let lower = x.floor();
+        if lower % 2.0 == 0.0 {
+            lower
+        } else {
+            lower + 1.0
+        }
     } else {
-        x.round() as i64
+        x.round()
     }
 }
 
@@ -33897,12 +33915,41 @@ fn eval_int_div(
         return Err(BlissError::ArithmeticError("division by zero".into()));
     }
     let quot = av / bv;
-    let q = match mode {
+    let qf = match mode {
         RoundMode::Floor => quot.floor(),
         RoundMode::Ceiling => quot.ceil(),
         RoundMode::Truncate => quot.trunc(),
-        RoundMode::Round => round_half_even(quot) as f64,
-    } as i64;
+        RoundMode::Round => round_half_even(quot),
+    };
+    // A quotient outside the 61-bit fixnum range must become a BIGNUM. This
+    // went through `as i64` -- which SATURATES -- and then `from_fixnum` --
+    // which WRAPS -- with no range check, so large floats answered silently
+    // NEGATIVE integers:
+    //     (floor 2^60)                       => -1152921504606846976
+    //     (floor 2^70)                       => -1
+    //     (floor most-positive-single-float) => -1
+    // ansi BIGNUM.FLOAT.COMPARE.7-8 take (floor x) of every real and compare
+    // against it, so every such comparison was against garbage. Same class as
+    // the (abs most-negative-fixnum) wrap fixed in 6da063e.
+    //
+    // RATIONAL already converts a float to its EXACT value, and qf is integral
+    // by construction, so it yields the exact integer.
+    // The bound is 2^60 (exactly representable in f64), NOT `FIXNUM_MAX as
+    // f64`: FIXNUM_MAX is 2^60-1, which needs 61 mantissa bits and therefore
+    // ROUNDS UP to exactly 2^60 in f64 -- so `qf > FIXNUM_MAX as f64` was false
+    // for qf = 2^60 and (floor 2^60) still wrapped. Valid fixnums are strictly
+    // below 2^60, so `>=` against it is both precise and correct.
+    if qf.abs() >= (1u64 << 60) as f64 {
+        bliss_rt::rooted!(q_big = cl_rational(box_float(qf, FloatKind::Double))?);
+        // The remainder follows numeric contagion over the operands, computed
+        // in f64 -- with an integral quotient this size it is zero in practice,
+        // but the formula is the same one integer_or_float_remainder uses.
+        let kind = widen_float(float_kind_of(a), float_kind_of(divisor));
+        let rem = box_float(av - qf * bv, kind);
+        env.set_mv(vec![*q_big, rem]);
+        return Ok(*q_big);
+    }
+    let q = qf as i64;
     let rem = integer_or_float_remainder(a, divisor, q, av, bv);
     env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
     Ok(BlissVal::from_fixnum(q))

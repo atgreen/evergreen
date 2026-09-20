@@ -13714,3 +13714,131 @@ fn coerce_to_complex_honours_the_part_type() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi BIGNUM.FLOAT.COMPARE.7-8: FLOOR/CEILING/TRUNCATE/ROUND of a float at or
+/// beyond the 61-bit fixnum range answered silently NEGATIVE integers. The
+/// float path went through `as i64` (which SATURATES) and then `from_fixnum`
+/// (which WRAPS), with no range check:
+///
+///     (floor 2^60)                       => -1152921504606846976
+///     (floor 2^70)                       => -1
+///     (floor most-positive-single-float) => -1
+///
+/// Those tests take `(floor x)` of every real and compare against it, so the
+/// comparisons were against garbage. Same class as the `(abs
+/// most-negative-fixnum)` wrap.
+///
+/// Two subtleties, both found by testing the boundary rather than a value well
+/// past it:
+///   * the bound must be 2^60, not `FIXNUM_MAX as f64` -- FIXNUM_MAX is 2^60-1,
+///     which needs 61 mantissa bits and ROUNDS UP to exactly 2^60 in f64, so a
+///     `>` test against it was false at the boundary and 2^60 still wrapped;
+///   * `round_half_even` had its own `as i64`, so ROUND still saturated (to
+///     2^63) even once the caller promoted large quotients correctly.
+#[test]
+fn float_rounding_promotes_past_the_fixnum_range() {
+    let cases = [
+        // At the boundary and beyond, the exact integer.
+        ("(floor (float (expt 2 60) 1.0d0))", "1152921504606846976"),
+        ("(floor (float (expt 2 70) 1.0d0))", "1180591620717411303424"),
+        ("(ceiling (float (expt 2 70) 1.0d0))", "1180591620717411303424"),
+        ("(truncate (float (expt 2 70) 1.0d0))", "1180591620717411303424"),
+        ("(round (float (expt 2 70) 1.0d0))", "1180591620717411303424"),
+        // Agreement with RATIONAL, which was always exact -- this is what the
+        // ansi comparison tests actually rely on.
+        ("(= (floor most-positive-single-float) (rational most-positive-single-float))", "T"),
+        ("(= (floor most-negative-single-float) (rational most-negative-single-float))", "T"),
+        ("(plusp (floor most-positive-single-float))", "T"),
+        ("(minusp (floor most-negative-single-float))", "T"),
+        // Ordinary rounding is untouched, ties-to-even included.
+        ("(floor 3.7)", "3"),
+        ("(floor -3.7)", "-4"),
+        ("(ceiling 3.2)", "4"),
+        ("(truncate -3.7)", "-3"),
+        ("(round 2.5)", "2"),
+        ("(round 3.5)", "4"),
+        ("(round -2.5)", "-2"),
+        // Two-argument and exact-rational forms are untouched.
+        ("(floor 7 2)", "3"),
+        ("(floor 7.0 2)", "3"),
+        ("(round 7 2)", "4"),
+        ("(floor 2/3)", "0"),
+        ("(mod -7 3)", "2"),
+        ("(rem -7 3)", "-1"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi RATIONAL.*.RANDOM.COMPARE and BIGNUM.*.RANDOM.COMPARE: an exponent
+/// marker straight after a bare decimal point was rejected, so the whole token
+/// became a SYMBOL -- `1.s0` read as |1.S0| and the tests died with "The
+/// variable |1.S0| is unbound" while writing their bounds.
+///
+/// CLHS 2.3.1 admits `[sign] {digit}+ [decimal-point {digit}*] exponent`, i.e.
+/// ZERO fractional digits before the marker. The parser required the character
+/// immediately before the marker to be a digit, which consuming the decimal
+/// point had cleared; requiring only that SOME digit has appeared still
+/// rejects `.s0` and a bare `e0`, which is what that guard was for.
+#[test]
+fn exponent_marker_after_a_bare_decimal_point() {
+    let cases = [
+        // Every marker, with no fractional digits. s/f force single, d/l
+        // double, e the default format.
+        ("(read-from-string \"1.s0\")", "1.0"),
+        ("(read-from-string \"1.S0\")", "1.0"),
+        ("(read-from-string \"1.f0\")", "1.0"),
+        ("(read-from-string \"1.e0\")", "1.0"),
+        ("(read-from-string \"1.d0\")", "1.0d0"),
+        ("(read-from-string \"1.l0\")", "1.0d0"),
+        ("(read-from-string \"-2.e3\")", "-2000.0"),
+        // Forms that already worked stay working.
+        ("(read-from-string \"1s0\")", "1.0"),
+        ("(read-from-string \"1.0s0\")", "1.0"),
+        ("(read-from-string \"1.5d0\")", "1.5d0"),
+        // ... and non-floats are still symbols, which is what the guard
+        // protected: no digit before the marker at all.
+        ("(symbolp (read-from-string \".s0\"))", "T"),
+        ("(symbolp (read-from-string \"e0\"))", "T"),
+        ("(symbolp (read-from-string \"abc\"))", "T"),
+        ("(symbolp (read-from-string \"A.S0\"))", "T"),
+        ("(symbolp (read-from-string \"1.2.3\"))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi IMAGPART.4 and EXPT.29.
+///
+/// (imagpart real) is (* 0 real), so the zero takes the argument's FORMAT. The
+/// double-float case fell into the rational branch and answered the integer 0
+/// rather than 0.0d0 -- single-float was already handled, which is why it went
+/// unnoticed.
+///
+/// EXPT reached its complex path for a complex BASE but not a complex
+/// EXPONENT, so `num_val` rejected the exponent and `(expt 2.0 #C(2 2))`
+/// type-errored.
+#[test]
+fn imagpart_zero_format_and_complex_exponent() {
+    let cases = [
+        // The zero matches (* 0 x) for every real format -- IMAGPART.4's
+        // actual assertion.
+        ("(imagpart 1.0d0)", "0.0d0"),
+        ("(imagpart 1.0)", "0.0"),
+        ("(imagpart 5)", "0"),
+        ("(imagpart 1/2)", "0"),
+        ("(loop for x in (list 3.141592653589793d0 1.0 5 1/2 1.0d0)
+            always (eql (* 0 x) (imagpart x)))", "T"),
+        // REALPART and the complex case are unchanged.
+        ("(realpart 1.0d0)", "1.0d0"),
+        ("(imagpart (complex 1 2))", "2"),
+        // A complex EXPONENT: 2^(2+2i) = e^((2+2i) ln 2).
+        ("(expt 2.0 (complex 2 2))", "#C(0.7338279 3.932111)"),
+        ("(complexp (expt (complex 1 1) (complex 2 2)))", "T"),
+        ("(expt 0 (complex 2 2))", "0.0"),
+        // Ordinary EXPT is untouched.
+        ("(expt 2 10)", "1024"),
+        ("(expt 2.0 0.5)", "1.4142135"),
+        ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
+        ("(expt 5 0)", "1"),
+    ];
+    run_expression_cases(&cases);
+}

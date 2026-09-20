@@ -2276,7 +2276,6 @@ fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
     // Marker-less and e/E-marked literals read in the DEFAULT format
     // (bliss-un1x); s/S/f/F force single, d/D/l/L force double.
     let mut is_double = READ_DEFAULT_FLOAT_DOUBLE.with(|c| c.get());
-    let mut prev_digit = false;
 
     if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
         out.push(chars[i]);
@@ -2286,16 +2285,24 @@ fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
         let c = chars[i];
         if c.is_ascii_digit() {
             has_digit = true;
-            prev_digit = true;
             out.push(c);
             i += 1;
         } else if c == '.' && !has_dot && !has_exp {
             has_dot = true;
-            prev_digit = false;
             out.push('.');
             i += 1;
         } else if !has_exp
-            && prev_digit
+            // `has_digit`, NOT `prev_digit`: consuming the decimal point clears
+            // prev_digit, so an exponent marker straight after it was rejected
+            // and the whole token became a SYMBOL -- `1.s0` read as |1.S0| and
+            // `1.d0` as |1.D0|. CLHS 2.3.1 admits
+            //     [sign] {digit}+ [decimal-point {digit}*] exponent
+            // i.e. ZERO fractional digits before the marker, so `1.s0` and
+            // `1.e0` are floats. Requiring a digit to have appeared at all
+            // still rejects `.s0` and a bare `e0`, which is what the guard was
+            // for. ansi RATIONAL.*.RANDOM.COMPARE and BIGNUM.*.RANDOM.COMPARE
+            // write their bounds as `1.s0` and friends.
+            && has_digit
             && matches!(c, 'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L')
         {
             has_exp = true;
