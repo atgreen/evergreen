@@ -12998,6 +12998,55 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-sci0: assigning to a constant variable PANICKED rather than
+/// signalling. NIL and T are special immediates, not TAG_SYMBOL values, so
+/// `is_symbol()` is false for them and SETQ fell through to `sym_name`, which
+/// asserts on the tag.
+///
+/// A panic is the worst failure mode available: no handler can run, and across
+/// the `extern "C"` c2i boundary it aborts. It did not even need the form to
+/// RUN -- CCASE's STORE-VALUE restart expands to `(setf <keyplace> ...)`, so
+/// merely LOWERING `(ccase nil ...)` killed the process. That case is asserted
+/// below: it must produce a function, not a corpse.
+///
+/// Three more targets did not panic but silently SUCCEEDED, which is its own
+/// wrong answer -- a keyword, a DEFCONSTANT name, and a non-symbol all
+/// returned the value as though something had been assigned. CLHS 3.1.2.1.1.3
+/// makes all of these constant variables; SBCL signals PROGRAM-ERROR for every
+/// row below, which is what these were checked against.
+#[test]
+fn assigning_to_a_constant_variable_signals_rather_than_panicking() {
+    let cases = [
+        ("(handler-case (eval '(setf nil 5)) (program-error () :pe))", ":PE"),
+        ("(handler-case (eval '(setq nil 5)) (program-error () :pe))", ":PE"),
+        ("(handler-case (eval '(setf t 5)) (program-error () :pe))", ":PE"),
+        ("(handler-case (eval '(setq t 5)) (program-error () :pe))", ":PE"),
+        ("(handler-case (eval '(setq :kw 5)) (program-error () :pe))", ":PE"),
+        ("(handler-case (eval '(setf 5 6)) (program-error () :pe))", ":PE"),
+        ("(progn (defconstant +sci0+ 7)\
+           (handler-case (eval '(setq +sci0+ 9)) (program-error () :pe)))", ":PE"),
+        // The motivating case: LOWERING a malformed place must not kill the
+        // process, even though the form never runs.
+        ("(functionp (eval '(lambda () (ccase nil (1 :one)))))", "T"),
+        // The value form must NOT be evaluated -- the check precedes it.
+        ("(let ((hit nil))\
+            (handler-case (eval '(setf nil (setq hit t))) (program-error () nil))\
+            hit)", "NIL"),
+        // Ordinary assignment is untouched.
+        ("(progn (setq sci0-x 5) sci0-x)", "5"),
+        ("(progn (setf sci0-y 6) sci0-y)", "6"),
+        ("(progn (setq sci0-a 1 sci0-b 2) (list sci0-a sci0-b))", "(1 2)"),
+        ("(let ((v 1)) (setq v 2) v)", "2"),
+        // Real SETF places are not variable names and must be unaffected.
+        ("(let ((l (list 1 2))) (setf (car l) 9) l)", "(9 2)"),
+        ("(let ((v (vector 1 2))) (setf (aref v 0) 7) (aref v 0))", "7"),
+        ("(let ((h (make-hash-table))) (setf (gethash :k h) 5) (gethash :k h))", "5"),
+        // A symbol macro expands BEFORE the guard, so SETQ through one works.
+        ("(let ((l (list 1 2))) (symbol-macrolet ((m (car l))) (setq m 42)) (car l))", "42"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-h21k: the two gaps left open by bliss-wzfm, both the same shape as it.
 ///
 /// `(vector bit)` names a bit vector through its ELEMENT TYPE, and COERCE's

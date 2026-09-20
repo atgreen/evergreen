@@ -1518,6 +1518,47 @@ fn is_keyword_arg(val: BlissVal) -> bool {
     val.is_symbol() && sym_name_rc(val).starts_with("KEYWORD:")
 }
 
+/// A SETQ/SETF target that is a *variable name* must actually be assignable.
+///
+/// CLHS 3.1.2.1.1.3 makes NIL, T and every keyword CONSTANT VARIABLES, and
+/// 3.1.2.1.1.1 makes assigning to one a PROGRAM-ERROR; so is assigning to a
+/// DEFCONSTANT name, and so is naming something that is not a variable at all.
+///
+/// Before this, NIL and T did not merely answer wrongly -- they PANICKED. They
+/// are special immediates, not TAG_SYMBOL values, so `is_symbol()` is false for
+/// them and SETQ fell to `sym_name`, which asserts on the tag. A panic is the
+/// worst failure mode available: no handler can run, and reached from compiled
+/// code across the `extern "C"` c2i boundary it aborts the process. It did not
+/// even need the form to RUN -- CCASE's STORE-VALUE restart expands to a
+/// `(setf <keyplace> …)`, so merely LOWERING `(ccase nil …)` killed the
+/// process (bliss-sci0).
+///
+/// The keyword, DEFCONSTANT and non-symbol cases did not panic; they silently
+/// SUCCEEDED, which is its own wrong answer -- `(setq :kw 5)` and `(setf 5 6)`
+/// returned the value as though something had been assigned.
+///
+/// Returns Ok for a cons, which is a SETF place like `(car x)` and not a
+/// variable name at all -- callers apply this only to non-cons targets.
+fn reject_assignment_to_constant(target: BlissVal) -> Result<(), BlissError> {
+    let what = if target.is_nil() {
+        "NIL"
+    } else if target == T {
+        "T"
+    } else if is_keyword_arg(target) {
+        "a keyword"
+    } else if !target.is_symbol() {
+        "a non-symbol"
+    } else if CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(target))) {
+        "a constant defined by DEFCONSTANT"
+    } else {
+        return Ok(());
+    };
+    Err(BlissError::ProgramError(format!(
+        "cannot assign to {what}: not an assignable variable name"
+    )))
+}
+
+
 /// Parse trailing (already-evaluated) `:start`/`:end` keyword pairs for a bounded
 /// sequence op, clamped to `[0, len]` with `start <= end`. Defaults: start 0,
 /// end len.
@@ -16863,6 +16904,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             continue;
                         }
                     }
+                    // A SETQ target is always a variable NAME, so it is
+                    // checked unconditionally (bliss-sci0).
+                    reject_assignment_to_constant(sym_form)?;
                     let val = eval_form(val_form, env)?;
                     if sym_form.is_symbol() {
                         env.set_var_symbol(sym_form, val);
@@ -16890,6 +16934,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_rt::rooted!(place = place);
                     bliss_rt::rooted!(val_form = val_form);
                     bliss_rt::rooted!(r2 = r2);
+                    // A NON-CONS place is a variable name, so it must be
+                    // assignable. A cons is a real place -- (car x), (gethash
+                    // k h) -- and is left to the accessor handling below.
+                    // Checked BEFORE the value form is evaluated: `(setf nil
+                    // (f))` must signal without calling F, and this arm is
+                    // reached during macro LOWERING, where nothing should run
+                    // (bliss-sci0).
+                    if !place.is_cons() {
+                        reject_assignment_to_constant(*place)?;
+                    }
                     // Order-correct handling for NTH and GETF places. CLHS
                     // 5.1.1.1 requires the PLACE subforms to be evaluated (left
                     // to right) BEFORE the value form; the generic path below
