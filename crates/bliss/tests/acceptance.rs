@@ -12998,6 +12998,62 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-3snc: SIMPLE-VECTOR-P shared VECTORP's dispatch arm, so it inherited
+/// VECTORP's answer and reported T for everything rank-1 -- strings, bit
+/// vectors, fill-pointer and adjustable arrays. CLHS scopes it to a SIMPLE
+/// one-dimensional array of element type T, so a specialized element type
+/// (CHARACTER, BIT) and a complex array (fill pointer / adjustable /
+/// displaced) each disqualify it independently.
+///
+/// It also contradicted TYPEP: `(typep "ab" 'simple-vector)` already answered
+/// NIL via the strict helper while `(simple-vector-p "ab")` answered T, and
+/// CLHS requires the two to be equivalent. Every case below is asserted three
+/// ways -- operator position, funcall (the evaluated-args fast path), and
+/// TYPEP -- because the bug was precisely that those paths disagreed.
+///
+/// Expectations verified against SBCL.
+#[test]
+fn simple_vector_p_excludes_specialized_and_complex_vectors() {
+    let subjects = [
+        ("(vector 1 2)", "T"),
+        ("(make-array 3)", "T"),
+        // Specialized element type: not element type T.
+        ("\"ab\"", "NIL"),
+        ("#*101", "NIL"),
+        ("(make-array 3 :element-type 'bit)", "NIL"),
+        ("(make-array 3 :element-type 'character)", "NIL"),
+        // Complex array: not simple.
+        ("(make-array 3 :fill-pointer 2)", "NIL"),
+        ("(make-array 3 :adjustable t)", "NIL"),
+        // Not a rank-1 array at all.
+        ("(make-array '(2 2))", "NIL"),
+        ("nil", "NIL"),
+        ("'(1 2)", "NIL"),
+        ("5", "NIL"),
+    ];
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for (subject, want) in subjects {
+        cases.push((format!("(simple-vector-p {subject})"), want.to_string()));
+        cases.push((format!("(funcall #'simple-vector-p {subject})"), want.to_string()));
+        cases.push((format!("(typep {subject} 'simple-vector)"), want.to_string()));
+    }
+    // VECTORP keeps its own, broader answer -- the fix must not narrow it.
+    for (subject, want) in [
+        ("\"ab\"", "T"),
+        ("#*101", "T"),
+        ("(vector 1 2)", "T"),
+        ("(make-array 3 :fill-pointer 2)", "T"),
+        ("'(1 2)", "NIL"),
+    ] {
+        cases.push((format!("(vectorp {subject})"), want.to_string()));
+    }
+    let refs: Vec<(&str, &str)> = cases
+        .iter()
+        .map(|(e, w)| (e.as_str(), w.as_str()))
+        .collect();
+    run_expression_cases(&refs);
+}
+
 /// bliss-swi5: LAST's loop exits immediately on a non-cons and returns its
 /// trailing pointer, which still points at the ORIGINAL argument -- so (last 5)
 /// answered 5, reporting a non-list as the last cons of itself. The bead frames

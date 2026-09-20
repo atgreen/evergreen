@@ -8597,9 +8597,33 @@ fn is_hash_table_value(v: BlissVal) -> bool {
     bliss_stdlib::hash_table_p(v)
 }
 
-/// Sentinel-safe SIMPLE-VECTOR-P (excludes strings and sentinels).
+/// Sentinel-safe SIMPLE-VECTOR-P.
+///
+/// CLHS: a SIMPLE-VECTOR is a simple one-dimensional array of element type T.
+/// So three separate things disqualify a rank-1 array, and this used to catch
+/// only the first (bliss-3snc):
+///
+///   - a specialized element type: a STRING holds CHARACTER and a BIT-VECTOR
+///     holds BIT, so neither is a simple-vector however simple it is;
+///   - a complex array -- fill pointer, adjustable, or displaced -- which is
+///     by definition not simple;
+///   - a registry sentinel, which is not a heap vector at all.
+///
+/// Before this, `(simple-vector-p #*101)`, `(simple-vector-p (make-array 3
+/// :fill-pointer 2))` and `(simple-vector-p (make-array 3 :adjustable t))` all
+/// answered T. Verified against SBCL, which answers NIL to each.
 fn is_simple_vector_value(v: BlissVal) -> bool {
     if is_string_value(v) || is_registry_sentinel(v) {
+        return false;
+    }
+    // A bit vector's element type is BIT, not T -- and this must cover the
+    // complex-bit case too, which is why it is `is_bit_vector_value` rather
+    // than `types::bit_vector_p` (bliss-65nx).
+    if is_bit_vector_value(v) {
+        return false;
+    }
+    // Fill pointer / adjustable / displaced => complex, hence not simple.
+    if bliss_stdlib::is_complex_vector(v) {
         return false;
     }
     bliss_rt::types::vectorp(v)
@@ -18348,10 +18372,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     expected: "vector with a fill pointer".into(),
                 });
             }
-            "VECTORP" | "SIMPLE-VECTOR-P" => {
+            "VECTORP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if is_vector_value(v) { T } else { NIL });
+            }
+            // SIMPLE-VECTOR-P is NOT VECTORP. It shared this arm, so it
+            // inherited VECTORP's answer and reported T for strings, bit
+            // vectors and complex arrays -- and disagreed with
+            // `(typep x 'simple-vector)`, which already used the strict
+            // helper (bliss-3snc). CLHS requires the two to be equivalent.
+            "SIMPLE-VECTOR-P" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if is_simple_vector_value(v) { T } else { NIL });
             }
             "ARRAYP" => {
                 let (af, _) = cp(cdr);
@@ -33621,13 +33655,17 @@ fn apply_builtin_fast(
             env.clear_mv();
             Some(Ok(if is_string_value(args[0]) { T } else { NIL }))
         }
-        // VECTORP and SIMPLE-VECTOR-P share the operator-position arm, which is
-        // why (simple-vector-p "ab") wrongly answers T (bliss-3snc). Reproduce
-        // that faithfully rather than fixing it here: a fast path that disagreed
-        // with operator position would be a worse bug than the one it fixed.
-        "VECTORP" | "SIMPLE-VECTOR-P" if args.len() == 1 => {
+        "VECTORP" if args.len() == 1 => {
             env.clear_mv();
             Some(Ok(if is_vector_value(args[0]) { T } else { NIL }))
+        }
+        // Mirrors the operator-position arm exactly. This used to share
+        // VECTORP's arm and carried a comment saying the shared answer was
+        // wrong but was reproduced deliberately, so the two paths would agree.
+        // They now agree on the CORRECT answer instead (bliss-3snc).
+        "SIMPLE-VECTOR-P" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if is_simple_vector_value(args[0]) { T } else { NIL }))
         }
         "KEYWORDP" if args.len() == 1 => {
             env.clear_mv();
