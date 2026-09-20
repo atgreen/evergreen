@@ -4509,6 +4509,89 @@ fn check_float_range(
     Ok(r)
 }
 
+// ── Complex inverse trigonometric / hyperbolic functions (bliss-i13d) ──
+//
+// Computed on raw (re, im) f64 pairs so nothing allocates until the result is
+// boxed. The formulas are CLHS 12.1.5.3 VERBATIM rather than algebraically
+// "simplified" equivalents: the standard states them in the form that puts the
+// principal-value branch cuts in the right place, and a rearrangement that is
+// correct as pure algebra can move a cut and produce plausible WRONG numbers
+// with no error to point at.
+
+type Cx = (f64, f64);
+
+fn cx_add(a: Cx, b: Cx) -> Cx {
+    (a.0 + b.0, a.1 + b.1)
+}
+fn cx_sub(a: Cx, b: Cx) -> Cx {
+    (a.0 - b.0, a.1 - b.1)
+}
+fn cx_mul(a: Cx, b: Cx) -> Cx {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+fn cx_div(a: Cx, b: Cx) -> Cx {
+    let d = b.0 * b.0 + b.1 * b.1;
+    ((a.0 * b.0 + a.1 * b.1) / d, (a.1 * b.0 - a.0 * b.1) / d)
+}
+/// Principal square root: the same formula SQRT's complex branch uses.
+fn cx_sqrt(z: Cx) -> Cx {
+    let r = z.0.hypot(z.1);
+    let re = ((r + z.0) / 2.0).sqrt();
+    let im = ((r - z.0) / 2.0).sqrt() * if z.1 < 0.0 { -1.0 } else { 1.0 };
+    (re, im)
+}
+/// Principal log: ln|z| + i*arg z, arg in (-pi, pi] via atan2.
+fn cx_log(z: Cx) -> Cx {
+    (z.0.hypot(z.1).ln(), z.1.atan2(z.0))
+}
+/// Multiply by -i, i.e. `-i * (a + bi) = b - ai`.
+fn cx_mul_neg_i(z: Cx) -> Cx {
+    (z.1, -z.0)
+}
+
+/// The principal value of one inverse function at a complex argument, or None
+/// if `name` is not one of them.
+fn complex_inverse(name: &str, z: Cx) -> Option<Cx> {
+    let one: Cx = (1.0, 0.0);
+    let i: Cx = (0.0, 1.0);
+    let z2 = cx_mul(z, z);
+    Some(match name {
+        // arcsin z = -i log(iz + sqrt(1 - z^2))
+        "ASIN" => cx_mul_neg_i(cx_log(cx_add(
+            cx_mul(i, z),
+            cx_sqrt(cx_sub(one, z2)),
+        ))),
+        // arccos z = -i log(z + i sqrt(1 - z^2))
+        "ACOS" => cx_mul_neg_i(cx_log(cx_add(
+            z,
+            cx_mul(i, cx_sqrt(cx_sub(one, z2))),
+        ))),
+        // arctan z = -i log((1 + iz) sqrt(1/(1 + z^2)))
+        "ATAN" => cx_mul_neg_i(cx_log(cx_mul(
+            cx_add(one, cx_mul(i, z)),
+            cx_sqrt(cx_div(one, cx_add(one, z2))),
+        ))),
+        // arcsinh z = log(z + sqrt(1 + z^2))
+        "ASINH" => cx_log(cx_add(z, cx_sqrt(cx_add(one, z2)))),
+        // arccosh z = 2 log(sqrt((z+1)/2) + sqrt((z-1)/2))
+        "ACOSH" => {
+            let half: Cx = (2.0, 0.0);
+            let s = cx_add(
+                cx_sqrt(cx_div(cx_add(z, one), half)),
+                cx_sqrt(cx_div(cx_sub(z, one), half)),
+            );
+            let l = cx_log(s);
+            (2.0 * l.0, 2.0 * l.1)
+        }
+        // arctanh z = (log(1+z) - log(1-z)) / 2
+        "ATANH" => {
+            let d = cx_sub(cx_log(cx_add(one, z)), cx_log(cx_sub(one, z)));
+            (d.0 / 2.0, d.1 / 2.0)
+        }
+        _ => return None,
+    })
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -20461,7 +20544,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             a.cosh() * b.cos(),
                             a.sinh() * b.sin(),
                         )),
-                        _ => None,
+                        // The six INVERSE functions (bliss-i13d): principal
+                        // values via complex log and sqrt, CLHS 12.1.5.3.
+                        _ => complex_inverse(name.as_str(), (a, b)),
                     };
                     if let Some((re_out, im_out)) = parts {
                         let kind = widen_float(real_float_kind(re), real_float_kind(imag));
@@ -20489,6 +20574,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "ATANH" => x.atanh(),
                     _ => unreachable!(),
                 };
+                // A REAL argument OUTSIDE the function's real domain --
+                // (asin 2), (acos 2), (acosh 0), (atanh 2) -- has a COMPLEX
+                // principal value, not NaN (CLHS 12.1.5.3). The real kernels
+                // above return NaN there, so recompute through the same complex
+                // formula used for a complex argument. Restricted to a finite
+                // input so a NaN ARGUMENT still yields NaN.
+                if r.is_nan() && x.is_finite() {
+                    if let Some((re_out, im_out)) = complex_inverse(name.as_str(), (x, 0.0)) {
+                        let kind = real_float_kind(v);
+                        bliss_rt::rooted!(re_v = box_float(re_out, kind));
+                        let im_v = box_float(im_out, kind);
+                        return make_complex(*re_v, im_v);
+                    }
+                }
                 // EXP only: e^x is never zero and never infinite for finite
                 // x, so either outcome is a range condition (CLHS 12.1.4.3).
                 let r = if name.as_str() == "EXP" {
@@ -20507,6 +20606,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let (yf, r) = cp(cdr);
                 bliss_rt::rooted!(yv = eval_form(yf, env)?);
+                // (ATAN z) on a COMPLEX: principal value via complex log
+                // (bliss-i13d). ATAN has its OWN arm because of the
+                // two-argument atan2 form, so it never reaches the
+                // transcendental arm's complex branch -- `num_val` below
+                // rejects a complex outright. Only the ONE-argument form is
+                // meaningful here; two-argument ATAN is atan2, which CLHS
+                // defines for reals only.
+                if !r.is_cons() {
+                    if let Some(re) = bliss_rt::types::complex_realpart(*yv) {
+                        let imag = bliss_rt::types::complex_imagpart(*yv).unwrap_or(NIL);
+                        let a = num_val(re)?;
+                        let b = num_val(imag)?;
+                        if let Some((re_out, im_out)) = complex_inverse("ATAN", (a, b)) {
+                            let kind = widen_float(real_float_kind(re), real_float_kind(imag));
+                            bliss_rt::rooted!(re_v = box_float(re_out, kind));
+                            let im_v = box_float(im_out, kind);
+                            return make_complex(*re_v, im_v);
+                        }
+                    }
+                }
                 let y = num_val(*yv)?;
                 if r.is_cons() {
                     bliss_rt::rooted!(xv = eval_form(cp(r).0, env)?);
@@ -20532,6 +20651,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let x = num_val(*xv)?;
                     let kind = widen_float(real_float_kind(*xv), real_float_kind(*bv));
                     return Ok(box_float(x.ln() / base.ln(), kind));
+                }
+                // A COMPLEX argument: ln z = ln|z| + i*arg z, with arg the
+                // PRINCIPAL value in (-pi, pi] -- exactly what atan2 gives.
+                // `num_val` rejects a complex, so `(log #C(0 1))` used to
+                // type-error; only log of a NEGATIVE REAL produced a complex
+                // (the branch just below). ansi LOG.7/LOG.8 feed LOG a complex
+                // directly.
+                //
+                // Complex LOG is also the prerequisite for the inverse
+                // transcendentals (bliss-i13d) -- asin, acos, atan, asinh,
+                // acosh and atanh are all expressed through complex log and
+                // sqrt, and their branch cuts come from arg's principal range.
+                if let Some(re) = bliss_rt::types::complex_realpart(*xv) {
+                    let imag = bliss_rt::types::complex_imagpart(*xv).unwrap_or(NIL);
+                    let a = num_val(re)?;
+                    let b = num_val(imag)?;
+                    let kind = widen_float(real_float_kind(re), real_float_kind(imag));
+                    // box_float may allocate (double); root the real part
+                    // across the imaginary allocation and the COMPLEX build,
+                    // the same idiom SQRT's complex branch uses (bliss-wlf).
+                    bliss_rt::rooted!(re_v = box_float(a.hypot(b).ln(), kind));
+                    let im_v = box_float(b.atan2(a), kind);
+                    return make_complex(*re_v, im_v);
                 }
                 let kind = real_float_kind(*xv);
                 let x = num_val(*xv)?;

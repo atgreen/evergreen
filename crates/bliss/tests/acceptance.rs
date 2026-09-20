@@ -13177,10 +13177,13 @@ fn transcendentals_accept_complex_arguments() {
         // zero, which a complex has no ordering for.
         ("(handler-case (plusp (complex 1.0 1.0)) (type-error () :te))", ":TE"),
         ("(handler-case (minusp (complex 1.0 1.0)) (type-error () :te))", ":TE"),
-        // The inverse functions are a documented follow-up: they need complex
-        // log/sqrt with principal-value branch cuts, so a complex argument
-        // still takes the real path rather than being silently mis-answered.
-        ("(handler-case (asin (complex 1.0 1.0)) (type-error () :te))", ":TE"),
+        // The inverse functions were a deferred follow-up when this test was
+        // written -- a complex argument type-errored rather than being
+        // silently mis-answered. They are implemented now (bliss-i13d), so
+        // this asserts the CURRENT behaviour; the detailed closed-form and
+        // round-trip checks live in
+        // `inverse_transcendentals_take_complex_and_out_of_domain_arguments`.
+        ("(complexp (asin (complex 1.0 1.0)))", "T"),
     ];
     run_expression_cases(&cases);
 }
@@ -13552,6 +13555,91 @@ fn integer_builtins_signal_the_right_conditions() {
         ("(boole boole-ior 12 10)", "14"),
         ("(let ((v (random 10))) (and (integerp v) (>= v 0) (< v 10)))", "T"),
         ("(floatp (random 10.0))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi LOG.7-8: `(log <complex>)` type-errored -- `num_val` rejects a complex,
+/// so only log of a NEGATIVE REAL ever produced one. ln z = ln|z| + i*arg z,
+/// with arg the PRINCIPAL value in (-pi, pi], which is what atan2 gives.
+///
+/// This is also the prerequisite for the inverse transcendentals (bliss-i13d):
+/// asin/acos/atan/asinh/acosh/atanh are all expressed through complex log and
+/// sqrt, and their branch cuts come from arg's principal range.
+#[test]
+fn log_accepts_complex_arguments() {
+    let cases = [
+        // ln(i) = i*pi/2 ; ln(-i) = -i*pi/2 -- the principal-value SIGN matters.
+        ("(realpart (log (complex 0.0 1.0)))", "0.0"),
+        ("(imagpart (log (complex 0.0 1.0)))", "1.5707964"),
+        ("(imagpart (log (complex 0.0 -1.0)))", "-1.5707964"),
+        // ln(1+i) = ln(sqrt 2) + i*pi/4
+        ("(realpart (log (complex 1.0 1.0)))", "0.3465736"),
+        ("(imagpart (log (complex 1.0 1.0)))", "0.7853982"),
+        // ln(-1+0i) = i*pi, agreeing with the negative-real branch.
+        ("(imagpart (log (complex -1.0 0.0)))", "3.1415927"),
+        ("(realpart (log (complex 2.0 0.0)))", "0.6931472"),
+        // Round-trip: exp(log z) = z.
+        ("(exp (log (complex 1.0 1.0)))", "#C(1.0 1.0)"),
+        // Reals are untouched, including the negative-real complex result and
+        // the two-argument base form.
+        ("(log 1.0)", "0.0"),
+        ("(log -1.0)", "#C(0.0 3.1415927)"),
+        ("(log 8 2)", "3.0"),
+        ("(log 100 10)", "2.0"),
+        ("(complexp (log (complex 1.0 1.0)))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// bliss-i13d: the six INVERSE transcendentals accepted neither a complex
+/// argument nor a real one outside their real domain -- `(asin 2)` answered
+/// NaN and `(asin #C(0 1))` type-errored.
+///
+/// Implemented from CLHS 12.1.5.3's formulas VERBATIM rather than
+/// algebraically simplified equivalents: the standard states them in the form
+/// that places the principal-value branch cuts correctly, and a rearrangement
+/// that is valid as pure algebra can move a cut and yield plausible WRONG
+/// numbers with nothing to signal.
+///
+/// The out-of-real-domain case is not hand-derived per function either: when
+/// the real kernel returns NaN from a finite input, the same complex formula
+/// is used. That avoids six separate domain conditions, each a chance to get a
+/// sign wrong.
+#[test]
+fn inverse_transcendentals_take_complex_and_out_of_domain_arguments() {
+    let cases = [
+        // Real arguments outside the real domain -> complex principal values.
+        ("(asin 2.0)", "#C(1.5707964 -1.316958)"),
+        ("(acos 2.0)", "#C(0.0 1.316958)"),
+        ("(acosh 0.0)", "#C(0.0 1.5707964)"),
+        ("(atanh 2.0)", "#C(0.54930615 -1.5707964)"),
+        ("(asin -2.0)", "#C(-1.5707964 1.316958)"),
+        // Complex arguments, against closed forms:
+        // asin(i) = i*asinh(1), asinh(i) = i*pi/2, atanh(i) = i*pi/4.
+        ("(asin (complex 0.0 1.0))", "#C(0.0 0.8813736)"),
+        ("(asinh (complex 0.0 1.0))", "#C(0.0 1.5707964)"),
+        ("(atanh (complex 0.0 1.0))", "#C(0.0 0.7853982)"),
+        ("(atan (complex 0.0 0.5))", "#C(0.0 0.54930615)"),
+        // ATAN has its OWN arm (for the two-argument atan2 form) and so needs
+        // its own complex branch -- it bypassed the shared one entirely.
+        ("(complexp (atan (complex 1.0 1.0)))", "T"),
+        ("(atan 1.0 1.0)", "0.7853982"),
+        ("(atan 0.0 -1.0)", "3.1415927"),
+        // Round-trip identities -- independent of how the formulas were
+        // transcribed, so these are the real check.
+        ("(sin (asin (complex 0.5 0.5)))", "#C(0.49999997 0.49999997)"),
+        ("(cosh (acosh (complex 2.0 1.0)))", "#C(2.0 1.0)"),
+        // In-domain reals are untouched.
+        ("(asin 0.5)", "0.5235988"),
+        ("(acos 0.5)", "1.0471976"),
+        ("(atan 1.0)", "0.7853982"),
+        ("(asinh 1.0)", "0.8813736"),
+        ("(acosh 2.0)", "1.316958"),
+        ("(atanh 0.5)", "0.54930615"),
+        // Every result is a complex of the argument's float format.
+        ("(typep (asin 2.0) '(complex single-float))", "T"),
+        ("(typep (atanh 2.0) '(complex single-float))", "T"),
     ];
     run_expression_cases(&cases);
 }
