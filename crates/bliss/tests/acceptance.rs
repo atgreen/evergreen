@@ -13502,6 +13502,25 @@ fn integer_builtins_signal_the_right_conditions() {
         // BOOLE: an op outside the constants is a TYPE-ERROR.
         ("(handler-case (boole nil 1 2) (type-error () :te))", ":TE"),
         ("(handler-case (boole 99 1 2) (type-error () :te))", ":TE"),
+        // ... and both OPERANDS must be integers even for the ops that IGNORE
+        // one of them. BOOLE-1/2/C2/CLR/SET returned without touching the
+        // argument, so `(boole boole-1 nil 1)` answered NIL (ansi
+        // BOOLE.ERROR.6-7 collect exactly those five names).
+        ("(handler-case (boole boole-1 nil 1) (type-error () :te))", ":TE"),
+        ("(handler-case (boole boole-2 1 nil) (type-error () :te))", ":TE"),
+        ("(handler-case (boole boole-clr nil 1) (type-error () :te))", ":TE"),
+        ("(handler-case (boole boole-set 1 nil) (type-error () :te))", ":TE"),
+        ("(handler-case (boole boole-c2 nil 1) (type-error () :te))", ":TE"),
+        ("(boole boole-1 12 10)", "12"),
+        ("(boole boole-clr 12 10)", "0"),
+        ("(boole boole-set 12 10)", "-1"),
+        // MAKE-RANDOM-STATE: the argument must be NIL, T or a RANDOM-STATE; it
+        // was ignored entirely (ansi MAKE-RANDOM-STATE.ERROR.4).
+        ("(handler-case (make-random-state 0) (type-error () :te))", ":TE"),
+        ("(handler-case (make-random-state \"x\") (type-error () :te))", ":TE"),
+        ("(random-state-p (make-random-state))", "T"),
+        ("(random-state-p (make-random-state t))", "T"),
+        ("(random-state-p (make-random-state *random-state*))", "T"),
         // RANDOM: count vs type, no longer swapped.
         ("(handler-case (random) (program-error () :pe))", ":PE"),
         ("(handler-case (random 10 *random-state* 3) (program-error () :pe))", ":PE"),

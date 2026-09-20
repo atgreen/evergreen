@@ -921,7 +921,15 @@
 ;; copies around a computation.
 (defvar *random-state* (list :random-state))
 (defun make-random-state (&optional state)
-  (declare (ignore state))
+  ;; CLHS: STATE is a RANDOM-STATE, T, or NIL. The argument was simply IGNORED,
+  ;; so (make-random-state 0) handed back a fresh state instead of signalling
+  ;; (ansi MAKE-RANDOM-STATE.ERROR.4). The placeholder RESULT is unchanged --
+  ;; bliss has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
+  ;; wants a real independent copy and still fails).
+  (unless (or (null state) (eq state t) (random-state-p state))
+    (error 'type-error
+           :datum state
+           :expected-type '(or (member nil t) random-state)))
   (list :random-state))
 (defun random-state-p (object)
   (and (consp object) (eq (car object) :random-state)))
@@ -2915,6 +2923,16 @@
 (defconstant boole-orc2 15)
 
 (defun boole (op integer1 integer2)
+  ;; Both operands are INTEGERS whatever OP does with them. The ops that IGNORE
+  ;; an argument -- BOOLE-CLR, BOOLE-SET, BOOLE-1, BOOLE-2, BOOLE-C2 -- returned
+  ;; without ever touching it, so (boole boole-1 nil 1) answered NIL instead of
+  ;; signalling (ansi BOOLE.ERROR.6-7 collect exactly those five names). Same
+  ;; shape as ASH's count-0 branch and ISQRT's (< n 2) branch: skipping the work
+  ;; skipped the validation.
+  (unless (integerp integer1)
+    (error 'type-error :datum integer1 :expected-type 'integer))
+  (unless (integerp integer2)
+    (error 'type-error :datum integer2 :expected-type 'integer))
   (cond
     ((eql op boole-clr) 0)
     ((eql op boole-set) -1)
