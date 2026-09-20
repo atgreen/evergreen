@@ -15600,6 +15600,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // defaults to a rational 0, so a rational realpart with no imagpart
             // returns the realpart itself (bliss-qng).
             "COMPLEX" => {
+                // (complex realpart &optional imagpart): one or two arguments.
+                // With none, `cp(NIL)` handed a NIL realpart straight to
+                // make_complex, which reported "NIL is not of type real" -- a
+                // TYPE-ERROR where CLHS 3.5.1 requires a PROGRAM-ERROR for a
+                // wrong argument COUNT (ansi COMPLEX.ERROR.1/2).
+                let n = form_arg_count(cdr);
+                if !(1..=2).contains(&n) {
+                    return Err(BlissError::ProgramError(format!(
+                        "COMPLEX requires one or two arguments, got {n}"
+                    )));
+                }
                 let (rf, rrest) = cp(cdr);
                 bliss_rt::rooted!(real = eval_form(rf, env)?);
                 let imag = if rrest.is_cons() {

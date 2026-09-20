@@ -13426,3 +13426,51 @@ fn complex_literals_read_the_same_as_the_complex_function() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi GCD.2-3 / LCM.2-3 / COMPLEX.ERROR.1-2.
+///
+/// GCD and LCM folded with REDUCE and no :initial-value. REDUCE hands back a
+/// lone element UNTOUCHED -- it never calls the function -- so the `(abs a)`
+/// inside never ran for a ONE-argument call and `(gcd -12)` answered -12.
+/// Seeding with each operation's identity (0 for GCD, since gcd(0,x) = |x|;
+/// 1 for LCM) puts every element through the function, including the only one.
+/// This is the same single-element fold shape as the LOGEQV bug.
+///
+/// COMPLEX with a wrong argument COUNT reported "NIL is not of type real", a
+/// TYPE-ERROR where CLHS 3.5.1 requires a PROGRAM-ERROR.
+#[test]
+fn gcd_lcm_one_argument_and_complex_arity() {
+    let cases = [
+        // The one-argument case is |x|, for either sign.
+        ("(gcd -12)", "12"),
+        ("(gcd 12)", "12"),
+        ("(lcm -12)", "12"),
+        ("(lcm 12)", "12"),
+        // Identities and the two-argument cases are unchanged.
+        ("(gcd)", "0"),
+        ("(lcm)", "1"),
+        ("(gcd 0 -12)", "12"),
+        ("(lcm 1 -12)", "12"),
+        ("(gcd 12 18)", "6"),
+        ("(gcd -12 18)", "6"),
+        ("(gcd 12 -18)", "6"),
+        ("(lcm 4 6)", "12"),
+        ("(lcm -4 6)", "12"),
+        ("(lcm 0 5)", "0"),
+        // Three arguments, and bignums.
+        ("(gcd 12 18 24)", "6"),
+        ("(lcm 4 6 10)", "60"),
+        ("(gcd (- (expt 2 70)) (expt 2 68))", "295147905179352825856"),
+        // COMPLEX: wrong COUNT is a PROGRAM-ERROR ...
+        ("(handler-case (complex) (program-error () :pe))", ":PE"),
+        ("(handler-case (complex 1 2 3) (program-error () :pe))", ":PE"),
+        // ... while a wrong argument TYPE stays a TYPE-ERROR.
+        ("(handler-case (complex \"x\") (type-error () :te))", ":TE"),
+        // Valid calls are untouched, including the canonicalising one.
+        ("(complex 1 2)", "#C(1 2)"),
+        ("(complex 3)", "3"),
+        ("(complex 1.0 2)", "#C(1.0 2.0)"),
+        ("(complex 1 0)", "1"),
+    ];
+    run_expression_cases(&cases);
+}

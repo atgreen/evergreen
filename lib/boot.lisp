@@ -1529,21 +1529,22 @@
     (unless (integerp n)
       (error 'type-error :datum n :expected-type 'integer))))
 
+;; REDUCE hands back a lone element UNTOUCHED -- it never calls the function --
+;; so the (abs a) below did not run for a ONE-argument call and (gcd -12)
+;; answered -12 instead of 12 (ansi GCD.2-3; LCM.2-3 is the same shape).
+;; Seeding with the identity (0 for GCD, since gcd(0,x) = |x|; 1 for LCM) puts
+;; every element through the function, including the only one.
 (defun gcd (&rest integers)
   (%require-integers integers)
-  (if (null integers)
-      0
-      (reduce (lambda (a b) (%gcd2 (abs a) (abs b))) integers)))
+  (reduce (lambda (a b) (%gcd2 (abs a) (abs b))) integers :initial-value 0))
 
 (defun lcm (&rest integers)
   (%require-integers integers)
-  (if (null integers)
-      1
-      (reduce (lambda (a b)
-                (if (or (= a 0) (= b 0))
-                    0
-                    (/ (abs (* a b)) (%gcd2 (abs a) (abs b)))))
-              integers)))
+  (reduce (lambda (a b)
+            (if (or (= a 0) (= b 0))
+                0
+                (/ (abs (* a b)) (%gcd2 (abs a) (abs b)))))
+          integers :initial-value 1))
 
 (defun string-left-trim (bag s)
   (let ((str (string s)) (n (length (string s))) (i 0))
