@@ -13385,3 +13385,44 @@ fn typep_handles_compound_complex_specifiers() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi PLUS.3 / MINUS.3: `#C(a b)` denotes `(complex a b)` (CLHS 2.4.8.11),
+/// but the READER applied neither of COMPLEX's rules, so a literal read
+/// differently from the same value constructed by `(complex a b)`. ansi seeds
+/// *NUMBERS* from such literals, so `(eql x (+ x 0))` failed for them -- the
+/// addition normalised what the reader had not.
+///
+/// Both rules are pinned here: float contagion to the widest format, and
+/// canonicalisation of a RATIONAL complex with a zero imaginary part. A FLOAT
+/// zero must NOT canonicalise.
+#[test]
+fn complex_literals_read_the_same_as_the_complex_function() {
+    let cases = [
+        // Float contagion, including the double/bignum/ratio parts that a
+        // fixnum-and-single-float-only coercion would have skipped.
+        ("(read-from-string \"#C(1.0 3.0d0)\")", "#C(1.0d0 3.0d0)"),
+        ("(read-from-string \"#C(1.0d0 3.0)\")", "#C(1.0d0 3.0d0)"),
+        ("(read-from-string \"#C(1 2.0)\")", "#C(1.0 2.0)"),
+        ("(read-from-string \"#C(2.0 1)\")", "#C(2.0 1.0)"),
+        ("(read-from-string \"#C(1/2 3.0)\")", "#C(0.5 3.0)"),
+        // Canonicalisation of a rational complex with a zero imaginary part.
+        ("(read-from-string \"#C(1 0)\")", "1"),
+        ("(read-from-string \"#C(1/2 0)\")", "1/2"),
+        ("(read-from-string \"#C(123456789012345678901234567890 0)\")",
+         "123456789012345678901234567890"),
+        // ... but a FLOAT zero imaginary part stays complex.
+        ("(read-from-string \"#C(1.0 0.0)\")", "#C(1.0 0.0)"),
+        // An all-rational complex is untouched.
+        ("(read-from-string \"#C(1 2)\")", "#C(1 2)"),
+        // The literal and the constructor must agree, which is the property
+        // the ansi tests actually rely on.
+        ("(let ((r (read-from-string \"#C(1.0 3.0d0)\")))
+            (eql r (complex (realpart r) (imagpart r))))", "T"),
+        // ... and identity under adding zero, which is PLUS.3's assertion.
+        ("(loop for x in (list (read-from-string \"#C(1.0 3.0d0)\")
+                               (read-from-string \"#C(1/2 3.0)\")
+                               (read-from-string \"#C(1 2)\") 1 1.5 1/2)
+            always (and (eql x (+ x 0)) (eql x (+ 0 x))))", "T"),
+    ];
+    run_expression_cases(&cases);
+}

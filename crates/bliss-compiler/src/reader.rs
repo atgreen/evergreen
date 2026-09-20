@@ -687,7 +687,69 @@ fn alloc_ratio(num: BlissVal, den: BlissVal) -> BlissVal {
     }
 }
 
+/// A complex part coerced to f64 for the float-contagion rule below.
+///
+/// `numeric_to_f64` covers only fixnums and single-floats, so a DOUBLE, a
+/// BIGNUM or a RATIO part returned None and silently skipped contagion --
+/// `#C(1.0d0 3.0)` kept a single-float imaginary part and `#C(1/2 3.0)` kept a
+/// ratio real part. Both are mixed-format complexes that cannot legally exist.
+fn complex_part_to_f64(v: BlissVal) -> Option<f64> {
+    if v.is_double_float() {
+        return Some(v.as_double_float());
+    }
+    if let Some(x) = numeric_to_f64(v) {
+        return Some(x);
+    }
+    bliss_rt::bignum::as_bigrat(v).map(|r| r.to_f64())
+}
+
 fn alloc_complex(real: BlissVal, imag: BlissVal) -> BlissVal {
+    // CLHS 2.4.8.11: `#C(a b)` denotes `(complex a b)`, so BOTH of COMPLEX's
+    // rules apply here -- and the reader applied NEITHER, so a literal read
+    // differently from the same value built by (complex a b):
+    //
+    //   #C(1.0 3.0d0)  read as #C(1.0 3.0d0), a MIXED-format complex that
+    //                  cannot legally exist; (complex 1.0 3.0d0) is
+    //                  #C(1.0d0 3.0d0)
+    //   #C(1 0)        read as #C(1 0); (complex 1 0) is the integer 1
+    //   #C(1 2.0)      read as #C(1 2.0); (complex 1 2.0) is #C(1.0 2.0)
+    //
+    // ansi seeds *NUMBERS* from such literals, so `(eql x (+ x 0))` failed for
+    // them: the addition normalised what the reader had not (PLUS.3, MINUS.3).
+    //
+    // 1. Float contagion -- if EITHER part is a float, both take the widest
+    //    float format.
+    // 2. Canonicalisation -- a RATIONAL complex with a zero imaginary part is
+    //    just the real part. A FLOAT zero does NOT canonicalise: #C(1.0 0.0)
+    //    stays complex, which is why the zero test is on a fixnum.
+    let (real, imag) = if real.is_double_float() || imag.is_double_float() {
+        match (complex_part_to_f64(real), complex_part_to_f64(imag)) {
+            // GC: alloc_double_float ALLOCATES, so the real part must be rooted
+            // across the imaginary part's allocation. Written as a tuple
+            // `(alloc(r), alloc(i))` the first value sits unrooted in a Rust
+            // temporary while the second allocates -- the same shape that made
+            // the bignum ratio reader return a wrong value under
+            // BLISS_GC_STRESS, with no crash to point at it.
+            (Some(r), Some(i)) => {
+                bliss_rt::rooted!(rv = bliss_rt::gc::alloc_double_float(r));
+                let iv = bliss_rt::gc::alloc_double_float(i);
+                (*rv, iv)
+            }
+            _ => (real, imag),
+        }
+    } else if real.is_single_float() || imag.is_single_float() {
+        match (complex_part_to_f64(real), complex_part_to_f64(imag)) {
+            (Some(r), Some(i)) => (
+                BlissVal::from_single_float(r as f32),
+                BlissVal::from_single_float(i as f32),
+            ),
+            _ => (real, imag),
+        }
+    } else if imag.is_fixnum() && imag.as_fixnum() == 0 {
+        return real;
+    } else {
+        (real, imag)
+    };
     // Root across gc_alloc — see alloc_ratio (bliss-wlf).
     bliss_rt::rooted!(real = real);
     bliss_rt::rooted!(imag = imag);
