@@ -4392,6 +4392,29 @@ fn reject_closure_as_list(v: BlissVal) -> Result<(), BlissError> {
     Ok(())
 }
 
+/// A list-walking builtin's argument must actually BE a list: NIL or a cons.
+///
+/// `reject_closure_as_list` alone is not enough. It only catches a closure
+/// that is physically `(BLISS::CLOSURE . id)`, so a walk driven by a bare
+/// `is_cons()` still accepted every other atom silently -- `(nth 1 5)` and
+/// `(nth 1 "abc")` answered NIL, and a heap-object closure sailed through
+/// because it is not a cons at all (bliss-swi5, whose title says "closure"
+/// but whose cause is the missing argument check).
+///
+/// A dotted list IS a list, so `(cons 1 2)` passes here; only the walk's
+/// treatment of the dotted TAIL is at issue, and that is deliberately left
+/// alone (see `nth_element`).
+fn require_list(v: BlissVal) -> Result<(), BlissError> {
+    reject_closure_as_list(v)?;
+    if !v.is_nil() && !v.is_cons() {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "list".into(),
+        });
+    }
+    Ok(())
+}
+
 /// `(nth idx list)`'s kernel, shared by the operator-position handler and the
 /// evaluated-args fast arm so the two cannot drift (the bliss-x5y.9 rule).
 ///
@@ -4404,13 +4427,20 @@ fn reject_closure_as_list(v: BlissVal) -> Result<(), BlissError> {
 /// than an error. A bignum index arrives as `usize::MAX` and terminates on the
 /// first non-cons, so it stays O(length), not O(index).
 ///
-/// A closure is rejected up front: it is physically `(BLISS::CLOSURE . id)`,
-/// so a raw walk answered the symbol BLISS::CLOSURE for `(nth 0 f)` and leaked
-/// an internal name into user code (bliss-74rl family).
+/// The argument must be a list. A raw walk answered NIL for ANY atom --
+/// `(nth 1 5)`, `(nth 1 "abc")` -- and answered the symbol BLISS::CLOSURE for
+/// `(nth 0 f)` on a cons-represented closure (bliss-74rl family). `require_list`
+/// covers both; SBCL signals a type-error on each of these.
+///
+/// NOT changed here: walking INTO a dotted tail. `(nth 3 (cons 1 (cons 2 3)))`
+/// still answers NIL, where SBCL signals a type-error because NTH is defined as
+/// `(car (nthcdr n list))` and NTHCDR would take the CDR of the atom 3. That is
+/// a separate behaviour change from the missing argument check, tracked apart
+/// from bliss-swi5.
 ///
 /// No allocation, so nothing here needs rooting.
 fn nth_element(idx: usize, list: BlissVal) -> Result<BlissVal, BlissError> {
-    reject_closure_as_list(list)?;
+    require_list(list)?;
     let mut cursor = list;
     for _ in 0..idx {
         if !cursor.is_cons() {

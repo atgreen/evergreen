@@ -1454,6 +1454,14 @@
   ;; lockstep until L reaches the terminating atom.
   (unless (and (integerp n) (>= n 0))
     (error 'type-error :datum n :expected-type '(integer 0)))
+  ;; LIST must actually be a list. Without this the loop below exits
+  ;; immediately on a non-cons and RETURNS THE ARGUMENT ITSELF, so (last 5)
+  ;; answered 5 and (last "abc") answered "abc" -- a non-list silently
+  ;; reported as the last cons of itself (bliss-swi5). A dotted list is still
+  ;; a list, so (last (cons 1 2)) => (1 . 2) is unaffected. SBCL gets this from
+  ;; its (defknown last (list &optional unsigned-byte) ...) declaration.
+  (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
   (let ((l list) (r list) (i 0))
     (do () ((or (>= i n) (not (consp l))))
       (setq l (cdr l)) (setq i (+ i 1)))

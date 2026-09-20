@@ -12973,15 +12973,62 @@ fn ordinal_accessors_share_the_nth_kernel() {
         // Dotted tails stop where the walk stops.
         ("(second (cons 1 2))", "NIL"),
         ("(third (cons 1 (cons 2 (cons 3 4))))", "3"),
-        // Non-lists answer NIL, as they did before.
-        ("(second 5)", "NIL"),
-        ("(third \"abc\")", "NIL"),
-        // ... but a closure is a FUNCTION, and CDR of one signals.
+        // A non-list argument SIGNALS (bliss-swi5). These previously answered
+        // NIL: the walk simply found no cons and fell out, so (second 5) and
+        // (nth 1 "abc") reported "no such element" for something that has no
+        // elements to begin with. SBCL type-errors on each of these, as CLHS
+        // requires -- SECOND..TENTH and NTH all specify a LIST argument.
+        ("(handler-case (second 5) (type-error () :te))", ":TE"),
+        ("(handler-case (third \"abc\") (type-error () :te))", ":TE"),
+        ("(handler-case (nth 1 5) (type-error () :te))", ":TE"),
+        ("(handler-case (nth 0 'sym) (type-error () :te))", ":TE"),
+        // A closure signals too, whether it is a heap object or the cons-shaped
+        // (BLISS::CLOSURE . id): require_list rejects both.
         ("(handler-case (second (lambda (x) x)) (type-error () :te))", ":TE"),
         ("(handler-case (third (lambda (x) x)) (type-error () :te))", ":TE"),
+        ("(handler-case (nth 1 (lambda (x) x)) (type-error () :te))", ":TE"),
+        // NIL and a too-short list still answer NIL -- absent element, not a
+        // bad argument -- so the new check must not swallow these.
+        ("(nth 5 (list 1 2 3))", "NIL"),
+        ("(nth 0 nil)", "NIL"),
         // FOURTH..TENTH are boot.lisp defuns and are unaffected.
         ("(fourth (list 1 2 3 4))", "4"),
         ("(tenth (list 1 2 3 4 5 6 7 8 9 10))", "10"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// bliss-swi5: LAST's loop exits immediately on a non-cons and returns its
+/// trailing pointer, which still points at the ORIGINAL argument -- so (last 5)
+/// answered 5, reporting a non-list as the last cons of itself. The bead frames
+/// this as closures walking their cons representation, but the cause is the
+/// missing argument check: every atom slipped through, and the heap-object
+/// closure that prompted the report is not a cons at all.
+///
+/// SBCL gets this from (defknown last (list &optional unsigned-byte) ...);
+/// verified against it that each erroring case below errors there and each
+/// preserved case returns the same value.
+#[test]
+fn last_requires_a_list_argument() {
+    let cases = [
+        // Non-lists signal rather than answering themselves.
+        ("(handler-case (last 5) (type-error () :te))", ":TE"),
+        ("(handler-case (last \"abc\") (type-error () :te))", ":TE"),
+        ("(handler-case (last 'sym) (type-error () :te))", ":TE"),
+        ("(handler-case (last (lambda (x) x)) (type-error () :te))", ":TE"),
+        // A dotted list IS a list: unchanged.
+        ("(last (cons 1 2))", "(1 . 2)"),
+        ("(last (list 1 2 3))", "(3)"),
+        ("(last nil)", "NIL"),
+        // The N argument keeps its own check and its own behaviour.
+        ("(last (list 1 2 3) 2)", "(2 3)"),
+        ("(last (list 1 2 3) 0)", "NIL"),
+        ("(last (list 1 2 3) 99)", "(1 2 3)"),
+        ("(handler-case (last (list 1 2) -1) (type-error () :te))", ":TE"),
+        ("(handler-case (last (list 1 2) 'x) (type-error () :te))", ":TE"),
+        // The list check must come after N's, so a bad N on a bad list still
+        // reports N -- both are type-errors, but N is checked first.
+        ("(handler-case (last 5 -1) (type-error (c) (type-error-datum c)))", "-1"),
     ];
     run_expression_cases(&cases);
 }
