@@ -55,7 +55,13 @@ fn file_stream_fd_released_by_gc_finalizer() {
         )
         .expect("open output file stream");
         let _ = stream_write_string(s, make_lisp_string("x"), 0, None);
-        drop(s); // unreachable, unclosed
+        // `s` is deliberately left unclosed and unrooted. This used to read
+        // `drop(s)`, which does NOTHING -- BlissVal is Copy, so the drop call
+        // moves a bit pattern and the original stays put (dropping_copy_types).
+        // The line implied it was what made the stream collectable; it was not.
+        // What actually makes it collectable is that `s` is never rooted, and
+        // the GC is precise: an unrooted Rust local is invisible to the trace,
+        // so the handle is already garbage the moment the collector runs.
         if i % 20 == 19 {
             bliss_rt::full_gc().expect("full_gc");
         }
