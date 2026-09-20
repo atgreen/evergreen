@@ -60,16 +60,43 @@ fi
 # a passing chapter into a wall-clock timeout (bliss-em8x).
 #
 # The size split is a HEURISTIC, not a guarantee: measured ~112MB for the
-# cargo-test build and ~100MB for the cargo-build one. It is advisory only —
-# the gate still runs either way.
+# cargo-test build and ~100MB for the cargo-build one.
+#
+# This REFUSES rather than warns (bliss-wzb3). It was advisory, and advice at
+# this spot does not work: the banner scrolls past, and a run on the slow
+# binary yields a number that reads like a real result while being ~9x off. It
+# has already produced one fictitious regression (bliss-em8x) and one wasted
+# 2400s timeout. A chapter tally from the slow binary is not wrong so much as
+# uninterpretable, and the gate should not emit uninterpretable numbers.
+#
+# Escape hatch for a deliberate correctness-only run, where speed is irrelevant:
+#   BLISS_ALLOW_SLOW_BIN=1 scripts/ansi-gate.sh <chapter>
 bliss_bin_size="$(stat -c%s "$BLISS_BIN" 2>/dev/null || echo 0)"
 echo "ansi-gate: binary $BLISS_BIN (${bliss_bin_size} bytes)"
 if [ "$bliss_bin_size" -gt 0 ] && [ "$bliss_bin_size" -lt 106000000 ]; then
-    echo "ansi-gate: WARNING: this looks like a 'cargo build' binary, whose"
-    echo "ansi-gate:   dependencies are unoptimized and which has measured ~9x"
-    echo "ansi-gate:   slower than a 'cargo test --workspace --no-run' build."
-    echo "ansi-gate:   Timings from it are not comparable, and a chapter may"
-    echo "ansi-gate:   time out that would otherwise pass. See bliss-em8x."
+    if [ "${BLISS_ALLOW_SLOW_BIN:-0}" = 1 ]; then
+        echo "ansi-gate: WARNING: slow-looking binary, continuing because"
+        echo "ansi-gate:   BLISS_ALLOW_SLOW_BIN=1. Pass/fail tallies are still"
+        echo "ansi-gate:   meaningful; TIMINGS AND TIMEOUTS ARE NOT (bliss-em8x)."
+    else
+        echo "ansi-gate: ERROR: this looks like a 'cargo build' binary, whose" >&2
+        echo "ansi-gate:   dependencies are unoptimized and which has measured" >&2
+        echo "ansi-gate:   ~9x slower than a 'cargo test --workspace --no-run'" >&2
+        echo "ansi-gate:   build. Timings are not comparable and a chapter can" >&2
+        echo "ansi-gate:   time out that would otherwise pass (bliss-em8x)." >&2
+        echo "ansi-gate:" >&2
+        echo "ansi-gate:   Rebuild the fast binary:" >&2
+        echo "ansi-gate:     cargo test --workspace --no-run" >&2
+        echo "ansi-gate:" >&2
+        echo "ansi-gate:   NOTE: a warning-clean 'cargo build --workspace' check" >&2
+        echo "ansi-gate:   overwrites this same path and puts you right back" >&2
+        echo "ansi-gate:   here. Use 'cargo check --workspace' for that (it does" >&2
+        echo "ansi-gate:   not write the binary) -- see bliss-wzb3." >&2
+        echo "ansi-gate:" >&2
+        echo "ansi-gate:   To run anyway (correctness only, timings void):" >&2
+        echo "ansi-gate:     BLISS_ALLOW_SLOW_BIN=1 $0 $*" >&2
+        exit 2
+    fi
 fi
 
 chapters=("${ENABLED_CHAPTERS[@]}")
@@ -96,8 +123,40 @@ for chapter in "${chapters[@]}"; do
 (defparameter cl-user::*ansi-test-root* "$ANSI_TEST_DIR/")
 (load "$(pwd)/scripts/ansi-chapter.lisp")
 EOF
+    # Record BOTH wall and CPU time (bliss-u64o). Wall time alone is not
+    # interpretable: if the host suspends mid-chapter, wall time inflates while
+    # no work happens, which looks exactly like a hang or a regression. It also
+    # means the BLISS_TIMEOUT cap -- which is wall-clock -- can be consumed, or
+    # fail to fire, for reasons that have nothing to do with the code. A wall
+    # time far above the CPU time is the signature of that, not of slow code.
+    chapter_t0="$(date +%s)"
+    # /proc/$$/stat, NOT /proc/self/stat: command substitution runs in a
+    # SUBSHELL, so `self` names that short-lived subshell -- which has reaped
+    # no children and always reports 0. `$$` stays the main shell even inside
+    # $( ). Fields 16/17 are cutime/cstime, the CPU of reaped children; the
+    # systemd scope in bliss-limited.sh does not hide it (verified: 81 ticks
+    # accounted both with and without the scope).
+    chapter_cpu_before="$(awk '{print $16+$17}' "/proc/$$/stat" 2>/dev/null)"
     scripts/bliss-limited.sh "$BLISS_BIN" --no-init --load "$driver" >"$log" 2>&1
     status=$?
+    chapter_cpu_after="$(awk '{print $16+$17}' "/proc/$$/stat" 2>/dev/null)"
+    chapter_wall=$(( "$(date +%s)" - chapter_t0 ))
+    chapter_cpu="?"
+    if [ -n "$chapter_cpu_before" ] && [ -n "$chapter_cpu_after" ]; then
+        ticks="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+        chapter_cpu=$(( (chapter_cpu_after - chapter_cpu_before) / ticks ))
+    fi
+    timing="${chapter_wall}s wall"
+    if [ "$chapter_cpu" != "?" ]; then
+        timing="$timing / ${chapter_cpu}s cpu"
+        # >2x wall vs cpu with a multi-minute run means the chapter spent most
+        # of its wall time not running: host suspend, or heavy contention.
+        if [ "$chapter_wall" -gt 120 ] && \
+           [ "$chapter_cpu" -gt 0 ] && \
+           [ "$chapter_wall" -gt $(( chapter_cpu * 2 )) ]; then
+            timing="$timing -- WALL >> CPU, elapsed time not meaningful (bliss-u64o)"
+        fi
+    fi
     rm -f "$driver"
 
     passed="$(sed -n 's/^passed: \([0-9]\+\)$/\1/p' "$log" | tail -1)"
@@ -105,7 +164,7 @@ EOF
 
     if [ -z "$passed" ] || [ -z "$failed" ]; then
         # No tally = the run died (crash, timeout, load error) — ERRORED.
-        echo "ansi-gate: $chapter: ERRORED (exit $status, no tally; log: $log)"
+        echo "ansi-gate: $chapter: ERRORED (exit $status, no tally; $timing; log: $log)"
         if [ "$status" = 124 ]; then
             echo "ansi-gate:   exit 124 = wall-clock timeout after ${BLISS_TIMEOUT}s."
             echo "ansi-gate:   Before treating this as a code problem, check the"
@@ -116,10 +175,10 @@ EOF
         tail -5 "$log" | sed 's/^/ansi-gate:   /'
         overall=1
     elif [ "$failed" -ne 0 ] || [ "$passed" -eq 0 ]; then
-        echo "ansi-gate: $chapter: FAILED ($passed passed, $failed failed; log: $log)"
+        echo "ansi-gate: $chapter: FAILED ($passed passed, $failed failed; $timing; log: $log)"
         overall=1
     else
-        echo "ansi-gate: $chapter: ok ($passed/$passed)"
+        echo "ansi-gate: $chapter: ok ($passed/$passed; $timing)"
         rm -f "$log"
     fi
 done
