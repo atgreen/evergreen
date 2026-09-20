@@ -13297,3 +13297,91 @@ fn logeqv_is_correct_at_every_arity() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi EXPT.7 and EXPT.18: `(expt x 0)` is 1 for EVERY x. That has to be
+/// decided before EXPT's complex branch, which fires on any complex base and
+/// on a negative real base with a non-fixnum exponent -- both reached it with a
+/// zero exponent and answered a complex one.
+///
+/// `(expt 5 0.0)` was already correct, so only NEGATIVE bases were wrong;
+/// EXPT.18 catches it because its loop runs i from -1000.
+#[test]
+fn expt_of_zero_exponent_is_one_for_every_base() {
+    let cases = [
+        // (expt x 0) is 1 OF THE RESULT TYPE, not the integer 1. These four
+        // pin all of it together, because a fix that returns a blanket integer
+        // 1 passes the first two and breaks the last two (it did, and ansi
+        // EXPT.3/10 caught it):
+        //   rational-complex base  -> integer 1  (#C(1 0) canonicalises)
+        //   float base             -> 1.0
+        //   double-complex base    -> #C(1.0d0 0.0d0)
+        ("(eql (expt (complex 3 3) 0) 1)", "T"),
+        ("(eql (expt 3.0 0) 1.0)", "T"),
+        ("(loop for i = (random 1000.0) repeat 100 always (eql (expt i 0) 1.0))", "T"),
+        ("(loop for i = (random 1.0d10) for c = (complex i i) repeat 100
+            always (eql (expt c 0) (complex 1.0d0 0.0d0)))", "T"),
+        ("(expt (complex 1.0 1.0) 0)", "#C(1.0 0.0)"),
+        // A FLOAT zero exponent on a rational complex contagiously gives a
+        // float complex -- that one was already right and must stay so.
+        ("(expt (complex 3 3) 0.0)", "#C(1.0 0.0)"),
+        ("(loop for i from -50 to 50 for c = (complex i i) always (eql (expt c 0) 1))", "T"),
+        // A float zero gives a float 1 in the EXPONENT's format, for negative
+        // bases as well as positive ones.
+        ("(expt -5 0.0)", "1.0"),
+        ("(expt -5 0.0d0)", "1.0d0"),
+        ("(expt 5 0.0)", "1.0"),
+        ("(loop for zero in (list 0.0 0.0d0) always
+            (loop for i from -50 to 50 always
+              (or (zerop i) (eql (expt i zero) (float 1 zero)))))", "T"),
+        // Rational, bignum and zero bases keep the exact integer 1.
+        ("(expt 5 0)", "1"),
+        ("(expt 1/2 0)", "1"),
+        ("(expt 123456789012345678901234567890 0)", "1"),
+        ("(expt 0 0)", "1"),
+        // Nonzero exponents are untouched, including the paths that legitimately
+        // produce a complex result.
+        ("(expt 2 10)", "1024"),
+        ("(expt -2 3)", "-8"),
+        ("(expt 2.0 10)", "1024.0"),
+        ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
+        ("(expt (complex 0 1) 2)", "-1"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi LOG.5-8 (and COSH.6/SINH.6/TANH.6): TYPEP's compound dispatch has arms
+/// for OR, AND, ARRAY, INTEGER, REAL, MEMBER, SATISFIES and friends but had
+/// NONE for COMPLEX, so every `(complex TYPE)` specifier fell through and
+/// answered NIL.
+///
+/// Worth recording how this presented: LOG.5 looks like a LOG bug, and the
+/// complex values LOG returns are in fact CORRECT -- `(log -0.5)` is
+/// #C(-0.6931 3.1416) with single-float parts. The test's real assertion is
+/// `(typep y '(complex single-float))`, which is what was broken.
+#[test]
+fn typep_handles_compound_complex_specifiers() {
+    let cases = [
+        ("(typep (log -0.5) '(complex single-float))", "T"),
+        ("(typep (log -0.5d0) '(complex double-float))", "T"),
+        // ... and rejects the wrong part type.
+        ("(typep (log -0.5) '(complex double-float))", "NIL"),
+        ("(typep (log -0.5d0) '(complex single-float))", "NIL"),
+        // A bare COMPLEX, and the `*` / no-argument forms, mean any complex.
+        ("(typep (complex 1 2) 'complex)", "T"),
+        ("(typep (complex 1 2) '(complex))", "T"),
+        ("(typep (complex 1 2) '(complex *))", "T"),
+        // Rational parts.
+        ("(typep (complex 1 2) '(complex integer))", "T"),
+        ("(typep (complex 1 2) '(complex float))", "NIL"),
+        ("(typep (complex 1.0 2.0) '(complex float))", "T"),
+        // Non-complex objects never match, whatever the part spec.
+        ("(typep 5 '(complex integer))", "NIL"),
+        ("(typep 5.0 '(complex single-float))", "NIL"),
+        ("(typep \"x\" '(complex t))", "NIL"),
+        // The ansi shape itself: LOG of a negative float is ONE value, of type
+        // (complex <that float format>).
+        ("(let* ((x -0.5) (r (multiple-value-list (log x))))
+            (and (null (cdr r)) (typep (car r) '(complex single-float))))", "T"),
+    ];
+    run_expression_cases(&cases);
+}

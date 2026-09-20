@@ -12311,6 +12311,32 @@ fn typep_matches(
             Ok(vector_length_matches(&size_args, object))
         }
         // The (MEMBER …) type specifier compares with EQL (CLHS 4.2.3), not EQUAL.
+        "COMPLEX" => {
+            // (complex typespec): a COMPLEX whose parts are of typespec (CLHS
+            // 12.1.5.3 -- strictly the UPGRADED complex part type, which bliss
+            // stores verbatim, so testing each part against the spec directly
+            // is exact). There was no arm here at all, so every compound form
+            // fell through and answered NIL -- `(typep (log -0.5) '(complex
+            // single-float))` was false even though (log -0.5) is a complex
+            // with single-float parts (ansi LOG.5-8, which check exactly that
+            // of LOG's result on a negative float).
+            //
+            // `(complex)` and `(complex *)` mean any complex, like the bare
+            // symbol.
+            if !bliss_rt::types::complexp(object) {
+                return Ok(false);
+            }
+            let specs = list_to_vec(args);
+            let Some(&spec) = specs.first() else {
+                return Ok(true);
+            };
+            if spec.is_symbol() && symbol_bare_name(&sym_name_rc(spec)) == "*" {
+                return Ok(true);
+            }
+            let re = bliss_rt::types::complex_realpart(object).unwrap_or(NIL);
+            let im = bliss_rt::types::complex_imagpart(object).unwrap_or(NIL);
+            Ok(typep_matches(env, re, spec)? && typep_matches(env, im, spec)?)
+        }
         "MEMBER" => Ok(list_to_vec(args)
             .into_iter()
             .any(|candidate| eql_values(object, candidate))),
@@ -20181,7 +20207,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // a rational complex the exact integer 1.
                         let rp = bliss_rt::types::complex_realpart(a).unwrap_or(a);
                         let ip = bliss_rt::types::complex_imagpart(a).unwrap_or(NIL);
-                        let kind = widen_float(real_float_kind(rp), real_float_kind(ip));
+                        // `float_kind_of`, NOT `real_float_kind`: the latter
+                        // never returns None -- it answers Single for anything
+                        // that is not a double -- so this test was always true
+                        // and the rational-complex case below was UNREACHABLE.
+                        // `(expt #C(3 3) 0)` answered #C(1.0 0.0) instead of the
+                        // integer 1 the comment above promises (ansi EXPT.7).
+                        let kind = widen_float(float_kind_of(rp), float_kind_of(ip));
                         if kind != FloatKind::None {
                             bliss_rt::rooted!(one = box_float(1.0, kind));
                             let zero = box_float(0.0, kind);
@@ -20202,7 +20234,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // the latter): base^power = exp(power · log base) (bliss-mg63 kin).
                 let base_negative =
                     !bliss_rt::types::complexp(a) && num_val(a).map(|x| x < 0.0).unwrap_or(false);
-                if bliss_rt::types::complexp(a) || (base_negative && !b.is_fixnum()) {
+                // A negative real base with a ZERO float exponent must not come
+                // here: CLHS makes (expt x 0) equal 1 of the result type, and
+                // the real path below already gets that right via powf(x, 0.0).
+                // Routing it to complex_expt answered #C(1.0 0.0) for
+                // `(expt -5 0.0)` instead of 1.0 (ansi EXPT.18, whose loop runs
+                // i from -1000 -- positive bases were already correct).
+                // A complex base with an integer zero exponent is handled
+                // above; with a FLOAT zero exponent, float contagion really
+                // does want #C(1.0 0.0), so complex_expt stays correct there.
+                let exponent_zero = !bliss_rt::types::complexp(b)
+                    && num_val(b).map(|x| x == 0.0).unwrap_or(false);
+                if bliss_rt::types::complexp(a)
+                    || (base_negative && !b.is_fixnum() && !exponent_zero)
+                {
                     return complex_expt(a, b);
                 }
                 let av = num_val(a)?;
