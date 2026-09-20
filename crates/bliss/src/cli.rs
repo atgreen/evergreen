@@ -14170,6 +14170,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
 
         match name.as_str() {
+            // An FLET/LABELS binding shadows a BUILTIN, not just a global macro
+            // or function (bliss-ccgu). Without this the arms below dispatched
+            // on the name alone, so the tree-walker ignored the binding while
+            // the bytecode lowerer honoured it and the two tiers gave DIFFERENT
+            // ANSWERS for the same form:
+            //
+            //   (flet ((cons (a b) (list :shadowed a b))) (cons 1 2))
+            //     compiled    => (:SHADOWED 1 2)
+            //     tree-walked => (1 . 2)
+            //
+            // Same for CAR, 1+ and every builtin with an arm here. CLHS
+            // 11.1.2.1.2 leaves binding a CL symbol undefined, so neither answer
+            // is "wrong" in isolation -- but the two tiers agreeing is a property
+            // this project does hold to, and the compiled answer is the one that
+            // respects the programmer's binding.
+            //
+            // An empty body falls out of the match into the general call path
+            // below, which resolves the lexical binding properly.
+            //
+            // SPECIAL OPERATORS ARE EXCLUDED. `(flet ((if ...)) (if a b))` must
+            // still evaluate IF as the special form -- it is not a function and
+            // cannot be called -- which is also what the lowerer does, so the
+            // exclusion keeps the tiers aligned rather than breaking them.
+            //
+            // Costs nothing extra: `shadowed_by_lexical_function` is already
+            // computed above for the macro decision.
+            _ if shadowed_by_lexical_function
+                && !is_ansi_special_operator(&sym_bare_name_rc(car)) => {}
             #[cfg(test)]
             "%FORCE-MINOR-GC-FOR-TEST" => {
                 bliss_rt::collect_t0_minor()?;

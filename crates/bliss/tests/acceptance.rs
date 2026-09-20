@@ -12998,6 +12998,46 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-ccgu: an FLET/LABELS binding shadows a BUILTIN, and the two tiers
+/// must agree about it. The tree-walker dispatched builtin names without
+/// consulting the lexical function environment, so
+/// `(flet ((cons (a b) (list :shadowed a b))) (cons 1 2))` answered
+/// `(:SHADOWED 1 2)` compiled and `(1 . 2)` tree-walked -- the same form, two
+/// answers.
+///
+/// CLHS 11.1.2.1.2 leaves binding a CL symbol undefined, so neither answer is
+/// wrong in isolation; the tiers agreeing is the property that matters, and the
+/// compiled answer is the one that respects the binding.
+///
+/// `run_expression_cases` runs every case through BOTH backends, which is
+/// exactly the check this needs.
+#[test]
+fn flet_and_labels_shadow_builtins_identically_in_both_tiers() {
+    let cases = [
+        ("(flet ((cons (a b) (list :shadowed a b))) (cons 1 2))", "(:SHADOWED 1 2)"),
+        ("(flet ((car (x) :shadowed)) (car (list 1)))", ":SHADOWED"),
+        ("(flet ((1+ (x) :shadowed)) (1+ 1))", ":SHADOWED"),
+        ("(labels ((length (x) :shadowed)) (length (list 1 2)))", ":SHADOWED"),
+        // Builtins moved to Rust in the character work inherit the same rule.
+        ("(flet ((char= (a b) :shadowed)) (char= #\\a #\\b))", ":SHADOWED"),
+        ("(flet ((char-code (c) :shadowed)) (char-code #\\a))", ":SHADOWED"),
+        ("(flet ((char-equal (a b) :shadowed)) (char-equal #\\a #\\b))", ":SHADOWED"),
+        // SPECIAL OPERATORS are excluded: IF is not a function and cannot be
+        // called, so the special form still wins -- as it does in the lowerer.
+        ("(flet ((if (a b) :shadowed)) (if t 1 2))", "1"),
+        ("(flet ((quote (x) :shadowed)) (quote a))", "A"),
+        ("(flet ((let (x) :shadowed)) (let ((v 5)) v))", "5"),
+        // An unshadowed call is untouched -- the guard must not leak out of the
+        // FLET, and the binding must not outlive its scope.
+        ("(char= #\\a #\\a)", "T"),
+        ("(car (list 7))", "7"),
+        ("(progn (flet ((car (x) :shadowed)) (car (list 1))) (car (list 7)))", "7"),
+        // A nested rebinding still resolves to the innermost one.
+        ("(flet ((car (x) :outer)) (flet ((car (x) :inner)) (car (list 1))))", ":INNER"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-7oa5: the character comparison family moved from boot.lisp `&rest`
 /// defuns to Rust builtins over bliss-stdlib::characters (37-200x faster).
 /// These assert the SEMANTICS the move had to preserve exactly -- the arity
