@@ -13823,6 +13823,14 @@ fn imagpart_zero_format_and_complex_exponent() {
         // actual assertion.
         ("(imagpart 1.0d0)", "0.0d0"),
         ("(imagpart 1.0)", "0.0"),
+        // (imagpart real) is LITERALLY (* 0 real), SIGN included: the zero of a
+        // negative float is -0.0, which no hand-built zero gives. Routing
+        // through the multiply kernel gets format, sign and the
+        // rational/float distinction together.
+        ("(imagpart -1.0)", "-0.0"),
+        ("(imagpart -1.0d0)", "-0.0d0"),
+        ("(loop for x in (list -3.4028235e38 -1.0e-45 -1.0 1.0 -1.0d0 1.0d0 5 -1/2 0.0)
+            unless (eql (* 0 x) (imagpart x)) collect x)", "NIL"),
         ("(imagpart 5)", "0"),
         ("(imagpart 1/2)", "0"),
         ("(loop for x in (list 3.141592653589793d0 1.0 5 1/2 1.0d0)
@@ -13833,7 +13841,23 @@ fn imagpart_zero_format_and_complex_exponent() {
         // A complex EXPONENT: 2^(2+2i) = e^((2+2i) ln 2).
         ("(expt 2.0 (complex 2 2))", "#C(0.7338279 3.932111)"),
         ("(complexp (expt (complex 1 1) (complex 2 2)))", "T"),
-        ("(expt 0 (complex 2 2))", "0.0"),
+        // ansi EXPT.29 asserts `(eql (* x y) (expt x y))` for every zero base
+        // and every exponent with a positive real part -- so (expt 0 y) simply
+        // IS (* x y), which makes the type follow contagion for free. The
+        // integer 0 stays an integer (because #C(0 0) canonicalises) while a
+        // float or complex zero keeps its own format. "Zero" has to include a
+        // COMPLEX zero, or those bases fall through to the float path.
+        ("(expt 0 (complex 2 2))", "0"),
+        ("(expt 0.0 (complex 2 2))", "#C(0.0 0.0)"),
+        ("(loop for x in (list 0 0.0 0.0d0 (complex 0.0 0.0) (complex 0.0d0 0.0d0))
+            append (loop for y in (list 2 2.0 2.0d0 (complex 2 2) (complex 2 1/2)
+                                        (complex 2.0 0.5) (complex 2.0d0 0.5d0))
+                     unless (eql (* x y) (expt x y)) collect (list x y)))", "NIL"),
+        // A zero EXPONENT still wins over the zero-base rule, and a negative
+        // exponent on a zero base still divides by zero.
+        ("(expt 0 0)", "1"),
+        ("(expt 0 0.0)", "1.0"),
+        ("(handler-case (expt 0 -1) (division-by-zero () :div0))", ":DIV0"),
         // Ordinary EXPT is untouched.
         ("(expt 2 10)", "1024"),
         ("(expt 2.0 0.5)", "1.4142135"),

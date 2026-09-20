@@ -15696,19 +15696,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     });
                 }
                 if is_number_value(v) {
-                    // CLHS: (imagpart real) is (* 0 real), so the zero takes
-                    // the argument's FORMAT. The double-float case fell into
-                    // the rational branch and answered the integer 0 rather
-                    // than 0.0d0 (ansi IMAGPART.4 compares against (* 0 x)).
-                    return Ok(if want_real {
-                        v
-                    } else if v.is_double_float() {
-                        bliss_rt::gc::alloc_double_float(0.0)
-                    } else if v.is_single_float() {
-                        BlissVal::from_single_float(0.0)
-                    } else {
-                        BlissVal::from_fixnum(0)
-                    });
+                    // CLHS: (imagpart real) is LITERALLY (* 0 real), and ansi
+                    // IMAGPART.4 compares against that expression directly. A
+                    // CONSTRUCTED zero cannot express it: the format has to
+                    // follow the argument (0.0d0 for a double, 0 for a
+                    // rational) AND so does the SIGN -- (* 0 -3.4028235e38) is
+                    // -0.0, which no hand-built zero gives. Routing through the
+                    // multiply kernel gets format, sign and the
+                    // rational/float distinction for free.
+                    if want_real {
+                        return Ok(v);
+                    }
+                    return match apply_numeric_op("*", &[BlissVal::from_fixnum(0), v]) {
+                        Some(r) => r,
+                        None => Ok(BlissVal::from_fixnum(0)),
+                    };
                 }
                 return Err(BlissError::TypeError {
                     datum: v,
@@ -20376,6 +20378,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // does want #C(1.0 0.0), so complex_expt stays correct there.
                 let exponent_zero = !bliss_rt::types::complexp(b)
                     && num_val(b).map(|x| x == 0.0).unwrap_or(false);
+                // (expt 0 y) with (realpart y) > 0 is (* x y) -- ansi
+                // EXPT.29 asserts exactly `(eql (* x y) (expt x y))` over every
+                // zero and every such exponent. Deferring to the multiply
+                // kernel makes the TYPE follow contagion for free: the integer
+                // 0 stays the integer 0 (because #C(0 0) canonicalises) while
+                // (expt 0.0 #C(2 2)) is #C(0.0 0.0). Computing it through
+                // complex_expt instead answered a bare 0.0 for every zero.
+                // "Zero" includes a COMPLEX zero: EXPT.29's bases are
+                // 0, 0.0, 0.0d0 AND #C(0.0 0.0), #C(0.0d0 0.0d0). Excluding the
+                // complex ones sent them to complex_expt, which answered a bare
+                // 0.0 instead of #C(0.0 0.0).
+                let base_is_zero = if let Some(re) = bliss_rt::types::complex_realpart(a) {
+                    let im = bliss_rt::types::complex_imagpart(a).unwrap_or(NIL);
+                    num_val(re).map(|x| x == 0.0).unwrap_or(false)
+                        && num_val(im).map(|x| x == 0.0).unwrap_or(false)
+                } else {
+                    num_val(a).map(|x| x == 0.0).unwrap_or(false)
+                };
+                let exp_real_positive = if let Some(re) = bliss_rt::types::complex_realpart(b) {
+                    num_val(re).map(|x| x > 0.0).unwrap_or(false)
+                } else {
+                    num_val(b).map(|x| x > 0.0).unwrap_or(false)
+                };
+                if base_is_zero && exp_real_positive {
+                    if let Some(r) = apply_numeric_op("*", &[a, b]) {
+                        return r;
+                    }
+                }
                 // A COMPLEX EXPONENT also needs the complex path -- `num_val`
                 // below rejects it, so `(expt 0 #C(2 2))` and
                 // `(expt 2.0 #C(2 2))` type-errored (ansi EXPT.29, which pairs
