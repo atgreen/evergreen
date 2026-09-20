@@ -13051,9 +13051,16 @@ fn abs_preserves_exact_type_on_both_dispatch_paths() {
         ("(abs -100000000000000000000)", "100000000000000000000"),
         ("(type-of (abs -5))", "FIXNUM"),
         ("(type-of (abs -5.5d0))", "DOUBLE-FLOAT"),
-        // ABS of a complex is its magnitude (bliss-dhrx).
+        // ABS of a complex is its magnitude (bliss-dhrx), and the magnitude
+        // takes the PARTS' float format -- this boxed as a single-float
+        // unconditionally, so a double-float complex lost both precision and
+        // type: |#C(-3.0d0 4.0d0)| answered 5.0 rather than 5.0d0 (ansi
+        // ABS.20-21).
         ("(abs (complex 3 4))", "5.0"),
         ("(abs (complex -3 -4))", "5.0"),
+        ("(abs (complex -3.0d0 4.0d0))", "5.0d0"),
+        ("(type-of (abs (complex -3.0d0 4.0d0)))", "DOUBLE-FLOAT"),
+        ("(type-of (abs (complex -3.0 4.0)))", "SINGLE-FLOAT"),
         // The evaluated-args path must agree with operator position.
         ("(funcall #'abs -7)", "7"),
         ("(funcall #'abs -1/2)", "1/2"),
@@ -13640,6 +13647,70 @@ fn inverse_transcendentals_take_complex_and_out_of_domain_arguments() {
         // Every result is a complex of the argument's float format.
         ("(typep (asin 2.0) '(complex single-float))", "T"),
         ("(typep (atanh 2.0) '(complex single-float))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi ARITHMETIC-ERROR.3 and the four ARITHMETIC-ERROR-OPERATION/OPERANDS
+/// arity tests: the ARITHMETIC-ERROR condition already HAD its OPERATION and
+/// OPERANDS slots (see cli.rs's condition table); only the two CLHS readers
+/// were missing, so calling either was an UNDEFINED-FUNCTION even on a
+/// condition explicitly built with :operation and :operands.
+///
+/// The slots carry no initform, so the readers guard with SLOT-BOUNDP: bliss's
+/// internal arithmetic signallers do not record the operation or operands yet,
+/// and reading an unbound slot would raise inside a handler rather than answer.
+#[test]
+fn arithmetic_error_readers() {
+    let cases = [
+        // Values supplied at construction round-trip, which is what
+        // ARITHMETIC-ERROR.3 checks.
+        ("(let ((a (make-condition 'arithmetic-error
+                     :operation '/ :operands '(0 0))))
+            (list (arithmetic-error-operation a) (arithmetic-error-operands a)))", "(/ (0 0))"),
+        // A SIGNALLED condition reports NIL rather than erroring on an unbound
+        // slot -- bliss does not record them yet.
+        ("(handler-case (/ 1 0)
+            (division-by-zero (e) (list (arithmetic-error-operation e)
+                                        (arithmetic-error-operands e))))", "(NIL NIL)"),
+        ("(handler-case (exp 1000.0)
+            (floating-point-overflow (e) (arithmetic-error-operation e)))", "NIL"),
+        // Wrong argument count is a PROGRAM-ERROR.
+        ("(handler-case (arithmetic-error-operation) (program-error () :pe))", ":PE"),
+        ("(handler-case (arithmetic-error-operands) (program-error () :pe))", ":PE"),
+        // The condition hierarchy is unchanged.
+        ("(subtypep 'division-by-zero 'arithmetic-error)", "T"),
+        ("(subtypep 'floating-point-overflow 'arithmetic-error)", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// ansi TANH.3 / SINH.3: `(coerce x '(complex TYPE))` must give a complex whose
+/// PARTS are of TYPE. The imaginary part was a fixnum 0 regardless of the spec,
+/// so for a RATIONAL value the result canonicalised straight back to the real:
+/// `(coerce 0 '(complex single-float))` answered the integer 0 rather than
+/// #C(0.0 0.0). Those tests build their complex zero exactly that way and then
+/// compare against it, so the zero being an integer broke the comparison.
+#[test]
+fn coerce_to_complex_honours_the_part_type() {
+    let cases = [
+        ("(coerce 0 '(complex single-float))", "#C(0.0 0.0)"),
+        ("(coerce 0 '(complex double-float))", "#C(0.0d0 0.0d0)"),
+        ("(coerce 5 '(complex single-float))", "#C(5.0 0.0)"),
+        ("(coerce 1/2 '(complex single-float))", "#C(0.5 0.0)"),
+        ("(typep (coerce 0 '(complex single-float)) '(complex single-float))", "T"),
+        ("(type-of (realpart (coerce 0 '(complex double-float))))", "DOUBLE-FLOAT"),
+        // A bare (complex) or (complex *) specifies no part type, so a rational
+        // stays rational and canonicalises -- unchanged behaviour.
+        ("(coerce 0 'complex)", "0"),
+        ("(coerce 0 '(complex *))", "0"),
+        // An argument that is already complex passes through.
+        ("(coerce (complex 1.0 2.0) '(complex single-float))", "#C(1.0 2.0)"),
+        // Ordinary coercions are untouched.
+        ("(coerce 0 'single-float)", "0.0"),
+        ("(coerce 1/2 'double-float)", "0.5d0"),
+        ("(coerce 5 'float)", "5.0"),
+        ("(handler-case (coerce \"x\" 'complex) (type-error () :te))", ":TE"),
     ];
     run_expression_cases(&cases);
 }

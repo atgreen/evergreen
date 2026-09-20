@@ -4457,9 +4457,15 @@ fn abs_value(v: BlissVal) -> Result<BlissVal, BlissError> {
     // (single) float — this used to type-error (bliss-dhrx).
     if bliss_rt::types::complexp(v) {
         let zero = BlissVal::from_fixnum(0);
-        let re = num_val(bliss_rt::types::complex_realpart(v).unwrap_or(zero))?;
-        let im = num_val(bliss_rt::types::complex_imagpart(v).unwrap_or(zero))?;
-        return Ok(BlissVal::from_single_float((re * re + im * im).sqrt() as f32));
+        let rp = bliss_rt::types::complex_realpart(v).unwrap_or(zero);
+        let ip = bliss_rt::types::complex_imagpart(v).unwrap_or(zero);
+        let re = num_val(rp)?;
+        let im = num_val(ip)?;
+        // The MAGNITUDE takes the parts' float format: |#C(-3.0d0 4.0d0)| is
+        // 5.0d0, not 5.0. This boxed as a single-float unconditionally, so a
+        // double-float complex lost precision and type (ansi ABS.20-21).
+        let kind = widen_float(real_float_kind(rp), real_float_kind(ip));
+        return Ok(box_float(re.hypot(im), kind));
     }
     Err(BlissError::TypeError {
         datum: v,
@@ -27693,7 +27699,32 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
             if bliss_rt::types::complexp(value) {
                 Ok(value)
             } else if is_real_number(value) {
-                make_complex(value, BlissVal::from_fixnum(0))
+                // `(coerce x '(complex TYPE))` must give a complex whose PARTS
+                // are of TYPE. The imaginary part was a fixnum 0 regardless of
+                // the spec, so for a RATIONAL value the result canonicalised
+                // straight back to the real: `(coerce 0 '(complex
+                // single-float))` answered the integer 0 instead of
+                // #C(0.0 0.0). ansi TANH.3/SINH.3 build their complex zero
+                // exactly that way and then compare against it.
+                //
+                // A bare `(complex)` or `(complex *)` keeps the old behaviour:
+                // no part type is specified, so a rational stays rational and
+                // canonicalises.
+                let part = if type_val.is_cons() {
+                    cp(cp(type_val).1).0
+                } else {
+                    NIL
+                };
+                let unspecified = part.is_nil()
+                    || (part.is_symbol() && symbol_bare_name(&sym_name_rc(part)) == "*");
+                if unspecified {
+                    return make_complex(value, BlissVal::from_fixnum(0));
+                }
+                // GC: coerce_value allocates when it boxes a double, so the
+                // real part must be rooted across the imaginary one's coercion.
+                bliss_rt::rooted!(re = coerce_value(value, part)?);
+                let im = coerce_value(BlissVal::from_fixnum(0), part)?;
+                make_complex(*re, im)
             } else {
                 Err(BlissError::TypeError {
                     datum: value,

@@ -479,6 +479,20 @@
 (defun type-error-expected-type (c) (slot-value c 'expected-type))
 (defun simple-condition-format-control (c) (slot-value c 'format-control))
 (defun simple-condition-format-arguments (c) (slot-value c 'format-arguments))
+;; ARITHMETIC-ERROR's OPERATION and OPERANDS slots already exist (see
+;; cli.rs's condition table); only these two readers were missing, so
+;; (arithmetic-error-operation c) was an UNDEFINED-FUNCTION even for a
+;; condition built with :operation and :operands supplied (ansi
+;; ARITHMETIC-ERROR.3 constructs one and reads both back).
+;; The slots carry no initform, so reading one the signaller never supplied
+;; would raise "slot OPERATION is unbound" rather than answering. bliss's
+;; internal arithmetic signallers do not record the operation or operands yet
+;; (a separate gap, filed), so guard the read: an arithmetic error with nothing
+;; recorded reports NIL rather than erroring inside a handler.
+(defun arithmetic-error-operation (c)
+  (if (slot-boundp c 'operation) (slot-value c 'operation) nil))
+(defun arithmetic-error-operands (c)
+  (if (slot-boundp c 'operands) (slot-value c 'operands) nil))
 (defun cell-error-name (c) (slot-value c 'name))
 (defun unbound-slot-instance (c) (slot-value c 'instance))
 (defun package-error-package (c) (slot-value c 'package))
