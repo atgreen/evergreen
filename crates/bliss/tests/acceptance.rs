@@ -12998,6 +12998,61 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-w0ae: MEMBER and ASSOC were the two worst builtins left on the
+/// synthesize-and-re-evaluate detour (6.3us and 5.9us against 0.23us for CAR).
+/// They are excluded from the direct-builtin table because :test/:key take
+/// arbitrary Lisp functions and the table requires LEAF builtins -- but the
+/// no-keyword shape cannot re-enter Lisp, so it qualifies.
+///
+/// The risk in specialising a shape is that the specialised and general paths
+/// drift, so operator position delegates to the SAME kernel for this shape
+/// rather than keeping a second copy. These cases pin both halves: the
+/// no-keyword answers, and that every keyword form still reaches the general
+/// path unchanged. Expectations verified against SBCL.
+#[test]
+fn member_and_assoc_no_keyword_fast_path_matches_the_general_path() {
+    let cases = [
+        // No keywords -- the specialised shape.
+        ("(member 3 (list 1 2 3 4))", "(3 4)"),
+        ("(member 9 (list 1 2 3))", "NIL"),
+        ("(member 1 nil)", "NIL"),
+        // A match found BEFORE the improper tail is reached is not an error...
+        ("(member 2 (cons 1 (cons 2 3)))", "(2 . 3)"),
+        // ...but reaching that tail without a match is.
+        ("(handler-case (member 5 (cons 1 2)) (type-error () :te))", ":TE"),
+        ("(handler-case (member 1 5) (type-error () :te))", ":TE"),
+        // A closure is physically a cons in the interpreter and must never be
+        // walked as a list (the bliss-74rl family).
+        ("(handler-case (member 1 (lambda (x) x)) (type-error () :te))", ":TE"),
+        // eql_values allocates for bignums; the kernel must root across it.
+        ("(member 1000000000000000000000 (list 1000000000000000000000))",
+         "(1000000000000000000000)"),
+        ("(assoc 'b '((a . 1) (b . 2)))", "(B . 2)"),
+        ("(assoc 'z '((a . 1)))", "NIL"),
+        ("(assoc 'a nil)", "NIL"),
+        // NIL entries are skipped; a non-NIL non-cons entry is a TYPE-ERROR.
+        ("(assoc 'a (list nil (cons 'a 1)))", "(A . 1)"),
+        ("(handler-case (assoc 'a (list 5)) (type-error () :te))", ":TE"),
+        ("(handler-case (assoc 'a (cons (cons 'b 1) 7)) (type-error () :te))", ":TE"),
+        ("(handler-case (assoc 'a 5) (type-error () :te))", ":TE"),
+        // Keyword forms must still reach the general path and behave exactly as
+        // before -- the fast arm has to DECLINE, not mishandle them.
+        ("(member 3 (list 1 2 3 4) :test #'eql)", "(3 4)"),
+        ("(member 2.0 (list 1 2 3) :test #'=)", "(2 3)"),
+        ("(member 'b (list (list 'a) (list 'b)) :key #'car)", "((B))"),
+        ("(member 3 (list 1 2 3) :test-not #'eql)", "(1 2 3)"),
+        ("(assoc 2.0 '((2 . b)) :test #'=)", "(2 . B)"),
+        ("(assoc 'b '((a . 1) (b . 2)) :key #'identity)", "(B . 2)"),
+        ("(assoc 'a '((a . 1)) :test-not #'eql)", "NIL"),
+        // A bad keyword tail is still a PROGRAM-ERROR, not silently ignored.
+        ("(handler-case (member 1 (list 1) :bogus 1) (program-error () :pe))", ":PE"),
+        // An explicit NIL :key is not "a :key was supplied" -- it must behave
+        // like the no-keyword case, which is how the general path reads it.
+        ("(member 3 (list 1 2 3) :key nil)", "(3)"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-ccgu: an FLET/LABELS binding shadows a BUILTIN, and the two tiers
 /// must agree about it. The tree-walker dispatched builtin names without
 /// consulting the lexical function environment, so

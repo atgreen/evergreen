@@ -4392,6 +4392,78 @@ fn reject_closure_as_list(v: BlissVal) -> Result<(), BlissError> {
     Ok(())
 }
 
+/// MEMBER's no-keyword kernel: EQL comparison, no :key/:test/:test-not.
+///
+/// Extracted so operator position and the evaluated-args fast path run the
+/// SAME code for this shape rather than two transcriptions (the bliss-x5y.9
+/// rule). Without :key/:test/:test-not there is no call back into Lisp, which
+/// is what makes this shape LEAF and lets it join the direct-builtin table --
+/// MEMBER as a whole cannot, because those keywords take arbitrary functions
+/// (bliss-w0ae).
+///
+/// GC: `eql_values` can allocate (bignum comparison), so the item and the
+/// spine cursor are rooted and the cdr is re-read from the rooted cell AFTER
+/// the comparison -- a cdr copied before it would be stale across a minor GC
+/// (bliss-4bp, the same hazard the keyword loop documents).
+fn member_eql(item: BlissVal, list: BlissVal) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted!(item = item);
+    bliss_rt::rooted!(c = list);
+    reject_closure_as_list(*c)?;
+    while c.is_cons() {
+        let (car, _) = cp(*c);
+        if eql_values(car, *item) {
+            return Ok(*c);
+        }
+        let (_, next) = cp(*c);
+        *c = next;
+    }
+    // A non-list, or an improper tail reached without a match, is a TYPE-ERROR
+    // (CLHS; ansi member.error).
+    if !c.is_nil() {
+        return Err(BlissError::TypeError {
+            datum: *c,
+            expected: "list".into(),
+        });
+    }
+    Ok(NIL)
+}
+
+/// ASSOC's no-keyword kernel. Mirrors `member_eql`; see it for the rooting
+/// rationale and why this shape is LEAF.
+fn assoc_eql(item: BlissVal, alist: BlissVal) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted!(item = item);
+    bliss_rt::rooted!(c = alist);
+    reject_closure_as_list(*c)?;
+    while c.is_cons() {
+        let (pair, _) = cp(*c);
+        // NIL entries are skipped; a non-NIL non-cons element is not a pair and
+        // is a TYPE-ERROR whose datum is that element (ansi assoc.error.11).
+        if !pair.is_cons() && !pair.is_nil() {
+            return Err(BlissError::TypeError {
+                datum: pair,
+                expected: "list".into(),
+            });
+        }
+        if pair.is_cons() {
+            let (k, _) = cp(pair);
+            if eql_values(k, *item) {
+                // Re-read from the rooted cell: `pair` predates eql_values.
+                let (fresh_pair, _) = cp(*c);
+                return Ok(fresh_pair);
+            }
+        }
+        let (_, next) = cp(*c);
+        *c = next;
+    }
+    if !c.is_nil() {
+        return Err(BlissError::TypeError {
+            datum: *c,
+            expected: "list".into(),
+        });
+    }
+    Ok(NIL)
+}
+
 /// A list-walking builtin's argument must actually BE a list: NIL or a cons.
 ///
 /// `reject_closure_as_list` alone is not enough. It only catches a closure
@@ -19290,6 +19362,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
                 ];
                 bliss_rt::rooted_ref!(_fns_root = &mut fns);
+                // No :key/:test/:test-not -- the exact shape the fast path
+                // handles. Delegate so the two cannot drift.
+                if !has_key && !has_test && !has_test_not {
+                    return member_eql(*item, *c);
+                }
                 reject_closure_as_list(*c)?;
                 while c.is_cons() {
                     let (car, _) = cp(*c);
@@ -19352,6 +19429,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
                 ];
                 bliss_rt::rooted_ref!(_fns_root = &mut fns);
+                // No keywords: same kernel the fast path uses (see member_eql).
+                if !has_key && !has_test && !has_test_not {
+                    return assoc_eql(*item, *c);
+                }
                 reject_closure_as_list(*c)?;
                 while c.is_cons() {
                     let (pair, _) = cp(*c);
@@ -32878,6 +32959,9 @@ const DIRECT_FAST: &[&str] = &[
     "CHAR-EQUAL", "CHAR-NOT-EQUAL", "CHAR-LESSP", "CHAR-GREATERP",
     "CHAR-NOT-GREATERP", "CHAR-NOT-LESSP", "CHAR-UPCASE", "CHAR-DOWNCASE",
     "CHAR-CODE", "CODE-CHAR",
+    // Only their no-keyword shape is leaf; the arms above decline otherwise
+    // (bliss-w0ae).
+    "MEMBER", "ASSOC",
     "EQL", "EQUAL", "EQUALP", "MIN", "MAX", "NTH",
     "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
@@ -33813,6 +33897,21 @@ fn apply_builtin_fast(
         // from DIRECT_FAST, so every call from compiled code still paid the
         // synthesize-`(CHAR-CODE 'c)`-and-re-evaluate detour below: 4.1us for
         // what is a tag check and a shift. Same kernels as operator position.
+        // MEMBER and ASSOC with NO keywords. They were the two worst builtins
+        // left on the synthesize-and-re-evaluate detour -- 6.3us and 5.9us
+        // against 0.23us for CAR -- and were excluded from the direct table
+        // because :test/:key can re-enter Lisp, which the leaf rule forbids.
+        // The 2-argument shape takes no such function and cannot re-enter, so
+        // it qualifies; anything longer DECLINES here and falls back to the
+        // general path, which handles the keywords (bliss-w0ae).
+        "MEMBER" if args.len() == 2 => {
+            env.clear_mv();
+            Some(member_eql(args[0], args[1]))
+        }
+        "ASSOC" if args.len() == 2 => {
+            env.clear_mv();
+            Some(assoc_eql(args[0], args[1]))
+        }
         "CHAR-CODE" if args.len() == 1 => {
             env.clear_mv();
             let v = args[0];
