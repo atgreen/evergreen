@@ -13474,3 +13474,52 @@ fn gcd_lcm_one_argument_and_complex_arity() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi ASH.ERROR.4-5, ISQRT.ERROR.5, BOOLE.ERROR.5-7, RANDOM.ERROR.1-3: four
+/// builtins signalling the wrong condition, or none at all.
+///
+/// ASH and ISQRT had NO type check on their early-exit paths -- ASH's
+/// `(zerop count)` branch and ISQRT's `(< n 2)` branch each returned the
+/// argument unchanged, so `(ash " " 0)` answered " " and `(isqrt 1.2)`
+/// answered 1.2. BOOLE signalled a SIMPLE-ERROR for an unrecognised op.
+/// RANDOM had its two error kinds SWAPPED: a missing argument gave a
+/// TYPE-ERROR and a non-positive limit gave a PROGRAM-ERROR, where CLHS 3.5.1
+/// wants a PROGRAM-ERROR for a wrong argument COUNT and a TYPE-ERROR for a
+/// limit outside (REAL (0)).
+#[test]
+fn integer_builtins_signal_the_right_conditions() {
+    let cases = [
+        // ASH: both arguments must be integers, including on the count-0 path.
+        ("(handler-case (ash \" \" 0) (type-error () :te))", ":TE"),
+        ("(handler-case (ash 1.5 0) (type-error () :te))", ":TE"),
+        ("(handler-case (ash nil 0) (type-error () :te))", ":TE"),
+        ("(handler-case (ash 1 1.5) (type-error () :te))", ":TE"),
+        // ISQRT: a NON-NEGATIVE INTEGER; a negative one is a TYPE-ERROR too,
+        // not the bare SIMPLE-ERROR it used to signal.
+        ("(handler-case (isqrt 1.2) (type-error () :te))", ":TE"),
+        ("(handler-case (isqrt 3/5) (type-error () :te))", ":TE"),
+        ("(handler-case (isqrt -1) (type-error () :te))", ":TE"),
+        // BOOLE: an op outside the constants is a TYPE-ERROR.
+        ("(handler-case (boole nil 1 2) (type-error () :te))", ":TE"),
+        ("(handler-case (boole 99 1 2) (type-error () :te))", ":TE"),
+        // RANDOM: count vs type, no longer swapped.
+        ("(handler-case (random) (program-error () :pe))", ":PE"),
+        ("(handler-case (random 10 *random-state* 3) (program-error () :pe))", ":PE"),
+        ("(handler-case (random -5) (type-error () :te))", ":TE"),
+        ("(handler-case (random 0) (type-error () :te))", ":TE"),
+        ("(handler-case (random 0.0) (type-error () :te))", ":TE"),
+        // Every ordinary call is unchanged.
+        ("(ash 1 4)", "16"),
+        ("(ash 16 -2)", "4"),
+        ("(ash 0 0)", "0"),
+        ("(ash -8 -1)", "-4"),
+        ("(isqrt 16)", "4"),
+        ("(isqrt 0)", "0"),
+        ("(isqrt (expt 10 40))", "100000000000000000000"),
+        ("(boole boole-and 12 10)", "8"),
+        ("(boole boole-ior 12 10)", "14"),
+        ("(let ((v (random 10))) (and (integerp v) (>= v 0) (< v 10)))", "T"),
+        ("(floatp (random 10.0))", "T"),
+    ];
+    run_expression_cases(&cases);
+}

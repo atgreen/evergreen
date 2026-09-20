@@ -2850,6 +2850,15 @@
 (defun functionp (x) (typep x 'function))
 
 (defun ash (n count)
+  ;; ANSI: both arguments are INTEGERS. The (zerop count) branch below returned
+  ;; N unchanged without checking it, so there was no type check at all on that
+  ;; path -- (ash " " 0) answered " " and (ash 1.5 0) answered 1.5, with no
+  ;; error (ansi ASH.ERROR.4-5, which apply (lambda (x) (ash x 0)) across the
+  ;; universe and expect a TYPE-ERROR for every non-integer).
+  (unless (integerp n)
+    (error 'type-error :datum n :expected-type 'integer))
+  (unless (integerp count)
+    (error 'type-error :datum count :expected-type 'integer))
   (cond ((zerop count) n)
         ((> count 0) (* n (expt 2 count)))
         ;; Right shift by (- count) bits. Once the shift reaches the operand's
@@ -2923,7 +2932,9 @@
     ((eql op boole-andc2) (logandc2 integer1 integer2))
     ((eql op boole-orc1) (logorc1 integer1 integer2))
     ((eql op boole-orc2) (logorc2 integer1 integer2))
-    (t (error "BOOLE: invalid operation ~a" op))))
+    ;; An unrecognised OP is a TYPE-ERROR, not a SIMPLE-ERROR: ansi
+    ;; BOOLE.ERROR.5-7 use SIGNALS-TYPE-ERROR over values outside *BOOLE-VALS*.
+    (t (error 'type-error :datum op :expected-type '(integer 0 15)))))
 
 (defun logtest (a b) (not (zerop (logand a b))))
 ;; LOGBITP is a native builtin (cli.rs apply_logbitp, bliss-gvkz).
@@ -3060,8 +3071,13 @@
         (t -1)))
 
 (defun isqrt (n)
-  (cond ((< n 0) (error "ISQRT of a negative integer"))
-        ((< n 2) n)
+  ;; ANSI: ISQRT takes a NON-NEGATIVE INTEGER. The (< n 2) branch returned its
+  ;; argument unchecked, so (isqrt 1.2) answered 1.2 and (isqrt 3/5) answered
+  ;; 3/5; a negative integer signalled a plain SIMPLE-ERROR rather than the
+  ;; TYPE-ERROR ansi ISQRT.ERROR.5 requires.
+  (unless (and (integerp n) (>= n 0))
+    (error 'type-error :datum n :expected-type '(integer 0)))
+  (cond ((< n 2) n)
         (t (let ((x (ash 1 (ceiling (integer-length n) 2))))
              (block nil
                (loop

@@ -20522,6 +20522,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (random limit &optional random-state) — a value in [0, limit)
                 // of the same type as LIMIT. The optional random-state arg is
                 // evaluated (for effect) but the shared generator is used.
+                // (random limit &optional random-state): one or two arguments.
+                // With none, `cp(NIL)` produced a NIL limit that fell through to
+                // "NIL is not of type positive integer or float" -- a TYPE-ERROR
+                // where CLHS 3.5.1 wants a PROGRAM-ERROR for a wrong argument
+                // COUNT (ansi RANDOM.ERROR.1-2).
+                let n = form_arg_count(cdr);
+                if !(1..=2).contains(&n) {
+                    return Err(BlissError::ProgramError(format!(
+                        "RANDOM requires one or two arguments, got {n}"
+                    )));
+                }
                 let (limit_form, rest) = cp(cdr);
                 // Root the pending spine and limit across the optional
                 // random-state eval (moving GC; bliss-4bp).
@@ -20534,9 +20545,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if limit.is_fixnum() {
                     let bound = limit.as_fixnum();
                     if bound <= 0 {
-                        return Err(BlissError::ProgramError(
-                            "RANDOM limit must be a positive number".into(),
-                        ));
+                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
+                        // error kinds were swapped with the arity case above.
+                        return Err(BlissError::TypeError {
+                            datum: limit,
+                            expected: "(REAL (0))".into(),
+                        });
                     }
                     let r = (next_random_u64() % bound as u64) as i64;
                     return Ok(BlissVal::from_fixnum(r));
@@ -20544,9 +20560,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if limit.is_single_float() {
                     let bound = limit.as_single_float();
                     if bound <= 0.0 {
-                        return Err(BlissError::ProgramError(
-                            "RANDOM limit must be a positive number".into(),
-                        ));
+                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
+                        // error kinds were swapped with the arity case above.
+                        return Err(BlissError::TypeError {
+                            datum: limit,
+                            expected: "(REAL (0))".into(),
+                        });
                     }
                     // 24 random mantissa bits give a uniform unit float in [0,1).
                     let unit = (next_random_u64() >> 40) as f32 / (1u64 << 24) as f32;
@@ -20555,9 +20576,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if limit.is_double_float() {
                     let bound = limit.as_double_float();
                     if bound <= 0.0 {
-                        return Err(BlissError::ProgramError(
-                            "RANDOM limit must be a positive number".into(),
-                        ));
+                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
+                        // error kinds were swapped with the arity case above.
+                        return Err(BlissError::TypeError {
+                            datum: limit,
+                            expected: "(REAL (0))".into(),
+                        });
                     }
                     // 53 random mantissa bits give a uniform unit double in [0,1).
                     let unit = (next_random_u64() >> 11) as f64 / (1u64 << 53) as f64;
@@ -20567,9 +20593,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // and reduce modulo the limit for a value in [0, limit).
                 if let Some(b) = bigint_from_val(limit) {
                     if b.sign <= 0 {
-                        return Err(BlissError::ProgramError(
-                            "RANDOM limit must be a positive number".into(),
-                        ));
+                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
+                        // error kinds were swapped with the arity case above.
+                        return Err(BlissError::TypeError {
+                            datum: limit,
+                            expected: "(REAL (0))".into(),
+                        });
                     }
                     let mut limbs = Vec::with_capacity(b.mag.len());
                     for _ in 0..b.mag.len() {
