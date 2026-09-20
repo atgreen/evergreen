@@ -12517,29 +12517,57 @@ fn typep_matches(
             if !base_ok {
                 return Ok(false);
             }
-            let value = match num_val(object) {
-                Ok(v) => v,
-                Err(_) => return Ok(false),
-            };
+            // A NaN is outside every interval. `numeric_cmp` has no ordering
+            // for it and falls back to an f64 partial_cmp that reports Equal,
+            // which would let it pass both bounds, so screen it out up front --
+            // the old f64 `>=`/`<=` rejected it for free.
+            if bliss_rt::types::floatp(object) && float_f64(object).is_nan() {
+                return Ok(false);
+            }
             let bounds = list_to_vec(args);
+            // Compare against the bound EXACTLY, not in f64.
+            //
+            // Both the object and the bound used to be pushed through
+            // `num_val` and compared as doubles. Beyond 2^53 an f64 cannot
+            // represent consecutive integers -- 2^53 and 2^53+1 are the SAME
+            // double -- so the comparison could not separate them and
+            // `(typep (1+ 2^53) '(real 0 2^53))` answered T. Every power of
+            // two from 2^53 up failed the same way, as did any large bignum
+            // bound: `(real 0 10^30)` admitted 10^30+1 (ansi REAL.1-4).
+            //
+            // `numeric_cmp` is the comparison `=` and `<` already use, which is
+            // why THEY were right while this was not: it converts a float to
+            // the rational it denotes (CLHS 12.1.4.1) instead of round-tripping
+            // the rational through f64, and it keeps a fixnum/fixnum fast path
+            // so the common case costs no more than before.
+            //
+            // SBCL reaches the same result structurally rather than by exact
+            // comparison: it translates (REAL lo hi) into
+            // (OR (FLOAT lo hi) (RATIONAL lo hi)) at parse time, giving the
+            // rational arm an exact bound and the float arms float bounds
+            // (src/code/type.lisp, def-type-translator real). Comparing
+            // exactly here gets the same answers without restructuring the
+            // type representation.
             let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
                 if bound.is_symbol() && symbol_bare_name(&sym_name_rc(bound)) == "*" {
                     return true;
                 }
-                if bound.is_cons() {
-                    // Exclusive bound `(n)`.
-                    let (b, _) = cp(bound);
-                    let n = match num_val(b) {
-                        Ok(n) => n,
-                        Err(_) => return true,
-                    };
-                    return if is_lower { value > n } else { value < n };
-                }
-                let n = match num_val(bound) {
-                    Ok(n) => n,
+                // An exclusive bound is written `(n)`.
+                let (b, exclusive) = if bound.is_cons() {
+                    (cp(bound).0, true)
+                } else {
+                    (bound, false)
+                };
+                let ord = match numeric_cmp(object, b) {
+                    Ok(o) => o,
                     Err(_) => return true,
                 };
-                if is_lower { value >= n } else { value <= n }
+                match (is_lower, exclusive) {
+                    (true, true) => ord == Ordering::Greater,
+                    (true, false) => ord != Ordering::Less,
+                    (false, true) => ord == Ordering::Less,
+                    (false, false) => ord != Ordering::Greater,
+                }
             };
             let lower_ok = bounds
                 .first()

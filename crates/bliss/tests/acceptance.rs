@@ -13866,3 +13866,58 @@ fn imagpart_zero_format_and_complex_exponent() {
     ];
     run_expression_cases(&cases);
 }
+
+/// ansi REAL.1-4: a numeric type's bounds were compared in f64. Beyond 2^53 an
+/// f64 cannot represent consecutive integers -- 2^53 and 2^53+1 are the SAME
+/// double -- so the comparison could not separate them:
+///
+///     (typep (1+ 2^53) '(real 0 2^53))     => T    wrong
+///     (typep (1+ 2^53) '(integer 0 2^53))  => NIL  correct
+///     (= (1+ 2^53) 2^53)                   => NIL  correct
+///
+/// `=` and the INTEGER path were right because they compare exactly; only this
+/// membership test round-tripped through f64. It now uses `numeric_cmp`, the
+/// same comparison `=` and `<` use, which converts a float to the rational it
+/// denotes (CLHS 12.1.4.1) rather than the reverse.
+///
+/// SBCL reaches the same answers structurally instead: it translates
+/// (REAL lo hi) into (OR (FLOAT lo hi) (RATIONAL lo hi)) at parse time, so an
+/// integer is tested against an exact rational bound.
+#[test]
+fn numeric_type_bounds_compare_exactly() {
+    let cases = [
+        // The 2^53 boundary and beyond, including a large bignum bound.
+        ("(typep (1+ 9007199254740992) '(real 0 9007199254740992))", "NIL"),
+        ("(typep 9007199254740992 '(real 0 9007199254740992))", "T"),
+        ("(let ((m (expt 2 60))) (typep (1+ m) (list 'real 0 m)))", "NIL"),
+        ("(let ((m (expt 10 30))) (typep (1+ m) (list 'real 0 m)))", "NIL"),
+        // REAL.1's own loop: 200 doublings, every clause.
+        ("(loop for i = 1 then (ash i 1) for tp = (list 'real 0 i) repeat 200
+            unless (and (not (typep -1 tp)) (not (typep -0.0001 tp)) (typep 0 tp)
+                        (typep 0.0001 tp) (typep 1 tp) (typep i tp)
+                        (not (typep (1+ i) tp)))
+            collect i)", "NIL"),
+        // Float, ratio and mixed bounds still behave.
+        ("(typep 0.5 '(real 0.0 1.0))", "T"),
+        ("(typep 1.5 '(real 0.0 1.0))", "NIL"),
+        ("(typep 1/2 '(real 0 1))", "T"),
+        ("(typep 1/2 '(real 0 1/3))", "NIL"),
+        // Exclusive bounds, written (n).
+        ("(typep 10 (list 'real 0 (list 10)))", "NIL"),
+        ("(typep 9 (list 'real 0 (list 10)))", "T"),
+        ("(typep 0 (list 'real (list 0) 10))", "NIL"),
+        // Every numeric head keeps its own membership rule.
+        ("(typep 5 '(integer 0 10))", "T"),
+        ("(typep 5.0 '(integer 0 10))", "NIL"),
+        ("(typep 1/2 '(rational 0 1))", "T"),
+        ("(typep 0.5 '(rational 0 1))", "NIL"),
+        ("(typep 0.5 '(float 0.0 1.0))", "T"),
+        ("(typep 0.5d0 '(double-float 0.0d0 1.0d0))", "T"),
+        ("(typep 0.5 '(single-float 0.0 1.0))", "T"),
+        // `*` bounds and the bare head.
+        ("(typep 5 '(real 0 *))", "T"),
+        ("(typep -5 '(real 0 *))", "NIL"),
+        ("(typep 5 'real)", "T"),
+    ];
+    run_expression_cases(&cases);
+}
