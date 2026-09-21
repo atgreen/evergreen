@@ -12779,34 +12779,55 @@ fn typep_matches(
             // comparison direction. alexandria's ARRAY-INDEX is
             // `(integer 0 (array-dimension-limit))` — an exclusive upper bound,
             // so calling as_fixnum on the `(n)` cons used to panic.
-            let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
+            // A bound that is neither `*` nor an integer is a MALFORMED type
+            // specifier, e.g. `(integer 0 a)`. Answering `true` -- treating the
+            // unusable bound as no constraint -- reported a value as being of a
+            // type that cannot be constructed, where SBCL signals. ansi's
+            // SIGNALS-ERROR depends on TYPEP rejecting such a spec when it
+            // validates a condition's DATUM against its EXPECTED-TYPE, which is
+            // what ARRAY-FILL-10 and its FIXNUM / UNSIGNED-BYTE8 siblings check.
+            //
+            // A BIGNUM bound is NOT malformed -- it is simply outside fixnum
+            // range, so a fixnum `value` can never exceed a positive one. Keep
+            // answering for those rather than signalling.
+            let bound_ok = |bound: BlissVal, is_lower: bool| -> Result<bool, BlissError> {
                 if bound.is_symbol() && symbol_bare_name(&sym_name_rc(bound)) == "*" {
-                    return true;
+                    return Ok(true);
                 }
-                if bound.is_cons() {
-                    let (b, _) = cp(bound);
-                    if !b.is_fixnum() {
-                        return true;
+                let (b, exclusive) = if bound.is_cons() {
+                    (cp(bound).0, true)
+                } else {
+                    (bound, false)
+                };
+                if !b.is_fixnum() {
+                    if bliss_rt::types::integerp(b) {
+                        // Bignum bound: decide by sign, no comparison needed.
+                        let negative = numeric_cmp(b, BlissVal::from_fixnum(0))
+                            .map(|o| o == Ordering::Less)
+                            .unwrap_or(false);
+                        return Ok(if is_lower { negative } else { !negative });
                     }
-                    let n = b.as_fixnum();
-                    return if is_lower { value > n } else { value < n };
+                    return Err(BlissError::TypeError {
+                        datum: b,
+                        expected: "an integer or *".into(),
+                    });
                 }
-                if !bound.is_fixnum() {
-                    return true;
-                }
-                let n = bound.as_fixnum();
-                if is_lower { value >= n } else { value <= n }
+                let n = b.as_fixnum();
+                Ok(match (is_lower, exclusive) {
+                    (true, true) => value > n,
+                    (true, false) => value >= n,
+                    (false, true) => value < n,
+                    (false, false) => value <= n,
+                })
             };
-            let lower_ok = bounds
-                .first()
-                .copied()
-                .map(|b| bound_ok(b, true))
-                .unwrap_or(true);
-            let upper_ok = bounds
-                .get(1)
-                .copied()
-                .map(|b| bound_ok(b, false))
-                .unwrap_or(true);
+            let lower_ok = match bounds.first().copied() {
+                Some(b) => bound_ok(b, true)?,
+                None => true,
+            };
+            let upper_ok = match bounds.get(1).copied() {
+                Some(b) => bound_ok(b, false)?,
+                None => true,
+            };
             Ok(lower_ok && upper_ok)
         }
         // Bounded numeric real types: (real low high), (float low high),
@@ -12858,9 +12879,9 @@ fn typep_matches(
             // (src/code/type.lisp, def-type-translator real). Comparing
             // exactly here gets the same answers without restructuring the
             // type representation.
-            let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
+            let bound_ok = |bound: BlissVal, is_lower: bool| -> Result<bool, BlissError> {
                 if bound.is_symbol() && symbol_bare_name(&sym_name_rc(bound)) == "*" {
-                    return true;
+                    return Ok(true);
                 }
                 // An exclusive bound is written `(n)`.
                 let (b, exclusive) = if bound.is_cons() {
@@ -12870,25 +12891,37 @@ fn typep_matches(
                 };
                 let ord = match numeric_cmp(object, b) {
                     Ok(o) => o,
-                    Err(_) => return true,
+                    // A bound that is neither `*` nor a real number is a
+                    // MALFORMED type specifier, e.g. `(integer 0 a)`. This used
+                    // to answer `true` -- treating the unusable bound as no
+                    // constraint -- so `(typep 0 '(integer 0 a))` was T where
+                    // SBCL signals. Silently ignoring the bound is the worst
+                    // option: it reports a value as being of a type that cannot
+                    // be constructed, and ansi's SIGNALS-ERROR relies on TYPEP
+                    // rejecting such a spec when it validates the DATUM against
+                    // the EXPECTED-TYPE of a condition (ARRAY-FILL-10).
+                    Err(_) => {
+                        return Err(BlissError::TypeError {
+                            datum: bound,
+                            expected: "a real number or *".into(),
+                        });
+                    }
                 };
-                match (is_lower, exclusive) {
+                Ok(match (is_lower, exclusive) {
                     (true, true) => ord == Ordering::Greater,
                     (true, false) => ord != Ordering::Less,
                     (false, true) => ord == Ordering::Less,
                     (false, false) => ord != Ordering::Greater,
-                }
+                })
             };
-            let lower_ok = bounds
-                .first()
-                .copied()
-                .map(|b| bound_ok(b, true))
-                .unwrap_or(true);
-            let upper_ok = bounds
-                .get(1)
-                .copied()
-                .map(|b| bound_ok(b, false))
-                .unwrap_or(true);
+            let lower_ok = match bounds.first().copied() {
+                Some(b) => bound_ok(b, true)?,
+                None => true,
+            };
+            let upper_ok = match bounds.get(1).copied() {
+                Some(b) => bound_ok(b, false)?,
+                None => true,
+            };
             Ok(lower_ok && upper_ok)
         }
         "UNSIGNED-BYTE" | "SIGNED-BYTE" | "MOD" => {

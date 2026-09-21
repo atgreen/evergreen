@@ -12998,6 +12998,55 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// TYPEP silently ignored a MALFORMED numeric bound, so a value was reported as
+/// being of a type that cannot be constructed:
+///
+///     (typep 0 '(integer 0 a))   =>  T     SBCL signals
+///     (typep 0 '(integer a 5))   =>  T     SBCL signals
+///
+/// Both bound checkers answered `true` for any bound they could not use --
+/// carried over from the original `num_val`-based code and preserved verbatim
+/// when the REAL arm was rewritten to compare exactly. Treating an unusable
+/// bound as "no constraint" is the worst of the options: it turns a malformed
+/// specifier into a permissive one.
+///
+/// It also broke ansi ARRAY-FILL-10 and its FIXNUM / UNSIGNED-BYTE8 siblings,
+/// which is how it surfaced. SIGNALS-ERROR validates a signalled condition by
+/// checking that its DATUM is NOT of its EXPECTED-TYPE; with a malformed
+/// expected-type answering T for everything, a correctly-signalled TYPE-ERROR
+/// was rejected as bogus.
+///
+/// A BIGNUM bound is NOT malformed -- it is merely outside fixnum range -- so
+/// those still answer rather than signal. alexandria's ARRAY-INDEX,
+/// `(integer 0 (array-dimension-limit))`, depends on that.
+#[test]
+fn typep_rejects_a_malformed_numeric_bound() {
+    let cases = [
+        ("(handler-case (typep 0 '(integer 0 a)) (error () :signalled))", ":SIGNALLED"),
+        ("(handler-case (typep 0 '(integer a 5)) (error () :signalled))", ":SIGNALLED"),
+        ("(handler-case (typep 0 '(real 0 a)) (error () :signalled))", ":SIGNALLED"),
+        ("(handler-case (typep 0.5 '(float a 5)) (error () :signalled))", ":SIGNALLED"),
+        // Well-formed bounds are unaffected.
+        ("(typep 5 '(integer 0 10))", "T"),
+        ("(typep 50 '(integer 0 10))", "NIL"),
+        ("(typep 3 '(integer 0 *))", "T"),
+        ("(typep 3 '(integer * 5))", "T"),
+        ("(typep 3 '(integer 0))", "T"),
+        ("(typep 3 '(integer (2) 5))", "T"),
+        ("(typep 2 '(integer (2) 5))", "NIL"),
+        ("(typep 3.0 '(real 0 5))", "T"),
+        ("(typep 5 '(mod 10))", "T"),
+        ("(typep 5 '(unsigned-byte 8))", "T"),
+        // A bignum bound is out of fixnum range, NOT malformed.
+        ("(typep 5 '(integer 0 1000000000000000000000))", "T"),
+        ("(typep 5 '(integer -1000000000000000000000 10))", "T"),
+        ("(typep 5 '(integer 1000000000000000000000 *))", "NIL"),
+        // The alexandria ARRAY-INDEX shape: exclusive bignum-ish upper bound.
+        ("(typep 5 '(integer 0 (1152921504606846975)))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-7lqe: REMOVE-DUPLICATES was O(n) with no :test and O(n^2) pairwise
 /// funcalls with one, because any :test fell to %REMOVE-DUPLICATES-GENERAL.
 /// EQ, EQL, EQUAL and EQUALP are exactly the four standard HASH-TABLE tests, so
