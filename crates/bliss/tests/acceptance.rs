@@ -12998,6 +12998,52 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// THE with a COMPOUND type specifier signalled a TYPE-ERROR naming the SPEC
+/// as the bad datum, instead of returning the value:
+///
+///     (the (integer 0 9) 5)   =>  "Cons(...) is not of type type specifier"
+///
+/// The tree-walker's THE arm reads
+///
+///     if value_satisfies_declared_type(type_form, value)?
+///         || typep_matches(env, value, type_form)?
+///
+/// and its own comment says the TYPEP fallback exists so "bounded/compound
+/// specs are honoured rather than rejected". But the quick check returned Err
+/// for any spec it could not canonicalise -- anything that is not a bare symbol
+/// -- and `?` propagated it, so the fallback it documents never ran. A guard
+/// meant to fall through instead bailed out.
+///
+/// The quick check now answers Ok(false) ("cannot tell") for those, and the
+/// error path prints the spec rather than re-raising. Found while clearing the
+/// last ansi sequences failures: LENGTH.STRING.5 and LENGTH.BIT-VECTOR.5 use
+/// (the (simple-string 5) ...) to assert the subform is evaluated exactly once.
+#[test]
+fn the_accepts_compound_type_specifiers() {
+    let cases = [
+        ("(the (integer 0 9) 5)", "5"),
+        ("(the (simple-string 5) \"abcde\")", "\"abcde\""),
+        ("(the (vector t) (vector 1 2))", "#(1 2)"),
+        ("(the (simple-bit-vector 5) #*00110)", "#*00110"),
+        ("(the (array t (2)) (vector 1 2))", "#(1 2)"),
+        // Bare symbols were already fine and must stay so.
+        ("(the simple-string \"abcde\")", "\"abcde\""),
+        ("(the integer 5)", "5"),
+        ("(the list (list 1 2))", "(1 2)"),
+        // The declared type must still be CHECKED, not just accepted: a value
+        // that genuinely fails a compound spec still signals.
+        ("(handler-case (funcall (compile nil '(lambda () (the (integer 0 9) 99)))) (type-error () :te))", ":TE"),
+        // THE must evaluate its subform EXACTLY ONCE -- the property the ansi
+        // LENGTH tests actually assert.
+        ("(let ((i 0)) (flet ((f () (incf i) (make-string 5 :initial-element #\\a))) (list (length (the (simple-string 5) (f))) i)))", "(5 1)"),
+        // NOTE: no `\` line-continuations inside these Lisp strings -- the
+        // continuation eats the newline AND the indentation, so 'bit and
+        // :initial-contents glue into the package reference bit:initial-contents.
+        ("(let ((i 0)) (flet ((f () (incf i) (make-array 5 :element-type 'bit :initial-contents '(0 0 1 1 0)))) (list (length (the (simple-bit-vector 5) (f))) i)))", "(5 1)"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-c02n: STRINGP gave a different ANSWER once it promoted a tier.
 ///
 /// The inlined T2 STRING test proves the heap tag and then accepts only

@@ -13590,8 +13590,19 @@ fn canonical_type_name(type_form: BlissVal) -> Result<String, BlissError> {
     })
 }
 
+/// Quick primitive check for a DECLARED type, used by THE before the full TYPEP.
+///
+/// Returns Ok(false) for any specifier this cannot canonicalise -- a COMPOUND
+/// spec like `(integer 0 9)` or `(simple-string 5)` -- meaning "cannot tell",
+/// so the caller falls through to TYPEP. It must NOT propagate
+/// `canonical_type_name`'s error: doing so skipped the very fallback its
+/// caller documents, and `(the (integer 0 9) 5)` signalled a TYPE-ERROR
+/// naming the TYPE SPEC as the bad datum instead of returning 5 (bliss-c02n
+/// follow-up; ansi LENGTH.STRING.5/6, LENGTH.BIT-VECTOR.5).
 fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result<bool, BlissError> {
-    let type_name = canonical_type_name(type_form)?;
+    let Ok(type_name) = canonical_type_name(type_form) else {
+        return Ok(false);
+    };
     Ok(match type_name.as_str() {
         "T" => true,
         "NIL" | "NULL" => value.is_nil(),
@@ -14390,9 +14401,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 {
                     return Ok(value);
                 }
+                // Name the DECLARED TYPE in the error, falling back to the
+                // spec's printed form for a compound one -- `canonical_type_name`
+                // only handles bare symbols and would otherwise replace a
+                // genuine "value is not of type (integer 0 9)" with a confusing
+                // error about the spec itself.
+                let expected = canonical_type_name(type_form).unwrap_or_else(|_| {
+                    let mut printed = String::new();
+                    print_val(type_form, &mut printed);
+                    printed
+                });
                 return Err(BlissError::TypeError {
                     datum: value,
-                    expected: canonical_type_name(type_form)?,
+                    expected,
                 });
             }
             "LOOP" => return eval_loop(cdr, env),
