@@ -1891,7 +1891,21 @@ fn emit_type_check(
         // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, bliss_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
-    } else if bits == TypeBits::STRING || class == Some(typep_class::STRING) {
+    } else if bits == TypeBits::STRING {
+        // NOTE: `typep_class::STRING` is deliberately NOT accepted here, so it
+        // falls through to the declining `else` below and T2 uses a real call
+        // (bliss-c02n). This test accepts only the two SIMPLE layouts, while a
+        // string with a fill pointer, an adjustable one, or a DISPLACED one is
+        // a COMPLEX_ARRAY -- so as a PREDICATE it answered NIL where every
+        // other tier answers T, and a hot (stringp x) / (typep x 'string)
+        // silently flipped. The CONS and LIST classes were removed from this
+        // chain for the same reason (bliss-74rl).
+        //
+        // `bits == TypeBits::STRING` stays: that form reaches here only from
+        // LAYOUT GUARDS, where proving the simple layout is the whole point and
+        // a complex string must deopt rather than be read raw. Deopting is
+        // conservative; answering NIL to a predicate is not.
+        //
         // A string predicate must prove the heap tag before reading the header.
         // Both simple UTF-8 string layouts share the same length/data offsets.
         single_tag(a, bliss_rt::value::TAG_HEAP_OBJECT as i32);

@@ -1343,7 +1343,26 @@ impl<'a> Builder<'a> {
             IntrinsicId::Consp => return Ok(false),
             IntrinsicId::Symbolp => Some(TypeBits::SYMBOL),
             IntrinsicId::Integerp => Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM)),
-            IntrinsicId::Stringp => Some(TypeBits::STRING),
+            // NOT inlinable, for the same reason CONSP is not (bliss-c02n).
+            // The inlined STRING test proves the heap tag and then accepts only
+            // SIMPLE_BASE_STRING / SIMPLE_CHARACTER_STRING. A string with a
+            // fill pointer, an adjustable one, or a DISPLACED one is a
+            // COMPLEX_ARRAY, so the inline test answered NIL where the
+            // interpreter -- which consults is_complex_vector + cvec_is_string
+            // -- answers T.
+            //
+            // That is a silent wrong ANSWER, not a missed optimisation: a
+            // promoted STRINGP flipped from T to NIL once the function got hot,
+            // so boot.lisp's %COERCE-LIKE took its (t ...) branch and REMOVE /
+            // REMOVE-IF / DELETE-IF / SUBSTITUTE / REMOVE-DUPLICATES started
+            // returning a general vector instead of a string. It only showed
+            // under the ansi harness because nothing else called them enough
+            // times to promote.
+            //
+            // Fall back to a real call. Correctness outranks the saved call
+            // (the bliss-x5y.9 rule: a fast path must be bit-identical to the
+            // tree-walker).
+            IntrinsicId::Stringp => return Ok(false),
             IntrinsicId::TypepConstant => {
                 if bcp <= block_start {
                     return Ok(false);

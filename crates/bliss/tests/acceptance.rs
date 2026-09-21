@@ -12998,6 +12998,82 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-c02n: STRINGP gave a different ANSWER once it promoted a tier.
+///
+/// The inlined T2 STRING test proves the heap tag and then accepts only
+/// SIMPLE_BASE_STRING / SIMPLE_CHARACTER_STRING. A string with a fill pointer,
+/// an adjustable one, or a DISPLACED one is a COMPLEX_ARRAY, so the inline
+/// answered NIL where the interpreter -- which consults is_complex_vector +
+/// cvec_is_string -- answers T.
+///
+/// The consequence was a wrong answer, not a slow path. boot.lisp's
+/// %COERCE-LIKE is `(cond ((stringp orig) ...) ... (t (coerce list 'vector)))`
+/// and REMOVE / REMOVE-IF / DELETE-IF / SUBSTITUTE / REMOVE-DUPLICATES all end
+/// in it, so once STRINGP flipped they returned a general vector instead of a
+/// string. It showed up only under the ansi harness because nothing else called
+/// them enough times to promote -- which is why the bead recorded, wrongly,
+/// that it would not reproduce standalone.
+///
+/// THE ITERATION COUNT IS LOAD-BEARING. Below the promotion threshold this
+/// test passes against the BROKEN build and proves nothing. 1.5M is comfortably
+/// past where the flip was observed (~1.2M) and costs ~5s on the debug binary.
+/// Every case compares the value BEFORE and AFTER the loop, so a build that
+/// never promotes cannot quietly pass only the easy half.
+#[test]
+fn stringp_keeps_its_answer_across_tier_promotion() {
+    let setup = concat!(
+        "(defvar *s0* (make-array 10 :element-type 'character ",
+        "  :initial-contents (concatenate 'string \"XX\" \"ab1c2\" \"YYY\"))) ",
+        "(defvar *sd* (make-array 5 :element-type 'character ",
+        "  :displaced-to *s0* :displaced-index-offset 2)) ",
+        "(defvar *fp* (make-array 9 :element-type 'character :fill-pointer 5 ",
+        "  :initial-contents (coerce \"ab1c2ZZZZ\" 'list))) ",
+        "(defvar *ad* (make-array 5 :element-type 'character :adjustable t ",
+        "  :initial-contents (coerce \"ab1c2\" 'list))) ",
+        "(defun sp (x) (stringp x)) ",
+        "(defun tp (x) (typep x 'string)) ",
+        "(defun hot (s) (remove-if #'alpha-char-p s))"
+    );
+    let cases: [(&str, &str); 8] = [
+        // Cold, then hot: the two must agree.
+        ("(list (sp *sd*) (progn (dotimes (i 1500000) (sp *sd*)) (sp *sd*)))", "(T T)"),
+        ("(list (sp *fp*) (progn (dotimes (i 1500000) (sp *fp*)) (sp *fp*)))", "(T T)"),
+        ("(list (sp *ad*) (progn (dotimes (i 1500000) (sp *ad*)) (sp *ad*)))", "(T T)"),
+        // TYPEP shares the emitter, so it must hold too.
+        ("(list (tp *sd*) (progn (dotimes (i 1500000) (tp *sd*)) (tp *sd*)))", "(T T)"),
+        // The end-to-end consequence: REMOVE-IF must still answer a STRING
+        // after its own promotion, not a general vector.
+        ("(progn (dotimes (i 300000) (hot *sd*)) (hot *sd*))", "\"12\""),
+        ("(progn (dotimes (i 300000) (hot *sd*)) (stringp (hot *sd*)))", "T"),
+        ("(progn (dotimes (i 300000) (hot *sd*)) (array-element-type (hot *sd*)))", "CHARACTER"),
+        // The fix must not make the predicate permissive the other way.
+        ("(list (sp (vector 1 2)) (progn (dotimes (i 1500000) (sp (vector 1 2))) (sp (vector 1 2))))",
+         "(NIL NIL)"),
+    ];
+    for (expr, expected) in cases {
+        let program = format!("(progn {setup} (cl:format t \"~S\" {expr}))");
+        let output = bliss_bin()
+            .args(["--eval", &program])
+            .output()
+            .expect("failed to run bliss");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "tier-promotion case failed: {expr}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim(),
+            expected,
+            "tier-promotion case: {expr}"
+        );
+    }
+}
+
 /// bliss-sci0: assigning to a constant variable PANICKED rather than
 /// signalling. NIL and T are special immediates, not TAG_SYMBOL values, so
 /// `is_symbol()` is false for them and SETQ fell through to `sym_name`, which
