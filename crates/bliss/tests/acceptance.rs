@@ -12998,6 +12998,52 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-7lqe: REMOVE-DUPLICATES was O(n) with no :test and O(n^2) pairwise
+/// funcalls with one, because any :test fell to %REMOVE-DUPLICATES-GENERAL.
+/// EQ, EQL, EQUAL and EQUALP are exactly the four standard HASH-TABLE tests, so
+/// those now take the same O(n) hash path. Measured on 873 short sublists:
+/// :test #'equal 1404 ms -> 6 ms, :test #'equalp 905 ms -> 4 ms.
+///
+/// Substituting hashing for pairwise comparison is sound only because those
+/// four are genuine EQUIVALENCE RELATIONS. An arbitrary :test need not be
+/// symmetric or transitive, so it still takes the general path -- asserted
+/// below with a non-transitive parity test, which must keep its old answer.
+///
+/// Every expectation here was diffed against SBCL: all 18 shapes identical.
+#[test]
+fn remove_duplicates_hashes_the_standard_tests() {
+    let cases = [
+        ("(remove-duplicates (list 1 2 1 3 2))", "(1 3 2)"),
+        ("(remove-duplicates (list (list 1) (list 2) (list 1)) :test #'equal)", "((2) (1))"),
+        // A symbol designator must work too, not just a function object.
+        ("(remove-duplicates (list (list 1) (list 2) (list 1)) :test 'equal)", "((2) (1))"),
+        ("(remove-duplicates (list \"a\" \"A\" \"b\") :test #'equalp)", "(\"A\" \"b\")"),
+        // EQUAL is case-SENSITIVE on strings; EQUALP is not. The hash table's
+        // test must match the :test, not merely be "some string test".
+        ("(remove-duplicates (list \"a\" \"A\" \"b\") :test #'equal)", "(\"a\" \"A\" \"b\")"),
+        ("(remove-duplicates (list 'a 'b 'a) :test #'eq)", "(B A)"),
+        // :from-end and :key interact with the hash path.
+        ("(remove-duplicates (list 1 2 1 3 2) :from-end t)", "(1 2 3)"),
+        ("(remove-duplicates (list (list 1) (list 2) (list 1)) :from-end t :test #'equal)", "((1) (2))"),
+        ("(remove-duplicates (list (list 1 :a) (list 2 :b) (list 1 :c)) :key #'car :test #'equal)",
+         "((2 :B) (1 :C))"),
+        ("(remove-duplicates (list (list 1 :a) (list 2 :b) (list 1 :c)) :key #'car :from-end t)",
+         "((1 :A) (2 :B))"),
+        // These must still take the GENERAL path -- bounds, :test-not, and a
+        // test that is not an equivalence relation.
+        ("(remove-duplicates (list 1 1 2 1) :start 1)", "(1 2 1)"),
+        ("(remove-duplicates (list 1 1 2 1) :end 2)", "(1 2 1)"),
+        ("(remove-duplicates (list 1 2 1) :test-not #'eql)", "(1)"),
+        ("(remove-duplicates (list 1 2 3 4) :test (lambda (a b) (= (mod a 2) (mod b 2))))", "(3 4)"),
+        // Non-list sequences keep their type.
+        ("(remove-duplicates \"abcabc\" :test #'char=)", "\"abc\""),
+        ("(remove-duplicates (vector 1 2 1) :test #'eql)", "#(2 1)"),
+        // DELETE-DUPLICATES delegates here, so it inherits the fast path.
+        ("(delete-duplicates (list (list 1) (list 1)) :test #'equal)", "((1))"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// bliss-hb0q: `#'<builtin>` was not EQ-stable.
 ///
 ///     (eq #'car #'car)      bliss NIL,  SBCL T

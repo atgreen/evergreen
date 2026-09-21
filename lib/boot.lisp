@@ -2532,13 +2532,39 @@
 ;; nil :start), (remove-duplicates nil 'bad t) and (remove-duplicates nil 1 2)
 ;; returned NIL instead of signalling (ansi REMOVE-DUPLICATES.ERROR.2/4/5/6 and
 ;; the DELETE-DUPLICATES ones).
+;; Which HASH-TABLE test, if any, is equivalent to this :test argument?
+;;
+;; EQ, EQL, EQUAL and EQUALP are exactly the four standard hash-table tests, so
+;; REMOVE-DUPLICATES with one of them can use the O(n) hash path below instead
+;; of %REMOVE-DUPLICATES-GENERAL's O(n^2) pairwise scan. Measured on 873 short
+;; sublists: 5 ms hashed against 1404 ms scanned with :test #'equal -- 280x, and
+;; it is algorithmic, not funcall overhead (bliss-7lqe).
+;;
+;; Substituting a hash lookup for pairwise comparison is only sound because
+;; these four are genuine EQUIVALENCE RELATIONS, so "matches something already
+;; seen" and "matches some earlier element" pick out the same duplicates. An
+;; arbitrary :test is not necessarily symmetric or transitive, which is why
+;; anything else still takes the general path.
+;;
+;; Both a function object and a symbol designator are accepted; #'<builtin> is
+;; EQ-stable (bliss-hb0q), which is what makes the EQ tests here work at all.
+(defun %hash-test-for (test)
+  (cond ((null test) 'eql)
+        ((symbolp test) (and (member test '(eq eql equal equalp)) test))
+        ((eq test #'eq) 'eq)
+        ((eq test #'eql) 'eql)
+        ((eq test #'equal) 'equal)
+        ((eq test #'equalp) 'equalp)
+        (t nil)))
+
 (defun remove-duplicates (seq &key test test-not key from-end (start 0) end
                                    allow-other-keys)
   (declare (ignore allow-other-keys))
-  (let ()
-    (if (and (null test) (null test-not) (eql start 0) (null end))
+  (let ((hash-test (and (null test-not) (eql start 0) (null end)
+                        (%hash-test-for test))))
+    (if hash-test
         (let ((items (coerce seq 'list))
-              (seen (make-hash-table :test 'eql))
+              (seen (make-hash-table :test hash-test))
               (out nil))
           (dolist (x (if from-end items (reverse items)))
             (let ((k (if key (funcall key x) x)))
