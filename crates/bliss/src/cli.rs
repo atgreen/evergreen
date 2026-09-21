@@ -12061,6 +12061,72 @@ fn parse_not_type(t: BlissVal) -> Option<BlissVal> {
     None
 }
 
+/// SUBTYPEP where t1 is a MEMBER/EQL type and t2 is an ARBITRARY type.
+///
+/// `(member x…) ⊆ t2` iff every x satisfies `(typep x t2)` -- trivially
+/// decidable, and CLHS requires the definite answer. bliss returned
+/// `(NIL NIL)` ("cannot determine") for all of these:
+///
+///     (subtypep '(member #\a #\b) 'character)  => NIL NIL, want T T
+///     (subtypep '(member a b) 'symbol)         => NIL NIL, want T T
+///     (subtypep '(eql #\a) 'character)         => NIL NIL, want T T
+///
+/// `member_subtypep` above only compares a MEMBER against another MEMBER, so
+/// nothing answered this shape. It matters beyond tidiness: the ansi random
+/// differential tests pick a random element via a `cond` over
+/// `(subtypep* '(member #\a … #\h) type)`, so an indefinite answer there made
+/// the helper signal "Can't get random element of type CHARACTER" and took out
+/// eight tests (REMOVE-RANDOM and siblings, RANDOM-REMOVE-DUPLICATES …).
+///
+/// DELIBERATELY CONSERVATIVE. Only elements decidable EXACTLY count; anything
+/// else returns None, leaving the indefinite answer. `(NIL NIL)` is always
+/// conforming, a wrong definite answer is not -- and the env-free quick check
+/// used elsewhere has false positives (every character satisfies its
+/// STANDARD-CHAR arm, which is untrue of `#\Null`), so it is not reused here.
+fn member_of_type_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
+    let elems = parse_member_type(t1)?;
+    // The empty MEMBER type is the empty type, a subtype of everything.
+    if elems.is_empty() {
+        return Some((true, true));
+    }
+    // Bare symbol supertypes only; a compound t2 is left to the machinery above.
+    if !t2.is_symbol() {
+        return None;
+    }
+    let name = symbol_bare_name(&sym_name_rc(t2));
+    let exact = |v: BlissVal| -> Option<bool> {
+        Some(match name.as_str() {
+            "T" => true,
+            "NIL" | "NULL" => v.is_nil(),
+            "BOOLEAN" => v.is_nil() || v == T,
+            // NIL and T are SPECIAL IMMEDIATES, not TAG_SYMBOL values, so
+            // `is_symbol()` alone misses them (the bliss-sci0 lesson).
+            "SYMBOL" => v.is_symbol() || v.is_nil() || v == T,
+            "KEYWORD" => is_keyword_arg(v),
+            "CHARACTER" => v.is_character(),
+            "INTEGER" => bliss_rt::types::integerp(v),
+            "RATIONAL" => bliss_rt::types::rationalp(v),
+            "NUMBER" => is_number_value(v),
+            "CONS" => v.is_cons() && !is_function_value(v),
+            "LIST" => v.is_list() && !is_function_value(v),
+            "FUNCTION" => is_function_value(v),
+            "STRING" => is_string_value(v),
+            // Anything else -- STANDARD-CHAR, BASE-CHAR, FIXNUM, the array
+            // types -- is not decided here rather than decided wrongly.
+            _ => return None,
+        })
+    };
+    let mut all = true;
+    for e in elems {
+        match exact(e) {
+            Some(true) => {}
+            Some(false) => all = false,
+            None => return None,
+        }
+    }
+    Some((all, true))
+}
+
 /// SUBTYPEP for two MEMBER/EQL types: `(member x…)` ⊆ `(member y…)` iff every x
 /// is EQL to some y. An empty member type is the empty type.
 fn member_subtypep(t1: BlissVal, t2: BlissVal) -> Option<(bool, bool)> {
@@ -12190,6 +12256,10 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
     }
     // MEMBER / EQL set containment.
     if let Some(res) = member_subtypep(t1, t2) {
+        return res;
+    }
+    // MEMBER / EQL against an arbitrary supertype, decided element-wise.
+    if let Some(res) = member_of_type_subtypep(t1, t2) {
         return res;
     }
     // COMPLEX element covariance and real-vs-complex disjointness.

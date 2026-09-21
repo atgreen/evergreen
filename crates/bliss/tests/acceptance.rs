@@ -12998,6 +12998,46 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// SUBTYPEP returned "cannot determine" for a MEMBER type against an ordinary
+/// supertype, where the answer is trivially decidable:
+///
+///     (subtypep '(member #\a #\b) 'character)   =>  NIL NIL,  want T T
+///
+/// `member_subtypep` only compared a MEMBER against ANOTHER MEMBER, so nothing
+/// answered this shape. It is not cosmetic: the ansi random differential tests
+/// pick an element through a `cond` over `(subtypep* '(member #\a … #\h) type)`,
+/// so the indefinite answer made their helper signal "Can't get random element
+/// of type CHARACTER" and took out eight tests (REMOVE-RANDOM and siblings,
+/// RANDOM-REMOVE-DUPLICATES, RANDOM-DELETE-DUPLICATES).
+///
+/// The last two cases are DELIBERATELY left undecided. Only elements decidable
+/// exactly get a definite answer; `(NIL NIL)` is always conforming while a
+/// wrong definite answer is not. SBCL answers (T T) to the (integer 0 3) case,
+/// so bliss is less precise there -- not incorrect. Everything else matches
+/// SBCL exactly.
+#[test]
+fn subtypep_decides_member_types_against_ordinary_supertypes() {
+    let cases = [
+        ("(multiple-value-list (subtypep '(member #\\a #\\b) 'character))", "(T T)"),
+        ("(multiple-value-list (subtypep '(member a b) 'symbol))", "(T T)"),
+        ("(multiple-value-list (subtypep '(member 1 2) 'integer))", "(T T)"),
+        ("(multiple-value-list (subtypep '(eql #\\a) 'character))", "(T T)"),
+        ("(multiple-value-list (subtypep '(member nil) 'symbol))", "(T T)"),
+        ("(multiple-value-list (subtypep '(member 1000000000000000000000) 'integer))", "(T T)"),
+        // The empty MEMBER type is the empty type: a subtype of everything.
+        ("(multiple-value-list (subtypep '(member) 'character))", "(T T)"),
+        // A member that fails the supertype gives a DEFINITE no.
+        ("(multiple-value-list (subtypep '(member 1 #\\a) 'integer))", "(NIL T)"),
+        // Unrelated types still behave.
+        ("(multiple-value-list (subtypep 'character 'character))", "(T T)"),
+        ("(multiple-value-list (subtypep 'fixnum 'character))", "(NIL T)"),
+        // Deliberately undecided -- see the note above.
+        ("(multiple-value-list (subtypep '(member #\\a) 'standard-char))", "(NIL NIL)"),
+        ("(multiple-value-list (subtypep '(member 1 2) '(integer 0 3)))", "(NIL NIL)"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// THE with a COMPOUND type specifier signalled a TYPE-ERROR naming the SPEC
 /// as the bad datum, instead of returning the value:
 ///
