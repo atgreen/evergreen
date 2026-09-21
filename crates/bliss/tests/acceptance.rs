@@ -12998,6 +12998,52 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-wukf: a signalled error did not STOP execution in native code. The c2i
+/// helper stashes the error and returns NIL for `run_native` to re-raise on
+/// exit, and the emitted call sequence had no post-call check -- so native
+/// execution carried on into code that must not run:
+///
+///   (defun h (x) (when (eq x :bad) (error "boom")) (setq *ran* t) :done)
+///   cold      -> *ran* NIL      correct
+///   hot (T1)  -> *ran* T        WRONG
+///
+/// T1 now follows HotSpot's UNCOMMON TRAP: a call to ERROR is not compiled at
+/// all, it deopts to T0 at that bytecode index, and T0 signals with proper
+/// unwinding. Free -- a branch that signals is cold by construction.
+///
+/// THE ITERATION COUNTS MATTER. The T1 window is roughly 50k-350k invocations;
+/// probes using only a large count miss it entirely, which is how an earlier
+/// sweep of this area came back clean against a broken build.
+///
+/// T2 IS NOT FIXED: see the bead. T2's deopt re-runs the whole function rather
+/// than resuming at a bytecode index, so the same trick would duplicate side
+/// effects performed before the error. The cases below are the ones T1 governs.
+#[test]
+fn a_signalled_error_stops_execution_in_native_code() {
+    let cases = [
+        // The wrong-error symptom: two validation clauses, warm up on good
+        // input, then hit bad input. The FIRST error must be the one raised.
+        ("(progn (defun wukf-g (end len)\
+            (unless (and (integerp end) (<= 0 end len)) (error \"first\"))\
+            (unless (<= 0 end) (error \"second\")) :ok)\
+          (defun wukf-p () (multiple-value-bind (v e) (ignore-errors (wukf-g 'a 5))\
+            (declare (ignore v)) (format nil \"~a\" e)))\
+          (let ((cold (wukf-p)))\
+            (dotimes (i 200000) (wukf-g 3 5))\
+            (list cold (wukf-p))))", "(\"first\" \"first\")"),
+        // ...and the clause BODIES must not both run.
+        ("(progn (defvar *wukf-tr* nil)\
+          (defun wukf-h (end len)\
+            (unless (and (integerp end) (<= 0 end len)) (push :b1 *wukf-tr*) (error \"first\"))\
+            (unless (<= 0 end) (push :b2 *wukf-tr*) (error \"second\")) :ok)\
+          (dotimes (i 200000) (wukf-h 3 5))\
+          (setq *wukf-tr* nil)\
+          (ignore-errors (wukf-h 'a 5))\
+          (reverse *wukf-tr*))", "(:B1)"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// TYPEP silently ignored a MALFORMED numeric bound, so a value was reported as
 /// being of a type that cannot be constructed:
 ///

@@ -16539,6 +16539,27 @@ fn emit_native_x86(
                 push_rax(&mut c);
             }
             Instr::CallNamed { sym, nargs } => {
+                // HotSpot's UNCOMMON TRAP, applied to signalling calls
+                // (bliss-wukf option E). A call that never returns normally
+                // gains nothing from native compilation and costs correctness:
+                // the c2i helper stashes the error and returns NIL, and native
+                // execution CONTINUES into code that must not run -- a store
+                // after the error lands, and a later error supersedes the real
+                // one.
+                //
+                // Deopt to T0 at this bcp instead. `run_native` resumes T0 at
+                // exactly this CallNamed (the documented case for the tail
+                // below), which then signals with proper unwinding. Nothing has
+                // been consumed yet, so re-executing the call is exactly right.
+                //
+                // Free on the hot path: a branch that signals is cold by
+                // construction, so this replaces cold code with a 7-byte stub
+                // and leaves every other call site untouched.
+                if is_always_signalling(*sym) {
+                    let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                    c.jmp(l);
+                    continue;
+                }
                 // Unary speculative fast path (bliss-jtc.27): 1+, 1-, and unary -
                 // saturate loop bodies. Guard the operand is a fixnum, then work
                 // on the tagged value directly: +1<<3 / -1<<3 / two's-complement
@@ -17233,6 +17254,21 @@ fn emit_native_x86(
 /// start is guaranteed to produce the same result. Pure numeric/comparison/list
 /// constructors and accessors qualify; anything doing I/O, mutation, RNG, or
 /// time does not, and simply keeps the function out of speculative mode.
+/// Calls that NEVER return normally, so T1 deopts rather than compiling them
+/// (bliss-wukf). CLHS: ERROR "never returns normally" -- control is transferred
+/// to a handler. Deliberately conservative: SIGNAL returns when unhandled,
+/// CERROR returns when the continue restart is taken, and WARN returns
+/// normally, so none of them belong here.
+fn is_always_signalling(sym: u32) -> bool {
+    matches!(
+        bliss_rt::symbols::symbol_name(sym)
+            .as_deref()
+            .map(|n| n.rsplit(':').next().unwrap_or(n).to_string())
+            .as_deref(),
+        Some("ERROR")
+    )
+}
+
 fn is_deopt_safe_primitive(sym: u32) -> bool {
     matches!(
         bliss_rt::symbols::symbol_name(sym).as_deref(),
