@@ -6727,6 +6727,15 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
             visit(value);
         }
     });
+    // The cached `#'<builtin>` wrapper conses (bliss-hb0q). Visiting them is
+    // what lets the cache hold a BlissVal at all: the collector rewrites each
+    // entry in place, so a cached `#'car` stays valid across a relocation
+    // instead of becoming a stale pointer.
+    BUILTIN_FN_WRAPPER_VALUES.with(|values| {
+        for value in values.borrow_mut().values_mut() {
+            visit(value);
+        }
+    });
     MACROEXPAND_ENVIRONMENTS.with(|environments| {
         for environment in environments.borrow_mut().values_mut() {
             environment.visit_gc_roots(visit);
@@ -13811,6 +13820,22 @@ thread_local! {
     /// everywhere for the life of the session.
     static BUILTIN_FN_WRAPPERS: RefCell<std::collections::HashMap<String, u64>> =
         RefCell::new(std::collections::HashMap::new());
+    /// The reified `#'<builtin>` wrapper VALUE per builtin, so two references to
+    /// the same builtin are EQ.
+    ///
+    /// `BUILTIN_FN_WRAPPERS` above already reuses the closure ID, but the value
+    /// returned was a FRESH `arena_cons` every time, so `(eq #'car #'car)` was
+    /// NIL where CLHS 5.3 and SBCL say T -- and every `#'<builtin>` reference
+    /// allocated (bliss-hb0q). User-defined functions were already EQ-stable;
+    /// only builtins were not.
+    ///
+    /// GC: these values ARE visited by `scan_evaluator_global_roots`, so the
+    /// moving collector rewrites them in place. That is what makes caching a
+    /// BlissVal safe here -- the surrounding tables deliberately key on stable
+    /// u32/u64 ids precisely because an UNVISITED cached BlissVal would go
+    /// stale. This follows the CONTROL_VALUES pattern.
+    static BUILTIN_FN_WRAPPER_VALUES: RefCell<std::collections::HashMap<String, BlissVal>> =
+        RefCell::new(std::collections::HashMap::new());
     /// Reverse of [`BUILTIN_FN_WRAPPERS`]: wrapper closure id -> the symbol the
     /// wrapper dispatches to. `builtin_wrapper_name` answers the same question
     /// but linear-scans and clones a String, which is far too slow for a call
@@ -13830,8 +13855,15 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
             BUILTIN_WRAPPER_SYMS.with(|m| m.borrow_mut().insert(id, sym));
         }
     }
+    // Return the SAME value for the same builtin, so `(eq #'car #'car)` is T
+    // (bliss-hb0q). Reusing only the closure id still minted a fresh cons.
+    if let Some(v) = BUILTIN_FN_WRAPPER_VALUES.with(|c| c.borrow().get(bare).copied()) {
+        return v;
+    }
     if let Some(id) = BUILTIN_FN_WRAPPERS.with(|c| c.borrow().get(bare).copied()) {
-        return arena_cons(closure_sym, BlissVal::from_fixnum(id as i64));
+        bliss_rt::rooted!(v = arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
+        BUILTIN_FN_WRAPPER_VALUES.with(|c| c.borrow_mut().insert(bare.to_string(), *v));
+        return *v;
     }
     // Build (&REST %args) and ((APPLY (QUOTE <name>) %args)), rooting each
     // intermediate across the allocating arena_cons calls (moving minor GC).
@@ -13863,7 +13895,12 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
     if let Some(sym) = name_sym.symbol_index() {
         BUILTIN_WRAPPER_SYMS.with(|m| m.borrow_mut().insert(id, sym));
     }
-    arena_cons(closure_sym, BlissVal::from_fixnum(id as i64))
+    // Rooted across the cache insert: `bare.to_string()` is a Rust allocation,
+    // but the value must not be held unrooted after an `arena_cons` regardless
+    // -- that is the shape gc-root-lint flags and the one that goes stale.
+    bliss_rt::rooted!(v = arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
+    BUILTIN_FN_WRAPPER_VALUES.with(|c| c.borrow_mut().insert(bare.to_string(), *v));
+    *v
 }
 
 /// If `v` is a reified builtin wrapper closure `(BLISS::CLOSURE . id)` produced by

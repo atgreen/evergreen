@@ -12998,6 +12998,51 @@ fn ordinal_accessors_share_the_nth_kernel() {
     run_expression_cases(&cases);
 }
 
+/// bliss-hb0q: `#'<builtin>` was not EQ-stable.
+///
+///     (eq #'car #'car)      bliss NIL,  SBCL T
+///     (eq #'equal #'equal)  bliss NIL,  SBCL T
+///     (eq #'myf #'myf)      bliss T     -- user functions already were
+///
+/// `builtin_fn_wrapper` reused the wrapper's closure ID but returned a FRESH
+/// `arena_cons` every call, so two references to the same builtin were distinct
+/// objects -- and every `#'<builtin>` reference allocated. CLHS 5.3 makes #'car
+/// denote "the function named car"; two such references should be identical.
+///
+/// The fix caches the wrapper VALUE, which is only safe because the cache is
+/// visited by `scan_evaluator_global_roots` -- the surrounding tables key on
+/// stable u32/u64 ids precisely because an unvisited cached BlissVal would go
+/// stale under the moving collector. The churn case below exists to exercise
+/// that: it forces allocation between taking `#'car` and comparing it.
+#[test]
+fn builtin_function_objects_are_eq_stable() {
+    let cases = [
+        ("(eq #'car #'car)", "T"),
+        ("(eq #'equal #'equal)", "T"),
+        ("(eq #'equalp #'equalp)", "T"),
+        ("(eq (fdefinition 'equal) (fdefinition 'equal))", "T"),
+        ("(eq (symbol-function 'car) (symbol-function 'car))", "T"),
+        // User-defined functions were already stable and must stay so.
+        ("(progn (defun hb0q-f (x) x) (eq #'hb0q-f #'hb0q-f))", "T"),
+        // DISTINCT builtins must remain distinct -- the cache is per name.
+        ("(eq #'equal #'equalp)", "NIL"),
+        ("(eq #'car #'cdr)", "NIL"),
+        // Identity must survive allocation churn, i.e. a relocating collection.
+        ("(let ((f #'car)) (dotimes (i 20000) (list i i)) (eq f #'car))", "T"),
+        ("(let ((f #'equal)) (dotimes (i 20000) (list i i)) (funcall f 3 3))", "T"),
+        // Calling behaviour is unchanged.
+        ("(funcall #'car (list 1 2))", "1"),
+        ("(apply #'+ (list 1 2 3))", "6"),
+        ("(mapcar #'1+ (list 1 2))", "(2 3)"),
+        ("(functionp #'car)", "T"),
+        // MAKE-HASH-TABLE recognises #'equal through the wrapper (bliss-uuh);
+        // the cache must not break that.
+        ("(let ((h (make-hash-table :test #'equal))) (setf (gethash \"a\" h) 1)\
+            (nth-value 1 (gethash (copy-seq \"a\") h)))", "T"),
+    ];
+    run_expression_cases(&cases);
+}
+
 /// SUBTYPEP returned "cannot determine" for a MEMBER type against an ordinary
 /// supertype, where the answer is trivially decidable:
 ///
