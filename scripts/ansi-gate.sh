@@ -52,15 +52,22 @@ if [ ! -x "$BLISS_BIN" ]; then
     exit 2
 fi
 
-# Which binary is this, and is it the fast one? Cargo.toml gives profile.test
-# opt-level 3 for ALL crates but profile.dev opt-level 2 for the bliss-cli
-# package ONLY, so `cargo build` leaves bliss-rt/bliss-stdlib/bliss-compiler —
-# where the hot code lives — at opt-level 0. Both write this same path, so the
-# binary can be ~9x slower with nothing to show for it, which is enough to turn
-# a passing chapter into a wall-clock timeout (bliss-em8x).
+# Which binary is this, and is it the fast one?
 #
-# The size split is a HEURISTIC, not a guarantee: measured ~112MB for the
-# cargo-test build and ~100MB for the cargo-build one.
+# The underlying trap is FIXED (bliss-em8x): profile.dev now gives bliss-rt,
+# bliss-stdlib and bliss-compiler opt-level 2 to match profile.test, so `cargo
+# build` and `cargo test --no-run` produce binaries of the same speed (measured
+# 40 ms each on the same benchmark that used to split 322 ms vs 40 ms) and it no
+# longer matters which ran last.
+#
+# This check is kept as a BACKSTOP against that config regressing -- drop those
+# profile.dev.package entries and the unoptimized build reappears at ~100MB,
+# which this still catches. It is NOT a live speed test: post-fix the two builds
+# are 110.7MB and 112.3MB and both are fast, so size no longer tracks opt-level
+# among healthy binaries. It only distinguishes "someone lost the profile
+# overrides" from "normal".
+#
+# The size split is a HEURISTIC, not a guarantee.
 #
 # This REFUSES rather than warns (bliss-wzb3). It was advisory, and advice at
 # this spot does not work: the banner scrolls past, and a run on the slow

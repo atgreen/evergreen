@@ -22,5 +22,35 @@ bliss-stdlib = { path = "crates/bliss-stdlib" }
 [profile.test]
 opt-level = 3
 
+# The DEV profile must optimize the same crates the TEST profile does, or the
+# two cargo subcommands produce measurably different binaries at the SAME path
+# (target/<target>/debug/bliss-cli) and whichever ran last silently decides how
+# fast it is. bliss-rt, bliss-stdlib and bliss-compiler hold the GC, the sequence
+# library and the lowerer -- most of the hot code -- so leaving them at
+# opt-level 0 under `cargo build` while `cargo test` built them at 3 made the
+# same source run ~8x slower:
+#
+#   written by `cargo build --workspace`  100,817,432 bytes  322 ms
+#   written by `cargo test --no-run`      112,981,184 bytes   40 ms
+#     -- (remove-duplicates <3000 short strings> :test #'equalp), one commit
+#
+# scripts/ansi-gate.sh defaults to that binary, so whether a chapter passed,
+# timed out, or reported a plausible-but-wrong tally depended on which cargo
+# subcommand you happened to run last. It cost a session once: chapter runs that
+# had been completing started timing out, and the bisect that "found" the cause
+# was invalid because the snapshots compared had been built by different
+# commands (bliss-em8x).
+#
+# Optimizing bliss-cli alone -- the one package that is NOT the bottleneck --
+# was the original override and is kept for consistency.
 [profile.dev.package.bliss-cli]
+opt-level = 2
+
+[profile.dev.package.bliss-rt]
+opt-level = 2
+
+[profile.dev.package.bliss-stdlib]
+opt-level = 2
+
+[profile.dev.package.bliss-compiler]
 opt-level = 2
