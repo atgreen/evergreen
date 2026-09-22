@@ -332,8 +332,16 @@ fn cl_equal(a: BlissVal, b: BlissVal) -> bool {
         }
     }
 
-    // Strings: byte-level content comparison (case-sensitive).
     if a.is_heap_object() && b.is_heap_object() {
+        // Pathnames compare by components. Without this the EQUAL hash table's
+        // key comparison fell through to `false`, so even a correct hash would
+        // not have made a pathname-keyed lookup hit (bliss-kssh). The CLI's own
+        // EQUAL already routed here via `pathnames_equal`; the stdlib table did
+        // not, which is how the two came apart.
+        if crate::pathnames::is_pathname(a) || crate::pathnames::is_pathname(b) {
+            return crate::pathnames::pathnames_equal(a, b);
+        }
+        // Strings: byte-level content comparison (case-sensitive).
         {
             if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
                 return sa == sb;
@@ -405,6 +413,14 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
 
     // Strings: case-insensitive byte comparison.
     if a.is_heap_object() && b.is_heap_object() {
+        // Two pathnames are EQUALP exactly when they are EQUAL — their
+        // components match (ansi merge-pathnames.1 compares pathnames with
+        // EQUALP). Must mirror the pathname case in `equalp_hash` or an EQUALP
+        // table keyed by a pathname hashes to the right bucket and then fails
+        // the key comparison (bliss-kssh).
+        if crate::pathnames::is_pathname(a) || crate::pathnames::is_pathname(b) {
+            return crate::pathnames::pathnames_equal(a, b);
+        }
         {
             if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
                 if sa.len() != sb.len() {
@@ -608,6 +624,16 @@ fn equal_hash(object: BlissVal, depth: usize) -> u64 {
         }
     }
     if object.is_heap_object() {
+        // A pathname hashes by the SAME namestring `pathnames_equal` compares,
+        // or EQUAL and SXHASH disagree and every EQUAL hash table keyed by a
+        // pathname misses (bliss-kssh). Checked before the string branch so a
+        // pathname hashes identically whether it reaches here as a PATHNAME heap
+        // object or as a registry-backed namestring sentinel.
+        if let Some(h) = crate::pathnames::with_pathname_equal_key(object, |key| {
+            hash_bytes(key.as_bytes(), false)
+        }) {
+            return h;
+        }
         // Any string (simple or complex/fill-pointer/displaced) — and a
         // registry-backed string sentinel such as a pathname namestring, which
         // `extract_string_bytes` resolves without dereferencing (sxhash.20) —
@@ -656,6 +682,14 @@ fn equalp_hash(object: BlissVal, depth: usize) -> u64 {
         }
     }
     if object.is_heap_object() {
+        // Pathnames are EQUALP exactly when they are EQUAL (components match),
+        // so they must hash alike here too. Case-folded like every other EQUALP
+        // string hash.
+        if let Some(h) = crate::pathnames::with_pathname_equal_key(object, |key| {
+            hash_bytes(key.as_bytes(), true)
+        }) {
+            return h;
+        }
         {
             if let Some(bytes) = extract_string_bytes(object) {
                 return hash_bytes(&bytes, true);

@@ -978,6 +978,22 @@ pub fn pathnames_equal(a: BlissVal, b: BlissVal) -> bool {
     }
 }
 
+/// Run `f` over the exact string [`pathnames_equal`] compares two pathnames by.
+/// `None` when `val` is not a pathname.
+///
+/// This exists so EQUAL, EQUALP and SXHASH cannot disagree about pathnames.
+/// They did: `pathnames_equal` compared namestrings while the hash table's
+/// `equal_hash` had no pathname case at all and fell through to hashing the raw
+/// pointer, so two EQUAL pathnames hashed differently and every EQUAL hash table
+/// keyed by a pathname missed — which is exactly what ASDF's pervasive pathname
+/// caching relies on (bliss-kssh, and bliss-nad before it for EQUAL itself).
+///
+/// Takes a closure rather than returning a `String` so the hot EQUAL path keeps
+/// comparing a borrowed `Cow` without allocating on the Rust or GC heap.
+pub fn with_pathname_equal_key<T>(val: BlissVal, f: impl FnOnce(&str) -> T) -> Option<T> {
+    get_record(val).map(|rec| f(&record_namestring(&rec)))
+}
+
 pub fn pathname_host(pathname: BlissVal) -> BlissVal {
     get_record(pathname).map_or(NIL, |r| r.host)
 }

@@ -697,6 +697,56 @@ fn loop_with_bare_type_and_final_arithmetic_value() {
     );
 }
 
+/// Regression for bliss-kssh: EQUAL pathnames must also HASH alike, and a
+/// pathname key must never collide with its own namestring.
+///
+/// `equal_hash` had no pathname case, so a pathname fell through to being hashed
+/// by raw pointer identity while EQUAL compared it by components — two EQUAL
+/// pathnames hashed differently and every EQUAL table keyed by one missed.
+/// `cl_equal` had no pathname case either, so even a correct hash would not have
+/// made the lookup hit.
+///
+/// The pathname check must run BEFORE the string branch in both: in an image a
+/// pathname can reach `extract_string_bytes` as a registry-backed namestring
+/// sentinel, and a string-first order would then report a pathname EQUAL to its
+/// own namestring. SBCL 2.6.8 answers NIL to all three collision probes here.
+#[test]
+fn equal_pathnames_hash_alike_and_do_not_collide_with_namestrings() {
+    // Two separately constructed EQUAL pathnames hash alike.
+    assert_eq!(
+        eval_ok("(= (sxhash (pathname \"/a/b\")) (sxhash (pathname \"/a/b\")))"),
+        "T"
+    );
+    // ... and an EQUALP table agrees.
+    assert_eq!(
+        eval_ok(
+            "(let ((h (make-hash-table :test 'equalp))) (setf (gethash (pathname \"/a/b\") h) 1) (nth-value 1 (gethash (pathname \"/a/b\") h)))"
+        ),
+        "T"
+    );
+    // A namestring must NOT find a pathname key...
+    assert_eq!(
+        eval_ok(
+            "(let ((h (make-hash-table :test 'equal))) (setf (gethash (pathname \"/a/b\") h) 1) (nth-value 1 (gethash \"/a/b\" h)))"
+        ),
+        "NIL"
+    );
+    // ... nor a pathname find a string key.
+    assert_eq!(
+        eval_ok(
+            "(let ((h (make-hash-table :test 'equal))) (setf (gethash \"/a/b\" h) 1) (nth-value 1 (gethash (pathname \"/a/b\") h)))"
+        ),
+        "NIL"
+    );
+    // Distinct pathnames must still miss.
+    assert_eq!(
+        eval_ok(
+            "(let ((h (make-hash-table :test 'equal))) (setf (gethash (pathname \"/a/b\") h) 1) (nth-value 1 (gethash (pathname \"/a/c\") h)))"
+        ),
+        "NIL"
+    );
+}
+
 #[test]
 fn equal_compares_pathnames_by_components() {
     // CLHS: EQUAL on pathnames is true when their components match. bliss's
