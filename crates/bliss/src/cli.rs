@@ -9149,16 +9149,47 @@ fn prune_closure_registry() -> (usize, usize) {
     (before, after)
 }
 
+/// Registry size below which pruning never fires.
+///
+/// A prune is not cheap: it forces a FULL major GC and then walks the whole
+/// heap. The trigger is meant to be amortized — "fire when the registry has
+/// doubled" — but doubling only governs once `last * 2` clears this floor, so
+/// the floor alone decides how often pruning happens in the early, small-live-set
+/// phase. A floor of 8192 made an `asdf:load-system :babel` fire eight full GCs
+/// (live set climbing 1453 -> 7579), ~16% of the load; the registry is a
+/// `HashMap` of id -> closure, so carrying more entries is far cheaper per entry
+/// than the collection that reclaims them (bliss-p1t).
+/// `BLISS_CLOSURE_PRUNE_FLOOR` overrides it.
+fn closure_prune_floor() -> usize {
+    use std::sync::OnceLock;
+    static F: OnceLock<usize> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("BLISS_CLOSURE_PRUNE_FLOOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(65536)
+    })
+}
+
+/// Diagnostic: bisect prune-related "Cannot apply: Cons" reports. Read once —
+/// this is consulted at every load boundary, and `var_os` rescans `environ`.
+fn closure_prune_disabled() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("BLISS_NO_CLOSURE_PRUNE").is_some())
+}
+
 /// Amortized prune trigger: fire when the registry has doubled since the last
 /// prune (and is big enough to matter). Called at file-load boundaries — a
 /// natural safe point between top-level forms.
 fn maybe_prune_closure_registry() {
-    if std::env::var_os("BLISS_NO_CLOSURE_PRUNE").is_some() {
-        return; // diagnostic: bisect prune-related "Cannot apply: Cons" reports
+    if closure_prune_disabled() {
+        return;
     }
+    let floor = closure_prune_floor();
     let len = CLOSURE_REGISTRY.with(|r| r.borrow().len());
     let last = LAST_CLOSURE_PRUNE_LEN.with(|c| c.get());
-    if len >= 8192 && len >= last.saturating_mul(2).max(8192) {
+    if len >= floor && len >= last.saturating_mul(2).max(floor) {
         prune_closure_registry();
     }
 }
