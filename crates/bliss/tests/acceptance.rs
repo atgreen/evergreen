@@ -1287,6 +1287,46 @@ fn class_allocated_slots_and_default_initargs() {
     );
 }
 
+/// Regression for bliss-htff follow-up: an instance-allocated slot in a subclass
+/// SHADOWS a superclass's `:allocation :class` slot, so each instance gets its
+/// own storage rather than the superclass's shared cell.
+///
+/// `class_slot_owner` used to collapse "slot not found in the super graph" and
+/// "slot found, instance-allocated" into the same `None`, which then triggered a
+/// whole-image fallback scan that happily matched the SUPERCLASS's
+/// class-allocated declaration. Writing through one instance was therefore
+/// visible through every other one. The same conflation made every ordinary slot
+/// access scan every class and slot in the image (measured 8.9x slower slot
+/// reads after defining 300 unrelated classes), so the fix is both a
+/// correctness and a performance one. SBCL 2.6.8 is the reference: it answers
+/// INST here.
+#[test]
+fn instance_slot_shadows_a_superclass_class_slot() {
+    let expr = r#"(progn
+  (defclass shadow-base () ((v :initform 'cls :accessor v :allocation :class)))
+  ;; Redeclared WITHOUT :allocation, i.e. instance-allocated: it shadows.
+  (defclass shadow-sub (shadow-base) ((v :initform 'inst :accessor v)))
+  (let ((s1 (make-instance 'shadow-sub))
+        (s2 (make-instance 'shadow-sub)))
+    (setf (v s1) 'mine)
+    ;; s2 must be untouched by the write through s1.
+    (format nil "~A|~A" (v s2) (v s1))))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("INST|MINE"),
+        "an instance slot must shadow a superclass class slot, so a write \
+         through one instance is not visible through another; got: '{}', \
+         stderr: '{}'",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// Regression for bliss-2ke: CLOS instances must not be representable as
 /// fixnums. Instance ids were once `from_fixnum(id)` (starting at 100000), so a
 /// plain integer equal to a live instance id collided with it in the registry

@@ -4959,12 +4959,22 @@ fn class_slot_cell(
 /// inheritance (bliss-lb6.14: ASDF's LOAD-OP inherits DOWNWARD-OPERATION's class
 /// slot through three superclasses).
 fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<String> {
+    /// `None` = the slot was not found anywhere in the super graph, so the
+    /// caller must fall back. `Some(answer)` = found, and `answer` is
+    /// definitive: `Some(owner)` when class-allocated, `None` when it is an
+    /// ordinary instance slot.
+    ///
+    /// Distinguishing "not found" from "found, instance-allocated" is what
+    /// keeps the whole-image fallback off the hot path. Collapsing both to
+    /// `None` made EVERY ordinary slot access scan every class and every slot
+    /// in the image — measured at 8.9x slower slot reads after defining 300
+    /// unrelated classes, with a `String` allocated per slot compared.
     fn walk(
         env: &Env,
         class_name: &str,
         slot_name: &str,
         seen: &mut HashSet<String>,
-    ) -> Option<String> {
+    ) -> Option<Option<String>> {
         if !seen.insert(class_name.to_string()) {
             return None;
         }
@@ -4974,27 +4984,37 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
         if let Some(slot) = cd
             .slots
             .iter()
-            .find(|s| symbol_bare_name(&s.name) == slot_name)
+            .find(|s| symbol_bare_name_is(&s.name, slot_name))
         {
-            return (slot.allocation == SlotAllocation::Class).then(|| class_name.to_string());
+            // The most specific definition wins, so this answer is final even
+            // when the slot is instance-allocated.
+            return Some(
+                (slot.allocation == SlotAllocation::Class).then(|| class_name.to_string()),
+            );
         }
         for sup in &cd.supers {
-            if let Some(owner) = walk(env, sup, slot_name, seen) {
-                return Some(owner);
+            if let Some(found) = walk(env, sup, slot_name, seen) {
+                return Some(found);
             }
         }
         None
     }
     let mut seen = HashSet::new();
-    walk(env, class_name, slot_name, &mut seen).or_else(|| {
-        env.classes.borrow().iter().find_map(|(name, cd)| {
-            cd.slots
-                .iter()
-                .any(|s| {
-                    symbol_bare_name(&s.name) == slot_name && s.allocation == SlotAllocation::Class
-                })
-                .then(|| name.clone())
-        })
+    if let Some(answer) = walk(env, class_name, slot_name, &mut seen) {
+        return answer;
+    }
+    // Not reachable through the CLI super graph at all. Fall back to any class
+    // declaring it class-allocated, which papers over CLI/stdlib class-graph
+    // divergence for deep multiple inheritance (bliss-lb6.14: ASDF's LOAD-OP
+    // inherits DOWNWARD-OPERATION's class slot through three superclasses).
+    env.classes.borrow().iter().find_map(|(name, cd)| {
+        cd.slots
+            .iter()
+            .any(|s| {
+                symbol_bare_name_is(&s.name, slot_name)
+                    && s.allocation == SlotAllocation::Class
+            })
+            .then(|| name.clone())
     })
 }
 
@@ -10530,6 +10550,35 @@ fn prompt_package_name(name: &str) -> &str {
 /// `trim_start_matches` stripped both prefixes, and stripping only the first
 /// leaves `"KEYWORD:FOO"`, whose single `':'` split removes the rest.
 fn symbol_bare_name(name: &str) -> String {
+    let (base, needs_upcasing) = symbol_bare_slice(name);
+    if needs_upcasing {
+        base.to_uppercase()
+    } else {
+        base.to_string()
+    }
+}
+
+/// `symbol_bare_name(name) == bare`, without materializing the bare name.
+///
+/// Comparing through `symbol_bare_name` costs a malloc and a memcpy per
+/// comparison, which is ruinous inside a slot scan that runs per slot per class
+/// (bliss-htff profiling put `class_slot_owner` at the top of its callers).
+/// Shares `symbol_bare_slice` with `symbol_bare_name` so the two can never
+/// disagree about `KEYWORD:` prefixes, `::` vs `:`, or upcasing.
+fn symbol_bare_name_is(name: &str, bare: &str) -> bool {
+    let (base, needs_upcasing) = symbol_bare_slice(name);
+    if needs_upcasing {
+        base.to_uppercase() == bare
+    } else {
+        base == bare
+    }
+}
+
+/// The bare-name slice of a symbol's registry spelling, plus whether it still
+/// needs Unicode upcasing. Pure-ASCII with no lowercase is already its own
+/// uppercasing — the overwhelmingly common case — so callers skip the
+/// conversion entirely.
+fn symbol_bare_slice(name: &str) -> (&str, bool) {
     let without_keyword = name.strip_prefix("KEYWORD:").unwrap_or(name);
     let bytes = without_keyword.as_bytes();
     // One pass: remember the first ':' and stop at the first "::".
@@ -10550,12 +10599,8 @@ fn symbol_bare_name(name: &str) -> String {
         (None, Some(i)) => &without_keyword[i + 1..],
         (None, None) => without_keyword,
     };
-    // Pure-ASCII with no lowercase is already its own uppercasing, so skip the
-    // Unicode conversion (the overwhelmingly common case for symbol names).
-    if base.bytes().all(|b| b.is_ascii() && !b.is_ascii_lowercase()) {
-        return base.to_string();
-    }
-    base.to_uppercase()
+    let needs_upcasing = !base.bytes().all(|b| b.is_ascii() && !b.is_ascii_lowercase());
+    (base, needs_upcasing)
 }
 
 /// A CLHS string designator's designated string: a symbol designates its
