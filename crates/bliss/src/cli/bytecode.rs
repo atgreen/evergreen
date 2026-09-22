@@ -15492,6 +15492,24 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             .collect()
     });
     let receiver_profiles = snapshot_receiver_profiles_for_t2();
+    // Only functions that have actually RUN are inlining candidates.
+    //
+    // This `filter_map` used to return `Some` unconditionally, i.e. "clone the
+    // entire registry", once per compilation request — and a `BytecodeFunction`
+    // clone is deep: ten `Vec`s including `nested_functions:
+    // Vec<Box<BytecodeFunction>>`, which clones recursively, plus `Vec<String>`
+    // fields. Measured at ~6.5% of a babel load by ablation (bliss-nzbi).
+    //
+    // A never-invoked function cannot be the target of a hot call site: if the
+    // function being compiled reaches it, it ran, so its count is non-zero.
+    // Skipping the cold ones therefore costs no inlining the compiler would
+    // have performed, and also skips `call_site_profile_snapshot`, which scans
+    // the whole CALL_SITE_PROFILE map per body.
+    //
+    // Guarded on profiling being enabled: with BLISS_PROFILING_DISABLED every
+    // count is zero, and filtering on it would drop every candidate and disable
+    // inlining altogether rather than just shrinking the snapshot.
+    let trust_invocation_counts = !profiling_disabled();
     let inline_bodies = REGISTRY.with(|registry| {
         registry
             .borrow()
@@ -15499,6 +15517,9 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             .filter_map(|(&symbol, body)| {
                 let ptr = Rc::as_ptr(body) as usize;
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
+                if trust_invocation_counts && invocations == 0 {
+                    return None;
+                }
                 Some(T2BodySnapshot {
                     symbol,
                     body: std::sync::Arc::new((**body).clone()),
