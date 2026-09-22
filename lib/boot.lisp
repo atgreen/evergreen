@@ -72,7 +72,11 @@
   ;; No separate constant cell: model as a global binding, but record the name
   ;; so CONSTANTP recognises it (alexandria's DEFINE-CONSTANT, used by babel,
   ;; asks CONSTANTP whether a re-defined constant is already constant).
-  `(progn (setq ,name ,value) (%mark-constant ',name)
+  ;; NOT `(setq ,name ,value)`: re-evaluating a DEFCONSTANT form is normal
+  ;; (COMPILE-FILE evaluates it, then the fasl load evaluates it again), and by
+  ;; then the name is marked, so a SETQ is an illegal assignment to a constant.
+  ;; %defconstant assigns and marks as one operation (bliss-sci0).
+  `(progn (%defconstant ',name ,value)
           ,@(when doc
               `((bliss-internal::%set-documentation ',name 'variable ,(car doc))))
           ',name))

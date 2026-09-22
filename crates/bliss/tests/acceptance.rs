@@ -13040,6 +13040,22 @@ fn a_signalled_error_stops_execution_in_native_code() {
           (setq *wukf-tr* nil)\
           (ignore-errors (wukf-h 'a 5))\
           (reverse *wukf-tr*))", "(:B1)"),
+        // The T2 shape: a branch that is NEVER taken while the function warms
+        // up, whose body calls ERROR. T1 deopts at such a call; T2 compiles the
+        // call and gives it a Trap terminator, so the block has no fall-through
+        // and its successor gets no edge. Getting that bookkeeping wrong panicked
+        // the SSA builder ("trying to get a VReg before observing its class") --
+        // and getting the SEMANTICS wrong let the code after the ERROR run. 600k
+        // iterations clears the OSR/T2 promotion window, which 200k does not.
+        ("(progn (defvar *wukf-t2* nil)\
+          (defun wukf-t2 (x)\
+            (when (eq x :bad) (error \"boom\"))\
+            (push :after *wukf-t2*) :done)\
+          (dotimes (i 600000) (wukf-t2 :good))\
+          (setq *wukf-t2* nil)\
+          (multiple-value-bind (v e) (ignore-errors (wukf-t2 :bad))\
+            (declare (ignore v))\
+            (list (format nil \"~a\" e) (and *wukf-t2* t))))", "(\"boom\" NIL)"),
     ];
     run_expression_cases(&cases);
 }
@@ -13347,9 +13363,10 @@ fn stringp_keeps_its_answer_across_tier_promotion() {
 }
 
 /// bliss-sci0: assigning to a constant variable PANICKED rather than
-/// signalling. NIL and T are special immediates, not TAG_SYMBOL values, so
-/// `is_symbol()` is false for them and SETQ fell through to `sym_name`, which
-/// asserts on the tag.
+/// signalling. NIL and T are special immediates rather than TAG_SYMBOL values;
+/// `is_symbol()` accepts them anyway ("tag 101 or special NIL/T"), but the
+/// accessors that take the symbol index -- `sym_name`, `as_symbol_index` --
+/// assert the strict tag, so an assignment to NIL reached one and panicked.
 ///
 /// A panic is the worst failure mode available: no handler can run, and across
 /// the `extern "C"` c2i boundary it aborts. It did not even need the form to
@@ -13391,6 +13408,62 @@ fn assigning_to_a_constant_variable_signals_rather_than_panicking() {
         ("(let ((h (make-hash-table))) (setf (gethash :k h) 5) (gethash :k h))", "5"),
         // A symbol macro expands BEFORE the guard, so SETQ through one works.
         ("(let ((l (list 1 2))) (symbol-macrolet ((m (car l))) (setq m 42)) (car l))", "42"),
+        // bliss-aoj7: every row above reaches the guard through `(eval '...)`,
+        // i.e. the TREE-WALKER only. sci0 guarded that evaluator and not the
+        // bytecode lowerer, so these same forms, compiled, still panicked in
+        // `store_to_symbol_place`. Written WITHOUT `eval`, they lower for real.
+        ("(handler-case (setq nil 5) (program-error () :pe))", ":PE"),
+        ("(handler-case (setf nil 5) (program-error () :pe))", ":PE"),
+        ("(handler-case (setq t 5) (program-error () :pe))", ":PE"),
+        ("(handler-case (setq :kw 5) (program-error () :pe))", ":PE"),
+        // A DEFCONSTANT name the compiler already knows about. (The constant
+        // must predate THIS form's compilation: the check is made when the
+        // store is lowered, so a name that only becomes constant later is not
+        // caught in code already compiled -- see bliss-p1a5.)
+        ("(handler-case (setq pi 3) (program-error () :pe))", ":PE"),
+        ("(handler-case (setq most-positive-fixnum 3) (program-error () :pe))", ":PE"),
+        // The motivating form, compiled rather than merely lowered: CCASE's
+        // STORE-VALUE restart is a `(setf <keyplace> ...)` on NIL.
+        ("(handler-case (ccase nil (1 :one)) (type-error () :te))", ":TE"),
+    ];
+    run_expression_cases(&cases);
+}
+
+/// bliss-im5c: DEFCONSTANT expanded to `(progn (setq name value)
+/// (%mark-constant 'name))` -- a bare SETQ. Re-evaluating a DEFCONSTANT form is
+/// normal and legal (COMPILE-FILE evaluates it per CLHS 3.2.2.3, then the fasl
+/// evaluates it again at load), but by the second evaluation the name is marked,
+/// so the SETQ became an assignment to an established constant. As soon as
+/// bliss-sci0 stopped silently permitting that, the expansion refused itself:
+/// `(asdf:load-system :babel)` died on alexandria's DEFINE-CONSTANT.
+///
+/// DEFCONSTANT is precisely the operator permitted to write a constant, so both
+/// expansion sites (the lib/boot.lisp macro and the fasl lowering, which had
+/// duplicated the shape) now emit one `%defconstant` that assigns and marks.
+#[test]
+fn re_evaluating_a_defconstant_form_is_not_an_illegal_assignment() {
+    let cases = [
+        // The direct shape: defining the same constant twice must not signal.
+        ("(progn (defconstant +im5c-a+ 5) (defconstant +im5c-a+ 5) +im5c-a+)", "5"),
+        // alexandria DEFINE-CONSTANT's shape -- a non-EQL value each time,
+        // funnelled through the old value when an EQUALP test accepts it. This
+        // is what babel's +EBCDIC-ENCODE-TABLE+ does.
+        ("(progn (defconstant +im5c-b+ (vector 1 2))\
+           (defconstant +im5c-b+ (if (equalp +im5c-b+ (vector 1 2)) +im5c-b+ (vector 1 2)))\
+           (coerce +im5c-b+ 'list))", "(1 2)"),
+        // The constant is still a constant, and still holds its value.
+        ("(progn (defconstant +im5c-c+ 3) (defconstant +im5c-c+ 3)\
+           (list (constantp '+im5c-c+) +im5c-c+))", "(T 3)"),
+        // ...so assigning to a constant is still refused (the sci0 guard is
+        // intact). Uses a constant that predates this form's compilation; see
+        // bliss-p1a5 for why a same-form DEFCONSTANT is not caught when
+        // compiled.
+        ("(handler-case (setq pi 3) (program-error () :pe))", ":PE"),
+        // DEFVAR and DEFPARAMETER keep their own semantics.
+        ("(progn (defvar *im5c-v* 1) (defvar *im5c-v* 99) *im5c-v*)", "1"),
+        ("(progn (defparameter *im5c-p* 1) (defparameter *im5c-p* 99) *im5c-p*)", "99"),
+        // DEFCONSTANT still returns its name and takes a doc string.
+        ("(defconstant +im5c-e+ 8 \"doc\")", "+IM5C-E+"),
     ];
     run_expression_cases(&cases);
 }

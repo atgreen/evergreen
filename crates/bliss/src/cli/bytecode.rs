@@ -2550,6 +2550,18 @@ impl<'e> Lowerer<'e> {
     /// otherwise the stack is left one shorter. Bails on a symbol-macro place
     /// (that is really a SETF of the expansion).
     fn store_to_symbol_place(&mut self, var: BlissVal, last: bool) -> LowerResult<()> {
+        // A place that is not an assignable variable name (NIL, T, a keyword,
+        // a DEFCONSTANT name, a non-symbol) is a PROGRAM-ERROR, not something to
+        // compile. Bail so the interpreter signals it -- and, critically, before
+        // `as_symbol_index` below, which asserts a strict TAG_SYMBOL: NIL and T
+        // answer true to `is_symbol()` (value.rs: "tag 101 OR special NIL/T") but
+        // are special immediates, so lowering `(setq nil 5)` PANICKED here --
+        // reached from compiled code across the c2i boundary, that aborts the
+        // process. bliss-sci0 guarded the interpreter's SETQ/SETF but never this
+        // path, so `(ccase nil ...)` still died in the compiled tier.
+        if super::reject_assignment_to_constant(var).is_err() {
+            return Err(Bail);
+        }
         if self
             .env
             .symbol_macros
@@ -8013,15 +8025,24 @@ fn portable_load_thunk_form(form: BlissVal) -> Option<BlissVal> {
             } else {
                 NIL
             };
+            if kind == "DEFCONSTANT" {
+                // Mirror the DEFCONSTANT macro in lib/boot.lisp: assign and mark
+                // as ONE operation, never a bare SETQ. The fasl re-evaluates this
+                // form at load time, after COMPILE-FILE already evaluated (and so
+                // marked) it, so a SETQ here is an assignment to an established
+                // constant and is refused (bliss-sci0).
+                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
+                return Some(form_list(&[
+                    resolve_sym("BLISS-INTERNAL::%DEFCONSTANT")?,
+                    quoted,
+                    init,
+                ]));
+            }
             let setq = form_list(&[resolve_sym("SETQ")?, var, init]);
             if kind == "DEFVAR" {
                 let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
                 let boundp = form_list(&[resolve_sym("BOUNDP")?, quoted]);
                 Some(form_list(&[resolve_sym("UNLESS")?, boundp, setq]))
-            } else if kind == "DEFCONSTANT" {
-                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
-                let mark = form_list(&[resolve_sym("BLISS-INTERNAL::%MARK-CONSTANT")?, quoted]);
-                Some(form_list(&[resolve_sym("PROGN")?, setq, mark]))
             } else {
                 Some(setq)
             }

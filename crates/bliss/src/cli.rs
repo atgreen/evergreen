@@ -1525,13 +1525,19 @@ fn is_keyword_arg(val: BlissVal) -> bool {
 /// DEFCONSTANT name, and so is naming something that is not a variable at all.
 ///
 /// Before this, NIL and T did not merely answer wrongly -- they PANICKED. They
-/// are special immediates, not TAG_SYMBOL values, so `is_symbol()` is false for
-/// them and SETQ fell to `sym_name`, which asserts on the tag. A panic is the
-/// worst failure mode available: no handler can run, and reached from compiled
-/// code across the `extern "C"` c2i boundary it aborts the process. It did not
-/// even need the form to RUN -- CCASE's STORE-VALUE restart expands to a
+/// are special immediates rather than TAG_SYMBOL values, and while `is_symbol()`
+/// accepts them (value.rs: "tag 101 or special NIL/T"), the accessors that take
+/// the symbol index -- `sym_name`, `as_symbol_index` -- assert the strict tag.
+/// So this check must test NIL and T *before* it tests `is_symbol()`. A panic is
+/// the worst failure mode available: no handler can run, and reached from
+/// compiled code across the `extern "C"` c2i boundary it aborts the process. It
+/// did not even need the form to RUN -- CCASE's STORE-VALUE restart expands to a
 /// `(setf <keyplace> …)`, so merely LOWERING `(ccase nil …)` killed the
 /// process (bliss-sci0).
+///
+/// Callers must cover *both* evaluators. The bytecode lowerer bails to the
+/// interpreter via this same predicate (`store_to_symbol_place`); guarding only
+/// the tree-walker left `(ccase nil …)` still aborting in the compiled tier.
 ///
 /// The keyword, DEFCONSTANT and non-symbol cases did not panic; they silently
 /// SUCCEEDED, which is its own wrong answer -- `(setq :kw 5)` and `(setf 5 6)`
@@ -1553,8 +1559,18 @@ fn reject_assignment_to_constant(target: BlissVal) -> Result<(), BlissError> {
     } else {
         return Ok(());
     };
+    // Name the offending symbol in the DEFCONSTANT case -- the only one where
+    // the category alone does not identify it. Without the name the message is
+    // undebuggable in a multi-thousand-form load (it cost a bisect of babel's
+    // ASDF build to find `+EBCDIC-ENCODE-TABLE+`). NIL/T/keyword name
+    // themselves; a non-symbol has no name to print.
+    let who = if what.starts_with("a constant") {
+        format!(" `{}`", symbol_bare_name(&sym_name_rc(target)))
+    } else {
+        String::new()
+    };
     Err(BlissError::ProgramError(format!(
-        "cannot assign to {what}: not an assignable variable name"
+        "cannot assign to {what}{who}: not an assignable variable name"
     )))
 }
 
@@ -16468,6 +16484,40 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(
                     bliss_rt::current_thread_id().0 as i64,
                 ));
+            }
+            "BLISS-INTERNAL::%DEFCONSTANT"
+            | "BLISS-INTERNAL:%DEFCONSTANT"
+            | "%DEFCONSTANT" => {
+                // (%defconstant 'name value) — establish NAME's value and record
+                // NAME as a DEFCONSTANT, as one operation.
+                //
+                // DEFCONSTANT must NOT expand to a bare SETQ. Re-evaluating the
+                // defining form is normal and legal: COMPILE-FILE evaluates it at
+                // compile time (CLHS 3.2.2.3) and the resulting fasl evaluates it
+                // again at load time. By that second evaluation the name is
+                // already marked, so a SETQ is an assignment to a constant and
+                // `reject_assignment_to_constant` rightly refuses it. DEFCONSTANT
+                // is exactly the operator permitted to write a constant, so it
+                // assigns here rather than routing through SETQ.
+                //
+                // (bliss-sci0 fallout: the old `(progn (setq n v) (%mark-constant
+                // 'n))` expansion broke alexandria's DEFINE-CONSTANT, and with it
+                // `(asdf:load-system :babel)`, as soon as assigning to a constant
+                // stopped being silently permitted.)
+                let (name_form, rest) = cp(cdr);
+                let name = eval_form(name_form, env)?;
+                let (val_form, _) = cp(rest);
+                // Root the value across the interning/homing below, which can
+                // allocate; `name` is a symbol handle (an immediate) and needs
+                // no root.
+                bliss_rt::rooted!(val = eval_form(val_form, env)?);
+                if name.is_symbol() {
+                    env.set_var_symbol(name, *val);
+                    let n = sym_name(name);
+                    CONSTANT_VARS.with(|c| c.borrow_mut().insert(n));
+                    home_defined_symbol(env, name);
+                }
+                return Ok(*val);
             }
             "BLISS-INTERNAL::%MARK-CONSTANT"
             | "BLISS-INTERNAL:%MARK-CONSTANT"
@@ -33880,7 +33930,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "STRINGP" | "CHAR-NAME" | "NAME-CHAR" | "PARSE-INTEGER" | "MAKE-STRING"
             | "STRING-TO-LIST"
             // Symbols / packages
-            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "%MARK-CONSTANT"
+            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "%MARK-CONSTANT" | "%DEFCONSTANT"
             | "%DEFINE-CONDITION-PORTABLE" | "SYMBOL-NAME"
             | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
             | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "COPY-SYMBOL"
