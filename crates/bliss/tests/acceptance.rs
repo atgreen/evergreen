@@ -5642,6 +5642,93 @@ fn declaim_proclaim_special_binds_dynamically() {
     }
 }
 
+/// Regression (bliss-gdom): CLHS 5.1.1.1 evaluates a place's subforms left to
+/// right and the new-value form LAST. CLHS 5.1.2.9 separately says the new value
+/// is the FIRST ARGUMENT to a `(setf f)` writer. Those are different orders, and
+/// `lower_setf`'s user-writer branch conflated them -- it lowered the value first
+/// because it is passed first, so the value ran before the place's subforms:
+///
+///     (setf (gf (progn (setf j (incf i)) 1) (progn (setf k (incf i)) x))
+///           (progn (incf i) 'a))
+///     bliss => j=2 k=3     sbcl => j=1 k=2
+///
+/// Each subform now goes into a temporary slot first, then the value, then the
+/// temps are reloaded -- which puts the value beneath the arguments on the stack
+/// without evaluating it early.
+///
+/// Compiled path only. The tree-walker has the same bug by a different route and
+/// is bliss-9n9q; these cases are therefore driven as real top-level forms rather
+/// than through `run_expression_cases`, whose second half would evaluate them in
+/// the interpreter and still fail.
+#[test]
+fn setf_evaluates_a_function_places_subforms_before_the_new_value() {
+    let cases: [(&[&str], &str, &str); 5] = [
+        // A (defun (setf f) …) writer -- the branch that was wrong.
+        (
+            &["(defun gdf (i x) (nth i x))",
+              "(defun (setf gdf) (v i x) (setf (nth i x) v) v)"],
+            "(let ((x (list 1 2 3)) (i 0) (j nil) (k nil))\
+               (setf (gdf (progn (setf j (incf i)) 1) (progn (setf k (incf i)) x))\
+                     (progn (incf i) 'a))\
+               (list x i j k))",
+            "((1 A 3) 3 1 2)",
+        ),
+        // The writer's own return is still what SETF yields (bliss-9298 /
+        // bliss-n0dc) -- reordering the evaluation must not disturb that.
+        (
+            &["(defun gdr (x) (car x))",
+              "(defun (setf gdr) (v x) (setf (car x) v) :writer-ret)"],
+            "(setf (gdr (list 1)) 9)",
+            ":WRITER-RET",
+        ),
+        // Guards: places that were already correct must stay correct. A builtin
+        // place, a long-form DEFSETF place, and a DEFSTRUCT accessor (whose store
+        // goes through the class-slot branch, not a writer) all take different
+        // paths through the same SETF.
+        (
+            &[],
+            "(let ((x (list 1 2 3)) (i 0) (j nil) (k nil))\
+               (setf (nth (progn (setf j (incf i)) 1) (progn (setf k (incf i)) x))\
+                     (progn (incf i) 'a))\
+               (list x i j k))",
+            "((1 A 3) 3 1 2)",
+        ),
+        (
+            &["(defun gdd (i x) (nth i x))",
+              "(defsetf gdd (i x) (v) `(progn (setf (nth ,i ,x) ,v) ,v))"],
+            "(let ((x (list 1 2 3)) (i 0) (j nil) (k nil))\
+               (setf (gdd (progn (setf j (incf i)) 1) (progn (setf k (incf i)) x))\
+                     (progn (incf i) 'a))\
+               (list x i j k))",
+            "((1 A 3) 3 1 2)",
+        ),
+        (
+            &["(defstruct gds (pend nil))"],
+            "(let ((l (list (make-gds) (make-gds))))\
+               (dolist (e l) (setf (gds-pend e) t))\
+               (mapcar #'gds-pend l))",
+            "(T T)",
+        ),
+    ];
+    for (setup, final_expr, expected) in cases {
+        let mut cmd = bliss_bin();
+        for form in setup {
+            cmd.args(["--eval", form]);
+        }
+        cmd.args(["--eval", &format!("(print {final_expr})")]);
+        let out = cmd.output().expect("run bliss");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{final_expr} should exit 0 (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).rev().find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{final_expr} => expected {expected}, got: {got}");
+    }
+}
+
 /// Regression (bliss-eq72): the proclaimed-special registry was keyed by BARE
 /// name, so `(declaim (special x))` / `(defvar pkg::x 1)` made EVERY package's
 /// X special. An unrelated `(let ((x 42)) ...)` then bound DYNAMICALLY.

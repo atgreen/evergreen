@@ -2726,14 +2726,35 @@ impl<'e> Lowerer<'e> {
                 }
             } else if let Some((writer, args)) = self.user_setf_writer_place(place) {
                 // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
-                // call the writer as `(writer val a b)` (new value first, then the
-                // place subforms), which returns the stored value.
+                // call the writer as `(writer val a b)` — the new value is the
+                // first ARGUMENT (CLHS 5.1.2.9), which is NOT the same as being
+                // evaluated first. CLHS 5.1.1.1 evaluates the place's subforms
+                // left to right and the new-value form LAST, so lowering the
+                // value first (as this did) ran it before `a` and `b`:
+                //
+                //   (setf (gf (progn (setf j (incf i)) 1)
+                //             (progn (setf k (incf i)) x))
+                //         (progn (incf i) 'a))
+                //   gave j=2 k=3; SBCL gives j=1 k=2
+                //
+                // Evaluate each subform into a temporary slot first, then the
+                // value, then reload the temps — that puts the value beneath the
+                // arguments on the stack without evaluating it early (bliss-gdom).
                 bliss_rt::rooted!(args = args);
                 let sym = resolve_sym(&writer).ok_or(Bail)?.as_symbol_index();
-                self.lower_expr(items[2 * i + 1])?; // new value
-                let mut nargs = 1u16;
+                let mut arg_slots = Vec::with_capacity(args.len());
                 for j in 0..args.len() {
                     self.lower_expr(args[j])?;
+                    let slot = self.alloc_slot(&format!("__setf_arg{j}__"));
+                    self.emit(Instr::StoreLocal(slot));
+                    self.pop_n(1);
+                    arg_slots.push(slot);
+                }
+                self.lower_expr(items[2 * i + 1])?; // new value, LAST
+                let mut nargs = 1u16;
+                for slot in arg_slots {
+                    self.emit(Instr::LoadLocal(slot));
+                    self.push_n(1);
                     nargs += 1;
                 }
                 self.emit(Instr::CallNamed { sym, nargs });
