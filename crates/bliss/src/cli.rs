@@ -24687,6 +24687,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // them: neither names a disassemblable function.
         let listing = if arg.is_symbol() && arg != NIL && arg != T {
             bytecode::disassemble_by_symbol(arg.as_symbol_index())
+        } else if arg != NIL && arg != T {
+            // CLHS takes an extended function designator, so a FUNCTION OBJECT
+            // is as valid as a symbol: `(disassemble #'f)` must work, and used
+            // to report `#'f` as "not a compiled Bliss function" (bliss-3jkz).
+            bytecode::disassemble_by_function(arg)
         } else {
             None
         };

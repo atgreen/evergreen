@@ -5642,6 +5642,37 @@ fn declaim_proclaim_special_binds_dynamically() {
     }
 }
 
+/// Regression (bliss-3jkz): CLHS DISASSEMBLE takes an *extended function
+/// designator*, so a FUNCTION OBJECT is as valid as a symbol. Only the symbol
+/// form was handled, so `(disassemble #'f)` answered "not a compiled Bliss
+/// function (a builtin or interpreted closure)" about a function that plainly
+/// was one -- and that is the spelling you reach for first when inspecting a
+/// value you already hold. Found while using DISASSEMBLE to investigate why
+/// float loops never tier up (bliss-fenm).
+#[test]
+fn disassemble_accepts_a_function_object() {
+    let out = bliss_bin()
+        .args(["--eval", "(defun dis3jkz (n) (let ((a 0)) (dotimes (i n) (setq a (+ a 1))) a))"])
+        .args(["--eval", "(dis3jkz 50000)"])
+        .args(["--eval", "(disassemble 'dis3jkz)"])
+        .args(["--eval", "(disassemble #'dis3jkz)"])
+        // A builtin and NIL have no listing and must still decline, not crash.
+        .args(["--eval", "(disassemble #'car)"])
+        .args(["--eval", "(disassemble nil)"])
+        .output()
+        .expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let s = String::from_utf8_lossy(&out.stdout);
+    // One listing header per successful DISASSEMBLE: the symbol form and the
+    // function-object form must BOTH produce one.
+    let listings = s.matches("; DIS3JKZ").count();
+    assert_eq!(listings, 2, "expected a listing from both spellings, got {listings}:\n{s}");
+    // The two declines are expected; a third would mean the function object was
+    // rejected again.
+    let declines = s.matches("is not a compiled Bliss function").count();
+    assert_eq!(declines, 2, "expected exactly the builtin and NIL to decline, got {declines}:\n{s}");
+}
+
 /// Regression (bliss-gdom): CLHS 5.1.1.1 evaluates a place's subforms left to
 /// right and the new-value form LAST. CLHS 5.1.2.9 separately says the new value
 /// is the FIRST ARGUMENT to a `(setf f)` writer. Those are different orders, and

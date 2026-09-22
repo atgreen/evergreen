@@ -1120,6 +1120,28 @@ pub fn tier_disasm(sym: u32) -> Option<TierDisasm> {
 /// decoded x86-64 machine instructions when it has been promoted to native.
 /// Returns `None` if `sym` names no compiled Bliss function (e.g. a builtin or a
 /// tree-walked closure), so the caller can fall back.
+/// DISASSEMBLE by FUNCTION OBJECT. CLHS takes an *extended function designator*,
+/// so `(disassemble #'f)` is as valid as `(disassemble 'f)` -- but only the
+/// symbol form was handled, and the object form reported "not a compiled Bliss
+/// function (a builtin or interpreted closure)" for a function that plainly was
+/// one. That is the spelling a caller reaches for first when inspecting a value
+/// they already hold.
+///
+/// The listing is keyed by symbol, so recover the symbol by matching the object
+/// against the function cell of each symbol that has bytecode registered. The
+/// registry holds only compiled functions, so this is a short scan, and
+/// DISASSEMBLE is a debug path. Allocation-free: no Bliss object is created, so
+/// there is nothing for a GC to relocate mid-scan.
+pub fn disassemble_by_function(f: BlissVal) -> Option<String> {
+    install_bytecode_root_scanner();
+    // Collect the keys before probing so the registry borrow is not held across
+    // the lookups below.
+    let syms: Vec<u32> = REGISTRY.with(|r| r.borrow().keys().copied().collect());
+    syms.into_iter()
+        .find(|&sym| bliss_rt::symbols::symbol_function(sym) == Some(f))
+        .and_then(disassemble_by_symbol)
+}
+
 pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
     let bf = registry_get(sym)?;
     let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
