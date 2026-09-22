@@ -5642,6 +5642,68 @@ fn declaim_proclaim_special_binds_dynamically() {
     }
 }
 
+/// Regression (bliss-eq72): the proclaimed-special registry was keyed by BARE
+/// name, so `(declaim (special x))` / `(defvar pkg::x 1)` made EVERY package's
+/// X special. An unrelated `(let ((x 42)) ...)` then bound DYNAMICALLY.
+///
+/// That is not a near-miss. A dynamic binding is unwound when the LET exits, so
+/// a closure over what the programmer wrote as a lexical variable loses it:
+/// `(funcall (let ((zvar 7)) (lambda () zvar)))` signalled "unbound variable:
+/// ZVAR". A `defvar` in a library package could silently break closures in
+/// unrelated user code.
+///
+/// The earmuff test stays bare-name -- it is about SPELLING, and `*x*` reads as
+/// special in every package -- so only the proclaimed set is keyed by identity.
+/// The paired case below pins that: proclaiming still makes the name dynamic in
+/// its OWN package (bliss-7na), which is the whole reason the registry exists.
+#[test]
+fn proclaiming_special_does_not_leak_across_packages() {
+    let cases: [(&[&str], &str, &str); 4] = [
+        // A defvar in another package must NOT make CL-USER's same-named symbol
+        // special: the LET below is lexical, so the symbol stays unbound.
+        (
+            &["(defpackage :eq72p (:use :cl))", "(defvar eq72p::zvar 1)"],
+            "(let ((zvar 42)) (declare (ignorable zvar)) (boundp 'zvar))",
+            "NIL",
+        ),
+        // The damage that made this worth fixing: a closure over the lexical.
+        (
+            &["(defpackage :eq72q (:use :cl))", "(defvar eq72q::wvar 1)"],
+            "(funcall (let ((wvar 7)) (lambda () wvar)))",
+            "7",
+        ),
+        // Proclaiming is still dynamic in its own package (bliss-7na).
+        (
+            &["(declaim (special eq72c))", "(defun eq72rd () eq72c)", "(defparameter eq72c 1)"],
+            "(let ((eq72c 5)) (eq72rd))",
+            "5",
+        ),
+        // ...and the earmuff convention is untouched.
+        (
+            &["(defvar *eq72e* 1)", "(defun eq72re () *eq72e*)"],
+            "(let ((*eq72e* 9)) (eq72re))",
+            "9",
+        ),
+    ];
+    for (setup, final_expr, expected) in cases {
+        let mut cmd = bliss_bin();
+        for form in setup {
+            cmd.args(["--eval", form]);
+        }
+        cmd.args(["--eval", &format!("(print {final_expr})")]);
+        let out = cmd.output().expect("run bliss");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{final_expr} should exit 0 (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).rev().find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{final_expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-zg9): bit-vectors (`#*…`) support the predicates
 /// BIT-VECTOR-P / SIMPLE-BIT-VECTOR-P, the sequence protocol (LENGTH/ELT/AREF/BIT
 /// and COERCE via collect_elements), TYPE-OF `(SIMPLE-BIT-VECTOR n)`, and print in

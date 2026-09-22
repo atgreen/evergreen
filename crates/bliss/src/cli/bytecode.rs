@@ -6318,8 +6318,9 @@ fn is_special_name(name: &str) -> bool {
     }
     // A name proclaimed special (declaim/proclaim) is dynamic even without
     // earmuffs — consult the shared registry so the compiler agrees with the
-    // tree-walker (bliss-7na).
-    super::is_proclaimed_special(bare)
+    // tree-walker (bliss-7na). Looked up by the FULL name, not `bare`:
+    // proclaiming is per-symbol, not per-spelling (bliss-eq72).
+    super::is_proclaimed_special(name)
 }
 
 fn binding_name_init(b: BlissVal) -> LowerResult<(String, BlissVal)> {

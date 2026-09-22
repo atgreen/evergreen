@@ -28611,13 +28611,26 @@ fn sort_sequence(
 // child and never reach the caller. Keeping one env also lets multiple values
 // and dynamic state flow out of the body naturally.
 thread_local! {
-    // Bare names proclaimed globally SPECIAL via `(declaim (special x))` /
+    // Symbol names proclaimed globally SPECIAL via `(declaim (special x))` /
     // `(proclaim '(special x))`. Consulted by `is_special_var` (tree-walker) and
     // `bytecode::is_special_name` (compiler) in addition to the earmuff
     // convention, so a non-earmuffed proclaimed-special variable `let`-binds
-    // DYNAMICALLY on BOTH backends (bliss-7na). Keyed by bare name to match the
-    // existing earmuff checks (which are also bare-name based). Populated by the
+    // DYNAMICALLY on BOTH backends (bliss-7na). Populated by the
     // `%PROCLAIM-SPECIAL` builtin.
+    //
+    // Keyed by the FULL (package-qualified) name. It was keyed by the BARE name
+    // to match the earmuff checks, which made proclaiming leak across packages:
+    // `(defvar zzp::zvar 1)` made every package's ZVAR special, so an unrelated
+    // `(let ((zvar 42)) ...)` bound DYNAMICALLY. That is not a near-miss -- it
+    // silently breaks closures, because the binding is unwound on exit:
+    // `(defun mk () (let ((zvar 7)) (lambda () zvar)))` then signalled "unbound
+    // variable: ZVAR" when the closure was called (bliss-eq72).
+    //
+    // The earmuff test stays bare-name -- it is about SPELLING, and `*x*` is
+    // spelled that way in every package. Only the proclaimed set is an identity
+    // question, so only it is keyed by identity. Both lookup sites derive the
+    // key with `sym_name`/`sym_name_rc` from the same interned symbol the
+    // proclamation used, so the two spellings cannot drift.
     static PROCLAIMED_SPECIAL: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
 }
@@ -28625,14 +28638,16 @@ thread_local! {
 /// Register `sym` as globally special (idempotent). No-op for non-symbols.
 fn proclaim_special(sym: BlissVal) {
     if sym.is_symbol() {
-        let bare = symbol_bare_name(&sym_name_rc(sym));
-        PROCLAIMED_SPECIAL.with(|s| s.borrow_mut().insert(bare));
+        let full = sym_name_rc(sym).to_string();
+        PROCLAIMED_SPECIAL.with(|s| s.borrow_mut().insert(full));
     }
 }
 
-/// True if `name` (a bare symbol name) has been proclaimed special. Shared by the
-/// tree-walker and the bytecode compiler so both agree which LET bindings are
-/// dynamic (bliss-7na).
+/// True if `name` (a symbol's FULL name, as `sym_name` spells it -- not the bare
+/// name) has been proclaimed special. Shared by the tree-walker and the bytecode
+/// compiler so both agree which LET bindings are dynamic (bliss-7na), and keyed
+/// by identity so a proclamation in one package does not make every package's
+/// same-bare-name symbol special (bliss-eq72).
 pub(super) fn is_proclaimed_special(name: &str) -> bool {
     PROCLAIMED_SPECIAL.with(|s| s.borrow().contains(name))
 }
@@ -28649,14 +28664,16 @@ fn is_special_var(sym: BlissVal) -> bool {
     if !sym.is_symbol() {
         return false;
     }
-    let bare = symbol_bare_name(&sym_name_rc(sym));
+    let full = sym_name_rc(sym);
+    let bare = symbol_bare_name(&full);
     let b = bare.as_bytes();
     if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' {
         return true;
     }
     // A name proclaimed special (declaim/proclaim) is special even without
-    // earmuffs (bliss-7na).
-    is_proclaimed_special(&bare)
+    // earmuffs (bliss-7na). Looked up by FULL name: proclaiming is per-symbol,
+    // not per-spelling (bliss-eq72).
+    is_proclaimed_special(&full)
 }
 
 /// Collect the symbol indices named in leading `(declare (special v …))` forms
