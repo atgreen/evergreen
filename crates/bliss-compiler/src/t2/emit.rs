@@ -3319,6 +3319,17 @@ fn emit_framed_inner(
         let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
         let td = f.inst(t).clone();
         match td.opcode {
+            // A Trap ends a path that must not continue (bliss-wukf): today,
+            // the code after a call that never returns normally.
+            //
+            // The GENERIC deopt suffices even though it re-runs the function,
+            // because this is only reachable when the c2i helper has already
+            // stashed an error -- and run_native takes NATIVE_ERROR BEFORE it
+            // looks at NATIVE_DEOPT, returning the error without re-running. No
+            // committed side effect is repeated, and no FrameState is needed.
+            Opcode::Trap => {
+                a.jmp(deopt);
+            }
             Opcode::Return => {
                 if let Some(&value) = td.args.first() {
                     if let Some(&bits) = const_tagged.get(&value) {

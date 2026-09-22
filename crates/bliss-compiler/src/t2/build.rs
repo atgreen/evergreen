@@ -53,6 +53,20 @@ pub enum BuildError {
 /// The `Instr` variant name, for diagnostics. `Debug` renders the whole
 /// instruction including operands; the discriminant alone is what identifies
 /// the missing builder case.
+/// Calls that never return normally, so the path after them is unreachable
+/// (bliss-wukf). CLHS: ERROR "never returns normally". Deliberately narrow --
+/// SIGNAL returns when unhandled, CERROR returns when the continue restart is
+/// taken, and WARN returns normally, so none of them belong here.
+fn is_never_returning_call(sym: u32) -> bool {
+    matches!(
+        crate::reader::symbol_name(sym)
+            .as_deref()
+            .map(|n| n.rsplit(':').next().unwrap_or(n).to_string())
+            .as_deref(),
+        Some("ERROR")
+    )
+}
+
 fn instr_kind(instr: &Instr) -> String {
     let full = format!("{instr:?}");
     match full.find(['(', ' ', '{']) {
@@ -205,6 +219,10 @@ struct Builder<'a> {
     pred_edges: HashMap<Block, Vec<(Block, usize)>>,
     /// Total structural predecessor-edge count of each block (drives sealing).
     total_preds: Vec<usize>,
+    /// Which blocks are reachable from the entry, by leader position.
+    /// `compute_total_preds` counts edges only out of these; see
+    /// `compute_reachable`.
+    reachable: Vec<bool>,
     /// Predecessor edges already materialised (their terminator is set).
     seen_preds: Vec<usize>,
     /// Whether a block has been interpreted.
@@ -240,6 +258,7 @@ impl<'a> Builder<'a> {
             block_exits: HashMap::new(),
             pred_edges: HashMap::new(),
             total_preds: Vec::new(),
+            reachable: Vec::new(),
             seen_preds: Vec::new(),
             interpreted: Vec::new(),
             terminator_inst: HashMap::new(),
@@ -269,6 +288,7 @@ impl<'a> Builder<'a> {
         self.find_leaders()?;
         self.compute_depths()?;
         self.create_blocks();
+        self.compute_reachable()?;
         self.compute_total_preds()?;
         self.seed_entry();
         // Record the function-entry interpreter state (bcp 0, empty stack):
@@ -369,6 +389,15 @@ impl<'a> Builder<'a> {
                 }
                 Instr::Go { target_bcp, .. } => {
                     set.insert(*target_bcp as usize);
+                }
+                // A call that never returns normally ENDS its block, so what
+                // follows begins a new one (bliss-wukf). That block is usually
+                // unreachable, which is what `compute_reachable` exists to
+                // account for.
+                Instr::CallNamed { sym, .. } if is_never_returning_call(*sym) => {
+                    if i + 1 < code.len() {
+                        set.insert(i + 1);
+                    }
                 }
                 Instr::PushBlock {
                     block_id,
@@ -513,8 +542,60 @@ impl<'a> Builder<'a> {
 
     // ── Pass 4: structural predecessor counts ───────────────────────
 
+    /// Mark the blocks reachable from the entry, following the same structural
+    /// successor relation `compute_total_preds` uses.
+    ///
+    /// Without this, `compute_total_preds` counted edges out of blocks that are
+    /// never entered, while `process_blocks` replaces such a block with a
+    /// `trap()` and emits NO edges. A block reachable only from an unreachable
+    /// one therefore had `total_preds` it could never see, was never sealed, and
+    /// its incomplete phis tripped "index out of bounds: the len is 0 but the
+    /// index is 0" in `add_phi_operands`.
+    ///
+    /// That was latent until a call which never returns normally began
+    /// terminating its block (bliss-wukf): before that every non-leader
+    /// instruction fell through, so unreachable blocks did not arise in
+    /// practice.
+    fn compute_reachable(&mut self) -> Result<(), BuildError> {
+        let n = self.leaders.len();
+        let mut pos_of: std::collections::HashMap<Block, usize> =
+            std::collections::HashMap::with_capacity(n);
+        for (p, l) in self.leaders.iter().enumerate() {
+            pos_of.insert(self.block_of[l], p);
+        }
+        let mut reachable = vec![false; n];
+        if n > 0 {
+            reachable[0] = true; // the entry leader is bytecode index 0
+            let mut work = vec![0usize];
+            while let Some(p) = work.pop() {
+                let (start, end) = self.block_range(p);
+                for s in self.structural_succs(start, end)? {
+                    let sp = *pos_of
+                        .get(&s)
+                        .ok_or(BuildError::Unsupported("successor is not a leader block"))?;
+                    if !reachable[sp] {
+                        reachable[sp] = true;
+                        work.push(sp);
+                    }
+                }
+            }
+        }
+        self.reachable = reachable;
+        Ok(())
+    }
+
+    /// True when the block at leader position `p` is entered at all.
+    fn block_is_reachable(&self, p: usize) -> bool {
+        self.reachable.get(p).copied().unwrap_or(true)
+    }
+
     fn compute_total_preds(&mut self) -> Result<(), BuildError> {
         for p in 0..self.leaders.len() {
+            // An unreachable block emits no edges (process_blocks traps it), so
+            // counting its successors would leave them permanently unsealed.
+            if !self.block_is_reachable(p) {
+                continue;
+            }
             let (start, end) = self.block_range(p);
             for s in self.structural_succs(start, end)? {
                 self.total_preds[s.index()] += 1;
@@ -555,6 +636,15 @@ impl<'a> Builder<'a> {
                 Instr::BrIfTrue(t) => return Ok(vec![blk(*t as usize)?, blk(end)?]),
                 Instr::BrIfFalse(t) => return Ok(vec![blk(end)?, blk(*t as usize)?]),
                 Instr::Return => return Ok(vec![]),
+                // A call that never returns normally has NO successors. Without
+                // this the scan falls through to "no terminator in range" and
+                // counts an edge to the next leader, so that block is sealed
+                // expecting a value from a predecessor Term::Trap never
+                // creates -- regalloc2 then panics with "trying to get a VReg
+                // before observing its class" (bliss-wukf).
+                Instr::CallNamed { sym, .. } if is_never_returning_call(*sym) => {
+                    return Ok(vec![]);
+                }
                 _ => {}
             }
         }
@@ -627,9 +717,14 @@ impl<'a> Builder<'a> {
             let leader = self.leaders[p];
             let block = self.block_of[&leader];
 
-            // Unreachable non-entry block (no predecessors): keep it well-formed
-            // with a Trap and move on.
-            if block != self.f.entry() && self.total_preds[block.index()] == 0 {
+            // Unreachable non-entry block: keep it well-formed with a Trap and
+            // move on. Tested against the reachability marking as well as the
+            // predecessor count -- a block whose only predecessors are
+            // themselves unreachable now has a zero count too, but testing
+            // reachability directly says what is meant.
+            if block != self.f.entry()
+                && (!self.block_is_reachable(p) || self.total_preds[block.index()] == 0)
+            {
                 self.sealed[block.index()] = true;
                 self.set_term(block, trap());
                 self.interpreted[block.index()] = true;
@@ -858,6 +953,20 @@ impl<'a> Builder<'a> {
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
                     let _ = inst;
+                    // A call that NEVER RETURNS NORMALLY ends this path
+                    // (bliss-wukf). Without it T2 carried on executing code
+                    // that must not run: a store after the error landed, and a
+                    // later error superseded the real one.
+                    //
+                    // CLHS says ERROR never returns normally, so everything
+                    // after the call is unreachable under correct semantics.
+                    // The result is deliberately NOT pushed -- nothing can
+                    // observe it, and a value defined here that no block
+                    // publishes gives regalloc a use with no def.
+                    if is_never_returning_call(*sym) {
+                        term = Some(Term::Trap);
+                        break;
+                    }
                     stack.push(results[0]);
                 }
                 Instr::TypeP(class) => {
@@ -970,7 +1079,7 @@ impl<'a> Builder<'a> {
     fn finish_block(&mut self, block: Block, term: Option<Term>, stack: Vec<Value>, end: usize) {
         // The exit operand stack that flows to successors.
         let exit_stack: &[Value] = match &term {
-            Some(Term::Ret(_)) => &[], // no successors
+            Some(Term::Ret(_)) | Some(Term::Trap) => &[], // no successors
             _ => &stack,
         };
         for (k, &v) in exit_stack.iter().enumerate() {
@@ -982,6 +1091,7 @@ impl<'a> Builder<'a> {
             Some(Term::Jump(s)) => (jump(s), vec![s]),
             Some(Term::Brif(cond, t, f)) => (brif(cond, t, f), vec![t, f]),
             Some(Term::Ret(v)) => (ret(v), vec![]),
+            Some(Term::Trap) => (trap(), vec![]),
             None => {
                 // Fall through to the next leader, or return NIL at code end.
                 if end < self.bf.code.len() {
@@ -1599,6 +1709,9 @@ enum Term {
     /// `Brif(cond, taken_when_true, taken_when_false)`.
     Brif(Value, Block, Block),
     Ret(Value),
+    /// Unreachable continuation with no successors: emitted after a call that
+    /// never returns normally (bliss-wukf).
+    Trap,
 }
 
 // ── Free helpers for terminator InstData ────────────────────────────
