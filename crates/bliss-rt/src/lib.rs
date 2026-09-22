@@ -70,7 +70,7 @@ pub use object::ObjectHeader;
 pub use runtime::{
     LogLevel, Runtime, RuntimeConfig, check_sigfpe, check_sigint, check_sigpipe,
     check_sigsegv_null_guard, check_sigsegv_stack_guard, check_sigterm, install_signal_handlers,
-    parse_cli, set_runtime_init_hook,
+    mark_process_signal_activity, parse_cli, set_runtime_init_hook, take_process_signal_activity,
 };
 pub use safepoint::{
     SafepointPage, enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads,
@@ -87,12 +87,13 @@ pub use sync::{
 };
 pub use thread::{
     Fiber, FiberContinuation, FiberId, FiberState, NativeThread, NativeThreadId, NativeThreadState,
-    PendingSignal, all_fiber_ids, all_thread_ids, carrier_thread_ids,
+    PendingSignal, all_fiber_ids, all_thread_ids, any_posted_pending_signal, carrier_thread_ids,
     clear_current_sandbox_cpu_deadline, current_fiber, current_fiber_id, current_stack,
     current_thread, current_thread_id, fiber_carrier_thread, fiber_state, fiber_yield,
     interrupt_fiber, interrupt_thread, join_fiber, join_thread, make_fiber, make_thread,
     park_current_fiber, poll_current_sandbox_cpu_deadline, post_current_pending_signal,
-    post_foreground_pending_signal, set_current_execution_foreground, set_thread_entry_runner,
+    post_foreground_pending_signal, sandbox_cpu_deadline_armed,
+    set_current_execution_foreground, set_thread_entry_runner,
     start_current_sandbox_cpu_deadline, submit_fiber, take_current_pending_signal,
     thread_is_carrier, thread_yield, with_current_condition_state_mut,
 };

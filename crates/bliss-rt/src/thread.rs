@@ -502,8 +502,14 @@ impl NativeThread {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        self.pending_signals
+        let previous = self
+            .pending_signals
             .fetch_or(signal.bit(), Ordering::Release);
+        // Only a bit that was not already set adds an untaken signal, or the
+        // count would drift above the number `take_pending_signal` can remove.
+        if previous & signal.bit() == 0 {
+            POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
@@ -516,6 +522,7 @@ impl NativeThread {
                 .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
                 return Some(signal);
             }
         }
@@ -582,6 +589,34 @@ thread_local! {
     static CURRENT_NATIVE_THREAD: RefCell<Option<CurrentNativeThread>> =
         const { RefCell::new(None) };
     static SANDBOX_CPU_DEADLINE_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count of pending signals posted to a thread or fiber and not yet taken.
+///
+/// `take_current_pending_signal` has to consult per-thread/per-fiber state, and
+/// reaching either costs a thread-local lookup, a `RefCell` borrow and an `Arc`
+/// clone/drop (two more atomic RMWs) — ~5% of every native call on top of the
+/// flag checks (bliss-htff). This count lets the overwhelmingly common "nobody
+/// has a pending signal" case skip all of it with one relaxed load.
+///
+/// It counts posts across ALL threads and fibers, so observing zero is safe for
+/// every thread to act on: a zero means no execution anywhere holds an untaken
+/// signal. That is what makes a process-global word correct here, where a
+/// global *boolean* would not be — one thread clearing it could hide another
+/// thread's pending signal.
+static POSTED_PENDING_SIGNALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// True if any thread or fiber holds a posted, untaken signal.
+pub fn any_posted_pending_signal() -> bool {
+    POSTED_PENDING_SIGNALS.load(Ordering::Relaxed) != 0
+}
+
+/// True if this thread has an armed sandbox CPU deadline that must keep being
+/// polled. Arming raises the process signal summary; the drain re-raises it
+/// while this holds, so polling continues.
+pub fn sandbox_cpu_deadline_armed() -> bool {
+    SANDBOX_CPU_DEADLINE_NS.with(|deadline| deadline.get()) != 0
 }
 
 struct CurrentNativeThread {
@@ -900,8 +935,14 @@ impl Fiber {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        self.pending_signals
+        let previous = self
+            .pending_signals
             .fetch_or(signal.bit(), Ordering::Release);
+        // Only a bit that was not already set adds an untaken signal, or the
+        // count would drift above the number `take_pending_signal` can remove.
+        if previous & signal.bit() == 0 {
+            POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
@@ -914,6 +955,7 @@ impl Fiber {
                 .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
                 return Some(signal);
             }
         }
@@ -1774,6 +1816,7 @@ pub fn start_current_sandbox_cpu_deadline(limit_ms: u64) -> Result<(), BlissErro
         .map_err(|errno| BlissError::Internal(format!("clock_gettime failed: {errno}")))?;
     let limit_ns = limit_ms.saturating_mul(1_000_000);
     SANDBOX_CPU_DEADLINE_NS.with(|deadline| deadline.set(now.saturating_add(limit_ns).max(1)));
+    crate::runtime::mark_process_signal_activity();
     Ok(())
 }
 

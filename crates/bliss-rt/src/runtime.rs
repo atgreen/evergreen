@@ -700,6 +700,42 @@ pub fn classify_sigsegv_address(addr: usize) -> SigsegvFaultKind {
     }
 }
 
+/// Summary word for the six process signal flags: "at least one of them may be
+/// set". Each `check_sig*` below consumes its flag with a `swap`, a locked
+/// read-modify-write; testing all six cost ~15% of every native call
+/// (bliss-htff) to answer a question that is "no" essentially always.
+///
+/// This is the process-global half of the per-thread poll word that both SBCL
+/// (`thread-slot-ea thread-pseudo-atomic-bits-slot`, tested with one
+/// instruction against a register-addressed thread slot) and HotSpot (the
+/// thread-local `_polling_word`, one acquire load plus a bit test) use for the
+/// same job. The per-thread half needs a cheap `current_thread()` first — see
+/// bliss-htff's follow-up.
+static PROCESS_SIGNAL_ACTIVITY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Announce that a process signal flag was just set. Called from signal
+/// handlers, so it must stay async-signal-safe: a single relaxed-release store.
+pub fn mark_process_signal_activity() {
+    PROCESS_SIGNAL_ACTIVITY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// True if any process signal flag may be set, clearing the summary so a later
+/// arrival re-arms it.
+///
+/// Clearing *before* the caller drains the individual flags is what makes this
+/// safe. A signal landing mid-drain either has its flag swapped by that drain
+/// (the handler sets the flag before this word), or re-sets this word after we
+/// cleared it and is caught on the next call. Neither loses a signal; a
+/// spurious `true` costs one redundant drain.
+pub fn take_process_signal_activity() -> bool {
+    if !PROCESS_SIGNAL_ACTIVITY.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    PROCESS_SIGNAL_ACTIVITY.store(false, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// Check whether a SIGINT has been received since the last check.
 pub fn check_sigint() -> bool {
     SIGINT_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -727,6 +763,7 @@ pub fn check_sigsegv_null_guard() -> bool {
 
 pub fn post_sigsegv_null_guard() {
     SIGSEGV_NULL_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_process_signal_activity();
 }
 
 pub fn set_sigsegv_null_guard_recovery_ip(ip: usize) {
@@ -747,6 +784,7 @@ pub fn check_sigsegv_stack_guard() -> bool {
 
 pub fn post_sigsegv_stack_guard() {
     SIGSEGV_STACK_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_process_signal_activity();
 }
 
 pub fn set_sigsegv_stack_guard_recovery_ip(ip: usize) {
@@ -870,6 +908,7 @@ extern "C" fn sigint_handler(_sig: i32) {
     // With rt_sigaction the handler stays installed (no SysV one-shot reset), so
     // no re-arming is needed.
     SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_process_signal_activity();
 }
 
 /// Grace period between SIGTERM and the SIGALRM hard exit (seconds).
@@ -877,6 +916,7 @@ const SIGTERM_GRACE_SECS: u32 = 5;
 
 extern "C" fn sigterm_handler(_sig: i32) {
     SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_process_signal_activity();
     // Arm a hard deadline (bliss-siv7): the cooperative shutdown flag only
     // works where code polls it — a hot T2 native loop has no back-edge poll
     // yet, so a SIGTERM'd process could spin until SIGKILL. If we are still
@@ -895,10 +935,12 @@ extern "C" fn sigalrm_handler(_sig: i32) {
 
 extern "C" fn sigfpe_handler(_sig: i32) {
     SIGFPE_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_process_signal_activity();
 }
 
 extern "C" fn sigpipe_handler(_sig: i32) {
     SIGPIPE_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_process_signal_activity();
 }
 
 extern "C" fn sigsegv_handler(

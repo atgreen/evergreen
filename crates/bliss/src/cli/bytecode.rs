@@ -12067,6 +12067,14 @@ fn run_with_binding(
 }
 
 fn claim_process_signal_flags_for_current_execution() {
+    // Fast path: one relaxed load instead of six locked read-modify-writes.
+    // Draining the flags cost ~15% of every native call (bliss-htff) to answer
+    // a question that is "no" essentially always. SBCL and HotSpot both reduce
+    // this to a single instruction against a poll word; this is the
+    // process-global half of that.
+    if !bliss_rt::take_process_signal_activity() {
+        return;
+    }
     fn post(signal: bliss_rt::PendingSignal) {
         if bliss_rt::post_foreground_pending_signal(signal).is_err() {
             bliss_rt::post_current_pending_signal(signal);
@@ -12092,10 +12100,22 @@ fn claim_process_signal_flags_for_current_execution() {
         post(bliss_rt::PendingSignal::Interrupt);
     }
     let _ = bliss_rt::poll_current_sandbox_cpu_deadline();
+    // The deadline needs polling on every pass, but the gate above only lets us
+    // through when the summary is raised, so re-raise it while one is armed.
+    if bliss_rt::sandbox_cpu_deadline_armed() {
+        bliss_rt::mark_process_signal_activity();
+    }
 }
 
 fn pending_signal_error_for_current_execution() -> Option<BlissError> {
     claim_process_signal_flags_for_current_execution();
+    // Second gate: reaching the current fiber/thread costs a thread-local
+    // lookup, a RefCell borrow and an Arc clone/drop. A zero count means no
+    // execution anywhere holds an untaken signal, so skipping is safe for every
+    // thread. Must follow the claim above, which may itself post one.
+    if !bliss_rt::any_posted_pending_signal() {
+        return None;
+    }
     match bliss_rt::take_current_pending_signal()? {
         bliss_rt::PendingSignal::Shutdown => Some(BlissError::Shutdown),
         bliss_rt::PendingSignal::Arithmetic => Some(BlissError::ArithmeticError(
