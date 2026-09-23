@@ -33070,10 +33070,10 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     if std::env::var_os("BLISS_NO_METHOD_COMPILE").is_none()
         && !nested_in_binding
         && !body_uses_next_method(body)
-        && !lambda_list_has_key(*lambda_list)
     {
+        let compile_ll = method_lambda_list_for_compile(*lambda_list);
         if let Some(callable) =
-            bytecode::compile_and_reify_lambda("METHOD", *lambda_list, body, env)
+            bytecode::compile_and_reify_lambda("METHOD", compile_ll, body, env)
         {
             METHOD_COMPILED.with(|m| m.borrow_mut().insert(method_id.0, callable));
         }
@@ -33095,21 +33095,57 @@ fn specializers_equal(a: &[MethodSpecializer], b: &[MethodSpecializer]) -> bool 
         })
 }
 
-/// True if a method lambda list contains `&key`. A method's keyword parameters
-/// are bound with implicit `&allow-other-keys` (CLHS 7.6.5: a generic call
-/// accepts the union of all applicable methods' keywords), which the standalone
-/// compiled function's strict keyword binding does not provide — so such methods
-/// keep tree-walking through `bind_method_params` (bliss-x5y.20).
-fn lambda_list_has_key(lambda_list: BlissVal) -> bool {
+/// A method's lambda list, extended with `&ALLOW-OTHER-KEYS` when it takes
+/// `&key` and does not already allow other keys.
+///
+/// Keyword validation for a generic call is against the union of ALL applicable
+/// methods' keywords, not this one method's (CLHS 7.6.5). The tree-walked path
+/// gets that by passing `allow_other_keys = true` explicitly
+/// (`bind_method_params`, bliss-lb6.14). A compiled body is bound by the
+/// ordinary function binder, which has no such flag, so the permission must be
+/// written into the lambda list itself — otherwise a compiled method signals
+/// `unexpected keyword argument` for a keyword some *other* applicable method
+/// declared. (This is why `&key` methods were excluded from compilation
+/// outright in bliss-x5y.20; they are 59.6% of tree-walked method invocations
+/// on an ASDF/babel load.)
+fn method_lambda_list_for_compile(lambda_list: BlissVal) -> BlissVal {
+    // Resolve the symbol FIRST. Interning can allocate, and every step below
+    // this point holds `BlissVal`s copied out of the lambda list in a Rust
+    // local, where a minor GC cannot find them (AGENTS.md GC invariant 1).
+    let Some(aok) = resolve_sym("&ALLOW-OTHER-KEYS") else {
+        return lambda_list;
+    };
+    let mut has_key = false;
+    let mut items: Vec<BlissVal> = Vec::new();
     let mut cur = lambda_list;
     while cur.is_cons() {
         let (item, rest) = cp(cur);
-        if item.is_symbol() && symbol_bare_name(&sym_name_rc(item)) == "&KEY" {
-            return true;
+        if item.is_symbol() {
+            let name = sym_name_rc(item);
+            if symbol_bare_name_is(&name, "&ALLOW-OTHER-KEYS") {
+                return lambda_list;
+            }
+            if symbol_bare_name_is(&name, "&KEY") {
+                has_key = true;
+            }
         }
+        items.push(item);
         cur = rest;
     }
-    false
+    if !has_key {
+        return lambda_list;
+    }
+    // Push before rooting: growing the Vec afterwards would reallocate its
+    // buffer and leave the registered root dangling. Nothing between the
+    // traversal above and this point allocates on the Lisp heap.
+    items.push(aok);
+    bliss_rt::rooted_ref!(_items_root = &mut items);
+    let mut out = NIL;
+    bliss_rt::rooted_ref!(_out_root = &mut out);
+    for item in items.iter().rev() {
+        out = arena_cons(*item, out);
+    }
+    out
 }
 
 /// True if a method body references CALL-NEXT-METHOD or NEXT-METHOD-P anywhere

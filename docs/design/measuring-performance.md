@@ -117,6 +117,33 @@ The cheap instruments that actually settled these:
 `(dotimes (i 50000) (class-of *o*))` allocates zero — the call is dead-code
 eliminated. Consume the result (`(setf *sink* …)`) or the probe is meaningless.
 
+## 6a. Profiling artifacts live in RAM
+
+`/tmp` here is tmpfs. A `perf record` of a babel run is 60–200 MB and a saved
+bliss image is 23 MB, so a session that profiles repeatedly quietly accumulates
+gigabytes of *memory*. This investigation reached 1.3 GB and got a `cargo test`
+run OOM-killed mid-suite.
+
+Delete `*.data` captures and stale images as you go, or write them somewhere
+disk-backed.
+
+## 6b. A bytecode-instruction counter cannot tell "native" from "tree-walked"
+
+A counter in `run_loop` reads zero for a function that was promoted to T1/T2
+native **and** for one that is tree-walked in `eval_form` — neither executes
+bytecode. Twice in this investigation a flat counter was read as evidence of
+tree-walking when the real cause was promotion.
+
+The tell that finally worked: call the function **fewer times than the
+promotion threshold** (`BLISS_T0_T1_THRESHOLD`, default 10). Below it a
+compiled body still runs bytecode, so a genuinely tree-walked body is the only
+thing that reads zero. `BLISS_DISABLE_T2=1` alone does *not* isolate this — T1
+still promotes, and all three of this session's readings were bit-identical
+with and without it.
+
+Counting a call site is not the same as counting execution tiers. To answer
+"which tier ran this?", use the threshold, or read the dispatch site.
+
 ## 7. Same path, different build
 
 `target/<target>/release/bliss-cli` is written by every `cargo build`, whatever
