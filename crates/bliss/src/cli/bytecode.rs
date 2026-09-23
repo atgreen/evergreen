@@ -15555,6 +15555,53 @@ fn t2_completion_sender() -> std::sync::mpsc::Sender<T2Completion> {
     })
 }
 
+/// Symbols reachable from `root` through `CallNamed`, transitively, following
+/// nested (`MakeClosure`) bodies as part of each function.
+///
+/// The inliner can only inline through a call it can see, and it resolves
+/// candidates by symbol, so this is exactly the set that can ever be consulted
+/// when compiling `root` (bliss-fhci).
+fn t2_reachable_callees(root: &Rc<BytecodeFunction>, root_sym: u32) -> std::collections::HashSet<u32> {
+    fn direct_calls(bf: &BytecodeFunction, out: &mut Vec<u32>) {
+        for instr in &bf.code {
+            if let Instr::CallNamed { sym, .. } = instr {
+                out.push(*sym);
+            }
+        }
+        for nested in &bf.nested_functions {
+            direct_calls(nested, out);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = Vec::new();
+    direct_calls(root, &mut queue);
+    // The ROOT itself must be a candidate, not just its callees. The compiler
+    // registers a call-site profile per supplied body, and the decision to
+    // inline a large callee is taken from the profile of the call site IN THE
+    // CALLER — so omitting the root loses the hot-site allowance and a
+    // deliberately-oversized callee stops being inlined
+    // (tier_observability::hot_call_site_inlines_body_above_small_threshold).
+    queue.push(root_sym);
+    let mut reached = std::collections::HashSet::new();
+    REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        while let Some(symbol) = queue.pop() {
+            if !seen.insert(symbol) {
+                continue;
+            }
+            // A callee with no registry entry has not been bytecode-compiled
+            // yet, so there is no body to inline; skip it.
+            let Some(body) = registry.get(&symbol) else {
+                continue;
+            };
+            reached.insert(symbol);
+            direct_calls(body, &mut queue);
+        }
+    });
+    reached
+}
+
 fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let root = registry_get(sym)?;
     let root_ptr = Rc::as_ptr(&root) as usize;
@@ -15584,13 +15631,44 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     // count is zero, and filtering on it would drop every candidate and disable
     // inlining altogether rather than just shrinking the snapshot.
     let trust_invocation_counts = !profiling_disabled();
-    let inline_bodies = REGISTRY.with(|registry| {
-        registry
-            .borrow()
+    // Only functions this one can actually REACH are inlining candidates.
+    //
+    // This used to snapshot the whole REGISTRY — note the closure never looked
+    // at `sym`, so every promotion rebuilt the identical set, deep-cloning every
+    // invoked function in the image each time. A `BytecodeFunction` clone is
+    // deep (ten `Vec`s, recursive `nested_functions`, `Vec<String>`), so with
+    // ~62 promotions per babel load this dominated everything else T2 did.
+    //
+    // Measured by ablation on a babel load (`real`, T2 off = 19.80s):
+    //
+    // ```text
+    //   snapshot only                        26.94s   (+7.14)
+    //   snapshot only, inline bodies skipped 19.92s   (+0.12)
+    //   T2 on                                28.60s   (+8.80)
+    //   T2 on, inline bodies skipped         21.43s   (+1.63)
+    // ```
+    //
+    // i.e. ~82% of T2's whole load-time cost was building this one list
+    // (bliss-fhci).
+    //
+    // The compiler registers candidates BY SYMBOL and only looks one up when it
+    // meets a call, so a body the root cannot reach is never consulted.
+    // Restricting to the transitive call-graph closure therefore costs no
+    // inlining the compiler would have performed, while cutting the clone volume
+    // to what this function can use. Unreachable-by-`CallNamed` targets (an
+    // indirect `funcall`) are conservatively dropped: less inlining, never wrong.
+    let reachable = t2_reachable_callees(&root, sym);
+    let inline_bodies: Vec<T2BodySnapshot> = REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        reachable
             .iter()
-            .filter_map(|(&symbol, body)| {
+            .filter_map(|&symbol| {
+                let body = registry.get(&symbol)?;
                 let ptr = Rc::as_ptr(body) as usize;
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
+                // A never-invoked function cannot be the target of a hot call
+                // site, and skipping it also skips `call_site_profile_snapshot`
+                // scanning the whole CALL_SITE_PROFILE map for it (bliss-nzbi).
                 if trust_invocation_counts && invocations == 0 {
                     return None;
                 }
@@ -15603,6 +15681,16 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             })
             .collect()
     });
+    if std::env::var_os("BLISS_T2_CANDIDATE_STATS").is_some() {
+        let total = REGISTRY.with(|r| r.borrow().len());
+        eprintln!(
+            "@CAND {} reachable={} kept={} registry={}",
+            sym_label(sym),
+            reachable.len(),
+            inline_bodies.len(),
+            total
+        );
+    }
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
     Some(T2CompileInput {
         sym,
@@ -15644,6 +15732,14 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
         T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
         return false;
     };
+    // Diagnostic (bliss-fhci): do the MUTATOR-side snapshot but never queue the
+    // job, so no background compilation happens and nothing is installed. With
+    // BLISS_T2_DISCARD (compile, install nothing) this splits T2's cost three
+    // ways: snapshot / compile / emitted code.
+    if t2_no_queue() {
+        T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
+        return false;
+    }
     let generation = input.generation;
     let priority = input.priority;
     let job = T2Job {
@@ -15688,6 +15784,12 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
 /// and the code it emits is a (small) net win. That is the measurement the
 /// persistent code cache is aimed at: caching removes the 9.39 s and keeps the
 /// 0.68 s (bliss-fhci, bliss-eoma).
+fn t2_no_queue() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_T2_NO_QUEUE").is_some())
+}
+
 fn t2_discard_installs() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
