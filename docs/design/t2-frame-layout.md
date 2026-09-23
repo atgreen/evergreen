@@ -131,9 +131,12 @@ When a native tier produces a wrong *value* (not a crash):
 - **Identify the tier precisely.** `BLISS_FORCE_TIER=interp|t0|t1|t2` pins tier
   selection process-wide; a value that differs between them is a miscompile.
   `scripts/tier-diff.sh` does this over a corpus.
-- **Isolate caller from callee** with `BLISS_T2_EXCLUDE=<NAME>`. Excluding the
-  faulty function makes the symptom vanish; this separates "bad codegen here"
-  from "bad codegen in what I call".
+- **Isolate caller from callee.** Excluding one function from T2 separates "bad
+  codegen here" from "bad codegen in what I call". There is no per-name knob for
+  this any more — `BLISS_T2_EXCLUDE` was removed once the bug it was written for
+  (bliss-lwws, narrowed to REDUCE) was fixed, because it sat on the per-dispatch
+  path. Reintroduce it locally if you need it, or bisect with
+  `BLISS_FORCE_TIER` over a corpus.
 - **Know which knob gates which transfer.** `BLISS_OSR_THRESHOLD` gates the
   T0/T1 OSR entry. The **T1→T2** back-edge transfer is gated by
   `BLISS_T1_T2_BACKEDGE_THRESHOLD` / `BLISS_LOOP_HEAT_THRESHOLD`. In bliss-kqdr

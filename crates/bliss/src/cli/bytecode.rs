@@ -15846,25 +15846,6 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
     {
         return false;
     }
-    // T2 exclusion by bare name: BLISS_T2_EXCLUDE=NAME[,NAME...] declines T2
-    // for the named functions at runtime (per-name bisection of a suspected T2
-    // miscompile — how bliss-lwws was isolated to REDUCE). The interim built-in
-    // exclusion of REDUCE (bliss-kfhp) is gone: the actual bug was emit_call's
-    // sequential argument marshalling clobbering an argument register that was
-    // a later argument's source (fixed in t2::emit::emit_call_arg_moves).
-    // BLISS_T2_NO_DEFAULT_EXCLUDE=1 is still accepted (a no-op) so existing
-    // reproduction recipes keep working.
-    {
-        let name = bliss_rt::symbols::symbol_name(sym).unwrap_or_default();
-        let bare = name.rsplit(':').next().unwrap_or(&name);
-        let env_excluded = std::env::var("BLISS_T2_EXCLUDE")
-            .map(|excl| excl.split(',').any(|e| e.eq_ignore_ascii_case(bare)))
-            .unwrap_or(false);
-        if env_excluded {
-            T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
-            return false;
-        }
-    }
     let Some(input) = snapshot_t2_input(sym, priority) else {
         T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
         return false;
