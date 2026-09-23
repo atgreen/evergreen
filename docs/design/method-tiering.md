@@ -90,8 +90,12 @@ rather than at load time.
 
 - **bliss-ccso** (P1) — `call-next-method` bodies cannot tier up: 63% of what
   still tree-walks, and it is exactly ASDF's `:around` protocol.
-- **bliss-o4cp** (P2) — the compiler bails on `ASDF/PLAN::ACTION-STATUS`
-  (10,046 invocations) in both opportunistic and portable modes.
+- **bliss-ljmj** (P1) — `SETF` through a *function-named* accessor place (a
+  struct accessor or a CLOS `:accessor`) bails the lowerer with `form:SETF`,
+  keeping the whole enclosing function tree-walked. `gethash`, `slot-value`,
+  `aref`, `car`, specials and locals all compile; only the accessor call does
+  not. This is the cause of **bliss-o4cp** (P2) — `ASDF/PLAN::ACTION-STATUS`,
+  10,046 invocations, contains `(incf (total-action-count *asdf-session*))`.
 - **bliss-d9ak** (P2) — make method compilation tier-driven.
 - **bliss-ok3f** (P3) — pre-existing: a generic call accepts a keyword no
   applicable method declares.
