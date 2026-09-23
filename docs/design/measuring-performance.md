@@ -176,6 +176,33 @@ for few expensive ones (a cache-missing load, a division) can cut time while
 raising the count, or the reverse. Use it to resolve a small effect you cannot
 otherwise see, and confirm direction with wall-clock once the machine is quiet.
 
+## 6d. musl's allocator is not glibc's, and the difference is the thread cache
+
+The same source built for `x86_64-unknown-linux-musl` and
+`x86_64-unknown-linux-gnu` ran a babel load in 21.54 s and 13.95 s. That is a
+libc difference, not a code difference, and it is worth knowing before
+attributing a 35% swing to anything you changed.
+
+Isolating it needs the right knob. `MALLOC_ARENA_MAX=1` costs only 2%, which
+looks like "per-thread behaviour is irrelevant" and is the wrong conclusion —
+arena count and glibc's **tcache** are separate layers, and `arena_max` does not
+touch the latter:
+
+```text
+  glibc default                13.95 s
+  glibc tcache=0               17.99 s   (+4.04)   <- GLIBC_TUNABLES=glibc.malloc.tcache_count=0
+  glibc tcache=0, arena_max=1  19.08 s   (+5.13)
+  musl mallocng                21.54 s   (+7.59)
+```
+
+~53% of the gap is the thread cache. bliss now ships its own for musl
+(bliss-05as), which recovered most of it.
+
+Corollary for profiling: `__lock` and `__unlock` high in a musl profile read
+like contention and usually are not — mallocng takes its lock on every
+operation, so the symbol is really "you called malloc a lot". Confirm with a
+single-threaded run or an allocation count before optimising for parallelism.
+
 ## 7. Same path, different build
 
 `target/<target>/release/bliss-cli` is written by every `cargo build`, whatever
