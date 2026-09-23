@@ -33739,12 +33739,30 @@ fn call_direct_builtin(
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
     let name = *direct_builtin_table().get(slot as usize)?;
-    if let Some(res) = apply_numeric_op(name, args) {
-        // Single-valued, so reset MV state exactly as apply_function does.
-        env.clear_mv();
-        return Some(res);
-    }
-    if DIRECT_STRUCTURAL.contains(&name) {
+    // The slot ALREADY says which family this is: the table is
+    // DIRECT_NUMERIC ++ DIRECT_STRUCTURAL ++ DIRECT_FAST, so the index ranges
+    // classify it. Re-deriving that from the NAME threw the information away
+    // and made every call walk `apply_numeric_op`'s string match (dozens of
+    // arms, all missing for a structural builtin) and then a linear
+    // `DIRECT_STRUCTURAL.contains` doing string compares.
+    //
+    // On a T2-native call loop `(cdr x)` / `(consp x)` paid both on every call:
+    // `memcmp` was 11.6% of per-call self time, the single largest item after
+    // memcpy (bliss-htff).
+    //
+    // Behaviour is unchanged. A numeric name that declines its arity still
+    // falls through to `apply_builtin_fast`, exactly as the `contains` chain
+    // did, and no structural/fast name was ever matched by `apply_numeric_op`.
+    let slot = slot as usize;
+    const N_NUMERIC: usize = DIRECT_NUMERIC.len();
+    const N_THROUGH_STRUCTURAL: usize = N_NUMERIC + DIRECT_STRUCTURAL.len();
+    if slot < N_NUMERIC {
+        if let Some(res) = apply_numeric_op(name, args) {
+            // Single-valued, so reset MV state exactly as apply_function does.
+            env.clear_mv();
+            return Some(res);
+        }
+    } else if slot < N_THROUGH_STRUCTURAL {
         env.clear_mv();
         return Some(apply_builtin(name, args, env));
     }
