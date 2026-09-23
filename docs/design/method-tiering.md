@@ -88,8 +88,23 @@ rather than at load time.
 
 ## Remaining, in measured order
 
-- **bliss-ccso** (P1) — `call-next-method` bodies cannot tier up: 63% of what
-  still tree-walks, and it is exactly ASDF's `:around` protocol.
+- ~~**bliss-ccso**~~ (done) — `call-next-method` / `next-method-p` bodies could
+  not tier up at all. Both are special forms reading `env.method_context`, so
+  there was no callable spelling to lower to; a compiled body already runs
+  against that same `env`, so it only needed evaluated-argument entry points
+  (`BLISS::%CALL-NEXT-METHOD`, `BLISS::%NEXT-METHOD-P`), the context published
+  around the compiled path, and `mv_operator_preserves` taught the new spelling
+  so the next method's secondary values survive. Tier split 61.9% -> 74.8%
+  compiled, tree-walked invocations 27,550 -> 18,172.
+
+  **The babel load did not move** (-0.5% instructions, within noise). The
+  offenders here are `:around` methods that merely delegate, so their bodies are
+  almost entirely the `call-next-method` itself. The payoff is for methods with
+  real bodies, which previously could never leave the tree-walker: 300k calls of
+  one went 41.17s -> 3.11s (**13.2x**). Worth recording as the general lesson —
+  a tier-up cliff can be 63% of invocations and still be worth ~nothing on a
+  given workload, because what matters is how much work sits *behind* the
+  cliff.
 - ~~**bliss-ljmj**~~ (done) — `SETF` through a *function-named* accessor place
   (a struct accessor or a CLOS `:accessor`) bailed the lowerer with `form:SETF`,
   keeping the whole enclosing function tree-walked; `gethash`, `slot-value`,
