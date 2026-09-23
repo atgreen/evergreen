@@ -25,11 +25,39 @@ mod alloc_probe {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Sample every Nth allocation and record where it came from.
+    /// `BLISS_PROBE_ALLOC_SAMPLE=N` enables it; 0/unset disables.
+    pub static SAMPLE_EVERY: AtomicU64 = AtomicU64::new(0);
+    pub static SAMPLES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    thread_local! {
+        /// Capturing a backtrace allocates, which would re-enter this allocator
+        /// and recurse forever. `const` init so reading the flag cannot itself
+        /// allocate on first touch.
+        static IN_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn maybe_sample(n: u64) {
+        let every = SAMPLE_EVERY.load(Ordering::Relaxed);
+        if every == 0 || n % every != 0 {
+            return;
+        }
+        let already = IN_PROBE.with(|f| f.replace(true));
+        if already {
+            return; // allocation made BY the probe itself
+        }
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        if let Ok(mut s) = SAMPLES.lock() {
+            s.push(bt);
+        }
+        IN_PROBE.with(|f| f.set(false));
+    }
+
     pub struct Counting;
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let n = ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
+            maybe_sample(n);
             unsafe { System.alloc(l) }
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -46,12 +74,25 @@ mod alloc_probe {
 static COUNTING_ALLOC: alloc_probe::Counting = alloc_probe::Counting;
 
 fn main() {
+    #[cfg(feature = "alloc-count")]
+    if let Ok(n) = std::env::var("BLISS_PROBE_ALLOC_SAMPLE") {
+        if let Ok(n) = n.parse::<u64>() {
+            alloc_probe::SAMPLE_EVERY.store(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     // Collect OS args, skipping argv[0] (the program name).
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let result = cli::run(&args);
     // JFR-style event stream (bliss-3gme): dump the recording if BLISS_EVENTS_DUMP
     // is set, whichever way the run ended, before we exit the process.
+    #[cfg(feature = "alloc-count")]
+    if let Some(path) = std::env::var_os("BLISS_PROBE_ALLOC_SAMPLE_OUT") {
+        if let Ok(samples) = alloc_probe::SAMPLES.lock() {
+            let _ = std::fs::write(&path, samples.join("\n=====\n"));
+            eprintln!("@SAMPLES {} written to {:?}", samples.len(), path);
+        }
+    }
     #[cfg(feature = "alloc-count")]
     if std::env::var_os("BLISS_PROBE_ALLOC_COUNT").is_some() {
         use std::sync::atomic::Ordering;

@@ -4975,9 +4975,15 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
         slot_name: &str,
         seen: &mut HashSet<String>,
     ) -> Option<Option<String>> {
-        if !seen.insert(class_name.to_string()) {
+        // `insert` builds a fresh String on EVERY visit, including the repeat
+        // visits this cycle check exists to catch. Probe first so only the first
+        // visit to a class allocates; walk revisits classes through the super
+        // graph, and this was 37.7% of String::clone during make-plan
+        // (bliss-ou03).
+        if seen.contains(class_name) {
             return None;
         }
+        seen.insert(class_name.to_string());
         let cd = env.classes.borrow().get(class_name).cloned()?;
         // Slot names are stored as the full symbol name (possibly package-
         // qualified); compare bare-to-bare since `slot_name` is already bare.
@@ -8462,7 +8468,12 @@ fn sym_name_rc(val: BlissVal) -> std::rc::Rc<str> {
 fn sym_name(val: BlissVal) -> String {
     if val.is_symbol() && !val.is_nil() && val != T && !bliss_rt::symbols::is_uninterned(val.as_symbol_index())
     {
-        return sym_name_rc(val).to_string();
+        // `Rc<str>` implements Display, so `.to_string()` on it resolves to the
+        // GENERIC ToString and runs the whole fmt machinery, growing a String
+        // incrementally. Going through `&str` picks the specialised one-shot
+        // String::from instead. Sampling the allocator during asdf:make-plan put
+        // 98.9% of all String::write_str allocations under sym_name (bliss-ou03).
+        return String::from(&*sym_name_rc(val));
     }
     sym_name_uncached(val)
 }

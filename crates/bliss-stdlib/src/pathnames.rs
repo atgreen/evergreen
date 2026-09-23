@@ -314,6 +314,23 @@ fn get_record(pathname: BlissVal) -> Option<PathnameRecord> {
     with_pathname_store(|store| store.get(&pathname.0).cloned())
 }
 
+/// Run `f` over a pathname's record WITHOUT cloning it.
+///
+/// [`get_record`] clones the whole `PathnameRecord` — six `BlissVal`s, a
+/// `ParsedPathname`, and an `Option<String>` namestring — so every accessor that
+/// wanted one field paid many heap allocations. Measured with the `alloc-count`
+/// feature, that put MAKE-PATHNAME at 105 Rust allocations per call and
+/// `asdf:make-plan` at 11.7 million (372 MB of churn), which is most of what an
+/// `asdf:load-system` costs (bliss-ou03).
+///
+/// CONSTRAINT: `f` runs while the global pathname mutex is held. It must not
+/// allocate on the GC heap, call back into pathname code, or otherwise re-enter
+/// — `with_pathname_store` is a plain `Mutex`, so re-entry deadlocks. Keep these
+/// closures to field reads and pure computation over borrowed data.
+fn with_record<T>(pathname: BlissVal, f: impl FnOnce(&PathnameRecord) -> T) -> Option<T> {
+    with_pathname_store(|store| store.get(&pathname.0).map(f))
+}
+
 /// True if `val` is a pathname. Pathnames are real heap objects with the
 /// PATHNAME type_id (bliss-lb6.9), so `is_string()` etc. read a genuine header
 /// and are already false for them; this membership check identifies pathnames by
@@ -972,10 +989,12 @@ fn record_namestring(rec: &PathnameRecord) -> std::borrow::Cow<'_, str> {
 /// proxy ASDF relies on for its pervasive pathname-EQUAL caching (bliss-nad,
 /// bliss-8jt).
 pub fn pathnames_equal(a: BlissVal, b: BlissVal) -> bool {
-    match (get_record(a), get_record(b)) {
-        (Some(ra), Some(rb)) => record_namestring(&ra) == record_namestring(&rb),
+    // Both records under ONE lock: with_pathname_store is a plain Mutex, so two
+    // nested with_record calls would deadlock.
+    with_pathname_store(|store| match (store.get(&a.0), store.get(&b.0)) {
+        (Some(ra), Some(rb)) => record_namestring(ra) == record_namestring(rb),
         _ => false,
-    }
+    })
 }
 
 /// Run `f` over the exact string [`pathnames_equal`] compares two pathnames by.
@@ -991,19 +1010,19 @@ pub fn pathnames_equal(a: BlissVal, b: BlissVal) -> bool {
 /// Takes a closure rather than returning a `String` so the hot EQUAL path keeps
 /// comparing a borrowed `Cow` without allocating on the Rust or GC heap.
 pub fn with_pathname_equal_key<T>(val: BlissVal, f: impl FnOnce(&str) -> T) -> Option<T> {
-    get_record(val).map(|rec| f(&record_namestring(&rec)))
+    with_record(val, |rec| f(&record_namestring(rec)))
 }
 
 pub fn pathname_host(pathname: BlissVal) -> BlissVal {
-    get_record(pathname).map_or(NIL, |r| r.host)
+    with_record(pathname, |r| r.host).unwrap_or(NIL)
 }
 
 pub fn pathname_device(pathname: BlissVal) -> BlissVal {
-    get_record(pathname).map_or(NIL, |r| r.device)
+    with_record(pathname, |r| r.device).unwrap_or(NIL)
 }
 
 pub fn pathname_directory(pathname: BlissVal) -> BlissVal {
-    get_record(pathname).map_or(NIL, |r| r.directory)
+    with_record(pathname, |r| r.directory).unwrap_or(NIL)
 }
 
 /// One component of an ANSI `pathname-directory` list.
@@ -1038,15 +1057,15 @@ pub fn pathname_directory_components(pathname: BlissVal) -> Option<(bool, Vec<Pa
 }
 
 pub fn pathname_name(pathname: BlissVal) -> BlissVal {
-    get_record(pathname).map_or(NIL, |r| r.name)
+    with_record(pathname, |r| r.name).unwrap_or(NIL)
 }
 
 pub fn pathname_type(pathname: BlissVal) -> BlissVal {
-    get_record(pathname).map_or(NIL, |r| r.type_field)
+    with_record(pathname, |r| r.type_field).unwrap_or(NIL)
 }
 
 pub fn pathname_version(pathname: BlissVal) -> BlissVal {
-    get_record(pathname).map_or(NIL, |r| r.version)
+    with_record(pathname, |r| r.version).unwrap_or(NIL)
 }
 
 fn match_glob(value: &str, pattern: &str) -> Option<Vec<String>> {
