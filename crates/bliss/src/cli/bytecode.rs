@@ -12475,15 +12475,44 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
                 );
                 // Collect arguments (pushed left-to-right, so arg0 is deepest).
-                let mut args = Vec::with_capacity(nargs as usize);
+                //
+                // A fresh `Vec` here was one malloc/free on EVERY bytecode call
+                // — one of the ~7 Rust allocations per call that dominate the
+                // per-call cost (bliss-iry5). Pop into a stack array and root
+                // THAT, spilling to the heap only past `ROOTED_ARGS_INLINE`,
+                // exactly as `rooted_args!` does for the tree-walker's call path
+                // (bliss-lxpg.1).
+                //
+                // Both buffers and both roots are created before the branch so
+                // the guards outlive the slice borrowed from whichever is used.
+                // The destination is rooted BEFORE anything is popped into it:
+                // once a value leaves the operand stack it is no longer reachable
+                // through the activation the collector scans.
+                let n = nargs as usize;
+                bliss_rt::rooted!(inline_args = [NIL; super::ROOTED_ARGS_INLINE]);
+                bliss_rt::rooted!(spill_args = Vec::<BlissVal>::new());
                 {
-                    let act = &mut acts[top_idx];
-                    for _ in 0..nargs {
-                        args.push(act.pop_op());
+                    if n > super::ROOTED_ARGS_INLINE {
+                        *spill_args = vec![NIL; n];
                     }
-                    args.reverse();
+                    let act = &mut acts[top_idx];
+                    // `pop_op` only moves a value off the operand stack and
+                    // cannot allocate, so no GC can fire part-way through.
+                    if n <= super::ROOTED_ARGS_INLINE {
+                        for i in (0..n).rev() {
+                            inline_args[i] = act.pop_op();
+                        }
+                    } else {
+                        for i in (0..n).rev() {
+                            spill_args[i] = act.pop_op();
+                        }
+                    }
                 }
-                bliss_rt::rooted!(args = args);
+                let args: &[BlissVal] = if n <= super::ROOTED_ARGS_INLINE {
+                    &inline_args[..n]
+                } else {
+                    &spill_args
+                };
 
                 // Argument forms are single-value contexts. A producer used as
                 // an argument may have populated env.mv, but those secondary
