@@ -673,6 +673,21 @@ static SIGSEGV_NULL_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEGV
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
 static SIGSEGV_STACK_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
+/// Per-thread delivery of the two recoverable SIGSEGV kinds, parallel to the
+/// recovery-IP slots above.
+///
+/// These were process-global `AtomicBool`s consumed with `swap(false)`, so a
+/// fault raised on one thread could be consumed by ANY other thread that polled
+/// first — the faulting thread then saw no pending signal and returned a value
+/// instead of signalling. A stack overflow in one thread could be swallowed by
+/// another (bliss-2mqf). The globals remain as a fallback for threads that never
+/// armed recovery and therefore own no slot.
+static SIGSEGV_STACK_GUARD_RECEIVED_SLOTS: [std::sync::atomic::AtomicBool;
+    SIGSEGV_RECOVERY_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_NULL_GUARD_RECEIVED_SLOTS: [std::sync::atomic::AtomicBool;
+    SIGSEGV_RECOVERY_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; SIGSEGV_RECOVERY_SLOTS];
 const SIGSEGV_STACK_GUARD_SLOTS: usize = 128;
 static SIGSEGV_STACK_GUARD_ADDRS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
@@ -711,13 +726,28 @@ pub fn classify_sigsegv_address(addr: usize) -> SigsegvFaultKind {
 /// thread-local `_polling_word`, one acquire load plus a bit test) use for the
 /// same job. The per-thread half needs a cheap `current_thread()` first — see
 /// bliss-htff's follow-up.
-static PROCESS_SIGNAL_ACTIVITY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// A monotonic COUNT of arrivals, not a clearable flag.
+///
+/// It was an `AtomicBool` that `take_process_signal_activity` cleared before
+/// draining. That is correct with a single consumer and wrong with several: one
+/// thread's clear hides the arrival from every other thread, whose own pending
+/// flags then go undrained forever. Concretely, a stack-guard SIGSEGV raised on
+/// thread A could be swallowed because thread B consumed the summary first, and
+/// A's `run_native` returned a value where it should have signalled
+/// STACK-OVERFLOW (bliss-2mqf). Each thread now compares against the last count
+/// it drained, so no thread can consume another's notification.
+static PROCESS_SIGNAL_ACTIVITY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Arrival count this thread has already drained.
+    static SEEN_SIGNAL_ACTIVITY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Announce that a process signal flag was just set. Called from signal
-/// handlers, so it must stay async-signal-safe: a single relaxed-release store.
+/// handlers, so it must stay async-signal-safe: one lock-free atomic increment.
 pub fn mark_process_signal_activity() {
-    PROCESS_SIGNAL_ACTIVITY.store(true, std::sync::atomic::Ordering::Release);
+    PROCESS_SIGNAL_ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// True if any process signal flag may be set, clearing the summary so a later
@@ -729,11 +759,20 @@ pub fn mark_process_signal_activity() {
 /// cleared it and is caught on the next call. Neither loses a signal; a
 /// spurious `true` costs one redundant drain.
 pub fn take_process_signal_activity() -> bool {
-    if !PROCESS_SIGNAL_ACTIVITY.load(std::sync::atomic::Ordering::Acquire) {
-        return false;
-    }
-    PROCESS_SIGNAL_ACTIVITY.store(false, std::sync::atomic::Ordering::Relaxed);
-    true
+    let current = PROCESS_SIGNAL_ACTIVITY.load(std::sync::atomic::Ordering::Acquire);
+    // Still one atomic load on the fast path; the comparison is thread-local, so
+    // a drain by one thread cannot hide an arrival from another. During TLS
+    // teardown, fall back to draining rather than risk dropping a signal.
+    SEEN_SIGNAL_ACTIVITY
+        .try_with(|seen| {
+            if seen.get() == current {
+                false
+            } else {
+                seen.set(current);
+                true
+            }
+        })
+        .unwrap_or(true)
 }
 
 /// Check whether a SIGINT has been received since the last check.
@@ -758,10 +797,21 @@ pub fn check_sigpipe() -> bool {
 
 /// Check whether a null-guard SIGSEGV has been classified since the last check.
 pub fn check_sigsegv_null_guard() -> bool {
+    // Same per-thread delivery as the stack guard above.
+    if let Some(i) = sigsegv_recovery_slot_index(crate::syscall::cached_tid() as usize)
+        && SIGSEGV_NULL_GUARD_RECEIVED_SLOTS[i].swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        return true;
+    }
     SIGSEGV_NULL_GUARD_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn post_sigsegv_null_guard() {
+    if let Some(i) = sigsegv_recovery_slot_index(crate::syscall::gettid() as usize) {
+        SIGSEGV_NULL_GUARD_RECEIVED_SLOTS[i].store(true, std::sync::atomic::Ordering::Relaxed);
+        mark_process_signal_activity();
+        return;
+    }
     SIGSEGV_NULL_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     mark_process_signal_activity();
 }
@@ -779,11 +829,26 @@ pub fn current_sigsegv_null_guard_recovery_ip() -> usize {
 
 /// Check whether a stack-guard SIGSEGV has been classified since the last check.
 pub fn check_sigsegv_stack_guard() -> bool {
+    // This thread's own delivery first, so it cannot consume a fault raised on
+    // another thread.
+    if let Some(i) = sigsegv_recovery_slot_index(crate::syscall::cached_tid() as usize)
+        && SIGSEGV_STACK_GUARD_RECEIVED_SLOTS[i].swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        return true;
+    }
     SIGSEGV_STACK_GUARD_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn post_sigsegv_stack_guard() {
-    SIGSEGV_STACK_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Signal-handler context. `sigsegv_recovery_slot_index` is a linear scan of
+    // atomics that takes no lock and touches no thread-local, so it is safe
+    // here; the CLAIMING path is not, which is why a thread with no slot falls
+    // back to the process-global flag.
+    if let Some(i) = sigsegv_recovery_slot_index(crate::syscall::gettid() as usize) {
+        SIGSEGV_STACK_GUARD_RECEIVED_SLOTS[i].store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        SIGSEGV_STACK_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     mark_process_signal_activity();
 }
 
@@ -1078,14 +1143,71 @@ extern "C" fn sigsegv_handler(
     crate::syscall::exit_group(128 + crate::syscall::SIGSEGV);
 }
 
+/// Releases this thread's SIGSEGV-recovery slot when the thread exits.
+///
+/// Without this the slot leaked: `SIGSEGV_RECOVERY_TIDS` was only ever moved
+/// `0 -> tid` and never back. Two things then go wrong, because the kernel
+/// RECYCLES thread ids:
+///
+///  * a new thread handed a dead thread's tid matched the dead thread's slot
+///    and inherited its recovery IPs — including a `0` meaning "native SIGSEGV
+///    recovery disabled", which silently turns a recoverable native stack
+///    overflow into a hard crash instead of a Lisp STACK-OVERFLOW; and
+///  * the table (128 entries) filled permanently, after which
+///    `set_sigsegv_*_recovery_ip` became a silent no-op for every new thread.
+///
+/// Observed as `run_native_rewrites_stack_guard_sigsegv_to_stack_overflow`
+/// failing only in the PARALLEL lib-test run (it passes alone and under
+/// `--test-threads=1`): a neighbouring test disables recovery, its thread
+/// exits, and the next test's thread is given the same tid.
+struct SigsegvSlotGuard {
+    slot: std::cell::Cell<Option<usize>>,
+}
+
+impl Drop for SigsegvSlotGuard {
+    fn drop(&mut self) {
+        if let Some(i) = self.slot.get() {
+            clear_sigsegv_recovery_slot(i);
+        }
+    }
+}
+
+thread_local! {
+    static SIGSEGV_SLOT: SigsegvSlotGuard = const {
+        SigsegvSlotGuard { slot: std::cell::Cell::new(None) }
+    };
+}
+
+/// Blank a slot and only then release its tid, so a concurrent reader can never
+/// see the tid published with another thread's recovery IPs still attached.
+fn clear_sigsegv_recovery_slot(i: usize) {
+    SIGSEGV_STACK_GUARD_RECOVERY_IPS[i].store(0, std::sync::atomic::Ordering::Release);
+    SIGSEGV_NULL_GUARD_RECOVERY_IPS[i].store(0, std::sync::atomic::Ordering::Release);
+    // Undelivered flags must not outlive the slot, or the next owner of this
+    // slot would observe the previous thread's fault.
+    SIGSEGV_STACK_GUARD_RECEIVED_SLOTS[i].store(false, std::sync::atomic::Ordering::Release);
+    SIGSEGV_NULL_GUARD_RECEIVED_SLOTS[i].store(false, std::sync::atomic::Ordering::Release);
+    SIGSEGV_RECOVERY_TIDS[i].store(0, std::sync::atomic::Ordering::Release);
+}
+
 fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
     if tid == 0 {
         return None;
     }
 
+    // Fast path: this thread already owns a slot. Keyed on thread-local state,
+    // not on the tid, so a recycled tid cannot masquerade as the same thread.
+    if let Ok(Some(i)) = SIGSEGV_SLOT.try_with(|g| g.slot.get()) {
+        return Some(i);
+    }
+
+    // First touch from this thread. Any slot still carrying our tid belongs to a
+    // dead thread whose tid was recycled (or whose TLS destructor never ran).
+    // It must go: the signal handler resolves a tid by taking the FIRST matching
+    // slot, so a stale duplicate would shadow the one we are about to claim.
     for i in 0..SIGSEGV_RECOVERY_SLOTS {
         if SIGSEGV_RECOVERY_TIDS[i].load(std::sync::atomic::Ordering::Acquire) == tid {
-            return Some(i);
+            clear_sigsegv_recovery_slot(i);
         }
     }
 
@@ -1099,6 +1221,13 @@ fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
             )
             .is_ok()
         {
+            // Start from a known state rather than whatever the previous owner
+            // left, and arm release at thread exit. If the thread-local is
+            // already being destroyed we still hand back the slot; it is then
+            // reclaimed by the stale-slot sweep above when the tid is reused.
+            SIGSEGV_STACK_GUARD_RECOVERY_IPS[i].store(0, std::sync::atomic::Ordering::Release);
+            SIGSEGV_NULL_GUARD_RECOVERY_IPS[i].store(0, std::sync::atomic::Ordering::Release);
+            let _ = SIGSEGV_SLOT.try_with(|g| g.slot.set(Some(i)));
             return Some(i);
         }
     }
