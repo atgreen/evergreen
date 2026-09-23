@@ -1285,6 +1285,39 @@ fn alternate_qualified_spelling(name: &str) -> Option<String> {
 /// Whether `place_name` (an accessor's `sym_name`) has a user `(defun (setf
 /// place) …)` writer known at compile time (registered as a global setf writer).
 /// Used by the portable SETF lowering to recognize a user setf-function place.
+/// The slot that a class accessor / reader / writer names, if any.
+///
+/// Matches by BARE name as well as the printed one: at a SETF site in a package
+/// that only imports (or references qualified) the accessor symbol, the place
+/// head arrives package-qualified (`ASDF/COMPONENT:%FOO`) while the slot
+/// recorded the bare accessor name (`%FOO`). Without the bare comparison e.g.
+/// ASDF's `(push … (%additional-input-files c))` raised "SETF: unsupported
+/// place" (bliss-d0b family).
+///
+/// Shared by the tree-walker's SETF store path and the `BLISS::SET-ACCESSOR-SLOT`
+/// store primitive the bytecode lowerer emits, so the two tiers cannot drift
+/// apart on which slot an accessor names (bliss-ljmj).
+pub(in crate::cli) fn accessor_slot_name(env: &Env, accessor: &str) -> Option<String> {
+    let bare = symbol_bare_name(accessor);
+    let name_matches = |n: &str| n == accessor || symbol_bare_name(n) == bare;
+    env.classes.borrow().values().find_map(|class| {
+        class.slots.iter().find_map(|slot| {
+            let matches_reader = slot
+                .accessor
+                .as_ref()
+                .map(|acc| name_matches(acc))
+                .unwrap_or(false)
+                || slot.readers.iter().any(|reader| name_matches(reader))
+                || slot.writers.iter().any(|writer| name_matches(writer));
+            if matches_reader {
+                Some(slot.name.clone())
+            } else {
+                None
+            }
+        })
+    })
+}
+
 pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
     let key = format!("(SETF {place_name})");
     if GLOBAL_SETF_FNS.with(|m| m.borrow().contains_key(&key)) {
@@ -18135,24 +18168,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // ASDF's `(push … (%additional-input-files c))`
                                 // raised "SETF: unsupported place", blocking
                                 // (asdf:load-system :split-sequence).
-                                let bare_other = symbol_bare_name(other);
-                                let name_matches = |n: &str| n == other || symbol_bare_name(n) == bare_other;
-                                let reader_slot = env.classes.borrow().values().find_map(|class| {
-                                    class.slots.iter().find_map(|slot| {
-                                        let matches_reader = slot
-                                            .accessor
-                                            .as_ref()
-                                            .map(|acc| name_matches(acc))
-                                            .unwrap_or(false)
-                                            || slot.readers.iter().any(|reader| name_matches(reader))
-                                            || slot.writers.iter().any(|writer| name_matches(writer));
-                                        if matches_reader {
-                                            Some(slot.name.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                });
+                                let reader_slot = accessor_slot_name(env, other);
                                 if let Some(slot_name) = reader_slot {
                                     let tgt = eval_form(tgt_form, env)?;
                                     write_slot_value(
@@ -19454,6 +19470,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let slot = args.get(1).copied().unwrap_or(NIL);
                 let val = args.get(2).copied().unwrap_or(NIL);
                 write_slot_value(instance, slot, val, env)?;
+                return Ok(val);
+            }
+            "BLISS::SET-ACCESSOR-SLOT" => {
+                // Store primitive for bytecode-lowered `(setf (accessor obj) v)`
+                // where ACCESSOR is a DEFCLASS :accessor/:reader/:writer or a
+                // DEFSTRUCT accessor (bliss-ljmj).
+                //
+                // The accessor -> slot mapping is resolved HERE, at run time,
+                // exactly as the tree-walker does. Baking the slot name in at
+                // lowering time would be wrong in both directions: a function can
+                // be compiled before the class it touches exists, and a class can
+                // be redefined afterwards. The lowerer only uses the mapping's
+                // existence as a gate.
+                let args = eval_args(cdr, env)?;
+                let instance = args.first().copied().unwrap_or(NIL);
+                let accessor = args.get(1).copied().unwrap_or(NIL);
+                let val = args.get(2).copied().unwrap_or(NIL);
+                let Some(slot_name) = accessor_slot_name(env, &sym_name(accessor)) else {
+                    return Err(BlissError::Internal(format!(
+                        "SETF: {} does not name a slot accessor",
+                        format_val(accessor)
+                    )));
+                };
+                write_slot_value(instance, resolve_sym(&slot_name).unwrap_or(NIL), val, env)?;
                 return Ok(val);
             }
             "BLISS::SET-CAR" | "BLISS::SET-CDR" => {

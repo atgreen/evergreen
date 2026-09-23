@@ -144,6 +144,38 @@ with and without it.
 Counting a call site is not the same as counting execution tiers. To answer
 "which tier ran this?", use the threshold, or read the dispatch site.
 
+## 6c. When wall-clock is too noisy, count instructions
+
+Wall-clock on this box could not resolve a ~2% change: with a load average
+around 1.5 (a browser, a shell, the agent itself) and core 0 sitting at 1.8 GHz
+under the `powersave` governor, six alternating reps of the babel benchmark
+spread 14.59–17.21 s — a 2.6 s range against a 0.4 s effect. Five of six paired
+reps favoured the patched binary and the sixth contradicted it by more than the
+effect size. That is not a measurement.
+
+Retired-instruction count is nearly deterministic for a deterministic program,
+and is immune to both frequency scaling and to another process stealing the
+core. The same comparison, three reps each:
+
+      patched   134.34G  134.23G  134.85G    mean 134.47G
+      baseline  136.56G  136.97G  136.74G    mean 136.76G   -> -1.67%
+
+The ranges do not overlap. That is a measurement.
+
+This is a **hybrid** CPU, so `perf` exposes one counter per core type and an
+unpinned run reports `<not counted>` for whichever PMU it missed. Pin the
+process AND name the P-core's PMU explicitly:
+
+```bash
+taskset -c 0 perf stat -e cpu_core/instructions/u -x, \
+    taskset -c 0 ./bliss-cli --no-init --load bench.lisp
+```
+
+Caveat: instructions are not time. A change that trades many cheap instructions
+for few expensive ones (a cache-missing load, a division) can cut time while
+raising the count, or the reverse. Use it to resolve a small effect you cannot
+otherwise see, and confirm direction with wall-clock once the machine is quiet.
+
 ## 7. Same path, different build
 
 `target/<target>/release/bliss-cli` is written by every `cargo build`, whatever

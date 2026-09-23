@@ -2797,11 +2797,56 @@ impl<'e> Lowerer<'e> {
                 self.pop_n(3);
                 self.push_n(1);
                 if !last { self.emit(Instr::Pop); self.pop_n(1); }
+            } else if let Some((mut inst, acc_sym)) = self.accessor_setf_place(place) {
+                // `(setf (accessor obj) v)` for a DEFCLASS :accessor/:reader/
+                // :writer or a DEFSTRUCT accessor -> BLISS::SET-ACCESSOR-SLOT
+                // (instance, accessor-symbol, value). The accessor symbol is a
+                // literal, not an evaluated subform; the primitive resolves it to
+                // a slot at run time, as the tree-walker does (bliss-ljmj).
+                bliss_rt::rooted_ref!(_inst_root = &mut inst);
+                let sym = resolve_sym("BLISS::SET-ACCESSOR-SLOT")
+                    .ok_or(Bail)?
+                    .as_symbol_index();
+                self.lower_expr(inst)?;
+                let c = self.add_const(acc_sym);
+                self.emit(Instr::Const(c));
+                self.push_n(1);
+                self.lower_expr(items[2 * i + 1])?;
+                self.emit(Instr::CallNamed { sym, nargs: 3 });
+                self.pop_n(3);
+                self.push_n(1);
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else {
                 return Err(Bail);
             }
         }
         Ok(())
+    }
+
+    /// Recognise a one-argument place `(accessor obj)` whose head names a slot
+    /// of some known class — a DEFCLASS `:accessor`/`:reader`/`:writer` or a
+    /// DEFSTRUCT accessor — returning the instance form and the accessor symbol.
+    ///
+    /// Only the EXISTENCE of the mapping is decided here; which slot the
+    /// accessor names is resolved at run time by `BLISS::SET-ACCESSOR-SLOT`, so
+    /// a later class redefinition is followed rather than baked in.
+    ///
+    /// Probed last, after every other place shape, so it can only turn a bail
+    /// into a compile and never changes a lowering that already worked
+    /// (bliss-ljmj).
+    fn accessor_setf_place(&self, place: BlissVal) -> Option<(BlissVal, BlissVal)> {
+        if !place.is_cons() {
+            return None;
+        }
+        let items = list_to_vec(place);
+        if items.len() != 2 || !items[0].is_symbol() {
+            return None;
+        }
+        super::accessor_slot_name(self.env, &sym_name(items[0]))?;
+        Some((items[1], items[0]))
     }
 
     /// Recognise a `(f a b …)` place whose accessor `f` has a user
