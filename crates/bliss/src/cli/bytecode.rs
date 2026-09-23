@@ -5295,10 +5295,17 @@ impl<'e> Lowerer<'e> {
             // so bail to the tree-walker. The closure resolves any boxed name in
             // scope, so pass the whole boxed set (plus the enclosing capturing
             // closures it may call).
-            for name in captured {
-                if matches!(self.lookup_local(name), Some(VarLoc::Slot(_))) {
-                    return Err(Bail);
-                }
+            let slot_captured: Vec<String> = captured
+                .iter()
+                .filter(|n| matches!(self.lookup_local(n), Some(VarLoc::Slot(_))))
+                .cloned()
+                .collect();
+            if !slot_captured.is_empty() {
+                // Ask for a recompile with these boxed rather than giving up:
+                // the capture is real, it was just invisible to the pre-scan
+                // (bliss-ptv4).
+                request_boxing(slot_captured);
+                return Err(record_bail(|| "function:closure-captures-slot".to_string()));
             }
             let captures: std::collections::HashSet<String> = self
                 .scopes
@@ -6976,9 +6983,39 @@ fn compile_function(
     )
 }
 
+// Names a nested closure captured that were allocated to frame SLOTS.
+//
+// `emit_portable_closure` can only capture BOXED bindings, and whether a name
+// needs boxing is decided by `compute_captured_names` before the body is
+// lowered. That pre-scan is syntactic, so a closure that only appears after a
+// macro expands is invisible to it — ASDF's `do-asdf-cache` expands to
+// `(consult-asdf-cache key #'(lambda () body))`, capturing the method's
+// parameters, which are already in slots by then. Rather than give up, the
+// closure records what it needed here and `compile_function_in` recompiles the
+// whole function with those names boxed (bliss-ptv4).
+thread_local! {
+    static BOX_REQUEST: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+fn request_boxing(names: impl IntoIterator<Item = String>) {
+    BOX_REQUEST.with(|r| r.borrow_mut().extend(names));
+}
+
+fn take_box_request() -> std::collections::HashSet<String> {
+    BOX_REQUEST.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
 /// As [`compile_function`], but with a set of enclosing block names the body may
 /// non-locally `return-from` (used when compiling a lambda nested in another
 /// function). Top-level definitions pass an empty set.
+///
+/// Compiles, and if lowering failed only because a macro-revealed closure
+/// captured a slot-allocated binding, compiles again with those names boxed.
+///
+/// Bounded: each round must add a name that is not already forced, so it
+/// terminates in at most the number of bindings, and the cap keeps a
+/// pathological body from looping.
 #[allow(clippy::too_many_arguments)]
 fn compile_function_in(
     name: &str,
@@ -6990,6 +7027,46 @@ fn compile_function_in(
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
+) -> Option<BytecodeFunction> {
+    let mut forced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let _ = take_box_request();
+        let attempt = compile_function_forcing_boxed(
+            name,
+            params_form,
+            body,
+            env,
+            portable,
+            macro_lambda_list,
+            enclosing_blocks,
+            enclosing_tags,
+            enclosing_slots,
+            &forced,
+        );
+        if attempt.is_some() {
+            return attempt;
+        }
+        let requested = take_box_request();
+        if requested.is_empty() || requested.is_subset(&forced) {
+            return None;
+        }
+        forced.extend(requested);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_function_forcing_boxed(
+    name: &str,
+    params_form: BlissVal,
+    body: BlissVal,
+    env: &Env,
+    portable: bool,
+    macro_lambda_list: bool,
+    enclosing_blocks: &std::collections::HashSet<String>,
+    enclosing_tags: &std::collections::HashSet<String>,
+    enclosing_slots: &std::collections::HashSet<String>,
+    forced_boxed: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     bliss_rt::rooted!(params_form = params_form);
     bliss_rt::rooted!(body = body);
@@ -7063,6 +7140,11 @@ fn compile_function_in(
     bliss_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(*body);
+    // Names a previous attempt discovered were captured by a macro-revealed
+    // closure but had been given frame slots (bliss-ptv4).
+    for forced in forced_boxed {
+        lo.captured_names.insert(forced.clone());
+    }
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
     // Drop names shadowed by this function's own params: only genuinely-free
