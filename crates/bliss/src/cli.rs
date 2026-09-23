@@ -1726,7 +1726,11 @@ struct Env {
     mv: Vec<BlissVal>,
     mv_active: bool,
     /// Closures stored by name or lambda id
-    closures: Rc<RefCell<HashMap<u64, Closure>>>,
+    /// Keyed by a plain `u64` id, so the default SipHash is pure overhead —
+    /// every closure construction and every invocation hashes one. `FxHash` is
+    /// the same choice already made for the symbol registry and the GF dispatch
+    /// cache (bliss-p1t).
+    closures: Rc<RefCell<HashMap<u64, Closure, bliss_rt::fxhash::FxBuildHasher>>>,
     block_stack: Vec<(String, String)>,
     catch_stack: Vec<(String, String)>,
     /// Tags visible for GO: (tag-name, tagbody-token)
@@ -9206,8 +9210,8 @@ thread_local! {
     /// broke the documented "one root map per process" invariant on the
     /// BUILTIN_FN_WRAPPERS comment). Every `Env` now shares THIS one table by
     /// Rc, so an id minted anywhere resolves everywhere.
-    static CLOSURE_REGISTRY: Rc<RefCell<HashMap<u64, Closure>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    static CLOSURE_REGISTRY: Rc<RefCell<HashMap<u64, Closure, bliss_rt::fxhash::FxBuildHasher>>> =
+        Rc::new(RefCell::new(HashMap::default()));
 }
 
 fn next_closure_id() -> u64 {
