@@ -203,6 +203,36 @@ like contention and usually are not — mallocng takes its lock on every
 operation, so the symbol is really "you called malloc a lot". Confirm with a
 single-threaded run or an allocation count before optimising for parallelism.
 
+## 6e. Getting perf call graphs out of the static musl binary
+
+The standing note in this file is that perf "cannot unwind out of musl's
+malloc", and by default it cannot unwind much of anything here: the release
+build has no frame pointers, and `--call-graph dwarf` also comes back with bare
+leaves. That leaves you with self-time only, which is how several hot symbols in
+this investigation sat unattributed for a long time.
+
+Build with frame pointers and unwinding works:
+
+```bash
+RUSTFLAGS="-C force-frame-pointers=yes" \
+    cargo build --release --target x86_64-unknown-linux-musl
+taskset -c 0 perf record -F 999 --call-graph fp -- taskset -c 0 ./bliss-cli …
+perf report --children --comms <binary-name>          # inclusive
+perf report --no-children --symbols memcpy -g caller  # who calls this leaf
+```
+
+Two traps that cost time here:
+
+- **`--comms` takes the BINARY name**, so a copied/renamed binary (`bliss-FP`)
+  needs that name, not `bliss-cli`. The wrong filter silently reports nothing at
+  all rather than erroring.
+- This is a hybrid CPU: an unpinned run lands on E-cores and reports
+  `cpu_atom/cycles`, with far fewer samples. Pin with `taskset -c 0` to get
+  `cpu_core` and a usable sample count.
+
+Frame pointers cost a little speed, so profile with them and *measure* without
+them.
+
 ## 7. Same path, different build
 
 `target/<target>/release/bliss-cli` is written by every `cargo build`, whatever
