@@ -296,6 +296,33 @@ the load path and keeps the 0.68 s. Projected babel load with a warm cache:
 
 This is the number §8 said would be "approximately zero".
 
+### §8c. …but most of that saving has since been taken directly (bliss-fhci)
+
+Splitting the compile cost again — `BLISS_T2_NO_QUEUE` snapshots without
+queueing — showed that **82% of it was not the compiler at all**, but the
+mutator-side inline-candidate snapshot: `snapshot_t2_input` walked the whole
+registry (9,626 functions) and deep-cloned every invoked one, on each of 109
+promotions, to hand the compiler an average of 3 candidates it could actually
+consult.
+
+Scoping that to the transitive call-graph closure (aaeb60a) took the babel load
+from 28.66 s to 21.64 s (−24.5%) on its own. The decomposition now reads:
+
+| | before | after |
+|---|---|---|
+| T2 net penalty | +8.80 s | **+1.61 s** |
+| snapshot + compile | +9.39 s | +2.17 s |
+| emitted code | −0.66 s | −0.56 s |
+
+**So the cache's remaining headroom on this workload is ~2.2 s of a 21.6 s load,
+not ~9.4 s.** The epic is still right for application steady state and for
+avoiding recompilation across runs, but it should no longer be justified by
+babel load time — that argument has largely been spent. Re-measure before
+scheduling Stage 3.
+
+The general lesson is the one this investigation keeps repeating: measure which
+*half* of a cost you are about to optimise before building the expensive fix.
+
 **Consequence for this epic: the case is much STRONGER than §8 allowed, and for
 a reason §8 never considered.** §8 weighed only the *benefit* side of a cache —
 "it makes good code arrive sooner, and good code is worth nothing here" — and
