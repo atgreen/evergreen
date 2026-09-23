@@ -46,8 +46,8 @@ use super::{
     RestartFunction, apply_function, arena_cons, arena_str, bliss_error_to_condition,
     condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec, next_control_token,
     resolve_sym, restart_invoked_name, run_handler_bind_handlers, signal_raw_error_in_context,
-    store_control_value, sym_name, symbol_bare_name, tag_key, take_control_value, val_as_str,
-    vec_to_list,
+    store_control_value, sym_bare_name_rc, sym_name, symbol_bare_name, tag_key,
+    take_control_value, val_as_str, vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use bliss_rt::asm::{Asm, Cc, Label};
@@ -297,7 +297,7 @@ fn is_member_nil_t(form: BlissVal) -> bool {
         return false;
     }
     let (head, tail) = cp(form);
-    if !head.is_symbol() || symbol_bare_name(&sym_name(head)) != "MEMBER" {
+    if !head.is_symbol() || sym_bare_name_rc(head).as_ref() != "MEMBER" {
         return false;
     }
     let (mut saw_nil, mut saw_t, mut n, mut cur) = (false, false, 0u8, tail);
@@ -339,7 +339,7 @@ fn typep_inline_class(rest: BlissVal) -> Option<u16> {
         return None;
     }
     let (q, qr) = cp(type_form);
-    if !q.is_symbol() || symbol_bare_name(&sym_name(q)) != "QUOTE" || !qr.is_cons() {
+    if !q.is_symbol() || sym_bare_name_rc(q).as_ref() != "QUOTE" || !qr.is_cons() {
         return None;
     }
     let (tsym, qr2) = cp(qr);
@@ -347,7 +347,7 @@ fn typep_inline_class(rest: BlissVal) -> Option<u16> {
         return None;
     }
     if tsym.is_symbol() {
-        return find_typep_class(&symbol_bare_name(&sym_name(tsym)));
+        return find_typep_class(&sym_bare_name_rc(tsym));
     }
     // A quoted compound type designator: only (MEMBER NIL T) is inlinable.
     if is_member_nil_t(tsym) {
@@ -2769,7 +2769,7 @@ impl<'e> Lowerer<'e> {
                 bliss_rt::rooted_ref!(_sym_form_root = &mut sym_form);
                 let is_fdefinition = {
                     let (head, _) = cp(place);
-                    head.is_symbol() && symbol_bare_name(&sym_name(head)) == "FDEFINITION"
+                    head.is_symbol() && sym_bare_name_rc(head).as_ref() == "FDEFINITION"
                 };
                 let setter = resolve_sym(if is_fdefinition {
                     "BLISS::SET-FDEFINITION"
@@ -2921,7 +2921,7 @@ impl<'e> Lowerer<'e> {
         if items.len() != 3 || !items[0].is_symbol() {
             return None;
         }
-        if symbol_bare_name(&sym_name(items[0])) != "GETHASH" {
+        if sym_bare_name_rc(items[0]).as_ref() != "GETHASH" {
             return None;
         }
         Some((items[1], items[2]))
@@ -3393,7 +3393,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
         // their iteration keyword, else bail to the tree-walker's full LOOP.
         if !forms.iter().all(|f| f.is_cons()) {
             let kw = |f: BlissVal| -> Option<String> {
-                f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+                f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
             };
             // Try the proven specialized handlers first for the shapes they
             // recognize; each bails during parsing (before emitting) on an
@@ -3445,7 +3445,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         let top = resolve_sym(&format!("%LG-TOP{id}")).ok_or(Bail)?;
         let end = resolve_sym(&format!("%LG-END{id}")).ok_or(Bail)?;
@@ -3920,7 +3920,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
 
     /// `(loop repeat COUNT {do ...|collect EXPR|sum EXPR|count EXPR})`.
     fn lower_loop_repeat(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
-        if forms.len() < 4 || symbol_bare_name(&sym_name(forms[0])) != "REPEAT" {
+        if forms.len() < 4 || sym_bare_name_rc(forms[0]).as_ref() != "REPEAT" {
             return Err(Bail);
         }
         let id = self.fresh_id();
@@ -3966,7 +3966,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
     fn lower_loop_numeric_for(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
         // Bare (KEYWORD:-stripped, upcased) name of a loop-keyword token.
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         let kw_is = |f: BlissVal, name: &str| kw(f).as_deref() == Some(name);
 
@@ -4070,7 +4070,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
         acc: BlissVal,
     ) -> LowerResult<(bool, BlissVal, Vec<BlissVal>, BlissVal)> {
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         if tail.is_empty() {
@@ -4131,7 +4131,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
     /// variables are recomputed in order after the primary bindings.
     fn lower_loop_for_in(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         if forms.len() < 5
             || kw(forms[0]).as_deref() != Some("FOR")
@@ -4282,7 +4282,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
     /// traversal order while making ASDF/UIOP hash loops tierable.
     fn lower_loop_for_being_hash(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         if forms.len() < 8
             || kw(forms[0]).as_deref() != Some("FOR")
@@ -4318,7 +4318,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
         // each iteration; the plain `for ... in <snapshot>` normalization below
         // can't express that. Bail (before emitting) so the full tree-walker LOOP,
         // which handles `using`, runs it correctly.
-        if action[0].is_symbol() && symbol_bare_name(&sym_name(action[0])) == "USING" {
+        if action[0].is_symbol() && sym_bare_name_rc(action[0]).as_ref() == "USING" {
             return Err(Bail);
         }
 
@@ -4338,7 +4338,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
     ///     (setq VAR (cdr VAR)) (go top)) result)))`.
     fn lower_loop_for_on(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         if forms.len() < 5
             || kw(forms[0]).as_deref() != Some("FOR")
@@ -4390,7 +4390,7 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
     /// The test is re-evaluated each turn and references enclosing-scope vars.
     fn lower_loop_while(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
         let kw = |f: BlissVal| -> Option<String> {
-            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
         if forms.len() < 3 {
             return Err(Bail);
@@ -5898,8 +5898,8 @@ fn symbol_function_setf_place(place: BlissVal) -> Option<BlissVal> {
     if !head.is_symbol() {
         return None;
     }
-    let n = symbol_bare_name(&sym_name(head));
-    if n != "SYMBOL-FUNCTION" && n != "FDEFINITION" {
+    let n = sym_bare_name_rc(head);
+    if n.as_ref() != "SYMBOL-FUNCTION" && n.as_ref() != "FDEFINITION" {
         return None;
     }
     let (arg, tail) = cp(rest);
@@ -5920,7 +5920,7 @@ fn aref_setf_place(place: BlissVal) -> Option<(&'static str, BlissVal, BlissVal)
     if items.len() != 3 || !items[0].is_symbol() {
         return None;
     }
-    match symbol_bare_name(&sym_name(items[0])).as_str() {
+    match sym_bare_name_rc(items[0]).as_ref() {
         "ELT" => Some(("BLISS::SET-ELT", items[1], items[2])),
         "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
             Some(("BLISS::SET-AREF", items[1], items[2]))
@@ -5933,7 +5933,7 @@ fn slot_value_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
     if !place.is_cons() { return None; }
     let items = list_to_vec(place);
     if items.len() != 3 || !items[0].is_symbol() { return None; }
-    if symbol_bare_name(&sym_name(items[0])) == "SLOT-VALUE" { Some((items[1], items[2])) } else { None }
+    if sym_bare_name_rc(items[0]).as_ref() == "SLOT-VALUE" { Some((items[1], items[2])) } else { None }
 }
 
 /// Recognize a `(cXr X)` SETF place — any `c[ad]+r` accessor plus `first`/`rest`
@@ -5953,7 +5953,7 @@ fn cons_setf_place(place: BlissVal) -> Option<(&'static str, BlissVal)> {
     if !tail.is_nil() {
         return None; // exactly one argument
     }
-    let name = match symbol_bare_name(&sym_name(op)).as_str() {
+    let name = match sym_bare_name_rc(op).as_ref() {
         "FIRST" => "CAR".to_string(),
         "REST" => "CDR".to_string(),
         other => other.to_string(),
@@ -6061,7 +6061,7 @@ fn parse_loop_accumulations(
 /// `loop` (which rebinds its own `it`). Used to wire the anaphor to a fresh temp
 /// bound to the conditional's test value.
 fn subst_loop_it(form: BlissVal, repl: BlissVal) -> BlissVal {
-    if form.is_symbol() && symbol_bare_name(&sym_name(form)) == "IT" {
+    if form.is_symbol() && sym_bare_name_rc(form).as_ref() == "IT" {
         return repl;
     }
     if !form.is_cons() {
@@ -6069,8 +6069,8 @@ fn subst_loop_it(form: BlissVal, repl: BlissVal) -> BlissVal {
     }
     let (car, cdr) = cp(form);
     if car.is_symbol() {
-        let n = symbol_bare_name(&sym_name(car));
-        if n == "QUOTE" || n == "LOOP" {
+        let n = sym_bare_name_rc(car);
+        if n.as_ref() == "QUOTE" || n.as_ref() == "LOOP" {
             return form;
         }
     }
@@ -6206,11 +6206,11 @@ fn body_uses_macrolet(body: BlissVal) -> bool {
         }
         let (car, cdr) = cp(form);
         if car.is_symbol() {
-            let n = symbol_bare_name(&sym_name(car));
-            if n == "MACROLET" || n == "SYMBOL-MACROLET" {
+            let n = sym_bare_name_rc(car);
+            if n.as_ref() == "MACROLET" || n.as_ref() == "SYMBOL-MACROLET" {
                 return true;
             }
-            if n == "QUOTE" {
+            if n.as_ref() == "QUOTE" {
                 return false;
             }
         }
@@ -6229,11 +6229,11 @@ fn body_uses_return_from(body: BlissVal) -> bool {
         }
         let (car, cdr) = cp(form);
         if car.is_symbol() {
-            let n = symbol_bare_name(&sym_name(car));
-            if n == "RETURN-FROM" {
+            let n = sym_bare_name_rc(car);
+            if n.as_ref() == "RETURN-FROM" {
                 return true;
             }
-            if n == "QUOTE" {
+            if n.as_ref() == "QUOTE" {
                 return false;
             }
         }
@@ -6457,8 +6457,8 @@ fn collect_symbol_names_qq(form: BlissVal, out: &mut std::collections::HashSet<S
     if form.is_cons() {
         let (car, cdr) = cp(form);
         if car.is_symbol() {
-            let head = symbol_bare_name(&sym_name(car));
-            match head.as_str() {
+            let head = sym_bare_name_rc(car);
+            match head.as_ref() {
                 "QUASIQUOTE" => {
                     collect_symbol_names_qq(cdr, out, qq + 1);
                     return;
@@ -6888,7 +6888,7 @@ fn primitive_declared_type(type_form: BlissVal) -> Option<DeclaredType> {
     if !type_form.is_symbol() {
         return None;
     }
-    match symbol_bare_name(&sym_name(type_form)).as_str() {
+    match sym_bare_name_rc(type_form).as_ref() {
         "FIXNUM" => Some(DeclaredType::Fixnum),
         "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
         _ => None,
@@ -6919,7 +6919,7 @@ fn body_declared_special(body: BlissVal) -> std::collections::HashSet<String> {
             break;
         }
         let (op, declarations) = cp(form);
-        if !op.is_symbol() || symbol_bare_name(&sym_name(op)) != "DECLARE" {
+        if !op.is_symbol() || sym_bare_name_rc(op).as_ref() != "DECLARE" {
             break;
         }
         for declaration in list_to_vec(declarations) {
@@ -6927,7 +6927,7 @@ fn body_declared_special(body: BlissVal) -> std::collections::HashSet<String> {
                 continue;
             }
             let (head, vars) = cp(declaration);
-            if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SPECIAL" {
+            if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SPECIAL" {
                 for v in list_to_vec(vars) {
                     if v.is_symbol() {
                         out.insert(sym_name(v));
@@ -6953,7 +6953,7 @@ fn declared_parameter_types(body: BlissVal, params: &[String]) -> Option<Vec<Dec
             break;
         }
         let (op, declarations) = cp(form);
-        if !op.is_symbol() || symbol_bare_name(&sym_name(op)) != "DECLARE" {
+        if !op.is_symbol() || sym_bare_name_rc(op).as_ref() != "DECLARE" {
             break;
         }
         for declaration in list_to_vec(declarations) {
@@ -6964,8 +6964,8 @@ fn declared_parameter_types(body: BlissVal, params: &[String]) -> Option<Vec<Dec
             if !head.is_symbol() {
                 continue;
             }
-            let head_name = symbol_bare_name(&sym_name(head));
-            let (declared, variables) = if head_name == "TYPE" {
+            let head_name = sym_bare_name_rc(head);
+            let (declared, variables) = if head_name.as_ref() == "TYPE" {
                 if !tail.is_cons() {
                     continue;
                 }
@@ -8276,18 +8276,18 @@ fn portable_load_thunk_form(form: BlissVal) -> Option<BlissVal> {
     if !op.is_symbol() {
         return Some(form);
     }
-    match symbol_bare_name(&sym_name(op)).as_str() {
+    match sym_bare_name_rc(op).as_ref() {
         // Package context has already selected the package-qualified identities
         // serialized into subsequent symbol references. LOAD dynamically
         // restores *PACKAGE*, so there is no observable load action to retain.
         "IN-PACKAGE" => None,
         "DEFVAR" | "DEFPARAMETER" | "DEFCONSTANT" => {
-            let kind = symbol_bare_name(&sym_name(op));
+            let kind = sym_bare_name_rc(op);
             let (var, init_and_doc) = cp(rest);
             if !var.is_symbol() {
                 return Some(form);
             }
-            if kind == "DEFVAR" && !init_and_doc.is_cons() {
+            if kind.as_ref() == "DEFVAR" && !init_and_doc.is_cons() {
                 return None;
             }
             let init = if init_and_doc.is_cons() {
@@ -8295,7 +8295,7 @@ fn portable_load_thunk_form(form: BlissVal) -> Option<BlissVal> {
             } else {
                 NIL
             };
-            if kind == "DEFCONSTANT" {
+            if kind.as_ref() == "DEFCONSTANT" {
                 // Mirror the DEFCONSTANT macro in lib/boot.lisp: assign and mark
                 // as ONE operation, never a bare SETQ. The fasl re-evaluates this
                 // form at load time, after COMPILE-FILE already evaluated (and so
@@ -8309,7 +8309,7 @@ fn portable_load_thunk_form(form: BlissVal) -> Option<BlissVal> {
                 ]));
             }
             let setq = form_list(&[resolve_sym("SETQ")?, var, init]);
-            if kind == "DEFVAR" {
+            if kind.as_ref() == "DEFVAR" {
                 let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
                 let boundp = form_list(&[resolve_sym("BOUNDP")?, quoted]);
                 Some(form_list(&[resolve_sym("UNLESS")?, boundp, setq]))
@@ -8361,7 +8361,7 @@ struct BbuPackagePlan {
 
 fn bbu_package_designator(value: BlissVal) -> Option<String> {
     let raw = if value.is_symbol() {
-        symbol_bare_name(&sym_name(value))
+        sym_bare_name_rc(value).to_string()
     } else if value.is_string() {
         val_as_str(value)
     } else {
@@ -8385,7 +8385,7 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
     let (op, rest) = cp(form);
     if !op.is_symbol()
         || !matches!(
-            symbol_bare_name(&sym_name(op)).as_str(),
+            sym_bare_name_rc(op).as_ref(),
             "DEFPACKAGE" | "DEFINE-PACKAGE"
         )
     {
@@ -8412,9 +8412,9 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
         if !key.is_symbol() {
             continue;
         }
-        let key = symbol_bare_name(&sym_name(key));
+        let key = sym_bare_name_rc(key);
         let values = list_to_vec(values);
-        let destination = match key.as_str() {
+        let destination = match key.as_ref() {
             "USE" | "MIX" => Some(&mut plan.uses),
             "NICKNAMES" => Some(&mut plan.nicknames),
             "EXPORT" => Some(&mut plan.exports),
@@ -8443,7 +8443,7 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
         };
         if let Some(destination) = destination {
             for value in values {
-                let item = if matches!(key.as_str(), "EXPORT" | "INTERN") {
+                let item = if matches!(key.as_ref(), "EXPORT" | "INTERN") {
                     if !value.is_symbol() && !value.is_string() {
                         return Err(bbu_error(format!(
                             "package option :{key} contains a non-literal designator"
@@ -8620,7 +8620,7 @@ pub fn build_bbu_from_forms(
         // handled by step (2b); this covers the DEFSETF spelling.
         let source_only_definer = form.is_cons() && {
             let (op, _) = cp(form);
-            op.is_symbol() && symbol_bare_name(&sym_name(op)) == "DEFSETF"
+            op.is_symbol() && sym_bare_name_rc(op).as_ref() == "DEFSETF"
         };
         if !done && !source_only_definer {
             match portable_load_thunk_form(form) {
@@ -8918,7 +8918,7 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
         // Intern every present symbol via the identity-safe kind-2 path so a
         // package's own symbols (including ones with no function/value) exist.
         for s in bliss_stdlib::present_symbols(pkg) {
-            let bare = symbol_bare_name(&sym_name(s));
+            let bare = sym_bare_name_rc(s);
             let name_ref = pool.string(&bare);
             load_actions.push((2, 0, package_ref, name_ref, BBU_NO_INDEX));
         }
@@ -10415,7 +10415,7 @@ fn body_contains_loop(body: BlissVal) -> bool {
         if v.is_cons() {
             let (car, cdr) = cp(v);
             if car.is_symbol() {
-                match symbol_bare_name(&sym_name(car)).as_str() {
+                match sym_bare_name_rc(car).as_ref() {
                     "LOOP" | "DOTIMES" | "DOLIST" | "DO" | "DO*" | "TAGBODY" | "PROG"
                     | "PROG*" => return true,
                     "QUOTE" => return false, // quoted data is not code
@@ -10442,7 +10442,7 @@ fn body_may_capture_closure(items: &[BlissVal]) -> bool {
         if v.is_cons() {
             let (car, cdr) = cp(v);
             if car.is_symbol() {
-                match symbol_bare_name(&sym_name(car)).as_str() {
+                match sym_bare_name_rc(car).as_ref() {
                     "LAMBDA" | "FUNCTION" | "FLET" | "LABELS" | "NAMED-LAMBDA" => return true,
                     "QUOTE" => return false, // quoted data is not code
                     _ => {}
@@ -10482,7 +10482,7 @@ fn form_escapes_to_control(
         }
         let (car, cdr) = cp(v);
         if car.is_symbol() {
-            match symbol_bare_name(&sym_name(car)).as_str() {
+            match sym_bare_name_rc(car).as_ref() {
                 "QUOTE" => return false, // quoted data is not code
                 "RETURN" => {
                     if !shadowed.contains("NIL") && blocks.contains("NIL") {
@@ -18849,8 +18849,8 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
         // definitions inside a thunk, which bails and tree-walks them. LOCALLY's
         // leading `(declare …)` forms recurse to a harmless NIL.
         if op.is_symbol() {
-            let bare = symbol_bare_name(&sym_name(op));
-            if bare == "PROGN" || bare == "LOCALLY" {
+            let bare = sym_bare_name_rc(op);
+            if bare.as_ref() == "PROGN" || bare.as_ref() == "LOCALLY" {
                 let mut last = NIL;
                 bliss_rt::rooted!(forms = list_to_vec(cdr));
                 for index in 0..forms.len() {
@@ -18977,7 +18977,7 @@ fn as_defun(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
     // BLISS-INTERNAL setf-writer symbol so the SETF store path can dispatch it.
     if name_form.is_cons() {
         let (head, tail) = cp(name_form);
-        if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SETF" && tail.is_cons() {
+        if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SETF" && tail.is_cons() {
             let (place, _) = cp(tail);
             if place.is_symbol() {
                 let writer = super::setf_writer_symbol_name(&sym_name(place));
@@ -19001,7 +19001,7 @@ fn as_macro_definition(form: BlissVal) -> Option<(bool, String, BlissVal, BlissV
     if !op.is_symbol() {
         return None;
     }
-    let compiler_macro = match symbol_bare_name(&sym_name(op)).as_str() {
+    let compiler_macro = match sym_bare_name_rc(op).as_ref() {
         "DEFMACRO" => false,
         "DEFINE-COMPILER-MACRO" => true,
         _ => return None,
@@ -19021,7 +19021,7 @@ fn as_setf_expander_definition(form: BlissVal) -> Option<(String, BlissVal, Blis
         return None;
     }
     let (op, rest) = cp(form);
-    if !op.is_symbol() || symbol_bare_name(&sym_name(op)) != "DEFINE-SETF-EXPANDER" {
+    if !op.is_symbol() || sym_bare_name_rc(op).as_ref() != "DEFINE-SETF-EXPANDER" {
         return None;
     }
     let (name_sym, rest) = cp(rest);
