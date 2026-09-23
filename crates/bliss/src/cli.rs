@@ -1760,6 +1760,25 @@ impl<K: PartialEq, V> VecMap<K, V> {
             None
         }
     }
+    /// Update an existing entry through a BORROWED key.
+    ///
+    /// `insert` needs an owned `K`, so updating a `VecMap<String, _>` through it
+    /// forces a `String` allocation even when the entry already exists. Every
+    /// assignment to an existing lexical variable took that path
+    /// (`set_symbol_frame_var` materialised the name via `sym_name` just to
+    /// re-insert it), which showed up under `String` allocation while running
+    /// ASDF (bliss-2erp, bliss-ou03).
+    #[inline]
+    fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        self.entries
+            .iter_mut()
+            .find(|(ek, _)| ek.borrow() == k)
+            .map(|(_, v)| v)
+    }
     #[inline]
     fn len(&self) -> usize {
         self.entries.len()
@@ -7563,8 +7582,9 @@ impl Env {
     fn set_frame_var(frame: &Rc<RefCell<EnvFrame>>, name: &str, val: BlissVal) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
-            if borrowed.vars.contains_key(name) {
-                borrowed.vars.insert(name.to_string(), val);
+            if let Some(slot) = borrowed.vars.get_mut(name) {
+                // In place: the entry exists, so no owned key is needed.
+                *slot = val;
                 if let Some(idx) = bliss_rt::symbols::find_index(name) {
                     borrowed.symbol_vars.insert(idx, val);
                 }
@@ -7586,11 +7606,20 @@ impl Env {
     ) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
-            let name = sym_name(BlissVal::from_symbol_index(symbol_index));
-            if borrowed.symbol_vars.contains_key(&symbol_index) || borrowed.vars.contains_key(&name)
+            // `sym_name_rc` is the cached Rc<str> accessor: no allocation, where
+            // `sym_name` built a fresh String on every assignment.
+            let name = sym_name_rc(BlissVal::from_symbol_index(symbol_index));
+            if borrowed.symbol_vars.contains_key(&symbol_index)
+                || borrowed.vars.contains_key(&*name)
             {
                 borrowed.symbol_vars.insert(symbol_index, val);
-                borrowed.vars.insert(name, val);
+                // Update the legacy name map in place when the entry exists, so
+                // the common assignment path allocates nothing.
+                if let Some(slot) = borrowed.vars.get_mut(&*name) {
+                    *slot = val;
+                } else {
+                    borrowed.vars.insert(name.to_string(), val);
+                }
                 return true;
             }
             let parent = borrowed.parent.clone();

@@ -63,6 +63,15 @@ vary, and a single baseline is not enough: one run of this shape produced a
 repetition. Three baselines and three workload runs, compared by median, gave
 the truth (7.86M → 7.88M, i.e. no change).
 
+## 3a. Discard the first run after building an image
+
+Two measurements in this investigation came back at 61.9M allocations where
+every neighbour was ~26M — a 36M spike, about 4.6 `make-plan`s worth. Both were
+the *first* run against a freshly written image. Eight consecutive runs of the
+same binary afterwards were all 25.8–26.0M with no outlier.
+
+Throw the first run away, or warm the image before measuring.
+
 ## 4. This machine's CPU makes small wall-clock deltas meaningless
 
 Two effects, both documented in AGENTS.md for other reasons:
