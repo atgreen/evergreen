@@ -14,6 +14,14 @@ name = "bliss-cli"
 path = "src/main.rs"
 test = false
 
+[features]
+# Count every Rust-side heap allocation through a wrapping #[global_allocator],
+# reported at exit when BLISS_PROBE_ALLOC_COUNT is set. Off by default and zero
+# cost when off; two relaxed atomics per allocation when on. perf cannot unwind
+# out of musl's malloc, so this is the only way to attribute Rust allocation
+# (bliss-iry5, asked for by bliss-sgis).
+alloc-count = []
+
 [dependencies]
 bliss-rt.workspace = true
 bliss-compiler.workspace = true
