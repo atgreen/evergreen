@@ -5472,7 +5472,21 @@ fn invoke_method(
     // runs as tiered bytecode/native. The compiled body binds its own params and
     // never consults env.method_context, so `next` is irrelevant here.
     if let Some(callable) = METHOD_COMPILED.with(|m| m.borrow().get(&method.method_id.0).copied()) {
-        return apply_function(callable, args, env);
+        // A compiled body binds its own parameters, but it may still contain
+        // CALL-NEXT-METHOD / NEXT-METHOD-P, which read env.method_context —
+        // so publish the context here exactly as the tree-walked path does,
+        // including only pushing it when there IS a next method (bliss-ccso).
+        let Some(mut next) = next else {
+            return apply_function(callable, args, env);
+        };
+        bliss_rt::rooted_ref!(_next_root = &mut next);
+        env.method_context.push(MethodContext {
+            args: args.to_vec(),
+            next: next.clone(),
+        });
+        let result = apply_function(callable, args, env);
+        env.method_context.pop();
+        return result;
     }
     // A method defined inside a user binding form runs its body against that
     // captured lexical environment, not the caller's frame (bliss-sdd).
@@ -13858,6 +13872,13 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "FUNCALL"
             | "APPLY"
             | "CALL-NEXT-METHOD"
+            // The bytecode-lowered spelling of the same thing: a compiled method
+            // body calls the next method through this, and CALL-NEXT-METHOD
+            // returns the next method's VALUES (CLHS 7.6.6.2). Without this the
+            // synthesized call truncates to one, so
+            // `(multiple-value-list (call-next-method))` silently lost every
+            // secondary value once method bodies started compiling (bliss-ccso).
+            | "%CALL-NEXT-METHOD"
             // TIME returns (and so must preserve) its body form's values.
             | "TIME"
             | "LOOP"
@@ -22143,6 +22164,36 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     eval_args(cdr, env)?
                 };
                 return invoke_next_method(env, &context, &args);
+            }
+            // Evaluated-argument entry points for bytecode-lowered
+            // (call-next-method …) / (next-method-p). The forms above are
+            // SPECIAL FORMS reading env.method_context; a compiled method body
+            // runs through apply_function against that same `env`, so the
+            // context is visible — it just needs a callable spelling. Arguments
+            // arrive already evaluated (self-evaluating literals through
+            // apply_function's synthesize path), which is why `eval_args` is
+            // still correct here (bliss-ccso).
+            "BLISS::%CALL-NEXT-METHOD" => {
+                let mut context = env.method_context.last().cloned().ok_or_else(|| {
+                    BlissError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
+                })?;
+                bliss_rt::rooted_ref!(_context_root = &mut context);
+                // No arguments means the next method receives the ORIGINAL ones
+                // (CLHS 7.6.6.2), which the saved context carries.
+                let args = if cdr.is_nil() {
+                    RootedVals::new(context.args.clone())
+                } else {
+                    eval_args(cdr, env)?
+                };
+                return invoke_next_method(env, &context, &args);
+            }
+            "BLISS::%NEXT-METHOD-P" => {
+                let has_next = env
+                    .method_context
+                    .last()
+                    .map(method_context_has_next)
+                    .unwrap_or(false);
+                return Ok(if has_next { T } else { NIL });
             }
             "CERROR" => return eval_cerror(cdr, env),
             "COMPUTE-RESTARTS" => {
@@ -33109,7 +33160,6 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     METHOD_COMPILED.with(|m| m.borrow_mut().remove(&method_id.0));
     if std::env::var_os("BLISS_NO_METHOD_COMPILE").is_none()
         && !nested_in_binding
-        && !body_uses_next_method(body)
     {
         let compile_ll = method_lambda_list_for_compile(*lambda_list);
         if let Some(callable) =
@@ -33188,28 +33238,6 @@ fn method_lambda_list_for_compile(lambda_list: BlissVal) -> BlissVal {
     out
 }
 
-/// True if a method body references CALL-NEXT-METHOD or NEXT-METHOD-P anywhere
-/// (as an operator or otherwise). Such a body needs env.method_context, which the
-/// bytecode compiler does not model, so it must keep tree-walking (bliss-x5y.20).
-fn body_uses_next_method(body: BlissVal) -> bool {
-    fn walk(v: BlissVal, depth: u32) -> bool {
-        if depth > 512 {
-            // Give up (treat as "uses") on pathologically deep forms rather than
-            // overflow — err toward tree-walking.
-            return true;
-        }
-        if v.is_symbol() {
-            let n = symbol_bare_name(&sym_name_rc(v));
-            return n == "CALL-NEXT-METHOD" || n == "NEXT-METHOD-P";
-        }
-        if v.is_cons() {
-            let (car, cdr) = cp(v);
-            return walk(car, depth + 1) || walk(cdr, depth + 1);
-        }
-        false
-    }
-    walk(body, 0)
-}
 
 /// Install a `defclass` slot `:reader`/`:writer`/`:accessor` as a *real* generic
 /// method, equivalent to

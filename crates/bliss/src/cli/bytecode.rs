@@ -1796,6 +1796,14 @@ impl<'e> Lowerer<'e> {
                 "HANDLER-CASE" => self.lower_handler_case(rest),
                 "HANDLER-BIND" => self.lower_handler_bind(rest),
                 "RESTART-CASE" => self.lower_restart_case(rest),
+                // CALL-NEXT-METHOD / NEXT-METHOD-P are special forms reading
+                // env.method_context, not ordinary functions, so they have no
+                // callable symbol for a plain CallNamed. Lower them to the
+                // evaluated-argument entry points instead. `invoke_method`
+                // publishes the context around a compiled body exactly as it
+                // does around a tree-walked one (bliss-ccso).
+                "CALL-NEXT-METHOD" => self.lower_next_method_call(rest, true),
+                "NEXT-METHOD-P" => self.lower_next_method_call(rest, false),
                 "BLISS::QUASIQUOTE" => {
                     if !self.portable {
                         return Err(Bail);
@@ -2639,6 +2647,32 @@ impl<'e> Lowerer<'e> {
     /// here, so bail to the tree-walker. This is what unblocks counting loops —
     /// the increment `(setf i (1+ i))` is the reason idiomatic loops never
     /// promoted to native code (bliss-jtc.26).
+    /// Lower `(call-next-method …)` / `(next-method-p)`.
+    ///
+    /// With no arguments CALL-NEXT-METHOD passes the ORIGINAL arguments on
+    /// (CLHS 7.6.6.2); the primitive reads them from the saved context, so
+    /// emitting zero arguments is exactly right rather than a special case.
+    fn lower_next_method_call(&mut self, rest: BlissVal, call: bool) -> LowerResult<()> {
+        let name = if call {
+            "BLISS::%CALL-NEXT-METHOD"
+        } else {
+            "BLISS::%NEXT-METHOD-P"
+        };
+        let sym = resolve_sym(name).ok_or(Bail)?.as_symbol_index();
+        bliss_rt::rooted!(args = list_to_vec(rest));
+        if !call && !args.is_empty() {
+            return Err(Bail);
+        }
+        let nargs = u16::try_from(args.len()).map_err(|_| Bail)?;
+        for i in 0..args.len() {
+            self.lower_expr(args[i])?;
+        }
+        self.emit(Instr::CallNamed { sym, nargs });
+        self.pop_n(nargs);
+        self.push_n(1);
+        Ok(())
+    }
+
     fn lower_setf(&mut self, rest: BlissVal) -> LowerResult<()> {
         // Root the pair list across the allocating resolve_sym/lower_expr
         // recursion (moving GC; bliss-wlf); re-read `items[..]` for the value and
