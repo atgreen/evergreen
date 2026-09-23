@@ -17822,7 +17822,54 @@ enum FixnumOp {
     NumEq,
 }
 
+/// Memoize a `sym -> classification` lookup by symbol index.
+///
+/// The classifiers below all answered "is this symbol one of these operators?"
+/// by calling `bliss_rt::symbols::symbol_name`, which takes a read lock on the
+/// symbol registry AND allocates a `String`, and then string-compared it against
+/// a handful of literals. `run_loop` runs them per executed call site, so a
+/// recursive T2-native call loop spent ~20% of its time there — `symbol_name`
+/// 4.4%, `read_simple_string` 4.5%, plus the registry lock (bliss-htff, found by
+/// a gdb backtrace: run_loop -> is_arith_speculatable -> inlinable_fixnum_op ->
+/// symbol_name).
+///
+/// A symbol's name never changes once interned, so the answer is stable for the
+/// life of the process and the memo needs no invalidation. Uncached lookups
+/// still go through the original name comparison, so a symbol interned later is
+/// classified correctly the first time it is seen.
+fn memoized_by_sym<T: Copy>(
+    memo: &'static std::thread::LocalKey<RefCell<Vec<Option<T>>>>,
+    sym: u32,
+    compute: impl FnOnce(u32) -> T,
+) -> T {
+    let i = sym as usize;
+    if let Some(hit) = memo.with(|m| m.borrow().get(i).copied().flatten()) {
+        return hit;
+    }
+    let value = compute(sym);
+    memo.with(|m| {
+        let mut m = m.borrow_mut();
+        if i >= m.len() {
+            m.resize(i + 1, None);
+        }
+        m[i] = Some(value);
+    });
+    value
+}
+
+thread_local! {
+    static FIXNUM_OP_MEMO: RefCell<Vec<Option<Option<FixnumOp>>>> = const { RefCell::new(Vec::new()) };
+    static UNARY_FIXNUM_OP_MEMO: RefCell<Vec<Option<Option<UnaryFixnumOp>>>> =
+        const { RefCell::new(Vec::new()) };
+    static FIXNUM_PRED_MEMO: RefCell<Vec<Option<Option<FixnumPred>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 fn inlinable_fixnum_op(sym: u32) -> Option<FixnumOp> {
+    memoized_by_sym(&FIXNUM_OP_MEMO, sym, inlinable_fixnum_op_uncached)
+}
+
+fn inlinable_fixnum_op_uncached(sym: u32) -> Option<FixnumOp> {
     match bliss_rt::symbols::symbol_name(sym).as_deref() {
         Some("+") => Some(FixnumOp::Add),
         Some("-") => Some(FixnumOp::Sub),
@@ -17848,6 +17895,10 @@ enum UnaryFixnumOp {
 }
 
 fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
+    memoized_by_sym(&UNARY_FIXNUM_OP_MEMO, sym, inlinable_unary_fixnum_op_uncached)
+}
+
+fn inlinable_unary_fixnum_op_uncached(sym: u32) -> Option<UnaryFixnumOp> {
     match bliss_rt::symbols::symbol_name(sym).as_deref() {
         Some("1+") => Some(UnaryFixnumOp::Incr),
         Some("1-") => Some(UnaryFixnumOp::Decr),
@@ -17869,6 +17920,10 @@ enum FixnumPred {
 }
 
 fn inlinable_fixnum_pred(sym: u32) -> Option<FixnumPred> {
+    memoized_by_sym(&FIXNUM_PRED_MEMO, sym, inlinable_fixnum_pred_uncached)
+}
+
+fn inlinable_fixnum_pred_uncached(sym: u32) -> Option<FixnumPred> {
     match bliss_rt::symbols::symbol_name(sym).as_deref() {
         Some("ZEROP") => Some(FixnumPred::Zerop),
         Some("PLUSP") => Some(FixnumPred::Plusp),
