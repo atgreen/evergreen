@@ -320,6 +320,38 @@ avoiding recompilation across runs, but it should no longer be justified by
 babel load time — that argument has largely been spent. Re-measure before
 scheduling Stage 3.
 
+### §8d. Final: the prize is now ~1.6% of a babel load
+
+Re-measured on current HEAD, after the inline-candidate fix (aaeb60a), the
+tiering fixes (bliss-5rcy / ljmj / ccso / ptv4) and the musl thread cache
+(bliss-05as). Retired instructions, 2 reps each:
+
+| | instructions | vs off |
+|---|---|---|
+| T2 off | 68.89 G | — |
+| T2 discard (compile, install nothing) | 69.96 G | **+1.07 G** — the compile cost |
+| T2 on | **66.80 G** | **−2.09 G net** |
+
+**T2 is now a net WIN of 3.0%**: it costs 1.6% to compile and returns 4.5% from
+the code it emits. When this investigation started it was a 42% instruction
+penalty.
+
+**A perfect cache can therefore save at most ~1.6% of a babel load.** The epic
+should no longer be justified by load time at all — that argument has been
+spent three times over, in three different directions:
+
+| | claim | status |
+|---|---|---|
+| §8 | caching saves ~0% ("T2 is worth nothing here") | wrong — T2 was worth *less* than nothing |
+| §8a/b | caching saves ~9.4 s (~33%) | wrong — 82% of that was redundant snapshot work |
+| §8c | caching saves ~2.2 s | superseded |
+| §8d | caching saves ~1.07 G instructions (~1.6%) | current |
+
+What remains valid for the epic is **cross-run and cross-image reuse** — not
+paying to rediscover the same 109 promotions in every process — and application
+steady state, which this benchmark does not measure at all. Stage 3 should be
+scheduled on those grounds or not at all.
+
 The general lesson is the one this investigation keeps repeating: measure which
 *half* of a cost you are about to optimise before building the expensive fix.
 
