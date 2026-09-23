@@ -7559,13 +7559,36 @@ impl Env {
     }
 
     fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<BlissVal> {
-        let borrowed = frame.borrow();
-        if let Some(val) = borrowed.vars.get(name) {
-            return Some(*val);
+        // Resolve the name ONCE, then check both maps at EACH frame, symbol
+        // first. Walking symbol_vars through the whole chain and only then the
+        // name map would let an OUTER symbol binding win over an INNER
+        // name-only one — the bliss-lb6 shadowing bug. Per-frame keeps the
+        // shadowing exact.
+        //
+        // `find_index`, never `intern`: interned symbols are never reclaimed, so
+        // interning every name reachable here (including names restored from a
+        // frozen env) grows the registry without bound. An earlier version did
+        // that and OOM-killed the acceptance suite.
+        //
+        // The u32 probe runs first because the name map is a VecMap<String, _>,
+        // a linear scan comparing Strings per entry (bliss-2erp).
+        let idx = bliss_rt::symbols::find_index(name);
+        let mut cur = Some(Rc::clone(frame));
+        while let Some(f) = cur {
+            let borrowed = f.borrow();
+            if let Some(i) = idx {
+                if let Some(val) = borrowed.symbol_vars.get(&i) {
+                    return Some(*val);
+                }
+            }
+            if let Some(val) = borrowed.vars.get(name) {
+                return Some(*val);
+            }
+            let parent = borrowed.parent.clone();
+            drop(borrowed);
+            cur = parent;
         }
-        let parent = borrowed.parent.clone();
-        drop(borrowed);
-        parent.and_then(|parent| Self::lookup_frame(&parent, name))
+        None
     }
 
     fn lookup_symbol_frame(frame: &Rc<RefCell<EnvFrame>>, symbol_index: u32) -> Option<BlissVal> {
@@ -7607,10 +7630,15 @@ impl Env {
             let mut borrowed = frame.borrow_mut();
             // `sym_name_rc` is the cached Rc<str> accessor: no allocation, where
             // `sym_name` built a fresh String on every assignment.
+            // Fast path: symbol map hit — no name, no String-keyed scan. Safe
+            // because lookup_frame checks symbol_vars before vars at every
+            // frame, so the stale name entry left behind is never read.
+            if borrowed.symbol_vars.contains_key(&symbol_index) {
+                borrowed.symbol_vars.insert(symbol_index, val);
+                return true;
+            }
             let name = sym_name_rc(BlissVal::from_symbol_index(symbol_index));
-            if borrowed.symbol_vars.contains_key(&symbol_index)
-                || borrowed.vars.contains_key(&*name)
-            {
+            if borrowed.vars.contains_key(&*name) {
                 borrowed.symbol_vars.insert(symbol_index, val);
                 // Update the legacy name map in place when the entry exists, so
                 // the common assignment path allocates nothing.
