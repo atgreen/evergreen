@@ -221,44 +221,69 @@ and benefits a user who loads one new library into an otherwise unchanged world.
 The image route remains available as a later optimization for the base system,
 where the coarseness costs nothing.
 
-## 8. Scope boundary: this is not a load-time fix (measured)
+## 8. Scope boundary — SUPERSEDED, see §8a
 
-Worth stating plainly so the epic is not mis-aimed. Measured 2026-09-22 against
-SBCL 2.6.8, same babel, same source registry, both warm from fasls (bliss-yb10):
+This section argued, from a measurement of `BLISS_DISABLE_T2=1` that showed
+"~3%, within noise, one run faster *with* T2", that **"T2 is currently worth
+approximately nothing on this workload"**, and concluded that caching T2 would
+have approximately zero effect on babel load time.
 
-| | SBCL | bliss | gap |
+**That measurement was wrong, and the conclusion drawn from it was wrong.** It
+is kept here only because the reasoning error is instructive; §8a has the
+corrected numbers. Two specific failures:
+
+- The `~3%` reading did not survive a clean re-measurement (`taskset -c 0`, no
+  `systemd-run` wrapper, retired-instruction counts). The real effect is ~30%.
+- Earlier in the same investigation an 18% T2 regression *was* observed and then
+  explained away as an artifact of the wrapper in `scripts/bliss-limited.sh`.
+  That dismissal removed a real signal. A surprising result is not automatically
+  an artifact.
+
+## 8a. T2 is a net LOSS on loading (measured, bliss-fhci)
+
+Babel load (cold + 10 no-op re-loads), `taskset -c 0`, 3 reps, non-overlapping
+ranges:
+
+| | cold | reload x10 | user |
 |---|---|---|---|
-| cold load, fresh process | 0.170 s | 5.36 s | 31x |
-| no-op re-load, each | 0.0024 s | 2.05 s | **~850x** |
+| T2 on (default) | 7.85 s | 16.76 s | 26.57 s |
+| T2 off | **4.13 s** | **12.61 s** | **18.62 s** |
+| | −47% | −25% | **−30%** |
 
-bliss takes ~2 s to decide it has nothing to do — about 40% of a full cold load
-— where SBCL takes 2.4 ms. Four hypotheses were tested and three rejected:
+Retired instructions (frequency-independent; the wall-clock above was near this
+machine's noise floor, see `measuring-performance.md` §6c):
 
-- **Not tiering failing to fire.** 62 functions promote to T2 across 11 babel
-  loads, and they are the right ones (UIOP/PATHNAME, ASDF/PLAN, ASDF/SESSION).
-- **Not the absence of a JIT.** `BLISS_DISABLE_T2=1` vs default, 3 interleaved
-  runs: 20.7/22.5/20.2 s vs 19.9/20.8/20.6 s. ~3%, within noise, one run faster
-  *with* T2. **T2 is currently worth approximately nothing on this workload.**
-- **Not extra work.** Filesystem syscalls per no-op re-load: bliss 1176, SBCL
-  906 — only 1.3x. Both do ~1000; bliss executes the surrounding Lisp ~850x
-  slower.
-- **It is raw per-call execution speed**, and it persists at T2. A recursive
-  function that *does* reach T2 costs 1.04 µs/call against SBCL's 2.5 ns —
-  ~400x while fully native. Per-call runtime overhead (~20% signal checking,
-  12% malloc/free, 8.6% locks, 7.3% TLS, 7.2% function lookup by *name*)
-  dwarfs the quality of the emitted code. See bliss-htff.
+|  | T2 on | T2 off | |
+|---|---|---|---|
+| after the tiering fixes | 134.6 G | 94.7 G | on is **+42%** |
+| before them | 149.9 G | 105.5 G | on is **+42%** |
 
-**Consequence for this epic:** caching T2 would have approximately zero effect on
-babel load time. A cache makes T2 code arrive sooner; T2 code currently saves
-nothing there. This does not invalidate the epic — it is aimed at application
-steady state, not loading — but it does reorder it. Until per-call overhead comes
-down, better code delivered sooner buys little, because the code is not where the
-time goes. Stage 3c is gated on bliss-htff for exactly this reason.
+So roughly **30% of the work in a babel load is the optimizing compiler
+running**, not the code it produces. The identical 42% ratio on the pre-fix
+binary shows this is not a consequence of bliss-5rcy / bliss-ljmj moving more
+code onto the compiled tier — it was always true.
 
-Making *loading* fast is a different problem with different levers: bliss-htff
-(per-call overhead), bliss-qerr (`symbol_bare_name`, now P1 — it is on the
-per-call fast path, not only the load path), the BBU bytecode path (R6.71–R6.79),
-and bliss-p1t.
+**Consequence for this epic: the case is much STRONGER than §8 allowed, and for
+a reason §8 never considered.** §8 weighed only the *benefit* side of a cache —
+"it makes good code arrive sooner, and good code is worth nothing here" — and
+never weighed the *cost* side: that the compiler runs **during the load**. A
+cache takes that cost off the load path. That is a load-time win, and it does
+not depend on per-call overhead (bliss-htff) coming down first, which is what §8
+gated it on.
+
+It also reorders the stages. The cheapest large win is not the on-disk format at
+all — it is getting T2 **off the load critical path**: defer tier-up to a
+background thread (Stage 2), or raise the T2 threshold while loading. That
+captures most of the 30% before any persistence work is needed, and it is the
+half of the original proposal that §8's framing talked us out of.
+
+Do **not** respond to this by disabling T2. It exists for application steady
+state, which this benchmark does not measure at all.
+
+Making loading fast still also wants: bliss-htff (per-call overhead), bliss-qerr
+(`symbol_bare_name` on the per-call fast path), the BBU bytecode path
+(R6.71–R6.79), bliss-p1t, and the remaining tiering work in
+`method-tiering.md`.
 
 ## 9. Spec impact
 
