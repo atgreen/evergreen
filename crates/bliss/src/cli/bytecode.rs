@@ -2930,6 +2930,36 @@ impl<'e> Lowerer<'e> {
     // ── Non-local control flow lowering (nmq.4) ────────────────────
 
     /// `(block name body...)` — establish a lexical exit, run the body.
+/// Whether an instruction could let a `return-from` reach a block from OUTSIDE
+/// the function that established it.
+///
+/// Only two things can: creating a closure (which may contain a named return to
+/// an enclosing block), or a named return itself. Everything else transfers
+/// control within this function, where `ReturnFrom { block_id }` already
+/// handles it without consulting `env.block_stack`.
+///
+/// Deliberately conservative — it answers "could", not "does" — and it is
+/// applied to EMITTED code, so a closure a macro produced is included.
+fn instr_may_escape_block(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        // Closure construction, in each of the three shapes the lowerer emits:
+        // a nested bytecode body, an env-capturing one, and the opportunistic
+        // path that hands the lambda form back to the interpreter.
+        Instr::MakeClosure { .. }
+            | Instr::MakeClosureEnv(_)
+            | Instr::EvalHost(_)
+            // A named return/go already present in this body.
+            | Instr::ReturnFromNamed { .. }
+            | Instr::GoNamed { .. }
+            // Separately-lowered bodies (handler/restart clauses) are not part
+            // of this instruction stream, so treat establishing one as opaque.
+            | Instr::PushHandlerCase { .. }
+            | Instr::PushHandlerBind { .. }
+            | Instr::PushRestartCase { .. }
+    )
+}
+
     fn lower_block(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (name_form, body) = cp(rest);
         if !name_form.is_symbol() && !name_form.is_nil() {
@@ -2944,6 +2974,8 @@ impl<'e> Lowerer<'e> {
             name_idx,
             resume_bcp: 0,
             sp_restore,
+            // Patched below, once the body has been lowered.
+            register: true,
         });
         let push_at = self.code.len() - 1;
         self.block_scope.push((name, block_id));
@@ -2951,8 +2983,21 @@ impl<'e> Lowerer<'e> {
         self.block_scope.pop();
         self.emit(Instr::PopHandler);
         let after = self.code.len() as u32;
-        if let Instr::PushBlock { resume_bcp, .. } = &mut self.code[push_at] {
+        // Decide registration from the code actually emitted, not from the
+        // source form: a closure introduced by a macro expansion is invisible
+        // to a syntactic pre-scan (the trap that made bliss-ptv4 bail), while
+        // the instruction stream is post-expansion and therefore complete.
+        let register = self.code[push_at + 1..]
+            .iter()
+            .any(|i| Self::instr_may_escape_block(i));
+        if let Instr::PushBlock {
+            resume_bcp,
+            register: reg,
+            ..
+        } = &mut self.code[push_at]
+        {
             *resume_bcp = after;
+            *reg = register;
         }
         Ok(())
     }
@@ -7919,8 +7964,13 @@ fn serialize_bbu_function(
                 name_idx,
                 resume_bcp,
                 sp_restore,
+                register,
             } => {
-                put_u8(&mut code, 0x1e);
+                // 0x43 is the same instruction with `register` false. A separate
+                // opcode keeps older .bfasl files readable: they only ever
+                // contain 0x1e, which decodes as registering — correct, if
+                // slower than a freshly compiled body.
+                put_u8(&mut code, if *register { 0x1e } else { 0x43 });
                 put_u32(&mut code, *block_id);
                 let name_ref = bf
                     .names
@@ -9857,7 +9907,8 @@ fn decode_bbu_function(
     let mut names = Vec::new();
     while !cursor.done() {
         starts.push(cursor.pos as u32);
-        let instr = match cursor.u8()? {
+        let opcode = cursor.u8()?;
+        let instr = match opcode {
             0x01 => {
                 let literal = cursor.u32()?;
                 if literal > u16::MAX as u32 || literal as usize >= encoded.literal_refs.len() {
@@ -9908,7 +9959,8 @@ fn decode_bbu_function(
             0x18 => Instr::Br(cursor.u32()?),
             0x19 => Instr::BrIfFalse(cursor.u32()?),
             0x1a => Instr::BrIfTrue(cursor.u32()?),
-            0x1e => {
+            0x1e | 0x43 => {
+                let register = opcode == 0x1e;
                 let block_id = cursor.u32()?;
                 let name_ref = cursor.u32()?;
                 let name = if name_ref == BBU_NO_INDEX {
@@ -9926,6 +9978,7 @@ fn decode_bbu_function(
                     name_idx: name_idx as u16,
                     resume_bcp: cursor.u32()?,
                     sp_restore: cursor.u16()?,
+                    register,
                 }
             }
             0x1f => Instr::ReturnFrom {
@@ -12880,10 +12933,35 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 name_idx,
                 resume_bcp,
                 sp_restore,
+                register,
             } => {
-                let name = acts[top_idx].func.names[name_idx as usize].clone();
-                let token = next_control_token("__RETURN_FROM__");
-                env.block_stack.push((name, token.clone()));
+                // `register` is false when the lowerer proved this block's body
+                // creates no closure and performs no named return, so nothing
+                // can reach it by name from another function. The local
+                // `ReturnFrom { block_id }` unwind never consults the name or
+                // the token, so the whole registration — a name clone, a
+                // `format!`-built token, and a clone of that token — is
+                // unobservable and was pure cost on EVERY entry to EVERY block,
+                // including every DEFUN's implicit block.
+                //
+                // This is the shape SBCL and HotSpot share. SBCL's
+                // `maybe-delete-exit` deletes an exit whose entry shares its
+                // home lambda, so a locally-exited block has no runtime
+                // representation at all, and only genuine non-local exits get a
+                // (stack-allocated) NLX block. HotSpot enters a `try` in zero
+                // instructions, keeping the region in static per-method
+                // metadata consulted only when something is thrown. Neither
+                // mints an identity on entry (bliss-htff).
+                let token = if register {
+                    let name = acts[top_idx].func.names[name_idx as usize].clone();
+                    let token = next_control_token("__RETURN_FROM__");
+                    env.block_stack.push((name, token.clone()));
+                    token
+                } else {
+                    // Never read: the local unwind matches on `block_id`.
+                    // `String::new()` does not allocate.
+                    String::new()
+                };
                 acts[top_idx].handlers.push(Handler::Block {
                     block_id,
                     token,
@@ -16462,10 +16540,19 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
                 name_idx,
                 resume_bcp,
                 sp_restore,
+                register,
             } => {
-                let name = entry.names[*name_idx as usize].clone();
-                let token = next_control_token("__RETURN_FROM__");
-                env.block_stack.push((name, token.clone()));
+                // Mirror the live path: a block the lowerer proved unreachable
+                // by name registers nothing when resumed either, or the two
+                // would disagree about what is on `env.block_stack`.
+                let token = if *register {
+                    let name = entry.names[*name_idx as usize].clone();
+                    let token = next_control_token("__RETURN_FROM__");
+                    env.block_stack.push((name, token.clone()));
+                    token
+                } else {
+                    String::new()
+                };
                 handlers.push(Handler::Block {
                     block_id: *block_id,
                     token,

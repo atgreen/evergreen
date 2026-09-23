@@ -126,6 +126,15 @@ pub enum Instr {
         name_idx: u16,
         resume_bcp: u32,
         sp_restore: u16,
+        /// Publish `(name, token)` on `env.block_stack` so a `return-from` in
+        /// ANOTHER function can find this block by name. A local `return-from`
+        /// compiles to `ReturnFrom { block_id }` and never consults either, so
+        /// this is false whenever the block's body provably creates no closure
+        /// and performs no named return — the registration is then
+        /// unobservable, and it costs three heap allocations (a name clone, a
+        /// formatted token, and a clone of that token) on every entry to every
+        /// block, which includes every DEFUN's implicit block (bliss-htff).
+        register: bool,
     },
     /// Establish a `TAGBODY` handler keyed by the lexical `tagbody_id`.
     PushTag { tagbody_id: u32, sp_restore: u16 },
