@@ -1188,7 +1188,17 @@ fn bail_trace_on() -> bool {
 fn record_bail(reason: impl FnOnce() -> String) -> Bail {
     if bail_trace_on() {
         let reason = reason();
-        LAST_BAIL_REASON.with(|last| *last.borrow_mut() = Some(reason.clone()));
+        // Keep the FIRST reason recorded since the last reset, not the last.
+        // A bail propagates outwards and each enclosing form records its own, so
+        // last-wins reports the outermost wrapper (`form:FUNCTION` for anything
+        // inside a `#'(lambda …)`) instead of the construct that actually could
+        // not be lowered. The histogram below still counts every level.
+        LAST_BAIL_REASON.with(|last| {
+            let mut last = last.borrow_mut();
+            if last.is_none() {
+                *last = Some(reason.clone());
+            }
+        });
         BAIL_LOG.with(|m| *m.borrow_mut().entry(reason).or_insert(0) += 1);
     }
     Bail
@@ -5364,16 +5374,21 @@ impl<'e> Lowerer<'e> {
                 let (params_form, body) = cp(t_rest);
                 let captured = self.lambda_captured_locals(params_form, body);
                 if self.portable {
-                    return self.emit_portable_closure(params_form, body, &captured);
+                    return self.emit_portable_closure(params_form, body, &captured).map_err(|e| {
+                        let _ = record_bail(|| "function:portable-closure".to_string());
+                        e
+                    });
                 }
                 captured
             } else {
-                return Err(Bail);
+                return Err(record_bail(|| {
+                    format!("function:non-lambda-cons:{}", sym_name(t_op))
+                }));
             }
         } else if target.is_symbol() {
             Vec::new()
         } else {
-            return Err(Bail);
+            return Err(record_bail(|| "function:non-symbol-target".to_string()));
         };
         let function_sym = resolve_sym("FUNCTION").ok_or(Bail)?;
         bliss_rt::rooted!(form = arena_cons(function_sym, rest));
@@ -10532,8 +10547,14 @@ pub(super) fn compile_and_reify_lambda(
     // mode (heap-frame closures), so a method body with a capturing flet/labels
     // or closure compiles instead of tree-walking — same rationale as
     // lazy_compile_defun (bliss-mr4p).
-    let bf = compile_function(label, lambda_list, body, env, false, false)
-        .or_else(|| compile_function(label, lambda_list, body, env, true, false))?;
+    let bf = compile_function(label, lambda_list, body, env, false, false).or_else(|| {
+        // The opportunistic attempt's bail reason is noise once we retry: it
+        // bails on things portable mode handles (quasiquote, capturing
+        // closures). Clear it so `last_bail_reason` reports why the attempt
+        // that actually decides gave up.
+        reset_last_bail_reason();
+        compile_function(label, lambda_list, body, env, true, false)
+    })?;
     let sym = bliss_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
     registry_put(sym_idx, Rc::new(bf));
