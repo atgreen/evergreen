@@ -263,6 +263,39 @@ running**, not the code it produces. The identical 42% ratio on the pre-fix
 binary shows this is not a consequence of bliss-5rcy / bliss-ljmj moving more
 code onto the compiled tier — it was always true.
 
+### §8b. Attributed: it is the compiler running, not the code it emits
+
+`BLISS_T2_DISCARD=1` pays the full T2 compilation cost and then installs
+nothing, so execution stays at T1. Moving the threshold cannot separate
+"compiling costs time" from "the emitted code is slower" — both scale with the
+number of functions promoted — but this does. Babel load, 3 reps,
+non-overlapping ranges:
+
+| | cold | reload x10 | real |
+|---|---|---|---|
+| T2 off (no compile, no T2 code) | 4.22 s | 12.66 s | **19.92 s** |
+| T2 discard (compile only) | 8.24 s | 16.92 s | **29.31 s** |
+| T2 on (compile + T2 code) | 7.80 s | 16.75 s | **28.63 s** |
+
+Decomposing T2's 8.71 s penalty:
+
+```text
+  compilation      +9.39 s
+  emitted code     -0.68 s     (T2 code is FASTER than T1, slightly)
+  ------------------------
+  net              +8.71 s
+```
+
+**Essentially all of it is the compiler running, and the code it produces is a
+net win.** That is exactly the shape a cache fixes: it removes the 9.39 s from
+the load path and keeps the 0.68 s. Projected babel load with a warm cache:
+
+```text
+  28.63 s  ->  ~19.2 s      (-33%)
+```
+
+This is the number §8 said would be "approximately zero".
+
 **Consequence for this epic: the case is much STRONGER than §8 allowed, and for
 a reason §8 never considered.** §8 weighed only the *benefit* side of a cache —
 "it makes good code arrive sooner, and good code is worth nothing here" — and

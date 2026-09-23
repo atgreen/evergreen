@@ -15670,6 +15670,30 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
     true
 }
 
+/// `BLISS_T2_DISCARD=1`: pay the full T2 compilation cost, then install nothing,
+/// so execution stays at T1.
+///
+/// Moving `BLISS_T1_T2_INVOKE_THRESHOLD` cannot separate "compiling costs time"
+/// from "the emitted code is slower", because both scale with the number of
+/// functions promoted. This does separate them, and the answer for an
+/// `(asdf:load-system :babel)` is lopsided (3 reps, non-overlapping):
+///
+/// ```text
+///   T2 off      19.92 s      no compile, no T2 code
+///   T2 discard  29.31 s      compile only          -> compiling costs +9.39 s
+///   T2 on       28.63 s      compile + T2 code     -> the code itself SAVES 0.68 s
+/// ```
+///
+/// So essentially all of T2's ~30% load-time penalty is the compiler running,
+/// and the code it emits is a (small) net win. That is the measurement the
+/// persistent code cache is aimed at: caching removes the 9.39 s and keeps the
+/// 0.68 s (bliss-fhci, bliss-eoma).
+fn t2_discard_installs() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_T2_DISCARD").is_some())
+}
+
 fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     // Bridge rooting from the worker through construction of the smaller
     // installed-code root below. The completion owns this handle until return.
@@ -15689,6 +15713,16 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
     };
+    // Diagnostic (bliss-fhci): pay the full T2 COMPILATION cost but install
+    // nothing, so execution stays at T1. Moving the T2 threshold cannot separate
+    // "compiling cost time" from "the emitted code is slower", because both
+    // scale with the number of functions promoted; this does separate them.
+    // Not a supported mode — it exists to attribute the ~30% that T2 costs a
+    // babel load.
+    if t2_discard_installs() {
+        T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
+        return None;
+    }
     let bf = registry_get(done.sym)?;
     let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
     let code_info = install_stack_map(total_slots)?;
