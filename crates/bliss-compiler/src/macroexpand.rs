@@ -96,6 +96,16 @@ pub struct Environment {
     functions: HashMap<u64, FunctionInfo>,
     /// Active declarations.
     declarations: Vec<DeclInfo>,
+    /// True when this level and everything above it hold no MOVABLE GC
+    /// pointers, so `visit_gc_roots` may stop here.
+    ///
+    /// Set only for the cached global-macro base, whose function map holds
+    /// immediate macro handles (`from_macro_handle`) — visiting an immediate is
+    /// a no-op, so skipping it is equivalent. It matters because descending
+    /// into a parent uses `Arc::make_mut`, which CLONES a shared Arc: without
+    /// this, sharing the base would make every GC trace copy it, which is worse
+    /// than the per-expansion clone it replaces (bliss-htff).
+    no_gc_roots: bool,
     /// Block names in scope (for RETURN-FROM), keyed by BlissVal.0.
     blocks: HashSet<u64>,
     /// Tag names in scope (for GO), keyed by BlissVal.0.
@@ -152,6 +162,7 @@ impl Environment {
             variables: HashMap::new(),
             functions: HashMap::new(),
             declarations: Vec::new(),
+            no_gc_roots: false,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -186,7 +197,12 @@ impl Environment {
             }
         }
         if let Some(parent) = &mut self.parent {
-            Arc::make_mut(parent).visit_gc_roots(visit);
+            // `Arc::make_mut` clones a SHARED parent, so descending into the
+            // shared global-macro base would copy it on every collection. That
+            // base holds only immediate handles, so there is nothing to visit.
+            if !parent.no_gc_roots {
+                Arc::make_mut(parent).visit_gc_roots(visit);
+            }
         }
     }
 
@@ -259,6 +275,7 @@ impl Environment {
             variables,
             functions: HashMap::new(),
             declarations: Vec::new(),
+            no_gc_roots: false,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -275,6 +292,7 @@ impl Environment {
             variables: HashMap::new(),
             functions,
             declarations: Vec::new(),
+            no_gc_roots: false,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -288,6 +306,7 @@ impl Environment {
             variables: HashMap::new(),
             functions: HashMap::new(),
             declarations: decls,
+            no_gc_roots: false,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -302,6 +321,7 @@ impl Environment {
             variables: HashMap::new(),
             functions: HashMap::new(),
             declarations: Vec::new(),
+            no_gc_roots: false,
             blocks,
             tags: HashSet::new(),
         }
@@ -316,6 +336,7 @@ impl Environment {
             variables: HashMap::new(),
             functions: HashMap::new(),
             declarations: Vec::new(),
+            no_gc_roots: false,
             blocks: HashSet::new(),
             tags,
         }
@@ -323,6 +344,45 @@ impl Environment {
 
     /// General-purpose augment-environment (CLtL2 compatible).
     /// Creates a new environment augmented with given bindings and declarations.
+    /// Mark this environment as holding no movable GC pointers, so a child may
+    /// share it by `Arc` without the collector cloning it. Only correct when
+    /// every value it (and its parents) hold is an immediate.
+    pub fn mark_no_gc_roots(mut self) -> Environment {
+        self.no_gc_roots = true;
+        self
+    }
+
+    /// A child of an already-shared parent.
+    ///
+    /// `augment_environment` builds its parent as `Arc::new(self.clone())`,
+    /// which copies a whole level even though `parent` is an `Arc` precisely so
+    /// levels can be SHARED. Callers that already hold the parent behind an
+    /// `Arc` should use this instead: it costs one refcount bump.
+    pub fn child_of(
+        parent: Arc<Environment>,
+        variables: Vec<(BlissVal, VariableInfo)>,
+        functions: Vec<(BlissVal, FunctionInfo)>,
+        declarations: Vec<DeclInfo>,
+    ) -> Environment {
+        let mut var_map = HashMap::new();
+        for (name, info) in variables {
+            var_map.insert(name.0, info);
+        }
+        let mut fn_map = HashMap::new();
+        for (name, info) in functions {
+            fn_map.insert(name.0, info);
+        }
+        Environment {
+            parent: Some(parent),
+            variables: var_map,
+            functions: fn_map,
+            declarations,
+            no_gc_roots: false,
+            blocks: HashSet::new(),
+            tags: HashSet::new(),
+        }
+    }
+
     pub fn augment_environment(
         &self,
         variables: Vec<(BlissVal, VariableInfo)>,
@@ -342,6 +402,7 @@ impl Environment {
             variables: var_map,
             functions: fn_map,
             declarations,
+            no_gc_roots: false,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }

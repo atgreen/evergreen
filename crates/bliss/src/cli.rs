@@ -2301,7 +2301,7 @@ thread_local! {
     /// macro-aware analysis (bliss-usb2 / bliss-9u6d). The function-map values are
     /// immediate macro handles (`from_macro_handle`), so this env holds no movable
     /// GC pointers and is safe to retain across collections without tracing.
-    static CLI_GLOBAL_MACRO_ENV: RefCell<Option<(u64, MacroexpandEnv)>> =
+    static CLI_GLOBAL_MACRO_ENV: RefCell<Option<(u64, Arc<MacroexpandEnv>)>> =
         const { RefCell::new(None) };
 }
 
@@ -31656,7 +31656,25 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     // the independent variables map, so augmenting them on top preserves the
     // original shadowing; lexical MACROLET macros are augmented last so they
     // shadow a same-named global.
-    let mut macro_env = cli_global_macro_env();
+    let base = cli_global_macro_env();
+
+    // The base is SHARED, not copied. It used to be returned by value, so every
+    // call cloned its whole function map — 158 macros, 34,414 times on a babel
+    // load, which made `memcpy` the largest single entry in a no-op re-load's
+    // profile at 12.3% (bliss-htff). Levels above it stay owned: they hold only
+    // this scope's variables, so cloning one is cheap, and they may carry
+    // movable GC pointers (a SymbolMacro expansion) that must stay traceable.
+    //
+    // `macro_env` is `None` while nothing has been added, so the common case —
+    // no symbol macros, no lexical variables, no MACROLET — produces a single
+    // empty child of the shared base. Empty maps do not allocate.
+    let mut macro_env: Option<MacroexpandEnv> = None;
+    let mut augment = |macro_env: &mut Option<MacroexpandEnv>, vars: Vec<(BlissVal, VariableInfo)>| {
+        *macro_env = Some(match macro_env.take() {
+            None => MacroexpandEnv::child_of(Arc::clone(&base), vars, Vec::new(), Vec::new()),
+            Some(existing) => existing.augment_environment(vars, Vec::new(), Vec::new()),
+        });
+    };
 
     let mut global_symbol_macros = Vec::new();
     for (&symbol_index, &expansion) in env.symbol_macros.borrow().iter() {
@@ -31666,7 +31684,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         ));
     }
     if !global_symbol_macros.is_empty() {
-        macro_env = macro_env.augment_environment(global_symbol_macros, Vec::new(), Vec::new());
+        augment(&mut macro_env, global_symbol_macros);
     }
 
     let mut frames = Vec::new();
@@ -31680,10 +31698,15 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                 VariableInfo::Lexical,
             ));
         }
+        drop(borrowed);
         if !variables.is_empty() {
-            macro_env = macro_env.augment_environment(variables, Vec::new(), Vec::new());
+            augment(&mut macro_env, variables);
         }
     }
+
+    let macro_env = macro_env.unwrap_or_else(|| {
+        MacroexpandEnv::child_of(Arc::clone(&base), Vec::new(), Vec::new(), Vec::new())
+    });
 
     // Only lexical MACROLET macros remain to fold in (globals are in the base).
     if env.macros.borrow().is_empty() {
@@ -31698,19 +31721,22 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
 /// DEFMACRO change) advances; between changes every compiled form reuses it via
 /// a shallow clone instead of re-cloning GLOBAL_MACROS and re-augmenting per
 /// macro. Immediate-handle-only, so it carries no movable GC roots.
-fn cli_global_macro_env() -> MacroexpandEnv {
+fn cli_global_macro_env() -> Arc<MacroexpandEnv> {
     let generation = MACRO_ENV_GENERATION.with(|g| g.get());
     if let Some(cached) = CLI_GLOBAL_MACRO_ENV.with(|c| {
         c.borrow()
             .as_ref()
             .filter(|(cached_gen, _)| *cached_gen == generation)
-            .map(|(_, env)| env.clone())
+            .map(|(_, env)| Arc::clone(env))
     }) {
         return cached;
     }
     let globals: HashMap<String, MacroDef> = GLOBAL_MACROS.with(|m| m.borrow().clone());
-    let base = augment_env_with_macros(MacroexpandEnv::null(), &globals);
-    CLI_GLOBAL_MACRO_ENV.with(|c| *c.borrow_mut() = Some((generation, base.clone())));
+    // `mark_no_gc_roots`: the function map holds immediate macro handles only,
+    // which is what makes sharing this safe — see the comment on the cache and
+    // on `Environment::no_gc_roots`.
+    let base = Arc::new(augment_env_with_macros(MacroexpandEnv::null(), &globals).mark_no_gc_roots());
+    CLI_GLOBAL_MACRO_ENV.with(|c| *c.borrow_mut() = Some((generation, Arc::clone(&base))));
     base
 }
 
@@ -31993,7 +32019,13 @@ fn eval_macroexpand(
             // `(macroexpand place env)` when POP's expander is invoked with a nil
             // environment, e.g. after (setf (macro-function s) (macro-function
             // 'pop)) then evaluating (s x) (ansi macro-function.15; bliss-gxe9).
-            cli_global_macro_env()
+            // An empty child of the shared base: same bindings, no copy.
+            MacroexpandEnv::child_of(
+                cli_global_macro_env(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
         } else {
             load_macroexpand_environment(env_value).ok_or_else(|| {
                 BlissError::Internal("MACROEXPAND: invalid lexical environment".into())
