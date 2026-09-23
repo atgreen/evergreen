@@ -34107,6 +34107,108 @@ fn apply_builtin_fast(
             env.clear_mv();
             Some(Ok(if args[0] == args[1] { T } else { NIL }))
         }
+        // CLOS readers on already-evaluated arguments. ASDF is CLOS data
+        // structures end to end and its plan traversal is almost entirely slot
+        // reads, so each of these paid the synthesize-and-re-evaluate detour
+        // above. Measured with ROOM over 50k iterations: SLOT-VALUE and
+        // SLOT-BOUNDP consed 224 bytes per call, CLASS-OF and CLASS-NAME 128,
+        // against 0 in SBCL — while `(car '(1 2))`, which already had an arm,
+        // consed nothing. That is why asdf:make-plan consed 9.16 MB per call
+        // against SBCL's 1.205 MB, and make-plan is 95% of what a no-op
+        // (asdf:load-system :babel) conses (bliss-4rgg, bliss-sgis).
+        //
+        // All four are leaf readers — no :test/:key can re-enter Lisp — so they
+        // satisfy the leaf rule that makes a direct arm safe without invocation
+        // counting or a depth cap (bliss-edzd). Same kernels as the
+        // operator-position handlers, so results and multiple values stay
+        // bit-identical to the tree-walker (bliss-x5y.9).
+        "SLOT-VALUE" if args.len() == 2 => {
+            env.clear_mv();
+            Some(slot_value_or_signal(args[0], args[1], env))
+        }
+        "SLOT-BOUNDP" if args.len() == 2 => {
+            env.clear_mv();
+            Some(slot_is_bound(args[0], args[1], env).map(|b| if b { T } else { NIL }))
+        }
+        "CLASS-OF" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(bliss_stdlib::class_of(args[0])))
+        }
+        "CLASS-NAME" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(bliss_stdlib::class_name(args[0])))
+        }
+        // Pathname accessors on already-evaluated arguments. ASDF's plan
+        // traversal is pathname-heavy: asdf:apply-output-translations consed
+        // 19,522 bytes per call against SBCL's 1,375 (14x), and the gap is not
+        // the pathname algorithms — bliss's MERGE-PATHNAMES actually conses LESS
+        // than SBCL's (225 vs 295). It is that these accessors had no arm and so
+        // paid the synthesize-and-re-evaluate detour above, ~129 bytes a call,
+        // dozens of times per translation. SBCL conses ZERO for each of these
+        // (bliss-4rgg).
+        //
+        // Pure readers over one designator, so they are leaf-safe. Same kernels
+        // as the operator-position handlers (bliss-x5y.9). Only the single-
+        // argument form is taken here; the &optional/&key arities fall through
+        // to the general path, which still validates them.
+        "PATHNAME-NAME" if args.len() == 1 => {
+            env.clear_mv();
+            Some(
+                pathname_accessor_arg("PATHNAME-NAME", args)
+                    .and_then(coerce_pathname_designator)
+                    .map(bliss_stdlib::pathname_name),
+            )
+        }
+        "PATHNAME-TYPE" if args.len() == 1 => {
+            env.clear_mv();
+            Some(
+                pathname_accessor_arg("PATHNAME-TYPE", args)
+                    .and_then(coerce_pathname_designator)
+                    .map(bliss_stdlib::pathname_type),
+            )
+        }
+        // The rest of the measured hot set. A per-name count of detour calls
+        // during asdf:apply-output-translations put these at, per call:
+        // PATHNAME 14, PATHNAME-DIRECTORY 12, PATHNAMEP 6, MAKE-PATHNAME 5,
+        // PATHNAME-VERSION 3, WILD-PATHNAME-P 2, PATHNAME-HOST 2 — 45 of 61
+        // calls being pathname builtins. PATHNAME-DIRECTORY and MAKE-PATHNAME
+        // are left out here: the first returns a freshly built list and the
+        // second takes &key, so neither is a mechanical lift from its
+        // operator-position handler.
+        "PATHNAME" if args.len() == 1 => {
+            env.clear_mv();
+            let mut thing = args[0];
+            // Rooted across parse_namestring exactly as the operator-position
+            // handler does: that allocates, and a designator left in a bare
+            // local would be stale after a collection.
+            bliss_rt::rooted_ref!(_thing_root = &mut thing);
+            Some(if bliss_stdlib::is_pathname(thing) {
+                Ok(thing)
+            } else {
+                thing = normalize_pathname_string_designator(thing);
+                bliss_stdlib::parse_namestring(thing, None, None).map(|(pathname, _)| pathname)
+            })
+        }
+        "PATHNAMEP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(if bliss_stdlib::is_pathname(args[0]) {
+                T
+            } else {
+                NIL
+            }))
+        }
+        "PATHNAME-VERSION" if args.len() == 1 => {
+            env.clear_mv();
+            Some(coerce_pathname_designator(args[0]).map(bliss_stdlib::pathname_version))
+        }
+        "PATHNAME-HOST" if args.len() == 1 => {
+            env.clear_mv();
+            Some(
+                pathname_accessor_arg("PATHNAME-HOST", args)
+                    .and_then(coerce_pathname_designator)
+                    .map(bliss_stdlib::pathname_host),
+            )
+        }
         // `(setf (car|cdr place) v)` lowers to a CallNamed of these, so without
         // a fast arm every destructive list update paid apply_function's
         // synthesize-and-re-evaluate detour -- it rebuilt `(BLISS::SET-CAR 'c
