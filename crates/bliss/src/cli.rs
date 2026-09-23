@@ -6814,6 +6814,11 @@ fn frozen_macro_captures() -> &'static OrderedMutex<Vec<Weak<OrderedMutex<Frozen
     })
 }
 
+/// Size at which the frozen-macro-capture vector is next compacted; doubles
+/// after each compaction so registration stays O(1) amortized.
+static COMPACT_CAPTURES_AT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(64);
+
 fn register_frozen_macro_capture(
     capture: FrozenMacroCapture,
 ) -> Arc<OrderedMutex<FrozenMacroCapture>> {
@@ -6828,7 +6833,25 @@ fn register_frozen_macro_capture(
     let mut captures = frozen_macro_captures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    captures.retain(|weak| weak.strong_count() != 0);
+    // Compact on a doubling schedule, not on every registration.
+    //
+    // This used to `retain` — a full scan of every capture ever registered —
+    // before each push, which is O(n) per registration and O(n^2) overall. On a
+    // babel no-op re-load that made `register_frozen_macro_capture` 5.75% of the
+    // profile, the second-largest entry after memcpy, for a load that does no
+    // work at all (bliss-htff).
+    //
+    // Amortizing keeps the same bound on retained garbage — the vector never
+    // holds more than twice the live captures after a compaction — while making
+    // registration O(1) amortized. The entries are `Weak`, so a stale one costs
+    // only its slot until the next compaction.
+    if captures.len() >= COMPACT_CAPTURES_AT.load(AtomicOrdering::Relaxed) {
+        captures.retain(|weak| weak.strong_count() != 0);
+        COMPACT_CAPTURES_AT.store(
+            captures.len().saturating_mul(2).max(64),
+            AtomicOrdering::Relaxed,
+        );
+    }
     captures.push(Arc::downgrade(&capture));
     capture
 }
