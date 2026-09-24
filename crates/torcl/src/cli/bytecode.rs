@@ -197,6 +197,9 @@ unsafe fn trace_bytecode_function(
     for constant in &mut function.constants {
         visit(constant as *mut TorclVal);
     }
+    for (_, form) in &mut function.load_time_values {
+        visit(form as *mut TorclVal);
+    }
     visit(&mut function.params_form as *mut TorclVal);
     for handler_bind in &mut function.handler_binds {
         for (_, form) in &mut handler_bind.bindings {
@@ -1417,6 +1420,7 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
 struct Lowerer<'e> {
     code: Vec<Instr>,
     constants: Vec<TorclVal>,
+    load_time_values: Vec<(u16, TorclVal)>,
     /// Lexical scope: name → variable location. A `Vec` of frames so `let`
     /// bindings shadow correctly and unbind at scope exit.
     scopes: Vec<HashMap<String, VarLoc>>,
@@ -1514,6 +1518,9 @@ struct TagScope {
 impl torcl_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         torcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.macro_env, visit);
+        for (_, form) in &mut self.load_time_values {
+            visit(form as *mut TorclVal);
+        }
         for constant in &mut self.constants {
             visit(constant as *mut TorclVal);
         }
@@ -1538,6 +1545,7 @@ impl<'e> Lowerer<'e> {
         Lowerer {
             code: Vec::new(),
             constants: Vec::new(),
+            load_time_values: Vec::new(),
             scopes: vec![HashMap::new()],
             captured_names: std::collections::HashSet::new(),
             declared_special: std::collections::HashMap::new(),
@@ -1813,6 +1821,36 @@ impl<'e> Lowerer<'e> {
                     let c = self.add_const(datum);
                     self.emit(Instr::Const(c));
                     self.push_n(1);
+                    Ok(())
+                }
+                "LOAD-TIME-VALUE" if self.portable => {
+                    torcl_rt::rooted!(rest = rest);
+                    if !rest.is_cons() {
+                        return Err(Bail);
+                    }
+                    let (_, tail) = cp(*rest);
+                    if !tail.is_nil()
+                        && (!tail.is_cons()
+                            || !cp(tail).1.is_nil()
+                            || (cp(tail).0 != NIL && cp(tail).0 != T))
+                    {
+                        return Err(Bail);
+                    }
+                    // A unique marker prevents structural constant interning
+                    // from coalescing distinct mutable load-time cells.
+                    torcl_rt::rooted!(
+                        marker = torcl_rt::symbols::make_uninterned("LOAD-TIME-CELL")
+                    );
+                    let cell = arena_cons(NIL, *marker);
+                    let slot = self.add_const(cell);
+                    self.load_time_values.push((slot, cp(*rest).0));
+                    self.emit(Instr::Const(slot));
+                    self.push_n(1);
+                    self.emit(Instr::CallNamed {
+                        sym: symbol_index_of("CAR").ok_or(Bail)?,
+                        nargs: 1,
+                    });
+                    self.emit(Instr::ClearMv);
                     Ok(())
                 }
                 "IF" => self.lower_if(rest),
@@ -5934,6 +5972,7 @@ fn compile_local_function(
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        load_time_values: lo.load_time_values,
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
@@ -6011,6 +6050,7 @@ fn compile_capturing_local(
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        load_time_values: lo.load_time_values,
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
@@ -6537,6 +6577,7 @@ fn compile_restart_clause(
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        load_time_values: lo.load_time_values,
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
@@ -7412,6 +7453,7 @@ fn compile_function_forcing_boxed(
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        load_time_values: lo.load_time_values,
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
@@ -7586,6 +7628,7 @@ fn compile_thunk(form: TorclVal, env: &Env, portable: bool) -> Option<BytecodeFu
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        load_time_values: lo.load_time_values,
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
@@ -7624,7 +7667,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // A BBU is authoritative: an unsupported version is rejected, never replaced
 // by executing source text from the container.
 // 0x010a: exact Bignum (tag 3) and DoubleFloat (tag 6) literals.
-const BBU_BYTECODE_VERSION: u16 = 0x010a;
+// 0x010b: compiled LOAD-TIME-VALUE initializers (SetLoadTimeCell, action 11).
+const BBU_BYTECODE_VERSION: u16 = 0x010b;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -8361,6 +8405,67 @@ fn serialize_bbu_function_tree(
     result
 }
 
+/// Compile pending value forms separately from their enclosing lexical scope.
+/// No initializer executes during compilation, including failed/boxed retries.
+#[allow(clippy::too_many_arguments)]
+fn serialize_bbu_loadable_function(
+    bf: BytecodeFunction,
+    name_ref: u32,
+    flags: u32,
+    pool: &mut BbuConstPool,
+    functions: &mut Vec<BbuFunction>,
+    load_actions: &mut Vec<(u8, u8, u32, u32, u32)>,
+    env: &Env,
+) -> Option<u32> {
+    fn collect(function: &BytecodeFunction, pending: &mut Vec<TorclVal>) {
+        for &(slot, form) in &function.load_time_values {
+            pending.extend([function.constants[slot as usize], form]);
+        }
+        for nested in &function.nested_functions {
+            collect(nested, pending);
+        }
+        for table in &function.restart_cases {
+            for restart in &table.restarts {
+                collect(&restart.function, pending);
+            }
+        }
+    }
+
+    let bf = Rc::new(bf);
+    let _function_root = ActiveBytecodeRoot::new(&bf);
+    torcl_rt::rooted!(pending = Vec::<TorclVal>::new());
+    collect(&bf, &mut pending);
+    let original_functions = functions.len();
+    let original_actions = load_actions.len();
+    let result = (|| {
+        let owner = serialize_bbu_function_tree(&bf, name_ref, flags, pool, functions)?;
+        if !pending.is_empty() {
+            let mut initializer_env = env.null_lexical_child();
+            torcl_rt::rooted_ref!(_env_root = &mut initializer_env);
+            for index in (0..pending.len()).step_by(2) {
+                let initializer = compile_thunk(pending[index + 1], &initializer_env, true)?;
+                let thunk = serialize_bbu_loadable_function(
+                    initializer,
+                    BBU_NO_INDEX,
+                    BBU_FUNC_LOAD_TIME_THUNK,
+                    pool,
+                    functions,
+                    load_actions,
+                    &initializer_env,
+                )?;
+                let cell = pool.value(pending[index])?;
+                load_actions.push((11, 0, cell, thunk, BBU_NO_INDEX));
+            }
+        }
+        Some(owner)
+    })();
+    if result.is_none() {
+        functions.truncate(original_functions);
+        load_actions.truncate(original_actions);
+    }
+    result
+}
+
 fn serialize_bbu_function_record(out: &mut Vec<u8>, f: &BbuFunction) {
     put_u32(out, f.name_ref);
     put_u32(out, f.lambda_list_ref);
@@ -8719,12 +8824,14 @@ pub fn build_bbu_from_forms(
                             } else {
                                 BBU_FUNC_MACRO
                             };
-                            if let Some(function_index) = serialize_bbu_function_tree(
-                                &bf,
+                            if let Some(function_index) = serialize_bbu_loadable_function(
+                                bf,
                                 name_ref,
                                 function_flag,
                                 &mut pool,
                                 &mut functions,
+                                &mut load_actions,
+                                env,
                             ) {
                                 let definition_package_ref = if compiler_macro {
                                     pool.string(&definition_packages[form_index])
@@ -8752,12 +8859,14 @@ pub fn build_bbu_from_forms(
             if let Some(sym) = symbol_index_of(&name) {
                 if let Some(name_ref) = pool.symbol_by_index(sym) {
                     if let Some(bf) = compile_function(&name, params, body, env, true, false) {
-                        if let Some(function_index) = serialize_bbu_function_tree(
-                            &bf,
+                        if let Some(function_index) = serialize_bbu_loadable_function(
+                            bf,
                             name_ref,
                             BBU_FUNC_NAMED,
                             &mut pool,
                             &mut functions,
+                            &mut load_actions,
+                            env,
                         ) {
                             load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
                             done = true;
@@ -8777,12 +8886,14 @@ pub fn build_bbu_from_forms(
                 if let Some(sym) = symbol_index_of(&name) {
                     if let Some(name_ref) = pool.symbol_by_index(sym) {
                         if let Some(bf) = compile_function(&name, params, body, env, true, true) {
-                            if let Some(function_index) = serialize_bbu_function_tree(
-                                &bf,
+                            if let Some(function_index) = serialize_bbu_loadable_function(
+                                bf,
                                 name_ref,
                                 BBU_FUNC_MACRO,
                                 &mut pool,
                                 &mut functions,
+                                &mut load_actions,
+                                env,
                             ) {
                                 load_actions.push((8, 0, function_index, name_ref, BBU_NO_INDEX));
                                 done = true;
@@ -8810,12 +8921,14 @@ pub fn build_bbu_from_forms(
                 None => done = true,
                 Some(thunk_form) => {
                     if let Some(bf) = compile_thunk(thunk_form, env, true) {
-                        if let Some(function_index) = serialize_bbu_function_tree(
-                            &bf,
+                        if let Some(function_index) = serialize_bbu_loadable_function(
+                            bf,
                             BBU_NO_INDEX,
                             BBU_FUNC_LOAD_TIME_THUNK,
                             &mut pool,
                             &mut functions,
+                            &mut load_actions,
+                            env,
                         ) {
                             load_actions.push((7, 0, function_index, BBU_NO_INDEX, BBU_NO_INDEX));
                             done = true;
@@ -10409,6 +10522,7 @@ fn decode_bbu_function(
     Ok(BytecodeFunction {
         code,
         constants: literal_values,
+        load_time_values: Vec::new(),
         handler_cases,
         handler_binds: Vec::new(),
         names,
@@ -10902,7 +11016,7 @@ pub(super) fn lazy_compile_defun(
             compile_function(name, params, body, env, true, false)
         }
     };
-    match compiled {
+    match compiled.filter(|function| !contains_load_time_values(function)) {
         Some(bf) => {
             registry_put(sym, Rc::new(bf));
             true
@@ -10913,6 +11027,20 @@ pub(super) fn lazy_compile_defun(
             false
         }
     }
+}
+
+fn contains_load_time_values(function: &BytecodeFunction) -> bool {
+    !function.load_time_values.is_empty()
+        || function
+            .nested_functions
+            .iter()
+            .any(|nested| contains_load_time_values(nested))
+        || function.restart_cases.iter().any(|table| {
+            table
+                .restarts
+                .iter()
+                .any(|restart| contains_load_time_values(&restart.function))
+        })
 }
 
 fn contains_host_eval(function: &BytecodeFunction) -> bool {
@@ -10953,6 +11081,11 @@ pub(super) fn compile_and_reify_lambda(
         reset_last_bail_reason();
         compile_function(label, lambda_list, body, env, true, false)
     })?;
+    // Portable lowering is also a live-compiler fallback, but only a FASL load
+    // plan can initialize these pending cells. Never publish them uninitialized.
+    if contains_load_time_values(&bf) {
+        return None;
+    }
     let sym = torcl_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
     registry_put(sym_idx, Rc::new(bf));
@@ -11717,6 +11850,30 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
                     return Err(bbu_error("EvalThunk has an unexpected argument"));
                 }
             }
+            11 => {
+                if bytecode_version < 0x010b || action.flags != 0 || action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error(
+                        "SetLoadTimeCell has unsupported version/arguments",
+                    ));
+                }
+                let cell = bbu_index(action.arg0, encoded_constants.len(), "load-time cell")?;
+                if !matches!(encoded_constants[cell], BbuConstant::Cons(_, _)) {
+                    return Err(bbu_error("SetLoadTimeCell target is not a cons cell"));
+                }
+                let function = &encoded_functions[bbu_index(
+                    action.arg1,
+                    encoded_functions.len(),
+                    "load-time initializer",
+                )?];
+                if function.flags & BBU_FUNC_LOAD_TIME_THUNK == 0
+                    || function.arity_min != 0
+                    || function.arity_max != 0
+                {
+                    return Err(bbu_error(
+                        "SetLoadTimeCell initializer is not a zero-argument thunk",
+                    ));
+                }
+            }
             10 => {
                 // RegisterClosure (core images, bliss-zz6w): register a nested
                 // function's bytecode under the raw uninterned symbol index in
@@ -11939,6 +12096,17 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
                 let mut form = constants[action.arg0 as usize];
                 torcl_rt::rooted_ref!(_form_root = &mut form);
                 last = eval_form(form, env)?;
+            }
+            11 => {
+                let mut initializer_env = env.null_lexical_child();
+                torcl_rt::rooted_ref!(_env_root = &mut initializer_env);
+                last = run(
+                    Rc::clone(&functions[action.arg1 as usize]),
+                    &[],
+                    NIL,
+                    &mut initializer_env,
+                )?;
+                super::store_cons_field(constants[action.arg0 as usize], last, true)?;
             }
             10 => {
                 // RegisterClosure (core images, bliss-zz6w): re-register a
@@ -19185,7 +19353,10 @@ pub fn eval_toplevel(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, Torc
     // in portable mode before tree-walking — same rationale as lazy_compile_defun
     // (bliss-mr4p). Only reached after the fast path already declined, so it
     // never adds work to a form that compiles opportunistically.
-    match compile_thunk(form, env, false).or_else(|| compile_thunk(form, env, true)) {
+    match compile_thunk(form, env, false)
+        .or_else(|| compile_thunk(form, env, true))
+        .filter(|function| !contains_load_time_values(function))
+    {
         Some(bf) => {
             trace("compiled");
             let arc = Rc::new(bf);

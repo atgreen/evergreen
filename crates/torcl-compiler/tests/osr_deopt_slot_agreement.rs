@@ -25,6 +25,7 @@ fn bf(name: &str, code: Vec<Instr>, constants: Vec<TorclVal>, n_locals: u16) -> 
     BytecodeFunction {
         code,
         constants,
+        load_time_values: vec![],
         handler_cases: vec![],
         handler_binds: vec![],
         names: vec![],

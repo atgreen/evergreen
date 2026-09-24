@@ -453,6 +453,7 @@ mod tests {
         Arc::new(BytecodeFunction {
             code,
             constants: vec![],
+            load_time_values: vec![],
             handler_cases: vec![],
             handler_binds: vec![],
             names: vec![],

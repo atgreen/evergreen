@@ -31,6 +31,7 @@ fn bytecode_fn(
     BytecodeFunction {
         code,
         constants,
+        load_time_values: vec![],
         handler_cases: vec![],
         handler_binds: vec![],
         names: vec![],
@@ -1187,6 +1188,7 @@ fn fixnum_profile_speculates_the_call() {
             Instr::Return,
         ],
         constants: vec![TorclVal::from_fixnum(5)],
+        load_time_values: vec![],
         handler_cases: vec![],
         handler_binds: vec![],
         names: vec![],

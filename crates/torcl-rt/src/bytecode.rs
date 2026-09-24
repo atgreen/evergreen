@@ -219,6 +219,10 @@ impl DeclaredType {
 pub struct BytecodeFunction {
     pub code: Vec<Instr>,
     pub constants: Vec<TorclVal>,
+    /// Compiler-only LOAD-TIME-VALUE initializers: (cell constant slot, form).
+    /// The FASL writer turns these into ordered load actions. Decoded and live
+    /// executable functions have an empty list.
+    pub load_time_values: Vec<(u16, TorclVal)>,
     /// Static per-`handler-case` clause tables (indexed by `PushHandlerCase`).
     pub handler_cases: Vec<HandlerCaseInfo>,
     /// Static per-`handler-bind` binding tables (indexed by `PushHandlerBind`).

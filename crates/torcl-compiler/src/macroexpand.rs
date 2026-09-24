@@ -1336,8 +1336,12 @@ fn expand_special_form(
         "LOCALLY" => expand_locally(form, env),
         "MACROLET" => expand_macrolet(form, env),
         "SYMBOL-MACROLET" => expand_symbol_macrolet(form, env),
+        // The value form is a separate compilation in the null lexical
+        // environment. Its compiler expands global macros later; walking it
+        // here would capture this body's MACROLET/SYMBOL-MACROLET bindings.
+        "LOAD-TIME-VALUE" => Ok(form),
         // For IF, PROGN, CATCH, THROW, UNWIND-PROTECT, MULTIPLE-VALUE-CALL,
-        // MULTIPLE-VALUE-PROG1, PROGV, LOAD-TIME-VALUE — all subforms are
+        // MULTIPLE-VALUE-PROG1, PROGV — all subforms are
         // expression positions, so the generic walk is correct.
         _ => expand_function_call_args(operator, form, env),
     }

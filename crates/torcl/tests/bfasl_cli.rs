@@ -116,6 +116,191 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+#[test]
+fn load_time_values_are_initialized_once_per_fasl_load() {
+    let dir = workdir("load-time-values");
+    let src = dir.join("cells.lisp");
+    let out = dir.join("cells.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun ltv-a () (load-time-value (list (incf *ltv-count*))))
+      (defun ltv-b () (load-time-value (list (incf *ltv-count*))))
+      (defun ltv-maker (x)
+        (lambda () (cons x (load-time-value (list (incf *ltv-count*))))))
+      (defun ltv-scope (ltv-global)
+        (load-time-value (list ltv-global *ltv-dynamic*)))
+      (defun ltv-primary () (load-time-value (values 7 8) t))
+      (defun ltv-recursive () (load-time-value (list (load-time-value (list :inner) nil))))
+      (defun ltv-symbol-scope ()
+        (symbol-macrolet ((ltv-global :shadow)) (load-time-value ltv-global)))
+      (defmacro ltv-expand () :global-macro)
+      (defun ltv-macro-scope ()
+        (macrolet ((ltv-expand () :local-macro)) (load-time-value (ltv-expand))))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        "(setq *ltv-count* 0) (compile-file {src:?} :output-file {out:?}) (format t \"COMPILE-COUNT ~S~%\" *ltv-count*)"
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(String::from_utf8_lossy(&compiled.stdout).contains("COMPILE-COUNT 0"));
+    let bytes = fs::read(&out).unwrap();
+    assert!(bfasl_section(&bytes, 11).is_none());
+    assert!(
+        bbu_counts(&bytes).1 >= 6,
+        "LTV functions and nested closure must compile"
+    );
+    let bbu = bfasl_section(&bytes, 12).unwrap();
+    let start = bbu_action_start(bbu);
+    let count = u32::from_le_bytes(bbu[20..24].try_into().unwrap()) as usize;
+    for action in bbu[start..start + count * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "LOAD-TIME-VALUE fell back to EvalSource");
+    }
+    fs::remove_file(src).unwrap();
+    let program = format!(
+        r#"
+      (setq *ltv-count* 0 ltv-global :global *ltv-dynamic* :outer)
+      (let ((ltv-global :lexical) (*ltv-dynamic* :dynamic)) (load {out:?}))
+      (format t "LOAD-COUNT ~S~%" *ltv-count*)
+      (setq *ltv-old* (ltv-a))
+      (format t "CELLS ~S ~S ~S ~S~%" (ltv-a) (ltv-b) (eq (ltv-a) (ltv-a)) (eq (ltv-a) (ltv-b)))
+      (setq *ltv-f* (ltv-maker 10) *ltv-g* (ltv-maker 20))
+      (format t "NESTED ~S ~S ~S~%" (funcall *ltv-f*) (funcall *ltv-g*) (eq (cdr (funcall *ltv-f*)) (cdr (funcall *ltv-g*))))
+      (format t "SCOPE ~S PRIMARY ~S~%" (ltv-scope :argument) (multiple-value-list (ltv-primary)))
+      (format t "RECURSIVE ~S~%" (ltv-recursive))
+      (format t "MACROS ~S ~S~%" (ltv-symbol-scope) (ltv-macro-scope))
+      (format t "CALL-COUNT ~S~%" *ltv-count*)
+      (load {out:?})
+      (format t "RELOAD ~S ~S ~S ~S~%" *ltv-old* (ltv-a) (ltv-b) *ltv-count*)
+    "#
+    );
+    for (tier, stress) in [("t0", false), ("t0", true), ("t1", true)] {
+        let mut command = Command::new(BIN);
+        command.args(["--no-init", "--no-bootstrap", "--eval", &program]);
+        command.env("TORCL_FORCE_TIER", tier);
+        if stress {
+            command
+                .env("TORCL_GC_STRESS", "1")
+                .env("TORCL_GC_POISON", "1")
+                .env("TORCL_GC_VERIFY", "1");
+        }
+        let loaded = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&loaded.stdout);
+        assert!(
+            loaded.status.success(),
+            "tier={tier}, stress={stress}: {stdout}\n{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        for expected in [
+            "LOAD-COUNT 3",
+            "CELLS (1) (2) T NIL",
+            "NESTED (10 3) (20 3) T",
+            "SCOPE (:GLOBAL :DYNAMIC) PRIMARY (7)",
+            "RECURSIVE ((:INNER))",
+            "MACROS :GLOBAL :GLOBAL-MACRO",
+            "CALL-COUNT 3",
+            "RELOAD (1) (4) (5) 6",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "tier={tier}, stress={stress}, missing {expected}: {stdout}"
+            );
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn load_time_value_errors_stop_loading_and_bad_actions_are_prevalidated() {
+    let dir = workdir("load-time-value-errors");
+    let src = dir.join("error.lisp");
+    let good = dir.join("error.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun ltv-before-error () :before)
+      (defun ltv-error () (load-time-value (progn (incf *ltv-errors*) (error "LTV initializer"))))
+      (defun ltv-after-error () :after)
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {src:?} :output-file {good:?})"));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&good).unwrap();
+    let bbu = bfasl_section(&bytes, 12).unwrap();
+    let start = bbu_action_start(bbu);
+    let count = u32::from_le_bytes(bbu[20..24].try_into().unwrap()) as usize;
+    let init = (0..count)
+        .map(|i| start + i * 14)
+        .find(|&pos| bbu[pos] == 11)
+        .expect("must compile a SetLoadTimeCell action");
+    let probe = |path: &PathBuf| {
+        run(&format!(
+            r#"
+      (setq *ltv-errors* 0)
+      (handler-case (load {path:?}) (error () (format t "CAUGHT~%")))
+      (format t "STATE ~S ~S ~S ~S~%" *ltv-errors* (fboundp 'ltv-before-error) (fboundp 'ltv-error) (fboundp 'ltv-after-error))
+    "#
+        ))
+    };
+    let loaded = probe(&good);
+    let stdout = String::from_utf8_lossy(&loaded.stdout);
+    assert!(
+        loaded.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(
+        stdout.contains("CAUGHT") && stdout.contains("STATE 1 T NIL NIL"),
+        "{stdout}"
+    );
+
+    for corruption in ["cell", "thunk", "role", "flags", "extra", "version"] {
+        let image = torcl_rt::bfasl::load(&bytes).unwrap();
+        let mut builder = torcl_rt::bfasl::BfaslBuilder::new();
+        for (kind, section) in image.sections() {
+            let mut section = section.to_vec();
+            if kind == torcl_rt::bfasl::section::BYTECODE_UNIT {
+                match corruption {
+                    "cell" => section[init + 2..init + 6].copy_from_slice(&u32::MAX.to_le_bytes()),
+                    "thunk" => {
+                        section[init + 6..init + 10].copy_from_slice(&u32::MAX.to_le_bytes())
+                    }
+                    "role" => section[init + 6..init + 10].copy_from_slice(&0u32.to_le_bytes()),
+                    "flags" => section[init + 1] = 1,
+                    "extra" => section[init + 10..init + 14].copy_from_slice(&0u32.to_le_bytes()),
+                    "version" => section[4..6].copy_from_slice(&0x010au16.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+            }
+            builder = builder.section(kind, section);
+        }
+        let bad = dir.join(format!("bad-{corruption}.bfasl"));
+        fs::write(&bad, builder.build()).unwrap();
+        let loaded = probe(&bad);
+        let stdout = String::from_utf8_lossy(&loaded.stdout);
+        assert!(
+            loaded.status.success(),
+            "{corruption}: {stdout}\n{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert!(
+            stdout.contains("CAUGHT") && stdout.contains("STATE 0 NIL NIL NIL"),
+            "{corruption}: {stdout}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// WITH-OPEN-FILE must not force a parser's entire body back to source eval.
 #[test]
 fn with_open_file_bfasl_keeps_cleanup_values_and_declarations() {

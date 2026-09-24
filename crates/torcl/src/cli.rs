@@ -7513,6 +7513,21 @@ impl Env {
         }
     }
 
+    /// Retain dynamic state and global definitions, but no enclosing lexical
+    /// variables, local functions/macros, declarations, or exit targets.
+    fn null_lexical_child(&self) -> Self {
+        let mut child = self.child_with_parent(Rc::new(RefCell::new(EnvFrame::default())));
+        child.funs = Rc::new(RefCell::new(HashMap::new()));
+        child.macros = Rc::new(RefCell::new(HashMap::new()));
+        child.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
+        child.block_stack.clear();
+        child.tag_stack.clear();
+        child.locally_specials.clear();
+        child.method_context.clear();
+        child.clear_mv();
+        child
+    }
+
     fn lookup_var(&self, name: &str) -> Option<TorclVal> {
         let frame = self.frame.borrow();
         if let Some(val) = frame.vars.get(name) {

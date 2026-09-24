@@ -4116,6 +4116,7 @@ mod tests {
                 Instr::Return,
             ],
             constants: vec![TorclVal::from_fixnum(5)],
+            load_time_values: vec![],
             handler_cases: vec![],
             handler_binds: vec![],
             names: vec![],

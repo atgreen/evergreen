@@ -104,6 +104,7 @@ mod tests {
         BytecodeFunction {
             code,
             constants,
+            load_time_values: vec![],
             handler_cases: vec![],
             handler_binds: vec![],
             names: vec![],

@@ -447,6 +447,19 @@ serialized as an `InstallMacro` load action when `:load-toplevel` applies.  A
 `SetLoadTimeCell`; executable code then uses `LOAD_TIME_VALUE` to read that
 cell.  The loader never re-runs macro expansion as part of executing a `BBU`.
 
+The current bytecode version 1.11 implements this cell protocol using a private
+`Cons` constant and an ordinary `CAR` call, rather than the reserved
+`LoadTimeCell` constant/opcode above. A unique uninterned marker in the cell's
+CDR prevents structural constant interning from merging distinct occurrences.
+Its concrete `SetLoadTimeCell` action is kind **11** (`arg0 = Cons constant`,
+`arg1 = zero-argument load-time thunk`, `arg2 = 0xffffffff`, `flags = 0`);
+earlier concrete action numbers are retained for existing artifacts. The
+loader validates every action before executing any of them and initializes
+each cell before installing its owning function. Each load materializes fresh
+cells; nested closures share their source occurrence's initialized cell.
+Initializers are compiled without enclosing lexical bindings and execute in
+the loader's dynamic environment. Only their primary value is retained.
+
 The load plan executes in file order and is the unit's observable load-time
 semantics.  Loader implementations MAY pre-materialize constants and verify all
 functions before the first action, but they MUST NOT reorder actions with
