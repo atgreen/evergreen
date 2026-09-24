@@ -5,6 +5,77 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Cross-crate release optimization (2026-09-24, bliss-zjwh)
+
+The previously deferred ThinLTO experiment reproduces against `f8cad53`, including
+the subsequent FASL method/closure fixes. Release builds now use ThinLTO and one
+codegen unit; development and ordinary test profiles are unchanged. This lets
+LLVM optimize across the runtime, standard-library, compiler, and CLI boundaries
+without changing Lisp semantics, tiering thresholds, or cached FASLs.
+
+Five alternating CPU-0-pinned, fresh-process initial Babel loads with populated
+FASL caches and the isolated TorCL dependency port give:
+
+| Median | Before | ThinLTO + one codegen unit |
+|---|---:|---:|
+| Initial-load retired instructions | 3.856 G | **3.500 G (9.2% less)** |
+| Initial-load CPU cycles | 1.568 G | **1.442 G (8.0% less)** |
+| Initial-load wall time | 0.737 s | 0.680 s |
+| Lisp bytes allocated | 10,185,616 | 10,185,616 |
+
+All measured TorCL loads return the correct Hello encoding, perform zero
+collections, and do not recompile source. SBCL's same-batch median is 0.291 s,
+but clock variation is substantial: TorCL before spans 0.629–0.754 s, after
+0.336–0.684 s, and SBCL 0.155–0.293 s. The raw median ratio is 2.34×; use the
+repeated instruction/cycle reduction as the improvement evidence, not a claim
+of a universally stable ratio or a closed gap. Whole-process startup was not
+measured in this batch. The candidate release build took 82 seconds.
+
+After validation, a second five-pair batch on the final Cargo-configured binary
+confirms **3.856 → 3.494 G instructions (9.4% less)** and
+**1.590 → 1.452 G cycles (8.7% less)**. SBCL's isolated-load medians are
+1.219 G instructions and 0.636 G cycles: the remaining cycle gap is about
+**2.3×**, not closed. This batch's wall medians reverse direction
+(0.368 → 0.502 s) despite the consistent cycle reduction: individual TorCL
+samples switch between roughly 2.1 and 4.3 GHz effective clock rates. Do not
+claim a stable wall-time speedup from these batches. SBCL spans 0.159–0.296 s.
+
+Full workspace validation ran in both profiles. All **796 CLI unit/integration
+tests pass, zero fail, three ignored** in each. The release workspace reports
+2,564 passes, 13 failures, seven ignored; the default workspace reports 2,570
+passes, 11 failures, seven ignored. Seven failures are the existing STRINGP
+metadata (`bliss-4ihx`), sequence fixtures (`bliss-0bdl`), and Lisp-as-Rust
+doctests (`bliss-pqyy`). Additional parallel thread/safepoint and global
+allocation-counter failures are tracked in `bliss-z11t` and `bliss-57hx`.
+Non-LTO release controls reproduce them, including repeated safepoint and
+allocation-counter failures. The exact ThinLTO binaries pass all 34 affected
+tests serially. A default-profile parallel threading repeat also SIGSEGVs;
+its precise cause remains open. **The workspace is not all green.**
+
+The optimized CLI agrees with SBCL on all 15,106 Babel reverse-table entries,
+normally and with stress-20,000/poison/verification; four focused method/closure
+tests pass every-allocation stress. GNU release builds and produces identical
+table entries, without the musl-only memcpy wrapper. Workspace check and format
+pass; root lint has six baseline findings, zero new. Existing unused-mut,
+strict-clippy and spec-coverage findings remain (`bliss-d3hs`, `bliss-5vr`,
+`bliss-kjjd`). The full release test build took 16m35s; ordinary profiles are
+unchanged. An unnecessary development build inside a release integration-test
+helper is separately tracked as `bliss-97pz`.
+
+The motivating current-state profile has 3,325 cycle samples and zero lost
+samples. Main-thread self costs remain diffuse: bytecode run-loop 5.17%,
+symbol-function lookup 4.69%, evaluator and symbol-index lookup 4.00% each.
+Constant materialization is only 2.98% inclusive; BBU loading including its
+Lisp execution is 20.66%. This is a runtime optimization, not a new FASL format.
+
+Artifacts: `/tmp/torcl-initial-current.perf`,
+`/tmp/torcl-initial-sprof.log`, `/tmp/torcl-initial-lto-bench.sh`,
+`/tmp/torcl-initial-lto-{before,after,sbcl}-*.{log,stat}`, and
+`/tmp/torcl-initial-lto-final-{before,after,sbcl}-*.{log,stat}`;
+validation logs are `/tmp/torcl-initial-lto-{default-workspace,workspace}.log`,
+`/tmp/torcl-initial-lto-final-tables-{normal,stress}.log`, and
+`/tmp/torcl-initial-nolto-{controls,repeat-*}.log`.
+
 ## Keep FASL methods compiled and their captures GC-safe (2026-09-24)
 
 `bliss-p7ha` fixes an asymmetry between source and compiled loading: the BBU

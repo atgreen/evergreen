@@ -22,6 +22,13 @@ torcl-stdlib = { path = "crates/torcl-stdlib" }
 [profile.test]
 opt-level = 3
 
+# Let release optimization cross the runtime/compiler/stdlib crate boundaries.
+# Initial cached Babel loads retire ~9% fewer instructions with this pair
+# (bliss-zjwh); development and ordinary test profiles stay unchanged.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # The DEV profile must optimize the same crates the TEST profile does, or the
 # two cargo subcommands produce measurably different binaries at the SAME path
 # (target/<target>/debug/torcl) and whichever ran last silently decides how
