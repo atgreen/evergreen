@@ -22383,7 +22383,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "COMPILE-FILE requires a source".into(),
                     ));
                 }
-                let src_path = path_designator_to_string(args[0])?;
+                bliss_rt::rooted!(source_pathname = resolve_against_dpd(args[0], env)?);
+                let src_path = path_designator_to_string(*source_pathname)?;
                 let mut out_path: Option<String> = None;
                 let mut i = 1;
                 // Extension: accept `(compile-file src out)` with a positional
@@ -22458,7 +22459,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // ASDF/FOOTER. Snapshot the current package and restore it once
                 // compilation is done (mirrors LOAD in load_path_into_env).
                 let saved_package = env.current_package.clone();
-                let image = build_bfasl_from_source(&source, &src_path, env);
+                let image = {
+                    // Bind BEFORE reading: #.*COMPILE-FILE-PATHNAME* must
+                    // capture the source, even when ASDF redirects the output.
+                    // Keep its spelling distinct from the canonical truename.
+                    bliss_rt::rooted!(source_truename = bliss_stdlib::truename(*source_pathname)?);
+                    let pathname_symbol = resolve_sym("*COMPILE-FILE-PATHNAME*").unwrap();
+                    let truename_symbol = resolve_sym("*COMPILE-FILE-TRUENAME*").unwrap();
+                    // Saved caller values also need roots across nested
+                    // compilation/GC. Dropping the guards restores on errors.
+                    bliss_rt::rooted!(
+                        _compile_paths = vec![
+                            DynBind::establish(pathname_symbol, *source_pathname),
+                            DynBind::establish(truename_symbol, *source_truename),
+                        ]
+                    );
+                    build_bfasl_from_source(&source, &src_path, env)
+                };
                 if env.current_package != saved_package {
                     env.current_package = saved_package.clone();
                     env.define_local("*PACKAGE*", package_object(&saved_package));
