@@ -1,8 +1,61 @@
-//! Integer primitives shared by interpreted and compiled calls (§5.2.1).
+//! Numeric primitives shared by interpreted and compiled calls (§5.2.1).
 
-use bliss_rt::bignum::{BigInt, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen};
+use bliss_rt::bignum::{
+    BigInt, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, ratio_parts_val,
+};
 use bliss_rt::error::BlissError;
 use bliss_rt::value::BlissVal;
+use std::cmp::Ordering;
+
+/// Compare a real number with zero without rounding exact rationals through a
+/// float. None denotes an unordered floating-point value (NaN). This path only
+/// reads Lisp objects; any bignum copies allocate Rust memory, never Lisp memory.
+fn compare_real_to_zero(value: BlissVal) -> Result<Option<Ordering>, BlissError> {
+    if value.is_fixnum() {
+        return Ok(Some(value.as_fixnum().cmp(&0)));
+    }
+    if value.is_single_float() {
+        return Ok(value.as_single_float().partial_cmp(&0.0));
+    }
+    if value.is_double_float() {
+        return Ok(value.as_double_float().partial_cmp(&0.0));
+    }
+    if let Some(n) = bigint_from_val(value) {
+        return Ok(Some(n.sign.cmp(&0)));
+    }
+    if let Some((num, den)) = ratio_parts_val(value) {
+        let sign = integer(num)?.sign * integer(den)?.sign;
+        return Ok(Some(sign.cmp(&0)));
+    }
+    Err(BlissError::TypeError {
+        datum: value,
+        expected: "real".into(),
+    })
+}
+
+/// ZEROP accepts the whole numeric tower, including complex zero.
+pub fn zerop(value: BlissVal) -> Result<bool, BlissError> {
+    if let Some(real) = bliss_rt::types::complex_realpart(value) {
+        let imag = bliss_rt::types::complex_imagpart(value).expect("complex imaginary part");
+        return Ok(compare_real_to_zero(real)? == Some(Ordering::Equal)
+            && compare_real_to_zero(imag)? == Some(Ordering::Equal));
+    }
+    compare_real_to_zero(value)
+        .map(|order| order == Some(Ordering::Equal))
+        .map_err(|_| BlissError::TypeError {
+            datum: value,
+            expected: "number".into(),
+        })
+}
+
+/// PLUSP and MINUSP accept reals only; complex numbers have no ordering.
+pub fn plusp(value: BlissVal) -> Result<bool, BlissError> {
+    compare_real_to_zero(value).map(|order| order == Some(Ordering::Greater))
+}
+
+pub fn minusp(value: BlissVal) -> Result<bool, BlissError> {
+    compare_real_to_zero(value).map(|order| order == Some(Ordering::Less))
+}
 
 fn integer(value: BlissVal) -> Result<BigInt, BlissError> {
     bigint_from_val(value).ok_or_else(|| BlissError::TypeError {

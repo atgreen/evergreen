@@ -427,6 +427,68 @@ fn closure_literals_survive_gc_during_fasl_closure_construction() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// R5.06 / R6.71: numeric predicates on runtime-created heap numbers retain
+/// exact signs through source-free native calls and moving collections.
+#[test]
+fn numeric_predicates_load_without_source_under_gc_stress() {
+    let dir = workdir("numeric-predicates");
+    let src = dir.join("predicates.lisp");
+    let out = dir.join("predicates.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun predicates (x) (list (zerop x) (plusp x) (minusp x)))
+      (defun check-predicates ()
+        (let* ((big (ash 1 2000)) (tiny (/ 1 big)))
+          (list (predicates 0) (predicates big) (predicates (- big))
+                (predicates tiny) (predicates (- tiny))
+                (zerop (complex 0.0 -0.0)) (zerop (complex 0 tiny)))))
+      (format t "PRED-FASL ~S~%" (check-predicates))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "numeric predicates fell back to EvalSource");
+    }
+    fs::remove_file(&src).unwrap();
+    for stride in ["1", "7", "31"] {
+        let loaded = Command::new(BIN)
+            .args(["--no-init", "--no-bootstrap", "--load"])
+            .arg(&out)
+            .env("BLISS_FORCE_TIER", "t1")
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .env("BLISS_GC_VERIFY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&loaded.stdout).trim(),
+            "PRED-FASL ((T NIL NIL) (NIL T NIL) (NIL NIL T) (NIL T NIL) (NIL NIL T) T NIL)",
+            "stride {stride}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// R5.06 / R6.71: source-free ASH calls use the same allocating integer kernel
 /// in compiled code, with operands kept live across bignum result allocation.
 #[test]

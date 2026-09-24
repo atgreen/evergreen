@@ -14360,6 +14360,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // :test-not of #'NOT is called with TWO arguments and must be a
         // PROGRAM-ERROR (ansi POSITION.ERROR.13 and its FIND/COUNT siblings).
         "NOT" | "NULL" => Some((1, 1)),
+        "ZEROP" | "PLUSP" | "MINUSP" => Some((1, 1)),
         // (rest list) — exactly one; (nth n list) — exactly two.
         "REST" => Some((1, 1)),
         "NTH" => Some((2, 2)),
@@ -20876,35 +20877,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return sub_vals(&[v, one]);
             }
-            "ZEROP" | "PLUSP" | "MINUSP" => {
-                let (af, rest) = cp(cdr);
-                if !cdr.is_cons() || rest.is_cons() {
-                    return Err(BlissError::ProgramError(format!(
-                        "{name} requires exactly one argument"
-                    )));
-                }
+            "ZEROP" | "PLUSP" | "MINUSP" if global_fn(&name).is_none() => {
+                let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
-                // ZEROP accepts ANY number, a complex included -- (zerop #C(0 0))
-                // is true. `num_val` rejects a complex, so ZEROP signalled, and
-                // with it SIGNUM, whose boot.lisp definition opens with
-                // `(if (zerop n) n (/ n (abs n)))` -- ABS and `/` already handled
-                // complex, so ZEROP alone was blocking it (bliss-bd9c).
-                //
-                // PLUSP and MINUSP stay real-only: CLHS defines them by
-                // comparison with zero, which a complex has no ordering for.
-                if name.as_str() == "ZEROP" {
-                    if let Some(re) = bliss_rt::types::complex_realpart(v) {
-                        let imag = bliss_rt::types::complex_imagpart(v).unwrap_or(NIL);
-                        let is_zero = num_val(re)? == 0.0 && num_val(imag)? == 0.0;
-                        return Ok(if is_zero { T } else { NIL });
-                    }
-                }
-                let n = num_val(v)?;
                 let result = match name.as_str() {
-                    "ZEROP" => n == 0.0,
-                    "PLUSP" => n > 0.0,
-                    _ => n < 0.0,
-                };
+                    "ZEROP" => bliss_stdlib::numbers::zerop(v),
+                    "PLUSP" => bliss_stdlib::numbers::plusp(v),
+                    _ => bliss_stdlib::numbers::minusp(v),
+                }?;
                 return Ok(if result { T } else { NIL });
             }
             "EVENP" | "ODDP" => {
@@ -33640,6 +33620,7 @@ const DIRECT_FAST: &[&str] = &[
     // need no invocation counting, depth cap or panic barrier (bliss-fdny).
     "SET-CAR", "SET-CDR",
     "SECOND", "THIRD", "ABS",
+    "ZEROP", "PLUSP", "MINUSP",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
@@ -34358,6 +34339,15 @@ fn apply_builtin_fast(
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
     match name {
+        "ZEROP" | "PLUSP" | "MINUSP" if args.len() == 1 => {
+            env.clear_mv();
+            let result = match name {
+                "ZEROP" => bliss_stdlib::numbers::zerop(args[0]),
+                "PLUSP" => bliss_stdlib::numbers::plusp(args[0]),
+                _ => bliss_stdlib::numbers::minusp(args[0]),
+            };
+            Some(result.map(|yes| if yes { T } else { NIL }))
+        }
         "TYPEP" if args.len() == 2 => {
             let r = typep_matches(env, args[0], args[1]).map(|m| if m { T } else { NIL });
             if r.is_ok() {
@@ -37983,6 +37973,39 @@ mod transient_shadow_root_tests {
 #[cfg(test)]
 mod jtc5_numeric_tests {
     use super::*;
+
+    #[test]
+    fn numeric_predicates_accept_evaluated_args_without_lisp_allocation() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        let before = bliss_rt::heap_stats().bytes_allocated;
+        for n in -1000..1000 {
+            for (name, expected) in [("ZEROP", n == 0), ("PLUSP", n > 0), ("MINUSP", n < 0)] {
+                env.set_mv(vec![T, T]);
+                let actual = apply_builtin_fast(name, &[BlissVal::from_fixnum(n)], &mut env)
+                    .expect("numeric predicate must bypass the form bridge")
+                    .unwrap();
+                assert_eq!(actual, if expected { T } else { NIL });
+                assert!(
+                    env.mv.is_empty() && !env.mv_active,
+                    "predicate must discard stale secondary values"
+                );
+            }
+        }
+        assert_eq!(bliss_rt::heap_stats().bytes_allocated, before);
+    }
+
+    #[test]
+    fn numeric_predicates_keep_exact_nonzero_rationals_nonzero() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            read_eval_all(
+                "(let ((x (/ 1 (ash 1 2000)))) (and (not (zerop x)) (plusp x) (minusp (- x))))"
+            )
+            .unwrap(),
+            T
+        );
+    }
 
     /// Fixnum overflow (bignum) and division (ratio) allocate on the shared GC
     /// heap using the spec layouts, so heap walking sees them.

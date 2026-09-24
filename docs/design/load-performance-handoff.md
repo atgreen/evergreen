@@ -5,6 +5,82 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Stop rebuilding forms for numeric predicates (2026-09-24, bliss-qcqx)
+
+A temporary census of the evaluated-argument-to-source-form bridge counted
+28,218 ZEROP calls and 1,920 PLUSP calls during the initial FASL load alone.
+Those calls synthesized quoted Lisp forms only to evaluate them again.
+ZEROP, PLUSP, and MINUSP now use shared, non-Lisp-allocating stdlib kernels
+directly from interpreted and compiled calls. The census instrumentation is
+removed. Function rebinding, lexical shadowing, arity checks, type errors, and
+single-value semantics remain covered across interpreter, T0, and T1 paths.
+
+Five alternating CPU-0-pinned release runs against `d16a84a`, fresh processes
+with populated build-specific FASL caches, before running test jobs:
+
+| Median | Before | Direct numeric predicates |
+|---|---:|---:|
+| Initial Babel FASL load | 1.222 s | **1.015 s (16.9% less)** |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 4.27× | **3.55×** |
+| Initial-load instructions (three isolated windows) | 5.444 G | **4.621 G (15.1% less)** |
+| Lisp bytes allocated during load | 21,175,568 | **17,090,960 (19.3% less)** |
+| Whole-process instructions | 18.687 G | **17.861 G (4.4% less)** |
+
+**GC timing contributes substantially to this result.** Baseline performs one
+minor collection during load; the candidate performs none. Removing temporary
+allocation lets the load finish just before the nursery fills (66,467,616 of
+67,108,864 bytes occupied in a separate ROOM diagnostic). Subsequent allocation
+can trigger the collection. No heap-size or collection-threshold knob changed,
+but this is not a claim that the entire gain is intrinsic dispatch speed or
+that collection work disappeared permanently.
+
+An equal-collection control allocates a 65,536-element list before enabling
+the initial-load instruction counter. Both versions then collect exactly once
+during load: three-pair medians are **5.437 G → 5.049 G instructions (7.1% less)**.
+This diagnostic ran alongside tests, so its wall times are not used. It shows
+direct work reduction separately from crossing the GC threshold in the actual
+workload. Whole-process wall medians in the uncontended headline batch are
+3.70 → 3.49 s, with broad ranges 2.23–3.71 and 3.13–3.49 s. Initial-load ranges
+are 0.845–1.225 and 1.014–1.016 s. The remaining gap is still substantial.
+
+The shared kernels also fix exact-rational sign checks (`bliss-85sk`): converting
+1/(ASH 1 2000) to float previously made ZEROP true and PLUSP false. The new
+implementation inspects exact integer/ratio signs, handles complex zero, and
+keeps PLUSP/MINUSP real-only. A watched rebinding regression exposed operator
+calls ignoring global replacements; those now agree with FUNCALL/APPLY
+(`bliss-jy9s`). Zero-allocation bridge and exact-rational regressions were
+observed failing before implementation. Review is adversarial self-review,
+not independent.
+
+All 36 Dietz ANSI tests for these three predicates pass. A source-free FASL
+test rejects legacy source/EvalSource, deletes the source, and exercises native
+calls on runtime-created heap numbers under stress strides 1, 7, and 31 with
+poison and verification. Normal and stress-20,000/poison/verify Babel output
+matches fresh SBCL output on all 15,106 reverse-table entries.
+
+Full gates report 1,777 non-CLI workspace tests passed, five known failures,
+four ignored; CLI units pass 36/36 and CLI integration passes 720 with three
+ignored. This includes all 358 acceptance, 50 FASL, and 12 bytecode differential
+tests. The previously intermittent T2-observation test passes this batch;
+that is not a claim to have fixed `bliss-ugmu`. The five non-CLI failures remain
+STRINGP metadata (`bliss-4ihx`) and four sequence fixtures (`bliss-0bdl`).
+Two existing Lisp-as-Rust doctests fail (`bliss-pqyy`). Workspace check passes
+with the tracked unused-mut warning (`bliss-d3hs`). Root lint reports six
+baseline findings, zero new. Strict clippy stops at nine existing runtime
+findings (`bliss-5vr`); a separate stdlib run finds no new warnings. Existing
+spec-coverage and formatting failures remain (`bliss-kjjd`, `bliss-2uj1`),
+with none of the formatting diagnostics targeting this change's new code.
+These results do not represent a fully green workspace.
+
+Artifacts: `/tmp/babel-numpred-final-*` and
+`/tmp/babel-numpred-final-bench.sh` for the headline comparison;
+`/tmp/babel-numpred-balanced-*` and
+`/tmp/babel-numpred-gc-balanced-window.lisp` for the equal-collection control;
+`/tmp/babel-numpred-*.log` for correctness gates.
+The next fresh initial-load profile is tracked in `bliss-wf7f`; remaining
+bridge-call counts are leads, not proof of which cost dominates now.
+
 ## Reuse class-precedence query results (2026-09-24, bliss-uqle)
 
 The post-ASH initial-load profile put 3.48% under class-precedence queries.
