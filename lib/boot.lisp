@@ -3300,6 +3300,23 @@
   (multiple-value-bind (decls forms) (%prog-split-declarations body)
     `(block nil (let* ,bindings ,@decls (tagbody ,@forms)))))
 
+;;; Keep file bodies visible to the compiler instead of interpreting the whole
+;;; scope. Bind declarations to the stream, preserve all values, and request an
+;;; abort only when control leaves the body without returning normally.
+(defmacro with-open-file ((stream filespec &rest options) &body body)
+  (multiple-value-bind (decls forms) (%prog-split-declarations body)
+    (let ((abort (gensym "FILE-ABORT"))
+          (results (gensym "FILE-VALUES")))
+      `(let ((,stream (open ,filespec ,@options)))
+         ,@decls
+         (let ((,abort t))
+           (values-list
+             (unwind-protect
+                 (let ((,results (multiple-value-list (progn ,@forms))))
+                   (setq ,abort nil)
+                   ,results)
+               (when ,stream (close ,stream :abort ,abort)))))))))
+
 ;;; (SETF BIT) / (SETF SBIT) as real writer FUNCTIONS, not just SETF places.
 ;;; (setf (apply #'bit bv 4 nil) 1) expands to (apply #'(setf bit) 1 bv 4 nil)
 ;;; per CLHS 5.1.2.5, so the writer has to be callable and take its subscripts
@@ -3412,6 +3429,18 @@
 (defgeneric gray-stream-element-type (stream))
 (defgeneric gray-close (stream))
 
+;;; Retain the native operations as least-specific methods. Libraries such as
+;;; Flexi Streams extend these CL functions and call them on an underlying
+;;; native stream; adding a wrapper method must not discard native support.
+(defmethod open-stream-p ((stream t))
+  (bliss::%native-open-stream-p stream))
+(defmethod input-stream-p ((stream t))
+  (bliss::%native-input-stream-p stream))
+(defmethod output-stream-p ((stream t))
+  (bliss::%native-output-stream-p stream))
+(defmethod close ((stream t) &key abort)
+  (bliss::%native-close stream :abort abort))
+
 ;;; Required-to-implement operations: a subclass that does not provide a method
 ;;; gets a clear error rather than a mysterious no-applicable-method.
 (defmethod stream-read-char ((stream fundamental-input-stream))
@@ -3477,6 +3506,25 @@
 (defmethod gray-stream-element-type ((stream fundamental-character-stream)) 'character)
 (defmethod gray-stream-element-type ((stream fundamental-binary-stream)) '(unsigned-byte 8))
 (defmethod gray-close ((stream fundamental-stream)) t)
+
+;;; Publish the existing protocol symbols, not a second same-named protocol.
+;;; Portable libraries import these symbols and specialize their methods.
+(defpackage :bliss-gray-streams (:use))
+(let ((protocol '(fundamental-stream fundamental-input-stream fundamental-output-stream
+                  fundamental-character-stream fundamental-binary-stream
+                  fundamental-character-input-stream fundamental-character-output-stream
+                  fundamental-binary-input-stream fundamental-binary-output-stream
+                  stream-read-char stream-unread-char stream-read-char-no-hang
+                  stream-peek-char stream-listen stream-read-line stream-clear-input
+                  stream-write-char stream-line-column stream-start-line-p
+                  stream-write-string stream-terpri stream-fresh-line
+                  stream-finish-output stream-force-output stream-clear-output
+                  stream-advance-to-column stream-read-byte stream-write-byte)))
+  ;; Bootstrap symbols were historically available by their unqualified names.
+  ;; Keep them present in CL-USER as well as in the public protocol package.
+  (import protocol :cl-user)
+  (import protocol :bliss-gray-streams)
+  (export protocol :bliss-gray-streams))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Pathname namestring helpers (bliss-lb6). These are standard CL functions

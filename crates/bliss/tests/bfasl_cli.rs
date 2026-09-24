@@ -116,6 +116,111 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+/// WITH-OPEN-FILE must not force a parser's entire body back to source eval.
+#[test]
+fn with_open_file_bfasl_keeps_cleanup_values_and_declarations() {
+    let dir = workdir("with-open-file");
+    let src = dir.join("reader.lisp");
+    let out = dir.join("reader.bfasl");
+    let data = dir.join("data.txt");
+    fs::write(&data, "hello\n").unwrap();
+    fs::write(
+        &src,
+        r#"
+      (defun read-special-stream () (declare (special file-stream-var))
+        (read-line file-stream-var))
+      (defun declared-file-read (path)
+        (with-open-file (file-stream-var path)
+          (declare (special file-stream-var))
+          (read-special-stream)))
+      (defun compiled-file-read (path mode)
+        (with-open-file (s path :if-does-not-exist nil)
+          (if s
+              (case mode
+                (:normal (values (read-line s) 42))
+                (:zero (values))
+                (:escape (throw 'file-done 77))
+                (:error (error "file body")))
+              :missing)))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed source fallback"
+    );
+    assert!(
+        bbu_counts(&bytes).1 >= 3,
+        "must contain the compiled readers"
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        r#"
+      (load {out:?})
+      (setq *file-closed* nil *file-aborts* nil)
+      (defmethod close :before ((s t) &key abort)
+        (setq *file-closed* s)
+        (push abort *file-aborts*))
+      (format t "READ ~S~%" (multiple-value-list (compiled-file-read {data:?} :normal)))
+      (format t "CLOSED ~S~%" (open-stream-p *file-closed*))
+      (format t "ZERO ~S~%" (multiple-value-list (compiled-file-read {data:?} :zero)))
+      (format t "ESCAPE ~S~%" (catch 'file-done (compiled-file-read {data:?} :escape)))
+      (format t "ERROR ~S~%" (handler-case (compiled-file-read {data:?} :error) (error () :caught)))
+      (format t "MISSING ~S~%" (compiled-file-read {missing:?} :normal))
+      (format t "SPECIAL ~S~%" (declared-file-read {data:?}))
+      (format t "ABORTS ~S~%" (reverse *file-aborts*))
+    "#,
+        missing = dir.join("missing.txt")
+    ));
+    let stdout = String::from_utf8_lossy(&loaded.stdout);
+    assert!(
+        loaded.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    for expected in [
+        "READ (\"hello\" 42)",
+        "CLOSED NIL",
+        "ZERO NIL",
+        "ESCAPE 77",
+        "ERROR :CAUGHT",
+        "MISSING :MISSING",
+        "SPECIAL \"hello\"",
+        "ABORTS (NIL NIL T T NIL)",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+    let stress = Command::new(BIN)
+        .args([
+            "--no-init",
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {out:?}) (format t \"STRESS ~S~%\" (multiple-value-list (compiled-file-read {data:?} :normal)))"
+            ),
+        ])
+        .env("BLISS_GC_STRESS", "1")
+        .env("BLISS_GC_POISON", "1")
+        .env("BLISS_GC_VERIFY", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&stress.stdout);
+    assert!(
+        stress.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&stress.stderr)
+    );
+    assert!(stdout.contains("STRESS (\"hello\" 42)"), "{stdout}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// `handler-case` (and therefore `ignore-errors`) must serialize to a source-free
 /// BBU — its clause tables (type name, clause body PC, var slot) round-trip in an
 /// auxiliary table — and dispatch correctly from a fresh process.

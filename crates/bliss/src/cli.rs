@@ -7373,9 +7373,6 @@ impl Env {
         // allocation, or the earlier Rust locals go stale (bliss-wlf: PRINT
         // failed with "not a stream" under BLISS_GC_STRESS because
         // `stdin_stream` was left dangling by make_stdout's collection).
-        bliss_rt::rooted!(stdin_stream = bliss_stdlib::make_stdin());
-        bliss_rt::rooted!(stdout_stream = bliss_stdlib::make_stdout());
-        bliss_rt::rooted!(stderr_stream = bliss_stdlib::make_stderr());
         // The stream specials are seeded in the GLOBAL value cell, NOT a lexical
         // frame binding: a `(let ((*standard-output* s)) …)` rebinding is DYNAMIC
         // (BindSpecial / DynBind writes the global cell), and lookup_var checks
@@ -7384,11 +7381,26 @@ impl Env {
         // default stream via lookup_var) wrote to the original stdout regardless.
         // Seeding the cell instead makes the common capture idiom
         // `(with-output-to-string (*standard-output*) …)` work (bliss-oht4).
-        let set_global = |name: &str, val: BlissVal| {
-            if let Some(s) = resolve_sym(name) {
-                bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), val);
-            }
-        };
+        // Expansion runs in the caller's dynamic stream bindings. Recreating
+        // stdio here both clobbered those bindings and accumulated three stream
+        // finalizers for every expanded macro (bliss-sayc).
+        if !for_macro_expansion {
+            bliss_rt::rooted!(stdin_stream = bliss_stdlib::make_stdin());
+            bliss_rt::rooted!(stdout_stream = bliss_stdlib::make_stdout());
+            bliss_rt::rooted!(stderr_stream = bliss_stdlib::make_stderr());
+            let set_global = |name: &str, val: BlissVal| {
+                if let Some(s) = resolve_sym(name) {
+                    bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), val);
+                }
+            };
+            set_global("*STANDARD-INPUT*", *stdin_stream);
+            set_global("*STANDARD-OUTPUT*", *stdout_stream);
+            set_global("*ERROR-OUTPUT*", *stderr_stream);
+            set_global("*TRACE-OUTPUT*", *stdout_stream);
+            set_global("*TERMINAL-IO*", *stdout_stream);
+            set_global("*QUERY-IO*", *stdout_stream);
+            set_global("*DEBUG-IO*", *stdout_stream);
+        }
         // Initialise a special variable's global value cell only if it is not
         // already bound, so re-entering `new_impl` (a fresh top-level env — e.g.
         // a spawned worker thread, or a nested load) does not wipe accumulated
@@ -7403,13 +7415,6 @@ impl Env {
                 }
             }
         };
-        set_global("*STANDARD-INPUT*", *stdin_stream);
-        set_global("*STANDARD-OUTPUT*", *stdout_stream);
-        set_global("*ERROR-OUTPUT*", *stderr_stream);
-        set_global("*TRACE-OUTPUT*", *stdout_stream);
-        set_global("*TERMINAL-IO*", *stdout_stream);
-        set_global("*QUERY-IO*", *stdout_stream);
-        set_global("*DEBUG-IO*", *stdout_stream);
         // Type / condition registries are accumulation lists that DEFTYPE and
         // DEFINE-CONDITION grow via `(setq *…* (cons … *…*))`. Compiled code
         // (a .fasl produced by compile-file, e.g. a library's DEFTYPE forms)
@@ -15324,7 +15329,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let obj = args.first().copied().unwrap_or(NIL);
                 return Ok(if is_stream(obj) { T } else { NIL });
             }
-            "INPUT-STREAM-P" => {
+            "INPUT-STREAM-P" | "BLISS::%NATIVE-INPUT-STREAM-P"
+                if !env.generics.borrow().contains_key(&name) =>
+            {
                 // (input-stream-p stream) → T if the stream can be read from.
                 let args = eval_args(cdr, env)?;
                 let obj = args.first().copied().unwrap_or(NIL);
@@ -15334,7 +15341,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 });
             }
-            "OUTPUT-STREAM-P" => {
+            "OUTPUT-STREAM-P" | "BLISS::%NATIVE-OUTPUT-STREAM-P"
+                if !env.generics.borrow().contains_key(&name) =>
+            {
                 // (output-stream-p stream) → T if the stream can be written to.
                 let args = eval_args(cdr, env)?;
                 let obj = args.first().copied().unwrap_or(NIL);
@@ -15344,7 +15353,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 });
             }
-            "OPEN-STREAM-P" => {
+            "OPEN-STREAM-P" | "BLISS::%NATIVE-OPEN-STREAM-P"
+                if !env.generics.borrow().contains_key(&name) =>
+            {
                 // (open-stream-p stream) → T if the stream is not closed.
                 let args = eval_args(cdr, env)?;
                 let obj = args.first().copied().unwrap_or(NIL);
@@ -15354,7 +15365,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 });
             }
-            "CLOSE" => {
+            "CLOSE" | "BLISS::%NATIVE-CLOSE"
+                if !env.generics.borrow().contains_key(&name) =>
+            {
                 // (close stream &key abort) → T. Closing a non-stream is a no-op.
                 let args = eval_args(cdr, env)?;
                 let stream = if args.is_empty() { NIL } else { args[0] };
@@ -34268,6 +34281,7 @@ fn is_builtin_function(name: &str) -> bool {
             // Profiling (bliss-kfy4)
             | "TIME" | "ROOM"
             // I/O
+            | "OPEN"
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
             | "PEEK-CHAR" | "UNREAD-CHAR"
@@ -38492,6 +38506,38 @@ mod jtc5mf_storage_condition_pool_tests {
             pool.contains(&mapped),
             "stack overflow must signal one of the preallocated STORAGE-CONDITION instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod macro_stream_environment_tests {
+    use super::*;
+
+    #[test]
+    fn macro_environments_preserve_active_standard_streams() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        bliss_rt::rooted_ref!(_env_root = &mut env);
+        bliss_rt::rooted!(output = bliss_stdlib::make_string_output_stream(NIL).unwrap());
+        let output_symbol = resolve_sym("*STANDARD-OUTPUT*").unwrap();
+        bliss_rt::rooted!(_binding = DynBind::establish(output_symbol, *output));
+        let names = [
+            "*STANDARD-INPUT*",
+            "*STANDARD-OUTPUT*",
+            "*ERROR-OUTPUT*",
+            "*TRACE-OUTPUT*",
+            "*TERMINAL-IO*",
+            "*QUERY-IO*",
+            "*DEBUG-IO*",
+        ];
+        bliss_rt::rooted!(streams = names.iter().map(|n| env.lookup_var(n).unwrap()).collect::<Vec<_>>());
+        for _ in 0..3 {
+            let macro_env = Env::new_for_macro_expansion(false);
+            for (i, name) in names.iter().enumerate() {
+                assert_eq!(macro_env.lookup_var(name), Some(streams[i]), "{name}");
+            }
+        }
+        assert_eq!(env.lookup_var("*STANDARD-OUTPUT*"), Some(*output));
     }
 }
 

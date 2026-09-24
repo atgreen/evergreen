@@ -19409,6 +19409,9 @@ mod jtc4_stack_map_tests {
 
     #[test]
     fn native_sigsegv_recovery_epilogue_returns_to_run_native_boundary() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         bliss_rt::install_signal_handlers().unwrap();
         bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(
             native_sigsegv_recovery_epilogue as *const () as usize,
@@ -19434,6 +19437,9 @@ mod jtc4_stack_map_tests {
 
     #[test]
     fn run_native_rewrites_null_guard_sigsegv_to_type_error() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         bliss_rt::install_signal_handlers().unwrap();
         let _ = bliss_rt::runtime::check_sigsegv_null_guard();
 
@@ -19474,6 +19480,9 @@ mod jtc4_stack_map_tests {
 
     #[test]
     fn run_native_rewrites_stack_guard_sigsegv_to_stack_overflow() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         bliss_rt::install_signal_handlers().unwrap();
         let _ = bliss_rt::runtime::check_sigsegv_stack_guard();
 
@@ -19546,6 +19555,9 @@ mod jtc4_stack_map_tests {
 
     #[test]
     fn bbu_numeric_literals_preserve_bits_and_exact_integers() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut pool = BbuConstPool::default();
         let float_bits = [
             0,
