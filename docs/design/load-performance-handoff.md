@@ -5,6 +5,44 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Reproducible PGO training fixture (2026-09-24, bliss-08hq)
+
+`scripts/pgo-workload.lisp` supplies dependency-free training phases for the
+forthcoming opt-in PGO build. It requires an absolute `TORCL_PGO_WORK` private
+directory and `TORCL_PGO_PHASE` set to `prepare`, `load`, or `runtime`. Run each
+phase in a fresh process from the checkout root, with init files disabled.
+Preparation generates and compiles a 24-file ASDF system into its private
+cache. Cached loading checks every unit and refuses any attempted compilation;
+runtime training checks CLOS, hash tables, sequences, and conditions. No Babel,
+CL-PPCRE, ocicl, user configuration, or downloaded data is needed.
+
+For example, with a built release CLI:
+
+```sh
+pgo_work=$(mktemp -d /tmp/torcl-pgo-training.XXXXXX)
+TORCL_PGO_WORK="$pgo_work" TORCL_PGO_PHASE=prepare \
+  scripts/torcl-limited.sh target/x86_64-unknown-linux-musl/release/torcl \
+  --no-init --load scripts/pgo-workload.lisp
+# In separate fresh processes, use TORCL_PGO_PHASE=load and =runtime.
+# An instrumented build must keep preparation's raw profile separate and
+# merge only the intended load/runtime profiles, never all profiles blindly.
+```
+
+The real-process regression is `bash scripts/test-pgo-workload.sh BINARY`,
+wrapped in `scripts/torcl-limited.sh` for TorCL, or the same command with a
+third argument `sbcl` for the SBCL oracle. It checks missing preparation,
+invalid phase/path, space-containing paths, clean and repeated preparation,
+two fresh cached loads with unchanged source/cache metadata, runtime results,
+and rejection of a deliberately removed FASL. Test artifacts are retained in
+the printed temporary directory. ASDF configuration uses string path
+designators; the equivalent pathname-object destination exposes a baseline
+TorCL bug tracked as `bliss-hw5x`.
+
+This fixture is not yet a PGO image build. Its resulting profile still requires
+new held-out measurements; the experimental gains below do not automatically
+transfer to this version. The guarded build and full validation remain in
+`bliss-84km` and `bliss-lm5f`.
+
 ## PGO experiment: held-out initial loads (2026-09-24, bliss-j9de)
 
 **Experimental, not shipped.** Rust instrumentation profile-guided optimization
