@@ -63,6 +63,34 @@ fn check_list(mut v: BlissVal, expected: &[i64]) {
 }
 
 #[test]
+fn persistent_forwarding_chain_is_marked_before_nursery_evacuation() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).expect("init_heap");
+    let mut alloc = HeapAllocator::new().expect("allocator");
+    let first = make_cons(&mut alloc, BlissVal::from_fixnum(1), NIL);
+    let second = make_cons(&mut alloc, BlissVal::from_fixnum(2), NIL);
+    let target = make_cons(&mut alloc, BlissVal::from_fixnum(42), NIL);
+    // Only the first stub is rooted. Neither stub is indexed as a nursery
+    // object, so marking must follow the entire chain to retain the target.
+    unsafe {
+        bliss_rt::gc::forward_object_to(first, second);
+        bliss_rt::gc::forward_object_to(second, target);
+    }
+    let stack = current_thread().stack();
+    let frame = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .unwrap();
+    unsafe { BlissStack::frame_slots_mut(frame)[0] = first };
+    HeapCollector::new().minor_gc().expect("minor_gc");
+    let relocated = unsafe { BlissStack::frame_slots_mut(frame)[0] };
+    assert_ne!(relocated, target, "the target must actually evacuate");
+    check_list(relocated, &[42]);
+    HeapCollector::new().major_gc().expect("major_gc");
+    check_list(unsafe { BlissStack::frame_slots_mut(frame)[0] }, &[42]);
+    stack.pop_frame();
+}
+
+#[test]
 fn interconnected_objects_survive_minor_and_major_evacuation_with_identity() {
     let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     init_heap(&gc_config()).expect("init_heap");

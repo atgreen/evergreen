@@ -626,22 +626,167 @@ pub struct HeapCollector {
     promotion_threshold: u8,
 }
 
+/// Exact object starts and liveness for one nursery collection. Two bits per
+/// object-alignment granule replace per-object hash entries. Region offsets
+/// keep the bitmaps proportional to the nursery, not the reserved heap size.
+/// Body addresses are normalized to header addresses before indexing, just as
+/// the old nursery index keyed every object by header + OBJECT_HEADER_SIZE.
+#[derive(Default)]
+struct NurseryObjectMap {
+    heap_base: usize,
+    region_size: usize,
+    region_offsets: Vec<usize>,
+    starts: Vec<u64>,
+    marked: Vec<u64>,
+}
+
+impl NurseryObjectMap {
+    fn reset(
+        &mut self,
+        heap_base: usize,
+        region_size: usize,
+        region_count: usize,
+        nursery: &[usize],
+    ) {
+        self.heap_base = heap_base;
+        self.region_size = region_size;
+        self.region_offsets.resize(region_count, usize::MAX);
+        self.region_offsets.fill(usize::MAX);
+        let words_per_region = (region_size / OBJECT_ALIGNMENT).div_ceil(64);
+        for (ordinal, &region) in nursery.iter().enumerate() {
+            self.region_offsets[region] = ordinal * words_per_region;
+        }
+        let words = nursery.len() * words_per_region;
+        self.starts.resize(words, 0);
+        self.starts.fill(0);
+        self.marked.resize(words, 0);
+        self.marked.fill(0);
+    }
+
+    #[inline]
+    fn position(&self, body: usize) -> Option<(usize, u64)> {
+        let offset = body
+            .checked_sub(self.heap_base)?
+            .checked_sub(OBJECT_HEADER_SIZE)?;
+        if offset % OBJECT_ALIGNMENT != 0 || self.region_size == 0 {
+            return None;
+        }
+        let &words = self.region_offsets.get(offset / self.region_size)?;
+        if words == usize::MAX {
+            return None;
+        }
+        let bit = (offset % self.region_size) / OBJECT_ALIGNMENT;
+        Some((words + bit / 64, 1u64 << (bit % 64)))
+    }
+
+    fn insert(&mut self, body: usize) {
+        let (word, bit) = self
+            .position(body)
+            .expect("nursery object outside indexed regions");
+        self.starts[word] |= bit;
+    }
+
+    #[inline]
+    fn contains(&self, body: usize) -> bool {
+        self.position(body)
+            .is_some_and(|(word, bit)| self.starts[word] & bit != 0)
+    }
+
+    #[inline]
+    fn mark(&mut self, body: usize) -> bool {
+        let Some((word, bit)) = self.position(body) else {
+            return false;
+        };
+        if self.starts[word] & bit == 0 || self.marked[word] & bit != 0 {
+            return false;
+        }
+        self.marked[word] |= bit;
+        true
+    }
+
+    #[inline]
+    fn is_marked(&self, body: usize) -> bool {
+        self.position(body)
+            .is_some_and(|(word, bit)| self.marked[word] & bit != 0)
+    }
+}
+
+#[cfg(test)]
+mod nursery_object_map_tests {
+    use super::*;
+
+    const BASE: usize = 0x10000;
+    const REGION: usize = 4096;
+
+    #[test]
+    fn nursery_map_marks_only_indexed_object_bodies_once() {
+        let mut map = NurseryObjectMap::default();
+        map.reset(BASE, REGION, 5, &[1, 3]);
+        let body = BASE + REGION + OBJECT_HEADER_SIZE;
+        map.insert(body);
+        assert!(map.contains(body));
+        assert!(!map.is_marked(body));
+        assert!(map.mark(body));
+        assert!(map.is_marked(body));
+        assert!(!map.mark(body));
+        // Interior addresses, headers, unindexed objects, and old regions
+        // must never become roots merely because they fall inside the heap.
+        for invalid in [
+            0,
+            BASE - 1,
+            body - 8,
+            body + 1,
+            body + 16,
+            BASE + OBJECT_HEADER_SIZE,
+            BASE + 5 * REGION + OBJECT_HEADER_SIZE,
+            usize::MAX,
+        ] {
+            assert!(!map.contains(invalid), "{invalid:#x}");
+            assert!(!map.mark(invalid), "{invalid:#x}");
+        }
+        let last = BASE + 4 * REGION - OBJECT_ALIGNMENT + OBJECT_HEADER_SIZE;
+        map.insert(last);
+        assert!(map.mark(last));
+    }
+
+    #[test]
+    fn nursery_map_reset_drops_previous_objects_and_marks() {
+        let mut map = NurseryObjectMap::default();
+        let body = BASE + REGION + OBJECT_HEADER_SIZE;
+        map.reset(BASE, REGION, 5, &[1, 3]);
+        map.insert(body);
+        assert!(map.mark(body));
+        map.reset(BASE, REGION, 5, &[1]);
+        assert!(!map.contains(body));
+        assert!(!map.is_marked(body));
+        map.insert(body);
+        assert!(map.mark(body));
+        map.reset(BASE + 8 * REGION, REGION * 2, 2, &[0]);
+        assert!(!map.contains(body));
+        let moved_heap_body = BASE + 8 * REGION + OBJECT_HEADER_SIZE;
+        map.insert(moved_heap_body);
+        assert!(map.mark(moved_heap_body));
+    }
+
+    #[test]
+    fn nursery_map_storage_tracks_nursery_not_heap_capacity() {
+        let mut map = NurseryObjectMap::default();
+        map.reset(BASE, REGION, 10000, &[2, 9999]);
+        assert_eq!(map.starts.len(), 2 * (REGION / OBJECT_ALIGNMENT / 64));
+        assert_eq!(map.marked.len(), map.starts.len());
+        map.reset(BASE, REGION, 10000, &[]);
+        assert!(!map.mark(BASE + 2 * REGION + OBJECT_HEADER_SIZE));
+        assert!(map.starts.is_empty());
+    }
+}
+
 thread_local! {
     /// Persistent minor-GC scratch (bliss-5i3f). `HeapCollector`s are created
-    /// ad-hoc per collection, so these HashMap/HashSet/Vec were reallocated
-    /// and grown from empty on EVERY minor GC — at per-allocation GC frequency
-    /// on a load-heavy workload the hashbrown reserve_rehash churn dominated
-    /// (gdb: minor_gc_stw_body in reserve_rehash). The STW body is
-    /// single-threaded under the heap lock, so a thread-local reused across
-    /// collections is safe: `mem::take` it out at the top, `.clear()` (keeps
-    /// capacity), use as before, put it back before returning. No early return
-    /// or `?` runs between take and restore in minor_gc_stw_body; a panic in
-    /// the collector aborts the process, so lost restoration is moot.
-    static MINOR_NURSERY_INDEX: std::cell::RefCell<
-        std::collections::HashMap<usize, (usize, usize, u8, usize)>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-    static MINOR_MARKED: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// ad-hoc per collection, so retain bitmap/worklist capacity between
+    /// collections. The STW body is single-threaded under the heap lock:
+    /// take the scratch, reset it, and return it before resuming mutators.
+    /// No early return or `?` runs between take and restore.
+    static MINOR_OBJECT_MAP: RefCell<NurseryObjectMap> = RefCell::new(NurseryObjectMap::default());
     static MINOR_WORKLIST: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
 }
 
@@ -980,21 +1125,12 @@ impl HeapCollector {
     /// `BlissVal`, so references are found by tag and non-references are never
     /// pinned. The current thread uses its live frame pointer; parked threads
     /// use the frame pointer they published at their safepoint.
-    fn scan_cl_stack_roots(
-        marked: &mut std::collections::HashSet<usize>,
-        worklist: &mut Vec<usize>,
-        object_index: &std::collections::HashMap<usize, (usize, usize, u8, usize)>,
-    ) {
+    fn scan_cl_stack_roots(mut visit: impl FnMut(BlissVal)) {
         let mut mark_from = |fp: *const crate::stack::Frame| {
             // SAFETY: `fp` is a valid frame chain (live or published).
             unsafe {
                 crate::stack::visit_stack_refs(fp, |slot| {
-                    // Resolve persistent (CHANGE-CLASS) forwarding before the
-                    // index lookup, as in mark_ref (bliss-334).
-                    let addr = ref_body_addr(resolve_forwarded(*slot));
-                    if object_index.contains_key(&addr) && marked.insert(addr) {
-                        worklist.push(addr);
-                    }
+                    visit(*slot);
                 });
             }
         };
@@ -1315,10 +1451,16 @@ impl HeapCollector {
             })
             .collect();
 
-        // body address -> (total size, region index, type id, body length).
-        // Reused across collections with retained capacity (bliss-5i3f).
-        let mut nursery_index = MINOR_NURSERY_INDEX.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        nursery_index.clear();
+        // Record exact object starts, excluding persistent forwarding stubs.
+        // Headers remain intact until copying, so the mark worklist can read
+        // layouts directly instead of duplicating them in a hash table.
+        let mut nursery_index = MINOR_OBJECT_MAP.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        nursery_index.reset(
+            state.heap_base as usize,
+            state.config.region_size,
+            state.regions.len(),
+            &nursery_indices,
+        );
         for &nursery_idx in &nursery_indices {
             let base = state.regions[nursery_idx].base as usize;
             let top = state.regions[nursery_idx].header.alloc_top as usize;
@@ -1334,10 +1476,7 @@ impl HeapCollector {
                 let total_size =
                     align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
                 if !unsafe { header_is_forwarded(header_ptr) } {
-                    nursery_index.insert(
-                        cursor + OBJECT_HEADER_SIZE,
-                        (total_size, nursery_idx, type_id, body_size as usize),
-                    );
+                    nursery_index.insert(cursor + OBJECT_HEADER_SIZE);
                 }
                 cursor += total_size;
             }
@@ -1354,12 +1493,10 @@ impl HeapCollector {
         }
 
         // Reused across collections with retained capacity (bliss-5i3f).
-        let mut marked = MINOR_MARKED.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        marked.clear();
         let mut mark_worklist = MINOR_WORKLIST.with(|s| std::mem::take(&mut *s.borrow_mut()));
         mark_worklist.clear();
         let mark_ref = |v: BlissVal,
-                        marked: &mut std::collections::HashSet<usize>,
+                        nursery_index: &mut NurseryObjectMap,
                         worklist: &mut Vec<usize>| {
             if is_heap_ref(v) {
                 // Resolve PERSISTENT forwarding (a CHANGE-CLASS stub) before
@@ -1370,15 +1507,15 @@ impl HeapCollector {
                 // caught by gc-verify's holder trace).
                 let v = resolve_forwarded(v);
                 let target = ref_body_addr(v);
-                if nursery_index.contains_key(&target) && marked.insert(target) {
+                if nursery_index.mark(target) {
                     worklist.push(target);
                 }
             }
         };
 
         // Direct roots shared with the major collector.
-        mark_ref(get_entry_continuation(), &mut marked, &mut mark_worklist);
-        Self::scan_cl_stack_roots(&mut marked, &mut mark_worklist, &nursery_index);
+        mark_ref(get_entry_continuation(), &mut nursery_index, &mut mark_worklist);
+        Self::scan_cl_stack_roots(|v| mark_ref(v, &mut nursery_index, &mut mark_worklist));
         let tracing = gc_verify_enabled();
         if tracing {
             VERIFY_TRACE.with(|t| {
@@ -1392,14 +1529,14 @@ impl HeapCollector {
             if tracing {
                 VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
             }
-            mark_ref(v, &mut marked, &mut mark_worklist);
+            mark_ref(v, &mut nursery_index, &mut mark_worklist);
         });
         scan_external_roots(|slot| {
             let v = unsafe { *slot };
             if tracing {
                 VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
             }
-            mark_ref(v, &mut marked, &mut mark_worklist);
+            mark_ref(v, &mut nursery_index, &mut mark_worklist);
         });
 
         // Barrier-recorded old-to-young slots are roots even when their holder
@@ -1410,7 +1547,7 @@ impl HeapCollector {
             if slot_addr >= heap_base_addr && slot_addr + 8 <= heap_end {
                 mark_ref(
                     unsafe { *(slot_addr as *const BlissVal) },
-                    &mut marked,
+                    &mut nursery_index,
                     &mut mark_worklist,
                 );
             }
@@ -1449,7 +1586,7 @@ impl HeapCollector {
                             (cursor + body_off) as *mut u8,
                             type_id,
                             body_size as usize,
-                            |slot| mark_ref(*slot, &mut marked, &mut mark_worklist),
+                            |slot| mark_ref(*slot, &mut nursery_index, &mut mark_worklist),
                         );
                     }
                 }
@@ -1462,21 +1599,31 @@ impl HeapCollector {
         // otherwise an unmarked neighbour could keep a stale pointer after the
         // region is promoted wholesale.
         for &nursery_idx in &pinned_indices {
-            for (&body_addr, &(_, region_idx, _, _)) in &nursery_index {
-                if region_idx == nursery_idx && marked.insert(body_addr) {
-                    mark_worklist.push(body_addr);
+            let mut cursor = state.regions[nursery_idx].base as usize;
+            let top = state.regions[nursery_idx].header.alloc_top as usize;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let (type_id, body_size) = unsafe { read_object_header(cursor as *const u8) };
+                if type_id == 0 && body_size == 0 {
+                    break;
                 }
+                let body = cursor + OBJECT_HEADER_SIZE;
+                if nursery_index.mark(body) {
+                    mark_worklist.push(body);
+                }
+                cursor += align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
             }
         }
 
         // Young-to-young transitive closure.
         while let Some(body_addr) = mark_worklist.pop() {
-            if let Some(&(_, _, type_id, body_len)) = nursery_index.get(&body_addr) {
-                unsafe {
-                    trace_object(body_addr as *mut u8, type_id, body_len, |slot| {
-                        mark_ref(*slot, &mut marked, &mut mark_worklist);
-                    });
-                }
+            // Worklist entries are indexed nursery bodies, and no evacuation
+            // has begun yet: their headers still contain the original layout.
+            unsafe {
+                let (type_id, body_len) =
+                    read_object_header((body_addr - OBJECT_HEADER_SIZE) as *const u8);
+                trace_object(body_addr as *mut u8, type_id, body_len as usize, |slot| {
+                    mark_ref(*slot, &mut nursery_index, &mut mark_worklist);
+                });
             }
         }
 
@@ -1514,7 +1661,7 @@ impl HeapCollector {
                     align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
 
                 let body_addr = cursor + OBJECT_HEADER_SIZE;
-                if !marked.contains(&body_addr) {
+                if !nursery_index.is_marked(body_addr) {
                     cursor += total_size;
                     continue;
                 }
@@ -1736,7 +1883,7 @@ impl HeapCollector {
                     // pointer or an index-excluded object is mark-missed,
                     // relocate-no-op'd, and flagged only here.
                     let body = ref_body_addr(v);
-                    let indexed = nursery_index.contains_key(&body);
+                    let indexed = nursery_index.contains(body);
                     let header_ptr = (body - OBJECT_HEADER_SIZE) as *const u8;
                     let header_word = unsafe { *(header_ptr as *const u64) };
                     let forwarded = unsafe { header_is_forwarded(header_ptr) };
@@ -1752,7 +1899,7 @@ impl HeapCollector {
             };
             let describe_target = |v: BlissVal| -> String {
                 let body = ref_body_addr(v);
-                let indexed = nursery_index.contains_key(&body);
+                let indexed = nursery_index.contains(body);
                 let header_ptr = (body - OBJECT_HEADER_SIZE) as *const u8;
                 let header_word = unsafe { *(header_ptr as *const u64) };
                 let forwarded = unsafe { header_is_forwarded(header_ptr) };
@@ -1894,8 +2041,7 @@ impl HeapCollector {
 
         // Return the scratch to the thread-local with its capacity retained
         // (bliss-5i3f). No early exit runs between the takes above and here.
-        MINOR_NURSERY_INDEX.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
-        MINOR_MARKED.with(|s| *s.borrow_mut() = std::mem::take(&mut marked));
+        MINOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
         MINOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut mark_worklist));
 
         Ok(())
@@ -2124,7 +2270,7 @@ impl Collector for HeapCollector {
         // identified by BlissVal tag, so no non-reference CL data is pinned.
         // Interpreter (T0) and compiled (T1) frames share the §2.4.2 layout, so
         // this one walk covers mixed-tier stacks.
-        Self::scan_cl_stack_roots(&mut marked, &mut scan_worklist, &object_index);
+        Self::scan_cl_stack_roots(|v| mark_ref(v, &mut marked, &mut scan_worklist));
 
         // Symbol-table roots (bliss-jtc.6 Stage C): every interned/uninterned
         // symbol's cells are roots, so a heap object reachable only through a

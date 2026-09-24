@@ -5,7 +5,59 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
-## 1. Where things stand
+## Initial FASL load update (2026-09-23, bliss-w337)
+
+The active target is now the **first** `asdf:load-system` in a fresh process,
+with already-compiled FASLs, not no-op reloads. Five alternating CPU-0-pinned
+release runs against saved baseline `94f7570`, with SBCL in the same batch:
+
+| Metric (median) | Before | Nursery bitmaps |
+|---|---:|---:|
+| Initial Babel FASL load | 2.428 s | 1.686 s (**30.6% less**) |
+| SBCL initial load | 0.247 s | 0.247 s |
+| Bliss / SBCL | 9.8× | **6.8×** |
+| Minor GC during initial load | 0.925 s | 0.234 s |
+| Whole process, including ASDF startup | 4.67 s | 4.08 s |
+| Whole-process retired instructions | 24.585 G | 22.976 G |
+| Peak process RSS | 393 MiB | 168 MiB |
+
+Both versions perform one minor GC during the timed load; neither changes the
+nursery size or moves collection outside the timer. Every run returns
+`BABEL-CHECK #(72 101 108 108 111)`, with no source compilation in the measured
+runs. Whole-process instructions are **not** isolated load-phase instructions.
+
+The structural change replaces the minor collector's per-object address
+`HashMap` and live-object `HashSet` with two compact bitmaps. A region-offset
+table packs only nursery regions: 64 MiB of nursery needs 1 MiB of bitmap
+storage. One bitmap records exact object starts, the other liveness; interior
+addresses and non-nursery references are still rejected. Marking reads layout
+from intact object headers before evacuation rather than duplicating metadata
+for every nursery object. Persistent forwarding is resolved before marking.
+This removes hash-table construction and random lookups, not necessary GC work.
+
+Reproduce the load phase from the repository root with this shared script:
+
+```lisp
+#+sbcl (require :asdf)
+#+bliss (load "lib/asdf.bfasl")
+(asdf:initialize-source-registry
+ `(:source-registry (:tree ,(truename "ocicl/")) :inherit-configuration))
+(time (asdf:load-system :babel))
+(format t "~&BABEL-CHECK ~S~%"
+        (babel:string-to-octets "Hello" :encoding :utf-8))
+```
+
+Use `scripts/bliss-limited.sh taskset -c 0` for each process. Bliss uses
+`--no-init --load`; SBCL uses
+`--noinform --no-sysinit --no-userinit --non-interactive --load`. Populate each
+binary's build-hash-specific FASL cache first, then alternate saved baseline and
+candidate binaries. `/usr/bin/time` and `perf stat -e cpu_core/instructions/u`
+around the process measure the whole-process columns.
+
+The remaining gap is real. The historical leads below remain context, not a
+fresh attribution of the remaining initial-load time.
+
+## 1. Earlier baseline (before the initial-load follow-up)
 
 Benchmark: `(asdf:load-system :babel)` — one cold load plus ten no-op re-loads,
 from fasls, `--no-init`.
