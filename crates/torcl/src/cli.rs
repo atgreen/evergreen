@@ -13514,7 +13514,16 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclErr
     let unit = torcl_rt::bfasl::load(bytes)
         .map_err(|e| TorclError::FileError(format!("invalid .bfasl: {e}")))?;
     if let Some(bbu) = unit.section(torcl_rt::bfasl::section::BYTECODE_UNIT) {
-        return with_eval_context(env, EvalContext::Load, |env| bytecode::load_bbu(bbu, env));
+        return with_eval_context(env, EvalContext::Load, |env| {
+            // Like source LOAD, the compiled unit establishes its own top-level
+            // boundary. Otherwise definitions loaded from an ASDF call frame
+            // capture that incidental frame and methods cannot be compiled.
+            // Binding forms inside the unit still create distinct child frames.
+            TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
+            let result = bytecode::load_bbu(bbu, env);
+            TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().pop());
+            result
+        });
     }
     let forms = unit
         .section(torcl_rt::bfasl::section::TOPLEVEL_FORMS)
@@ -38717,6 +38726,114 @@ mod symbol_bare_name_tests {
 #[cfg(test)]
 mod method_block_tests {
     use super::*;
+
+    #[test]
+    fn dormant_compiled_closure_relocates_its_captured_values() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let bytes = build_bfasl_from_source(
+            "(defun make-dormant-closure (held) (lambda () held))",
+            "dormant-closure.lisp",
+            &mut env,
+        )
+        .unwrap();
+        load_bfasl_into_env(&bytes, &mut env).unwrap();
+        torcl_rt::rooted!(held = arena_cons(TorclVal::from_fixnum(71), NIL));
+        let maker = resolve_sym("MAKE-DORMANT-CLOSURE").unwrap();
+        torcl_rt::rooted!(closure = apply_function(maker, &[*held], &mut env).unwrap());
+        let captured = bytecode::closure_captured_env(*closure).expect("compiled closure capture");
+        torcl_rt::collect_t0_minor().unwrap();
+        // HELD is independently rooted so the object survives. The dormant
+        // closure's reference must be rewritten too, not left at its old address.
+        assert_eq!(Env::lookup_frame(&captured, "HELD"), Some(*held));
+        assert_eq!(apply_function(*closure, &[], &mut env).unwrap(), *held);
+        drop(held);
+        torcl_rt::gc::full_gc().unwrap();
+        let value = apply_function(*closure, &[], &mut env).unwrap();
+        assert_eq!(cp(value).0, TorclVal::from_fixnum(71));
+    }
+
+    #[test]
+    fn reified_method_keeps_its_source_roots_during_macroexpansion() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env(
+            "(defmacro method-root-allocation () (list '+ 'x 1))",
+            &mut env,
+        )
+        .unwrap();
+        torcl_rt::rooted!(params = read_from_string_in_env("(x)", &mut env).unwrap().0);
+        torcl_rt::rooted!(
+            body = read_from_string_in_env("((method-root-allocation))", &mut env)
+                .unwrap()
+                .0
+        );
+        torcl_rt::rooted!(
+            callable =
+                bytecode::compile_and_reify_lambda("METHOD-ROOT-PROBE", *params, *body, &env)
+                    .expect("compile macro-expanded method")
+        );
+        assert_eq!(torcl_rt::function::lambda_list(*callable), *params);
+        assert_eq!(torcl_rt::function::body(*callable), *body);
+        assert_eq!(
+            apply_function(*callable, &[TorclVal::from_fixnum(41)], &mut env).unwrap(),
+            TorclVal::from_fixnum(42)
+        );
+    }
+
+    #[test]
+    fn fasl_methods_do_not_capture_the_load_callers_frame() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let bytes = build_bfasl_from_source(
+            "(defmethod fasl-top-method ((x t)) x)
+             (let ((captured 41))
+               (defmethod fasl-nested-method ((x t)) (+ captured x)))",
+            "method-environments.lisp",
+            &mut env,
+        )
+        .unwrap();
+        // ASDF invokes LOAD from a function frame below the original top-level
+        // form. The loaded file must establish its own top-level boundary.
+        TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
+        let parent = Rc::clone(&env.frame);
+        let result = with_child_frame(&mut env, parent, |env| load_bfasl_into_env(&bytes, env));
+        TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().pop());
+        result.unwrap();
+        assert!(TOPLEVEL_FRAME_BASE.with(|s| s.borrow().is_empty()));
+        let top_id = env.methods.borrow()["FASL-TOP-METHOD"][0].method_id.0;
+        let nested_id = env.methods.borrow()["FASL-NESTED-METHOD"][0].method_id.0;
+        assert!(
+            !METHOD_CAPTURED_ENV.with(|m| m.borrow().contains_key(&top_id)),
+            "a top-level FASL method must not capture the LOAD caller"
+        );
+        assert!(METHOD_COMPILED.with(|m| m.borrow().contains_key(&top_id)));
+        assert!(METHOD_CAPTURED_ENV.with(|m| m.borrow().contains_key(&nested_id)));
+        assert_eq!(
+            read_eval_all_env("(fasl-nested-method 1)", &mut env).unwrap(),
+            TorclVal::from_fixnum(42)
+        );
+        let failed_load = build_bfasl_from_source(
+            "(error \"load-boundary-error\")",
+            "method-environment-error.lisp",
+            &mut env,
+        )
+        .unwrap();
+        TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
+        let saved_base = TOPLEVEL_FRAME_BASE.with(|s| s.borrow().clone());
+        let parent = Rc::clone(&env.frame);
+        assert!(
+            with_child_frame(&mut env, parent, |env| {
+                load_bfasl_into_env(&failed_load, env)
+            })
+            .is_err()
+        );
+        assert_eq!(TOPLEVEL_FRAME_BASE.with(|s| s.borrow().clone()), saved_base);
+        TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().pop());
+    }
 
     #[test]
     fn named_return_method_installs_a_compiled_body() {

@@ -5,6 +5,52 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Keep FASL methods compiled and their captures GC-safe (2026-09-24)
+
+`bliss-p7ha` fixes an asymmetry between source and compiled loading: the BBU
+loader did not establish a top-level frame boundary. Methods loaded through an
+ASDF call frame consequently captured that incidental environment and skipped
+compilation. Compiled units now establish and restore their own boundary,
+including on errors; methods genuinely nested in a binding form still capture it.
+
+This exposed two independently reproduced GC defects. Method reification kept
+unrooted copies of its lambda list and body across allocating macro expansion
+(`bliss-ikho`). More importantly, dormant compiled closures' captured frames
+were absent from root scanning (`bliss-6xts`): CL-PPCRE's `INNER-MATCHER` became a
+stale pointer after collection. The bytecode scanner now visits these frames,
+and method reification roots its inputs and newly compiled code before publishing
+the function. An isolated real regex scanner previously crashed after full GC;
+it now returns the expected Unicode-data fields with poison and verification.
+
+On the final release, reading the same 1,000 characters through cached Flexi
+Streams allocates **27,237,504 → 1,060,160 Lisp bytes (96.1% less)**. Both return
+checksum 69,642. The native-stream control stays at 129,808 bytes. One paired run
+took 1.740 → 0.029 seconds, but concurrent validation and clock variation make
+allocation the stronger evidence. This is a stream-execution improvement, not a
+Babel initial-load claim: five alternating cached Babel samples showed no
+reliable wall-time gain and essentially unchanged allocation.
+
+Validation: **796 CLI unit/integration tests pass, zero fail, three ignored**;
+four focused method/closure tests also pass every-allocation stress with poison
+and verification. A further full-GC liveness assertion passes after dropping the
+test's independent capture root. All 15,106 Babel reverse-table entries match
+between normal TorCL, stress-20,000/poison/verify TorCL, and SBCL. Workspace check,
+format and diff checks pass; root lint has six baseline findings and zero new.
+The existing unused-mut warning remains tracked as `bliss-d3hs`. Non-CLI test
+suites were not rerun for these internal CLI changes.
+
+CL-UNICODE is **not working end to end**. Its original-data generator progresses
+beyond the callable corruption but hits the 6 GiB cap after 410 seconds; its
+last sampled input offset is 270,336 bytes. `bliss-het3` tracks unbounded compiled
+closure/environment retention and repeated bytecode-body cloning. Do not remove
+necessary roots to mask that cost, or present this partial progress as a completed
+Unicode load. The TorCL dependency-rename port is separately available in
+`ports/trivial-features-torcl/`.
+
+Artifacts: `/tmp/torcl-unicode.UQCFUA/` (regex, stream, and full-generation
+probes), `/tmp/torcl-babel-port.Fs7oj1/roots-tables-*.log`, and
+`/tmp/torcl-closure-roots-cli-full.log`.
+
 ## Remove five more evaluated-argument form bridges (2026-09-24, bliss-f7qh)
 
 A fresh census of **only the initial cached Babel load** counted 21,099

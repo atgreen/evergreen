@@ -235,6 +235,16 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
             }
         }
     });
+    // Escaped compiled closures can be dormant when collection happens. Their
+    // Rust-owned frames are not reachable through the function object's heap
+    // fields, so activation roots alone do not preserve or relocate captures.
+    super::with_env_visit_state(|state| {
+        CLOSURE_ENV.with(|environments| {
+            for frame in environments.borrow().values() {
+                super::visit_env_frame_roots(frame, state, visit);
+            }
+        });
+    });
 }
 
 fn install_bytecode_root_scanner() {
@@ -10637,6 +10647,7 @@ pub(super) fn closure_captured_env(fn_val: TorclVal) -> Option<Rc<RefCell<EnvFra
 /// then reaches those lexicals through the same `CLOSURE_ENV` channel the
 /// bytecode `MakeClosure` path uses (bliss-jtc.23.3).
 pub(super) fn register_closure_env(sym_idx: u32, frame: Rc<RefCell<EnvFrame>>) {
+    install_bytecode_root_scanner();
     CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
 }
 
@@ -11071,10 +11082,14 @@ fn contains_host_eval(function: &BytecodeFunction) -> bool {
 /// dispatch path uses if the bytecode is ever invalidated.
 pub(super) fn compile_and_reify_lambda(
     label: &str,
-    lambda_list: TorclVal,
-    body: TorclVal,
+    mut lambda_list: TorclVal,
+    mut body: TorclVal,
     env: &super::Env,
 ) -> Option<TorclVal> {
+    // Macro expansion and portable retries allocate. Caller roots do not
+    // rewrite these copies, which are also used to reify the fallback body.
+    torcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
+    torcl_rt::rooted_ref!(_body_root = &mut body);
     reset_last_bail_reason();
     // Opportunistic lowering first; on a capture-related bail retry in portable
     // mode (heap-frame closures), so a method body with a capturing flet/labels
@@ -11093,9 +11108,11 @@ pub(super) fn compile_and_reify_lambda(
     if contains_load_time_values(&bf) {
         return None;
     }
+    let bf = Rc::new(bf);
+    let _bytecode_root = ActiveBytecodeRoot::new(&bf);
     let sym = torcl_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
-    registry_put(sym_idx, Rc::new(bf));
+    registry_put(sym_idx, Rc::clone(&bf));
     Some(torcl_rt::function::alloc_interpreted(
         lambda_list,
         body,

@@ -529,6 +529,13 @@ Loading is **not** transactional across functions by default: functions installe
 before an error remain installed (matching CL `load`), but the loader MUST signal
 on the first structural error rather than continue past corruption.
 
+Each compiled unit establishes its own top-level definition boundary, as source
+loading does. A top-level method must not capture the incidental lexical frame
+of the function calling `load`; a binding form within the unit still establishes
+a genuine lexical capture. Restore the caller's boundary on both normal return
+and a load error. Escaped compiled closures retain GC-visible captured frames
+even while those closures have no active invocation.
+
 ## 6.11.5 Interaction With Other Subsystems
 
 - **Images (§7).** An image is a whole-heap snapshot; a `.bfasl` is a single
