@@ -1,6 +1,37 @@
 use std::process::Command;
 
 #[test]
+fn stream_element_type_preserves_native_and_gray_methods() {
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
+          (defclass typed-wrapper (torcl-gray-streams:fundamental-character-input-stream) ())
+          (assert (eq 'character (stream-element-type (make-string-input-stream "abc"))))
+          (assert (eq 'character (stream-element-type (make-instance 'typed-wrapper))))
+          (defmethod stream-element-type ((s typed-wrapper)) '(unsigned-byte 16))
+          (let ((s (make-instance 'typed-wrapper)))
+            (assert (equal '(unsigned-byte 16) (stream-element-type s)))
+            (assert (equal '(unsigned-byte 16) (funcall #'stream-element-type s)))
+            (assert (equal '(unsigned-byte 16) (apply #'stream-element-type (list s)))))
+          (assert (eq 'character (funcall #'stream-element-type (make-string-output-stream))))
+          (assert (handler-case (progn (stream-element-type 42) nil) (type-error () t)))
+          (format t "STREAM-TYPES-OK~%")
+        "#,
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("STREAM-TYPES-OK"), "{stdout}");
+}
+
+#[test]
 fn open_is_a_callable_builtin_without_bootstrap() {
     let path = std::env::temp_dir().join(format!("torcl-open-function-{}.txt", std::process::id()));
     std::fs::write(&path, "from-open\n").unwrap();

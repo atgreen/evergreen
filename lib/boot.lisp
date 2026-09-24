@@ -3438,6 +3438,13 @@
   (torcl::%native-input-stream-p stream))
 (defmethod output-stream-p ((stream t))
   (torcl::%native-output-stream-p stream))
+(defmethod stream-element-type ((stream t))
+  (let ((element-type (torcl::%native-stream-element-type stream)))
+    (cond ((eq element-type t) 'character)
+          ((eql element-type 8) '(unsigned-byte 8))
+          (t (error 'type-error :datum stream :expected-type 'stream)))))
+(defmethod stream-element-type ((stream fundamental-stream))
+  (gray-stream-element-type stream))
 (defmethod close ((stream t) &key abort)
   (torcl::%native-close stream :abort abort))
 

@@ -15370,6 +15370,15 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     NIL
                 });
             }
+            "TORCL::%NATIVE-STREAM-ELEMENT-TYPE" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(TorclError::ProgramError(
+                        "%native-stream-element-type requires one stream".into(),
+                    ));
+                }
+                return Ok(torcl_stdlib::stream_element_type(args[0]));
+            }
             "OUTPUT-STREAM-P" | "TORCL::%NATIVE-OUTPUT-STREAM-P"
                 if !env.generics.borrow().contains_key(&name) =>
             {
@@ -15655,6 +15664,72 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 });
             }
             // ── TCP socket primitives (for the slynk backend) ──────────
+            "TORCL::%SOCKET-CONNECT" => {
+                // (%socket-connect host port &optional timeout-ms) → UB8 stream.
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("network access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                if !(2..=3).contains(&args.len()) {
+                    return Err(TorclError::ProgramError(
+                        "%socket-connect requires host, port and optional timeout-ms".into(),
+                    ));
+                }
+                if !is_string_value(args[0]) {
+                    return Err(TorclError::TypeError {
+                        datum: args[0],
+                        expected: "STRING".into(),
+                    });
+                }
+                if !args[1].is_fixnum() || !(1..=65535).contains(&args[1].as_fixnum()) {
+                    return Err(TorclError::TypeError {
+                        datum: args[1],
+                        expected: "(INTEGER 1 65535)".into(),
+                    });
+                }
+                let timeout = match args.get(2).copied().unwrap_or(NIL) {
+                    v if v.is_nil() => None,
+                    v if v.is_fixnum() && v.as_fixnum() > 0 => {
+                        Some(std::time::Duration::from_millis(v.as_fixnum() as u64))
+                    }
+                    v => {
+                        return Err(TorclError::TypeError {
+                            datum: v,
+                            expected: "(OR NULL (INTEGER 1 *))".into(),
+                        });
+                    }
+                };
+                return torcl_stdlib::socket_connect(
+                    &val_as_str(args[0]),
+                    args[1].as_fixnum() as u16,
+                    timeout,
+                );
+            }
+            "TORCL::%SOCKET-READ-TIMEOUT" => {
+                // (%socket-read-timeout stream &optional timeout-ms) → ms | NIL.
+                let args = eval_args(cdr, env)?;
+                if !(1..=2).contains(&args.len()) {
+                    return Err(TorclError::ProgramError(
+                        "%socket-read-timeout requires stream and optional timeout-ms".into(),
+                    ));
+                }
+                if let Some(value) = args.get(1).copied() {
+                    let timeout = if value.is_nil() {
+                        None
+                    } else if value.is_fixnum() && value.as_fixnum() > 0 {
+                        Some(std::time::Duration::from_millis(value.as_fixnum() as u64))
+                    } else {
+                        return Err(TorclError::TypeError {
+                            datum: value,
+                            expected: "(OR NULL (INTEGER 1 *))".into(),
+                        });
+                    };
+                    torcl_stdlib::streams::socket_set_read_timeout(args[0], timeout)?;
+                }
+                return Ok(torcl_stdlib::streams::socket_read_timeout(args[0])?
+                    .map(|duration| TorclVal::from_fixnum(duration.as_millis() as i64))
+                    .unwrap_or(NIL));
+            }
             "TORCL::%SOCKET-LISTEN" => {
                 // (%socket-listen host port &optional backlog) → listener-id
                 let args = eval_args(cdr, env)?;

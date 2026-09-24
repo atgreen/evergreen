@@ -2471,7 +2471,7 @@ pub fn install_gc_hooks() {
 // the FileIo machinery over the socket's file descriptor — so all the Gray-stream
 // I/O (read-char, read-line, write-string, force-output, …) works unchanged.
 use std::cell::{Cell, RefCell};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 thread_local! {
@@ -2507,7 +2507,46 @@ pub fn socket_close_listener(id: u64) {
     });
 }
 
-/// Accept a connection on listener `id`, returning a bidirectional character
+/// Connect a TCP client and return an owned bidirectional octet stream.
+/// The optional timeout bounds connection attempts across all resolved addresses;
+/// system hostname resolution precedes that deadline.
+pub fn socket_connect(
+    host: &str,
+    port: u16,
+    timeout: Option<std::time::Duration>,
+) -> Result<TorclVal, TorclError> {
+    let connected = if let Some(timeout) = timeout {
+        let addresses = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| TorclError::FileError(format!("socket-connect {host}:{port}: {e}")))?;
+        let start = std::time::Instant::now();
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "hostname resolved to no addresses",
+        ));
+        for address in addresses {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                result = Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect timeout",
+                ));
+                break;
+            }
+            result = TcpStream::connect_timeout(&address, remaining);
+            if result.is_ok() {
+                break;
+            }
+        }
+        result
+    } else {
+        TcpStream::connect((host, port))
+    }
+    .map_err(|e| TorclError::FileError(format!("socket-connect {host}:{port}: {e}")))?;
+    Ok(socket_stream(connected))
+}
+
+/// Accept a connection on listener `id`, returning a bidirectional octet
 /// stream over the new socket (blocks until a client connects).
 pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
     let stream = SOCKET_LISTENERS.with(|m| {
@@ -2520,6 +2559,11 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
             .map(|(s, _)| s)
             .map_err(|e| TorclError::FileError(format!("socket-accept: {e}")))
     })?;
+    Ok(socket_stream(stream))
+}
+
+/// Transfer sole descriptor ownership to the standard stream/finalizer machinery.
+fn socket_stream(stream: TcpStream) -> TorclVal {
     let _ = stream.set_nodelay(true);
     let fd = stream.into_raw_fd();
     // SAFETY: `fd` is a freshly-owned socket descriptor; `File` takes sole
@@ -2529,7 +2573,7 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
     // A byte (unsigned-byte 8) stream: the SLIME/slynk protocol frames its
     // messages with raw octet I/O (read-sequence into a byte buffer, write-byte /
     // write-sequence of octets); it does its own UTF-8 conversion in Lisp.
-    Ok(alloc_stream(
+    alloc_stream(
         StreamElementType::UnsignedByte8,
         StreamInner::FileIo {
             file,
@@ -2543,7 +2587,38 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
             external_format: ExternalFormat::Utf8,
         },
         vec![],
-    ))
+    )
+}
+
+// Duplicate under the stream lock: CLOSE cannot invalidate the descriptor
+// between lookup and an option syscall. Dropping this handle closes only the
+// duplicate, while socket options affect the shared underlying socket.
+fn socket_option_handle(stream: TorclVal) -> Result<TcpStream, TorclError> {
+    let guard = lock_stream(stream)?;
+    let StreamInner::FileIo { file, .. } = &guard.inner else {
+        return Err(TorclError::StreamError(
+            "not a bidirectional socket stream".into(),
+        ));
+    };
+    let file = file
+        .try_clone()
+        .map_err(|e| TorclError::StreamError(format!("socket option: {e}")))?;
+    Ok(TcpStream::from(std::os::fd::OwnedFd::from(file)))
+}
+
+pub fn socket_read_timeout(stream: TorclVal) -> Result<Option<std::time::Duration>, TorclError> {
+    socket_option_handle(stream)?
+        .read_timeout()
+        .map_err(|e| TorclError::StreamError(format!("socket read timeout: {e}")))
+}
+
+pub fn socket_set_read_timeout(
+    stream: TorclVal,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), TorclError> {
+    socket_option_handle(stream)?
+        .set_read_timeout(timeout)
+        .map_err(|e| TorclError::StreamError(format!("socket read timeout: {e}")))
 }
 
 /// The raw file descriptor backing a file/socket IO stream, or None.
