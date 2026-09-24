@@ -18,6 +18,11 @@ exercises these forks:
 |---|---|---|
 | trivial-features | https://github.com/atgreen/trivial-features | `26e8d168deb7d70d762d0d7e41b2919eba4321aa` |
 | trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `e55ad7e91aa5aa92408fe082b2e307f8986be080` |
+| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `5f8ba3596b4be3b3962a26957ff5508d4d02cbcc` |
+
+The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
+incremental loopback I/O through cold and cached loads. It requires the new
+TorCL client primitives and is not a claim of HTTPS or completions support.
 
 For an existing ocicl project, run there:
 
