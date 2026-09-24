@@ -7740,6 +7740,13 @@ impl Env {
         self.mv = values;
         self.mv_active = true;
     }
+
+    /// Publish exactly these values, including the distinct zero-value result.
+    fn return_values(&mut self, values: Vec<BlissVal>) -> BlissVal {
+        let primary = values.first().copied().unwrap_or(NIL);
+        self.set_mv(values);
+        primary
+    }
 }
 
 // ── Live tree-walker environment roots (bliss-6b2.3) ─────────────
@@ -14350,7 +14357,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // nothing at all (ansi ELT.ERROR.1/2/3, LENGTH.ERROR.1/2,
         // REVERSE.ERROR.1/2, SUBSEQ.ERROR.2/3, CONCATENATE.ERROR.3).
         "ELT" => Some((2, 2)),
-        "LENGTH" | "REVERSE" | "NREVERSE" => Some((1, 1)),
+        "LENGTH" | "REVERSE" | "NREVERSE" | "VALUES-LIST" => Some((1, 1)),
         "SUBSEQ" => Some((2, 3)),
         "CONCATENATE" => Some((1, usize::MAX)),
         "CONSP" | "ATOM" | "LISTP" | "ENDP" => Some((1, 1)),
@@ -16354,7 +16361,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 });
             }
-            "ENDP" => {
+            "ENDP" if global_fn(&name).is_none() => {
                 // (endp list) — CLHS: T at the end of a proper list (NIL), NIL
                 // for a cons, a type error for anything else.
                 let (af, _) = cp(cdr);
@@ -17272,12 +17279,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let value = eval_form(af, env)?;
                     vals.push(value);
                 }
-                if vals.is_empty() {
-                    env.set_mv(Vec::new());
-                    return Ok(NIL);
-                }
-                env.set_mv(vals.clone());
-                return Ok(vals[0]);
+                return Ok(env.return_values(std::mem::take(&mut *vals)));
             }
             "FORMAT" => return eval_format(cdr, env),
             "ERROR" => {
@@ -19302,7 +19304,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(*result);
             }
-            "REVERSE" => {
+            "REVERSE" if global_fn(&name).is_none() => {
                 // Delegate to the stdlib so lists, vectors, and strings all
                 // reverse with the correct result type (AGENTS.md: don't
                 // reimplement sequence ops in the interpreter).
@@ -21707,7 +21709,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (_, values) = eval_form_collecting_values(form, env)?;
                 return Ok(vec_to_list(&values));
             }
-            "VALUES-LIST" => {
+            "VALUES-LIST" if global_fn(&name).is_none() => {
                 // (values-list list) — exactly one argument, else a PROGRAM-ERROR
                 // (ansi VALUES-LIST.ERROR.1/2).
                 let n = form_arg_count(cdr);
@@ -21719,27 +21721,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (values-list list) — return the elements of list as values.
                 let (form, _) = cp(cdr);
                 let lst = eval_form(form, env)?;
-                // The argument must be a proper list; a dotted/improper list is a
-                // TYPE-ERROR (ansi VALUES-LIST.ERROR.4).
-                {
-                    let mut cur = lst;
-                    while cur.is_cons() {
-                        cur = cp(cur).1;
-                    }
-                    if !cur.is_nil() {
-                        return Err(BlissError::TypeError {
-                            datum: lst,
-                            expected: "LIST".to_string(),
-                        });
-                    }
-                }
-                let vals = list_to_vec(lst);
-                if vals.is_empty() {
-                    env.set_mv(Vec::new());
-                    return Ok(NIL);
-                }
-                env.set_mv(vals.clone());
-                return Ok(vals[0]);
+                return return_list_values(lst, env);
             }
             "HANDLER-CASE" => return eval_handler_case(cdr, env),
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
@@ -28112,19 +28094,44 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
 }
 
-/// The monotonic numeric comparators `< > <= >= =` are VARIADIC in CL: `(op x1
-/// x2 … xn)` is true iff every adjacent pair satisfies `op` (so all-equal for
-/// `=`, strictly/weakly ordered for the others). One argument is always true
-/// (after a numeric type-check); zero arguments is a program error. Previously
-/// these compared only the first two arguments (`(< 1 2 1)` => T, `(= 2 2 1)` =>
-/// T), which broke cl-ppcre's `(= minimum maximum 1)` repetition dispatch.
+/// Return the elements of a proper list as multiple values, without building
+/// a quoted call form or traversing the list twice.
+fn return_list_values(list: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let mut cursor = list;
+    let mut values = Vec::new();
+    // Only reads Lisp objects and allocates Rust memory: no relocating GC can
+    // occur before the collected values are installed in the environment.
+    while cursor.is_cons() {
+        let (car, cdr) = cp(cursor);
+        values.push(car);
+        cursor = cdr;
+    }
+    if !cursor.is_nil() {
+        return Err(BlissError::TypeError {
+            datum: list,
+            expected: "LIST".into(),
+        });
+    }
+    Ok(env.return_values(values))
+}
+
+/// Ordered comparisons are variadic; a single argument still needs a type
+/// check, and zero arguments signal PROGRAM-ERROR.
 fn eval_cmp(
     args: BlissVal,
     env: &mut Env,
     pred: fn(Ordering) -> bool,
 ) -> Result<BlissVal, BlissError> {
     let vals = eval_args(args, env)?;
-    let v: &[BlissVal] = &vals;
+    compare_ordered_values(&vals, pred)
+}
+
+/// Shared real-number comparison over already-evaluated arguments. In
+/// particular, unary comparisons still validate their argument's type.
+fn compare_ordered_values(
+    v: &[BlissVal],
+    pred: fn(Ordering) -> bool,
+) -> Result<BlissVal, BlissError> {
     if v.is_empty() {
         return Err(BlissError::ProgramError(
             "numeric comparison requires at least one argument".into(),
@@ -33621,6 +33628,7 @@ const DIRECT_FAST: &[&str] = &[
     "SET-CAR", "SET-CDR",
     "SECOND", "THIRD", "ABS",
     "ZEROP", "PLUSP", "MINUSP",
+    "VALUES", "VALUES-LIST", "REVERSE", "ENDP",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
@@ -33824,15 +33832,6 @@ fn call_direct_builtin(
 }
 
 fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, BlissError>> {
-    // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
-    // fast-path the 2-arg shape so other arities match the general path exactly.
-    let cmp = |pred: fn(Ordering) -> bool| -> Result<BlissVal, BlissError> {
-        Ok(if pred(numeric_cmp(args[0], args[1])?) {
-            T
-        } else {
-            NIL
-        })
-    };
     Some(match name {
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
         "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
@@ -33851,10 +33850,10 @@ fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, Bl
             |a, b| a + b,
         ),
         "1-" if args.len() == 1 => sub_vals(&[args[0], BlissVal::from_fixnum(1)]),
-        "<" if args.len() == 2 => cmp(|o| o == Ordering::Less),
-        ">" if args.len() == 2 => cmp(|o| o == Ordering::Greater),
-        "<=" if args.len() == 2 => cmp(|o| o != Ordering::Greater),
-        ">=" if args.len() == 2 => cmp(|o| o != Ordering::Less),
+        "<" => compare_ordered_values(args, |o| o == Ordering::Less),
+        ">" => compare_ordered_values(args, |o| o == Ordering::Greater),
+        "<=" => compare_ordered_values(args, |o| o != Ordering::Greater),
+        ">=" => compare_ordered_values(args, |o| o != Ordering::Less),
         // `=`/`/=` are defined on complex numbers (unordered), so they use the
         // componentwise numeric_equal rather than the Ordering-based cmp.
         "=" if args.len() == 2 => numeric_equal(args[0], args[1]).map(|e| if e { T } else { NIL }),
@@ -34339,6 +34338,16 @@ fn apply_builtin_fast(
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
     match name {
+        "VALUES" => Some(Ok(env.return_values(args.to_vec()))),
+        "VALUES-LIST" if args.len() == 1 => Some(return_list_values(args[0], env)),
+        "REVERSE" if args.len() == 1 => {
+            env.clear_mv();
+            Some(bliss_stdlib::reverse(args[0]))
+        }
+        "ENDP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(apply_builtin(name, args, env))
+        }
         "ZEROP" | "PLUSP" | "MINUSP" if args.len() == 1 => {
             env.clear_mv();
             let result = match name {
@@ -37973,6 +37982,69 @@ mod transient_shadow_root_tests {
 #[cfg(test)]
 mod jtc5_numeric_tests {
     use super::*;
+
+    #[test]
+    fn value_and_sequence_calls_bypass_form_allocation() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        bliss_rt::rooted_ref!(_env_root = &mut env);
+        let args = [BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)];
+        bliss_rt::rooted!(list = arena_cons(args[1], NIL));
+        *list = arena_cons(args[0], *list);
+        let before = bliss_rt::heap_stats().bytes_allocated;
+        for _ in 0..1000 {
+            for values in [&[][..], &args[..1], &args[..]] {
+                let result = apply_builtin_fast("VALUES", values, &mut env)
+                    .expect("VALUES must not reconstruct a form")
+                    .unwrap();
+                assert_eq!(result, values.first().copied().unwrap_or(NIL));
+                assert!(env.mv_active);
+                assert_eq!(env.mv, values);
+            }
+            assert_eq!(
+                apply_builtin_fast("VALUES-LIST", &[*list], &mut env)
+                    .expect("VALUES-LIST must not reconstruct a form")
+                    .unwrap(),
+                args[0]
+            );
+            assert!(env.mv_active);
+            assert_eq!(env.mv, args);
+            for (name, result) in [("REVERSE", NIL), ("ENDP", T)] {
+                assert_eq!(
+                    apply_builtin_fast(name, &[NIL], &mut env)
+                        .expect("sequence operation must not reconstruct a form")
+                        .unwrap(),
+                    result
+                );
+                assert!(!env.mv_active);
+            }
+        }
+        assert_eq!(bliss_rt::heap_stats().bytes_allocated, before);
+    }
+
+    #[test]
+    fn ordered_comparisons_accept_nonbinary_evaluated_arguments() {
+        let args = [
+            BlissVal::from_fixnum(1),
+            BlissVal::from_fixnum(2),
+            BlissVal::from_fixnum(3),
+        ];
+        for name in ["<", ">", "<=", ">="] {
+            assert_eq!(
+                apply_numeric_op(name, &args[..1])
+                    .expect("unary comparison must not reconstruct a form")
+                    .unwrap(),
+                T
+            );
+            let expected = if matches!(name, "<" | "<=") { T } else { NIL };
+            assert_eq!(
+                apply_numeric_op(name, &args)
+                    .expect("variadic comparison must not reconstruct a form")
+                    .unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn numeric_predicates_accept_evaluated_args_without_lisp_allocation() {

@@ -5,6 +5,73 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Remove value/sequence/comparison form bridges (2026-09-24, bliss-ixm0)
+
+The next measured batch removes quoted-form reconstruction for VALUES,
+VALUES-LIST, REVERSE, ENDP, and non-binary ordered comparisons. Interpreted and
+evaluated-argument calls share comparison and multiple-value kernels; REVERSE
+still delegates to the existing stdlib implementation. VALUES-LIST traverses
+its proper-list argument once instead of validating, traversing again, and
+cloning the result vector. Leaf calls also enter the direct builtin table.
+Function-cell invalidation and arity checks remain in place.
+
+Five alternating CPU-0-pinned release runs against `328e44a`, fresh processes
+with populated build-specific FASL caches, before test jobs:
+
+| Median | Before | Shared evaluated-argument kernels |
+|---|---:|---:|
+| Initial Babel FASL load | 1.015 s | **0.969 s (4.5% less)** |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 3.55× | **3.39×** |
+| Initial-load instructions (three isolated windows) | 4.612 G | **4.350 G (5.7% less)** |
+| Lisp bytes allocated during load | 17,090,960 | **13,465,040 (21.2% less)** |
+| Whole-process instructions | 17.850 G | **17.528 G (1.8% less)** |
+
+Both versions perform **zero minor and zero major collections** during every
+measured load: unlike the preceding numeric-predicate change, this comparison
+does not move a collection across the load timer. Whole-process wall medians
+are 3.48 → 3.42 s; ranges are 3.21–3.48 and 3.08–3.44 s. Initial-load ranges
+are 1.012–1.018 and 0.631–0.971 s; SBCL spans 0.151–0.287 s. Instruction counts
+corroborate the direction despite the occasional much faster wall sample.
+The remaining gap is substantial, not parity.
+
+Watched red-to-green units require evaluated-argument dispatch and no temporary
+Lisp allocation for value returns, empty reversal, and ENDP. Cross-tier cases
+check zero/one/many values, stale secondary values, lists/vectors/strings/bits,
+exact rational/bignum comparisons, arity/type errors, lexical shadowing, and
+post-warmup replacement. The replacement test exposed existing operator-arm
+inconsistencies for REVERSE/ENDP/VALUES-LIST, now fixed (`bliss-3ok2`). A
+source-free FASL regression exercises runtime-created heap strings through
+native calls at stress strides 1, 7, and 31 with poison and heap verification.
+Normal and stress-20,000 Babel loads match fresh SBCL output on all 15,106
+reverse-table entries. Review is adversarial self-review, not independent.
+
+The Dietz comparison/REVERSE/ENDP/VALUES/VALUES-LIST run passes 204 of 205
+tests; the saved `328e44a` binary gives the same result. Its lone failure,
+unary `/=` rejecting a complex argument, is tracked as `bliss-cbjz` and is
+outside the ordered-comparison change. CLI units pass 38/38; CLI integration
+reports 722 passed, one known asynchronous T2-observation failure
+(`bliss-ugmu`), and three ignored. All 358 acceptance, 51 FASL, and 12 bytecode
+differential tests pass. The two existing Lisp-as-Rust doctests still fail
+(`bliss-pqyy`). The non-CLI
+workspace run reports 1,772 passed, ten failed, four ignored: five known
+compiler/sequence failures (`bliss-4ihx`, `bliss-0bdl`) and five already-tracked
+parallel safepoint-test failures (`bliss-cfo6`). An immediate serial rerun of
+that concurrency target passes 21/21. Workspace check passes with the tracked
+unused-mut warning (`bliss-d3hs`); root lint has six baseline findings and zero
+new ones. Strict clippy stops at the nine existing runtime findings
+(`bliss-5vr`). Existing spec-coverage and formatting failures remain
+(`bliss-kjjd`, `bliss-2uj1`), with no new formatting findings in this change.
+Gate logs are `/tmp/babel-value-*.log`; these results are not an all-green
+workspace claim.
+
+The fresh profile that selected this work is `/tmp/babel-post-numpred.perf`
+(4,116 samples, zero lost, no source compilation). A single-lock named-function
+lookup probe saved only 0.34% of load instructions and was removed (`bliss-27nz`).
+The value-bridge throwaway probe was also removed before keeper tests; its
+5.45% instruction reduction justified this implementation. Final artifacts are
+`/tmp/babel-value-final-*` and `/tmp/babel-value-final-bench.sh`.
+
 ## Stop rebuilding forms for numeric predicates (2026-09-24, bliss-qcqx)
 
 A temporary census of the evaluated-argument-to-source-form bridge counted

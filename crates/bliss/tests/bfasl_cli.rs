@@ -489,6 +489,67 @@ fn numeric_predicates_load_without_source_under_gc_stress() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// R5.06 / R5.131 / R6.71: direct value and sequence calls preserve relocated
+/// heap arguments and multiple values without requiring their source file.
+#[test]
+fn value_bridges_load_without_source_under_gc_stress() {
+    let dir = workdir("value-bridges");
+    let src = dir.join("bridges.lisp");
+    let out = dir.join("bridges.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun bridge (xs)
+        (multiple-value-call #'list (values-list (reverse xs))
+          (values (endp xs) (< 1 2 3) (>= 3 2 1))))
+      (defun check-bridge ()
+        (bridge (list (reverse "ahpla") (reverse "ateb") (reverse "ammag"))))
+      (format t "BRIDGE ~S~%" (check-bridge))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "value bridge fell back to EvalSource");
+    }
+    fs::remove_file(&src).unwrap();
+    for stride in ["1", "7", "31"] {
+        let loaded = Command::new(BIN)
+            .args(["--no-init", "--no-bootstrap", "--load"])
+            .arg(&out)
+            .env("BLISS_FORCE_TIER", "t1")
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .env("BLISS_GC_VERIFY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&loaded.stdout).trim(),
+            "BRIDGE (\"gamma\" \"beta\" \"alpha\" NIL T T)",
+            "stride {stride}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// R5.06 / R6.71: source-free ASH calls use the same allocating integer kernel
 /// in compiled code, with operands kept live across bignum result allocation.
 #[test]
