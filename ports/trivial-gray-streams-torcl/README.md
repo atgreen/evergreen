@@ -1,5 +1,8 @@
 # Gray protocol imports for TorCL
 
+Use the [atgreen fork and ocicl Git pin](../README.md) for new test scenarios.
+The patch below is retained as a historical reference, not the installation path.
+
 `package.patch` adds the TorCL package selection to trivial-gray-streams 2.1
 (tested against ocicl `trivial-gray-streams-20260818-257d73e`). It imports the
 existing `TORCL-GRAY-STREAMS` protocol, preserving the identity of the generic

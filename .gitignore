@@ -69,6 +69,7 @@ _bureau_*
 # gstack skill scratch output
 .gstack/
 ocicl.csv
+!tests/library-forks/ocicl.csv
 ocicl/
 
 # compiled TorCL FASL artifacts

@@ -1,5 +1,8 @@
 # TorCL support for trivial-features
 
+Use the [atgreen fork and ocicl Git pin](../README.md) for new test scenarios.
+The patch below is retained as a historical reference, not the installation path.
+
 `implementation.patch` adds TorCL to ocicl's
 `trivial-features-20260908-828246a`. TorCL already provides the canonical OS,
 architecture, endianness and word-size features; the port enables implementation

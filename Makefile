@@ -22,7 +22,7 @@ TORCL_EXE := target/torcl
 
 .DEFAULT_GOAL := build
 .PHONY: build check test test-rt test-cli clippy fmt fmt-check clean release run \
-        help image pgo-image image-no-pgo test-pgo-build install uninstall
+        help image pgo-image image-no-pgo test-pgo-build test-library-forks install uninstall
 
 ## build: compile the whole workspace (default target)
 build:
@@ -75,6 +75,10 @@ pgo-image: image
 ## test-pgo-build: test PGO orchestration and failure isolation without compiling
 test-pgo-build:
 	python3 scripts/test-pgo-build.py
+
+## test-library-forks: fetch pinned ocicl forks and test cold/cached library loads
+test-library-forks:
+	bash scripts/test-library-forks.sh
 
 # Always retrain for the current sources/toolchain; an existing image alone
 # cannot establish profile freshness. `install` remains a copy-only operation.

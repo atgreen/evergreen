@@ -73,6 +73,17 @@ skill for everyone (the symlink points at the tracked file).
 - Before adding a builtin to cli.rs, check whether `torcl-stdlib` already
   implements it. Prefer extending stdlib over growing cli.rs.
 
+## Common Lisp library ports
+
+Keep TorCL compatibility changes in GitHub forks under `atgreen`, using
+`#+torcl` / `#-torcl` or ASDF `:if-feature :torcl` as appropriate. Test scenarios
+must import these through ocicl's `git+URL@SHA` support and commit the pinned
+`ocicl.csv`; do not use edited download directories as the durable port source.
+See [ports/README.md](ports/README.md) and `~/git/ocicl/README.md`.
+
+**Do not submit upstream patches, PRs, or issues yet.** Fork commits and test
+integration are authorized; upstream submissions require a new user instruction.
+
 ## GC safety (READ THIS before touching allocating code)
 
 torcl has a **moving, precise** minor GC: any allocation (`Arena::alloc_cons`,
