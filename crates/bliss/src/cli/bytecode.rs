@@ -13893,9 +13893,6 @@ extern "C" fn c2i_load_global(sym: u64) -> u64 {
     }
 }
 
-/// Write a global/special symbol's dynamic value cell (bliss-x5y.15). A side
-/// effect, so a function containing `StoreGlobal` opts out of speculation (see
-/// `deopt_safe`) — a whole-function deopt-rerun must never re-run the store.
 /// `#'f` from T2 code: read the symbol's FUNCTION cell (bliss-m285). Mirrors
 /// the T0 `Instr::LoadFunction` semantics exactly — the heap function object
 /// when the symbol names an interpreted/compiled function (so it is FUNCTIONP
@@ -14145,6 +14142,20 @@ extern "C" fn c2i_eval_host(form: u64) -> u64 {
 
 extern "C" fn c2i_make_closure(form: u64) -> u64 {
     c2i_eval_form_with_frame(BlissVal(form), true)
+}
+
+extern "C" fn c2i_alloc_cons(car: u64, cdr: u64) -> u64 {
+    match guard_c2i(|| {
+        bliss_rt::rooted!(car = BlissVal(car));
+        bliss_rt::rooted!(cdr = BlissVal(cdr));
+        Ok(arena_cons(*car, *cdr))
+    }) {
+        Ok(value) => value.0,
+        Err(error) => {
+            stash_native_error(error);
+            NIL.0
+        }
+    }
 }
 
 extern "C" fn c2i_take_values(primary: u64, dst: *mut BlissVal, n: u64) {
@@ -17021,6 +17032,7 @@ fn emit_native_x86(
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
+    let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let take_values_addr =
         c2i_take_values as extern "C" fn(u64, *mut BlissVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
@@ -17075,10 +17087,6 @@ fn emit_native_x86(
         c.extend_from_slice(&disp.to_le_bytes());
     };
 
-    // Speculative-fixnum eligibility (bliss-jtc.27): only when every call in the
-    // function is to a re-execution-safe primitive may we inline fixnum fast
-    // paths whose guards deoptimize by re-running the whole function. Purity of
-    // every call makes that re-run observably equivalent.
     // T1 deopt is always precise state-transfer: every guard's deopt stub records
     // its (bcp, depth) via c2i_deopt_state and `run_native` resumes T0 at that
     // exact bcp, so an already-executed side effect (e.g. StoreGlobal) at an
@@ -17086,12 +17094,6 @@ fn emit_native_x86(
     // fast paths. Hence side-effecting functions may speculate freely, like C2
     // (bliss-izt.3). (The whole-function-rerun tail exists only for the T2
     // emitter's c2i_deopt, which is a separate, non-T1 path.)
-    let deopt_safe = allow_speculation
-        && bf.code.iter().all(|i| match i {
-            Instr::CallNamed { sym, .. } => is_deopt_safe_primitive(*sym),
-            _ => true,
-        });
-
     // OSR-eligible loop headers (bliss-izt.1): the target of a backward `Go`
     // whose tagbody sits at an empty operand stack (sp_restore == 0), so an OSR
     // entry needs only set up the activation registers and jump — the live
@@ -17233,7 +17235,7 @@ fn emit_native_x86(
                 // on the tagged value directly: +1<<3 / -1<<3 / two's-complement
                 // negate, each with `jo` for the fixnum-overflow edge (negating
                 // the most-negative fixnum sets OF → correct deopt).
-                if deopt_safe && *nargs == 1 {
+                if allow_speculation && *nargs == 1 {
                     if let Some(op) = inlinable_unary_fixnum_op(*sym) {
                         // PEEK-guard-commit (bliss-izt.2): read x without moving
                         // r15, so a failed guard leaves the operand in its slot for
@@ -17341,13 +17343,13 @@ fn emit_native_x86(
                         continue;
                     }
                 }
-                // Speculative fixnum fast path (bliss-jtc.27): in a pure function,
+                // Speculative fixnum fast path (bliss-jtc.27):
                 // inline binary +,-,*,<,>,<=,>=,= for fixnum operands, guarding on
                 // both being fixnums and (for arithmetic) no overflow. A failed
-                // guard jumps to the shared deopt block, which flags a deopt and
-                // returns; run_native then re-runs the function in the
-                // interpreter, yielding the correct value (e.g. a bignum).
-                if deopt_safe && *nargs == 2 {
+                // guard records this bytecode position and operand depth;
+                // run_native resumes the interpreter at that operation,
+                // yielding the correct value without replaying prior effects.
+                if allow_speculation && *nargs == 2 {
                     if is_inlinable_eq(*sym) {
                         // EQ: bit-identity → total, no guard, no deopt.
                         pop_into(&mut c, 1, false); // a1 -> rcx
@@ -17645,6 +17647,14 @@ fn emit_native_x86(
                 c.extend_from_slice(&helper.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
             }
+            Instr::AllocCons => {
+                pop_into(&mut c, 6, false); // cdr -> rsi
+                pop_into(&mut c, 7, false); // car -> rdi
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&alloc_cons_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
                 // Like Const: the form is a movable heap cons — load it through
                 // the GC-rewritten constants slot, never as a baked immediate.
@@ -17915,13 +17925,6 @@ fn emit_native_x86(
     Some((c.finish()?, osr_entries, bcp_offsets, has_deopt))
 }
 
-/// Whether `sym` names a primitive that is safe to re-execute from scratch — no
-/// observable side effects (bliss-jtc.27). Speculative T1 codegen deoptimizes by
-/// re-running the whole function in the interpreter, so it may only speculate in
-/// functions whose every call is to such a primitive; then re-running from the
-/// start is guaranteed to produce the same result. Pure numeric/comparison/list
-/// constructors and accessors qualify; anything doing I/O, mutation, RNG, or
-/// time does not, and simply keeps the function out of speculative mode.
 /// Calls that NEVER return normally, so T1 deopts rather than compiling them
 /// (bliss-wukf). CLHS: ERROR "never returns normally" -- control is transferred
 /// to a handler. Deliberately conservative: SIGNAL returns when unhandled,
@@ -17934,24 +17937,6 @@ fn is_always_signalling(sym: u32) -> bool {
             .map(|n| n.rsplit(':').next().unwrap_or(n).to_string())
             .as_deref(),
         Some("ERROR")
-    )
-}
-
-fn is_deopt_safe_primitive(sym: u32) -> bool {
-    matches!(
-        bliss_rt::symbols::symbol_name(sym).as_deref(),
-        Some(
-            // arithmetic / comparison (some inlined, all re-run-safe)
-            "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "=" | "/="
-            | "1+" | "1-" | "MIN" | "MAX" | "ABS" | "MOD" | "REM" | "GCD" | "LCM"
-            | "FLOOR" | "CEILING" | "TRUNCATE" | "ROUND" | "EXPT" | "ISQRT"
-            | "LOGAND" | "LOGIOR" | "LOGXOR" | "LOGNOT" | "ASH"
-            | "ZEROP" | "PLUSP" | "MINUSP" | "EVENP" | "ODDP"
-            | "NUMBERP" | "INTEGERP" | "FLOATP" | "REALP" | "RATIONALP"
-            // pure list constructors / accessors (allocation is not observable)
-            | "CONS" | "CAR" | "CDR" | "LIST" | "NULL" | "NOT" | "EQ" | "EQL"
-            | "FIRST" | "REST" | "CONSP" | "ATOM" | "SYMBOLP"
-        )
     )
 }
 
@@ -18176,9 +18161,8 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // callee in the interpreter (NOT via `run_native`), so the native call path
     // is not self-recursive. Any native re-entry is still bounded by the
     // NATIVE_DEPTH cap in the dispatcher. (The old leaf-only guard here kept
-    // essentially all real, call-heavy library code out of T1.) Speculative
-    // fixnum codegen stays gated on `is_deopt_safe_primitive`, so a non-leaf
-    // function that calls impure helpers emits no deopt-able ops.
+    // essentially all real, call-heavy library code out of T1.) Precise
+    // state-transfer deopt permits arithmetic speculation after impure calls.
     let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
         as *mut std::sync::atomic::AtomicU32 as usize as u64;
     // allow_traps = false: the T1-invoke entry runs from the top, where an
@@ -18634,8 +18618,7 @@ fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> 
     // top — state-transfer deopt resumes T0 at the guard on the LIVE frame
     // (the loop's locals and operands are already in the shared slots), so
     // the loop runs at full native speed until (if ever) a value leaves the
-    // fixnum domain. Speculation only actually engages for `deopt_safe`
-    // functions (every call a pure primitive); others fall back to c2i.
+    // fixnum domain, including loops that call side-effecting helpers.
     //
     // A leaked, non-zero back-edge counter makes the emitter install the
     // sampled back-edge poll: emitted with sym == u32::MAX the poll is the

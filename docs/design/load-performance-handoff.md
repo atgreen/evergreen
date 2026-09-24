@@ -5,6 +5,74 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Remove repeated runtime work from first FASL load (2026-09-23)
+
+The next profile led to three general changes (`bliss-djhf`, `bliss-vbar`,
+`bliss-7pyh`):
+
+- Emit native `AllocCons` instructions, so portable quasiquote bytecode no
+  longer disqualifies an entire function/loop from T1 or OSR.
+- Remove T1's obsolete whole-function purity gate. Guards already resume at
+  the exact failing bytecode instruction, so arithmetic after an impure call
+  can speculate without replaying that call. Tests check actual deoptimization
+  and exact side-effect counts through both invocation promotion and OSR.
+- Borrow class metadata during read-only slot-owner traversal, instead of
+  cloning every visited class, its slots, and its default initargs. The cycle
+  set also borrows class names. There is no new cache or invalidation policy;
+  instance-slot shadowing and the existing missing-graph fallback are preserved.
+
+Three repeated isolated-load measurements against `89bab35`: median **7.769 G →
+7.088 G instructions**, **8.8% less**. Native cons plus the purity-gate removal
+alone measured 7.593 G; borrowing class metadata accounts for most of this
+iteration's improvement. These are fresh processes loading existing FASLs;
+source-compilation runs are excluded, and one minor GC remains inside the timer.
+
+Five alternating CPU-0-pinned release runs, after all test processes finished:
+
+| Metric (median) | `89bab35` | This change |
+|---|---:|---:|
+| Initial Babel FASL load | 1.628 s | **1.475 s (9.4% less)** |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 5.7× | **5.2×** |
+| Whole-process wall time, including ASDF startup | 4.07 s | 3.96 s |
+
+Baseline load samples ranged 1.383–1.632 s, candidate 1.474–1.490 s, SBCL
+0.285–0.287 s. Both Bliss versions collected once during each timed load;
+candidate GC time was about 0.260 s versus 0.255 s baseline, so the gain did
+not come from deferring collection. This is incremental progress, not parity.
+
+Rejected experiments matter for the next session:
+
+- Lowering named OSR thresholds to 200: 7.732 G instructions versus 7.767 G
+  default. Anonymous threshold 10: 7.757 G; anonymous OSR disabled: 7.759 G.
+  Earlier promotion is not a large remaining lever in this workload.
+- Enabling OSR uncommon traps: 7.655 G, also small.
+- Native `MakeClosure` added only about 1% beyond native cons. That prototype
+  was removed before landing: baked body pointers need an ownership audit
+  across self-redefinition and direct native calls (`bliss-sg8w`, `bliss-ku9w`).
+  A passing Lisp redefinition probe did not establish ownership safety.
+
+A fresh frame-pointer profile (1,542 load-only samples) puts class-slot lookup
+at 1.4% inclusive, down from roughly 6%. Remaining sampled costs include minor
+GC 17%, source-reading/evaluation 10.7%, extended LOOP evaluation 6.8%,
+multiple-value classification 5.8%, and variadic binding 4.7%. These overlap;
+do not sum them. Constant materialization is only about 1.6%. Next leads are
+remaining source-evaluated initializers (`bliss-mbzt`) and redundant
+multiple-value classification (`bliss-amyr`), not a binary-decoder rewrite.
+
+The real Babel load under `BLISS_GC_STRESS=20000 BLISS_GC_POISON=1
+BLISS_GC_VERIFY=1` matches normal execution and SBCL for all 15,106 entries in
+the two reverse tables. The focused final suites pass: 48 FASL tests, five OSR,
+14 T1-deoptimization tests (one ignored), and five T1-native tests. Root lint
+has zero new findings. Review was adversarial self-review, not independent.
+
+The final workspace test run recorded **2,506 passed, eight failed, seven
+ignored**. All 357 CLI acceptance tests pass. Failures remain the same tracked
+baseline issues listed in the preceding iteration: `bliss-4ihx`, `bliss-0bdl`,
+`bliss-pqyy`, and `bliss-ugmu`. Workspace check passes with the existing warning
+(`bliss-d3hs`); Clippy still stops at nine runtime diagnostics (`bliss-5vr`),
+and spec coverage at 14 uncited stage-5 requirements (`bliss-kjjd`).
+
 ## Compile encoding-table initializers (2026-09-23, bliss-bd8a)
 
 The next initial-load profile isolated `asdf:load-system` with a `perf` control

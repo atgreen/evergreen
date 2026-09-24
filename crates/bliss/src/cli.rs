@@ -5028,22 +5028,16 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
     /// `None` made EVERY ordinary slot access scan every class and every slot
     /// in the image — measured at 8.9x slower slot reads after defining 300
     /// unrelated classes, with a `String` allocated per slot compared.
-    fn walk(
-        env: &Env,
-        class_name: &str,
+    fn walk<'a>(
+        classes: &'a HashMap<String, ClassDef>,
+        class_name: &'a str,
         slot_name: &str,
-        seen: &mut HashSet<String>,
-    ) -> Option<Option<String>> {
-        // `insert` builds a fresh String on EVERY visit, including the repeat
-        // visits this cycle check exists to catch. Probe first so only the first
-        // visit to a class allocates; walk revisits classes through the super
-        // graph, and this was 37.7% of String::clone during make-plan
-        // (bliss-ou03).
-        if seen.contains(class_name) {
+        seen: &mut HashSet<&'a str>,
+    ) -> Option<Option<&'a str>> {
+        if !seen.insert(class_name) {
             return None;
         }
-        seen.insert(class_name.to_string());
-        let cd = env.classes.borrow().get(class_name).cloned()?;
+        let cd = classes.get(class_name)?;
         // Slot names are stored as the full symbol name (possibly package-
         // qualified); compare bare-to-bare since `slot_name` is already bare.
         if let Some(slot) = cd
@@ -5053,26 +5047,28 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
         {
             // The most specific definition wins, so this answer is final even
             // when the slot is instance-allocated.
-            return Some(
-                (slot.allocation == SlotAllocation::Class).then(|| class_name.to_string()),
-            );
+            return Some((slot.allocation == SlotAllocation::Class).then_some(class_name));
         }
         for sup in &cd.supers {
-            if let Some(found) = walk(env, sup, slot_name, seen) {
+            if let Some(found) = walk(classes, sup, slot_name, seen) {
                 return Some(found);
             }
         }
         None
     }
+    // This walk only reads Rust metadata; it never allocates on the Lisp heap
+    // or invokes user code. Keep one shared borrow and copy only the result,
+    // not every visited ClassDef (including all slot/default-initarg payloads).
+    let classes = env.classes.borrow();
     let mut seen = HashSet::new();
-    if let Some(answer) = walk(env, class_name, slot_name, &mut seen) {
-        return answer;
+    if let Some(answer) = walk(&classes, class_name, slot_name, &mut seen) {
+        return answer.map(str::to_owned);
     }
     // Not reachable through the CLI super graph at all. Fall back to any class
     // declaring it class-allocated, which papers over CLI/stdlib class-graph
     // divergence for deep multiple inheritance (bliss-lb6.14: ASDF's LOAD-OP
     // inherits DOWNWARD-OPERATION's class slot through three superclasses).
-    env.classes.borrow().iter().find_map(|(name, cd)| {
+    classes.iter().find_map(|(name, cd)| {
         cd.slots
             .iter()
             .any(|s| {
@@ -37389,6 +37385,61 @@ impl Default for ReplConfig {
 fn heap_test_lock() -> &'static std::sync::Mutex<()> {
     static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod class_slot_owner_tests {
+    use super::*;
+
+    fn class(supers: &[&str], allocation: Option<SlotAllocation>) -> ClassDef {
+        ClassDef {
+            name: String::new(),
+            supers: supers.iter().map(|s| s.to_string()).collect(),
+            slots: allocation
+                .map(|allocation| SlotDef {
+                    name: "PKG:SHARED".into(),
+                    initargs: vec![],
+                    accessor: None,
+                    readers: vec![],
+                    writers: vec![],
+                    initform: None,
+                    allocation,
+                })
+                .into_iter()
+                .collect(),
+            class_slot_values: Arc::new(Mutex::new(HashMap::new())),
+            default_initargs: vec![],
+        }
+    }
+
+    #[test]
+    fn cycles_fallback_and_instance_shadowing_remain_distinct() {
+        let _guard = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let env = Env::new(false);
+        env.classes.borrow_mut().extend([
+            ("A".into(), class(&["B"], None)),
+            ("B".into(), class(&["A"], None)),
+            ("OWNER".into(), class(&[], Some(SlotAllocation::Class))),
+        ]);
+        // A cycle/missing CLI edge still reaches the whole-image fallback.
+        assert_eq!(
+            class_slot_owner(&env, "A", "SHARED").as_deref(),
+            Some("OWNER")
+        );
+        assert_eq!(class_slot_owner(&env, "A", "MISSING"), None);
+        // A found instance slot is definitive: no fallback to OWNER.
+        env.classes.borrow_mut().insert(
+            "B".into(),
+            class(&["A", "OWNER"], Some(SlotAllocation::Instance)),
+        );
+        assert_eq!(class_slot_owner(&env, "A", "SHARED"), None);
+        // Borrowed traversal must observe new metadata, not a cached answer.
+        env.classes.borrow_mut().insert(
+            "B".into(),
+            class(&["A", "OWNER"], Some(SlotAllocation::Class)),
+        );
+        assert_eq!(class_slot_owner(&env, "A", "SHARED").as_deref(), Some("B"));
+    }
 }
 
 #[cfg(test)]

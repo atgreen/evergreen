@@ -2,13 +2,13 @@
 //! gate: "an invalidated speculation deoptimizes and still returns the correct
 //! result."
 //!
-//! Pure functions promote to T1 with inlined fixnum arithmetic (+ - * and the
+//! Functions promote to T1 with inlined fixnum arithmetic (+ - * and the
 //! comparisons), guarded on fixnum operands and no overflow. Binary + - * also
 //! have a native single-float fast path (bliss-izt.3), so single-float operands
 //! run native rather than deopting. When neither guard applies — a ratio/bignum
 //! operand, a fixnum⊕float mix, a float comparison, or a result that overflows
 //! the 61-bit fixnum range — the native code deoptimizes and the interpreter
-//! re-runs the call, producing the value the tree-walker would. These tests
+//! resumes at the failing instruction without replaying prior effects. These tests
 //! drive the shipping binary and compare against pure interpretation.
 
 use std::process::Command;
@@ -34,6 +34,80 @@ fn assert_matches(program: &str) {
     let tw = eval(program, &[("BLISS_BACKEND", "tree-walker")]);
     let t1 = eval(program, &[("BLISS_T1_THRESHOLD", "1")]);
     assert_eq!(tw, t1, "T1 must match interpretation for:\n  {program}");
+}
+
+/// R4.40: an impure call must not disable later arithmetic speculation, and a
+/// guard failure must resume at the arithmetic instruction without replaying
+/// the already-completed side effect.
+#[test]
+fn arithmetic_after_impure_call_deopts_without_replaying_effects() {
+    let program = "\
+        (defparameter *effects* 0) \
+        (defun record-effect () (setq *effects* (1+ *effects*))) \
+        (defun add-after-effect (x) (record-effect) (+ x 1)) \
+        (add-after-effect 1) \
+        (let* ((before (bliss-ext:deopt-count)) \
+              (ratio (add-after-effect 1/2)) \
+              (big (add-after-effect 1152921504606846975))) \
+          (format t \"PRECISE ~S~%\" \
+            (list ratio big *effects* \
+              (> (bliss-ext:deopt-count) before))))";
+    let output = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("BLISS_LAZY_COMPILE", "0")
+        .env("BLISS_T0_T1_THRESHOLD", "1")
+        .env("BLISS_DISABLE_T2", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("PRECISE (3/2 1152921504606846976 3 T)"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// R4.40: OSR must also resume after, not replay, an impure call when a later
+/// arithmetic guard fails mid-loop.
+#[test]
+fn impure_osr_loop_resumes_after_effect_on_numeric_guard_failure() {
+    let program = "\
+        (defparameter *effects* 0) \
+        (defun record-effect () (setq *effects* (1+ *effects*))) \
+        (defun impure-loop (n) \
+          (let ((result 0)) \
+            (dotimes (i n result) \
+              (record-effect) \
+              (setq result (+ (if (= i 100) 1/2 i) 1))))) \
+        (let ((before (bliss-ext:deopt-count))) \
+          (format t \"OSR-EFFECTS ~S~%\" \
+            (list (impure-loop 200) *effects* \
+              (> (bliss-ext:function-osr-count 'impure-loop) 0) \
+              (> (bliss-ext:deopt-count) before))))";
+    let output = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("BLISS_T0_T1_THRESHOLD", "100000")
+        .env("BLISS_OSR_THRESHOLD", "20")
+        .env("BLISS_DISABLE_T2", "1")
+        .env("BLISS_GC_STRESS", "7")
+        .env("BLISS_GC_POISON", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("OSR-EFFECTS (200 200 T T)"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 /// Speculative fixnum arithmetic across signs, zero, and all comparison

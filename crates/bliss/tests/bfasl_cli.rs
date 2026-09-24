@@ -311,6 +311,70 @@ fn extended_loop_and_setf_place_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// R4.24 / R4.38: portable quasiquote allocation must not prevent either T1
+/// invocation promotion or OSR of a one-shot loop loaded from a FASL.
+#[test]
+fn portable_quasiquote_runs_natively_after_fasl_load() {
+    let dir = workdir("native-quasiquote");
+    let src = dir.join("quasiquote.lisp");
+    let out = dir.join("quasiquote.bfasl");
+    fs::write(
+        &src,
+        "(defun qq-loop (n) (let ((result nil)) \
+          (dotimes (i n result) (setq result `(,i . ,result)))))",
+    )
+    .unwrap();
+    let compiled = Command::new(BIN)
+        .args(["--no-bootstrap", "--no-init", "--eval"])
+        .arg(format!(
+            "(compile-file \"{}\" :output-file \"{}\")",
+            src.display(),
+            out.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::remove_file(src).unwrap();
+    for (threshold, expected_tier, expected_osr) in [("1", 1, false), ("100000", 0, true)] {
+        let loaded = Command::new(BIN)
+            .args(["--no-bootstrap", "--no-init", "--eval"])
+            .arg(format!(
+                "(progn (load \"{}\") (let ((v (qq-loop 100))) \
+                 (format t \"NATIVE-QQ ~S~%\" \
+                  (list (length v) (car v) (nth 99 v) \
+                   (bliss-ext:function-tier 'qq-loop) \
+                   (> (bliss-ext:function-osr-count 'qq-loop) 0)))))",
+                out.display()
+            ))
+            .env("BLISS_T0_T1_THRESHOLD", threshold)
+            .env("BLISS_OSR_THRESHOLD", "20")
+            .env("BLISS_DISABLE_T2", "1")
+            .env("BLISS_GC_STRESS", "7")
+            .env("BLISS_GC_POISON", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        let expected = format!(
+            "NATIVE-QQ (100 99 0 {expected_tier} {})",
+            if expected_osr { "T" } else { "NIL" }
+        );
+        assert!(
+            String::from_utf8_lossy(&loaded.stdout).contains(&expected),
+            "threshold {threshold}: {}",
+            String::from_utf8_lossy(&loaded.stdout)
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// A nested function's literal pool must stay rooted while MAKE-CLOSURE
 /// allocates its installed lambda list, before registry installation.
 #[test]
