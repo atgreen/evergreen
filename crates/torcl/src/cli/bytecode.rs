@@ -5816,9 +5816,11 @@ impl<'e> Lowerer<'e> {
             .collect();
         let enclosing_callable = self.closure_fns.clone();
 
-        // A captured enclosing lexical must be boxed to live in the heap frame;
-        // if a local body references an unboxed enclosing slot, defer the whole
-        // form to the tree-walker.
+        // A macro can reveal these captures after the initial syntactic scan.
+        // Ask the enclosing compiler to retry with heap bindings, just as for
+        // a macro-revealed lambda capture, instead of permanently interpreting
+        // the entire function.
+        let mut slot_captured = std::collections::HashSet::new();
         for i in 0..parsed.len() {
             let (params_form, fbody) = flet_def_forms(defs[i]);
             let params: std::collections::HashSet<String> = list_to_vec(params_form)
@@ -5830,14 +5832,16 @@ impl<'e> Lowerer<'e> {
             for f in list_to_vec(fbody) {
                 collect_symbol_names(f, &mut used);
             }
-            if used.iter().any(|u| {
+            slot_captured.extend(used.into_iter().filter(|u| {
                 enclosing_slots.contains(u)
                     && !enclosing_boxed.contains(u)
                     && !params.contains(u)
                     && !local_names.contains(u)
-            }) {
-                return Err(Bail);
-            }
+            }));
+        }
+        if !slot_captured.is_empty() {
+            request_boxing(slot_captured);
+            return Err(record_bail(|| "flet:closure-captures-slot".to_string()));
         }
 
         // Establish a child heap frame to hold the closures, so labels siblings
@@ -7272,13 +7276,16 @@ fn compile_function_in(
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
+    // A failed allocating attempt can relocate both inputs before a retry.
+    torcl_rt::rooted!(params_form = params_form);
+    torcl_rt::rooted!(body = body);
     let mut forced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for _ in 0..4 {
         let _ = take_box_request();
         let attempt = compile_function_forcing_boxed(
             name,
-            params_form,
-            body,
+            *params_form,
+            *body,
             env,
             portable,
             macro_lambda_list,

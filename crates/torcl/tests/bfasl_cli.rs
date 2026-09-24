@@ -117,6 +117,79 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
 }
 
 #[test]
+fn macro_generated_flet_captures_compile_without_source_fallback() {
+    let dir = workdir("macro-flet-capture");
+    let src = dir.join("capture.lisp");
+    let out = dir.join("capture.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defmacro with-hidden-local (&body body)
+        `(flet ((reader () ,@body)) (reader)))
+      (defun macro-flet-capture (x)
+        (with-hidden-local (setq x (+ x 1)) x))
+      (defun macro-flet-heap (x)
+        (with-hidden-local (cons :head x)))
+      (format t "CAPTURE ~S ~S~%" (macro-flet-capture 41) (macro-flet-heap (list :tail)))
+    "#,
+    )
+    .unwrap();
+    for stress in [false, true] {
+        let mut command = Command::new(BIN);
+        command.args([
+            "--no-init",
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {src:?} :output-file {out:?})"),
+        ]);
+        if stress {
+            command
+                .env("TORCL_GC_STRESS", "1")
+                .env("TORCL_GC_POISON", "1")
+                .env("TORCL_GC_VERIFY", "1");
+        }
+        let compiled = command.output().unwrap();
+        assert!(
+            compiled.status.success(),
+            "compile stress={stress}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let bytes = fs::read(&out).unwrap();
+        assert!(bfasl_section(&bytes, 11).is_none());
+        let bbu = bfasl_section(&bytes, 12).unwrap();
+        let start = bbu_action_start(bbu);
+        let (_, _, count) = bbu_counts(&bytes);
+        for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+            assert_ne!(
+                action[0], 9,
+                "macro-generated FLET fell back to EvalSource, stress={stress}"
+            );
+        }
+    }
+    fs::remove_file(src).unwrap();
+    for stress in [false, true] {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--no-init", "--no-bootstrap", "--load"])
+            .arg(&out);
+        if stress {
+            command
+                .env("TORCL_GC_STRESS", "1")
+                .env("TORCL_GC_POISON", "1")
+                .env("TORCL_GC_VERIFY", "1");
+        }
+        let loaded = command.output().unwrap();
+        assert!(
+            loaded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert!(String::from_utf8_lossy(&loaded.stdout).contains("CAPTURE 42 (:HEAD :TAIL)"));
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn load_time_values_are_initialized_once_per_fasl_load() {
     let dir = workdir("load-time-values");
     let src = dir.join("cells.lisp");
