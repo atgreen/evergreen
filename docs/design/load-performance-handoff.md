@@ -5,6 +5,70 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Reuse minor-GC evacuation destinations (2026-09-24, bliss-b03z)
+
+A throwaway action-timing probe ruled out a large remaining binary-decoder win.
+Alexandria's source-only `types` and `numbers` FASLs cost about 44 ms combined;
+ASDF's source definitions cost about 114 ms. Babel's major initializers already
+execute compiled load thunks. The 426 ms `enc-jpn` load includes the 267 ms minor
+GC, rather than representing 426 ms of Lisp execution. Missing numeric literal
+formats are tracked in `bliss-ujsc`, not treated as the primary remaining gap.
+
+The GC probe found **346,384 live copies and 317,068 failed initial copy
+attempts**. After the first survivor region filled, the collector kept trying
+that same full region for every object, then searched all regions for another
+destination. The copy phase alone took 101 ms. The collector now retains its
+current survivor and old-generation destinations until they fill. Object-size
+checks, pinned-host exclusion, root relocation, and collection timing remain
+unchanged. All throwaway profiling instrumentation was removed.
+
+Five alternating CPU-0-pinned release runs, each a fresh process loading an
+already populated build-specific FASL cache, against `ff97468`:
+
+| Median | Before | Destination reuse |
+|---|---:|---:|
+| Initial Babel FASL load | 1.476 s | **1.410 s (4.5% less)** |
+| SBCL initial load, same batch | 0.287 s | 0.287 s |
+| Bliss / SBCL | 5.1× | **4.9×** |
+| Minor-GC pause during load | 0.258 s | **0.196 s (23.8% less)** |
+| Initial-load retired instructions (three isolated windows) | 7.090 G | **6.422 G (9.4% less)** |
+| Whole-process retired instructions | 20.349 G | 19.687 G |
+
+Both versions collect exactly once (minor, not major) inside the timer. Load
+samples span 1.255–1.489 s before and 1.267–1.421 s after. Whole-process wall
+time, including ASDF startup, was especially noisy: medians 3.62 s before and
+3.88 s after, despite fewer instructions. Do not infer a startup speedup from
+this batch. The initial-load improvement is incremental; parity is not close.
+The instruction-window repeats vary by less than 0.1% per binary. CLI tests
+were still active during that count-only check, so its wall timings are not
+used; the five-run wall-time batch above ran before workspace validation.
+
+The deterministic regression first failed at 2,001 searches for 2,000 conses.
+It now bounds searches by the number of destination regions, checks every
+list element, and covers both survivor copying and immediate promotion.
+The full runtime suite passes all 621 tests. Normal execution and
+`BLISS_GC_STRESS=20000 BLISS_GC_POISON=1 BLISS_GC_VERIFY=1` agree with SBCL on
+all 15,106 Babel reverse-table entries. An every-allocation stress/poison/verify
+probe also preserves source-free native-cons results. Root lint has no new
+findings. Review is adversarial self-review, not independent.
+
+The complete workspace gate records **2,507 passed, eight failed, seven
+ignored**, split into serial non-CLI tests and process-isolated CLI tests with
+eight workers. All 357 acceptance and 48 FASL tests pass. The eight failures
+are the tracked baseline compiler STRINGP metadata test (`bliss-4ihx`), four
+sequence fixtures (`bliss-0bdl`), two Lisp-containing doctests (`bliss-pqyy`),
+and asynchronous tier-observability assertion (`bliss-ugmu`). Workspace check
+passes with the existing unused-mut warning (`bliss-d3hs`). Clippy still reports
+nine existing runtime diagnostics (`bliss-5vr`); spec coverage has 14 uncovered
+stage-5 requirements (`bliss-kjjd`). Widespread existing rustfmt drift is tracked
+separately in `bliss-2uj1`.
+
+The pre-change phase probe also measured roughly 60 ms indexing nursery
+objects, 33 ms marking external roots, and 33 ms relocating external roots.
+These are further profiling leads, not proven optimizations. The analogous
+per-object major-GC destination search is filed separately as `bliss-2f9l`;
+major GC is not on this initial-load path.
+
 ## Remove repeated runtime work from first FASL load (2026-09-23)
 
 The next profile led to three general changes (`bliss-djhf`, `bliss-vbar`,

@@ -1253,6 +1253,8 @@ impl HeapCollector {
         gen_age: u8,
         needed: usize,
     ) -> Option<usize> {
+        #[cfg(test)]
+        evacuation_target_tests::TARGET_SEARCHES.with(|count| count.set(count.get() + 1));
         // First, look for an existing region of the right kind with space for
         // the OBJECT BEING PLACED. The old fixed `> header + alignment` test
         // could return a region with a sliver of free space smaller than the
@@ -1356,12 +1358,13 @@ impl HeapCollector {
         let promotion_threshold = self.promotion_threshold;
 
         // Phase 1: Ensure we have a survivor region to copy into.
-        let survivor_idx = Self::find_or_create_target_region(
+        let mut survivor_idx = Self::find_or_create_target_region(
             state,
             RegionKind::Survivor,
             1,
             OBJECT_HEADER_SIZE + OBJECT_ALIGNMENT,
         );
+        let mut old_gen_idx = None;
 
         // Phase 2: Build the precise young-generation live set.  A nursery
         // collection must not copy every allocated object: doing so merely
@@ -1675,16 +1678,18 @@ impl HeapCollector {
                     (RegionKind::Survivor, nursery_age + 1)
                 };
 
-                // Find target region. We may need to allocate new ones as they fill up.
-                let mut target_idx_opt = if target_kind == RegionKind::Survivor {
-                    survivor_idx
+                // Keep copying into the current destination until it fills.
+                // Searching all regions per object makes evacuation quadratic
+                // in live heap size; only refill needs the region search.
+                let target_idx = if target_kind == RegionKind::Survivor {
+                    &mut survivor_idx
                 } else {
-                    Self::find_or_create_target_region(state, target_kind, target_gen_age, total_size)
+                    &mut old_gen_idx
                 };
 
                 // Try to copy the object.
                 let mut copied = false;
-                if let Some(tidx) = target_idx_opt {
+                if let Some(tidx) = *target_idx {
                     if Self::copy_object(state, header_ptr, body_size, tidx).is_some() {
                         copied = true;
                     }
@@ -1692,13 +1697,13 @@ impl HeapCollector {
 
                 // If copy failed (target full), get a target that FITS and retry.
                 if !copied {
-                    target_idx_opt = Self::find_or_create_target_region(
+                    *target_idx = Self::find_or_create_target_region(
                         state,
                         target_kind,
                         target_gen_age,
                         total_size,
                     );
-                    if let Some(tidx) = target_idx_opt {
+                    if let Some(tidx) = *target_idx {
                         if Self::copy_object(state, header_ptr, body_size, tidx).is_some() {
                             copied = true;
                         }
@@ -6028,6 +6033,89 @@ mod trace_tests {
         assert!(!is_heap_ref(BlissVal::from_fixnum(0x4000)));
         assert!(!is_heap_ref(crate::value::NIL));
         assert!(!is_heap_ref(crate::value::T));
+    }
+}
+
+#[cfg(test)]
+mod evacuation_target_tests {
+    use super::*;
+    use crate::value::NIL;
+
+    thread_local! {
+        pub(super) static TARGET_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn minor_evacuation_searches_per_region_not_per_object() {
+        // A collecting test must not scan the roots of concurrently running
+        // unit tests. Run this test alone in a child with its own global heap.
+        const CHILD: &str = "BLISS_TEST_EVACUATION_TARGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::evacuation_target_tests::minor_evacuation_searches_per_region_not_per_object", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for promotion_threshold in [0, 15] {
+            let config = GcConfig {
+                heap_size: 4 * 1024 * 1024,
+                heap_max: 8 * 1024 * 1024,
+                nursery_size: 4 * 1024 * 1024,
+                tlab_size: 4096,
+                region_size: 8192,
+                promotion_threshold,
+                pause_target_ms: 10,
+                gc_workers: 1,
+                satb_buffer_size: 64,
+                old_occupancy_trigger: 0.5,
+            };
+            init_heap(&config).unwrap();
+            let mut alloc = HeapAllocator::new().unwrap();
+            crate::rooted!(list = NIL);
+            for i in 0..2000 {
+                let body = alloc
+                    .alloc_fast(16)
+                    .or_else(|| alloc.alloc_slow(16).ok())
+                    .unwrap();
+                unsafe {
+                    write_object_header(
+                        body.sub(OBJECT_HEADER_SIZE),
+                        crate::object::type_id::CONS,
+                        16,
+                    );
+                    *(body as *mut BlissVal) = BlissVal::from_fixnum(i);
+                    *((body as *mut BlissVal).add(1)) = *list;
+                }
+                *list = BlissVal(body as u64 | crate::value::TAG_CONS);
+            }
+            TARGET_SEARCHES.with(|count| count.set(0));
+            HeapCollector::new().minor_gc().unwrap();
+            let searches = TARGET_SEARCHES.with(|count| count.get());
+            let mut cursor = *list;
+            for i in (0..2000).rev() {
+                let body = (cursor.0 & !crate::value::TAG_MASK) as *const BlissVal;
+                unsafe {
+                    assert_eq!(*body, BlissVal::from_fixnum(i));
+                    cursor = *body.add(1);
+                }
+            }
+            assert_eq!(cursor, NIL);
+            let live_bytes = 2000 * align_up(OBJECT_HEADER_SIZE + 16, OBJECT_ALIGNMENT);
+            let target_regions = live_bytes.div_ceil(config.region_size);
+            assert!(
+                searches <= target_regions + 1,
+                "{live_bytes} bytes of live conses need {target_regions} regions, not {searches} searches (promotion threshold {promotion_threshold})"
+            );
+        }
     }
 }
 
