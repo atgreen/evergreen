@@ -14303,6 +14303,36 @@ fn emit_c2i_helper_call(c: &mut Asm) {
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
     c.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
     c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
+    emit_native_transfer_check(c);
+}
+
+/// This leaf only inspects the pending transfer: it cannot allocate, collect,
+/// or invoke Lisp. The emitter may therefore preserve its result on the native
+/// stack without creating a GC root.
+extern "C" fn c2i_transfer_pending() -> u64 {
+    NATIVE_ERROR.with(|error| u64::from(error.borrow().is_some()))
+}
+
+/// Stop T1 at the call that initiated an error/THROW/RETURN-FROM. Returning a
+/// placeholder NIL and running the rest of the body first is not equivalent:
+/// later side effects (including ASDF dependency traversal) must never happen.
+/// T1 declines local unwind handlers, so run_native/OSR owns delivery of the
+/// pending transfer; leave through the ordinary three-register epilogue.
+fn emit_native_transfer_check(c: &mut Asm) {
+    let resume = c.label();
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+    c.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, pending-transfer leaf
+    c.extend_from_slice(
+        &(c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64).to_le_bytes(),
+    );
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp] (preserve flags)
+    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp+16]
+    c.jcc(Cc::E, resume);
+    c.extend_from_slice(&[0x41, 0x5C, 0x41, 0x5F, 0x41, 0x5E, 0xC3]);
+    c.bind(resume);
 }
 
 fn stash_native_error(error: TorclError) {
@@ -14794,12 +14824,10 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
     });
     match result {
         Ok(v) => v.0,
-        // A raw error can't unwind native code mid-function, so stash it and
-        // return NIL; native execution continues but run_native re-raises on
-        // exit. Crucially, keep the FIRST error (first-error-wins): once one is
-        // pending, later c2i calls that see the placeholder NIL (e.g. `(+ 1 nil)`)
-        // must not overwrite it, or a real STORAGE-CONDITION from deep recursion
-        // gets masked by a spurious downstream type error (bliss-x5y.4).
+        // Rust cannot unwind through native code: stash the transfer and return
+        // a placeholder. T1 checks immediately after the crossing and returns
+        // to run_native for delivery. Keep first-error-wins defensively for
+        // other native paths that may still continue with the placeholder.
         Err(e) => {
             NATIVE_ERROR.with(|c| {
                 let mut slot = c.borrow_mut();
@@ -17298,6 +17326,8 @@ fn emit_direct_native_call(
     c.extend_from_slice(&[0x41, 0x5A]); // pop r10 (old_fp)
     mem(c, 0x89, R10, R12, bs_fp);
     mem(c, 0x89, RCX, R12, bs_sp);
+    // Unpublish the direct callee's frame before unwinding this caller.
+    emit_native_transfer_check(c);
     // pop args off the caller operand stack, push the result
     c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, imm32
     c.extend_from_slice(&(8 * nargs).to_le_bytes());
@@ -17820,9 +17850,9 @@ fn emit_native_x86(
                             && CLOSURE_CONTROL.with(|m| !m.borrow().contains_key(sym));
                         // !has_deopt: a callee with no speculation-guard deopt
                         // point never mid-flight resumes to T0, so a direct call
-                        // needs no post-call deopt handling (its errors still
-                        // propagate via NATIVE_ERROR, checked by the caller's
-                        // run_native — exactly as the c2i path does).
+                        // needs no post-call deopt handling. Pending errors are
+                        // checked after restoring the callee frame, then
+                        // delivered by the enclosing run_native boundary.
                         // T2 callees are eligible too: the T2 codegen is SysV-
                         // compliant (saves/restores r12/r14/r15) and uses the
                         // same rdi=slots run_native frame ABI. Only the real
@@ -19823,7 +19853,7 @@ mod jtc4_stack_map_tests {
             code.windows(2)
                 .filter(|bytes| *bytes == [0xFF, 0xD0])
                 .count(),
-            3
+            4
         );
         assert!(
             code.windows(5).any(|bytes| bytes == [0xBF, 0, 0, 0, 0]),
