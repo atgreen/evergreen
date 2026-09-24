@@ -7685,7 +7685,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // by executing source text from the container.
 // 0x010a: exact Bignum (tag 3) and DoubleFloat (tag 6) literals.
 // 0x010b: compiled LOAD-TIME-VALUE initializers (SetLoadTimeCell, action 11).
-const BBU_BYTECODE_VERSION: u16 = 0x010b;
+// 0x010c: preserve load-time IN-PACKAGE (SetPackage, action 12).
+const BBU_BYTECODE_VERSION: u16 = 0x010c;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -8570,7 +8571,7 @@ fn serialize_bbu_handler_cases(functions: &[BbuFunction]) -> Vec<u8> {
 
 /// Rewrite definition-like top-level forms into portable load-time bytecode.
 /// `None` means the form has no load-time action after compile-file has already
-/// resolved its effect (currently IN-PACKAGE and an initializer-less DEFVAR).
+/// resolved its effect (an initializer-less DEFVAR).
 fn portable_load_thunk_form(form: TorclVal) -> Option<TorclVal> {
     if !form.is_cons() {
         return Some(form);
@@ -8580,10 +8581,6 @@ fn portable_load_thunk_form(form: TorclVal) -> Option<TorclVal> {
         return Some(form);
     }
     match sym_bare_name_rc(op).as_ref() {
-        // Package context has already selected the package-qualified identities
-        // serialized into subsequent symbol references. LOAD dynamically
-        // restores *PACKAGE*, so there is no observable load action to retain.
-        "IN-PACKAGE" => None,
         "DEFVAR" | "DEFPARAMETER" | "DEFCONSTANT" => {
             let kind = sym_bare_name_rc(op);
             let (var, init_and_doc) = cp(rest);
@@ -8799,6 +8796,14 @@ pub fn build_bbu_from_forms(
         torcl_rt::rooted_ref!(_form_root = &mut form);
         let mut done = false;
         reset_last_bail_reason();
+
+        // IN-PACKAGE changes dynamic state observed by later EXPORT/INTERN
+        // and *PACKAGE* reads, even though symbol literals are fully qualified.
+        if let Some(package) = super::compile_file_in_package_name(form) {
+            let name_ref = pool.string(&package);
+            load_actions.push((12, 0, name_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            continue;
+        }
 
         // (0) Package creation is a deterministic load action, not an
         // executable source thunk. Its structural constants are validated in
@@ -11772,6 +11777,18 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
     // Validate the complete load plan before mutating any function/value cell.
     for action in &actions {
         match action.kind {
+            12 => {
+                if bytecode_version < 0x010c
+                    || action.flags != 0
+                    || action.arg1 != BBU_NO_INDEX
+                    || action.arg2 != BBU_NO_INDEX
+                {
+                    return Err(bbu_error(
+                        "SetPackage has unsupported version/flags/arguments",
+                    ));
+                }
+                bbu_string(&encoded_constants, action.arg0)?;
+            }
             1 => {
                 if action.flags != 0 {
                     return Err(bbu_error("EnsurePackage has unsupported flags"));
@@ -12028,6 +12045,16 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
     torcl_rt::rooted_ref!(_last_root = &mut last);
     for action in actions {
         match action.kind {
+            12 => {
+                let name = bbu_string(&encoded_constants, action.arg0)?;
+                let package = torcl_stdlib::find_package(name).ok_or_else(|| {
+                    TorclError::PackageError(format!("there is no package named {name}"))
+                })?;
+                last = package;
+                env.current_package = name.to_owned();
+                env.define_local("*PACKAGE*", last);
+                super::sync_package_value_cell(name);
+            }
             1 => {
                 last = execute_bbu_ensure_package(&encoded_constants, &constants, action)?;
             }

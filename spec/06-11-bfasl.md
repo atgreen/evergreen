@@ -465,6 +465,14 @@ semantics.  Loader implementations MAY pre-materialize constants and verify all
 functions before the first action, but they MUST NOT reorder actions with
 observable effects.
 
+Bytecode version 1.12 adds concrete action **12**, `SetPackage`: `arg0` is a
+String naming an existing package, `arg1` and `arg2` are `0xffffffff`, and flags
+are zero. It preserves top-level `IN-PACKAGE` effects on subsequent dynamic
+package operations, not merely symbol identity. The loader validates the
+constant reference before executing any action, signals a package error if the
+package does not exist at execution, and updates its current package and
+`*PACKAGE*` together. The enclosing `LOAD` restores the caller's package.
+
 ### 6.11.3.6 Auxiliary Tables
 
 Auxiliary tables may be embedded in the `BBU` or mirrored in outer `.bfasl`

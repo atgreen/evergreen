@@ -2582,6 +2582,59 @@ fn compile_file_round_trips_define_package_without_source() {
 }
 
 #[test]
+fn compiled_in_package_affects_load_time_exports_and_restores_caller() {
+    let dir = workdir("load-time-package");
+    let src = dir.join("package-effects.lisp");
+    let out = dir.join("package-effects.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defpackage :load-package-a (:use :cl))
+      (defpackage :load-package-b (:use :cl))
+      (in-package :load-package-a)
+      (defmacro publish (name)
+        `(eval-when (:load-toplevel :execute) (export ',name)))
+      (publish first-name)
+      (defparameter *loaded-package* (package-name *package*))
+      (in-package :load-package-b)
+      (eval-when (:load-toplevel :execute) (export 'second-name))
+      (defparameter *loaded-package* (package-name *package*))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must remain source-free"
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        r#"
+      (let ((*package* (find-package :cl-user)))
+        (load {out:?})
+        (assert (eq *package* (find-package :cl-user)))
+        (assert (eq :external (nth-value 1 (find-symbol "FIRST-NAME" :load-package-a))))
+        (assert (eq :external (nth-value 1 (find-symbol "SECOND-NAME" :load-package-b))))
+        (assert (string= "LOAD-PACKAGE-A" (symbol-value (find-symbol "*LOADED-PACKAGE*" :load-package-a))))
+        (assert (string= "LOAD-PACKAGE-B" (symbol-value (find-symbol "*LOADED-PACKAGE*" :load-package-b))))
+        (format t "LOAD-PACKAGE-EFFECTS-OK~%"))
+    "#
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(String::from_utf8_lossy(&loaded.stdout).contains("LOAD-PACKAGE-EFFECTS-OK"));
+}
+
+#[test]
 fn compile_file_preserves_shadowed_symbol_identity() {
     let dir = workdir("package-shadow");
     let src = dir.join("shadow.lisp");
@@ -2717,6 +2770,66 @@ fn malformed_package_action_is_rejected_before_package_creation() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn malformed_set_package_action_is_rejected_before_any_load_effects() {
+    let dir = workdir("invalid-set-package");
+    let src = dir.join("set-package.lisp");
+    let good = dir.join("good.bfasl");
+    fs::write(
+        &src,
+        "(defpackage :package-action-guard (:use :cl))\n(in-package :package-action-guard)\n",
+    )
+    .unwrap();
+    assert!(
+        run(&format!("(compile-file {:?} {:?})", src, good))
+            .status
+            .success()
+    );
+    let image = torcl_rt::bfasl::load(&fs::read(&good).unwrap()).unwrap();
+    for mutation in ["index", "flags", "argument", "version"] {
+        let bad = dir.join(format!("{mutation}.bfasl"));
+        let mut builder = torcl_rt::bfasl::BfaslBuilder::new();
+        for (kind, bytes) in image.sections() {
+            let mut section = bytes.to_vec();
+            if kind == torcl_rt::bfasl::section::BYTECODE_UNIT {
+                let count = u32::from_le_bytes(section[20..24].try_into().unwrap()) as usize;
+                let start = bbu_action_start(&section);
+                let action = (0..count)
+                    .map(|i| start + 14 * i)
+                    .find(|&i| section[i] == 12)
+                    .expect("SetPackage emitted");
+                match mutation {
+                    "index" => {
+                        section[action + 2..action + 6].copy_from_slice(&u32::MAX.to_le_bytes())
+                    }
+                    "flags" => section[action + 1] = 1,
+                    "argument" => {
+                        section[action + 6..action + 10].copy_from_slice(&0u32.to_le_bytes())
+                    }
+                    "version" => section[4..6].copy_from_slice(&0x010bu16.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+            }
+            builder = builder.section(kind, section);
+        }
+        fs::write(&bad, builder.build()).unwrap();
+        let output = run(&format!(
+            r#"
+          (progn
+            (assert (handler-case (progn (load {bad:?}) nil) (error () t)))
+            (assert (null (find-package "PACKAGE-ACTION-GUARD")))
+            (format t "REJECTED-BEFORE-EFFECTS~%"))
+        "#
+        ));
+        assert!(
+            output.status.success(),
+            "{mutation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("REJECTED-BEFORE-EFFECTS"));
+    }
 }
 
 #[test]
