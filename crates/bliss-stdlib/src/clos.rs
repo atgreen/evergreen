@@ -341,6 +341,10 @@ struct ClosState {
     class_by_name: HashMap<String, BlissVal>,
     /// class value → metadata
     class_meta: HashMap<BlissVal, ClassMeta>,
+    /// Derived query results, discarded on every mutable state access and GC.
+    /// Never serialized or treated as owning roots; metadata remains the source
+    /// of truth, including bootstrap's registration-order superclass inference.
+    cpl_cache: RefCell<HashMap<BlissVal, Vec<BlissVal>>>,
     /// gf id → generic function data
     generic_functions: HashMap<BlissVal, GFData>,
     /// method id → method metadata (specializers, qualifier)
@@ -378,6 +382,7 @@ impl ClosState {
             class_registry: HashMap::new(),
             class_by_name: HashMap::new(),
             class_meta: HashMap::new(),
+            cpl_cache: RefCell::new(HashMap::new()),
             generic_functions: HashMap::new(),
             method_meta: HashMap::new(),
             effective_methods: HashMap::new(),
@@ -447,6 +452,10 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
             }
             return;
         };
+        // Discard derived values before relocation rather than retaining and
+        // tracing a second copy of every cached class reference. Queries cannot
+        // run concurrently: CLOS state and this scanner are thread-local.
+        state.cpl_cache.get_mut().clear();
         // Registry keys are symbols or private meta-handles and never move.
         // Payloads can include reader-built lambda lists and other heap values.
         for value in state.class_registry.values_mut() {
@@ -535,7 +544,14 @@ fn with_state_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ClosState) -> R,
 {
-    CLOS_STATE.with(|cell| f(&mut cell.borrow_mut()))
+    CLOS_STATE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        // Even registration of a different class can change inferred supers.
+        // Invalidating here also covers bootstrap, redefinition and restoration
+        // without maintaining a separate hierarchy-generation protocol.
+        state.cpl_cache.get_mut().clear();
+        f(&mut state)
+    })
 }
 
 // ── Core-image serialization of CLOS state (bliss-x0f2.7a) ─────────────
@@ -1588,9 +1604,21 @@ pub fn class_name(class: BlissVal) -> BlissVal {
     with_state(|st| st.class_meta.get(&class).map(|m| m.name).unwrap_or(NIL))
 }
 
-/// Compute the class precedence list using C3 linearization (R5.11).
+/// Compute the class precedence list using C3 linearization (R5.67).
 pub fn compute_class_precedence_list(class: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
-    with_state(|st| c3_linearize(st, class))
+    with_state(|st| {
+        if let Some(cpl) = st.cpl_cache.borrow().get(&class) {
+            return Ok(cpl.clone());
+        }
+        // Pure Rust allocation only: no GC or Lisp callbacks while borrowed.
+        // Do not cache errors or unknown classes. This bounds derived entries
+        // by registered metadata and preserves the existing unknown-class API.
+        let cpl = c3_linearize(st, class)?;
+        if st.class_meta.contains_key(&class) {
+            st.cpl_cache.borrow_mut().insert(class, cpl.clone());
+        }
+        Ok(cpl)
+    })
 }
 
 /// Get the direct superclasses of a class.
@@ -1698,6 +1726,8 @@ fn infer_group_supers(st: &ClosState, class: BlissVal) -> Option<Vec<BlissVal>> 
 }
 
 fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
+    #[cfg(test)]
+    cpl_tests::LINEARIZATIONS.with(|count| count.set(count.get() + 1));
     c3_linearize_guarded(st, class, &mut Vec::new())
 }
 
@@ -2579,3 +2609,126 @@ pub fn change_class(instance: BlissVal, new_class: BlissVal) -> Result<(), Bliss
     Ok(())
 }
 type EffectiveMethodParts = (Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>);
+
+#[cfg(test)]
+mod cpl_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static LINEARIZATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn class(id: i64) -> BlissVal {
+        BlissVal::from_fixnum(id)
+    }
+
+    fn define(id: i64, supers: &[BlissVal]) -> BlissVal {
+        let value = class(id);
+        define_class(value, value, supers, &[]).unwrap();
+        value
+    }
+
+    #[test]
+    fn repeated_cpl_queries_linearize_once_and_return_independent_vectors() {
+        // R5.67: preserve C3 diamond order without rebuilding the hierarchy
+        // on every method applicability query.
+        let a = define(50001, &[]);
+        let b = define(50002, &[a]);
+        let c = define(50003, &[a]);
+        let d = define(50004, &[b, c]);
+        LINEARIZATIONS.set(0);
+        let expected = vec![d, b, c, a];
+        for _ in 0..1000 {
+            let mut result = compute_class_precedence_list(d).unwrap();
+            assert_eq!(result, expected);
+            result.clear();
+        }
+        assert_eq!(LINEARIZATIONS.get(), 1, "repeated queries must reuse C3");
+    }
+
+    #[test]
+    fn superclass_redefinition_invalidates_descendant_cpl_and_cycles() {
+        let a = define(51001, &[]);
+        let b = define(51002, &[a]);
+        let c = define(51003, &[b]);
+        assert_eq!(compute_class_precedence_list(c).unwrap(), vec![c, b, a]);
+        let new_base = define(51004, &[]);
+        define(51002, &[new_base]);
+        assert_eq!(
+            compute_class_precedence_list(c).unwrap(),
+            vec![c, b, new_base]
+        );
+        define(51002, &[c]);
+        assert!(compute_class_precedence_list(c).is_err());
+        define(51002, &[a]);
+        assert_eq!(compute_class_precedence_list(c).unwrap(), vec![c, b, a]);
+    }
+
+    #[test]
+    fn gc_root_scan_discards_derived_cpl_before_visiting_roots() {
+        let a = define(52001, &[]);
+        let b = define(52002, &[a]);
+        let expected = vec![b, a];
+        assert_eq!(compute_class_precedence_list(b).unwrap(), expected);
+        LINEARIZATIONS.set(0);
+        scan_clos_state_roots(&mut |_| {});
+        assert_eq!(compute_class_precedence_list(b).unwrap(), expected);
+        assert_eq!(LINEARIZATIONS.get(), 1);
+    }
+
+    #[test]
+    fn newly_registered_class_replaces_unknown_cpl() {
+        let a = define(53001, &[]);
+        let b = class(53002);
+        assert_eq!(compute_class_precedence_list(b).unwrap(), vec![b]);
+        define(53002, &[a]);
+        assert_eq!(compute_class_precedence_list(b).unwrap(), vec![b, a]);
+    }
+
+    #[test]
+    fn registration_order_changes_invalidate_inferred_superclasses() {
+        let base = define(54001, &[]);
+        with_state_mut(|st| {
+            st.standard_object_class = base;
+            st.bootstrapped = true;
+        });
+        let a = BlissVal::from_meta_handle(54010);
+        let b = BlissVal::from_meta_handle(54011);
+        let c = BlissVal::from_meta_handle(54012);
+        let d = BlissVal::from_meta_handle(54013);
+        for value in [a, b, c] {
+            set_find_class(value, value).unwrap();
+        }
+        assert_eq!(
+            compute_class_precedence_list(c).unwrap(),
+            vec![c, b, a, base]
+        );
+        set_find_class(d, d).unwrap();
+        // C was the bottom of the three-class group, but becomes a middle
+        // class in the four-class diamond even though C itself wasn't edited.
+        assert_eq!(compute_class_precedence_list(c).unwrap(), vec![c, a, base]);
+        assert_eq!(
+            compute_class_precedence_list(d).unwrap(),
+            vec![d, b, c, a, base]
+        );
+    }
+
+    #[test]
+    fn core_restore_rebuilds_cpl_from_restored_metadata() {
+        let a = define(55001, &[]);
+        let b = define(55002, &[a]);
+        let expected = vec![b, a];
+        assert_eq!(compute_class_precedence_list(b).unwrap(), expected);
+        let snapshot = serialize_clos_state();
+        define(55002, &[]);
+        assert_eq!(compute_class_precedence_list(b).unwrap(), vec![b]);
+        assert_eq!(
+            restore_clos_state(&snapshot, &|value| value).unwrap(),
+            snapshot.len()
+        );
+        LINEARIZATIONS.set(0);
+        assert_eq!(compute_class_precedence_list(b).unwrap(), expected);
+        assert_eq!(LINEARIZATIONS.get(), 1);
+    }
+}

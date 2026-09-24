@@ -6312,6 +6312,53 @@ fn method_dispatch_cache_preserves_clos_semantics() {
     }
 }
 
+/// R5.67 / bliss-uqle: derived CPL reuse must survive real Lisp allocation and
+/// invalidate descendants when a superclass is redefined after dispatch warms.
+#[test]
+fn class_precedence_reuse_preserves_redefinition_under_gc_stress() {
+    let program = r#"
+      (defclass cpl-a () ())
+      (defclass cpl-b () ())
+      (defclass cpl-parent (cpl-a) ())
+      (defclass cpl-leaf (cpl-parent) ())
+      (defgeneric cpl-route (x))
+      (defmethod cpl-route ((x cpl-a)) :a)
+      (defmethod cpl-route ((x cpl-b)) :b)
+      (defun cpl-query (x)
+        (let ((order (class-precedence-list (class-of x))))
+          (list (cpl-route x)
+                (not (null (member (find-class 'cpl-a) order)))
+                (not (null (member (find-class 'cpl-b) order))))))
+      (let ((instance (make-instance 'cpl-leaf)))
+        (dotimes (i 40) (cpl-query instance))
+        (let ((before (cpl-query instance)))
+          (defclass cpl-parent (cpl-b) ())
+          (dotimes (i 40) (cpl-query instance))
+          (format t "~&CPL-RESULT ~S~%" (list before (cpl-query instance)))))
+    "#;
+    for stride in ["0", "1", "7", "31"] {
+        let output = bliss_bin()
+            // Keep this focused on CLOS; bootstrap itself hits the pre-existing
+            // evacuated-nursery verification failure tracked in bliss-vzph.
+            .args(["--no-bootstrap", "--no-init", "--eval", program])
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .env("BLISS_GC_VERIFY", "1")
+            .output()
+            .expect("run CPL regression");
+        assert!(
+            output.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("CPL-RESULT ((:A T NIL) (:B NIL T))"),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
 /// Regression (bliss-day): DEFMETHOD with the same qualifier and specializers
 /// REPLACES the existing method (CLHS 7.6.2). bliss appended it, leaving the
 /// stale method applicable so a redefinition never took effect.

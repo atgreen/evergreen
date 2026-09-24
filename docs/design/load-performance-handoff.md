@@ -5,6 +5,72 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Reuse class-precedence query results (2026-09-24, bliss-uqle)
+
+The post-ASH initial-load profile put 3.48% under class-precedence queries.
+Method applicability repeatedly rebuilt the same C3 inheritance lists. Those
+query results are now reused, with conservative invalidation on **every mutable
+CLOS-state access and every GC**. Bootstrap registration-order inference can
+change an otherwise untouched class's ancestors, so invalidating only the
+explicitly redefined class would be incorrect. The derived cache holds only
+registered classes, does not cache errors, and is omitted from core images.
+It is discarded before root relocation, not retained as a second owning root.
+
+Five alternating CPU-0-pinned release runs against `7a3c7d2`, fresh processes
+with populated build-specific FASL caches, before running test jobs:
+
+| Median | Before | Reused precedence lists |
+|---|---:|---:|
+| Initial Babel FASL load | 1.249 s | **1.224 s (2.0% less)** |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 4.37× | **4.28×** |
+| Initial-load instructions (three separate isolated windows) | 5.583 G | **5.447 G (2.4% less)** |
+| Whole-process instructions | 18.825 G | 18.680 G |
+
+Every load still allocates 21,175,568 Lisp bytes and performs one minor, zero
+major collections; median GC time is essentially unchanged, 0.146688 versus
+0.146774 seconds. This removes Rust-side hierarchy reconstruction, not Lisp
+allocation or a collection from the timer. Wall ranges are 0.983–1.253 s before
+and 1.222–1.229 s after. Whole-process wall medians are 3.50 versus 3.70 s,
+with ranges 3.26–3.74 and 3.33–3.71 s: this batch does **not** establish a
+whole-process startup speedup.
+
+The deterministic regression first failed at 1,000 C3 calculations for 1,000
+identical queries; it now requires exactly one and checks independent result
+vectors. Other unit cases cover ancestor redefinition, cycle introduction and
+repair, unknown-class registration, inferred-superclass changes, GC invalidation,
+and core restoration. Normal and GC-stress-20,000/poison/verify loads match a
+fresh SBCL run on all 15,106 Babel reverse-table entries. Measurement artifacts
+are `/tmp/babel-cpl-final-*`; the driver is `/tmp/babel-cpl-final-bench.sh`.
+
+The six CPL units pass, as does a Lisp redefinition/dispatch regression at
+stress strides 0, 1, 7, and 31 with poison and verification. That focused test
+skips bootstrap: its original bootstrap-enabled version exposed `bliss-vzph`,
+independently reduced to the saved **baseline** running only `--eval 1` at
+stress stride 31 (an evacuated-nursery reference in a function object).
+This is a tracked pre-existing GC failure, not a passing bootstrap stress gate.
+Review was adversarial self-review, not independent.
+
+The full non-CLI workspace run reports 1,774 passed, five known failures,
+four ignored; serial CLI units pass 34/34. CLI integration reports 715 passed,
+two failed, three ignored: the original bootstrap-enabled regression above,
+now passing in its isolated form, and the existing T2-observation failure
+(`bliss-ugmu`). All 357 pre-existing acceptance, 49 FASL, and 12 bytecode
+differential cases pass. Two existing Lisp-as-Rust doctests still fail
+(`bliss-pqyy`). Workspace check passes with the tracked unused-mut warning;
+root lint has six baseline findings, zero new. Strict clippy stops at the nine
+existing runtime findings (`bliss-5vr`); a separate stdlib run reports no new
+findings. Spec coverage and formatting retain their existing failures
+(`bliss-kjjd`, `bliss-2uj1`); new code is formatted. Detailed gate logs are
+`/tmp/babel-cpl-*.log`. These results are not an all-green workspace claim.
+
+Two other probes were removed: keying generic dispatch only by required
+arguments saved 0.1% of instructions (`bliss-2t7v`); allowing EVAL through the
+ordinary call lowerer saved 0.9% (`bliss-jx2n`). EVAL's existing null-lexical
+environment violation is tracked separately in `bliss-rrcn`. Neither probe is
+part of this change. The gap remains substantial; these measurements do not
+claim parity with SBCL.
+
 ## Shift integers instead of exponentiating (2026-09-24, bliss-7jt1)
 
 A fresh load-only profile after `d4427b8` put minor GC at 9.8% inclusive,
