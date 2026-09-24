@@ -311,6 +311,149 @@ fn extended_loop_and_setf_place_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A nested function's literal pool must stay rooted while MAKE-CLOSURE
+/// allocates its installed lambda list, before registry installation.
+#[test]
+fn closure_literals_survive_gc_during_fasl_closure_construction() {
+    let dir = workdir("closure-literal-roots");
+    let src = dir.join("closure.lisp");
+    let out = dir.join("closure.bfasl");
+    fs::write(
+        &src,
+        r#"(defun literal-factory ()
+              (lambda (a b) (list '(kept (nested datum)) a b)))
+            (format t "CLOSURE-CHECK ~S~%" (funcall (literal-factory) 1 2))"#,
+    )
+    .unwrap();
+    let compiled = Command::new(BIN)
+        .args(["--no-bootstrap", "--no-init", "--eval"])
+        .arg(format!(
+            "(compile-file \"{}\" :output-file \"{}\")",
+            src.display(),
+            out.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    // Every-allocation stress can promote the literal before closure creation
+    // and miss the bug. Strides exercise it while still in the nursery.
+    for stride in ["7", "13", "31"] {
+        let loaded = Command::new(BIN)
+            .args(["--no-bootstrap", "--no-init", "--load"])
+            .arg(&out)
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&loaded.stdout).trim(),
+            "CLOSURE-CHECK ((KEPT (NESTED DATUM)) 1 2)",
+            "stride {stride}"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// R4.23 / R6.71: Babel builds reverse encoding tables with capturing ACROSS
+/// loops and typed numeric drivers. These must be compiled load thunks, not
+/// EvalSource actions that rebuild the tables in the tree walker.
+#[test]
+fn encoding_table_loops_load_without_source_fallback() {
+    let dir = workdir("encoding-table-loops");
+    let src = dir.join("tables.lisp");
+    let out = dir.join("tables.bfasl");
+    fs::write(
+        &src,
+        r#"
+        (defparameter *reverse-table*
+          (let ((h (make-hash-table)))
+            (flet ((flip (codes start)
+                     (loop with row = start with col = 1
+                           for code across codes
+                           do (unless (= code 0)
+                                (setf (gethash code h) (+ (* row 16) col)))
+                              (incf col)
+                              (when (= col 4) (incf row) (setf col 1)))))
+              (flip #(10 0 12 13 14) 2)
+              h)))
+        (defparameter *typed-table*
+          (let ((h (make-hash-table)))
+            (loop for row of-type (unsigned-byte 8) from 1 to 3
+                  do (loop for col of-type fixnum from 1 to 2
+                           for code of-type integer = (+ (* row 10) col)
+                           unless (= code 22)
+                             do (setf (gethash code h) (+ row col))))
+            h))
+        (defun scan-vector (v)
+          (loop for x across v collect x))
+        (defun scan-once ()
+          (let ((calls 0))
+            (list (loop for x across (progn (incf calls) #(3 4)) sum x)
+                  calls)))
+        (defun scan-mutable ()
+          (let ((v (vector 1 2 3)))
+            (loop for x across v
+                  do (when (= x 1) (setf (aref v 1) 9))
+                  collect x)))
+        (defun scan-drivers ()
+          (list (loop for x of-type fixnum across #(1 2 3)
+                      for i of-type fixnum from 1 sum (* x i))
+                (loop for x across #(1 2 3) until (= x 2) collect x)
+                (loop for x across #(1 2 3) for y across #(4)
+                      collect (+ x y))))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "encoding table loop fell back to EvalSource");
+    }
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        r#"(progn (load "{}")
+        (list (hash-table-count *reverse-table*)
+              (gethash 10 *reverse-table*) (gethash 13 *reverse-table*)
+              (hash-table-count *typed-table*) (gethash 32 *typed-table*)
+              (scan-vector #()) (scan-vector "az") (scan-vector #*101)
+              (scan-vector (make-array 4 :initial-contents '(7 8 9 10) :fill-pointer 2))
+              (scan-once) (scan-mutable) (scan-drivers)
+              (handler-case (scan-vector '(1 2)) (type-error () :bad-vector))))"#,
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(4 33 49 5 5 NIL (#\\a #\\z) (1 0 1) (7 8) (7 1) (1 9 3) (14 (1) (5)) :BAD-VECTOR)"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// The LOOP conditional-execution grammar (`when TEST do …`, `when TEST return
 /// …`, and `when TEST … else …`) must lower to source-free bytecode. This is the
 /// shape of alexandria's `ends-with-subseq` / `map-derangements`.

@@ -5,6 +5,75 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Compile encoding-table initializers (2026-09-23, bliss-bd8a)
+
+The next initial-load profile isolated `asdf:load-system` with a `perf` control
+FIFO, excluding ASDF startup. About 25% of samples were source evaluation inside
+the FASL loader. Action timing identified two expensive reverse-table builders:
+`+UNICODE-TO-JIS-X-0208+` and `+UNICODE-TO-KSC-5601+`. Their `LOOP` forms fell back
+to `EvalSource` because the bytecode compiler lacked `ACROSS` and `OF-TYPE`
+iteration clauses. Binary decoding was not the bottleneck.
+
+Five alternating CPU-0-pinned release runs, each in a fresh process with its
+build-specific FASL cache already populated, against saved baseline `66c6d4f`:
+
+| Metric (median) | Before | Compiled initializers |
+|---|---:|---:|
+| Initial Babel FASL load | 1.964 s | 1.631 s (**17.0% less**) |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 6.9× | **5.7×** |
+| Initial-load retired instructions (three isolated windows) | 9.569 G | 7.761 G (**18.9% less**) |
+| Initial-load allocation | 32.56 MB | 26.83 MB (**17.6% less**) |
+| Whole-process retired instructions | 22.975 G | 21.177 G |
+| Whole-process wall time, including ASDF startup | 4.26 s | 4.14 s |
+
+No measured run compiled source. Both versions still perform **one minor GC**
+during the timed load; collection was not deferred or moved outside the timer.
+Wall time remains noisy even when pinned: baseline load samples ranged from
+1.775–1.968 s, candidate 1.185–1.645 s, SBCL 0.186–0.288 s. Compare within this
+batch, not against the earlier entry's absolute times. The three isolated
+instruction measurements reproduce within 0.2% for each binary.
+
+The compiler now lowers those clauses into portable bytecode. `ACROSS` evaluates
+its vector and active length once, reads elements as the loop advances, and
+supports strings, bit vectors, fill pointers, and multiple iteration drivers.
+`OF-TYPE` is accepted as an unspecialized declaration. This is general compiler
+support, not a Babel-specific cache or a change to when load-time work occurs.
+
+GC stress exposed three correctness bugs, fixed alongside the optimization:
+
+- Recursive `LOOP IT` substitution must root both the source tail and rebuilt
+  head. Losing either could silently force source fallback during compilation.
+- The reader must zero packed bit-vector payloads before OR-ing in one bits.
+  Poisoned/reused nursery bytes otherwise changed `#*101` into `#*111`.
+- Closure construction must root its cloned bytecode body **before** allocating
+  the installed lambda list. Otherwise moved literal constants become stale
+  before registry installation. A stride-7 regression catches this; collection
+  on every allocation happened to promote the literal early and miss it.
+
+Validation includes source-free FASL action assertions, deleting source before
+load, every-allocation GC/poison testing, and a real Babel load with
+`BLISS_GC_STRESS=20000 BLISS_GC_POISON=1 BLISS_GC_VERIFY=1`. All 15,106 entries in
+the two reverse tables match SBCL, and stressed output matches normal output.
+
+The workspace test run (non-CLI serial, CLI four threads) recorded **2,502 passed,
+eight failed, seven ignored**. The failures are separately tracked baseline
+issues: compiler STRINGP metadata (`bliss-4ihx`), four invalid sequence fixtures
+(`bliss-0bdl`), two unlabelled Lisp rustdoc examples (`bliss-pqyy`), and a
+40-call asynchronous tier-promotion assertion (`bliss-ugmu`). The latter also
+fails on the saved baseline in all five control runs, with correct Lisp values.
+All 47 FASL tests pass. Root lint has zero new findings; workspace check passes
+with the existing unused-mut warning (`bliss-d3hs`). Clippy remains blocked by
+existing runtime lints (`bliss-5vr`), and spec coverage by 14 uncited stage-5
+requirements (`bliss-kjjd`).
+
+The next larger hypothesis is selective native execution of one-shot FASL
+initialization loops (`bliss-y625`): ordinary hotness thresholds may not pay off
+before a load-time loop finishes. Profile the new load before changing policy,
+and include compilation cost in the first-load timer. Class-metadata cloning
+(`bliss-7pyh`) accounted for about 5% of the pre-change initial-load profile;
+it is not an explanation of the entire remaining gap.
+
 ## Initial FASL load update (2026-09-23, bliss-w337)
 
 The active target is now the **first** `asdf:load-system` in a fresh process,

@@ -779,6 +779,9 @@ fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
         *ptr.add(8) = ElementTypeTag::Bit as u8;
         // Length stored after the element-type word
         *(ptr.add(16) as *mut u64) = bits.len() as u64;
+        // Nursery reuse (especially GC poison) need not return zeroed bytes.
+        // Clear the payload before OR-ing the one bits into it.
+        std::ptr::write_bytes(ptr.add(24), 0, data_bytes);
         // Pack bits
         for (i, &b) in bits.iter().enumerate() {
             if b != 0 {

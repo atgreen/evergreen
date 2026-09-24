@@ -3558,7 +3558,45 @@ fn instr_may_escape_block(instr: &Instr) -> bool {
                     // recursion (moving GC; bliss-wlf).
                     let mut var = *forms.get(i + 1).ok_or(Bail)?;
                     bliss_rt::rooted_ref!(_var_root = &mut var);
+                    // OF-TYPE is a declaration, not an iteration driver. Like
+                    // THE, T0 currently accepts it without specializing code.
+                    // Remove it from this private rooted clause copy so all
+                    // drivers share the same operand offsets below.
+                    if kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() == Some("OF-TYPE") {
+                        forms.get(i + 4).ok_or(Bail)?;
+                        forms.drain(i + 2..i + 4);
+                    }
                     match kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() {
+                        Some("ACROSS") => {
+                            // Evaluate the vector and its active length once;
+                            // retain the vector itself, not an element snapshot,
+                            // so mutations of later elements remain observable.
+                            if !var.is_symbol() {
+                                return Err(Bail);
+                            }
+                            bliss_rt::rooted!(vector_form = *forms.get(i + 3).ok_or(Bail)?);
+                            let vector = fresh("VEC", &mut nsym)?;
+                            let index = fresh("INDEX", &mut nsym)?;
+                            let length = fresh("LEN", &mut nsym)?;
+                            bindings.push(form_list(&[vector, *vector_form]));
+                            bliss_rt::rooted!(check =
+                                form_list(&[s("CHECK-TYPE")?, vector, s("VECTOR")?]));
+                            bliss_rt::rooted!(len = form_list(&[s("LENGTH")?, vector]));
+                            bliss_rt::rooted!(checked_len =
+                                form_list(&[s("PROGN")?, *check, *len]));
+                            bindings.push(form_list(&[length, *checked_len]));
+                            bindings.push(form_list(&[index, BlissVal::from_fixnum(0)]));
+                            bindings.push(form_list(&[var, NIL]));
+                            bliss_rt::rooted!(done = form_list(&[s(">=")?, index, length]));
+                            bliss_rt::rooted!(exit = form_list(&[s("GO")?, end]));
+                            top_tests.push(form_list(&[s("WHEN")?, *done, *exit]));
+                            bliss_rt::rooted!(element =
+                                form_list(&[s("AREF")?, vector, index]));
+                            pre.push(form_list(&[s("SETQ")?, var, *element]));
+                            bliss_rt::rooted!(next = form_list(&[s("1+")?, index]));
+                            steps.push(form_list(&[s("SETQ")?, index, *next]));
+                            i += 4;
+                        }
                         Some("IN") | Some("ON") => {
                             let on = kw(forms[i + 2]).as_deref() == Some("ON");
                             let mut list = *forms.get(i + 3).ok_or(Bail)?;
@@ -6127,7 +6165,12 @@ fn subst_loop_it(form: BlissVal, repl: BlissVal) -> BlissVal {
             return form;
         }
     }
-    arena_cons(subst_loop_it(car, repl), subst_loop_it(cdr, repl))
+    // Rebuilding the car can move the source cdr; rebuilding the cdr can
+    // move the newly built car. Root both sides of this recursive allocation.
+    bliss_rt::rooted!(cdr = cdr);
+    bliss_rt::rooted!(car = subst_loop_it(car, repl));
+    let cdr = subst_loop_it(*cdr, repl);
+    arena_cons(*car, cdr)
 }
 
 fn apply_loop_accumulation(
@@ -10387,6 +10430,10 @@ fn make_bytecode_closure(
     nested: &BytecodeFunction,
     captured_env: Option<Rc<RefCell<EnvFrame>>>,
 ) -> BlissVal {
+    // Building the installed lambda list can move literals in this cloned
+    // body before the registry owns it. Root the clone, not just its parent.
+    let nested = Rc::new(nested.clone());
+    let _nested_roots = ActiveBytecodeRoot::new(&nested);
     let sym = bliss_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
     let lambda_list = if nested.variadic {
@@ -10394,7 +10441,7 @@ fn make_bytecode_closure(
     } else {
         installed_lambda_list(nested.arity)
     };
-    registry_put(sym_idx, Rc::new(nested.clone()));
+    registry_put(sym_idx, Rc::clone(&nested));
     if let Some(frame) = captured_env {
         CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
     }
