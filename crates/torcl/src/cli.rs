@@ -33100,6 +33100,19 @@ fn eval_defmethod(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
     let (mut spec_params_form, mut body) = cp(cursor);
     torcl_rt::rooted_ref!(_spec_params_form_root = &mut spec_params_form);
     torcl_rt::rooted_ref!(_body_root = &mut body);
+    // The method body has an implicit block named after the generic function;
+    // a SETF method uses the underlying accessor name. Store the block in the
+    // body so interpreted execution and compiled/nested closures share exactly
+    // the same lexical exit scope.
+    let block_op = resolve_sym("BLOCK").unwrap();
+    let block_name = if name_form.is_cons() {
+        cp(cp(name_form).1).0
+    } else {
+        name_form
+    };
+    torcl_rt::rooted!(block_tail = arena_cons(block_name, body));
+    torcl_rt::rooted!(block_form = arena_cons(block_op, *block_tail));
+    body = arena_cons(*block_form, NIL);
     let method_id = next_stdlib_class_id();
 
     // Parse the specialized lambda list. Required parameters (before any
@@ -38698,5 +38711,33 @@ mod symbol_bare_name_tests {
                 "symbol_bare_name disagreed with the reference on {name:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod method_block_tests {
+    use super::*;
+
+    #[test]
+    fn named_return_method_installs_a_compiled_body() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env(
+            "(defmethod method-block-compiled ((x t)) (return-from method-block-compiled x))",
+            &mut env,
+        )
+        .unwrap();
+        let symbol = resolve_sym("METHOD-BLOCK-COMPILED").unwrap();
+        let name = function_name_key(symbol);
+        let method_id = env.methods.borrow()[&name][0].method_id.0;
+        assert!(
+            METHOD_COMPILED.with(|methods| methods.borrow().contains_key(&method_id)),
+            "named RETURN-FROM must not force a method back to interpretation"
+        );
+        assert_eq!(
+            read_eval_all_env("(method-block-compiled 42)", &mut env).unwrap(),
+            TorclVal::from_fixnum(42)
+        );
     }
 }
