@@ -5,6 +5,73 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## PGO experiment: held-out initial loads (2026-09-24, bliss-j9de)
+
+**Experimental, not shipped.** Rust instrumentation profile-guided optimization
+removes another material fraction of initial cached-load work beyond the
+ThinLTO baseline `a42cc6c`. No production build configuration, default image,
+installed executable, or machine-generated profile was changed by this spike.
+
+The final training set uses bundled ASDF, a synthetic 24-file system, and
+CLOS/hash/sequence/condition checks. It has no third-party dependencies;
+**neither Babel nor CL-PPCRE is in training**. Cache preparation runs separately
+and its profile is excluded. Three fresh cached-system processes and three
+runtime processes supply the training profile. Five alternating CPU-0-pinned
+fresh-process measurements per held-out library give:
+
+| Initial-load median | ThinLTO baseline | ThinLTO + PGO |
+|---|---:|---:|
+| Babel instructions | 3.497 G | **2.815 G (19.5% less)** |
+| Babel cycles | 1.422 G | **1.242 G (12.6% less)** |
+| CL-PPCRE instructions | 1.804 G | **1.390 G (22.9% less)** |
+| CL-PPCRE cycles | 0.673 G | **0.579 G (13.9% less)** |
+
+These windows count the first ASDF system load from populated FASL caches,
+not process startup, training, or repeated loads. No measured load recompiles
+source or collects garbage. Lisp allocation is unchanged: Babel 10,185,616
+bytes, CL-PPCRE 3,701,024 bytes. Three fresh SBCL reference loads per library,
+immediately preceding this batch, have median cycles 0.624 G and 0.558 G:
+the candidate remains about **2.0× SBCL cycles for Babel**, versus **1.04× for
+CL-PPCRE**. This is not wall-time parity; clock regimes still vary. An earlier
+profile trained on Flexi Streams plus synthetic runtime work also reduced
+held-out cycles by 11.8% and 12.8%, respectively.
+
+Both candidate profiles produce all 15,106 Babel reverse-table entries
+identically to SBCL, normally and with stress stride 20,000, poison, and heap
+verification. The actual CL-PPCRE scanner/full-GC probe also passes with poison
+and verification. Full workspace tests, GNU-target PGO, saved-image restart,
+and broad non-load performance regression checks have **not** been run for
+PGO; these focused checks do not establish production readiness.
+
+Toolchain: rustc 1.94.1, LLVM 21.1.8, matching llvm-profdata 21.1.8. The
+instrumented release build took 2m08s; profile-use rebuilds took about 2m36s.
+The use builds enable `-pgo-warn-missing-function` and report no profile
+mismatch warnings; the existing unused-mut warning remains (`bliss-d3hs`).
+Builds use isolated `target/pgo-probe`, absolute profile paths, and the same
+base compiler flags and target. Profiles must be regenerated for their build,
+not committed or silently reused across unrelated sources/toolchains.
+
+Training exposed two baseline correctness bugs, not PGO regressions:
+`bliss-7zc7` (Flexi in-memory input constructor has no applicable VECTOR
+method), and `bliss-t4qs` (ordinary top-level INCF executes during COMPILE-FILE:
+TorCL counter 1 after compile / 2 after load, SBCL 0 / 1). Fresh cached synthetic
+loads correctly execute each of the 24 units once. Keeper training must make
+its phases explicit without concealing the compile-time side-effect defect.
+
+Stabilization is tracked in dependent Beads tasks: `bliss-08hq` (deterministic
+dependency-free training), `bliss-84km` (guarded opt-in `make pgo-image`), and
+`bliss-lm5f` (full validation and fresh held-out measurements). Opt-in is the
+proposed default pending user preference; the spike scripts are disposable,
+not an existing supported build workflow. The overall initial-load goal remains
+open.
+
+Artifacts: `/tmp/torcl-pgo-portable-{babel,ppcre}-{before,after}-[12345].{log,stat}`,
+`/tmp/torcl-pgo-{babel,ppcre}-sbcl-[123].{log,stat}`,
+`/tmp/torcl-pgo-portable-tables-{normal,stress}.log`,
+`/tmp/torcl-pgo-portable-regex-gc.log`, and
+`/tmp/torcl-pgo-portable-{training-v2,build}.log`. Exclude the
+`ppcre-sbcl-warm` files from performance comparisons: they include compilation.
+
 ## Cross-crate release optimization (2026-09-24, bliss-zjwh)
 
 The previously deferred ThinLTO experiment reproduces against `f8cad53`, including
