@@ -42,22 +42,25 @@ cargo build -p torcl
 Build the standalone `torcl` executable with ASDF preloaded, then install it:
 
 ```sh
-make image              # produces target/torcl
+make image              # trains PGO and produces target/torcl
 sudo make install       # installs /usr/local/bin/torcl
 ```
 
-An experimental opt-in profile-guided build uses dependency-free synthetic
-training to optimize the Rust runtime. It requires `llvm-profdata` matching the LLVM
+`make image` uses profile-guided optimization (PGO) by default, with dependency-free
+synthetic training to optimize the Rust runtime. It requires `llvm-profdata` matching the LLVM
 version printed by `rustc -vV` (the Rust `llvm-tools-preview` component is
 preferred; alternatively set `LLVM_PROFDATA` to a matching executable):
 
 ```sh
-TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh make pgo-image
+rustup component add llvm-tools-preview
+TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh make image
 ```
 
 This performs two release builds plus training, then saves and restarts the
 ASDF image before atomically replacing `target/torcl`. It does not install it.
-`make image` and ordinary Cargo builds remain unchanged. Build logs, private
+`make pgo-image` remains an alias. For an ordinary release image without training
+or `llvm-profdata`, use `make image-no-pgo`; ordinary Cargo builds are unchanged.
+PGO failures are reported, never silently replaced with a non-PGO build. Build logs, private
 training caches, and profiles are retained under a fresh `target/pgo/run.*`
 directory; preparation profiles are excluded from optimization training.
 Profiles are local build artifacts, not distributable inputs to unrelated

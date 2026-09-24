@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in, local instrumentation PGO. Run from any directory. No installation.
+# Local instrumentation PGO, used by `make image`. No installation.
 # All build/profile artifacts are retained in a fresh directory for diagnosis.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)

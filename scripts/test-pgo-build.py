@@ -2,7 +2,7 @@
 """Build-orchestration tests with cheap external-tool substitutes.
 
 These test failure isolation and command contracts, not LLVM or TorCL itself.
-A real capped `make pgo-image` is the separate end-to-end validation.
+A real capped `make image` is the separate end-to-end validation.
 """
 import json
 import os
@@ -108,6 +108,50 @@ class PgoBuildTests(unittest.TestCase):
 
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def run_make(self, target, **overrides):
+        return subprocess.run(
+            ["make", "--no-print-directory", target], cwd=ROOT,
+            env=dict(self.env, **overrides), text=True, capture_output=True,
+        )
+
+    def test_make_image_uses_pgo_and_honors_output_override(self):
+        result = self.run_make("image")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [c for c in self.commands() if c["name"] == "cargo"]
+        self.assertEqual(len(builds), 2)
+        self.assertIn("-Cprofile-generate=", builds[0]["flags"])
+        self.assertIn("-Cprofile-use=", builds[1]["flags"])
+        self.assertNotEqual(self.image.read_bytes(), b"previous image")
+
+    def test_make_image_failure_does_not_fall_back_or_replace_image(self):
+        result = self.run_make("image", PGO_TEST_LLVM="23.1.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.image.read_bytes(), b"previous image")
+        self.assertFalse(any(c["name"] == "cargo" for c in self.commands()))
+
+    def test_image_aliases_share_one_build(self):
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-n", "image", "pgo-image"],
+            cwd=ROOT, env=self.env, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("bash scripts/build-pgo-image.sh"), 1)
+
+    def test_explicit_non_pgo_and_install_remain_independent(self):
+        for target in ("image-no-pgo", "install"):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["make", "--no-print-directory", "-n", target], cwd=ROOT,
+                    env=self.env, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("build-pgo-image.sh", result.stdout)
+                if target == "image-no-pgo":
+                    self.assertIn("build --workspace --release", result.stdout)
+                    self.assertIn("scripts/build-image.lisp", result.stdout)
+                else:
+                    self.assertNotIn("cargo build", result.stdout)
 
     def test_success_uses_only_selected_profiles_and_preserves_base_flags(self):
         base = "-Copt-level=3\x1f--cfg=fixture"

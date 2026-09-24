@@ -22,7 +22,7 @@ TORCL_EXE := target/torcl
 
 .DEFAULT_GOAL := build
 .PHONY: build check test test-rt test-cli clippy fmt fmt-check clean release run \
-        help image pgo-image test-pgo-build install uninstall
+        help image pgo-image image-no-pgo test-pgo-build install uninstall
 
 ## build: compile the whole workspace (default target)
 build:
@@ -64,24 +64,26 @@ release:
 run:
 	$(CARGO) run -p torcl -- $(ARGS)
 
-## image: dump the standalone `torcl` executable (runtime + ASDF-loaded image)
+## image: build a profile-guided standalone executable with ASDF preloaded
 # Run this as your normal user — it invokes cargo. `install` only copies the
 # result, so `sudo make install` needs no cargo in root's PATH.
 image: $(TORCL_EXE)
 
-## pgo-image: build a profile-guided ASDF image (requires matching llvm-profdata)
-pgo-image:
-	CARGO="$(CARGO)" bash scripts/build-pgo-image.sh
+## pgo-image: alias for image (requires matching llvm-profdata)
+pgo-image: image
 
 ## test-pgo-build: test PGO orchestration and failure isolation without compiling
 test-pgo-build:
 	python3 scripts/test-pgo-build.py
 
-# Depends on the phony `release` so cargo (the source of truth for freshness)
-# always runs — a bare file dependency on $(RELEASE_BIN) would let make skip the
-# rebuild after Rust sources change. `install` does NOT depend on this, so it
-# needs no cargo.
-$(TORCL_EXE): release scripts/build-image.lisp
+# Always retrain for the current sources/toolchain; an existing image alone
+# cannot establish profile freshness. `install` remains a copy-only operation.
+.PHONY: $(TORCL_EXE)
+$(TORCL_EXE):
+	CARGO="$(CARGO)" TORCL_IMAGE_OUT="$(or $(TORCL_IMAGE_OUT),$(TORCL_EXE))" bash scripts/build-pgo-image.sh
+
+## image-no-pgo: build an ordinary release image without training or llvm-profdata
+image-no-pgo: release
 	TORCL_IMAGE_OUT=$(TORCL_EXE) $(RELEASE_BIN) --no-init --load scripts/build-image.lisp
 
 ## install: install `torcl` (ASDF-preloaded executable) to $(DESTDIR)$(PREFIX)/bin

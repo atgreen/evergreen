@@ -5,10 +5,35 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
-## Opt-in PGO images and the actual CLI gap (2026-09-24, bliss-84km)
+## PGO is the default image build (2026-09-24, bliss-jcr9)
+
+At the user's request, `make image` now runs the guarded PGO pipeline described
+below. `make pgo-image` is an alias; `make image-no-pgo` retains the ordinary
+release-image recipe. `make install` still only copies the existing executable.
+The image target always retrains for the current sources and toolchain, including
+when `target/torcl` already exists. A missing or mismatched `llvm-profdata` is an
+error, not a silent fallback. Ordinary Cargo builds remain unchanged.
+
+This changes the build default, not the scope of the performance evidence below.
+It does not fix the unported ocicl `trivial-features` dependency or the ASDF
+unsupported-implementation error runaway (`bliss-xku1`).
+
+Validation: 12 orchestration tests pass, including default routing, output
+override, failure isolation, alias coalescing, and non-PGO/install separation.
+A real capped `make image` completed both compiler passes (2m12s/2m46s), all
+training phases, image save and restart (`PGO-IMAGE-OK`), then loaded cached
+Babel with the correct Hello encoding. The isolated output is
+`target/pgo-default-check/torcl`; profiles/logs are in `target/pgo/run.urm6ec/`.
+Neither the installed executable nor the user's default image was replaced.
+Shellcheck, shell syntax, formatting and diff checks pass. Spec coverage still
+reports the tracked 14 uncovered/11 unstaged requirements; the separate full
+PGO-harness validation (`bliss-lm5f`) remains in progress. Review was a solo
+adversarial review, not an independent review.
+
+## Initially opt-in PGO images and the actual CLI gap (2026-09-24, bliss-84km)
 
 `make pgo-image` now provides the reproducible instrument/train/merge/use/image
-pipeline. Ordinary `make image` and Cargo release builds are unchanged. It
+pipeline. At that point ordinary `make image` and Cargo release builds were unchanged. It
 requires llvm-profdata matching rustc's LLVM version, uses fresh private build
 and profile directories, excludes preparation profiles, checks each training
 run's results and raw profile, and rejects profile-use warnings. Image saving
