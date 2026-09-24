@@ -5,6 +5,79 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Keep numeric literals in compiled artifacts (2026-09-24, bliss-ujsc)
+
+BBU version 1.10 adds the reserved portable bignum and double-float constant
+encodings. Doubles preserve their IEEE bits; integers use signed little-endian
+magnitude bytes, including partial final limbs. Ratio constants can now contain
+bignum components. The parser rejects invalid signs, noncanonical magnitudes,
+truncation, and use of the new tags under an older bytecode version. Existing
+artifacts remain readable; an old reader rejects the new version cleanly.
+
+This avoids **whole-file source fallback** for Alexandria's `types.lisp` and
+`numbers.lisp`. It removes source reading/expansion during the initial load,
+not merely a few decoder instructions. The throwaway probe was removed before
+keeper implementation; both pool units and the source-free artifact regression
+were observed failing before the implementation.
+
+Five alternating CPU-0-pinned release samples against `b0e0fdc`, fresh
+processes with populated build-specific FASL caches, before test jobs:
+
+| Median | Before | Numeric literal encoding |
+|---|---:|---:|
+| Initial Babel FASL load | 0.969 s | **0.925 s (4.5% less)** |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 3.39× | **3.23×** |
+| Initial-load instructions (three isolated windows) | 4.354 G | **4.138 G (5.0% less)** |
+| Lisp bytes allocated during load | 13,465,040 | **12,610,480 (6.3% less)** |
+| Whole-process instructions | 17.522 G | **17.313 G (1.2% less)** |
+
+Both versions perform **zero minor and zero major collections** during all
+measured loads. Initial-load wall ranges are 0.832–0.975 s before and
+0.806–0.932 s after; SBCL spans 0.285–0.288 s. Whole-process wall medians
+are **3.29 → 3.38 s**, with ranges 3.25–3.44 and 2.84–3.40 s. Whole-process
+wall time is noisy and slightly worse in this batch: do not infer a startup
+speedup from the load-window result. The remaining initial-load gap is still
+substantial.
+
+Exact-bit pool tests include signed zero, subnormals, infinities, a NaN payload,
+multi-limb positive/negative bignums, and pool canonicalization. The exact-value
+unit also passes every-allocation stress with poison and heap verification.
+The source-deleted artifact test rejects legacy source and EvalSource, and
+loads nested numeric literals and a big-denominator ratio at stress strides
+1, 7, and 31 with forced T1, poison, and verification. Normal and stress-20,000
+Babel output match fresh SBCL on all 15,106 reverse-table entries. A saved
+`b0e0fdc` binary produces an old numeric artifact accepted by the new reader
+and cleanly rejects a new artifact with `unsupported bytecode version 0x010a`.
+Review is adversarial self-review, not independent.
+
+Final gates: CLI units pass 40/40; CLI integration reports **723 passed, one
+known T2-observability failure, three ignored** (`bliss-ugmu`). All 358
+acceptance, 52 FASL, and 12 bytecode differential tests pass. The non-CLI
+workspace suite reports 1,777 passed, five known failures, four ignored:
+STRINGP compiler metadata (`bliss-4ihx`) and four sequence fixtures
+(`bliss-0bdl`). The two existing Lisp-as-Rust doctests still fail (`bliss-pqyy`).
+Workspace check passes with the tracked unused-mut warning (`bliss-d3hs`).
+Root lint reports six baseline findings, zero new. Strict clippy stops at the
+nine existing runtime diagnostics (`bliss-5vr`); spec coverage and existing
+format drift remain (`bliss-kjjd`, `bliss-2uj1`), with no new formatting
+findings in the changed code. These are not all-green workspace results.
+
+Artifacts are `/tmp/babel-number-final-*`, `/tmp/babel-number-*.log`, and
+`/tmp/babel-number-final-bench.sh`. The preceding T0 dispatch-before-metadata
+probe saved only 0.05% of load instructions and was removed (`bliss-pwbb`).
+The distinct native function-cell epoch idea remains unmeasured (`bliss-dw24`).
+The refreshed isolated-load profile (`bliss-xqz0`) is
+`/tmp/babel-post-literals.perf`: 3,968 samples, zero lost, no source compilation
+and no GC. Self samples: memcpy 12.26%, run_loop 5.22%, eval_list 3.55%,
+find_index 3.42%, symbol_function 3.38%. Inclusive samples: bind_variadic 7.69%,
+eval_make_instance 5.84%, ClassDef cloning 2.04%, source reading/evaluation
+12.24%, extended LOOP 10.52%, constant materialization 2.29%. These overlap;
+Lisp execution beneath an interpreter frame is not all removable overhead.
+Tests were active during sampling, so this profile supplies attribution, not
+wall-time evidence. The next copying investigation is `bliss-gv5v`; a
+speculative error-boxing rewrite is not justified by this profile alone.
+
 ## Remove value/sequence/comparison form bridges (2026-09-24, bliss-ixm0)
 
 The next measured batch removes quoted-form reconstruction for VALUES,

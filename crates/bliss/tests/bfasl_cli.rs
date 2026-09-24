@@ -74,7 +74,12 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
         pos += 1;
         match tag {
             0 | 1 => {}
-            2 => pos += 8,
+            2 | 6 => pos += 8,
+            3 => {
+                pos += 1;
+                let len = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4 + len;
+            }
             5 | 7 | 12 => pos += 4,
             8 => {
                 let len = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
@@ -90,7 +95,8 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
                 pos += 4 + count * 4;
             }
             11 => pos += 9,
-            13 => pos += 8,
+            13 | 16 | 17 => pos += 8,
+            18 => pos += 4,
             other => panic!("test BBU parser does not know constant tag {other}"),
         }
     }
@@ -483,6 +489,73 @@ fn numeric_predicates_load_without_source_under_gc_stress() {
         assert_eq!(
             String::from_utf8_lossy(&loaded.stdout).trim(),
             "PRED-FASL ((T NIL NIL) (NIL T NIL) (NIL NIL T) (NIL T NIL) (NIL NIL T) T NIL)",
+            "stride {stride}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// R6.71/R6.75: heap numeric literals must not turn a compiled unit back into
+/// source. Nested constants and exact ratios survive a fresh moving-GC load.
+#[test]
+fn numeric_literals_load_without_source_under_gc_stress() {
+    let dir = workdir("numeric-literals");
+    let src = dir.join("literals.lisp");
+    let out = dir.join("literals.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun numeric-literals ()
+        '(1.0000000000000002d0 -0.0d0
+          #(1267650600228229401496703205377 -1267650600228229401496703205377)
+          1/1267650600228229401496703205376))
+      (let ((v (numeric-literals)))
+        (format t "LITERALS ~S~%"
+          (list (= (first v) 1.0000000000000002d0)
+                (> (first v) 1.0d0)
+                (= (second v) -0.0d0)
+                (= (aref (third v) 0) (+ (ash 1 100) 1))
+                (= (aref (third v) 1) (- (+ (ash 1 100) 1)))
+                (= (car (cdr (cdr (cdr v)))) (/ 1 (ash 1 100))))))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("numeric literals require bytecode");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "numeric literals fell back to EvalSource");
+    }
+    fs::remove_file(&src).unwrap();
+    for stride in ["1", "7", "31"] {
+        let loaded = Command::new(BIN)
+            .args(["--no-init", "--no-bootstrap", "--load"])
+            .arg(&out)
+            .env("BLISS_FORCE_TIER", "t1")
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .env("BLISS_GC_VERIFY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&loaded.stdout).trim(),
+            "LITERALS (T T T T T T)",
             "stride {stride}"
         );
     }

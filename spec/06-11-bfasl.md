@@ -183,6 +183,20 @@ primitive constants.  Cycles are not allowed in the portable constant pool; a
 compiler that needs circular literal structure MUST emit load-time bytecode to
 construct it and store the result in a `LoadTimeCell`.
 
+#### Exact numeric literals (bytecode version 1.10)
+
+Version 1.10 implements `Bignum` (tag 3) and `DoubleFloat` (tag 6).
+The bignum sign byte is `0 = positive`, `1 = negative`; other values are
+rejected. The magnitude is nonempty and has a nonzero final (most significant)
+byte. Zero is emitted as `Fixnum(0)`. A partial final 64-bit limb is legal:
+the byte encoding does not depend on the runtime's limb width. The reader
+bounds-checks the magnitude length before allocating its buffer and reconstructs
+an exact integer, canonicalizing to a fixnum when it fits. Double floats retain
+all 64 IEEE-754 bits, including signed zero, subnormals, and NaN payloads.
+These tags require version 1.10 or later; the loader continues to accept older
+units without them. Existing ratio entries can reference these bignum entries,
+so exact ratios are no longer restricted to fixnum-sized components.
+
 ### 6.11.3.3 Function Table
 
 Each function record serializes one §4.4.3 `BytecodeFunction`.

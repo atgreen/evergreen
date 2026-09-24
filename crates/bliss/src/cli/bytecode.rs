@@ -7562,7 +7562,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // clause body PC, var slot) serialize in a new auxiliary table (kind 9).
 // A BBU is authoritative: an unsupported version is rejected, never replaced
 // by executing source text from the container.
-const BBU_BYTECODE_VERSION: u16 = 0x0109;
+// 0x010a: exact Bignum (tag 3) and DoubleFloat (tag 6) literals.
+const BBU_BYTECODE_VERSION: u16 = 0x010a;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -7713,6 +7714,29 @@ impl BbuConstPool {
             bytes.extend_from_slice(&v.as_single_float().to_bits().to_le_bytes());
             return Some(self.intern_encoded(bytes));
         }
+        if v.is_double_float() {
+            let mut bytes = vec![6];
+            put_u64(&mut bytes, v.as_double_float().to_bits());
+            return Some(self.intern_encoded(bytes));
+        }
+        if let Some(integer) = bliss_rt::bignum::bigint_from_val(v) {
+            // No process-local heap layout or native-width limbs on disk.
+            let mut magnitude: Vec<u8> = integer
+                .mag
+                .iter()
+                .flat_map(|limb| limb.to_le_bytes())
+                .collect();
+            while magnitude.last() == Some(&0) {
+                magnitude.pop();
+            }
+            if magnitude.is_empty() {
+                return self.value(BlissVal::from_fixnum(0));
+            }
+            let mut bytes = vec![3, u8::from(integer.sign < 0)];
+            put_u32(&mut bytes, u32::try_from(magnitude.len()).ok()?);
+            bytes.extend_from_slice(&magnitude);
+            return Some(self.intern_encoded(bytes));
+        }
         if v.is_character() {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 7);
@@ -7771,7 +7795,7 @@ impl BbuConstPool {
         }
         // A ratio (e.g. `1/2`): pool its numerator and denominator (fixnums or
         // bignums, themselves poolable) and reconstruct the RATIO heap object on
-        // load. Bignum parts that are not poolable make the whole ratio bail.
+        // load, preserving exact parts even when they exceed the fixnum range.
         if let Some((mut num, mut den)) = super::ratio_parts_val(v) {
             bliss_rt::rooted_ref!(_num_root = &mut num);
             bliss_rt::rooted_ref!(_den_root = &mut den);
@@ -9454,6 +9478,11 @@ enum BbuConstant {
     T,
     Fixnum(i64),
     SingleFloat(u32),
+    DoubleFloat(u64),
+    Bignum {
+        negative: bool,
+        magnitude: Vec<u8>,
+    },
     Character(u32),
     String(String),
     Package {
@@ -9615,7 +9644,25 @@ fn parse_bbu_constant(
         0 => BbuConstant::Nil,
         1 => BbuConstant::T,
         2 => BbuConstant::Fixnum(cursor.i64()?),
+        3 if bytecode_version >= 0x010a => {
+            let negative = match cursor.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(bbu_error("invalid bignum sign")),
+            };
+            let len = cursor.u32()? as usize;
+            // Bounds-check against the file before allocating any limb buffer.
+            let magnitude = cursor.take(len)?;
+            if magnitude.is_empty() || magnitude.last() == Some(&0) {
+                return Err(bbu_error("noncanonical bignum magnitude"));
+            }
+            BbuConstant::Bignum {
+                negative,
+                magnitude: magnitude.to_vec(),
+            }
+        }
         5 => BbuConstant::SingleFloat(cursor.u32()?),
+        6 if bytecode_version >= 0x010a => BbuConstant::DoubleFloat(cursor.u64()?),
         7 => BbuConstant::Character(cursor.u32()?),
         8 => {
             let len = cursor.u32()? as usize;
@@ -9843,6 +9890,23 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
                 BlissVal::from_fixnum(*value)
             }
             BbuConstant::SingleFloat(bits) => BlissVal::from_single_float(f32::from_bits(*bits)),
+            BbuConstant::DoubleFloat(bits) => {
+                bliss_rt::gc::alloc_double_float(f64::from_bits(*bits))
+            }
+            BbuConstant::Bignum {
+                negative,
+                magnitude,
+            } => {
+                let limbs = magnitude
+                    .chunks(8)
+                    .map(|chunk| {
+                        let mut bytes = [0; 8];
+                        bytes[..chunk.len()].copy_from_slice(chunk);
+                        u64::from_le_bytes(bytes)
+                    })
+                    .collect();
+                bliss_rt::bignum::BigInt::from_mag(if *negative { -1 } else { 1 }, limbs).to_val()
+            }
             BbuConstant::Character(code) => char::from_u32(*code)
                 .map(BlissVal::from_char)
                 .ok_or_else(|| bbu_error(format!("invalid character scalar {code}")))?,
@@ -19478,5 +19542,82 @@ mod jtc4_stack_map_tests {
             BbuConstant::LegacySymbol(3)
         ));
         assert!(cursor.done());
+    }
+
+    #[test]
+    fn bbu_numeric_literals_preserve_bits_and_exact_integers() {
+        let mut pool = BbuConstPool::default();
+        let float_bits = [
+            0,
+            1,
+            0x8000_0000_0000_0000,
+            0x3ff0_0000_0000_0001,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff8_0000_0000_1234,
+        ];
+        let mut refs = Vec::new();
+        for bits in float_bits {
+            bliss_rt::rooted!(value = bliss_rt::gc::alloc_double_float(f64::from_bits(bits)));
+            let index = pool.value(*value).expect("double-float must be poolable");
+            assert_eq!(pool.entries[index as usize][0], 6);
+            assert_eq!(pool.value(*value), Some(index), "canonical pool entry");
+            refs.push(index);
+        }
+        let integers = [
+            bliss_rt::bignum::BigInt::from_mag(1, vec![1 << 60]),
+            bliss_rt::bignum::BigInt::from_mag(-1, vec![(1 << 60) + 1]),
+            bliss_rt::bignum::BigInt::from_mag(1, vec![u64::MAX, 0, 0x123]),
+            bliss_rt::bignum::BigInt::from_mag(-1, vec![0, 0, 0x123]),
+        ];
+        for integer in &integers {
+            bliss_rt::rooted!(value = integer.to_val());
+            let index = pool.value(*value).expect("bignum must be poolable");
+            assert_eq!(pool.entries[index as usize][0], 3);
+            assert_ne!(pool.entries[index as usize].last(), Some(&0));
+            assert_eq!(pool.value(*value), Some(index), "canonical pool entry");
+            refs.push(index);
+        }
+        let constants = pool
+            .entries
+            .iter()
+            .map(|bytes| {
+                let mut cursor = BbuCursor::new(bytes);
+                let constant = parse_bbu_constant(&mut cursor, BBU_BYTECODE_VERSION).unwrap();
+                assert!(cursor.done());
+                constant
+            })
+            .collect::<Vec<_>>();
+        bliss_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
+        for (index, bits) in refs.iter().zip(float_bits) {
+            assert_eq!(values[*index as usize].as_double_float().to_bits(), bits);
+        }
+        for (index, expected) in refs[float_bits.len()..].iter().zip(integers) {
+            let actual = bliss_rt::bignum::bigint_from_val(values[*index as usize]).unwrap();
+            assert_eq!(actual.sign, expected.sign);
+            assert_eq!(actual.mag, expected.mag);
+        }
+    }
+
+    #[test]
+    fn bbu_numeric_literal_decoder_checks_version_and_encoding() {
+        // Tag 3, negative magnitude 0x123: a partial final limb is valid.
+        let bytes = [3, 1, 2, 0, 0, 0, 0x23, 1];
+        assert!(parse_bbu_constant(&mut BbuCursor::new(&bytes), 0x010a).is_ok());
+        assert!(parse_bbu_constant(&mut BbuCursor::new(&bytes), 0x0109).is_err());
+        for bad in [
+            vec![3, 2, 1, 0, 0, 0, 1],      // invalid sign
+            vec![3, 0, 0, 0, 0, 0],         // empty magnitude
+            vec![3, 0, 2, 0, 0, 0, 1, 0],   // noncanonical high zero byte
+            vec![3, 0, 4, 0, 0, 0, 1],      // truncated magnitude
+            vec![3, 0, 255, 255, 255, 255], // oversized declared length
+            vec![6, 0, 0, 0],               // truncated double
+        ] {
+            assert!(parse_bbu_constant(&mut BbuCursor::new(&bad), 0x010a).is_err());
+        }
+        let double = [6, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(parse_bbu_constant(&mut BbuCursor::new(&double), 0x0109).is_err());
+        assert!(parse_bbu_constant(&mut BbuCursor::new(&double), 0x010a).is_ok());
     }
 }
