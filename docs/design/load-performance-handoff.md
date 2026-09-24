@@ -5,10 +5,98 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Opt-in PGO images and the actual CLI gap (2026-09-24, bliss-84km)
+
+`make pgo-image` now provides the reproducible instrument/train/merge/use/image
+pipeline. Ordinary `make image` and Cargo release builds are unchanged. It
+requires llvm-profdata matching rustc's LLVM version, uses fresh private build
+and profile directories, excludes preparation profiles, checks each training
+run's results and raw profile, and rejects profile-use warnings. Image saving
+and restart validation happen in a staging directory beside the destination;
+only then is the old executable atomically replaced. Python orchestration
+tests cover failure isolation and run in CI. See README for configuration.
+
+Real musl and GNU runs both build, train, save, and restart ASDF images. The GNU
+run also exercises a space-containing build directory. Musl compiler passes
+took 2m55s and 2m44s; GNU passes took 1m25s and 1m59s, with concurrent validation
+affecting those times. Both have only the tracked unused-mut warning, no
+profile-mismatch warnings. Validation outputs are isolated at
+`target/pgo-candidate/torcl` and `target/pgo-gnu-candidate/torcl`: neither the
+existing default `target/torcl` nor `/usr/local/bin/torcl` was replaced.
+
+After build/test jobs stopped, five alternating CPU-0-pinned fresh processes
+per workload/build measured first cached loads using the **actual ASDF-preloaded
+executables**, without reloading ASDF into those images:
+
+| Saved-image load | ThinLTO cycles | PGO cycles | Reduction | SBCL cycles |
+|---|---:|---:|---:|---:|
+| Babel | 2.359 G | 2.012 G | **14.7%** | 0.707 G |
+| CL-PPCRE | 1.010 G | 0.853 G | **15.5%** | 0.621 G |
+
+Instructions fall 6.284 → 5.095 G for Babel and 2.778 → 2.170 G for CL-PPCRE.
+Allocation is unchanged at 12,094,944 and 4,298,272 Lisp bytes respectively;
+no measured load recompiles source or collects garbage. Three fresh SBCL
+references per library were taken in the same batch. Saved-image wall medians
+are Babel **0.550 → 0.473 s** (SBCL 0.166 s), and CL-PPCRE
+**0.234 → 0.202 s** (SBCL 0.144 s). This batch's Babel ranges are tight:
+0.548–0.557 s before, 0.471–0.480 s after. These are measured batch results,
+not universal wall-clock promises. Process startup is excluded.
+
+**The earlier ~2× Babel figure was for the raw runtime, not the saved-image
+CLI.** The actual PGO saved-image load remains **~2.85× SBCL cycles for Babel**
+and **~1.37× for CL-PPCRE**. The saved image does substantially more work than
+the raw runtime even though startup is outside the counter window. In the
+same validation session, raw runtime Babel uses 3.500 → 2.816 G instructions
+and 1.498 → 1.307 G cycles (12.7% less); raw CL-PPCRE uses
+1.801 → 1.390 G instructions and 0.707 → 0.608 G cycles (14.1% less).
+The raw-runtime allocation is also lower: 10,185,616 and 3,701,024 bytes.
+`bliss-c6td` tracks profiling and removing this image-specific overhead;
+restored tiers, method state, and captures are leads, not established causes.
+There is an initialization confound: `REQUIRE ASDF` (used to build the image)
+explicitly loads `lib/asdf.lisp`, while the raw benchmark loads `lib/asdf.bfasl`.
+A follow-up raw PGO control using REQUIRE/source still uses only 2.935 G
+instructions, 1.388 G cycles, and 10,120,080 Lisp bytes in the Babel window.
+That single sample suggests the source/FASL difference alone does not explain
+most of the image gap; compare images built both ways and profile restoration
+before assigning a cause. Its log/counters are
+`/tmp/torcl-pgo-source-asdf-control.{log,stat}`.
+
+Focused musl PGO checks pass: all 15,106 Babel reverse-table entries match
+normal/stress-20,000/poison/verify/SBCL; the actual regex scanner survives full
+GC; the saved image loads cached Babel; the complete training-fixture regression
+passes on the profile-use compiler, including source compilation and missing
+FASL rejection. A held-out runtime probe (4M-iteration sum, sorting, mutable
+capture, multiple values) produces identical output on baseline, PGO, and SBCL.
+Five alternating pairs of that source/runtime probe also reduce median
+instructions 2.539 → 2.147 G and cycles 0.501 → 0.438 G. This window includes
+reading/compiling its Lisp source and executing its checks; it is not a pure
+steady-state loop benchmark or a blanket no-regression claim. GNU table results
+also match normal/stress/poison/verify/SBCL, and its saved image loads Babel.
+
+Normal workspace gates were rerun: default **2,569 pass / 12 fail / 7 ignored**;
+release **2,565 pass / 12 fail / 7 ignored**. Existing STRINGP, sequence-fixture,
+doctest, and parallel threading/safepoint failures remain. A newly observed
+normal-profile scheduler yield-order failure is filed as `bliss-8diq`; the
+exact default scheduler/threading binaries pass all 31 tests serially. The
+exact release threading/safepoint binaries also pass all 31 tests serially. These
+are normal builds, **not a full PGO-compiled Rust test-harness run**. Broader
+PGO validation remains tracked in `bliss-lm5f`; the workspace is not all green
+and the overall performance goal is not complete.
+
+Artifacts: `target/pgo/run.huOVbE/`, `target/pgo gnu/run.UEKgAt/`,
+`/tmp/torcl-pgo-keeper[-image]-{babel,ppcre}-{before,after,sbcl}-*.{log,stat}`,
+`/tmp/torcl-pgo-keeper-{default,release}-tests.log`, and
+`/tmp/torcl-pgo-keeper-{tables-normal,tables-stress,regex-gc,image-load}.log`.
+An earlier real run stopped because its executing shell script was edited
+mid-run; that failed validation attempt is retained at `target/pgo/run.NTaujw/`.
+The successful runs used a frozen script. A subsequently added regression
+checks that leftover staging diagnostics cannot turn a successfully published
+image into an apparent build failure; cleanup now retains them with a note.
+
 ## Reproducible PGO training fixture (2026-09-24, bliss-08hq)
 
 `scripts/pgo-workload.lisp` supplies dependency-free training phases for the
-forthcoming opt-in PGO build. It requires an absolute `TORCL_PGO_WORK` private
+opt-in PGO build. It requires an absolute `TORCL_PGO_WORK` private
 directory and `TORCL_PGO_PHASE` set to `prepare`, `load`, or `runtime`. Run each
 phase in a fresh process from the checkout root, with init files disabled.
 Preparation generates and compiles a 24-file ASDF system into its private
@@ -38,10 +126,10 @@ the printed temporary directory. ASDF configuration uses string path
 designators; the equivalent pathname-object destination exposes a baseline
 TorCL bug tracked as `bliss-hw5x`.
 
-This fixture is not yet a PGO image build. Its resulting profile still requires
-new held-out measurements; the experimental gains below do not automatically
-transfer to this version. The guarded build and full validation remain in
-`bliss-84km` and `bliss-lm5f`.
+The fixture's profile has now been remeasured through the guarded build
+(`bliss-84km`), as recorded above. The experimental gains below are historical
+spike results, not a substitute for those maintained-workflow measurements.
+Broader validation remains tracked in `bliss-lm5f`.
 
 ## PGO experiment: held-out initial loads (2026-09-24, bliss-j9de)
 

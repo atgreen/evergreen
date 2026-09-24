@@ -46,6 +46,33 @@ make image              # produces target/torcl
 sudo make install       # installs /usr/local/bin/torcl
 ```
 
+An experimental opt-in profile-guided build uses dependency-free synthetic
+training to optimize the Rust runtime. It requires `llvm-profdata` matching the LLVM
+version printed by `rustc -vV` (the Rust `llvm-tools-preview` component is
+preferred; alternatively set `LLVM_PROFDATA` to a matching executable):
+
+```sh
+TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh make pgo-image
+```
+
+This performs two release builds plus training, then saves and restarts the
+ASDF image before atomically replacing `target/torcl`. It does not install it.
+`make image` and ordinary Cargo builds remain unchanged. Build logs, private
+training caches, and profiles are retained under a fresh `target/pgo/run.*`
+directory; preparation profiles are excluded from optimization training.
+Profiles are local build artifacts, not distributable inputs to unrelated
+source revisions or toolchains. Allow several minutes and extra build storage.
+
+Overrides: `TORCL_PGO_TARGET` (default `x86_64-unknown-linux-musl`, must be
+runnable on the build host), `TORCL_PGO_ROOT` (artifact directory),
+`TORCL_IMAGE_OUT` (output executable), and `CARGO_BUILD_JOBS` (build parallelism).
+Both compiler passes preserve the same `CARGO_ENCODED_RUSTFLAGS` or `RUSTFLAGS`.
+Failures leave the previous output executable intact and retain logs; failed
+image stages may also leave a `.torcl-pgo.*` directory beside the output.
+Run `make test-pgo-build` for the orchestration tests (Python 3, no Rust build).
+Performance evidence and outstanding validation are in
+[the load-performance handoff](docs/design/load-performance-handoff.md).
+
 The implementation identifies itself as `TorCL` and provides the `:torcl`
 feature. Configuration uses `~/.torclrc` and `TORCL_*` environment variables.
 When migrating an existing installation, update initialization files and

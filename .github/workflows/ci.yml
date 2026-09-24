@@ -13,6 +13,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: PGO build orchestration contracts
+        run: make test-pgo-build
       - uses: dtolnay/rust-toolchain@stable
       - name: spec coverage gate
         run: python3 scripts/spec-coverage.py --gate

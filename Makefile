@@ -22,7 +22,7 @@ TORCL_EXE := target/torcl
 
 .DEFAULT_GOAL := build
 .PHONY: build check test test-rt test-cli clippy fmt fmt-check clean release run \
-        help image install uninstall
+        help image pgo-image test-pgo-build install uninstall
 
 ## build: compile the whole workspace (default target)
 build:
@@ -68,6 +68,14 @@ run:
 # Run this as your normal user — it invokes cargo. `install` only copies the
 # result, so `sudo make install` needs no cargo in root's PATH.
 image: $(TORCL_EXE)
+
+## pgo-image: build a profile-guided ASDF image (requires matching llvm-profdata)
+pgo-image:
+	CARGO="$(CARGO)" bash scripts/build-pgo-image.sh
+
+## test-pgo-build: test PGO orchestration and failure isolation without compiling
+test-pgo-build:
+	python3 scripts/test-pgo-build.py
 
 # Depends on the phony `release` so cargo (the source of truth for freshness)
 # always runs — a bare file dependency on $(RELEASE_BIN) would let make skip the
