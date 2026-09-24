@@ -5,6 +5,100 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Reduce short-copy latency in the musl CLI (2026-09-24, bliss-gv5v)
+
+The next win is below the Lisp dispatch layer. The post-literal profile put
+12.26% of self samples in musl `memcpy`; disassembly showed alignment and
+REP MOVSQ setup even for small buffers. Its missing frame pointer can skip
+the immediate caller in sampled stacks, so this was **not** evidence for a
+speculative error-object or ownership rewrite.
+
+The Linux x86-64 musl CLI now wraps `memcpy`: lengths 0–64 use bounded
+scalar/SSE2 head/tail copies, and larger lengths tail-call the original libc
+routine. All source chunks are loaded before any stores. SSE2 is baseline
+on x86-64; there is no CPU probing, AVX/ERMS dependency, allocation, lock,
+TLS, or runtime initialization. Cargo scopes the linker argument to this
+binary and target; GNU builds and library consumers retain their libc.
+An initial probe also changed bulk copies, but preserving libc above 64 bytes
+retained the gain, so that larger change was discarded.
+
+Five alternating CPU-0-pinned release samples against `2e97d50`, fresh
+processes with populated build-specific FASL caches, before test jobs:
+
+| Median | Before | Short-copy path |
+|---|---:|---:|
+| Initial Babel FASL load | 0.932 s | **0.801 s (14.1% less)** |
+| SBCL initial load, same batch | 0.287 s | 0.287 s |
+| Bliss / SBCL | 3.25× | **2.79×** |
+| Initial-load cycles (three isolated windows) | 1.974 G | **1.692 G (14.3% less)** |
+| Initial-load instructions (same windows) | 4.135 G | 4.109 G (0.6% less) |
+| Whole-process wall time | 3.40 s | 3.01 s |
+| Whole-process cycles | 7.248 G | 6.365 G |
+
+This is chiefly a latency gain, not eliminated Lisp work. Both versions
+allocate 12,610,480 Lisp bytes and perform zero minor/major collections in
+the measured load. Headline load ranges are 0.931–0.947 s before,
+0.797–0.807 s after, and 0.286–0.288 s for SBCL. Whole-process ranges are
+3.26–3.42 s before and 2.68–3.03 s after. One candidate isolated-window
+sample runs in 0.422 s instead of ~0.800 s while retaining similar cycles
+and instructions; use the five-pair headline and cycle evidence, not that
+outlier, for the claim. Performance evidence is from this host, not a
+cross-machine guarantee. The gap remains substantial.
+
+A second five-pair batch after the test-harness binding correction and all
+test jobs confirms **0.929 → 0.796 s (14.3% less)** for Bliss. Isolated-load
+cycles are **1.971 → 1.686 G (14.4% less)**, with instructions 4.128 → 4.113 G
+and unchanged allocation/GC. Whole-process wall medians are 3.38 → 2.88 s.
+However, this batch has pronounced frequency-regime shifts: SBCL spans
+0.153–0.286 s (median 0.206), and Bliss has a 0.404 s candidate sample.
+Its wall-time ratio is not comparable to the stable first batch; the ~2.8×
+headline above refers specifically to that first batch, not universal parity
+across clock regimes. The repeated cycle reduction corroborates the change.
+
+The keeper was rebuilt in a fresh Cargo target directory. Five dedicated
+tests check every short length and alignment pair, untouched surrounding
+bytes, read-only sources and inaccessible guard pages, zero-length invalid
+pointers, large libc fallbacks, concurrent calls, callee-saved registers and
+the direction flag, and overlapping small ranges. The bytewise oracle uses
+volatile accesses independently of memcpy. The initial three tests were
+observed failing against an inert stub before implementation. Linked-binary
+disassembly verifies the large-copy tail jump resolves to original `memcpy`,
+not the wrapper. A GNU release build has no wrapper symbol and passes a
+copy/reverse smoke test. Normal and stress-20,000/poison/verification Babel
+output match fresh SBCL on all 15,106 reverse-table entries. Review is
+adversarial self-review, not independent. It caught a binary-unit-test-only
+linker recursion: a `cfg(test)` fallback to `memcpy` was itself wrapped.
+The kernel now always names `__real_memcpy`; only the unwrapped integration
+test supplies a libc trampoline. The binary test harness then exits cleanly,
+and all five dedicated tests pass again.
+
+Final correctness gates: **729 CLI integration tests pass, zero fail, three
+ignored**, including all 358 acceptance, 52 FASL, and 12 differential tests.
+The previously flaky T2-observation case passes in this run. CLI units pass
+40/40. The non-CLI workspace has 1,777 passes, five known failures, four
+ignored: STRINGP metadata (`bliss-4ihx`) and four sequence fixtures
+(`bliss-0bdl`). Two existing Lisp-as-Rust doctests fail (`bliss-pqyy`).
+Workspace check passes with the tracked unused-mut warning (`bliss-d3hs`).
+Root lint has six baseline findings, zero new. Strict clippy stops at nine
+existing runtime diagnostics (`bliss-5vr`); spec coverage still has 14
+uncovered stage-5 requirements and 11 unstaged requirements (`bliss-kjjd`).
+Existing workspace format drift remains (`bliss-2uj1`); the new files pass
+targeted rustfmt and the changed lines pass diff checks. The whole workspace
+is not all green.
+
+Artifacts: `/tmp/babel-copy-first-batch/` (first benchmark),
+`/tmp/babel-copy-final-*` (repeat), `/tmp/babel-copy-*.log`, and
+`/tmp/babel-copy-final-bench.sh`. The refreshed frame-pointer profile
+(`bliss-9h2o`) is `/tmp/babel-post-copy.perf`: 3,545 samples, zero lost, no
+source compilation and no GC. Main-thread self samples: run_loop 5.04%,
+symbol_function 4.66%, find_index 3.34%, eval_list 3.15%, short-copy wrapper
+1.77%, original memcpy 1.10%. Inclusive samples: source read/eval 11.82%,
+extended LOOP 9.94%, variadic binding 5.17%, make-instance 4.53%, constant
+materialization 2.56%, ClassDef cloning 1.02%. Tests were active, so use this
+for attribution only. Inclusive costs overlap, not all are removable. The
+next bounded probe is `bliss-dw24`, the native function-cell epoch fast path,
+with a full mutation audit and redefinition guards intact.
+
 ## Keep numeric literals in compiled artifacts (2026-09-24, bliss-ujsc)
 
 BBU version 1.10 adds the reserved portable bignum and double-float constant

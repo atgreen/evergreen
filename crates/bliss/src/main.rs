@@ -2,6 +2,9 @@
 
 use bliss::cli;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
+mod short_copy;
+
 /// A per-thread free-list cache in front of the system allocator.
 ///
 /// musl's `mallocng` has no equivalent of glibc's `tcache`, and that single
