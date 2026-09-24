@@ -2830,6 +2830,36 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some((writer, args)) = self.generic_setf_writer_place(place) {
+                // A `(setf accessor)` generic uses the same calling convention
+                // as an ordinary writer: NEW-VALUE first, followed by the
+                // place subforms, even though those subforms are evaluated
+                // before NEW-VALUE. Preserve that order through temporary
+                // slots, then dispatch the synthetic function-name symbol
+                // through apply_function's ordinary generic-function path.
+                bliss_rt::rooted!(args = args);
+                let mut arg_slots = Vec::with_capacity(args.len());
+                for j in 0..args.len() {
+                    self.lower_expr(args[j])?;
+                    let slot = self.alloc_slot(&format!("__setf_arg{j}__"));
+                    self.emit(Instr::StoreLocal(slot));
+                    self.pop_n(1);
+                    arg_slots.push(slot);
+                }
+                self.lower_expr(items[2 * i + 1])?;
+                let mut nargs = 1u16;
+                for slot in arg_slots {
+                    self.emit(Instr::LoadLocal(slot));
+                    self.push_n(1);
+                    nargs += 1;
+                }
+                self.emit(Instr::CallNamed { sym: writer, nargs });
+                self.pop_n(nargs);
+                self.push_n(1);
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else if let Some((mut inst, mut slot)) = slot_value_setf_place(place) {
                 bliss_rt::rooted_ref!(_inst_root = &mut inst);
                 bliss_rt::rooted_ref!(_slot_root = &mut slot);
@@ -2864,7 +2894,9 @@ impl<'e> Lowerer<'e> {
                     self.pop_n(1);
                 }
             } else {
-                return Err(Bail);
+                return Err(record_bail(|| {
+                    format!("setf:unsupported-place:{}", super::fmt_form_debug(place))
+                }));
             }
         }
         Ok(())
@@ -2909,6 +2941,27 @@ impl<'e> Lowerer<'e> {
             return None;
         }
         Some((super::setf_writer_symbol_name(&name), list_to_vec(rest)))
+    }
+
+    /// Recognise a `(f args...)` place whose writer is a `(setf f)` generic.
+    /// The synthetic function-name symbol is the same representation used by
+    /// FUNCTION/FDEFINITION for compound function names, so CallNamed reaches
+    /// apply_function's generic dispatch without a host-evaluated SETF form.
+    fn generic_setf_writer_place(&self, place: BlissVal) -> Option<(u32, Vec<BlissVal>)> {
+        if !place.is_cons() {
+            return None;
+        }
+        let (op, rest) = cp(place);
+        if !op.is_symbol() {
+            return None;
+        }
+        let key = format!("(SETF {})", sym_name(op));
+        let is_generic = self.env.generics.borrow().contains_key(&key)
+            || self.env.methods.borrow().contains_key(&key);
+        if !is_generic {
+            return None;
+        }
+        Some((reader::intern_symbol(&key), list_to_vec(rest)))
     }
 
     /// Recognise a `(gethash key table)` place — exactly two arguments, head
@@ -7170,11 +7223,11 @@ fn compile_function_forcing_boxed(
                 bliss_rt::rooted_ref!(_expanded_root = &mut expanded);
                 *body = arena_cons(expanded, NIL);
             }
-            Err(_) => {
+            Err(err) => {
                 // A macrolet body that will not expand cannot be lowered; a
                 // capture-expand failure is best-effort — keep the raw body.
                 if uses_macrolet {
-                    let _ = record_bail(|| "macroexpand:macrolet".to_string());
+                    let _ = record_bail(|| format!("macroexpand:macrolet:{err}"));
                     return None;
                 }
             }
@@ -10649,18 +10702,65 @@ pub(super) fn lazy_compile_defun(
     // lexicals) that otherwise runs interpreted (bliss-mr4p). Only reached when
     // the fast path already declined, so it never slows a function that compiles
     // opportunistically; a genuinely unsupported form bails in both modes.
-    let compiled = compile_function(name, params, body, env, false, false)
-        .or_else(|| compile_function(name, params, body, env, true, false));
+    let compiled = match compile_function(name, params, body, env, false, false) {
+        Some(fast) if contains_host_eval(&fast) => {
+            // The opportunistic compiler can call a result "compiled" while
+            // leaving a capturing lambda behind as MakeClosureEnv. Executing
+            // that instruction re-enters eval_form to build a tree-walked
+            // closure, so the hottest part of the function never reaches
+            // bytecode at all. ASDF's TRAVERSE-ACTION is exactly this shape:
+            // its outer callback captures the traversal state and contains the
+            // recursive VISIT-ACTION LABELS function.
+            //
+            // Portable lowering compiles the closure body as a nested
+            // BytecodeFunction. Prefer that complete result when available;
+            // retain the opportunistic result as the correctness fallback for
+            // forms whose constants cannot be represented portably.
+            reset_last_bail_reason();
+            match compile_function(name, params, body, env, true, false) {
+                Some(portable) => Some(portable),
+                None => {
+                    trace_named(
+                        name,
+                        "portable retry bailed",
+                        last_bail_reason().as_deref(),
+                    );
+                    Some(fast)
+                }
+            }
+        }
+        Some(fast) => Some(fast),
+        None => {
+            reset_last_bail_reason();
+            compile_function(name, params, body, env, true, false)
+        }
+    };
     match compiled {
         Some(bf) => {
             registry_put(sym, Rc::new(bf));
             true
         }
         None => {
+            trace_named(
+                name,
+                "lazy compile bailed",
+                last_bail_reason().as_deref(),
+            );
             LAZY_DECLINED.with(|s| s.borrow_mut().insert(sym));
             false
         }
     }
+}
+
+fn contains_host_eval(function: &BytecodeFunction) -> bool {
+    function
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)))
+        || function
+            .nested_functions
+            .iter()
+            .any(|nested| contains_host_eval(nested))
 }
 
 /// Compile a standalone lambda (`lambda_list` + `body`) to bytecode and reify it

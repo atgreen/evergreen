@@ -413,6 +413,47 @@ fn macroexpand_all_expands_symbol_macros_and_rewrites_setq_to_setf() {
 }
 
 #[test]
+fn macrolet_expander_can_intern_keyword_names() {
+    // ASDF's ENSURE-PATHNAME defines ERR this way.  Eagerly expanding the
+    // surrounding function body must be able to evaluate the pure INTERN*
+    // call in the local macro expander instead of abandoning bytecode
+    // compilation for every invocation of ENSURE-PATHNAME.
+    let expanded = macroexpand_all(
+        parse(
+            "(macrolet ((err (constraint) \
+               `(quote ,(intern* constraint :keyword)))) \
+               (err want-file))",
+        ),
+        &Environment::null(),
+    )
+    .expect("expand ASDF-style ERR macrolet");
+
+    let quoted = list_items(expanded);
+    assert_eq!(symbol_text(quoted[0]).as_deref(), Some("QUOTE"));
+    assert_eq!(symbol_text(quoted[1]).as_deref(), Some("KEYWORD:WANT-FILE"));
+}
+
+#[test]
+fn macrolet_expander_can_select_generated_syntax_with_if() {
+    // ASDF's ENSURE-PATHNAME TRANSFORM macro uses IF while constructing its
+    // quasiquoted expansion.  The choice happens while the local macro runs,
+    // not in the generated run-time form.
+    let expanded = macroexpand_all(
+        parse(
+            "(macrolet ((choose (condition) \
+               `(quote ,(if condition :yes :no)))) \
+               (choose t))",
+        ),
+        &Environment::null(),
+    )
+    .expect("expand local macro containing IF");
+
+    let quoted = list_items(expanded);
+    assert_eq!(symbol_text(quoted[0]).as_deref(), Some("QUOTE"));
+    assert_eq!(symbol_text(quoted[1]).as_deref(), Some("KEYWORD:YES"));
+}
+
+#[test]
 fn macroexpand_environment_shadowing_and_declarations_are_visible() {
     // Per R4.14, the environment protocol MUST return accurate information for
     // bindings and declarations visible at macro-expansion time.

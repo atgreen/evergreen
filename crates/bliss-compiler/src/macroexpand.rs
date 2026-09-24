@@ -2490,6 +2490,30 @@ fn eval_local_macro_form(
         }
         "APPEND" => eval_local_macro_append(args, env, call_env),
         "PROGN" => eval_local_macro_body(args, env, call_env),
+        "IF" => {
+            bliss_rt::rooted!(forms = cons_to_vec(args));
+            if forms.len() < 2 || forms.len() > 3 {
+                return Err(BlissError::Internal(
+                    "MACROLET: IF expects two or three arguments".into(),
+                ));
+            }
+            let test = eval_local_macro_form(forms[0], env, call_env)?;
+            if !test.is_nil() {
+                eval_local_macro_form(forms[1], env, call_env)
+            } else if forms.len() == 3 {
+                eval_local_macro_form(forms[2], env, call_env)
+            } else {
+                Ok(bliss_rt::value::NIL)
+            }
+        }
+        // UIOP's ENSURE-PATHNAME macrolet turns a constraint name into the
+        // corresponding keyword with `(intern* constraint :keyword)`.  Local
+        // macro bodies run in this deliberately small, pure evaluator, so
+        // support that deterministic subset without calling back into the
+        // host interpreter during compilation.
+        name if name == "INTERN*" || name.ends_with("::INTERN*") => {
+            eval_local_macro_keyword_intern(args, env, call_env)
+        }
         "BLISS::QUASIQUOTE" => expand_local_quasiquote(
             if args.is_cons() {
                 unsafe { cons_car(args) }
@@ -2523,6 +2547,51 @@ fn eval_local_macro_form(
             }
         }
     }
+}
+
+fn eval_local_macro_keyword_intern(
+    args: BlissVal,
+    env: &Environment,
+    call_env: &Environment,
+) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted!(forms = cons_to_vec(args));
+    if forms.len() < 2 || forms.len() > 3 {
+        return Err(BlissError::Internal(
+            "MACROLET: INTERN* expects two or three arguments".into(),
+        ));
+    }
+
+    bliss_rt::rooted!(values = Vec::<BlissVal>::with_capacity(forms.len()));
+    for i in 0..forms.len() {
+        values.push(eval_local_macro_form(forms[i], env, call_env)?);
+    }
+    let package = local_macro_string_designator(values[1]).ok_or_else(|| {
+        BlissError::Internal("MACROLET: INTERN* package is not a string designator".into())
+    })?;
+    if package != "KEYWORD" {
+        return Err(BlissError::Internal(format!(
+            "MACROLET: INTERN* only supports the KEYWORD package, got {package}"
+        )));
+    }
+    let name = local_macro_string_designator(values[0]).ok_or_else(|| {
+        BlissError::Internal("MACROLET: INTERN* name is not a string designator".into())
+    })?;
+    Ok(BlissVal::from_symbol_index(intern_symbol(&format!(
+        "KEYWORD:{name}"
+    ))))
+}
+
+fn local_macro_string_designator(value: BlissVal) -> Option<String> {
+    if value.is_string() {
+        return Some(value.as_string());
+    }
+    let key = get_symbol_name(value)?;
+    Some(
+        bliss_rt::symbols::split_registry_key(&key)
+            .map(|(_, name)| name)
+            .unwrap_or(&key)
+            .to_string(),
+    )
 }
 
 fn eval_local_macro_append(

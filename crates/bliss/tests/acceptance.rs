@@ -6467,6 +6467,35 @@ fn lazy_compile_preserves_results() {
     }
 }
 
+#[test]
+fn lazy_compile_does_not_leave_capturing_closures_tree_walked() {
+    let program = "(progn \
+        (defun outer (x) (funcall (lambda (y) (+ x y)) 1)) \
+        (dotimes (i 20) (outer i)) \
+        (disassemble 'outer))";
+    let out = bliss_bin()
+        .env("BLISS_LAZY_COMPILE", "1")
+        .env("BLISS_LAZY_THRESHOLD", "4")
+        .env("BLISS_T0_T1_THRESHOLD", "100000")
+        .args(["--no-init", "--eval", program])
+        .output()
+        .expect("run bliss");
+    assert!(
+        out.status.success(),
+        "lazy compile run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("MakeClosure"),
+        "capturing closure should be compiled as nested bytecode: {stdout}"
+    );
+    assert!(
+        !stdout.contains("MakeClosureEnv"),
+        "capturing closure fell back to eval_form and will stay tree-walked: {stdout}"
+    );
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.
@@ -7696,6 +7725,34 @@ fn setf_of_a_setf_generic_function() {
         stdout.contains("(8)"),
         "setf of a (setf f) generic should mutate the place, got: '{stdout}', stderr: '{}'",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn setf_generic_writer_compiles() {
+    let prog = "(defgeneric (setf gspc) (v x)) \
+                (defmethod (setf gspc) (v (x cons)) (setf (car x) v)) \
+                (defun run-gspc (c v) (setf (gspc c) v)) \
+                (let ((c (list 0))) \
+                  (dotimes (i 20) (run-gspc c i)) \
+                  (format t \"RESULT=~a~%\" c) \
+                  (disassemble 'run-gspc))";
+    let output = bliss_bin()
+        .env("BLISS_LAZY_COMPILE", "1")
+        .env("BLISS_LAZY_THRESHOLD", "4")
+        .env("BLISS_T0_T1_THRESHOLD", "100000")
+        .args(["--no-init", "--eval", prog])
+        .output()
+        .expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("RESULT=(19)"),
+        "compiled generic writer must preserve SETF semantics; stdout: {stdout}, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("; RUN-GSPC —"),
+        "generic SETF made the bytecode compiler bail: {stdout}"
     );
 }
 
