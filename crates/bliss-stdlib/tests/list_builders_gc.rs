@@ -81,3 +81,32 @@ fn sequence_list_result_traces_heap_elements_after_full_gc() {
         "heap element must remain reachable through the sequence result list"
     );
 }
+
+#[test]
+fn append_copies_heads_and_keeps_shared_tail_and_elements_alive() {
+    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_test_heap();
+
+    let tail_marker = 0x51E0_0002;
+    let head_marker = 0x51E0_0003;
+    bliss_rt::rooted!(
+        tail = sequences::copy_seq(leaked_test_list(&[marker_object(tail_marker)])).expect("tail")
+    );
+    let head = leaked_test_list(&[marker_object(head_marker)]);
+    bliss_rt::rooted!(result = sequences::append(&[head, NIL, *tail]).expect("append"));
+    assert_ne!(*result, head, "non-final list spine must be copied");
+    bliss_rt::full_gc().expect("full_gc");
+    let result_cell = unsafe { &*(result.as_ptr() as *const ConsCell) };
+    assert_eq!(
+        result_cell.cdr, *tail,
+        "final tail must be shared unchanged"
+    );
+    assert!(heap_contains_bignum_marker(head_marker));
+    assert!(heap_contains_bignum_marker(tail_marker));
+
+    assert_eq!(sequences::append(&[]).unwrap(), NIL);
+    let atom = BlissVal::from_fixnum(42);
+    assert_eq!(sequences::append(&[NIL, atom]).unwrap(), atom);
+    assert_eq!(sequences::append(&[*tail]).unwrap(), *tail);
+    assert!(sequences::append(&[atom, NIL]).is_err());
+}

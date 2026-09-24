@@ -623,6 +623,79 @@ fn value_bridges_load_without_source_under_gc_stress() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn sequence_clos_bridges_load_without_source_under_gc_stress() {
+    let dir = workdir("sequence-clos-bridges");
+    let src = dir.join("bridges.lisp");
+    let out = dir.join("bridges.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defclass bridge-base () ((item :initarg :item)))
+      (defclass bridge-child (bridge-base) ())
+      (defmethod bridge-next ((x bridge-base) n)
+        (values (slot-value x 'item) n))
+      (defmethod bridge-next ((x bridge-child) n) (call-next-method))
+      (defmethod bridge-next :around ((x bridge-child) n)
+        (call-next-method x (+ n 1)))
+      (defun bridge-store (x value) (setf (slot-value x 'item) value))
+      (defun bridge-join (head tail) (append head tail))
+      (defun bridge-convert (x type) (coerce x type))
+      (defun bridge-slice (x) (subseq x 1 4))
+      (let* ((x (make-instance 'bridge-child :item nil))
+             (head (list (reverse "ahpla")))
+             (tail (list (reverse "ateb")))
+             (joined (bridge-join head tail)))
+        (format t "SEQUENCE-CLOS ~S~%"
+          (list joined (eq tail (cdr joined)) (not (eq head joined))
+            (bridge-convert '(#\g #\a #\m #\m #\a) 'string)
+            (bridge-slice (reverse "abcde"))
+            (bridge-store x (list (reverse "atled")))
+            (multiple-value-list (bridge-next x 4)))))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    assert!(
+        bbu_counts(&bytes).1 >= 4,
+        "must contain compiled bridge functions"
+    );
+    fs::remove_file(&src).unwrap();
+    for stride in ["0", "1", "7", "31"] {
+        let loaded = Command::new(BIN)
+            .args(["--no-init", "--no-bootstrap", "--load"])
+            .arg(&out)
+            .env("BLISS_FORCE_TIER", "t1")
+            .env("BLISS_T1_THRESHOLD", "1")
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .env("BLISS_GC_VERIFY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&loaded.stdout).trim(),
+            "SEQUENCE-CLOS ((\"alpha\" \"beta\") T T \"gamma\" \"dcb\" (\"delta\") ((\"delta\") 5))",
+            "stride {stride}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// R5.06 / R6.71: source-free ASH calls use the same allocating integer kernel
 /// in compiled code, with operands kept live across bignum result allocation.
 #[test]

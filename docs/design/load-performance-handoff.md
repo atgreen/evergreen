@@ -5,6 +5,81 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Remove five more evaluated-argument form bridges (2026-09-24, bliss-f7qh)
+
+A fresh census of **only the initial cached Babel load** counted 21,099
+remaining calls through `apply_function`'s quoted-form reconstruction. The
+largest included COERCE (2,654), APPEND (2,454), PATHNAME-DIRECTORY (2,131),
+MAKE-INSTANCE (1,852), slot writes (1,849), next-method calls (1,264),
+SUBTYPEP (1,086), and SUBSEQ (831). This is execution overhead, not FASL
+decoding: already-evaluated arguments were being wrapped in temporary Lisp
+forms and evaluated again.
+
+Five paths now share evaluated-argument kernels with their source handlers:
+APPEND, COERCE, SUBSEQ, `BLISS::SET-SLOT-VALUE`, and
+`BLISS::%CALL-NEXT-METHOD`. APPEND's library behavior moved out of the
+interpreter into `bliss-stdlib::sequences`; the other paths reuse existing
+coercion, sequence, slot, and method machinery. Non-leaf operations were not
+added to the native direct-builtin table. Cross-tier testing also exposed
+and fixed three interpreter operator arms that ignored global function
+redefinitions (`bliss-7bje`).
+
+Five alternating CPU-0-pinned release samples against `9d0551c`, in fresh
+processes with populated build-specific FASL caches and before test jobs:
+
+| Median | Before | Shared value kernels |
+|---|---:|---:|
+| Initial Babel FASL load | 0.789 s | 0.719 s |
+| SBCL initial load, same batch | 0.284 s | 0.284 s |
+| Initial-load cycles (three isolated windows) | 1.691 G | **1.616 G (4.4% less)** |
+| Initial-load instructions (same windows) | 4.111 G | **3.956 G (3.8% less)** |
+| Lisp bytes allocated in the load | 12,610,480 | **10,568,240 (16.2% less)** |
+
+Both versions perform zero minor/major collections in the measured load,
+and no measured run recompiles. Clock variation matters: load ranges are
+0.670–0.794 s before, 0.631–0.764 s after, and 0.239–0.286 s for SBCL.
+The raw ratio of medians is 2.53×, but this is not as stable a wall-time
+comparison as the preceding short-copy batch. Treat the remaining gap as
+roughly 2.5–3× on this host; the repeated instruction/cycle reduction is
+the firmer evidence for this change. Do not claim the gap is closed.
+
+The five new dispatcher tests were observed failing before implementation.
+Cross-tier coverage checks tail sharing, coercion to functions, slicing,
+slot writes, original/replacement next-method arguments, multiple values,
+errors, and lexical/global replacement. A fresh-process FASL regression
+deletes its source before loading and agrees at normal and GC-stress strides
+1/7/31 with poison and heap verification. A stdlib full-GC regression checks
+APPEND's copied heads and shared tail. All **15,106** entries in Babel's two
+encoding tables agree between normal Bliss, stress/poison/verify Bliss,
+and SBCL. Review was adversarial self-review, not independent review.
+
+Final gates: **733 CLI integration tests pass, zero fail, three ignored**;
+45 CLI unit tests pass. The non-CLI workspace has 1,778 passes, five known
+failures, four ignored: STRINGP metadata (`bliss-4ihx`) and four sequence
+fixtures (`bliss-0bdl`). Two existing doctests fail (`bliss-pqyy`). Workspace
+check passes with the tracked unused-mut warning (`bliss-d3hs`); root lint
+has six baseline findings, zero new. Strict clippy stops at nine existing
+runtime diagnostics (`bliss-5vr`); spec coverage retains 14 uncovered
+stage-5 and 11 unstaged requirements (`bliss-kjjd`). Workspace format drift
+remains (`bliss-2uj1`); changed code was formatted without sweeping unrelated
+lines, and diff checks pass. The workspace is not all green.
+
+Two alternative probes were rejected before this keeper: removing the
+native builtin function-cell guard entirely saved only 0.15% instructions
+and 0.62% cycles (`bliss-dw24`, closed); compiling keyword
+DESTRUCTURING-BIND through an APPLY/lambda rewrite saved 1.0% instructions
+and 0.49% cycles while adding 131,472 Lisp bytes (`bliss-jx2n`, reopened).
+Neither speculative change remains. An alleged PATHNAME-DIRECTORY rooting
+bug was refuted by allocation tracing and output-equal stress testing
+(`bliss-85cy`). Separately tracked inspection findings: duplicate
+MAKE-INSTANCE initarg-key evaluation (`bliss-zbcw`) and SUBSEQ's existing
+NIL-end/noninteger-index handling (`bliss-wo86`); neither is fixed here.
+
+Artifacts: `/tmp/babel-bridge-census.log`,
+`/tmp/babel-bridge5-final-{before,after,sbcl}-*.{log,stat}`,
+`/tmp/babel-bridge5-final-window-{before,after}-*.{log,stat}`,
+and `/tmp/babel-bridge5-{normal,stress,sbcl}-tables.log`.
+
 ## Reduce short-copy latency in the musl CLI (2026-09-24, bliss-gv5v)
 
 The next win is below the Lisp dispatch layer. The post-literal profile put

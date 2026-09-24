@@ -278,6 +278,31 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     })
 }
 
+/// Copy the spines of all but the final argument onto the final argument.
+/// The final argument is shared unchanged and may be any object (ANSI APPEND).
+pub fn append(args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    let Some((&tail, lists)) = args.split_last() else {
+        return Ok(NIL);
+    };
+    bliss_rt::rooted!(result = tail);
+    bliss_rt::rooted!(elements = Vec::<BlissVal>::new());
+    // No Lisp allocation while traversing: finish reading the source spines
+    // before consing. Elements and the final tail remain rooted while copying.
+    for &list in lists {
+        let mut cursor = list;
+        while cursor.is_cons() {
+            let cell = unsafe { &*(cursor.as_ptr() as *const ConsCell) };
+            elements.push(cell.car);
+            cursor = cell.cdr;
+        }
+        reject_improper_tail(cursor)?;
+    }
+    for i in (0..elements.len()).rev() {
+        *result = alloc_cons(elements[i], *result);
+    }
+    Ok(*result)
+}
+
 /// Build a proper list from a slice of BlissVals.
 fn build_list(vals: &[BlissVal]) -> BlissVal {
     bliss_rt::rooted!(vals = vals.to_vec());

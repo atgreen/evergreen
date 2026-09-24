@@ -5800,6 +5800,32 @@ fn method_context_has_next(context: &MethodContext) -> bool {
     }
 }
 
+fn store_slot_value(
+    instance: BlissVal,
+    slot: BlissVal,
+    value: BlissVal,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted!(value = value);
+    write_slot_value(instance, slot, *value, env)?;
+    Ok(*value)
+}
+
+fn call_next_method_values(
+    env: &mut Env,
+    context: &MethodContext,
+    args: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    // No replacement arguments means reuse the original arguments, including
+    // all keyword pairs. A next method may allocate or produce multiple values.
+    if args.is_empty() {
+        let original = RootedVals::new(context.args.clone());
+        invoke_next_method(env, context, &original)
+    } else {
+        invoke_next_method(env, context, args)
+    }
+}
+
 fn invoke_next_method(
     env: &mut Env,
     context: &MethodContext,
@@ -19250,59 +19276,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(BlissVal::from_fixnum(bliss_stdlib::length(v)? as i64));
             }
-            "APPEND" => {
-                // Root the accumulated elements AND the source-form spine across
-                // the arg-eval loop (bliss-6b2 #2): a later argument's evaluation
-                // allocates and can relocate both the Vec-resident list elements
-                // and the not-yet-evaluated source forms.
-                bliss_rt::rooted!(all = Vec::<BlissVal>::new());
-                if !cdr.is_cons() {
-                    return Ok(NIL);
-                }
-                bliss_rt::rooted!(c = cdr);
-                // CLHS: APPEND copies every argument BUT THE LAST, and the last
-                // argument becomes the tail of the result AS-IS (any object — an
-                // atom yields a dotted list; a single argument is returned
-                // unchanged). Previously the last arg was flattened with
-                // list_to_vec, so its atom tail was dropped: `(append '(1 2) 'x)`
-                // wrongly gave (1 2) instead of (1 2 . x) (ansi-test append.4/5).
-                bliss_rt::rooted!(tail = NIL);
-                while c.is_cons() {
-                    let (item_form, rest) = cp(*c);
-                    bliss_rt::rooted!(rest = rest);
-                    let is_last = !rest.is_cons();
-                    let v = eval_form(item_form, env)?;
-                    *c = *rest;
-                    if is_last {
-                        *tail = v;
-                    } else {
-                        // A non-last APPEND argument must be a proper list; a
-                        // dotted/improper one is a TYPE-ERROR whose datum is the
-                        // offending non-list tail (so it genuinely violates
-                        // 'list — ANSI SIGNALS-ERROR rejects a datum that
-                        // satisfies its expected-type). append.error.1/2. The
-                        // walk only reads conses and pushes into the rooted
-                        // `all`, so it allocates nothing (GC-safe).
-                        let mut p = v;
-                        while p.is_cons() {
-                            let (car, cdr2) = cp(p);
-                            all.push(car);
-                            p = cdr2;
-                        }
-                        if !p.is_nil() {
-                            return Err(BlissError::TypeError {
-                                datum: p,
-                                expected: "list".into(),
-                            });
-                        }
-                    }
-                }
-                // Cons the collected elements onto the (as-is) tail, right to left.
-                bliss_rt::rooted!(result = *tail);
-                for i in (0..all.len()).rev() {
-                    *result = arena_cons(all[i], *result);
-                }
-                return Ok(*result);
+            "APPEND" if global_fn(&name).is_none() => {
+                let args = eval_args(cdr, env)?;
+                return bliss_stdlib::sequences::append(&args);
             }
             "REVERSE" if global_fn(&name).is_none() => {
                 // Delegate to the stdlib so lists, vectors, and strings all
@@ -19524,8 +19500,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let instance = args.first().copied().unwrap_or(NIL);
                 let slot = args.get(1).copied().unwrap_or(NIL);
                 let val = args.get(2).copied().unwrap_or(NIL);
-                write_slot_value(instance, slot, val, env)?;
-                return Ok(val);
+                return store_slot_value(instance, slot, val, env);
             }
             "BLISS::SET-ACCESSOR-SLOT" => {
                 // Store primitive for bytecode-lowered `(setf (accessor obj) v)`
@@ -20001,21 +19976,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(expanded = expanded);
                 return bliss_stdlib::concatenate(*expanded, &sequences);
             }
-            "SUBSEQ" => {
-                // Root the sequence and pending arg forms across the index
-                // evaluations (moving GC; bliss-4bp).
-                let (seq_form, rest) = cp(cdr);
-                let (start_form, rest2) = cp(rest);
-                bliss_rt::rooted!(start_form = start_form);
-                bliss_rt::rooted!(rest2 = rest2);
-                bliss_rt::rooted!(seq = eval_form(seq_form, env)?);
-                let start = num_val(eval_form(*start_form, env)?)? as usize;
-                let end = if rest2.is_cons() {
-                    Some(num_val(eval_form(cp(*rest2).0, env)?)? as usize)
-                } else {
-                    None
-                };
-                return bliss_stdlib::subseq(*seq, start, end);
+            "SUBSEQ" if global_fn(&name).is_none() => {
+                let args = eval_args(cdr, env)?;
+                return subseq_values(&args);
             }
             "SOME" | "EVERY" | "NOTANY" | "NOTEVERY" => {
                 let args = eval_args(cdr, env)?;
@@ -20053,7 +20016,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     _ => NIL, // NOTEVERY
                 });
             }
-            "COERCE" => {
+            "COERCE" if global_fn(&name).is_none() => {
                 // (coerce object result-type): exactly two arguments, or a
                 // PROGRAM-ERROR (CLHS — ansi COERCE.ERROR.6/7/8).
                 let (val_form, rest) = cp(cdr);
@@ -20067,41 +20030,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (moving GC; bliss-4bp).
                 bliss_rt::rooted!(type_form = type_form);
                 bliss_rt::rooted!(value = eval_form(val_form, env)?);
-                // Expand a DEFTYPE alias: CLHS COERCE takes any type specifier,
-                // and only the expansion carries the representation, so
-                // `(coerce '(#\a #\b) 'babel::unicode-string)` must build a
-                // STRING rather than fall through to the identity case.
                 let raw_type = eval_form(*type_form, env)?;
-                let type_val = resolve_type_spec(env, raw_type);
-                // COERCE to FUNCTION: a symbol coerces to the function it NAMES
-                // (fdefinition), not the symbol itself, so the result is FUNCTIONP
-                // (bliss-v304). A lambda expression `(lambda …)` coerces to the
-                // function it denotes. An already-callable value passes through.
-                if type_val.is_symbol()
-                    && sym_bare_name_rc(type_val).as_ref() == "FUNCTION"
-                {
-                    if is_function_value(*value) {
-                        return Ok(*value);
-                    }
-                    if value.is_cons()
-                        && sym_bare_name_rc(cp(*value).0).as_ref() == "LAMBDA"
-                    {
-                        // Evaluate #'(lambda …) to build the closure.
-                        bliss_rt::rooted!(fn_form = {
-                            let f = resolve_sym("FUNCTION").unwrap_or(NIL);
-                            vec_to_list(&[f, *value])
-                        });
-                        return eval_form(*fn_form, env);
-                    }
-                    if let Some(f) = symbol_function_object(env, *value) {
-                        return Ok(f);
-                    }
-                    return Err(BlissError::TypeError {
-                        datum: *value,
-                        expected: "a function or the name of a function".into(),
-                    });
-                }
-                return coerce_value(*value, type_val);
+                return coerce_evaluated(*value, raw_type, env);
             }
             "SORT" | "STABLE-SORT" => {
                 // SEQUENCE and PREDICATE are required; too few is a
@@ -22156,39 +22086,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 apply_class_initforms(instance, &new_class_name, env, Some(&added_slots), &[])?;
                 return Ok(instance);
             }
-            "CALL-NEXT-METHOD" => {
+            "CALL-NEXT-METHOD" | "BLISS::%CALL-NEXT-METHOD" => {
                 let mut context = env.method_context.last().cloned().ok_or_else(|| {
                     BlissError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
                 })?;
                 bliss_rt::rooted_ref!(_context_root = &mut context);
-                let args = if cdr.is_nil() {
-                    RootedVals::new(context.args.clone())
-                } else {
-                    eval_args(cdr, env)?
-                };
-                return invoke_next_method(env, &context, &args);
-            }
-            // Evaluated-argument entry points for bytecode-lowered
-            // (call-next-method …) / (next-method-p). The forms above are
-            // SPECIAL FORMS reading env.method_context; a compiled method body
-            // runs through apply_function against that same `env`, so the
-            // context is visible — it just needs a callable spelling. Arguments
-            // arrive already evaluated (self-evaluating literals through
-            // apply_function's synthesize path), which is why `eval_args` is
-            // still correct here (bliss-ccso).
-            "BLISS::%CALL-NEXT-METHOD" => {
-                let mut context = env.method_context.last().cloned().ok_or_else(|| {
-                    BlissError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
-                })?;
-                bliss_rt::rooted_ref!(_context_root = &mut context);
-                // No arguments means the next method receives the ORIGINAL ones
-                // (CLHS 7.6.6.2), which the saved context carries.
-                let args = if cdr.is_nil() {
-                    RootedVals::new(context.args.clone())
-                } else {
-                    eval_args(cdr, env)?
-                };
-                return invoke_next_method(env, &context, &args);
+                let args = eval_args(cdr, env)?;
+                return call_next_method_values(env, &context, &args);
             }
             "BLISS::%NEXT-METHOD-P" => {
                 let has_next = env
@@ -28552,6 +28456,47 @@ fn coerce_to_string_value(value: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(bliss_stdlib::make_lisp_string_fresh(&s))
 }
 
+/// Resolve DEFTYPE and function designators once, for both call paths.
+fn coerce_evaluated(
+    value: BlissVal,
+    raw_type: BlissVal,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted!(value = value);
+    bliss_rt::rooted!(type_val = resolve_type_spec(env, raw_type));
+    if type_val.is_symbol() && sym_bare_name_rc(*type_val).as_ref() == "FUNCTION" {
+        if is_function_value(*value) {
+            return Ok(*value);
+        }
+        if value.is_cons() && sym_bare_name_rc(cp(*value).0).as_ref() == "LAMBDA" {
+            let function = resolve_sym("FUNCTION").unwrap_or(NIL);
+            bliss_rt::rooted!(form = vec_to_list(&[function, *value]));
+            return eval_form(*form, env);
+        }
+        return symbol_function_object(env, *value).ok_or_else(|| BlissError::TypeError {
+            datum: *value,
+            expected: "a function or the name of a function".into(),
+        });
+    }
+    coerce_value(*value, *type_val)
+}
+
+fn subseq_values(args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(BlissError::ProgramError(
+            "SUBSEQ requires two or three arguments".into(),
+        ));
+    }
+    let start = num_val(args[1])? as usize;
+    let end = args
+        .get(2)
+        .copied()
+        .map(num_val)
+        .transpose()?
+        .map(|n| n as usize);
+    bliss_stdlib::subseq(args[0], start, end)
+}
+
 fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissError> {
     // Reduce the type spec to a bare head-symbol name.
     let head = if type_val.is_cons() {
@@ -34338,6 +34283,31 @@ fn apply_builtin_fast(
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
     match name {
+        "APPEND" => {
+            env.clear_mv();
+            Some(bliss_stdlib::sequences::append(args))
+        }
+        "COERCE" if args.len() == 2 => {
+            env.clear_mv();
+            Some(coerce_evaluated(args[0], args[1], env))
+        }
+        "SUBSEQ" if (2..=3).contains(&args.len()) => {
+            env.clear_mv();
+            Some(subseq_values(args))
+        }
+        "BLISS::SET-SLOT-VALUE" if args.len() == 3 => {
+            env.clear_mv();
+            Some(store_slot_value(args[0], args[1], args[2], env))
+        }
+        "BLISS::%CALL-NEXT-METHOD" => {
+            let Some(mut context) = env.method_context.last().cloned() else {
+                return Some(Err(BlissError::UndefinedFunction(
+                    resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL),
+                )));
+            };
+            bliss_rt::rooted_ref!(_context_root = &mut context);
+            Some(call_next_method_values(env, &context, args))
+        }
         "VALUES" => Some(Ok(env.return_values(args.to_vec()))),
         "VALUES-LIST" if args.len() == 1 => Some(return_list_values(args[0], env)),
         "REVERSE" if args.len() == 1 => {
@@ -37982,6 +37952,87 @@ mod transient_shadow_root_tests {
 #[cfg(test)]
 mod jtc5_numeric_tests {
     use super::*;
+
+    fn with_value_bridge_env(test: impl FnOnce(&mut Env)) {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        bliss_rt::rooted_ref!(_env_root = &mut env);
+        test(&mut env);
+    }
+
+    #[test]
+    fn append_values_bypass_form_bridge() {
+        with_value_bridge_env(|env| {
+            let tail = BlissVal::from_fixnum(42);
+            let before = bliss_rt::heap_stats().bytes_allocated;
+            for args in [&[][..], &[NIL][..], &[NIL, tail][..]] {
+                env.set_mv(vec![T, T]);
+                let result = apply_builtin_fast("APPEND", args, env)
+                    .expect("APPEND must dispatch evaluated arguments")
+                    .unwrap();
+                assert_eq!(result, args.last().copied().unwrap_or(NIL));
+                assert!(!env.mv_active);
+            }
+            assert_eq!(bliss_rt::heap_stats().bytes_allocated, before);
+        });
+    }
+
+    #[test]
+    fn coerce_values_bypass_form_bridge() {
+        with_value_bridge_env(|env| {
+            env.set_mv(vec![T, T]);
+            let value = BlissVal::from_fixnum(42);
+            let result = apply_builtin_fast("COERCE", &[value, T], env)
+                .expect("COERCE must dispatch evaluated arguments")
+                .unwrap();
+            assert_eq!(result, value);
+            assert!(!env.mv_active);
+        });
+    }
+
+    #[test]
+    fn subseq_values_bypass_form_bridge() {
+        with_value_bridge_env(|env| {
+            env.set_mv(vec![T, T]);
+            let result = apply_builtin_fast("SUBSEQ", &[NIL, BlissVal::from_fixnum(0)], env)
+                .expect("SUBSEQ must dispatch evaluated arguments")
+                .unwrap();
+            assert_eq!(result, NIL);
+            assert!(!env.mv_active);
+        });
+    }
+
+    #[test]
+    fn slot_write_values_bypass_form_bridge() {
+        with_value_bridge_env(|env| {
+            bliss_rt::rooted!(
+                instance = read_eval_all_env(
+                    "(defclass bridge-box () ((item :initarg :item))) (make-instance 'bridge-box)",
+                    env,
+                )
+                .unwrap()
+            );
+            let slot = resolve_sym("ITEM").unwrap();
+            let value = BlissVal::from_fixnum(42);
+            env.set_mv(vec![T, T]);
+            let result =
+                apply_builtin_fast("BLISS::SET-SLOT-VALUE", &[*instance, slot, value], env)
+                    .expect("slot writes must dispatch evaluated arguments")
+                    .unwrap();
+            assert_eq!(result, value);
+            assert_eq!(slot_value_or_signal(*instance, slot, env).unwrap(), value);
+            assert!(!env.mv_active);
+        });
+    }
+
+    #[test]
+    fn next_method_values_bypass_form_bridge() {
+        with_value_bridge_env(|env| {
+            let result = apply_builtin_fast("BLISS::%CALL-NEXT-METHOD", &[], env)
+                .expect("next-method calls must dispatch evaluated arguments");
+            assert!(matches!(result, Err(BlissError::UndefinedFunction(_))));
+        });
+    }
 
     #[test]
     fn value_and_sequence_calls_bypass_form_allocation() {
