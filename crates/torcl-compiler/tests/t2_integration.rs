@@ -329,6 +329,7 @@ fn take_values_to_locals_materializes_secondary_ssa_results() {
         0,
         take_values as *const () as usize as u64,
         0,
+        0,
         bf.num_slots(),
         None,
     )
@@ -582,6 +583,7 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
         0,
         0,
         moving_gc_c2i as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -1420,6 +1422,7 @@ fn wide_call_uses_a_gc_visible_activation_slice() {
         0,
         0,
         call_slice as *const () as usize as u64,
+        0,
         0,
         0,
         0,

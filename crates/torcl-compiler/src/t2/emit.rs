@@ -1175,6 +1175,7 @@ fn emit_call(
     c2i_call_addr: u64,
     c2i_call_slice_addr: u64,
     c2i_recovery_toggle_addr: u64,
+    transfer_check: Option<NativeTransferCheck>,
     frame_base: Option<FramedHome>,
     activation_slots: Option<u16>,
     call_arg_base: u16,
@@ -1266,7 +1267,8 @@ fn emit_call(
                 mov_imm64(a, 6, nargs as i64); // rsi = nargs
                 mov_imm64(a, 9, 0); // r9 = no call-site profile
                 mov_imm64(a, 0, c2i_call_addr as i64);
-                emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+                // The common join checks both the helper and direct entries.
+                emit_runtime_helper_call(a, c2i_recovery_toggle_addr, None);
             } else {
                 // Four self-call arguments do not fit c2i's register ABI. Keep
                 // the direct call rather than emit a wrong dispatch — the guard
@@ -1285,6 +1287,7 @@ fn emit_call(
             }
 
             a.bind(join);
+            emit_transfer_check(a, transfer_check);
             if let Some(&r0) = data.results.first() {
                 mov_rr(a, *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?, 0);
             }
@@ -1319,7 +1322,7 @@ fn emit_call(
         );
         mov_imm32(a, 1, 0); // rcx = profile site (T2 does not gather one)
         mov_imm64(a, 0, c2i_call_slice_addr as i64);
-        emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+        emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
         if let Some(&result) = data.results.first() {
             let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
             store_home(a, home, RAX, 0);
@@ -1354,7 +1357,7 @@ fn emit_call(
             mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
         }
     }
-    emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+    emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
     if let Some(&r0) = data.results.first() {
         let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
         mov_rr(a, dst, 0); // mov result, rax
@@ -1372,6 +1375,7 @@ fn emit_symbol_value(
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     c2i_load_global_addr: u64,
     c2i_recovery_toggle_addr: u64,
+    transfer_check: Option<NativeTransferCheck>,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1380,7 +1384,7 @@ fn emit_symbol_value(
     };
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_load_global_addr as i64); // mov rax, c2i_load_global
-    emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+    emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
     let r0 = *data.results.first().ok_or(EmitError::UnsupportedOp(0xFA))?;
     let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
     mov_rr(a, dst, 0); // mov result, rax
@@ -1396,6 +1400,7 @@ fn emit_set_symbol_value(
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
     c2i_store_global_addr: u64,
     c2i_recovery_toggle_addr: u64,
+    transfer_check: Option<NativeTransferCheck>,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1412,13 +1417,39 @@ fn emit_set_symbol_value(
     }
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_store_global_addr as i64); // mov rax, c2i_store_global
-    emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
+    emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
     Ok(())
 }
 
-fn emit_runtime_helper_call(a: &mut Asm, c2i_recovery_toggle_addr: u64) {
+#[derive(Clone, Copy)]
+struct NativeTransferCheck {
+    pending_addr: u64,
+    exit: torcl_rt::asm::Label,
+}
+
+fn emit_transfer_check(a: &mut Asm, check: Option<NativeTransferCheck>) {
+    let Some(check) = check else { return };
+    // This callback must not allocate, safepoint, or invoke Lisp: the primary
+    // result is temporarily saved on the native stack, not in a GC root. Other
+    // live values already have call-preserved homes. Leave multiple values alone.
+    a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+    a.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    mov_imm64(a, RAX, check.pending_addr as i64);
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    a.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    a.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
+    a.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp+16]
+    a.jcc(torcl_rt::asm::Cc::Ne, check.exit);
+}
+
+fn emit_runtime_helper_call(
+    a: &mut Asm,
+    c2i_recovery_toggle_addr: u64,
+    transfer_check: Option<NativeTransferCheck>,
+) {
     if c2i_recovery_toggle_addr == 0 {
         a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        emit_transfer_check(a, transfer_check);
         return;
     }
 
@@ -1454,6 +1485,7 @@ fn emit_runtime_helper_call(a: &mut Asm, c2i_recovery_toggle_addr: u64) {
     a.extend_from_slice(&[0xFF, 0xD0]); // call rax
     a.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
+    emit_transfer_check(a, transfer_check);
 }
 
 fn edge_home_moves(
@@ -2282,6 +2314,7 @@ pub fn emit_framed(
         c2i_store_global_addr,
         c2i_mv_addr,
         0,
+        0,
         None,
         self_sym,
     )
@@ -2289,6 +2322,9 @@ pub fn emit_framed(
 
 /// Emit production T2 code whose native roots are synchronized through shadow
 /// slots appended after `activation_slots` in the owning TorclStack frame.
+/// A nonzero `c2i_transfer_pending_addr` is an `extern "C" fn() -> u64` that
+/// returns nonzero for a pending error/nonlocal exit. It must not allocate,
+/// safepoint, or call Lisp; results are saved on the native stack during it.
 pub fn emit_framed_with_activation_slots(
     f: &Function,
     c2i_deopt_addr: u64,
@@ -2300,6 +2336,7 @@ pub fn emit_framed_with_activation_slots(
     c2i_store_global_addr: u64,
     c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
+    c2i_transfer_pending_addr: u64,
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
@@ -2314,6 +2351,7 @@ pub fn emit_framed_with_activation_slots(
         c2i_store_global_addr,
         c2i_mv_addr,
         c2i_recovery_toggle_addr,
+        c2i_transfer_pending_addr,
         Some(activation_slots),
         self_sym,
     )
@@ -2330,6 +2368,7 @@ fn emit_framed_inner(
     c2i_store_global_addr: u64,
     c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
+    c2i_transfer_pending_addr: u64,
     activation_slots: Option<u16>,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
@@ -2902,6 +2941,10 @@ fn emit_framed_inner(
 
     let mut a = Asm::new();
     let deopt = a.label();
+    let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
+        pending_addr: c2i_transfer_pending_addr,
+        exit: a.label(),
+    });
     // Precise deopt (bliss-mba): each guarding instruction gets its own deopt stub
     // that reconstructs the interpreter frame at that guard's bytecode position.
     // Every instruction that reaches `emit_arith_inst` (the only guard emitter)
@@ -3150,6 +3193,7 @@ fn emit_framed_inner(
                     c2i_call_addr,
                     c2i_call_slice_addr,
                     c2i_recovery_toggle_addr,
+                    transfer_check,
                     frame_base_home,
                     activation_slots,
                     root_shadow_slots,
@@ -3212,6 +3256,7 @@ fn emit_framed_inner(
                     &inst_reg,
                     c2i_load_global_addr,
                     c2i_recovery_toggle_addr,
+                    transfer_check,
                 )?;
             } else if d.opcode == Opcode::SymbolFunction {
                 // Same shape as a global read, different helper: it reads the
@@ -3222,6 +3267,7 @@ fn emit_framed_inner(
                     &inst_reg,
                     c2i_load_function_addr,
                     c2i_recovery_toggle_addr,
+                    transfer_check,
                 )?;
             } else if d.opcode == Opcode::SetSymbolValue {
                 emit_set_symbol_value(
@@ -3231,6 +3277,7 @@ fn emit_framed_inner(
                     &const_tagged,
                     c2i_store_global_addr,
                     c2i_recovery_toggle_addr,
+                    transfer_check,
                 )?;
             } else if d.opcode == Opcode::ClearMv {
                 // A zero count selects the clear operation in the shared T2 MV
@@ -3240,7 +3287,7 @@ fn emit_framed_inner(
                 mov_imm32(&mut a, 6, 0); // esi = destination (null)
                 mov_imm32(&mut a, 2, 0); // edx = count (clear)
                 mov_imm64(&mut a, 0, c2i_mv_addr as i64);
-                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
+                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
             } else if d.opcode == Opcode::TakeValuesToLocals {
                 let (nvars, slot_base) = match d.aux {
                     AuxData::ValuesLocals { nvars, slot_base } => (nvars, slot_base),
@@ -3264,7 +3311,7 @@ fn emit_framed_inner(
                 alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
                 mov_imm64(&mut a, 2, i64::from(nvars));
                 mov_imm64(&mut a, 0, c2i_mv_addr as i64);
-                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
+                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
 
                 // The helper writes the activation slots. Materialise each SSA
                 // result into its stable home one at a time; this also handles
@@ -3470,6 +3517,16 @@ fn emit_framed_inner(
         }
     }
 
+    if let Some(check) = transfer_check {
+        // Do not resume bytecode or run later side effects. The owning runtime
+        // activation delivers the pending transfer after this native return.
+        // Use this function's actual spill/padding/saved-register layout.
+        a.bind(check.exit);
+        mov_imm64(&mut a, RAX, torcl_rt::value::NIL.0 as i64);
+        emit_epilogue(&mut a);
+        a.push(0xC3); // ret
+    }
+
     // Deopt stub: restore callee-saved (so the caller's registers are intact),
     // then align rsp and call c2i_deopt, unwind the alignment, return (the value is
     // ignored on deopt). After the epilogue rsp%16==8 (as at entry), so one
@@ -3478,7 +3535,9 @@ fn emit_framed_inner(
     emit_epilogue(&mut a);
     a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
     mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
-    emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
+    // Deopt stubs have their own temporary stack layout and return immediately;
+    // they must finish that cleanup instead of taking the normal transfer exit.
+    emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
     a.push(0xC3); // ret
 
@@ -3604,7 +3663,7 @@ fn emit_framed_inner(
         mov_imm32(&mut a, 1, 0);
         mov_rr(&mut a, 2, 4); // mov rdx, rsp
         mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
-        emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
+        emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
         if alloc > 0 {
             a.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
             a.extend_from_slice(&(alloc as i32).to_le_bytes());
@@ -4004,7 +4063,7 @@ mod tests {
     #[test]
     fn runtime_helper_call_can_bracket_recovery_for_production_c2i_crossings() {
         let mut asm = Asm::new();
-        emit_runtime_helper_call(&mut asm, 0x1234_5678);
+        emit_runtime_helper_call(&mut asm, 0x1234_5678, None);
         let code = asm.finish().unwrap();
 
         assert_eq!(

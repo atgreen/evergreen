@@ -18783,6 +18783,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         store_global_addr,
         mv_addr,
         recovery_toggle_addr,
+        c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64,
         bf.num_slots(),
         Some(sym),
     ) {
