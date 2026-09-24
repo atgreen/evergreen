@@ -51,6 +51,8 @@ impl TorclMutex {
     }
 
     pub fn grab(&self, wait: bool, timeout: Option<Duration>) -> Result<bool, TorclError> {
+        // Only Rust-owned queue/owner state is touched until this scope drops.
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         let owner = current_owner();
         let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
         loop {
@@ -122,6 +124,7 @@ impl TorclMutex {
     }
 
     pub fn release(&self) -> Result<(), TorclError> {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         let owner = current_owner();
         let mut state = self.state.lock().unwrap();
         if state.owner != Some(owner) {

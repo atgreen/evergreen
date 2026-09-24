@@ -36,6 +36,8 @@ impl TorclCondVar {
     /// Atomically enqueue on this wait queue and release `mutex`.  The mutex is
     /// reacquired before returning, including on timeout.
     pub fn wait(&self, mutex: &TorclMutex, timeout: Option<Duration>) -> Result<bool, TorclError> {
+        // The native wait and mutex reacquisition use no moving heap values.
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         if !mutex.owned_by_current() {
             return Err(TorclError::ProgramError(
                 "CONDITION-WAIT requires the current execution to own the mutex".into(),
@@ -102,6 +104,7 @@ impl TorclCondVar {
     }
 
     pub fn notify(&self, count: usize) {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         if count == 0 {
             return;
         }
@@ -124,6 +127,7 @@ impl TorclCondVar {
     }
 
     pub fn broadcast(&self) {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         let mut state = self.state.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
         for waiter in state.fiber_waiters.drain(..) {

@@ -196,6 +196,74 @@ fn global_safepoint_page() -> &'static SafepointPage {
 
 // ── Public coordination functions ────────────────────────────────────
 
+/// A native-only synchronization region containing no Lisp heap accesses.
+/// Unpinned fibers keep using their cooperative park protocol instead.
+pub(crate) struct NativeBlockingScope {
+    thread: Option<&'static crate::thread::NativeThread>,
+    // State must be restored by the execution that entered the region.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl NativeBlockingScope {
+    /// Publish roots before touching native wait-queue locks. The matching
+    /// drop waits for an active collection before allowing Lisp execution.
+    ///
+    /// # Safety
+    /// Until this scope is dropped, native code must not access the Lisp heap,
+    /// change its root slots, allocate Lisp values, or invoke Lisp. Keep any
+    /// referenced synchronization state alive independently of moving handles.
+    /// Do not enter from the collector while it owns a stop-the-world pause.
+    pub(crate) unsafe fn enter() -> Self {
+        let inactive = Self {
+            thread: None,
+            _not_send: std::marker::PhantomData,
+        };
+        if crate::thread::current_fiber().is_some_and(|fiber| fiber.can_yield()) {
+            return inactive;
+        }
+        let thread = crate::thread::current_thread();
+        if thread.state() != crate::thread::NativeThreadState::Running {
+            // Nested native operations (e.g. CONDITION-WAIT reacquiring its
+            // mutex) must leave the outer scope in charge of resuming Lisp.
+            return inactive;
+        }
+        crate::thread::current_stack().publish_top();
+        crate::gc::retire_current_t0_tlab_for_safepoint();
+        let coord = coordinator();
+        let guard = coord.park_mutex.lock().unwrap();
+        let counted = coord.parked.load(Ordering::SeqCst);
+        thread.set_state(crate::thread::NativeThreadState::Blocked);
+        drop(guard);
+        if counted {
+            // The active request counted us while Running. Acknowledge once,
+            // but remain Blocked across subsequent collections until our Drop
+            // can resume. Parking as Running here would let a new request count
+            // us again before we had returned from the previous safepoint.
+            let _arrival = coord.arrival_mutex.lock().unwrap();
+            coord.arrived.fetch_add(1, Ordering::SeqCst);
+            coord.arrival_condvar.notify_all();
+        }
+        Self {
+            thread: Some(thread),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for NativeBlockingScope {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread else { return };
+        let coord = coordinator();
+        let mut guard = coord.park_mutex.lock().unwrap();
+        while coord.parked.load(Ordering::SeqCst) {
+            guard = coord.park_condvar.wait(guard).unwrap();
+        }
+        // Serialize with the requester's participant snapshot: it either sees
+        // us Running and waits for a poll, or we stay Blocked until its resume.
+        thread.set_state(crate::thread::NativeThreadState::Running);
+    }
+}
+
 /// Inline safepoint poll — checks the safepoint flag.
 ///
 /// In generated code this compiles to a single load + branch. If the
@@ -313,17 +381,14 @@ pub fn wait_for_all_threads() -> Result<(), TorclError> {
     let page = global_safepoint_page();
 
     let current = crate::thread::current_thread_id();
+    // Native synchronization regions enter/leave Blocked under this same lock.
+    // Never take a participant snapshot between their state transition and
+    // publication of the stop-the-world flag.
+    let transition = coord.park_mutex.lock().unwrap();
     // Determine how many other mutator threads need to arrive.
     // Native threads are excluded because they cannot observe poll sites
     // while executing foreign code and therefore must not block the handshake.
     let other_count = crate::thread::safepoint_participant_count_excluding(current);
-
-    if other_count == 0 {
-        // Single-threaded: trivially at a safepoint already.
-        // Still set the flag so poll_safepoint returns correctly if called.
-        page.request_safepoint()?;
-        return Ok(());
-    }
 
     // Prepare coordination state.
     coord.arrived.store(0, Ordering::SeqCst);
@@ -331,7 +396,18 @@ pub fn wait_for_all_threads() -> Result<(), TorclError> {
     coord.parked.store(true, Ordering::SeqCst);
 
     // Poison the safepoint page so polling threads enter the safepoint.
-    page.request_safepoint()?;
+    if let Err(error) = page.request_safepoint() {
+        coord.parked.store(false, Ordering::SeqCst);
+        coord.park_condvar.notify_all();
+        return Err(error);
+    }
+    drop(transition);
+
+    // Even with no Running peers, keep the pause active: a blocked thread can
+    // time out or be notified while the collector scans its published roots.
+    if other_count == 0 {
+        return Ok(());
+    }
 
     // Wait until all expected threads have arrived.
     // Issue #5 fix: `arrived` is now incremented under `arrival_mutex`,

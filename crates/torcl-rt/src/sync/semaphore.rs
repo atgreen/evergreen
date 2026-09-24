@@ -51,6 +51,8 @@ impl TorclSemaphore {
     }
 
     pub fn wait(&self, timeout: Option<Duration>) -> Result<bool, TorclError> {
+        // Permits and wait queues live in stable Rust storage, not the GC heap.
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
         loop {
             if self.try_wait(1)? {
@@ -111,6 +113,7 @@ impl TorclSemaphore {
     }
 
     pub fn signal(&self, permits: i64) -> Result<(), TorclError> {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         if permits <= 0 {
             return Err(TorclError::ProgramError(
                 "semaphore signal count must be positive".into(),
