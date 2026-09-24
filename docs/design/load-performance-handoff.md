@@ -5,6 +5,71 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Shift integers instead of exponentiating (2026-09-24, bliss-7jt1)
+
+A fresh load-only profile after `d4427b8` put minor GC at 9.8% inclusive,
+but also exposed **8.0% under ASH**. The bootstrap implementation calculated
+powers of two and multiplied or divided, paying for general rational arithmetic,
+GCD, interpreter calls, and temporary values merely to shift integers.
+`bliss-stdlib::numbers::ash` now shifts fixnums directly and bignums limb-wise.
+Both tree-walked and compiled builtin calls use that kernel; the bootstrap
+workaround is gone. Right shifts preserve negative rounding and huge-count
+saturation. Both arguments remain type-checked, including zero cases.
+
+Five alternating CPU-0-pinned release runs against `d4427b8`, each a fresh
+process with its build-specific FASL cache populated, before any test jobs:
+
+| Median | Before | Direct integer shifts |
+|---|---:|---:|
+| Initial Babel FASL load | 1.362 s | **1.250 s (8.2% less)** |
+| SBCL initial load, same batch | 0.286 s | 0.286 s |
+| Bliss / SBCL | 4.8× | **4.4×** |
+| Initial-load instructions (three separate isolated windows) | 6.250 G | **5.583 G (10.7% less)** |
+| Whole-process instructions | 19.502 G | 18.827 G |
+| Minor-GC pause during load | 0.146229 s | 0.146936 s |
+
+Every measured load still performs one minor and zero major collections.
+The change removes roughly 5.6 MB of temporary Lisp allocation per load;
+it does not defer collection or move work outside the timer. Load wall samples
+span 0.922–1.366 s before and 1.109–1.255 s after. Whole-process medians are
+3.83 s before and 3.71 s after, with wide ranges of 2.79–3.86 s and 3.11–3.74 s.
+The isolated instruction counts support the improvement despite timing noise.
+This remains a substantial gap to SBCL, not parity.
+
+The regression first failed with `undefined function: ASH` before bootstrap
+(R5.06). Tests now check 247 operand/count combinations through ordinary calls,
+FUNCALL, and APPLY in interpreter, T0, and T1 modes, including function
+rebinding. A direct-kernel test checks 150,000 small shifts without allocating
+Lisp heap objects, fixnum boundaries, and oversized counts. A source-free FASL
+test rejects legacy source and EvalSource actions, then exercises allocating
+native calls under GC stress strides 1, 7, and 31 with poisoning and verification.
+Normal and stress-20,000/poison/verify Babel runs match a fresh SBCL run on all
+15,106 reverse-table entries. Review is adversarial self-review, not independent.
+All 12 Dietz ANSI ASH tests also pass, including randomized fixnum/bignum shifts,
+huge negative counts, type errors, and argument evaluation order.
+
+The full non-CLI workspace gate reports 1,767 passed, six failed, four ignored.
+The CLI gate reports 715 passed, three failed, three ignored, plus an aborted
+parallel unit-test process. Its serial rerun passes all 34 units. All 357
+acceptance, 49 FASL, and 12 bytecode differential tests pass. Known failures
+remain in STRINGP metadata (`bliss-4ihx`), four sequence fixtures (`bliss-0bdl`),
+two Lisp-containing doctests (`bliss-pqyy`), asynchronous T2 observation
+(`bliss-ugmu`, also fails alone), and the parallel runtime lifecycle
+(`bliss-lb6.20`). The additional reader property-test failure is an unchanged
+generator/oracle mismatch: `Symbol("NIL")` renders as `NIL` and reads as `Nil`
+(`bliss-stz9`). Workspace check passes with the tracked unused-mut warning;
+root lint has six baseline findings and zero new ones. Strict clippy still
+stops at nine baseline runtime errors; a separate non-strict stdlib run finds
+nothing in the new module. Existing spec-coverage and rustfmt failures remain
+(`bliss-kjjd`, `bliss-2uj1`); none of the formatting diagnostics target the new
+module or tests. These gates are not represented as fully green.
+
+The valid profile is `/tmp/babel-current-single.perf`; an earlier recording
+around three child processes lost symbol mappings and was discarded as evidence.
+Measurement artifacts are `/tmp/babel-ash-final-*`, with the benchmark driver
+`/tmp/babel-ash-final-bench.sh`. Remaining copy/C3 and external-root leads are
+tracked in `bliss-uqle` and `bliss-399z`; neither is a proven next optimization.
+
 ## Walk dead nursery objects once (2026-09-24, bliss-j0wa)
 
 Minor GC separately walked all nursery objects to repair TLAB gaps, find pinned

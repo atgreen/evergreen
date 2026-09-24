@@ -427,6 +427,62 @@ fn closure_literals_survive_gc_during_fasl_closure_construction() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// R5.06 / R6.71: source-free ASH calls use the same allocating integer kernel
+/// in compiled code, with operands kept live across bignum result allocation.
+#[test]
+fn integer_shifts_load_without_source_under_gc_stress() {
+    let dir = workdir("integer-shifts");
+    let src = dir.join("shifts.lisp");
+    let out = dir.join("shifts.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun shift-pair (n count)
+        (let ((big (ash n count)))
+          (list big (ash big (- count)) (ash (- big 1) (- count)))))
+      (format t "ASH-FASL ~S~%" (list (shift-pair 1 130) (shift-pair -1 130)))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "integer shifts fell back to EvalSource");
+    }
+    fs::remove_file(&src).unwrap();
+    for stride in ["1", "7", "31"] {
+        let loaded = Command::new(BIN)
+            .args(["--no-init", "--no-bootstrap", "--load"])
+            .arg(&out)
+            .env("BLISS_FORCE_TIER", "t1")
+            .env("BLISS_GC_STRESS", stride)
+            .env("BLISS_GC_POISON", "1")
+            .env("BLISS_GC_VERIFY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "stride {stride}: {}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&loaded.stdout).trim(),
+            "ASH-FASL ((1361129467683753853853498429727072845824 1 0) (-1361129467683753853853498429727072845824 -1 -2))", "stride {stride}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// R4.23 / R6.71: Babel builds reverse encoding tables with capturing ACROSS
 /// loops and typed numeric drivers. These must be compiled load thunks, not
 /// EvalSource actions that rebuild the tables in the tree walker.

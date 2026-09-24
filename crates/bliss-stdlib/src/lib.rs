@@ -11,6 +11,7 @@ pub mod packages;
 
 // ── CLOS ──────────────────────────────────────────────────────────
 pub mod characters;
+pub mod numbers;
 pub mod clos;
 
 // ── Condition system ──────────────────────────────────────────────

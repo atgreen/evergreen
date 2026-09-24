@@ -14419,7 +14419,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // LOGAND/LOGIOR/LOGXOR accept any count and need no entry.
         "LOGNOT" => Some((1, 1)),
         // (logbitp index integer) — exactly two (ansi logbitp.error.1-3).
-        "LOGBITP" => Some((2, 2)),
+        "LOGBITP" | "ASH" => Some((2, 2)),
         // (integer-length n) / (logcount n) — exactly one.
         "INTEGER-LENGTH" | "LOGCOUNT" | "ABS" => Some((1, 1)),
         "GET" => Some((2, 3)),
@@ -21071,6 +21071,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 return eval_int_div(args[0], args.get(1).copied(), RoundMode::Round, env);
+            }
+            "ASH" if global_fn(&name).is_none() => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(
+                        "ASH requires exactly two arguments".into(),
+                    ));
+                }
+                env.clear_mv();
+                return bliss_stdlib::numbers::ash(args[0], args[1]);
             }
             "LOGAND" | "LOGIOR" | "LOGXOR" => {
                 let args = eval_args(cdr, env)?;
@@ -33623,7 +33633,7 @@ const DIRECT_FAST: &[&str] = &[
     // (bliss-w0ae).
     "MEMBER", "ASSOC",
     "EQL", "EQUAL", "EQUALP", "MIN", "MAX", "NTH",
-    "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP",
+    "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "LOGBITP", "ASH",
     "MOD", "REM", "FLOOR", "CEILING", "TRUNCATE", "ROUND",
     // The car/cdr store primitives `(setf (car|cdr x) v)` lowers to. Leaf
     // builtins: they never re-enter Lisp and take evaluated arguments, so they
@@ -34487,6 +34497,10 @@ fn apply_builtin_fast(
         "LOGBITP" if args.len() == 2 => {
             env.clear_mv();
             Some(apply_logbitp(args[0], args[1]))
+        }
+        "ASH" if args.len() == 2 => {
+            env.clear_mv();
+            Some(bliss_stdlib::numbers::ash(args[0], args[1]))
         }
         "INTEGER-LENGTH" | "LOGCOUNT" if args.len() == 1 => {
             env.clear_mv();

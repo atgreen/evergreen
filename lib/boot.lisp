@@ -2865,26 +2865,8 @@
 (defun character (c) (coerce c 'character))
 (defun functionp (x) (typep x 'function))
 
-(defun ash (n count)
-  ;; ANSI: both arguments are INTEGERS. The (zerop count) branch below returned
-  ;; N unchanged without checking it, so there was no type check at all on that
-  ;; path -- (ash " " 0) answered " " and (ash 1.5 0) answered 1.5, with no
-  ;; error (ansi ASH.ERROR.4-5, which apply (lambda (x) (ash x 0)) across the
-  ;; universe and expect a TYPE-ERROR for every non-integer).
-  (unless (integerp n)
-    (error 'type-error :datum n :expected-type 'integer))
-  (unless (integerp count)
-    (error 'type-error :datum count :expected-type 'integer))
-  (cond ((zerop count) n)
-        ((> count 0) (* n (expt 2 count)))
-        ;; Right shift by (- count) bits. Once the shift reaches the operand's
-        ;; INTEGER-LENGTH the result collapses to the sign (0 for non-negative
-        ;; N, -1 for negative N). Testing that first avoids materialising
-        ;; (EXPT 2 (- COUNT)) as an astronomically large bignum for a big shift
-        ;; count — which otherwise exhausts memory and aborts (e.g. ASH.5's
-        ;; `(ash (- (ash 1 i)) (- (ash 1 i)))`).
-        ((>= (- count) (integer-length n)) (if (minusp n) -1 0))
-        (t (values (floor n (expt 2 (- count)))))))
+;; ASH is a native stdlib primitive: direct fixnum/limb shifts instead of
+;; EXPT followed by multiplication or FLOOR (bliss-7jt1).
 
 ;; LOGNOT/LOGAND/LOGIOR/LOGXOR are native builtins (limb-wise two's-complement
 ;; kernels in cli.rs, bliss-gvkz); the old bit-at-a-time recursive Lisp kernels
