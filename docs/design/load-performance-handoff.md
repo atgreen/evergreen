@@ -5,6 +5,73 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Walk dead nursery objects once (2026-09-24, bliss-j0wa)
+
+Minor GC separately walked all nursery objects to repair TLAB gaps, find pinned
+regions, and build the exact-object-start index. Its evacuation pass then walked
+them again to skip the dead objects. Preparation now combines the first three
+walks; evacuation enumerates the live bitmap directly, in the original address
+order. This removes work, without enlarging the nursery or deferring collection
+past the load timer. Pinned-region retention, persistent forwarding, large
+filler footprints, and exact-start validation remain intact.
+
+Five alternating CPU-0-pinned release runs against `b31a3d0`, using fresh
+processes and populated build-specific FASL caches:
+
+| Median | Before | Single preparation walk + live iteration |
+|---|---:|---:|
+| Initial Babel FASL load | 1.412 s | **1.361 s (3.6% less)** |
+| SBCL initial load, same batch | 0.287 s | 0.287 s |
+| Bliss / SBCL | 4.9× | **4.7×** |
+| Minor-GC pause during load | 0.195733 s | **0.146118 s (25.3% less)** |
+| Initial-load instructions (three separate isolated windows) | 6.426 G | **6.256 G (2.6% less)** |
+| Whole-process instructions | 19.689 G | 19.496 G |
+
+Every measured Bliss load performs one minor and zero major collections.
+Wall samples remain noisy: 1.073–1.415 s before, 1.036–1.362 s after.
+Whole-process medians, including ASDF startup, were 3.51 s before and 3.85 s
+after despite fewer instructions; this batch does **not** establish a startup
+speedup. The isolated instruction check ran concurrently with tests, so its wall
+times are not used. The five-run wall batch finished before workspace tests.
+
+The deterministic regression first failed at **8,101 header reads for 2,000
+mostly-dead objects**. It now reads **2,099** headers, passes a bound of fewer
+than 2,256 reads, and checks the surviving cons's relocation and contents.
+Other new tests cover bitmap
+word/region boundaries and reset, zero-filled TLAB gaps, pinned forwarding
+stubs, and large-header filler spans. All 625 runtime tests pass, including
+61 unit tests.
+Normal and stress/poison/verify runs match SBCL on all **15,106** Babel
+reverse-table entries. An every-allocation stress/poison/verify run also
+preserves source-free native-cons output `CONS-STRESS (100 99 0 1)`.
+Review is adversarial self-review, not independent.
+
+The complete workspace gate records **2,512 passed, seven failed, seven
+ignored**: non-CLI 1,767/5/4 and CLI 745/2/3. All 357 acceptance, 48 FASL,
+and 12 bytecode differential tests pass. The failures are the tracked compiler
+STRINGP metadata test (`bliss-4ihx`), four sequence fixtures (`bliss-0bdl`), and
+two Lisp-containing doctests (`bliss-pqyy`). The previously flaky T2 observation
+test passes in this run. Workspace check passes with the existing unused-mut
+warning (`bliss-d3hs`); root lint reports six baseline findings and zero new
+ones. Clippy still reports nine existing runtime diagnostics (`bliss-5vr`),
+spec coverage has 14 uncovered stage-5 requirements (`bliss-kjjd`), and existing
+rustfmt drift remains (`bliss-2uj1`); none of its diagnostics target new code.
+
+Several tempting alternatives were measured and discarded in this iteration:
+static multiple-value classifier shortcuts and function-cell checks each saved
+less than 1% (`bliss-amyr`); keyword-only direct-slot binding saved 0.33%
+(`bliss-8cko`); allowing cold restart instructions to deopt promoted
+`MAKE-ACTION-STATUS` to T1 but saved only 0.7% (`bliss-yun1`). Blanket invocation
+uncommon traps broke bootstrap with an unbound `TESTFN` (`bliss-r03w`). Removing
+the runtime destructuring-lowering restriction still left the observed ASDF
+functions uncompiled (`bliss-jx2n`). All those probes were removed. Lisp-leaf
+sample percentages were not removable dispatch costs.
+
+Refresh the now-stale load-only profile next (`bliss-ixj5`). The remaining
+external-root scanning lead is `bliss-399z`. The previous phase
+probe's 33 ms marking and 33 ms relocation are attribution leads, not a proven
+optimization or a reason to skip root scans.
+
 ## Reuse minor-GC evacuation destinations (2026-09-24, bliss-b03z)
 
 A throwaway action-timing probe ruled out a large remaining binary-decoder win.

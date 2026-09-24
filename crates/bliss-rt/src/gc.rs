@@ -323,6 +323,8 @@ unsafe fn header_exact_body_len(ptr: *const u8) -> usize {
 ///
 /// Safety: `ptr` must be valid for reads of at least OBJECT_HEADER_SIZE bytes.
 unsafe fn read_object_header(ptr: *const u8) -> (u8, u32) {
+    #[cfg(test)]
+    nursery_scan_tests::HEADER_READS.with(|count| count.set(count.get() + 1));
     if unsafe { header_is_free(ptr) } {
         return (0, 0);
     }
@@ -704,10 +706,89 @@ impl NurseryObjectMap {
         true
     }
 
+    #[cfg(test)]
     #[inline]
     fn is_marked(&self, body: usize) -> bool {
         self.position(body)
             .is_some_and(|(word, bit)| self.marked[word] & bit != 0)
+    }
+
+    /// Repair unretired TLAB tails, index exact starts, and detect pinning in
+    /// one walk. A zero gap must not hide objects in a later TLAB (bliss-bw3t).
+    /// Persistent forwarding stubs are excluded, as in the mark worklist.
+    ///
+    /// # Safety
+    /// The indexed region through `top` must be writable, stopped nursery
+    /// memory containing valid objects separated only by zero-filled gaps.
+    unsafe fn prepare_region(&mut self, region: usize, top: usize) -> bool {
+        let base = self.heap_base + region * self.region_size;
+        let mut cursor = base;
+        let mut pinned = false;
+        while cursor + OBJECT_HEADER_SIZE <= top {
+            let header = cursor as *mut u8;
+            let (type_id, body_size) = unsafe { read_object_header(header) };
+            if type_id == 0 && body_size == 0 {
+                let mut end = cursor + OBJECT_ALIGNMENT;
+                while end + OBJECT_HEADER_SIZE <= top {
+                    if unsafe { read_object_header(end as *const u8) } != (0, 0) {
+                        break;
+                    }
+                    end += OBJECT_ALIGNMENT;
+                }
+                let end = end.min(top);
+                let span = end - cursor;
+                if span >= OBJECT_ALIGNMENT {
+                    // Extended headers need their extra word subtracted too,
+                    // so the filler occupies exactly the unused TLAB span.
+                    let normal_body = span - OBJECT_HEADER_SIZE;
+                    let (_, large) = object_footprint(normal_body);
+                    let filler_body = if large {
+                        span - LARGE_OBJECT_PAYLOAD_OFFSET
+                    } else {
+                        normal_body
+                    };
+                    debug_assert_eq!(object_footprint(filler_body).0, span);
+                    unsafe { write_object_header(header, 0, filler_body as u32) };
+                    self.insert(cursor + OBJECT_HEADER_SIZE);
+                } else if gc_verify_enabled() {
+                    panic!(
+                        "gc-verify(tlab-gap): nursery region {region} has an unfilled \
+                         gap at {cursor:#x} before alloc_top {top:#x} (base {base:#x})"
+                    );
+                }
+                cursor = end;
+                continue;
+            }
+            if !unsafe { header_is_forwarded(header) } {
+                self.insert(cursor + OBJECT_HEADER_SIZE);
+                pinned |= unsafe { header_is_pinned(header) };
+            }
+            cursor += align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+        }
+        pinned
+    }
+
+    /// Enumerate only live bodies, in the same address order as the old stride
+    /// walk. Bits were set only for exact, non-forwarded object starts, before
+    /// evacuation changed any header. No scratch allocation is needed.
+    fn marked_bodies(&self, region: usize) -> impl Iterator<Item = usize> + '_ {
+        let words = (self.region_size / OBJECT_ALIGNMENT).div_ceil(64);
+        let start = self.region_offsets[region];
+        let base = self.heap_base + region * self.region_size;
+        self.marked[start..start + words]
+            .iter()
+            .enumerate()
+            .flat_map(move |(word, &bits)| {
+                let mut remaining = bits;
+                std::iter::from_fn(move || {
+                    if remaining == 0 {
+                        return None;
+                    }
+                    let bit = remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+                    Some(base + (word * 64 + bit) * OBJECT_ALIGNMENT + OBJECT_HEADER_SIZE)
+                })
+            })
     }
 }
 
@@ -777,6 +858,85 @@ mod nursery_object_map_tests {
         map.reset(BASE, REGION, 10000, &[]);
         assert!(!map.mark(BASE + 2 * REGION + OBJECT_HEADER_SIZE));
         assert!(map.starts.is_empty());
+    }
+
+    #[test]
+    fn live_body_iteration_preserves_address_order_and_region_boundaries() {
+        let mut map = NurseryObjectMap::default();
+        // Deliberately use a different bitmap order from physical region order.
+        map.reset(BASE, REGION, 5, &[3, 1]);
+        for region in [1, 3] {
+            let bodies: Vec<usize> = [0, 1, 63, 64, 255]
+                .map(|bit| BASE + region * REGION + bit * OBJECT_ALIGNMENT + OBJECT_HEADER_SIZE)
+                .into();
+            for &body in bodies.iter().rev() {
+                map.insert(body);
+                assert!(map.mark(body));
+            }
+            map.insert(BASE + region * REGION + 32 * OBJECT_ALIGNMENT + OBJECT_HEADER_SIZE);
+            assert_eq!(map.marked_bodies(region).collect::<Vec<_>>(), bodies);
+        }
+        map.reset(BASE, REGION, 5, &[1]);
+        assert_eq!(map.marked_bodies(1).count(), 0);
+        // Small regions have a partial final bitmap word.
+        map.reset(BASE, 32, 2, &[0, 1]);
+        map.insert(BASE + 16 + OBJECT_HEADER_SIZE);
+        map.mark(BASE + 16 + OBJECT_HEADER_SIZE);
+        assert_eq!(
+            map.marked_bodies(0).collect::<Vec<_>>(),
+            [BASE + 16 + OBJECT_HEADER_SIZE]
+        );
+        assert_eq!(map.marked_bodies(1).count(), 0);
+    }
+
+    #[test]
+    fn preparation_fills_tlab_gaps_without_indexing_forwarded_stubs() {
+        let mut memory = vec![0u128; REGION / OBJECT_ALIGNMENT];
+        let ptr = memory.as_mut_ptr() as *mut u8;
+        let base = ptr as usize;
+        let mut map = NurseryObjectMap::default();
+        map.reset(base, REGION, 1, &[0]);
+        unsafe {
+            for offset in [0, 128, 160] {
+                write_object_header(ptr.add(offset), crate::object::type_id::CONS, 16);
+            }
+            (*(ptr.add(128) as *mut ObjectHeader)).set_pinned();
+            (*(ptr.add(160) as *mut ObjectHeader)).set_pinned();
+            header_set_forwarded(ptr.add(160), ptr.add(128 + OBJECT_HEADER_SIZE));
+            assert!(map.prepare_region(0, base + 256));
+            assert_eq!(header_total_bytes(ptr.add(32)), 96);
+            assert_eq!(header_total_bytes(ptr.add(192)), 64);
+        }
+        for offset in [0, 32, 128, 192] {
+            assert!(map.contains(base + offset + OBJECT_HEADER_SIZE));
+        }
+        for offset in [16, 48, 96, 144, 160, 176, 208, 256] {
+            assert!(!map.contains(base + offset + OBJECT_HEADER_SIZE));
+        }
+        // Pinning on a forwarding stub must not retain the region by itself.
+        unsafe { (*(ptr.add(128) as *mut ObjectHeader)).clear_pinned() };
+        map.reset(base, REGION, 1, &[0]);
+        assert!(!unsafe { map.prepare_region(0, base + 256) });
+    }
+
+    #[test]
+    fn preparation_preserves_large_filler_footprints_and_later_objects() {
+        const REGION: usize = 2 * 1024 * 1024;
+        const LATER: usize = 1024 * 1024;
+        let mut memory = vec![0u128; REGION / OBJECT_ALIGNMENT];
+        let ptr = memory.as_mut_ptr() as *mut u8;
+        let base = ptr as usize;
+        let mut map = NurseryObjectMap::default();
+        map.reset(base, REGION, 1, &[0]);
+        unsafe {
+            write_object_header(ptr, crate::object::type_id::CONS, 16);
+            write_object_header(ptr.add(LATER), crate::object::type_id::CONS, 16);
+            assert!(!map.prepare_region(0, base + LATER + 32));
+            assert_eq!(body_offset(ptr.add(32)), LARGE_OBJECT_PAYLOAD_OFFSET);
+            assert_eq!(header_total_bytes(ptr.add(32)), LATER - 32);
+        }
+        assert!(map.contains(base + LATER + OBJECT_HEADER_SIZE));
+        assert!(!map.contains(base + LATER - 16 + OBJECT_HEADER_SIZE));
     }
 }
 
@@ -1384,79 +1544,9 @@ impl HeapCollector {
             .map(|(i, _)| i)
             .collect();
 
-        // (bliss-bw3t) Make every nursery region parseable base..alloc_top BEFORE
-        // any object-stride walk. `refill_tlab` advances a region's alloc_top past
-        // each carved TLAB, but a TLAB whose under-filled tail was never retired
-        // (filled) leaves a ZERO header gap. Every stride walk below (pinned scan,
-        // nursery_index build, the copy loop) treats a zero header as end-of-region
-        // and STOPS — hiding every object in a LATER TLAB carved from the same
-        // region (a concurrent peer thread's TLAB). Those live objects are then
-        // never marked, get reclaimed when the nursery resets, and their still-live
-        // references (e.g. a survivor cons's cdr) dangle: the concurrent-GC
-        // corruption. Reconstruct a filler object over each zero gap, spanning
-        // exactly to the next real object (probed through the zeroed tail) or to
-        // alloc_top — the collector-side equivalent of HotSpot filling all TLAB
-        // dead space at a stop-the-world so the heap stays walkable.
-        for &nursery_idx in &nursery_indices {
-            let base = state.regions[nursery_idx].base as usize;
-            let top = state.regions[nursery_idx].header.alloc_top as usize;
-            let mut cursor = base;
-            while cursor + OBJECT_HEADER_SIZE <= top {
-                let (type_id, body_size) = unsafe { read_object_header(cursor as *const u8) };
-                if type_id == 0 && body_size == 0 {
-                    // Zero gap (an unretired TLAB tail). Probe forward, object-
-                    // aligned, to the next non-zero header or alloc_top. The gap is
-                    // genuinely zeroed nursery space, so the first non-zero header
-                    // is the next TLAB's first live object.
-                    let mut probe = cursor + OBJECT_ALIGNMENT;
-                    while probe + OBJECT_HEADER_SIZE <= top {
-                        let (t, b) = unsafe { read_object_header(probe as *const u8) };
-                        if !(t == 0 && b == 0) {
-                            break;
-                        }
-                        probe += OBJECT_ALIGNMENT;
-                    }
-                    let gap_end = probe.min(top);
-                    let span = gap_end - cursor;
-                    if span >= OBJECT_ALIGNMENT {
-                        // Match retire_tlab's footprint math so the filler occupies
-                        // EXACTLY `span` bytes (normal vs large-object header).
-                        let normal_body = span - OBJECT_HEADER_SIZE;
-                        let (_, needs_large_header) = object_footprint(normal_body);
-                        let filler_body = if needs_large_header {
-                            span - LARGE_OBJECT_PAYLOAD_OFFSET
-                        } else {
-                            normal_body
-                        };
-                        debug_assert_eq!(object_footprint(filler_body).0, span);
-                        unsafe {
-                            write_object_header(cursor as *mut u8, 0, filler_body as u32);
-                        }
-                    }
-                    cursor = gap_end;
-                    continue;
-                }
-                let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                cursor += total;
-            }
-        }
-
-        // Nursery regions that hold a pinned object are retained in place: their
-        // objects are not copied and the region is promoted to old-gen so it is
-        // never treated as a copy space again (bliss-jtc.18).
-        let pinned_indices: Vec<usize> = nursery_indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                let base = state.regions[idx].base as usize;
-                let top = state.regions[idx].header.alloc_top as usize;
-                top > base && unsafe { region_has_pinned(base, top) }
-            })
-            .collect();
-
-        // Record exact object starts, excluding persistent forwarding stubs.
-        // Headers remain intact until copying, so the mark worklist can read
-        // layouts directly instead of duplicating them in a hash table.
+        // Record exact starts while repairing TLAB gaps and finding retained
+        // (pinned) regions. Headers remain intact until evacuation; one walk
+        // supplies all three facts without rereading every dead nursery object.
         let mut nursery_index = MINOR_OBJECT_MAP.with(|s| std::mem::take(&mut *s.borrow_mut()));
         nursery_index.reset(
             state.heap_base as usize,
@@ -1464,34 +1554,13 @@ impl HeapCollector {
             state.regions.len(),
             &nursery_indices,
         );
-        for &nursery_idx in &nursery_indices {
-            let base = state.regions[nursery_idx].base as usize;
-            let top = state.regions[nursery_idx].header.alloc_top as usize;
-            let mut cursor = base;
-            let mut stopped_at_zero = false;
-            while cursor + OBJECT_HEADER_SIZE <= top {
-                let header_ptr = cursor as *const u8;
-                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
-                if body_size == 0 && type_id == 0 {
-                    stopped_at_zero = true;
-                    break;
-                }
-                let total_size =
-                    align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                if !unsafe { header_is_forwarded(header_ptr) } {
-                    nursery_index.insert(cursor + OBJECT_HEADER_SIZE);
-                }
-                cursor += total_size;
-            }
-            // (bliss-bw3t) After the gap-fill pre-pass the walk must reach alloc_top;
-            // a residual zero gap would again hide later-TLAB objects. Guard the
-            // invariant under BLISS_GC_VERIFY.
-            if gc_verify_enabled() && stopped_at_zero {
-                panic!(
-                    "gc-verify(tlab-gap): nursery region {nursery_idx} walk stopped at ZERO \
-                     header {cursor:#x} before alloc_top {top:#x} (base {base:#x}) — an unfilled \
-                     TLAB gap still hides later objects from the collector (bliss-bw3t)"
-                );
+        let mut pinned_indices = Vec::new();
+        for &idx in &nursery_indices {
+            let top = state.regions[idx].header.alloc_top as usize;
+            // SAFETY: mutators are stopped and these are allocated nursery
+            // regions; prepare_region repairs their zero-filled TLAB gaps.
+            if unsafe { nursery_index.prepare_region(idx, top) } {
+                pinned_indices.push(idx);
             }
         }
 
@@ -1643,31 +1712,14 @@ impl HeapCollector {
                 continue; // Empty nursery region.
             }
 
-            // Scan objects in this nursery region from base to alloc_top.
-            let mut cursor = base;
-            while cursor + OBJECT_HEADER_SIZE <= top {
-                let header_ptr = cursor as *mut u8;
+            // The mark bitmap already identifies every evacuation candidate.
+            // Do not reread dead objects just to advance past their payloads.
+            for body_addr in nursery_index.marked_bodies(nursery_idx) {
+                let header_ptr = (body_addr - OBJECT_HEADER_SIZE) as *mut u8;
                 let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
-
-                if body_size == 0 && type_id == 0 {
-                    break; // End of allocated objects (zeroed memory).
-                }
-
-                // Skip already-forwarded objects.
-                if unsafe { header_is_forwarded(header_ptr) } {
-                    let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                    cursor += total;
-                    continue;
-                }
-
+                debug_assert!(!unsafe { header_is_forwarded(header_ptr) });
                 let total_size =
                     align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-
-                let body_addr = cursor + OBJECT_HEADER_SIZE;
-                if !nursery_index.is_marked(body_addr) {
-                    cursor += total_size;
-                    continue;
-                }
 
                 // Decide target: promote to old-gen if region age >= threshold,
                 // otherwise copy to survivor.
@@ -1737,7 +1789,6 @@ impl HeapCollector {
                 }
 
                 bytes_promoted += total_size as u64;
-                cursor += total_size;
             }
 
             // Finalizer/weak-pointer side tables are NOT touched here: firing a
@@ -6033,6 +6084,93 @@ mod trace_tests {
         assert!(!is_heap_ref(BlissVal::from_fixnum(0x4000)));
         assert!(!is_heap_ref(crate::value::NIL));
         assert!(!is_heap_ref(crate::value::T));
+    }
+}
+
+#[cfg(test)]
+mod nursery_scan_tests {
+    use super::*;
+    use crate::value::NIL;
+
+    thread_local! {
+        pub(super) static HEADER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn minor_gc_visits_dead_nursery_objects_once() {
+        // Isolate the collector from unrelated unit-test roots and heap resets.
+        const CHILD: &str = "BLISS_TEST_NURSERY_SCAN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc::nursery_scan_tests::minor_gc_visits_dead_nursery_objects_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("BLISS_GC_VERIFY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let config = GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 8 * 1024 * 1024,
+            nursery_size: 4 * 1024 * 1024,
+            tlab_size: 4096,
+            region_size: 8192,
+            promotion_threshold: 15,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 64,
+            old_occupancy_trigger: 0.5,
+        };
+        init_heap(&config).unwrap();
+        let mut alloc = HeapAllocator::new().unwrap();
+        crate::rooted!(last = NIL);
+        const OBJECTS: usize = 2000;
+        for i in 0..OBJECTS {
+            let body = alloc
+                .alloc_fast(16)
+                .or_else(|| alloc.alloc_slow(16).ok())
+                .unwrap();
+            unsafe {
+                write_object_header(
+                    body.sub(OBJECT_HEADER_SIZE),
+                    crate::object::type_id::CONS,
+                    16,
+                );
+                *(body as *mut BlissVal) = BlissVal::from_fixnum(i as i64);
+                *((body as *mut BlissVal).add(1)) = NIL;
+            }
+            // All but the final cons are dead. Their headers are needed for
+            // preparation, not again to locate the single evacuation candidate.
+            *last = BlissVal(body as u64 | crate::value::TAG_CONS);
+        }
+        let before = *last;
+        HEADER_READS.with(|count| count.set(0));
+        HeapCollector::new().minor_gc().unwrap();
+        let reads = HEADER_READS.with(|count| count.get());
+        eprintln!("{OBJECTS} nursery objects: {reads} header reads");
+        assert_ne!(*last, before, "the live object must actually evacuate");
+        let body = (last.0 & !crate::value::TAG_MASK) as *const BlissVal;
+        unsafe {
+            assert_eq!(*body, BlissVal::from_fixnum((OBJECTS - 1) as i64));
+            assert_eq!(*body.add(1), NIL);
+        }
+        // Allow the final unused TLAB tail and the live object's tracing and
+        // relocation; a second full dead-object walk cannot fit this budget.
+        assert!(
+            reads < OBJECTS + 256,
+            "{OBJECTS} nursery objects required {reads} header reads"
+        );
     }
 }
 
