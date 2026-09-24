@@ -1,5 +1,5 @@
 #!/bin/bash
-# Instructions retired for one bliss-cli run — the reliable perf metric on this box.
+# Instructions retired for one torcl run — the reliable perf metric on this box.
 #
 # Wall clock here is unusable below ~10%: the same binary on the same workload
 # has measured 3.5s and 6.9s within one session as background load moved, which

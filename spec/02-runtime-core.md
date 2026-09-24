@@ -1,10 +1,10 @@
 # §2 Runtime Core
 
-The Runtime Core is the lowest Rust-implemented layer of Bliss. It owns
+The Runtime Core is the lowest Rust-implemented layer of TorCL. It owns
 process lifecycle (startup → run → shutdown), the thread model (exposed OS
 carrier threads + M:N fibers), stack layout and frame walking, safepoint
 synchronisation, POSIX signal handling, and the C-ABI FFI bridge.
-Source lives in `crates/bliss-rt/src/` (see §0 directory map).
+Source lives in `crates/torcl-rt/src/` (see §0 directory map).
 
 ---
 
@@ -29,7 +29,7 @@ Source lives in `crates/bliss-rt/src/` (see §0 directory map).
 | R2.15 | FFI calls MUST transition the calling fiber to a "native" state that does not block GC safepoints; a plain native thread publishes equivalent root state. | MUST |
 | R2.16 | Environment variables listed in §2.8 MUST be read before any heap allocation. | MUST |
 | R2.17 | Shutdown MUST run all registered finalizers, finish fibers, join carrier/native threads, and exit with a CL-controlled exit code. | MUST |
-| R2.18 | The runtime MUST NOT call `panic!()` in any production code path; all errors propagate via `Result<T, BlissError>`. | MUST NOT |
+| R2.18 | The runtime MUST NOT call `panic!()` in any production code path; all errors propagate via `Result<T, TorclError>`. | MUST NOT |
 | R2.19 | The runtime MUST support at least 100 000 simultaneous fibers on a 64-bit system with default stack sizes. | MUST |
 | R2.20 | Stack overflow on a CL stack MUST raise `STORAGE-CONDITION`, not a process-killing signal. | MUST |
 
@@ -108,13 +108,13 @@ ms) and is only used during development and cross-compilation (§0.4.5).
 
 | Component | Description |
 |-----------|-------------|
-| **Carrier thread** | An exposed `BLISS-THREAD` OS-backed thread. A scheduler group marks its carriers and gives each a TLAB, a work-stealing deque, and a Rust call stack. User-created native threads and group-owned carriers share the same public thread type. |
-| **Fiber** | A distinct `BLISS-FIBER` lightweight managed execution. Has its own `BlissStack` (§2.4), dynamic state, saved continuation, and lifecycle independent of any one carrier. |
+| **Carrier thread** | An exposed `TORCL-THREAD` OS-backed thread. A scheduler group marks its carriers and gives each a TLAB, a work-stealing deque, and a Rust call stack. User-created native threads and group-owned carriers share the same public thread type. |
+| **Fiber** | A distinct `TORCL-FIBER` lightweight managed execution. Has its own `TorclStack` (§2.4), dynamic state, saved continuation, and lifecycle independent of any one carrier. |
 | **Scheduler** | Internal per-carrier run queue (LIFO push/pop) with cross-carrier stealing (FIFO). A public scheduler-group handle controls carrier/fiber lifecycle; scheduling decisions happen only at safepoints (§2.5). |
 
 **R2.21** Native/carrier threads and fibers MUST be distinct public object
-types. `BLISS-THREAD:MAKE-THREAD` creates a one-to-one OS-backed thread;
-`BLISS-FIBER:MAKE-FIBER` creates a lightweight fiber. Scheduler-group carrier
+types. `TORCL-THREAD:MAKE-THREAD` creates a one-to-one OS-backed thread;
+`TORCL-FIBER:MAKE-FIBER` creates a lightweight fiber. Scheduler-group carrier
 threads MUST be observable through both thread introspection and the group.
 
 ### 2.3.2 State Machine
@@ -178,12 +178,12 @@ Transitions summary:
 pub struct Fiber {
     id:          FiberId,             // monotonic u64
     state:       AtomicU8,            // enum FiberState
-    stack:       BlissStack,          // §2.4
-    entry:       BlissVal,            // CL function to call
-    result:      UnsafeCell<BlissVal>,
+    stack:       TorclStack,          // §2.4
+    entry:       TorclVal,            // CL function to call
+    result:      UnsafeCell<TorclVal>,
     join_waker:  AtomicWaker,         // for join semantics
     continuation: FiberContinuation,  // saved SP/FP + callee-saved registers
-    tls_slots:   Box<[BlissVal; MAX_TLS]>, // per-fiber dynamic bindings
+    tls_slots:   Box<[TorclVal; MAX_TLS]>, // per-fiber dynamic bindings
     handler_stack: Vec<HandlerFrame>,
     restart_stack: Vec<RestartFrame>,
     pin_count:   AtomicU32,
@@ -191,10 +191,10 @@ pub struct Fiber {
 }
 ```
 
-Creating a fiber (`BLISS-FIBER:MAKE-FIBER`) allocates a `BlissStack` from a
+Creating a fiber (`TORCL-FIBER:MAKE-FIBER`) allocates a `TorclStack` from a
 pool and sets `state = Created`. `SUBMIT-FIBER` transitions it to `Runnable`
 and pushes it onto a carrier's deque. Creating a native thread
-(`BLISS-THREAD:MAKE-THREAD`) instead creates a dedicated OS thread and does
+(`TORCL-THREAD:MAKE-THREAD`) instead creates a dedicated OS thread and does
 not allocate or submit a fiber. **R2.19**: with a default CL stack of 512 KiB
 (guard-page protected), 100 000 fibers require
 ~50 GiB of virtual address space — feasible on 64-bit with
@@ -222,7 +222,7 @@ higher-priority fiber is ready).
 
 ## 2.4 Stack Layout
 
-Each fiber owns a `BlissStack`: a contiguous virtual memory
+Each fiber owns a `TorclStack`: a contiguous virtual memory
 region used for CL control/value frames. The Rust call stack of the
 carrier thread (the "shadow stack") is separate.
 
@@ -244,7 +244,7 @@ carrier thread (the "shadow stack") is separate.
  Low address
 ```
 
-Default usable size: 512 KiB (configurable via `BLISS_STACK_SIZE`).
+Default usable size: 512 KiB (configurable via `TORCL_STACK_SIZE`).
 
 ### 2.4.2 Frame Format
 
@@ -255,16 +255,16 @@ variable-size locals area.
  ┌────────────────────────────────────┐  ← FP (frame pointer)
  │ prev_fp        : *mut Frame       │  8 bytes — linked list for walking
  │ return_pc      : *const u8        │  8 bytes — return address in native code
- │ function       : BlissVal         │  8 bytes — calling function (for debugger)
+ │ function       : TorclVal         │  8 bytes — calling function (for debugger)
  │ code_info      : *const CodeInfo  │  8 bytes — safepoint map + source loc table
  │ flags          : u32              │  4 bytes — frame type, catch/unwind bits
  │ num_locals     : u16              │  2 bytes
  │ _pad           : u16              │  2 bytes (alignment)
  ├────────────────────────────────────┤
- │ locals[0]      : BlissVal         │
- │ locals[1]      : BlissVal         │
+ │ locals[0]      : TorclVal         │
+ │ locals[1]      : TorclVal         │
  │ ...                               │
- │ locals[N-1]    : BlissVal         │
+ │ locals[N-1]    : TorclVal         │
  └────────────────────────────────────┘  ← SP (stack pointer)
 ```
 
@@ -283,20 +283,20 @@ O(n) stack walks without requiring metadata side-tables (R2.06).
 ### 2.4.4 Unified Control Stack (Interpreted + Compiled Frames)
 
 **Every CL activation — interpreted (T0) or compiled (T1/T2) — lives as a
-frame on the fiber's `BlissStack`** (R2.05), in the §2.4.2 format, so a
+frame on the fiber's `TorclStack`** (R2.05), in the §2.4.2 format, so a
 single call chain freely interleaves tiers and one frame walker (the `prev_fp`
 chain) sees them all. This is the key mechanism deviation from HotSpot noted in
 §0 §1.1: rather than a template (assembly) interpreter whose frames are native
-machine-stack frames, Bliss's baseline interpreter is a host-language (Rust)
+machine-stack frames, TorCL's baseline interpreter is a host-language (Rust)
 loop, but its frames still live on the CL stack — not on the carrier's Rust
 "shadow" stack.
 
 The Rust shadow stack therefore holds only **transient, non-CL** activity: the
 interpreter dispatch loop itself, GC inner loops, and runtime-internal helpers.
 It never holds a durable CL activation, so a fiber can be parked or
-migrated by saving its `BlissStack` pointer alone (§2.3) — interpreter state is
+migrated by saving its `TorclStack` pointer alone (§2.3) — interpreter state is
 not stranded on a shared worker stack. Deep interpreted recursion consumes
-`BlissStack` frames and raises `STORAGE-CONDITION` on overflow (R2.20), rather
+`TorclStack` frames and raises `STORAGE-CONDITION` on overflow (R2.20), rather
 than overflowing the Rust stack.
 
 #### D2.03 — Interpreter Frame
@@ -328,7 +328,7 @@ Crossing tiers is an argument-shuffle, not a stack switch. A **c2i adapter**
 interpreter frame slots; an **i2c adapter** (interpreted→compiled) moves
 operand-stack arguments into the compiled calling convention. Adapters are the
 single-stack analog of a cross-world trampoline: control and both frames stay
-on the one `BlissStack`, so OSR and deoptimisation (§4.6) rebuild or unwind
+on the one `TorclStack`, so OSR and deoptimisation (§4.6) rebuild or unwind
 frames in place without bridging two stacks.
 
 #### GC of the control stack
@@ -343,13 +343,13 @@ conservative pinning of interpreter values implied by an all-shadow-stack T0.
 ### 2.4.5 Interpreter Realisation: Host-Loop vs. Template
 
 The unified-stack model above is independent of *how* the interpreter is coded.
-Two realisations satisfy it; Bliss ships the first and keeps the second as an
+Two realisations satisfy it; TorCL ships the first and keeps the second as an
 explicit, deferred option.
 
 | | **Host-loop (baseline)** | **Template (later option)** |
 |---|---|---|
 | Interpreter body | Rust dispatch loop over bytecode | Generated machine-code stub per bytecode (via the codegen emitter, §4.7) |
-| Frames | On `BlissStack` (D2.03), driven by the Rust loop | On `BlissStack`, native-stack frames |
+| Frames | On `TorclStack` (D2.03), driven by the Rust loop | On `TorclStack`, native-stack frames |
 | Cost | No codegen prerequisite; portable; debuggable | Assembly interpreter per ISA (x86-64 + aarch64); largest single component |
 | Payoff | One stack, exact maps, cheap fiber park, mixed-tier chains | The above **plus** raw interpreter throughput / full HotSpot fidelity |
 
@@ -367,10 +367,10 @@ and (2) *host-language* (Rust) vs. *compiled to native code*. A true single stac
 requires **explicit-stack _or_ compiled** — the only combination that fails is
 *recursive and host-language*, which is exactly today's tree-walker (its Rust
 recursion puts CL activations on the Rust stack, a separate stack from
-`BlissStack` — the two-stack condition bliss-nmq removes).
+`TorclStack` — the two-stack condition bliss-nmq removes).
 
 - The **host-loop baseline above qualifies because it is a _bytecode_ loop**:
-  `CALL`/`RETURN` push and pop D2.03 frames on the `BlissStack`, so CL
+  `CALL`/`RETURN` push and pop D2.03 frames on the `TorclStack`, so CL
   activations live there and only the single dispatch-loop frame (plus transient
   helpers) sits on the Rust stack. It is host-language but not recursive.
 - **SBCL reaches the same single control stack from the other axis.** Its
@@ -384,9 +384,9 @@ recursion puts CL activations on the Rust stack, a separate stack from
   stack-allocates any ENV"). So **call-frame unification and locals-in-frame are
   separable**: SBCL unifies the control stack while heap-allocating bindings,
   whereas D2.03's in-frame locals are a bytecode-VM / compiled-code property that
-  a lowering pass makes available. Bliss's current `EnvFrame` chain
+  a lowering pass makes available. TorCL's current `EnvFrame` chain
   (`Rc<RefCell<EnvFrame>>`) matches SBCL's heap-env model; moving *call frames*
-  onto the `BlissStack` is the separable step, and the bytecode loop is what
+  onto the `TorclStack` is the separable step, and the bytecode loop is what
   achieves it without the interpreter itself being native code.
 
 ---
@@ -499,7 +499,7 @@ signal handler.
 
 ### 2.7.1 Calling Convention (R2.11)
 
-Bliss-generated native code uses the platform C ABI (System V AMD64 on
+TorCL-generated native code uses the platform C ABI (System V AMD64 on
 Linux/macOS x86-64; AAPCS64 on aarch64). This means CL-compiled
 functions can be called directly from C without wrapper overhead when
 they use fixed-arity, non-variadic signatures.
@@ -546,7 +546,7 @@ they use fixed-arity, non-variadic signatures.
                             3. call via fn ptr ─────►
                             5. transition back  ◄─────  return
   6. unmarshal return          to Runnable
-     into BlissVal
+     into TorclVal
 ```
 
 Step 2 (R2.15): Before entering C code, the fiber sets
@@ -557,7 +557,7 @@ the thread's CL stack is quiescent and scannable without cooperation.
 
 When C code needs to call back into CL:
 
-1. `BLISS-FFI:MAKE-CALLBACK` allocates an executable trampoline (a
+1. `TORCL-FFI:MAKE-CALLBACK` allocates an executable trampoline (a
    small code stub on a writable+executable page).
 2. The trampoline saves C callee-save registers, transitions the
    thread from `Native` to `Runnable`, pushes a trampoline frame on
@@ -588,16 +588,16 @@ declaration. Hand-rolled stubs avoid the ~50 ns overhead of
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BLISS_HEAP_SIZE` | `512m` | Initial old-gen heap reservation |
-| `BLISS_TLAB_SIZE` | `2m` | Per-thread TLAB size (§3.2.2, `--tlab-size`) |
-| `BLISS_NURSERY_SIZE` | `64m` | Total nursery region pool (§3.2.2, `--nursery-size`) |
-| `BLISS_STACK_SIZE` | `512k` | CL stack size per fiber |
-| `BLISS_WORKERS` | `nproc` | Default scheduler-group carrier count (legacy name) |
-| `BLISS_IMAGE` | `bliss.bimg` | Path to boot image |
-| `BLISS_GC_LOG` | (none) | Path to GC log file (enables GC logging) |
-| `BLISS_JIT_DUMP` | `0` | `1` = emit `jitdump` file for `perf` |
-| `BLISS_SAFEPOINT_SPIN` | `1000` | Spin iterations before parking at safepoint |
-| `BLISS_FFI_POOL_PAGES` | `4` | Executable pages for callback trampolines |
+| `TORCL_HEAP_SIZE` | `512m` | Initial old-gen heap reservation |
+| `TORCL_TLAB_SIZE` | `2m` | Per-thread TLAB size (§3.2.2, `--tlab-size`) |
+| `TORCL_NURSERY_SIZE` | `64m` | Total nursery region pool (§3.2.2, `--nursery-size`) |
+| `TORCL_STACK_SIZE` | `512k` | CL stack size per fiber |
+| `TORCL_WORKERS` | `nproc` | Default scheduler-group carrier count (legacy name) |
+| `TORCL_IMAGE` | `torcl.bimg` | Path to boot image |
+| `TORCL_GC_LOG` | (none) | Path to GC log file (enables GC logging) |
+| `TORCL_JIT_DUMP` | `0` | `1` = emit `jitdump` file for `perf` |
+| `TORCL_SAFEPOINT_SPIN` | `1000` | Spin iterations before parking at safepoint |
+| `TORCL_FFI_POOL_PAGES` | `4` | Executable pages for callback trampolines |
 
 All environment variables are read once in step 1 of startup (§2.2)
 before any heap allocation occurs.
@@ -605,21 +605,21 @@ before any heap allocation occurs.
 ### 2.8.2 CLI Arguments
 
 ```text
-bliss [options] [-- CL-args...]
+torcl [options] [-- CL-args...]
 
 Options:
-  --image PATH        Override BLISS_IMAGE
+  --image PATH        Override TORCL_IMAGE
   --eval FORM         Evaluate FORM and exit
   --load FILE         Load FILE and exit
   --no-image          Bootstrap from lib/boot.lisp (no image)
-  --workers N         Override BLISS_WORKERS
-  --heap-size SIZE    Override BLISS_HEAP_SIZE
+  --workers N         Override TORCL_WORKERS
+  --heap-size SIZE    Override TORCL_HEAP_SIZE
   --help              Print usage and exit
   --version           Print version and exit
 ```
 
 Arguments after `--` are passed to CL as
-`BLISS-EXT:*COMMAND-LINE-ARGUMENTS*`.
+`TORCL-EXT:*COMMAND-LINE-ARGUMENTS*`.
 
 ---
 
@@ -646,12 +646,12 @@ forced shutdown (threads are detached, not joined).
 
 ### 2.10.1 Rust-Side Errors
 
-All runtime-internal functions return `Result<T, BlissError>`.
-`BlissError` is a non-exhaustive enum:
+All runtime-internal functions return `Result<T, TorclError>`.
+`TorclError` is a non-exhaustive enum:
 
 ```rust
 /// D2.04 — Runtime error type.
-pub enum BlissError {
+pub enum TorclError {
     Oom,                          // nursery + old-gen exhausted
     StackOverflow(GreenThreadId),
     InvalidImage(String),
@@ -662,21 +662,21 @@ pub enum BlissError {
 }
 ```
 
-`BlissError` MUST NOT be converted to `panic!` (R2.18). At the FFI
-boundary, `BlissError` is translated into the appropriate CL condition
+`TorclError` MUST NOT be converted to `panic!` (R2.18). At the FFI
+boundary, `TorclError` is translated into the appropriate CL condition
 class.
 
 ### 2.10.2 CL Condition Mapping
 
-| BlissError | CL Condition |
+| TorclError | CL Condition |
 |------------|-------------|
 | `Oom` | `STORAGE-CONDITION` |
 | `StackOverflow` | `STORAGE-CONDITION` |
-| `InvalidImage` | `BLISS-EXT:IMAGE-ERROR` (subclass of `ERROR`) |
-| `FfiError` | `BLISS-FFI:FFI-ERROR` (subclass of `ERROR`) |
-| `SignalError` | `BLISS-EXT:SIGNAL-ERROR` |
+| `InvalidImage` | `TORCL-EXT:IMAGE-ERROR` (subclass of `ERROR`) |
+| `FfiError` | `TORCL-FFI:FFI-ERROR` (subclass of `ERROR`) |
+| `SignalError` | `TORCL-EXT:SIGNAL-ERROR` |
 | `Shutdown` | Not signalled — initiates shutdown path |
-| `Internal` | `BLISS-EXT:INTERNAL-ERROR` — always a bug, dump & abort |
+| `Internal` | `TORCL-EXT:INTERNAL-ERROR` — always a bug, dump & abort |
 
 ---
 
@@ -699,7 +699,7 @@ MUST be added to this table with its position in the total order.
 
 | What | How |
 |------|-----|
-| Startup sequence | Integration test: spawn `bliss --eval '(quit 42)'`, assert exit code 42 and elapsed < 50 ms. |
+| Startup sequence | Integration test: spawn `torcl --eval '(quit 42)'`, assert exit code 42 and elapsed < 50 ms. |
 | Fiber creation / join | Unit test: submit 1 000 fibers each incrementing an atomic counter; assert final value. |
 | Safepoint liveness | Unit test: tight loop in T1; verify GC completes within 100 ms. |
 | Stack overflow | Unit test: deeply recursive function; assert `STORAGE-CONDITION` raised, stack intact. |
@@ -714,10 +714,10 @@ MUST be added to this table with its position in the total order.
 
 | Source file | Responsibility | Key types / functions |
 |-------------|---------------|-----------------------|
-| `crates/bliss-rt/src/startup.rs` | §2.2 boot sequence | `bliss_main()`, `load_image()` |
-| `crates/bliss-rt/src/thread.rs` | §2.3 thread model | `GreenThread`, `WorkerThread`, `Scheduler` |
-| `crates/bliss-rt/src/stack.rs` | §2.4 stack layout | `BlissStack`, `Frame`, `FrameWalker` |
-| `crates/bliss-rt/src/safepoint.rs` | §2.5 safepoint | `SafepointPage`, `poll_safepoint()` |
-| `crates/bliss-rt/src/signal.rs` | §2.6 signals | `install_handlers()`, `sigsegv_handler()` |
-| `crates/bliss-rt/src/ffi.rs` | §2.7 FFI bridge | `AlienType`, `ffi_call()`, `make_callback()` |
-| `crates/bliss-rt/src/config.rs` | §2.8 config | `RuntimeConfig`, `parse_cli()` |
+| `crates/torcl-rt/src/startup.rs` | §2.2 boot sequence | `torcl_main()`, `load_image()` |
+| `crates/torcl-rt/src/thread.rs` | §2.3 thread model | `GreenThread`, `WorkerThread`, `Scheduler` |
+| `crates/torcl-rt/src/stack.rs` | §2.4 stack layout | `TorclStack`, `Frame`, `FrameWalker` |
+| `crates/torcl-rt/src/safepoint.rs` | §2.5 safepoint | `SafepointPage`, `poll_safepoint()` |
+| `crates/torcl-rt/src/signal.rs` | §2.6 signals | `install_handlers()`, `sigsegv_handler()` |
+| `crates/torcl-rt/src/ffi.rs` | §2.7 FFI bridge | `AlienType`, `ffi_call()`, `make_callback()` |
+| `crates/torcl-rt/src/config.rs` | §2.8 config | `RuntimeConfig`, `parse_cli()` |

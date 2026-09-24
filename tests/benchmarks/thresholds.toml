@@ -1,11 +1,11 @@
 # Benchmark regression tripwires (bliss-jpd0).
 #
-# `max_ms` is a CEILING on bliss's own min-of-N time, not a target and not a
+# `max_ms` is a CEILING on torcl's own min-of-N time, not a target and not a
 # comparison with SBCL. Two deliberate choices:
 #
-#   * Gate on ABSOLUTE bliss milliseconds, never on the SBCL ratio. SBCL runs
+#   * Gate on ABSOLUTE torcl milliseconds, never on the SBCL ratio. SBCL runs
 #     several of these in 0-2ms, which is timer resolution, so the ratio swings
-#     wildly on noise while the bliss number stays stable. A ratio-based gate
+#     wildly on noise while the torcl number stays stable. A ratio-based gate
 #     would be flaky and would also drift silently if SBCL were upgraded.
 #
 #   * Headroom of roughly 3x the observed baseline, because the observed

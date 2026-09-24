@@ -1,11 +1,11 @@
-;;;; boot.lisp — Bliss bootstrap prelude.
+;;;; boot.lisp — TorCL bootstrap prelude.
 ;;;;
 ;;;; This file is loaded by the CLI when invoked with --bootstrap. It is the
 ;;;; first slice of the standard library written in Lisp rather than Rust: the
 ;;;; goal is to push everything that can be expressed as a macro or ordinary
 ;;;; function out of the `eval_form` interpreter and into this file.
 ;;;;
-;;;; Constraints of the current bootstrap evaluator (see crates/bliss):
+;;;; Constraints of the current bootstrap evaluator (see crates/torcl):
 ;;;;   * macro lambda lists are flat — &optional and &rest work, but nested
 ;;;;     destructuring does NOT yet. Keep parameter lists simple.
 ;;;;   * user macros are expanded before builtins, so nothing here should
@@ -27,20 +27,20 @@
 ;;; so every doc-type shares a single store. Defined BEFORE DEFVAR because
 ;;; DEFVAR's expansion records its docstring through it — and set up with plain
 ;;; SETQ rather than DEFVAR for the same reason (bliss-61u1).
-(bliss-internal::%proclaim-special (list 'bliss-internal::*documentation*))
-(setq bliss-internal::*documentation* (make-hash-table :test 'equal))
+(torcl-internal::%proclaim-special (list 'torcl-internal::*documentation*))
+(setq torcl-internal::*documentation* (make-hash-table :test 'equal))
 
 (defun documentation (object &optional doc-type)
   ;; GETHASH returns two values; DOCUMENTATION returns one.
-  (values (gethash (cons object doc-type) bliss-internal::*documentation*)))
+  (values (gethash (cons object doc-type) torcl-internal::*documentation*)))
 
 (defun (setf documentation) (new object &optional doc-type)
-  (setf (gethash (cons object doc-type) bliss-internal::*documentation*) new)
+  (setf (gethash (cons object doc-type) torcl-internal::*documentation*) new)
   new)
 
 ;;; Record DOC for NAME under DOC-TYPE, ignoring a NIL docstring so the definers
 ;;; can pass their optional one unconditionally.
-(defun bliss-internal::%set-documentation (name doc-type doc)
+(defun torcl-internal::%set-documentation (name doc-type doc)
   (when doc
     (setf (documentation name doc-type) doc))
   name)
@@ -50,20 +50,20 @@
   ;; NOT assign a value (NAME stays unbound if it was unbound). Only
   ;; (defvar name value) initialises it, and only when currently unbound (CLHS).
   `(progn
-     (bliss-internal::%proclaim-special (list ',name))
+     (torcl-internal::%proclaim-special (list ',name))
      ,@(when value
          `((unless (boundp ',name)
              (setq ,name ,(car value)))))
      ,@(when (cdr value)
-         `((bliss-internal::%set-documentation ',name 'variable ,(cadr value))))
+         `((torcl-internal::%set-documentation ',name 'variable ,(cadr value))))
      ',name))
 
 (defmacro defparameter (name &rest value)
   `(progn
-     (bliss-internal::%proclaim-special (list ',name))
+     (torcl-internal::%proclaim-special (list ',name))
      (setq ,name ,(if value (car value) nil))
      ,@(when (cdr value)
-         `((bliss-internal::%set-documentation ',name 'variable ,(cadr value))))
+         `((torcl-internal::%set-documentation ',name 'variable ,(cadr value))))
      ',name))
 
 ;; defconstant: this interpreter has no separate constant cell; model it as a
@@ -78,10 +78,10 @@
   ;; %defconstant assigns and marks as one operation (bliss-sci0).
   `(progn (%defconstant ',name ,value)
           ,@(when doc
-              `((bliss-internal::%set-documentation ',name 'variable ,(car doc))))
+              `((torcl-internal::%set-documentation ',name 'variable ,(car doc))))
           ',name))
 
-;; Fixnums are 61-bit signed (BlissVal tags the low 3 bits): the value is
+;; Fixnums are 61-bit signed (TorclVal tags the low 3 bits): the value is
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].
 (defconstant most-positive-fixnum 1152921504606846975)
 (defconstant most-negative-fixnum -1152921504606846976)
@@ -97,7 +97,7 @@
 (defconstant array-rank-limit 8)
 (defconstant array-dimension-limit 1152921504606846975)
 (defconstant array-total-size-limit 1152921504606846975)
-;; PI (a float approximation of π; bliss floats are single-precision, so the
+;; PI (a float approximation of π; torcl floats are single-precision, so the
 ;; long-float literal rounds to 3.1415927) and the single-float magnitude
 ;; extremes, plus the least-positive / normalized / epsilon family for both
 ;; float formats (bliss-pzz4; values match SBCL / IEEE-754 binary32 & binary64).
@@ -118,10 +118,10 @@
 (defconstant least-negative-normalized-double-float -2.2250738585072014d-308)
 (defconstant double-float-epsilon 1.1102230246251568d-16)
 (defconstant double-float-negative-epsilon 5.551115123125784d-17)
-;; bliss has two float formats: SHORT-FLOAT ≡ SINGLE-FLOAT and LONG-FLOAT ≡
+;; torcl has two float formats: SHORT-FLOAT ≡ SINGLE-FLOAT and LONG-FLOAT ≡
 ;; DOUBLE-FLOAT. The corresponding limit constants are aliases of the single/
 ;; double values so that code referencing the short/long family (e.g. ansi-test
-;; make-hash-table.26/.29) resolves them (bliss hash-tables chapter).
+;; make-hash-table.26/.29) resolves them (torcl hash-tables chapter).
 (defconstant most-positive-short-float most-positive-single-float)
 (defconstant most-negative-short-float most-negative-single-float)
 (defconstant least-positive-short-float least-positive-single-float)
@@ -140,7 +140,7 @@
 (defconstant long-float-negative-epsilon double-float-negative-epsilon)
 (defconstant lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &body &whole &environment))
-;; Implementation limits: bliss caps these at MOST-POSITIVE-FIXNUM so they are
+;; Implementation limits: torcl caps these at MOST-POSITIVE-FIXNUM so they are
 ;; themselves fixnums (a larger literal like 2^62 would be a bignum and is not a
 ;; meaningful arg-count ceiling here). Must match the seed_standard_constant
 ;; values in cli.rs (bliss-1i3q).
@@ -321,7 +321,7 @@
   (let ((forms nil))
     (dolist (spec specs)
       (when (and (consp spec) (eq (car spec) 'special))
-        (push (list 'bliss-internal::%proclaim-special (list 'quote (cdr spec)))
+        (push (list 'torcl-internal::%proclaim-special (list 'quote (cdr spec)))
               forms)))
     (if forms (cons 'progn (nreverse forms)) nil)))
 
@@ -330,7 +330,7 @@
 (defun proclaim (declaration-specifier)
   (when (and (consp declaration-specifier)
              (eq (car declaration-specifier) 'special))
-    (bliss-internal::%proclaim-special (cdr declaration-specifier)))
+    (torcl-internal::%proclaim-special (cdr declaration-specifier)))
   nil)
 
 ;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
@@ -356,13 +356,13 @@
                            (or (ignore-errors (funcall (lambda ,lambda-list ,@body)))
                                t))
                      *type-definitions*))
-         (bliss-internal::%home-symbol ',name)
+         (torcl-internal::%home-symbol ',name)
          ',name)
       `(progn
          (setq *type-definitions*
                (cons (list ',name ,(if body (cons 'progn body) t))
                      *type-definitions*))
-         (bliss-internal::%home-symbol ',name)
+         (torcl-internal::%home-symbol ',name)
          ',name)))
 
 ;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match
@@ -489,7 +489,7 @@
 ;; condition built with :operation and :operands supplied (ansi
 ;; ARITHMETIC-ERROR.3 constructs one and reads both back).
 ;; The slots carry no initform, so reading one the signaller never supplied
-;; would raise "slot OPERATION is unbound" rather than answering. bliss's
+;; would raise "slot OPERATION is unbound" rather than answering. torcl's
 ;; internal arithmetic signallers do not record the operation or operands yet
 ;; (a separate gap, filed), so guard the read: an arithmetic error with nothing
 ;; recorded reports NIL rather than erroring inside a handler.
@@ -682,7 +682,7 @@
     (values (float q (%float-quotient-proto number divisor)) r)))
 
 ;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
-;; actually stores. bliss specialises only bit and character arrays; every other
+;; actually stores. torcl specialises only bit and character arrays; every other
 ;; element type upgrades to T.
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
@@ -691,7 +691,7 @@
         (t t)))
 
 ;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
-;; the given part type. bliss stores complex parts unspecialised, so a float part
+;; the given part type. torcl stores complex parts unspecialised, so a float part
 ;; keeps its float type and everything else upgrades to RATIONAL (CL default).
 (defun upgraded-complex-part-type (type &optional environment)
   (declare (ignore environment))
@@ -765,7 +765,7 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Lenient package layer
 ;;;
-;;; Bliss's evaluator provides package primitives from the Rust CLI/runtime.
+;;; TorCL's evaluator provides package primitives from the Rust CLI/runtime.
 ;;; Keep only thin symbol helpers here; package functions themselves should
 ;;; resolve to the real builtins so bundled ASDF can exercise actual package
 ;;; state instead of bootstrap stubs.
@@ -790,14 +790,14 @@
     ;; :external — only the package's exported symbols (CLHS); passing NIL here
     ;; enumerated every PRESENT symbol, which broke UIOP's ensure-package
     ;; export bookkeeping (bliss-jnzb).
-    `(dolist (,var (bliss-internal::package-symbols ,package :external) ,result)
+    `(dolist (,var (torcl-internal::package-symbols ,package :external) ,result)
        ,@body)))
 
 (defmacro do-symbols (binding &rest body)
   (let ((var (car binding))
         (package (if (cdr binding) (car (cdr binding)) '*package*))
         (result (if (cdr (cdr binding)) (car (cdr (cdr binding))) nil)))
-    `(dolist (,var (bliss-internal::package-symbols ,package t) ,result)
+    `(dolist (,var (torcl-internal::package-symbols ,package t) ,result)
        ,@body)))
 
 (defmacro do-all-symbols (binding &rest body)
@@ -813,7 +813,7 @@
     ;; DOLIST also evaluates the result-form with VAR bound to NIL (CLHS).
     `(dolist (,var (let ((,all nil))
                      (dolist (,pkg (list-all-packages))
-                       (dolist (,s (bliss-internal::package-symbols ,pkg t))
+                       (dolist (,s (torcl-internal::package-symbols ,pkg t))
                          (push ,s ,all)))
                      (nreverse ,all))
              ,result)
@@ -821,13 +821,13 @@
 
 ;;; WITH-PACKAGE-ITERATOR / FIND-ALL-SYMBOLS
 ;;;
-;;; Built on the BLISS-INTERNAL::PACKAGE-SYMBOLS primitive:
+;;; Built on the TORCL-INTERNAL::PACKAGE-SYMBOLS primitive:
 ;;;   (… pkg nil)       → present symbols (internal + external)
 ;;;   (… pkg :external)  → external symbols only
 ;;;   (… pkg t)          → accessible symbols (present + inherited)
 ;;; from which internal = present \ external and inherited = accessible \ present.
 
-(defun bliss-internal::%package-iterator-tuples (packages symbol-types)
+(defun torcl-internal::%package-iterator-tuples (packages symbol-types)
   ;; PACKAGES is a single package designator or a list of them. Returns a list
   ;; of (symbol access-type package) triples for the requested SYMBOL-TYPES.
   (let ((pkgs (if (listp packages) packages (list packages)))
@@ -835,9 +835,9 @@
     (dolist (pd pkgs result)
       (let* ((p (find-package pd)))
         (when p
-          (let ((present (bliss-internal::package-symbols p nil))
-                (external (bliss-internal::package-symbols p :external))
-                (accessible (bliss-internal::package-symbols p t)))
+          (let ((present (torcl-internal::package-symbols p nil))
+                (external (torcl-internal::package-symbols p :external))
+                (accessible (torcl-internal::package-symbols p t)))
             (when (member :external symbol-types)
               (dolist (s external) (push (list s :external p) result)))
             (when (member :internal symbol-types)
@@ -856,7 +856,7 @@
       (error 'program-error)))
   (let ((tuples (gensym "TUPLES"))
         (tup (gensym "TUP")))
-    `(let ((,tuples (bliss-internal::%package-iterator-tuples
+    `(let ((,tuples (torcl-internal::%package-iterator-tuples
                      ,package-list-form ',symbol-types)))
        (macrolet ((,name ()
                     '(if ,tuples
@@ -925,14 +925,14 @@
 ;; pprint dispatch, but the variable must be bound: ASDF's DEFINE-OP saves and
 ;; rebinds it around loading a .asd (bliss-lb6.17).
 (defvar *print-pprint-dispatch* nil)
-;; Bliss has no pretty-print dispatch table (the printer ignores it); provide
+;; TorCL has no pretty-print dispatch table (the printer ignores it); provide
 ;; COPY-PPRINT-DISPATCH so portable code that rebinds *PRINT-PPRINT-DISPATCH*
 ;; around output loads and runs. With a NIL table there is nothing to copy, so
 ;; return NIL (bordeaux-threads' +STANDARD-IO-BINDINGS+ uses this).
 (defun copy-pprint-dispatch (&optional table)
   (declare (ignore table))
   nil)
-;; Random-state and readtable copiers. Bliss's RANDOM uses a single global PRNG
+;; Random-state and readtable copiers. TorCL's RANDOM uses a single global PRNG
 ;; and its readtable is the immutable :STANDARD-READTABLE, so these return
 ;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
 ;; +STANDARD-IO-BINDINGS+) that rebinds *RANDOM-STATE* / *READTABLE* to fresh
@@ -942,7 +942,7 @@
   ;; CLHS: STATE is a RANDOM-STATE, T, or NIL. The argument was simply IGNORED,
   ;; so (make-random-state 0) handed back a fresh state instead of signalling
   ;; (ansi MAKE-RANDOM-STATE.ERROR.4). The placeholder RESULT is unchanged --
-  ;; bliss has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
+  ;; torcl has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
   ;; wants a real independent copy and still fails).
   (unless (or (null state) (eq state t) (random-state-p state))
     (error 'type-error
@@ -956,27 +956,27 @@
   ;; (bliss-r4mk). (copy-readtable nil) per CLHS restores standard syntax —
   ;; the builtin copies from the CURRENT readtable when from is nil, which
   ;; still yields a fresh table without user registrations at boot time.
-  (bliss::%copy-readtable from-readtable to-readtable))
+  (torcl::%copy-readtable from-readtable to-readtable))
 (defun readtablep (object)
   (typep object 'readtable))
-;; Bliss has a single immutable standard readtable; its case mode is :UPCASE
+;; TorCL has a single immutable standard readtable; its case mode is :UPCASE
 ;; (CLHS 23.1.2 default). Portable code (e.g. chunga) reads READTABLE-CASE to
 ;; decide how to case-fold tokens; supporting the reader — and a SETF that
 ;; accepts the one mode we implement — is enough to load such systems.
 ;; Placeholder reader-macro function reported by GET-MACRO-CHARACTER for a
-;; standard macro character (bliss's built-in char readers are in Rust, so there
+;; standard macro character (torcl's built-in char readers are in Rust, so there
 ;; is no real Lisp function to hand back; this fbound stub satisfies portable
 ;; code that only checks FUNCTIONP / FBOUNDP of the result).
-(defun bliss::%standard-reader-macro (stream char)
+(defun torcl::%standard-reader-macro (stream char)
   (declare (ignore stream char))
   (error "The standard reader macro cannot be invoked directly."))
 (defun readtable-case (readtable)
-  (bliss::%readtable-case readtable))
+  (torcl::%readtable-case readtable))
 (defun (setf readtable-case) (mode readtable)
   (unless (member mode '(:upcase :downcase :preserve :invert))
     (error 'type-error :datum mode
                        :expected-type '(member :upcase :downcase :preserve :invert)))
-  (bliss::%set-readtable-case mode readtable)
+  (torcl::%set-readtable-case mode readtable)
   mode)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
@@ -1384,7 +1384,7 @@
 ;; pairwise distinct. cl-ppcre's char-class matcher relies on (char<= lo c hi)
 ;; range tests (3 args) (bliss-omw).
 ;; CHAR=, CHAR/=, CHAR<, CHAR>, CHAR<= and CHAR>= are Rust builtins wired to
-;; bliss-stdlib::characters (bliss-7oa5). They were defuns here, which made
+;; torcl-stdlib::characters (bliss-7oa5). They were defuns here, which made
 ;; every 2-argument call allocate a rest list, run an interpreted DOLIST,
 ;; dispatch CHAR-CODE twice and then generic `=` -- 9.8us against 0.27us for
 ;; EQ. A defun here would SHADOW the builtin (the function cell wins over the
@@ -1790,7 +1790,7 @@
              (t (copy-seq (coerce (car (cdr ic-cell)) 'vector)))))
       (stringp
        (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
-      ;; A BIT array is a real SIMPLE-BIT-VECTOR (bliss builds these immutably,
+      ;; A BIT array is a real SIMPLE-BIT-VECTOR (torcl builds these immutably,
       ;; so the whole content is supplied at construction). Default fill 0.
       (bitp
        (%bit-vector-from-bits
@@ -1829,7 +1829,7 @@
 ;; Bit-vector boolean operations (CLHS 14.2.1). Each takes two simple-bit-vectors
 ;; of the same length and returns a fresh SIMPLE-BIT-VECTOR of the elementwise
 ;; result; BIT-NOT is unary. The optional OPT-RESULT arg (NIL/omitted, T, or a
-;; bit-vector) selects the destination in ANSI, but bliss bit-vectors are built
+;; bit-vector) selects the destination in ANSI, but torcl bit-vectors are built
 ;; immutable (bliss-27f5), so these always allocate a fresh result — value-correct
 ;; for the ubiquitous 2-arg use; a caller relying on in-place identity is not
 ;; served until bit-vectors become mutable. Each op is a bit of a boolean of two
@@ -2056,7 +2056,7 @@
 (defun copy-list (list)
   ;; Iterative (tail-pointer) copy so a long list does not recurse one stack
   ;; frame per element — deep lists (flexi-streams code-page tables, bliss-2r5)
-  ;; overflowed the default BlissStack. A dotted tail is preserved.
+  ;; overflowed the default TorclStack. A dotted tail is preserved.
   (if (consp list)
       (let* ((head (cons (car list) nil))
              (tail head))
@@ -2992,12 +2992,12 @@
      (mask-field bytespec newbyte)))
 
 ;; The standard `(setf ACCESSOR)` FUNCTIONS (CLHS 5.1.2.9). These make
-;; #'(setf car) and friends real callable functions for portable code. Bliss's
+;; #'(setf car) and friends real callable functions for portable code. TorCL's
 ;; GET-SETF-EXPANSION uses SETF directly for known built-in places that lack a
 ;; writer, while retaining the canonical callable-writer form for other function
 ;; places (bliss-0qd8, bliss-42iv).
 ;;
-;; They are written against the STORE PRIMITIVES (RPLACA/RPLACD/BLISS::SET-AREF/
+;; They are written against the STORE PRIMITIVES (RPLACA/RPLACD/TORCL::SET-AREF/
 ;; …), never against SETF itself: routing them through `(setf (car o) v)` would
 ;; make each writer's correctness depend on SETF continuing to prefer its builtin
 ;; place handling over the writer we are defining here, which is exactly the kind
@@ -3018,17 +3018,17 @@
 (defun (setf cddr) (new x) (rplacd (cdr x) new) new)
 (defun (setf second) (new x) (rplaca (cdr x) new) new)
 (defun (setf third) (new x) (rplaca (cddr x) new) new)
-;; BLISS::SET-AREF takes a single ROW-MAJOR index, so a multidimensional store
+;; TORCL::SET-AREF takes a single ROW-MAJOR index, so a multidimensional store
 ;; must flatten the subscripts first — passing them through verbatim silently
 ;; stored nothing and broke (setf (aref a 1 2) 99).
 (defun (setf aref) (new array &rest subscripts)
-  (bliss::set-aref array (apply (function array-row-major-index) array subscripts) new)
+  (torcl::set-aref array (apply (function array-row-major-index) array subscripts) new)
   new)
-(defun (setf svref) (new v i) (bliss::set-aref v i new) new)
-(defun (setf elt) (new seq i) (bliss::set-elt seq i new) new)
+(defun (setf svref) (new v i) (torcl::set-aref v i new) new)
+(defun (setf elt) (new seq i) (torcl::set-elt seq i new) new)
 (defun (setf gethash) (new key table &optional default)
   (declare (ignore default))
-  (bliss::put-gethash new key table)
+  (torcl::put-gethash new key table)
   new)
 (defun (setf symbol-value) (new sym) (set sym new) new)
 
@@ -3240,7 +3240,7 @@
 ;; place defers and delegates here — expressing it in Lisp reuses
 ;; GET-SETF-EXPANSION rather than re-implementing setf expansion in Rust
 ;; (bliss-dj5k).
-(defmacro bliss::%setf-values (places form &environment env)
+(defmacro torcl::%setf-values (places form &environment env)
   (if (null places)
       ;; (setf (values) form) evaluates FORM and returns NO values -- not NIL.
       ;; ansi SETF-VALUES.6 (bliss-prdk).
@@ -3380,7 +3380,7 @@
 
 ;;; ---------------------------------------------------------------------------
 ;;; Gray streams: CLOS class hierarchy and generic-function protocol (spec
-;;; §5.5.2, bliss-jtc.7b).
+;;; §5.5.2, torcl-jtc.7b).
 ;;;
 ;;; Built-in streams stay Rust-backed for speed; these classes and generics let
 ;;; user code define its own stream types. The standard stream functions
@@ -3433,13 +3433,13 @@
 ;;; Flexi Streams extend these CL functions and call them on an underlying
 ;;; native stream; adding a wrapper method must not discard native support.
 (defmethod open-stream-p ((stream t))
-  (bliss::%native-open-stream-p stream))
+  (torcl::%native-open-stream-p stream))
 (defmethod input-stream-p ((stream t))
-  (bliss::%native-input-stream-p stream))
+  (torcl::%native-input-stream-p stream))
 (defmethod output-stream-p ((stream t))
-  (bliss::%native-output-stream-p stream))
+  (torcl::%native-output-stream-p stream))
 (defmethod close ((stream t) &key abort)
-  (bliss::%native-close stream :abort abort))
+  (torcl::%native-close stream :abort abort))
 
 ;;; Required-to-implement operations: a subclass that does not provide a method
 ;;; gets a clear error rather than a mysterious no-applicable-method.
@@ -3509,7 +3509,7 @@
 
 ;;; Publish the existing protocol symbols, not a second same-named protocol.
 ;;; Portable libraries import these symbols and specialize their methods.
-(defpackage :bliss-gray-streams (:use))
+(defpackage :torcl-gray-streams (:use))
 (let ((protocol '(fundamental-stream fundamental-input-stream fundamental-output-stream
                   fundamental-character-stream fundamental-binary-stream
                   fundamental-character-input-stream fundamental-character-output-stream
@@ -3523,8 +3523,8 @@
   ;; Bootstrap symbols were historically available by their unqualified names.
   ;; Keep them present in CL-USER as well as in the public protocol package.
   (import protocol :cl-user)
-  (import protocol :bliss-gray-streams)
-  (export protocol :bliss-gray-streams))
+  (import protocol :torcl-gray-streams)
+  (export protocol :torcl-gray-streams))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Pathname namestring helpers (bliss-lb6). These are standard CL functions
@@ -3553,7 +3553,7 @@
                                      (t part))
                                "/")))))))
 
-;; All bliss strings are simple (no fill pointers / displacement yet), so the
+;; All torcl strings are simple (no fill pointers / displacement yet), so the
 ;; SIMPLE- predicates coincide with their general counterparts (bliss-d0b:
 ;; cl-cookie calls simple-string-p via ppcre).
 (defun simple-string-p (x) (stringp x))
@@ -3597,7 +3597,7 @@ by that pair's cdr (ANSI 14.2; bliss-d0b: flexi-streams)."
 
 (defun host-namestring (pathname)
   "The host portion of pathname PATHNAME as a string, or NIL when it has no
-host (ANSI 19.4). bliss physical pathnames carry no host, so this is NIL for
+host (ANSI 19.4). torcl physical pathnames carry no host, so this is NIL for
 them and the host name for a logical pathname."
   (let* ((p (pathname pathname))
          (host (pathname-host p)))
@@ -3630,10 +3630,10 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; loading; they can be wired to real system info later.
 ;;; ---------------------------------------------------------------------------
 
-(defun lisp-implementation-type () "Bliss")
+(defun lisp-implementation-type () "TorCL")
 (defun lisp-implementation-version () "0.1.0")
-(defun machine-type () (bliss-ext::%machine-type))
-(defun machine-version () (bliss-ext::%machine-type))
+(defun machine-type () (torcl-ext::%machine-type))
+(defun machine-version () (torcl-ext::%machine-type))
 (defun machine-instance () "localhost")
 (defun software-type () "Linux")
 (defun software-version () "1.0")

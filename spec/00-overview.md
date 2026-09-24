@@ -1,4 +1,4 @@
-# Bliss — Technical Specification
+# TorCL — Technical Specification
 
 **Version:** 0.1-draft
 **North Star:** HotSpot JVM — tiered compilation, adaptive optimisation,
@@ -6,7 +6,7 @@ production-grade GC, and a self-hosting runtime.
 
 ## 0  Scope & Goals
 
-Bliss is a from-scratch Common Lisp implementation written in Rust (bootstrap
+TorCL is a from-scratch Common Lisp implementation written in Rust (bootstrap
 runtime) and, eventually, Common Lisp itself (compiler, optimiser, large parts
 of the standard library). The project targets ANSI X3.226-1994 (CLtL2 + ANSI
 errata) with SBCL-compatible extensions where the standard is silent.
@@ -25,7 +25,7 @@ conflict with ANSI semantics. Each adopted extension MUST be listed in
 | G4 | Tiered compilation | Interpreter → baseline compiler → optimising compiler |
 | G5 | Modern GC | Generational, concurrent, compacting collector |
 | G6 | Native threads | OS-thread-per-core with green-thread scheduling |
-| G7 | Self-hosting | Compiler and GC policy written in Bliss CL |
+| G7 | Self-hosting | Compiler and GC policy written in TorCL CL |
 | G8 | Embeddability | C-ABI shared library with stable FFI surface |
 
 ### 0.2  Non-Goals (initial release)
@@ -36,8 +36,8 @@ conflict with ANSI semantics. Each adopted extension MUST be listed in
 
 ## 0.3  Delivery Model: Staged Vertical Slices
 
-Bliss is specified and implemented as a sequence of **stages**, each of
-which is a runnable vertical slice through the real `bliss` entrypoint.
+TorCL is specified and implemented as a sequence of **stages**, each of
+which is a runnable vertical slice through the real `torcl` entrypoint.
 The stage manifest lives in `spec/stages.json`; the roadmap in §11
 interprets that manifest for humans, and §10 defines how the gates are
 verified.
@@ -116,7 +116,7 @@ stages.
 
 | Tier | Name | When | Output |
 |------|------|------|--------|
-| T0 | **Bytecode interpreter** | First call | Portable Bliss bytecode |
+| T0 | **Bytecode interpreter** | First call | Portable TorCL bytecode |
 | T1 | **Baseline compiler** | Call count ≥ 10 | Unoptimised native code compiled from bytecode |
 | T2 | **Optimising compiler** | Hot loop / call count ≥ 5000 | Optimised native via IR |
 
@@ -126,7 +126,7 @@ counters, promotion thresholds, OSR at loop back-edges, deoptimisation on
 speculative-guard failure, inline caches — follows HotSpot's C1/C2 pipeline
 directly. The **execution *mechanism*** deliberately differs: HotSpot uses a
 template (assembly) interpreter whose frames share one native stack with
-compiled code under an exact GC, whereas Bliss's baseline model runs a
+compiled code under an exact GC, whereas TorCL's baseline model runs a
 host-language (Rust) bytecode interpreter. Both interpreted and compiled CL
 activations still live on a single per-green-thread control stack bridged by
 interpreter↔compiled adapters (§2.4.4); a template interpreter is an explicit
@@ -134,7 +134,7 @@ later option (§2.4.5), not the baseline. See §2.4 for the stack model and the
 scope of the HotSpot correspondence.
 Source forms are never the long-lived execution representation: the reader
 and macroexpander produce forms, the compiler front-end lowers them to
-portable Bliss bytecode, and every tier uses bytecode PCs as the stable
+portable TorCL bytecode, and every tier uses bytecode PCs as the stable
 debugging, profiling, OSR, and deoptimisation coordinate system.
 
 ### 1.2  Language Used per Layer
@@ -167,17 +167,17 @@ cross-referencing. Code modules reference spec sections as `§N.M`.
 ## 3  Directory Structure (Current Source Tree)
 
 ```
-bliss/
+torcl/
 ├── Cargo.toml              # workspace root
 ├── spec/                   # this specification
 ├── scripts/
 │   └── spec-coverage.py    # requirement traceability gate
 ├── crates/
-│   ├── bliss-rt/           # §2 runtime core (Rust)
+│   ├── torcl-rt/           # §2 runtime core (Rust)
 │   │   ├── src/
 │   │   │   ├── runtime.rs      # runtime entry points and coordination
 │   │   │   ├── object.rs       # tagged object model support
-│   │   │   ├── value.rs        # Bliss value representation helpers
+│   │   │   ├── value.rs        # TorCL value representation helpers
 │   │   │   ├── gc.rs           # §3 garbage collector
 │   │   │   ├── image.rs        # image save/load support
 │   │   │   ├── safepoint.rs    # safepoint protocol
@@ -190,7 +190,7 @@ bliss/
 │   │   │   ├── types.rs        # runtime type descriptors
 │   │   │   └── lib.rs
 │   │   └── Cargo.toml
-│   ├── bliss-compiler/     # §4 compiler pipeline (Rust bootstrap)
+│   ├── torcl-compiler/     # §4 compiler pipeline (Rust bootstrap)
 │   │   ├── src/
 │   │   │   ├── reader.rs       # CL reader
 │   │   │   ├── macroexpand.rs  # macro expansion
@@ -203,7 +203,7 @@ bliss/
 │   │   │   ├── profiling.rs    # profiling counters and metadata
 │   │   │   └── lib.rs
 │   │   └── Cargo.toml
-│   ├── bliss-stdlib/       # §5 standard library (Rust bootstrap implementation)
+│   ├── torcl-stdlib/       # §5 standard library (Rust bootstrap implementation)
 │   │   ├── src/
 │   │   │   ├── clos.rs         # CLOS support
 │   │   │   ├── conditions.rs   # condition system
@@ -216,7 +216,7 @@ bliss/
 │   │   │   ├── devtools.rs     # developer tools hooks
 │   │   │   └── lib.rs
 │   │   └── Cargo.toml
-│   └── bliss/          # REPL + command-line driver
+│   └── torcl/          # REPL + command-line driver
 │       ├── src/cli.rs
 │       ├── src/main.rs
 │       └── Cargo.toml
@@ -229,7 +229,7 @@ bliss/
 
 ### 4.1  Tagged Pointers (§1)
 
-All Lisp values are represented as 64-bit tagged words (`BlissVal`).
+All Lisp values are represented as 64-bit tagged words (`TorclVal`).
 The low 3 bits encode the type tag:
 
 | Tag (bits 2:0) | Type | Payload |
@@ -281,50 +281,50 @@ A block-based SSA IR (Cranelift / TurboFan-lite lineage):
    compiler, GC, and enough stdlib to load CL source files.
 2. **Phase 2 (cross-compile):** Optimising compiler written in CL,
    compiled by the baseline compiler.
-3. **Phase 3 (self-host):** Bliss compiles its own compiler and
+3. **Phase 3 (self-host):** TorCL compiles its own compiler and
    growing portions of the runtime. Rust core shrinks to GC inner
    loops, FFI bridge, and platform glue.
 
 ### 4.6  Prior Art & Design Rationale (CL implementation landscape)
 
-Most of Bliss's execution-model choices are well-trodden in the CL family;
-one is genuinely novel. This subsection records where Bliss follows precedent
+Most of TorCL's execution-model choices are well-trodden in the CL family;
+one is genuinely novel. This subsection records where TorCL follows precedent
 and where it does not, so later decisions can be weighed against real systems.
 
 **Execution strategy — precedented.** CL implementations cluster into a few
 strategies:
 
-| Implementation | Strategy | Relevance to Bliss |
+| Implementation | Strategy | Relevance to TorCL |
 |----------------|----------|--------------------|
 | **CLISP** | Portable **bytecode VM** (C); compiler emits bytecode, FASLs are bytecode; no native codegen | Reference for the T0 loop and bytecode FASL (§4.4.3, §6) |
-| **ECL** | **Two backends sharing one front-end**: portable bytecode compiler/interpreter (default) + "Lisp → C → native via a C compiler" | Closest cousin to Bliss's **bytecode baseline + native tiers** |
+| **ECL** | **Two backends sharing one front-end**: portable bytecode compiler/interpreter (default) + "Lisp → C → native via a C compiler" | Closest cousin to TorCL's **bytecode baseline + native tiers** |
 | **CMUCL** | Native (Python compiler) **plus** a historical byte-compiler for space | Precedent that a serious native CL can carry a bytecode tier |
 | **SBCL** | **No bytecode**: `*evaluator-mode*` selects tree-walk interpret *or* compile-to-native; one optimising compiler, no tiers | Reference for tree-walk-or-native and the compilation environment |
 | **CCL** | Fast compile-to-native; `eval` minimally compiles | — |
 | **ABCL** | Compiles to **JVM bytecode**; inherits the JVM's adaptive JIT/tiering | The only mainstream CL with HotSpot-style tiering — by delegation |
 
-Bliss's **bytecode-baseline-plus-native-tiers** structure follows ECL (and
+TorCL's **bytecode-baseline-plus-native-tiers** structure follows ECL (and
 historical CMUCL); the **portable bytecode + bytecode FASL** follows CLISP.
 
-**Compile-time evaluation — standardised, so Bliss copies the standard.**
+**Compile-time evaluation — standardised, so TorCL copies the standard.**
 `eval-when`, the compile-time side effects of `defmacro` / `define-compiler-macro`
 / `defclass` / `deftype` / `defstruct` / `defpackage` / `defconstant`, and the
 compiler-macro decline/`notinline` protocol are fixed by CLHS 3.2. Every
 conforming implementation maintains a **compilation environment** into which
 those effects register (SBCL: the global *info database* + `*lexenv*`) and runs
 macro/compiler-macro **expander bodies through its own evaluator** during
-compilation. Bliss does the same: the **tree-walker is the compile-time
+compilation. TorCL does the same: the **tree-walker is the compile-time
 evaluator**, and the macro / compiler-macro registries live in the shared
-front-end (`bliss-compiler`), so a `define-compiler-macro` fires identically for
+front-end (`torcl-compiler`), so a `define-compiler-macro` fires identically for
 interpreted and compiled callers. Implementing CLHS 3.2.3 top-level / `eval-when`
 processing is the compiler-specific work; it is a standardised algorithm, not an
 invention. (The hard variant — separating **host** vs **target** macros during a
-from-scratch cross-build — is SBCL's *genesis*; it applies to Bliss only if it
+from-scratch cross-build — is SBCL's *genesis*; it applies to TorCL only if it
 cross-bootstraps, not to in-image compilation.)
 
 **Two coexisting backends — an established discipline.** SBCL (`:interpret` vs
 `:compile`) and ECL (bytecode vs C) both ship two evaluators that must agree,
-kept consistent by a shared front-end plus conformance testing. Bliss adopts the
+kept consistent by a shared front-end plus conformance testing. TorCL adopts the
 same discipline: keep the tree-walker as the reference **oracle**, build the
 bytecode backend behind a flag with **fallback-on-bail**, and **differential-test**
 both against the stage-0..4 corpus, flipping the default only at parity.
@@ -334,7 +334,7 @@ deoptimisation** (tiered compilation §4.4, OSR/deopt §4.6, profiling §4.9) ha
 **no self-hosted-CL precedent**: the CL
 family is "interpret *or* compile-to-native, chosen once," and the only mainstream
 CL that gets HotSpot-style adaptive tiering (ABCL) does so by running on the JVM.
-Bliss's references for this layer are therefore **HotSpot / the JVM, not the CL
+TorCL's references for this layer are therefore **HotSpot / the JVM, not the CL
 implementations** — and the bytecode PC is deliberately the stable coordinate
 system that makes OSR/deopt tractable (§4.4.3.1). This is the part of the design
 to scrutinise against JVM literature rather than CL prior art.
@@ -343,7 +343,7 @@ to scrutinise against JVM literature rather than CL prior art.
 
 ### 5.1  Error Handling
 
-- Rust layers use `Result<T, BlissError>` — no panics in runtime code.
+- Rust layers use `Result<T, TorclError>` — no panics in runtime code.
 - CL layers use the full ANSI condition system (§5).
 - FFI boundary converts between Rust `Result` and CL conditions.
 
@@ -362,7 +362,7 @@ to scrutinise against JVM literature rather than CL prior art.
 
 ### 5.4  Image Format
 
-A Bliss image (`.bimg`) is a memory-mapped snapshot:
+A TorCL image (`.bimg`) is a memory-mapped snapshot:
 - Header: magic, version, platform tag, GC metadata.
 - Heap dump: serialised object graph (portable across same-arch).
 - Symbol table, package registry, compiled code cache.

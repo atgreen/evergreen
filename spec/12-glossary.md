@@ -6,7 +6,7 @@
 
 | Term | Definition | Spec Reference |
 |------|-----------|----------------|
-| **BlissVal** | A 64-bit tagged word representing any Common Lisp value; low 3 bits encode the primary type tag. | §1.2 (D1.01) |
+| **TorclVal** | A 64-bit tagged word representing any Common Lisp value; low 3 bits encode the primary type tag. | §1.2 (D1.01) |
 | **ObjectHeader** | An 8-byte header at the start of every heap-allocated object (except cons cells), containing type ID, GC bits, identity hash, and size. | §1.3 (D1.02) |
 | **TLAB** | Thread-Local Allocation Buffer — a per-thread bump-pointer arena carved from nursery regions, enabling lock-free allocation. | §3.2.2 (D3.02) |
 | **Nursery** | The young-generation heap pool; objects are initially allocated here via TLABs and collected by minor GC. | §3.2.2 |
@@ -32,22 +32,22 @@
 | **OSR (On-Stack Replacement)** | Transferring execution from one compilation tier to another (typically T0/T1 → T2) at a loop back-edge without restarting the function. | §4.6 (A4.03) |
 | **Deoptimisation** | The reverse of OSR: when a speculative guard fails in T2 code, the compiled frame is deconstructed and execution resumes in the interpreter (T0). | §4.6 (A4.04) |
 | **Uncommon trap** | A guard inserted by the optimising compiler at speculative points; when the guard fails, it triggers deoptimisation and records the reason. | §4.6 (D4.10) |
-| **Bliss bytecode** | Architecture-neutral instruction stream produced from macroexpanded forms; executed by T0, serialized in `.bfasl`, and used as the stable PC coordinate system for debug info, profiling, OSR, and deoptimisation. | §4.4 |
+| **TorCL bytecode** | Architecture-neutral instruction stream produced from macroexpanded forms; executed by T0, serialized in `.bfasl`, and used as the stable PC coordinate system for debug info, profiling, OSR, and deoptimisation. | §4.4 |
 | **Tier (T0/T1/T2)** | Execution tiers: T0 = bytecode interpreter; T1 = baseline compiler (unoptimised native from bytecode); T2 = optimising compiler (block-based SSA, full pass pipeline). | §0 §1.1, §4.4 |
 | **Type propagation** | A forward data-flow analysis pass in the T2 compiler that infers CL types for IR nodes, enabling specialisation and type-check elimination. | §4.5 (A4.02 step 2) |
 | **Escape analysis** | An optimisation pass that identifies allocations that do not escape their defining scope, enabling stack-allocation or scalar replacement. | §4.5 (D4.09) |
-| **Linear scan** | The register allocation algorithm used by Bliss: a single pass over SSA live ranges assigning physical registers and spilling to stack slots. | §4.7 (A4.10) |
+| **Linear scan** | The register allocation algorithm used by TorCL: a single pass over SSA live ranges assigning physical registers and spilling to stack slots. | §4.7 (A4.10) |
 | **CodeBuffer** | A growable byte buffer into which the code emitter writes machine instructions; copied into a GC-managed code region upon completion. | §4.7 (D4.12) |
 | **Discriminating function** | A compiled native function that implements generic function dispatch; generated from the method table and inline caches. | §5.3 (R5.14) |
 | **Gray streams** | An extensibility protocol for CL streams based on CLOS generic functions (trivial-gray-streams compatible). | §5.5 (R5.23) |
-| **Robin Hood hashing** | The open-addressing hash table strategy used by Bliss, with backward-shift deletion and probe-distance balancing. | §5.7 (D5.01, D5.20) |
+| **Robin Hood hashing** | The open-addressing hash table strategy used by TorCL, with backward-shift deletion and probe-distance balancing. | §5.7 (D5.01, D5.20) |
 | **Condition system** | The CL error-handling mechanism based on conditions, handlers, and restarts; conditions are CLOS instances. | §5.4 |
 | **Sandbox** | A restricted evaluation mode with capability-based access control, preventing untrusted code from accessing files, network, FFI, or OS processes. | §8.2 (D8.01, D8.02) |
 | **Capability set** | An immutable bitfield attached to a sandbox context controlling which system resources are accessible (deny-by-default). | §8.2.2 (D8.01) |
-| **`.bimg`** | The Bliss image file format: a memory-mapped snapshot of the heap, symbol table, package registry, and compiled code cache. | §7.2 (D7.01) |
+| **`.bimg`** | The TorCL image file format: a memory-mapped snapshot of the heap, symbol table, package registry, and compiled code cache. | §7.2 (D7.01) |
 | **Relocation table** | A delta-encoded list of heap offsets requiring pointer adjustment when an image is loaded at a different base address. | §7.2.10 (A7.01) |
 | **C3 linearisation** | The algorithm for computing the Class Precedence List (CPL) in CLOS, ensuring a monotonic, consistent ordering of superclasses. | §5.3 (R5.11) |
-| **SWANK / Slynk** | The IDE communication protocol (SLIME/SLY compatible) providing eval, completion, debugging, and inspection over a socket connection. Bliss does not implement it; it loads a standard upstream backend as a library and provides the socket/introspection primitives (§6.1.5). | §6.1.5, §6.3.7 (D6.07) |
+| **SWANK / Slynk** | The IDE communication protocol (SLIME/SLY compatible) providing eval, completion, debugging, and inspection over a socket connection. TorCL does not implement it; it loads a standard upstream backend as a library and provides the socket/introspection primitives (§6.1.5). | §6.1.5, §6.3.7 (D6.07) |
 | **Trampoline** | A small executable code stub used for FFI callbacks; allocated from a pool of executable pages and freed when the CL callback object is GC'd. | §2.7.5 |
 | **Frame pointer chain** | The linked list of `prev_fp` pointers in CL stack frames enabling O(n) stack walks for debugging and GC root scanning. | §2.4.2 (D2.02) |
 | **AlienType** | The enum describing foreign (C) types for FFI marshalling: Void, Int, Float, Double, Pointer, Struct, Union, FnPtr. | §2.7.2 (D2.03) |
@@ -61,10 +61,10 @@
 
 | ID | Name | Chapter | Description |
 |----|------|---------|-------------|
-| D1.01 | BlissVal | §1.2 | 64-bit tagged pointer encoding all CL values |
+| D1.01 | TorclVal | §1.2 | 64-bit tagged pointer encoding all CL values |
 | D1.02 | ObjectHeader | §1.3 | 8-byte header for heap objects (type ID, GC bits, hash, size) |
 | D1.03 | Cons Cell | §1.5.1 | Headerless 16-byte pair (CAR + CDR) |
-| D1.04 | Simple-Vector | §1.6.1 | Header + length + BlissVal[] data array |
+| D1.04 | Simple-Vector | §1.6.1 | Header + length + TorclVal[] data array |
 | D1.05 | Simple Specialised Array | §1.6.2 | Header + length + rank + element-type tag + dimensions + packed data |
 | D1.06 | String | §1.6.3 | UTF-8 encoded string (Simple-Base-String / Simple-Character-String) |
 | D1.07 | Complex Array | §1.6.4 | Displaced/adjustable array with fill-pointer support |
@@ -87,7 +87,7 @@
 | D2.01 | GreenThread | §2.3.3 | Green thread descriptor (ID, state, stack, entry, TLS slots) |
 | D2.02 | Frame Header | §2.4.2 | 40-byte CL stack frame: prev_fp, return_pc, function, code_info, flags |
 | D2.03 | AlienType | §2.7.2 | FFI type descriptor enum (Void, Int, Float, Pointer, Struct, etc.) |
-| D2.04 | BlissError | §2.10.1 | Rust-side runtime error enum (Oom, StackOverflow, FfiError, etc.) |
+| D2.04 | TorclError | §2.10.1 | Rust-side runtime error enum (Oom, StackOverflow, FfiError, etc.) |
 | D3.01 | RegionHeader | §3.2.1 | Per-region metadata: kind, generation age, live bytes, alloc pointers |
 | D3.02 | TLAB | §3.2.2 | Thread-Local Allocation Buffer (cursor, limit, region index) |
 | D3.03 | WeakPointer | §3.10.2 | Weak reference with atomically-clearable referent |
@@ -107,7 +107,7 @@
 | D4.12 | CodeBuffer | §4.7 | Growable byte buffer for machine code emission |
 | D4.13 | InlineCacheSite | §4.8 | Metadata for a patchable IC location in compiled code |
 | D4.14 | TypeProfileRing | §4.9 | Fixed-size ring buffer of observed types at call sites |
-| D5.01 | BlissHashTable | §5.7 | Rust-side hash table struct (test, entries, count, lock) |
+| D5.01 | TorclHashTable | §5.7 | Rust-side hash table struct (test, entries, count, lock) |
 | D5.02 | PackageRegistry | §5.1 | Global name→Package HashMap under RwLock |
 | D5.03 | Package (detailed) | §5.1 | Full package with local nicknames, conduit list, shadowing set |
 | D5.04 | SymbolTable | §5.1 | Open-addressing hash table for package symbol lookup |
@@ -121,8 +121,8 @@
 | D5.11 | RestartCluster | §5.4 | Cluster of restarts established by RESTART-BIND/RESTART-CASE |
 | D5.12 | ThreadConditionState | §5.4 | Per-thread handler/restart stack and debugger state |
 | D5.13 | Pre-allocated Storage Conditions | §5.4 | Pool of 4 pre-allocated STORAGE-CONDITION instances for OOM scenarios |
-| D5.15 | BlissFileStream | §5.4 | File-backed stream with fd, buffer, external format |
-| D5.16 | BlissStringStream | §5.4 | String-backed stream (input or output) |
+| D5.15 | TorclFileStream | §5.4 | File-backed stream with fd, buffer, external format |
+| D5.16 | TorclStringStream | §5.4 | String-backed stream (input or output) |
 | D5.17 | Broadcast Stream | §5.4 | Output stream fanning to multiple component streams |
 | D5.18 | Concatenated Stream | §5.4 | Input stream reading sequentially from multiple sources |
 | D5.19 | Two-Way Stream | §5.4 | Bidirectional stream delegating to input/output components |
@@ -170,7 +170,7 @@
 
 | ID | Name | Chapter | Description |
 |----|------|---------|-------------|
-| A1.01 | Type-Tag Check Sequences | §1.17 | Inline type predicate logic for all BlissVal tags |
+| A1.01 | Type-Tag Check Sequences | §1.17 | Inline type predicate logic for all TorclVal tags |
 | A3.01 | Minor GC (Nursery Collection) | §3.5 | Parallel stop-the-world scavenge: root scan → copy → reclaim |
 | A3.02 | Concurrent Mark | §3.6 | Tri-colour marking with SATB write barrier for old-gen |
 | A4.01 | Macro Expansion | §4.2 | Iterative expansion: symbol-macro → compiler-macro → regular macro |
@@ -301,7 +301,7 @@ requirements that satisfy it.
 | R2.19 | Support ≥ 100,000 simultaneous green threads |
 | R9.04 | SBCL-compatible threading API (SB-THREAD) |
 
-### G7 — Self-Hosting (compiler and GC policy in Bliss CL)
+### G7 — Self-Hosting (compiler and GC policy in TorCL CL)
 
 | Requirement | Summary |
 |-------------|---------|
@@ -314,7 +314,7 @@ requirements that satisfy it.
 | Requirement | Summary |
 |-------------|---------|
 | R2.11–R2.14 | Platform C ABI; libffi for variadic/struct calls |
-| R7.05–R7.06 | Standalone executable; libbliss.so with stable C-ABI |
+| R7.05–R7.06 | Standalone executable; libtorcl.so with stable C-ABI |
 | R7.14 | Shared library follows semantic versioning |
 | R8.03–R8.05 | Unsafe code confined; no raw pointers to CL code |
 | R8.19 | Type-safe alien value marshalling |
@@ -345,7 +345,7 @@ their resolutions are confirmed below. Any remaining findings follow.
 
 3. **Large-object threshold (§1.3 ↔ §3.2.5):** §1.3 defines the
    threshold as `region_size / 2` (default 1 MB with 2 MB regions).
-   §3.2.5 uses the same formula. §1.21 lists `BLISS_LARGE_OBJECT_THRESHOLD`
+   §3.2.5 uses the same formula. §1.21 lists `TORCL_LARGE_OBJECT_THRESHOLD`
    as derived from region size. §3.13 shows `(derived)` with
    `region_size / 2`. **Status: Consistent.**
 
@@ -356,7 +356,7 @@ their resolutions are confirmed below. Any remaining findings follow.
    sections use SHA-256 uniformly.
 
 5. **Nursery/TLAB environment variables (§2.8.1 ↔ §3.13):** §2.8.1
-   lists `BLISS_TLAB_SIZE` (default 2m) and `BLISS_NURSERY_SIZE`
+   lists `TORCL_TLAB_SIZE` (default 2m) and `TORCL_NURSERY_SIZE`
    (default 64m) as separate variables. §3.13 lists matching
    `--tlab-size` and `--nursery-size` CLI flags with the same defaults.
    **Status: Consistent.** The split correctly separates per-thread
@@ -365,19 +365,19 @@ their resolutions are confirmed below. Any remaining findings follow.
 ### 12.5.2  Remaining Findings
 
 6. **Heap size default: §2.8.1 vs §3.13 vs §7.6.2.**
-   - §2.8.1 lists `BLISS_HEAP_SIZE` default as `512m`.
+   - §2.8.1 lists `TORCL_HEAP_SIZE` default as `512m`.
    - §3.13 lists `--heap-size` default as `256 MB`.
-   - §7.6.2 lists `BLISS_HEAP_SIZE` default as `256m`.
+   - §7.6.2 lists `TORCL_HEAP_SIZE` default as `256m`.
    - **Recommendation:** Unify to a single value. §3.13 and §7.6.2
      agree on 256 MB; §2.8.1 should be updated to match.
 
-7. **`BLISS_NURSERY_SIZE` semantics: §7.6.2 vs §2.8.1/§3.13.**
-   - §7.6.2 describes `BLISS_NURSERY_SIZE` as "Per-thread nursery
+7. **`TORCL_NURSERY_SIZE` semantics: §7.6.2 vs §2.8.1/§3.13.**
+   - §7.6.2 describes `TORCL_NURSERY_SIZE` as "Per-thread nursery
      (TLAB) size" with default `2m`, conflating it with TLAB size.
    - §2.8.1 and §3.13 correctly distinguish nursery pool (64m) from
      TLAB (2m) as separate variables.
-   - **Recommendation:** §7.6.2 should list both `BLISS_NURSERY_SIZE`
-     (default 64m, total nursery pool) and `BLISS_TLAB_SIZE` (default
+   - **Recommendation:** §7.6.2 should list both `TORCL_NURSERY_SIZE`
+     (default 64m, total nursery pool) and `TORCL_TLAB_SIZE` (default
      2m, per-thread buffer) to match §2.8.1 and §3.13.
 
 8. **D4.08 dual assignment.**

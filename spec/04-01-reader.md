@@ -1,10 +1,10 @@
 # §4.1 CL Reader
 
-**Scope:** The Bliss reader converts a stream of characters into Lisp
+**Scope:** The TorCL reader converts a stream of characters into Lisp
 objects. It implements the full CLHS §2 reader algorithm including
 readtable dispatch, reader macros, number parsing, package-qualified
 symbols, circular structure notation, and source-position tracking.
-The bootstrap reader is written in Rust (`crates/bliss-compiler/src/reader.rs`);
+The bootstrap reader is written in Rust (`crates/torcl-compiler/src/reader.rs`);
 a self-hosted CL reader MAY replace it in Phase 3 (§0, 4.5).
 
 ---
@@ -42,12 +42,12 @@ pub enum SyntaxType {
 #[derive(Clone)]
 pub struct CharEntry {
     pub syntax: SyntaxType,
-    pub macro_fn: Option<BlissVal>,         // callable, or None
+    pub macro_fn: Option<TorclVal>,         // callable, or None
     pub dispatch_table: Option<Box<DispatchTable>>,  // dispatch macros only
 }
 
 /// Dispatch sub-table: sub-char → handler.  HashMap for Unicode support.
-pub struct DispatchTable { pub entries: HashMap<char, BlissVal> }
+pub struct DispatchTable { pub entries: HashMap<char, TorclVal> }
 
 pub struct Readtable {
     ascii: [CharEntry; 128],                // fast-path (0..128)
@@ -103,7 +103,7 @@ pub struct ReaderState {
 #[derive(Clone)]
 pub enum CircleEntry {
     Pending(PlaceholderRef),   // seen #n= but reading in progress
-    Resolved(BlissVal),        // fully read
+    Resolved(TorclVal),        // fully read
 }
 
 pub struct PosTracker {
@@ -133,7 +133,7 @@ queries it; the GC preserves entries for live objects (weak-key map).
 ### A4.05 Reader Algorithm (CLHS §2.2 — 10 Steps)
 
 ```text
-PROCEDURE read(state: &mut ReaderState) → BlissVal:
+PROCEDURE read(state: &mut ReaderState) → TorclVal:
 
   STEP 1 — Read one character X from stream.
     If EOF:
@@ -251,7 +251,7 @@ integers, ratios, floats, and the potential-number rules of CLHS §2.3.1.
 
 ```text
 INPUT: token chars[] with escaped[] flags, read_base (default 10)
-OUTPUT: BlissVal (fixnum, bignum, ratio, float) or FAIL (not a number)
+OUTPUT: TorclVal (fixnum, bignum, ratio, float) or FAIL (not a number)
 
 RULE 0 — No escaped character may appear in a number.
           If any char is escaped → FAIL immediately.
@@ -288,10 +288,10 @@ PHASE 2 — Classify token form by scanning for '/', '.', exponent markers.
       digit    ::= [0-9]        (floats are always base 10)
 
     Exponent marker mapping:
-      S, s → short-float  (Bliss: single-float / f32)
+      S, s → short-float  (TorCL: single-float / f32)
       F, f → single-float (f32)
       D, d → double-float (f64)
-      L, l → long-float   (Bliss: double-float / f64)
+      L, l → long-float   (TorCL: double-float / f64)
       E, e → *READ-DEFAULT-FLOAT-FORMAT* (default: single-float)
 
     If no digits at all (e.g., just ".") → FAIL.
@@ -314,7 +314,7 @@ PHASE 2 — Classify token form by scanning for '/', '.', exponent markers.
 
     If the token satisfies potential-number syntax but does not
     match any concrete number syntax (integer, ratio, or float)
-    above → Bliss signals a READER-ERROR with the message
+    above → TorCL signals a READER-ERROR with the message
     "token has potential number syntax but is not a valid number".
     (Rationale: silently treating these as symbols masks typos;
     signalling an error is the safest portable-compatible choice and
@@ -333,7 +333,7 @@ resolves the symbol as follows:
 
 ```text
 INPUT: token string (after case conversion)
-OUTPUT: symbol BlissVal
+OUTPUT: symbol TorclVal
 
 CASE 1 — No package marker:
   Intern symbol in *PACKAGE* (current package).
@@ -366,7 +366,7 @@ consult the package nickname table as well as primary names.
 ## 4.1.5 Standard Reader Macros
 
 Each standard reader macro is a Rust function with signature:
-`fn(state: &mut ReaderState, char: char) → Option<BlissVal>`.
+`fn(state: &mut ReaderState, char: char) → Option<TorclVal>`.
 Returning `None` means "no value produced" (e.g., comments).
 
 | Char | Macro | Behaviour |
@@ -383,7 +383,7 @@ Returning `None` means "no value produced" (e.g., comments).
 
 Backquote (quasiquote) expansion is implementation-dependent per CLHS
 §2.4.6, but MUST produce forms that, when evaluated, yield the
-structure described by the template. Bliss follows the algorithm
+structure described by the template. TorCL follows the algorithm
 described in **Alan Bawden, "Quasiquotation in Lisp" (1999)**, which
 correctly handles arbitrary nesting depths. Guy Steele's Appendix C
 from CLtL2 is an acceptable alternative reference.
@@ -553,7 +553,7 @@ subtype of `STREAM-ERROR` per CLHS §23.
 pub struct ReaderErrorData {
     pub message: String,
     pub span: SourceSpan,
-    pub stream: BlissVal,  // the stream, for STREAM-ERROR-STREAM
+    pub stream: TorclVal,  // the stream, for STREAM-ERROR-STREAM
 }
 ```
 
@@ -600,8 +600,8 @@ pub struct ReaderErrorData {
 | `*READ-EVAL*` | T | Allow `#.` read-time eval |
 | `*READ-SUPPRESS*` | NIL | Suppress object construction (for `#+`/`#-`) |
 | `*PACKAGE*` | `COMMON-LISP-USER` | Current package for interning |
-| `*FEATURES*` | `(:BLISS :ANSI-CL :IEEE-FLOATING-POINT :64-BIT ...)` | Feature list for `#+`/`#-` |
-| `BLISS-EXT:*READER-SOURCE-TRACKING*` | T | Enable source-span collection; `BLISS:*READER-SOURCE-TRACKING*` is a deprecated compatibility spelling |
+| `*FEATURES*` | `(:TORCL :ANSI-CL :IEEE-FLOATING-POINT :64-BIT ...)` | Feature list for `#+`/`#-` |
+| `TORCL-EXT:*READER-SOURCE-TRACKING*` | T | Enable source-span collection; `TORCL:*READER-SOURCE-TRACKING*` is a deprecated compatibility spelling |
 
 ---
 

@@ -1,6 +1,6 @@
 ;;; Tier-differential corpus (bliss-19tm).
 ;;;
-;;; Run under BLISS_FORCE_TIER=interp|t0|t1|t2; every run must produce
+;;; Run under TORCL_FORCE_TIER=interp|t0|t1|t2; every run must produce
 ;;; byte-identical output.  Covers the divergence-prone shapes: all NLX kinds
 ;;; (tagbody/go, catch/throw, unwind-protect, block/return-from), multiple-
 ;;; values state (multiple-value-bind/-list/-setq, nth-value, values-list,

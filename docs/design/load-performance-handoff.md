@@ -16,9 +16,9 @@ decoding: already-evaluated arguments were being wrapped in temporary Lisp
 forms and evaluated again.
 
 Five paths now share evaluated-argument kernels with their source handlers:
-APPEND, COERCE, SUBSEQ, `BLISS::SET-SLOT-VALUE`, and
-`BLISS::%CALL-NEXT-METHOD`. APPEND's library behavior moved out of the
-interpreter into `bliss-stdlib::sequences`; the other paths reuse existing
+APPEND, COERCE, SUBSEQ, `TORCL::SET-SLOT-VALUE`, and
+`TORCL::%CALL-NEXT-METHOD`. APPEND's library behavior moved out of the
+interpreter into `torcl-stdlib::sequences`; the other paths reuse existing
 coercion, sequence, slot, and method machinery. Non-leaf operations were not
 added to the native direct-builtin table. Cross-tier testing also exposed
 and fixed three interpreter operator arms that ignored global function
@@ -50,7 +50,7 @@ errors, and lexical/global replacement. A fresh-process FASL regression
 deletes its source before loading and agrees at normal and GC-stress strides
 1/7/31 with poison and heap verification. A stdlib full-GC regression checks
 APPEND's copied heads and shared tail. All **15,106** entries in Babel's two
-encoding tables agree between normal Bliss, stress/poison/verify Bliss,
+encoding tables agree between normal TorCL, stress/poison/verify TorCL,
 and SBCL. Review was adversarial self-review, not independent review.
 
 Final gates: **733 CLI integration tests pass, zero fail, three ignored**;
@@ -104,7 +104,7 @@ processes with populated build-specific FASL caches, before test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 0.932 s | **0.801 s (14.1% less)** |
 | SBCL initial load, same batch | 0.287 s | 0.287 s |
-| Bliss / SBCL | 3.25× | **2.79×** |
+| TorCL / SBCL | 3.25× | **2.79×** |
 | Initial-load cycles (three isolated windows) | 1.974 G | **1.692 G (14.3% less)** |
 | Initial-load instructions (same windows) | 4.135 G | 4.109 G (0.6% less) |
 | Whole-process wall time | 3.40 s | 3.01 s |
@@ -121,11 +121,11 @@ outlier, for the claim. Performance evidence is from this host, not a
 cross-machine guarantee. The gap remains substantial.
 
 A second five-pair batch after the test-harness binding correction and all
-test jobs confirms **0.929 → 0.796 s (14.3% less)** for Bliss. Isolated-load
+test jobs confirms **0.929 → 0.796 s (14.3% less)** for TorCL. Isolated-load
 cycles are **1.971 → 1.686 G (14.4% less)**, with instructions 4.128 → 4.113 G
 and unchanged allocation/GC. Whole-process wall medians are 3.38 → 2.88 s.
 However, this batch has pronounced frequency-regime shifts: SBCL spans
-0.153–0.286 s (median 0.206), and Bliss has a 0.404 s candidate sample.
+0.153–0.286 s (median 0.206), and TorCL has a 0.404 s candidate sample.
 Its wall-time ratio is not comparable to the stable first batch; the ~2.8×
 headline above refers specifically to that first batch, not universal parity
 across clock regimes. The repeated cycle reduction corroborates the change.
@@ -196,7 +196,7 @@ processes with populated build-specific FASL caches, before test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 0.969 s | **0.925 s (4.5% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 3.39× | **3.23×** |
+| TorCL / SBCL | 3.39× | **3.23×** |
 | Initial-load instructions (three isolated windows) | 4.354 G | **4.138 G (5.0% less)** |
 | Lisp bytes allocated during load | 13,465,040 | **12,610,480 (6.3% less)** |
 | Whole-process instructions | 17.522 G | **17.313 G (1.2% less)** |
@@ -264,7 +264,7 @@ with populated build-specific FASL caches, before test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.015 s | **0.969 s (4.5% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 3.55× | **3.39×** |
+| TorCL / SBCL | 3.55× | **3.39×** |
 | Initial-load instructions (three isolated windows) | 4.612 G | **4.350 G (5.7% less)** |
 | Lisp bytes allocated during load | 17,090,960 | **13,465,040 (21.2% less)** |
 | Whole-process instructions | 17.850 G | **17.528 G (1.8% less)** |
@@ -331,7 +331,7 @@ with populated build-specific FASL caches, before running test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.222 s | **1.015 s (16.9% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 4.27× | **3.55×** |
+| TorCL / SBCL | 4.27× | **3.55×** |
 | Initial-load instructions (three isolated windows) | 5.444 G | **4.621 G (15.1% less)** |
 | Lisp bytes allocated during load | 21,175,568 | **17,090,960 (19.3% less)** |
 | Whole-process instructions | 18.687 G | **17.861 G (4.4% less)** |
@@ -408,7 +408,7 @@ with populated build-specific FASL caches, before running test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.249 s | **1.224 s (2.0% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 4.37× | **4.28×** |
+| TorCL / SBCL | 4.37× | **4.28×** |
 | Initial-load instructions (three separate isolated windows) | 5.583 G | **5.447 G (2.4% less)** |
 | Whole-process instructions | 18.825 G | 18.680 G |
 
@@ -462,7 +462,7 @@ A fresh load-only profile after `d4427b8` put minor GC at 9.8% inclusive,
 but also exposed **8.0% under ASH**. The bootstrap implementation calculated
 powers of two and multiplied or divided, paying for general rational arithmetic,
 GCD, interpreter calls, and temporary values merely to shift integers.
-`bliss-stdlib::numbers::ash` now shifts fixnums directly and bignums limb-wise.
+`torcl-stdlib::numbers::ash` now shifts fixnums directly and bignums limb-wise.
 Both tree-walked and compiled builtin calls use that kernel; the bootstrap
 workaround is gone. Right shifts preserve negative rounding and huge-count
 saturation. Both arguments remain type-checked, including zero cases.
@@ -474,7 +474,7 @@ process with its build-specific FASL cache populated, before any test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.362 s | **1.250 s (8.2% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 4.8× | **4.4×** |
+| TorCL / SBCL | 4.8× | **4.4×** |
 | Initial-load instructions (three separate isolated windows) | 6.250 G | **5.583 G (10.7% less)** |
 | Whole-process instructions | 19.502 G | 18.827 G |
 | Minor-GC pause during load | 0.146229 s | 0.146936 s |
@@ -538,12 +538,12 @@ processes and populated build-specific FASL caches:
 |---|---:|---:|
 | Initial Babel FASL load | 1.412 s | **1.361 s (3.6% less)** |
 | SBCL initial load, same batch | 0.287 s | 0.287 s |
-| Bliss / SBCL | 4.9× | **4.7×** |
+| TorCL / SBCL | 4.9× | **4.7×** |
 | Minor-GC pause during load | 0.195733 s | **0.146118 s (25.3% less)** |
 | Initial-load instructions (three separate isolated windows) | 6.426 G | **6.256 G (2.6% less)** |
 | Whole-process instructions | 19.689 G | 19.496 G |
 
-Every measured Bliss load performs one minor and zero major collections.
+Every measured TorCL load performs one minor and zero major collections.
 Wall samples remain noisy: 1.073–1.415 s before, 1.036–1.362 s after.
 Whole-process medians, including ASDF startup, were 3.51 s before and 3.85 s
 after despite fewer instructions; this batch does **not** establish a startup
@@ -612,7 +612,7 @@ already populated build-specific FASL cache, against `ff97468`:
 |---|---:|---:|
 | Initial Babel FASL load | 1.476 s | **1.410 s (4.5% less)** |
 | SBCL initial load, same batch | 0.287 s | 0.287 s |
-| Bliss / SBCL | 5.1× | **4.9×** |
+| TorCL / SBCL | 5.1× | **4.9×** |
 | Minor-GC pause during load | 0.258 s | **0.196 s (23.8% less)** |
 | Initial-load retired instructions (three isolated windows) | 7.090 G | **6.422 G (9.4% less)** |
 | Whole-process retired instructions | 20.349 G | 19.687 G |
@@ -630,7 +630,7 @@ The deterministic regression first failed at 2,001 searches for 2,000 conses.
 It now bounds searches by the number of destination regions, checks every
 list element, and covers both survivor copying and immediate promotion.
 The full runtime suite passes all 621 tests. Normal execution and
-`BLISS_GC_STRESS=20000 BLISS_GC_POISON=1 BLISS_GC_VERIFY=1` agree with SBCL on
+`TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1` agree with SBCL on
 all 15,106 Babel reverse-table entries. An every-allocation stress/poison/verify
 probe also preserves source-free native-cons results. Root lint has no new
 findings. Review is adversarial self-review, not independent.
@@ -680,11 +680,11 @@ Five alternating CPU-0-pinned release runs, after all test processes finished:
 |---|---:|---:|
 | Initial Babel FASL load | 1.628 s | **1.475 s (9.4% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 5.7× | **5.2×** |
+| TorCL / SBCL | 5.7× | **5.2×** |
 | Whole-process wall time, including ASDF startup | 4.07 s | 3.96 s |
 
 Baseline load samples ranged 1.383–1.632 s, candidate 1.474–1.490 s, SBCL
-0.285–0.287 s. Both Bliss versions collected once during each timed load;
+0.285–0.287 s. Both TorCL versions collected once during each timed load;
 candidate GC time was about 0.260 s versus 0.255 s baseline, so the gain did
 not come from deferring collection. This is incremental progress, not parity.
 
@@ -707,8 +707,8 @@ do not sum them. Constant materialization is only about 1.6%. Next leads are
 remaining source-evaluated initializers (`bliss-mbzt`) and redundant
 multiple-value classification (`bliss-amyr`), not a binary-decoder rewrite.
 
-The real Babel load under `BLISS_GC_STRESS=20000 BLISS_GC_POISON=1
-BLISS_GC_VERIFY=1` matches normal execution and SBCL for all 15,106 entries in
+The real Babel load under `TORCL_GC_STRESS=20000 TORCL_GC_POISON=1
+TORCL_GC_VERIFY=1` matches normal execution and SBCL for all 15,106 entries in
 the two reverse tables. The focused final suites pass: 48 FASL tests, five OSR,
 14 T1-deoptimization tests (one ignored), and five T1-native tests. Root lint
 has zero new findings. Review was adversarial self-review, not independent.
@@ -736,7 +736,7 @@ build-specific FASL cache already populated, against saved baseline `66c6d4f`:
 |---|---:|---:|
 | Initial Babel FASL load | 1.964 s | 1.631 s (**17.0% less**) |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| Bliss / SBCL | 6.9× | **5.7×** |
+| TorCL / SBCL | 6.9× | **5.7×** |
 | Initial-load retired instructions (three isolated windows) | 9.569 G | 7.761 G (**18.9% less**) |
 | Initial-load allocation | 32.56 MB | 26.83 MB (**17.6% less**) |
 | Whole-process retired instructions | 22.975 G | 21.177 G |
@@ -768,7 +768,7 @@ GC stress exposed three correctness bugs, fixed alongside the optimization:
 
 Validation includes source-free FASL action assertions, deleting source before
 load, every-allocation GC/poison testing, and a real Babel load with
-`BLISS_GC_STRESS=20000 BLISS_GC_POISON=1 BLISS_GC_VERIFY=1`. All 15,106 entries in
+`TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1`. All 15,106 entries in
 the two reverse tables match SBCL, and stressed output matches normal output.
 
 The workspace test run (non-CLI serial, CLI four threads) recorded **2,502 passed,
@@ -799,7 +799,7 @@ release runs against saved baseline `94f7570`, with SBCL in the same batch:
 |---|---:|---:|
 | Initial Babel FASL load | 2.428 s | 1.686 s (**30.6% less**) |
 | SBCL initial load | 0.247 s | 0.247 s |
-| Bliss / SBCL | 9.8× | **6.8×** |
+| TorCL / SBCL | 9.8× | **6.8×** |
 | Minor GC during initial load | 0.925 s | 0.234 s |
 | Whole process, including ASDF startup | 4.67 s | 4.08 s |
 | Whole-process retired instructions | 24.585 G | 22.976 G |
@@ -823,7 +823,7 @@ Reproduce the load phase from the repository root with this shared script:
 
 ```lisp
 #+sbcl (require :asdf)
-#+bliss (load "lib/asdf.bfasl")
+#+torcl (load "lib/asdf.bfasl")
 (asdf:initialize-source-registry
  `(:source-registry (:tree ,(truename "ocicl/")) :inherit-configuration))
 (time (asdf:load-system :babel))
@@ -831,7 +831,7 @@ Reproduce the load phase from the repository root with this shared script:
         (babel:string-to-octets "Hello" :encoding :utf-8))
 ```
 
-Use `scripts/bliss-limited.sh taskset -c 0` for each process. Bliss uses
+Use `scripts/torcl-limited.sh taskset -c 0` for each process. TorCL uses
 `--no-init --load`; SBCL uses
 `--noinform --no-sysinit --no-userinit --non-interactive --load`. Populate each
 binary's build-hash-specific FASL cache first, then alternate saved baseline and
@@ -853,7 +853,7 @@ now                      ~14.4 s
 
 Against SBCL 2.6.8 on the same machine, alternating runs, both warm from fasls:
 
-| | bliss | SBCL | ratio |
+| | torcl | SBCL | ratio |
 |---|---|---|---|
 | cold load from fasl | 3.15 s | 0.31 s | ~10x |
 | no-op re-load (each) | 0.89 s | 0.0046 s | **~193x** |
@@ -965,13 +965,13 @@ Recorded so they are not repeated:
   three different directions, so re-measure before believing any of it.
 - **Integer control tokens** (bliss-taqn, closed). Ceiling ≤7% on
   catch/handler-case-heavy code and ~0 elsewhere, against a blast radius that
-  includes a new `BlissError` variant, because tokens ride through errors as
+  includes a new `TorclError` variant, because tokens ride through errors as
   strings with prefix parsing.
 - **Replacing the allocator wholesale** (bliss-05as). mimalloc will not build for
   musl here; dlmalloc builds and is 8% SLOWER. What worked was adding the one
   thing musl lacks — a per-thread free-list cache — which is now default-on for
   musl and was worth 28.7%.
-- **Lowering `BLISS_CLOSURE_PRUNE_FLOOR`** — strictly worse, see §5.4.
+- **Lowering `TORCL_CLOSURE_PRUNE_FLOOR`** — strictly worse, see §5.4.
 
 ## 7. Known-flaky / pre-existing failures
 
@@ -982,21 +982,21 @@ Do not spend time on these; both reproduce without any local change:
   bliss-zzty, which also fixed three real cross-thread signal-delivery races
   found while chasing it. An early 0/15 baseline made this look like a
   regression; it was sampling noise. Use n>=40 for flaky baselines here.
-- `bliss-compiler --test t2_integration stringp_reaches_string_typecheck_through_inline_metadata`
+- `torcl-compiler --test t2_integration stringp_reaches_string_typecheck_through_inline_metadata`
   — fails at HEAD with everything stashed.
 
 ## 8. Useful knobs
 
 ```
-BLISS_DISABLE_T2=1            no T2
-BLISS_T2_DISCARD=1            compile at T2, install nothing  (separates compile
+TORCL_DISABLE_T2=1            no T2
+TORCL_T2_DISCARD=1            compile at T2, install nothing  (separates compile
                               cost from emitted-code cost)
-BLISS_T2_NO_QUEUE=1           snapshot for T2, never queue    (isolates the
+TORCL_T2_NO_QUEUE=1           snapshot for T2, never queue    (isolates the
                               mutator-side snapshot)
-BLISS_BAIL_TRACE=1            record why the lowerer bailed; read with
-                              (bliss-ext:bail-report)
-BLISS_DIRECT_BUILTIN_STATS=1  direct-builtin hit/fallback counts
-BLISS_GC_STRESS=1 BLISS_GC_POISON=1   mandatory for anything that allocates
+TORCL_BAIL_TRACE=1            record why the lowerer bailed; read with
+                              (torcl-ext:bail-report)
+TORCL_DIRECT_BUILTIN_STATS=1  direct-builtin hit/fallback counts
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1   mandatory for anything that allocates
 ```
 
 The bail reporter now reports the reason from the attempt that actually decides,

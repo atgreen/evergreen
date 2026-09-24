@@ -1,6 +1,6 @@
 # §9  SBCL-Compatible Extensions
 
-**Scope:** Bliss adopts a curated set of SBCL-compatible extensions where
+**Scope:** TorCL adopts a curated set of SBCL-compatible extensions where
 ANSI X3.226-1994 is silent and the extension is widely depended upon by the
 portable Common Lisp ecosystem. Each extension MUST have a rationale,
 MUST NOT conflict with ANSI semantics, and MUST be documented here.
@@ -11,20 +11,20 @@ An SBCL extension is adopted when ALL of the following hold:
 1. **Ecosystem demand** — used by ≥3 popular libraries (Quicklisp top-100)
    or essential for practical CL development.
 2. **No ANSI conflict** — operates in an unspecified or implementation-defined area.
-3. **Clean namespace** — exported from `BLISS-EXT` (not `CL`), with
+3. **Clean namespace** — exported from `TORCL-EXT` (not `CL`), with
    `SB-EXT`-compatible symbol names via a compatibility package.
 4. **Documented divergence** — any behavioural difference from SBCL listed explicitly.
 
-**R9.01** Bliss MUST provide a `BLISS-EXT` package exporting all adopted extensions.
-**R9.02** Bliss MUST provide `SB-EXT`, `SB-THREAD`, `SB-MOP` compatibility
-packages that re-export the corresponding Bliss symbols.
+**R9.01** TorCL MUST provide a `TORCL-EXT` package exporting all adopted extensions.
+**R9.02** TorCL MUST provide `SB-EXT`, `SB-THREAD`, `SB-MOP` compatibility
+packages that re-export the corresponding TorCL symbols.
 **R9.03** Each adopted extension MUST include a test verifying SBCL-compatible behaviour.
 
 ---
 
 ## 9.2  Native Threads and Fibers (`SB-THREAD` Compatibility)
 
-**Design decision (2026-08-20).** Bliss adopts the scheduler-group and fiber
+**Design decision (2026-08-20).** TorCL adopts the scheduler-group and fiber
 lifecycle shape described by the SBCL Fibers proposal, but deliberately uses a
 JVM-style two-level public model: OS-backed platform/carrier threads and
 lightweight fibers are separate, exposed object types. This preserves honest
@@ -32,10 +32,10 @@ resource and blocking semantics—code can tell whether it owns an OS thread or
 a schedulable fiber—while still allowing carrier introspection. It rejects the
 earlier design in which `MAKE-THREAD` secretly returned a managed fiber.
 
-**R9.04** Bliss MUST expose OS-backed platform/carrier threads through the
-`BLISS-THREAD` package and lightweight managed fibers through the distinct
-`BLISS-FIBER` package. `BLISS-THREADS` is a deprecated nickname for
-`BLISS-THREAD`. `SB-THREAD` re-exports the compatible native-thread and
+**R9.04** TorCL MUST expose OS-backed platform/carrier threads through the
+`TORCL-THREAD` package and lightweight managed fibers through the distinct
+`TORCL-FIBER` package. `TORCL-THREADS` is a deprecated nickname for
+`TORCL-THREAD`. `SB-THREAD` re-exports the compatible native-thread and
 synchronisation symbols; it MUST NOT make a fiber appear to be an OS thread.
 
 ### 9.2.1  Native/Carrier Thread Lifecycle
@@ -71,7 +71,7 @@ itself is public.
 
 ### 9.2.2  Fiber Lifecycle and Scheduler Groups
 
-**R9.42** Bliss MUST provide the following API in `BLISS-FIBER`:
+**R9.42** TorCL MUST provide the following API in `TORCL-FIBER`:
 
 ```lisp
 (make-fiber function &key name arguments stack-size initial-bindings)
@@ -87,7 +87,7 @@ itself is public.
 (submit-fiber group fiber)            ;; Thread-safe dynamic submission.
 (finish-fibers group)                 ;; Join carriers; results in submission order.
 (fiber-group-done-p group)            ;; Non-blocking completion predicate.
-(scheduler-group-carriers group)      ;; Snapshot of exposed BLISS-THREAD objects.
+(scheduler-group-carriers group)      ;; Snapshot of exposed TORCL-THREAD objects.
 ```
 
 A fiber belongs to at most one scheduler group. `START-FIBERS` creates an
@@ -115,7 +115,7 @@ pinned, `:WARN` warns then uses the OS-blocking operation, `:ERROR` signals an
 error before blocking, and `NIL` silently uses the OS-blocking operation.
 `WITH-FIBER-PINNED` MUST unpin with `UNWIND-PROTECT` semantics.
 The bootstrap runtime maps `*PINNED-BLOCKING-ACTION*` to
-`BLISS_PINNED_BLOCKING_ACTION`; `NIL` and `NATIVE` select the silent native
+`TORCL_PINNED_BLOCKING_ACTION`; `NIL` and `NATIVE` select the silent native
 fallback spelling.
 
 **R9.44** Fiber introspection MUST include:
@@ -149,10 +149,10 @@ cooperatively brought to a safepoint or the operation signals
 ### 9.2.4  Condition Variables
 
 ```lisp
-(bliss-thread:make-condition-variable &key name) ;; → condition-variable (D9.03)
-(bliss-thread:condition-wait condition-variable mutex &key timeout) ;; Atomically release+block. Returns T/NIL.
-(bliss-thread:condition-notify condition-variable &optional (count 1)) ;; Wake COUNT waiters.
-(bliss-thread:condition-broadcast condition-variable) ;; Wake all waiters.
+(torcl-thread:make-condition-variable &key name) ;; → condition-variable (D9.03)
+(torcl-thread:condition-wait condition-variable mutex &key timeout) ;; Atomically release+block. Returns T/NIL.
+(torcl-thread:condition-notify condition-variable &optional (count 1)) ;; Wake COUNT waiters.
+(torcl-thread:condition-broadcast condition-variable) ;; Wake all waiters.
 ```
 
 ### 9.2.5  Semaphores
@@ -168,19 +168,19 @@ cooperatively brought to a safepoint or the operation signals
 ### 9.2.6  Memory Barriers
 
 ```lisp
-(bliss-ext:memory-barrier &optional (kind :full)) ;; KIND ∈ {:READ :WRITE :FULL :DATA-DEPENDENCY}.
-(bliss-ext:load-barrier)
-(bliss-ext:store-barrier)
+(torcl-ext:memory-barrier &optional (kind :full)) ;; KIND ∈ {:READ :WRITE :FULL :DATA-DEPENDENCY}.
+(torcl-ext:load-barrier)
+(torcl-ext:store-barrier)
 ```
 
 ### 9.2.7  Atomic Operations (CAS)
 
-**R9.37** Bliss MUST provide SBCL-compatible atomic operations in `BLISS-EXT`,
+**R9.37** TorCL MUST provide SBCL-compatible atomic operations in `TORCL-EXT`,
 re-exported via `SB-EXT` and, where SBCL compatibility requires it,
 `SB-THREAD`.
 
 ```lisp
-(bliss-ext:cas place old new)
+(torcl-ext:cas place old new)
   ;; Macro. Atomically: if PLACE holds OLD (by EQ), store NEW, return OLD value.
   ;; If PLACE does not hold OLD, return actual current value; no store.
   ;; Applicable place types: special variables, structure slots (defstruct),
@@ -188,13 +188,13 @@ re-exported via `SB-EXT` and, where SBCL compatibility requires it,
   ;; Expansion: compiler-generated CAS intrinsic per place type.
   ;; Thread-safety: lock-free; full memory barrier on success.
 
-(bliss-ext:atomic-incf place &optional (delta 1))
+(torcl-ext:atomic-incf place &optional (delta 1))
   ;; Atomically increment PLACE by DELTA (a fixnum). Returns previous value.
   ;; Applicable places: fixnum-typed special variables, structure slots
   ;;   declared (type fixnum), SVREF of (simple-array fixnum).
   ;; Thread-safety: lock-free fetch-and-add.
 
-(bliss-ext:atomic-decf place &optional (delta 1))
+(torcl-ext:atomic-decf place &optional (delta 1))
   ;; Atomically decrement PLACE by DELTA (a fixnum). Returns previous value.
   ;; Same applicable places and semantics as ATOMIC-INCF.
 ```
@@ -207,7 +207,7 @@ with fallback to the global cell. Overflow from fixnum arithmetic in `ATOMIC-INC
 
 ### 9.2.8  Recursive Locks
 
-**R9.38** Bliss MUST provide recursive mutexes compatible with SBCL's `sb-thread:make-lock`.
+**R9.38** TorCL MUST provide recursive mutexes compatible with SBCL's `sb-thread:make-lock`.
 
 ```lisp
 (make-lock &key name)
@@ -250,21 +250,21 @@ exposed carrier-thread vector, submitted fibers in stable order, active count,
 submission-closed flag, and join notification. Each carrier owns an internal
 work-stealing deque and scheduler state (§13.5).
 
-### 9.2.10  Compatibility: Bliss vs SBCL
+### 9.2.10  Compatibility: TorCL vs SBCL
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `make-thread` | OS thread | exposed OS native/carrier thread; adds `:arguments`, `:ephemeral` | superset; never creates a fiber |
-| Fiber API | experimental SBCL proposal | `BLISS-FIBER` | separate package; JVM-style type distinction |
+| Fiber API | experimental SBCL proposal | `TORCL-FIBER` | separate package; JVM-style type distinction |
 | Mutex recursion | non-recursive (error) | non-recursive (error) | identical |
 | `interrupt-thread` | safe-point delivery | safepoint delivery (§2.5) | identical |
 | `destroy-thread` | `terminate-thread` | `destroy-thread` + alias | name differs |
 | `condition-wait` spurious | possible | possible | identical |
-| `memory-barrier` | internal | `bliss-ext:memory-barrier` | Bliss addition |
-| `cas` | `sb-ext:cas` macro | `bliss-ext:cas` macro | identical semantics |
-| `atomic-incf`/`decf` | `sb-ext:atomic-incf` | `bliss-ext:atomic-incf` | identical; overflow signals error |
+| `memory-barrier` | internal | `torcl-ext:memory-barrier` | TorCL addition |
+| `cas` | `sb-ext:cas` macro | `torcl-ext:cas` macro | identical semantics |
+| `atomic-incf`/`decf` | `sb-ext:atomic-incf` | `torcl-ext:atomic-incf` | identical; overflow signals error |
 | CAS places | specials, struct, svref, car/cdr | same set | identical |
-| `make-lock` (recursive) | `sb-thread:make-lock` | `bliss-thread:make-lock` | identical; `BLISS-THREADS` is a deprecated nickname |
+| `make-lock` (recursive) | `sb-thread:make-lock` | `torcl-thread:make-lock` | identical; `TORCL-THREADS` is a deprecated nickname |
 | Recursive lock semantics | re-entrant, counted | re-entrant, counted | identical |
 
 ---
@@ -279,9 +279,9 @@ work-stealing deque and scheduler state (§13.5).
 (define-load-time-global name value &optional doc) ;; Evaluated once; not re-evaluated on reload.
 ```
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
-| `defglobal` | `sb-ext:defglobal` | `bliss-ext:defglobal` | identical semantics |
+| `defglobal` | `sb-ext:defglobal` | `torcl-ext:defglobal` | identical semantics |
 | Thread visibility | seq-cst | seq-cst | identical |
 
 ---
@@ -298,9 +298,9 @@ work-stealing deque and scheduler state (§13.5).
 (cancel-finalization object)            ;; Remove all finalizers. Idempotent.
 ```
 
-**D9.06 — Weak-Pointer:** `header(8) | referent:BlissVal(8) | broken-p:AtomicU8(1)` — 24 bytes (padded). GC clears referent to NIL when target unreachable.
+**D9.06 — Weak-Pointer:** `header(8) | referent:TorclVal(8) | broken-p:AtomicU8(1)` — 24 bytes (padded). GC clears referent to NIL when target unreachable.
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `weak-pointer-value` 2nd val | `t`/`nil` | `t`/`nil` | identical |
 | Finalizer thread | dedicated | dedicated | identical |
@@ -340,7 +340,7 @@ work-stealing deque and scheduler state (§13.5).
 
 ### 9.5.2  Compatibility
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `:synchronized` | RW lock | RW lock | identical |
 | `:weakness` keywords | 4 modes | 4 modes | identical |
@@ -348,7 +348,7 @@ work-stealing deque and scheduler state (§13.5).
 | `hash-table-synchronized-p` | supported | supported | identical |
 | `hash-table-weakness` | supported | supported | identical |
 | `:hash-function` | supported | supported | identical |
-| Concurrent resize | stop-the-world | incremental rehash | Bliss avoids long pauses |
+| Concurrent resize | stop-the-world | incremental rehash | TorCL avoids long pauses |
 
 ---
 
@@ -362,16 +362,16 @@ protocol requires deep integration with every standard sequence function
 few Quicklisp libraries depend on it). The implementation cost is disproportionate
 to adoption benefit for v1. Will be revisited for v2 based on user demand.
 
-**R9.40** When user code calls `sb-sequence:define-sequence-class` in Bliss v1,
-the macro MUST signal a `BLISS-EXT:NOT-YET-IMPLEMENTED` error with a descriptive
+**R9.40** When user code calls `sb-sequence:define-sequence-class` in TorCL v1,
+the macro MUST signal a `TORCL-EXT:NOT-YET-IMPLEMENTED` error with a descriptive
 message referencing v2.
 
 ---
 
 ## 9.7  MOP Extensions (`SB-MOP` / Closer-MOP Compatibility)
 
-**R9.14** Bliss MUST export enough MOP symbols for `CLOSER-MOP` to load.
-All symbols exported from `BLISS-MOP`, re-exported via `SB-MOP`.
+**R9.14** TorCL MUST export enough MOP symbols for `CLOSER-MOP` to load.
+All symbols exported from `TORCL-MOP`, re-exported via `SB-MOP`.
 
 ### 9.7.1  Class Introspection
 
@@ -391,8 +391,8 @@ All symbols exported from `BLISS-MOP`, re-exported via `SB-MOP`.
 
 ### 9.7.1b  MOP Metaclasses
 
-**R9.39** Bliss MUST export the following metaclass and slot-definition classes
-from `BLISS-MOP` (re-exported via `SB-MOP`):
+**R9.39** TorCL MUST export the following metaclass and slot-definition classes
+from `TORCL-MOP` (re-exported via `SB-MOP`):
 
 | Class | Superclass | Purpose |
 |-------|------------|---------|
@@ -480,15 +480,15 @@ Each is a documented customization point.
 | `remove-method` | `(gf method)` | recomputes discriminator |
 | `set-funcallable-instance-function` | `(fin function)` | set FIN's function |
 
-### 9.7.6  Compatibility: Bliss vs SBCL MOP
+### 9.7.6  Compatibility: TorCL vs SBCL MOP
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `compute-applicable-methods-using-classes` | 2 values | 2 values | identical |
 | `make-method-lambda` | `(gf method lambda env)` | identical | identical |
 | `validate-superclass` default | T for standard-class | T for standard-class | identical |
 | `set-funcallable-instance-function` | supported | supported | identical |
-| `add-method` locking | acquires GF lock | GF lock + IC flush (§4.8) | Bliss also flushes inline caches |
+| `add-method` locking | acquires GF lock | GF lock + IC flush (§4.8) | TorCL also flushes inline caches |
 | `compute-class-precedence-list` | supported | supported | identical |
 | `compute-slots` | supported | supported | identical |
 | `compute-effective-slot-definition` | supported | supported | identical |
@@ -504,7 +504,7 @@ Each is a documented customization point.
 ## 9.8  Miscellaneous
 
 **R9.15** `SAVE-LISP-AND-DIE` — dump a heap image and exit (§7).
-Bliss name: `SAVE-IMAGE`; compatibility alias provided.
+TorCL name: `SAVE-IMAGE`; compatibility alias provided.
 **R9.16** `QUIT` / `EXIT` — process exit with status code.
 
 ```lisp
@@ -522,25 +522,25 @@ Bliss name: `SAVE-IMAGE`; compatibility alias provided.
 **R9.18** `NATIVE-NAMESTRING` — OS-native path string for a pathname (§5.7).
 **R9.19** Source-location tracking: `DEFINITION-SOURCE` → file, line, form-number (§6).
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `save-lisp-and-die` | primary name | alias for `save-image` | alias provided |
-| `exit :timeout` | not supported | supported | Bliss addition |
-| `with-timeout` condition | `sb-ext:timeout` | `bliss-ext:timeout` | `sb-ext` alias provided |
+| `exit :timeout` | not supported | supported | TorCL addition |
+| `with-timeout` condition | `sb-ext:timeout` | `torcl-ext:timeout` | `sb-ext` alias provided |
 | `definition-source` | struct | plist `(:file :line :form)` | accessor compat macros provided |
 
 ---
 
 ## 9.9  Extension Versioning
 
-**R9.20** `BLISS-EXT` exports `:BLISS-EXT-VERSION` → `(major minor)` list.
+**R9.20** `TORCL-EXT` exports `:TORCL-EXT-VERSION` → `(major minor)` list.
 **R9.21** Incompatible changes MUST bump major version and appear in release notes.
 
 ---
 
 ## 9.10  Timer & Scheduling Extensions
 
-**R9.22** Bliss MUST provide a timer facility in `BLISS-EXT`, compatible with SBCL's `sb-ext` timer API.
+**R9.22** TorCL MUST provide a timer facility in `TORCL-EXT`, compatible with SBCL's `sb-ext` timer API.
 
 ### 9.10.1  API
 
@@ -578,20 +578,20 @@ Bliss name: `SAVE-IMAGE`; compatibility alias provided.
 
 ### 9.10.3  Compatibility
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `make-timer :thread` | supported | supported | identical |
 | `schedule-timer :repeat-interval` | supported | supported | identical |
-| `schedule-timer :catch-up` | not supported | supported | Bliss addition |
-| Timer resolution | ~10ms (signal) | ~1ms (timing wheel) | Bliss more precise |
-| `unschedule-timer` blocks | no | yes (safer cleanup) | Bliss stricter |
-| `list-all-timers` | not provided | provided | Bliss addition |
+| `schedule-timer :catch-up` | not supported | supported | TorCL addition |
+| Timer resolution | ~10ms (signal) | ~1ms (timing wheel) | TorCL more precise |
+| `unschedule-timer` blocks | no | yes (safer cleanup) | TorCL stricter |
+| `list-all-timers` | not provided | provided | TorCL addition |
 
 ---
 
 ## 9.11  Introspection Extensions
 
-**R9.23** Bliss MUST provide introspection for interactive development and IDE integration.
+**R9.23** TorCL MUST provide introspection for interactive development and IDE integration.
 
 ### 9.11.1  Function Introspection
 
@@ -629,18 +629,18 @@ Cross-reference data retained when `debug` ≥ 1. Requires compiler xref pass (�
 
 ### 9.11.4  Compatibility
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `function-lambda-expression` | source at debug≥1 | source at debug≥1 | identical |
-| `function-arglist` | `sb-introspect` package | `bliss-ext` package | package name |
-| `who-calls` et al. | `sb-introspect` package | `bliss-ext` package | package name |
+| `function-arglist` | `sb-introspect` package | `torcl-ext` package | package name |
+| `who-calls` et al. | `sb-introspect` package | `torcl-ext` package | package name |
 | `describe-object` format | SBCL-specific text | SBCL-compatible layout | minor formatting |
 
 ---
 
 ## 9.12  Compiler-Hint Extensions
 
-**R9.26** Bliss MUST support compiler-hint declarations for guided optimisation.
+**R9.26** TorCL MUST support compiler-hint declarations for guided optimisation.
 
 ### 9.12.1  `truly-the`
 
@@ -656,7 +656,7 @@ asserted type for downstream propagation and specialised code selection.
 ### 9.12.2  `always-bound`
 
 ```lisp
-(declaim (bliss-ext:always-bound *variable*))
+(declaim (torcl-ext:always-bound *variable*))
   ;; Elides UNBOUND-VARIABLE check on every special-variable read.
 ```
 
@@ -664,17 +664,17 @@ asserted type for downstream propagation and specialised code selection.
 behaviour (UNBOUND-MARKER treated as valid object; no GC corruption).
 
 **R9.41** The compiler's declaration-identifier resolver MUST recognise both
-`bliss-ext:always-bound` and `sb-ext:always-bound` as equivalent declaration
+`torcl-ext:always-bound` and `sb-ext:always-bound` as equivalent declaration
 identifiers. Declarations are resolved by symbol identity (via the compatibility
 package re-export in R9.02), so `(declaim (sb-ext:always-bound *var*))` MUST
 work identically. The same applies to `freeze-type` and `muffle-conditions` /
 `unmuffle-conditions` — all four declaration identifiers MUST be recognised
-under both `BLISS-EXT` and `SB-EXT` prefixes.
+under both `TORCL-EXT` and `SB-EXT` prefixes.
 
 ### 9.12.3  `freeze-type`
 
 ```lisp
-(declaim (bliss-ext:freeze-type type-name))
+(declaim (torcl-ext:freeze-type type-name))
   ;; Compiler MAY inline typep, structure accessors, stamp checks.
 ```
 
@@ -687,22 +687,22 @@ under both `BLISS-EXT` and `SB-EXT` prefixes.
 ### 9.12.4  Condition Muffling
 
 ```lisp
-(declaim (bliss-ext:muffle-conditions condition-type))   ;; Suppress matching warnings/notes.
-(declaim (bliss-ext:unmuffle-conditions condition-type))  ;; Re-enable.
+(declaim (torcl-ext:muffle-conditions condition-type))   ;; Suppress matching warnings/notes.
+(declaim (torcl-ext:unmuffle-conditions condition-type))  ;; Re-enable.
 ```
 
 `inhibit-warnings` optimize quality (0–3): 0=all notes, 3=silence all.
 
 ### 9.12.5  Compatibility
 
-| Feature | SBCL | Bliss | Divergence |
+| Feature | SBCL | TorCL | Divergence |
 |---------|------|-------|------------|
 | `truly-the` | special form | special form | identical |
-| `always-bound` | declaration (`sb-ext:`) | declaration (`bliss-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
-| `freeze-type` | declaration (`sb-ext:`) | declaration (`bliss-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
-| `freeze-type` redef | `style-warning` | `style-warning` + continuable `error` at load | Bliss stricter |
-| `muffle-conditions` | declaration (`sb-ext:`) | declaration (`bliss-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
-| Trust violation | undefined | undefined (but GC-safe) | Bliss guarantees no GC corruption |
+| `always-bound` | declaration (`sb-ext:`) | declaration (`torcl-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
+| `freeze-type` | declaration (`sb-ext:`) | declaration (`torcl-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
+| `freeze-type` redef | `style-warning` | `style-warning` + continuable `error` at load | TorCL stricter |
+| `muffle-conditions` | declaration (`sb-ext:`) | declaration (`torcl-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
+| Trust violation | undefined | undefined (but GC-safe) | TorCL guarantees no GC corruption |
 
 ---
 

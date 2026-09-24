@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# flamegraph.sh — CPU flamegraph of a bliss run, symbolicating JIT'd (T1/T2/OSR)
+# flamegraph.sh — CPU flamegraph of a torcl run, symbolicating JIT'd (T1/T2/OSR)
 # native frames (bliss-0ivo, profiling epic bliss-bfxm).
 #
-# Bliss already emits the symbolication data `perf` needs: set BLISS_PERF_MAP=1
+# TorCL already emits the symbolication data `perf` needs: set TORCL_PERF_MAP=1
 # and it writes /tmp/perf-<pid>.map (addr size name) so `perf` names JIT frames;
-# set BLISS_PERF_JITDUMP=1 for the richer perf jitdump (usable via `perf inject
-# --jit`). This wrapper turns a bliss command into folded stacks and, if the
+# set TORCL_PERF_JITDUMP=1 for the richer perf jitdump (usable via `perf inject
+# --jit`). This wrapper turns a torcl command into folded stacks and, if the
 # Brendan Gregg FlameGraph tools are available, an SVG.
 #
 # Usage:
-#   scripts/flamegraph.sh [options] -- <bliss-cli command...>
+#   scripts/flamegraph.sh [options] -- <torcl command...>
 #
 # Options:
-#   --out FILE      output path (default: /tmp/bliss-flamegraph.svg, or
-#                   /tmp/bliss-profile.perf for --speedscope)
+#   --out FILE      output path (default: /tmp/torcl-flamegraph.svg, or
+#                   /tmp/torcl-profile.perf for --speedscope)
 #   --speedscope    emit raw `perf script` data instead of an SVG, for
 #                   https://speedscope.app (drag-and-drop; keeps time-ordering,
 #                   Time Order / Left Heavy / Sandwich views). Needs no extra
@@ -29,7 +29,7 @@
 #
 # Example:
 #   scripts/flamegraph.sh --out /tmp/babel.svg -- \
-#     target/x86_64-unknown-linux-musl/release/bliss-cli --no-init \
+#     target/x86_64-unknown-linux-musl/release/torcl --no-init \
 #       --eval '(dotimes (i 5000000) (some-hot-fn))'
 #
 # Caveats on this machine (see AGENTS.md): the static-pie/LTO/JIT binary makes
@@ -62,29 +62,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -eq 0 ]]; then
-  echo "flamegraph.sh: no command given (use: ... -- <bliss-cli ...>)" >&2
+  echo "flamegraph.sh: no command given (use: ... -- <torcl ...>)" >&2
   exit 2
 fi
 
 # Default output path depends on the format.
 if [[ -z "$OUT" ]]; then
   case "$FORMAT" in
-    speedscope) OUT=/tmp/bliss-profile.perf ;;
-    *) OUT=/tmp/bliss-flamegraph.svg ;;
+    speedscope) OUT=/tmp/torcl-profile.perf ;;
+    *) OUT=/tmp/torcl-flamegraph.svg ;;
   esac
 fi
 
 command -v perf >/dev/null 2>&1 || { echo "flamegraph.sh: 'perf' not found" >&2; exit 1; }
 
-WORK="$(mktemp -d /tmp/bliss-flame.XXXXXX)"
+WORK="$(mktemp -d /tmp/torcl-flame.XXXXXX)"
 PERF_DATA="$WORK/perf.data"
 FOLDED="${OUT%.svg}.folded"
 
 echo "[flamegraph] recording (freq=${FREQ}Hz call-graph=${CALLGRAPH} core=${PIN_CORE}) ..." >&2
-# BLISS_PERF_MAP names JIT frames; -k 1 (monotonic clock) is needed for jitdump.
+# TORCL_PERF_MAP names JIT frames; -k 1 (monotonic clock) is needed for jitdump.
 record_extra=()
 [[ "$JITDUMP" == 1 ]] && record_extra+=(-k 1)
-BLISS_PERF_MAP=1 BLISS_PERF_JITDUMP="$JITDUMP" \
+TORCL_PERF_MAP=1 TORCL_PERF_JITDUMP="$JITDUMP" \
   taskset -c "$PIN_CORE" \
   perf record -F "$FREQ" --call-graph "$CALLGRAPH" -o "$PERF_DATA" -- "$@" \
   || { echo "[flamegraph] perf record failed (perf_event_paranoid? hybrid-CPU PMU? see caveats above)" >&2; exit 1; }
@@ -135,7 +135,7 @@ fi
 perf script -i "$SCRIPT_DATA" | "$STACKCOLLAPSE" > "$FOLDED"
 echo "[flamegraph] folded stacks: $FOLDED" >&2
 if [[ -n "$FLAMEGRAPH" ]]; then
-  "$FLAMEGRAPH" --title "bliss CPU flamegraph" "$FOLDED" > "$OUT"
+  "$FLAMEGRAPH" --title "torcl CPU flamegraph" "$FOLDED" > "$OUT"
   echo "[flamegraph] wrote $OUT" >&2
 else
   echo "[flamegraph] flamegraph.pl not found; folded stacks are at $FOLDED" >&2

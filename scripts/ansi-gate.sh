@@ -12,12 +12,12 @@
 #
 # Environment:
 #   ANSI_TEST_DIR   ansi-test checkout (default: ~/git/ansi-test)
-#   BLISS_BIN       bliss binary (default: the musl debug bliss-cli)
-#   BLISS_TIMEOUT   per-chapter wall-clock seconds (default 2400)
+#   TORCL_BIN       torcl binary (default: the musl debug torcl)
+#   TORCL_TIMEOUT   per-chapter wall-clock seconds (default 2400)
 #
-# Each chapter runs in a fresh bliss under scripts/bliss-limited.sh (memory
+# Each chapter runs in a fresh torcl under scripts/torcl-limited.sh (memory
 # cap; see AGENTS.md). Stale *.fasl files are cleared first: compile-and-load
-# keys on mtime, and fasls compiled under older bliss semantics silently
+# keys on mtime, and fasls compiled under older torcl semantics silently
 # mis-load (bliss-89lj). A run with no parseable tally is ERRORED, never ok.
 
 set -u
@@ -35,9 +35,9 @@ set -u
 ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
-BLISS_BIN="${BLISS_BIN:-target/x86_64-unknown-linux-musl/debug/bliss-cli}"
-export BLISS_TIMEOUT="${BLISS_TIMEOUT:-2400}"
-export BLISS_MEM_MAX="${BLISS_MEM_MAX:-8G}"
+TORCL_BIN="${TORCL_BIN:-target/x86_64-unknown-linux-musl/debug/torcl}"
+export TORCL_TIMEOUT="${TORCL_TIMEOUT:-2400}"
+export TORCL_MEM_MAX="${TORCL_MEM_MAX:-8G}"
 
 cd "$(dirname "$0")/.."
 
@@ -45,8 +45,8 @@ if [ ! -d "$ANSI_TEST_DIR" ]; then
     echo "ansi-gate: ERROR: ansi-test checkout not found at $ANSI_TEST_DIR" >&2
     exit 2
 fi
-if [ ! -x "$BLISS_BIN" ]; then
-    echo "ansi-gate: ERROR: bliss binary not found at $BLISS_BIN" >&2
+if [ ! -x "$TORCL_BIN" ]; then
+    echo "ansi-gate: ERROR: torcl binary not found at $TORCL_BIN" >&2
     echo "ansi-gate: build it with: cargo test --workspace --no-run" >&2
     echo "ansi-gate: (NOT 'cargo build' — see the profile note below / bliss-em8x)" >&2
     exit 2
@@ -54,8 +54,8 @@ fi
 
 # Which binary is this, and is it the fast one?
 #
-# The underlying trap is FIXED (bliss-em8x): profile.dev now gives bliss-rt,
-# bliss-stdlib and bliss-compiler opt-level 2 to match profile.test, so `cargo
+# The underlying trap is FIXED (bliss-em8x): profile.dev now gives torcl-rt,
+# torcl-stdlib and torcl-compiler opt-level 2 to match profile.test, so `cargo
 # build` and `cargo test --no-run` produce binaries of the same speed (measured
 # 40 ms each on the same benchmark that used to split 322 ms vs 40 ms) and it no
 # longer matters which ran last.
@@ -77,13 +77,13 @@ fi
 # uninterpretable, and the gate should not emit uninterpretable numbers.
 #
 # Escape hatch for a deliberate correctness-only run, where speed is irrelevant:
-#   BLISS_ALLOW_SLOW_BIN=1 scripts/ansi-gate.sh <chapter>
-bliss_bin_size="$(stat -c%s "$BLISS_BIN" 2>/dev/null || echo 0)"
-echo "ansi-gate: binary $BLISS_BIN (${bliss_bin_size} bytes)"
-if [ "$bliss_bin_size" -gt 0 ] && [ "$bliss_bin_size" -lt 106000000 ]; then
-    if [ "${BLISS_ALLOW_SLOW_BIN:-0}" = 1 ]; then
+#   TORCL_ALLOW_SLOW_BIN=1 scripts/ansi-gate.sh <chapter>
+torcl_bin_size="$(stat -c%s "$TORCL_BIN" 2>/dev/null || echo 0)"
+echo "ansi-gate: binary $TORCL_BIN (${torcl_bin_size} bytes)"
+if [ "$torcl_bin_size" -gt 0 ] && [ "$torcl_bin_size" -lt 106000000 ]; then
+    if [ "${TORCL_ALLOW_SLOW_BIN:-0}" = 1 ]; then
         echo "ansi-gate: WARNING: slow-looking binary, continuing because"
-        echo "ansi-gate:   BLISS_ALLOW_SLOW_BIN=1. Pass/fail tallies are still"
+        echo "ansi-gate:   TORCL_ALLOW_SLOW_BIN=1. Pass/fail tallies are still"
         echo "ansi-gate:   meaningful; TIMINGS AND TIMEOUTS ARE NOT (bliss-em8x)."
     else
         echo "ansi-gate: ERROR: this looks like a 'cargo build' binary, whose" >&2
@@ -101,7 +101,7 @@ if [ "$bliss_bin_size" -gt 0 ] && [ "$bliss_bin_size" -lt 106000000 ]; then
         echo "ansi-gate:   not write the binary) -- see bliss-wzb3." >&2
         echo "ansi-gate:" >&2
         echo "ansi-gate:   To run anyway (correctness only, timings void):" >&2
-        echo "ansi-gate:     BLISS_ALLOW_SLOW_BIN=1 $0 $*" >&2
+        echo "ansi-gate:     TORCL_ALLOW_SLOW_BIN=1 $0 $*" >&2
         exit 2
     fi
 fi
@@ -122,7 +122,7 @@ for chapter in "${chapters[@]}"; do
     find "$ANSI_TEST_DIR" -name '*.fasl' -delete
 
     log="$(mktemp "${TMPDIR:-/tmp}/ansi-gate-$chapter.XXXXXX.log")"
-    # bliss-cli rejects mixing --eval with --load, so parameterize via a tiny
+    # torcl rejects mixing --eval with --load, so parameterize via a tiny
     # generated driver file instead.
     driver="$(mktemp "${TMPDIR:-/tmp}/ansi-gate-$chapter.XXXXXX.lisp")"
     cat >"$driver" <<EOF
@@ -133,7 +133,7 @@ EOF
     # Record BOTH wall and CPU time (bliss-u64o). Wall time alone is not
     # interpretable: if the host suspends mid-chapter, wall time inflates while
     # no work happens, which looks exactly like a hang or a regression. It also
-    # means the BLISS_TIMEOUT cap -- which is wall-clock -- can be consumed, or
+    # means the TORCL_TIMEOUT cap -- which is wall-clock -- can be consumed, or
     # fail to fire, for reasons that have nothing to do with the code. A wall
     # time far above the CPU time is the signature of that, not of slow code.
     chapter_t0="$(date +%s)"
@@ -141,10 +141,10 @@ EOF
     # SUBSHELL, so `self` names that short-lived subshell -- which has reaped
     # no children and always reports 0. `$$` stays the main shell even inside
     # $( ). Fields 16/17 are cutime/cstime, the CPU of reaped children; the
-    # systemd scope in bliss-limited.sh does not hide it (verified: 81 ticks
+    # systemd scope in torcl-limited.sh does not hide it (verified: 81 ticks
     # accounted both with and without the scope).
     chapter_cpu_before="$(awk '{print $16+$17}' "/proc/$$/stat" 2>/dev/null)"
-    scripts/bliss-limited.sh "$BLISS_BIN" --no-init --load "$driver" >"$log" 2>&1
+    scripts/torcl-limited.sh "$TORCL_BIN" --no-init --load "$driver" >"$log" 2>&1
     status=$?
     chapter_cpu_after="$(awk '{print $16+$17}' "/proc/$$/stat" 2>/dev/null)"
     chapter_wall=$(( "$(date +%s)" - chapter_t0 ))
@@ -173,7 +173,7 @@ EOF
         # No tally = the run died (crash, timeout, load error) — ERRORED.
         echo "ansi-gate: $chapter: ERRORED (exit $status, no tally; $timing; log: $log)"
         if [ "$status" = 124 ]; then
-            echo "ansi-gate:   exit 124 = wall-clock timeout after ${BLISS_TIMEOUT}s."
+            echo "ansi-gate:   exit 124 = wall-clock timeout after ${TORCL_TIMEOUT}s."
             echo "ansi-gate:   Before treating this as a code problem, check the"
             echo "ansi-gate:   binary note above: an unoptimized-dependency build"
             echo "ansi-gate:   is ~9x slower and times out on chapters that pass"

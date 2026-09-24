@@ -1,6 +1,6 @@
 # §4.4  Tiered Compilation
 
-**Scope.**  Bliss executes Common Lisp code through three tiers modelled on
+**Scope.**  TorCL executes Common Lisp code through three tiers modelled on
 the HotSpot JVM's interpreter → C1 → C2 pipeline.  This section specifies
 each tier's internal mechanics, the decision logic for tier transitions, the
 compilation queue, and the interaction with the profiling subsystem (§4.9).
@@ -17,7 +17,7 @@ compilation queue, and the interaction with the profiling subsystem (§4.9).
 | R4.26 | T1 compilation MUST complete synchronously on the calling thread before the function's next invocation executes compiled code.  T2 compilation MUST execute on a background compiler thread. |
 | R4.27 | While T2 compilation is in progress, the function MUST continue executing its T1 code; the switch to T2 code MUST be atomic (single pointer store, visible at the next call-site dispatch or matching OSR back-edge poll). |
 | R4.28 | If T2 compilation fails (e.g., unsupported construct, resource exhaustion), the function MUST remain at T1 permanently and the failure MUST be logged. |
-| R4.29 | Tier thresholds MUST be configurable at startup via environment variables (`BLISS_T0_T1_THRESHOLD`, `BLISS_T1_T2_THRESHOLD`, `BLISS_LOOP_HEAT_THRESHOLD`). |
+| R4.29 | Tier thresholds MUST be configurable at startup via environment variables (`TORCL_T0_T1_THRESHOLD`, `TORCL_T1_T2_THRESHOLD`, `TORCL_LOOP_HEAT_THRESHOLD`). |
 | R4.30 | The compilation queue MUST be bounded (default 64 entries); when full, new compilation requests MUST be dropped with a counter increment, not block the caller. |
 
 ---
@@ -51,7 +51,7 @@ Each tier is described in detail below.
 ### 4.4.3.1  Purpose
 
 T0 provides architecture-independent cold-code execution with low front-end
-latency.  Every executable form is first lowered to portable Bliss bytecode;
+latency.  Every executable form is first lowered to portable TorCL bytecode;
 every user-defined function starts by executing that bytecode.  T0 collects
 invocation and bytecode back-edge counts so the runtime can decide when
 native compilation is worthwhile.
@@ -73,7 +73,7 @@ pub struct BytecodeFunction {
     /// Encoded bytecode instructions.
     code: Vec<u8>,
     /// Literal constants referenced by bytecode operands.
-    constants: Vec<BlissVal>,
+    constants: Vec<TorclVal>,
     /// Symbol, package, class, and function references.
     references: Vec<BytecodeRef>,
     /// Bytecode PC -> source location mapping.
@@ -102,15 +102,15 @@ on the Rust call stack for recursive evaluation.
 /// Interpreter operand stack (per green-thread).
 pub struct ValueStack {
     /// Bump-allocated backing store; grows toward higher addresses.
-    slots: Vec<BlissVal>,
+    slots: Vec<TorclVal>,
     /// Index of the first free slot.
     sp: usize,
 }
 
 impl ValueStack {
-    pub fn push(&mut self, v: BlissVal);
-    pub fn pop(&mut self) -> BlissVal;
-    pub fn peek(&self, depth: usize) -> BlissVal;
+    pub fn push(&mut self, v: TorclVal);
+    pub fn pop(&mut self) -> TorclVal;
+    pub fn peek(&self, depth: usize) -> TorclVal;
     /// Reset to a saved stack pointer (for non-local exits).
     pub fn unwind_to(&mut self, saved_sp: usize);
 }
@@ -118,12 +118,12 @@ impl ValueStack {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `slots` | `Vec<BlissVal>` | Growable backing array, default capacity 1 024 |
+| `slots` | `Vec<TorclVal>` | Growable backing array, default capacity 1 024 |
 | `sp` | `usize` | Current stack pointer (index into `slots`) |
 
 **Invariant:** `sp <= slots.len()`.  If `push` would exceed capacity, the
 vector doubles via `Vec::reserve`, up to a configurable maximum depth
-(default 65 536 slots, set via `BLISS_MAX_STACK_DEPTH`).
+(default 65 536 slots, set via `TORCL_MAX_STACK_DEPTH`).
 
 **Overflow handling:** If `push` would exceed the maximum depth, the
 interpreter signals a `STORAGE-CONDITION` (ANSI CL §9.1) with a restart
@@ -145,7 +145,7 @@ through the frame's stack map.
 pub struct BytecodeFrame {
     function: *const BytecodeFunction,
     pc: u32,
-    locals: Vec<BlissVal>,
+    locals: Vec<TorclVal>,
     stack_base: usize,
 }
 ```
@@ -159,8 +159,8 @@ Signature:
 pub fn bytecode_loop(
     function: &BytecodeFunction,
     frame: &mut BytecodeFrame,
-    stack: &mut ValueStack, thread: &mut BlissThread,
-) -> Result<BlissVal, BlissError>;
+    stack: &mut ValueStack, thread: &mut TorclThread,
+) -> Result<TorclVal, TorclError>;
 ```
 
 Representative bytecodes:
@@ -260,7 +260,7 @@ When `invoke_count` reaches `T0_T1_THRESHOLD` (R4.24), the T0 eval loop calls
 on the calling thread (R4.26):
 
 ```rust
-fn request_t1_compilation(meta: &FnMeta, thread: &mut BlissThread) {
+fn request_t1_compilation(meta: &FnMeta, thread: &mut TorclThread) {
     // Prevent double compilation.
     let prev = meta.tier.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
     if prev.is_err() { return; }
@@ -307,7 +307,7 @@ flow through the stack frame's spill area.
 
 ### 4.4.4.4  Calling Convention
 
-T1 (and T2) compiled code uses a Bliss-internal calling convention to avoid
+T1 (and T2) compiled code uses a TorCL-internal calling convention to avoid
 the overhead of the platform C ABI on every Lisp-to-Lisp call:
 
 | Register (x86-64) | Purpose |
@@ -321,10 +321,10 @@ the overhead of the platform C ABI on every Lisp-to-Lisp call:
 | `r9` | Argument 4 |
 | `r10` | Scratch / argument 5 |
 | `r11` | Scratch |
-| `rbx` | Thread pointer (`*mut BlissThread`) — callee-saved |
+| `rbx` | Thread pointer (`*mut TorclThread`) — callee-saved |
 | `r12` | Heap allocation pointer (TLAB bump ptr) — callee-saved |
 | `r13` | Heap allocation limit — callee-saved |
-| `r14` | Frame pointer (Bliss) — callee-saved |
+| `r14` | Frame pointer (TorCL) — callee-saved |
 | `r15` | Safepoint page address — callee-saved |
 | `rbp` | Platform frame pointer (for unwinding) — callee-saved |
 | `rsp` | Stack pointer |
@@ -398,7 +398,7 @@ and runs a full optimisation pass pipeline.
 
 ### 4.4.5.2  IR Construction
 
-T2 constructs its IR from the macroexpanded **bytecode** (`bliss_rt::bytecode`,
+T2 constructs its IR from the macroexpanded **bytecode** (`torcl_rt::bytecode`,
 §4.4) — the same bytecode T0 interprets and T1 compiles, so deopt/OSR `bcp`
 coordinates line up by construction — not from the AST or T1 machine code. SSA
 form is built directly using the Braun et al. (2013) algorithm — no
@@ -435,7 +435,7 @@ the IR in valid SSA form.
 ### 4.4.5.4  Background Thread Model
 
 T2 compilation runs on a dedicated **compiler thread pool** (default: 2 OS
-threads, configurable via `BLISS_T2_THREADS`).  Each thread loops:
+threads, configurable via `TORCL_T2_THREADS`).  Each thread loops:
 `pop_blocking()` → `t2_compile()` → return a relocatable compilation artifact.
 The requesting mutator installs completed artifacts at its next dispatch or
 back-edge poll. This ownership split keeps thread-local function registries,
@@ -596,23 +596,23 @@ hold the queue mutex only during enqueue/dequeue (microseconds).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BLISS_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation |
-| `BLISS_T1_T2_THRESHOLD` | 5 000 | Invocation count to trigger T2 compilation |
-| `BLISS_LOOP_HEAT_THRESHOLD` | 10 000 | Back-edge count to trigger T2 compilation |
-| `BLISS_DISABLE_T2` | unset | Set to a true value to keep hot functions at T1 for debugging/differential testing |
-| `BLISS_T2_THREADS` | 2 | Number of background compiler threads |
-| `BLISS_COMPILE_QUEUE_SIZE` | 64 | Maximum entries in the T2 compilation queue |
-| `BLISS_INLINE_LIMIT` | 30 | Maximum IR node count for inlining in T2 |
-| `BLISS_T2_NODE_BUDGET` | 500 | Maximum IR nodes per function post-inlining |
-| `BLISS_MAX_STACK_DEPTH` | 65 536 | Maximum ValueStack slots per green thread (overflow signals `STORAGE-CONDITION`) |
+| `TORCL_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation |
+| `TORCL_T1_T2_THRESHOLD` | 5 000 | Invocation count to trigger T2 compilation |
+| `TORCL_LOOP_HEAT_THRESHOLD` | 10 000 | Back-edge count to trigger T2 compilation |
+| `TORCL_DISABLE_T2` | unset | Set to a true value to keep hot functions at T1 for debugging/differential testing |
+| `TORCL_T2_THREADS` | 2 | Number of background compiler threads |
+| `TORCL_COMPILE_QUEUE_SIZE` | 64 | Maximum entries in the T2 compilation queue |
+| `TORCL_INLINE_LIMIT` | 30 | Maximum IR node count for inlining in T2 |
+| `TORCL_T2_NODE_BUDGET` | 500 | Maximum IR nodes per function post-inlining |
+| `TORCL_MAX_STACK_DEPTH` | 65 536 | Maximum ValueStack slots per green thread (overflow signals `STORAGE-CONDITION`) |
 
 T2 is enabled during normal execution; it is not gated by an opt-in variable.
-The profiling-specific spellings `BLISS_T1_T2_INVOKE_THRESHOLD` and
-`BLISS_T1_T2_BACKEDGE_THRESHOLD` are accepted aliases for
-`BLISS_T1_T2_THRESHOLD` and `BLISS_LOOP_HEAT_THRESHOLD`. The historical
-`BLISS_T1_THRESHOLD` and `BLISS_T2_THRESHOLD` spellings remain compatibility
-aliases. `BLISS_T2=1` remains a force/debug shorthand for making T2 eligible
-immediately after T1, while `BLISS_T2=0` is a compatibility off-switch.
+The profiling-specific spellings `TORCL_T1_T2_INVOKE_THRESHOLD` and
+`TORCL_T1_T2_BACKEDGE_THRESHOLD` are accepted aliases for
+`TORCL_T1_T2_THRESHOLD` and `TORCL_LOOP_HEAT_THRESHOLD`. The historical
+`TORCL_T1_THRESHOLD` and `TORCL_T2_THRESHOLD` spellings remain compatibility
+aliases. `TORCL_T2=1` remains a force/debug shorthand for making T2 eligible
+immediately after T1, while `TORCL_T2=0` is a compatibility off-switch.
 
 ---
 
@@ -621,8 +621,8 @@ immediately after T1, while `BLISS_T2=0` is a compatibility off-switch.
 | Test | Scope | Method |
 |------|-------|--------|
 | Tier transition correctness | Unit | Call a function N times; assert `fn_meta.tier` progresses 0 → 1 → 2 |
-| T0/T1 semantic equivalence | Integration | Run ansi-test under forced T0 and forced T1 (`BLISS_T0_T1_THRESHOLD=1`); diff results |
-| T1/T2 semantic equivalence | Integration | Run ansi-test under forced T1 and forced T2 (`BLISS_T1_T2_THRESHOLD=1`); diff results |
+| T0/T1 semantic equivalence | Integration | Run ansi-test under forced T0 and forced T1 (`TORCL_T0_T1_THRESHOLD=1`); diff results |
+| T1/T2 semantic equivalence | Integration | Run ansi-test under forced T1 and forced T2 (`TORCL_T1_T2_THRESHOLD=1`); diff results |
 | Compilation queue overflow | Unit | Fill queue to capacity; assert `try_enqueue` returns `false` and `dropped` increments |
 | Concurrent T2 install | Stress | N threads calling hot function while T2 installs; no crashes or wrong results |
 | Deoptimisation round-trip | Integration | Force type guard failure; assert correct fallback to T1 and eventual re-promotion |

@@ -1,6 +1,6 @@
 # §6 Developer Tools
 
-Bliss provides a full-featured interactive development environment
+TorCL provides a full-featured interactive development environment
 matching or exceeding the facilities available in mature Common Lisp
 implementations (SBCL, CCL). Developer tools are first-class subsystems:
 they integrate deeply with the runtime (§2), compiler (§4), and object
@@ -16,28 +16,28 @@ programmatically from CL code or an IDE protocol connection.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.01 | Bliss MUST provide an interactive REPL conforming to the ANSI `read`-`eval`-`print` loop semantics. | MUST |
+| R6.01 | TorCL MUST provide an interactive REPL conforming to the ANSI `read`-`eval`-`print` loop semantics. | MUST |
 | R6.02 | The REPL MUST support multi-line input editing with bracket/paren matching and auto-indentation. | MUST |
-| R6.03 | The REPL MUST maintain per-session persistent history, saved to `~/.bliss/repl-history`. | MUST |
+| R6.03 | The REPL MUST maintain per-session persistent history, saved to `~/.torcl/repl-history`. | MUST |
 | R6.04 | The REPL MUST provide TAB-completion for symbols (exported and accessible), package names, keywords, and filesystem paths in `load`/`require` forms. | MUST |
 | R6.05 | The REPL SHOULD integrate with the inspector (§6.5) so that printed result objects can be interactively inspected. | SHOULD |
 | R6.06 | The REPL MUST honour `*`, `**`, `***`, `+`, `++`, `+++`, `/`, `//`, `///` history variables per ANSI. | MUST |
 | R6.07 | The REPL MUST catch all conditions and present restarts when an unhandled error occurs, rather than aborting. | MUST |
-| R6.08 | The REPL SHOULD support user-configurable prompts via `bliss-ext:*repl-prompt-function*`. | SHOULD |
+| R6.08 | The REPL SHOULD support user-configurable prompts via `torcl-ext:*repl-prompt-function*`. | SHOULD |
 | R6.09 | The REPL MAY provide syntax highlighting of input (parenthesis rainbow, keyword colouring). | MAY |
 
 ### 6.1.2 Debugger
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.10 | Bliss MUST provide an interactive debugger entered on unhandled conditions. | MUST |
+| R6.10 | TorCL MUST provide an interactive debugger entered on unhandled conditions. | MUST |
 | R6.11 | The debugger MUST display the condition, available restarts, and a numbered backtrace of stack frames. | MUST |
 | R6.12 | Stack frame inspection MUST show the function name, source location (file, line, column), and local variable bindings (when debug quality ≥ 2). | MUST |
 | R6.13 | The debugger MUST support the `step`, `next`, `out`, and `continue` stepping commands. | MUST |
-| R6.14 | Bliss MUST support breakpoints on function entry via `(bliss-debug:break-on-entry 'fn)`. | MUST |
-| R6.15 | Bliss MUST support breakpoints on source location via `(bliss-debug:break-at file line)`. | MUST |
-| R6.16 | Bliss MUST support conditional breakpoints: `(bliss-debug:break-on-entry 'fn :when expr)`. | MUST |
-| R6.17 | Bliss SHOULD support watchpoints: `(bliss-debug:watch 'var :test #'predicate)` triggering the debugger when a watched binding changes and the predicate returns true. Special (dynamic) variable watchpoints MUST work at all debug levels. Lexical variable watchpoints require `(optimize (debug 3))` and compiler instrumentation (see A6.04a). | SHOULD |
+| R6.14 | TorCL MUST support breakpoints on function entry via `(torcl-debug:break-on-entry 'fn)`. | MUST |
+| R6.15 | TorCL MUST support breakpoints on source location via `(torcl-debug:break-at file line)`. | MUST |
+| R6.16 | TorCL MUST support conditional breakpoints: `(torcl-debug:break-on-entry 'fn :when expr)`. | MUST |
+| R6.17 | TorCL SHOULD support watchpoints: `(torcl-debug:watch 'var :test #'predicate)` triggering the debugger when a watched binding changes and the predicate returns true. Special (dynamic) variable watchpoints MUST work at all debug levels. Lexical variable watchpoints require `(optimize (debug 3))` and compiler instrumentation (see A6.04a). | SHOULD |
 | R6.18 | The debugger MUST allow evaluation of arbitrary forms in the lexical environment of the selected frame. | MUST |
 | R6.19 | Debug information MUST be preserved according to the `debug` optimize quality: 0 = name only; 1 = name + source location; 2 = all locals; 3 = all locals + stepping. | MUST |
 | R6.20 | When running under an IDE protocol connection, debugger events MUST be forwarded to the IDE rather than presented on the terminal. | MUST |
@@ -46,11 +46,11 @@ programmatically from CL code or an IDE protocol connection.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.21 | Bliss MUST provide a statistical (sampling) profiler that records the program counter at OS timer-signal intervals. | MUST |
+| R6.21 | TorCL MUST provide a statistical (sampling) profiler that records the program counter at OS timer-signal intervals. | MUST |
 | R6.22 | The sampling profiler MUST map sampled PCs back to CL function names and source locations via the code-location map (§4). | MUST |
 | R6.23 | The sampling profiler MUST support configurable sample rate (default 1000 Hz, range 10–10000 Hz). | MUST |
-| R6.24 | Bliss MUST provide a deterministic instrumentation profiler recording per-function call counts and cumulative/self time. | MUST |
-| R6.25 | Bliss MUST provide an allocation profiler tracking per-type allocation counts, sizes, and allocation-site backtraces. | MUST |
+| R6.24 | TorCL MUST provide a deterministic instrumentation profiler recording per-function call counts and cumulative/self time. | MUST |
+| R6.25 | TorCL MUST provide an allocation profiler tracking per-type allocation counts, sizes, and allocation-site backtraces. | MUST |
 | R6.26 | Profiler results MUST be reportable as flat tables (sorted by self-time or allocation count) and as call-graph trees. | MUST |
 | R6.27 | The statistical profiler SHOULD be able to produce output compatible with `perf` (via JIT-dump, see §2) and FlameGraph tooling. | SHOULD |
 | R6.28 | Profiler overhead: the sampling profiler MUST add < 5% overhead at default sample rate. The instrumentation profiler MAY add up to 3× slowdown. | MUST |
@@ -68,22 +68,22 @@ programmatically from CL code or an IDE protocol connection.
 ### 6.1.5 IDE Protocol
 
 IDE integration (SLIME/SLY, and its wire protocol variously called SWANK or
-Slynk) is **not** built into the Bliss runtime. The protocol is large, tracks
+Slynk) is **not** built into the TorCL runtime. The protocol is large, tracks
 the editor's releases, and is already maintained upstream; reimplementing it in
 the core would duplicate library behaviour and drift. Instead — exactly as on
-SBCL — Bliss loads a standard upstream backend (`slynk` or `swank`) as an
+SBCL — TorCL loads a standard upstream backend (`slynk` or `swank`) as an
 ordinary Common Lisp library, and the runtime's job is to provide the primitives
 that backend depends on. A vendored copy of the backend lives under `lib/slynk/`
-with a thin Bliss adapter (`communication-style nil`, single-threaded).
+with a thin TorCL adapter (`communication-style nil`, single-threaded).
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.33 | Bliss MUST support SLIME/SLY-based IDE integration by loading a standard upstream backend (`slynk` or `swank`) as an ordinary library, the same way that backend loads on SBCL. Bliss MUST NOT build the IDE wire protocol (message framing, `:emacs-rex` dispatch, the eval/inspect/debug RPCs) into the runtime. | MUST |
-| R6.34 | To host such a backend, Bliss MUST provide the runtime primitives it depends on: TCP stream sockets (listen / accept / local-port / connect / close), `(unsigned-byte 8)` socket streams supporting framed octet I/O (`read-sequence`/`write-sequence`/`read-byte`/`write-byte` and an explicit `finish-output` that flushes to the descriptor), and a blocking single-threaded (`communication-style nil`) serve loop that can be driven entirely from Lisp. | MUST |
+| R6.33 | TorCL MUST support SLIME/SLY-based IDE integration by loading a standard upstream backend (`slynk` or `swank`) as an ordinary library, the same way that backend loads on SBCL. TorCL MUST NOT build the IDE wire protocol (message framing, `:emacs-rex` dispatch, the eval/inspect/debug RPCs) into the runtime. | MUST |
+| R6.34 | To host such a backend, TorCL MUST provide the runtime primitives it depends on: TCP stream sockets (listen / accept / local-port / connect / close), `(unsigned-byte 8)` socket streams supporting framed octet I/O (`read-sequence`/`write-sequence`/`read-byte`/`write-byte` and an explicit `finish-output` that flushes to the descriptor), and a blocking single-threaded (`communication-style nil`) serve loop that can be driven entirely from Lisp. | MUST |
 | R6.35 | The introspection operations a SLIME/SLY backend composes MUST be available to loaded Lisp code so that eval, completion, arglist hints, cross-reference, and the inspector work through it: `macroexpand-1`/`macroexpand-all`, function arglists (§9), `find-definitions` and `xref` (callers/callees), `apropos`, `describe`, `inspect`, `compile-string`/`compile-file`, and symbol completion. | MUST |
-| R6.36 | Bliss SHOULD also support an LSP (Language Server Protocol) server for non-Emacs editors, likewise loaded as a library over the same introspection primitives. | SHOULD |
-| R6.37 | Connection authentication and the SLIME security model are the loaded backend's responsibility; Bliss MUST provide the file and socket primitives it uses for a per-session secret, and MUST default socket binding to localhost (`127.0.0.1`). | MUST |
-| R6.38 | When Bliss's threading model (§13) provides threads, the loaded backend MUST be able to enumerate them and drive thread-focused debugging through Bliss's thread-introspection primitives; a single-threaded (`communication-style nil`) backend is permitted when threads are unavailable. | MUST |
+| R6.36 | TorCL SHOULD also support an LSP (Language Server Protocol) server for non-Emacs editors, likewise loaded as a library over the same introspection primitives. | SHOULD |
+| R6.37 | Connection authentication and the SLIME security model are the loaded backend's responsibility; TorCL MUST provide the file and socket primitives it uses for a per-session secret, and MUST default socket binding to localhost (`127.0.0.1`). | MUST |
+| R6.38 | When TorCL's threading model (§13) provides threads, the loaded backend MUST be able to enumerate them and drive thread-focused debugging through TorCL's thread-introspection primitives; a single-threaded (`communication-style nil`) backend is permitted when threads are unavailable. | MUST |
 
 ### 6.1.6 Trace, Describe, Inspect, Room, Time
 
@@ -100,10 +100,10 @@ with a thin Bliss adapter (`communication-style nil`, single-threaded).
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.45 | Bliss MUST integrate ASDF 3.3+ as its system/build manager. | MUST |
+| R6.45 | TorCL MUST integrate ASDF 3.3+ as its system/build manager. | MUST |
 | R6.46 | `(require :system-name)` MUST delegate to ASDF when the module is not a built-in. | MUST |
-| R6.47 | Bliss MUST provide `bliss-ext:*asdf-output-translations*` defaulting to a per-implementation cache directory (`~/.cache/bliss/asdf/`). | MUST |
-| R6.48 | ASDF `compile-op` and `load-op` MUST interact correctly with Bliss's tiered compilation: ASDF-compiled files are compiled at T1 minimum. | MUST |
+| R6.47 | TorCL MUST provide `torcl-ext:*asdf-output-translations*` defaulting to a per-implementation cache directory (`~/.cache/torcl/asdf/`). | MUST |
+| R6.48 | ASDF `compile-op` and `load-op` MUST interact correctly with TorCL's tiered compilation: ASDF-compiled files are compiled at T1 minimum. | MUST |
 
 ---
 
@@ -188,15 +188,15 @@ A runtime representation of a single stack frame exposed to the debugger.
 ### D6.07 — `swank-connection` (informative)
 
 This connection state is maintained by the **loaded** IDE backend
-(`lib/slynk/`), not by the Bliss runtime — it is documented here only so the
-primitives §6.1.5 requires can be traced to a concrete consumer. Bliss supplies
+(`lib/slynk/`), not by the TorCL runtime — it is documented here only so the
+primitives §6.1.5 requires can be traced to a concrete consumer. TorCL supplies
 the `socket` stream (an `(unsigned-byte 8)` TCP stream, R6.34) and, when threads
 are available (§13), the `thread`/`repl-thread` objects; the remaining fields are
 purely the backend's bookkeeping.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `socket` | `stream` | Bidirectional `(unsigned-byte 8)` socket stream (provided by Bliss) |
+| `socket` | `stream` | Bidirectional `(unsigned-byte 8)` socket stream (provided by TorCL) |
 | `thread` | `thread` | Dedicated I/O thread for this connection (multi-threaded style only) |
 | `repl-thread` | `thread` | REPL evaluation thread (multi-threaded style only) |
 | `auth-token` | `string` | Session secret for authentication |
@@ -280,7 +280,7 @@ breakpoint traps (`int3` on x86-64, `brk` on AArch64):
 **Thread-locality of trap patches.** Because code pages are shared
 across threads, patching a code byte with a trap instruction is
 inherently process-wide — all threads executing through that address
-will hit the trap. Bliss achieves thread-local stepping semantics via
+will hit the trap. TorCL achieves thread-local stepping semantics via
 a **thread-check in the trap handler**:
 
 1. When a stepping command is issued, the stepping thread's ID is
@@ -314,8 +314,8 @@ variable scope:
   watched special variable bindings by replacing the symbol's value
   cell with a **guarded cell** — a wrapper that invokes the watchpoint
   check on each `setq`/`set`/`setf symbol-value`. The guard is
-  installed by `bliss-debug:watch` and removed by
-  `bliss-debug:unwatch`. No compiler support is needed; all writes to
+  installed by `torcl-debug:watch` and removed by
+  `torcl-debug:unwatch`. No compiler support is needed; all writes to
   special variables go through the value-cell indirection already.
 
 - **Lexical variables:** Watching lexical variable mutations requires
@@ -323,7 +323,7 @@ variable scope:
   compiled with `(optimize (debug 3))`. At debug level 3, the
   compiler emits write-barrier instrumentation around every `setq` of
   a watched lexical variable: after each write, a check calls
-  `bliss-debug::%check-watchpoint` with the new value. The watched set
+  `torcl-debug::%check-watchpoint` with the new value. The watched set
   is consulted via a thread-local table indexed by the
   `(function, variable-index)` pair from the debug info.
 
@@ -341,7 +341,7 @@ PROCEDURE check-watchpoint(watch, old-value, new-value):
 ```
 
 If a lexical watchpoint is requested for a function compiled below
-`debug` 3, `bliss-debug:watch` signals a `simple-warning` explaining
+`debug` 3, `torcl-debug:watch` signals a `simple-warning` explaining
 that the function must be recompiled with `(debug 3)` for lexical
 watchpoints and offers a restart to recompile.
 
@@ -385,13 +385,13 @@ inserting an allocation-site callback:
 ### 6.3.7 IDE Protocol Dispatch — A6.07 (informative)
 
 The dispatch loop below is implemented by the **loaded** backend (`lib/slynk/`),
-not by the Bliss runtime; it is shown to make the primitive requirements of
-§6.1.5 concrete. Bliss's contribution is the framed `(unsigned-byte 8)` socket
+not by the TorCL runtime; it is shown to make the primitive requirements of
+§6.1.5 concrete. TorCL's contribution is the framed `(unsigned-byte 8)` socket
 I/O (R6.34) that `read-message`/`write-message` build on, the reader/evaluator,
 and the introspection operations `eval-for-emacs` calls (R6.35).
 
 ```text
-PROCEDURE serve(connection):                 // backend code, running on Bliss
+PROCEDURE serve(connection):                 // backend code, running on TorCL
   LOOP:
     message ← read-message(connection.socket) // framed 6-hex-digit length + s-expr
     CASE message.type OF
@@ -401,9 +401,9 @@ PROCEDURE serve(connection):                 // backend code, running on Bliss
       :emacs-channel-send → dispatch-channel(message)
 ```
 
-Under `communication-style nil` (the single-threaded style Bliss uses today)
+Under `communication-style nil` (the single-threaded style TorCL uses today)
 `serve` runs the whole loop on the calling thread and evaluates each `:emacs-rex`
-inline. When Bliss's threading model (§13) provides threads, the same backend can
+inline. When TorCL's threading model (§13) provides threads, the same backend can
 run the multi-threaded style, evaluating on a per-connection REPL thread with the
 `pending-returns` table under a lock.
 
@@ -440,13 +440,13 @@ original function and installs a wrapper that calls through:
                                  (* 2 (1- *trace-depth*)) (1- *trace-depth*)
                                  fname values)
                          (values-list values))))))
-    (bliss-debug:encapsulate fname wrapper :type :trace)
+    (torcl-debug:encapsulate fname wrapper :type :trace)
     (record-trace fname original wrapper)))
 ```
 
-`bliss-debug:encapsulate` records the encapsulation in a global table
+`torcl-debug:encapsulate` records the encapsulation in a global table
 keyed by `(fname, type)` and swaps the fdefinition. `untrace` calls
-`bliss-debug:unencapsulate` to restore the original.
+`torcl-debug:unencapsulate` to restore the original.
 
 #### 6.4.2 Generic Functions
 
@@ -529,7 +529,7 @@ buffer / SLY stickers).
 `room` queries the GC subsystem (§3) and formats a report:
 
 ```text
-BLISS Heap Usage:
+TORCL Heap Usage:
   Nursery:     1.3 MB used /  2.0 MB capacity  (65%)
   Old Gen:    42.7 MB used / 64.0 MB capacity  (67%)  [32 regions]
   Large Obj:   8.0 MB across 4 regions
@@ -554,24 +554,24 @@ normally.
 
 ```lisp
 (defmacro time (form)
-  `(let* ((gc-count-before   (bliss-gc:gc-count))
-          (gc-time-before    (bliss-gc:total-gc-time-ns))
-          (bytes-before      (bliss-gc:bytes-allocated))
-          (faults-before     (bliss-sys:page-faults))
-          (start-real        (bliss-sys:monotonic-ns))
-          (start-user        (bliss-sys:cpu-user-ns))
-          (start-sys         (bliss-sys:cpu-system-ns))
+  `(let* ((gc-count-before   (torcl-gc:gc-count))
+          (gc-time-before    (torcl-gc:total-gc-time-ns))
+          (bytes-before      (torcl-gc:bytes-allocated))
+          (faults-before     (torcl-sys:page-faults))
+          (start-real        (torcl-sys:monotonic-ns))
+          (start-user        (torcl-sys:cpu-user-ns))
+          (start-sys         (torcl-sys:cpu-system-ns))
           (completed-p       nil))
      (unwind-protect
          (multiple-value-prog1 ,form
            (setq completed-p t))
-       (let ((elapsed-real (- (bliss-sys:monotonic-ns) start-real))
-             (elapsed-user (- (bliss-sys:cpu-user-ns) start-user))
-             (elapsed-sys  (- (bliss-sys:cpu-system-ns) start-sys))
-             (bytes-consed (- (bliss-gc:bytes-allocated) bytes-before))
-             (gc-pauses    (- (bliss-gc:gc-count) gc-count-before))
-             (gc-time      (- (bliss-gc:total-gc-time-ns) gc-time-before))
-             (page-faults  (- (bliss-sys:page-faults) faults-before)))
+       (let ((elapsed-real (- (torcl-sys:monotonic-ns) start-real))
+             (elapsed-user (- (torcl-sys:cpu-user-ns) start-user))
+             (elapsed-sys  (- (torcl-sys:cpu-system-ns) start-sys))
+             (bytes-consed (- (torcl-gc:bytes-allocated) bytes-before))
+             (gc-pauses    (- (torcl-gc:gc-count) gc-count-before))
+             (gc-time      (- (torcl-gc:total-gc-time-ns) gc-time-before))
+             (page-faults  (- (torcl-sys:page-faults) faults-before)))
          (format *trace-output*
                  "~&~:[(aborted) ~;~]Evaluation took:~%  ~,3F seconds of real time~%  ~
                   ~,3F seconds of user run time~%  ~
@@ -588,17 +588,17 @@ normally.
 
 ## 6.8 ASDF Integration
 
-Bliss integrates ASDF 3.3+ as its system/build manager. The integration
+TorCL integrates ASDF 3.3+ as its system/build manager. The integration
 consists of:
 
 1. **Boot loading:** ASDF source is bundled in `lib/asdf.lisp` and
    loaded during the boot sequence (§2) after the condition system and
    streams are available.
 2. **Output translations:** Default output directory is
-   `~/.cache/bliss/asdf/<implementation-version>/` so FASL files do not
+   `~/.cache/torcl/asdf/<implementation-version>/` so FASL files do not
    collide with other CL implementations.
-3. **FASL format:** Bliss FASL files (`.bfasl`) are architecture-neutral
-   compiled-unit files.  They contain portable Bliss bytecode plus constant
+3. **FASL format:** TorCL FASL files (`.bfasl`) are architecture-neutral
+   compiled-unit files.  They contain portable TorCL bytecode plus constant
    pools, symbol/package references, source maps, stack maps, unwind tables,
    verification metadata, and optional cached T1 code for the producing
    platform.  When loaded on another architecture, the bytecode is interpreted
@@ -620,7 +620,7 @@ consists of:
 | Debugger stack walk encounters corrupt frame | Skip frame, emit `[corrupt frame at 0x...]` marker, continue walking. |
 | Profiler signal handler re-enters itself | Drop the sample (detected via per-thread re-entry flag). |
 | SWANK socket disconnects mid-eval | Evaluation thread receives `connection-closed` condition; evaluation is aborted, resources cleaned up. |
-| Breakpoint in foreign code | Bliss does NOT set breakpoints in foreign frames; attempting to do so signals `simple-error`. |
+| Breakpoint in foreign code | TorCL does NOT set breakpoints in foreign frames; attempting to do so signals `simple-error`. |
 | ASDF system not found | `asdf:missing-component` condition is signalled with a restart to install via Quicklisp if available. |
 
 ---
@@ -642,15 +642,15 @@ consists of:
 
 | Knob | Default | Env Variable | Description |
 |------|---------|--------------|-------------|
-| REPL history size | 10 000 entries | `BLISS_REPL_HISTORY_SIZE` | Max lines saved to history file |
-| REPL history file | `~/.bliss/repl-history` | `BLISS_HISTFILE` | Path to persistent history |
-| Profiler sample rate | 1000 Hz | `BLISS_PROF_RATE` | Samples per second (10–10000) |
-| Profiler max depth | 64 frames | `BLISS_PROF_DEPTH` | Maximum backtrace depth per sample |
-| Profiler sample buffer | 1 M samples | `BLISS_PROF_BUFSIZE` | Ring buffer capacity |
+| REPL history size | 10 000 entries | `TORCL_REPL_HISTORY_SIZE` | Max lines saved to history file |
+| REPL history file | `~/.torcl/repl-history` | `TORCL_HISTFILE` | Path to persistent history |
+| Profiler sample rate | 1000 Hz | `TORCL_PROF_RATE` | Samples per second (10–10000) |
+| Profiler max depth | 64 frames | `TORCL_PROF_DEPTH` | Maximum backtrace depth per sample |
+| Profiler sample buffer | 1 M samples | `TORCL_PROF_BUFSIZE` | Ring buffer capacity |
 | IDE backend listen port | 4005 | — | Default port the loaded backend (`lib/slynk/`) listens on; chosen by the editor/backend, not a runtime knob |
-| IDE backend interface | `127.0.0.1` | — | Bind address; Bliss's socket primitives default to localhost-only for security (R6.37) |
-| ASDF output dir | `~/.cache/bliss/asdf/` | `BLISS_ASDF_CACHE` | Output translation root |
-| Debug default quality | 1 | `BLISS_DEBUG` | Default `(optimize (debug N))` |
+| IDE backend interface | `127.0.0.1` | — | Bind address; TorCL's socket primitives default to localhost-only for security (R6.37) |
+| ASDF output dir | `~/.cache/torcl/asdf/` | `TORCL_ASDF_CACHE` | Output translation root |
+| Debug default quality | 1 | `TORCL_DEBUG` | Default `(optimize (debug N))` |
 
 ---
 
@@ -660,12 +660,12 @@ Developer tools span several crates and CL source files:
 
 ```
 crates/
-  bliss/
+  torcl/
     src/
       main.rs           # CLI entry point, argument parsing
       repl.rs            # §6.1 — REPL loop, line editing, history
       completion.rs      # §6.1 — TAB completion engine
-  bliss-rt/
+  torcl-rt/
     src/
       debug/
         mod.rs           # Debug subsystem initialisation
@@ -686,14 +686,14 @@ lib/
   profiler.lisp          # CL API: with-profiling, report-profile
   disassemble.lisp       # §6.1.4 — disassemble, source annotation
   slynk/                 # §6.1.5 — VENDORED upstream SLIME/SLY backend, loaded
-                         #   as a library (NOT a built-in server). Bliss only
+                         #   as a library (NOT a built-in server). TorCL only
                          #   adds the adapter + prelude below.
     slynk.lisp           # upstream: message loop, RPCs, inspector, SLDB
     slynk-rpc.lisp       # upstream: wire protocol (framed s-expressions)
     slynk-completion.lisp# upstream: completion backend
-    backend/bliss.lisp   # Bliss adapter: sockets, streams, getpid, compile hooks
-    bliss-prelude.lisp   # Bliss shims the upstream code expects
-    bliss-slynk-patch.lisp # single-threaded serve-requests + auth disabling
+    backend/torcl.lisp   # TorCL adapter: sockets, streams, getpid, compile hooks
+    torcl-prelude.lisp   # TorCL shims the upstream code expects
+    torcl-slynk-patch.lisp # single-threaded serve-requests + auth disabling
   asdf.lisp              # Bundled ASDF source
   asdf-integration.lisp  # §6.8 — require hook, output translations
 ```
@@ -710,7 +710,7 @@ lib/
 | Sampling profiler | Run a known CPU-bound loop, verify the top function in the report matches | Self-time of target function > 80% of total; overhead < 5% |
 | Allocation profiler | Allocate known quantities of known types, verify report matches | Reported counts and sizes within 1% of actual |
 | Disassembler | Compile a known function, verify disassembly contains expected instruction patterns | Source annotations point to correct line numbers |
-| IDE protocol | Load the vendored `lib/slynk/` backend into `bliss`, have it listen, connect a SLIME/SLY client (e.g. `icl`), and exercise the handshake | Client verifies the connection, injects its runtime, and round-trips eval + completion; replies are delivered (framed octets reach the socket) |
+| IDE protocol | Load the vendored `lib/slynk/` backend into `torcl`, have it listen, connect a SLIME/SLY client (e.g. `icl`), and exercise the handshake | Client verifies the connection, injects its runtime, and round-trips eval + completion; replies are delivered (framed octets reach the socket) |
 | Trace | Trace a function, call it, verify `*trace-output*` contains expected entry/exit lines | Nested call depth indentation is correct |
 | `room` | Allocate known objects, call `room t`, parse output, verify reported sizes | Nursery/old-gen sizes within 10% of expected |
 | `time` | Time a known-duration form (busy loop), verify wall-clock and bytes-consed | Wall-clock within 20% of expected; bytes-consed accurate |

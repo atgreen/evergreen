@@ -62,20 +62,20 @@ skill for everyone (the symlink points at the tracked file).
 ## Architecture Principles
 
 - **The interpreter MUST NOT duplicate functionality that belongs in the
-  standard library.** `crates/bliss/src/cli.rs` (the tree-walking evaluator)
-  should delegate to `crates/bliss-stdlib` for library behaviour — streams,
+  standard library.** `crates/torcl/src/cli.rs` (the tree-walking evaluator)
+  should delegate to `crates/torcl-stdlib` for library behaviour — streams,
   sequences, format, conditions, pathnames, hash tables, etc. — rather than
   reimplementing it inline. Duplicated implementations drift apart and create
   incompatible data representations (e.g. the negative-fixnum stream hack in
-  cli.rs vs. the heap-object streams in `bliss-stdlib::streams`). When a
+  cli.rs vs. the heap-object streams in `torcl-stdlib::streams`). When a
   builtin needs library behaviour, wire it to the stdlib API; if the stdlib
   lacks it, add it there and call it from the interpreter.
-- Before adding a builtin to cli.rs, check whether `bliss-stdlib` already
+- Before adding a builtin to cli.rs, check whether `torcl-stdlib` already
   implements it. Prefer extending stdlib over growing cli.rs.
 
 ## GC safety (READ THIS before touching allocating code)
 
-bliss has a **moving, precise** minor GC: any allocation (`Arena::alloc_cons`,
+torcl has a **moving, precise** minor GC: any allocation (`Arena::alloc_cons`,
 `alloc_typed`, `arena_str`, building a list/instance/error, `resolve_sym`
 interning, `eval_form`, `apply_function`, macro expansion, …) can fire a minor
 GC that **relocates nursery objects** and updates every root the GC can find.
@@ -83,22 +83,22 @@ Two invariants must hold, or you get intermittent segfaults / "already borrowed"
 panics / (across the `extern "C"` c2i boundary) a process **abort**. These are
 recurring, hard-to-spot bugs (bliss-6b2 / asdf-6b2 / h6z / 011) — hold the line.
 
-1. **Root every Rust-local `BlissVal` that must survive an allocation.** A
-   `BlissVal` held only in a Rust local, register, or `Vec` across an alloc that
+1. **Root every Rust-local `TorclVal` that must survive an allocation.** A
+   `TorclVal` held only in a Rust local, register, or `Vec` across an alloc that
    can GC is invisible to the collector: the object moves and your copy is a
    stale (or poisoned) pointer. Use the intrusive lock-free root macros
    (bliss-a03; docs/design/gc-rooting.md):
 
    ```rust
-   bliss_rt::rooted!(v = eval_form(expr, env)?);   // OWNS v; read/write as *v
-   bliss_rt::rooted_ref!(_g = &mut existing);      // roots EXISTING local/Vec/
+   torcl_rt::rooted!(v = eval_form(expr, env)?);   // OWNS v; read/write as *v
+   torcl_rt::rooted_ref!(_g = &mut existing);      // roots EXISTING local/Vec/
                                                    // struct in place; keep
                                                    // using `existing` directly
    ```
 
    `rooted_ref!` also roots whole structs (`Env`, `Lowerer`, `Environment`)
    via their `TraceHostRoots` impls. The legacy `ShadowRootScope`/`StackRoot`/
-   `HostRoot` primitives still exist in bliss-rt but new code should not add
+   `HostRoot` primitives still exist in torcl-rt but new code should not add
    uses — they cost a global lock per operation and are queued for removal.
    Classic smell: `let v = eval_form(..)?; <more eval_form/alloc>; use(v)` with
    `v` unrooted, or pushing into a `Vec` and calling `eval_form` again before
@@ -107,7 +107,7 @@ recurring, hard-to-spot bugs (bliss-6b2 / asdf-6b2 / h6z / 011) — hold the lin
 
 2. **Never hold a `RefCell` borrow (or a raw `&mut`) to GC-scanned state across
    an allocation.** The registered root scanners re-enter those cells during a
-   GC — `CLOS_STATE` (bliss-stdlib clos.rs), a macro's bytecode-function
+   GC — `CLOS_STATE` (torcl-stdlib clos.rs), a macro's bytecode-function
    `RefCell` (cli.rs `visit_macro_def_roots`), `EnvFrame`s. If a `borrow_mut`
    is held (e.g. `with_state_mut { … alloc … }`) when GC fires, the scan's
    `borrow_mut` double-borrows and panics — and reached via compiled code across
@@ -121,18 +121,18 @@ they turn these latent, load-dependent bugs into deterministic failures:
 ```bash
 # Fire a minor GC on (almost) every allocation — the deterministic reproducer
 # for BOTH invariants above:
-BLISS_GC_STRESS=1 ./target/.../bliss-cli --no-init --eval '(your form)'
+TORCL_GC_STRESS=1 ./target/.../torcl --no-init --eval '(your form)'
 # Fill freed nursery with 0xFA (non-canonical HEAP_OBJECT) so a stale deref
 # segfaults immediately instead of silently reading moved data:
-BLISS_GC_STRESS=1 BLISS_GC_POISON=1 ./target/.../bliss-cli --no-init --eval '…'
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1 ./target/.../torcl --no-init --eval '…'
 ```
 
 An "already borrowed" panic, a segfault, or an abort under stress that passes
-without it means you have one of these. A clean run under `BLISS_GC_STRESS=1`
+without it means you have one of these. A clean run under `TORCL_GC_STRESS=1`
 is the cheapest evidence a change that allocates is GC-safe.
 
 **Bisecting a stress crash to one allocation (bliss-1uzt).** When
-`BLISS_GC_STRESS=1` crashes but you can't see *which* allocation orphaned the
+`TORCL_GC_STRESS=1` crashes but you can't see *which* allocation orphaned the
 value, two knobs turn "segfault somewhere" into a bracket. They count every
 allocation on the thread (the index is stable across runs of a deterministic
 program):
@@ -141,12 +141,12 @@ program):
 # Only stress AFTER allocation index N — startup runs fast, and a GC fires on
 # every later allocation, so the corrupting one can't be missed. Binary-search N:
 # it crashes while N < (bad index) and goes clean once N passes it.
-BLISS_GC_STRESS=1 BLISS_GC_STRESS_SKIP=40000 BLISS_GC_POISON=1 ./…/bliss-cli …
+TORCL_GC_STRESS=1 TORCL_GC_STRESS_SKIP=40000 TORCL_GC_POISON=1 ./…/torcl …
 # Force ONE collection at exactly index N and print the Rust allocation
 # backtrace there. Precise, but sensitive to run-to-run index drift, so use it
 # to name the site once SKIP has bracketed the window (independent of
-# BLISS_GC_STRESS):
-BLISS_GC_STRESS_AT=40120 BLISS_GC_POISON=1 ./…/bliss-cli …
+# TORCL_GC_STRESS):
+TORCL_GC_STRESS_AT=40120 TORCL_GC_POISON=1 ./…/torcl …
 ```
 
 Prefer `SKIP` to localize (robust: it stresses the whole suffix) and `AT` to
@@ -157,27 +157,27 @@ disables stressing entirely and reports a *clean run that proves nothing*
 (bliss-sqpi: an early bracketing of that bug concluded "the fault is in
 startup" purely from this artifact; the real corrupting GC was ~70
 allocations from the *end*). Before trusting any clean `SKIP` result, confirm
-the probe actually fires — `BLISS_GC_STRESS_AT=N` prints
+the probe actually fires — `TORCL_GC_STRESS_AT=N` prints
 `[gc-stress] … forcing minor GC at allocation #N` when `N` is in range, so
 bisecting `AT` on that line first tells you the total and the usable range.
 
-**A clean `BLISS_GC_POISON=1` run does not mean "no GC bug".** Poison only
+**A clean `TORCL_GC_POISON=1` run does not mean "no GC bug".** Poison only
 catches a *stale pointer being dereferenced*. A value orphaned before it is
 stored — e.g. a sub-list left in a Rust temporary while a sibling argument
 allocates — makes the program compute a quietly wrong answer with no
 segfault at all. Diff the program's *output* against a non-stress run;
 don't wait for a crash.
 
-## The debug bliss-cli used to be ~9x slower after `cargo build` (FIXED)
+## The debug torcl used to be ~9x slower after `cargo build` (FIXED)
 
 **Fixed in bliss-em8x — kept here because the symptom is memorable and you may
 meet it in an old branch, an old bead, or a stale snapshot.**
 
 `Cargo.toml` set `[profile.test] opt-level = 3` (all crates) but
-`[profile.dev.package.bliss-cli] opt-level = 2` (**that package only**), so
-`cargo build` left `bliss-rt`, `bliss-stdlib` and `bliss-compiler` — the GC, the
+`[profile.dev.package.torcl] opt-level = 2` (**that package only**), so
+`cargo build` left `torcl-rt`, `torcl-stdlib` and `torcl-compiler` — the GC, the
 sequence library, the lowerer, i.e. most of the hot code — at opt-level 0.
-**Both commands write the same path**, `target/<target>/debug/bliss-cli`, so
+**Both commands write the same path**, `target/<target>/debug/torcl`, so
 whichever ran last silently decided the binary's speed. Measured on one commit,
 identical source, `(remove-duplicates <3000 short strings> :test #'equalp)`:
 
@@ -205,7 +205,7 @@ What still holds:
 
 ## Benchmarking a tiered loop: run 1M+ iterations, not 100k
 
-`osr_threshold()` (crates/bliss/src/cli/bytecode.rs) defaults to **100,000
+`osr_threshold()` (crates/torcl/src/cli/bytecode.rs) defaults to **100,000
 back-edges**, so a 100k-iteration loop sits *exactly on* the OSR promotion
 point: roughly half its iterations run at T0 and half natively. Such a
 benchmark measures warmup, not steady state, and is **bimodal** — an unchanged
@@ -218,7 +218,7 @@ or as a regression and is neither. Scaling one empty `DOTIMES` loop:
 ```
 
 Use **1M+ iterations** for anything meant to measure tiered steady state, and
-say which regime a number came from. (`BLISS_OSR_THRESHOLD` overrides it.)
+say which regime a number came from. (`TORCL_OSR_THRESHOLD` overrides it.)
 
 **`DISASSEMBLE` does not tell you whether a loop promoted.** It reports the
 *function's* installed tier, so a loop-hot function still prints `T0` long
@@ -227,29 +227,29 @@ reports T0 while running ~150x faster than T0. To check promotion, scale the
 iteration count and compare us/iter; use `DISASSEMBLE` for invocation-hot
 functions, where it is accurate.
 
-## Always cap bliss memory: `scripts/bliss-limited.sh`
+## Always cap torcl memory: `scripts/torcl-limited.sh`
 
-Runaway bliss runs (e.g. ASDF recursion-to-OOM bugs like bliss-hlsa) have
+Runaway torcl runs (e.g. ASDF recursion-to-OOM bugs like bliss-hlsa) have
 driven this machine deep into swap and set off the global OOM killer. Wrap
-**every** ad-hoc `bliss-cli` invocation — and memory-hungry `cargo test` runs —
-in `scripts/bliss-limited.sh`:
+**every** ad-hoc `torcl` invocation — and memory-hungry `cargo test` runs —
+in `scripts/torcl-limited.sh`:
 
 ```bash
-scripts/bliss-limited.sh target/x86_64-unknown-linux-musl/debug/bliss-cli \
+scripts/torcl-limited.sh target/x86_64-unknown-linux-musl/debug/torcl \
     --no-init --eval '(form)'
-BLISS_MEM_MAX=8G BLISS_TIMEOUT=1200 scripts/bliss-limited.sh cargo test ...
+TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh cargo test ...
 ```
 
 It runs the command in a `systemd-run --user` scope with `MemoryMax`
 (default 4G) and `MemorySwapMax=0`, plus a wall-clock `timeout` (default 600s).
 Reading the outcome — the cap **cannot** masquerade as a GC bug:
 
-- exit **137** (SIGKILL) + the `[bliss-limited]` note = cgroup OOM kill —
-  memory cap hit, NOT corruption. Raise `BLISS_MEM_MAX` if legitimate.
+- exit **137** (SIGKILL) + the `[torcl-limited]` note = cgroup OOM kill —
+  memory cap hit, NOT corruption. Raise `TORCL_MEM_MAX` if legitimate.
 - exit **124** = wall-clock timeout (hang/runaway loop).
 - exit **139** (SIGSEGV) / **134** (SIGABRT) / "already borrowed" = a real
   GC/rooting bug. The cap never causes these: the kernel OOM-kills the scope
-  outright, so bliss never sees a failed malloc.
+  outright, so torcl never sees a failed malloc.
 
 ## Running rr (reverse debugger) on this machine
 
@@ -267,7 +267,7 @@ microarch on **both** record and replay:
 
 ```bash
 # Record (pin to core 0, force microarch so detection + counter-check pass)
-taskset -c 0 rr record --microarch='Intel Meteorlake' ./target/release/bliss-cli
+taskset -c 0 rr record --microarch='Intel Meteorlake' ./target/release/torcl
 
 # Replay in batch/autopilot (runs to program exit, no debugger).
 # With no trace path, rr replays the most recently recorded trace.
@@ -286,7 +286,7 @@ Notes / caveats:
   misbehaves.
 - Set `_RR_TRACE_DIR=<dir>` to control where traces land (otherwise
   `~/.local/share/rr/`).
-- Verified end-to-end 2026-08-21: recorded `bliss-cli` and replayed it to exit
+- Verified end-to-end 2026-08-21: recorded `torcl` and replayed it to exit
   0 with no FATAL. Originally captured in bead memory `asdf-load-rr-findings`
   (`bd memories rr`), where it was used to reproduce the asdf-load corruption
   under `rr record`.

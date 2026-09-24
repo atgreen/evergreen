@@ -5,9 +5,9 @@ bliss-011, bliss-wlf, bliss-noh, bliss-8qf, bliss-wpe, bliss-52d
 
 ## 1. Problem
 
-bliss has a **precise, moving** minor GC. Any allocation can relocate a nursery
-object and must update every reference the collector can find. But a `BlissVal`
-is a `Copy` tagged word (`BlissVal(u64)`), so Rust code copies live references
+torcl has a **precise, moving** minor GC. Any allocation can relocate a nursery
+object and must update every reference the collector can find. But a `TorclVal`
+is a `Copy` tagged word (`TorclVal(u64)`), so Rust code copies live references
 into locals, `Vec`s, `HashMap`s, and closure captures freely — and the collector
 cannot find those unless the code **opted in** to rooting. Every omission is a
 latent, load-dependent segfault / abort / silently-wrong result.
@@ -20,7 +20,7 @@ corrupts under stress). Each was fixed case-by-case by adding *more* rooting.
 Two concrete weaknesses drive the churn:
 
 **(a) Rooting is opt-in and invisible in the type system.** Nothing distinguishes
-"a `BlissVal` it is safe to hold across an allocation" from "one that will dangle."
+"a `TorclVal` it is safe to hold across an allocation" from "one that will dangle."
 The reviewer must reason, per call site, about which locals cross which allocating
 calls. Humans (and agents) miss cases; the failure surfaces only under GC pressure.
 
@@ -44,7 +44,7 @@ the lock + lookup per operation, on every rooted local of every recursion level 
 | `scan_bytecode_roots`, `scan_lowerer_consts` / `LowererConstGuard` | bytecode.rs |
 | `scan_global_macro_roots`, `scan_macrolet_capture_roots`, `scan_active_expansion_envs` | macroexpand.rs (last two: bliss-noh) |
 | `scan_clos_state_roots` | clos.rs |
-| condition / format / pathname / stream / hashtable / devtools scanners | bliss-stdlib |
+| condition / format / pathname / stream / hashtable / devtools scanners | torcl-stdlib |
 | `FrozenMacroCapture` table, `MACRO_FN_CACHE` | cli.rs |
 
 Several register **raw stack addresses** in thread-locals (use-after-scope if a
@@ -54,19 +54,19 @@ mid-GC).
 
 ## 2. Current mechanism (accurate baseline)
 
-- **Scanner protocol.** `register_root_scanner(fn(&mut dyn FnMut(*mut BlissVal)))`.
+- **Scanner protocol.** `register_root_scanner(fn(&mut dyn FnMut(*mut TorclVal)))`.
   The collector calls every scanner during both the mark and relocate passes with
-  a visitor that receives each root **slot** (`*mut BlissVal`), updating it in
+  a visitor that receives each root **slot** (`*mut TorclVal`), updating it in
   place. Scanners run under the heap lock and must not allocate. (gc.rs:2095)
-- **`StackRoot::new(&mut BlissVal)`** — registers the *address of an existing
+- **`StackRoot::new(&mut TorclVal)`** — registers the *address of an existing
   local*; the GC rewrites the local in place, so reads stay direct (free). Cost:
   locked push on new; locked `O(n)` remove on drop. (gc.rs:2248)
 - **`HostRoot<T: TraceHostRoots>`** — owns a `Box<T>`, registers the box address;
-  `Deref`/`DerefMut`. `TraceHostRoots` is implemented for `BlissVal`, `Vec`,
-  `Option`, and 2-tuples. For `Vec<BlissVal>` accumulators. (gc.rs:2211)
+  `Deref`/`DerefMut`. `TraceHostRoots` is implemented for `TorclVal`, `Vec`,
+  `Option`, and 2-tuples. For `Vec<TorclVal>` accumulators. (gc.rs:2211)
 - **`ShadowRootScope` / `ShadowRoot`** — handle model: `root(v) -> ShadowRoot`,
   read back via `.get()` / `.set()`. Every access takes the mutex and does a
-  `HashMap<ThreadId, Vec<BlissVal>>` lookup. (gc.rs:2373)
+  `HashMap<ThreadId, Vec<TorclVal>>` lookup. (gc.rs:2373)
 - **Cross-thread.** Threads already publish per-safepoint state
   (`thread::publish_stack(sp, fp)` / `published_stack()`, `all_thread_ids()`), and
   the STW collector reads parked threads' published frame pointers. Root registries
@@ -80,7 +80,7 @@ neither unified nor cheap nor enforced.
 
 ## 3. Goals / non-goals
 
-**Goals.** (1) Make "held a live `BlissVal` across an allocation" a *structural*
+**Goals.** (1) Make "held a live `TorclVal` across an allocation" a *structural*
 error or a mechanical lint, not a reasoning task. (2) Remove the per-op lock and
 the `O(n)` drop. (3) Collapse the bespoke stack/handle scanners into one
 mechanism. (4) Migratable incrementally — no big-bang rewrite; each phase ships.
@@ -95,14 +95,14 @@ enforcement on day one.
 - **V8 `HandleScope` / `Handle<T>`.** Handles point into a contiguous per-thread
   handle arena (a bump stack). Create = bump a pointer (no lock); scope destroy =
   reset the pointer; GC scans the arena as a contiguous range. Reads = one
-  indirection. This is the model bliss's `ShadowRoot` approximates but pays a lock
+  indirection. This is the model torcl's `ShadowRoot` approximates but pays a lock
   per access for.
 - **SpiderMonkey `Rooted<T>` / `Handle<T>`.** `Rooted<T>` is an **intrusive,
   thread-local, singly-linked list**: construction links `self` onto a thread-local
   head (`next = head; head = &self`), destruction unlinks (`head = next`) — O(1),
   lock-free. The value lives *inline* in the `Rooted`, so reads are direct and the
   GC rewrites it in place. `Handle<T>` is a `&Rooted<T>` for passing without
-  re-rooting. This is the closest fit to bliss's `StackRoot`, minus the lock.
+  re-rooting. This is the closest fit to torcl's `StackRoot`, minus the lock.
 - **`gc-arena` (Rust).** Branded `'gc` lifetimes: `Gc<'gc, T>` values cannot escape
   the `arena.mutate(|mc, root| …)` closure, and a `&Mutation<'gc>` capability token
   is required to allocate. The borrow checker makes "hold a `Gc` across the end of
@@ -127,8 +127,8 @@ Replace the mutex-guarded per-thread `Vec`s (`shadow_roots`, `host_roots`) with 
 // Thread-local head, published to the collector at each safepoint.
 thread_local! { static ROOT_HEAD: Cell<*mut RootLink> = const { Cell::new(null_mut()) }; }
 
-// One list node type; `trace` handles BlissVal, Vec<BlissVal>, or any TraceHostRoots.
-struct RootLink { next: *mut RootLink, trace: unsafe fn(*mut RootLink, &mut dyn FnMut(*mut BlissVal)) }
+// One list node type; `trace` handles TorclVal, Vec<TorclVal>, or any TraceHostRoots.
+struct RootLink { next: *mut RootLink, trace: unsafe fn(*mut RootLink, &mut dyn FnMut(*mut TorclVal)) }
 
 pub struct Rooted<T: TraceHostRoots> { link: RootLink, value: T, _pin: PhantomPinned }
 // new(): link.next = ROOT_HEAD.get(); ROOT_HEAD.set(&mut self.link)   — O(1), no lock
@@ -136,10 +136,10 @@ pub struct Rooted<T: TraceHostRoots> { link: RootLink, value: T, _pin: PhantomPi
 // Deref/DerefMut to T; GC rewrites `value` in place.
 ```
 
-- **`Rooted<BlissVal>`** subsumes `StackRoot` (root a local — but now the value
+- **`Rooted<TorclVal>`** subsumes `StackRoot` (root a local — but now the value
   lives *in* the `Rooted`, avoiding the raw-address-of-local footgun) and, via a
   `Handle<'r> = &'r Rooted<…>` alias, `ShadowRoot`'s pass-by-reference use.
-- **`Rooted<Vec<BlissVal>>`, `Rooted<(BlissVal, BlissVal)>`, …** subsume
+- **`Rooted<Vec<TorclVal>>`, `Rooted<(TorclVal, TorclVal)>`, …** subsume
   `HostRoot<T>` (reuse the existing `TraceHostRoots` trait verbatim).
 - **Cross-thread:** add `published_root_head` next to `published_fp` in the
   per-thread state (thread.rs). A thread publishes its `ROOT_HEAD` at the same
@@ -162,21 +162,21 @@ Migration is mechanical because the surface barely changes: `StackRoot::new(&mut
 
 1. **Lint / checker (ship first).** A `dylint`/clippy-style lint (or a small
    custom AST pass in CI) that flags the smell the whole bug class reduces to: a
-   bare `BlissVal`-typed binding that is *read after* an intervening call to a
+   bare `TorclVal`-typed binding that is *read after* an intervening call to a
    known-allocating function. Start with a hand-maintained allowlist of allocating
    entry points (`alloc_typed`, `alloc_cons`, `eval_form`, `apply_function`,
    `macroexpand*`, `resolve_sym`, …). Not sound, but turns "reason per site" into
    "CI tells you," at near-zero code churn. High value, low risk.
 
 2. **Handle-only alloc/eval APIs (the realistic target).** Make the allocating and
-   evaluating entry points *take and return* `Rooted`/`Handle`, not bare `BlissVal`
+   evaluating entry points *take and return* `Rooted`/`Handle`, not bare `TorclVal`
    (V8's discipline). You can still read a bare value; you just cannot thread one
    *through* an allocation without rooting it, because the API won't accept it.
    This makes the common cross-an-alloc mistakes ill-typed. Introduce behind new
    signatures and migrate call sites incrementally.
 
 3. **Branded `'gc` lifetimes (evaluate; likely too invasive to retrofit).**
-   Adopt `gc-arena`-style `BlissVal<'gc>` + a `Mutation<'gc>` capability, so
+   Adopt `gc-arena`-style `TorclVal<'gc>` + a `Mutation<'gc>` capability, so
    holding a value across the mutation boundary is a *compile error*. This is the
    only rung that is fully sound, but it threads a `'gc` lifetime through the entire
    codebase and every value-holding type — a multi-month change. Recommend a
@@ -200,8 +200,8 @@ each is clearly "a global," not "a forgotten local."
 
 ## 7. Incremental migration plan
 
-1. **Land `Rooted<T>` (Part A)** in bliss-rt alongside the existing primitives;
-   prove equivalence with the GC fuzzers (`BLISS_GC_STRESS`/`POISON`). No call-site
+1. **Land `Rooted<T>` (Part A)** in torcl-rt alongside the existing primitives;
+   prove equivalence with the GC fuzzers (`TORCL_GC_STRESS`/`POISON`). No call-site
    changes yet.
 2. **Convert one hot subsystem** end-to-end (recommend the bytecode lowerer or
    macroexpand.rs, both freshly swept so the diff is legible) from
@@ -222,7 +222,7 @@ fuzzers.
 - **`extern "C"` c2i boundary.** Compiled code calls back into Rust; a `Rooted`
   created in a c2i callback links onto the same thread-local head — fine — but the
   boundary must remain a clean safepoint (it already is). Verify `Rooted` in a c2i
-  adapter is scanned correctly under `BLISS_GC_STRESS`.
+  adapter is scanned correctly under `TORCL_GC_STRESS`.
 - **`Rooted` immovability.** Relies on the `rooted!` macro / `PhantomPinned`
   discipline; a moved `Rooted` corrupts the list. The macro removes the footgun but
   must be the only blessed constructor.
@@ -238,7 +238,7 @@ fuzzers.
 
 Part A's core is implemented and validated:
 
-- **`Rooted<T>` / `RootedGuard` / `rooted!`** in `bliss-rt/src/gc.rs`
+- **`Rooted<T>` / `RootedGuard` / `rooted!`** in `torcl-rt/src/gc.rs`
   ("Intrusive, lock-free precise roots" section): intrusive node with the value
   inline, thread-local head cell, one process-wide `scan_rooted_lists` scanner
   over a registry of head-cell addresses (registered once per thread, removed by
@@ -252,10 +252,10 @@ Part A's core is implemented and validated:
   from four `StackRoot`s to `rooted!`.
 - **Validation:** normal-operation macrolet/symbol-macrolet output identical on
   both backends; the canonical bliss-noh reproducer passes
-  `BLISS_GC_STRESS=1 BLISS_GC_POISON=1`; all 22 bliss-compiler test suites pass;
+  `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`; all 22 torcl-compiler test suites pass;
   no new failure class under stride sweep (residual stride-dependent wrong
   answers are the pre-existing bliss-8qf corruption, present before this change).
-- **Benchmark** (`cargo run --release -p bliss-rt --example bench_roots`; 2000
+- **Benchmark** (`cargo run --release -p torcl-rt --example bench_roots`; 2000
   nested scopes × 4 roots × 500 iters, LIFO):
 
   | primitive | ns / root-op |
@@ -291,7 +291,7 @@ Part A's core is implemented and validated:
   imposed; bliss-h6z.5 must design for it if guard scopes ever span suspension
   points.
 - **Part B rung 1 shipped as `tools/gc-root-lint`** (bliss-jaf): a syn-based
-  checker flagging producer-bound / `BlissVal`-typed locals read after a
+  checker flagging producer-bound / `TorclVal`-typed locals read after a
   known-allocating call without rooting, ratcheted by a checked-in baseline
   (`--check` fails only on findings not in `tools/gc-root-lint/baseline.txt`;
   `--bless` regenerates it). Keys are `file:function:variable` so unrelated

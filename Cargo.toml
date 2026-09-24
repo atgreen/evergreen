@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bliss-rt",
-    "crates/bliss-compiler",
-    "crates/bliss-stdlib",
-    "crates/bliss",
+    "crates/torcl-rt",
+    "crates/torcl-compiler",
+    "crates/torcl-stdlib",
+    "crates/torcl",
     "tools/gc-root-lint",
 ]
 
@@ -15,17 +15,17 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
-bliss-rt = { path = "crates/bliss-rt" }
-bliss-compiler = { path = "crates/bliss-compiler" }
-bliss-stdlib = { path = "crates/bliss-stdlib" }
+torcl-rt = { path = "crates/torcl-rt" }
+torcl-compiler = { path = "crates/torcl-compiler" }
+torcl-stdlib = { path = "crates/torcl-stdlib" }
 
 [profile.test]
 opt-level = 3
 
 # The DEV profile must optimize the same crates the TEST profile does, or the
 # two cargo subcommands produce measurably different binaries at the SAME path
-# (target/<target>/debug/bliss-cli) and whichever ran last silently decides how
-# fast it is. bliss-rt, bliss-stdlib and bliss-compiler hold the GC, the sequence
+# (target/<target>/debug/torcl) and whichever ran last silently decides how
+# fast it is. torcl-rt, torcl-stdlib and torcl-compiler hold the GC, the sequence
 # library and the lowerer -- most of the hot code -- so leaving them at
 # opt-level 0 under `cargo build` while `cargo test` built them at 3 made the
 # same source run ~8x slower:
@@ -41,16 +41,16 @@ opt-level = 3
 # was invalid because the snapshots compared had been built by different
 # commands (bliss-em8x).
 #
-# Optimizing bliss-cli alone -- the one package that is NOT the bottleneck --
+# Optimizing torcl alone -- the one package that is NOT the bottleneck --
 # was the original override and is kept for consistency.
-[profile.dev.package.bliss-cli]
+[profile.dev.package.torcl]
 opt-level = 2
 
-[profile.dev.package.bliss-rt]
+[profile.dev.package.torcl-rt]
 opt-level = 2
 
-[profile.dev.package.bliss-stdlib]
+[profile.dev.package.torcl-stdlib]
 opt-level = 2
 
-[profile.dev.package.bliss-compiler]
+[profile.dev.package.torcl-compiler]
 opt-level = 2

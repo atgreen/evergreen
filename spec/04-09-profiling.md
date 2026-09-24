@@ -111,7 +111,7 @@ assigned one `TypeProfileRing`.
 #[repr(C, align(32))]
 pub struct TypeProfileRing {
     /// Ring entries.  Each entry holds a class-wrapper pointer
-    /// (BlissVal with tag 010) and a hit count.
+    /// (TorclVal with tag 010) and a hit count.
     pub entries: [TypeProfileEntry; TYPE_PROFILE_RING_SIZE],
 
     /// Write cursor (index into `entries`).  Updated with Relaxed
@@ -388,7 +388,7 @@ from T2 promotion for the remainder of the session.
 
 #### JIT-dump file (`jit-<pid>.dump`)
 
-On Linux, when the environment variable `BLISS_PERF_JITDUMP=1` is set,
+On Linux, when the environment variable `TORCL_PERF_JITDUMP=1` is set,
 the runtime:
 
 1. Opens `/tmp/jit-<pid>.dump` at startup.
@@ -405,7 +405,7 @@ the runtime:
 #### Perf map file (`/tmp/perf-<pid>.map`)
 
 Concurrently, and unconditionally on Linux when
-`BLISS_PERF_MAP=1` (default off), the runtime maintains a text file
+`TORCL_PERF_MAP=1` (default off), the runtime maintains a text file
 `/tmp/perf-<pid>.map` with lines of the form:
 
 ```text
@@ -418,39 +418,39 @@ first) to remove stale entries.
 
 #### macOS dtrace integration
 
-On macOS, when `BLISS_DTRACE=1` is set, the runtime fires USDT probes:
+On macOS, when `TORCL_DTRACE=1` is set, the runtime fires USDT probes:
 
 | Probe | Arguments |
 |-------|-----------|
-| `bliss:jit:compile` | fn-name, tier, code-addr, code-size |
-| `bliss:jit:deopt` | fn-name, reason, code-addr |
-| `bliss:gc:start` | generation, reason |
-| `bliss:gc:end` | generation, duration-ns, bytes-reclaimed |
+| `torcl:jit:compile` | fn-name, tier, code-addr, code-size |
+| `torcl:jit:deopt` | fn-name, reason, code-addr |
+| `torcl:gc:start` | generation, reason |
+| `torcl:gc:end` | generation, duration-ns, bytes-reclaimed |
 
 ---
 
 ## 4.9.7 Configuration
 
 All profiling tunables are exposed as environment variables and as
-CL special variables (in the `BLISS-PROFILER` package).
+CL special variables (in the `TORCL-PROFILER` package).
 
 | Env Variable | CL Variable | Type | Default | Description |
 |---|---|---|---|---|
-| `BLISS_T0_T1_THRESHOLD` | `*t0-t1-threshold*` | u32 | 10 | Invocations before T0→T1 |
-| `BLISS_T1_T2_INVOKE_THRESHOLD` | `*t1-t2-invoke-threshold*` | u32 | 5000 | Invocations before T1→T2 |
-| `BLISS_T1_T2_BACKEDGE_THRESHOLD` | `*t1-t2-backedge-threshold*` | u32 | 10000 | Back-edge iterations before T1→T2 |
-| `BLISS_DISABLE_T2` | — | bool | false | Keep otherwise-hot functions at T1 for debug/differential runs |
-| `BLISS_OSR_BACKEDGE_THRESHOLD` | `*osr-backedge-threshold*` | u32 | 50000 | Back-edge iterations before OSR |
-| `BLISS_DEOPT_PENALTY_MULTIPLIER` | `*deopt-penalty-multiplier*` | f32 | 2.0 | Threshold multiplier after deopt |
-| `BLISS_DEOPT_BLACKLIST_LIMIT` | `*deopt-blacklist-limit*` | u32 | 3 | Consecutive deopts before blacklist |
-| `BLISS_SCHEDULER_POLL_MS` | `*scheduler-poll-ms*` | u32 | 50 | Scheduler poll interval (ms) |
-| `BLISS_PERF_JITDUMP` | `*perf-jitdump*` | bool | false | Enable JIT-dump file on Linux |
-| `BLISS_PERF_MAP` | `*perf-map*` | bool | false | Enable perf map file on Linux |
-| `BLISS_DTRACE` | `*dtrace*` | bool | false | Enable USDT probes on macOS |
-| `BLISS_PROFILING_DISABLED` | `*profiling-disabled*` | bool | false | Disable all counter instrumentation |
-| `BLISS_TYPE_PROFILE_RING_SIZE` | — | u8 | 4 | Ring size (compile-time only) |
+| `TORCL_T0_T1_THRESHOLD` | `*t0-t1-threshold*` | u32 | 10 | Invocations before T0→T1 |
+| `TORCL_T1_T2_INVOKE_THRESHOLD` | `*t1-t2-invoke-threshold*` | u32 | 5000 | Invocations before T1→T2 |
+| `TORCL_T1_T2_BACKEDGE_THRESHOLD` | `*t1-t2-backedge-threshold*` | u32 | 10000 | Back-edge iterations before T1→T2 |
+| `TORCL_DISABLE_T2` | — | bool | false | Keep otherwise-hot functions at T1 for debug/differential runs |
+| `TORCL_OSR_BACKEDGE_THRESHOLD` | `*osr-backedge-threshold*` | u32 | 50000 | Back-edge iterations before OSR |
+| `TORCL_DEOPT_PENALTY_MULTIPLIER` | `*deopt-penalty-multiplier*` | f32 | 2.0 | Threshold multiplier after deopt |
+| `TORCL_DEOPT_BLACKLIST_LIMIT` | `*deopt-blacklist-limit*` | u32 | 3 | Consecutive deopts before blacklist |
+| `TORCL_SCHEDULER_POLL_MS` | `*scheduler-poll-ms*` | u32 | 50 | Scheduler poll interval (ms) |
+| `TORCL_PERF_JITDUMP` | `*perf-jitdump*` | bool | false | Enable JIT-dump file on Linux |
+| `TORCL_PERF_MAP` | `*perf-map*` | bool | false | Enable perf map file on Linux |
+| `TORCL_DTRACE` | `*dtrace*` | bool | false | Enable USDT probes on macOS |
+| `TORCL_PROFILING_DISABLED` | `*profiling-disabled*` | bool | false | Disable all counter instrumentation |
+| `TORCL_TYPE_PROFILE_RING_SIZE` | — | u8 | 4 | Ring size (compile-time only) |
 
-When `BLISS_PROFILING_DISABLED=1`, the T1 compiler omits counter
+When `TORCL_PROFILING_DISABLED=1`, the T1 compiler omits counter
 increments and type-recording stubs entirely, yielding zero profiling
 overhead but disabling tier promotion (functions remain at T1
 indefinitely).
@@ -538,7 +538,7 @@ The overhead budget is allocated as follows:
 | `test_deopt_penalty` | Integration | Threshold multiplier applied after deoptimisation; blacklist after 3 |
 | `test_jit_dump_format` | Integration | JIT-dump file parses correctly with `perf inject --jit` |
 | `test_perf_map_format` | Integration | Perf map entries match installed code regions |
-| `test_profiling_disabled` | Integration | Zero counter overhead when `BLISS_PROFILING_DISABLED=1` |
+| `test_profiling_disabled` | Integration | Zero counter overhead when `TORCL_PROFILING_DISABLED=1` |
 | `bench_profiling_overhead` | Benchmark | Wall-clock overhead ≤5% on gabriel/cl-bench suite |
 
 ---
@@ -546,7 +546,7 @@ The overhead budget is allocated as follows:
 ## 4.9.12 Module Map
 
 ```
-crates/bliss-compiler/src/
+crates/torcl-compiler/src/
 ├── profile/
 │   ├── mod.rs              # re-exports, MethodCounters, TypeProfileRing
 │   ├── counters.rs         # D4.04 MethodCounters impl

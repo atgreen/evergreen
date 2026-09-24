@@ -75,12 +75,12 @@ instead, appending `&ALLOW-OTHER-KEYS`. Result:
 ## The ladder is inverted for methods (bliss-d9ak)
 
 Eager compilation at `DEFMETHOD` is itself a measured cost. With it disabled
-(`BLISS_NO_METHOD_COMPILE=1`), cold load was **0.87s (11%) faster** and reload
-was 0.7% *better*, 3 reps out of 3 — bliss pays to compile ~243 method bodies
+(`TORCL_NO_METHOD_COMPILE=1`), cold load was **0.87s (11%) faster** and reload
+was 0.7% *better*, 3 reps out of 3 — torcl pays to compile ~243 method bodies
 whether or not they are ever invoked, and before this fix the ones that ran hot
 were excluded anyway.
 
-Functions get a hotness gate (`BLISS_T0_T1_THRESHOLD`, default 10); methods get
+Functions get a hotness gate (`TORCL_T0_T1_THRESHOLD`, default 10); methods get
 compiled unconditionally at definition and then, if ineligible, never promoted.
 Both halves are backwards. HotSpot never compiles a method it has not seen
 execute; SBCL sidesteps the question by compiling AOT at file-compile time
@@ -92,7 +92,7 @@ rather than at load time.
   not tier up at all. Both are special forms reading `env.method_context`, so
   there was no callable spelling to lower to; a compiled body already runs
   against that same `env`, so it only needed evaluated-argument entry points
-  (`BLISS::%CALL-NEXT-METHOD`, `BLISS::%NEXT-METHOD-P`), the context published
+  (`TORCL::%CALL-NEXT-METHOD`, `TORCL::%NEXT-METHOD-P`), the context published
   around the compiled path, and `mv_operator_preserves` taught the new spelling
   so the next method's secondary values survive. Tier split 61.9% -> 74.8%
   compiled, tree-walked invocations 27,550 -> 18,172.
@@ -111,7 +111,7 @@ rather than at load time.
   `aref`, `car`, specials and locals all compiled, only the accessor call did
   not. It was also the cause of **bliss-o4cp** — `ASDF/PLAN::ACTION-STATUS`
   (10,046 invocations) contains `(incf (total-action-count *asdf-session*))`.
-  Fixed by lowering such a place to a `BLISS::SET-ACCESSOR-SLOT` primitive that
+  Fixed by lowering such a place to a `TORCL::SET-ACCESSOR-SLOT` primitive that
   resolves accessor -> slot at RUN time, as the tree-walker does; the lowerer
   uses only the mapping's existence as a gate, so a function compiled before its
   class exists still bails rather than baking in a stale slot. `form:SETF` bails

@@ -1,0 +1,12 @@
+[package]
+name = "torcl-stdlib"
+description = "TorCL Common Lisp standard library: packages, CLOS, conditions, streams, sequences"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+torcl-rt.workspace = true
+torcl-compiler.workspace = true
+rustyline = "18.0.1"

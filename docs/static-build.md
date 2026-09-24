@@ -1,7 +1,7 @@
-# Fully static `bliss-cli` (no mandatory libc)
+# Fully static `torcl` (no mandatory libc)
 
-Bliss's runtime-internal OS services use **direct Linux syscalls** rather than
-libc (see `crates/bliss-rt/src/syscall.rs` and `context.rs`), so a default build
+TorCL's runtime-internal OS services use **direct Linux syscalls** rather than
+libc (see `crates/torcl-rt/src/syscall.rs` and `context.rs`), so a default build
 links no libc of our own and can be produced as a fully static executable.
 bliss-bca.5.
 
@@ -28,16 +28,16 @@ bliss-bca.5.
 ```sh
 # Fully static (musl). No system musl toolchain needed for pure-Rust std.
 rustup target add x86_64-unknown-linux-musl
-cargo build --release -p bliss-cli --target x86_64-unknown-linux-musl
+cargo build --release -p torcl --target x86_64-unknown-linux-musl
 
 # With dynamic C-ABI FFI (NOT static): enable the feature on a glibc target.
-cargo build --release -p bliss-cli --features bliss-rt/c-ffi
+cargo build --release -p torcl --features torcl-rt/c-ffi
 ```
 
 ## Verifying it is static
 
 ```sh
-BIN=target/x86_64-unknown-linux-musl/release/bliss-cli
+BIN=target/x86_64-unknown-linux-musl/release/torcl
 file "$BIN"     # => ELF ... static-pie linked
 ldd  "$BIN"     # => statically linked
 ```

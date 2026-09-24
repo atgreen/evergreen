@@ -34,7 +34,7 @@ Bootstrap     Core Runtime     Self-Hosting        Production
   Stage 0 gate, not by subsystem completeness claims.
 
 **Milestone criterion:** the Stage 0 gate passes through the real
-`bliss` binary: `bliss --eval "(+ 1 2)"` prints `3`, core datatypes
+`torcl` binary: `torcl --eval "(+ 1 2)"` prints `3`, core datatypes
 round-trip read→print unchanged, and a short nested arithmetic/list
 script prints correct results.
 
@@ -58,13 +58,13 @@ writing the standard library in CL.
   broadly than the Stage 1 and Stage 2 gates.
 
 **Milestone criterion:** the Stage 1 gate and then the Stage 2 gate
-pass through the real `bliss` binary with no regression of Stage 0.
+pass through the real `torcl` binary with no regression of Stage 0.
 
 **Dependencies:** Phase 0 complete.
 
 ## 11.4  Phase 2 — Self-Hosting Compiler
 
-**Goal:** The optimising compiler is written in Bliss CL, compiled
+**Goal:** The optimising compiler is written in TorCL CL, compiled
 by T1, and produces T2-quality code.
 
 **R11.03** Deliverables:
@@ -80,7 +80,7 @@ by T1, and produces T2-quality code.
   bypass or replace the stage gates as acceptance criteria.
 
 **Milestone criterion:** the Stage 3, Stage 4, and Stage 5 gates pass
-in order through the real `bliss` binary with no regression of earlier
+in order through the real `torcl` binary with no regression of earlier
 stages.
 
 **Dependencies:** Phase 1 complete.
@@ -110,7 +110,7 @@ self-compiles (see §11.9).
 | C12 | Pass manager & ordering | `lib/compiler/opt/pass-mgr.lisp` | Orchestrates C4–C11 in the fixed order defined by §4.5 (A4.02) |
 | C13 | Lowering (IR → MachNode) | `lib/compiler/lower.lisp` | Requires C1; produces machine-specific nodes consumed by C14 |
 | C14 | Register allocator | `lib/compiler/regalloc.lisp` | Requires C13; linear-scan over SSA live ranges |
-| C15 | Code emitter (x86-64) | `lib/compiler/emit-x86.lisp` | Requires C13, C14; emits bytes into CodeBuffer via Rust FFI to `crates/bliss-compiler/src/codegen/x86_64.rs` |
+| C15 | Code emitter (x86-64) | `lib/compiler/emit-x86.lisp` | Requires C13, C14; emits bytes into CodeBuffer via Rust FFI to `crates/torcl-compiler/src/codegen/x86_64.rs` |
 | C16 | Code emitter (AArch64) | `lib/compiler/emit-aarch64.lisp` | Requires C13, C14; secondary backend, MAY lag C15 |
 | C17 | Inline cache runtime | `lib/compiler/ic.lisp` | Requires C15 (patchable call sites); wires IC state machine (§4.8) |
 | C18 | Profiling & tier promotion | `lib/compiler/profile.lisp` | Requires C15, C17; installs counters and triggers tier transitions (§4.9) |
@@ -241,7 +241,7 @@ time with a clear diagnostic naming the missing dependency.
   completed stage ledger, not as substitutes for it.
 
 **Milestone criterion:** the Stage 6 gate passes through the real
-`bliss` binary, earlier gates still pass, and the production-readiness
+`torcl` binary, earlier gates still pass, and the production-readiness
 targets in §10 and §7 are met.
 
 **Dependencies:** Phase 2 complete.
@@ -303,8 +303,8 @@ targets in §10 and §7 are met.
 | 0.5.x–0.9.x | Phase 2 builds | Beta |
 | 1.0.0 | Phase 3 complete | Stable |
 
-**R11.05** Bliss follows Semantic Versioning 2.0.0 for its public API
-(C-ABI surface and `BLISS-EXT` package). Internal APIs (Rust crate
+**R11.05** TorCL follows Semantic Versioning 2.0.0 for its public API
+(C-ABI surface and `TORCL-EXT` package). Internal APIs (Rust crate
 interfaces) use workspace-level versioning without stability guarantees
 before 1.0.0.
 
@@ -381,32 +381,32 @@ CL-side feature gating uses standard `*FEATURES*` and reader conditionals:
 
 ```lisp
 ;; Only load T2 passes when the T2 feature is active
-#+bliss-tier2
+#+torcl-tier2
 (load "lib/compiler/opt/pass-mgr.lisp")
 
 ;; Provide a stub when CLOS is not yet bootstrapped
-#-bliss-clos
+#-torcl-clos
 (defun make-instance (class &rest initargs)
   (error "CLOS not yet available — load clos/boot.lisp first"))
 ```
 
 | Feature keyword | Pushed when |
 |-----------------|-------------|
-| `:bliss` | Always (identifies the implementation) |
-| `:bliss-phase-0` | Phase 0 builds |
-| `:bliss-phase-1` | Phase 1+ builds |
-| `:bliss-phase-2` | Phase 2+ builds |
-| `:bliss-phase-3` | Phase 3+ builds |
-| `:bliss-tier2` | T2 compiler is loaded and functional |
-| `:bliss-clos` | CLOS bootstrap is complete |
-| `:bliss-unicode` | Full Unicode support is loaded (vs. ASCII-only bootstrap) |
-| `:bliss-threads` | Thread subsystem is active |
-| `:bliss-image` | Image save/restore is available |
+| `:torcl` | Always (identifies the implementation) |
+| `:torcl-phase-0` | Phase 0 builds |
+| `:torcl-phase-1` | Phase 1+ builds |
+| `:torcl-phase-2` | Phase 2+ builds |
+| `:torcl-phase-3` | Phase 3+ builds |
+| `:torcl-tier2` | T2 compiler is loaded and functional |
+| `:torcl-clos` | CLOS bootstrap is complete |
+| `:torcl-unicode` | Full Unicode support is loaded (vs. ASCII-only bootstrap) |
+| `:torcl-threads` | Thread subsystem is active |
+| `:torcl-image` | Image save/restore is available |
 
 **R11.14** Feature keywords MUST be pushed onto `*FEATURES*` at the
 point where the subsystem is verified functional, not merely loaded.
 
-**R11.15** All `#+bliss-*` / `#-bliss-*` conditionals in stdlib source
+**R11.15** All `#+torcl-*` / `#-torcl-*` conditionals in stdlib source
 MUST be documented in a feature-flag registry file
 (`lib/feature-flags.lisp`) listing each flag, its meaning, and when it
 activates.
@@ -482,33 +482,33 @@ and against SBCL on the same hardware.
 
 ## 11.12  Migration Guide for SBCL Users
 
-This section documents key differences between Bliss and SBCL to aid
+This section documents key differences between TorCL and SBCL to aid
 users porting existing code.
 
 ### 11.12.1  Key Differences
 
-| Area | SBCL | Bliss | Migration action |
+| Area | SBCL | TorCL | Migration action |
 |------|------|-------|------------------|
-| Package for extensions | `SB-EXT`, `SB-THREAD`, etc. | `BLISS-EXT`, `BLISS-THREAD`, etc.; `BLISS` and `BLISS-THREADS` are deprecated compatibility spellings | Use compatibility package (see below) or `#+`/`#-` conditionals |
-| Thread API | `sb-thread:make-thread` | `bliss-thread:make-thread` (BORDEAUX-THREADS compatible) | Use `bordeaux-threads` for portability |
-| GC control | `(sb-ext:gc)`, `sb-ext:*gc-run-time*` | `(bliss-ext:gc)`, `bliss-ext:*gc-run-time*` | Rename calls |
-| Compiler policy | `(declare (optimize (speed 3)))` | Same ANSI syntax; Bliss interprets values similarly | No change needed |
-| `defglobal` | `sb-ext:defglobal` | `bliss-ext:defglobal` | Rename or use compat package |
-| Image save | `sb-ext:save-lisp-and-die` | `bliss-ext:save-image` | Rename; keyword args differ (see §7) |
-| Foreign calls | `sb-alien:define-alien-routine` | `bliss-ffi:define-foreign-function` | Rewrite FFI declarations |
-| Weak pointers | `sb-ext:make-weak-pointer` | `bliss-ext:make-weak-pointer` | Rename |
-| MOP | Full AMOP via `sb-mop` | Partial MOP via `bliss-mop` (Phase 2); full AMOP deferred | Test MOP usage; use `closer-mop` shim |
-| `*posix-argv*` | `sb-ext:*posix-argv*` | `bliss-ext:*command-line-arguments*` | Rename |
-| Exit | `sb-ext:exit` | `bliss-ext:exit` | Rename; compatible keyword args |
+| Package for extensions | `SB-EXT`, `SB-THREAD`, etc. | `TORCL-EXT`, `TORCL-THREAD`, etc.; `TORCL` and `TORCL-THREADS` are deprecated compatibility spellings | Use compatibility package (see below) or `#+`/`#-` conditionals |
+| Thread API | `sb-thread:make-thread` | `torcl-thread:make-thread` (BORDEAUX-THREADS compatible) | Use `bordeaux-threads` for portability |
+| GC control | `(sb-ext:gc)`, `sb-ext:*gc-run-time*` | `(torcl-ext:gc)`, `torcl-ext:*gc-run-time*` | Rename calls |
+| Compiler policy | `(declare (optimize (speed 3)))` | Same ANSI syntax; TorCL interprets values similarly | No change needed |
+| `defglobal` | `sb-ext:defglobal` | `torcl-ext:defglobal` | Rename or use compat package |
+| Image save | `sb-ext:save-lisp-and-die` | `torcl-ext:save-image` | Rename; keyword args differ (see §7) |
+| Foreign calls | `sb-alien:define-alien-routine` | `torcl-ffi:define-foreign-function` | Rewrite FFI declarations |
+| Weak pointers | `sb-ext:make-weak-pointer` | `torcl-ext:make-weak-pointer` | Rename |
+| MOP | Full AMOP via `sb-mop` | Partial MOP via `torcl-mop` (Phase 2); full AMOP deferred | Test MOP usage; use `closer-mop` shim |
+| `*posix-argv*` | `sb-ext:*posix-argv*` | `torcl-ext:*command-line-arguments*` | Rename |
+| Exit | `sb-ext:exit` | `torcl-ext:exit` | Rename; compatible keyword args |
 
 ### 11.12.2  Compatibility Package
 
-**R11.18** Bliss MUST provide a `BLISS-SBCL-COMPAT` package that
-re-exports Bliss equivalents under SBCL symbol names for the most
+**R11.18** TorCL MUST provide a `TORCL-SBCL-COMPAT` package that
+re-exports TorCL equivalents under SBCL symbol names for the most
 commonly used SBCL extensions:
 
 ```lisp
-(defpackage :bliss-sbcl-compat
+(defpackage :torcl-sbcl-compat
   (:use :cl)
   (:export
    ;; sb-ext equivalents
@@ -527,26 +527,26 @@ The compatibility package may additionally export deprecated aliases such as
 
 ### 11.12.3  Porting Checklist
 
-1. Replace `#+sbcl` conditionals with `#+bliss` (or `#+(or sbcl bliss)`
+1. Replace `#+sbcl` conditionals with `#+torcl` (or `#+(or sbcl torcl)`
    for code that should work on both).
 2. Replace `sb-ext:`, `sb-thread:`, `sb-alien:` package prefixes with
-   Bliss equivalents, or `(:use :bliss-sbcl-compat)`.
-3. Audit FFI declarations — Bliss uses `bliss-ffi:define-foreign-function`
+   TorCL equivalents, or `(:use :torcl-sbcl-compat)`.
+3. Audit FFI declarations — TorCL uses `torcl-ffi:define-foreign-function`
    with keyword syntax closer to CFFI than to `sb-alien`.
-4. Test `defstruct` `:include` chains — Bliss Phase 2 supports them but
-   layout may differ from SBCL (check `bliss-ext:struct-slot-offset`).
-5. Replace `sb-mop` usage with `closer-mop` or `bliss-mop`; verify
+4. Test `defstruct` `:include` chains — TorCL Phase 2 supports them but
+   layout may differ from SBCL (check `torcl-ext:struct-slot-offset`).
+5. Replace `sb-mop` usage with `closer-mop` or `torcl-mop`; verify
    that only the supported MOP subset is used (see §5.3).
-6. Test `LOOP` — Bliss implements ANSI `LOOP` exactly; some SBCL `LOOP`
+6. Test `LOOP` — TorCL implements ANSI `LOOP` exactly; some SBCL `LOOP`
    extensions (e.g., `LOOP FOR x ACROSS-OF-TYPE`) are not supported.
-7. Run the application's test suite under Bliss with
+7. Run the application's test suite under TorCL with
    `(pushnew :sbcl *features*)` removed.
-8. Check startup time — Bliss images are not identical to SBCL cores;
-   rebuild via `bliss-ext:save-image`.
+8. Check startup time — TorCL images are not identical to SBCL cores;
+   rebuild via `torcl-ext:save-image`.
 
 ## 11.13  Deprecation Policy for Internal APIs
 
-Internal APIs (Rust crate public interfaces, `BLISS-INTERNALS` package
+Internal APIs (Rust crate public interfaces, `TORCL-INTERNALS` package
 symbols, and compiler intrinsics) are not covered by Semver guarantees
 before 1.0.0. After 1.0.0, the following policy applies.
 
@@ -574,9 +574,9 @@ replacement suggestion:
 
 ```lisp
 ;; Example deprecation warning
-; WARNING: BLISS-INTERNALS::%OLD-ALLOC is deprecated.
-;          Use BLISS-INTERNALS::%REGION-ALLOC instead.
-;          Will be removed in Bliss 1.5.
+; WARNING: TORCL-INTERNALS::%OLD-ALLOC is deprecated.
+;          Use TORCL-INTERNALS::%REGION-ALLOC instead.
+;          Will be removed in TorCL 1.5.
 ```
 
 ### 11.13.2  Scope
@@ -584,15 +584,15 @@ replacement suggestion:
 | API surface | Covered by policy | Notes |
 |-------------|------------------|-------|
 | `COMMON-LISP` package | N/A — ANSI standard, never deprecated | |
-| `BLISS` public extensions | YES — full deprecation lifecycle | |
-| `BLISS-INTERNALS` | Best-effort notice; MAY be removed in any minor release before 1.0 | |
+| `TORCL` public extensions | YES — full deprecation lifecycle | |
+| `TORCL-INTERNALS` | Best-effort notice; MAY be removed in any minor release before 1.0 | |
 | Rust crate public items | YES after 1.0; unstable before 1.0 | |
-| C-ABI (`libbliss.so`) | YES — full lifecycle; minimum 3 minor releases | Longest window due to ABI stability expectations |
+| C-ABI (`libtorcl.so`) | YES — full lifecycle; minimum 3 minor releases | Longest window due to ABI stability expectations |
 | Image format | Breaking changes require major version bump after 1.0 | Images are not forward-compatible |
 
-**R11.21** The `BLISS` package MUST maintain a machine-readable
+**R11.21** The `TORCL` package MUST maintain a machine-readable
 deprecation registry accessible via
-`(bliss:deprecated-symbols)` → list of `(symbol replacement removal-version)`.
+`(torcl:deprecated-symbols)` → list of `(symbol replacement removal-version)`.
 
 ## 11.14  Phase Exit Gates
 
@@ -687,7 +687,7 @@ same gates.
 
 | Stage | Gate summary |
 |-------|--------------|
-| 0 | `bliss --eval "(+ 1 2)"` prints `3`; core datatypes round-trip read→print; a nested arithmetic/list script prints correct results |
+| 0 | `torcl --eval "(+ 1 2)"` prints `3`; core datatypes round-trip read→print; a nested arithmetic/list script prints correct results |
 | 1 | Recursive factorial/Fibonacci, higher-order list processing, closures with captured state, and non-local exits run correctly through the CLI |
 | 2 | A real multi-form `.lisp` file that defines and uses its own macros plus standard macros loads and runs to a correct result |
 | 3 | A library-heavy program using strings/sequences/hash tables/formatted output produces correct observable results |

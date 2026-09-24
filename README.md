@@ -1,6 +1,6 @@
-# Bliss
+# TorCL
 
-Bliss is a from-scratch Common Lisp implementation written in Rust. The
+TorCL is a from-scratch Common Lisp implementation written in Rust. The
 current repository contains the bootstrap runtime, compiler pipeline,
 standard-library support, command-line driver, tests, and a detailed technical
 specification for the longer-term self-hosting system.
@@ -17,10 +17,10 @@ This is a Cargo workspace using Rust 2024 and requiring Rust 1.85 or newer.
 
 | Path | Purpose |
 | --- | --- |
-| `crates/bliss-rt` | Runtime core: object model, values, GC, threads, FFI, sandboxing, images |
-| `crates/bliss-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
-| `crates/bliss-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
-| `crates/bliss` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
+| `crates/torcl-rt` | Runtime core: object model, values, GC, threads, FFI, sandboxing, images |
+| `crates/torcl-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
+| `crates/torcl-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
+| `crates/torcl` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
 | `lib/` | Lisp-side prelude (`boot.lisp`) and bundled sources loaded at startup |
 | `tests/` | Cross-cutting suites: ANSI conformance, differential, integration, property, and sanitizer configs |
 | `fuzz/` | `cargo-fuzz` targets and corpora for the reader, compiler, evaluator, FORMAT, FFI, and image loader |
@@ -36,8 +36,21 @@ cargo build
 Build the CLI binary:
 
 ```sh
-cargo build -p bliss
+cargo build -p torcl
 ```
+
+Build the standalone `torcl` executable with ASDF preloaded, then install it:
+
+```sh
+make image              # produces target/torcl
+sudo make install       # installs /usr/local/bin/torcl
+```
+
+The implementation identifies itself as `TorCL` and provides the `:torcl`
+feature. Configuration uses `~/.torclrc` and `TORCL_*` environment variables.
+When migrating an existing installation, update initialization files and
+library feature conditionals, and rebuild saved images and compiled caches.
+The rename does not install compatibility aliases for the previous names.
 
 Run the test suite:
 
@@ -48,10 +61,10 @@ cargo test
 Run tests for one crate:
 
 ```sh
-cargo test -p bliss-rt
-cargo test -p bliss-compiler
-cargo test -p bliss-stdlib
-cargo test -p bliss
+cargo test -p torcl-rt
+cargo test -p torcl-compiler
+cargo test -p torcl-stdlib
+cargo test -p torcl
 ```
 
 Fuzz targets live under `fuzz/` and run via `cargo-fuzz`:
@@ -67,7 +80,7 @@ clippy on Linux and macOS, a nightly fuzzing job, and sanitizer builds.
 
 ## CLI Usage
 
-The [Bliss-specific Lisp API manual](docs/bliss-lisp-api.md) documents the
+The [TorCL-specific Lisp API manual](docs/torcl-lisp-api.md) documents the
 currently callable extensions and the status of the complete planned Lisp API,
 including fibers, native threads, synchronization, compiler introspection,
 sandboxing, and developer tools.
@@ -75,33 +88,33 @@ sandboxing, and developer tools.
 Run the REPL:
 
 ```sh
-cargo run -p bliss
+cargo run -p torcl
 ```
 
 Evaluate an expression:
 
 ```sh
-cargo run -p bliss -- --eval "(+ 1 2)"
+cargo run -p torcl -- --eval "(+ 1 2)"
 ```
 
 Load a file:
 
 ```sh
-cargo run -p bliss -- --load path/to/file.lisp
+cargo run -p torcl -- --load path/to/file.lisp
 ```
 
 Run a script and pass arguments through to Lisp as `*COMMAND-LINE-ARGS*`:
 
 ```sh
-cargo run -p bliss -- path/to/script.lisp -- arg1 arg2
+cargo run -p torcl -- path/to/script.lisp -- arg1 arg2
 ```
 
 The CLI currently accepts:
 
 ```text
-Usage: bliss [OPTIONS] [SCRIPT] [-- CL-ARGS...]
+Usage: torcl [OPTIONS] [SCRIPT] [-- CL-ARGS...]
 
-Bliss Common Lisp
+TorCL Common Lisp
 
 Options:
   --help               Print this help message and exit
@@ -130,8 +143,8 @@ The bootstrap prelude (`lib/boot.lisp`) now loads by default; `--bootstrap`
 is retained only for compatibility, and `--no-bootstrap` starts the raw
 evaluator without it.
 
-When starting the REPL without `--no-init`, Bliss attempts to load the file
-specified by `BLISS_INIT_FILE`; if that is unset, it falls back to `~/.blissrc`.
+When starting the REPL without `--no-init`, TorCL attempts to load the file
+specified by `TORCL_INIT_FILE`; if that is unset, it falls back to `~/.torclrc`.
 
 ## Specification
 

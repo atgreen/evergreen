@@ -2,7 +2,7 @@
 
 This chapter specifies image persistence, deployment modes, platform
 support tiers, configuration, build & release processes, versioning
-policy, and logging/diagnostics infrastructure for the Bliss runtime.
+policy, and logging/diagnostics infrastructure for the TorCL runtime.
 
 ---
 
@@ -14,9 +14,9 @@ policy, and logging/diagnostics infrastructure for the Bliss runtime.
 | R7.02 | Image load MUST use `mmap(2)` for the heap section and complete in < 50 ms for a 64 MB image on tier-1 platforms. |
 | R7.03 | The image loader MUST perform pointer relocation when the mapped base address differs from the original save address. |
 | R7.04 | The image format MUST include a magic number, format version, platform tag, and checksum so that incompatible images are rejected with a clear error before any heap access. |
-| R7.05 | Bliss MUST support a standalone executable deployment mode by prepending an image to the runtime binary. |
-| R7.06 | Bliss MUST provide a shared-library (`libbliss.so` / `libbliss.dylib`) embedding mode with a stable C-ABI surface (see §8, R8.xx). |
-| R7.07 | Bliss MUST provide a REPL/script mode that reads from stdin or a file path argument. |
+| R7.05 | TorCL MUST support a standalone executable deployment mode by prepending an image to the runtime binary. |
+| R7.06 | TorCL MUST provide a shared-library (`libtorcl.so` / `libtorcl.dylib`) embedding mode with a stable C-ABI surface (see §8, R8.xx). |
+| R7.07 | TorCL MUST provide a REPL/script mode that reads from stdin or a file path argument. |
 | R7.08 | Linux x86-64 and macOS aarch64 MUST be tier-1 platforms: all tests pass, CI-gated, release binaries provided. |
 | R7.09 | macOS x86-64 MUST be tier-2: CI runs, best-effort fixes, community-contributed binaries. |
 | R7.10 | FreeBSD x86-64 MUST be tier-3: builds accepted, no CI, fixes accepted but not prioritised. |
@@ -33,7 +33,7 @@ policy, and logging/diagnostics infrastructure for the Bliss runtime.
 | R7.21 | Startup mode selection MUST be deterministic: explicit CLI mode (`--eval`, `--load`, script path, `--bootstrap`, `--no-image`) overrides appended-image and default-image discovery. |
 | R7.22 | The runtime MUST support a bootstrap-without-image operating profile that loads `lib/boot.lisp` from the source tree or installation prefix and exposes enough functionality to build and save a first image. |
 | R7.23 | The runtime MUST support an immutable-image operating profile in which the mapped image remains read-only and all post-startup mutation occurs in freshly allocated writable regions. |
-| R7.24 | Init-file discovery MUST be explicit and suppressible: in interactive startup with no explicit `--eval`, `--load`, or script path, the runtime MUST load the file named by `BLISS_INIT_FILE` if set, else `~/.blissrc` if present; `--no-init` MUST suppress both probes. |
+| R7.24 | Init-file discovery MUST be explicit and suppressible: in interactive startup with no explicit `--eval`, `--load`, or script path, the runtime MUST load the file named by `TORCL_INIT_FILE` if set, else `~/.torclrc` if present; `--no-init` MUST suppress both probes. |
 | R7.25 | The standard bootstrap prelude MUST load before init-file processing and before executing `--eval`, `--load`, or a positional script unless `--no-bootstrap` is in effect; `--bootstrap` MAY remain as a compatibility alias for explicitly requesting this prelude-backed bootstrap profile. |
 | R7.26 | `--no-bootstrap` MUST disable standard bootstrap-prelude loading and expose the raw evaluator/runtime state for the selected startup mode. |
 
@@ -43,7 +43,7 @@ policy, and logging/diagnostics infrastructure for the Bliss runtime.
 
 ### 7.2.1  Overview
 
-A `.bimg` file is a serialised snapshot of the Bliss runtime state.
+A `.bimg` file is a serialised snapshot of the TorCL runtime state.
 It captures the heap, symbol table, package registry, and compiled
 native code so that the runtime can resume from a saved continuation
 without replaying bootstrap load sequences.  See §0 (section 5.4) for
@@ -69,13 +69,13 @@ Offset  Section              Size
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0x00 | 8 | `magic` | `0x424C4953_53494D47` (`"BLISSIMG"` in ASCII) |
+| 0x00 | 8 | `magic` | `0x544F5243_4C494D47` (`"TORCLIMG"` in ASCII) |
 | 0x08 | 4 | `format_version` | Monotonically increasing u32; see §7.8 |
 | 0x0C | 4 | `flags` | Bit flags (see below) |
 | 0x10 | 8 | `platform_tag` | Encoded arch + OS (see §7.2.4) |
 | 0x18 | 8 | `original_base` | Virtual address at which the heap was mapped during save |
 | 0x20 | 8 | `heap_size` | Byte length of the serialised heap section |
-| 0x28 | 8 | `entry_continuation` | `BlissVal` of the continuation to resume on load |
+| 0x28 | 8 | `entry_continuation` | `TorclVal` of the continuation to resume on load |
 | 0x30 | 4 | `section_count` | Number of entries in the section directory |
 | 0x34 | 4 | `gc_generation` | GC generation counter at save time |
 | 0x38 | 8 | `gc_metadata_offset` | Offset to GC remembered-set / mark bitmap snapshot |
@@ -119,7 +119,7 @@ Each entry in the section directory:
 
 ### 7.2.6  Heap Section
 
-The heap section is a verbatim copy of the Bliss heap regions (§3)
+The heap section is a verbatim copy of the TorCL heap regions (§3)
 serialised in region order.  Each region is page-aligned (4 KiB) in
 the file to allow `mmap` with `MAP_FIXED` at the original base or
 a relocated base.
@@ -137,9 +137,9 @@ struct ImageSymbol {
     name_offset: u32,   // offset into name string pool
     name_len: u16,
     package_id: u16,    // index into package registry
-    value_cell: u64,    // relocated BlissVal
-    function_cell: u64, // relocated BlissVal
-    plist_cell: u64,    // relocated BlissVal
+    value_cell: u64,    // relocated TorclVal
+    function_cell: u64, // relocated TorclVal
+    plist_cell: u64,    // relocated TorclVal
     flags: u32,         // exported, shadowing-imported, constant, etc.
 }
 ```
@@ -241,17 +241,17 @@ preserved (R7.20).
 
 ## 7.3  Image Save / Load Operations
 
-### 7.3.1  Save (`BLISS-EXT:SAVE-IMAGE`)
+### 7.3.1  Save (`TORCL-EXT:SAVE-IMAGE`)
 
 ```lisp
-(bliss-ext:save-image pathname &key (executable nil)
+(torcl-ext:save-image pathname &key (executable nil)
                                     (compression :none)  ; or :zstd
                                     (purify t))
 ;; Returns: pathname on success.
-;; Signals BLISS-EXT:IMAGE-ERROR on failure.
+;; Signals TORCL-EXT:IMAGE-ERROR on failure.
 ```
 
-`BLISS:SAVE-IMAGE` and `BLISS:IMAGE-ERROR` are deprecated compatibility
+`TORCL:SAVE-IMAGE` and `TORCL:IMAGE-ERROR` are deprecated compatibility
 spellings for older migration code.
 
 1. Trigger a full GC to compact the heap and clear the nursery.
@@ -267,7 +267,7 @@ spellings for older migration code.
 ### 7.3.2  Load
 
 Load is performed by the runtime startup code
-(`crates/bliss-rt/src/startup.rs`).
+(`crates/torcl-rt/src/startup.rs`).
 
 1. Open image file, read and validate header (magic, version,
    platform tag, header SHA-256).
@@ -314,23 +314,23 @@ fn find_appended_image(exe_path: &Path) -> Option<MappedImage> {
     }
     // Validate .bimg magic number at the computed offset before mmap.
     let magic: [u8; 8] = read_at(&file, img_offset)?;
-    if u64::from_le_bytes(magic) != 0x424C4953_53494D47 {
+    if u64::from_le_bytes(magic) != 0x544F5243_4C494D47 {
         return None; // Not a valid .bimg payload
     }
     mmap_image(&file, img_offset)
 }
 ```
 
-This enables single-file distribution of Bliss applications (R7.05).
+This enables single-file distribution of TorCL applications (R7.05).
 
 ### 7.4.2  Shared Library (Embedding)
 
-`libbliss` exposes a C-ABI interface (§8):
+`libtorcl` exposes a C-ABI interface (§8):
 
 ```c
-bliss_ctx *bliss_init(const char *image_path, const bliss_opts *opts);
-bliss_val  bliss_eval(bliss_ctx *ctx, const char *form);
-void       bliss_destroy(bliss_ctx *ctx);
+torcl_ctx *torcl_init(const char *image_path, const torcl_opts *opts);
+torcl_val  torcl_eval(torcl_ctx *ctx, const char *form);
+void       torcl_destroy(torcl_ctx *ctx);
 ```
 
 Multiple independent contexts MAY coexist in a single process.  Each
@@ -338,15 +338,15 @@ context owns its own heap, GC threads, and package registry (R7.06).
 
 ### 7.4.3  REPL / Script Mode
 
-The `bliss` CLI binary operates in three sub-modes:
+The `torcl` CLI binary operates in three sub-modes:
 
 | Invocation | Behaviour |
 |------------|-----------|
-| `bliss` | Interactive REPL (see §6) |
-| `bliss script.lisp` | Load and execute `script.lisp`, then exit |
-| `bliss -e '(+ 1 2)'` | Evaluate expression, print result, exit |
+| `torcl` | Interactive REPL (see §6) |
+| `torcl script.lisp` | Load and execute `script.lisp`, then exit |
+| `torcl -e '(+ 1 2)'` | Evaluate expression, print result, exit |
 
-The CLI uses the default image located via `BLISS_IMAGE_PATH` or the
+The CLI uses the default image located via `TORCL_IMAGE_PATH` or the
 compiled-in fallback path (R7.07).
 
 ---
@@ -402,34 +402,34 @@ in-image defaults  →  environment variables  →  CLI flags
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `BLISS_HEAP_SIZE` | Size (e.g. `512m`, `2g`) | `256m` | Maximum heap size |
-| `BLISS_GC_THREADS` | Integer | CPU count / 2 | Number of concurrent GC worker threads |
-| `BLISS_IMAGE_PATH` | Path | `$PREFIX/lib/bliss/bliss.bimg` | Path to the default boot image |
-| `BLISS_LOG_LEVEL` | `error\|warn\|info\|debug\|trace` | `warn` | Global log severity threshold |
-| `BLISS_GC_LOG` | `0` or `1` | `0` | Enable GC-specific structured log channel |
-| `BLISS_JIT_LOG` | `0` or `1` | `0` | Enable JIT-specific structured log channel |
-| `BLISS_NURSERY_SIZE` | Size | `2m` | Per-thread nursery (TLAB) size |
-| `BLISS_TIER1_THRESHOLD` | Integer | `10` | Call count triggering T0→T1 promotion |
-| `BLISS_TIER2_THRESHOLD` | Integer | `5000` | Call/back-edge count triggering T1→T2 promotion |
-| `BLISS_PERF_MAP` | `0` or `1` | `1` (Linux) | Emit `/tmp/perf-<pid>.map` for JIT symbols |
-| `BLISS_CODE_CACHE_SIZE` | Size | `64m` | Maximum compiled-code cache size |
-| `BLISS_INIT_FILE` | Path | `~/.blissrc` fallback | Interactive init file override; only consulted when no explicit `--eval`, `--load`, or script path is selected |
+| `TORCL_HEAP_SIZE` | Size (e.g. `512m`, `2g`) | `256m` | Maximum heap size |
+| `TORCL_GC_THREADS` | Integer | CPU count / 2 | Number of concurrent GC worker threads |
+| `TORCL_IMAGE_PATH` | Path | `$PREFIX/lib/torcl/torcl.bimg` | Path to the default boot image |
+| `TORCL_LOG_LEVEL` | `error\|warn\|info\|debug\|trace` | `warn` | Global log severity threshold |
+| `TORCL_GC_LOG` | `0` or `1` | `0` | Enable GC-specific structured log channel |
+| `TORCL_JIT_LOG` | `0` or `1` | `0` | Enable JIT-specific structured log channel |
+| `TORCL_NURSERY_SIZE` | Size | `2m` | Per-thread nursery (TLAB) size |
+| `TORCL_TIER1_THRESHOLD` | Integer | `10` | Call count triggering T0→T1 promotion |
+| `TORCL_TIER2_THRESHOLD` | Integer | `5000` | Call/back-edge count triggering T1→T2 promotion |
+| `TORCL_PERF_MAP` | `0` or `1` | `1` (Linux) | Emit `/tmp/perf-<pid>.map` for JIT symbols |
+| `TORCL_CODE_CACHE_SIZE` | Size | `64m` | Maximum compiled-code cache size |
+| `TORCL_INIT_FILE` | Path | `~/.torclrc` fallback | Interactive init file override; only consulted when no explicit `--eval`, `--load`, or script path is selected |
 
 ### 7.6.3  CLI Flags
 
 | Flag | Equivalent Env Var | Example |
 |------|--------------------|---------|
-| `--heap-size` | `BLISS_HEAP_SIZE` | `--heap-size 1g` |
-| `--gc-threads` | `BLISS_GC_THREADS` | `--gc-threads 4` |
-| `--image` | `BLISS_IMAGE_PATH` | `--image app.bimg` |
-| `--log-level` | `BLISS_LOG_LEVEL` | `--log-level debug` |
-| `--gc-log` | `BLISS_GC_LOG` | `--gc-log` |
-| `--jit-log` | `BLISS_JIT_LOG` | `--jit-log` |
+| `--heap-size` | `TORCL_HEAP_SIZE` | `--heap-size 1g` |
+| `--gc-threads` | `TORCL_GC_THREADS` | `--gc-threads 4` |
+| `--image` | `TORCL_IMAGE_PATH` | `--image app.bimg` |
+| `--log-level` | `TORCL_LOG_LEVEL` | `--log-level debug` |
+| `--gc-log` | `TORCL_GC_LOG` | `--gc-log` |
+| `--jit-log` | `TORCL_JIT_LOG` | `--jit-log` |
 | `--eval`, `-e` | — | `-e '(print 42)'` |
 | `--no-image` | — | Start with an empty heap (no CL environment loaded) |
 | `--bootstrap` | — | Load `lib/boot.lisp` bootstrap sequence without a pre-existing image (see §0 section 3); provides enough CL to run `SAVE-IMAGE` |
 | `--no-bootstrap` | — | Skip the standard bootstrap prelude and run with the raw evaluator/runtime state |
-| `--no-init` | — | Suppress `BLISS_INIT_FILE` and `~/.blissrc` init-file loading |
+| `--no-init` | — | Suppress `TORCL_INIT_FILE` and `~/.torclrc` init-file loading |
 | `--version` | — | Print version and exit |
 
 ### 7.6.4  Init-File Discovery and Suppression
@@ -438,8 +438,8 @@ Init-file discovery is part of configuration resolution for interactive
 use and is governed by R7.24:
 
 1. If `--no-init` is present, no init file is probed or loaded.
-2. Otherwise, if `BLISS_INIT_FILE` is set, its path is used.
-3. Otherwise, the runtime probes `~/.blissrc`.
+2. Otherwise, if `TORCL_INIT_FILE` is set, its path is used.
+3. Otherwise, the runtime probes `~/.torclrc`.
 4. Init-file discovery only occurs when startup remains in interactive
    mode; any explicit `--eval`, `--load`, or positional script path
    suppresses it.
@@ -488,9 +488,9 @@ The project is a Cargo workspace (see §0, section 3):
 ```toml
 [workspace]
 members = [
-    "crates/bliss-rt",
-    "crates/bliss-compiler",
-    "crates/bliss",
+    "crates/torcl-rt",
+    "crates/torcl-compiler",
+    "crates/torcl",
 ]
 ```
 
@@ -523,41 +523,41 @@ cost).
 
 | Artifact | Contents | Produced By |
 |----------|----------|-------------|
-| `bliss-<ver>-src.tar.gz` | Full source tree | `git archive` |
-| `bliss-<ver>-linux-x86_64.tar.gz` | `bliss` binary + default image + man page | CI |
-| `bliss-<ver>-macos-arm64.tar.gz` | `bliss` binary + default image + man page | CI |
-| `bliss-<ver>-macos-x86_64.tar.gz` | `bliss` binary + default image (best-effort) | CI |
-| `bliss_<ver>_amd64.deb` | Debian package (binary + image + man page) | `cargo-deb` |
-| `bliss.rb` | Homebrew formula (source build) | Release script |
+| `torcl-<ver>-src.tar.gz` | Full source tree | `git archive` |
+| `torcl-<ver>-linux-x86_64.tar.gz` | `torcl` binary + default image + man page | CI |
+| `torcl-<ver>-macos-arm64.tar.gz` | `torcl` binary + default image + man page | CI |
+| `torcl-<ver>-macos-x86_64.tar.gz` | `torcl` binary + default image (best-effort) | CI |
+| `torcl_<ver>_amd64.deb` | Debian package (binary + image + man page) | `cargo-deb` |
+| `torcl.rb` | Homebrew formula (source build) | Release script |
 
 ### 7.7.4  Debian Package Layout
 
 ```text
-/usr/bin/bliss
-/usr/lib/bliss/bliss.bimg
-/usr/lib/x86_64-linux-gnu/libbliss.so.<major>
-/usr/share/man/man1/bliss.1.gz
-/usr/share/doc/bliss/copyright
+/usr/bin/torcl
+/usr/lib/torcl/torcl.bimg
+/usr/lib/x86_64-linux-gnu/libtorcl.so.<major>
+/usr/share/man/man1/torcl.1.gz
+/usr/share/doc/torcl/copyright
 ```
 
 ### 7.7.5  Homebrew Formula
 
 ```ruby
-class Bliss < Formula
+class TorCL < Formula
   desc "Common Lisp implementation inspired by HotSpot"
-  homepage "https://github.com/user/bliss"
-  url "https://github.com/user/bliss/archive/refs/tags/v#{version}.tar.gz"
+  homepage "https://github.com/user/torcl"
+  url "https://github.com/user/torcl/archive/refs/tags/v#{version}.tar.gz"
   depends_on "rust" => :build
   def install
     system "cargo", "build", "--release"
-    bin.install "target/release/bliss"
-    lib.install "target/release/libbliss.dylib"
+    bin.install "target/release/torcl"
+    lib.install "target/release/libtorcl.dylib"
     # Build default image via the bootstrap sequence (see §0 section 3,
     # lib/boot.lisp).  --bootstrap loads the minimal runtime from
     # lib/boot.lisp without requiring a pre-existing image, providing
     # enough of the CL environment to execute SAVE-IMAGE.
-    system bin/"bliss", "--bootstrap", "--eval",
-           "(bliss-ext:save-image \"#{lib}/bliss/bliss.bimg\")"
+    system bin/"torcl", "--bootstrap", "--eval",
+           "(torcl-ext:save-image \"#{lib}/torcl/torcl.bimg\")"
   end
 end
 ```
@@ -578,8 +578,8 @@ The project follows [SemVer 2.0](https://semver.org/):
 ### 7.8.2  C-ABI Stability
 
 The shared library soname encodes the major version:
-`libbliss.so.1`, `libbliss.so.2`, etc.  Functions in the public C
-header are annotated `BLISS_API` and MUST NOT change signature within
+`libtorcl.so.1`, `libtorcl.so.2`, etc.  Functions in the public C
+header are annotated `TORCL_API` and MUST NOT change signature within
 a major version (R7.14).
 
 ### 7.8.3  Image Format Version
@@ -620,7 +620,7 @@ Fields:
 
 ### 7.9.2  GC Log Channel
 
-Enabled by `BLISS_GC_LOG=1` or `--gc-log` (R7.18).  Events:
+Enabled by `TORCL_GC_LOG=1` or `--gc-log` (R7.18).  Events:
 
 | Event | Key Fields |
 |-------|------------|
@@ -633,7 +633,7 @@ Enabled by `BLISS_GC_LOG=1` or `--gc-log` (R7.18).  Events:
 
 ### 7.9.3  JIT Log Channel
 
-Enabled by `BLISS_JIT_LOG=1` or `--jit-log` (R7.18).  Events:
+Enabled by `TORCL_JIT_LOG=1` or `--jit-log` (R7.18).  Events:
 
 | Event | Key Fields |
 |-------|------------|
@@ -645,7 +645,7 @@ Enabled by `BLISS_JIT_LOG=1` or `--jit-log` (R7.18).  Events:
 
 ### 7.9.4  Perf-Map for Linux `perf`
 
-When `BLISS_PERF_MAP=1` (default on Linux), the JIT compiler writes
+When `TORCL_PERF_MAP=1` (default on Linux), the JIT compiler writes
 entries to `/tmp/perf-<pid>.map` in the standard format (R7.17):
 
 ```text
@@ -662,12 +662,12 @@ the `probe!` macro (Rust `usdt` crate):
 
 | Probe | Arguments |
 |-------|-----------|
-| `bliss:gc:minor-start` | `thread_id` |
-| `bliss:gc:minor-end` | `copied_bytes`, `pause_ns` |
-| `bliss:gc:major-start` | `heap_used` |
-| `bliss:gc:major-end` | `freed_bytes`, `pause_ns` |
-| `bliss:jit:compile` | `function_name`, `tier`, `code_size` |
-| `bliss:jit:deopt` | `function_name`, `reason` |
+| `torcl:gc:minor-start` | `thread_id` |
+| `torcl:gc:minor-end` | `copied_bytes`, `pause_ns` |
+| `torcl:gc:major-start` | `heap_used` |
+| `torcl:gc:major-end` | `freed_bytes`, `pause_ns` |
+| `torcl:jit:compile` | `function_name`, `tier`, `code_size` |
+| `torcl:jit:deopt` | `function_name`, `reason` |
 
 ---
 
@@ -692,12 +692,12 @@ the `probe!` macro (Rust `usdt` crate):
 | Image round-trip | Save image, load in new process, verify heap integrity | Per-PR |
 | Relocation | Save at address A, force load at address B, run test suite | Per-PR |
 | Standalone executable | Build standalone, execute, check output | Per-PR |
-| Shared library embedding | C test harness calls `bliss_init` / `bliss_eval` / `bliss_destroy` | Per-PR |
+| Shared library embedding | C test harness calls `torcl_init` / `torcl_eval` / `torcl_destroy` | Per-PR |
 | Configuration precedence | Test env-var → CLI override → in-image default ordering | Per-PR |
 | Cross-platform image rejection | Attempt to load a Linux image on macOS mock; expect error | Per-PR |
 | Perf-map emission | JIT-compile a function, verify map file contains entry | Nightly |
 | Structured log parsing | Capture log output, parse as JSON, validate schema | Per-PR |
-| Debian package | `dpkg -i`, verify paths, run `bliss --version` | Release |
+| Debian package | `dpkg -i`, verify paths, run `torcl --version` | Release |
 
 ---
 
@@ -718,15 +718,15 @@ log-writer thread drains the ring and writes to stderr.
 
 | Source File | Responsibility | Spec Refs |
 |-------------|---------------|-----------|
-| `crates/bliss-rt/src/startup.rs` | Image load, appended-image detection, CLI parsing | R7.02–R7.07 |
-| `crates/bliss-rt/src/image.rs` | Image serialisation / deserialisation, relocation | R7.01, R7.03, R7.04, R7.20 |
-| `crates/bliss-rt/src/image/header.rs` | Header and section directory types (D7.01, D7.02) | R7.04, R7.15 |
-| `crates/bliss-rt/src/image/reloc.rs` | Relocation table encoder / decoder (A7.01) | R7.03 |
-| `crates/bliss-rt/src/config.rs` | Configuration resolution (env → CLI → image) | R7.11 |
-| `crates/bliss-rt/src/log.rs` | Structured logger, GC/JIT channels | R7.16–R7.18 |
-| `crates/bliss-rt/src/perf_map.rs` | Linux perf-map writer | R7.17 |
-| `crates/bliss-rt/src/dtrace.rs` | USDT probe definitions | §7.9.5 |
-| `crates/bliss/src/main.rs` | CLI flag parsing, REPL/script dispatch | R7.07 |
+| `crates/torcl-rt/src/startup.rs` | Image load, appended-image detection, CLI parsing | R7.02–R7.07 |
+| `crates/torcl-rt/src/image.rs` | Image serialisation / deserialisation, relocation | R7.01, R7.03, R7.04, R7.20 |
+| `crates/torcl-rt/src/image/header.rs` | Header and section directory types (D7.01, D7.02) | R7.04, R7.15 |
+| `crates/torcl-rt/src/image/reloc.rs` | Relocation table encoder / decoder (A7.01) | R7.03 |
+| `crates/torcl-rt/src/config.rs` | Configuration resolution (env → CLI → image) | R7.11 |
+| `crates/torcl-rt/src/log.rs` | Structured logger, GC/JIT channels | R7.16–R7.18 |
+| `crates/torcl-rt/src/perf_map.rs` | Linux perf-map writer | R7.17 |
+| `crates/torcl-rt/src/dtrace.rs` | USDT probe definitions | §7.9.5 |
+| `crates/torcl/src/main.rs` | CLI flag parsing, REPL/script dispatch | R7.07 |
 
 ---
 
@@ -751,7 +751,7 @@ The runtime chooses exactly one startup profile in the following order
    rooted at `lib/boot.lisp`.
 5. `--no-image` — start with an empty heap and no boot image.
 6. Appended image on the executable — if present and valid, load it.
-7. Default image discovery via `--image` or `BLISS_IMAGE_PATH`.
+7. Default image discovery via `--image` or `TORCL_IMAGE_PATH`.
 8. Fallback interactive REPL with no image if all image discovery
    mechanisms fail and stdin is a terminal.
 
@@ -781,7 +781,7 @@ Bootstrap mode MUST:
 - Search for `lib/boot.lisp` relative to the current working directory,
   then relative to the installed prefix, and fail with `FILE-ERROR` if
   neither location is valid.
-- Permit `(bliss-ext:save-image ...)` once the bootstrap sequence has
+- Permit `(torcl-ext:save-image ...)` once the bootstrap sequence has
   completed successfully.
 - Continue to load the standard bootstrap prelude unless
   `--no-bootstrap` is set; `--no-bootstrap` selects the raw

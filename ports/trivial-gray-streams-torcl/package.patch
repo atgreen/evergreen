@@ -1,0 +1,18 @@
+--- a/package.lisp
++++ b/package.lisp
+@@ -57,5 +57,6 @@
+               (:import-from
+                #+sbcl :sb-gray
++               #+torcl :torcl-gray-streams
+                #+allegro :excl
+                #+cmu :ext
+                #+(or clisp ecl mkcl mocl clasp clamiga) :gray
+@@ -64,7 +65,7 @@
+                #+(or abcl genera) :gray-streams
+                #+mezzano :mezzano.gray
+                #+dotcl :dotcl-gray
+-               #-(or sbcl allegro cmu clisp openmcl lispworks ecl clasp mkcl abcl mocl genera mezzano dotcl clamiga) ...
++               #-(or torcl sbcl allegro cmu clisp openmcl lispworks ecl clasp mkcl abcl mocl genera mezzano dotcl clamiga) ...
+                ,@gray-class-symbols
+                ,@gray-function-symbols)
+               (:export

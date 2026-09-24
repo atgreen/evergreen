@@ -2,13 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin="${BLISS_BIN:-$repo_root/target/x86_64-unknown-linux-musl/release/bliss-cli}"
-reps="${BLISS_PROFILE_GATE_REPS:-5}"
-iterations="${BLISS_PROFILE_GATE_ITERATIONS:-250000}"
+bin="${TORCL_BIN:-$repo_root/target/x86_64-unknown-linux-musl/release/torcl}"
+reps="${TORCL_PROFILE_GATE_REPS:-5}"
+iterations="${TORCL_PROFILE_GATE_ITERATIONS:-250000}"
 
 if [[ ! -x "$bin" ]]; then
   echo "missing executable: $bin" >&2
-  echo "build one with: cargo build -p bliss-cli --release --target x86_64-unknown-linux-musl" >&2
+  echo "build one with: cargo build -p torcl --release --target x86_64-unknown-linux-musl" >&2
   exit 2
 fi
 
@@ -26,9 +26,9 @@ median_ns() {
   for ((i = 0; i < reps; i++)); do
     start="$(date +%s%N)"
     if [[ "$mode" == disabled ]]; then
-      BLISS_PROFILING_DISABLED=1 "$bin" --no-init --eval "$program" >/dev/null
+      TORCL_PROFILING_DISABLED=1 "$bin" --no-init --eval "$program" >/dev/null
     else
-      env -u BLISS_PROFILING_DISABLED "$bin" --no-init --eval "$program" >/dev/null
+      env -u TORCL_PROFILING_DISABLED "$bin" --no-init --eval "$program" >/dev/null
     fi
     end="$(date +%s%N)"
     elapsed=$((end - start))

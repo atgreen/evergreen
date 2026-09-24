@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# event-viewer.sh — render a bliss run's JIT/GC event stream as a self-contained,
+# event-viewer.sh — render a torcl run's JIT/GC event stream as a self-contained,
 # JITWatch-style HTML page (bliss-3gme, profiling epic bliss-bfxm).
 #
-# Bliss records a JFR-style event stream (tier promotions, deopt-with-reason,
-# OSR entries, GC pauses) into a low-overhead ring buffer when BLISS_EVENTS=1.
-# This wrapper runs a bliss command with recording on, has it dump the stream as
-# JSON via BLISS-EXT:EVENTS-JSON, and injects that JSON into
+# TorCL records a JFR-style event stream (tier promotions, deopt-with-reason,
+# OSR entries, GC pauses) into a low-overhead ring buffer when TORCL_EVENTS=1.
+# This wrapper runs a torcl command with recording on, has it dump the stream as
+# JSON via TORCL-EXT:EVENTS-JSON, and injects that JSON into
 # tools/event-viewer/viewer.html to produce a standalone page (no server, no
 # external assets) you open in a browser — the offline model of JITWatch / JDK
 # Mission Control.
 #
 # Usage:
-#   scripts/event-viewer.sh [--out FILE] -- <bliss-cli command...>
+#   scripts/event-viewer.sh [--out FILE] -- <torcl command...>
 #
 # The command runs exactly as given (add --load / --eval yourself); this wrapper
-# sets BLISS_EVENTS=1 (record) and BLISS_EVENTS_DUMP=<file> (bliss writes the
+# sets TORCL_EVENTS=1 (record) and TORCL_EVENTS_DUMP=<file> (torcl writes the
 # stream as JSON to that file as it exits), so it works with any workload —
 # --load, --eval, or a REPL session — without editing your program.
 #
 # Options:
-#   --out FILE   output HTML path (default: /tmp/bliss-events.html)
+#   --out FILE   output HTML path (default: /tmp/torcl-events.html)
 #
 # Example:
 #   scripts/event-viewer.sh --out /tmp/babel-jit.html -- \
-#     target/x86_64-unknown-linux-musl/release/bliss-cli --no-init --load babel-load.lisp
+#     target/x86_64-unknown-linux-musl/release/torcl --no-init --load babel-load.lisp
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$HERE/tools/event-viewer/viewer.html"
-OUT="/tmp/bliss-events.html"
+OUT="/tmp/torcl-events.html"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,22 +38,22 @@ while [[ $# -gt 0 ]]; do
     *) echo "event-viewer.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
-[[ $# -gt 0 ]] || { echo "event-viewer.sh: no bliss command given (use: ... -- <bliss-cli ...>)" >&2; exit 2; }
+[[ $# -gt 0 ]] || { echo "event-viewer.sh: no torcl command given (use: ... -- <torcl ...>)" >&2; exit 2; }
 [[ -f "$TEMPLATE" ]] || { echo "event-viewer.sh: template not found: $TEMPLATE" >&2; exit 1; }
 
-WORK="$(mktemp -d /tmp/bliss-events.XXXXXX)"
+WORK="$(mktemp -d /tmp/torcl-events.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 DUMP="$WORK/events.json"
 
-# BLISS_EVENTS_DUMP makes bliss write the ring buffer as JSON to $DUMP as it
+# TORCL_EVENTS_DUMP makes torcl write the ring buffer as JSON to $DUMP as it
 # exits — after the whole workload has run, whatever way it ends.
-echo "[event-viewer] recording (BLISS_EVENTS=1) ..." >&2
-BLISS_EVENTS=1 BLISS_EVENTS_DUMP="$DUMP" "$@" >/dev/null 2>&1 || true
+echo "[event-viewer] recording (TORCL_EVENTS=1) ..." >&2
+TORCL_EVENTS=1 TORCL_EVENTS_DUMP="$DUMP" "$@" >/dev/null 2>&1 || true
 
 JSON="$(grep -m1 '^{"events":' "$DUMP" 2>/dev/null || true)"
 if [[ -z "$JSON" ]]; then
   echo "[event-viewer] no event JSON captured (is $DUMP written?)." >&2
-  echo "  The command must reach process exit so bliss can flush the dump." >&2
+  echo "  The command must reach process exit so torcl can flush the dump." >&2
   exit 1
 fi
 

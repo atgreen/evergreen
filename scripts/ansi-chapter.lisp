@@ -23,7 +23,7 @@
 (defparameter *aux-dir* (truename (merge-pathnames "auxiliary/" *ansi-test-dir*)))
 (setq *default-pathname-defaults* *ansi-test-dir*)
 
-(format t "~%=== ANSI chapter ~a (bliss gate) ===~%" *ansi-chapter*)
+(format t "~%=== ANSI chapter ~a (torcl gate) ===~%" *ansi-chapter*)
 
 (load (merge-pathnames "compile-and-load.lsp" *ansi-test-dir*))
 (load (merge-pathnames "rt-package.lsp" *ansi-test-dir*))

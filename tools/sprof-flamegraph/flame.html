@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bliss Lisp Flamegraph</title>
+<title>TorCL Lisp Flamegraph</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap">
 <style>
@@ -32,7 +32,7 @@
   footer{margin-top:28px;color:var(--muted);font-size:.8rem;border-top:1px solid var(--line);padding-top:12px}
   footer code{font-family:var(--font-mono)}
 </style></head><body><div class="wrap">
-<header><div><div class="e">bliss · lisp CPU profile</div><h1>Flamegraph</h1></div><span class="sub" id="sub">—</span></header>
+<header><div><div class="e">torcl · lisp CPU profile</div><h1>Flamegraph</h1></div><span class="sub" id="sub">—</span></header>
 <div class="controls">
   <button class="reset" id="reset">Reset zoom</button>
   <input id="search" placeholder="highlight function…">
@@ -44,7 +44,7 @@
   </div>
 </div>
 <div id="chart"></div>
-<footer>Sampled Lisp call stacks (<code>BLISS-EXT:SPROF</code> / <code>BLISS_SPROF</code>). Width = share of samples; color = tier. Click a frame to zoom, click Reset to return.</footer>
+<footer>Sampled Lisp call stacks (<code>TORCL-EXT:SPROF</code> / <code>TORCL_SPROF</code>). Width = share of samples; color = tier. Click a frame to zoom, click Reset to return.</footer>
 </div>
 <div id="tip"></div>
 <script>

@@ -36,42 +36,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "bliss-cli"
-version = "0.1.0"
-dependencies = [
- "bliss-compiler",
- "bliss-rt",
- "bliss-stdlib",
- "iced-x86",
-]
-
-[[package]]
-name = "bliss-compiler"
-version = "0.1.0"
-dependencies = [
- "bliss-rt",
- "proptest",
- "regalloc2",
-]
-
-[[package]]
-name = "bliss-rt"
-version = "0.1.0"
-dependencies = [
- "elf_loader",
- "libc",
-]
-
-[[package]]
-name = "bliss-stdlib"
-version = "0.1.0"
-dependencies = [
- "bliss-compiler",
- "bliss-rt",
- "rustyline",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,6 +464,42 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "torcl"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "torcl-compiler",
+ "torcl-rt",
+ "torcl-stdlib",
+]
+
+[[package]]
+name = "torcl-compiler"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "regalloc2",
+ "torcl-rt",
+]
+
+[[package]]
+name = "torcl-rt"
+version = "0.1.0"
+dependencies = [
+ "elf_loader",
+ "libc",
+]
+
+[[package]]
+name = "torcl-stdlib"
+version = "0.1.0"
+dependencies = [
+ "rustyline",
+ "torcl-compiler",
+ "torcl-rt",
 ]
 
 [[package]]

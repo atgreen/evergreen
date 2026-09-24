@@ -1,6 +1,6 @@
-# Bliss architecture overview
+# TorCL architecture overview
 
-Bliss is a Common Lisp implementation whose bootstrap system is written in
+TorCL is a Common Lisp implementation whose bootstrap system is written in
 Rust. Its long-term direction is a self-hosting Lisp with a HotSpot-inspired
 execution engine: cold code starts cheaply, hot code is promoted to native
 tiers, and optimized code can deoptimize without changing program semantics.
@@ -15,32 +15,32 @@ being integrated into the bootstrap system.
 The Cargo dependency graph is intentionally layered:
 
 ```text
-crates/bliss -------------------------------> crates/bliss-rt
+crates/torcl -------------------------------> crates/torcl-rt
     |                                               ^
-    +---> crates/bliss-compiler --------------------+
+    +---> crates/torcl-compiler --------------------+
     |               ^                               ^
     |               |                               |
-    +---> crates/bliss-stdlib ----------------------+
+    +---> crates/torcl-stdlib ----------------------+
 ```
 
-`crates/bliss-rt` is the foundation and has no dependency on the compiler or
-standard library. `crates/bliss-compiler` depends on the runtime's value and
-bytecode representations. `crates/bliss-stdlib` builds on both. The `bliss-cli`
+`crates/torcl-rt` is the foundation and has no dependency on the compiler or
+standard library. `crates/torcl-compiler` depends on the runtime's value and
+bytecode representations. `crates/torcl-stdlib` builds on both. The `torcl`
 package depends on all three and connects them to a runnable Lisp.
 
 | Component | Primary responsibility |
 | --- | --- |
-| `crates/bliss-rt` | VM substrate: tagged values, heap object layouts, allocation and GC, function metadata, Lisp stacks, safepoints, threads and fibers, synchronization, images, BFASL support, FFI, sandboxing, and OS services |
-| `crates/bliss-compiler` | Reusable compiler facilities: reader, macro-expansion environment, profiling and tier policy types, intermediate representations, optimization, register allocation, OSR/deoptimization metadata, and native code emission |
-| `crates/bliss-stdlib` | Rust bootstrap implementation of library behavior: packages, CLOS, conditions and restarts, streams, sequences, hash tables, `FORMAT`, pathnames, time, and developer tools |
-| `crates/bliss` | Process-facing integration: CLI and REPL, loading, evaluator state, tree-walking fallback, form-to-bytecode lowering, T0 interpretation, T1 emission, tier dispatch, and bridges between compiler, runtime, and stdlib |
+| `crates/torcl-rt` | VM substrate: tagged values, heap object layouts, allocation and GC, function metadata, Lisp stacks, safepoints, threads and fibers, synchronization, images, BFASL support, FFI, sandboxing, and OS services |
+| `crates/torcl-compiler` | Reusable compiler facilities: reader, macro-expansion environment, profiling and tier policy types, intermediate representations, optimization, register allocation, OSR/deoptimization metadata, and native code emission |
+| `crates/torcl-stdlib` | Rust bootstrap implementation of library behavior: packages, CLOS, conditions and restarts, streams, sequences, hash tables, `FORMAT`, pathnames, time, and developer tools |
+| `crates/torcl` | Process-facing integration: CLI and REPL, loading, evaluator state, tree-walking fallback, form-to-bytecode lowering, T0 interpretation, T1 emission, tier dispatch, and bridges between compiler, runtime, and stdlib |
 | `lib/boot.lisp` | Lisp-side bootstrap prelude. It implements macros and ordinary functions that do not belong in the evaluator |
 | `lib/asdf.*` and `lib/slynk/` | Bundled real-world library and editor-integration payloads |
 
-The large `crates/bliss/src/cli.rs` is therefore both a user interface and a
+The large `crates/torcl/src/cli.rs` is therefore both a user interface and a
 bootstrap integration layer. It is not the desired final home for library
 behavior. When the evaluator exposes a Common Lisp operation, it should
-delegate to `bliss-stdlib`; new package, stream, sequence, condition, pathname,
+delegate to `torcl-stdlib`; new package, stream, sequence, condition, pathname,
 or similar semantics belong in the stdlib crate first.
 
 ## From source text to execution
@@ -68,12 +68,12 @@ reader -> Lisp forms -> macro expansion -> top-level dispatcher
              interpreter      native         native
 ```
 
-1. `bliss-compiler::reader` turns characters into `BlissVal` forms and interns
+1. `torcl-compiler::reader` turns characters into `TorclVal` forms and interns
    symbols in the runtime symbol registry.
 2. The compiler macro-expander processes forms using an environment assembled
    from the live bootstrap evaluator. This bridge lets macros defined by loaded
    Lisp code participate in later compilation.
-3. The top-level dispatcher in `crates/bliss/src/cli/bytecode.rs` preserves
+3. The top-level dispatcher in `crates/torcl/src/cli/bytecode.rs` preserves
    Common Lisp top-level semantics for forms such as `EVAL-WHEN`, `PROGN`, and
    defining forms. A `DEFUN` is installed in the evaluator and, when supported,
    lowered to a `BytecodeFunction`.
@@ -95,14 +95,14 @@ program counters identify source locations, profiling sites, stack maps, OSR
 entries, and deoptimization continuations. A tier transition is an execution
 policy decision; it must not change observable Common Lisp behavior.
 
-The bytecode backend is the default. `BLISS_BACKEND=tree-walker` selects the
+The bytecode backend is the default. `TORCL_BACKEND=tree-walker` selects the
 fallback directly, chiefly for diagnosis and differential tests. The compiler
 still has coverage gaps, so real programs commonly use compiled and
 tree-walked paths in the same process.
 
 ## Runtime object and memory model
 
-Every Lisp value crosses subsystem boundaries as a 64-bit `BlissVal`. Low tag
+Every Lisp value crosses subsystem boundaries as a 64-bit `TorclVal`. Low tag
 bits distinguish immediates such as fixnums and characters from conses,
 general heap objects, symbols, and functions. Most heap objects begin with an
 `ObjectHeader` containing their type, size, identity hash, and structural GC
@@ -114,7 +114,7 @@ the active entry point, current tier, and compilation flags. Redefinition
 updates this state in place so inline caches, profiling, and deoptimization can
 refer to a stable function identity.
 
-The collector in `bliss-rt` is precise, generational, moving, and region based:
+The collector in `torcl-rt` is precise, generational, moving, and region based:
 
 - Mutators allocate through thread-local allocation buffers in nursery
   regions.
@@ -128,21 +128,21 @@ The collector in `bliss-rt` is precise, generational, moving, and region based:
   literal pools, stdlib registries, and scoped Rust locals all contribute
   precise roots.
 
-Because nursery objects move, a raw `BlissVal` held only in a Rust local is not
+Because nursery objects move, a raw `TorclVal` held only in a Rust local is not
 safe across an allocation. Allocating code roots live host values with
-`bliss_rt::rooted!` or `bliss_rt::rooted_ref!`; the collector then rewrites the
+`torcl_rt::rooted!` or `torcl_rt::rooted_ref!`; the collector then rewrites the
 root in place. It is equally important not to hold a `RefCell` borrow of
 GC-scanned state while allocating, because collection re-enters root scanners.
 The detailed contract is in [GC rooting](design/gc-rooting.md).
 
 ## Lisp and host state
 
-Bliss is partway through moving bootstrap data into uniform heap
+TorCL is partway through moving bootstrap data into uniform heap
 representations. The runtime heap and global symbol cells already provide the
 shared representation used by interpreted and compiled code. The bootstrap
 `Env`, however, still owns some lexical environments, macro definitions,
 closures, CLOS metadata, handlers, restarts, and multiple-value state in Rust
-structures. Those structures implement root tracing so their `BlissVal` fields
+structures. Those structures implement root tracing so their `TorclVal` fields
 remain valid across moving collections.
 
 Subsystems with host-side registries install explicit GC and image hooks. This
@@ -153,7 +153,7 @@ not a separate object model that new code should extend.
 
 ## Standard-library boundary
 
-`bliss-stdlib` owns reusable Common Lisp library semantics. The CLI maps Lisp
+`torcl-stdlib` owns reusable Common Lisp library semantics. The CLI maps Lisp
 calls onto those APIs and supplies evaluator callbacks where the library needs
 to invoke Lisp code. Examples include CLOS method execution, condition
 handlers, stream operations, `FORMAT`, generic sequence operations, hash-table
@@ -167,13 +167,13 @@ the low-level Rust runtime.
 
 ## Stacks, threads, and platform services
 
-Each managed fiber owns a `BlissStack`, separate from the carrier thread's Rust
+Each managed fiber owns a `TorclStack`, separate from the carrier thread's Rust
 stack. T0 and native frames use a shared walkable layout with frame metadata and
 stack maps, allowing the GC, debugger, OSR, and deoptimizer to describe live
 values consistently. Safepoint polling coordinates stack publication, garbage
 collection, cooperative scheduling, and pending signal delivery.
 
-`bliss-rt` also contains the M:N fiber scheduler, native-thread support,
+`torcl-rt` also contains the M:N fiber scheduler, native-thread support,
 synchronization primitives, timers, asynchronous file-descriptor waits, signal
 handling, and the foreign-function bridge. Linux runtime services use direct
 syscalls where practical, which permits a fully static default build. That
@@ -188,7 +188,7 @@ remain staged work.
 
 ## Startup and persistence
 
-`crates/bliss/src/main.rs` delegates process startup to the CLI driver. The
+`crates/torcl/src/main.rs` delegates process startup to the CLI driver. The
 driver parses options, installs signal and registry hooks, creates the initial
 environment, and then chooses between image and bootstrap paths:
 
@@ -205,10 +205,10 @@ environment, and then chooses between image and bootstrap paths:
 
 There are two complementary persistence formats:
 
-- BFASL (`bliss-rt::bfasl`) packages portable compiled bytecode units plus
+- BFASL (`torcl-rt::bfasl`) packages portable compiled bytecode units plus
   source/debug metadata. When a source unit cannot yet be externalized as
   bytecode, the current compiler can emit a loadable source-form fallback.
-- Core images (`bliss-rt::image`) snapshot the runtime heap and associated
+- Core images (`torcl-rt::image`) snapshot the runtime heap and associated
   registries for fast restoration and saved executables.
 
 ## Repository guide
@@ -217,16 +217,16 @@ The most useful entry points for following a feature end to end are:
 
 | Area | Start here |
 | --- | --- |
-| Process modes and bootstrap evaluation | `crates/bliss/src/cli.rs` |
-| Bytecode lowering, T0/T1 dispatch, and tier integration | `crates/bliss/src/cli/bytecode.rs` |
-| Tagged values and heap layouts | `crates/bliss-rt/src/value.rs`, `crates/bliss-rt/src/object.rs`, and `crates/bliss-rt/src/function.rs` |
-| GC and root protocol | `crates/bliss-rt/src/gc.rs` and `docs/design/gc-rooting.md` |
-| Lisp stacks, threads, fibers, and safepoints | `crates/bliss-rt/src/stack.rs`, `crates/bliss-rt/src/thread.rs`, `crates/bliss-rt/src/scheduler.rs`, and `crates/bliss-rt/src/safepoint.rs` |
-| Reader and macro expansion | `crates/bliss-compiler/src/reader.rs` and `crates/bliss-compiler/src/macroexpand.rs` |
-| Optimizing compiler | `crates/bliss-compiler/src/t2/` |
-| Library subsystems | `crates/bliss-stdlib/src/` |
+| Process modes and bootstrap evaluation | `crates/torcl/src/cli.rs` |
+| Bytecode lowering, T0/T1 dispatch, and tier integration | `crates/torcl/src/cli/bytecode.rs` |
+| Tagged values and heap layouts | `crates/torcl-rt/src/value.rs`, `crates/torcl-rt/src/object.rs`, and `crates/torcl-rt/src/function.rs` |
+| GC and root protocol | `crates/torcl-rt/src/gc.rs` and `docs/design/gc-rooting.md` |
+| Lisp stacks, threads, fibers, and safepoints | `crates/torcl-rt/src/stack.rs`, `crates/torcl-rt/src/thread.rs`, `crates/torcl-rt/src/scheduler.rs`, and `crates/torcl-rt/src/safepoint.rs` |
+| Reader and macro expansion | `crates/torcl-compiler/src/reader.rs` and `crates/torcl-compiler/src/macroexpand.rs` |
+| Optimizing compiler | `crates/torcl-compiler/src/t2/` |
+| Library subsystems | `crates/torcl-stdlib/src/` |
 | Lisp bootstrap layer | `lib/boot.lisp` |
-| Lisp-visible implementation extensions | `docs/bliss-lisp-api.md` |
+| Lisp-visible implementation extensions | `docs/torcl-lisp-api.md` |
 | Normative requirements and staged roadmap | `spec/INDEX.md` and `spec/stages.json` |
 
 Tests normally live with the crate that owns the behavior. Cross-cutting Lisp
@@ -236,7 +236,7 @@ current vertical slice; specification coverage is checked by
 `scripts/spec-coverage.py`.
 
 The central architectural test for a change is ownership: put representation,
-allocation, stacks, or OS machinery in `bliss-rt`; compiler analysis in
-`bliss-compiler`; Common Lisp library behavior in `bliss-stdlib` or Lisp; and
+allocation, stacks, or OS machinery in `torcl-rt`; compiler analysis in
+`torcl-compiler`; Common Lisp library behavior in `torcl-stdlib` or Lisp; and
 only process orchestration and the remaining bootstrap bridges in
-`crates/bliss`.
+`crates/torcl`.

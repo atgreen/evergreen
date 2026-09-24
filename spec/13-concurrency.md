@@ -5,8 +5,8 @@ hierarchy, lock-free structures, fiber scheduling, GC
 safepoint/thread-suspension interaction, async signal safety.
 Supersedes fragments in §2.11, §3.11, §5.1.5, §5.4.7, §8.8.
 
-Source: `crates/bliss-rt/src/{thread,scheduler,safepoint,signal}.rs`,
-`crates/bliss-rt/src/gc/`.
+Source: `crates/torcl-rt/src/{thread,scheduler,safepoint,signal}.rs`,
+`crates/torcl-rt/src/gc/`.
 
 ---
 
@@ -14,10 +14,10 @@ Source: `crates/bliss-rt/src/{thread,scheduler,safepoint,signal}.rs`,
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R13.01 | Bliss MUST provide sequential consistency for reads and writes to special (dynamically-bound) variables within a single thread. | MUST |
+| R13.01 | TorCL MUST provide sequential consistency for reads and writes to special (dynamically-bound) variables within a single thread. | MUST |
 | R13.02 | Reads and writes to global symbol value cells from different threads MUST use acquire-release ordering. | MUST |
 | R13.03 | Reads and writes to CLOS slot values from different threads MAY use relaxed ordering unless the slot is declared `(:synchronized t)`. | MAY |
-| R13.04 | Atomic compare-and-swap operations (`BLISS-EXT:CAS`) MUST provide acquire-release semantics. | MUST |
+| R13.04 | Atomic compare-and-swap operations (`TORCL-EXT:CAS`) MUST provide acquire-release semantics. | MUST |
 | R13.05 | A complete lock-ordering hierarchy MUST be defined spanning all subsystems; acquiring locks out of order MUST be detected in debug builds (see also R8.16). | MUST |
 | R13.06 | The lock hierarchy MUST be documented as a single total order with numeric levels; every lock in the system MUST be assigned a level. | MUST |
 | R13.07 | Symbol value cells, inline-cache (IC) patch words, and profiling counters MUST be implemented as lock-free data structures. | MUST |
@@ -28,18 +28,18 @@ Source: `crates/bliss-rt/src/{thread,scheduler,safepoint,signal}.rs`,
 | R13.12 | Fibers or native threads in the `Blocked` state MUST publish their stack top before blocking; the GC MUST be able to scan their stacks without waking them. | MUST |
 | R13.13 | All signal handlers MUST be async-signal-safe; non-trivial work MUST be deferred to the next safepoint via per-thread flags (see also R8.10). | MUST |
 | R13.14 | The runtime MUST support a `SIGUSR1` fallback to interrupt threads blocked in long-running syscalls, but the handler MUST only set a flag — it MUST NOT suspend the thread. | MUST |
-| R13.15 | The runtime MUST provide `BLISS-EXT:WITH-ATOMIC` — a macro that disables thread preemption (yield-flag checks) for its dynamic extent, to allow short critical sections without locks. | MUST |
+| R13.15 | The runtime MUST provide `TORCL-EXT:WITH-ATOMIC` — a macro that disables thread preemption (yield-flag checks) for its dynamic extent, to allow short critical sections without locks. | MUST |
 | R13.16 | `WITH-ATOMIC` sections MUST NOT span safepoints; the compiler MUST reject code that places a safepoint poll inside a `WITH-ATOMIC` body if the body exceeds an estimated 10 µs execution bound. | MUST |
 | R13.17 | The runtime MUST support execution-local dynamic bindings: each native thread and each fiber has its own binding stack for special variables. Binding a special variable in one execution MUST NOT affect another. | MUST |
-| R13.18 | The runtime MUST provide exposed OS-backed thread lifecycle and introspection in `BLISS-THREAD`, plus a distinct lightweight fiber lifecycle and introspection API in `BLISS-FIBER` (§9.2). A thread and a fiber MUST NOT be aliases or accepted interchangeably. | MUST |
-| R13.19 | Mutex, condition-variable, read-write-lock, and semaphore primitives MUST be provided in the `BLISS-THREAD` package. | MUST |
+| R13.18 | The runtime MUST provide exposed OS-backed thread lifecycle and introspection in `TORCL-THREAD`, plus a distinct lightweight fiber lifecycle and introspection API in `TORCL-FIBER` (§9.2). A thread and a fiber MUST NOT be aliases or accepted interchangeably. | MUST |
+| R13.19 | Mutex, condition-variable, read-write-lock, and semaphore primitives MUST be provided in the `TORCL-THREAD` package. | MUST |
 | R13.20 | The runtime SHOULD detect potential deadlocks (lock-wait-graph cycle detection) in debug builds (see also R8.21). | SHOULD |
 
 ---
 
 ## 13.2 Memory Model
 
-Bliss exposes a memory model to CL code that balances safety with
+TorCL exposes a memory model to CL code that balances safety with
 performance. It is **not** sequentially consistent by default — relaxed
 access is permitted for slot reads to allow the JIT to avoid memory
 fences on hot paths.
@@ -54,8 +54,8 @@ fences on hot paths.
 | CLOS slot read (unsynchronized) | **Relaxed** | No ordering guarantee across threads. User must use explicit synchronisation if sharing mutable objects. (R13.03) |
 | CLOS slot read (`:synchronized t`) | **Acquire** | Compiler emits an acquire fence after the load. |
 | CLOS slot write (`:synchronized t`) | **Release** | Compiler emits a release fence before the store. |
-| `BLISS-EXT:CAS` | **Acquire-Release** (AcqRel) | Both success and failure paths use AcqRel. (R13.04) |
-| `BLISS-EXT:ATOMIC-INCF` / `ATOMIC-DECF` | **Acquire-Release** | Fetch-and-add with AcqRel ordering. |
+| `TORCL-EXT:CAS` | **Acquire-Release** (AcqRel) | Both success and failure paths use AcqRel. (R13.04) |
+| `TORCL-EXT:ATOMIC-INCF` / `ATOMIC-DECF` | **Acquire-Release** | Fetch-and-add with AcqRel ordering. |
 | Hash-table entry read (synchronized table) | **Acquire** (via striped lock) | Lock acquisition provides the fence. |
 | Hash-table entry write (synchronized table) | **Release** (via striped lock) | Lock release provides the fence. |
 | Write-barrier stores (SATB buffer, card table) | **Relaxed** | Benign races acceptable (§3.11). |
@@ -63,7 +63,7 @@ fences on hot paths.
 ### 13.2.2 Data-Race Semantics
 
 A data race on a non-atomic CL value MUST NOT crash the process. All
-`BlissVal` slots are `AtomicU64` at the Rust level with relaxed
+`TorclVal` slots are `AtomicU64` at the Rust level with relaxed
 loads/stores for unsynchronized paths. A racy read MAY return a stale
 value but MUST NOT return a value with an invalid tag. The type tag is
 always written atomically with the payload (naturally aligned 64-bit
@@ -73,9 +73,9 @@ writes are tear-free on x86-64 and aarch64).
 
 | Primitive | Mapping |
 |-----------|---------|
-| `BLISS-EXT:MEMORY-BARRIER` | Full `SeqCst` fence. |
-| `BLISS-EXT:LOAD-BARRIER` | `fence(Acquire)`. |
-| `BLISS-EXT:STORE-BARRIER` | `fence(Release)`. |
+| `TORCL-EXT:MEMORY-BARRIER` | Full `SeqCst` fence. |
+| `TORCL-EXT:LOAD-BARRIER` | `fence(Acquire)`. |
+| `TORCL-EXT:STORE-BARRIER` | `fence(Release)`. |
 
 The JIT MUST NOT reorder memory accesses across these barriers.
 
@@ -102,13 +102,13 @@ R13.06).
 | 5 | Interned-string table | Canonical string-object identities | §5.4 | Package operations may prepare string keys while holding a package lock; no allocation may occur while holding level 6 or above. |
 | 6 | Compiler/code-cache and debugger-metadata locks | Code installation, compiler registries, IC/debug trap coordination | §4, §6 | — |
 | 7 | Profiling-data locks | Sampling, allocation, instrumentation and tier-promotion data | §4.9, §6 | Ordered by the declared profiler sub-order. |
-| 8 | GC world and external-root locks | Heap state, root scanners, weak/finalizer registries, all side tables containing relocatable `BlissVal`s | §3.9 | The heap lock has sub-order 1; root side tables have larger sub-orders. |
+| 8 | GC world and external-root locks | Heap state, root scanners, weak/finalizer registries, all side tables containing relocatable `TorclVal`s | §3.9 | The heap lock has sub-order 1; root side tables have larger sub-orders. |
 | 9 | Execution and scheduler registries | Native-thread/fiber registries, scheduler groups, timer/I/O registries, any IDE-backend connection registry (owned by the loaded SLIME/SLY backend, §6.1.5, when it runs multi-threaded) | §2.3, §13.7 | Must precede per-execution objects. |
 | 10 | Per-execution object locks | Native-thread/fiber state, stacks and individual connection objects | §2.3 | Ordered by stable object identity when multiple objects are needed. |
 | 11 | Image save mutex | Heap serialisation to `.bimg` | §7 | Highest level — no other lock may be acquired while held. |
 
 The implementation names these levels in
-`bliss_rt::lock_order::LockLevel`. Long-lived cross-subsystem locks use
+`torcl_rt::lock_order::LockLevel`. Long-lived cross-subsystem locks use
 `OrderedMutex` or `OrderedRwLock`. Condvar wait cells, user-visible Lisp
 locks, and a stream's private I/O mutex are protocol locks: they are assigned
 the level of their owning object but MUST be leaf acquisitions (no other
@@ -149,7 +149,7 @@ stack in reverse acquisition order, including during unwinding.
 ### 13.3.6 Deadlock Detection (R13.20)
 
 In debug builds, a background watchdog thread (interval:
-`BLISS_DEADLOCK_WATCHDOG_MS`, default 5 s) scans the lock-wait graph
+`TORCL_DEADLOCK_WATCHDOG_MS`, default 5 s) scans the lock-wait graph
 for cycles. The graph is constructed from per-thread lock stacks
 (locks held) and a `LOCK_WAITERS` table (thread → waited-for lock).
 A cycle implies deadlock; the watchdog reports thread IDs, lock names,
@@ -162,7 +162,7 @@ Setting the interval to `0` disables the watchdog.
 
 ### 13.4.1 Symbol Value Cells (R13.07)
 
-Global symbol value cells are `AtomicU64` fields storing `BlissVal`.
+Global symbol value cells are `AtomicU64` fields storing `TorclVal`.
 Operations:
 
 | Operation | Implementation | Ordering |
@@ -207,7 +207,7 @@ CAS). Push: `Release`. Pop: `SeqCst` fence. Steal:
 
 Lock-free MPSC linked list. Mutators enqueue full SATB buffers via CAS
 on the head pointer; the GC marker drains by swapping head to null and
-walking the chain. Each node holds `buffer: [BlissVal; SATB_BUFFER_SIZE]`,
+walking the chain. Each node holds `buffer: [TorclVal; SATB_BUFFER_SIZE]`,
 `len: usize`, `next: AtomicPtr`.
 
 ---
@@ -276,10 +276,10 @@ ALGORITHM carrier_loop(carrier_id):
 
 The scheduler-group object is public; its per-carrier scheduler and deque are
 not. `START-FIBERS` creates the configured number of exposed
-`BLISS-THREAD` carrier objects and `SCHEDULER-GROUP-CARRIERS` returns a stable
+`TORCL-THREAD` carrier objects and `SCHEDULER-GROUP-CARRIERS` returns a stable
 snapshot of them. Consequently thread monitoring, naming, interruption, and
 backtraces work uniformly for application-created platform threads and runtime
-carriers, while fiber monitoring uses the separate `BLISS-FIBER` API.
+carriers, while fiber monitoring uses the separate `TORCL-FIBER` API.
 
 Fibers may migrate between carriers only while unpinned. A fiber is mounted on
 at most one carrier at a time, and a carrier runs at most one fiber at a time.
@@ -292,7 +292,7 @@ A scheduler-group service timer (1 ms by default) reads each carrier's
 atomically published mounted-fiber ID and sets that fiber's `yield_flag`. The
 timer never suspends a carrier. Every safepoint poll checks this flag;
 if set, the fiber is pushed to the back of the local deque and
-the next task is popped. Default time slice: 1 ms (`BLISS_TIME_SLICE_US`).
+the next task is popped. Default time slice: 1 ms (`TORCL_TIME_SLICE_US`).
 
 ### 13.5.6 Priority Levels
 
@@ -389,7 +389,7 @@ safepoint, the thread performs (in order, expanding §2.5.3):
 
 ### 13.7.1 Signal Handler Rules
 
-All Bliss signal handlers MUST obey POSIX async-signal-safety:
+All TorCL signal handlers MUST obey POSIX async-signal-safety:
 
 1. **No heap allocation.** Signal handlers MUST NOT call `malloc`,
    `mmap`, or any GC allocator path.
@@ -465,47 +465,47 @@ specials start with global values.
 
 | Type | CL Name | Implementation |
 |------|---------|----------------|
-| Mutex | `BLISS-THREAD:MUTEX` | Futex-based, non-reentrant by default; `:recursive t` option available. |
-| RW-Lock | `BLISS-THREAD:RW-LOCK` | Reader-writer lock with writer preference to prevent starvation. |
-| Condition Variable | `BLISS-THREAD:CONDITION-VARIABLE` | Paired with a mutex; supports `WAIT`, `NOTIFY`, `NOTIFY-ALL`. |
-| Semaphore | `BLISS-THREAD:SEMAPHORE` | Counting semaphore; `WAIT` decrements, `SIGNAL` increments. |
-| Barrier | `BLISS-THREAD:BARRIER` | N-thread barrier with `WAIT` that blocks until all N threads arrive. |
+| Mutex | `TORCL-THREAD:MUTEX` | Futex-based, non-reentrant by default; `:recursive t` option available. |
+| RW-Lock | `TORCL-THREAD:RW-LOCK` | Reader-writer lock with writer preference to prevent starvation. |
+| Condition Variable | `TORCL-THREAD:CONDITION-VARIABLE` | Paired with a mutex; supports `WAIT`, `NOTIFY`, `NOTIFY-ALL`. |
+| Semaphore | `TORCL-THREAD:SEMAPHORE` | Counting semaphore; `WAIT` decrements, `SIGNAL` increments. |
+| Barrier | `TORCL-THREAD:BARRIER` | N-thread barrier with `WAIT` that blocks until all N threads arrive. |
 
-`BLISS-THREADS` is a deprecated compatibility nickname for `BLISS-THREAD`; new
-APIs and examples use `BLISS-THREAD`.
+`TORCL-THREADS` is a deprecated compatibility nickname for `TORCL-THREAD`; new
+APIs and examples use `TORCL-THREAD`.
 
 ### 13.9.1.1 Public Lambda Lists
 
 ```lisp
-(bliss-thread:make-mutex &key name recursive) -> mutex
-(bliss-thread:grab-mutex mutex &key (waitp t) timeout) -> boolean
-(bliss-thread:release-mutex mutex &key (if-not-owner :error)) -> nil
-(bliss-thread:with-mutex (mutex &key (waitp t) timeout) body*) -> values
+(torcl-thread:make-mutex &key name recursive) -> mutex
+(torcl-thread:grab-mutex mutex &key (waitp t) timeout) -> boolean
+(torcl-thread:release-mutex mutex &key (if-not-owner :error)) -> nil
+(torcl-thread:with-mutex (mutex &key (waitp t) timeout) body*) -> values
 
-(bliss-thread:make-rw-lock &key name) -> rw-lock
-(bliss-thread:grab-rw-lock-read rw-lock &key (waitp t) timeout) -> boolean
-(bliss-thread:grab-rw-lock-write rw-lock &key (waitp t) timeout) -> boolean
-(bliss-thread:release-rw-lock-read rw-lock &key (if-not-owner :error)) -> nil
-(bliss-thread:release-rw-lock-write rw-lock &key (if-not-owner :error)) -> nil
-(bliss-thread:with-rw-lock-read (rw-lock &key (waitp t) timeout) body*) -> values
-(bliss-thread:with-rw-lock-write (rw-lock &key (waitp t) timeout) body*) -> values
+(torcl-thread:make-rw-lock &key name) -> rw-lock
+(torcl-thread:grab-rw-lock-read rw-lock &key (waitp t) timeout) -> boolean
+(torcl-thread:grab-rw-lock-write rw-lock &key (waitp t) timeout) -> boolean
+(torcl-thread:release-rw-lock-read rw-lock &key (if-not-owner :error)) -> nil
+(torcl-thread:release-rw-lock-write rw-lock &key (if-not-owner :error)) -> nil
+(torcl-thread:with-rw-lock-read (rw-lock &key (waitp t) timeout) body*) -> values
+(torcl-thread:with-rw-lock-write (rw-lock &key (waitp t) timeout) body*) -> values
 
-(bliss-thread:make-condition-variable &key name) -> condition-variable
-(bliss-thread:condition-wait condition-variable mutex &key timeout) -> boolean
-(bliss-thread:condition-notify condition-variable &optional (count 1)) -> count
-(bliss-thread:condition-broadcast condition-variable) -> count
+(torcl-thread:make-condition-variable &key name) -> condition-variable
+(torcl-thread:condition-wait condition-variable mutex &key timeout) -> boolean
+(torcl-thread:condition-notify condition-variable &optional (count 1)) -> count
+(torcl-thread:condition-broadcast condition-variable) -> count
 
-(bliss-thread:make-semaphore &key name (count 0)) -> semaphore
-(bliss-thread:signal-semaphore semaphore &optional (count 1)) -> nil
-(bliss-thread:wait-on-semaphore semaphore &key timeout notification) -> boolean
-(bliss-thread:try-semaphore semaphore &optional (count 1)) -> boolean
-(bliss-thread:semaphore-count semaphore) -> non-negative-integer
+(torcl-thread:make-semaphore &key name (count 0)) -> semaphore
+(torcl-thread:signal-semaphore semaphore &optional (count 1)) -> nil
+(torcl-thread:wait-on-semaphore semaphore &key timeout notification) -> boolean
+(torcl-thread:try-semaphore semaphore &optional (count 1)) -> boolean
+(torcl-thread:semaphore-count semaphore) -> non-negative-integer
 
-(bliss-thread:make-barrier count &key name) -> barrier
-(bliss-thread:barrier-wait barrier &key timeout) -> index, status
-(bliss-thread:barrier-count barrier) -> positive-integer
-(bliss-thread:barrier-waiting-count barrier) -> non-negative-integer
-(bliss-thread:reset-barrier barrier) -> nil
+(torcl-thread:make-barrier count &key name) -> barrier
+(torcl-thread:barrier-wait barrier &key timeout) -> index, status
+(torcl-thread:barrier-count barrier) -> positive-integer
+(torcl-thread:barrier-waiting-count barrier) -> non-negative-integer
+(torcl-thread:reset-barrier barrier) -> nil
 ```
 
 `TIMEOUT` is `NIL` or a non-negative real number of seconds. `WAITP NIL`
@@ -540,14 +540,14 @@ submitted to a second scheduler group.
 
 | Parameter | Default | Env Var | Description |
 |-----------|---------|---------|-------------|
-| Carrier threads | `nproc` | `BLISS_WORKERS` | Default scheduler-group carrier count. |
-| Time slice | 1000 µs | `BLISS_TIME_SLICE_US` | Cooperative preemption interval. |
-| Safepoint spin iterations | 1000 | `BLISS_SAFEPOINT_SPIN` | Spin count before parking at safepoint. |
-| Deadlock watchdog interval | 5 s | `BLISS_DEADLOCK_WATCHDOG_MS` | Debug-build only. 0 = disabled. |
-| SIGUSR1 timeout | 100 ms | `BLISS_SIGUSR1_TIMEOUT_MS` | Delay before sending SIGUSR1 fallback. |
-| Fiber stack size | 512 KiB | `BLISS_STACK_SIZE` | Per-fiber CL stack. |
-| Max fibers | 100 000 | `BLISS_MAX_FIBERS` | Upper limit (legacy `BLISS_MAX_THREADS` accepted; R2.19). |
-| Pinned blocking | `:WARN` | `BLISS_PINNED_BLOCKING_ACTION` | `WARN`, `ERROR`, or `NIL`/`NATIVE` fallback policy (R9.43). |
+| Carrier threads | `nproc` | `TORCL_WORKERS` | Default scheduler-group carrier count. |
+| Time slice | 1000 µs | `TORCL_TIME_SLICE_US` | Cooperative preemption interval. |
+| Safepoint spin iterations | 1000 | `TORCL_SAFEPOINT_SPIN` | Spin count before parking at safepoint. |
+| Deadlock watchdog interval | 5 s | `TORCL_DEADLOCK_WATCHDOG_MS` | Debug-build only. 0 = disabled. |
+| SIGUSR1 timeout | 100 ms | `TORCL_SIGUSR1_TIMEOUT_MS` | Delay before sending SIGUSR1 fallback. |
+| Fiber stack size | 512 KiB | `TORCL_STACK_SIZE` | Per-fiber CL stack. |
+| Max fibers | 100 000 | `TORCL_MAX_FIBERS` | Upper limit (legacy `TORCL_MAX_THREADS` accepted; R2.19). |
+| Pinned blocking | `:WARN` | `TORCL_PINNED_BLOCKING_ACTION` | `WARN`, `ERROR`, or `NIL`/`NATIVE` fallback policy (R9.43). |
 
 ---
 
@@ -558,8 +558,8 @@ submitted to a second scheduler group.
 | Lock-order violation (debug) | `debug_assert!` panic with diagnostic. |
 | Deadlock detected (debug) | Log cycle to stderr and crash log; no abort (informational). |
 | Safepoint timeout (>1 s) | Panic — indicates a bug (thread stuck in unsafe code). |
-| Native-thread creation failure | Signal `BLISS-THREAD:THREAD-ERROR` with `:reason :limit-exceeded` or `:reason :oom`. |
-| Fiber creation/submission failure | Signal `BLISS-FIBER:FIBER-ERROR` with `:reason :limit-exceeded`, `:already-submitted`, `:closed-group`, or `:oom`. |
+| Native-thread creation failure | Signal `TORCL-THREAD:THREAD-ERROR` with `:reason :limit-exceeded` or `:reason :oom`. |
+| Fiber creation/submission failure | Signal `TORCL-FIBER:FIBER-ERROR` with `:reason :limit-exceeded`, `:already-submitted`, `:closed-group`, or `:oom`. |
 | SIGUSR1 delivery failure | Log warning; GC proceeds — thread will eventually reach a poll. |
 
 ---
@@ -586,16 +586,16 @@ submitted to a second scheduler group.
 
 | Source File | Responsibility | Key Types / Functions |
 |-------------|---------------|-----------------------|
-| `crates/bliss-rt/src/thread.rs` | Native-thread/fiber descriptors, continuation switching, carrier pool | `NativeThread`, `Fiber`, `FiberContinuation`, `ChaseLevDeque` |
-| `crates/bliss-rt/src/scheduler.rs` | Public scheduler-group lifecycle over exposed carriers | `SchedulerGroup`, `SchedulerConfig` |
-| `crates/bliss-rt/src/safepoint.rs` | Safepoint page, STW protocol | `SafepointPage`, `stop_the_world()`, `resume_all()` |
-| `crates/bliss-rt/src/sync/mutex.rs` | Green-thread-aware mutex | `BlissMutex`, `BlissRwLock` |
-| `crates/bliss-rt/src/sync/condvar.rs` | Condition variables | `BlissCondVar` |
-| `crates/bliss-rt/src/sync/semaphore.rs` | Counting semaphore, barrier | `BlissSemaphore`, `BlissBarrier` |
-| `crates/bliss-rt/src/sync/timer.rs` | Shared deadline scheduler | per-fiber generation-tagged timer wakeups |
-| `crates/bliss-rt/src/sync/io.rs` | Async descriptor readiness | epoll/kqueue poller; poll fallback |
-| `crates/bliss-rt/src/sync/atomic.rs` | CAS, atomic-incf, memory barriers | `bliss_cas()`, `atomic_incf()` |
-| `crates/bliss-rt/src/{runtime,safepoint,thread}.rs` | Signal handlers, directed SIGUSR1 fallback | `install_signal_handlers()`, `sigusr1_handler()`, participant signalling |
-| `crates/bliss-rt/src/gc/safepoint.rs` | GC-side safepoint coordination | `request_safepoint()`, `wait_at_safepoint()` |
-| `crates/bliss-rt/src/profiling.rs` | Lock-free profiling counters | `FunctionProfile` |
-| `crates/bliss-compiler/src/ic.rs` | Inline cache patching | `MonomorphicIC`, `patch_ic()` |
+| `crates/torcl-rt/src/thread.rs` | Native-thread/fiber descriptors, continuation switching, carrier pool | `NativeThread`, `Fiber`, `FiberContinuation`, `ChaseLevDeque` |
+| `crates/torcl-rt/src/scheduler.rs` | Public scheduler-group lifecycle over exposed carriers | `SchedulerGroup`, `SchedulerConfig` |
+| `crates/torcl-rt/src/safepoint.rs` | Safepoint page, STW protocol | `SafepointPage`, `stop_the_world()`, `resume_all()` |
+| `crates/torcl-rt/src/sync/mutex.rs` | Green-thread-aware mutex | `TorclMutex`, `TorclRwLock` |
+| `crates/torcl-rt/src/sync/condvar.rs` | Condition variables | `TorclCondVar` |
+| `crates/torcl-rt/src/sync/semaphore.rs` | Counting semaphore, barrier | `TorclSemaphore`, `TorclBarrier` |
+| `crates/torcl-rt/src/sync/timer.rs` | Shared deadline scheduler | per-fiber generation-tagged timer wakeups |
+| `crates/torcl-rt/src/sync/io.rs` | Async descriptor readiness | epoll/kqueue poller; poll fallback |
+| `crates/torcl-rt/src/sync/atomic.rs` | CAS, atomic-incf, memory barriers | `torcl_cas()`, `atomic_incf()` |
+| `crates/torcl-rt/src/{runtime,safepoint,thread}.rs` | Signal handlers, directed SIGUSR1 fallback | `install_signal_handlers()`, `sigusr1_handler()`, participant signalling |
+| `crates/torcl-rt/src/gc/safepoint.rs` | GC-side safepoint coordination | `request_safepoint()`, `wait_at_safepoint()` |
+| `crates/torcl-rt/src/profiling.rs` | Lock-free profiling counters | `FunctionProfile` |
+| `crates/torcl-compiler/src/ic.rs` | Inline cache patching | `MonomorphicIC`, `patch_ic()` |

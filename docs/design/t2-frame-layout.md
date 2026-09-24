@@ -19,13 +19,13 @@ single easiest way to introduce a memory-safety bug here.
 - **The host (C) stack**, addressed off `rsp`. Holds T2's spill slots, the
   register save area around c2i helper calls, and the saved slots pointer.
   Private to one native activation; nothing outside the function reads it.
-- **The BlissStack** (`crates/bliss-rt/src/stack.rs`), a bump-allocated region
+- **The TorclStack** (`crates/torcl-rt/src/stack.rs`), a bump-allocated region
   of `Frame`s. This is what the GC scans and what deopt reconstructs from. It is
   shared: the callee's frame is pushed immediately above the caller's.
 
-"Slots" in T2 always means BlissStack activation slots, never host-stack spills.
+"Slots" in T2 always means TorclStack activation slots, never host-stack spills.
 
-## 2. Frame layout on the BlissStack
+## 2. Frame layout on the TorclStack
 
 `Frame` is a fixed 40-byte header (`#[repr(C)]`, D2.02) followed by a
 variable-length slot area:
@@ -33,10 +33,10 @@ variable-length slot area:
 ```
 frame_ptr ──► +0x00  prev_fp     *mut Frame     link to the previous frame
               +0x08  return_pc   *const u8
-              +0x10  function    BlissVal
+              +0x10  function    TorclVal
               +0x18  code_info   *const CodeInfo   safepoint/stack map
               +0x20  flags u32 | num_locals u16 | _pad u16
-              +0x28  slots[0]    BlissVal       ◄── the "slots pointer"
+              +0x28  slots[0]    TorclVal       ◄── the "slots pointer"
               +0x30  slots[1]
               ...
               +0x28 + 8*(num_locals-1)  slots[num_locals-1]
@@ -128,18 +128,18 @@ header back as if it were your value.
 
 When a native tier produces a wrong *value* (not a crash):
 
-- **Identify the tier precisely.** `BLISS_FORCE_TIER=interp|t0|t1|t2` pins tier
+- **Identify the tier precisely.** `TORCL_FORCE_TIER=interp|t0|t1|t2` pins tier
   selection process-wide; a value that differs between them is a miscompile.
   `scripts/tier-diff.sh` does this over a corpus.
 - **Isolate caller from callee.** Excluding one function from T2 separates "bad
   codegen here" from "bad codegen in what I call". There is no per-name knob for
-  this any more — `BLISS_T2_EXCLUDE` was removed once the bug it was written for
+  this any more — `TORCL_T2_EXCLUDE` was removed once the bug it was written for
   (bliss-lwws, narrowed to REDUCE) was fixed, because it sat on the per-dispatch
   path. Reintroduce it locally if you need it, or bisect with
-  `BLISS_FORCE_TIER` over a corpus.
-- **Know which knob gates which transfer.** `BLISS_OSR_THRESHOLD` gates the
+  `TORCL_FORCE_TIER` over a corpus.
+- **Know which knob gates which transfer.** `TORCL_OSR_THRESHOLD` gates the
   T0/T1 OSR entry. The **T1→T2** back-edge transfer is gated by
-  `BLISS_T1_T2_BACKEDGE_THRESHOLD` / `BLISS_LOOP_HEAT_THRESHOLD`. In bliss-kqdr
+  `TORCL_T1_T2_BACKEDGE_THRESHOLD` / `TORCL_LOOP_HEAT_THRESHOLD`. In bliss-kqdr
   the wrong knob made an OSR bug look unrelated to OSR.
 - **Suspect frame sizing when the garbage is a plausible address.** A raw
   pointer appearing where a Lisp value belongs, that *changes with the callee's
@@ -148,7 +148,7 @@ When a native tier produces a wrong *value* (not a crash):
   prints as a huge FIXNUM.
 - **Perturb the frame.** Adding unused locals to the caller changes its slot
   count; if that makes the bug disappear, the fault is layout-dependent.
-- `BLISS_T2_DISASM=<NAME>` dumps the emitted code; `BLISS_RA_DBG=1` dumps each
+- `TORCL_T2_DISASM=<NAME>` dumps the emitted code; `TORCL_RA_DBG=1` dumps each
   value's stable home plus every FrameState-carrying instruction.
 
 ## 6. Why the tier-differential corpus did not catch bliss-kqdr
@@ -157,5 +157,5 @@ When a native tier produces a wrong *value* (not a crash):
 loops across all four tiers, but its loops run far below the T2 promotion
 threshold, so the T1→T2 OSR transfer never fires. Corpus coverage of a *shape*
 does not imply coverage of a *tier transition*. Tests that must exercise
-promotion belong in `crates/bliss/tests/osr.rs`, which drives the real binary
+promotion belong in `crates/torcl/tests/osr.rs`, which drives the real binary
 with forced tiers and explicit thresholds.

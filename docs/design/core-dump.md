@@ -30,25 +30,25 @@ whole live world byte-for-byte, so any value round-trips.
   reachable object and root. A core dump reuses this machinery.
 - The "world" is **split**: Lisp objects live on the heap, but the roots that
   reach them are **Rust-side registries** outside the heap —
-  - `bliss_rt::symbols`: the symbol table (name → index, value cells, function
+  - `torcl_rt::symbols`: the symbol table (name → index, value cells, function
     cells, plist),
-  - `bliss-stdlib` packages,
+  - `torcl-stdlib` packages,
   - cli.rs thread-locals: `GLOBAL_MACROS`, `GLOBAL_SETF_FNS`, setf-expanders,
     `CLOS_STATE`, class/generic/method tables,
   - compiled-function registry (bytecode).
   A core dump must serialize **both** the heap span and these registries.
   (SBCL keeps symbols/packages/functions *on* the Lisp heap, so its core is just
-  the heap; bliss's hybrid model makes the registries extra work.)
+  the heap; torcl's hybrid model makes the registries extra work.)
 
 ## What already exists (discovered during M1)
 
 A spec §7.2–7.3 heap-image system is **implemented and unit-tested in-process,
 but not wired to the CLI**:
 
-- `bliss_rt::image::save_image` / `load_image` — full file format: `ImageHeader`
-  (magic `BLISSIMG`), section table, sha256 checksums, optional zstd, and
+- `torcl_rt::image::save_image` / `load_image` — full file format: `ImageHeader`
+  (magic `TORCLIMG`), section table, sha256 checksums, optional zstd, and
   `find_appended_image` (already supports the executable-append case for M4).
-- `bliss_rt::gc::serialize_heap_objects` / `restore_heap` — walk every live
+- `torcl_rt::gc::serialize_heap_objects` / `restore_heap` — walk every live
   object (`walk_heap`) and re-materialize it (`append_serialized_object`); a
   **relocating** restore, fixed up by `serialize_relocation_table`.
 - `serialize_code_cache` / `restore_code_cache` — the compiled bytecode.
@@ -66,9 +66,9 @@ The gaps that keep it from being a cross-process core dump (what
    registry, so a loaded heap's `SymbolData`/`PackageData` objects exist but
    nothing indexes them. Real cross-process serialization
    (`crate::symbols::serialize`/`restore`, per the code comment) must be used.
-3. **bliss-crate registries are invisible to bliss-rt.** `GLOBAL_MACROS`,
+3. **torcl-crate registries are invisible to torcl-rt.** `GLOBAL_MACROS`,
    `GLOBAL_SETF_FNS`, setf-expanders, `CLOS_STATE`, class/generic/method tables
-   live in the `bliss` crate; `image.rs` (in `bliss-rt`) can't see them. Needs a
+   live in the `torcl` crate; `image.rs` (in `torcl-rt`) can't see them. Needs a
    registration hook (like the existing root-scanner registration) so the CLI
    contributes extra image sections.
 4. **Off-heap object bodies.** Streams and similar hold raw pointers to off-heap
@@ -86,7 +86,7 @@ already RE-MATERIALIZES objects and fixes pointers via the relocation table, so
 1. `major_gc` to compact — live data becomes a dense prefix of the heap.
 2. Record `heap_base` and the live high-water `live_size`.
 3. Write the live span `[heap_base, heap_base + live_size)` verbatim.
-4. Serialize each Rust registry: its structure plus the `BlissVal`s it holds
+4. Serialize each Rust registry: its structure plus the `TorclVal`s it holds
    (which are absolute heap addresses, valid at `heap_base`).
 5. Header: magic, version, `heap_base`, `heap_size`, `live_size`, registry
    sections, optional `:toplevel`.
@@ -97,7 +97,7 @@ already RE-MATERIALIZES objects and fixes pointers via the relocation table, so
    metadata so the allocator continues past `live_size`.
 3. If the recorded base was unavailable (ASLR/occupied): map anywhere and run a
    **rebase pass** — walk every heap object's pointer slots and every registry
-   `BlissVal`, adding `new_base - old_base` (a uniform delta; reuses the precise
+   `TorclVal`, adding `new_base - old_base` (a uniform delta; reuses the precise
    object walker, not forwarding).
 4. Restore the Rust registries (delta-adjusted if rebased).
 
@@ -111,7 +111,7 @@ already RE-MATERIALIZES objects and fixes pointers via the relocation table, so
 - **M2 — registry serialization.** Symbols (name, value cell, function cell,
   plist), packages, `GLOBAL_MACROS`, `GLOBAL_SETF_FNS`, setf-expanders,
   `CLOS_STATE`/classes/generics/methods, compiled-function registry. Each as a
-  section of `(key, BlissVal…)` records, delta-adjusted on rebase. Done-signal:
+  section of `(key, TorclVal…)` records, delta-adjusted on rebase. Done-signal:
   a `defvar`/`defun`/`defmacro`/`defclass`/`make-instance`/`make-hash-table`
   world round-trips via core dump (including the hash-table + instance values).
 - **M3 — wire to `save-lisp-and-die` / `--image`.** New core format selected by a
@@ -120,7 +120,7 @@ already RE-MATERIALIZES objects and fixes pointers via the relocation table, so
   `*operations*` is bound.
 - **M4 — executable wrapping.** Append the core to a copy of the runtime binary
   (reuse `wrap_executable` / `embedded_image`); `make image` produces a
-  self-contained `bliss` whose libraries load. Done-signal: installed `bliss`
+  self-contained `torcl` whose libraries load. Done-signal: installed `torcl`
   runs `(asdf:load-system :cl-ppcre)`.
 
 ## M2 progress + the per-object-relocation blocker (discovered while implementing)
@@ -203,18 +203,18 @@ Two dispatch points already exist and are where M3 hooks in:
 - **Save:** the `SAVE-LISP-AND-DIE` builtin (cli.rs ~14307) currently always calls
   `bytecode::build_image_from_runtime` (source-form `.bfasl`), then optionally
   `wrap_executable`. M3 adds a core path: run a compacting `major_gc`, set the
-  entry continuation (+ `:toplevel`), call `bliss_rt::image::save_image(path,
+  entry continuation (+ `:toplevel`), call `torcl_rt::image::save_image(path,
   opts)`; reuse `wrap_executable` for `:executable t`. Select via `:format :core`
   (default stays `.bfasl` until the core path is proven).
 - **Load:** `run()` dispatches both `embedded_image()` (~23841) and `--image`
-  (~23863) on `BFASL_MAGIC`. M3 adds an `IMAGE_MAGIC` (`BLISSIMG`) branch →
+  (~23863) on `BFASL_MAGIC`. M3 adds an `IMAGE_MAGIC` (`TORCLIMG`) branch →
   `image::load_image(path)` then `drain_pending_host_registries(&env.frame)`.
 
 **The hard constraint: a core loads into a FRESH runtime, before bootstrap.**
 By the time `run()` reaches the `--image` branch it has already built `Env` and
 evaluated the bootstrap prelude, so the heap is populated. `restore_heap` calls
 `clear_heap_objects` and re-materializes the snapshot — loading a core *over* a
-live heap would strand every `BlissVal` the Rust-side `Env` (frame vars, funs,
+live heap would strand every `TorclVal` the Rust-side `Env` (frame vars, funs,
 macros, closures) holds, because `load_image` remaps heap objects and the
 symbol/package registries but NOT the interpreter's `Env` (it is Rust state it
 cannot see). So the core branch must run EARLY:
@@ -248,11 +248,11 @@ symbol-value-cell restore end-to-end before tackling ASDF.
 ## M3/M4 LANDED + the two concrete remaining blockers (a0573b1)
 
 The save/load/executable machinery is implemented and proven cross-process
-(including under `BLISS_GC_STRESS`+`POISON`) for heap-resident, non-CLOS values:
+(including under `TORCL_GC_STRESS`+`POISON`) for heap-resident, non-CLOS values:
 
 - **`%save-core path [:executable t]`** — compacting `full_gc`, `save_image`, exit.
-  `:executable t` appends the core to a runtime copy (existing `BLISSEXE` wrap).
-- **`--image` / appended-image fast path** — a `BLISSIMG`-magic image is restored
+  `:executable t` appends the core to a runtime copy (existing `TORCLEXE` wrap).
+- **`--image` / appended-image fast path** — a `TORCLIMG`-magic image is restored
   into a fresh runtime BEFORE bootstrap (`load_core_image_bytes`), then bootstrap
   and the source-form image paths are skipped.
 - **`restore_heap` pins every restored object** (immortal base world; a minor GC
@@ -271,7 +271,7 @@ actual crash backtrace, each with a filed bead:
 
 1. **CLOS_STATE restoration (bliss-x0f2.7).** After a core load, macro expansion
    builds a fresh `Env` → `initialize_condition_runtime_support` → `class_of` →
-   null, because `bliss-stdlib::clos::CLOS_STATE` (class_registry, class_meta,
+   null, because `torcl-stdlib::clos::CLOS_STATE` (class_registry, class_meta,
    generic_functions, method_meta, effective/short-form methods, structure_classes,
    the built-in class values, counters) is NOT serialized — bootstrap, which
    normally populates it, is skipped on a core load. This is a large structure;
@@ -299,17 +299,17 @@ returns, once Pass 2 has remapped key internals (EQUAL/EQUALP hashing recurses
 into the key structure) and the heap lock is free (hashing re-enters the
 collector). Entries whose key/value did not relocate into the restored heap
 (e.g. keys whose own body is off-heap and not yet serialized — package-internal
-symbol tables) are *skipped*, not deref'd (`BLISS_OFFHEAP_DBG=1` reports the
-count). Hooks: `bliss_rt::gc::set_offheap_hooks` ←
-`bliss_stdlib::hashtable::{serialize,allocate,populate}_live_tables`.
+symbol tables) are *skipped*, not deref'd (`TORCL_OFFHEAP_DBG=1` reports the
+count). Hooks: `torcl_rt::gc::set_offheap_hooks` ←
+`torcl_stdlib::hashtable::{serialize,allocate,populate}_live_tables`.
 
 Validating it exposed a **pre-existing loader bug** (bliss-64r1, fixed in the
 same commit): `restore_heap` replaced all region state without bumping
 `GC_MOVE_EPOCH`, so threads kept allocating from pre-restore TLABs whose space
 the reset region `alloc_top`s handed out again — the first allocating form
 after a core load silently overwrote the re-opened stdio streams ("stream
-error: not a stream"; reproducible with `BLISS_GC_DISABLE=1`, i.e. not a GC
-bug; masked under `BLISS_GC_STRESS=1`, which retires TLABs early). Remaining
+error: not a stream"; reproducible with `TORCL_GC_DISABLE=1`, i.e. not a GC
+bug; masked under `TORCL_GC_STRESS=1`, which retires TLABs early). Remaining
 before the ASDF done-signal: CLOS_STATE restoration (blocker 1, bliss-x0f2.7)
 and any other off-heap body types (streams already re-open; enumerate the rest).
 
@@ -349,7 +349,7 @@ bliss-gjey, bliss-zz6w, bliss-5ven):
   reinstalls closure bytecode under image-stable uninterned indices;
   source-free bytecode macro expanders re-emit as kind-4 installs.
 - **OffHeap** grew two families beside hash tables, framed as
-  `[len u64][bytes]` sub-blocks (`bliss_stdlib::offheap_image`): **pathnames**
+  `[len u64][bytes]` sub-blocks (`torcl_stdlib::offheap_image`): **pathnames**
   (16-byte header blocks + PathnameRecord side table) and the
   **make_lisp_string intern table** by content — each (old,new) folds into the
   reloc map, so references buried inside structures remap like heap objects.

@@ -1,13 +1,13 @@
-//! gc-root-lint — flag bare `BlissVal` locals read across allocating calls
+//! gc-root-lint — flag bare `TorclVal` locals read across allocating calls
 //! (bliss-jaf; docs/design/gc-rooting.md Part B rung 1).
 //!
-//! bliss has a precise MOVING minor GC: any allocation can relocate heap
-//! objects, so a `BlissVal` held in a plain Rust local across an allocating
+//! torcl has a precise MOVING minor GC: any allocation can relocate heap
+//! objects, so a `TorclVal` held in a plain Rust local across an allocating
 //! call is a stale pointer afterwards unless the local is rooted. This lint
 //! finds the smell mechanically:
 //!
 //!   a candidate local (one bound from a known heap-value producer, or
-//!   explicitly typed `BlissVal`) that is READ in a statement AFTER an
+//!   explicitly typed `TorclVal`) that is READ in a statement AFTER an
 //!   intervening statement that contains a known-ALLOCATING call, without
 //!   having been rooted (`rooted!`/`rooted_ref!`/`StackRoot`/`HostRoot`/
 //!   `ShadowRootScope::root`) or reassigned in between.
@@ -93,7 +93,7 @@ const ALLOCATING: &[&str] = &[
     "bind_macrolet_lambda_list",
 ];
 
-/// Producers whose results are (or may be) MOVABLE heap `BlissVal`s. A `let`
+/// Producers whose results are (or may be) MOVABLE heap `TorclVal`s. A `let`
 /// binding initialized from one of these becomes a lint candidate. Immediates
 /// (fixnum/symbol constructors) are intentionally NOT here.
 const PRODUCERS: &[&str] = &[
@@ -153,10 +153,10 @@ fn main() {
     let root = repo_root();
     let mut findings: Vec<Finding> = Vec::new();
     for dir in [
-        "crates/bliss/src",
-        "crates/bliss-compiler/src",
-        "crates/bliss-stdlib/src",
-        "crates/bliss-rt/src",
+        "crates/torcl/src",
+        "crates/torcl-compiler/src",
+        "crates/torcl-stdlib/src",
+        "crates/torcl-rt/src",
     ] {
         walk_dir(&root.join(dir), &root, &mut findings);
     }
@@ -232,7 +232,7 @@ fn repo_root() -> PathBuf {
             return dir;
         }
         if !dir.pop() {
-            panic!("run from within the bliss repo");
+            panic!("run from within the torcl repo");
         }
     }
 }
@@ -353,11 +353,11 @@ fn lint_block(block: &syn::Block, file: &str, function: &str, findings: &mut Vec
             }
         }
 
-        // 2. New candidate bindings from producer calls or explicit BlissVal type.
+        // 2. New candidate bindings from producer calls or explicit TorclVal type.
         if let syn::Stmt::Local(local) = stmt {
             let from_producer = calls.iter().any(|c| PRODUCERS.contains(&c.as_str()));
-            let typed_blissval = local_is_typed_blissval(local);
-            if from_producer || typed_blissval {
+            let typed_torclval = local_is_typed_torclval(local);
+            if from_producer || typed_torclval {
                 for name in pattern_names(&local.pat) {
                     // (Re)binding resets any prior state for the name.
                     candidates.retain(|(n, _)| n != &name);
@@ -385,7 +385,7 @@ fn lint_block(block: &syn::Block, file: &str, function: &str, findings: &mut Vec
     }
 }
 
-fn local_is_typed_blissval(local: &syn::Local) -> bool {
+fn local_is_typed_torclval(local: &syn::Local) -> bool {
     if let syn::Pat::Type(t) = &local.pat
         && let syn::Type::Path(p) = &*t.ty
     {
@@ -393,7 +393,7 @@ fn local_is_typed_blissval(local: &syn::Local) -> bool {
             .path
             .segments
             .last()
-            .is_some_and(|s| s.ident == "BlissVal");
+            .is_some_and(|s| s.ident == "TorclVal");
     }
     false
 }

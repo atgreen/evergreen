@@ -1,19 +1,19 @@
-# §6.11 — Bliss FASL (`.bfasl`) Portable Compiled-Artifact Format
+# §6.11 — TorCL FASL (`.bfasl`) Portable Compiled-Artifact Format
 
-Bliss FASL files (`.bfasl`) are the unit of *ahead-of-time compiled, loadable
+TorCL FASL files (`.bfasl`) are the unit of *ahead-of-time compiled, loadable
 code*.  The outer `.bfasl` container is the file-level envelope; its canonical
-portable code payload is a **Bliss Bytecode Unit** (`BBU`), the closest analogue
+portable code payload is a **TorCL Bytecode Unit** (`BBU`), the closest analogue
 to a JVM classfile: a versioned, verifiable compiled unit that sits **below
 whole-heap images** (§7) and **above source**.
 ASDF `compile-op` writes one `.bfasl` per source file under the output-
-translation root (`~/.cache/bliss/asdf/<implementation-version>/`, R6.47);
+translation root (`~/.cache/torcl/asdf/<implementation-version>/`, R6.47);
 `load-op` loads it. The format is defined here so that ASDF compile/load
 (bliss-lb6.5), tiered runtime installation (bliss-jtc.3), and deopt metadata
 (bliss-jtc.11) harden around a stable artifact rather than ad-hoc compiled
 objects.
 
 **Portability principle.** A `.bfasl` is *architecture-neutral*: its code
-sections are portable Bliss **bytecode** (the T0/§4.4.3 representation), never
+sections are portable TorCL **bytecode** (the T0/§4.4.3 representation), never
 raw native machine code as a required payload. Loading on any platform installs
 the bytecode (executable at T0) and lets the tiered system recompile to local
 T1/T2 (§4.4). A `.bfasl` MAY additionally carry a platform-tagged **cached T1**
@@ -25,7 +25,7 @@ matches exactly and is otherwise ignored. This follows the CLISP model
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.60 | A `.bfasl` file MUST begin with the 8-byte header: magic `b"BLISSFAS"` (bytes `42 4C 49 53 53 46 41 53`) is not used; the magic is the 6 bytes `b"BFASL\0"` followed by a `u16` little-endian `format_version`. | MUST |
+| R6.60 | A `.bfasl` file MUST begin with the 8-byte header: magic `b"TORCLFAS"` (bytes `42 4C 49 53 53 46 41 53`) is not used; the magic is the 6 bytes `b"BFASL\0"` followed by a `u16` little-endian `format_version`. | MUST |
 | R6.61 | The header MUST record: `format_version` (u16), `flags` (u8), `platform` (u8: 0 = portable/arch-neutral, nonzero = a registered native-target id for cached-T1 sections), `target_abi` (u16, 0 when portable), a `content_hash` (u64) over the source + declared dependency identities for cache invalidation, and a `checksum` (u32) over all header-and-section bytes. | MUST |
 | R6.62 | The body MUST be a sequence of length-prefixed **sections**, each `{ kind: u16, length: u32, bytes }`. Unknown section kinds MUST be skippable by length (forward compatibility). | MUST |
 | R6.63 | The loader MUST reject a file whose magic does not match (`bad-magic`), whose `format_version` major component differs from the running runtime's (`version-mismatch`), whose length is truncated (`truncated`), or whose `checksum` does not verify (`bad-checksum`). Rejection MUST be a signalled, catchable error — never a crash or silent partial load. | MUST |
@@ -36,7 +36,7 @@ matches exactly and is otherwise ignored. This follows the CLISP model
 | R6.68 | A `.bfasl` MUST carry a **source/debug map** section: for each function, its name, source pathname, and top-level form position, so backtraces and the debugger (§6.4) resolve loaded code to source. This metadata MUST survive a load in a fresh process. | MUST |
 | R6.69 | `compile-op` output MUST be reproducible: compiling identical source with identical compiler settings MUST produce byte-identical `.bfasl` (modulo the `content_hash`/timestamps, which are excluded from reproducibility by being derived only from inputs). | SHOULD |
 | R6.70 | Cache invalidation: a build tool (ASDF) MUST treat a `.bfasl` as stale when its `content_hash` does not match a freshly computed hash of the current source + dependency identities, and recompile. | MUST |
-| R6.71 | New portable `.bfasl` writers MUST emit a `BYTECODE_UNIT` section containing a Bliss Bytecode Unit (`BBU`) for the source file's macroexpanded executable content. Legacy/decomposed sections MAY be emitted in addition, but the `BBU` is authoritative when present. [S6] | MUST |
+| R6.71 | New portable `.bfasl` writers MUST emit a `BYTECODE_UNIT` section containing a TorCL Bytecode Unit (`BBU`) for the source file's macroexpanded executable content. Legacy/decomposed sections MAY be emitted in addition, but the `BBU` is authoritative when present. [S6] | MUST |
 | R6.72 | A `BBU` MUST contain bytecode lowered from macroexpanded Lisp forms, not raw source forms as the executable representation. Source forms MAY appear only in debug or provenance records. [S6] | MUST |
 | R6.73 | A `BBU` MUST have its own bytecode-format version independent of the outer `.bfasl` container version, so loader changes and bytecode instruction-set changes can evolve separately. [S6] | MUST |
 | R6.74 | All function bodies, load-time thunks, top-level side-effecting forms, and macro definitions that must run at load time MUST be represented as bytecode functions referenced from an ordered load plan. [S6] | MUST |
@@ -89,7 +89,7 @@ bytes  : [u8; length]
 The bytecode instruction encoding is the serialization of the §4.4.3
 `BytecodeFunction` instruction set; constant/symbol operands are pool indices.
 
-## 6.11.3 Bliss Bytecode Unit (`BBU`)
+## 6.11.3 TorCL Bytecode Unit (`BBU`)
 
 A `BBU` is a self-contained, architecture-neutral bytecode object stored in a
 `BYTECODE_UNIT` section.  The outer `.bfasl` says "this is a loadable compiled
@@ -260,7 +260,7 @@ flags           : u16  // safepoint, back-edge, deopt-point, type-check, call-si
 
 ### 6.11.3.4 Bytecode Instruction Stream
 
-The `code` bytes in each function are Bliss T0 bytecode (§4.4.3), emitted after
+The `code` bytes in each function are TorCL T0 bytecode (§4.4.3), emitted after
 macro expansion and special-form lowering.  The BBU bytecode encoding is:
 
 ```text

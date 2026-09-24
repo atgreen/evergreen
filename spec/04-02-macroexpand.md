@@ -1,13 +1,13 @@
 # §4.2 Macro Expansion
 
-**Scope:** This section specifies Bliss's macro expansion subsystem —
+**Scope:** This section specifies TorCL's macro expansion subsystem —
 the layer between the reader (§4.1) and IR construction (§4.3). It
 covers `macroexpand-1`, `macroexpand`, compiler macros, symbol macros,
 the environment protocol, `*macroexpand-hook*`, circular expansion
 detection, code-walking for special forms, and the interaction between
 macro expansion and the lexical environment.
 
-Source: `crates/bliss-compiler/src/macroexpand.rs`
+Source: `crates/torcl-compiler/src/macroexpand.rs`
 
 ---
 
@@ -66,7 +66,7 @@ pub struct Environment {
 | `Lexical` | `type_decl: Option<TypeSpec>`, `special_p: bool` | Variable from LET, LET*, LAMBDA, etc. |
 | `Special` | `type_decl: Option<TypeSpec>` | Dynamic variable |
 | `SymbolMacro` | `expansion: Form` | Symbol macro (SYMBOL-MACROLET / DEFINE-SYMBOL-MACRO) |
-| `Constant` | `value: BlissVal` | Named constant (DEFCONSTANT) |
+| `Constant` | `value: TorclVal` | Named constant (DEFCONSTANT) |
 
 #### Function binding info
 
@@ -386,7 +386,7 @@ and memoization (cache expansions keyed on form identity).
 
 **R4.14 compliance.**
 
-Bliss exposes the following functions in the `BLISS-CLTL2` package
+TorCL exposes the following functions in the `TORCL-CLTL2` package
 (also aliased into `SB-CLTL2` for SBCL compatibility):
 
 ### `variable-information`

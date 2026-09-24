@@ -71,11 +71,11 @@ _bureau_*
 ocicl.csv
 ocicl/
 
-# compiled Bliss FASL artifacts
+# compiled TorCL FASL artifacts
 *.bfasl
 
 # Local-only standing goal prompt (kept out of the repo per owner)
 GOAL.md
 
-# stray build artifact (static bliss-cli copy)
+# stray build artifact (static torcl copy)
 hellos
