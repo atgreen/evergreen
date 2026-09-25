@@ -3677,6 +3677,34 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
           torcl-thread:grab-mutex torcl-thread:release-mutex torcl-thread:with-mutex)
         "TORCL-THREAD")
 
+(defun torcl-thread:make-condition-variable (&key name)
+  (torcl::%native-condition :make name))
+
+(defun torcl-thread:condition-variable-p (object)
+  (torcl::%native-condition :p object))
+
+(deftype torcl-thread:condition-variable ()
+  '(satisfies torcl-thread:condition-variable-p))
+
+(defun torcl-thread:condition-wait (condition-variable mutex &key timeout)
+  (unless (or (null timeout) (and (realp timeout) (not (minusp timeout))))
+    (error 'type-error :datum timeout :expected-type '(or null (real 0))))
+  (torcl::%native-condition :wait condition-variable mutex (and timeout (float timeout 1d0))))
+
+(defun torcl-thread:condition-notify (condition-variable &optional (count 1))
+  (unless (and (integerp count) (not (minusp count)))
+    (error 'type-error :datum count :expected-type '(integer 0)))
+  ;; There cannot be more live waiters than this process can address.
+  (torcl::%native-condition :notify condition-variable (min count most-positive-fixnum)))
+
+(defun torcl-thread:condition-broadcast (condition-variable)
+  (torcl::%native-condition :broadcast condition-variable))
+
+(export '(torcl-thread:make-condition-variable torcl-thread:condition-variable
+          torcl-thread:condition-variable-p torcl-thread:condition-wait
+          torcl-thread:condition-notify torcl-thread:condition-broadcast)
+        "TORCL-THREAD")
+
 (defun lisp-implementation-type () "TorCL")
 (defun lisp-implementation-version () "0.1.0")
 (defun machine-type () (torcl-ext::%machine-type))

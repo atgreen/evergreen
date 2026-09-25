@@ -69,6 +69,7 @@ static COND_DONE: AtomicUsize = AtomicUsize::new(0);
 fn condition_waiter() -> TorclVal {
     let mutex = COND_MUTEX.get().unwrap();
     mutex.grab(true, None).unwrap();
+    mutex.grab(true, None).unwrap();
     COND_READY.fetch_add(1, Ordering::AcqRel);
     assert!(
         CONDVAR
@@ -79,13 +80,15 @@ fn condition_waiter() -> TorclVal {
     );
     COND_DONE.fetch_add(1, Ordering::AcqRel);
     mutex.release().unwrap();
+    mutex.release().unwrap();
+    assert!(mutex.release().is_err());
     T
 }
 
 #[test]
 fn condition_notify_and_broadcast_wake_parked_fibers() {
     let _guard = serial_lock().lock().unwrap();
-    COND_MUTEX.get_or_init(TorclMutex::default);
+    COND_MUTEX.get_or_init(|| TorclMutex::new(None, true));
     CONDVAR.get_or_init(TorclCondVar::default);
     COND_READY.store(0, Ordering::Release);
     COND_DONE.store(0, Ordering::Release);

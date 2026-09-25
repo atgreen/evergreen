@@ -2429,6 +2429,10 @@ fn stdlib_gc_finalize(_finalizer: TorclVal, object: TorclVal) {
             crate::synchronization::finalize_mutex(body);
             return;
         }
+        if header.type_id() == type_id::CONDITION_VARIABLE {
+            crate::synchronization::finalize_condition_variable(body);
+            return;
+        }
         if header.type_id() != type_id::STREAM {
             return; // not a stream — leave for other finalizer kinds
         }

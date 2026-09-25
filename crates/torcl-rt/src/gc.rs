@@ -5402,7 +5402,9 @@ pub fn serialize_heap_objects() -> Vec<u8> {
         // but restore it as unavailable, never as a dangling native pointer.
         if matches!(
             type_id,
-            crate::object::type_id::STREAM | crate::object::type_id::MUTEX
+            crate::object::type_id::STREAM
+                | crate::object::type_id::MUTEX
+                | crate::object::type_id::CONDITION_VARIABLE
         ) {
             let zeros = [0u8; 8];
             out.extend_from_slice(&zeros[..size.min(8)]);

@@ -5,6 +5,44 @@ use std::time::Duration;
 use torcl_rt::sync::{TorclCondVar, TorclMutex};
 
 #[test]
+fn condition_wait_releases_and_restores_all_recursive_acquisitions() {
+    let mutex = Arc::new(TorclMutex::new(None, true));
+    let condition = Arc::new(TorclCondVar::default());
+    mutex.grab(true, None).unwrap();
+    mutex.grab(true, None).unwrap();
+    let worker = {
+        let mutex = Arc::clone(&mutex);
+        let condition = Arc::clone(&condition);
+        std::thread::spawn(move || {
+            let acquired = mutex.grab(true, Some(Duration::from_millis(200))).unwrap();
+            if acquired {
+                assert_eq!(condition.notify(1), 1);
+                mutex.release().unwrap();
+            }
+            acquired
+        })
+    };
+    let woke = condition
+        .wait(&mutex, Some(Duration::from_millis(500)))
+        .unwrap();
+    let acquired = worker.join().unwrap();
+    mutex.release().unwrap();
+    mutex.release().unwrap();
+    assert!(
+        mutex.release().is_err(),
+        "restore exactly the original depth"
+    );
+    assert!(acquired, "wait must fully release the recursive mutex");
+    assert!(woke);
+    mutex.grab(true, None).unwrap();
+    mutex.grab(true, None).unwrap();
+    assert!(!condition.wait(&mutex, Some(Duration::ZERO)).unwrap());
+    mutex.release().unwrap();
+    mutex.release().unwrap();
+    assert!(mutex.release().is_err(), "timeout restores the depth too");
+}
+
+#[test]
 fn notify_one_does_not_turn_another_waiters_timeout_into_success() {
     let mutex = Arc::new(TorclMutex::default());
     let condition = Arc::new(TorclCondVar::default());

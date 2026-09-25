@@ -57,7 +57,7 @@ impl TorclCondVar {
                     crate::thread::prepare_current_fiber_park(crate::thread::FiberState::Blocked)?;
                 let waiter = FiberWaiter::new(fiber, token);
                 state.fiber_waiters.push_back(waiter.clone());
-                mutex.release()?;
+                let depth = mutex.release_for_wait()?;
                 if let Some(deadline) = deadline {
                     if let Err(error) = timer::schedule(fiber, token, deadline) {
                         state
@@ -65,7 +65,7 @@ impl TorclCondVar {
                             .retain(|entry| !(entry.fiber == fiber && entry.token == token));
                         crate::thread::cancel_prepared_current_fiber_park();
                         drop(state);
-                        mutex.grab(true, None)?;
+                        mutex.reacquire_after_wait(depth)?;
                         return Err(error);
                     }
                 }
@@ -77,7 +77,7 @@ impl TorclCondVar {
                     .fiber_waiters
                     .retain(|entry| !(entry.fiber == fiber && entry.token == token));
                 drop(state);
-                mutex.grab(true, None)?;
+                mutex.reacquire_after_wait(depth)?;
                 Ok(notified)
             }
             BlockingMode::Native => {
@@ -86,7 +86,7 @@ impl TorclCondVar {
                     notified: AtomicBool::new(false),
                     wake: Condvar::new(),
                 });
-                mutex.release()?;
+                let depth = mutex.release_for_wait()?;
                 state.native_waiters.push_back(Arc::clone(&waiter));
                 let notified = loop {
                     if waiter.notified.load(Ordering::Acquire) {
@@ -110,7 +110,7 @@ impl TorclCondVar {
                     .native_waiters
                     .retain(|entry| !Arc::ptr_eq(entry, &waiter));
                 drop(state);
-                mutex.grab(true, None)?;
+                mutex.reacquire_after_wait(depth)?;
                 Ok(notified)
             }
         }

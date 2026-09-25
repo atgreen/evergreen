@@ -193,6 +193,8 @@ pub mod type_id {
     pub const MD_ARRAY: u8 = 0x18;
     /// Opaque mutex handle: one untraced word owning a process-local Arc.
     pub const MUTEX: u8 = 0x19;
+    /// Opaque condition-variable handle: one untraced process-local Arc.
+    pub const CONDITION_VARIABLE: u8 = 0x1A;
 }
 
 // ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────

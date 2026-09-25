@@ -124,6 +124,22 @@ impl TorclMutex {
     }
 
     pub fn release(&self) -> Result<(), TorclError> {
+        self.release_depth(false).map(|_| ())
+    }
+
+    /// A condition wait releases every recursive acquisition atomically.
+    pub(crate) fn release_for_wait(&self) -> Result<usize, TorclError> {
+        self.release_depth(true)
+    }
+
+    pub(crate) fn reacquire_after_wait(&self, depth: usize) -> Result<(), TorclError> {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+        self.grab(true, None)?;
+        self.state.lock().unwrap().depth = depth;
+        Ok(())
+    }
+
+    fn release_depth(&self, all: bool) -> Result<usize, TorclError> {
         let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         let owner = current_owner();
         let mut state = self.state.lock().unwrap();
@@ -132,19 +148,20 @@ impl TorclMutex {
                 "attempt to release a mutex not owned by the current execution".into(),
             ));
         }
-        if state.depth > 1 {
+        let depth = state.depth;
+        if !all && depth > 1 {
             state.depth -= 1;
-            return Ok(());
+            return Ok(1);
         }
         state.owner = None;
         state.depth = 0;
         while let Some(waiter) = state.fiber_waiters.pop_front() {
             if waiter.wake() {
-                return Ok(());
+                return Ok(depth);
             }
         }
         self.native_waiters.notify_one();
-        Ok(())
+        Ok(depth)
     }
 
     pub(crate) fn owned_by_current(&self) -> bool {

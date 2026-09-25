@@ -523,6 +523,18 @@ satisfy `MUTEX-P`, but locking or releasing one signals `PROGRAM-ERROR`;
 applications must recreate their mutexes after restart. Version-1 images
 remain readable. This is deliberately not an implicit unlock of a saved mutex.
 
+Condition variables use the same retained-native-storage handle discipline.
+`CONDITION-VARIABLE-P` and `TYPE-OF` recognize their handle. `CONDITION-WAIT`
+requires ownership of its mutex, releases all recursive acquisitions while
+waiting, and restores the original depth before returning on notification or
+timeout. `CONDITION-NOTIFY` accepts a non-negative integer count; notification
+and broadcast return the number of selected waiters, without storing permits
+for future waits. Applications must still check their protected predicate.
+
+Image format 4 clears condition-variable native pointers. Restored handles
+retain their type, but wait/notify/broadcast signal `PROGRAM-ERROR`; recreate
+them after restart. Formats 1–3 remain readable.
+
 ### 13.9.2 Green-Thread–Aware Blocking
 
 Blocking on a sync primitive parks an unpinned fiber (§2.3.2), freeing its
