@@ -5,6 +5,47 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Remaining-load attribution: two small probes rejected (2026-09-25, bliss-gn5y)
+
+No runtime change was retained in this investigation; the shipping baseline is
+still **d883d5b**. A portable ASDF `PERFORM :AROUND` probe timed 51 Babel source
+components and 17 CL-PPCRE components. Single-run Babel component CPU totals were
+182 ms of 391 ms overall on TorCL, versus 151 ms of 291 ms on SBCL. These are
+attribution observations, not new speed ratios: CPU frequency varied between runs.
+TorCL's largest Babel component was `enc-jpn` (52 ms versus SBCL's 7.6 ms).
+
+Fresh frame-pointer profiles of unchanged HEAD show diffuse whole-load costs.
+Component-only samples narrow the encoding initialization cost: `enc-jpn` has
+16% self samples in `symbol_function` and 12% in `run_loop`; `enc-ksc-5601` has
+20% / 35%. These small profiles contain 503 / 167 samples. Truncated stack
+ancestry does **not** support an exact decoder-versus-execution percentage.
+
+Two disposable ordinary-release probes each ran seven alternating CPU-0 pairs
+per library, using fresh processes, the existing FASL caches, a `COMPILE-FILE`
+error guard and functional checks. Builds had stopped before measurement:
+
+| Probe | Babel median cycles, before → probe | CL-PPCRE, before → probe |
+|---|---:|---:|
+| Direct dispatch for GETHASH and its internal setter | 1.235 → 1.215 G (−1.7%) | 0.608 → 0.605 G (−0.6%) |
+| OSR entry with pending operand-stack values | 1.243 → 1.213 G (−2.4%) | 0.608 → 0.609 G (+0.1%) |
+
+All 56 load checks passed. Neither probe is a substantial remaining-load win;
+both were removed completely. Their effects were **not** tested together or with
+fresh PGO training, and these functional checks do not establish production safety.
+
+The OSR probe identifies a genuine coverage limitation, tracked as **bliss-y8cn**:
+anonymous initialization loops take thousands of back-edges with two pending
+operands, but the current OSR gate admits only an empty operand stack. Threshold
+tuning cannot help those edges. A disposable native-entry stub that restores the
+tagbody's recorded stack depth also preserved a pending cons in a focused loop
+and recorded one native entry. A keeper needs promotion assertions plus GC,
+deoptimization, exact-once side-effect and control-flow coverage; it is not shipped.
+
+Artifacts: `/tmp/torcl-load-delta.MU6lKF/` contains component timings, unchanged
+HEAD profiles, OSR traces, both private probe images and comparison scripts/logs.
+Do not use the probe images as production controls. The installed executable and
+default `target/torcl` were not replaced.
+
 ## Amortize optimizing compilation (2026-09-25, bliss-304g)
 
 The default T1→T2 invocation threshold is now **4,096**, previously 256.
