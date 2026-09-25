@@ -7802,7 +7802,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x010a: exact Bignum (tag 3) and DoubleFloat (tag 6) literals.
 // 0x010b: compiled LOAD-TIME-VALUE initializers (SetLoadTimeCell, action 11).
 // 0x010c: preserve load-time IN-PACKAGE (SetPackage, action 12).
-const BBU_BYTECODE_VERSION: u16 = 0x010c;
+// 0x010d: source-independent multidimensional-array constants (tag 19).
+const BBU_BYTECODE_VERSION: u16 = 0x010d;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -8074,6 +8075,39 @@ impl BbuConstPool {
                     refs.push(self.value(elem)?);
                 }
                 return Some(self.vector(&refs));
+            }
+            if tid == torcl_rt::object::type_id::MD_ARRAY {
+                let dims_value = torcl_rt::types::md_array_dims(v)?;
+                let storage = torcl_rt::types::md_array_storage(v)?;
+                let rank = torcl_stdlib::length(dims_value).ok()?;
+                let mut dimensions = Vec::with_capacity(rank);
+                for index in 0..rank {
+                    let dimension = torcl_stdlib::elt(dims_value, index).ok()?;
+                    if !dimension.is_fixnum() || dimension.as_fixnum() < 0 {
+                        return None;
+                    }
+                    dimensions.push(u64::try_from(dimension.as_fixnum()).ok()?);
+                }
+                let count = torcl_stdlib::length(storage).ok()?;
+                let mut elements = Vec::with_capacity(count);
+                torcl_rt::rooted_ref!(_elements_root = &mut elements);
+                for index in 0..count {
+                    elements.push(torcl_stdlib::elt(storage, index).ok()?);
+                }
+                let mut refs = Vec::with_capacity(count);
+                for &element in &elements {
+                    refs.push(self.value(element)?);
+                }
+                let mut bytes = vec![19];
+                put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
+                for dimension in dimensions {
+                    put_u64(&mut bytes, dimension);
+                }
+                put_u32(&mut bytes, u32::try_from(refs.len()).ok()?);
+                for reference in refs {
+                    put_u32(&mut bytes, reference);
+                }
+                return Some(self.intern_encoded(bytes));
             }
         }
         None
@@ -9829,6 +9863,11 @@ enum BbuConstant {
     Pathname {
         name_ref: u32,
     },
+    /// A general multidimensional array: dimensions plus row-major element refs.
+    MdArray {
+        dimensions: Vec<u64>,
+        element_refs: Vec<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -10027,6 +10066,33 @@ fn parse_bbu_constant(
         18 => BbuConstant::Pathname {
             name_ref: cursor.u32()?,
         },
+        19 if bytecode_version >= 0x010d => {
+            let rank = cursor.u32()? as usize;
+            if rank > 1024 {
+                return Err(bbu_error("multidimensional array rank is too large"));
+            }
+            let mut dimensions = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                dimensions.push(cursor.u64()?);
+            }
+            let count = cursor.u32()? as usize;
+            let expected = dimensions
+                .iter()
+                .try_fold(1u64, |total, dimension| total.checked_mul(*dimension));
+            if expected != Some(count as u64) {
+                return Err(bbu_error(
+                    "multidimensional array dimensions do not match element count",
+                ));
+            }
+            let mut element_refs = Vec::with_capacity(count);
+            for _ in 0..count {
+                element_refs.push(cursor.u32()?);
+            }
+            BbuConstant::MdArray {
+                dimensions,
+                element_refs,
+            }
+        }
         tag => return Err(bbu_error(format!("unsupported constant tag {tag}"))),
     })
 }
@@ -10347,6 +10413,29 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<TorclVal>,
                     .collect::<Result<Vec<_>, _>>()?;
                 torcl_rt::rooted_ref!(_elements_root = &mut elements);
                 torcl_stdlib::build_simple_vector(&elements)
+            }
+            BbuConstant::MdArray {
+                dimensions,
+                element_refs,
+            } => {
+                let dimensions = dimensions
+                    .iter()
+                    .map(|dimension| {
+                        usize::try_from(*dimension)
+                            .map_err(|_| bbu_error("array dimension exceeds host range"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut elements = element_refs
+                    .iter()
+                    .map(|reference| {
+                        values.get(*reference as usize).copied().ok_or_else(|| {
+                            bbu_error(format!("forward/cyclic array reference at {index}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                torcl_rt::rooted_ref!(_elements_root = &mut elements);
+                torcl_stdlib::build_md_array_from_elements(&dimensions, &elements)
+                    .map_err(|error| bbu_error(format!("invalid array constant: {error}")))?
             }
         };
         values.push(value);
@@ -11747,6 +11836,11 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
             BbuConstant::Vector(refs) => {
                 for &reference in refs {
                     bbu_index(reference, encoded_constants.len(), "vector element")?;
+                }
+            }
+            BbuConstant::MdArray { element_refs, .. } => {
+                for &reference in element_refs {
+                    bbu_index(reference, encoded_constants.len(), "array element")?;
                 }
             }
             _ => {}

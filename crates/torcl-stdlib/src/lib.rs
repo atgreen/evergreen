@@ -111,13 +111,13 @@ pub use pathnames::{
 };
 pub use sequences::{
     adjust_complex_vector, aref, array_total_size, build_complex_vector, build_displaced_vector,
-    build_filled_simple_vector, build_md_array, build_result_sequence, build_simple_vector,
-    concatenate, copy_seq, count, cvec_adjustable, cvec_capacity, cvec_char_contents,
-    cvec_displacement, cvec_element, cvec_fill_pointer, cvec_has_fill_pointer, cvec_is_bit,
-    cvec_is_string, elt, find, is_complex_vector, length, map, nreverse, position, reduce, remove,
-    result_type_is_bit_vector, result_type_is_string, reverse, set_aref, set_elt, set_fill_pointer,
-    sort, stable_sort, string_char_at, string_char_count, string_set_char, subseq, substitute,
-    vector_pop, vector_push, vector_push_extend,
+    build_filled_simple_vector, build_md_array, build_md_array_from_elements,
+    build_result_sequence, build_simple_vector, concatenate, copy_seq, count, cvec_adjustable,
+    cvec_capacity, cvec_char_contents, cvec_displacement, cvec_element, cvec_fill_pointer,
+    cvec_has_fill_pointer, cvec_is_bit, cvec_is_string, elt, find, is_complex_vector, length, map,
+    nreverse, position, reduce, remove, result_type_is_bit_vector, result_type_is_string, reverse,
+    set_aref, set_elt, set_fill_pointer, sort, stable_sort, string_char_at, string_char_count,
+    string_set_char, subseq, substitute, vector_pop, vector_push, vector_push_extend,
 };
 pub use streams::GrayStream;
 pub use streams::{

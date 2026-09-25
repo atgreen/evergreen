@@ -852,16 +852,24 @@ fn build_complex_array_body(
     unsafe { TorclVal::from_heap_ptr(ptr) }
 }
 
-/// Build a multidimensional (rank ≥ 2) array: `dims` gives the per-axis
-/// dimensions, `fill` seeds every element of the row-major storage. GC-safe: the
-/// storage vector is rooted while the dims vector is built, and both are rooted
-/// across the MD_ARRAY allocation (bliss-rh0t).
-pub fn build_md_array(dims: &[usize], fill: TorclVal) -> TorclVal {
-    let total: usize = dims.iter().product();
-    // Row-major storage: `total` copies of the fill element.
-    torcl_rt::rooted!(fill = fill);
-    let store_vec = vec![*fill; total];
-    let storage = build_vector(&store_vec);
+/// Build a multidimensional (rank ≥ 2) array from row-major `elements`.
+///
+/// GC-safe: `build_vector` roots its copied element vector before allocating;
+/// the resulting storage is rooted while the dimensions vector and MD_ARRAY
+/// wrapper are allocated.
+pub fn build_md_array_from_elements(
+    dims: &[usize],
+    elements: &[TorclVal],
+) -> Result<TorclVal, TorclError> {
+    let total = dims
+        .iter()
+        .try_fold(1usize, |total, &dimension| total.checked_mul(dimension));
+    if total != Some(elements.len()) {
+        return Err(TorclError::ProgramError(
+            "multidimensional array dimensions do not match element count".into(),
+        ));
+    }
+    let storage = build_vector(elements);
     torcl_rt::rooted!(storage = storage);
     // Dimensions as a SIMPLE_VECTOR of fixnums.
     let dim_vals: Vec<TorclVal> = dims
@@ -879,7 +887,7 @@ pub fn build_md_array(dims: &[usize], fill: TorclVal) -> TorclVal {
             *(body as *mut u64) = (*storage).to_raw();
             *(body.add(8) as *mut u64) = (*dims_vec).to_raw();
             *(body.add(16) as *mut u64) = rank.to_raw();
-            return TorclVal::from_heap_ptr(body.sub(8));
+            return Ok(TorclVal::from_heap_ptr(body.sub(8)));
         }
     }
     // OOM fallback: a leaked block (header + 3 body words).
@@ -891,7 +899,17 @@ pub fn build_md_array(dims: &[usize], fill: TorclVal) -> TorclVal {
     buf.push(rank.to_raw());
     let ptr = buf.as_mut_ptr() as *mut u8;
     std::mem::forget(buf);
-    unsafe { TorclVal::from_heap_ptr(ptr) }
+    Ok(unsafe { TorclVal::from_heap_ptr(ptr) })
+}
+
+/// Build a multidimensional (rank ≥ 2) array: `dims` gives the per-axis
+/// dimensions, `fill` seeds every element of the row-major storage.
+pub fn build_md_array(dims: &[usize], fill: TorclVal) -> TorclVal {
+    let total: usize = dims.iter().product();
+    torcl_rt::rooted!(fill = fill);
+    let elements = vec![*fill; total];
+    build_md_array_from_elements(dims, &elements)
+        .expect("fresh multidimensional array dimensions match its storage")
 }
 
 /// Set the fill pointer of a complex vector (CL `(setf fill-pointer)`), clamped

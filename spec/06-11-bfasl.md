@@ -171,6 +171,7 @@ payload : tag-specific bytes
 | 16 | `FunctionRef` | `u32 function_index` |
 | 17 | `LayoutRef` | `u32 class_symbol_ref`, `u32 layout_hash_ref` |
 | 18 | `LoadTimeCell` | `u32 producing_action_index` |
+| 19 | `MdArray` | `u32 rank`, `u64 dimensions[rank]`, `u32 element_count`, `u32 row_major_element_refs[element_count]` |
 
 `Symbol.symbol_kind` is `0 = interned`, `1 = uninterned`, `2 = gensym`,
 `3 = external`.  Interned and external symbols are reconstructed through their
@@ -196,6 +197,18 @@ all 64 IEEE-754 bits, including signed zero, subnormals, and NaN payloads.
 These tags require version 1.10 or later; the loader continues to accept older
 units without them. Existing ratio entries can reference these bignum entries,
 so exact ratios are no longer restricted to fixnum-sized components.
+
+#### Multidimensional array literals (bytecode version 1.13)
+
+Version 1.13 implements `MdArray` (tag 19). Dimensions are encoded as
+architecture-neutral `u64` values followed by constant-pool references for the
+elements in row-major order. The verifier MUST reject a dimension product that
+overflows or differs from `element_count`, an out-of-range element reference,
+or a dimension that cannot be represented by the loading host. Materialization
+allocates fresh array storage; no process-local heap address is serialized.
+This permits values produced by `#.` during `COMPILE-FILE` to remain in the
+authoritative BBU without replaying compile-time-only helper definitions when
+the artifact is loaded in a fresh process.
 
 ### 6.11.3.3 Function Table
 

@@ -97,6 +97,12 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
             11 => pos += 9,
             13 | 16 | 17 => pos += 8,
             18 => pos += 4,
+            19 => {
+                let rank = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4 + rank * 8;
+                let count = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4 + count * 4;
+            }
             other => panic!("test BBU parser does not know constant tag {other}"),
         }
     }
@@ -2577,6 +2583,59 @@ fn compile_file_round_trips_define_package_without_source() {
         String::from_utf8_lossy(&l.stdout).trim(),
         "(42 T :INHERITED :EXTERNAL)"
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_time_multidimensional_array_is_portable_without_compile_time_helper() {
+    let dir = workdir("read-time-md-array");
+    let src = dir.join("array.lisp");
+    let out = dir.join("array.bfasl");
+    fs::write(
+        &src,
+        "(eval-when (:compile-toplevel)\n\
+           (defun cf-build-grid ()\n\
+             (let ((grid (make-array '(2 2) :initial-element 0)))\n\
+               (setf (aref grid 1 0) 42)\n\
+               grid)))\n\
+         (defparameter *cf-grid* #.(cf-build-grid))\n\
+         (defun cf-grid-value () (aref *cf-grid* 1 0))\n",
+    )
+    .unwrap();
+
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "compile-file failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "a read-time array must be encoded in the portable BBU, not by replaying source"
+    );
+    assert!(
+        bfasl_section(&bytes, 12).is_some(),
+        "compile-file must emit an authoritative BYTECODE_UNIT"
+    );
+
+    let loaded = run(&format!(
+        "(progn (load \"{}\") (list (cf-grid-value) (fboundp 'cf-build-grid)))",
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "fresh-process load failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&loaded.stdout).trim(), "(42 NIL)");
 
     let _ = fs::remove_dir_all(&dir);
 }
