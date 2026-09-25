@@ -13995,6 +13995,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
             | "TORCL-EXT:RUN-PROGRAM"
+            | "TORCL-EXT:GET-PRECISE-TIME"
             // COMPILE sets (values result warnings-p failure-p) but was absent
             // here, so the allowlist truncated it to one value (bliss-p14j).
             | "COMPILE"
@@ -20590,6 +20591,22 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(TorclVal::from_fixnum(
                     torcl_stdlib::time::get_internal_run_time(),
                 ));
+            }
+            // Atomic wall-clock sample for libraries that need a fractional
+            // absolute deadline: (values universal-seconds nanoseconds).
+            "TORCL-EXT:GET-PRECISE-TIME" => {
+                let args = eval_args(cdr, env)?;
+                if !args.is_empty() {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:GET-PRECISE-TIME requires no arguments, got {}",
+                        args.len()
+                    )));
+                }
+                let (seconds, nanoseconds) = torcl_stdlib::time::get_precise_time();
+                let seconds = TorclVal::from_fixnum(seconds);
+                let nanoseconds = TorclVal::from_fixnum(nanoseconds);
+                env.set_mv(vec![seconds, nanoseconds]);
+                return Ok(seconds);
             }
             // High-resolution monotonic nanoseconds for the deterministic
             // profiler (bliss-xgr5); the CL ms clock is too coarse per call.
@@ -34599,6 +34616,7 @@ fn is_builtin_function(name: &str) -> bool {
             // Time
             | "GET-UNIVERSAL-TIME" | "ENCODE-UNIVERSAL-TIME" | "DECODE-UNIVERSAL-TIME"
             | "GET-INTERNAL-REAL-TIME" | "GET-INTERNAL-RUN-TIME"
+            | "TORCL-EXT:GET-PRECISE-TIME"
             // Profiling (bliss-kfy4)
             | "TIME" | "ROOM"
             // I/O

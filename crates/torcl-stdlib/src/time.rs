@@ -105,6 +105,20 @@ pub fn get_universal_time() -> i64 {
     unix + DAYS_1900_TO_1970 * SECS_PER_DAY
 }
 
+/// High-resolution wall-clock time as `(CL universal seconds, nanoseconds
+/// within the second)`. Sampling both values from one `SystemTime` instant
+/// prevents a second-boundary mismatch in consumers that need fractional
+/// absolute deadlines.
+pub fn get_precise_time() -> (i64, i64) {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (
+        unix.as_secs() as i64 + DAYS_1900_TO_1970 * SECS_PER_DAY,
+        unix.subsec_nanos() as i64,
+    )
+}
+
 /// `get-internal-real-time`: milliseconds of wall-clock time since an
 /// arbitrary fixed origin (process start), matching torcl's
 /// `INTERNAL-TIME-UNITS-PER-SECOND` of 1000 (CLHS 25.1.4.3 leaves the origin
@@ -158,6 +172,13 @@ mod tests {
             encode_universal_time(0, 0, 0, 1, 1, 1970, Some(0)),
             2_208_988_800
         );
+    }
+
+    #[test]
+    fn precise_time_is_normalized_and_matches_universal_time() {
+        let (seconds, nanoseconds) = get_precise_time();
+        assert!((0..1_000_000_000).contains(&nanoseconds));
+        assert!((seconds - get_universal_time()).abs() <= 1);
     }
 
     #[test]
