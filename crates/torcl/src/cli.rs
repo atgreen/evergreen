@@ -1134,7 +1134,7 @@ fn coerce_installed_function(env: &Env, val: TorclVal) -> TorclVal {
                 let fresh = torcl_rt::symbols::make_uninterned("CLOSURE");
                 bytecode::register_closure_env(
                     fresh.as_symbol_index(),
-                    Rc::clone(&closure.captured_frame),
+                    Arc::clone(&closure.captured_frame),
                 );
                 // params_form/body are bare TorclVals; alloc_interpreted roots
                 // them before it can allocate, and nothing allocates between the
@@ -1647,7 +1647,7 @@ struct Closure {
     /// Raw lambda list, for full &optional/&rest/&key binding.
     params_form: TorclVal,
     body: TorclVal,
-    captured_frame: Rc<RefCell<EnvFrame>>,
+    captured_frame: Arc<SharedCell<EnvFrame>>,
     /// The lexically-enclosing BLOCK and TAGBODY exit points, captured at
     /// closure-creation time. CL specifies BLOCK/RETURN-FROM and TAGBODY/GO as
     /// LEXICAL: a closure that does `(return-from tag …)` must target the block
@@ -1671,14 +1671,14 @@ struct Closure {
     /// "The function F is undefined", and `#'f` inside such a body evaluated to
     /// the bare symbol (ansi LABELS.40; bliss-5q20).
     ///
-    /// `Rc` because `Env::funs_mut` is copy-on-write: a later mutation in any
+    /// `Arc` because `Env::funs_mut` is copy-on-write: a later mutation in any
     /// descendant env forks its own map rather than disturbing this snapshot.
     /// `None` means "inherit the caller's namespace", which is right for a
     /// lambda written outside any FLET/LABELS — and is what a core-restored
     /// closure gets, since this is deliberately not serialized (the image format
     /// is unversioned; restoring one loses its local-function scope exactly as
     /// it did before this field existed).
-    captured_funs: Option<Rc<RefCell<HashMap<String, FunDef>>>>,
+    captured_funs: Option<Arc<SharedCell<HashMap<String, FunDef>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1696,8 +1696,8 @@ enum EvalContext {
 // collector.
 #[derive(Clone)]
 struct Env {
-    frame: Rc<RefCell<EnvFrame>>,
-    funs: Rc<RefCell<HashMap<String, FunDef>>>,
+    frame: Arc<SharedCell<EnvFrame>>,
+    funs: Arc<SharedCell<HashMap<String, FunDef>>>,
     macros: Rc<RefCell<HashMap<String, MacroDef>>>,
     /// User SETF-expanders (DEFINE-SETF-EXPANDER / DEFSETF), keyed by access-fn
     /// name. Shared and mutated in place (like `closures`) so a definition made
@@ -1729,7 +1729,7 @@ struct Env {
     /// every closure construction and every invocation hashes one. `FxHash` is
     /// the same choice already made for the symbol registry and the GF dispatch
     /// cache (bliss-p1t).
-    closures: Rc<RefCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>>,
+    closures: Arc<SharedCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>>,
     block_stack: Vec<(String, String)>,
     catch_stack: Vec<(String, String)>,
     /// Tags visible for GO: (tag-name, tagbody-token)
@@ -1852,31 +1852,49 @@ impl<K: PartialEq + std::borrow::Borrow<Q>, Q: PartialEq + ?Sized, V> std::ops::
     }
 }
 
+/// Short, non-allocating access to lexical state shared by native threads.
+///
+/// A guard must never survive a Lisp allocation, evaluation, or safepoint.
+/// Acquisition deliberately does not poll: callers may hold unrooted values
+/// precisely because lexical lookup/store has always been GC-free. Mutators
+/// finish these short critical sections before acknowledging a world stop;
+/// the collector can then lock and relocate their slots.
+#[derive(Default)]
+struct SharedCell<T>(Mutex<T>);
+
+impl<T> SharedCell<T> {
+    fn new(value: T) -> Self {
+        Self(Mutex::new(value))
+    }
+
+    fn borrow(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn borrow_mut(&self) -> std::sync::MutexGuard<'_, T> {
+        self.borrow()
+    }
+
+    fn try_borrow_mut(&self) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, T>> {
+        self.0.try_lock()
+    }
+}
+
 #[derive(Clone, Default)]
 struct EnvFrame {
     vars: VecMap<String, TorclVal>,
     symbol_vars: VecMap<u32, TorclVal>,
-    parent: Option<Rc<RefCell<EnvFrame>>>,
+    parent: Option<Arc<SharedCell<EnvFrame>>>,
 }
 
 /// An owned, thread-safe (`Arc`-based) deep-copy snapshot of a lexical
 /// [`EnvFrame`] chain.
 ///
-/// The live evaluator represents lexical scopes as `Rc<RefCell<EnvFrame>>`,
-/// which closures, restarts, and the ordinary macro-expansion path
-/// ([`expand_macro`]) all *share* by `Rc::clone` (see bliss-gd4). This frozen
-/// form exists solely for the compiler-macro / macroexpand-environment registry
-/// bridge: `torcl-compiler` stores macro and compiler-macro expanders as
-/// `Arc<dyn Fn(..) + Send + Sync + 'static>` in a *global* table
-/// ([`macroexpand::CompilerMacroFn`] / `MacroFn`) that outlives the defining
-/// `Env`. Such a closure cannot capture an `Rc<RefCell<EnvFrame>>` — it is
-/// neither `Send`/`Sync` nor `'static` against a transient `Env`, and would
-/// dangle once that `Env` is gone. So at definition time we `freeze` the frame
-/// into this immutable `Arc` structure, and at expansion time `thaw` it into a
-/// throwaway `Env` to recover the lexical variables the expander was defined in.
-/// This copy is therefore load-bearing (a lifetime/`Send` requirement, not the
-/// gd4 aliasing bug) and cannot be replaced by frame sharing while the registry
-/// stays in a separate crate behind `Send + Sync` bounds. See bliss-9sf.
+/// The compiler-macro / macroexpand-environment registry historically owns a
+/// snapshot, thawed into a transient evaluator at expansion time (bliss-9sf).
+/// Keep that separate bridge's behavior unchanged here. Ordinary closures,
+/// including callbacks passed to native threads, share the live `EnvFrame`
+/// locations; they must never use freeze/thaw to transfer their captures.
 struct FrozenEnvFrame {
     vars: Mutex<VecMap<String, TorclVal>>,
     symbol_vars: Mutex<VecMap<u32, TorclVal>>,
@@ -1925,8 +1943,10 @@ struct FunDef {
     /// same-named block happens to be active when the function is referenced or
     /// called. `local_fn_closure` used the block stack at `#'name` time, so
     ///
-    ///     (block done (flet ((%f (x) (return-from done x)))
-    ///                   (block done (mapcar #'%f '(good bad bad)))) 'bad)
+    /// ```lisp
+    /// (block done (flet ((%f (x) (return-from done x)))
+    ///               (block done (mapcar #'%f '(good bad bad)))) 'bad)
+    /// ```
     ///
     /// captured the INNER `done` and returned BAD (ansi BLOCK.10; bliss-wfxx).
     /// `None` for a global defun, which inherits the caller's as before.
@@ -1953,7 +1973,7 @@ impl FunDef {
 struct MacroDef {
     params_form: TorclVal,
     body: TorclVal,
-    captured_frame: Rc<RefCell<EnvFrame>>,
+    captured_frame: Arc<SharedCell<EnvFrame>>,
     /// Source-free BFASL macros execute this pre-lowered expander. Source and
     /// lexical MACROLET definitions retain the ordinary body representation.
     bytecode: Option<Rc<RefCell<torcl_rt::bytecode::BytecodeFunction>>>,
@@ -1986,7 +2006,7 @@ enum SetfExpander {
         /// (,z ,y) ,v)))` must see Z. Evaluating the body in the CALLER's
         /// environment instead made Z unbound (ansi DEFSETF.6A; bliss-30i6).
         /// MacroDef captures `captured_frame` for the same reason.
-        captured_frame: Rc<RefCell<EnvFrame>>,
+        captured_frame: Arc<SharedCell<EnvFrame>>,
     },
 }
 
@@ -2139,11 +2159,11 @@ enum RestartFunction {
         // Share the LIVE lexical frame (like closures/macros) so a setf/setq
         // inside the restart function persists to the establishing scope.
         // Frozen snapshots dropped writes (bliss-gd4).
-        captured_frame: Rc<RefCell<EnvFrame>>,
+        captured_frame: Arc<SharedCell<EnvFrame>>,
     },
     Bytecode {
         function: Rc<RefCell<torcl_rt::bytecode::BytecodeFunction>>,
-        captured_frame: Rc<RefCell<EnvFrame>>,
+        captured_frame: Arc<SharedCell<EnvFrame>>,
     },
     ContinueNil,
 }
@@ -2186,13 +2206,14 @@ enum HandlerImpl {
         var_name: Option<String>,
         body: TorclVal,
         // Live lexical frame of the HANDLER-CASE form (shared, not snapshotted).
-        captured_frame: Rc<RefCell<EnvFrame>>,
+        captured_frame: Arc<SharedCell<EnvFrame>>,
     },
 }
 
+static CONTROL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     static CONTROL_VALUES: RefCell<HashMap<String, TorclVal>> = RefCell::new(HashMap::new());
-    static CONTROL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
     /// Stack of the innermost-enclosing LOOP's own implicit-block return token.
     /// The LOOP `return` clause and `loop-finish` unwind THIS block (nil for an
     /// unnamed loop, else the named block) — distinct from the Lisp RETURN
@@ -2229,7 +2250,7 @@ thread_local! {
     /// caller's. MethodDef itself must stay `Send` (the macro-capture path freezes
     /// it), so the non-`Send` frame lives here, not in the struct. The frames are
     /// traced as GC roots by `scan_evaluator_global_roots` (bliss-sdd).
-    static METHOD_CAPTURED_ENV: RefCell<HashMap<u64, Rc<RefCell<EnvFrame>>>> =
+    static METHOD_CAPTURED_ENV: RefCell<HashMap<u64, Arc<SharedCell<EnvFrame>>>> =
         RefCell::new(HashMap::new());
 
     /// Compiled (bytecode) body for a DEFMETHOD, keyed by the method's
@@ -2309,8 +2330,8 @@ fn bump_macro_env_generation() {
 
 /// Address-identity of an `EnvFrame`, for comparing whether the current frame is
 /// the top-level base or a genuinely nested binding frame (bliss-sdd).
-fn frame_addr(frame: &Rc<RefCell<EnvFrame>>) -> usize {
-    Rc::as_ptr(frame) as usize
+fn frame_addr(frame: &Arc<SharedCell<EnvFrame>>) -> usize {
+    Arc::as_ptr(frame) as usize
 }
 
 #[derive(Clone, Copy)]
@@ -2773,24 +2794,28 @@ fn host_serialize_registries() -> Vec<u8> {
     // once by identity so restored closures keep sharing. Reads raw tagged
     // words post-full-gc; Rust reads only — GC-safe.
     out.extend_from_slice(b"CLSR");
-    out.extend_from_slice(&NEXT_CLOSURE_ID.with(|c| *c.borrow()).to_le_bytes());
+    out.extend_from_slice(
+        &NEXT_CLOSURE_ID
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_le_bytes(),
+    );
     {
-        let reg = CLOSURE_REGISTRY.with(Rc::clone);
+        let reg = closure_registry();
         let reg = reg.borrow();
         let bc_env = bytecode::closure_env_entries();
         // Assign dense ids to every reachable frame (worklist over parents),
         // from BOTH the tree-walker closures and the bytecode CLOSURE_ENV.
         let mut frame_ids: HashMap<usize, u32> = HashMap::new();
-        let mut frames: Vec<Rc<RefCell<EnvFrame>>> = Vec::new();
-        let roots: Vec<Rc<RefCell<EnvFrame>>> = reg
+        let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
+        let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
             .values()
-            .map(|c| Rc::clone(&c.captured_frame))
-            .chain(bc_env.iter().map(|(_, f)| Rc::clone(f)))
+            .map(|c| Arc::clone(&c.captured_frame))
+            .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
             .collect();
         for root in roots {
             let mut cur = Some(root);
             while let Some(f) = cur {
-                let key = Rc::as_ptr(&f) as usize;
+                let key = Arc::as_ptr(&f) as usize;
                 if frame_ids.contains_key(&key) {
                     break;
                 }
@@ -2816,7 +2841,7 @@ fn host_serialize_registries() -> Vec<u8> {
             let parent_id = fb
                 .parent
                 .as_ref()
-                .and_then(|p| frame_ids.get(&(Rc::as_ptr(p) as usize)).copied())
+                .and_then(|p| frame_ids.get(&(Arc::as_ptr(p) as usize)).copied())
                 .unwrap_or(u32::MAX);
             out.extend_from_slice(&parent_id.to_le_bytes());
         }
@@ -2826,7 +2851,7 @@ fn host_serialize_registries() -> Vec<u8> {
             out.extend_from_slice(&closure.params_form.to_raw().to_le_bytes());
             out.extend_from_slice(&closure.body.to_raw().to_le_bytes());
             let fid = frame_ids
-                .get(&(Rc::as_ptr(&closure.captured_frame) as usize))
+                .get(&(Arc::as_ptr(&closure.captured_frame) as usize))
                 .copied()
                 .unwrap_or(u32::MAX);
             out.extend_from_slice(&fid.to_le_bytes());
@@ -2848,7 +2873,7 @@ fn host_serialize_registries() -> Vec<u8> {
         for (sym, frame) in &bc_env {
             out.extend_from_slice(&sym.to_le_bytes());
             let fid = frame_ids
-                .get(&(Rc::as_ptr(frame) as usize))
+                .get(&(Arc::as_ptr(frame) as usize))
                 .copied()
                 .unwrap_or(u32::MAX);
             out.extend_from_slice(&fid.to_le_bytes());
@@ -3235,9 +3260,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
         };
         let saved_next = hr_get_u64(data, &mut off).ok_or_else(bad)?;
         let n_frames = get_u32(data, &mut off).ok_or_else(bad)? as usize;
-        let frames: Vec<Rc<RefCell<EnvFrame>>> = (0..n_frames)
+        let frames: Vec<Arc<SharedCell<EnvFrame>>> = (0..n_frames)
             .map(|_| {
-                Rc::new(RefCell::new(EnvFrame {
+                Arc::new(SharedCell::new(EnvFrame {
                     vars: VecMap::default(),
                     symbol_vars: VecMap::default(),
                     parent: None,
@@ -3265,12 +3290,12 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
         for (frame, &pid) in frames.iter().zip(&parent_ids) {
             if pid != u32::MAX {
                 if let Some(parent) = frames.get(pid as usize) {
-                    frame.borrow_mut().parent = Some(Rc::clone(parent));
+                    frame.borrow_mut().parent = Some(Arc::clone(parent));
                 }
             }
         }
         let n_closures = get_u32(data, &mut off).ok_or_else(bad)? as usize;
-        let registry = CLOSURE_REGISTRY.with(Rc::clone);
+        let registry = closure_registry();
         for _ in 0..n_closures {
             let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
             let params = hr_get_u64(data, &mut off).ok_or_else(bad)?;
@@ -3291,7 +3316,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
                 captured_tags.push((a, b));
             }
             let captured_frame = frames.get(fid as usize).cloned().unwrap_or_else(|| {
-                Rc::new(RefCell::new(EnvFrame {
+                Arc::new(SharedCell::new(EnvFrame {
                     vars: VecMap::default(),
                     symbol_vars: VecMap::default(),
                     parent: None,
@@ -3318,7 +3343,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
             let sym = get_u32(data, &mut off).ok_or_else(bad)?;
             let fid = get_u32(data, &mut off).ok_or_else(bad)?;
             if let Some(frame) = frames.get(fid as usize) {
-                bytecode::register_closure_env(sym, Rc::clone(frame));
+                bytecode::register_closure_env(sym, Arc::clone(frame));
             }
         }
         let n_bcc = get_u32(data, &mut off).ok_or_else(bad)? as usize;
@@ -3340,10 +3365,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
             }
             bytecode::install_closure_control(sym, blocks, tags);
         }
-        NEXT_CLOSURE_ID.with(|c| {
-            let cur = *c.borrow();
-            *c.borrow_mut() = cur.max(saved_next);
-        });
+        NEXT_CLOSURE_ID.fetch_max(saved_next, std::sync::atomic::Ordering::Relaxed);
     }
     // Bytecode-registry unit (bliss-zz6w): stash for the post-Env drain — the
     // BBU loader needs the Env, which this hook does not have.
@@ -3411,7 +3433,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
 /// macro/setf-fn to the fresh root frame. Called by the CLI once the top-level
 /// `Env` exists after an image load. GC-safe: no TorCL allocation (only
 /// `from_raw`, `Rc::clone`, and map inserts).
-fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
+fn drain_pending_host_registries(root_frame: &Arc<SharedCell<EnvFrame>>) {
     let macros = PENDING_HOST_MACROS.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (name, params_raw, body_raw) in macros {
         global_macro_insert(
@@ -3419,7 +3441,7 @@ fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
             MacroDef {
                 params_form: TorclVal::from_raw(params_raw),
                 body: TorclVal::from_raw(body_raw),
-                captured_frame: Rc::clone(root_frame),
+                captured_frame: Arc::clone(root_frame),
                 bytecode: None,
                 function: None,
             },
@@ -3498,7 +3520,7 @@ pub(crate) fn register_host_registry_hooks() {
 
 fn install_loaded_macro(
     name: TorclVal,
-    function: Rc<torcl_rt::bytecode::BytecodeFunction>,
+    function: Arc<torcl_rt::bytecode::BytecodeFunction>,
     env: &Env,
 ) {
     install_evaluator_global_root_scanner();
@@ -3507,7 +3529,7 @@ fn install_loaded_macro(
         MacroDef {
             params_form: NIL,
             body: NIL,
-            captured_frame: Rc::clone(&env.frame),
+            captured_frame: Arc::clone(&env.frame),
             bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
             function: None,
         },
@@ -3518,7 +3540,7 @@ fn install_loaded_macro(
 /// `.bfasl`: a setf expander whose body is the compiled bytecode function.
 fn install_loaded_setf_expander(
     name: TorclVal,
-    function: Rc<torcl_rt::bytecode::BytecodeFunction>,
+    function: Arc<torcl_rt::bytecode::BytecodeFunction>,
     env: &Env,
 ) {
     install_evaluator_global_root_scanner();
@@ -3527,7 +3549,7 @@ fn install_loaded_setf_expander(
         SetfExpander::Expander(MacroDef {
             params_form: NIL,
             body: NIL,
-            captured_frame: Rc::clone(&env.frame),
+            captured_frame: Arc::clone(&env.frame),
             bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
             function: None,
         }),
@@ -3536,7 +3558,7 @@ fn install_loaded_setf_expander(
 
 fn install_loaded_compiler_macro(
     name: TorclVal,
-    function: Rc<torcl_rt::bytecode::BytecodeFunction>,
+    function: Arc<torcl_rt::bytecode::BytecodeFunction>,
     definition_package: String,
 ) {
     install_evaluator_global_root_scanner();
@@ -3575,7 +3597,7 @@ fn install_loaded_compiler_macro(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            bytecode::run_macro(Rc::new(function), &args, Some(*form), &mut env)
+            bytecode::run_macro(Arc::new(function), &args, Some(*form), &mut env)
         }),
     );
 }
@@ -3628,11 +3650,7 @@ fn macro_defined(env: &Env, name: &str) -> bool {
 }
 
 fn next_control_token(prefix: &str) -> String {
-    let id = CONTROL_COUNTER.with(|counter| {
-        let id = *counter.borrow();
-        *counter.borrow_mut() = id + 1;
-        id
-    });
+    let id = CONTROL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{prefix}:{id}")
 }
 
@@ -3732,17 +3750,24 @@ fn store_control_value(token: &str, value: TorclVal) {
 /// Deep-copy a live lexical frame chain into an owned, `Send + Sync` snapshot.
 /// Only the global macro/compiler-macro registry bridge needs this; see
 /// [`FrozenEnvFrame`].
-fn freeze_env_frame(frame: &Rc<RefCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
-    let borrowed = frame.borrow();
+fn freeze_env_frame(frame: &Arc<SharedCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
+    let (vars, symbol_vars, parent) = {
+        let borrowed = frame.borrow();
+        (
+            borrowed.vars.clone(),
+            borrowed.symbol_vars.clone(),
+            borrowed.parent.clone(),
+        )
+    };
     Arc::new(FrozenEnvFrame {
-        vars: Mutex::new(borrowed.vars.clone()),
-        symbol_vars: Mutex::new(borrowed.symbol_vars.clone()),
-        parent: borrowed.parent.as_ref().map(freeze_env_frame),
+        vars: Mutex::new(vars),
+        symbol_vars: Mutex::new(symbol_vars),
+        parent: parent.as_ref().map(freeze_env_frame),
     })
 }
 
-fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Rc<RefCell<EnvFrame>> {
-    Rc::new(RefCell::new(EnvFrame {
+fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Arc<SharedCell<EnvFrame>> {
+    Arc::new(SharedCell::new(EnvFrame {
         vars: frame
             .vars
             .lock()
@@ -5516,7 +5541,7 @@ fn invoke_method(
     // captured lexical environment, not the caller's frame (bliss-sdd).
     let parent = METHOD_CAPTURED_ENV
         .with(|m| m.borrow().get(&method.method_id.0).cloned())
-        .unwrap_or_else(|| Rc::clone(&env.frame));
+        .unwrap_or_else(|| Arc::clone(&env.frame));
     if let Some(mut next) = next {
         torcl_rt::rooted_ref!(_next_root = &mut next);
         return with_child_frame(env, parent, |env| {
@@ -5562,7 +5587,7 @@ fn invoke_restart_function_in(
             function_form,
             captured_frame,
         } => {
-            let mut restart_env = env.child_with_parent(Rc::clone(captured_frame));
+            let mut restart_env = env.child_with_parent(Arc::clone(captured_frame));
             // Run the body against the exits visible where the restart was
             // ESTABLISHED, not those the handler happened to carry: a
             // handler-bind lambda is written outside the tagbody, so its captured
@@ -5584,8 +5609,8 @@ fn invoke_restart_function_in(
             function,
             captured_frame,
         } => {
-            let function = Rc::new(function.borrow().clone());
-            let saved = std::mem::replace(&mut env.frame, Rc::clone(captured_frame));
+            let function = Arc::new(function.borrow().clone());
+            let saved = std::mem::replace(&mut env.frame, Arc::clone(captured_frame));
             // Same reasoning as the FunctionForm arm: the body's exits are the
             // ones visible where the restart was established (bliss-jf2b).
             let saved_scope = scope.map(|(blocks, tags)| {
@@ -6527,11 +6552,11 @@ pub(crate) fn with_env_visit_state<R>(f: impl FnOnce(&mut EnvRootVisitState) -> 
 }
 
 fn visit_env_frame_roots(
-    frame: &Rc<RefCell<EnvFrame>>,
+    frame: &Arc<SharedCell<EnvFrame>>,
     state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut TorclVal),
 ) {
-    let identity = Rc::as_ptr(frame) as usize;
+    let identity = Arc::as_ptr(frame) as usize;
     if !state.frames.insert(identity) {
         return;
     }
@@ -6553,13 +6578,13 @@ fn visit_env_frame_roots(
 
 /// Walk a shared function-namespace map once per collection pass.
 fn visit_fun_map_roots(
-    funs: &Rc<RefCell<HashMap<String, FunDef>>>,
+    funs: &Arc<SharedCell<HashMap<String, FunDef>>>,
     _state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut TorclVal),
 ) {
     // Deliberately NOT deduplicated by map address, and `try_borrow_mut` rather
-    // than `borrow_mut`: both match `scan_suspended_funs`, the existing scanner
-    // for the same kind of map. An earlier version here skipped a map it had
+    // than `borrow_mut`: preserve the existing function-map scanning policy.
+    // An earlier version here skipped a map it had
     // already seen this pass, which measured no faster (tracing cost 557s vs
     // 558s on an identical workload) and is exactly the kind of cleverness that
     // makes a root scanner wrong. A map reachable twice is simply walked twice.
@@ -6912,11 +6937,9 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
     // what lets the cache hold a TorclVal at all: the collector rewrites each
     // entry in place, so a cached `#'car` stays valid across a relocation
     // instead of becoming a stale pointer.
-    BUILTIN_FN_WRAPPER_VALUES.with(|values| {
-        for value in values.borrow_mut().values_mut() {
-            visit(value);
-        }
-    });
+    for value in builtin_wrapper_cache().borrow_mut().values.values_mut() {
+        visit(value);
+    }
     MACROEXPAND_ENVIRONMENTS.with(|environments| {
         for environment in environments.borrow_mut().values_mut() {
             environment.visit_gc_roots(visit);
@@ -6925,6 +6948,14 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
 
     // Shared per-pass visit state (bliss-s56e).
     with_env_visit_state(|state| {
+        for closure in closure_registry().borrow_mut().values_mut() {
+            visit(&mut closure.params_form);
+            visit(&mut closure.body);
+            visit_env_frame_roots(&closure.captured_frame, state, visit);
+            if let Some(funs) = &closure.captured_funs {
+                visit_fun_map_roots(funs, state, visit);
+            }
+        }
         // Lexical frames captured by DEFMETHODs defined inside binding forms
         // (bliss-sdd) are roots: the moving collector must rewrite the TorclVals they
         // hold (e.g. cl-ppcre's REG-SCANNER) so the method body reads live pointers.
@@ -7050,10 +7081,10 @@ fn thread_entry_runner(mut entry: TorclVal) -> Result<TorclVal, TorclError> {
 }
 
 impl Env {
-    fn funs_mut(&mut self) -> std::cell::RefMut<'_, HashMap<String, FunDef>> {
-        if Rc::strong_count(&self.funs) > 1 {
+    fn funs_mut(&mut self) -> std::sync::MutexGuard<'_, HashMap<String, FunDef>> {
+        if Arc::strong_count(&self.funs) > 1 {
             let definitions = self.funs.borrow().clone();
-            self.funs = Rc::new(RefCell::new(definitions));
+            self.funs = Arc::new(SharedCell::new(definitions));
         }
         self.funs.borrow_mut()
     }
@@ -7202,8 +7233,8 @@ impl Env {
         torcl_stdlib::initialize_condition_runtime_support()
             .expect("initialize condition runtime support (STORAGE-CONDITION pool) at startup");
         let mut env = Env {
-            frame: Rc::new(RefCell::new(EnvFrame::default())),
-            funs: Rc::new(RefCell::new(HashMap::new())),
+            frame: Arc::new(SharedCell::new(EnvFrame::default())),
+            funs: Arc::new(SharedCell::new(HashMap::new())),
             macros: Rc::new(RefCell::new(HashMap::new())),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
             symbol_macros: Rc::new(RefCell::new(HashMap::new())),
@@ -7217,7 +7248,7 @@ impl Env {
             handlers: Vec::new(),
             mv: Vec::new(),
             mv_active: false,
-            closures: CLOSURE_REGISTRY.with(Rc::clone),
+            closures: closure_registry(),
             block_stack: Vec::new(),
             catch_stack: Vec::new(),
             tag_stack: Vec::new(),
@@ -7256,7 +7287,7 @@ impl Env {
         } else {
             LIVE_DEFINITIONAL_REGISTRIES.with(|cell| {
                 *cell.borrow_mut() = Some(DefinitionalRegistries {
-                    funs: Rc::downgrade(&env.funs),
+                    funs: Arc::downgrade(&env.funs),
                     setf_expanders: Rc::downgrade(&env.setf_expanders),
                     symbol_macros: Rc::downgrade(&env.symbol_macros),
                     classes: Rc::downgrade(&env.classes),
@@ -7485,12 +7516,12 @@ impl Env {
     /// detaches them through the copy-on-write mutation helpers above.
     fn child(&self) -> Self {
         Env {
-            frame: Rc::new(RefCell::new(EnvFrame {
+            frame: Arc::new(SharedCell::new(EnvFrame {
                 vars: VecMap::default(),
                 symbol_vars: VecMap::default(),
-                parent: Some(Rc::clone(&self.frame)),
+                parent: Some(Arc::clone(&self.frame)),
             })),
-            funs: Rc::clone(&self.funs),
+            funs: Arc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
@@ -7504,7 +7535,7 @@ impl Env {
             handlers: self.handlers.clone(),
             mv: self.mv.clone(),
             mv_active: self.mv_active,
-            closures: Rc::clone(&self.closures),
+            closures: Arc::clone(&self.closures),
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
@@ -7514,14 +7545,14 @@ impl Env {
         }
     }
 
-    fn child_with_parent(&self, parent: Rc<RefCell<EnvFrame>>) -> Self {
+    fn child_with_parent(&self, parent: Arc<SharedCell<EnvFrame>>) -> Self {
         Env {
-            frame: Rc::new(RefCell::new(EnvFrame {
+            frame: Arc::new(SharedCell::new(EnvFrame {
                 vars: VecMap::default(),
                 symbol_vars: VecMap::default(),
                 parent: Some(parent),
             })),
-            funs: Rc::clone(&self.funs),
+            funs: Arc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
@@ -7535,7 +7566,7 @@ impl Env {
             handlers: self.handlers.clone(),
             mv: self.mv.clone(),
             mv_active: self.mv_active,
-            closures: Rc::clone(&self.closures),
+            closures: Arc::clone(&self.closures),
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
@@ -7548,8 +7579,8 @@ impl Env {
     /// Retain dynamic state and global definitions, but no enclosing lexical
     /// variables, local functions/macros, declarations, or exit targets.
     fn null_lexical_child(&self) -> Self {
-        let mut child = self.child_with_parent(Rc::new(RefCell::new(EnvFrame::default())));
-        child.funs = Rc::new(RefCell::new(HashMap::new()));
+        let mut child = self.child_with_parent(Arc::new(SharedCell::new(EnvFrame::default())));
+        child.funs = Arc::new(SharedCell::new(HashMap::new()));
         child.macros = Rc::new(RefCell::new(HashMap::new()));
         child.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
         child.block_stack.clear();
@@ -7674,9 +7705,10 @@ impl Env {
     }
 
     fn define_local_symbol(&mut self, symbol: TorclVal, val: TorclVal) {
+        let name = sym_name(symbol);
         let mut frame = self.frame.borrow_mut();
         frame.symbol_vars.insert(symbol.as_symbol_index(), val);
-        frame.vars.insert(sym_name(symbol), val);
+        frame.vars.insert(name, val);
     }
 
     fn seed_standard_constant(&mut self, name: &str, val: TorclVal) {
@@ -7698,7 +7730,7 @@ impl Env {
         torcl_rt::symbols::set_symbol_value(idx, val);
     }
 
-    fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<TorclVal> {
+    fn lookup_frame(frame: &Arc<SharedCell<EnvFrame>>, name: &str) -> Option<TorclVal> {
         // Resolve the name ONCE, then check both maps at EACH frame, symbol
         // first. Walking symbol_vars through the whole chain and only then the
         // name map would let an OUTER symbol binding win over an INNER
@@ -7713,7 +7745,7 @@ impl Env {
         // The u32 probe runs first because the name map is a VecMap<String, _>,
         // a linear scan comparing Strings per entry (bliss-2erp).
         let idx = torcl_rt::symbols::find_index(name);
-        let mut cur = Some(Rc::clone(frame));
+        let mut cur = Some(Arc::clone(frame));
         while let Some(f) = cur {
             let borrowed = f.borrow();
             if let Some(i) = idx {
@@ -7731,7 +7763,10 @@ impl Env {
         None
     }
 
-    fn lookup_symbol_frame(frame: &Rc<RefCell<EnvFrame>>, symbol_index: u32) -> Option<TorclVal> {
+    fn lookup_symbol_frame(
+        frame: &Arc<SharedCell<EnvFrame>>,
+        symbol_index: u32,
+    ) -> Option<TorclVal> {
         let borrowed = frame.borrow();
         if let Some(val) = borrowed.symbol_vars.get(&symbol_index) {
             return Some(*val);
@@ -7741,13 +7776,14 @@ impl Env {
         parent.and_then(|parent| Self::lookup_symbol_frame(&parent, symbol_index))
     }
 
-    fn set_frame_var(frame: &Rc<RefCell<EnvFrame>>, name: &str, val: TorclVal) -> bool {
+    fn set_frame_var(frame: &Arc<SharedCell<EnvFrame>>, name: &str, val: TorclVal) -> bool {
+        let symbol_index = torcl_rt::symbols::find_index(name);
         {
             let mut borrowed = frame.borrow_mut();
             if let Some(slot) = borrowed.vars.get_mut(name) {
                 // In place: the entry exists, so no owned key is needed.
                 *slot = val;
-                if let Some(idx) = torcl_rt::symbols::find_index(name) {
+                if let Some(idx) = symbol_index {
                     borrowed.symbol_vars.insert(idx, val);
                 }
                 return true;
@@ -7762,7 +7798,7 @@ impl Env {
     }
 
     fn set_symbol_frame_var(
-        frame: &Rc<RefCell<EnvFrame>>,
+        frame: &Arc<SharedCell<EnvFrame>>,
         symbol_index: u32,
         val: TorclVal,
     ) -> bool {
@@ -7777,7 +7813,9 @@ impl Env {
                 borrowed.symbol_vars.insert(symbol_index, val);
                 return true;
             }
+            drop(borrowed);
             let name = sym_name_rc(TorclVal::from_symbol_index(symbol_index));
+            let mut borrowed = frame.borrow_mut();
             if borrowed.vars.contains_key(&*name) {
                 borrowed.symbol_vars.insert(symbol_index, val);
                 // Update the legacy name map in place when the entry exists, so
@@ -7827,90 +7865,44 @@ impl torcl_rt::gc::TraceHostRoots for Env {
     }
 }
 
-thread_local! {
-    // Caller frames that `with_child_frame` has swapped OUT of `env.frame` while a
-    // nested evaluation runs. For a lexical child the new frame's parent IS the
-    // saved caller frame, so it stays reachable via `env.frame`; but a *function
-    // call* installs the callee's captured frame as parent, taking the caller's
-    // frame (and its locals — e.g. a `loop` iteration variable) off the scanned
-    // `env.frame` chain. Those locals then survive only in this Rust-side stack,
-    // invisible to the relocating GC. Rooting them here keeps them (and the values
-    // they bind) live and relocated for the whole nested call (bliss-6b2 #2).
-    static SUSPENDED_FRAMES: RefCell<Vec<Rc<RefCell<EnvFrame>>>> =
-        const { RefCell::new(Vec::new()) };
+/// A caller frame temporarily displaced by a callee's captured environment.
+/// Use the intrusive root list: a TLS-only scanner misses this frame when a
+/// different native thread collects while the caller is suspended.
+struct SuspendedFrameRoot(Arc<SharedCell<EnvFrame>>);
+
+impl torcl_rt::gc::TraceHostRoots for SuspendedFrameRoot {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        with_env_visit_state(|state| visit_env_frame_roots(&self.0, state, visit));
+    }
 }
 
-fn scan_suspended_frames(visit: &mut dyn FnMut(*mut TorclVal)) {
-    SUSPENDED_FRAMES.with(|s| {
-        let frames = s.borrow();
-        // Shared per-pass visit state (bliss-s56e).
-        with_env_visit_state(|state| {
-            for frame in frames.iter() {
-                visit_env_frame_roots(frame, state, visit);
-            }
-        });
-    });
-}
+/// The caller's local function definitions displaced by a FLET or closure call.
+/// An intrusive root keeps their original body slots visible even when another
+/// native thread performs the collection while this caller is suspended.
+struct SuspendedFunsRoot(Arc<SharedCell<HashMap<String, FunDef>>>);
 
-fn install_suspended_frame_scanner() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| torcl_rt::gc::register_root_scanner(scan_suspended_frames));
-}
-
-thread_local! {
-    /// FLET function-namespace maps that `eval_named_call_ex` has swapped OUT of
-    /// `env.funs` while a FLET function's body runs (a FLET body sees the parent
-    /// snapshot, not its siblings — bliss-ayq8). The swapped-out map still holds
-    /// the FLET `FunDef`s' body cons trees, but `env.funs` no longer points at it,
-    /// so without this a minor GC during the body would free those bodies —
-    /// a LATER call to the same FLET function then reads a poisoned body and
-    /// crashes (bliss-biol; e.g. COUNT's `(flet ((matchp …)) (loop … (matchp …)))`
-    /// under GC stress). Scan the swapped-out maps here for the extent of the call.
-    static SUSPENDED_FUNS: RefCell<Vec<Rc<RefCell<HashMap<String, FunDef>>>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-fn scan_suspended_funs(visit: &mut dyn FnMut(*mut TorclVal)) {
-    SUSPENDED_FUNS.with(|s| {
-        for funs in s.borrow().iter() {
-            // The map is off `env.funs` for the call's extent, so the mutator is
-            // not holding a borrow; try_borrow_mut keeps the stop-the-world scan
-            // panic-free regardless.
-            if let Ok(mut map) = funs.try_borrow_mut() {
-                for def in map.values_mut() {
-                    visit_fun_def_roots(def, visit);
-                }
-            }
-        }
-    });
-}
-
-fn install_suspended_funs_scanner() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| torcl_rt::gc::register_root_scanner(scan_suspended_funs));
+impl torcl_rt::gc::TraceHostRoots for SuspendedFunsRoot {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        with_env_visit_state(|state| visit_fun_map_roots(&self.0, state, visit));
+    }
 }
 
 fn with_child_frame<T>(
     env: &mut Env,
-    parent: Rc<RefCell<EnvFrame>>,
+    parent: Arc<SharedCell<EnvFrame>>,
     f: impl FnOnce(&mut Env) -> Result<T, TorclError>,
 ) -> Result<T, TorclError> {
-    install_suspended_frame_scanner();
-    let saved_frame = Rc::clone(&env.frame);
+    torcl_rt::rooted!(saved_frame = SuspendedFrameRoot(Arc::clone(&env.frame)));
     // Keep the swapped-out caller frame rooted for the extent of `f`: a function
     // call reparents `env.frame` to the callee's captured frame, so without this
     // the caller's locals would be unscanned during the call (bliss-6b2 #2).
-    SUSPENDED_FRAMES.with(|s| s.borrow_mut().push(Rc::clone(&saved_frame)));
-    env.frame = Rc::new(RefCell::new(EnvFrame {
+    env.frame = Arc::new(SharedCell::new(EnvFrame {
         vars: VecMap::default(),
         symbol_vars: VecMap::default(),
         parent: Some(parent),
     }));
     let result = f(env);
-    env.frame = saved_frame;
-    SUSPENDED_FRAMES.with(|s| {
-        s.borrow_mut().pop();
-    });
+    env.frame = Arc::clone(&saved_frame.0);
     result
 }
 
@@ -7956,7 +7948,7 @@ fn eval_lambda_call(
     params_form: TorclVal,
     body: TorclVal,
     args: &[TorclVal],
-    parent: Rc<RefCell<EnvFrame>>,
+    parent: Arc<SharedCell<EnvFrame>>,
 ) -> Result<TorclVal, TorclError> {
     eval_lambda_call_ex(
         env,
@@ -7982,7 +7974,7 @@ fn eval_named_call_ex(
     params_form: TorclVal,
     body: TorclVal,
     args: &[TorclVal],
-    parent: Rc<RefCell<EnvFrame>>,
+    parent: Arc<SharedCell<EnvFrame>>,
     control: LexicalControl,
 ) -> Result<TorclVal, TorclError> {
     // Lisp-aware statistical profiler (bliss-sc4t): this is the tree-walked call
@@ -8004,18 +7996,18 @@ fn eval_named_call_ex(
     };
     match def_scope {
         Some(scope_map) => {
-            install_suspended_funs_scanner();
-            let saved = std::mem::replace(&mut env.funs, Rc::new(RefCell::new(scope_map)));
+            torcl_rt::rooted!(
+                saved = SuspendedFunsRoot(std::mem::replace(
+                    &mut env.funs,
+                    Arc::new(SharedCell::new(scope_map)),
+                ))
+            );
             // Keep the swapped-out funs (holding this FLET function's FunDef body,
             // no longer reachable via env.funs) GC-scanned for the call, or a minor
             // GC during the body frees the body and a later call reads poison
             // (bliss-biol).
-            SUSPENDED_FUNS.with(|s| s.borrow_mut().push(Rc::clone(&saved)));
             let r = eval_lambda_call_ex(env, params_form, body, args, parent, control);
-            SUSPENDED_FUNS.with(|s| {
-                s.borrow_mut().pop();
-            });
-            env.funs = saved;
+            env.funs = Arc::clone(&saved.0);
             r
         }
         None => eval_lambda_call_ex(env, params_form, body, args, parent, control),
@@ -8027,7 +8019,7 @@ fn eval_lambda_call_ex(
     params_form: TorclVal,
     body: TorclVal,
     args: &[TorclVal],
-    parent: Rc<RefCell<EnvFrame>>,
+    parent: Arc<SharedCell<EnvFrame>>,
     control: LexicalControl,
 ) -> Result<TorclVal, TorclError> {
     // The interim host-stack depth guard (commit ddba528) is retired (nmq.6):
@@ -8827,7 +8819,7 @@ struct DefinitionalRegistries {
     // every definition deep-clone its map and silently decouple the live env
     // from this record. Weak handles observe without inflating the count; a
     // macro-expansion env upgrades them only for its (short) lifetime.
-    funs: std::rc::Weak<RefCell<HashMap<String, FunDef>>>,
+    funs: std::sync::Weak<SharedCell<HashMap<String, FunDef>>>,
     setf_expanders: std::rc::Weak<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: std::rc::Weak<RefCell<HashMap<u32, TorclVal>>>,
     classes: std::rc::Weak<RefCell<HashMap<String, ClassDef>>>,
@@ -9303,28 +9295,47 @@ fn eval_quasiquote_depth(
 }
 
 // ── Closure ID generation ────────────────────────────────────────
+static NEXT_CLOSURE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 thread_local! {
-    static NEXT_CLOSURE_ID: RefCell<u64> = const { RefCell::new(1) };
     static NEXT_STDLIB_CLASS_ID: RefCell<i64> = const { RefCell::new(300_000) };
-    /// The PROCESS-WIDE (per-thread) closure table (bliss-w1sf). Closure ids
-    /// from `next_closure_id` are unique across the whole session, and a reified
-    /// `(TORCL::CLOSURE . id)` may be applied from ANY environment — including a
-    /// FRESH macro-expansion `Env` (`Env::new_for_macro_expansion`) that a macro
-    /// body funcalls into. Keying the table per-`Env` meant such an env had an
-    /// empty table and the application failed with "Cannot apply: Cons(..)" (it
-    /// broke the documented "one root map per process" invariant on the
-    /// BUILTIN_FN_WRAPPERS comment). Every `Env` now shares THIS one table by
-    /// Rc, so an id minted anywhere resolves everywhere.
-    static CLOSURE_REGISTRY: Rc<RefCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>> =
-        Rc::new(RefCell::new(HashMap::default()));
+}
+
+fn closure_registry() -> Arc<SharedCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>> {
+    static REGISTRY: std::sync::OnceLock<
+        Arc<SharedCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>>,
+    > = std::sync::OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(SharedCell::new(HashMap::default()))))
 }
 
 fn next_closure_id() -> u64 {
-    NEXT_CLOSURE_ID.with(|c| {
-        let v = *c.borrow();
-        *c.borrow_mut() = v + 1;
-        v
-    })
+    NEXT_CLOSURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl torcl_rt::gc::TraceHostRoots for Closure {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        visit(&mut self.params_form);
+        visit(&mut self.body);
+        with_env_visit_state(|state| {
+            visit_env_frame_roots(&self.captured_frame, state, visit);
+            if let Some(funs) = &self.captured_funs {
+                visit_fun_map_roots(funs, state, visit);
+            }
+        });
+    }
+}
+
+/// Build the rooted Lisp identity before publishing its registry entry. A
+/// concurrent prune must never see an entry whose identity cons is still being
+/// allocated; the construction root preserves its captures until publication.
+fn register_tree_closure(mut closure: Closure) -> TorclVal {
+    torcl_rt::rooted_ref!(_construction_root = &mut closure);
+    let id = next_closure_id();
+    let marker = resolve_sym("TORCL::CLOSURE").unwrap_or(NIL);
+    torcl_rt::rooted!(reference = arena_cons(marker, TorclVal::from_fixnum(id as i64)));
+    drop(_construction_root);
+    closure_registry().borrow_mut().insert(id, closure);
+    *reference
 }
 
 thread_local! {
@@ -9356,40 +9367,39 @@ fn prune_closure_registry() -> (usize, usize) {
     if torcl_rt::gc::full_gc().is_err() {
         return (0, 0);
     }
-    let mut live: HashSet<u64> = HashSet::new();
-    let _ = torcl_rt::gc::walk_heap(|body, type_id, size| {
-        if type_id == torcl_rt::object::type_id::CONS && size >= 16 {
-            // SAFETY: a CONS body is [car u64][cdr u64]; walk_heap hands us
-            // the body pointer of a live object under the heap lock.
-            let car = TorclVal::from_raw(unsafe { *(body as *const u64) });
-            if car == closure_sym {
-                let cdr = TorclVal::from_raw(unsafe { *(body as *const u64).add(1) });
-                if cdr.is_fixnum() {
-                    live.insert(cdr.as_fixnum() as u64);
+    let result = torcl_rt::gc::with_heap_snapshot(|| {
+        let mut live: HashSet<u64> = HashSet::new();
+        torcl_rt::gc::walk_heap(|body, type_id, size| {
+            if type_id == torcl_rt::object::type_id::CONS && size >= 16 {
+                // SAFETY: a CONS body is [car u64][cdr u64]; walk_heap hands us
+                // the body pointer of a live object under the heap lock.
+                let car = TorclVal::from_raw(unsafe { *(body as *const u64) });
+                if car == closure_sym {
+                    let cdr = TorclVal::from_raw(unsafe { *(body as *const u64).add(1) });
+                    if cdr.is_fixnum() {
+                        live.insert(cdr.as_fixnum() as u64);
+                    }
                 }
             }
-        }
-        true
+            true
+        })
+        .ok()?;
+        // Builtin wrappers retain their identity conses in a globally scanned
+        // cache, so their liveness follows the same heap rule as every closure.
+        let reg = closure_registry();
+        let before = reg.borrow().len();
+        reg.borrow_mut().retain(|id, _| live.contains(id));
+        let after = reg.borrow().len();
+        Some((before, after, live.len()))
     });
-    // Ids cached RUST-SIDE as raw numbers are invisible to the heap walk:
-    // BUILTIN_FN_WRAPPERS reconstitutes `(TORCL::CLOSURE . id)` conses on
-    // demand from its String→u64 cache, so its ids are permanently live even
-    // when no cons currently exists (bliss-kfhp: pruning one killed trivia's
-    // #'first wrapper mid-load). Keep them.
-    BUILTIN_FN_WRAPPERS.with(|c| {
-        for &id in c.borrow().values() {
-            live.insert(id);
-        }
-    });
-    let reg = CLOSURE_REGISTRY.with(Rc::clone);
-    let before = reg.borrow().len();
-    reg.borrow_mut().retain(|id, _| live.contains(id));
-    let after = reg.borrow().len();
+    let Ok(Some((before, after, live_count))) = result else {
+        return (0, 0);
+    };
     LAST_CLOSURE_PRUNE_LEN.with(|c| c.set(after));
     if std::env::var_os("TORCL_PRUNE_DBG").is_some() {
         eprintln!(
             ";; closure prune: {before} -> {after}; live-set {} ids",
-            live.len()
+            live_count
         );
     }
     (before, after)
@@ -9433,7 +9443,7 @@ fn maybe_prune_closure_registry() {
         return;
     }
     let floor = closure_prune_floor();
-    let len = CLOSURE_REGISTRY.with(|r| r.borrow().len());
+    let len = closure_registry().borrow().len();
     let last = LAST_CLOSURE_PRUNE_LEN.with(|c| c.get());
     if len >= floor && len >= last.saturating_mul(2).max(floor) {
         prune_closure_registry();
@@ -10494,7 +10504,7 @@ fn compile_file_load_forms(form: TorclVal, env: &mut Env) -> Result<Vec<TorclVal
                 let mdef = MacroDef {
                     params_form,
                     body: macro_body,
-                    captured_frame: Rc::clone(&env.frame),
+                    captured_frame: Arc::clone(&env.frame),
                     bytecode: None,
                     function: None,
                 };
@@ -12395,9 +12405,11 @@ fn parse_not_type(t: TorclVal) -> Option<TorclVal> {
 /// decidable, and CLHS requires the definite answer. torcl returned
 /// `(NIL NIL)` ("cannot determine") for all of these:
 ///
-///     (subtypep '(member #\a #\b) 'character)  => NIL NIL, want T T
-///     (subtypep '(member a b) 'symbol)         => NIL NIL, want T T
-///     (subtypep '(eql #\a) 'character)         => NIL NIL, want T T
+/// ```lisp
+/// (subtypep '(member #\a #\b) 'character)  => NIL NIL, want T T
+/// (subtypep '(member a b) 'symbol)         => NIL NIL, want T T
+/// (subtypep '(eql #\a) 'character)         => NIL NIL, want T T
+/// ```
 ///
 /// `member_subtypep` above only compares a MEMBER against another MEMBER, so
 /// nothing answered this shape. It matters beyond tidiness: the ansi random
@@ -14176,63 +14188,32 @@ fn tag_key(form: TorclVal) -> Option<String> {
     None
 }
 
-thread_local! {
-    /// Reified builtin function-object wrappers, keyed by the builtin's bare name
-    /// → the closure id in the shared `env.closures` table (bliss-uuh). Builtins
-    /// have no heap function cell, so `#'car` used to return the bare symbol CAR,
-    /// which is not FUNCTIONP. Instead return a wrapper closure
-    /// `(lambda (&rest a) (apply '<builtin> a))`; APPLY dispatches the builtin by
-    /// name (the tree-walker's builtin arm), so it never recurses back into the
-    /// wrapper. Cached so repeated `#'car` yields the SAME object (EQ) and does not
-    /// grow `env.closures` without bound. `env.closures` is shared via `Rc` across
-    /// the whole env tree (one root map per process), so an id minted once resolves
-    /// everywhere for the life of the session.
-    static BUILTIN_FN_WRAPPERS: RefCell<std::collections::HashMap<String, u64>> =
-        RefCell::new(std::collections::HashMap::new());
-    /// The reified `#'<builtin>` wrapper VALUE per builtin, so two references to
-    /// the same builtin are EQ.
-    ///
-    /// `BUILTIN_FN_WRAPPERS` above already reuses the closure ID, but the value
-    /// returned was a FRESH `arena_cons` every time, so `(eq #'car #'car)` was
-    /// NIL where CLHS 5.3 and SBCL say T -- and every `#'<builtin>` reference
-    /// allocated (bliss-hb0q). User-defined functions were already EQ-stable;
-    /// only builtins were not.
-    ///
-    /// GC: these values ARE visited by `scan_evaluator_global_roots`, so the
-    /// moving collector rewrites them in place. That is what makes caching a
-    /// TorclVal safe here -- the surrounding tables deliberately key on stable
-    /// u32/u64 ids precisely because an UNVISITED cached TorclVal would go
-    /// stale. This follows the CONTROL_VALUES pattern.
-    static BUILTIN_FN_WRAPPER_VALUES: RefCell<std::collections::HashMap<String, TorclVal>> =
-        RefCell::new(std::collections::HashMap::new());
-    /// Reverse of [`BUILTIN_FN_WRAPPERS`]: wrapper closure id -> the symbol the
-    /// wrapper dispatches to. `builtin_wrapper_name` answers the same question
-    /// but linear-scans and clones a String, which is far too slow for a call
-    /// path; this is the O(1) form used to shortcut `#'<builtin>` calls.
-    static BUILTIN_WRAPPER_SYMS: RefCell<std::collections::HashMap<u64, u32>> =
-        RefCell::new(std::collections::HashMap::new());
+#[derive(Default)]
+struct BuiltinWrapperCache {
+    values: HashMap<String, TorclVal>,
+    symbols: HashMap<u64, u32>,
+}
+
+/// One process-wide identity per builtin, rooted regardless of which thread
+/// collects. Build wrappers outside the mutex and publish one winning value.
+fn builtin_wrapper_cache() -> &'static SharedCell<BuiltinWrapperCache> {
+    static CACHE: std::sync::OnceLock<SharedCell<BuiltinWrapperCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| SharedCell::new(BuiltinWrapperCache::default()))
 }
 
 /// Reify (and cache) a callable, FUNCTIONP wrapper closure for the builtin named
-/// `bare` (interned symbol `name_sym`). See [`BUILTIN_FN_WRAPPERS`] (bliss-uuh).
+/// `bare` (interned symbol `name_sym`). Its body dispatches by name through APPLY.
 fn builtin_fn_wrapper(env: &mut Env, name_sym: TorclVal, bare: &str) -> TorclVal {
-    let closure_sym = resolve_sym("TORCL::CLOSURE").unwrap_or(NIL);
-    if let Some(sym) = name_sym.symbol_index() {
-        // Recorded on BOTH paths: a wrapper minted before this map existed (or
-        // by another route) must still be shortcuttable.
-        if let Some(id) = BUILTIN_FN_WRAPPERS.with(|c| c.borrow().get(bare).copied()) {
-            BUILTIN_WRAPPER_SYMS.with(|m| m.borrow_mut().insert(id, sym));
+    {
+        let mut cache = builtin_wrapper_cache().borrow_mut();
+        if let Some(reference) = cache.values.get(bare).copied() {
+            if let Some(sym) = name_sym.symbol_index() {
+                cache
+                    .symbols
+                    .insert(cp(reference).1.as_fixnum() as u64, sym);
+            }
+            return reference;
         }
-    }
-    // Return the SAME value for the same builtin, so `(eq #'car #'car)` is T
-    // (bliss-hb0q). Reusing only the closure id still minted a fresh cons.
-    if let Some(v) = BUILTIN_FN_WRAPPER_VALUES.with(|c| c.borrow().get(bare).copied()) {
-        return v;
-    }
-    if let Some(id) = BUILTIN_FN_WRAPPERS.with(|c| c.borrow().get(bare).copied()) {
-        torcl_rt::rooted!(v = arena_cons(closure_sym, TorclVal::from_fixnum(id as i64)));
-        BUILTIN_FN_WRAPPER_VALUES.with(|c| c.borrow_mut().insert(bare.to_string(), *v));
-        return *v;
     }
     // Build (&REST %args) and ((APPLY (QUOTE <name>) %args)), rooting each
     // intermediate across the allocating arena_cons calls (moving minor GC).
@@ -14249,27 +14230,21 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: TorclVal, bare: &str) -> TorclVal
     *call = arena_cons(*quoted, *call);
     *call = arena_cons(apply_sym, *call);
     torcl_rt::rooted!(body = arena_cons(*call, NIL));
-    let id = next_closure_id();
     let closure = Closure {
         params_form: *params_form,
         body: *body,
-        captured_frame: Rc::clone(&env.frame),
+        captured_frame: Arc::clone(&env.frame),
         captured_blocks: env.block_stack.clone(),
         captured_tags: env.tag_stack.clone(),
-        captured_funs: Some(Rc::clone(&env.funs)),
+        captured_funs: Some(Arc::clone(&env.funs)),
     };
-    // Once inserted, params_form/body are rooted via the GC scan of env.closures.
-    env.closures.borrow_mut().insert(id, closure);
-    BUILTIN_FN_WRAPPERS.with(|c| c.borrow_mut().insert(bare.to_string(), id));
+    torcl_rt::rooted!(v = register_tree_closure(closure));
+    let mut cache = builtin_wrapper_cache().borrow_mut();
+    let winner = *cache.values.entry(bare.to_string()).or_insert(*v);
     if let Some(sym) = name_sym.symbol_index() {
-        BUILTIN_WRAPPER_SYMS.with(|m| m.borrow_mut().insert(id, sym));
+        cache.symbols.insert(cp(winner).1.as_fixnum() as u64, sym);
     }
-    // Rooted across the cache insert: `bare.to_string()` is a Rust allocation,
-    // but the value must not be held unrooted after an `arena_cons` regardless
-    // -- that is the shape gc-root-lint flags and the one that goes stale.
-    torcl_rt::rooted!(v = arena_cons(closure_sym, TorclVal::from_fixnum(id as i64)));
-    BUILTIN_FN_WRAPPER_VALUES.with(|c| c.borrow_mut().insert(bare.to_string(), *v));
-    *v
+    winner
 }
 
 /// If `v` is a reified builtin wrapper closure `(TORCL::CLOSURE . id)` produced by
@@ -14289,12 +14264,12 @@ fn builtin_wrapper_name(v: TorclVal) -> Option<String> {
         return None;
     }
     let id = cdr.as_fixnum() as u64;
-    BUILTIN_FN_WRAPPERS.with(|c| {
-        c.borrow()
-            .iter()
-            .find(|(_, wid)| **wid == id)
-            .map(|(n, _)| n.clone())
-    })
+    builtin_wrapper_cache()
+        .borrow()
+        .values
+        .iter()
+        .find(|(_, reference)| cp(**reference).1.as_fixnum() as u64 == id)
+        .map(|(name, _)| name.clone())
 }
 
 /// The bare name of a function DESIGNATOR — a symbol's name, or the builtin name
@@ -16848,37 +16823,17 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // The handle is presently the raw native-thread id as a fixnum;
                 // a distinct first-class THREAD object is tracked as bliss-8z5i.
                 //
-                // EXPERIMENTAL — foundational slice, not yet safe for general
-                // use (epic bliss-jiwf). Two known blockers: (1) FUNCTION must
-                // currently be a SYMBOL naming a global function or another
-                // non-capturing entry — a freshly consed closure/lambda lives in
-                // the parent's nursery and the worker reads a stale pointer
-                // (bliss-nubv). (2) The tree-walker does not poll GC safepoints,
-                // so two interpreter threads allocating *concurrently* deadlock
-                // at stop-the-world; today this is safe only when one interpreter
-                // thread runs at a time (e.g. the worker runs while the spawner
-                // blocks in JOIN-THREAD). Safepoint cooperation is bliss-bw3t.
+                // The runtime roots the entry until the new thread adopts it.
+                // Preserve a closure cons as-is: reifying it as a fresh function
+                // would discard its local function namespace and EQ identity.
                 let (ff, _) = cp(cdr);
                 let mut fnv = eval_form(ff, env)?;
                 torcl_rt::rooted_ref!(_fnv_root = &mut fnv);
-                // A `(lambda …)` evaluates to an interpreter closure cons
-                // `(TORCL::CLOSURE . id)` whose captured frame lives in the
-                // spawner's thread_local CLOSURE_ENV. Reify it into a
-                // self-contained, pinned interpreted-function object carrying its
-                // own lambda list + body so it can run on the worker
-                // (coerce_installed_function; the pinned object never moves).
-                // A lambda that references only globals and its own parameters —
-                // the overwhelmingly common `(make-thread (lambda () (work)))`
-                // form, and what bordeaux-threads passes — then runs correctly.
-                // A lambda that reads *captured lexicals* will find them unbound
-                // on the worker (that frame is not shared across threads yet —
-                // bliss-nubv); that is the documented limit.
-                if is_closure_cons(fnv) {
-                    fnv = coerce_installed_function(env, fnv);
-                }
-                // Symbols (resolved via the shared global function cell) and
-                // interpreted-function objects are runnable on the worker.
-                let shareable = fnv.is_symbol() || torcl_rt::function::is_interpreted_function(fnv);
+                // Both closure representations resolve their captured state
+                // through process-wide, precisely scanned registries.
+                let shareable = fnv.is_symbol()
+                    || is_closure_cons(fnv)
+                    || torcl_rt::function::is_interpreted_function(fnv);
                 if !shareable {
                     return Err(TorclError::ProgramError(
                         "TORCL-THREAD:MAKE-THREAD entry must be a function or a symbol \
@@ -17416,7 +17371,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let (pattern, rest) = cp(cdr);
                 let (value_form, body) = cp(rest);
                 let value = eval_form(value_form, env)?;
-                let parent = Rc::clone(&env.frame);
+                let parent = Arc::clone(&env.frame);
                 return with_child_frame(env, parent, move |env| {
                     // Use the full destructuring binder so &optional/&rest/&key
                     // work in the pattern (not just plain structural matching).
@@ -17698,7 +17653,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                 torcl_rt::rooted!(access_form = ex.access_form);
                                 let mut temps = ex.temps.clone();
                                 let mut vals = ex.vals.clone();
-                                let parent = Rc::clone(&env.frame);
+                                let parent = Arc::clone(&env.frame);
                                 let val_form_v = *val_form;
                                 let ind_form_v = *indform;
                                 let def_form_v = *defform;
@@ -18253,7 +18208,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                     MacroDef {
                                         params_form: NIL,
                                         body: NIL,
-                                        captured_frame: Rc::clone(&env.frame),
+                                        captured_frame: Arc::clone(&env.frame),
                                         bytecode: None,
                                         function: Some(fnval),
                                     },
@@ -18436,7 +18391,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                         params_form,
                                         body,
                                         &args,
-                                        Rc::clone(&env.frame),
+                                        Arc::clone(&env.frame),
                                     )?;
                                     *c = *r2;
                                     continue;
@@ -18504,7 +18459,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                         params_form,
                                         body,
                                         &args,
-                                        Rc::clone(&env.frame),
+                                        Arc::clone(&env.frame),
                                     )?;
                                 } else if {
                                     let key = format!("(SETF {})", other);
@@ -18704,16 +18659,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         let closure = Closure {
                             params_form,
                             body,
-                            captured_frame: Rc::clone(&env.frame),
+                            captured_frame: Arc::clone(&env.frame),
                             captured_blocks: env.block_stack.clone(),
                             captured_tags: env.tag_stack.clone(),
-                            captured_funs: Some(Rc::clone(&env.funs)),
+                            captured_funs: Some(Arc::clone(&env.funs)),
                         };
-                        let id = next_closure_id();
-                        env.closures.borrow_mut().insert(id, closure);
-                        // Return a tagged closure reference as (TORCL::CLOSURE . id)
-                        let closure_sym = resolve_sym("TORCL::CLOSURE").unwrap_or(NIL);
-                        return Ok(arena_cons(closure_sym, TorclVal::from_fixnum(id as i64)));
+                        return Ok(register_tree_closure(closure));
                     }
                 }
                 return Ok(name_form);
@@ -18729,15 +18680,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let closure = Closure {
                     params_form,
                     body,
-                    captured_frame: Rc::clone(&env.frame),
+                    captured_frame: Arc::clone(&env.frame),
                     captured_blocks: env.block_stack.clone(),
                     captured_tags: env.tag_stack.clone(),
-                    captured_funs: Some(Rc::clone(&env.funs)),
+                    captured_funs: Some(Arc::clone(&env.funs)),
                 };
-                let id = next_closure_id();
-                env.closures.borrow_mut().insert(id, closure);
-                let closure_sym = resolve_sym("TORCL::CLOSURE").unwrap_or(NIL);
-                return Ok(arena_cons(closure_sym, TorclVal::from_fixnum(id as i64)));
+                return Ok(register_tree_closure(closure));
             }
             "EVAL" => {
                 // (eval form): evaluate the argument to obtain the form, then
@@ -24566,7 +24514,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // the loop variable captures that iteration's binding, matching
                 // SBCL and the bytecode backend's per-iteration LET — a single
                 // reused frame made every captured closure see the last value.
-                let parent = Rc::clone(&env.frame);
+                let parent = Arc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
                     // The count-form is inside the implicit block nil, so
                     // `(dotimes (i (return 1)))` returns from DOTIMES's OWN
@@ -24577,7 +24525,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     // result form (DOTIMES.15/20 — not the negative count).
                     let n = (num_val(count)? as i64).max(0);
                     for i in 0..n {
-                        with_child_frame(env, Rc::clone(&parent), |env| {
+                        with_child_frame(env, Arc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, TorclVal::from_fixnum(i));
                             eval_tagbody(*body, env)
                         })?;
@@ -24602,7 +24550,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 torcl_rt::rooted!(result_rest = result_rest);
                 torcl_rt::rooted!(body = body);
                 // Fresh child frame PER ITERATION (bliss-0oey) — see DOTIMES.
-                let parent = Rc::clone(&env.frame);
+                let parent = Arc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
                     // The list-form is inside the implicit block nil, so
                     // `(dolist (x (return 1)))` returns from DOLIST's OWN block
@@ -24618,7 +24566,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     torcl_rt::rooted!(elems = elems_vec);
                     torcl_rt::rooted!(tail = tail);
                     for i in 0..elems.len() {
-                        with_child_frame(env, Rc::clone(&parent), |env| {
+                        with_child_frame(env, Arc::clone(&parent), |env| {
                             env.define_local_symbol(*var_form, elems[i]);
                             eval_tagbody(*body, env)
                         })?;
@@ -24863,7 +24811,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             // Guard on no lexical shadow — never redirect an FLET/LABELS binding
             // to the global registry entry of the same name.
             let is_local_fn = env.funs.borrow().contains_key(&name);
-            let mut call_parent = Rc::clone(&env.frame);
+            let mut call_parent = Arc::clone(&env.frame);
             if std::env::var_os("TORCL_DEBUG_DISPATCH").is_some() && name.contains("MK-CLOSURE") {
                 eprintln!(
                     "[disp] operator path name={name} local={is_local_fn} body_nil={}",
@@ -24904,7 +24852,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     // otherwise a callee dynamically scopes the caller's LET, and
                     // the cold tree-walked result diverges from the lexical
                     // bytecode backend (a tier inconsistency). bliss-20o.
-                    call_parent = Rc::new(RefCell::new(EnvFrame::default()));
+                    call_parent = Arc::new(SharedCell::new(EnvFrame::default()));
                 }
             }
             // A GLOBAL named function has no lexically-enclosing BLOCK/TAGBODY
@@ -25022,7 +24970,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let fn_name = parts[1].trim_start_matches(':');
                 if let Some((params_form, body)) = callable_body(env, fn_name) {
                     let args = eval_args(cdr, env)?;
-                    return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
+                    return eval_lambda_call(env, params_form, body, &args, Arc::clone(&env.frame));
                 }
             }
         }
@@ -25034,7 +24982,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body_rest) = cp(lr);
             let args = eval_args(cdr, env)?;
-            return eval_lambda_call(env, params_form, body_rest, &args, Rc::clone(&env.frame));
+            return eval_lambda_call(env, params_form, body_rest, &args, Arc::clone(&env.frame));
         }
     }
 
@@ -25581,13 +25529,13 @@ impl LoopAccs {
     }
 }
 
-impl LoopAccs {
+impl torcl_rt::gc::TraceHostRoots for LoopAccs {
     /// Visit every `TorclVal` this accumulator holds (bliss-6b2 #2). The values
     /// live in Rust-heap `Vec`/map buffers the collector can't see, yet persist
     /// across the whole loop body's allocating iterations — so they must be
     /// scanned as roots (relocated in place) or a minor/major GC would free or
     /// move their referents out from under the stored copies.
-    fn visit_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         for vals in self.map.values_mut() {
             for v in vals.iter_mut() {
                 visit(v as *mut TorclVal);
@@ -25609,11 +25557,11 @@ impl LoopAccs {
     }
 }
 
-impl ForState {
+impl torcl_rt::gc::TraceHostRoots for ForState {
     /// Visit every `TorclVal` this for-clause cursor holds (bliss-6b2 #2), for the
-    /// same reason as [`LoopAccs::visit_roots`] — `items`/`tail`/`current`/… span
+    /// same reason as the loop accumulators — `items`/`tail`/`current`/… span
     /// the loop's allocating body.
-    fn visit_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         match self {
             ForState::In {
                 pat, items, tail, ..
@@ -25660,55 +25608,6 @@ impl ForState {
                 }
             }
         }
-    }
-}
-
-thread_local! {
-    /// Active extended-LOOP root sources (accumulators + for-clause cursors) on
-    /// this thread, scanned by [`scan_loop_roots`] during every GC (bliss-6b2 #2).
-    static LOOP_ROOTS: RefCell<Vec<(*mut LoopAccs, *mut Vec<ForState>)>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-fn scan_loop_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
-    LOOP_ROOTS.with(|r| {
-        for &(accs, states) in r.borrow().iter() {
-            // SAFETY: guards register these only for the lexical extent in which
-            // the pointed-to locals remain live and immobile (they are not moved
-            // while a guard is on the stack).
-            unsafe {
-                (*accs).visit_roots(visit);
-                for st in (*states).iter_mut() {
-                    st.visit_roots(visit);
-                }
-            }
-        }
-    });
-}
-
-fn install_loop_root_scanner() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| torcl_rt::gc::register_root_scanner(scan_loop_roots));
-}
-
-/// Registers a loop's `accs`/`states` as GC roots for its lexical extent.
-struct LoopRootGuard;
-
-impl LoopRootGuard {
-    fn new(accs: &mut LoopAccs, states: &mut Vec<ForState>) -> Self {
-        install_loop_root_scanner();
-        let accs = accs as *mut LoopAccs;
-        let states = states as *mut Vec<ForState>;
-        LOOP_ROOTS.with(|r| r.borrow_mut().push((accs, states)));
-        LoopRootGuard
-    }
-}
-
-impl Drop for LoopRootGuard {
-    fn drop(&mut self) {
-        LOOP_ROOTS.with(|r| {
-            r.borrow_mut().pop();
-        });
     }
 }
 
@@ -26241,7 +26140,7 @@ fn eval_loop(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     // Run the loop in a fresh variable frame (for iteration variables and
     // accumulators) while keeping the shared global tables mutable in place, so
     // definitions made in the loop body (intern, use-package, defun, …) persist.
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
     // `loop named NAME` establishes a block named NAME so (return-from NAME …)
     // exits the loop. An UNNAMED loop instead establishes the implicit `block
     // nil`. A named loop does NOT also establish block nil (CLHS 6.1.1.4): a
@@ -26725,6 +26624,7 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
     }
 
     let mut accs = LoopAccs::default();
+    torcl_rt::rooted_ref!(_accs_root = &mut accs);
     // Establish the vacuous-truth default for ALWAYS/NEVER at setup so an
     // empty-range loop (whose body never runs) still returns T (bliss-ok5).
     if loop_has_boolean_clause(&body) {
@@ -26747,10 +26647,10 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
     let has_terminator = loop_body_has_terminator(&body);
     // Root the accumulators and for-clause cursors for the whole loop: they hold
     // TorclVals in Rust-heap buffers across the body's allocating iterations
-    // (bliss-6b2 #2). `states` is declared here (outside the branch) so one guard
-    // covers both the no-driver and driver paths.
+    // (bliss-6b2 #2). Intrusive roots are scanned even when another native
+    // thread collects while this loop is waiting.
     let mut states: Vec<ForState> = Vec::with_capacity(for_clauses.len());
-    let _loop_roots = LoopRootGuard::new(&mut accs, &mut states);
+    torcl_rt::rooted_ref!(_states_root = &mut states);
     if for_clauses.is_empty() && !has_terminator && repeat_remaining.is_none() {
         // No driver at all: run the body once (when/collect-only loops).
         let mut terminate = false;
@@ -29241,7 +29141,7 @@ fn shadow_locally_special(env: &mut Env, sym: TorclVal) {
 
 fn eval_let(cdr: TorclVal, env: &mut Env, sequential: bool) -> Result<TorclVal, TorclError> {
     let (bindings_form, body) = cp(cdr);
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
 
     // Names made dynamic by a `(declare (special v))` at the head of the body,
     // in addition to earmuffed / proclaimed specials (CLHS 3.3.4; bliss-20o).
@@ -29456,7 +29356,7 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 .is_some_and(|&base| base != frame_addr(&env.frame))
         });
         if nested_in_binding {
-            bytecode::register_closure_env(idx, Rc::clone(&env.frame));
+            bytecode::register_closure_env(idx, Arc::clone(&env.frame));
         } else {
             // Top-level (re)definition: drop any stale capture from an earlier
             // in-scope definition of the same name.
@@ -29562,13 +29462,13 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<TorclVal> {
         return Some(existing);
     }
     let captured_funs = Some(match flet_scope {
-        Some(scope) => Rc::new(RefCell::new(scope)),
-        None => Rc::clone(&env.funs),
+        Some(scope) => Arc::new(SharedCell::new(scope)),
+        None => Arc::clone(&env.funs),
     });
     let closure = Closure {
         params_form,
         body,
-        captured_frame: Rc::clone(&env.frame),
+        captured_frame: Arc::clone(&env.frame),
         // The exits visible where the function was DEFINED, falling back to the
         // current ones for a function with no recorded scope (bliss-wfxx).
         captured_blocks: defining_blocks
@@ -29581,19 +29481,48 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<TorclVal> {
             .unwrap_or_else(|| env.tag_stack.clone()),
         captured_funs,
     };
-    let id = next_closure_id();
-    env.closures.borrow_mut().insert(id, closure);
-    let closure_sym = resolve_sym("TORCL::CLOSURE").unwrap_or(NIL);
+    #[cfg(test)]
+    let closure = {
+        let mut closure = closure;
+        torcl_rt::rooted_ref!(_candidate_root = &mut closure);
+        // Exercise the actual cache-miss/allocation/publication interleaving,
+        // without relying on OS timing or disabling collection in the test.
+        local_reference_test_pause(name);
+        drop(_candidate_root);
+        closure
+    };
     // Rooted across the store below. The intervening map lookup allocates no
     // TorCL memory, so this is belt-and-braces rather than a known hazard — but
     // an unrooted local read after an allocating call is exactly the smell
     // gc-root-lint exists to catch, and rooting costs nothing here.
-    torcl_rt::rooted!(reference = arena_cons(closure_sym, TorclVal::from_fixnum(id as i64)));
-    // Store it back so the next `#'name` in this scope is EQ to this one.
+    torcl_rt::rooted!(reference = register_tree_closure(closure));
+    // A peer may have published while this candidate was allocating. Return
+    // the winning identity instead of replacing it with a second function.
     if let Some(def) = env.funs.borrow_mut().get_mut(name) {
-        def.closure_ref = Some(*reference);
+        return Some(*def.closure_ref.get_or_insert(*reference));
     }
     Some(*reference)
+}
+
+#[cfg(test)]
+static LOCAL_REFERENCE_TEST_GATE: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn local_reference_test_pause(name: &str) {
+    if !name.ends_with("LOCAL-REFERENCE-RACE") {
+        return;
+    }
+    let gate = LOCAL_REFERENCE_TEST_GATE.lock().unwrap().clone();
+    if let Some(gate) = gate {
+        use std::sync::atomic::Ordering;
+        gate.fetch_add(1, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gate.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            torcl_rt::safepoint::poll_safepoint();
+            std::thread::yield_now();
+        }
+    }
 }
 
 fn eval_flet(cdr: TorclVal, env: &mut Env, recursive: bool) -> Result<TorclVal, TorclError> {
@@ -30721,7 +30650,7 @@ fn eval_defmacro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         MacroDef {
             params_form,
             body,
-            captured_frame: Rc::clone(&env.frame),
+            captured_frame: Arc::clone(&env.frame),
             bytecode: None,
             function: None,
         },
@@ -30758,7 +30687,7 @@ fn eval_define_setf_expander(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, T
         SetfExpander::Expander(MacroDef {
             params_form,
             body: *wrapped_body,
-            captured_frame: Rc::clone(&env.frame),
+            captured_frame: Arc::clone(&env.frame),
             bytecode: None,
             function: None,
         }),
@@ -30800,7 +30729,7 @@ fn eval_defsetf_long(
             lambda_list,
             store_vars,
             body,
-            captured_frame: Rc::clone(&env.frame),
+            captured_frame: Arc::clone(&env.frame),
         },
     );
     Ok(name_form)
@@ -30970,13 +30899,13 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                     torcl_rt::rooted!(params_form = mdef.params_form);
                     torcl_rt::rooted!(body = mdef.body);
                     torcl_rt::rooted!(arg_list = list_to_vec(args));
-                    let mut child = env.child_with_parent(Rc::clone(&mdef.captured_frame));
+                    let mut child = env.child_with_parent(Arc::clone(&mdef.captured_frame));
                     torcl_rt::rooted_ref!(_child_root = &mut child);
                     let first = if let Some(function) = &mdef.bytecode {
                         // A source-free bytecode expander (loaded from a .bfasl):
                         // run it like a macro; its (values …) land on the child mv.
                         bytecode::run_macro(
-                            Rc::new(function.borrow().clone()),
+                            Arc::new(function.borrow().clone()),
                             &arg_list,
                             Some(*place),
                             &mut child,
@@ -31049,7 +30978,7 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                     // in, so its body can close over the surrounding bindings
                     // (bliss-30i6). `child_with_parent` keeps the caller's
                     // definitional registries while reparenting the lexical frame.
-                    let mut child = env.child_with_parent(Rc::clone(&captured_frame));
+                    let mut child = env.child_with_parent(Arc::clone(&captured_frame));
                     torcl_rt::rooted_ref!(_child_root = &mut child);
                     bind_macro_lambda_list(
                         *lambda_list,
@@ -31250,7 +31179,7 @@ fn apply_setf_expansion(
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
     let ex = get_setf_expansion(place, env)?;
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
     with_child_frame(env, parent, move |env| {
         for (temp, val_form) in ex.temps.iter().zip(ex.vals.iter()) {
             let v = eval_form(*val_form, env)?;
@@ -31373,7 +31302,7 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
             // before thawing its frame, which allocates and may relocate their
             // values. The frozen capture remains globally scanned, but these
             // by-value HashMap copies would not be rewritten there.
-            macro_env.funs = Rc::new(RefCell::new(funs));
+            macro_env.funs = Arc::new(SharedCell::new(funs));
             macro_env.macros = Rc::new(RefCell::new(HashMap::new()));
             macro_env.symbol_macros = Rc::new(RefCell::new(symbol_macros));
             macro_env.classes = Rc::new(RefCell::new(classes));
@@ -31701,7 +31630,7 @@ fn expand_macro(
     let expansion = if mdef.function.is_some() {
         apply_function(*macro_function, &[whole, NIL], env)
     } else {
-        let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
+        let mut child_env = env.child_with_parent(Arc::clone(&mdef.captured_frame));
         // Root the forked expansion Env for the WHOLE expansion — both branches:
         // run_macro (bytecode expanders) and the tree-walked body below allocate
         // heavily, and the fork's frame chain is otherwise unscanned (bliss-8qf;
@@ -31709,7 +31638,7 @@ fn expand_macro(
         torcl_rt::rooted_ref!(_child_root = &mut child_env);
         if let Some(function) = &mdef.bytecode {
             bytecode::run_macro(
-                Rc::new(function.borrow().clone()),
+                Arc::new(function.borrow().clone()),
                 &arg_list,
                 Some(whole),
                 &mut child_env,
@@ -31772,12 +31701,15 @@ fn expand_macro(
 }
 
 fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
-    fn collect_frames(frame: &Rc<RefCell<EnvFrame>>, frames: &mut Vec<Rc<RefCell<EnvFrame>>>) {
+    fn collect_frames(
+        frame: &Arc<SharedCell<EnvFrame>>,
+        frames: &mut Vec<Arc<SharedCell<EnvFrame>>>,
+    ) {
         let parent = frame.borrow().parent.clone();
         if let Some(parent) = parent {
             collect_frames(&parent, frames);
         }
-        frames.push(Rc::clone(frame));
+        frames.push(Arc::clone(frame));
     }
 
     // Global macros come from a cached base env (rebuilt only on macro
@@ -31798,8 +31730,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     // no symbol macros, no lexical variables, no MACROLET — produces a single
     // empty child of the shared base. Empty maps do not allocate.
     let mut macro_env: Option<MacroexpandEnv> = None;
-    let mut augment = |macro_env: &mut Option<MacroexpandEnv>,
-                       vars: Vec<(TorclVal, VariableInfo)>| {
+    let augment = |macro_env: &mut Option<MacroexpandEnv>, vars: Vec<(TorclVal, VariableInfo)>| {
         *macro_env = Some(match macro_env.take() {
             None => MacroexpandEnv::child_of(Arc::clone(&base), vars, Vec::new(), Vec::new()),
             Some(existing) => existing.augment_environment(vars, Vec::new(), Vec::new()),
@@ -31916,7 +31847,7 @@ fn augment_env_with_macros(
         // stale copies in `macro_def` (from the unrooted `all_macros` snapshot).
         let params_bits = macro_bodies[idx].0.0;
         let body_bits = macro_bodies[idx].1.0;
-        let frame_ptr = Rc::as_ptr(&macro_def.captured_frame) as usize;
+        let frame_ptr = Arc::as_ptr(&macro_def.captured_frame) as usize;
         let bytecode_ptr = macro_def
             .bytecode
             .as_ref()
@@ -31993,7 +31924,7 @@ fn augment_env_with_macros(
                             let mut macro_env = Env::new_for_macro_expansion(false);
                             torcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
                             bytecode::run_macro(
-                                Rc::new(function),
+                                Arc::new(function),
                                 &args,
                                 Some(*form),
                                 &mut macro_env,
@@ -32195,7 +32126,7 @@ fn eval_macrolet(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             MacroDef {
                 params_form,
                 body: macro_body,
-                captured_frame: Rc::clone(&env.frame),
+                captured_frame: Arc::clone(&env.frame),
                 bytecode: None,
                 function: None,
             },
@@ -33347,7 +33278,7 @@ fn eval_defmethod(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
             .is_some_and(|&base| base != frame_addr(&env.frame))
     });
     if nested_in_binding {
-        METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().insert(method_id.0, Rc::clone(&env.frame)));
+        METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().insert(method_id.0, Arc::clone(&env.frame)));
     } else {
         METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().remove(&method_id.0));
     }
@@ -34076,7 +34007,7 @@ fn apply_function(
             // bliss-jtc.23.3). Guard on no lexical FLET/LABELS shadow so a local
             // binding is never redirected to the global registry entry.
             let is_local_fn = env.funs.borrow().contains_key(&*name);
-            let mut call_parent = Rc::clone(&env.frame);
+            let mut call_parent = Arc::clone(&env.frame);
             if !is_local_fn {
                 // Lazy compile when hot (bliss-x5y) — this path handles a global
                 // function reached through funcall/apply or the c2i fallback from
@@ -34098,7 +34029,7 @@ fn apply_function(
                     // NOT the caller's frame, so free vars resolve to params +
                     // globals/specials only (bliss-20o; see operator-position
                     // path for the full rationale).
-                    call_parent = Rc::new(RefCell::new(EnvFrame::default()));
+                    call_parent = Arc::new(SharedCell::new(EnvFrame::default()));
                 }
             }
             // Fresh BLOCK/TAGBODY exit scope for a global named function; a local
@@ -34273,7 +34204,8 @@ fn apply_function(
             // (a generic's wrapper, a shadowed name, an arity the kernel does
             // not take) falls through to the trampoline below, which is always
             // correct.
-            if let Some(sym) = BUILTIN_WRAPPER_SYMS.with(|m| m.borrow().get(&id).copied())
+            let builtin_sym = builtin_wrapper_cache().borrow().symbols.get(&id).copied();
+            if let Some(sym) = builtin_sym
                 && let Some(slot) = direct_builtin_slot_memoized(sym, args.len())
                 && let Some(res) = call_direct_builtin(slot, args, env)
             {
@@ -34293,38 +34225,33 @@ fn apply_function(
                 // Swapping `env.funs` takes the CALLER's map off the scanned
                 // `env.funs`, leaving its FunDef body cons trees reachable only
                 // from this Rust frame — a minor GC during the body then frees
-                // them and a later call reads a freed body. SUSPENDED_FUNS exists
-                // for exactly this (bliss-biol); the same hazard, reached from the
-                // closure path (bliss-5q20).
-                let saved_funs = closure.captured_funs.as_ref().map(|funs| {
-                    install_suspended_funs_scanner();
-                    let saved = std::mem::replace(&mut env.funs, Rc::clone(funs));
-                    SUSPENDED_FUNS.with(|s| s.borrow_mut().push(Rc::clone(&saved)));
-                    saved
-                });
+                // them and a later call reads a freed body. Keep this namespace
+                // rooted across collections from any native thread.
+                torcl_rt::rooted!(
+                    saved_funs = closure.captured_funs.as_ref().map(|funs| {
+                        SuspendedFunsRoot(std::mem::replace(&mut env.funs, Arc::clone(funs)))
+                    })
+                );
                 let result = eval_lambda_call_ex(
                     env,
                     closure.params_form,
                     closure.body,
                     args,
-                    Rc::clone(&closure.captured_frame),
+                    Arc::clone(&closure.captured_frame),
                     LexicalControl::Captured(
                         closure.captured_blocks.clone(),
                         closure.captured_tags.clone(),
                     ),
                 );
-                if let Some(previous) = saved_funs {
-                    SUSPENDED_FUNS.with(|s| {
-                        s.borrow_mut().pop();
-                    });
-                    env.funs = previous;
+                if let Some(previous) = saved_funs.as_ref() {
+                    env.funs = Arc::clone(&previous.0);
                 }
                 return result;
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body) = cp(lr);
-            return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
+            return eval_lambda_call(env, params_form, body, args, Arc::clone(&env.frame));
         }
     }
     // A heap interpreted-function object, e.g. from FDEFINITION / SYMBOL-FUNCTION
@@ -34354,7 +34281,7 @@ fn apply_function(
         // top-level defun or a reified closure whose own implicit block lives in
         // its body — it must not inherit the caller's dynamic exits (bliss-4u5u).
         let parent =
-            bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Rc::clone(&env.frame));
+            bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Arc::clone(&env.frame));
         return eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh);
     }
     if std::env::var_os("TORCL_APPLY_DBG").is_some() && fn_val.is_cons() {
@@ -35415,7 +35342,7 @@ fn eval_multiple_value_bind(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, To
     // loses it entirely: references to a special name read the value cell, so the
     // lexical binding is written and never read.
     let body_specials = let_body_special_decls(body);
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
     with_child_frame(env, parent, move |env| {
         // Rooted: each guard's saved cell must stay precise across the body
         // evaluation (moving GC; bliss-8qf).
@@ -35462,14 +35389,14 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
     // A `(:no-error (lambda-list) body)` clause (CLHS 9.1) is not a handler: when
     // the protected form returns normally, its body runs with the lambda-list
     // bound to the returned values, OUTSIDE this HANDLER-CASE's handlers.
-    let mut no_error: Option<(TorclVal, TorclVal, Rc<RefCell<EnvFrame>>)> = None;
+    let mut no_error: Option<(TorclVal, TorclVal, Arc<SharedCell<EnvFrame>>)> = None;
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);
         let (type_form, clause_rest) = cp(clause);
         let (bind_list, handler_body) = cp(clause_rest);
         if sym_bare_name_rc(type_form).as_ref() == "NO-ERROR" {
-            no_error = Some((bind_list, handler_body, Rc::clone(&env.frame)));
+            no_error = Some((bind_list, handler_body, Arc::clone(&env.frame)));
             c = rest;
             continue;
         }
@@ -35485,7 +35412,7 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
                 token: token.clone(),
                 var_name: var_name.clone(),
                 body: handler_body,
-                captured_frame: Rc::clone(&env.frame),
+                captured_frame: Arc::clone(&env.frame),
             },
         };
         installed.push(entry);
@@ -35722,7 +35649,7 @@ fn restart_designator_form(form: TorclVal) -> TorclVal {
 
 fn parse_restart_options(
     option_forms: TorclVal,
-    captured_frame: &Rc<RefCell<EnvFrame>>,
+    captured_frame: &Arc<SharedCell<EnvFrame>>,
 ) -> (Option<RestartFunction>, Option<RestartFunction>, TorclVal) {
     let options = list_to_vec(option_forms);
     let mut interactive_function = None;
@@ -35761,7 +35688,7 @@ fn parse_restart_options(
 fn eval_restart_bind(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     let (bindings_form, body) = cp(cdr);
     let base_len = env.restarts.len();
-    let captured_frame = Rc::clone(&env.frame);
+    let captured_frame = Arc::clone(&env.frame);
     let mut c = bindings_form;
     while c.is_cons() {
         let (binding, rest) = cp(c);
@@ -35839,7 +35766,7 @@ fn eval_with_condition_restarts(cdr: TorclVal, env: &mut Env) -> Result<TorclVal
 fn eval_restart_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     let (mut restartable_form, clauses) = cp(cdr);
     let base_len = env.restarts.len();
-    let captured_frame = Rc::clone(&env.frame);
+    let captured_frame = Arc::clone(&env.frame);
     // Root the protected form and the clause cursor across the allocating
     // clause-lambda conses (moving GC; bliss-8qf).
     torcl_rt::rooted_ref!(_form_root = &mut restartable_form);
@@ -36204,7 +36131,7 @@ fn eval_with_open_file(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclEr
     // it is dereferenced by `close` after the body runs (moving GC; bliss-8qf).
     torcl_rt::rooted_ref!(_stream_root = &mut stream_val);
 
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
     // Evaluate body in a fresh frame on the same env, then close the stream
     // (unwind-protect style) whether the body returned or unwound.
     let result = with_child_frame(env, parent, move |env| {
@@ -37779,7 +37706,7 @@ mod host_registry_hook_tests {
             MacroDef {
                 params_form: params,
                 body,
-                captured_frame: Rc::new(RefCell::new(EnvFrame::default())),
+                captured_frame: Arc::new(SharedCell::new(EnvFrame::default())),
                 bytecode: None,
                 function: None,
             },
@@ -37815,7 +37742,7 @@ mod host_registry_hook_tests {
         );
 
         host_restore_registries(&bytes).expect("restore host registries");
-        let fresh_frame = Rc::new(RefCell::new(EnvFrame::default()));
+        let fresh_frame = Arc::new(SharedCell::new(EnvFrame::default()));
         drain_pending_host_registries(&fresh_frame);
 
         // Macro is back with the same params/body objects.
@@ -37827,7 +37754,7 @@ mod host_registry_hook_tests {
             let borrow = m.borrow();
             let def = borrow.get(name).unwrap();
             assert!(
-                Rc::ptr_eq(&def.captured_frame, &fresh_frame),
+                Arc::ptr_eq(&def.captured_frame, &fresh_frame),
                 "restored macro rebinds captured_frame to the fresh root frame"
             );
             assert!(
@@ -37880,11 +37807,11 @@ mod env_gc_root_tests {
     fn env_root_visitor_rewrites_all_retained_value_slots() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
-        let parent = Rc::new(RefCell::new(EnvFrame::default()));
+        let parent = Arc::new(SharedCell::new(EnvFrame::default()));
 
         env.frame.borrow_mut().vars.insert("ROOT".into(), marker(0));
         env.frame.borrow_mut().symbol_vars.insert(1, marker(1));
-        env.frame.borrow_mut().parent = Some(Rc::clone(&parent));
+        env.frame.borrow_mut().parent = Some(Arc::clone(&parent));
         parent.borrow_mut().vars.insert("PARENT".into(), marker(2));
         parent.borrow_mut().symbol_vars.insert(2, marker(3));
 
@@ -37897,7 +37824,7 @@ mod env_gc_root_tests {
             MacroDef {
                 params_form: marker(6),
                 body: marker(7),
-                captured_frame: Rc::clone(&parent),
+                captured_frame: Arc::clone(&parent),
                 bytecode: None,
                 function: None,
             },
@@ -37907,7 +37834,7 @@ mod env_gc_root_tests {
             SetfExpander::Expander(MacroDef {
                 params_form: marker(8),
                 body: marker(9),
-                captured_frame: Rc::clone(&parent),
+                captured_frame: Arc::clone(&parent),
                 bytecode: None,
                 function: None,
             }),
@@ -37954,15 +37881,15 @@ mod env_gc_root_tests {
             name: "ROOT-RESTART".into(),
             function: RestartFunction::FunctionForm {
                 function_form: marker(19),
-                captured_frame: Rc::clone(&parent),
+                captured_frame: Arc::clone(&parent),
             },
             interactive_function: Some(RestartFunction::FunctionForm {
                 function_form: marker(20),
-                captured_frame: Rc::clone(&parent),
+                captured_frame: Arc::clone(&parent),
             }),
             test_function: Some(RestartFunction::FunctionForm {
                 function_form: marker(21),
-                captured_frame: Rc::clone(&parent),
+                captured_frame: Arc::clone(&parent),
             }),
             unwind_on_invoke: false,
             group_base: 0,
@@ -37982,7 +37909,7 @@ mod env_gc_root_tests {
                         token: "ROOT-HANDLER".into(),
                         var_name: None,
                         body: marker(23),
-                        captured_frame: Rc::clone(&parent),
+                        captured_frame: Arc::clone(&parent),
                     },
                 },
             ],
@@ -37993,7 +37920,7 @@ mod env_gc_root_tests {
             Closure {
                 params_form: marker(25),
                 body: marker(26),
-                captured_frame: Rc::clone(&parent),
+                captured_frame: Arc::clone(&parent),
                 captured_blocks: Vec::new(),
                 captured_tags: Vec::new(),
                 // A closure's captured function namespace holds FunDefs whose
@@ -38004,7 +37931,7 @@ mod env_gc_root_tests {
                 // visit_fun_map_roots and visit_fun_def_roots' recursion —
                 // adding the field as `None` would have left that path unowned
                 // by any test.
-                captured_funs: Some(Rc::new(RefCell::new(HashMap::from([(
+                captured_funs: Some(Arc::new(SharedCell::new(HashMap::from([(
                     "CAPTURED".to_string(),
                     FunDef {
                         params: Vec::new(),
@@ -38094,7 +38021,7 @@ mod env_gc_root_tests {
             MacroDef {
                 params_form: marker(3),
                 body: marker(4),
-                captured_frame: Rc::clone(&parent.frame),
+                captured_frame: Arc::clone(&parent.frame),
                 bytecode: None,
                 function: None,
             },
@@ -38106,7 +38033,7 @@ mod env_gc_root_tests {
             FunDef::plain(Vec::new(), marker(5), marker(6)),
         );
         child.symbol_macros_mut().insert(100, marker(7));
-        let child_frame = Rc::clone(&child.frame);
+        let child_frame = Arc::clone(&child.frame);
         child.macros_mut().insert(
             "CHILD-MACRO".into(),
             MacroDef {
@@ -38239,7 +38166,7 @@ mod transient_shadow_root_tests {
         let marker = |offset| TorclVal::from_fixnum(GLOBAL_BASE + offset);
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         GLOBAL_MACROS.with(|macros| macros.borrow_mut().clear());
-        let frame = Rc::new(RefCell::new(EnvFrame::default()));
+        let frame = Arc::new(SharedCell::new(EnvFrame::default()));
         frame.borrow_mut().vars.insert("CAPTURED".into(), marker(2));
         GLOBAL_MACROS.with(|macros| {
             macros.borrow_mut().insert(
@@ -38247,7 +38174,7 @@ mod transient_shadow_root_tests {
                 MacroDef {
                     params_form: marker(0),
                     body: marker(1),
-                    captured_frame: Rc::clone(&frame),
+                    captured_frame: Arc::clone(&frame),
                     bytecode: None,
                     function: None,
                 },
@@ -38915,6 +38842,57 @@ mod method_block_tests {
     use super::*;
 
     #[test]
+    fn local_function_reference_publication_chooses_one_winner() {
+        const CHILD: &str = "TORCL_TEST_LOCAL_REFERENCE_RACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::method_block_tests::local_function_reference_publication_chooses_one_winner",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("TORCL_FORCE_TIER", "interp")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let gate = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *LOCAL_REFERENCE_TEST_GATE.lock().unwrap() = Some(Arc::clone(&gate));
+        let result = read_eval_all_env(
+            r#"
+          (labels ((local-reference-race () 42))
+            (let* ((callback (lambda () #'local-reference-race))
+                   (one (torcl-thread:make-thread callback))
+                   (two (torcl-thread:make-thread callback)))
+              (let ((first (torcl-thread:join-thread one))
+                    (second (torcl-thread:join-thread two)))
+                (if (eq first second) 42 -1))))
+        "#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(
+            gate.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both workers must observe the initial cache miss"
+        );
+        assert_eq!(
+            result,
+            TorclVal::from_fixnum(42),
+            "competing publications must return the same local function"
+        );
+    }
+
+    #[test]
     fn dormant_compiled_closure_relocates_its_captured_values() {
         let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
@@ -38986,7 +38964,7 @@ mod method_block_tests {
         // ASDF invokes LOAD from a function frame below the original top-level
         // form. The loaded file must establish its own top-level boundary.
         TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
-        let parent = Rc::clone(&env.frame);
+        let parent = Arc::clone(&env.frame);
         let result = with_child_frame(&mut env, parent, |env| load_bfasl_into_env(&bytes, env));
         TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().pop());
         result.unwrap();
@@ -39011,7 +38989,7 @@ mod method_block_tests {
         .unwrap();
         TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
         let saved_base = TOPLEVEL_FRAME_BASE.with(|s| s.borrow().clone());
-        let parent = Rc::clone(&env.frame);
+        let parent = Arc::clone(&env.frame);
         assert!(
             with_child_frame(&mut env, parent, |env| {
                 load_bfasl_into_env(&failed_load, env)
@@ -39020,6 +38998,20 @@ mod method_block_tests {
         );
         assert_eq!(TOPLEVEL_FRAME_BASE.with(|s| s.borrow().clone()), saved_base);
         TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().pop());
+    }
+
+    #[test]
+    fn lexical_control_tokens_are_unique_across_native_threads() {
+        let first = std::thread::spawn(|| next_control_token("BLOCK"))
+            .join()
+            .unwrap();
+        let second = std::thread::spawn(|| next_control_token("BLOCK"))
+            .join()
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "an exit must not target another execution's block"
+        );
     }
 
     #[test]

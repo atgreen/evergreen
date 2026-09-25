@@ -79,6 +79,22 @@ writes are tear-free on x86-64 and aarch64).
 
 The JIT MUST NOT reorder memory accesses across these barriers.
 
+### 13.2.4 Shared Lexical Closures
+
+A callback passed to a native thread retains its lexical binding locations,
+not copies of their values. Mutations remain visible to sibling closures and
+the defining execution, and captured locations outlive the creating thread.
+The evaluator shares lexical frames and local-function maps through stable
+reference-counted storage with short mutex-protected access. A frame guard
+must not span evaluation, Lisp allocation, or a safepoint. Acquiring a frame
+guard does not itself introduce a safepoint.
+
+Interpreter closure identities and captured environments are process-wide.
+Private compiled closure bodies are shared with their original constant pools
+and visited by the global root scanner during stop-the-world collection.
+Lexical exit tokens are unique across executions; sharing a closure must not
+make its exit target an unrelated block in the receiving thread.
+
 ---
 
 ## 13.3 Lock Ordering Protocol
@@ -368,6 +384,14 @@ code. If not, it resumes normally.
 A thread transitioning to `Blocked` publishes `sp` and `fp` to its
 descriptor. The GC can then walk its stack without synchronisation.
 On unblock, the thread checks for a pending safepoint before resuming.
+
+A safepoint-parked native thread also remains `Blocked` until it resumes under
+the participant-snapshot lock. Consecutive collections may reuse its published
+roots without waiting for a second acknowledgement from a thread still asleep.
+Native-thread retirement acknowledges an already-counted pause and waits for
+that pause to end before disabling participation. JOIN leaves a pending result
+in its scanned result cell while blocked, then roots the transferred result
+across the remaining OS-thread exit wait.
 
 ### 13.6.4 Safepoint and Scheduler Interaction
 

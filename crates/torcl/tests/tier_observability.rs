@@ -1831,12 +1831,16 @@ fn nested_definitions_in_progn_compile() {
 /// TIER and not just the result.
 #[test]
 fn comparison_used_as_a_value_still_reaches_t2() {
+    // Warming queues compilation; it does not guarantee publication before the
+    // next form. Poll each function with a bound, then require the same T2 tier.
     let program = "\
         (defun cmp-fused (x y) (if (< x y) 1 0)) \
         (defun cmp-negated (x y) (if (not (< x y)) 1 0)) \
         (defun cmp-value (x y) (< x y)) \
         (defun cmp-const (x) (< x 5)) \
         (dotimes (k 40) (cmp-fused k 7) (cmp-negated k 7) (cmp-value k 7) (cmp-const k)) \
+        (dolist (fn '(cmp-fused cmp-negated cmp-value cmp-const)) \
+          (loop repeat 30 until (= 2 (torcl-ext:function-tier fn)) do (sleep 0.01))) \
         (format t \"~a ~a ~a ~a | ~a ~a ~a ~a~%\" \
           (torcl-ext:function-tier (quote cmp-fused)) \
           (torcl-ext:function-tier (quote cmp-negated)) \

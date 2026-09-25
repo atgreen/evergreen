@@ -32,7 +32,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use torcl_compiler::macroexpand::{self as compiler_macroexpand, Environment as MacroexpandEnv};
 use torcl_compiler::reader;
@@ -43,8 +43,8 @@ use torcl_rt::{CodeInfo, Frame, FrameType};
 
 use super::{
     DynBind, Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
-    RestartFunction, apply_function, arena_cons, arena_str, condition_matches_handler, cp,
-    eval_form, handler_case_token, list_to_vec, next_control_token, resolve_sym,
+    RestartFunction, SharedCell, apply_function, arena_cons, arena_str, condition_matches_handler,
+    cp, eval_form, handler_case_token, list_to_vec, next_control_token, resolve_sym,
     restart_invoked_name, run_handler_bind_handlers, signal_raw_error_in_context,
     store_control_value, sym_bare_name_rc, sym_name, symbol_bare_name, tag_key, take_control_value,
     torcl_error_to_condition, val_as_str, vec_to_list,
@@ -171,19 +171,59 @@ fn bump_direct_call_gen() {
     DIRECT_CALL_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+// Captured lexical locations are process-wide, just like function identities.
+fn closure_envs() -> &'static SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>>> {
+    static ENVS: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>>>> =
+        std::sync::OnceLock::new();
+    ENVS.get_or_init(|| SharedCell::new(HashMap::new()))
+}
+
+type ClosureControl = (Vec<(String, String)>, Vec<(String, String)>);
+
+fn closure_controls() -> &'static SharedCell<HashMap<u32, ClosureControl>> {
+    static CONTROLS: std::sync::OnceLock<SharedCell<HashMap<u32, ClosureControl>>> =
+        std::sync::OnceLock::new();
+    CONTROLS.get_or_init(|| SharedCell::new(HashMap::new()))
+}
+
+/// Private closure symbols have immutable executable bodies. Keep the same
+/// body allocation alive and GC-visible when another thread calls the closure;
+/// its heap function object intentionally has no source body to fall back to.
+fn closure_bodies() -> &'static SharedCell<HashMap<u32, Arc<BytecodeFunction>>> {
+    static BODIES: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<BytecodeFunction>>>> =
+        std::sync::OnceLock::new();
+    BODIES.get_or_init(|| SharedCell::new(HashMap::new()))
+}
+
+/// Root the original constant pools of bodies owned by any execution. Weak
+/// ownership makes this a root-discovery index, not another code-retention
+/// registry: removed definitions and finished thunks can still die normally.
+fn live_bytecode_bodies() -> &'static SharedCell<HashMap<usize, std::sync::Weak<BytecodeFunction>>>
+{
+    static BODIES: std::sync::OnceLock<
+        SharedCell<HashMap<usize, std::sync::Weak<BytecodeFunction>>>,
+    > = std::sync::OnceLock::new();
+    BODIES.get_or_init(|| SharedCell::new(HashMap::new()))
+}
+
+fn register_bytecode_roots(function: &Arc<BytecodeFunction>) {
+    install_bytecode_root_scanner();
+    live_bytecode_bodies()
+        .borrow_mut()
+        .entry(Arc::as_ptr(function) as usize)
+        .or_insert_with(|| Arc::downgrade(function));
+}
+
 thread_local! {
     /// Bytecode functions keyed by symbol index. A `CallNamed` checks this
     /// first; a hit runs as a native frame on the `TorclStack`, a miss falls
     /// back to `apply_function` (builtins, generics, tree-walker functions).
-    static REGISTRY: RefCell<HashMap<u32, Rc<BytecodeFunction>, torcl_rt::fxhash::FxBuildHasher>> =
+    static REGISTRY: RefCell<HashMap<u32, Arc<BytecodeFunction>, torcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
     /// Definition generations reject background compilations that finish after
     /// a DEFUN has replaced their bytecode snapshot.
     static REGISTRY_GENERATION: RefCell<HashMap<u32, u64, torcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
-    /// Bytecode bodies currently executing but not necessarily present in the
-    /// global registry (top-level thunks, nested closures, and macro expanders).
-    static ACTIVE_BYTECODE_FUNCTIONS: RefCell<Vec<usize>> = RefCell::new(Vec::new());
 }
 
 unsafe fn trace_bytecode_function(
@@ -191,7 +231,7 @@ unsafe fn trace_bytecode_function(
     visit: &mut dyn FnMut(*mut TorclVal),
 ) {
     // SAFETY: the scanner runs during a stop-the-world GC. BytecodeFunction is
-    // held behind Rc during execution/registration, but its TorclVal slots must
+    // held behind Arc during execution/registration, but its TorclVal slots must
     // still be rewritten when the moving collector forwards their referents.
     let function = unsafe { &mut *function };
     for constant in &mut function.constants {
@@ -221,29 +261,23 @@ unsafe fn trace_bytecode_function(
 }
 
 fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
-    REGISTRY.with(|registry| {
-        for function in registry.borrow().values() {
-            unsafe {
-                trace_bytecode_function(Rc::as_ptr(function) as *mut BytecodeFunction, visit);
-            }
-        }
-    });
-    ACTIVE_BYTECODE_FUNCTIONS.with(|active| {
-        for &function in active.borrow().iter() {
-            unsafe {
-                trace_bytecode_function(function as *mut BytecodeFunction, visit);
-            }
-        }
+    live_bytecode_bodies().borrow_mut().retain(|_, weak| {
+        let Some(function) = weak.upgrade() else {
+            return false;
+        };
+        // All mutators are stopped. Trace the same Arc allocation used by its
+        // owning thread, including dormant named functions in that thread's
+        // registry; a copied constant pool would leave the original stale.
+        unsafe { trace_bytecode_function(Arc::as_ptr(&function) as *mut BytecodeFunction, visit) };
+        true
     });
     // Escaped compiled closures can be dormant when collection happens. Their
     // Rust-owned frames are not reachable through the function object's heap
     // fields, so activation roots alone do not preserve or relocate captures.
     super::with_env_visit_state(|state| {
-        CLOSURE_ENV.with(|environments| {
-            for frame in environments.borrow().values() {
-                super::visit_env_frame_roots(frame, state, visit);
-            }
-        });
+        for frame in closure_envs().borrow().values() {
+            super::visit_env_frame_roots(frame, state, visit);
+        }
     });
 }
 
@@ -253,28 +287,15 @@ fn install_bytecode_root_scanner() {
 }
 
 struct ActiveBytecodeRoot {
-    ptr: usize,
+    _function: Arc<BytecodeFunction>,
 }
 
 impl ActiveBytecodeRoot {
-    fn new(function: &Rc<BytecodeFunction>) -> Self {
-        install_bytecode_root_scanner();
-        let ptr = Rc::as_ptr(function) as usize;
-        ACTIVE_BYTECODE_FUNCTIONS.with(|active| active.borrow_mut().push(ptr));
-        Self { ptr }
-    }
-}
-
-impl Drop for ActiveBytecodeRoot {
-    fn drop(&mut self) {
-        ACTIVE_BYTECODE_FUNCTIONS.with(|active| {
-            let mut active = active.borrow_mut();
-            let index = active
-                .iter()
-                .rposition(|&ptr| ptr == self.ptr)
-                .expect("active bytecode root missing");
-            active.remove(index);
-        });
+    fn new(function: &Arc<BytecodeFunction>) -> Self {
+        register_bytecode_roots(function);
+        Self {
+            _function: Arc::clone(function),
+        }
     }
 }
 
@@ -406,9 +427,14 @@ fn form_list(items: &[TorclVal]) -> TorclVal {
     acc
 }
 
-fn registry_get(sym: u32) -> Option<Rc<BytecodeFunction>> {
+fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
     install_bytecode_root_scanner();
-    REGISTRY.with(|r| r.borrow().get(&sym).cloned())
+    if let Some(body) = REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
+        return Some(body);
+    }
+    let body = closure_bodies().borrow().get(&sym).cloned()?;
+    registry_put(sym, Arc::clone(&body));
+    Some(body)
 }
 
 /// Live entry counts for the process-wide bytecode registries, for leak
@@ -424,8 +450,8 @@ pub(super) fn registry_sizes() -> (usize, usize, usize) {
     )
 }
 
-/// Serialize every interned-symbol bytecode-registry entry as a synthetic
-/// BYTECODE_UNIT (function records + kind-3 install actions) for a core image
+/// Serialize the saving thread's named functions and all shared private closure
+/// bodies as a synthetic BYTECODE_UNIT for a core image
 /// (bliss-zz6w). A world loaded from compiled `.bfasl` fasls installs
 /// source-free stub function objects whose real code lives ONLY in this
 /// registry; the heap snapshot carries the stubs, so without this unit every
@@ -433,9 +459,9 @@ pub(super) fn registry_sizes() -> (usize, usize, usize) {
 /// get-character-encoding returned NIL). The ordinary BBU loader executes the
 /// unit post-restore, re-registering the code behind each restored stub (the
 /// kind-3 install reuses an existing interpreted-function object in place, so
-/// heap identity is preserved). Uninterned (closure-private) entries and
-/// functions with non-poolable constants are skipped — those stubs stay
-/// registry-orphans exactly as before. Returns empty bytes when nothing is
+/// heap identity is preserved). Private bodies also include closures produced
+/// by exited threads and use kind-10 installs. Functions with non-poolable
+/// constants are skipped. Returns empty bytes when nothing is
 /// serializable. Pool encoding is Rust-only (no TorCL allocation) — GC-safe
 /// post-STW-GC.
 pub(super) fn serialize_registry_unit() -> Vec<u8> {
@@ -443,8 +469,15 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
     let source_file_ref = pool.string("<core-registry>");
     let mut functions: Vec<BbuFunction> = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
-    let entries: Vec<(u32, Rc<BytecodeFunction>)> =
-        REGISTRY.with(|r| r.borrow().iter().map(|(k, v)| (*k, Rc::clone(v))).collect());
+    let mut entries = closure_bodies().borrow().clone();
+    REGISTRY.with(|registry| {
+        entries.extend(
+            registry
+                .borrow()
+                .iter()
+                .map(|(&symbol, body)| (symbol, Arc::clone(body))),
+        );
+    });
     let (mut sk_pool, mut sk_tree) = (0usize, 0usize);
     let dbg = std::env::var_os("TORCL_HOSTREG_DBG").is_some();
     for (sym, bf) in entries {
@@ -543,8 +576,8 @@ pub(super) fn is_registered(sym: u32) -> bool {
     REGISTRY.with(|r| r.borrow().contains_key(&sym))
 }
 
-fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
-    install_bytecode_root_scanner();
+fn registry_put(sym: u32, f: Arc<BytecodeFunction>) {
+    register_bytecode_roots(&f);
     REGISTRY_GENERATION.with(|g| {
         let mut generations = g.borrow_mut();
         let next = generations.get(&sym).copied().unwrap_or(0).wrapping_add(1);
@@ -556,7 +589,7 @@ fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
     // unrelated native calls. Keep replacements and named installs conservative.
     let invalidates_direct_calls = old.is_some() || !torcl_rt::symbols::is_uninterned(sym);
     if let Some(old) = old {
-        clear_bytecode_profiles(Rc::as_ptr(&old) as usize);
+        clear_bytecode_profiles(Arc::as_ptr(&old) as usize);
     }
     // A new definition starts a new tiering lifetime.  In particular, a T2
     // decline for the old body must not suppress compilation of the new one,
@@ -583,7 +616,7 @@ fn registry_remove(sym: u32) {
     });
     let old = REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     if let Some(old) = old {
-        clear_bytecode_profiles(Rc::as_ptr(&old) as usize);
+        clear_bytecode_profiles(Arc::as_ptr(&old) as usize);
     }
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
@@ -595,7 +628,7 @@ fn registry_remove(sym: u32) {
     DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
     PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
     LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
-    CLOSURE_CONTROL.with(|m| m.borrow_mut().remove(&sym));
+    closure_controls().borrow_mut().remove(&sym);
 }
 
 /// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
@@ -748,12 +781,12 @@ fn disasm_header(sym: u32, bf: &BytecodeFunction) -> String {
 
 /// The annotated **bytecode** (T0) listing: each instruction, with call sites
 /// carrying the observed operand-type profile that drives tier-up speculation.
-fn format_bytecode_listing(sym: u32, bf: &Rc<BytecodeFunction>) -> String {
+fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
     use std::fmt::Write;
     let mut out = disasm_header(sym, bf);
     out.push_str("; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n");
     out.push_str("; runtime operand-type profile (fix/float/other) that drives tier-up.\n");
-    let func_ptr = Rc::as_ptr(bf) as usize;
+    let func_ptr = Arc::as_ptr(bf) as usize;
     for (pc, instr) in bf.code.iter().enumerate() {
         // Render the instruction with symbol NAMES substituted for the raw sym
         // ids in the Debug form (e.g. `CallNamed { sym: +, nargs: 2 }`).
@@ -5785,7 +5818,7 @@ impl<'e> Lowerer<'e> {
                 self.portable,
             )
             .ok_or(Bail)?;
-            registry_put(sym, Rc::new(bf));
+            registry_put(sym, Arc::new(bf));
         }
 
         // Compile the form body with all local functions visible.
@@ -8455,7 +8488,7 @@ fn serialize_bbu_loadable_function(
         }
     }
 
-    let bf = Rc::new(bf);
+    let bf = Arc::new(bf);
     let _function_root = ActiveBytecodeRoot::new(&bf);
     torcl_rt::rooted!(pending = Vec::<TorclVal>::new());
     collect(&bf, &mut pending);
@@ -9639,7 +9672,7 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, TorclError> {
         }
         // (2) Frame-level special bindings (e.g. prelude constants seeded into the
         //     top-level frame) not reflected in a global value cell.
-        let mut frame = Some(Rc::clone(&env.frame));
+        let mut frame = Some(Arc::clone(&env.frame));
         while let Some(f) = frame {
             let borrowed = f.borrow();
             for (&idx, &value) in borrowed.symbol_vars.iter() {
@@ -10583,29 +10616,6 @@ fn installed_lambda_list(arity: u16) -> TorclVal {
     vec_to_list(&params)
 }
 
-thread_local! {
-    /// Heap `EnvFrame` captured by an env-capturing `MakeClosure`, keyed by the
-    /// closure's private symbol index. `run_with_binding` installs it as the
-    /// closure activation's environment so its body reaches the enclosing
-    /// lexicals. Entries are pruned when their closure symbol's bytecode is
-    /// removed from the registry.
-    static CLOSURE_ENV: RefCell<HashMap<u32, Rc<RefCell<EnvFrame>>>> =
-        RefCell::new(HashMap::new());
-
-    /// Lexical BLOCK/TAGBODY exit scope captured by a `MakeClosure`/
-    /// `MakeClosureEnv`, keyed by the closure's private symbol index. A closure's
-    /// non-local `(return-from NAME)` / `(go TAG)` must resolve against the
-    /// block/tag tokens that were lexically in scope where the closure was
-    /// *created*, not the dynamic accumulation on `env.block_stack` at the point
-    /// it is *called* (bliss-4u5u). `run_with_binding`/`run_native` install this
-    /// snapshot as the callee's block/tag scope so `ReturnFromNamed`/`GoNamed`
-    /// find the correct enclosing token. Only recorded when the creating scope is
-    /// non-empty; an absent entry means "fresh (empty) scope", the correct base
-    /// for a top-level defun.
-    static CLOSURE_CONTROL: RefCell<HashMap<u32, (Vec<(String, String)>, Vec<(String, String)>)>> =
-        RefCell::new(HashMap::new());
-}
-
 /// Snapshot the lexical block/tag scope for a freshly-created bytecode closure so
 /// its non-local exits resolve lexically (bliss-4u5u). `closure` is the
 /// interpreted-function object returned by [`make_bytecode_closure`]; its name is
@@ -10621,7 +10631,9 @@ fn register_closure_control(closure: TorclVal, env: &Env) {
     let sym_idx = name.as_symbol_index();
     let blocks = env.block_stack.clone();
     let tags = env.tag_stack.clone();
-    CLOSURE_CONTROL.with(|m| m.borrow_mut().insert(sym_idx, (blocks, tags)));
+    closure_controls()
+        .borrow_mut()
+        .insert(sym_idx, (blocks, tags));
 }
 
 /// The captured lexical block/tag scope for a closure, if any. Callers install it
@@ -10636,11 +10648,14 @@ fn closure_captured_control(
     if !name.is_symbol() {
         return None;
     }
-    CLOSURE_CONTROL.with(|m| m.borrow().get(&name.as_symbol_index()).cloned())
+    closure_controls()
+        .borrow()
+        .get(&name.as_symbol_index())
+        .cloned()
 }
 
 /// The heap environment an env-capturing closure was created in, if any.
-pub(super) fn closure_captured_env(fn_val: TorclVal) -> Option<Rc<RefCell<EnvFrame>>> {
+pub(super) fn closure_captured_env(fn_val: TorclVal) -> Option<Arc<SharedCell<EnvFrame>>> {
     if !fn_val.is_heap_object() || !torcl_rt::function::is_interpreted_function(fn_val) {
         return None;
     }
@@ -10648,7 +10663,10 @@ pub(super) fn closure_captured_env(fn_val: TorclVal) -> Option<Rc<RefCell<EnvFra
     if !name.is_symbol() {
         return None;
     }
-    CLOSURE_ENV.with(|m| m.borrow().get(&name.as_symbol_index()).cloned())
+    closure_envs()
+        .borrow()
+        .get(&name.as_symbol_index())
+        .cloned()
 }
 
 /// Record the captured heap frame for a closure whose interpreted-function object
@@ -10657,29 +10675,37 @@ pub(super) fn closure_captured_env(fn_val: TorclVal) -> Option<Rc<RefCell<EnvFra
 /// (symbol-function s) (lambda …))` that captures enclosing lexicals): the object
 /// then reaches those lexicals through the same `CLOSURE_ENV` channel the
 /// bytecode `MakeClosure` path uses (bliss-jtc.23.3).
-pub(super) fn register_closure_env(sym_idx: u32, frame: Rc<RefCell<EnvFrame>>) {
+pub(super) fn register_closure_env(sym_idx: u32, frame: Arc<SharedCell<EnvFrame>>) {
     install_bytecode_root_scanner();
-    CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
+    closure_envs().borrow_mut().insert(sym_idx, frame);
 }
 
 /// Drop any captured heap frame recorded for `sym_idx`. Used when a global
 /// function is (re)defined at top level, so a stale lexical capture from an
 /// earlier definition inside a `let` does not linger (bliss-sdd).
 pub(super) fn clear_closure_env(sym_idx: u32) {
-    CLOSURE_ENV.with(|m| m.borrow_mut().remove(&sym_idx));
-    CLOSURE_CONTROL.with(|m| m.borrow_mut().remove(&sym_idx));
+    closure_envs().borrow_mut().remove(&sym_idx);
+    closure_controls().borrow_mut().remove(&sym_idx);
 }
 
 /// Snapshot the CLOSURE_ENV table for core-image serialization (bliss-zz6w).
-pub(super) fn closure_env_entries() -> Vec<(u32, Rc<RefCell<EnvFrame>>)> {
-    CLOSURE_ENV.with(|m| m.borrow().iter().map(|(k, v)| (*k, Rc::clone(v))).collect())
+pub(super) fn closure_env_entries() -> Vec<(u32, Arc<SharedCell<EnvFrame>>)> {
+    closure_envs()
+        .borrow()
+        .iter()
+        .map(|(k, v)| (*k, Arc::clone(v)))
+        .collect()
 }
 
 /// Snapshot the CLOSURE_CONTROL table for core-image serialization.
 #[allow(clippy::type_complexity)]
 pub(super) fn closure_control_entries() -> Vec<(u32, (Vec<(String, String)>, Vec<(String, String)>))>
 {
-    CLOSURE_CONTROL.with(|m| m.borrow().iter().map(|(k, v)| (*k, v.clone())).collect())
+    closure_controls()
+        .borrow()
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect()
 }
 
 /// Install a restored block/tag scope snapshot for a closure (core restore).
@@ -10688,7 +10714,9 @@ pub(super) fn install_closure_control(
     blocks: Vec<(String, String)>,
     tags: Vec<(String, String)>,
 ) {
-    CLOSURE_CONTROL.with(|m| m.borrow_mut().insert(sym_idx, (blocks, tags)));
+    closure_controls()
+        .borrow_mut()
+        .insert(sym_idx, (blocks, tags));
 }
 
 /// Materialize a callable value for a nested-lambda `MakeClosure`. Each
@@ -10701,11 +10729,11 @@ pub(super) fn install_closure_control(
 /// read and write the enclosing lexical bindings (portable `flet`/`labels`).
 fn make_bytecode_closure(
     nested: &BytecodeFunction,
-    captured_env: Option<Rc<RefCell<EnvFrame>>>,
+    captured_env: Option<Arc<SharedCell<EnvFrame>>>,
 ) -> TorclVal {
     // Building the installed lambda list can move literals in this cloned
     // body before the registry owns it. Root the clone, not just its parent.
-    let nested = Rc::new(nested.clone());
+    let nested = Arc::new(nested.clone());
     let _nested_roots = ActiveBytecodeRoot::new(&nested);
     let sym = torcl_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
@@ -10714,9 +10742,12 @@ fn make_bytecode_closure(
     } else {
         installed_lambda_list(nested.arity)
     };
-    registry_put(sym_idx, Rc::clone(&nested));
+    registry_put(sym_idx, Arc::clone(&nested));
+    closure_bodies()
+        .borrow_mut()
+        .insert(sym_idx, Arc::clone(&nested));
     if let Some(frame) = captured_env {
-        CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
+        closure_envs().borrow_mut().insert(sym_idx, frame);
     }
     torcl_rt::function::alloc_interpreted(lambda_list, NIL, NIL, sym)
 }
@@ -11047,7 +11078,7 @@ pub(super) fn lazy_compile_defun(
     };
     match compiled.filter(|function| !contains_load_time_values(function)) {
         Some(bf) => {
-            registry_put(sym, Rc::new(bf));
+            registry_put(sym, Arc::new(bf));
             true
         }
         None => {
@@ -11120,11 +11151,11 @@ pub(super) fn compile_and_reify_lambda(
     if contains_load_time_values(&bf) {
         return None;
     }
-    let bf = Rc::new(bf);
+    let bf = Arc::new(bf);
     let _bytecode_root = ActiveBytecodeRoot::new(&bf);
     let sym = torcl_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
-    registry_put(sym_idx, Rc::clone(&bf));
+    registry_put(sym_idx, Arc::clone(&bf));
     Some(torcl_rt::function::alloc_interpreted(
         lambda_list,
         body,
@@ -12037,7 +12068,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
     }
     let functions = decoded_functions
         .into_iter()
-        .map(Rc::new)
+        .map(Arc::new)
         .collect::<Vec<_>>();
     // Load actions execute in order, and earlier actions can allocate before a
     // later thunk/function has been registered or made active. Keep every
@@ -12078,7 +12109,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
             3 => {
                 let function_index = action.arg0 as usize;
                 let sym = bbu_symbol(&constants, action.arg1)?;
-                let function = Rc::clone(&functions[function_index]);
+                let function = Arc::clone(&functions[function_index]);
                 let mut symbol = TorclVal::from_symbol_index(sym);
                 torcl_rt::rooted_ref!(_symbol_root = &mut symbol);
                 let mut lambda_list = if function.variadic {
@@ -12111,7 +12142,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
                 torcl_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_macro(
                     symbol,
-                    Rc::clone(&functions[action.arg0 as usize]),
+                    Arc::clone(&functions[action.arg0 as usize]),
                     env,
                 );
                 last = symbol;
@@ -12129,7 +12160,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
                 };
                 super::install_loaded_compiler_macro(
                     symbol,
-                    Rc::clone(&functions[action.arg0 as usize]),
+                    Arc::clone(&functions[action.arg0 as usize]),
                     definition_package,
                 );
                 last = symbol;
@@ -12140,13 +12171,13 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
                 torcl_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_setf_expander(
                     symbol,
-                    Rc::clone(&functions[action.arg0 as usize]),
+                    Arc::clone(&functions[action.arg0 as usize]),
                     env,
                 );
                 last = symbol;
             }
             7 => {
-                last = run(Rc::clone(&functions[action.arg0 as usize]), &[], NIL, env)?;
+                last = run(Arc::clone(&functions[action.arg0 as usize]), &[], NIL, env)?;
             }
             9 => {
                 // EvalSource: reconstruct the source form from the constant pool
@@ -12159,7 +12190,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
                 let mut initializer_env = env.null_lexical_child();
                 torcl_rt::rooted_ref!(_env_root = &mut initializer_env);
                 last = run(
-                    Rc::clone(&functions[action.arg1 as usize]),
+                    Arc::clone(&functions[action.arg1 as usize]),
                     &[],
                     NIL,
                     &mut initializer_env,
@@ -12168,8 +12199,13 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             10 => {
                 // RegisterClosure (core images, bliss-zz6w): re-register a
-                // closure's bytecode under its image-stable uninterned symbol.
-                registry_put(action.arg1, Rc::clone(&functions[action.arg0 as usize]));
+                // closure's bytecode under its image-stable uninterned symbol,
+                // including dispatch from workers started after restoration.
+                let body = &functions[action.arg0 as usize];
+                registry_put(action.arg1, Arc::clone(body));
+                closure_bodies()
+                    .borrow_mut()
+                    .insert(action.arg1, Arc::clone(body));
             }
             _ => unreachable!("load actions were verified above"),
         }
@@ -12306,7 +12342,7 @@ impl torcl_rt::gc::TraceHostRoots for CleanupCont {
 /// in-frame for precise GC).
 struct Activation {
     frame: *mut Frame,
-    func: Rc<BytecodeFunction>,
+    func: Arc<BytecodeFunction>,
     bcp: usize,
     sp_top: u16,
     n_locals: u16,
@@ -12319,7 +12355,7 @@ struct Activation {
     /// Heap `EnvFrame` chain holding this activation's captured (boxed) locals,
     /// shared with any closure it creates. `None` when the function has no
     /// captured locals (the common, fast, slot-only case).
-    env_frame: Option<Rc<RefCell<EnvFrame>>>,
+    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     /// The tiered function object (FnMeta) this activation is executing, when
     /// one exists. Present for named functions dispatched through `CallNamed`;
     /// `None` for anonymous/gensym lambdas and toplevel wrappers with no
@@ -12360,12 +12396,12 @@ impl torcl_rt::gc::TraceHostRoots for Activation {
 /// arguments. Returns `None` for the slot-only case.
 fn make_env_frame(
     func: &BytecodeFunction,
-    parent: Rc<RefCell<EnvFrame>>,
-) -> Option<Rc<RefCell<EnvFrame>>> {
+    parent: Arc<SharedCell<EnvFrame>>,
+) -> Option<Arc<SharedCell<EnvFrame>>> {
     if !func.has_env {
         return None;
     }
-    let frame = Rc::new(RefCell::new(EnvFrame {
+    let frame = Arc::new(SharedCell::new(EnvFrame {
         vars: super::VecMap::default(),
         symbol_vars: super::VecMap::default(),
         parent: Some(parent),
@@ -12375,9 +12411,10 @@ fn make_env_frame(
 
 /// Define a captured parameter in an activation's heap environment. Keep the
 /// name and symbol-index maps in sync, just like `DefineEnvVar`.
-fn bind_boxed_param(env_frame: &Rc<RefCell<EnvFrame>>, name: &str, value: TorclVal) {
+fn bind_boxed_param(env_frame: &Arc<SharedCell<EnvFrame>>, name: &str, value: TorclVal) {
+    let symbol_index = torcl_rt::symbols::find_index(name);
     let mut borrowed = env_frame.borrow_mut();
-    if let Some(idx) = torcl_rt::symbols::find_index(name) {
+    if let Some(idx) = symbol_index {
         borrowed.symbol_vars.insert(idx, value);
     }
     borrowed.vars.insert(name.to_string(), value);
@@ -12482,7 +12519,7 @@ fn bind_params(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[TorclVal],
-    env_frame: Option<&Rc<RefCell<EnvFrame>>>,
+    env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
 ) {
     for (i, (name, loc)) in func.param_layout.iter().enumerate() {
         if let Some(a) = args.get(i) {
@@ -12508,10 +12545,10 @@ fn bind_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[TorclVal],
-    env_frame: Option<&Rc<RefCell<EnvFrame>>>,
+    env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<(), TorclError> {
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
     // `param_layout` names are frozen into the .bfasl at compile time, but
     // `bind_lambda_list` binds each parameter under its *live* symbol's
     // rendered name (`define_local_symbol` keys `vars` by `sym_name`). A
@@ -12527,7 +12564,7 @@ fn bind_variadic(
         super::bind_lambda_list(func.params_form, args, env)?;
         // Argument/default evaluation is a single-value context.
         env.clear_mv();
-        let cur = Rc::clone(&env.frame);
+        let cur = Arc::clone(&env.frame);
         for (i, (name, loc)) in func.param_layout.iter().enumerate() {
             let key = live_names
                 .as_ref()
@@ -12564,10 +12601,10 @@ fn bind_macro_variadic(
     frame: *mut Frame,
     args: &[TorclVal],
     explicit_whole: Option<TorclVal>,
-    env_frame: Option<&Rc<RefCell<EnvFrame>>>,
+    env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<(), TorclError> {
-    let parent = Rc::clone(&env.frame);
+    let parent = Arc::clone(&env.frame);
     super::with_child_frame(env, parent, |env| {
         // If the macro lambda list begins with `&whole`, that variable must bind
         // to the ENTIRE macro call form INCLUDING the operator (CLHS 3.4.4). A
@@ -12609,7 +12646,7 @@ fn bind_macro_variadic(
             return Err(error);
         }
         env.clear_mv();
-        let current = Rc::clone(&env.frame);
+        let current = Arc::clone(&env.frame);
         // See bind_variadic: re-derive lookup keys from the live params_form so
         // a compile-vs-load symbol-rendering change can't orphan a parameter.
         let live_names = parse_macro_lambda_list(func.params_form).map(|(names, ..)| names);
@@ -12637,7 +12674,7 @@ fn bind_macro_variadic(
 /// `TorclStack`. `args` are the actual arguments bound into the entry frame's
 /// leading local slots.
 pub(super) fn run(
-    entry: Rc<BytecodeFunction>,
+    entry: Arc<BytecodeFunction>,
     args: &[TorclVal],
     entry_fn_val: TorclVal,
     env: &mut Env,
@@ -12653,7 +12690,7 @@ pub(super) fn run(
 /// unreachable in practice: a first-call hot loop interpreted forever
 /// (bliss-j1o7).
 pub(super) fn run_with_sym(
-    entry: Rc<BytecodeFunction>,
+    entry: Arc<BytecodeFunction>,
     args: &[TorclVal],
     entry_fn_val: TorclVal,
     sym: u32,
@@ -12663,7 +12700,7 @@ pub(super) fn run_with_sym(
 }
 
 pub(super) fn run_macro(
-    entry: Rc<BytecodeFunction>,
+    entry: Arc<BytecodeFunction>,
     args: &[TorclVal],
     whole: Option<TorclVal>,
     env: &mut Env,
@@ -12672,7 +12709,7 @@ pub(super) fn run_macro(
 }
 
 fn run_with_binding(
-    entry: Rc<BytecodeFunction>,
+    entry: Arc<BytecodeFunction>,
     args: &[TorclVal],
     entry_fn_val: TorclVal,
     entry_sym: u32,
@@ -12684,7 +12721,7 @@ fn run_with_binding(
     torcl_rt::rooted!(args = args.to_vec());
     torcl_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
     validate_declared_args(&entry, &args)?;
-    record_profiled_invocation(Rc::as_ptr(&entry) as usize);
+    record_profiled_invocation(Arc::as_ptr(&entry) as usize);
     // A callee's return values are determined by its own body — discard any
     // multiple-values state left by the caller's argument evaluation, so a
     // single-valued function returns exactly one value (an enclosing
@@ -12716,7 +12753,9 @@ fn run_with_binding(
     // frame; one that only reads the enclosing scope uses the captured frame
     // directly.
     let closure_env = closure_captured_env(entry_fn_val);
-    let parent = closure_env.clone().unwrap_or_else(|| Rc::clone(&env.frame));
+    let parent = closure_env
+        .clone()
+        .unwrap_or_else(|| Arc::clone(&env.frame));
     let env_frame = make_env_frame(&entry, parent).or(closure_env);
     if macro_lambda_list {
         if let Err(e) =
@@ -13047,8 +13086,9 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     .env_frame
                     .clone()
                     .expect("DefineEnvVar without a heap EnvFrame");
+                let symbol_index = torcl_rt::symbols::find_index(&name);
                 let mut borrowed = ef.borrow_mut();
-                if let Some(idx) = torcl_rt::symbols::find_index(&name) {
+                if let Some(idx) = symbol_index {
                     borrowed.symbol_vars.insert(idx, v);
                 }
                 borrowed.vars.insert(name, v);
@@ -13056,7 +13096,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
             Instr::PushEnvChild => {
                 let act = &mut acts[top_idx];
                 let parent = act.env_frame.clone();
-                act.env_frame = Some(Rc::new(RefCell::new(EnvFrame {
+                act.env_frame = Some(Arc::new(SharedCell::new(EnvFrame {
                     vars: super::VecMap::default(),
                     symbol_vars: super::VecMap::default(),
                     parent,
@@ -13213,7 +13253,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 // Profile every call site's execution frequency.  Type details
                 // remain restricted to speculatable arithmetic sites. `bcp` was
                 // already advanced past this instruction, so the site is bcp-1.
-                let func_ptr = Rc::as_ptr(&acts[top_idx].func) as usize;
+                let func_ptr = Arc::as_ptr(&acts[top_idx].func) as usize;
                 let call_bcp = acts[top_idx].bcp as u32 - 1;
                 if registered_callee.is_some() {
                     record_call_site(func_ptr, call_bcp);
@@ -13295,7 +13335,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                                 continue;
                             }
                         };
-                        let env_frame = make_env_frame(&callee, Rc::clone(&env.frame));
+                        let env_frame = make_env_frame(&callee, Arc::clone(&env.frame));
                         if callee.variadic {
                             if let Err(e) =
                                 bind_variadic(&callee, frame, &args, env_frame.as_ref(), env)
@@ -13307,7 +13347,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         } else {
                             bind_params(&callee, frame, &args, env_frame.as_ref());
                         }
-                        record_profiled_invocation(Rc::as_ptr(&callee) as usize);
+                        record_profiled_invocation(Arc::as_ptr(&callee) as usize);
                         acts.push(Activation {
                             frame,
                             n_locals: callee.n_locals,
@@ -13649,7 +13689,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                                 // Anonymous (top-level) loop: reset its per-(func,
                                 // header) back-edge count so it re-warms, matching
                                 // the named backoff (bliss-pohq).
-                                let key = (Rc::as_ptr(&acts[top_idx].func) as usize, target_bcp);
+                                let key = (Arc::as_ptr(&acts[top_idx].func) as usize, target_bcp);
                                 ANON_BACK_EDGES.with(|m| {
                                     m.borrow_mut().remove(&key);
                                 });
@@ -13720,7 +13760,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                             token: token.clone(),
                             var_name: None,
                             body: NIL,
-                            captured_frame: Rc::clone(&env.frame),
+                            captured_frame: Arc::clone(&env.frame),
                         },
                     });
                     runtime_clauses.push(RuntimeClause {
@@ -13835,7 +13875,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 let captured_frame = acts[top_idx]
                     .env_frame
                     .clone()
-                    .unwrap_or_else(|| Rc::clone(&env.frame));
+                    .unwrap_or_else(|| Arc::clone(&env.frame));
                 let mut cluster_values = Vec::with_capacity(info.restarts.len().saturating_mul(5));
                 for restart in &info.restarts {
                     env.restarts.push(RestartEntry {
@@ -13847,7 +13887,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         captured_tags: env.tag_stack.clone(),
                         function: RestartFunction::Bytecode {
                             function: Rc::new(RefCell::new((*restart.function).clone())),
-                            captured_frame: Rc::clone(&captured_frame),
+                            captured_frame: Arc::clone(&captured_frame),
                         },
                         interactive_function: None,
                         test_function: None,
@@ -14189,7 +14229,7 @@ thread_local! {
     static NATIVE_ENV: std::cell::Cell<*mut Env> = const { std::cell::Cell::new(std::ptr::null_mut()) };
     /// Captured lexical environment for the currently executing native
     /// activation. Nested native calls save/restore this just like NATIVE_ENV.
-    static NATIVE_ENV_FRAME: RefCell<Option<Rc<RefCell<EnvFrame>>>> = const { RefCell::new(None) };
+    static NATIVE_ENV_FRAME: RefCell<Option<Arc<SharedCell<EnvFrame>>>> = const { RefCell::new(None) };
     /// The bytecode function whose OSR native code is currently running
     /// (bliss-guck). OSR emits `sym == u32::MAX`, so env-var opcodes cannot map a
     /// name index through `registry_get(sym)`; `native_env_name` falls back to
@@ -14365,7 +14405,7 @@ fn native_env_name(function_sym: u64, name_index: u64) -> Option<String> {
     if bf.is_null() {
         return None;
     }
-    // SAFETY: run_native_osr holds the Rc<OsrCode> (hence the Rc<BytecodeFunction>)
+    // SAFETY: run_native_osr holds the Rc<OsrCode> (hence the Arc<BytecodeFunction>)
     // for the whole native call and sets/clears this pointer around it, so the
     // pointee outlives every c2i callback made from that code.
     let names: &[String] = unsafe { &(*bf).names };
@@ -14422,8 +14462,9 @@ extern "C" fn c2i_define_env(function_sym: u64, name_index: u64, value: u64) {
     };
     NATIVE_ENV_FRAME.with(|slot| {
         if let Some(frame) = slot.borrow().as_ref() {
+            let symbol_index = torcl_rt::symbols::find_index(&name);
             let mut borrowed = frame.borrow_mut();
-            if let Some(symbol_index) = torcl_rt::symbols::find_index(&name) {
+            if let Some(symbol_index) = symbol_index {
                 borrowed.symbol_vars.insert(symbol_index, TorclVal(value));
             }
             borrowed.vars.insert(name.clone(), TorclVal(value));
@@ -14434,7 +14475,7 @@ extern "C" fn c2i_define_env(function_sym: u64, name_index: u64, value: u64) {
 extern "C" fn c2i_push_env_child() {
     NATIVE_ENV_FRAME.with(|slot| {
         let parent = slot.borrow().clone();
-        *slot.borrow_mut() = Some(Rc::new(RefCell::new(EnvFrame {
+        *slot.borrow_mut() = Some(Arc::new(SharedCell::new(EnvFrame {
             vars: super::VecMap::default(),
             symbol_vars: super::VecMap::default(),
             parent,
@@ -15521,7 +15562,7 @@ fn supported_numeric_phase_change(sym: u32) -> bool {
     let Some(body) = registry_get(sym) else {
         return false;
     };
-    let func_ptr = Rc::as_ptr(&body) as usize;
+    let func_ptr = Arc::as_ptr(&body) as usize;
     failed.into_iter().any(|(bcp, old)| {
         type_profile_at(func_ptr, bcp).is_some_and(|profile| {
             profile.other == 0
@@ -16314,7 +16355,7 @@ fn t2_completion_sender() -> std::sync::mpsc::Sender<T2Completion> {
 /// candidates by symbol, so this is exactly the set that can ever be consulted
 /// when compiling `root` (bliss-fhci).
 fn t2_reachable_callees(
-    root: &Rc<BytecodeFunction>,
+    root: &Arc<BytecodeFunction>,
     root_sym: u32,
 ) -> std::collections::HashSet<u32> {
     fn direct_calls(bf: &BytecodeFunction, out: &mut Vec<u32>) {
@@ -16359,7 +16400,7 @@ fn t2_reachable_callees(
 
 fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let root = registry_get(sym)?;
-    let root_ptr = Rc::as_ptr(&root) as usize;
+    let root_ptr = Arc::as_ptr(&root) as usize;
     let type_profiles = TYPE_PROFILE.with(|profiles| {
         profiles
             .borrow()
@@ -16419,7 +16460,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             .iter()
             .filter_map(|&symbol| {
                 let body = registry.get(&symbol)?;
-                let ptr = Rc::as_ptr(body) as usize;
+                let ptr = Arc::as_ptr(body) as usize;
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
                 // A never-invoked function cannot be the target of a hot call
                 // site, and skipping it also skips `call_site_profile_snapshot`
@@ -16790,7 +16831,7 @@ fn run_native(
     // defun; the captured scope for a closure) and restore the caller's on every
     // exit via the guard (bliss-4u5u). Mirrors `run_with_binding`; closure scope
     // is keyed by the closure's own symbol, this activation's `sym`.
-    let (saved_blocks, saved_tags) = match CLOSURE_CONTROL.with(|m| m.borrow().get(&sym).cloned()) {
+    let (saved_blocks, saved_tags) = match closure_controls().borrow().get(&sym).cloned() {
         Some((blocks, tags)) => (
             std::mem::replace(&mut env.block_stack, blocks),
             std::mem::replace(&mut env.tag_stack, tags),
@@ -16835,8 +16876,10 @@ fn run_native(
     // those bindings — e.g. a T2-promoted `(lambda (x) (… separator))` passed to
     // substitute-if reports `separator` unbound (bliss-e7t). `CLOSURE_ENV` is
     // keyed by the closure's own symbol, which is this activation's `sym`.
-    let closure_env = CLOSURE_ENV.with(|m| m.borrow().get(&sym).cloned());
-    let parent = closure_env.clone().unwrap_or_else(|| Rc::clone(&env.frame));
+    let closure_env = closure_envs().borrow().get(&sym).cloned();
+    let parent = closure_env
+        .clone()
+        .unwrap_or_else(|| Arc::clone(&env.frame));
     let env_frame = bf
         .as_ref()
         .and_then(|body| make_env_frame(body, parent))
@@ -16845,7 +16888,7 @@ fn run_native(
     // same heap frame is published through NATIVE_ENV_FRAME for environment
     // bytecodes and closure construction.
     if let Some(body) = bf.as_ref() {
-        record_profiled_invocation(Rc::as_ptr(body) as usize);
+        record_profiled_invocation(Arc::as_ptr(body) as usize);
     }
     if let Some(bf) = bf.as_ref().filter(|b| b.variadic) {
         if let Err(e) = bind_variadic(bf, frame, args, env_frame.as_ref(), env) {
@@ -16925,7 +16968,7 @@ fn run_native(
                 // T1's optimistic arithmetic templates are always Fixnum. T2
                 // follows the profile that was dominant when it was compiled.
                 let forced = (!nc.is_t2).then_some(SpecType::Fixnum);
-                let failed = decay_failed_speculation(Rc::as_ptr(&bf) as usize, forced);
+                let failed = decay_failed_speculation(Arc::as_ptr(&bf) as usize, forced);
                 LAST_FAILED_SPECULATION.with(|m| {
                     m.borrow_mut().insert(sym, failed);
                 });
@@ -17033,12 +17076,12 @@ fn run_native(
 /// lifecycle like [`run`]: `run_loop`'s `Return` pops it on the normal path; on
 /// an error we pop any frames left live.
 fn resume_in_t0(
-    entry: Rc<BytecodeFunction>,
+    entry: Arc<BytecodeFunction>,
     frame: *mut Frame,
     bcp: u32,
     sp_top: u16,
     sym: u32,
-    env_frame: Option<Rc<RefCell<EnvFrame>>>,
+    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
     let thread = torcl_rt::current_thread();
@@ -17856,8 +17899,8 @@ fn emit_native_x86(
                             .iter()
                             .all(|t| matches!(t, DeclaredType::Any));
                         let not_closure = !cbf.has_env
-                            && CLOSURE_ENV.with(|m| !m.borrow().contains_key(sym))
-                            && CLOSURE_CONTROL.with(|m| !m.borrow().contains_key(sym));
+                            && !closure_envs().borrow().contains_key(sym)
+                            && !closure_controls().borrow().contains_key(sym);
                         // !has_deopt: a callee with no speculation-guard deopt
                         // point never mid-flight resumes to T0, so a direct call
                         // needs no post-call deopt handling. Pending errors are
@@ -18878,7 +18921,7 @@ struct OsrCode {
     /// `registry_get(sym).names`; holding the `bf` here (a) keeps its `names`
     /// alive for the code's lifetime and (b) lets `run_native_osr` publish it
     /// through `NATIVE_OSR_BF` so `native_env_name` can resolve names directly.
-    bf: Rc<BytecodeFunction>,
+    bf: Arc<BytecodeFunction>,
 }
 
 thread_local! {
@@ -18890,7 +18933,7 @@ thread_local! {
     /// Rc pointer. Top-level forms are `sym==u32::MAX` and were excluded from
     /// OSR entirely, so a hot loop in one (e.g. babel's 13886-entry encoding-
     /// table build) never tiered — it ran the whole load interpreted. Keying by
-    /// the live `Rc<BytecodeFunction>` address lets those loops OSR too
+    /// the live `Arc<BytecodeFunction>` address lets those loops OSR too
     /// (bliss-pohq / bliss-izt).
     static ANON_OSR_REGISTRY: RefCell<HashMap<usize, Option<Rc<OsrCode>>>> =
         RefCell::new(HashMap::new());
@@ -18977,12 +19020,12 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
 }
 
 /// OSR-compile an ANONYMOUS activation's loop directly from its bytecode
-/// function (no registry symbol). Keyed/cached by the `Rc<BytecodeFunction>`
+/// function (no registry symbol). Keyed/cached by the `Arc<BytecodeFunction>`
 /// address, which is stable for the running activation's lifetime. This is what
 /// lets a hot loop in a top-level form (babel's encoding-table build) reach
 /// native, since such activations carry `sym == u32::MAX` (bliss-pohq).
-fn compile_osr_from_func(func: &Rc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
-    let key = Rc::as_ptr(func) as usize;
+fn compile_osr_from_func(func: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
+    let key = Arc::as_ptr(func) as usize;
     if let Some(cached) = ANON_OSR_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
         return cached;
     }
@@ -18993,7 +19036,7 @@ fn compile_osr_from_func(func: &Rc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
 
 /// Emit OSR-entry native code for one bytecode function (shared by the sym-keyed
 /// and anonymous paths). `sym` is used only for perf-map / jitdump labelling.
-fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> {
+fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> {
     // Same safety gate as the T1-invoke path (see try_promote_to_t1): if a
     // closure created here captures one of this function's blocks/tags, the
     // native no-ops for PushBlock/PushTag/NamedTag would never publish the
@@ -19046,7 +19089,7 @@ fn compile_osr_code(bf: &Rc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> 
         num_slots,
         code_info,
         entries: osr.into_iter().collect(),
-        bf: Rc::clone(bf),
+        bf: Arc::clone(bf),
     }))
 }
 
@@ -19070,7 +19113,7 @@ fn run_native_osr(
     osr: &OsrCode,
     stub_off: usize,
     frame: *mut Frame,
-    env_frame: Option<Rc<RefCell<EnvFrame>>>,
+    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<OsrOutcome, TorclError> {
     NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
@@ -19090,7 +19133,7 @@ fn run_native_osr(
         NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
     // Publish this OSR function's bf so env-var opcodes can resolve their name
     // (OSR bakes sym == u32::MAX; bliss-guck). osr.bf keeps it alive for the call.
-    let saved_osr_bf = NATIVE_OSR_BF.with(|c| c.replace(Rc::as_ptr(&osr.bf)));
+    let saved_osr_bf = NATIVE_OSR_BF.with(|c| c.replace(Arc::as_ptr(&osr.bf)));
     let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_DEOPT.with(|d| d.set(false));
     let entry_addr = osr.entry as usize + stub_off;
@@ -19184,7 +19227,7 @@ fn maybe_osr(
             }
         }
         None => {
-            let key = (Rc::as_ptr(&act.func) as usize, target_bcp);
+            let key = (Arc::as_ptr(&act.func) as usize, target_bcp);
             let count = ANON_BACK_EDGES.with(|m| {
                 let mut m = m.borrow_mut();
                 let e = m.entry(key).or_insert(0);
@@ -19412,7 +19455,7 @@ pub fn eval_toplevel(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, Torc
                 Some(bf) => {
                     trace("compiled");
                     trace_named(&name, "compiled", None);
-                    registry_put(sym, Rc::new(bf));
+                    registry_put(sym, Arc::new(bf));
                 }
                 // Redefinition that no longer compiles must not leave stale
                 // bytecode behind — drop it so calls fall back to the tree-walker.
@@ -19451,7 +19494,7 @@ pub fn eval_toplevel(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, Torc
     {
         Some(bf) => {
             trace("compiled");
-            let arc = Rc::new(bf);
+            let arc = Arc::new(bf);
             let fn_val = NIL;
             run(arc, &[], fn_val, env)
         }
@@ -19603,7 +19646,7 @@ mod direct_call_invalidation_tests {
         );
         let symbol = torcl_rt::function::name(*callable).as_symbol_index();
         let code = registry_get(symbol).unwrap();
-        registry_put(symbol, Rc::clone(&code));
+        registry_put(symbol, Arc::clone(&code));
         assert_ne!(direct_call_gen(), generation, "replacement must invalidate");
         let generation = direct_call_gen();
         registry_remove(symbol);

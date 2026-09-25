@@ -352,9 +352,8 @@ fn take_values_to_locals_materializes_secondary_ssa_results() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn stringp_reaches_string_typecheck_through_inline_metadata() {
-    use torcl_compiler::t2::emit::emit_framed;
-    use torcl_compiler::t2::ir::{AuxData, Opcode, TypeBits};
+fn stringp_retains_semantic_call_instead_of_simple_string_typecheck() {
+    use torcl_compiler::t2::ir::{AuxData, Opcode};
 
     let stringp = torcl_rt::symbols::intern("STRINGP");
     let bf = bytecode_fn(
@@ -372,39 +371,26 @@ fn stringp_reaches_string_typecheck_through_inline_metadata() {
         1,
         1,
     );
-    let f = build_from_bytecode(&bf).expect("build STRINGP metadata expansion");
-    let check = f
+    let f = build_from_bytecode(&bf).expect("build STRINGP call");
+    verify(&f).expect("STRINGP fallback has valid frame state and operands");
+    // STRINGP also accepts adjustable, displaced, and fill-pointer strings.
+    // The raw STRING type check only recognizes simple strings (bliss-c02n),
+    // so metadata must decline that expansion and retain the semantic call.
+    let call = f
         .block_order()
         .iter()
         .flat_map(|&b| f.block(b).insts.iter())
         .map(|&i| f.inst(i))
-        .find(|d| d.opcode == Opcode::TypeCheck)
-        .expect("STRINGP must become TypeCheck");
-    assert!(matches!(&check.aux, AuxData::TypeTag(t) if t.bits == TypeBits::STRING));
+        .find(|d| d.opcode == Opcode::Call)
+        .expect("STRINGP must preserve the full string predicate");
+    assert!(matches!(call.aux, AuxData::CallTarget(sym) if sym == stringp));
+    assert_eq!(call.args.len(), 1);
     assert!(!f.block_order().iter().any(|&b| {
         f.block(b)
             .insts
             .iter()
-            .any(|&i| f.inst(i).opcode == Opcode::Call)
+            .any(|&i| f.inst(i).opcode == Opcode::TypeCheck)
     }));
-
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit STRINGP");
-    let buf = torcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
-    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
-    let run = |value: TorclVal| {
-        let mut frame = [value.0, 0];
-        TorclVal(func(frame.as_mut_ptr()))
-    };
-    let string_header = Box::new(ObjectHeader::new(type_id::SIMPLE_BASE_STRING, 2));
-    let string = unsafe { TorclVal::from_heap_ptr(Box::into_raw(string_header).cast::<u8>()) };
-    let wide_header = Box::new(ObjectHeader::new(type_id::SIMPLE_CHARACTER_STRING, 2));
-    let wide_string = unsafe { TorclVal::from_heap_ptr(Box::into_raw(wide_header).cast::<u8>()) };
-    let pathname_header = Box::new(ObjectHeader::new(type_id::PATHNAME, 2));
-    let pathname = unsafe { TorclVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()) };
-    assert_eq!(run(string), T);
-    assert_eq!(run(wide_string), T);
-    assert_eq!(run(pathname), NIL);
-    assert_eq!(run(TorclVal::from_fixnum(7)), NIL);
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]

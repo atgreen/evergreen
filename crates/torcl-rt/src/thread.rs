@@ -310,6 +310,15 @@ impl ThreadResult {
         guard.take().unwrap()
     }
 
+    /// Wait without removing the GC-visible result. A blocked native caller
+    /// must resume through the safepoint protocol before moving root slots.
+    fn wait_until_ready(&self) {
+        let mut guard = self.value.lock().unwrap();
+        while guard.is_none() {
+            guard = self.done.wait(guard).unwrap();
+        }
+    }
+
     /// Check if the thread has finished without blocking.
     #[allow(dead_code)]
     fn is_done(&self) -> bool {
@@ -325,7 +334,9 @@ pub struct NativeThread {
     carrier: bool,
     auto_registered: bool,
     entry: AtomicU64,
-    state: OrderedMutex<NativeThreadState>,
+    // Read during TLS retirement, when the debug lock-stack TLS may already
+    // be destroyed. This scalar state needs atomic publication, not a mutex.
+    state: AtomicU8,
     stack: TorclStack,
     tls: OrderedMutex<Vec<TorclVal>>,
     condition_state: OrderedMutex<ThreadConditionState>,
@@ -360,12 +371,7 @@ impl NativeThread {
             carrier,
             auto_registered,
             entry: AtomicU64::new(entry.0),
-            state: OrderedMutex::new(
-                LockLevel::ExecutionObject,
-                native_object_order(id, 1),
-                "native thread state",
-                NativeThreadState::Born,
-            ),
+            state: AtomicU8::new(NativeThreadState::Born as u8),
             stack: TorclStack::new(default_stack_size()),
             tls: OrderedMutex::new(
                 LockLevel::ExecutionObject,
@@ -419,11 +425,19 @@ impl NativeThread {
     }
 
     pub fn state(&self) -> NativeThreadState {
-        *self.state.lock().unwrap()
+        match self.state.load(Ordering::Acquire) {
+            0 => NativeThreadState::Born,
+            1 => NativeThreadState::Running,
+            2 => NativeThreadState::Blocked,
+            3 => NativeThreadState::Native,
+            4 => NativeThreadState::Dead,
+            5 => NativeThreadState::Aborted,
+            _ => unreachable!("invalid native thread state"),
+        }
     }
 
     pub(crate) fn set_state(&self, state: NativeThreadState) {
-        *self.state.lock().unwrap() = state;
+        self.state.store(state as u8, Ordering::Release);
     }
 
     pub fn stack(&self) -> &TorclStack {
@@ -632,7 +646,7 @@ impl CurrentNativeThread {
 
 impl Drop for CurrentNativeThread {
     fn drop(&mut self) {
-        self.thread.set_gc_participates(false);
+        crate::safepoint::retire_native_thread(&self.thread);
     }
 }
 
@@ -1207,9 +1221,8 @@ impl WorkerPool {
                         install_current_native_thread(Arc::clone(&running_carrier));
                         running_carrier.set_state(NativeThreadState::Running);
                         worker_loop(running_pool, i);
-                        running_carrier.set_gc_participates(false);
-                        running_carrier.set_state(NativeThreadState::Dead);
                         result.complete(Ok(NIL));
+                        crate::safepoint::retire_native_thread(&running_carrier);
                     })
                     .expect("failed to spawn carrier thread");
                 *carrier.join_handle.lock().unwrap() = Some(handle);
@@ -1642,9 +1655,8 @@ pub fn make_thread(entry: TorclVal) -> Result<NativeThreadId, TorclError> {
                 value = Ok(interrupt);
             }
             running.stack.publish_top();
-            running.set_gc_participates(false);
-            running.set_state(NativeThreadState::Dead);
             result.complete(value);
+            crate::safepoint::retire_native_thread(&running);
         }) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1673,30 +1685,28 @@ pub fn join_thread(id: NativeThreadId) -> Result<TorclVal, TorclError> {
             .cloned()
             .ok_or_else(|| TorclError::Internal(format!("no native thread with id {}", id.0)))?
     };
-    // Block for the joined thread's result. If that thread (or any peer)
-    // triggers a GC while we wait here, stop-the-world must be able to skip us:
-    // we are parked in a futex and will never reach a safepoint poll on our own,
-    // so leaving our state as Running would make the collector wait for us until
-    // its 1s handshake timeout — an effective deadlock when a spawned worker GCs
-    // while its spawner joins (bliss-bw3t). Publish our CL stack top and enter
-    // the Blocked state (scannable without cooperation, excluded from the
-    // handshake — §13.6.1 / R13.12), then restore Running. current_thread() is
-    // registered by the time we get here (we allocated to build the call).
-    let value = {
-        let me = current_thread();
-        me.stack.publish_top();
-        me.set_state(NativeThreadState::Blocked);
-        let waited = thread.result.wait();
-        me.set_state(NativeThreadState::Running);
-        waited
-    }?;
-    if let Some(handle) = thread.join_handle.lock().unwrap().take() {
+    // Leave the result in its scanned cell throughout the native wait. The
+    // scope's Drop waits out any active collection before we move the value.
+    {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+        thread.result.wait_until_ready();
+    }
+    let mut value = thread.result.value.lock().unwrap().take().ok_or_else(|| {
+        TorclError::ProgramError(format!("native thread {} was already joined", id.0))
+    })?;
+    crate::rooted_ref!(_value_root = &mut value);
+    // OS teardown can outlast result publication. Keep the result rooted and
+    // participate in GC while waiting, with no join-handle lock held.
+    let handle = thread.join_handle.lock().unwrap().take();
+    if let Some(handle) = handle {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         handle
             .join()
             .map_err(|_| TorclError::Internal(format!("native thread {} panicked", id.0)))?;
     }
     native_thread_registry().lock().unwrap().remove(&id);
-    Ok(value)
+    drop(_value_root);
+    value
 }
 
 pub fn current_thread_id() -> NativeThreadId {
@@ -2260,6 +2270,76 @@ pub fn wait_for_other_threads() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod native_join_gc_tests {
+    use super::*;
+
+    #[test]
+    fn join_roots_result_while_waiting_for_native_exit() {
+        const CHILD: &str = "TORCL_TEST_JOIN_GC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "thread::native_join_gc_tests::join_roots_result_while_waiting_for_native_exit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::gc::ensure_heap_initialized();
+        current_thread_id();
+        let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+        let result = Arc::new(ThreadResult::new());
+        let thread = Arc::new(NativeThread::new(
+            id,
+            Some("join-gc-worker".into()),
+            false,
+            false,
+            NIL,
+            Arc::clone(&result),
+        ));
+        native_thread_registry()
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&thread));
+        let running = Arc::clone(&thread);
+        let (observed, collection) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            install_current_native_thread(Arc::clone(&running));
+            running.set_state(NativeThreadState::Running);
+            let body = crate::gc::alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT).unwrap();
+            unsafe { *(body as *mut f64) = 42.0 };
+            let original = unsafe { TorclVal::from_heap_ptr(body.sub(8)) }.to_raw();
+            result.complete(Ok(TorclVal::from_raw(original)));
+            // The Lisp result can be available before the OS thread exits.
+            // Collect only after JOIN has taken it from the result cell: its
+            // caller must keep that value rooted throughout the remaining wait.
+            while result.value.lock().unwrap().is_some() {
+                std::thread::yield_now();
+            }
+            let collected = crate::gc::collect_t0_minor();
+            observed.send((collected, original)).unwrap();
+            crate::safepoint::retire_native_thread(&running);
+        });
+        *thread.join_handle.lock().unwrap() = Some(handle);
+        let value = join_thread(id).unwrap();
+        let (collected, original) = collection.recv().unwrap();
+        collected.expect("worker GC during native join");
+        assert!(crate::gc::heap_stats().minor_gc_count > 0);
+        assert_ne!(value.to_raw(), original, "JOIN result must be relocated");
+        assert_eq!(unsafe { *(value.as_ptr().add(8) as *const f64) }, 42.0);
     }
 }
 

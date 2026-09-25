@@ -357,6 +357,15 @@ unsafe impl Send for HeapAllocator {}
 impl HeapAllocator {
     /// Create a new HeapAllocator. The heap must already be initialized via `init_heap`.
     pub fn new() -> Result<Self, TorclError> {
+        let mut alloc = Self::without_tlab()?;
+        alloc.refill_tlab()?;
+        Ok(alloc)
+    }
+
+    /// Initialize allocation state without reserving nursery space. T0 uses
+    /// this so its first allocation reaches the collecting slow path when a
+    /// fresh thread (or an invalidated allocator) finds the nursery full.
+    fn without_tlab() -> Result<Self, TorclError> {
         let guard = heap_state().lock().unwrap();
         let state = guard
             .as_ref()
@@ -365,7 +374,7 @@ impl HeapAllocator {
         let tlab_size = state.config.tlab_size;
         drop(guard);
 
-        let mut alloc = HeapAllocator {
+        Ok(HeapAllocator {
             tlab: Tlab {
                 cursor: std::ptr::null_mut(),
                 limit: std::ptr::null(),
@@ -373,10 +382,7 @@ impl HeapAllocator {
             },
             region_size,
             tlab_size,
-        };
-        // Try to get an initial TLAB from a nursery region.
-        alloc.refill_tlab()?;
-        Ok(alloc)
+        })
     }
 
     /// Refill the TLAB from a nursery region. If the configured nursery budget
@@ -2174,12 +2180,7 @@ impl Collector for HeapCollector {
     /// or promotes to old-gen based on gen_age vs promotion_threshold.
     fn minor_gc(&mut self) -> Result<(), TorclError> {
         let needs_major = {
-            let _exclude_cross_thread_readers = cross_thread_root_gc_gate()
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            let _gc_cycle = gc_cycle_lock()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let _gc_admission = acquire_gc_admission();
             self.minor_gc_stop_the_world()?;
             // `old_occupancy_trigger` was a config knob wired to NOTHING: no
             // automatic major collection existed, so old-gen garbage accumulated
@@ -2190,7 +2191,7 @@ impl Collector for HeapCollector {
             // run a major collection to sweep old-gen garbage back to Free.
             Self::occupancy_exceeds_trigger()
         };
-        // Outside the cycle lock: major_gc takes it itself (as full_gc does).
+        // Outside the admission gate: major_gc acquires it itself.
         // No retrigger loop: major_gc drains the nursery via
         // minor_gc_stop_the_world directly, not through this wrapper.
         if needs_major {
@@ -2222,17 +2223,39 @@ impl Collector for HeapCollector {
     /// 3. Evacuation: copy live objects from selected regions to fresh old-gen
     ///    regions, install forwarding pointers, and free evacuated regions.
     fn major_gc(&mut self) -> Result<(), TorclError> {
-        let _exclude_cross_thread_readers = cross_thread_root_gc_gate()
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        let _gc_cycle = gc_cycle_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _gc_admission = acquire_gc_admission();
+        crate::safepoint::wait_for_all_threads()?;
+        retire_current_t0_tlab_for_safepoint();
+        let body_result = self.major_gc_stw_body();
+        let resume_result = crate::safepoint::resume_all_threads();
+        body_result?;
+        resume_result
+    }
+
+    /// Full GC: runs minor + major collections. Used before image save.
+    fn full_gc(&mut self) -> Result<(), TorclError> {
+        // Drop the lock between phases to avoid deadlock (minor_gc and major_gc
+        // each acquire the lock internally).
+        self.minor_gc()?;
+        self.major_gc()?;
+        Ok(())
+    }
+
+    fn stats(&self) -> GcStats {
+        self.gc_stats.clone()
+    }
+}
+
+impl HeapCollector {
+    /// The current major collector is sequential: its root reads and pointer
+    /// rewrites require one uninterrupted pause, including the nursery drain.
+    /// A heap mutex alone cannot exclude mutators using their TLABs or roots.
+    fn major_gc_stw_body(&mut self) -> Result<(), TorclError> {
         let start = std::time::Instant::now();
 
         // A standalone major collection must first drain nursery state so
         // nursery deaths trigger finalizers and weak-reference clearing too.
-        self.minor_gc_stop_the_world()?;
+        self.minor_gc_stw_body()?;
 
         // Set marking flag (§3.6.2: SATB barrier only fires when marking active).
         set_gc_marking_in_progress(true);
@@ -2717,19 +2740,6 @@ impl Collector for HeapCollector {
 
         Ok(())
     }
-
-    /// Full GC: runs minor + major collections. Used before image save.
-    fn full_gc(&mut self) -> Result<(), TorclError> {
-        // Drop the lock between phases to avoid deadlock (minor_gc and major_gc
-        // each acquire the lock internally).
-        self.minor_gc()?;
-        self.major_gc()?;
-        Ok(())
-    }
-
-    fn stats(&self) -> GcStats {
-        self.gc_stats.clone()
-    }
 }
 
 // ── Concrete Write Barrier: SatbCardBarrier ────────────────────────
@@ -3135,6 +3145,23 @@ impl TraceHostRoots for TorclError {
 fn cross_thread_root_gc_gate() -> &'static RwLock<()> {
     static GATE: OnceLock<RwLock<()>> = OnceLock::new();
     GATE.get_or_init(|| RwLock::new(()))
+}
+
+/// The exclusive root-reader gate also serializes collectors. A competing
+/// collector is still a mutator until admitted: blocking in RwLock::write
+/// would prevent it from acknowledging the current collector's safepoint.
+/// Poll only while holding no gate, then retry admission after the pause.
+fn acquire_gc_admission() -> std::sync::RwLockWriteGuard<'static, ()> {
+    loop {
+        match cross_thread_root_gc_gate().try_write() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::safepoint::poll_safepoint();
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4374,7 +4401,7 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         }
         let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
         if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
-            *guard = HeapAllocator::new()
+            *guard = HeapAllocator::without_tlab()
                 .ok()
                 .map(|allocator| (epoch, allocator));
         }
@@ -4574,7 +4601,9 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
 /// walkers stop at a zero header. Turning the unused tail into filler makes the
 /// whole reserved slice walkable before a moving collector scans that region.
 pub(crate) fn retire_current_t0_tlab_for_safepoint() {
-    T0_ALLOCATOR.with(|cell| {
+    // Native-thread retirement can run during TLS teardown, after this slot
+    // has already been destroyed. Ordinary safepoints still visit the live slot.
+    let _ = T0_ALLOCATOR.try_with(|cell| {
         let Ok(mut guard) = cell.try_borrow_mut() else {
             // The current thread is collecting from alloc_slow with its T0
             // allocator already borrowed; alloc_slow retired that TLAB before
@@ -5017,14 +5046,6 @@ fn heap_state() -> &'static OrderedMutex<Option<HeapState>> {
     STATE.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 2, "GC heap state", None))
 }
 
-/// Serializes collector cycles. This is only the collector-entry lock; it does
-/// not exclude mutators, which must be handled by the native safepoint/STW
-/// handshake in the follow-up h6z increments.
-fn gc_cycle_lock() -> &'static OrderedMutex<()> {
-    static LOCK: OnceLock<OrderedMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 1, "GC cycle", ()))
-}
-
 /// Initialize the GC heap. Called once during runtime startup.
 /// Validates configuration and sets up the region-based heap structure.
 pub fn init_heap(config: &GcConfig) -> Result<(), TorclError> {
@@ -5230,6 +5251,28 @@ where
     }
 
     Ok(())
+}
+
+/// Inspect heap liveness and update host metadata in one mutator-free extent.
+/// The callback may call `walk_heap`, but must not allocate Lisp objects,
+/// invoke Lisp, or request collection. Roots and object headers stay stable
+/// until it returns, including against other collectors.
+pub fn with_heap_snapshot<R>(inspect: impl FnOnce() -> R) -> Result<R, TorclError> {
+    let _admission = acquire_gc_admission();
+    crate::safepoint::wait_for_all_threads()?;
+    retire_current_t0_tlab_for_safepoint();
+    struct ResumeOnUnwind;
+    impl Drop for ResumeOnUnwind {
+        fn drop(&mut self) {
+            let _ = crate::safepoint::resume_all_threads();
+        }
+    }
+    let resume_on_unwind = ResumeOnUnwind;
+    let result = inspect();
+    let resumed = crate::safepoint::resume_all_threads();
+    std::mem::forget(resume_on_unwind);
+    resumed?;
+    Ok(result)
 }
 
 // ── Image / persistence helpers ───────────────────────────────────
@@ -6110,6 +6153,129 @@ mod nursery_scan_tests {
 
     thread_local! {
         pub(super) static HEADER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn fresh_thread_collects_when_initial_nursery_is_full() {
+        const CHILD: &str = "TORCL_TEST_FRESH_ALLOCATOR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=5", "30"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc::nursery_scan_tests::fresh_thread_collects_when_initial_nursery_is_full",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("TORCL_GC_STRESS")
+                .env_remove("TORCL_GC_STRESS_AT")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        init_heap(&GcConfig {
+            heap_size: 64 * 1024,
+            heap_max: 64 * 1024,
+            nursery_size: 4096,
+            tlab_size: 4096,
+            region_size: 4096,
+            promotion_threshold: 3,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 32,
+            old_occupancy_trigger: 0.9,
+        })
+        .unwrap();
+        // The parent reserves the only nursery TLAB. It holds a live object
+        // whose relocation proves that the worker actually collects and retries.
+        let body = alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT).unwrap();
+        unsafe { *(body as *mut f64) = 42.0 };
+        crate::rooted!(parent_value = unsafe { TorclVal::from_heap_ptr(body.sub(8)) });
+        let original = parent_value.to_raw();
+        let allocated = {
+            // No Lisp/root accesses while the parent waits for the worker.
+            let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+            std::thread::spawn(|| {
+                let body = alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT);
+                if let Some(body) = body {
+                    unsafe { *(body as *mut f64) = 17.0 };
+                }
+                body.is_some()
+            })
+            .join()
+            .unwrap()
+        };
+        assert!(
+            allocated,
+            "first allocation must collect a full nursery and retry"
+        );
+        assert!(heap_stats().minor_gc_count > 0);
+        assert_ne!(parent_value.to_raw(), original);
+        assert_eq!(
+            unsafe { *(parent_value.as_ptr().add(8) as *const f64) },
+            42.0
+        );
+    }
+
+    #[test]
+    fn simultaneous_collectors_complete_safepoint_handshakes() {
+        const CHILD: &str = "TORCL_TEST_SIMULTANEOUS_COLLECTORS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc::nursery_scan_tests::simultaneous_collectors_complete_safepoint_handshakes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        ensure_heap_initialized();
+        crate::thread::current_thread_id();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_start = std::sync::Arc::clone(&start);
+        let (finish, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::thread::current_thread_id();
+            // Both participants are Running before either requests collection.
+            // After this barrier each must either collect or acknowledge its
+            // peer's pause while waiting for the collector admission lock.
+            worker_start.wait();
+            let result = HeapCollector::new().minor_gc();
+            // Stay registered and explicitly Blocked until the peer finishes;
+            // thread-exit coordination is not what this fixture is testing.
+            let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+            finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            result
+        });
+        start.wait();
+        let parent_result = HeapCollector::new().minor_gc();
+        finish.send(()).unwrap();
+        let worker_result = {
+            let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+            worker.join().unwrap()
+        };
+        assert!(parent_result.is_ok(), "parent collector: {parent_result:?}");
+        assert!(worker_result.is_ok(), "worker collector: {worker_result:?}");
     }
 
     #[test]

@@ -264,6 +264,36 @@ impl Drop for NativeBlockingScope {
     }
 }
 
+/// Finish an execution without disappearing from an active participant
+/// snapshot. Its result must already be published and it must perform no more
+/// Lisp operations. Keep the thread's roots intact until any active pause ends.
+pub(crate) fn retire_native_thread(thread: &crate::thread::NativeThread) {
+    if !thread.gc_participates() {
+        return;
+    }
+    thread.stack().publish_top();
+    crate::gc::retire_current_t0_tlab_for_safepoint();
+    let coord = coordinator();
+    let mut transition = coord.park_mutex.lock().unwrap();
+    let counted = coord.parked.load(Ordering::SeqCst)
+        && thread.state() == crate::thread::NativeThreadState::Running;
+    thread.set_state(crate::thread::NativeThreadState::Blocked);
+    if counted {
+        drop(transition);
+        {
+            let _arrival = coord.arrival_mutex.lock().unwrap();
+            coord.arrived.fetch_add(1, Ordering::SeqCst);
+            coord.arrival_condvar.notify_all();
+        }
+        transition = coord.park_mutex.lock().unwrap();
+    }
+    while coord.parked.load(Ordering::SeqCst) {
+        transition = coord.park_condvar.wait(transition).unwrap();
+    }
+    thread.set_gc_participates(false);
+    thread.set_state(crate::thread::NativeThreadState::Dead);
+}
+
 /// Inline safepoint poll — checks the safepoint flag.
 ///
 /// In generated code this compiles to a single load + branch. If the
@@ -338,17 +368,26 @@ pub fn enter_safepoint() {
 
     crate::gc::retire_current_t0_tlab_for_safepoint();
 
-    // Issue #5 fix: increment `arrived` while holding `arrival_mutex`
-    // so the notification cannot be lost between the increment and
-    // the condvar wait in `wait_for_all_threads`.
-    //
-    // Note: we do NOT re-check `parked` under the lock here. The
-    // ordering guarantee is that `wait_for_all_threads` sets
-    // `parked = true` (SeqCst) BEFORE `request_safepoint()`, and
-    // `resume_all_threads` clears `parked` AFTER all threads have
-    // been accounted for. So if we saw `parked == true` above, the
-    // coordination cycle is active and we must participate.
-    {
+    // Publish the parked extent under the same lock as the collector's
+    // participant snapshot. A subsequent pause may begin before this thread
+    // wakes from the first: its roots remain published, so it must stay
+    // excluded rather than be counted as a Running peer that cannot poll.
+    let thread = crate::thread::current_thread();
+    let transition = coord.park_mutex.lock().unwrap();
+    if !coord.parked.load(Ordering::SeqCst) {
+        drop(transition);
+        check_preemption();
+        return;
+    }
+    let previous = thread.state();
+    let counted = previous == crate::thread::NativeThreadState::Running;
+    if counted {
+        thread.set_state(crate::thread::NativeThreadState::Blocked);
+    }
+    drop(transition);
+
+    if counted {
+        // Pair with the collector's arrival wait to avoid lost notification.
         let _lock = coord.arrival_mutex.lock().unwrap();
         coord.arrived.fetch_add(1, Ordering::SeqCst);
         coord.arrival_condvar.notify_all();
@@ -359,6 +398,11 @@ pub fn enter_safepoint() {
         let mut guard = coord.park_mutex.lock().unwrap();
         while coord.parked.load(Ordering::SeqCst) {
             guard = coord.park_condvar.wait(guard).unwrap();
+        }
+        // No new participant snapshot can interleave between observing the
+        // world running and making this execution Running again.
+        if counted {
+            thread.set_state(previous);
         }
     }
 
@@ -482,4 +526,212 @@ pub fn resume_all_threads() -> Result<(), TorclError> {
     coord.expected.store(0, Ordering::SeqCst);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gc_pause_tests {
+    use super::*;
+    use crate::gc::{Collector, HeapCollector};
+
+    #[test]
+    fn heap_snapshot_holds_pause_and_resumes_after_unwind() {
+        const CHILD: &str = "TORCL_TEST_HEAP_SNAPSHOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "safepoint::gc_pause_tests::heap_snapshot_holds_pause_and_resumes_after_unwind",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::gc::ensure_heap_initialized();
+        let inspected = crate::gc::with_heap_snapshot(|| {
+            assert!(global_safepoint_page().is_requested());
+            42
+        })
+        .unwrap();
+        assert_eq!(inspected, 42);
+        assert!(!global_safepoint_page().is_requested());
+        let unwound = std::panic::catch_unwind(|| {
+            let _ = crate::gc::with_heap_snapshot(|| {
+                assert!(global_safepoint_page().is_requested());
+                panic!("snapshot callback failure");
+            });
+        });
+        assert!(unwound.is_err());
+        assert!(!global_safepoint_page().is_requested());
+        // A callback panic must not strand the admission gate or the world.
+        crate::gc::with_heap_snapshot(|| assert!(global_safepoint_page().is_requested())).unwrap();
+        assert!(!global_safepoint_page().is_requested());
+    }
+
+    #[test]
+    fn exiting_native_thread_acknowledges_active_pause() {
+        const CHILD: &str = "TORCL_TEST_EXIT_DURING_PAUSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "safepoint::gc_pause_tests::exiting_native_thread_acknowledges_active_pause",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        crate::gc::ensure_heap_initialized();
+        crate::thread::current_thread_id();
+        let (ready, started) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::thread::current_thread_id();
+            ready.send(()).unwrap();
+            // Exit only after the request has counted this Running thread.
+            // There is no later allocation or poll to acknowledge it for us.
+            while !global_safepoint_page().is_requested() {
+                std::thread::yield_now();
+            }
+        });
+        {
+            let _blocked = unsafe { NativeBlockingScope::enter() };
+            started
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        let result = wait_for_all_threads();
+        if result.is_ok() {
+            resume_all_threads().unwrap();
+        }
+        {
+            let _blocked = unsafe { NativeBlockingScope::enter() };
+            worker.join().unwrap();
+        }
+        assert!(result.is_ok(), "thread exit lost an arrival: {result:?}");
+    }
+
+    #[test]
+    fn parked_mutator_participates_in_consecutive_pauses() {
+        const CHILD: &str = "TORCL_TEST_CONSECUTIVE_PAUSES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "safepoint::gc_pause_tests::parked_mutator_participates_in_consecutive_pauses",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        crate::gc::ensure_heap_initialized();
+        crate::thread::current_thread_id();
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_finished = std::sync::Arc::clone(&finished);
+        let (ready, started) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::thread::current_thread_id();
+            ready.send(()).unwrap();
+            while !worker_finished.load(Ordering::Acquire) {
+                poll_safepoint();
+                std::thread::yield_now();
+            }
+        });
+        {
+            let _blocked = unsafe { NativeBlockingScope::enter() };
+            started
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        let mut failure = None;
+        for cycle in 0..100 {
+            if let Err(error) = wait_for_all_threads() {
+                failure = Some((cycle, error));
+                break;
+            }
+            resume_all_threads().unwrap();
+        }
+        finished.store(true, Ordering::Release);
+        {
+            let _blocked = unsafe { NativeBlockingScope::enter() };
+            worker.join().unwrap();
+        }
+        assert!(failure.is_none(), "consecutive pause failed: {failure:?}");
+    }
+
+    #[test]
+    fn major_gc_keeps_world_stopped_while_scanning_roots() {
+        const CHILD: &str = "TORCL_TEST_MAJOR_PAUSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "safepoint::gc_pause_tests::major_gc_keeps_world_stopped_while_scanning_roots",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        static SCANS: AtomicUsize = AtomicUsize::new(0);
+        static UNSTOPPED_SCANS: AtomicUsize = AtomicUsize::new(0);
+        fn observe_pause(_visit: &mut dyn FnMut(*mut crate::TorclVal)) {
+            SCANS.fetch_add(1, Ordering::Relaxed);
+            if !global_safepoint_page().is_requested() {
+                UNSTOPPED_SCANS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        crate::gc::ensure_heap_initialized();
+        crate::gc::register_root_scanner(observe_pause);
+        let mut collector = HeapCollector::new();
+        collector.major_gc().unwrap();
+        assert_eq!(
+            collector.stats().major_gc_count,
+            1,
+            "must complete a major GC"
+        );
+        assert!(SCANS.load(Ordering::Relaxed) > 0, "scanner must run");
+        assert_eq!(
+            UNSTOPPED_SCANS.load(Ordering::Relaxed),
+            0,
+            "major GC scanned mutable roots after resuming Lisp mutators"
+        );
+        assert!(
+            !global_safepoint_page().is_requested(),
+            "must resume on return"
+        );
+    }
 }
