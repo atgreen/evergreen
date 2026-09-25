@@ -33,7 +33,9 @@ pub mod typep_class {
 /// A single bytecode instruction. Operand-stack based; the frame's value-slot
 /// area holds `n_locals` lexical slots followed by `max_stack` operand slots
 /// (spec D2.03).
-#[derive(Clone, Debug)]
+/// Payloads are plain metadata; Lisp values and owned tables live in the
+/// containing function. Keep fetch/copy independent of the instruction variant.
+#[derive(Clone, Copy, Debug)]
 pub enum Instr {
     /// Push `constants[idx]`.
     Const(u16),

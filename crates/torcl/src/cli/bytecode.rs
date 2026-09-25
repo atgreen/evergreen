@@ -12887,7 +12887,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
         }
         let (instr, top_idx) = {
             let act = acts.last_mut().unwrap();
-            let instr = act.func.code[act.bcp].clone();
+            let instr = act.func.code[act.bcp];
             act.bcp += 1;
             (instr, acts.len() - 1)
         };

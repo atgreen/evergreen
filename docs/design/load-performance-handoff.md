@@ -5,6 +5,65 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Copy instruction metadata directly (2026-09-25, bliss-f49z)
+
+`Instr` contains only integer indices/counts and booleans, but T0 fetched each
+instruction through derived, variant-by-variant `Clone`. It now implements
+`Copy`, and fetch uses an indexed copy. This also enables bulk copying of code
+vectors. No instruction payload, serialized format, GC root, tiering threshold,
+or library-specific path changed. The type-level regression was watched failing
+with `Instr: Copy` absent before implementation.
+
+Five alternating CPU-0-pinned fresh processes per library/build compare ordinary
+and freshly trained PGO images with **4167171** controls. Builds and tests had
+stopped. Counters/timers cover only the first cached ASDF load; the
+`COMPILE-FILE` error guard prevents recompilation. All 50 functional checks pass;
+all 40 TorCL windows have zero collections.
+
+| First cached load, CPU cycles | Before | After | Reduction |
+|---|---:|---:|---:|
+| Babel, ordinary ThinLTO | 1.373 G | 1.353 G | 1.5% |
+| CL-PPCRE, ordinary ThinLTO | 0.680 G | 0.672 G | 1.2% |
+| Babel, default PGO | 1.196 G | 1.183 G | 1.1% |
+| CL-PPCRE, default PGO | 0.583 G | 0.578 G | 0.7% |
+
+Ordinary instructions fall 3.402 → 3.377 G / 1.844 → 1.839 G; PGO instructions
+fall 2.746 → 2.722 G / 1.417 → 1.410 G. Lisp allocation is unchanged.
+Current PGO/SBCL cycle ratios are **1.87× Babel / 1.05× CL-PPCRE**. Wall medians
+are 0.574 / 0.277 s versus SBCL 0.296 / 0.254 s; PGO ranges remain wide
+(0.324–0.580 / 0.138–0.279 s). Whole-process medians are 0.840 / 0.540 s versus
+0.480 / 0.450 s. This is a small gain, **not closure of the initial-load gap**.
+
+Validation: all **818 CLI unit/integration tests** pass, including 358 acceptance
+and 59 FASL tests, as does the new runtime Copy test. Ordinary and PGO images
+match fresh SBCL output for all 15,106 Babel reverse-table entries under GC
+stress stride 20,000 (13 minor collections), and CL-PPCRE scanners survive two
+minor plus one major collection. Forced-T2 closure/redefinition checks pass
+every-allocation stress/poison/verification on the ordinary image and stride 20
+on PGO. Review was adversarial self-review, not independent.
+
+The full workspace gate records **2,594 passed / 12 failed / 7 ignored**.
+Failures comprise the tracked STRINGP metadata test, four parallel threading
+fixtures, four sequence fixtures and two doctests, plus a newly observed
+wall-clock profiling-budget fixture (`bliss-p6bd`). Exact failing threading and
+profiling harnesses pass 21 / 12 tests serially; that does not fix their parallel
+failures. Workspace check retains the tracked unused-mut warning; strict Clippy
+retains nine runtime diagnostics; spec coverage retains 14 uncovered MUSTs.
+Formatting/diff checks and the all-target `clone_on_copy` check pass; root lint
+has six baseline findings and zero new ones.
+
+A larger preceding experiment shared callback bytecode bodies and JIT warmup
+while keeping identities/captures separate. Babel cycles fell about 3%, but
+instructions barely changed and CL-PPCRE instructions increased. The entire
+prototype was removed (`bliss-1u43`); its ownership/profiling complexity was not
+justified by this initial-load result.
+
+Artifacts: `/tmp/torcl-load-profile-new.cCSpqN/` contains `copy-image`,
+`copy-pgo-image`, `final-compare.sh`, `summary.pl`, counters and validation logs.
+Fresh PGO artifacts are `target/pgo/run.f9wpMq/` (LLVM 21.1.8, generate 2m08s,
+use 2m47s; training/verification pass, no profile mismatch warnings).
+The installed executable and default `target/torcl` were not replaced.
+
 ## Keep native builtin calls fast across definitions (2026-09-25, bliss-lyat)
 
 Registering a fresh uninterned callback used to bump the global direct-call
