@@ -13323,7 +13323,15 @@ fn typep_matches(
             };
             Ok(lower_ok && upper_ok)
         }
-        "UNSIGNED-BYTE" | "SIGNED-BYTE" | "MOD" => {
+        "UNSIGNED-BYTE" | "SIGNED-BYTE" => {
+            let bounds = list_to_vec(args);
+            let width = bounds
+                .first()
+                .copied()
+                .filter(|b| !(b.is_symbol() && sym_bare_name_rc(*b).as_ref() == "*"));
+            torcl_stdlib::numbers::byte_type_p(object, width, op.as_ref() == "SIGNED-BYTE")
+        }
+        "MOD" => {
             if !object.is_fixnum() {
                 return Ok(false);
             }
@@ -13337,20 +13345,7 @@ fn typep_matches(
                     Some(b.as_fixnum())
                 }
             });
-            let ok = match op.as_ref() {
-                // (unsigned-byte s) == (integer 0 (2^s - 1))
-                "UNSIGNED-BYTE" => value >= 0 && size.map(|s| value < (1i64 << s)).unwrap_or(true),
-                // (signed-byte s) == (integer -2^(s-1) (2^(s-1) - 1))
-                "SIGNED-BYTE" => size
-                    .map(|s| {
-                        let limit = 1i64 << (s - 1);
-                        value >= -limit && value < limit
-                    })
-                    .unwrap_or(true),
-                // (mod n) == (integer 0 (n - 1)); n is required.
-                _ => size.map(|n| value >= 0 && value < n).unwrap_or(false),
-            };
-            Ok(ok)
+            Ok(size.map(|n| value >= 0 && value < n).unwrap_or(false))
         }
         "SATISFIES" => {
             let (predicate, _) = cp(args);

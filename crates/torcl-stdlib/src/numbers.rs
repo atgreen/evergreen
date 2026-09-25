@@ -2,7 +2,8 @@
 
 use std::cmp::Ordering;
 use torcl_rt::bignum::{
-    BigInt, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, ratio_parts_val,
+    BigInt, big_cmp, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, mag_sub,
+    ratio_parts_val,
 };
 use torcl_rt::error::TorclError;
 use torcl_rt::value::TorclVal;
@@ -62,6 +63,44 @@ fn integer(value: TorclVal) -> Result<BigInt, TorclError> {
         datum: value,
         expected: "integer".into(),
     })
+}
+
+/// Membership in a sized SIGNED-BYTE/UNSIGNED-BYTE type. None means any width.
+/// Compare bit lengths rather than constructing 2^width: even a bignum width
+/// needs no giant allocation or host-sized shift. No Lisp allocation occurs.
+pub fn byte_type_p(
+    value: TorclVal,
+    width: Option<TorclVal>,
+    signed: bool,
+) -> Result<bool, TorclError> {
+    let width = width
+        .map(|width| {
+            bigint_from_val(width)
+                .filter(|n| n.sign > 0)
+                .ok_or_else(|| TorclError::TypeError {
+                    datum: width,
+                    expected: "a positive integer byte width".into(),
+                })
+        })
+        .transpose()?;
+    let Some(value) = bigint_from_val(value) else {
+        return Ok(false);
+    };
+    if !signed && value.sign < 0 {
+        return Ok(false);
+    }
+    let Some(width) = width else {
+        return Ok(true);
+    };
+    // For negative n, INTEGER-LENGTH counts the bits of -n-1. The signed
+    // representation then needs one additional sign bit, including for -1.
+    let bits = if value.sign < 0 {
+        mag_bitlen(&mag_sub(&value.mag, &[1]))
+    } else {
+        mag_bitlen(&value.mag)
+    };
+    let required = BigInt::from_mag(1, vec![bits as u64 + u64::from(signed)]);
+    Ok(big_cmp(&required, &width) != Ordering::Greater)
 }
 
 /// Arithmetic shift, with sign extension on right shifts and arbitrary precision
