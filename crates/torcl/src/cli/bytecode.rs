@@ -570,7 +570,7 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
             sk_pool += 1;
             continue;
         };
-        let bf = bf_cell.borrow();
+        let bf = bf_cell.lock().unwrap();
         match serialize_bbu_function_tree(&bf, name_ref, BBU_FUNC_MACRO, &mut pool, &mut functions)
         {
             Some(function_index) => {

@@ -559,4 +559,5 @@ available from the reader's source-location table (§4.1).
 | Symbol macro + `setq` → `setf` conversion | R4.13 |
 | Shadowing rules (all five cases in §4.2.10) | Structural |
 | Concurrency (multi-threaded compilation under ThreadSanitizer) | Safety |
+| Global definitions expanded on native workers, including worker-triggered moving GC | Safety |
 | Performance (expand 10 000 nested macros in < 200 ms) | Throughput |

@@ -33,8 +33,9 @@ whole live world byte-for-byte, so any value round-trips.
   - `torcl_rt::symbols`: the symbol table (name → index, value cells, function
     cells, plist),
   - `torcl-stdlib` packages,
-  - cli.rs thread-locals: `GLOBAL_MACROS`, `GLOBAL_SETF_FNS`, setf-expanders,
-    `CLOS_STATE`, class/generic/method tables,
+  - cli.rs host registries: process-wide `GLOBAL_MACROS`, thread-local
+    `GLOBAL_SETF_FNS`, setf-expanders, and class/generic/method metadata,
+  - torcl-stdlib's process-wide `CLOS_STATE`,
   - compiled-function registry (bytecode).
   A core dump must serialize **both** the heap span and these registries.
   (SBCL keeps symbols/packages/functions *on* the Lisp heap, so its core is just

@@ -430,8 +430,8 @@ fn native_thread_capture_survives_collection_while_waiting() {
              (ready nil) (released nil) (payload (list 3 4))
              (callback
                (lambda ()
-                 ;; Use primitives to isolate captures/GC from the separately
-                 ;; tracked visibility of global macros on interpreter workers.
+                 ;; Use primitives to isolate capture/GC behavior from macro
+                 ;; expansion and the higher-level thread wrappers.
                  (torcl-thread:grab-mutex mutex)
                  (unwind-protect
                      (progn

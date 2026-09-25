@@ -2066,7 +2066,7 @@ struct MacroDef {
     captured_frame: Arc<SharedCell<EnvFrame>>,
     /// Source-free BFASL macros execute this pre-lowered expander. Source and
     /// lexical MACROLET definitions retain the ordinary body representation.
-    bytecode: Option<Rc<RefCell<torcl_rt::bytecode::BytecodeFunction>>>,
+    bytecode: Option<Arc<Mutex<torcl_rt::bytecode::BytecodeFunction>>>,
     /// A first-class EXPANDER FUNCTION installed via (setf (macro-function
     /// name) fn) (bliss-fo0o): applied as (fn whole-form env) per CLHS.
     /// Pinned (coerce_installed_function) or an index-immune symbol.
@@ -2305,6 +2305,22 @@ enum HandlerImpl {
 
 static CONTROL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Global definitions and their movable cache keys must be scanned regardless
+// of which native thread initiates collection. Never evaluate or allocate Lisp
+// objects while holding either registry lock.
+static GLOBAL_MACROS: LazyLock<OrderedMutex<HashMap<String, MacroDef>>> =
+    LazyLock::new(|| OrderedMutex::new(LockLevel::GcWorld, 25, "global macros", HashMap::new()));
+static MACRO_FN_CACHE: LazyLock<OrderedMutex<HashMap<String, MacroFnCacheEntry>>> =
+    LazyLock::new(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            26,
+            "macro registration cache",
+            HashMap::new(),
+        )
+    });
+static MACRO_ENV_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
     static CONTROL_VALUES: RefCell<HashMap<String, TorclVal>> = RefCell::new(HashMap::new());
     /// Stack of the innermost-enclosing LOOP's own implicit-block return token.
@@ -2321,13 +2337,6 @@ thread_local! {
     static LOOP_FINISH_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static MACROEXPAND_ENVIRONMENTS: RefCell<HashMap<u64, MacroexpandEnv>> = RefCell::new(HashMap::new());
     static NEXT_MACROEXPAND_ENVIRONMENT_ID: RefCell<u64> = const { RefCell::new(1) };
-    /// Global macro table. A top-level DEFMACRO has global effect (like DEFUN,
-    /// which installs into the symbol's function cell), so its definition must
-    /// survive the throwaway child Envs used during compile/load — storing it in
-    /// a per-Env `macros` map lost it across files (bliss-lb6.22). MACROLET
-    /// macros stay lexical in `Env::macros` and shadow these.
-    static GLOBAL_MACROS: RefCell<HashMap<String, MacroDef>> = RefCell::new(HashMap::new());
-
     /// Identity (pointer address) of the lexical frame current at the start of
     /// each top-level form under evaluation, one entry per active load/eval
     /// nesting level. A DEFUN closes over its enclosing lexicals only when its
@@ -2373,20 +2382,6 @@ thread_local! {
     static CONSTANT_VARS: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
 
-    /// Memoized macro-expander registrations for the bytecode compiler
-    /// (bliss-gq5.8). Building a MacroexpandEnv used to re-freeze every macro's
-    /// captured frame, allocate a fresh expander closure, and re-parse the
-    /// name — for EVERY compiled form. During a large load (asdf/alexandria)
-    /// that is O(forms × macros) and dominated compile time. Keyed by macro
-    /// name, the value carries the macro's identity (params/body TorclVal bits +
-    /// captured-frame Rc pointer) so a redefinition re-registers, and caches the
-    /// registered handle and resolved symbol so unchanged macros are reused.
-    static MACRO_FN_CACHE: RefCell<HashMap<String, MacroFnCacheEntry>> =
-        RefCell::new(HashMap::new());
-
-    /// Bumped whenever the global macro table (`GLOBAL_MACROS`) changes, to
-    /// invalidate the cached global-macro MacroexpandEnv below (bliss-usb2).
-    static MACRO_ENV_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Cached `(generation, env)` where `env` holds every global macro in its
     /// function map. `macroexpand_environment_from_cli` was rebuilding this for
     /// EVERY compiled form — cloning all of GLOBAL_MACROS and re-augmenting once
@@ -2399,7 +2394,7 @@ thread_local! {
 }
 
 fn bump_macro_env_generation() {
-    MACRO_ENV_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    MACRO_ENV_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Address-identity of an `EnvFrame`, for comparing whether the current frame is
@@ -2479,7 +2474,8 @@ fn global_macro_insert(name: String, def: MacroDef) {
     install_evaluator_global_root_scanner();
     debug_validate_form("defmacro", &name, def.params_form);
     debug_validate_form("defmacro", &name, def.body);
-    GLOBAL_MACROS.with(|m| m.borrow_mut().insert(name, def));
+    let mut macros = GLOBAL_MACROS.lock().unwrap();
+    macros.insert(name, def);
     bump_macro_env_generation();
 }
 
@@ -2492,13 +2488,13 @@ fn global_macro_insert(name: String, def: MacroDef) {
 /// calls.
 #[allow(clippy::type_complexity)]
 pub(crate) fn global_bytecode_macros()
--> Vec<(String, Rc<RefCell<torcl_rt::bytecode::BytecodeFunction>>)> {
-    GLOBAL_MACROS.with(|m| {
-        m.borrow()
-            .iter()
-            .filter_map(|(name, def)| def.bytecode.as_ref().map(|b| (name.clone(), Rc::clone(b))))
-            .collect()
-    })
+-> Vec<(String, Arc<Mutex<torcl_rt::bytecode::BytecodeFunction>>)> {
+    GLOBAL_MACROS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(name, def)| def.bytecode.as_ref().map(|b| (name.clone(), Arc::clone(b))))
+        .collect()
 }
 
 /// Names of every global macro that retains source (a `defmacro` body, not a
@@ -2508,13 +2504,13 @@ pub(crate) fn global_bytecode_macros()
 /// UIOP macros like NEST failed to load from an installed image).
 #[allow(dead_code)] // image macro-source retention API (bliss-cje1); tests + build_image_from_runtime
 pub(crate) fn global_macro_source_names() -> Vec<String> {
-    GLOBAL_MACROS.with(|m| {
-        m.borrow()
-            .iter()
-            .filter(|(_, d)| d.bytecode.is_none())
-            .map(|(n, _)| n.clone())
-            .collect()
-    })
+    GLOBAL_MACROS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, d)| d.bytecode.is_none())
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 /// The `(params-form, body)` source of a named source-bearing global macro, or
@@ -2522,12 +2518,12 @@ pub(crate) fn global_macro_source_names() -> Vec<String> {
 /// callers read the current post-GC object locations before rebuilding a form.
 #[allow(dead_code)] // image macro-source retention API (bliss-cje1); tests + build_image_from_runtime
 pub(crate) fn global_macro_source(name: &str) -> Option<(TorclVal, TorclVal)> {
-    GLOBAL_MACROS.with(|m| {
-        m.borrow()
-            .get(name)
-            .filter(|d| d.bytecode.is_none())
-            .map(|d| (d.params_form, d.body))
-    })
+    GLOBAL_MACROS
+        .lock()
+        .unwrap()
+        .get(name)
+        .filter(|d| d.bytecode.is_none())
+        .map(|d| (d.params_form, d.body))
 }
 
 /// Place names of every global `(defun (setf place) …)` writer (the key is
@@ -2657,13 +2653,13 @@ fn host_serialize_registries() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"HREG");
     // Macros.
-    let macros: Vec<(String, u64, u64)> = GLOBAL_MACROS.with(|m| {
-        m.borrow()
-            .iter()
-            .filter(|(_, d)| d.bytecode.is_none())
-            .map(|(n, d)| (n.clone(), d.params_form.to_raw(), d.body.to_raw()))
-            .collect()
-    });
+    let macros: Vec<(String, u64, u64)> = GLOBAL_MACROS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, d)| d.bytecode.is_none())
+        .map(|(n, d)| (n.clone(), d.params_form.to_raw(), d.body.to_raw()))
+        .collect();
     out.extend_from_slice(&(macros.len() as u32).to_le_bytes());
     for (name, params_raw, body_raw) in &macros {
         hr_put_str(&mut out, name);
@@ -3606,7 +3602,7 @@ fn install_loaded_macro(
             params_form: NIL,
             body: NIL,
             captured_frame: Arc::clone(&env.frame),
-            bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
+            bytecode: Some(Arc::new(Mutex::new((*function).clone()))),
             function: None,
         },
     );
@@ -3626,7 +3622,7 @@ fn install_loaded_setf_expander(
             params_form: NIL,
             body: NIL,
             captured_frame: Arc::clone(&env.frame),
-            bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
+            bytecode: Some(Arc::new(Mutex::new((*function).clone()))),
             function: None,
         }),
     );
@@ -3680,9 +3676,8 @@ fn install_loaded_compiler_macro(
 
 /// Remove a global macro (FMAKUNBOUND / redefinition as a function).
 fn global_macro_remove(name: &str) {
-    GLOBAL_MACROS.with(|m| {
-        m.borrow_mut().remove(name);
-    });
+    let mut macros = GLOBAL_MACROS.lock().unwrap();
+    macros.remove(name);
     bump_macro_env_generation();
 }
 
@@ -3698,8 +3693,8 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
             return Some(def);
         }
     }
-    GLOBAL_MACROS.with(|m| {
-        let g = m.borrow();
+    {
+        let g = GLOBAL_MACROS.lock().unwrap();
         g.get(name).cloned().or_else(|| {
             if leaf != name {
                 g.get(leaf).cloned()
@@ -3707,7 +3702,7 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
                 None
             }
         })
-    })
+    }
 }
 
 /// True if `name` names a macro visible in `env` (lexical or global).
@@ -3719,10 +3714,10 @@ fn macro_defined(env: &Env, name: &str) -> bool {
     if leaf != name && env.macros.borrow().contains_key(leaf) {
         return true;
     }
-    GLOBAL_MACROS.with(|m| {
-        let g = m.borrow();
+    {
+        let g = GLOBAL_MACROS.lock().unwrap();
         g.contains_key(name) || (leaf != name && g.contains_key(leaf))
-    })
+    }
 }
 
 fn next_control_token(prefix: &str) -> String {
@@ -6703,21 +6698,9 @@ fn visit_macro_def_roots(
         visit(f);
     }
     if let Some(function) = &def.bytecode {
-        // A minor GC can fire mid-macro-expansion (alloc during the macro's own
-        // bytecode run) while `expand_macro`/`run_loop` hold this cell borrowed,
-        // so a `borrow_mut` here would double-borrow-panic (bliss-011) — and
-        // SKIPPING the visit is wrong too: a bfasl-loaded macro's constants and
-        // params_form are nursery values materialized at load, so an unvisited
-        // executing macro was left with stale pointers after the move — its
-        // params_form read back as poison/zeroed during argument binding
-        // (bliss-d0b: trivial-gray-streams macros crashing smart-buffer /
-        // fast-http loads). The scan runs stop-the-world, so bypass the borrow
-        // flag and rewrite through the cell's raw pointer — the same aliasing
-        // discipline scan_bytecode_roots uses for registry functions that
-        // running activations reference.
-        unsafe {
-            visit_bytecode_function_roots(&mut *function.as_ptr(), visit);
-        }
+        // Callers clone and release this lock before evaluation; the collector
+        // can relocate the registered body even while that snapshot executes.
+        visit_bytecode_function_roots(&mut function.lock().unwrap(), visit);
     }
     visit_env_frame_roots(&def.captured_frame, state, visit);
 }
@@ -7060,18 +7043,18 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
         for callable in METHOD_COMPILED.borrow_mut().values_mut() {
             visit(callable);
         }
-        GLOBAL_MACROS.with(|macros| {
-            for definition in macros.borrow_mut().values_mut() {
+        {
+            for definition in GLOBAL_MACROS.lock().unwrap().values_mut() {
                 visit_macro_def_roots(definition, state, visit);
             }
-        });
+        }
         GLOBAL_SETF_FNS.with(|functions| {
             for definition in functions.borrow_mut().values_mut() {
                 visit_fun_def_roots(definition, visit);
             }
         });
-        MACRO_FN_CACHE.with(|cache| {
-            for entry in cache.borrow_mut().values_mut() {
+        {
+            for entry in MACRO_FN_CACHE.lock().unwrap().values_mut() {
                 let mut params = TorclVal(entry.params_bits);
                 let mut body = TorclVal(entry.body_bits);
                 visit(&mut params);
@@ -7081,7 +7064,7 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
                 visit(&mut entry.handle);
                 visit(&mut entry.symbol);
             }
-        });
+        }
 
         let captures = frozen_macro_captures()
             .lock()
@@ -7138,11 +7121,11 @@ fn install_evaluator_global_root_scanner() {
 ///
 /// The parent's `Env` is `Rc<RefCell<…>>` (`!Send`) and must never cross the
 /// thread boundary; only `entry` (a `Copy` `TorclVal`) does. Here we build a
-/// *fresh* per-thread environment. Global definitional state that already lives
-/// in shared `torcl-rt` cells (function/value cells) is visible; state still
-/// held in `thread_local!`/`Rc`-local maps (macros defined at the REPL) is NOT
-/// yet shared — that migration is tracked as bliss-nubv. CLOS definitions are
-/// process-global. Crucially we use the *non-resetting* constructor:
+/// *fresh* per-thread environment. Global definitional state in shared
+/// `torcl-rt` cells (function/value cells), the evaluator's macro registry, and
+/// the CLOS definition table is visible. Other state still held in
+/// `thread_local!`/`Rc`-local maps remains part of the migration tracked as
+/// bliss-nubv. Crucially we use the *non-resetting* constructor:
 /// `reset_clos=true` would wipe the parent thread's classes and packages.
 fn thread_entry_runner(mut entry: TorclVal) -> Result<TorclVal, TorclError> {
     torcl_rt::rooted_ref!(_entry_root = &mut entry);
@@ -10778,16 +10761,20 @@ fn rekey_renamed_symbols(env: &Env, renamed: &[(u32, String, String)]) {
     rekey(&mut env.classes.borrow_mut(), renamed);
     rekey(&mut env.generics.borrow_mut(), renamed);
     rekey(&mut env.methods.borrow_mut(), renamed);
-    GLOBAL_MACROS.with(|m| rekey(&mut m.borrow_mut(), renamed));
+    {
+        let mut macros = GLOBAL_MACROS.lock().unwrap();
+        rekey(&mut macros, renamed);
+        bump_macro_env_generation();
+    }
     GLOBAL_SETF_FNS.with(|m| rekey(&mut m.borrow_mut(), renamed));
     // The macro-expander cache is keyed by macro name; entries under the old
     // name are unreachable now — drop them rather than serving stale expanders.
-    MACRO_FN_CACHE.with(|m| {
-        let mut m = m.borrow_mut();
+    {
+        let mut m = MACRO_FN_CACHE.lock().unwrap();
         for (_, old_key, _) in renamed {
             m.remove(old_key);
         }
-    });
+    }
 }
 
 /// Resolve a package designator to a canonical package name, following
@@ -30962,12 +30949,8 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                     let first = if let Some(function) = &mdef.bytecode {
                         // A source-free bytecode expander (loaded from a .bfasl):
                         // run it like a macro; its (values …) land on the child mv.
-                        bytecode::run_macro(
-                            Arc::new(function.borrow().clone()),
-                            &arg_list,
-                            Some(*place),
-                            &mut child,
-                        )?
+                        let function = Arc::new(function.lock().unwrap().clone());
+                        bytecode::run_macro(function, &arg_list, Some(*place), &mut child)?
                     } else {
                         let macroexpand_env = if params_form_uses_environment(*params_form) {
                             Some(macroexpand_environment_from_cli(env))
@@ -31643,6 +31626,9 @@ fn expand_macro(
     // The whole macro call form `(name . args)`, for an `&whole` parameter.
     mut whole: TorclVal,
 ) -> Result<TorclVal, TorclError> {
+    // Another execution can redefine/remove the global entry during expansion.
+    // Keep this snapshot's captured frame and bytecode alive independently.
+    torcl_rt::rooted!(mdef = mdef.clone());
     // `whole` is bound (into `&whole`) only after the child env fork and arg-list
     // build below, both of which allocate and can fire a relocating minor GC;
     // root it so the bound form is not left dangling (bliss-6b2 #2).
@@ -31689,12 +31675,8 @@ fn expand_macro(
         // previously only the tree-walk branch was rooted).
         torcl_rt::rooted_ref!(_child_root = &mut child_env);
         if let Some(function) = &mdef.bytecode {
-            bytecode::run_macro(
-                Arc::new(function.borrow().clone()),
-                &arg_list,
-                Some(whole),
-                &mut child_env,
-            )
+            let function = Arc::new(function.lock().unwrap().clone());
+            bytecode::run_macro(function, &arg_list, Some(whole), &mut child_env)
         } else {
             // Building the macroexpand environment walks every frame and
             // re-registers all global macros. Do that only for the uncommon
@@ -31835,7 +31817,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
 /// a shallow clone instead of re-cloning GLOBAL_MACROS and re-augmenting per
 /// macro. Immediate-handle-only, so it carries no movable GC roots.
 fn cli_global_macro_env() -> Arc<MacroexpandEnv> {
-    let generation = MACRO_ENV_GENERATION.with(|g| g.get());
+    let generation = MACRO_ENV_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     if let Some(cached) = CLI_GLOBAL_MACRO_ENV.with(|c| {
         c.borrow()
             .as_ref()
@@ -31844,7 +31826,7 @@ fn cli_global_macro_env() -> Arc<MacroexpandEnv> {
     }) {
         return cached;
     }
-    let globals: HashMap<String, MacroDef> = GLOBAL_MACROS.with(|m| m.borrow().clone());
+    let globals: HashMap<String, MacroDef> = GLOBAL_MACROS.lock().unwrap().clone();
     // `mark_no_gc_roots`: the function map holds immediate macro handles only,
     // which is what makes sharing this safe — see the comment on the cache and
     // on `Environment::no_gc_roots`.
@@ -31874,42 +31856,30 @@ fn augment_env_with_macros(
     mut macro_env: MacroexpandEnv,
     all_macros: &HashMap<String, MacroDef>,
 ) -> MacroexpandEnv {
-    // Root every snapshot's params_form/body: the loop below allocates
-    // (freeze_env_frame, resolve_sym interning, Env construction), and a
-    // relocating minor GC moves these TorclVals in GLOBAL_MACROS (the scanned
-    // root) but NOT in this local `all_macros` snapshot — a stale, since-freed
-    // body would then be stored into a frozen macro capture, corrupting every
-    // later expansion of that macro (bliss-wlf; observed as garbage quasiquote
-    // templates under TORCL_GC_STRESS). `captured_frame`/`bytecode` are Rc
-    // (Rust-heap, stable) and the shared EnvFrame's own values relocate via the
-    // GLOBAL_MACROS scan, so only the two by-value TorclVals need rooting here.
+    // A concurrent redefinition can detach a captured frame from the registry.
+    // Root complete snapshots, not only params/body, throughout registration.
     let macro_names: Vec<String> = all_macros.keys().cloned().collect();
     torcl_rt::rooted!(
-        macro_bodies = macro_names
+        macro_defs = macro_names
             .iter()
-            .map(|n| {
-                let d = &all_macros[n];
-                (d.params_form, d.body)
-            })
-            .collect::<Vec<(TorclVal, TorclVal)>>()
+            .map(|n| all_macros[n].clone())
+            .collect::<Vec<MacroDef>>()
     );
     for (idx, name) in macro_names.iter().enumerate() {
-        let macro_def = &all_macros[name];
-        // Always read the rooted, post-relocation params_form/body — never the
-        // stale copies in `macro_def` (from the unrooted `all_macros` snapshot).
-        let params_bits = macro_bodies[idx].0.0;
-        let body_bits = macro_bodies[idx].1.0;
+        let macro_def = &macro_defs[idx];
+        let params_bits = macro_defs[idx].params_form.0;
+        let body_bits = macro_defs[idx].body.0;
         let frame_ptr = Arc::as_ptr(&macro_def.captured_frame) as usize;
         let bytecode_ptr = macro_def
             .bytecode
             .as_ref()
-            .map_or(0, |function| Rc::as_ptr(function) as usize);
+            .map_or(0, |function| Arc::as_ptr(function) as usize);
 
         // Reuse the cached registration if this exact macro definition was
         // already registered (bliss-gq5.8) — the common case across the many
         // forms compiled during a load. Only a redefinition (changed params,
         // body, or captured frame) falls through to re-register.
-        let cached = MACRO_FN_CACHE.with(|c| c.borrow().get(name).copied());
+        let cached = MACRO_FN_CACHE.lock().unwrap().get(name).copied();
         let (handle, symbol) = match cached {
             Some(e)
                 if e.params_bits == params_bits
@@ -31939,9 +31909,9 @@ fn augment_env_with_macros(
                     // Cache keyed on the FUNCTION's identity (stored in
                     // body_bits — the source body is NIL for these), so a
                     // redefinition with a different expander re-registers.
-                    let params_bits = macro_bodies[idx].0.0;
-                    MACRO_FN_CACHE.with(|c| {
-                        c.borrow_mut().insert(
+                    let params_bits = macro_defs[idx].params_form.0;
+                    {
+                        MACRO_FN_CACHE.lock().unwrap().insert(
                             name.clone(),
                             MacroFnCacheEntry {
                                 params_bits,
@@ -31952,14 +31922,14 @@ fn augment_env_with_macros(
                                 symbol,
                             },
                         );
-                    });
+                    }
                     if !symbol.is_nil() {
                         macro_env = macro_env.augment_function(symbol, FunctionInfo::Macro(handle));
                     }
                     continue;
                 }
                 if let Some(function) = &macro_def.bytecode {
-                    let function = Arc::new(Mutex::new(function.borrow().clone()));
+                    let function = Arc::new(Mutex::new(function.lock().unwrap().clone()));
                     LOADED_COMPILER_MACRO_FUNCTIONS
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -31969,12 +31939,12 @@ fn augment_env_with_macros(
                         Arc::new(move |form, _call_macro_env| {
                             torcl_rt::rooted!(form = form);
                             torcl_rt::rooted!(args = list_to_vec(cp(*form).1));
+                            let mut macro_env = Env::new_for_macro_expansion(false);
+                            torcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
                             let function = function
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .clone();
-                            let mut macro_env = Env::new_for_macro_expansion(false);
-                            torcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
                             bytecode::run_macro(
                                 Arc::new(function),
                                 &args,
@@ -31991,10 +31961,10 @@ fn augment_env_with_macros(
                     // since-reused nursery memory — forwarding the wrong object
                     // and corrupting whatever now lives there (bliss-wlf).
                     // Re-read the rooted, post-relocation values instead.
-                    let params_bits = macro_bodies[idx].0.0;
-                    let body_bits = macro_bodies[idx].1.0;
-                    MACRO_FN_CACHE.with(|c| {
-                        c.borrow_mut().insert(
+                    let params_bits = macro_defs[idx].params_form.0;
+                    let body_bits = macro_defs[idx].body.0;
+                    {
+                        MACRO_FN_CACHE.lock().unwrap().insert(
                             name.clone(),
                             MacroFnCacheEntry {
                                 params_bits,
@@ -32005,7 +31975,7 @@ fn augment_env_with_macros(
                                 symbol,
                             },
                         );
-                    });
+                    }
                     if !symbol.is_nil() {
                         macro_env = macro_env.augment_function(symbol, FunctionInfo::Macro(handle));
                     }
@@ -32020,11 +31990,11 @@ fn augment_env_with_macros(
                 // are the post-relocation ones, never a copy stranded across the
                 // freeze_env_frame allocation (bliss-wlf).
                 let captured_frame = freeze_env_frame(&macro_def.captured_frame);
-                debug_validate_form("define", name, macro_bodies[idx].0);
-                debug_validate_form("define", name, macro_bodies[idx].1);
+                debug_validate_form("define", name, macro_defs[idx].params_form);
+                debug_validate_form("define", name, macro_defs[idx].body);
                 let capture = register_frozen_macro_capture(FrozenMacroCapture {
-                    params_form: macro_bodies[idx].0,
-                    body: macro_bodies[idx].1,
+                    params_form: macro_defs[idx].params_form,
+                    body: macro_defs[idx].body,
                     captured_frame,
                     funs: HashMap::new(),
                     symbol_macros: HashMap::new(),
@@ -32085,10 +32055,10 @@ fn augment_env_with_macros(
                 // Same staleness hazard as the bytecode branch above: resolve_sym
                 // can GC, so re-read the rooted bits before storing them into the
                 // scanned MACRO_FN_CACHE root (bliss-wlf).
-                let params_bits = macro_bodies[idx].0.0;
-                let body_bits = macro_bodies[idx].1.0;
-                MACRO_FN_CACHE.with(|c| {
-                    c.borrow_mut().insert(
+                let params_bits = macro_defs[idx].params_form.0;
+                let body_bits = macro_defs[idx].body.0;
+                {
+                    MACRO_FN_CACHE.lock().unwrap().insert(
                         name.clone(),
                         MacroFnCacheEntry {
                             params_bits,
@@ -32099,7 +32069,7 @@ fn augment_env_with_macros(
                             symbol,
                         },
                     );
-                });
+                }
                 (handle, symbol)
             }
         };
@@ -37780,9 +37750,7 @@ mod host_registry_hook_tests {
         let bytes = host_serialize_registries();
 
         // Forget our entries, then restore + drain them back.
-        GLOBAL_MACROS.with(|m| {
-            m.borrow_mut().remove(name);
-        });
+        global_macro_remove(name);
         GLOBAL_SETF_FNS.with(|m| {
             m.borrow_mut().remove(setf_key);
         });
@@ -37800,8 +37768,8 @@ mod host_registry_hook_tests {
         assert_eq!(rp.to_raw(), params.to_raw(), "macro params_form preserved");
         assert_eq!(rb.to_raw(), body.to_raw(), "macro body preserved");
         // Its captured frame is the fresh root frame (top-level rebind).
-        GLOBAL_MACROS.with(|m| {
-            let borrow = m.borrow();
+        {
+            let borrow = GLOBAL_MACROS.lock().unwrap();
             let def = borrow.get(name).unwrap();
             assert!(
                 Arc::ptr_eq(&def.captured_frame, &fresh_frame),
@@ -37811,7 +37779,7 @@ mod host_registry_hook_tests {
                 def.bytecode.is_none(),
                 "restored macro recompiles on demand"
             );
-        });
+        }
 
         // Setf-function is back with the same source.
         let (sp, sb) = global_setf_fn_source("HOST-HOOK-TEST-PLACE").expect("setf restored");
@@ -37819,9 +37787,7 @@ mod host_registry_hook_tests {
         assert_eq!(sb.to_raw(), setf_body.to_raw());
 
         // Cleanup so we don't leak into other same-thread tests.
-        GLOBAL_MACROS.with(|m| {
-            m.borrow_mut().remove(name);
-        });
+        global_macro_remove(name);
         GLOBAL_SETF_FNS.with(|m| {
             m.borrow_mut().remove(setf_key);
         });
@@ -38229,14 +38195,14 @@ mod transient_shadow_root_tests {
     fn evaluator_global_scanner_rewrites_macro_definition_slots() {
         const GLOBAL_BASE: i64 = 910_000_000;
         const DELTA: i64 = 10_000;
+        const NAME: &str = "GC-RETAINED-GLOBAL-MACRO";
         let marker = |offset| TorclVal::from_fixnum(GLOBAL_BASE + offset);
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        GLOBAL_MACROS.with(|macros| macros.borrow_mut().clear());
         let frame = Arc::new(SharedCell::new(EnvFrame::default()));
         frame.borrow_mut().vars.insert("CAPTURED".into(), marker(2));
-        GLOBAL_MACROS.with(|macros| {
-            macros.borrow_mut().insert(
-                "GC-RETAINED-GLOBAL-MACRO".into(),
+        {
+            GLOBAL_MACROS.lock().unwrap().insert(
+                NAME.into(),
                 MacroDef {
                     params_form: marker(0),
                     body: marker(1),
@@ -38245,7 +38211,7 @@ mod transient_shadow_root_tests {
                     function: None,
                 },
             );
-        });
+        }
 
         scan_evaluator_global_roots(&mut |slot| unsafe {
             let value = &mut *slot;
@@ -38253,19 +38219,19 @@ mod transient_shadow_root_tests {
                 *value = TorclVal::from_fixnum(value.as_fixnum() + DELTA);
             }
         });
-        let definition = GLOBAL_MACROS.with(|macros| {
-            macros
-                .borrow()
-                .get("GC-RETAINED-GLOBAL-MACRO")
-                .cloned()
-                .expect("global macro remains registered")
-        });
+        let definition = GLOBAL_MACROS
+            .lock()
+            .unwrap()
+            .get(NAME)
+            .cloned()
+            .expect("global macro remains registered");
         assert_eq!(definition.params_form.as_fixnum(), GLOBAL_BASE + DELTA);
         assert_eq!(definition.body.as_fixnum(), GLOBAL_BASE + 1 + DELTA);
         assert_eq!(
             frame.borrow().vars["CAPTURED"].as_fixnum(),
             GLOBAL_BASE + 2 + DELTA
         );
+        global_macro_remove(NAME);
     }
 }
 
