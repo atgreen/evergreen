@@ -5473,6 +5473,43 @@ fn evaluated_initargs(
     Ok(std::mem::take(&mut *initargs))
 }
 
+/// Resolve an already-evaluated keyword/value initarg vector to the slot-symbol
+/// representation used by the stdlib CLOS core. This is the APPLY/compiled-call
+/// counterpart of [`evaluated_initargs`]: the method binder has evaluated the
+/// values already, so evaluating them again would duplicate side effects.
+fn resolved_initarg_values(
+    class_name: &str,
+    initargs: &[TorclVal],
+    env: &Env,
+) -> Result<Vec<TorclVal>, TorclError> {
+    let mut resolved = initargs.to_vec();
+    torcl_rt::rooted_ref!(_resolved_root = &mut resolved);
+    let mut i = 0;
+    while i + 1 < resolved.len() {
+        resolved[i] = resolve_slot_symbol(class_name, resolved[i], env)?;
+        i += 2;
+    }
+    Ok(resolved)
+}
+
+/// Run the built-in primary behavior for ANSI REINITIALIZE-INSTANCE on an
+/// evaluated, slot-resolved initarg vector. The standard primary method in
+/// boot.lisp delegates here, so ordinary generic method combination still runs
+/// library-defined :around/:before/:after methods.
+fn reinitialize_instance_values(
+    instance: TorclVal,
+    initargs: &[TorclVal],
+    env: &Env,
+) -> Result<TorclVal, TorclError> {
+    let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
+    let (instance_initargs, class_initargs) = split_initargs_for_class(env, &class_name, initargs);
+    torcl_stdlib::reinitialize_instance(instance, &instance_initargs)?;
+    for (slot_name, value) in class_initargs {
+        write_class_slot_value(env, &class_name, &slot_name, Some(value));
+    }
+    Ok(instance)
+}
+
 /// Specificity distance for a method specialized on a built-in CL type name when
 /// the argument is an immediate value (fixnum, character, string, …) that has no
 /// user-registered CLOS class carrying that name. Returns `None` if the argument
@@ -22377,13 +22414,22 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let instance = eval_form(instance_form, env)?;
                 let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
                 let initargs = evaluated_initargs(&class_name, init_args, env)?;
-                let (instance_initargs, class_initargs) =
-                    split_initargs_for_class(env, &class_name, &initargs);
-                torcl_stdlib::reinitialize_instance(instance, &instance_initargs)?;
-                for (slot_name, value) in class_initargs {
-                    write_class_slot_value(env, &class_name, &slot_name, Some(value));
+                return reinitialize_instance_values(instance, &initargs, env);
+            }
+            "TORCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
+            | "TORCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 2 {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE requires 2 arguments, got {}",
+                        args.len()
+                    )));
                 }
-                return Ok(instance);
+                let instance = args[0];
+                let raw_initargs = list_to_vec(args[1]);
+                let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
+                let initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?;
+                return reinitialize_instance_values(instance, &initargs, env);
             }
             "CHANGE-CLASS" => {
                 let (instance_form, rest) = cp(cdr);
@@ -34492,7 +34538,9 @@ fn is_builtin_function(name: &str) -> bool {
     // BORDEAUX-THREADS:MAKE-THREAD spuriously FBOUNDP before BT defined it.
     if matches!(
         name,
-        "TORCL-THREAD:MAKE-THREAD"
+        "TORCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
+            | "TORCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
+            | "TORCL-THREAD:MAKE-THREAD"
             | "TORCL-THREAD::MAKE-THREAD"
             | "TORCL-THREAD:JOIN-THREAD"
             | "TORCL-THREAD::JOIN-THREAD"

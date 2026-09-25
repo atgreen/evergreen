@@ -459,6 +459,13 @@
   (declare (ignore args))
   `(quote ,name))
 
+;; ANSI supplies a primary REINITIALIZE-INSTANCE method on STANDARD-OBJECT.
+;; Keep that method in the Lisp standard library so methods added by libraries
+;; participate in ordinary :around/:before/:after combination; only the slot
+;; update itself delegates to the stdlib-backed evaluator primitive.
+(defmethod reinitialize-instance ((instance standard-object) &rest initargs)
+  (torcl-internal::%standard-reinitialize-instance instance initargs))
+
 (defmacro with-slots (slots instance &rest body)
   (let ((obj (gensym)))
     `(let ((,obj ,instance))

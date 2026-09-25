@@ -2902,6 +2902,29 @@ fn clos_shared_initialize_after_runs_during_make_instance() {
 }
 
 #[test]
+fn clos_reinitialize_instance_apply_uses_default_primary_and_after_method() {
+    // A library can add specialized REINITIALIZE-INSTANCE methods before an
+    // unrelated class is reinitialized through APPLY (Ironclad + ASDF). The
+    // standard primary method on STANDARD-OBJECT must remain applicable and
+    // user auxiliary methods must combine around it.
+    assert_eq!(
+        eval_ok(
+            "(progn \
+               (defvar *reinitialized* nil) \
+               (defclass unrelated () ()) \
+               (defmethod reinitialize-instance ((o unrelated) &rest args) o) \
+               (defclass target () ((x :initarg :x :accessor target-x))) \
+               (defmethod reinitialize-instance :after ((o target) &key x) \
+                 (setq *reinitialized* (list x (target-x o)))) \
+               (let ((o (make-instance 'target :x 1))) \
+                 (list (eq o (apply 'reinitialize-instance o '(:x 42))) \
+                       (target-x o) *reinitialized*)))"
+        ),
+        "(T 42 (42 42))"
+    );
+}
+
+#[test]
 fn clos_initialize_instance_after_least_specific_first() {
     assert_eq!(
         eval_ok(
