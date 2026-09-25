@@ -178,7 +178,6 @@ unsafe fn update_if_obsolete(inst: TorclVal) {
         // rooted across it — an unrooted `live` would forward a stale address,
         // and unrooted snap values would be copied stale into the new layout.
         let mut live = live;
-        let mut snap = snap;
         torcl_rt::rooted_ref!(_live_root = &mut live);
         torcl_rt::rooted_ref!(_snap_root = &mut snap);
         let new_inst = match allocate_instance(class) {

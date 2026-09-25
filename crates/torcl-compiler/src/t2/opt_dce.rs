@@ -406,7 +406,7 @@ mod tests {
     }
 
     fn run(f: &mut Function) {
-        Dce::default().run(f, &mut Analyses::new());
+        Dce.run(f, &mut Analyses::new());
     }
 
     /// A constant used only by a FrameState is preserved as its exact tagged
@@ -490,8 +490,10 @@ mod tests {
         let mut f = Function::new("effect");
         let entry = f.entry();
         let a = f.add_block_param(entry, fixnum(), VR::Tagged);
-        let mut fl = InstFlags::default();
-        fl.effectful = true;
+        let fl = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
         let (store_inst, _) = f.push_inst(entry, inst(Opcode::Store, vec![a], fl), &[]);
         f.set_terminator(entry, ret(vec![]));
 

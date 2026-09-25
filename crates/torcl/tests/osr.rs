@@ -14,6 +14,62 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
+#[test]
+fn active_loop_osr_preserves_its_definition_after_redefinition() {
+    let replacement = std::env::temp_dir().join(format!(
+        "torcl-active-osr-replacement-{}.lisp",
+        std::process::id()
+    ));
+    std::fs::write(
+        &replacement,
+        "(defun versioned-loop (n)
+           (let ((sum 0))
+             (dotimes (i n sum)
+               (replace-active-loop-once)
+               (incf sum 7))))",
+    )
+    .unwrap();
+    let program = format!(
+        r#"
+      (defvar *replace-active-loop* nil)
+      (defun replace-active-loop-once ()
+        (when *replace-active-loop*
+          (setq *replace-active-loop* nil)
+          (load {replacement:?})
+          (assert (= (versioned-loop 1) 7))))
+      (defun versioned-loop (n)
+        (let ((sum 0))
+          (dotimes (i n sum)
+            (replace-active-loop-once)
+            (incf sum 1))))
+      (setq *replace-active-loop* t)
+      (let ((old-result (versioned-loop 1000)))
+        (format t "OLD-RESULT=~a~%" old-result)
+        (assert (= old-result 1000)))
+      (assert (> (torcl-ext:function-osr-count 'versioned-loop) 0))
+      (assert (= (versioned-loop 1000) 7000))
+      (format t "ACTIVE-VERSION-OSR-OK~%")
+    "#
+    );
+    let output = Command::new("timeout")
+        .args(["--kill-after=5", "60", BIN, "--no-init", "--eval", &program])
+        .env_remove("TORCL_FORCE_TIER")
+        .env("TORCL_LAZY_COMPILE", "0")
+        .env("TORCL_T0_T1_THRESHOLD", "1000000")
+        .env("TORCL_DISABLE_T2", "1")
+        .env("TORCL_OSR_THRESHOLD", "20")
+        .output()
+        .expect("run active-version OSR regression");
+    std::fs::remove_file(replacement).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("ACTIVE-VERSION-OSR-OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
 /// Run `program` with OSR forced on (threshold 50) and under the pure
 /// tree-walker; assert identical stdout and exit status.
 fn assert_osr_matches(program: &str) {

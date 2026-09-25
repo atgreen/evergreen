@@ -750,7 +750,7 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<TorclVal, TorclError> {
     }
 
     // Parse and validate the header.
-    let header: ImageHeader = bytes_to_struct(&file_data)
+    let header: ImageHeader = bytes_to_struct(file_data)
         .ok_or_else(|| TorclError::InvalidImage("image file too small".into()))?;
 
     if header.magic != IMAGE_MAGIC {

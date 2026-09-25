@@ -1049,8 +1049,9 @@ fn read_u64_at(data: &[u8], off: &mut usize) -> Option<u64> {
 // the empty tables (so references to them can be relocated in the heap's Pass 2)
 // and stashes their entry lists; `populate` fills them once Pass 2 has made every
 // key object structurally hashable.
+type PendingTable = (TorclVal, Vec<(SlotRec, SlotRec)>);
 thread_local! {
-    static PENDING_TABLES: std::cell::RefCell<Vec<(TorclVal, Vec<(SlotRec, SlotRec)>)>> =
+    static PENDING_TABLES: std::cell::RefCell<Vec<PendingTable>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 

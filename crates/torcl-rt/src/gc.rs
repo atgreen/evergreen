@@ -953,7 +953,7 @@ thread_local! {
     /// take the scratch, reset it, and return it before resuming mutators.
     /// No early return or `?` runs between take and restore.
     static MINOR_OBJECT_MAP: RefCell<NurseryObjectMap> = RefCell::new(NurseryObjectMap::default());
-    static MINOR_WORKLIST: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
+    static MINOR_WORKLIST: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// True if `v` is a tagged heap reference (cons, heap object, or function
@@ -2041,7 +2041,7 @@ impl HeapCollector {
                                              survives minor GC in live object body {body_addr:#x} \
                                              (type {type_id}) slot {:#x}",
                                             v.to_raw(),
-                                            slot as *mut TorclVal as usize
+                                            slot as usize
                                         );
                                     }
                                 },
@@ -2097,7 +2097,7 @@ impl HeapCollector {
             crate::events::EventKind::GcMinor,
             crate::events::NO_SYM,
             elapsed_us,
-            bytes_promoted as u64,
+            bytes_promoted,
         );
 
         // Update local stats copy.
@@ -4855,7 +4855,8 @@ pub fn set_finalizer_dispatch(dispatch: fn(TorclVal, TorclVal)) {
 /// it for every STREAM object during marking and relocation, passing the handle
 /// body pointer and the `visit` closure that marks/forwards each reference slot
 /// (torcl-jtc.7a).
-static STREAM_TRACE_FN: OnceLock<fn(*mut u8, &mut dyn FnMut(*mut TorclVal))> = OnceLock::new();
+type StreamTraceFn = fn(*mut u8, &mut dyn FnMut(*mut TorclVal));
+static STREAM_TRACE_FN: OnceLock<StreamTraceFn> = OnceLock::new();
 
 /// Register the STREAM tracing hook (see [`STREAM_TRACE_FN`]).
 pub fn set_stream_trace_fn(f: fn(*mut u8, &mut dyn FnMut(*mut TorclVal))) {

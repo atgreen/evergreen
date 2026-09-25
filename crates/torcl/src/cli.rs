@@ -1926,6 +1926,8 @@ struct FunDef {
     /// `Send` — frozen macro-captures store `FunDef`s in a cross-thread global.
     /// `env.funs` holds only lexical local functions (globals live in the symbol
     /// table), so this snapshot is typically empty or tiny.
+    // Keep the common no-snapshot case pointer-sized inside every FunDef.
+    #[allow(clippy::box_collection)]
     def_funs: Option<Box<HashMap<String, FunDef>>>,
     /// The `#'name` value for THIS binding instance, minted on first reference
     /// and reused. CLHS 5.3: within the scope of one FLET/LABELS binding, `#'name`
@@ -1950,8 +1952,13 @@ struct FunDef {
     ///
     /// captured the INNER `done` and returned BAD (ansi BLOCK.10; bliss-wfxx).
     /// `None` for a global defun, which inherits the caller's as before.
-    defining_blocks: Option<(Vec<(String, String)>, Vec<(String, String)>)>,
+    defining_blocks: Option<LexicalExitNames>,
 }
+
+type LexicalExitNames = (Vec<(String, String)>, Vec<(String, String)>);
+type LexicalExitScope<'a> = (&'a [(String, String)], &'a [(String, String)]);
+type SharedEnvMap<T> = Rc<RefCell<HashMap<String, T>>>;
+type ClassSlotCells = Arc<Mutex<HashMap<String, Option<TorclVal>>>>;
 
 impl FunDef {
     /// A function whose body inherits the caller's function-namespace (globals,
@@ -2510,24 +2517,25 @@ type SpecRec = (u8, String, u64);
 /// A serialized MethodDef: (method_id_raw, lambda_list_raw, body_raw,
 /// qualifier, specializers).
 type MethodRec = (u64, u64, u64, u8, Vec<SpecRec>);
+type SetfRec = (String, Vec<String>, u64, u64);
 
 thread_local! {
     /// Remapped (name, params_form_raw, body_raw) records awaiting rebind to the
     /// fresh root frame after an image load. Drained by the CLI post-`Env::new`.
     static PENDING_HOST_MACROS: RefCell<Vec<(String, u64, u64)>> = const { RefCell::new(Vec::new()) };
     /// Remapped ((SETF place) key, params, params_form_raw, body_raw) records.
-    static PENDING_HOST_SETF: RefCell<Vec<(String, Vec<String>, u64, u64)>> =
+    static PENDING_HOST_SETF: RefCell<Vec<SetfRec>> =
         const { RefCell::new(Vec::new()) };
     /// Rc handles to the saving Env's generics/methods maps, stashed by
     /// `save_core_and_die` for the serialize hook (whose signature has no Env).
     /// Rc clones SHARE the live Env's storage, so the save-time full_gc root
     /// scan keeps the contained TorclVals current — a deep copy here would go
     /// stale when the compacting GC moves objects (torcl-x0f2.7a).
-    static SAVE_GENERICS: RefCell<Option<Rc<RefCell<HashMap<String, GenericDef>>>>> =
+    static SAVE_GENERICS: RefCell<Option<SharedEnvMap<GenericDef>>> =
         const { RefCell::new(None) };
-    static SAVE_METHODS: RefCell<Option<Rc<RefCell<HashMap<String, Vec<MethodDef>>>>>> =
+    static SAVE_METHODS: RefCell<Option<SharedEnvMap<Vec<MethodDef>>>> =
         const { RefCell::new(None) };
-    static SAVE_CLASSES: RefCell<Option<Rc<RefCell<HashMap<String, ClassDef>>>>> =
+    static SAVE_CLASSES: RefCell<Option<SharedEnvMap<ClassDef>>> =
         const { RefCell::new(None) };
     /// Remapped (name, generic_function_raw, combination) generic-function
     /// records awaiting drain into the fresh root Env after an image load.
@@ -3704,7 +3712,7 @@ impl Drop for MacroexpandEnvScope {
         // keeps that correct without tracking which scope made which entry.
         MACROEXPAND_ENVIRONMENTS.with(|envs| {
             let mut envs = envs.borrow_mut();
-            if envs.len() > 0 {
+            if !envs.is_empty() {
                 envs.retain(|&id, _| id < first);
             }
         });
@@ -5044,11 +5052,7 @@ fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: O
 /// The shared value cell for a `:allocation :class` slot named `slot_bare`
 /// reachable from `class_name` — the OWNING class's map, so all subclass
 /// instances read and write the one shared value (bliss-x4p).
-fn class_slot_cell(
-    env: &Env,
-    class_name: &str,
-    slot_bare: &str,
-) -> Option<Arc<Mutex<HashMap<String, Option<TorclVal>>>>> {
+fn class_slot_cell(env: &Env, class_name: &str, slot_bare: &str) -> Option<ClassSlotCells> {
     let owner = class_slot_owner(env, class_name, slot_bare)?;
     env.classes
         .borrow()
@@ -5580,7 +5584,7 @@ fn invoke_restart_function_in(
     function: &RestartFunction,
     args: &[TorclVal],
     env: &mut Env,
-    scope: Option<(&[(String, String)], &[(String, String)])>,
+    scope: Option<LexicalExitScope<'_>>,
 ) -> Result<TorclVal, TorclError> {
     match function {
         RestartFunction::FunctionForm {
@@ -5992,6 +5996,8 @@ fn run_initialization_aux_methods(
     };
     torcl_rt::rooted_ref!(_methods_root = &mut methods);
     let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
+    // Re-read the rooted vector after callbacks that may relocate its values.
+    #[allow(clippy::needless_range_loop)]
     for index in 0..methods.len() {
         if methods[index].qualifier != qualifier {
             continue;
@@ -6011,6 +6017,8 @@ fn run_initialization_aux_methods(
     if qualifier == torcl_stdlib::MethodQualifier::After {
         ordered.reverse();
     }
+    // Do not hold an iterator borrow while Lisp invokes a moving collection.
+    #[allow(clippy::needless_range_loop)]
     for index in 0..ordered.len() {
         invoke_method(env, &ordered[index], args, None)?;
     }
@@ -6400,6 +6408,8 @@ fn invoke_generic_function_inner(
     torcl_rt::rooted_ref!(_methods_root = &mut methods);
 
     let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
+    // The root scanner may rewrite methods during specificity callbacks.
+    #[allow(clippy::needless_range_loop)]
     for index in 0..methods.len() {
         let mut method = methods[index].clone();
         torcl_rt::rooted_ref!(_method_root = &mut method);
@@ -8032,7 +8042,7 @@ fn eval_lambda_call_ex(
     rooted_args!(args = args);
     // Install the callee's lexical BLOCK/TAGBODY scope for the body (bliss-4u5u),
     // saving the caller's to restore afterward. `Inherit` leaves them as-is.
-    let saved: Option<(Vec<(String, String)>, Vec<(String, String)>)> = match control {
+    let saved: Option<LexicalExitNames> = match control {
         LexicalControl::Inherit => None,
         LexicalControl::Fresh => Some((
             std::mem::take(&mut env.block_stack),
@@ -8095,7 +8105,7 @@ pub(super) fn fmt_form_debug(val: TorclVal) -> String {
     print_val(val, &mut s);
     if s.len() > 300 {
         s.truncate(300);
-        s.push_str("…");
+        s.push('…');
     }
     s
 }
@@ -8633,7 +8643,6 @@ fn sym_bare_name_rc(val: TorclVal) -> std::rc::Rc<str> {
 
 /// [`sym_name`] without the allocation: a shared, cached handle to the name.
 /// Use where the name is only borrowed (map keys, comparisons).
-
 fn sym_name_rc(val: TorclVal) -> std::rc::Rc<str> {
     if !val.is_symbol() || val.is_nil() || val == T {
         return std::rc::Rc::from(sym_name_uncached(val).as_str());
@@ -9616,11 +9625,11 @@ fn dispatch_print_object(val: TorclVal, escape: bool) -> Option<String> {
     PRINTING_OBJECT.with(|c| c.set(true));
     // Bind *PRINT-ESCAPE* so the method's `(when *print-escape* …)` sees the
     // right mode; the guard is restored on every exit path.
-    let result = (|| {
+    let result = {
         let _esc = resolve_sym("*PRINT-ESCAPE*")
             .map(|s| DynBind::establish(s, if escape { T } else { NIL }));
         invoke_generic_function("PRINT-OBJECT", &[*val, *stream], env)
-    })();
+    };
     PRINTING_OBJECT.with(|c| c.set(false));
     result.ok()?;
     let s = torcl_stdlib::get_output_stream_string(*stream).ok()?;
@@ -11051,9 +11060,7 @@ fn find_symbol_in_package_cased(
     } else {
         std::borrow::Cow::Owned(bare_name.to_uppercase())
     };
-    let Some(root) = torcl_stdlib::find_package(&resolve_package_name_cow(env, pkg_name)) else {
-        return None;
-    };
+    let root = torcl_stdlib::find_package(&resolve_package_name_cow(env, pkg_name))?;
     // KEYWORD is compared by identity, so resolve its handle once here rather
     // than re-deriving a name per step.
     let keyword = torcl_stdlib::find_package("KEYWORD");
@@ -12742,19 +12749,21 @@ fn typep_matches(
     // for a registered class. OBJECT is of the type iff its class equals, or has
     // as a precedence-list ancestor, that class (ansi-test hash-table.5,
     // make-condition.2 — the CPL check covers condition instances too).
-    if !type_spec.is_symbol() && !type_spec.is_cons() && !type_spec.is_nil() {
-        if !torcl_stdlib::class_name(type_spec).is_nil() {
-            let obj_class = torcl_stdlib::class_of(object);
-            if obj_class == type_spec {
-                return Ok(true);
-            }
-            return Ok(
-                match torcl_stdlib::compute_class_precedence_list(obj_class) {
-                    Ok(cpl) => cpl.iter().any(|c| *c == type_spec),
-                    Err(_) => false,
-                },
-            );
+    if !type_spec.is_symbol()
+        && !type_spec.is_cons()
+        && !type_spec.is_nil()
+        && !torcl_stdlib::class_name(type_spec).is_nil()
+    {
+        let obj_class = torcl_stdlib::class_of(object);
+        if obj_class == type_spec {
+            return Ok(true);
         }
+        return Ok(
+            match torcl_stdlib::compute_class_precedence_list(obj_class) {
+                Ok(cpl) => cpl.contains(&type_spec),
+                Err(_) => false,
+            },
+        );
     }
     // A closure's physical cons representation must not enter the CLOS
     // instance/class-of path below, where it would inherit CONS and LIST.
@@ -14673,6 +14682,12 @@ fn order_sensitive_setf_accessor(mut place: TorclVal) -> Option<String> {
     }
 }
 
+// End both registry borrows before the caller evaluates arguments or allocates.
+fn env_has_setf_generic(env: &Env, place: &str) -> bool {
+    let key = format!("(SETF {place})");
+    env.methods.borrow().contains_key(&key) || env.generics.borrow().contains_key(&key)
+}
+
 fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -15316,9 +15331,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     }
                     i += 2;
                 }
-                let content: String = std::iter::repeat(fill)
-                    .take(size.as_fixnum() as usize)
-                    .collect();
+                let content: String =
+                    std::iter::repeat_n(fill, size.as_fixnum() as usize).collect();
                 return Ok(torcl_stdlib::make_lisp_string_fresh(&content));
             }
             "MAKE-STRING-OUTPUT-STREAM" => {
@@ -17099,6 +17113,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                     index,
                                     torcl_rt::value::UNBOUND,
                                 );
+                                bytecode::clear_lazy_state(index);
                             }
                         }
                     }
@@ -17114,6 +17129,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     .or_else(|| torcl_rt::symbols::find_index(&name))
                 {
                     torcl_rt::symbols::set_symbol_function(idx, torcl_rt::value::UNBOUND);
+                    // Retire compiled definitions too, including copies cached
+                    // by other native workers and baked direct-call targets.
+                    bytecode::clear_lazy_state(idx);
                 }
                 env.funs_mut().remove(&name);
                 env.macros_mut().remove(&name);
@@ -18461,11 +18479,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                         &args,
                                         Arc::clone(&env.frame),
                                     )?;
-                                } else if {
-                                    let key = format!("(SETF {})", other);
-                                    env.methods.borrow().contains_key(&key)
-                                        || env.generics.borrow().contains_key(&key)
-                                } {
+                                } else if env_has_setf_generic(env, other) {
                                     // A (setf place) *generic function* (defmethod
                                     // (setf place) …): dispatch it with the new
                                     // value first, then the place's subforms.
@@ -22365,12 +22379,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     }
                     // RESTART-BIND: the function runs in the dynamic environment of
                     // the INVOKE-RESTART call; no unwinding.
-                    return Ok(invoke_restart_function_in(
+                    return invoke_restart_function_in(
                         &restart.function,
                         &args,
                         env,
                         Some((&restart.captured_blocks, &restart.captured_tags)),
-                    )?);
+                    );
                 }
                 return Err(TorclError::ProgramError(format!(
                     "Restart {} not found",
@@ -22419,11 +22433,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         restart_name
                     )));
                 }
-                return Ok(invoke_restart_function(
-                    &entry.function,
-                    &interactive_args,
-                    env,
-                )?);
+                return invoke_restart_function(&entry.function, &interactive_args, env);
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
             "LOAD" => {
@@ -22659,15 +22669,16 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 while i + 1 < args.len() {
                     let key = args[i];
                     let val = args[i + 1];
-                    if key.is_symbol() && sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE" {
-                        if val != NIL {
-                            let (pn, _) = torcl_stdlib::parse_namestring(
-                                arena_str(&path_designator_to_string(val)?),
-                                None,
-                                None,
-                            )?;
-                            return Ok(pn);
-                        }
+                    if key.is_symbol()
+                        && sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE"
+                        && val != NIL
+                    {
+                        let (pn, _) = torcl_stdlib::parse_namestring(
+                            arena_str(&path_designator_to_string(val)?),
+                            None,
+                            None,
+                        )?;
+                        return Ok(pn);
                     }
                     i += 2;
                 }
@@ -23756,9 +23767,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 };
                 let mut result = Vec::new();
                 for p in torcl_stdlib::list_all_packages() {
-                    let uses_target = torcl_stdlib::package_use_list(p)
-                        .iter()
-                        .any(|u| *u == target_pkg);
+                    let uses_target = torcl_stdlib::package_use_list(p).contains(&target_pkg);
                     if uses_target {
                         result.push(p);
                     }
@@ -24098,9 +24107,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         if let Some(pkg) = torcl_stdlib::find_package(&pkg_name) {
                             for other in torcl_stdlib::list_all_packages() {
                                 if other == pkg
-                                    || !torcl_stdlib::package_use_list(other)
-                                        .iter()
-                                        .any(|used| *used == pkg)
+                                    || !torcl_stdlib::package_use_list(other).contains(&pkg)
                                 {
                                     continue;
                                 }
@@ -30575,6 +30582,7 @@ fn bind_macro_lambda_list(
     // well (CLHS 3.4.1, LET* semantics). Re-read each spec out of the rooted
     // `aux_specs` per iteration — evaluating an earlier initform can allocate
     // and move the nursery, so a copy taken before the loop would go stale.
+    #[allow(clippy::needless_range_loop)] // GC rewrites rooted specs during eval.
     for index in 0..aux_specs.len() {
         let (mut pattern, mut default_form) = aux_specs[index];
         torcl_rt::rooted_ref!(_pattern_root = &mut pattern);
@@ -32107,6 +32115,7 @@ fn eval_macrolet(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     let mut child_env = env.child();
     let mut defs = list_to_vec(defs_form);
     torcl_rt::rooted_ref!(_defs_root = &mut defs);
+    #[allow(clippy::needless_range_loop)] // Re-read rooted forms after allocation.
     for i in 0..defs.len() {
         let def = defs[i];
         if !def.is_cons() {
@@ -32189,6 +32198,7 @@ fn eval_symbol_macrolet(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclE
     let mut child_env = env.child();
     let mut bindings = list_to_vec(bindings_form);
     torcl_rt::rooted_ref!(_bindings_root = &mut bindings);
+    #[allow(clippy::needless_range_loop)] // Re-read rooted forms after allocation.
     for i in 0..bindings.len() {
         let binding = bindings[i];
         if !binding.is_cons() {
@@ -32534,6 +32544,7 @@ fn define_condition_portable(
 
     let mut definitions = list_to_vec(reader_definitions);
     torcl_rt::rooted_ref!(_definitions_root = &mut definitions);
+    #[allow(clippy::needless_range_loop)] // EVAL may relocate later definitions.
     for index in 0..definitions.len() {
         eval_form(definitions[index], env)?;
     }
@@ -32780,7 +32791,7 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                     continue;
                 }
                 let (ohead, orest) = cp(ov);
-                if ohead.is_symbol() && &sym_bare_name_rc(ohead).as_ref() == sname {
+                if ohead.is_symbol() && sym_bare_name_rc(ohead).as_ref() == sname {
                     if orest.is_cons() {
                         default = cp(orest).0;
                     }
@@ -32802,7 +32813,7 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                     continue;
                 }
                 let (ohead, orest) = cp(ov);
-                if ohead.is_symbol() && &sym_bare_name_rc(ohead).as_ref() == sname {
+                if ohead.is_symbol() && sym_bare_name_rc(ohead).as_ref() == sname {
                     let ovec = list_to_vec(orest);
                     let mut k = 1; // skip the new-default form at index 0
                     while k + 1 < ovec.len() {
@@ -33812,7 +33823,7 @@ thread_local! {
     /// that generation (bliss-zhvn) and the whole memo is dropped, so a symbol
     /// that stops being a plain builtin is never dispatched as one.
     static DIRECT_BUILTIN_MEMO: RefCell<(u64, Vec<Option<BuiltinMemo>>)> =
-        RefCell::new((0, Vec::new()));
+        const { RefCell::new((0, Vec::new())) };
 }
 
 /// `direct_builtin_slot` with the name resolution memoized per symbol.
@@ -34925,7 +34936,7 @@ fn apply_builtin_fast(
                 // the operator handler; keep them on the slow path so this
                 // fast-path only handles the vector/complex-vector case.
                 && !args[0].is_cons()
-                && !(is_string_value(args[0]) && !torcl_stdlib::is_complex_vector(args[0])) =>
+                && (!is_string_value(args[0]) || torcl_stdlib::is_complex_vector(args[0])) =>
         {
             env.clear_mv();
             let i = args[1].as_fixnum() as usize;
@@ -35500,43 +35511,40 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
             // matches handle it, so HANDLER-CASE catches system errors — not only
             // those raised through SIGNAL/ERROR. Errors that are not conditions
             // (control-flow tokens, Shutdown) yield None and propagate unchanged.
-            match torcl_error_to_condition(env, &error)? {
-                Some(mut condition) => {
-                    torcl_rt::rooted_ref!(_condition_root = &mut condition);
-                    for handler in installed {
-                        if let HandlerImpl::HandlerCase {
-                            var_name,
-                            body,
-                            captured_frame,
-                            ..
-                        } = handler.handler
-                        {
-                            if condition_matches_handler(env, condition, &handler.type_name) {
-                                let mut handler_env = env.child_with_parent(captured_frame);
-                                // Root the handler env for the clause body — its
-                                // frame holds the condition variable, which a body
-                                // GC would otherwise leave dangling (bliss-5jwg).
-                                torcl_rt::rooted_ref!(_handler_env_root = &mut handler_env);
-                                if let Some(name) = var_name {
-                                    handler_env.define_local(&name, condition);
-                                }
-                                let r = eval_progn(body, &mut handler_env)?;
-                                // Propagate the handler's multiple-value state to the
-                                // caller. The handler body runs in a CHILD env, so a
-                                // `(values …)` in it set handler_env.mv, not env.mv;
-                                // without this the secondary values are lost — e.g.
-                                // IGNORE-ERRORS' `(values nil c)` dropped the condition
-                                // (bliss-xy7t). GC-safe: no allocation between
-                                // eval_progn returning and moving the value vector, so
-                                // `r` and the mv values stay put.
-                                env.mv = std::mem::take(&mut handler_env.mv);
-                                env.mv_active = handler_env.mv_active;
-                                return Ok(r);
+            if let Some(mut condition) = torcl_error_to_condition(env, &error)? {
+                torcl_rt::rooted_ref!(_condition_root = &mut condition);
+                for handler in installed {
+                    if let HandlerImpl::HandlerCase {
+                        var_name,
+                        body,
+                        captured_frame,
+                        ..
+                    } = handler.handler
+                    {
+                        if condition_matches_handler(env, condition, &handler.type_name) {
+                            let mut handler_env = env.child_with_parent(captured_frame);
+                            // Root the handler env for the clause body — its
+                            // frame holds the condition variable, which a body
+                            // GC would otherwise leave dangling (bliss-5jwg).
+                            torcl_rt::rooted_ref!(_handler_env_root = &mut handler_env);
+                            if let Some(name) = var_name {
+                                handler_env.define_local(&name, condition);
                             }
+                            let r = eval_progn(body, &mut handler_env)?;
+                            // Propagate the handler's multiple-value state to the
+                            // caller. The handler body runs in a CHILD env, so a
+                            // `(values …)` in it set handler_env.mv, not env.mv;
+                            // without this the secondary values are lost — e.g.
+                            // IGNORE-ERRORS' `(values nil c)` dropped the condition
+                            // (bliss-xy7t). GC-safe: no allocation between
+                            // eval_progn returning and moving the value vector, so
+                            // `r` and the mv values stay put.
+                            env.mv = std::mem::take(&mut handler_env.mv);
+                            env.mv_active = handler_env.mv_active;
+                            return Ok(r);
                         }
                     }
                 }
-                None => {}
             }
             Err(error)
         }

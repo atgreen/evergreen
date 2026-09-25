@@ -756,8 +756,9 @@ impl<'a> Builder<'a> {
         // ends and we fall through).
         let mut term: Option<Term> = None;
         let code = &self.bf.code;
-        for i in start..end {
-            match &code[i] {
+        for (offset, instruction) in code[start..end].iter().enumerate() {
+            let i = start + offset;
+            match instruction {
                 Instr::Const(idx) => {
                     let v = self.emit_const(block, *idx)?;
                     stack.push(v);

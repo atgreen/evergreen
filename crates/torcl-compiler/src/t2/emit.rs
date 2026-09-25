@@ -506,6 +506,9 @@ fn framed_alloc(
 /// single-float at compile time (float contagion — `(* 2.5 5)` = `12.5`) and
 /// materialised; a variable is guarded to be a single-float, then its f32 bits
 /// (high dword of the tagged value) are unpacked into the XMM register.
+// Keep the emitter's separate operand maps borrowed; bundling them solely for
+// argument count would obscure which parts of the allocation state are read.
+#[allow(clippy::too_many_arguments)]
 fn float_operand_to_xmm(
     a: &mut Asm,
     xmm: u8,
@@ -790,6 +793,8 @@ fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)])
 
 /// Emit one arithmetic instruction (result register pre-assigned). Operands are
 /// read from `reg`/`consts`; the result lands in its allocated register.
+// These are disjoint mutable allocation maps and immutable analysis inputs.
+#[allow(clippy::too_many_arguments)]
 fn emit_arith_inst(
     a: &mut Asm,
     f: &Function,
@@ -1128,11 +1133,6 @@ fn emit_call_arg_moves(a: &mut Asm, mut pending: Vec<(u8, ArgMoveSrc)>) -> Resul
     Ok(())
 }
 
-/// Emit a `Call` through the interpreter adapter. Up to three arguments use the
-/// c2i argument registers (rdx, rcx, r8); wider calls use a GC-scanned slice in
-/// the owning activation. Values live across the call are in callee-saved
-/// registers, so the call cannot clobber them; the result returns in rax.
-#[allow(clippy::too_many_arguments)]
 // ── Direct builtin calls (bliss-x5y.27) ───────────────────────────
 //
 // A compiled call to a builtin otherwise goes out through c2i and has its
@@ -1166,6 +1166,12 @@ fn direct_builtin_for(sym: u32, nargs: usize) -> Option<(u64, u32, u64)> {
     Some((hooks.addr, slot, (hooks.generation)()))
 }
 
+/// Emit a `Call` through the interpreter adapter. Up to three arguments use the
+/// c2i argument registers (rdx, rcx, r8); wider calls use a GC-scanned slice in
+/// the owning activation. Values live across the call are in callee-saved
+/// registers, so the call cannot clobber them; the result returns in rax.
+// Explicit maps and ABI hooks keep caller-specific emission inputs visible.
+#[allow(clippy::too_many_arguments)]
 fn emit_call(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
@@ -1515,6 +1521,11 @@ fn edge_home_moves(
     Ok(moves)
 }
 
+type PreparedFramedInst = (
+    std::collections::HashMap<crate::t2::ir::Value, u8>,
+    Vec<(FramedHome, u8)>,
+);
+
 /// Load spilled operands into the framed emitter's reserved r9-r11 temporary
 /// bank and choose a register for a spilled result. The returned map is valid
 /// for exactly one SSA instruction; `stores` must be committed afterward.
@@ -1523,13 +1534,7 @@ fn prepare_framed_inst(
     data: &crate::t2::ir::InstData,
     homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
-) -> Result<
-    (
-        std::collections::HashMap<crate::t2::ir::Value, u8>,
-        Vec<(FramedHome, u8)>,
-    ),
-    EmitError,
-> {
+) -> Result<PreparedFramedInst, EmitError> {
     use std::collections::{HashMap, HashSet};
     const TEMPS: [u8; 3] = [9, 10, 11]; // r9, r10, r11
     let mut regs: HashMap<crate::t2::ir::Value, u8> = homes
@@ -2291,6 +2296,8 @@ fn is_moving_gc_reference(value: torcl_rt::value::TorclVal) -> bool {
 /// activation-frame destination otherwise. A function that contains a `Call`
 /// uses callee-saved value registers (so the call cannot clobber live values)
 /// and a small frame.
+// Public adapter addresses remain explicit to preserve the emitter API.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_framed(
     f: &Function,
     c2i_deopt_addr: u64,
@@ -2325,6 +2332,8 @@ pub fn emit_framed(
 /// A nonzero `c2i_transfer_pending_addr` is an `extern "C" fn() -> u64` that
 /// returns nonzero for a pending error/nonlocal exit. It must not allocate,
 /// safepoint, or call Lisp; results are saved on the native stack during it.
+// Public ABI hooks and activation layout are independent emission inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_framed_with_activation_slots(
     f: &Function,
     c2i_deopt_addr: u64,
@@ -2357,6 +2366,8 @@ pub fn emit_framed_with_activation_slots(
     )
 }
 
+// Shared implementation mirrors both public emitter entry points above.
+#[allow(clippy::too_many_arguments)]
 fn emit_framed_inner(
     f: &Function,
     c2i_deopt_addr: u64,
@@ -4049,11 +4060,13 @@ mod tests {
     /// byte stream is non-empty and ends in `ret`.
     #[test]
     fn emits_const_return_bytes() {
-        let mut mf = MachFunc::default();
-        mf.insts = vec![
-            mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
-            mi(op::RET, vec![], vec![gpr(0)], None),
-        ];
+        let mut mf = MachFunc {
+            insts: vec![
+                mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
+                mi(op::RET, vec![], vec![gpr(0)], None),
+            ],
+            ..MachFunc::default()
+        };
         allocate(&mut mf).expect("regalloc2");
         let code = emit(&mf).expect("emit const-return");
         assert!(!code.is_empty());
@@ -4087,11 +4100,13 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn emitted_code_executes() {
-        let mut mf = MachFunc::default();
-        mf.insts = vec![
-            mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
-            mi(op::RET, vec![], vec![gpr(0)], None),
-        ];
+        let mut mf = MachFunc {
+            insts: vec![
+                mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
+                mi(op::RET, vec![], vec![gpr(0)], None),
+            ],
+            ..MachFunc::default()
+        };
         allocate(&mut mf).expect("regalloc2");
         let code = emit(&mf).expect("emit");
         let buf = torcl_rt::jit::JitBuffer::new(&code).expect("mmap exec");
@@ -4814,13 +4829,15 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn emitted_addition_executes() {
-        let mut mf = MachFunc::default();
-        mf.insts = vec![
-            mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(7)),
-            mi(op::MOV_IMM, vec![gpr(1)], vec![], Some(5)),
-            mi(op::ADD, vec![gpr(2)], vec![gpr(0), gpr(1)], None),
-            mi(op::RET, vec![], vec![gpr(2)], None),
-        ];
+        let mut mf = MachFunc {
+            insts: vec![
+                mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(7)),
+                mi(op::MOV_IMM, vec![gpr(1)], vec![], Some(5)),
+                mi(op::ADD, vec![gpr(2)], vec![gpr(0), gpr(1)], None),
+                mi(op::RET, vec![], vec![gpr(2)], None),
+            ],
+            ..MachFunc::default()
+        };
         allocate(&mut mf).expect("regalloc2");
         let code = emit(&mf).expect("emit");
         let buf = torcl_rt::jit::JitBuffer::new(&code).expect("mmap exec");

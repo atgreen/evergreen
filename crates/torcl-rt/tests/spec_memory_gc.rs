@@ -112,7 +112,7 @@ fn spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths() {
     // objects are now reclaimed, bliss-jg6g); this test checks it stays walkable
     // and in a dedicated region, not that it leaks.
     let saved = get_entry_continuation();
-    set_entry_continuation(unsafe { TorclVal::from_heap_ptr((large as *mut u8).sub(8)) });
+    set_entry_continuation(unsafe { TorclVal::from_heap_ptr(large.sub(8)) });
 
     let before = heap_stats();
     assert!(before.large_object_bytes >= 720);
@@ -265,7 +265,7 @@ fn spec_gc_large_object_is_not_moved_by_major_gc() {
     // test is that a surviving large object is not MOVED (R3.19). The value is
     // the tagged header pointer, body - OBJECT_HEADER_SIZE.
     let saved = get_entry_continuation();
-    set_entry_continuation(unsafe { TorclVal::from_heap_ptr((ptr as *mut u8).sub(8)) });
+    set_entry_continuation(unsafe { TorclVal::from_heap_ptr(ptr.sub(8)) });
 
     HeapCollector::new().major_gc().expect("major_gc");
 

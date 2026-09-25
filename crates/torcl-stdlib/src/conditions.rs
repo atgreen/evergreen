@@ -316,13 +316,15 @@ fn restart_cluster_entry(
     }
 }
 
-fn active_restart_entries() -> Vec<(
+type RestartEntry = (
     TorclVal,
     TorclVal,
     Option<TorclVal>,
     Option<TorclVal>,
     Option<TorclVal>,
-)> {
+);
+
+fn active_restart_entries() -> Vec<RestartEntry> {
     let clusters = with_state(|state| state.restart_stack.clone());
     let mut entries = Vec::new();
     for cluster in clusters.iter().rev() {

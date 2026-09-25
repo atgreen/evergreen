@@ -149,7 +149,7 @@ pub fn bit_vector_set(v: TorclVal, i: usize, bit: u8) -> bool {
     if i >= len {
         return false;
     }
-    let ptr = unsafe { v.as_ptr() as *mut u8 };
+    let ptr = unsafe { v.as_ptr() };
     unsafe {
         let byte = ptr.add(24 + i / 8);
         if bit != 0 {

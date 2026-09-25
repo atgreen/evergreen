@@ -195,6 +195,21 @@ fn closure_bodies() -> &'static SharedCell<HashMap<u32, Arc<BytecodeFunction>>> 
     BODIES.get_or_init(|| SharedCell::new(HashMap::new()))
 }
 
+/// Canonical named definitions outlive the execution that loaded them. A
+/// tombstone invalidates copies retained by workers after unbinding or a
+/// source-only redefinition. Native code and tiering feedback remain local.
+#[derive(Clone)]
+struct NamedBytecodeDefinition {
+    generation: u64,
+    body: Option<Arc<BytecodeFunction>>,
+}
+
+fn named_definitions() -> &'static SharedCell<HashMap<u32, NamedBytecodeDefinition>> {
+    static DEFINITIONS: std::sync::OnceLock<SharedCell<HashMap<u32, NamedBytecodeDefinition>>> =
+        std::sync::OnceLock::new();
+    DEFINITIONS.get_or_init(|| SharedCell::new(HashMap::new()))
+}
+
 /// Root the original constant pools of bodies owned by any execution. Weak
 /// ownership makes this a root-discovery index, not another code-retention
 /// registry: removed definitions and finished thunks can still die normally.
@@ -429,6 +444,14 @@ fn form_list(items: &[TorclVal]) -> TorclVal {
 
 fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
     install_bytecode_root_scanner();
+    let shared = named_definitions().borrow().get(&sym).cloned();
+    if let Some(definition) = shared {
+        let local_generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied());
+        if local_generation != Some(definition.generation) {
+            install_local_definition(sym, definition.body.clone(), definition.generation);
+        }
+        return definition.body;
+    }
     if let Some(body) = REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
         return Some(body);
     }
@@ -478,6 +501,15 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
                 .map(|(&symbol, body)| (symbol, Arc::clone(body))),
         );
     });
+    // A worker may have loaded a named FASL and exited without the saving
+    // thread ever calling it. Canonical definitions must win over local copies.
+    for (&symbol, definition) in named_definitions().borrow().iter() {
+        if let Some(body) = &definition.body {
+            entries.insert(symbol, Arc::clone(body));
+        } else {
+            entries.remove(&symbol);
+        }
+    }
     let (mut sk_pool, mut sk_tree) = (0usize, 0usize);
     let dbg = std::env::var_os("TORCL_HOSTREG_DBG").is_some();
     for (sym, bf) in entries {
@@ -573,53 +605,91 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
 /// Whether `sym` currently names a registered bytecode function (e.g. a
 /// source-free `(defun (setf place) …)` writer installed from a `.bfasl`).
 pub(super) fn is_registered(sym: u32) -> bool {
-    REGISTRY.with(|r| r.borrow().contains_key(&sym))
+    registry_get(sym).is_some()
 }
 
 fn registry_put(sym: u32, f: Arc<BytecodeFunction>) {
+    publish_bytecode(sym, f, None);
+}
+
+/// Definition loads replace unconditionally; compilation of an existing
+/// definition must still match the generation from which it started. No Lisp
+/// allocation, evaluation, or safepoint may occur while the publication lock
+/// protects the comparison and replacement.
+fn publish_bytecode(sym: u32, f: Arc<BytecodeFunction>, expected: Option<u64>) -> bool {
     register_bytecode_roots(&f);
-    REGISTRY_GENERATION.with(|g| {
-        let mut generations = g.borrow_mut();
-        let next = generations.get(&sym).copied().unwrap_or(0).wrapping_add(1);
-        generations.insert(sym, next);
-    });
-    let old = REGISTRY.with(|r| r.borrow_mut().insert(sym, f));
-    // Fresh uninterned closures cannot replace a baked target, and the builtin
-    // memo excludes uninterned symbols. Creating a callback must not invalidate
-    // unrelated native calls. Keep replacements and named installs conservative.
-    let invalidates_direct_calls = old.is_some() || !torcl_rt::symbols::is_uninterned(sym);
-    if let Some(old) = old {
-        clear_bytecode_profiles(Arc::as_ptr(&old) as usize);
-    }
-    // A new definition starts a new tiering lifetime.  In particular, a T2
-    // decline for the old body must not suppress compilation of the new one,
-    // and no native entry compiled from the old bytecode may remain callable.
-    NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-    if invalidates_direct_calls {
+    let private = torcl_rt::symbols::is_uninterned(sym);
+    let generation = if private {
+        let current = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
+        if expected.is_some_and(|generation| generation != current) {
+            return false;
+        }
+        // Fresh private closures cannot replace a baked target.
+        if REGISTRY.with(|r| r.borrow().contains_key(&sym)) {
+            bump_direct_call_gen();
+        }
+        current.wrapping_add(1)
+    } else {
+        let mut definitions = named_definitions().borrow_mut();
+        let current = definitions.get(&sym).map_or(0, |d| d.generation);
+        if expected.is_some_and(|generation| generation != current) {
+            return false;
+        }
+        let generation = current.wrapping_add(1);
+        // Invalidate baked targets before exposing the replacement, under the
+        // same lock observed by registry_get.
         bump_direct_call_gen();
-    }
-    T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
-    T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
-    T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
-    INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
-    DEOPT_COUNTS.with(|m| m.borrow_mut().remove(&sym));
-    DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
-    PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
-    LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+        definitions.insert(
+            sym,
+            NamedBytecodeDefinition {
+                generation,
+                body: Some(Arc::clone(&f)),
+            },
+        );
+        generation
+    };
+    install_local_definition(sym, Some(f), generation);
+    true
 }
 
 fn registry_remove(sym: u32) {
+    let generation = if torcl_rt::symbols::is_uninterned(sym) {
+        REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0).wrapping_add(1))
+    } else {
+        let mut definitions = named_definitions().borrow_mut();
+        let generation = definitions
+            .get(&sym)
+            .map_or(1, |d| d.generation.wrapping_add(1));
+        definitions.insert(
+            sym,
+            NamedBytecodeDefinition {
+                generation,
+                body: None,
+            },
+        );
+        generation
+    };
+    install_local_definition(sym, None, generation);
+    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+    closure_controls().borrow_mut().remove(&sym);
+}
+
+/// Refresh only the receiving execution. Reading a shared definition must not
+/// republish it as a redefinition and invalidate every other execution.
+fn install_local_definition(sym: u32, body: Option<Arc<BytecodeFunction>>, generation: u64) {
     REGISTRY_GENERATION.with(|g| {
-        let mut generations = g.borrow_mut();
-        let next = generations.get(&sym).copied().unwrap_or(0).wrapping_add(1);
-        generations.insert(sym, next);
+        g.borrow_mut().insert(sym, generation);
     });
-    let old = REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    let old = REGISTRY.with(|r| match body {
+        Some(body) => r.borrow_mut().insert(sym, body),
+        None => r.borrow_mut().remove(&sym),
+    });
     if let Some(old) = old {
         clear_bytecode_profiles(Arc::as_ptr(&old) as usize);
     }
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+    OSR_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    LAZY_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
@@ -628,7 +698,6 @@ fn registry_remove(sym: u32) {
     DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
     PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
     LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
-    closure_controls().borrow_mut().remove(&sym);
 }
 
 /// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
@@ -868,15 +937,15 @@ fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
                 "store-global (set symbol-value)"
             ),
             e!(
-                c2i_load_env as extern "C" fn(u64, u64) -> u64,
+                c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64,
                 "load lexical var"
             ),
             e!(
-                c2i_store_env as extern "C" fn(u64, u64, u64),
+                c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64),
                 "store lexical var"
             ),
             e!(
-                c2i_define_env as extern "C" fn(u64, u64, u64),
+                c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64),
                 "define lexical var"
             ),
             e!(c2i_push_env_child as extern "C" fn(), "push env frame"),
@@ -899,7 +968,8 @@ fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
                 "record deopt resume state"
             ),
             e!(
-                c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64,
+                c2i_t1_backedge
+                    as extern "C" fn(u64, u64, *mut u64, *const BytecodeFunction) -> u64,
                 "loop back-edge counter"
             ),
             e!(
@@ -1541,6 +1611,9 @@ struct Lowerer<'e> {
     /// Static `restart-case` tables.
     restart_cases: Vec<RestartCaseInfo>,
     /// Nested noncapturing lambda bodies.
+    // Match BytecodeFunction's boxed nested-body representation; lowering
+    // transfers this vector directly into the completed function.
+    #[allow(clippy::vec_box)]
     nested_functions: Vec<Box<BytecodeFunction>>,
     /// Portable BFASL compilation may lower quasiquote to explicit allocation;
     /// the ordinary opportunistic compiler keeps the tree-walker as its oracle.
@@ -3182,7 +3255,7 @@ impl<'e> Lowerer<'e> {
         // the instruction stream is post-expansion and therefore complete.
         let register = self.code[push_at + 1..]
             .iter()
-            .any(|i| Self::instr_may_escape_block(i));
+            .any(Self::instr_may_escape_block);
         if let Instr::PushBlock {
             resume_bcp,
             register: reg,
@@ -5588,7 +5661,8 @@ impl<'e> Lowerer<'e> {
                 .scopes
                 .iter()
                 .flat_map(|s| s.iter())
-                .filter_map(|(k, v)| matches!(v, VarLoc::Boxed).then(|| k.clone()))
+                .filter(|&(_k, v)| matches!(v, VarLoc::Boxed))
+                .map(|(k, _v)| k.clone())
                 .collect();
             self.has_env = true;
             let callable = self.closure_fns.clone();
@@ -5660,9 +5734,8 @@ impl<'e> Lowerer<'e> {
                 if self.portable {
                     return self
                         .emit_portable_closure(params_form, body, &captured)
-                        .map_err(|e| {
+                        .inspect_err(|_e| {
                             let _ = record_bail(|| "function:portable-closure".to_string());
-                            e
                         });
                 }
                 captured
@@ -5855,13 +5928,15 @@ impl<'e> Lowerer<'e> {
             .scopes
             .iter()
             .flat_map(|s| s.iter())
-            .filter_map(|(k, v)| matches!(v, VarLoc::Boxed).then(|| k.clone()))
+            .filter(|&(_k, v)| matches!(v, VarLoc::Boxed))
+            .map(|(k, _v)| k.clone())
             .collect();
         let enclosing_slots: std::collections::HashSet<String> = self
             .scopes
             .iter()
             .flat_map(|s| s.iter())
-            .filter_map(|(k, v)| matches!(v, VarLoc::Slot(_)).then(|| k.clone()))
+            .filter(|&(_k, v)| matches!(v, VarLoc::Slot(_)))
+            .map(|(k, _v)| k.clone())
             .collect();
         let enclosing_callable = self.closure_fns.clone();
 
@@ -5870,8 +5945,8 @@ impl<'e> Lowerer<'e> {
         // a macro-revealed lambda capture, instead of permanently interpreting
         // the entire function.
         let mut slot_captured = std::collections::HashSet::new();
-        for i in 0..parsed.len() {
-            let (params_form, fbody) = flet_def_forms(defs[i]);
+        for &definition in &defs[..parsed.len()] {
+            let (params_form, fbody) = flet_def_forms(definition);
             let params: std::collections::HashSet<String> = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
@@ -6330,6 +6405,8 @@ fn subst_loop_it(form: TorclVal, repl: TorclVal) -> TorclVal {
     arena_cons(*car, cdr)
 }
 
+// Explicit output buffers belong to separate phases of LOOP lowering.
+#[allow(clippy::too_many_arguments)]
 fn apply_loop_accumulation(
     op: &str,
     expr: TorclVal,
@@ -9849,10 +9926,7 @@ fn bbu_string(constants: &[BbuConstant], index: u32) -> Result<&str, TorclError>
     }
 }
 
-fn bbu_package<'a>(
-    constants: &'a [BbuConstant],
-    index: u32,
-) -> Result<(&'a str, &'a [u32]), TorclError> {
+fn bbu_package(constants: &[BbuConstant], index: u32) -> Result<(&str, &[u32]), TorclError> {
     match &constants[bbu_index(index, constants.len(), "package constant")?] {
         BbuConstant::Package {
             name_ref,
@@ -10457,7 +10531,7 @@ fn decode_bbu_function(
             0x2d => Instr::PopRestartCase,
             0x36 => Instr::PushEnvChild,
             0x37 => Instr::PopEnvChild,
-            0x3c | 0x3d | 0x3e => {
+            0x3c..=0x3e => {
                 let opcode = encoded.code[starts.last().copied().unwrap() as usize];
                 let name = bbu_string_from_values(constants, cursor.u32()?)?;
                 let index = names.len();
@@ -10638,9 +10712,7 @@ fn register_closure_control(closure: TorclVal, env: &Env) {
 
 /// The captured lexical block/tag scope for a closure, if any. Callers install it
 /// as the callee's `env.block_stack`/`env.tag_stack` on entry.
-fn closure_captured_control(
-    fn_val: TorclVal,
-) -> Option<(Vec<(String, String)>, Vec<(String, String)>)> {
+fn closure_captured_control(fn_val: TorclVal) -> Option<super::LexicalExitNames> {
     if !fn_val.is_heap_object() || !torcl_rt::function::is_interpreted_function(fn_val) {
         return None;
     }
@@ -11026,12 +11098,15 @@ pub(super) fn lazy_compile_defun(
     body: TorclVal,
     env: &super::Env,
 ) -> bool {
-    if REGISTRY.with(|r| r.borrow().contains_key(&sym)) {
+    if is_registered(sym) {
         return true;
     }
     if LAZY_DECLINED.with(|s| s.borrow().contains(&sym)) {
         return false;
     }
+    // is_registered refreshed this execution's generation. Macro expansion can
+    // run Lisp (including LOAD/DEFUN), so compilation is not a read-only phase.
+    let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
     reset_last_bail_reason();
     // First try the fast opportunistic (non-portable) lowering: enclosing
     // lexicals stay in activation slots and local calls use the gensym
@@ -11077,11 +11152,13 @@ pub(super) fn lazy_compile_defun(
         }
     };
     match compiled.filter(|function| !contains_load_time_values(function)) {
-        Some(bf) => {
-            registry_put(sym, Arc::new(bf));
-            true
-        }
+        Some(bf) => publish_bytecode(sym, Arc::new(bf), Some(generation)) || is_registered(sym),
         None => {
+            let registered = is_registered(sym);
+            let current = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
+            if generation != current {
+                return registered;
+            }
             trace_named(name, "lazy compile bailed", last_bail_reason().as_deref());
             LAZY_DECLINED.with(|s| s.borrow_mut().insert(sym));
             false
@@ -11642,7 +11719,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<TorclVal, TorclError> {
             } => {
                 bbu_string(&encoded_constants, *name_ref)?;
                 match (*package_ref, *kind) {
-                    (BBU_NO_INDEX, 0 | 1 | 2) => {}
+                    (BBU_NO_INDEX, 0..=2) => {}
                     (BBU_NO_INDEX, _) => {
                         return Err(bbu_error("external symbol has no package"));
                     }
@@ -12640,11 +12717,7 @@ fn bind_macro_variadic(
         } else {
             None
         };
-        if let Err(error) =
-            super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole, None)
-        {
-            return Err(error);
-        }
+        super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole, None)?;
         env.clear_mv();
         let current = Arc::clone(&env.frame);
         // See bind_variadic: re-derive lookup keys from the live params_form so
@@ -13259,7 +13332,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     record_call_site(func_ptr, call_bcp);
                 }
                 if is_arith_speculatable(sym) {
-                    record_type_profile(func_ptr, call_bcp, &args);
+                    record_type_profile(func_ptr, call_bcp, args);
                 }
 
                 // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
@@ -13293,7 +13366,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         let over_cap = NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap();
                         if let Some(nc) = native {
                             if !over_cap {
-                                match run_native(&nc, sym, &args, env) {
+                                match run_native(&nc, sym, args, env) {
                                     Ok(v) => {
                                         acts[top_idx].push_op(v);
                                         continue;
@@ -13309,7 +13382,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         // Native entry validates in `run_native`; the flat T0
                         // activation reaches no adapter, so enforce the same
                         // declaration contract here before binding its frame.
-                        if let Err(e) = validate_declared_args(&callee, &args) {
+                        if let Err(e) = validate_declared_args(&callee, args) {
                             let pending = error_to_pending(e, env);
                             initiate_unwind(acts, stack, env, pending)?;
                             continue;
@@ -13338,14 +13411,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         let env_frame = make_env_frame(&callee, Arc::clone(&env.frame));
                         if callee.variadic {
                             if let Err(e) =
-                                bind_variadic(&callee, frame, &args, env_frame.as_ref(), env)
+                                bind_variadic(&callee, frame, args, env_frame.as_ref(), env)
                             {
                                 stack.pop_frame();
                                 initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                                 continue;
                             }
                         } else {
-                            bind_params(&callee, frame, &args, env_frame.as_ref());
+                            bind_params(&callee, frame, args, env_frame.as_ref());
                         }
                         record_profiled_invocation(Arc::as_ptr(&callee) as usize);
                         acts.push(Activation {
@@ -13378,7 +13451,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 // `None` from either step falls through to the general path,
                 // which is always correct.
                 let direct = match super::direct_builtin_slot_memoized(sym, nargs as usize) {
-                    Some(slot) => super::call_direct_builtin(slot, &args, env),
+                    Some(slot) => super::call_direct_builtin(slot, args, env),
                     None => None,
                 };
                 if direct_builtin_stats_enabled() {
@@ -13389,7 +13462,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                match direct.unwrap_or_else(|| apply_function(fn_val, &args, env)) {
+                match direct.unwrap_or_else(|| apply_function(fn_val, args, env)) {
                     Ok(result) => acts[top_idx].push_op(result),
                     Err(e) => {
                         // Route the error through the bytecode unwind so
@@ -14230,13 +14303,28 @@ thread_local! {
     /// Captured lexical environment for the currently executing native
     /// activation. Nested native calls save/restore this just like NATIVE_ENV.
     static NATIVE_ENV_FRAME: RefCell<Option<Arc<SharedCell<EnvFrame>>>> = const { RefCell::new(None) };
-    /// The bytecode function whose OSR native code is currently running
-    /// (bliss-guck). OSR emits `sym == u32::MAX`, so env-var opcodes cannot map a
-    /// name index through `registry_get(sym)`; `native_env_name` falls back to
-    /// this function's `names`. Set by `run_native_osr` around the call (and
-    /// save/restored for nested OSR); null outside OSR. The pointee is kept alive
-    /// by the `Rc<OsrCode>` the caller holds for the whole native call.
-    static NATIVE_OSR_BF: std::cell::Cell<*const BytecodeFunction> = const { std::cell::Cell::new(std::ptr::null()) };
+    /// Metadata owner of the executing code, including a T1-to-T2 OSR entry.
+    static ACTIVE_NATIVE_CODE: std::cell::Cell<*const NativeCode> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+struct ActiveNativeCode<'a> {
+    previous: *const NativeCode,
+    _code: &'a NativeCode,
+}
+
+impl<'a> ActiveNativeCode<'a> {
+    fn enter(code: &'a NativeCode) -> Self {
+        Self {
+            previous: ACTIVE_NATIVE_CODE.with(|slot| slot.replace(code)),
+            _code: code,
+        }
+    }
+}
+
+impl Drop for ActiveNativeCode<'_> {
+    fn drop(&mut self) {
+        ACTIVE_NATIVE_CODE.with(|slot| slot.set(self.previous));
+    }
 }
 
 /// c2i adapter: call the interpreted function named by `sym` with `n` arguments
@@ -14391,29 +14479,17 @@ fn stash_native_error(error: TorclError) {
     });
 }
 
-fn native_env_name(function_sym: u64, name_index: u64) -> Option<String> {
-    if let Some(name) = registry_get(function_sym as u32)
-        .and_then(|body| body.names.get(name_index as usize).cloned())
-    {
-        return Some(name);
-    }
-    // OSR code is emitted with function_sym == u32::MAX, which is not a registry
-    // key. Fall back to the currently-running OSR function's names, published by
-    // run_native_osr (bliss-guck). The pointer is valid only while native OSR
-    // code is on the stack — exactly when this helper is reached from it.
-    let bf = NATIVE_OSR_BF.with(|c| c.get());
-    if bf.is_null() {
-        return None;
-    }
-    // SAFETY: run_native_osr holds the Rc<OsrCode> (hence the Arc<BytecodeFunction>)
-    // for the whole native call and sets/clears this pointer around it, so the
-    // pointee outlives every c2i callback made from that code.
-    let names: &[String] = unsafe { &(*bf).names };
+fn native_env_name(body: *const BytecodeFunction, name_index: u64) -> Option<String> {
+    // SAFETY: only emitted native code calls these environment adapters. It
+    // embeds its original body's address, retained by NativeCode/OsrCode for
+    // the whole call (including direct callees retained by their callers).
+    // Redefinition changes the registry, never this body's name table.
+    let names: &[String] = unsafe { &(*body).names };
     names.get(name_index as usize).cloned()
 }
 
-extern "C" fn c2i_load_env(function_sym: u64, name_index: u64) -> u64 {
-    let Some(name) = native_env_name(function_sym, name_index) else {
+extern "C" fn c2i_load_env(body: *const BytecodeFunction, name_index: u64) -> u64 {
+    let Some(name) = native_env_name(body, name_index) else {
         stash_native_error(TorclError::Internal(
             "native environment name vanished".into(),
         ));
@@ -14435,8 +14511,8 @@ extern "C" fn c2i_load_env(function_sym: u64, name_index: u64) -> u64 {
     })
 }
 
-extern "C" fn c2i_store_env(function_sym: u64, name_index: u64, value: u64) {
-    let Some(name) = native_env_name(function_sym, name_index) else {
+extern "C" fn c2i_store_env(body: *const BytecodeFunction, name_index: u64, value: u64) {
+    let Some(name) = native_env_name(body, name_index) else {
         stash_native_error(TorclError::Internal(
             "native environment name vanished".into(),
         ));
@@ -14453,8 +14529,8 @@ extern "C" fn c2i_store_env(function_sym: u64, name_index: u64, value: u64) {
     });
 }
 
-extern "C" fn c2i_define_env(function_sym: u64, name_index: u64, value: u64) {
-    let Some(name) = native_env_name(function_sym, name_index) else {
+extern "C" fn c2i_define_env(body: *const BytecodeFunction, name_index: u64, value: u64) {
+    let Some(name) = native_env_name(body, name_index) else {
         stash_native_error(TorclError::Internal(
             "native environment name vanished".into(),
         ));
@@ -14918,8 +14994,14 @@ thread_local! {
 }
 
 enum NativeDeoptResume {
-    Single { bcp: u32, sp_top: u16 },
-    Inlined(Vec<InlinedResumeScope>),
+    Single {
+        bcp: u32,
+        sp_top: u16,
+    },
+    Inlined {
+        scopes: Vec<InlinedResumeScope>,
+        metadata: Arc<T2InstalledMetadata>,
+    },
 }
 
 /// Slow poll reached by a T1 backward branch once per sampled batch. It never
@@ -14937,6 +15019,7 @@ enum NativeDeoptResume {
 ///    error would otherwise never be re-raised; or
 ///  - a new process signal (SIGTERM/SIGINT/…) is pending — stash it
 ///    (first-error-wins) so the Rust caller re-raises it.
+///
 /// Returns 0 to keep looping. Leaving early is observably equivalent to running
 /// to the function's return: `run_native`/`run_native_osr` re-raise the stashed
 /// error regardless; this only makes it prompt instead of never.
@@ -14971,7 +15054,12 @@ extern "C" fn c2i_osr_backedge() -> u64 {
     native_loop_should_exit()
 }
 
-extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64 {
+extern "C" fn c2i_t1_backedge(
+    sym: u64,
+    header_bcp: u64,
+    slots: *mut u64,
+    active_body: *const BytecodeFunction,
+) -> u64 {
     // A loop back-edge is the one place a hot NATIVE loop reliably re-enters
     // Rust, so it is where such a loop must poll for a pending signal or a
     // callee-stashed error — SIGTERM above all (bliss-7rdu): without a poll here,
@@ -14997,6 +15085,12 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     let Some(body) = registry_get(sym) else {
         return 0;
     };
+    // Redefinition affects future calls, not an already-running activation.
+    // Its code retains active_body; pointer identity is enough to decline a
+    // transition without dereferencing or attributing heat to the new body.
+    if Arc::as_ptr(&body) != active_body {
+        return 0;
+    }
     let fn_obj = torcl_rt::symbols::symbol_function(sym)
         .filter(|&v| torcl_rt::function::is_interpreted_function(v));
     if !profiling_disabled()
@@ -15023,7 +15117,12 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     let Some(t2) = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) else {
         return 0;
     };
-    if !t2.is_t2 {
+    if !t2.is_t2
+        || t2
+            .body
+            .as_ref()
+            .is_none_or(|body| Arc::as_ptr(body) != active_body)
+    {
         return 0;
     }
     let Some(&offset) = t2.osr_entries.get(&header_bcp) else {
@@ -15050,7 +15149,10 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     // SAFETY: the T2 emitter records only alternate entries having the same
     // `fn(*mut u64)->u64` ABI. `slots` is r14 from the still-live T1 frame.
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry) };
-    let result = f(slots);
+    let result = {
+        let _active = ActiveNativeCode::enter(&t2);
+        f(slots)
+    };
     // On normal completion the first operand slot is dead and carries the
     // result to T1's shared epilogue. On deopt, however, c2i_deopt_t2 may have
     // reconstructed a non-empty operand stack starting at this exact slot; do
@@ -15065,6 +15167,7 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
 
 struct InlinedResumeScope {
     function: u32,
+    body: Arc<BytecodeFunction>,
     bcp: u32,
     sp_top: u16,
     frame: *mut Frame,
@@ -15306,6 +15409,16 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
         return;
     }
 
+    let metadata = ACTIVE_NATIVE_CODE.with(|slot| {
+        // SAFETY: ActiveNativeCode retains a reference for the native call and
+        // restores the enclosing owner after nested calls or OSR return.
+        unsafe { slot.get().as_ref() }.and_then(|code| code.t2_metadata.clone())
+    });
+    let Some(metadata) = metadata else {
+        fail("T2 deopt has no active code metadata");
+        return;
+    };
+
     let words = unsafe { std::slice::from_raw_parts(buf, n_words as usize) };
     let mut at = 0usize;
     let mut pushed = 0usize;
@@ -15321,8 +15434,9 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
         let sp_top = words[at + 3] as usize;
         at += 4;
         let n_slots = n_locals.saturating_add(sp_top);
-        let Some(entry) = registry_get(function) else {
-            fail("T2 deopt function is absent from the bytecode registry");
+        let entry = metadata.deopt_bodies.get(&function).cloned();
+        let Some(entry) = entry else {
+            fail("T2 deopt function is absent from its compiled metadata");
             break;
         };
         if at + n_slots > words.len() || n_slots > entry.num_slots() as usize {
@@ -15365,6 +15479,7 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
         at += n_slots;
         scopes.push(InlinedResumeScope {
             function,
+            body: entry,
             bcp,
             sp_top: sp_top as u16,
             frame,
@@ -15378,7 +15493,7 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
     }
     NATIVE_DEOPT.with(|d| d.set(true));
     NATIVE_DEOPT_RESUME.with(|c| {
-        *c.borrow_mut() = Some(NativeDeoptResume::Inlined(scopes));
+        *c.borrow_mut() = Some(NativeDeoptResume::Inlined { scopes, metadata });
     });
 }
 
@@ -15386,6 +15501,12 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
 /// stack) lives in a TorclStack frame that the i2c adapter pushes; the native
 /// code addresses it through the frame-slot pointer passed in rdi (§D2.04).
 struct NativeCode {
+    /// The exact metadata and constant slots this machine code was built from.
+    /// Only synthetic signal-recovery test adapters have no bytecode body.
+    body: Option<Arc<BytecodeFunction>>,
+    /// A baked direct call can already be active when its name is redefined.
+    /// Keep that exact callee (and its transitive dependencies) alive.
+    _direct_calls: Vec<Rc<NativeCode>>,
     entry: *const u8,
     /// Length of the installed machine code, so `disassemble` can read the
     /// (R+X mapped) code bytes back for decoding.
@@ -15416,9 +15537,17 @@ struct NativeCode {
     /// no deopt point is eligible for a direct native→native call (bliss-zhvn)
     /// with no post-call deopt handling. Conservatively true when unknown.
     has_deopt: bool,
-    /// Owns the rooted constant-pool bodies whose slots T2 code loads
-    /// indirectly. `None` for T1, which loads registry-owned slots.
-    _t2_constants: Option<torcl_rt::CrossThreadRoot<T2InstalledConstants>>,
+    /// Owns original T2 constant slots and every deoptimization scope's body.
+    /// T1 uses the original `body` retained above.
+    t2_metadata: Option<Arc<T2InstalledMetadata>>,
+}
+
+struct NativeEmission {
+    code: Vec<u8>,
+    osr_entries: Vec<(u32, usize)>,
+    bcp_offsets: Vec<u32>,
+    has_deopt: bool,
+    direct_calls: Vec<Rc<NativeCode>>,
 }
 
 /// Build and register validated GC stack-map metadata for a T1 native function
@@ -15531,7 +15660,7 @@ fn decay_failed_speculation(func_ptr: usize, forced: Option<SpecType>) -> Vec<(u
     TYPE_PROFILE.with(|m| {
         for ((fp, bcp), p) in m.borrow_mut().iter_mut() {
             if *fp == func_ptr {
-                let spec = forced.or_else(|| {
+                let spec = forced.or({
                     if p.fixnum >= p.single_float && p.fixnum > 0 {
                         Some(SpecType::Fixnum)
                     } else if p.single_float > 0 {
@@ -15985,14 +16114,22 @@ impl torcl_rt::gc::TraceHostRoots for T2CompileInput {
     }
 }
 
-/// The minimal rooted ownership retained by installed T2 code. Keeping only
-/// bodies whose slots were actually emitted avoids pinning the full inlining
-/// snapshot for every compiled function.
-struct T2InstalledConstants {
-    bodies: Vec<std::sync::Arc<BytecodeFunction>>,
+/// The immutable Rust-only index can be read by a running mutator without
+/// acquiring the compiler-reader GC gate (a collector may already hold its
+/// write side while waiting for this mutator to reach a safepoint). The root
+/// handle separately protects the movable constants inside the indexed bodies.
+struct T2InstalledMetadata {
+    _roots: torcl_rt::CrossThreadRoot<T2InstalledBodies>,
+    deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
 }
 
-impl torcl_rt::gc::TraceHostRoots for T2InstalledConstants {
+/// Only bodies needed by emitted constants or recovery frames, each scanned
+/// once, rather than the full candidate inlining snapshot.
+struct T2InstalledBodies {
+    bodies: Vec<Arc<BytecodeFunction>>,
+}
+
+impl torcl_rt::gc::TraceHostRoots for T2InstalledBodies {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         for body in &self.bodies {
             // See T2CompileInput::trace_host_roots: collection excludes both
@@ -16017,7 +16154,8 @@ struct T2Artifact {
     emitted_safepoints: usize,
     root_sync_sites: Vec<torcl_compiler::t2::emit::RootSyncSite>,
     has_deopt: bool,
-    constant_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
+    rooted_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
+    deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
 }
 
 /// Validate the emitter's native-root synchronization contract before any T2
@@ -16577,6 +16715,10 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     // Bridge rooting from the worker through construction of the smaller
     // installed-code root below. The completion owns this handle until return.
     let _compilation_root = &done.input;
+    // Refresh the canonical definition before validating the local generation.
+    // Otherwise a worker can accept a job predating another thread's DEFUN,
+    // or record its decline against the replacement definition.
+    let bf = registry_get(done.sym)?;
     let current_generation =
         REGISTRY_GENERATION.with(|g| g.borrow().get(&done.sym).copied().unwrap_or(0));
     if current_generation != done.generation {
@@ -16602,14 +16744,16 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
     }
-    let bf = registry_get(done.sym)?;
     let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
     let code_info = install_stack_map(total_slots)?;
-    let rooted_constants = if artifact.constant_bodies.is_empty() {
+    let metadata = if artifact.rooted_bodies.is_empty() {
         None
     } else {
-        Some(torcl_rt::CrossThreadRoot::new(T2InstalledConstants {
-            bodies: std::mem::take(&mut artifact.constant_bodies),
+        Some(Arc::new(T2InstalledMetadata {
+            _roots: torcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+                bodies: std::mem::take(&mut artifact.rooted_bodies),
+            }),
+            deopt_bodies: std::mem::take(&mut artifact.deopt_bodies),
         }))
     };
     let buf = torcl_rt::jit::JitBuffer::new(&artifact.code)?;
@@ -16646,6 +16790,8 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         }
     }
     let nc = Rc::new(NativeCode {
+        body: Some(Arc::clone(&bf)),
+        _direct_calls: Vec::new(),
         entry,
         code_len: artifact.code.len(),
         is_t2: true,
@@ -16657,7 +16803,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         // Real value from the T2 emitter: a non-deopting T2 function is eligible
         // for a direct native→native call (bliss-zhvn).
         has_deopt: artifact.has_deopt,
-        _t2_constants: rooted_constants,
+        t2_metadata: metadata,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
     let fn_obj = torcl_rt::symbols::symbol_function(done.sym)
@@ -16823,7 +16969,7 @@ fn run_native(
     args: &[TorclVal],
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
-    let bf = registry_get(sym);
+    let bf = nc.body.clone();
     if let Some(body) = bf.as_ref() {
         validate_declared_args(body, args)?;
     }
@@ -16924,7 +17070,10 @@ fn run_native(
     // rsi = *mut TorclStack, stashed into the reserved r12 by the prologue
     // (bliss-zhvn Stage 1). Unused by the body yet; foundation for direct calls.
     let f: extern "C" fn(*mut u64, *const u8) -> u64 = unsafe { std::mem::transmute(nc.entry) };
-    let ret = f(slots, std::ptr::from_ref(stack) as *const u8);
+    let ret = {
+        let _active = ActiveNativeCode::enter(nc);
+        f(slots, std::ptr::from_ref(stack) as *const u8)
+    };
     torcl_rt::runtime::set_sigsegv_null_guard_recovery_ip(saved_null_recovery);
     torcl_rt::runtime::set_sigsegv_stack_guard_recovery_ip(saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
@@ -16950,93 +17099,103 @@ fn run_native(
     if deopt {
         DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         trace("native speculative deopt → interpreter");
-        // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
-        // the fast path stays installed. Repeated failures either indicate a
-        // supported numeric phase change (retire this version and recompile) or
-        // a genuinely unsupported domain (permanently blacklist speculation).
-        let n = DEOPT_COUNTS.with(|m| {
-            let mut b = m.borrow_mut();
-            let e = b.entry(sym).or_insert(0);
-            *e += 1;
-            *e
-        });
-        // Decay the profile once per promotion: the first deopt means the
-        // speculation was wrong for the current phase, so zero the type we bet on
-        // and let the new phase's samples take over quickly.
-        if PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym)) {
-            if let Some(bf) = registry_get(sym) {
-                // T1's optimistic arithmetic templates are always Fixnum. T2
-                // follows the profile that was dominant when it was compiled.
-                let forced = (!nc.is_t2).then_some(SpecType::Fixnum);
-                let failed = decay_failed_speculation(Arc::as_ptr(&bf) as usize, forced);
-                LAST_FAILED_SPECULATION.with(|m| {
-                    m.borrow_mut().insert(sym, failed);
-                });
-            }
-        }
-        let threshold_hit = n >= deopt_blacklist_threshold();
-        let phase_change = threshold_hit && supported_numeric_phase_change(sym);
-        // JFR-style event stream (bliss-ai8n): a speculation guard failed.
-        // Record the classified reason + running per-function count.
-        super::events::record(
-            super::events::EventKind::Deopt,
-            sym,
-            if phase_change {
-                super::events::DEOPT_PHASE_CHANGE
-            } else if threshold_hit {
-                super::events::DEOPT_BLACKLIST
-            } else {
-                super::events::DEOPT_GUARD
-            },
-            n as u64,
-        );
-        if t2_log_target().is_some() {
-            let nm = registry_get(sym)
-                .map(|b| b.name.clone())
-                .unwrap_or_default();
-            t2_log_write(format_args!(
-                "{nm}: native guard deopt #{n} => resuming interpreted{}",
-                if phase_change {
-                    " (threshold hit: supported numeric phase change => generic T1 + recompile)"
-                } else if threshold_hit {
-                    " (threshold hit: uninstall + blacklist => T0)"
-                } else {
-                    ""
+        // An obsolete activation may still fail a guard. Resume its original
+        // body, but do not retire or blacklist the replacement's native code.
+        let current = registry_get(sym);
+        if current
+            .as_ref()
+            .zip(bf.as_ref())
+            .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
+        {
+            // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
+            // the fast path stays installed. Repeated failures either indicate a
+            // supported numeric phase change (retire this version and recompile) or
+            // a genuinely unsupported domain (permanently blacklist speculation).
+            let n = DEOPT_COUNTS.with(|m| {
+                let mut b = m.borrow_mut();
+                let e = b.entry(sym).or_insert(0);
+                *e += 1;
+                *e
+            });
+            // Decay the profile once per promotion: the first deopt means the
+            // speculation was wrong for the current phase, so zero the type we bet on
+            // and let the new phase's samples take over quickly.
+            if PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym)) {
+                if let Some(bf) = bf.as_ref() {
+                    // T1's optimistic arithmetic templates are always Fixnum. T2
+                    // follows the profile that was dominant when it was compiled.
+                    let forced = (!nc.is_t2).then_some(SpecType::Fixnum);
+                    let failed = decay_failed_speculation(Arc::as_ptr(bf) as usize, forced);
+                    LAST_FAILED_SPECULATION.with(|m| {
+                        m.borrow_mut().insert(sym, failed);
+                    });
                 }
-            ));
-        }
-        if phase_change {
-            // The current T2 assumptions are stale, but native execution itself
-            // is profitable. Replace it immediately with non-speculating T1 so
-            // subsequent calls stay native while dispatch queues a profile-led
-            // replacement T2 version.
-            NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
-            T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
-            DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
-            PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
-            LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
-            let fn_obj = torcl_rt::symbols::symbol_function(sym)
-                .filter(|&value| torcl_rt::function::is_interpreted_function(value));
-            if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
-                publish_native(sym, fn_obj, &fallback);
-                trace("stale numeric specialization retired → generic T1");
-            } else if let Some(function) = fn_obj {
-                torcl_rt::function::set_tier(function, 0);
             }
-        } else if threshold_hit {
-            NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
-            DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
-            if let Some(function) = torcl_rt::symbols::symbol_function(sym)
-                .filter(|&value| torcl_rt::function::is_interpreted_function(value))
-            {
-                torcl_rt::function::set_tier(function, 0);
+            let threshold_hit = n >= deopt_blacklist_threshold();
+            let phase_change = threshold_hit && supported_numeric_phase_change(sym);
+            // JFR-style event stream (bliss-ai8n): a speculation guard failed.
+            // Record the classified reason + running per-function count.
+            super::events::record(
+                super::events::EventKind::Deopt,
+                sym,
+                if phase_change {
+                    super::events::DEOPT_PHASE_CHANGE
+                } else if threshold_hit {
+                    super::events::DEOPT_BLACKLIST
+                } else {
+                    super::events::DEOPT_GUARD
+                },
+                n as u64,
+            );
+            if t2_log_target().is_some() {
+                let nm = registry_get(sym)
+                    .map(|b| b.name.clone())
+                    .unwrap_or_default();
+                t2_log_write(format_args!(
+                    "{nm}: native guard deopt #{n} => resuming interpreted{}",
+                    if phase_change {
+                        " (threshold hit: supported numeric phase change => generic T1 + recompile)"
+                    } else if threshold_hit {
+                        " (threshold hit: uninstall + blacklist => T0)"
+                    } else {
+                        ""
+                    }
+                ));
             }
-            trace("t1 speculation blacklisted → staying T0");
+            if phase_change {
+                // The current T2 assumptions are stale, but native execution itself
+                // is profitable. Replace it immediately with non-speculating T1 so
+                // subsequent calls stay native while dispatch queues a profile-led
+                // replacement T2 version.
+                NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+                bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+                T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+                DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
+                PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
+                LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+                let fn_obj = torcl_rt::symbols::symbol_function(sym)
+                    .filter(|&value| torcl_rt::function::is_interpreted_function(value));
+                if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
+                    publish_native(sym, fn_obj, &fallback);
+                    trace("stale numeric specialization retired → generic T1");
+                } else if let Some(function) = fn_obj {
+                    torcl_rt::function::set_tier(function, 0);
+                }
+            } else if threshold_hit {
+                NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+                bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+                DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
+                if let Some(function) = torcl_rt::symbols::symbol_function(sym)
+                    .filter(|&value| torcl_rt::function::is_interpreted_function(value))
+                {
+                    torcl_rt::function::set_tier(function, 0);
+                }
+                trace("t1 speculation blacklisted → staying T0");
+            }
         }
-        let entry = registry_get(sym)
-            .ok_or_else(|| TorclError::Internal("deopt: bytecode function vanished".into()))?;
+        let entry = bf.ok_or_else(|| {
+            TorclError::Internal("deopt: native code has no bytecode body".into())
+        })?;
         if let Some(resume) = resume {
             return match resume {
                 NativeDeoptResume::Single { bcp, sp_top } => {
@@ -17047,11 +17206,11 @@ fn run_native(
                     // owns the frame's lifecycle from here (do NOT pop it first).
                     resume_in_t0(entry, frame, bcp, sp_top, sym, env_frame, env)
                 }
-                NativeDeoptResume::Inlined(scopes) => {
+                NativeDeoptResume::Inlined { scopes, metadata } => {
                     if std::env::var_os("TORCL_DEOPT_PATH_DBG").is_some() {
                         eprintln!("[deopt-path] Inlined sym={sym} scopes={}", scopes.len());
                     }
-                    resume_inlined_in_t0(scopes, env)
+                    resume_inlined_in_t0(scopes, metadata, env)
                 }
             };
         }
@@ -17106,6 +17265,7 @@ fn resume_in_t0(
         fn_obj,
         sym,
     }];
+    torcl_rt::rooted_ref!(_acts_root = &mut acts);
     let result = run_loop(&mut acts, env);
     while !acts.is_empty() {
         stack.pop_frame();
@@ -17192,14 +17352,13 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
 /// through the same activation chain an uninlined execution would have used.
 fn resume_inlined_in_t0(
     scopes: Vec<InlinedResumeScope>,
+    _metadata: Arc<T2InstalledMetadata>,
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
     let stack = torcl_rt::current_thread().stack();
     let mut acts = Vec::with_capacity(scopes.len());
     for scope in scopes {
-        let entry = registry_get(scope.function).ok_or_else(|| {
-            TorclError::Internal("deopt: inlined bytecode function vanished".into())
-        })?;
+        let entry = scope.body;
         let handlers = rebuild_resume_handlers(&entry, scope.bcp, env);
         let fn_obj = torcl_rt::symbols::symbol_function(scope.function)
             .filter(|&v| torcl_rt::function::is_interpreted_function(v));
@@ -17217,6 +17376,7 @@ fn resume_inlined_in_t0(
             sym: scope.function,
         });
     }
+    torcl_rt::rooted_ref!(_acts_root = &mut acts);
     let result = run_loop(&mut acts, env);
     while !acts.is_empty() {
         stack.pop_frame();
@@ -17413,7 +17573,9 @@ fn emit_native_x86(
     sym: u32,
     backedge_counter: u64,
     allow_traps: bool,
-) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>, bool)> {
+) -> Option<NativeEmission> {
+    let mut direct_calls = Vec::new();
+    let mut can_osr_to_t2 = false;
     macro_rules! decline_t1 {
         ($($reason:tt)*) => {{
             // Unified logging (bliss-89rd): tag "compile".
@@ -17452,9 +17614,12 @@ fn emit_native_x86(
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
-    let load_env_addr = c2i_load_env as extern "C" fn(u64, u64) -> u64 as usize as u64;
-    let store_env_addr = c2i_store_env as extern "C" fn(u64, u64, u64) as usize as u64;
-    let define_env_addr = c2i_define_env as extern "C" fn(u64, u64, u64) as usize as u64;
+    let load_env_addr =
+        c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
+    let store_env_addr =
+        c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+    let define_env_addr =
+        c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
     let push_env_addr = c2i_push_env_child as extern "C" fn() as usize as u64;
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
@@ -17465,8 +17630,9 @@ fn emit_native_x86(
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
     let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
-    let t2_backedge_addr =
-        c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64 as usize as u64;
+    let t2_backedge_addr = c2i_t1_backedge
+        as extern "C" fn(u64, u64, *mut u64, *const BytecodeFunction) -> u64
+        as usize as u64;
     let osr_backedge_addr = c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64;
     let values_sym = resolve_sym("VALUES")?.as_symbol_index();
 
@@ -17887,9 +18053,12 @@ fn emit_native_x86(
                 // on success it jumps past c2i to `direct_after`.
                 let mut direct_after: Option<Label> = None;
                 if nn_direct_enabled() {
-                    if let (Some(cnc), Some(cbf)) = (
-                        NATIVE_REGISTRY.with(|r| r.borrow().get(sym).cloned()),
+                    // Capture the guard before lookup: a concurrent replacement
+                    // must not stamp an old target with its newer generation.
+                    let baked_gen = direct_call_gen();
+                    if let (Some(cbf), Some(cnc)) = (
                         registry_get(*sym),
+                        NATIVE_REGISTRY.with(|r| r.borrow().get(sym).cloned()),
                     ) {
                         let fixed = !cbf.variadic
                             && cbf.max_args == Some(cbf.min_args)
@@ -17922,8 +18091,6 @@ fn emit_native_x86(
                             );
                             let slow = c.label();
                             let after = c.label();
-                            let baked_gen =
-                                DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed);
                             emit_direct_native_call(
                                 &mut c,
                                 cnc.entry as u64,
@@ -17933,6 +18100,7 @@ fn emit_native_x86(
                                 baked_gen,
                                 slow,
                             );
+                            direct_calls.push(cnc);
                             c.jmp(after);
                             c.bind(slow);
                             direct_after = Some(after);
@@ -17968,7 +18136,7 @@ fn emit_native_x86(
                 let profile_site = if direct_builtin.is_some() {
                     DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed)
                 } else if registry_get(*sym).is_some() {
-                    call_site_profile_token(bf as *const BytecodeFunction as usize, bcp as u32)
+                    call_site_profile_token(bf as *const BytecodeFunction as usize, bcp)
                 } else {
                     0
                 };
@@ -18039,14 +18207,12 @@ fn emit_native_x86(
                 c.extend_from_slice(&clear_mv_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
             }
-            // Env-var opcodes resolve their name at runtime via
-            // native_env_name(sym, idx). OSR bakes sym == u32::MAX (not a
-            // registry key), so native_env_name falls back to the running OSR
-            // function's names via NATIVE_OSR_BF (bliss-guck) — the invoke path
-            // carries the real sym. Either way the native call is correct.
+            // Name indexes belong to this exact code version, not the current
+            // symbol definition. NativeCode/OsrCode retain this body even after
+            // redefinition, for invocation and OSR entries alike.
             Instr::LoadEnvVar(name_idx) => {
-                c.push(0xBF); // mov edi, function symbol
-                c.extend_from_slice(&sym.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, original body
+                c.extend_from_slice(&(std::ptr::from_ref(bf) as u64).to_le_bytes());
                 c.push(0xBE); // mov esi, name index
                 c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -18056,8 +18222,8 @@ fn emit_native_x86(
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
                 pop_into(&mut c, 2, false); // value -> rdx
-                c.push(0xBF); // mov edi, function symbol
-                c.extend_from_slice(&sym.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, original body
+                c.extend_from_slice(&(std::ptr::from_ref(bf) as u64).to_le_bytes());
                 c.push(0xBE); // mov esi, name index
                 c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -18181,11 +18347,14 @@ fn emit_native_x86(
                     c.jcc(Cc::L, keep);
                     c.extend_from_slice(&[0xC7, 0x00, 0, 0, 0, 0]); // reset sample
                     if sym != u32::MAX {
+                        can_osr_to_t2 = true;
                         c.push(0xBF); // mov edi,sym
                         c.extend_from_slice(&sym.to_le_bytes());
                         c.push(0xBE); // mov esi,header bcp
                         c.extend_from_slice(&target_bcp.to_le_bytes());
                         c.extend_from_slice(&[0x4C, 0x89, 0xF2]); // mov rdx,r14 slots
+                        c.extend_from_slice(&[0x48, 0xB9]); // mov rcx,original body
+                        c.extend_from_slice(&(std::ptr::from_ref(bf) as u64).to_le_bytes());
                         c.extend_from_slice(&[0x48, 0xB8]);
                         c.extend_from_slice(&t2_backedge_addr.to_le_bytes());
                     } else {
@@ -18301,10 +18470,10 @@ fn emit_native_x86(
     // run_native resumes T0 at exactly that `CallNamed` instead of re-running the
     // whole function. rsp is 16-aligned here (as at any CallNamed), so the call
     // is well-formed. The value returned through the epilogue is ignored.
-    // Whether this code contains any speculation-guard deopt point. A callee
-    // with no deopt point can be direct-called (bliss-zhvn Stage 2) without a
-    // post-call deopt check, since it can never mid-flight resume to T0.
-    let has_deopt = !deopt_labels.is_empty();
+    // Even a non-speculating T1 loop can enter T2 and fail a guard there.
+    // Such a callee needs the c2i recovery boundary: a bare direct call would
+    // pop its reconstructed frame and lose the caller's continuation.
+    let has_deopt = !deopt_labels.is_empty() || can_osr_to_t2;
     if !deopt_labels.is_empty() {
         let tail = c.label();
         c.bind(tail);
@@ -18354,7 +18523,13 @@ fn emit_native_x86(
         .iter()
         .map(|&l| c.label_offset(l).map_or(u32::MAX, |o| o as u32))
         .collect();
-    Some((c.finish()?, osr_entries, bcp_offsets, has_deopt))
+    Some(NativeEmission {
+        code: c.finish()?,
+        osr_entries,
+        bcp_offsets,
+        has_deopt,
+        direct_calls,
+    })
 }
 
 /// Calls that NEVER return normally, so T1 deopts rather than compiling them
@@ -18559,7 +18734,7 @@ fn emit_native_x86(
     _sym: u32,
     _backedge_counter: u64,
     _allow_traps: bool,
-) -> Option<(Vec<u8>, Vec<(u32, usize)>, Vec<u32>, bool)> {
+) -> Option<NativeEmission> {
     None
 }
 
@@ -18605,8 +18780,13 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // unsupported opcode sits BEFORE any loop — trapping there would deopt
     // immediately every call. Decline instead, keeping such functions at T0 for
     // top-level calls (the OSR path below still traps to compile their loops).
-    let (code, _osr, bcp_offsets, has_deopt) =
-        emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
+    let NativeEmission {
+        code,
+        bcp_offsets,
+        has_deopt,
+        direct_calls,
+        ..
+    } = emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -18618,6 +18798,8 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
+        body: Some(bf),
+        _direct_calls: direct_calls,
         entry,
         code_len: code.len(),
         is_t2: false,
@@ -18627,7 +18809,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         bcp_offsets,
         code_info,
         has_deopt,
-        _t2_constants: None,
+        t2_metadata: None,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
@@ -18846,7 +19028,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             return None;
         }
     };
-    let mut constant_bodies = Vec::new();
+    let mut rooted_bodies = Vec::new();
     for &slot in &framed.heap_constant_slots {
         let owner = std::iter::once(&input.body)
             .chain(input.inline_bodies.iter().map(|saved| &saved.body))
@@ -18855,11 +19037,38 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             t2_log!("{name}: emitted heap constant has no rooted owner => stay T1");
             return None;
         };
-        if !constant_bodies
+        if !rooted_bodies
             .iter()
             .any(|body| std::sync::Arc::ptr_eq(body, owner))
         {
-            constant_bodies.push(std::sync::Arc::clone(owner));
+            rooted_bodies.push(std::sync::Arc::clone(owner));
+        }
+    }
+    let mut deopt_bodies = HashMap::new();
+    if framed.has_deopt {
+        for (_, state) in f.frame_states.iter() {
+            for scope in &state.scopes {
+                if deopt_bodies.contains_key(&scope.function) {
+                    continue;
+                }
+                let owner = if scope.function == sym {
+                    &input.body
+                } else {
+                    let Some(saved) = input
+                        .inline_bodies
+                        .iter()
+                        .find(|saved| saved.symbol == scope.function)
+                    else {
+                        t2_log!("{name}: deopt scope has no source snapshot => stay T1");
+                        return None;
+                    };
+                    &saved.body
+                };
+                if !rooted_bodies.iter().any(|body| Arc::ptr_eq(body, owner)) {
+                    rooted_bodies.push(Arc::clone(owner));
+                }
+                deopt_bodies.insert(scope.function, Arc::clone(owner));
+            }
         }
     }
     let code = framed.code;
@@ -18887,7 +19096,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         emitted_safepoints: framed.emitted_safepoints,
         root_sync_sites: framed.root_sync_sites,
         has_deopt: framed.has_deopt,
-        constant_bodies,
+        rooted_bodies,
+        deopt_bodies,
     })
 }
 
@@ -18903,7 +19113,7 @@ fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> boo
     let Some(end) = start.checked_add(bytes) else {
         return false;
     };
-    slot >= start && slot < end && (slot - start).is_multiple_of(std::mem::size_of::<TorclVal>())
+    slot >= start && slot < end && (slot - start) % std::mem::size_of::<TorclVal>() == 0
 }
 
 /// Installed OSR code for a function (bliss-izt.1): a non-speculating native
@@ -18911,22 +19121,25 @@ fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> boo
 /// entry stub that jumps into that header. Shares the frame/GC layout with the
 /// normal native tier (same `num_slots`/stack map).
 struct OsrCode {
+    _direct_calls: Vec<Rc<NativeCode>>,
     entry: *const u8,
     num_slots: u16,
     code_info: &'static CodeInfo,
     /// header bcp → entry-stub byte offset from `entry`.
     entries: std::collections::HashMap<u32, usize>,
-    /// The bytecode function this OSR code was compiled from (bliss-guck). OSR
-    /// emits `sym == u32::MAX`, so env-var opcodes cannot resolve their name via
-    /// `registry_get(sym).names`; holding the `bf` here (a) keeps its `names`
-    /// alive for the code's lifetime and (b) lets `run_native_osr` publish it
-    /// through `NATIVE_OSR_BF` so `native_env_name` can resolve names directly.
+    /// Retains the original constants and environment names embedded in code.
     bf: Arc<BytecodeFunction>,
+}
+
+struct OsrCompilation {
+    /// Identifies declined compilations too, without keeping retired bodies alive.
+    body: std::sync::Weak<BytecodeFunction>,
+    code: Option<Rc<OsrCode>>,
 }
 
 thread_local! {
     /// Compiled OSR code per function symbol (bliss-izt.1).
-    static OSR_REGISTRY: RefCell<HashMap<u32, Option<Rc<OsrCode>>>> =
+    static OSR_REGISTRY: RefCell<HashMap<u32, OsrCompilation>> =
         RefCell::new(HashMap::new());
     /// Compiled OSR code for ANONYMOUS activations (top-level forms, gensym
     /// lambdas) that have no registry symbol, keyed by the bytecode function's
@@ -19007,15 +19220,28 @@ fn osr_traps_enabled() -> bool {
     *E.get_or_init(|| std::env::var_os("TORCL_OSR_TRAPS").is_some())
 }
 
-/// Compile (once, memoized) a non-speculating native version of `sym` with OSR
-/// entry stubs. Returns `None` if it can't be compiled (cached so we don't retry
-/// every back-edge).
-fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
-    if let Some(cached) = OSR_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
+/// Compile the running activation's body, not a possibly newer definition of
+/// its name. Both successful and declined compilations are version-specific.
+fn compile_osr(sym: u32, body: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
+    let cached = OSR_REGISTRY.with(|r| {
+        let registry = r.borrow();
+        let cached = registry.get(&sym)?;
+        let cached_body = cached.body.upgrade()?;
+        Arc::ptr_eq(&cached_body, body).then(|| cached.code.clone())
+    });
+    if let Some(cached) = cached {
         return cached;
     }
-    let result = registry_get(sym).and_then(|bf| compile_osr_code(&bf, sym));
-    OSR_REGISTRY.with(|r| r.borrow_mut().insert(sym, result.clone()));
+    let result = compile_osr_code(body, sym);
+    OSR_REGISTRY.with(|r| {
+        r.borrow_mut().insert(
+            sym,
+            OsrCompilation {
+                body: Arc::downgrade(body),
+                code: result.clone(),
+            },
+        );
+    });
     result
 }
 
@@ -19071,7 +19297,12 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     if std::env::var_os("TORCL_OSR_DEBUG").is_some() && emitted.is_none() {
         eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
     }
-    let (code, osr, _bcp_offsets, _has_deopt) = emitted?;
+    let NativeEmission {
+        code,
+        osr_entries: osr,
+        direct_calls,
+        ..
+    } = emitted?;
     if osr.is_empty() {
         if std::env::var_os("TORCL_OSR_DEBUG").is_some() {
             eprintln!("[osr] osr map empty (no loop entry) for sym {sym}");
@@ -19085,6 +19316,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
     Some(Rc::new(OsrCode {
+        _direct_calls: direct_calls,
         entry,
         num_slots,
         code_info,
@@ -19131,9 +19363,6 @@ fn run_native_osr(
     // functions that previously declined).
     let saved_env_frame =
         NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
-    // Publish this OSR function's bf so env-var opcodes can resolve their name
-    // (OSR bakes sym == u32::MAX; bliss-guck). osr.bf keeps it alive for the call.
-    let saved_osr_bf = NATIVE_OSR_BF.with(|c| c.replace(Arc::as_ptr(&osr.bf)));
     let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_DEOPT.with(|d| d.set(false));
     let entry_addr = osr.entry as usize + stub_off;
@@ -19148,7 +19377,6 @@ fn run_native_osr(
     );
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
-    NATIVE_OSR_BF.with(|c| c.set(saved_osr_bf));
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
@@ -19216,7 +19444,7 @@ fn maybe_osr(
             if torcl_rt::function::back_edge_count(fn_obj) < osr_threshold() {
                 return None;
             }
-            match compile_osr(act.sym) {
+            match compile_osr(act.sym, &act.func) {
                 Some(o) => o,
                 None => {
                     if dbg {
@@ -19248,6 +19476,7 @@ fn maybe_osr(
             }
         }
     };
+    debug_assert!(Arc::ptr_eq(&osr.bf, &act.func));
     let stub_off = match osr.entries.get(&target_bcp) {
         Some(&s) => s,
         None => {
@@ -19626,6 +19855,366 @@ fn symbol_index_of(name: &str) -> Option<u32> {
 mod direct_call_invalidation_tests {
     use super::*;
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn native_caller_handles_callee_osr_deoptimization() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let callee_symbol = torcl_rt::symbols::intern("OSR-DIRECT-CALLEE");
+        let caller_symbol = torcl_rt::symbols::intern("OSR-DIRECT-CALLER");
+        // Establish the Lisp name before lowering the caller; native bodies
+        // are installed explicitly below to control the tier transition order.
+        super::super::read_eval_all_env("(defun osr-direct-callee () nil)", &mut env).unwrap();
+        let iterations = t2_backedge_threshold() * 3;
+        torcl_rt::rooted!(
+            form = reader::read_from_string(&format!(
+                "((let ((sum 1152921504606846975) (i 0)) (block done (tagbody top
+                (if (>= i {iterations}) (return-from done sum))
+                (setq sum (+ sum 1)) (setq i (+ i 1)) (go top)))))"
+            ))
+            .unwrap()
+            .0
+        );
+        let body = compile_function("OSR-DIRECT-CALLEE", NIL, *form, &env, false, false)
+            .expect("compile loop with eventual guard failure");
+        registry_put(callee_symbol, Arc::new(body));
+        let callee = try_promote_to_t1_with_speculation(callee_symbol, false)
+            .expect("select non-speculating T1 loop");
+        *form = reader::read_from_string("((+ (osr-direct-callee) 7))")
+            .unwrap()
+            .0;
+        let caller = compile_function("OSR-DIRECT-CALLER", NIL, *form, &env, false, false)
+            .expect("compile caller");
+        registry_put(caller_symbol, Arc::new(caller));
+        let caller = try_promote_to_t1_with_speculation(caller_symbol, false)
+            .expect("compile native caller");
+        let bytes = unsafe { std::slice::from_raw_parts(caller.entry, caller.code_len) };
+        let direct = bytes
+            .windows(8)
+            .any(|window| window == (callee.entry as u64).to_le_bytes());
+        eprintln!(
+            "caller embeds T1 callee: {direct}; callee.has_deopt={}",
+            callee.has_deopt
+        );
+        assert_eq!(
+            direct, !callee.has_deopt,
+            "must exercise the native eligibility decision"
+        );
+
+        let input = snapshot_t2_input(callee_symbol, 0).expect("snapshot callee");
+        let generation = input.generation;
+        let input = torcl_rt::CrossThreadRoot::new(input);
+        let artifact = input
+            .with_gc_stable(compile_t2_artifact)
+            .expect("compile callee T2");
+        let replacement = install_t2_completion(T2Completion {
+            sym: callee_symbol,
+            generation,
+            artifact: Some(artifact),
+            input,
+        })
+        .expect("install callee T2 after caller emission");
+        assert!(!replacement.osr_entries.is_empty());
+        assert!(replacement.num_slots <= callee.num_slots);
+        let before = deopt_count();
+        torcl_rt::rooted!(
+            answer = run_native(&caller, caller_symbol, &[], &mut env)
+                .expect("callee deoptimization must preserve the caller frame")
+        );
+        let mut printed = String::new();
+        super::super::print_val(*answer, &mut printed);
+        assert_eq!(
+            printed,
+            (1152921504606846975u64 + u64::from(iterations) + 7).to_string()
+        );
+        assert!(deopt_count() > before, "must actually fail a T2 guard");
+        registry_remove(caller_symbol);
+        registry_remove(callee_symbol);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn active_t1_loop_cannot_enter_replacement_t2_code() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let symbol = torcl_rt::symbols::intern("NATIVE-LOOP-VERSION");
+        let iterations = t2_backedge_threshold() * 3;
+        torcl_rt::rooted!(
+            form = reader::read_from_string(&format!(
+                "((let ((sum 0) (i 0)) (block done (tagbody top
+                (if (>= i {iterations}) (return-from done sum))
+                (setq sum (+ sum 1)) (setq i (+ i 1)) (go top)))))"
+            ))
+            .unwrap()
+            .0
+        );
+        let body = compile_function("NATIVE-LOOP-VERSION", NIL, *form, &env, false, false)
+            .expect("compile original loop");
+        registry_put(symbol, Arc::new(body));
+        let original =
+            try_promote_to_t1_with_speculation(symbol, true).expect("select original T1 loop");
+
+        *form = reader::read_from_string(&format!(
+            "((let ((sum 0) (i 0)) (block done (tagbody top
+                (if (>= i {iterations}) (return-from done sum))
+                (setq sum (+ sum 7)) (setq i (+ i 1)) (go top)))))"
+        ))
+        .unwrap()
+        .0;
+        let replacement = compile_function("NATIVE-LOOP-VERSION", NIL, *form, &env, false, false)
+            .expect("compile replacement loop");
+        registry_put(symbol, Arc::new(replacement));
+        let input = snapshot_t2_input(symbol, 0).expect("snapshot replacement");
+        let generation = input.generation;
+        let input = torcl_rt::CrossThreadRoot::new(input);
+        let artifact = input
+            .with_gc_stable(compile_t2_artifact)
+            .expect("compile real replacement T2 code");
+        let replacement = install_t2_completion(T2Completion {
+            sym: symbol,
+            generation,
+            artifact: Some(artifact),
+            input,
+        })
+        .expect("install replacement T2 code");
+        assert!(
+            !replacement.osr_entries.is_empty(),
+            "must have a real OSR target"
+        );
+        assert!(
+            replacement.num_slots <= original.num_slots,
+            "must reach version check, not frame-size refusal"
+        );
+        assert_eq!(
+            run_native(&replacement, symbol, &[], &mut env).unwrap(),
+            TorclVal::from_fixnum(i64::from(iterations) * 7)
+        );
+        assert_eq!(
+            run_native(&original, symbol, &[], &mut env).unwrap(),
+            TorclVal::from_fixnum(i64::from(iterations)),
+            "T1 backedges must not transfer an old activation into a new definition"
+        );
+        registry_remove(symbol);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn selected_native_code_uses_its_original_environment_names() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let old_name = torcl_rt::symbols::intern("NATIVE-ENV-OLD");
+        let new_name = torcl_rt::symbols::intern("NATIVE-ENV-NEW");
+        env.define_local_symbol(
+            TorclVal::from_symbol_index(old_name),
+            TorclVal::from_fixnum(11),
+        );
+        env.define_local_symbol(
+            TorclVal::from_symbol_index(new_name),
+            TorclVal::from_fixnum(29),
+        );
+        torcl_rt::rooted!(form = reader::read_from_string("(11)").unwrap().0);
+        let mut body = compile_function("NATIVE-ENV-VERSION", NIL, *form, &env, false, false)
+            .expect("compile native frame shape");
+        // Exercise the native environment opcode itself: the same name index
+        // deliberately denotes different bindings in the two code versions.
+        body.has_env = true;
+        body.names = vec!["NATIVE-ENV-OLD".into()];
+        body.code = vec![Instr::LoadEnvVar(0), Instr::Return];
+        let mut replacement = body.clone();
+        replacement.names = vec!["NATIVE-ENV-NEW".into()];
+        let symbol = torcl_rt::symbols::intern("NATIVE-ENV-VERSION");
+        registry_put(symbol, Arc::new(body));
+        let original = try_promote_to_t1_with_speculation(symbol, false).unwrap();
+        registry_put(symbol, Arc::new(replacement));
+        let replacement = try_promote_to_t1_with_speculation(symbol, false).unwrap();
+        assert_eq!(
+            run_native(&replacement, symbol, &[], &mut env).unwrap(),
+            TorclVal::from_fixnum(29)
+        );
+        assert_eq!(
+            run_native(&original, symbol, &[], &mut env).unwrap(),
+            TorclVal::from_fixnum(11),
+            "an old activation must not resolve its indexes through replacement metadata"
+        );
+        registry_remove(symbol);
+        assert_eq!(
+            run_native(&original, symbol, &[], &mut env).unwrap(),
+            TorclVal::from_fixnum(11)
+        );
+    }
+
+    #[test]
+    fn lazy_compilation_cannot_overwrite_a_definition_loaded_by_its_macro() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        let path = std::env::temp_dir().join(format!(
+            "torcl-lazy-publication-{}.lisp",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "(defun lazy-publication-probe () (loop repeat 1 do nil) 29)",
+        )
+        .unwrap();
+        super::super::read_eval_all_env(
+            &format!(
+                "(defmacro replace-lazy-publication () (load {:?}) 11)",
+                path.to_str().unwrap()
+            ),
+            &mut env,
+        )
+        .unwrap();
+        let symbol = torcl_rt::symbols::intern("LAZY-PUBLICATION-PROBE");
+        registry_remove(symbol);
+        torcl_rt::rooted!(
+            body = reader::read_from_string("((replace-lazy-publication))")
+                .unwrap()
+                .0
+        );
+        lazy_compile_defun(symbol, "LAZY-PUBLICATION-PROBE", NIL, *body, &env);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            super::super::read_eval_all_env("(lazy-publication-probe)", &mut env).unwrap(),
+            TorclVal::from_fixnum(29),
+            "compilation of the old body must not overwrite the newer definition"
+        );
+        registry_remove(symbol);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn selected_native_code_retains_its_original_bytecode_body() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        torcl_rt::rooted!(form = reader::read_from_string("(11)").unwrap().0);
+        let body = Arc::new(
+            compile_function("NATIVE-BODY-OWNER-PROBE", NIL, *form, &env, false, false)
+                .expect("compile native body"),
+        );
+        let weak_body = Arc::downgrade(&body);
+        let symbol = torcl_rt::symbols::intern("NATIVE-BODY-OWNER-PROBE");
+        registry_put(symbol, body);
+        let native = try_promote_to_t1_with_speculation(symbol, false)
+            .expect("select native code before redefinition");
+        registry_remove(symbol);
+        assert!(
+            weak_body.upgrade().is_some(),
+            "selected native code must own the source of its raw constant/body pointers"
+        );
+        assert_eq!(
+            run_native(&native, symbol, &[], &mut env).unwrap(),
+            TorclVal::from_fixnum(11)
+        );
+        drop(native);
+        assert!(
+            weak_body.upgrade().is_none(),
+            "retired body is not immortal"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn direct_native_caller_retains_its_embedded_callee() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        torcl_rt::rooted!(form = reader::read_from_string("(11)").unwrap().0);
+        let leaf = compile_function("DIRECT-BODY-LEAF", NIL, *form, &env, false, false)
+            .expect("compile native leaf");
+        let callee_symbol = torcl_rt::symbols::intern("DIRECT-BODY-LEAF");
+        let caller_symbol = torcl_rt::symbols::intern("DIRECT-BODY-CALLER");
+        let mut caller = leaf.clone();
+        caller.name = "DIRECT-BODY-CALLER".into();
+        caller.code = vec![
+            Instr::CallNamed {
+                sym: callee_symbol,
+                nargs: 0,
+            },
+            Instr::Return,
+        ];
+        registry_put(callee_symbol, Arc::new(leaf));
+        let callee = try_promote_to_t1_with_speculation(callee_symbol, false)
+            .expect("compile direct-call target");
+        let weak_callee = Rc::downgrade(&callee);
+        registry_put(caller_symbol, Arc::new(caller));
+        let caller = try_promote_to_t1_with_speculation(caller_symbol, false)
+            .expect("compile direct caller");
+        let bytes = unsafe { std::slice::from_raw_parts(caller.entry, caller.code_len) };
+        assert!(
+            bytes
+                .windows(8)
+                .any(|window| window == (callee.entry as u64).to_le_bytes()),
+            "test must cover an embedded direct call, not the c2i fallback"
+        );
+        drop(callee);
+        registry_remove(callee_symbol);
+        registry_remove(caller_symbol);
+        assert!(
+            weak_callee.upgrade().is_some(),
+            "a direct caller must retain the exact callee embedded in its machine code"
+        );
+        drop(caller);
+        assert!(
+            weak_callee.upgrade().is_none(),
+            "dependency dies with its caller"
+        );
+    }
+
+    #[test]
+    fn stale_t2_decline_does_not_poison_a_definition_replaced_on_another_thread() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        torcl_rt::rooted!(form = reader::read_from_string("(11)").unwrap().0);
+        let body = Arc::new(
+            compile_function("STALE-T2-THREAD-PROBE", NIL, *form, &env, false, false)
+                .expect("compile baseline definition"),
+        );
+        let symbol = torcl_rt::symbols::intern("STALE-T2-THREAD-PROBE");
+        registry_put(symbol, Arc::clone(&body));
+        let input = snapshot_t2_input(symbol, 0).expect("snapshot queued definition");
+        let generation = input.generation;
+        let input = torcl_rt::CrossThreadRoot::new(input);
+        T2_QUEUED.with(|queued| queued.borrow_mut().insert(symbol, generation));
+
+        std::thread::spawn(move || registry_put(symbol, body))
+            .join()
+            .expect("replace definition from another execution");
+        assert!(
+            install_t2_completion(T2Completion {
+                sym: symbol,
+                generation,
+                artifact: None,
+                input,
+            })
+            .is_none()
+        );
+        assert!(
+            !T2_DECLINED.with(|declined| declined.borrow().contains(&symbol)),
+            "an old compilation decline must not suppress the new definition"
+        );
+        registry_remove(symbol);
+    }
+
     #[test]
     fn fresh_anonymous_code_preserves_existing_direct_calls() {
         let _lock = super::super::heap_test_lock()
@@ -19778,7 +20367,8 @@ mod jtc4_stack_map_tests {
                 spill_roots: 1,
             }],
             has_deopt: false,
-            constant_bodies: vec![],
+            rooted_bodies: vec![],
+            deopt_bodies: HashMap::new(),
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 
@@ -19935,6 +20525,8 @@ mod jtc4_stack_map_tests {
         let entry = buf.leak();
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
+            body: None,
+            _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),
             is_t2: false,
@@ -19944,7 +20536,7 @@ mod jtc4_stack_map_tests {
             bcp_offsets: vec![],
             code_info,
             has_deopt: false,
-            _t2_constants: None,
+            t2_metadata: None,
         };
         let mut env = Env::new(false);
 
@@ -19984,6 +20576,8 @@ mod jtc4_stack_map_tests {
         let entry = buf.leak();
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
+            body: None,
+            _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),
             is_t2: false,
@@ -19993,7 +20587,7 @@ mod jtc4_stack_map_tests {
             bcp_offsets: vec![],
             code_info,
             has_deopt: false,
-            _t2_constants: None,
+            t2_metadata: None,
         };
         let mut env = Env::new(false);
 

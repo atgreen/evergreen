@@ -91,7 +91,7 @@ mod tcache {
         if size == 0 || size > MAX_SIZE || layout.align() > GRAN {
             return None;
         }
-        Some((size + GRAN - 1) / GRAN - 1)
+        Some(size.div_ceil(GRAN) - 1)
     }
 
     /// The layout a class is actually allocated with — the same for every

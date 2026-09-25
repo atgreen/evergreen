@@ -7151,6 +7151,7 @@ fn defpackage_shadow_interns_distinct_symbol() {
 ///   - TAGBODY: the `items` statement `Vec<TorclVal>` was unrooted across the
 ///     per-statement `eval_form`, so a moved statement form read back as a zeroed
 ///     cons (car => Fixnum(0)) → "undefined function:".
+///
 /// Both surfaced deep in cl-ppcre's tagbody-heavy, `(funcall next-fn ..)` CPS
 /// scanner closures. `TORCL_GC_STRESS` fires a minor GC on (almost) every
 /// allocation, turning the load-dependent corruption into a deterministic one;

@@ -3069,10 +3069,10 @@ fn runtime_feature_present(name: &str) -> bool {
     };
     while list.is_cons() {
         let (item, next) = cons_parts(list);
-        if item.tag() == torcl_rt::value::TAG_SYMBOL {
-            if feature_symbol_bare_name(item).eq_ignore_ascii_case(name) {
-                return true;
-            }
+        if item.tag() == torcl_rt::value::TAG_SYMBOL
+            && feature_symbol_bare_name(item).eq_ignore_ascii_case(name)
+        {
+            return true;
         }
         list = next;
     }

@@ -1577,7 +1577,7 @@ fn single_float_printed_representation_round_trips() {
         // 1.4012985e-45. Both denote this same value — the shortest
         // round-tripping decimal is not unique down here — so the round-trip,
         // not the spelling, is what this asserts.
-        1.4012985e-45,
+        f32::from_bits(1),
         0.0,
     ] {
         let s = torcl_stdlib::format::single_float_to_string(x);

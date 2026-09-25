@@ -1202,8 +1202,8 @@ fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
     // dead thread whose tid was recycled (or whose TLS destructor never ran).
     // It must go: the signal handler resolves a tid by taking the FIRST matching
     // slot, so a stale duplicate would shadow the one we are about to claim.
-    for i in 0..SIGSEGV_RECOVERY_SLOTS {
-        if SIGSEGV_RECOVERY_TIDS[i].load(std::sync::atomic::Ordering::Acquire) == tid {
+    for (i, owner) in SIGSEGV_RECOVERY_TIDS.iter().enumerate() {
+        if owner.load(std::sync::atomic::Ordering::Acquire) == tid {
             clear_sigsegv_recovery_slot(i);
         }
     }
@@ -1236,12 +1236,9 @@ fn sigsegv_recovery_slot_index(tid: usize) -> Option<usize> {
     if tid == 0 {
         return None;
     }
-    for i in 0..SIGSEGV_RECOVERY_SLOTS {
-        if SIGSEGV_RECOVERY_TIDS[i].load(std::sync::atomic::Ordering::Acquire) == tid {
-            return Some(i);
-        }
-    }
-    None
+    SIGSEGV_RECOVERY_TIDS
+        .iter()
+        .position(|owner| owner.load(std::sync::atomic::Ordering::Acquire) == tid)
 }
 
 fn sigsegv_null_guard_recovery_ip_for_tid(tid: usize) -> usize {

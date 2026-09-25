@@ -500,7 +500,7 @@ mod tests {
     }
 
     fn run(f: &mut Function) {
-        EscapeAnalysis::default().run(f, &mut Analyses::new());
+        EscapeAnalysis.run(f, &mut Analyses::new());
     }
 
     fn frame(locals: Vec<ValueSource>) -> FrameState {
@@ -562,8 +562,10 @@ mod tests {
         let entry = f.entry();
         let (cons, _a, _b, _alloc) = with_cons(&mut f);
         let callee = f.add_block_param(entry, any_ty(), VR::Tagged);
-        let mut fl = InstFlags::default();
-        fl.call = true;
+        let fl = InstFlags {
+            call: true,
+            ..InstFlags::default()
+        };
         f.push_inst(entry, inst(Opcode::Call, vec![callee, cons], fl), &[]);
         f.set_terminator(entry, ret(vec![]));
 
@@ -593,8 +595,10 @@ mod tests {
             &[(cons_ty(), VR::Tagged)],
         );
         let inner = i_res[0];
-        let mut fl = InstFlags::default();
-        fl.effectful = true;
+        let fl = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
         // SetCdr(outer, inner): outer at pos 0 (object), inner at pos 1 (value).
         f.push_inst(entry, inst(Opcode::SetCdr, vec![outer, inner], fl), &[]);
         f.set_terminator(entry, ret(vec![outer]));
@@ -613,8 +617,10 @@ mod tests {
             &[(cons_ty(), VR::Tagged)],
         );
         let gcons = gres[0];
-        let mut gfl = InstFlags::default();
-        gfl.effectful = true;
+        let gfl = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
         g.push_inst(ge, inst(Opcode::SetCar, vec![gcons, ga], gfl), &[]);
         g.set_terminator(ge, ret(vec![]));
         let gr = analyse(&g);
@@ -746,8 +752,10 @@ mod tests {
         let mut f = Function::new("mutated");
         let entry = f.entry();
         let (cons, a, _b, alloc) = with_cons(&mut f);
-        let mut fl = InstFlags::default();
-        fl.effectful = true;
+        let fl = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
         f.push_inst(entry, inst(Opcode::SetCar, vec![cons, a], fl), &[]);
         f.push_inst(
             entry,

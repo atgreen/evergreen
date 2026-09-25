@@ -788,6 +788,8 @@ pub fn build_complex_vector(
 /// `length` is the displaced array's own total size; `fill_pointer` is the
 /// active length (= `length` when `has_fill_pointer` is false). The caller
 /// validates `offset + length <= (array-total-size base)`.
+// Preserve the public constructor's independent CL array attributes.
+#[allow(clippy::too_many_arguments)]
 pub fn build_displaced_vector(
     base: TorclVal,
     offset: usize,
