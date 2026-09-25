@@ -398,7 +398,7 @@ reads the profile to insert speculative type guards.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TORCL_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation (`TORCL_T1_THRESHOLD` alias) |
-| `TORCL_T1_T2_INVOKE_THRESHOLD` | 5000 | Invocation count to trigger T2 compilation (`TORCL_T1_T2_THRESHOLD` / `TORCL_T2_THRESHOLD` aliases) |
+| `TORCL_T1_T2_INVOKE_THRESHOLD` | 4096 | Invocation count to trigger T2 compilation (`TORCL_T1_T2_THRESHOLD` / `TORCL_T2_THRESHOLD` aliases) |
 | `TORCL_T1_T2_BACKEDGE_THRESHOLD` | 10000 | Back-edge count to trigger T2 compilation (`TORCL_LOOP_HEAT_THRESHOLD` alias) |
 | `TORCL_DISABLE_T2` | unset | Explicit debug/differential switch that keeps functions at T1 |
 | `TORCL_OSR_THRESHOLD` | 10000 | Back-edge count to trigger OSR entry |

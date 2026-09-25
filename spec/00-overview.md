@@ -118,7 +118,7 @@ stages.
 |------|------|------|--------|
 | T0 | **Bytecode interpreter** | First call | Portable TorCL bytecode |
 | T1 | **Baseline compiler** | Call count ≥ 10 | Unoptimised native code compiled from bytecode |
-| T2 | **Optimising compiler** | Hot loop / call count ≥ 5000 | Optimised native via IR |
+| T2 | **Optimising compiler** | Hot loop / call count ≥ 4096 | Optimised native via IR |
 
 Tier transitions are managed by the **Profiling Subsystem** (§4.9) which
 inserts counters and traps. The **tiering *policy*** — invocation/back-edge

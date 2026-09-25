@@ -5,6 +5,82 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Amortize optimizing compilation (2026-09-25, bliss-304g)
+
+The default T1→T2 invocation threshold is now **4,096**, previously 256.
+T1 still starts at 10 calls and already executes native code; loop heat still
+requests T2 independently at 10,000 back-edges. Explicit thresholds and forced
+tiers retain their behavior. No FASL/image format or library-specific path changed.
+
+The motivation is measured compilation cost, not an assumption that optimizing
+code is bad. On the unchanged PGO baseline, Babel's default / snapshot-only /
+compile-but-discard / fully-disabled T2 cycle medians were 1.188 / 1.091 /
+1.191 / 1.077 G. CL-PPCRE showed the same pattern. Optimizing these warm helpers
+barely repaid compilation during the initial load. Earlier T1 promotion did not
+help. Note that `TORCL_T2_NO_QUEUE` **still constructs compiler snapshots**;
+only `TORCL_DISABLE_T2` removes that work too.
+
+Final ordinary and freshly trained PGO images were compared with **c738741**
+controls after builds/tests stopped. Five alternating CPU-0-pinned fresh
+processes measure only the first cached ASDF load, with `COMPILE-FILE` forbidden:
+
+| First cached load, CPU cycles | Before | After | Reduction |
+|---|---:|---:|---:|
+| Babel, ordinary ThinLTO | 1.350 G | 1.238 G | 8.3% |
+| CL-PPCRE, ordinary ThinLTO | 0.673 G | 0.610 G | 9.4% |
+| Babel, default PGO | 1.182 G | 1.075 G | 9.0% |
+| CL-PPCRE, default PGO | 0.579 G | 0.518 G | 10.6% |
+
+PGO instructions fall 2.721 → 2.609 G / 1.410 → 1.330 G. Allocation remains
+10,270,032 / 3,804,336 bytes. PGO load wall medians fall 0.578 → 0.521 s /
+0.279 → 0.247 s; whole-process medians fall 0.840 → 0.790 / 0.540 → 0.510 s.
+SBCL load medians are 0.295 / 0.255 s and 0.630 / 0.555 G cycles: the current
+PGO cycle ratios are **1.70× Babel / 0.93× CL-PPCRE**. Babel is not at parity.
+
+A six-P-core check lets compiler workers run alongside the mutator. Its initial
+five-run Babel wall median looked worse despite lower cycles; ranges overlapped
+widely. A separate **15-run alternating repeat** gives Babel 0.543 → 0.518 s
+(ranges 0.317–0.569 / 0.272–0.523), and CL-PPCRE 0.273 → 0.260 s
+(0.259–0.278 / 0.245–0.263). Cycles fall 1.176 → 1.073 G / 0.579 → 0.519 G.
+Treat those wall medians as observations, not precise hardware-independent
+speedups. All 170 final comparison runs pass functional checks; all 120 TorCL
+load windows report zero collections.
+
+Before changing the default, all seven existing steady-state workloads ran five
+times at each of 256, 1,024 and 4,096 calls. All five T2-eligible workloads retain
+T2 publication in every run; sumloop/ctak retain their existing OSR/T0 behavior.
+Default→4,096 warm medians in milliseconds: fib 4→4, tak 11→11, sumloop 85→85,
+takl 104→104, deriv 293→295, ctak 54→55, div2 132→132. This is coverage of these
+workloads, not proof that every warm program has identical latency.
+
+Validation: the new warm-helper regression failed on the old default because it
+queued T2 before 769 calls. With the change, the tier suite passes 52 tests
+(one ignored), including default eventual T2 promotion and loop-triggered T2.
+All **819 CLI tests** pass, including 358 acceptance and 59 FASL tests. Ordinary
+and PGO images match fresh SBCL output for all 15,106 Babel reverse-table entries
+under stress stride 20,000 with poisoning/verification (13 minor collections).
+PGO scanners survive two minor plus one major collection; forced-T2 closure,
+redefinition and multiple-value checks pass with stress stride 20.
+
+The full workspace gate is **not green**: six targets fail, covering the tracked
+STRINGP metadata assertion, parallel threading/safepoint fixtures, four stale
+sequence assertions and two Lisp-as-Rust doctests. The threading harness reports
+four failures then exits 139, so aggregate completed-test summaries omit it.
+Exact threading and safepoint harnesses pass 21 / 10 tests serially; their parallel
+failures remain open. Workspace check retains the tracked unused-mut warning;
+strict Clippy retains nine runtime diagnostics; spec coverage retains 14 uncovered
+MUSTs. Formatting/diff checks, 12 PGO orchestration tests and GC-root lint pass
+(six baseline root findings, zero new). Review was adversarial self-review.
+
+Artifacts: `/tmp/torcl-load-bridge.6r6ZPA/` contains final images, comparison
+scripts/counters and validation logs. Fresh PGO run `target/pgo/run.UoGXxE/`
+used LLVM 21.1.8; generate 2m10s, use 2m40s, training/image verification pass.
+The installed executable and default `target/torcl` were not replaced.
+
+A preceding five-pathname-builtin bridge-removal prototype saved only 2% / 0.8%
+ordinary load cycles and was removed completely (`bliss-nn4k`). Its census and
+measurements remain in the same artifact directory; they are not shipped code.
+
 ## Copy instruction metadata directly (2026-09-25, bliss-f49z)
 
 `Instr` contains only integer indices/counts and booleans, but T0 fetched each

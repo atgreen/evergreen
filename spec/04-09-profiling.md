@@ -437,7 +437,7 @@ CL special variables (in the `TORCL-PROFILER` package).
 | Env Variable | CL Variable | Type | Default | Description |
 |---|---|---|---|---|
 | `TORCL_T0_T1_THRESHOLD` | `*t0-t1-threshold*` | u32 | 10 | Invocations before T0→T1 |
-| `TORCL_T1_T2_INVOKE_THRESHOLD` | `*t1-t2-invoke-threshold*` | u32 | 5000 | Invocations before T1→T2 |
+| `TORCL_T1_T2_INVOKE_THRESHOLD` | `*t1-t2-invoke-threshold*` | u32 | 4096 | Invocations before T1→T2 |
 | `TORCL_T1_T2_BACKEDGE_THRESHOLD` | `*t1-t2-backedge-threshold*` | u32 | 10000 | Back-edge iterations before T1→T2 |
 | `TORCL_DISABLE_T2` | — | bool | false | Keep otherwise-hot functions at T1 for debug/differential runs |
 | `TORCL_OSR_BACKEDGE_THRESHOLD` | `*osr-backedge-threshold*` | u32 | 50000 | Back-edge iterations before OSR |

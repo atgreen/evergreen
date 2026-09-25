@@ -30,6 +30,9 @@ fn run_output(program: &str, envs: &[(&str, &str)]) -> Output {
         "TORCL_COMPILE_QUEUE_SIZE",
         "TORCL_DEOPT_BLACKLIST_THRESHOLD",
         "TORCL_PROFILING_DISABLED",
+        "TORCL_FORCE_TIER",
+        "TORCL_T2_NO_QUEUE",
+        "TORCL_T2_DISCARD",
         "TORCL_LAZY_COMPILE",
         "TORCL_LOG",
         "TORCL_NN_DIRECT",
@@ -437,6 +440,28 @@ fn t1_to_t2_osr_deopt_preserves_multiple_values() {
         (1000..4_000_000).contains(&back_edges),
         "T1 should hand off to T2 before completing the loop: {out}"
     );
+}
+
+/// Warm straight-line helpers should already run natively in T1 without paying
+/// for optimizing compilation that a short initial library load cannot amortize.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn default_tiering_keeps_warm_helpers_native_without_requesting_t2() {
+    let out = run_output(
+        "(defun warm-helper (x) (* x 5)) \
+         (dotimes (i 768) (warm-helper i)) \
+         (format t \"~a ~a~%\" \
+           (torcl-ext:function-tier 'warm-helper) (warm-helper 7))",
+        &[("TORCL_T2_LOG", "-")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "warm helper failed:\n{stderr}");
+    assert!(
+        !stderr.contains("WARM-HELPER: queued for background T2 compilation"),
+        "warm helpers must not pay for T2 compilation:\n{stderr}"
+    );
+    assert_eq!(stdout.lines().next(), Some("1 35"), "{stdout}");
 }
 
 /// With all tier-control variables absent, the default thresholds eventually

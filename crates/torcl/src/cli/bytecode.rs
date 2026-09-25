@@ -16196,7 +16196,7 @@ fn t2_enabled() -> bool {
 
 /// T1→T2 invocation threshold.  The old `TORCL_T2=1` opt-in is retained only
 /// as a force/debug shorthand: absent an explicit threshold it makes T2 eligible
-/// immediately after T1 has been observed.  Normal, unset operation uses 5000.
+/// immediately after T1 has been observed. Normal, unset operation uses 4096.
 fn t2_invoke_threshold() -> u32 {
     if forced_tier() == Some(ForcedTier::T2) {
         return 1;
@@ -16220,13 +16220,12 @@ fn t2_invoke_threshold() -> u32 {
             if env_flag("TORCL_T2") == Some(true) {
                 t1_threshold()
             } else {
-                // 5000 (HotSpot-C2-like) left warm-but-not-blistering load-time code
-                // stuck in T1 bytecode: an `(asdf:load-system …)` calls each library
-                // function hundreds–thousands of times but rarely 5000+, so nothing
-                // reached T2 before the load finished. 256 tiers that code to native
-                // — babel load ~22s -> ~15.6s (~29%), flat across 32..512 — while
-                // staying well above once-or-twice-called code (bliss-pohq).
-                256
+                // T1 already executes native code. Optimizing after only 256
+                // calls spends compiler work on warm helpers that finish before
+                // T2 repays it: first cached Babel/PPCRE loads spend ~9–10% fewer
+                // cycles at 4096, with steady-state tier coverage preserved
+                // (bliss-304g). Loop heat remains an independent promotion route.
+                4096
             }
         })
     })

@@ -13,7 +13,7 @@ compilation queue, and the interaction with the profiling subsystem (§4.9).
 |----|-------------|
 | R4.23 | Every user-defined function MUST begin execution at T0 (portable bytecode interpreter). |
 | R4.24 | The runtime MUST promote a function from T0 to T1 when its invocation counter reaches the T0→T1 threshold (default 10). |
-| R4.25 | The runtime MUST promote a function from T1 to T2 when its invocation counter reaches the T1→T2 threshold (default 5 000) **or** a back-edge counter in the function reaches the loop-heat threshold (default 10 000). |
+| R4.25 | The runtime MUST promote a function from T1 to T2 when its invocation counter reaches the T1→T2 threshold (default 4 096) **or** a back-edge counter in the function reaches the loop-heat threshold (default 10 000). |
 | R4.26 | T1 compilation MUST complete synchronously on the calling thread before the function's next invocation executes compiled code.  T2 compilation MUST execute on a background compiler thread. |
 | R4.27 | While T2 compilation is in progress, the function MUST continue executing its T1 code; the switch to T2 code MUST be atomic (single pointer store, visible at the next call-site dispatch or matching OSR back-edge poll). |
 | R4.28 | If T2 compilation fails (e.g., unsupported construct, resource exhaustion), the function MUST remain at T1 permanently and the failure MUST be logged. |
@@ -597,7 +597,7 @@ hold the queue mutex only during enqueue/dequeue (microseconds).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TORCL_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation |
-| `TORCL_T1_T2_THRESHOLD` | 5 000 | Invocation count to trigger T2 compilation |
+| `TORCL_T1_T2_THRESHOLD` | 4 096 | Invocation count to trigger T2 compilation |
 | `TORCL_LOOP_HEAT_THRESHOLD` | 10 000 | Back-edge count to trigger T2 compilation |
 | `TORCL_DISABLE_T2` | unset | Set to a true value to keep hot functions at T1 for debugging/differential testing |
 | `TORCL_T2_THREADS` | 2 | Number of background compiler threads |
