@@ -80,7 +80,7 @@ fn lisp_string_to_string(val: TorclVal) -> String {
 }
 
 fn vector_symbol() -> TorclVal {
-    TorclVal::from_symbol_index(7)
+    TorclVal::from_symbol_index(torcl_compiler::reader::intern_symbol("VECTOR"))
 }
 
 fn addition_fn() -> TorclVal {

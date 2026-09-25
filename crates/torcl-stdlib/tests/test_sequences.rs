@@ -281,7 +281,9 @@ fn nreverse_destructive() {
 
 #[test]
 fn concatenate_two_lists() {
-    let cat = sequences::concatenate(T, &[make_list(&[1, 2]), make_list(&[3, 4])]).unwrap();
+    let list_type = TorclVal::from_symbol_index(torcl_compiler::reader::intern_symbol("LIST"));
+    let cat = sequences::concatenate(list_type, &[make_list(&[1, 2]), make_list(&[3, 4])]).unwrap();
+    assert!(cat.is_cons());
     assert_eq!(sequences::length(cat).unwrap(), 4);
     assert_eq!(sequences::elt(cat, 0).unwrap(), TorclVal::from_fixnum(1));
     assert_eq!(sequences::elt(cat, 3).unwrap(), TorclVal::from_fixnum(4));
@@ -289,14 +291,21 @@ fn concatenate_two_lists() {
 
 #[test]
 fn concatenate_with_empty() {
-    let cat = sequences::concatenate(T, &[make_list(&[1, 2, 3]), NIL]).unwrap();
+    let list_type = TorclVal::from_symbol_index(torcl_compiler::reader::intern_symbol("LIST"));
+    let cat = sequences::concatenate(list_type, &[make_list(&[1, 2, 3]), NIL]).unwrap();
+    assert!(cat.is_cons());
     assert_eq!(sequences::length(cat).unwrap(), 3);
 }
 
 #[test]
 fn concatenate_multiple() {
-    let cat =
-        sequences::concatenate(T, &[make_list(&[1]), make_list(&[2]), make_list(&[3])]).unwrap();
+    let list_type = TorclVal::from_symbol_index(torcl_compiler::reader::intern_symbol("LIST"));
+    let cat = sequences::concatenate(
+        list_type,
+        &[make_list(&[1]), make_list(&[2]), make_list(&[3])],
+    )
+    .unwrap();
+    assert!(cat.is_cons());
     assert_eq!(sequences::length(cat).unwrap(), 3);
     assert_eq!(sequences::elt(cat, 1).unwrap(), TorclVal::from_fixnum(2));
 }
