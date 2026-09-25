@@ -36,9 +36,14 @@ fn restored_methods_keep_compilation_semantics_and_allow_redefinition() {
       (defmethod image-method ((x t)) (image-method-add x))
       (defmethod image-method :around ((x t))
         (values (call-next-method) :second))
+      (defmethod image-callback ((x t))
+        (funcall (lambda () (image-method-add x))))
+      (defmethod image-callback :around ((x t))
+        (funcall (lambda () (values (call-next-method) :callback))))
       (defmacro image-method-add (x)
         (declare (ignore x)) (error "Restored method re-expanded source"))
       (assert (equal '(42 :second) (multiple-value-list (image-method 41))))
+      (assert (equal '(42 :callback) (multiple-value-list (image-callback 41))))
       (format t "METHOD-SAVE-OK~%")
       (save-lisp-and-die "{filename}")
     "#
@@ -51,6 +56,7 @@ fn restored_methods_keep_compilation_semantics_and_allow_redefinition() {
             "--eval",
             r#"
       (assert (equal '(42 :second) (multiple-value-list (image-method 41))))
+      (assert (equal '(42 :callback) (multiple-value-list (image-callback 41))))
       (defmethod image-method ((x t)) (+ x 2))
       (assert (equal '(43 :second) (multiple-value-list (image-method 41))))
       (format t "METHOD-RESTORE-OK~%")

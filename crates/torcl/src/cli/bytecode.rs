@@ -11096,18 +11096,19 @@ pub(super) fn compile_and_reify_lambda(
     torcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
     torcl_rt::rooted_ref!(_body_root = &mut body);
     reset_last_bail_reason();
-    // Opportunistic lowering first; on a capture-related bail retry in portable
-    // mode (heap-frame closures), so a method body with a capturing flet/labels
-    // or closure compiles instead of tree-walking — same rationale as
-    // lazy_compile_defun (bliss-mr4p).
-    let bf = compile_function(label, lambda_list, body, env, false, false).or_else(|| {
-        // The opportunistic attempt's bail reason is noise once we retry: it
-        // bails on things portable mode handles (quasiquote, capturing
-        // closures). Clear it so `last_bail_reason` reports why the attempt
-        // that actually decides gave up.
-        reset_last_bail_reason();
-        compile_function(label, lambda_list, body, env, true, false)
-    })?;
+    // Compile nested callbacks as bytecode too, rather than accepting an outer
+    // method whose EvalHost/MakeClosureEnv instructions still interpret them.
+    // Trying complete lowering first also avoids compiling callback-heavy
+    // methods twice during a library load. Retain opportunistic lowering for
+    // bodies whose callbacks need host evaluation.
+    let bf = compile_function(label, lambda_list, body, env, true, false)
+        // Live compilation has no FASL load plan to initialize pending cells;
+        // in that case try the host-evaluation fallback instead.
+        .filter(|portable| !contains_load_time_values(portable))
+        .or_else(|| {
+            reset_last_bail_reason();
+            compile_function(label, lambda_list, body, env, false, false)
+        })?;
     // Portable lowering is also a live-compiler fallback, but only a FASL load
     // plan can initialize these pending cells. Never publish them uninitialized.
     if contains_load_time_values(&bf) {
@@ -19566,6 +19567,71 @@ fn symbol_index_of(name: &str) -> Option<u32> {
         // symbols but have no index — yield None instead of panicking (bliss-hkf).
         Ok((sym, _)) => sym.symbol_index(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod method_compilation_tests {
+    use super::*;
+
+    #[test]
+    fn method_callback_retry_preserves_live_load_time_value_fallback() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env(
+            "(defmethod method-callback-ltv ((x t))
+               (lambda () (list x (load-time-value (list :cell)))))",
+            &mut env,
+        )
+        .unwrap();
+        let id = env.methods.borrow()["METHOD-CALLBACK-LTV"][0].method_id.0;
+        let callable = super::super::METHOD_COMPILED.with(|m| m.borrow()[&id]);
+        let name = torcl_rt::function::name(callable).as_symbol_index();
+        let body = registry_get(name).unwrap();
+        assert!(contains_host_eval(&body));
+        assert!(!contains_load_time_values(&body));
+        assert_eq!(
+            super::super::read_eval_all_env(
+                "(equal (funcall (method-callback-ltv '(42))) '((42) (:cell)))",
+                &mut env,
+            )
+            .unwrap(),
+            T
+        );
+    }
+
+    #[test]
+    fn method_callbacks_are_compiled_recursively() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env(
+            "(defmethod method-callback-probe ((x t))
+               (lambda () (lambda () (+ x 1))))",
+            &mut env,
+        )
+        .unwrap();
+        let id = env.methods.borrow()["METHOD-CALLBACK-PROBE"][0].method_id.0;
+        let callable = super::super::METHOD_COMPILED.with(|m| m.borrow()[&id]);
+        let name = torcl_rt::function::name(callable).as_symbol_index();
+        let body = registry_get(name).unwrap();
+        assert!(
+            !contains_host_eval(&body),
+            "a compiled method must compile its supported nested callbacks too"
+        );
+        assert_eq!(
+            super::super::read_eval_all_env(
+                "(funcall (funcall (method-callback-probe 41)))",
+                &mut env,
+            )
+            .unwrap(),
+            TorclVal::from_fixnum(42)
+        );
     }
 }
 

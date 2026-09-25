@@ -5,6 +5,100 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Compile nested method callbacks (2026-09-25, bliss-fq2q)
+
+A method recorded as compiled could still contain `EvalHost`/`MakeClosureEnv`
+instructions that interpreted its callbacks. Method reification now tries
+complete portable lowering first, keeping opportunistic lowering as the fallback
+for unsupported bodies or pending `LOAD-TIME-VALUE` cells that live compilation
+cannot initialize. This also avoids an extra compiler pass during library loading.
+No FASL/image schema, tiering threshold, or library-specific shortcut changed.
+Rebuild the saved image to get the new ASDF method bodies.
+
+Five alternating CPU-0-pinned fresh processes per library/build, after all build
+and test jobs stopped, compare unchanged **823e413** images with the final code.
+Counters/timers surround only the **first cached ASDF load**, excluding startup;
+`COMPILE-FILE` is replaced with an error. All 50 TorCL windows have zero GCs and
+all 60 runs pass their functional checks without source compilation.
+
+| Ordinary ThinLTO image | Before | After | Reduction |
+|---|---:|---:|---:|
+| Babel instructions | 3.906 G | 3.526 G | 9.7% |
+| Babel CPU cycles | 1.595 G | 1.436 G | 10.0% |
+| CL-PPCRE instructions | 2.008 G | 1.886 G | 6.1% |
+| CL-PPCRE CPU cycles | 0.749 G | 0.699 G | 6.7% |
+
+Lisp allocation falls from 10,566,416 to 10,270,032 bytes for Babel and from
+3,890,480 to 3,809,456 for CL-PPCRE. Fresh PGO images reduce Babel cycles
+1.369 → 1.259 G (**8.1%**) and CL-PPCRE 0.640 → 0.604 G (**5.6%**).
+Their load wall medians fall 0.657 → 0.610 s and 0.304 → 0.291 s respectively.
+Training uses the dependency-free fixture, not these held-out libraries.
+
+| Current default-PGO image versus SBCL | TorCL | SBCL | Ratio |
+|---|---:|---:|---:|
+| Babel CPU cycles | 1.259 G | 0.634 G | 1.99× |
+| Babel load wall median | 0.610 s | 0.296 s | 2.06× |
+| CL-PPCRE CPU cycles | 0.604 G | 0.557 G | 1.08× |
+| CL-PPCRE load wall median | 0.291 s | 0.256 s | 1.14× |
+
+Wall time remains frequency-sensitive even in this quiet pinned batch: Babel
+PGO ranges 0.457–0.612 s and SBCL 0.158–0.311 s. Prefer the matched instruction
+and cycle reductions for attribution. Whole-process PGO medians are 0.870 s
+and 0.550 s, versus SBCL 0.480 s and 0.450 s. **Babel parity is not achieved.**
+
+The saved-image penalty tracked by `bliss-c6td` is no longer present in these
+workloads. Five matched current raw-runtime controls, initializing ASDF with
+`REQUIRE` like the image builder, use 3.548 G / 1.912 G instructions versus
+the image's 3.526 G / 1.886 G. Raw load cycles are 1.459 G / 0.720 G versus
+image 1.436 G / 0.699 G. This closes that measured image/raw issue, not the
+overall SBCL gap or the separate captured-method-environment issue `bliss-mxjr`.
+
+The first keeper attempt preserved fast bodies and retried portable lowering
+conditionally. It retained Babel's gain but reduced CL-PPCRE instructions only
+1.2% and increased allocation: the extra compile pass erased most of the probe's
+benefit. It was replaced with the simpler complete-first policy above. Likewise,
+fresh profiling found the obvious duplicate dispatch-cell reads account for less
+than 1% of the load; `bliss-whf3` remains deferred rather than being sold as a
+large opportunity. Successful outer-method compilation alone is not evidence
+that its nested callbacks are compiled.
+
+Validation on the final code: **815 CLI unit/integration tests pass**, zero fail,
+three ignored (including 54 unit, 358 acceptance, and 59 FASL tests). The new
+recursive-callback structural regression was observed failing on the baseline;
+the pending-load-time-value fallback regression and both tests under strict
+every-allocation GC stress/poison/verification pass. The extended image test
+checks captured callbacks, macro-expansion semantics, `CALL-NEXT-METHOD`, multiple
+values, and redefinition; it passes strict GC stress (78.26 s) and forced
+T0/T1/T2. The baseline also passes the separate macro-freezing probe: this change
+is a performance improvement, not a newly reproduced macro-semantics fix.
+
+All 15,106 Babel reverse-table entries match fresh SBCL output in normal and
+stress-20,000 ordinary-image runs and a stressed PGO-image run. Real CL-PPCRE
+scanners survive two minor plus one major collection with poison/verification in
+both builds. PGO orchestration's 12 tests pass; final training/build passes take
+2m32s / 3m40s with matching LLVM 21.1.8 and no profile mismatch warnings.
+
+The partitioned full workspace gate remains **2,587 passed / 15 failed / 7
+ignored**: unchanged compiler metadata, sequence fixtures, CLI doctests and
+parallel runtime fixtures remain red. Full serial runtime validation passes all
+626 tests. Newly observed parallel fixture failures are tracked in `bliss-brfv`,
+`bliss-vmcq`, and `bliss-bs4g`; serial success does not prove them fixed.
+Strict Clippy still reports nine tracked runtime diagnostics, spec coverage 14
+uncited stage-5 MUSTs, and workspace check the tracked unused-mut warning.
+Formatting/diff checks pass and root lint has six baseline findings, zero new.
+Review was adversarial self-review, not independent. `bliss-e3op` records a
+separate, unproven rooting hazard noticed in the older named-function retry;
+the final method policy does not retain bytecode across a second compilation.
+
+Artifacts: `/tmp/torcl-load-profile.C3WW9C/` holds the final `simple-image` and
+`simple-pgo-image`, `simple-final-*` counters/logs, `compare-simple.sh`, final
+`simple-*` validation logs, and the rejected conditional/probe controls. Summarize
+the final batch with `perl summarize.pl simple-final` from that directory.
+Fresh PGO artifacts are `target/pgo/run.n9PTrL/`. Profiling reports used
+`perf report --no-inline -g none`; default inline-DWARF reporting exceeded the
+240-second cap, whereas these reports completed promptly. Neither the installed
+`/usr/local/bin/torcl` nor the default `target/torcl` was replaced.
+
 ## Preserve compiled ASDF methods across image restart (2026-09-24, bliss-13he)
 
 The saved executable was restoring compiled method bodies but dropping
