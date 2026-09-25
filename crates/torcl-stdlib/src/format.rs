@@ -1134,13 +1134,7 @@ fn torclval_to_print_inner(v: TorclVal, escapep: bool) -> String {
             // (CLHS 22.1.3.2) — must match cli print_val, which was correct while
             // the stdlib printer emitted `#\` + the literal char.
             let mut s = String::from("#\\");
-            match c {
-                ' ' => s.push_str("Space"),
-                '\n' => s.push_str("Newline"),
-                '\t' => s.push_str("Tab"),
-                '\r' => s.push_str("Return"),
-                other => s.push(other),
-            }
+            s.push_str(&character_name(c));
             s
         } else {
             format!("{}", c)
@@ -1742,7 +1736,10 @@ fn to_roman(n: i64, old: bool) -> String {
     result
 }
 
-fn char_name(c: char) -> String {
+/// Return TorCL's preferred reader-compatible name for a character, or the
+/// character itself when it has no name.  The implementation-defined names
+/// match SBCL for compatibility with libraries such as cl-str (bliss-rr9q).
+pub fn character_name(c: char) -> String {
     match c {
         ' ' => "Space".into(),
         '\n' => "Newline".into(),
@@ -1751,6 +1748,10 @@ fn char_name(c: char) -> String {
         '\x08' => "Backspace".into(),
         '\x7f' => "Rubout".into(),
         '\x0c' => "Page".into(),
+        '\x0b' => "Vt".into(),
+        '\u{0085}' => "Next-Line".into(),
+        '\u{00a0}' => "NO-BREAK_SPACE".into(),
+        '\u{3000}' => "IDEOGRAPHIC_SPACE".into(),
         _ => format!("{}", c),
     }
 }
@@ -2794,7 +2795,7 @@ fn format_impl(
                 if at_sign {
                     output.push_str(&format!("#\\{}", c));
                 } else if colon {
-                    output.push_str(&char_name(c));
+                    output.push_str(&character_name(c));
                 } else {
                     output.push(c);
                 }

@@ -3800,6 +3800,16 @@ fn character_prin1_names_nongraphic_chars() {
         ("(prin1-to-string #\\Space)", "\"#\\\\Space\""),
         ("(prin1-to-string #\\Tab)", "\"#\\\\Tab\""),
         ("(prin1-to-string #\\Return)", "\"#\\\\Return\""),
+        ("(prin1-to-string #\\Vt)", "\"#\\\\Vt\""),
+        ("(prin1-to-string #\\Next-Line)", "\"#\\\\Next-Line\""),
+        (
+            "(prin1-to-string #\\No-break_space)",
+            "\"#\\\\NO-BREAK_SPACE\"",
+        ),
+        (
+            "(prin1-to-string #\\Ideographic_space)",
+            "\"#\\\\IDEOGRAPHIC_SPACE\"",
+        ),
         ("(prin1-to-string #\\a)", "\"#\\\\a\""),
         ("(format nil \"~s\" #\\Space)", "\"#\\\\Space\""),
         // princ/~A still emits the literal character.
@@ -3807,6 +3817,10 @@ fn character_prin1_names_nongraphic_chars() {
         // cli PRIN1 and the stdlib printer must agree.
         (
             "(equal (prin1-to-string #\\Newline) (with-output-to-string (s) (prin1 #\\Newline s)))",
+            "T",
+        ),
+        (
+            "(equal (prin1-to-string #\\No-break_space) (with-output-to-string (s) (prin1 #\\No-break_space s)))",
             "T",
         ),
     ];
@@ -4153,7 +4167,14 @@ fn char_name_round_trips() {
         (dolist (c '(32 10 9 13 12 8 127 0 7 27 65533 65 200 1000))
           (let* ((ch (code-char c)) (nm (char-name ch)))
             (when (and nm (not (eql (name-char nm) ch))) (push (list c nm) bad))))
-        (prin1 (list (char-name (code-char 65533)) (char-name (code-char 127)) bad)))";
+        (prin1 (list (char-name (code-char 65533)) (char-name (code-char 127)) bad
+                     (char-name #\\Vt) (char-name #\\Next-Line)
+                     (char-name #\\No-break_space)
+                     (char-name #\\Ideographic_space)
+                     (char-code (name-char \"Vt\"))
+                     (char-code (name-char \"Next-Line\"))
+                     (char-code (name-char \"No-break_space\"))
+                     (char-code (name-char \"Ideographic_space\")))))";
     let out = torcl_bin()
         .args(["--eval", prog])
         .output()
@@ -4164,9 +4185,12 @@ fn char_name_round_trips() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // U+FFFD unnamed, 127 is Rubout, and no round-trip mismatches (bad = NIL).
+    // U+FFFD unnamed, 127 is Rubout, and the implementation names used by
+    // cl-str round-trip with SBCL-compatible spellings and code points.
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("(NIL \"Rubout\" NIL)"),
+        String::from_utf8_lossy(&out.stdout).contains(
+            "(NIL \"Rubout\" NIL \"Vt\" \"Next-Line\" \"NO-BREAK_SPACE\" \"IDEOGRAPHIC_SPACE\" 11 133 160 12288)"
+        ),
         "got: {}",
         String::from_utf8_lossy(&out.stdout)
     );

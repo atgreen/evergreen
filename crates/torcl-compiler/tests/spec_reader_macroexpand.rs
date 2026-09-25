@@ -168,6 +168,27 @@ fn reader_acceptance_parses_numbers_and_dispatch_forms() {
     assert_eq!(ch.as_char(), ' ');
 }
 
+/// bliss-rr9q: libraries such as cl-str use the implementation character
+/// names accepted by SBCL for vertical tab, next-line, and no-break space.
+/// Character names are case-insensitive and may contain `-` or `_`; the
+/// reader must consume the whole name rather than stopping at the first
+/// non-alphabetic character.
+#[test]
+fn reader_accepts_common_implementation_character_names() {
+    for (source, expected) in [
+        ("#\\Vt", '\u{000b}'),
+        ("#\\Next-Line", '\u{0085}'),
+        ("#\\No-break_space", '\u{00a0}'),
+        ("#\\Ideographic_space", '\u{3000}'),
+    ] {
+        let (value, end) = read_from_string(source)
+            .unwrap_or_else(|error| panic!("reader rejected {source}: {error}"));
+        assert_eq!(end, source.len(), "reader did not consume all of {source}");
+        assert!(value.is_character(), "{source} did not read as a character");
+        assert_eq!(value.as_char(), expected, "wrong character for {source}");
+    }
+}
+
 #[test]
 fn reader_acceptance_resolves_package_qualified_keyword_and_uninterned_symbols() {
     // Per R4.05, package-qualified, keyword, and uninterned symbols MUST be

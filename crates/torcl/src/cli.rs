@@ -8324,13 +8324,7 @@ fn print_val_inner(val: TorclVal, out: &mut String) {
         ));
     } else if val.is_character() {
         out.push_str("#\\");
-        match val.as_char() {
-            ' ' => out.push_str("Space"),
-            '\n' => out.push_str("Newline"),
-            '\t' => out.push_str("Tab"),
-            '\r' => out.push_str("Return"),
-            c => out.push(c),
-        }
+        out.push_str(&torcl_stdlib::format::character_name(val.as_char()));
     } else if val.is_symbol() {
         let name = sym_name(val);
         if let Some(bare) = name.strip_prefix("KEYWORD:") {

@@ -2693,12 +2693,20 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(TorclVal, usize), To
     if pos >= chars.len() {
         return Err(TorclError::StreamError("unexpected end after #\\".into()));
     }
-    // Collect char name
+    // Collect a named character token.  Implementation-defined names are not
+    // restricted to letters: SBCL (and libraries written against it) uses
+    // names such as NEXT-LINE and NO-BREAK_SPACE.  Stop at reader delimiters,
+    // just as an ordinary token would, rather than truncating the name at `-`
+    // or `_` (bliss-rr9q).
     let start = pos;
     let mut end = pos + 1;
-    // If first char is alphabetic, read the full name
+    // A non-alphabetic first character is the character itself (`#\)`,
+    // `#\\`, etc.); only an alphabetic start introduces a named character.
     if chars[pos].is_ascii_alphabetic() {
-        while end < chars.len() && chars[end].is_ascii_alphabetic() {
+        while end < chars.len()
+            && !chars[end].is_whitespace()
+            && !matches!(chars[end], '(' | ')' | '"' | '\'' | '`' | ',' | ';')
+        {
             end += 1;
         }
     }
@@ -2713,6 +2721,10 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(TorclVal, usize), To
             "rubout" | "delete" => return Ok((TorclVal::from_char('\u{7F}'), end)),
             "page" => return Ok((TorclVal::from_char('\u{0C}'), end)),
             "linefeed" => return Ok((TorclVal::from_char('\n'), end)),
+            "vt" => return Ok((TorclVal::from_char('\u{0B}'), end)),
+            "next-line" => return Ok((TorclVal::from_char('\u{85}'), end)),
+            "no-break_space" => return Ok((TorclVal::from_char('\u{A0}'), end)),
+            "ideographic_space" => return Ok((TorclVal::from_char('\u{3000}'), end)),
             "nul" | "null" => return Ok((TorclVal::from_char('\0'), end)),
             _ => {
                 if name.len() == 1 {
