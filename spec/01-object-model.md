@@ -140,7 +140,9 @@ Bits 50:48: reserved for future use (MUST be zero)
 | `0x15` | `READTABLE` | §1.15 |
 | `0x16` | `CONDITION` | §1.10.3 |
 | `0x17` | `RESTART` | §1.16 |
-| `0x18` – `0xFF` | — | Reserved for user-defined / future types |
+| `0x18` | `MD-ARRAY` | Multidimensional array: storage, dimensions, rank |
+| `0x19` | `MUTEX` | §13.9; opaque native mutex handle |
+| `0x1A` – `0xFF` | — | Reserved for user-defined / future types |
 
 ---
 

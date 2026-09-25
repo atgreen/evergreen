@@ -2419,12 +2419,16 @@ fn stream_trace(handle_body: *mut u8, visit: &mut dyn FnMut(*mut TorclVal)) {
 ///
 /// Runs inside the GC pause under the heap lock, so it must not allocate on the
 /// GC heap; dropping the Box and writing to stderr are both safe here.
-fn stream_gc_finalize(_finalizer: TorclVal, object: TorclVal) {
-    // `object` is from_raw(body): body word 0 holds the StreamAlloc pointer, and
-    // the handle header (body − 8) carries the type id.
+fn stdlib_gc_finalize(_finalizer: TorclVal, object: TorclVal) {
+    // `object` is from_raw(body): body word 0 holds native storage, and the
+    // handle header (body − 8) selects the resource's finalizer.
     let body = object.to_raw() as *mut u8;
     unsafe {
         let header = &*(body.sub(8) as *const ObjectHeader);
+        if header.type_id() == type_id::MUTEX {
+            crate::synchronization::finalize_mutex(body);
+            return;
+        }
         if header.type_id() != type_id::STREAM {
             return; // not a stream — leave for other finalizer kinds
         }
@@ -2460,7 +2464,7 @@ fn stream_gc_finalize(_finalizer: TorclVal, object: TorclVal) {
 /// once at interpreter startup (torcl-jtc.7a).
 pub fn install_gc_hooks() {
     torcl_rt::gc::set_stream_trace_fn(stream_trace);
-    torcl_rt::gc::set_finalizer_dispatch(stream_gc_finalize);
+    torcl_rt::gc::set_finalizer_dispatch(stdlib_gc_finalize);
 }
 
 // ── TCP sockets ────────────────────────────────────────────────────

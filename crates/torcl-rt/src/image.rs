@@ -56,7 +56,9 @@ pub fn current_platform_tag() -> u64 {
 pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"TORCLIMG");
 
 /// Current image format version.
-const FORMAT_VERSION: u32 = 1;
+// Version 2 adds opaque MUTEX handles (type 0x19). Their process-local Arc is
+// nulled on save. Version-1 images retain the same layout and remain readable.
+const FORMAT_VERSION: u32 = 2;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

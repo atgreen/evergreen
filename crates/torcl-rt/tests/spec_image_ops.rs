@@ -363,6 +363,11 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
 
     let mut bytes = fs::read(&path).expect("read image");
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        2,
+        "MUTEX heap handles require image format version 2"
+    );
     bytes[0] ^= 0xFF;
     let bad_magic = temp_path("header-bad-magic.bimg");
     fs::write(&bad_magic, &bytes).expect("write mutated image");

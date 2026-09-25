@@ -5398,7 +5398,12 @@ pub fn serialize_heap_objects() -> Vec<u8> {
         // ansi-test *mini-universe* stream element under a type probe)
         // segfaulted (bliss-agmi). Streams are re-opened on load; the loader
         // re-creates the standard ones.
-        if type_id == crate::object::type_id::STREAM {
+        // Mutexes also own process-local native state. Preserve the Lisp handle
+        // but restore it as unavailable, never as a dangling native pointer.
+        if matches!(
+            type_id,
+            crate::object::type_id::STREAM | crate::object::type_id::MUTEX
+        ) {
             let zeros = [0u8; 8];
             out.extend_from_slice(&zeros[..size.min(8)]);
             if size > 8 {

@@ -587,6 +587,10 @@ a major version (R7.14).
 The `format_version` field in the header (D7.01) is independent of the
 release version:
 
+The current format is **2**, which adds the opaque mutex heap type (`0x19`).
+Its process-local native pointer is cleared on save; see §13.9 for restart
+semantics. Format-1 images retain the same section layout and remain readable.
+
 | Compat Rule | Behaviour |
 |-------------|-----------|
 | `loader_version == image_version` | Load normally |

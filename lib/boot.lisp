@@ -3637,6 +3637,46 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; loading; they can be wired to real system info later.
 ;;; ---------------------------------------------------------------------------
 
+;;; Native mutex policy lives here; %NATIVE-MUTEX delegates to the stdlib.
+(defun torcl-thread:make-mutex (&key name recursive)
+  (torcl::%native-mutex :make name recursive))
+
+(defun torcl-thread:mutex-p (object)
+  (torcl::%native-mutex :p object))
+
+(deftype torcl-thread:mutex () '(satisfies torcl-thread:mutex-p))
+
+(defun torcl-thread:grab-mutex (mutex &key (waitp t) timeout)
+  (unless (or (null timeout) (and (realp timeout) (not (minusp timeout))))
+    (error 'type-error :datum timeout :expected-type '(or null (real 0))))
+  (torcl::%native-mutex :grab mutex waitp (and timeout (float timeout 1d0))))
+
+(defun torcl-thread:release-mutex (mutex &key (if-not-owner :error))
+  (unless (member if-not-owner '(:error :warn :ignore))
+    (error 'type-error :datum if-not-owner :expected-type '(member :error :warn :ignore)))
+  (if (eq if-not-owner :error)
+      (torcl::%native-mutex :release mutex)
+      (unless (torcl::%native-mutex :release-if-owned mutex)
+        (when (eq if-not-owner :warn)
+          (warn "Attempt to release a mutex not owned by the current execution"))))
+  nil)
+
+(defmacro torcl-thread:with-mutex ((mutex &key (waitp t) timeout) &body body)
+  (let ((lock (gensym "MUTEX"))
+        (results (gensym "MUTEX-VALUES")))
+    `(let ((,lock ,mutex) (,results nil))
+       (when (torcl-thread:grab-mutex ,lock :waitp ,waitp :timeout ,timeout)
+         ;; Keep all values explicit across cleanup until the general compiled
+         ;; UNWIND-PROTECT multiple-value defect (bliss-pfgq) is resolved.
+         (unwind-protect
+             (setf ,results (multiple-value-list (progn ,@body)))
+           (torcl-thread:release-mutex ,lock))
+         (values-list ,results)))))
+
+(export '(torcl-thread:make-mutex torcl-thread:mutex-p torcl-thread:mutex
+          torcl-thread:grab-mutex torcl-thread:release-mutex torcl-thread:with-mutex)
+        "TORCL-THREAD")
+
 (defun lisp-implementation-type () "TorCL")
 (defun lisp-implementation-version () "0.1.0")
 (defun machine-type () (torcl-ext::%machine-type))

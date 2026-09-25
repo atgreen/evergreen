@@ -512,6 +512,17 @@ APIs and examples use `TORCL-THREAD`.
 performs a non-blocking try. `IF-NOT-OWNER` accepts `:ERROR`, `:WARN`, or
 `:IGNORE`. Barrier wait status is `:OK`, `:TIMEOUT`, or `:RESET`.
 
+The mutex implementation uses a moving GC handle owning an untraced reference
+to stable native storage. An operation retains that storage before it can
+block; unreachable handles release it through the stdlib finalizer dispatcher.
+`MUTEX-P` and `TYPE-OF` recognize the handle as `TORCL-THREAD:MUTEX`.
+
+Native ownership and wait queues do not survive an image restart. Image format
+2 saves mutex handles with their native pointer cleared. Restored handles still
+satisfy `MUTEX-P`, but locking or releasing one signals `PROGRAM-ERROR`;
+applications must recreate their mutexes after restart. Version-1 images
+remain readable. This is deliberately not an implicit unlock of a saved mutex.
+
 ### 13.9.2 Green-Thread–Aware Blocking
 
 Blocking on a sync primitive parks an unpinned fiber (§2.3.2), freeing its

@@ -191,6 +191,8 @@ pub mod type_id {
     /// a SIMPLE_VECTOR of the fixnum dimensions. Both are heap references the GC
     /// traces; rank is an immediate fixnum. Rank-1 arrays stay plain vectors.
     pub const MD_ARRAY: u8 = 0x18;
+    /// Opaque mutex handle: one untraced word owning a process-local Arc.
+    pub const MUTEX: u8 = 0x19;
 }
 
 // ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────

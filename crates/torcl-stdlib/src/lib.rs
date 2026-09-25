@@ -19,6 +19,7 @@ pub mod conditions;
 
 // ── Streams ───────────────────────────────────────────────────────
 pub mod streams;
+pub mod synchronization;
 
 // ── Sequences & hash tables ───────────────────────────────────────
 pub mod hashtable;

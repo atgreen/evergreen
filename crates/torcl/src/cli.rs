@@ -15663,6 +15663,11 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     NIL
                 });
             }
+            "TORCL::%NATIVE-MUTEX" => {
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::synchronization::call(&args);
+            }
             // ── TCP socket primitives (for the slynk backend) ──────────
             "TORCL::%SOCKET-CONNECT" => {
                 // (%socket-connect host port &optional timeout-ms) → UB8 stream.
@@ -24640,6 +24645,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                if torcl_stdlib::synchronization::mutex_p(v) {
+                    return Ok(resolve_sym("TORCL-THREAD::MUTEX").expect("mutex type symbol"));
+                }
                 // CLOS instances: TYPE-OF returns the direct class name, not the
                 // representation type (previously "FIXNUM"). See bliss-2ke.
                 if torcl_stdlib::is_instance(v) {
@@ -34339,6 +34347,7 @@ fn is_builtin_function(name: &str) -> bool {
         "DISASSEMBLE"
             // Native threads (TORCL-THREAD, §13.9; bliss-q9i1)
             | "MAKE-THREAD" | "JOIN-THREAD" | "CURRENT-THREAD"
+            | "TORCL::%NATIVE-MUTEX"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
             | "COMPILE"
@@ -35077,6 +35086,7 @@ fn apply_builtin_fast(
 
 fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclVal, TorclError> {
     match name {
+        "TORCL::%NATIVE-MUTEX" => torcl_stdlib::synchronization::call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
         "DISASSEMBLE" => {
