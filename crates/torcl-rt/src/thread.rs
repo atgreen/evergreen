@@ -1650,10 +1650,23 @@ pub fn make_thread(entry: TorclVal) -> Result<NativeThreadId, TorclError> {
         .spawn(move || {
             install_current_native_thread(Arc::clone(&running));
             running.set_state(NativeThreadState::Running);
-            let mut value = run_entry(running.entry());
-            if let Some(interrupt) = running.take_interrupt() {
-                value = Ok(interrupt);
-            }
+            // An unwinding entry must still publish completion: JOIN waits on
+            // this result before it can inspect the OS join handle. Catch at
+            // the worker boundary; after a panic this worker retires without
+            // evaluating any more Lisp or hiding the failure with an interrupt.
+            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut value = run_entry(running.entry());
+                if let Some(interrupt) = running.take_interrupt() {
+                    value = Ok(interrupt);
+                }
+                value
+            }))
+            .unwrap_or_else(|_| {
+                Err(TorclError::Internal(format!(
+                    "native thread {} panicked",
+                    id.0
+                )))
+            });
             running.stack.publish_top();
             result.complete(value);
             crate::safepoint::retire_native_thread(&running);
