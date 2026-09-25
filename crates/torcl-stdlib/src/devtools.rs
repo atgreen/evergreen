@@ -293,13 +293,7 @@ fn values_to_list(values: &[TorclVal]) -> TorclVal {
 #[cfg(test)]
 mod repl_history_gc_tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use torcl_rt::gc::{GcConfig, init_heap, walk_heap};
-
-    fn lock() -> &'static Mutex<()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-    }
 
     fn gc_config() -> GcConfig {
         GcConfig {
@@ -339,7 +333,7 @@ mod repl_history_gc_tests {
 
     #[test]
     fn repl_history_value_list_traces_heap_elements_after_full_gc() {
-        let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_heap_guard();
         init_heap(&gc_config()).expect("init_heap");
 
         let marker = 0x52D0_0001;

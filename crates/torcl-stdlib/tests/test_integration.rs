@@ -4,6 +4,13 @@
 //! their public APIs, proving that the modules integrate correctly.
 
 use torcl_rt::value::{NIL, T, TorclVal};
+
+// Tests reset the process-wide CLOS registry. Keep each fixture intact while
+// other cross-module tests may initialize condition classes on the same heap.
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
 use torcl_stdlib::clos::{
     bootstrap_clos, class_name, class_of, define_class, find_class, make_instance, set_slot_value,
     slot_boundp, slot_value,
@@ -47,6 +54,7 @@ fn fresh_registry() -> PackageRegistry {
 /// in another package and verify inherited symbol visibility.
 #[test]
 fn packages_intern_export_use_finds_across_packages() {
+    let _guard = test_guard();
     let mut reg = fresh_registry();
 
     // Create provider package and intern + export a symbol
@@ -83,6 +91,7 @@ fn packages_intern_export_use_finds_across_packages() {
 /// Intern a symbol in CL-USER, verify it is accessible via find_symbol.
 #[test]
 fn intern_in_cl_user_and_find() {
+    let _guard = test_guard();
     let reg = fresh_registry();
     let cl_user = reg.find_package("CL-USER").expect("CL-USER must exist");
     let (sym, status) = intern("MY-VAR", cl_user).unwrap();
@@ -97,6 +106,7 @@ fn intern_in_cl_user_and_find() {
 /// Import a symbol from one package into another (without use-package).
 #[test]
 fn import_symbol_across_packages() {
+    let _guard = test_guard();
     let mut reg = fresh_registry();
     let src = reg.make_package("SRC", &[], &[]).unwrap();
     let dst = reg.make_package("DST", &[], &[]).unwrap();
@@ -118,6 +128,7 @@ fn import_symbol_across_packages() {
 /// C uses B — X should NOT be inherited in C (only direct use-list).
 #[test]
 fn use_package_is_not_transitive() {
+    let _guard = test_guard();
     let mut reg = fresh_registry();
     let pkg_a = reg.make_package("PKG-A", &[], &[]).unwrap();
     let (sym_x, _) = intern("X", pkg_a).unwrap();
@@ -146,6 +157,7 @@ fn use_package_is_not_transitive() {
 /// Intern many symbols and verify they are all independently accessible.
 #[test]
 fn intern_multiple_symbols_in_same_package() {
+    let _guard = test_guard();
     let mut reg = fresh_registry();
     let pkg = reg.make_package("MULTI", &[], &[]).unwrap();
 
@@ -185,6 +197,7 @@ fn intern_multiple_symbols_in_same_package() {
 /// CLOS class hierarchy and condition system work together.
 #[test]
 fn define_condition_class_and_handle() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
     initialize_condition_runtime_support().expect("condition runtime support");
 
@@ -236,6 +249,7 @@ fn define_condition_class_and_handle() {
 /// Create a type-error condition via CLOS, verify its datum/expected-type.
 #[test]
 fn type_error_condition_carries_datum() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
 
     let datum = TorclVal::from_fixnum(99);
@@ -252,6 +266,7 @@ fn type_error_condition_carries_datum() {
 /// restarts are available during the body and removed after restart_bind returns.
 #[test]
 fn restart_from_handler_bind() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
 
     let restart_name = make_lisp_string("USE-VALUE");
@@ -292,6 +307,7 @@ fn restart_from_handler_bind() {
 /// CLOS class_of returns the correct class for fixnums after bootstrap.
 #[test]
 fn class_of_fixnum_after_bootstrap() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
     let val = TorclVal::from_fixnum(7);
     // class_of returns TorclVal directly, not Result
@@ -305,6 +321,7 @@ fn class_of_fixnum_after_bootstrap() {
 /// CLOS class_of returns the correct class for characters.
 #[test]
 fn class_of_character_after_bootstrap() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
     let val = TorclVal::from_char('A');
     // class_of and class_name return TorclVal directly
@@ -316,6 +333,7 @@ fn class_of_character_after_bootstrap() {
 /// Make an instance, set slot values, verify slot_boundp and slot_value.
 #[test]
 fn clos_make_instance_and_slots() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
 
     let t_class = find_class(T).expect("T must exist");
@@ -364,6 +382,7 @@ fn make_list(vals: &[TorclVal]) -> TorclVal {
 /// then use sequence functions to query the keys and verify entries.
 #[test]
 fn populate_hashtable_from_sequence() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).expect("make_hash_table");
 
@@ -391,6 +410,7 @@ fn populate_hashtable_from_sequence() {
 /// cross-module test proving hashtable lookups feed into sequence operations.
 #[test]
 fn hashtable_values_to_list_then_sequence_ops() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).expect("make_hash_table");
 
@@ -425,6 +445,7 @@ fn hashtable_values_to_list_then_sequence_ops() {
 /// demonstrating sequences feeding hashtable keys.
 #[test]
 fn sxhash_sequence_elements_as_keys() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions {
         test: HashTest::Equal,
         ..MakeHashTableOptions::default()
@@ -457,6 +478,7 @@ fn sxhash_sequence_elements_as_keys() {
 /// copy_seq and reverse on a list derived from the hashtable entries.
 #[test]
 fn hashtable_keys_to_list_copy_and_reverse() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).unwrap();
 
@@ -496,6 +518,7 @@ fn hashtable_keys_to_list_copy_and_reverse() {
 /// built from hash table values, exercising sequences + hashtables together.
 #[test]
 fn sequence_functions_on_hashtable_derived_data() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).unwrap();
 
@@ -543,6 +566,7 @@ fn sequence_functions_on_hashtable_derived_data() {
 /// then use copy_seq, reverse, and subseq on that list.
 #[test]
 fn sequence_copy_reverse_with_hashtable_lookup() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).unwrap();
 
@@ -587,6 +611,7 @@ fn sequence_copy_reverse_with_hashtable_lookup() {
 /// Use reduce on a cons list of fixnums extracted from a hash table.
 #[test]
 fn reduce_sequence_from_hashtable_values() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).unwrap();
 
@@ -628,6 +653,7 @@ fn reduce_sequence_from_hashtable_values() {
 /// Use maphash to iterate over hash table entries and collect into a sequence.
 #[test]
 fn maphash_iterate_and_collect() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).unwrap();
 
@@ -660,6 +686,7 @@ fn maphash_iterate_and_collect() {
 /// Use find from sequences module on a list built from hashtable values.
 #[test]
 fn sequence_find_in_hashtable_values() {
+    let _guard = test_guard();
     let opts = MakeHashTableOptions::default();
     let ht = make_hash_table(&opts).unwrap();
 
@@ -707,6 +734,7 @@ fn sequence_find_in_hashtable_values() {
 /// via get_output_stream_string — proving streams+FORMAT integration.
 #[test]
 fn format_to_string_output_stream() {
+    let _guard = test_guard();
     let stream = make_string_output_stream(NIL).expect("make_string_output_stream");
     // output_stream_p returns bool directly
     assert!(output_stream_p(stream));
@@ -727,6 +755,7 @@ fn format_to_string_output_stream() {
 /// Format with ~D for integer arguments.
 #[test]
 fn format_integer_directive() {
+    let _guard = test_guard();
     let arg = TorclVal::from_fixnum(42);
     // format takes &str for control_string
     let result = format(NIL, "The answer is ~D.", &[arg]).expect("format ~D");
@@ -742,6 +771,7 @@ fn format_integer_directive() {
 /// Format with ~% produces newlines.
 #[test]
 fn format_newline_directive() {
+    let _guard = test_guard();
     let result = format(NIL, "line1~%line2", &[]).expect("format ~%");
     assert!(!result.is_nil());
     // The result should contain a newline between line1 and line2
@@ -755,6 +785,7 @@ fn format_newline_directive() {
 /// Format into an actual stream (T = *standard-output*, or a stream val).
 #[test]
 fn format_to_stream_destination() {
+    let _guard = test_guard();
     let stream = make_string_output_stream(NIL).expect("make_string_output_stream");
 
     // Format to the stream; format takes &str for control_string
@@ -773,6 +804,7 @@ fn format_to_stream_destination() {
 /// Write characters to a string output stream and read the result.
 #[test]
 fn stream_write_chars_and_get_string() {
+    let _guard = test_guard();
     let stream = make_string_output_stream(NIL).expect("make_string_output_stream");
 
     stream_write_char(stream, TorclVal::from_char('H')).unwrap();
@@ -785,6 +817,7 @@ fn stream_write_chars_and_get_string() {
 /// Write a string to a stream and retrieve the output.
 #[test]
 fn stream_write_string_and_get_output() {
+    let _guard = test_guard();
     let stream = make_string_output_stream(NIL).expect("make_string_output_stream");
 
     let s = make_lisp_string("Hello, streams!");
@@ -802,6 +835,7 @@ fn stream_write_string_and_get_output() {
 /// String input stream: read characters one by one.
 #[test]
 fn string_input_stream_read_chars() {
+    let _guard = test_guard();
     let input_str = make_lisp_string("abc");
     // make_string_input_stream takes (string, start: usize, end: Option<usize>)
     let stream = make_string_input_stream(input_str, 0, None).expect("make_string_input_stream");
@@ -822,6 +856,7 @@ fn string_input_stream_read_chars() {
 /// Two-way stream: write to output side, read from input side.
 #[test]
 fn two_way_stream_integration() {
+    let _guard = test_guard();
     let input_str = make_lisp_string("input data");
     let in_stream = make_string_input_stream(input_str, 0, None).expect("input stream");
     let out_stream = make_string_output_stream(NIL).expect("output stream");
@@ -844,6 +879,7 @@ fn two_way_stream_integration() {
 /// Broadcast stream: writes go to all component streams.
 #[test]
 fn broadcast_stream_writes_to_all() {
+    let _guard = test_guard();
     let s1 = make_string_output_stream(NIL).unwrap();
     let s2 = make_string_output_stream(NIL).unwrap();
 
@@ -872,6 +908,7 @@ fn broadcast_stream_writes_to_all() {
 /// Format with multiple directives (~A ~D ~%) combined.
 #[test]
 fn format_multiple_directives() {
+    let _guard = test_guard();
     let name_arg = make_lisp_string("Alice");
     let age_arg = TorclVal::from_fixnum(30);
 
@@ -890,6 +927,7 @@ fn format_multiple_directives() {
 /// Formatter compiles a control string into a closure, then use it.
 #[test]
 fn formatter_compile_and_use() {
+    let _guard = test_guard();
     // formatter takes &str (not TorclVal)
     let compiled = formatter("~A = ~D");
     assert!(
@@ -913,6 +951,7 @@ fn make_pathname_string(s: &str) -> TorclVal {
 /// Parse a pathname string and extract its components.
 #[test]
 fn parse_pathname_and_extract_components() {
+    let _guard = test_guard();
     let path_str = make_pathname_string("/home/user/file.lisp");
     // parse_namestring returns Result<(TorclVal, usize)>
     let (pathname, _position) = parse_namestring(path_str, None, None).expect("parse_namestring");
@@ -932,6 +971,7 @@ fn parse_pathname_and_extract_components() {
 /// reconstructs it as a string.
 #[test]
 fn make_pathname_roundtrip() {
+    let _guard = test_guard();
     // Use make_pathname_string so components are registered in pathnames' registry
     // and namestring can reconstruct the full path string.
     let name = make_pathname_string("test");
@@ -957,6 +997,7 @@ fn make_pathname_roundtrip() {
 /// merge_pathnames fills in defaults from a second pathname.
 #[test]
 fn merge_pathnames_fills_defaults() {
+    let _guard = test_guard();
     let data_str = make_pathname_string("data");
     let partial = make_pathname(NIL, NIL, NIL, data_str, NIL, NIL).expect("partial pathname");
 
@@ -986,6 +1027,7 @@ fn merge_pathnames_fills_defaults() {
 /// that result proves the pathname designator was decoded correctly.
 #[test]
 fn pathname_to_stream_open() {
+    let _guard = test_guard();
     let path_str = make_pathname_string("/tmp/torcl-test-nonexistent.lisp");
     // parse_namestring returns (TorclVal, usize)
     let (pathname, _pos) = parse_namestring(path_str, None, None).expect("parse_namestring");
@@ -1006,6 +1048,7 @@ fn pathname_to_stream_open() {
 /// it back, and verify components match.
 #[test]
 fn pathname_namestring_parse_roundtrip() {
+    let _guard = test_guard();
     let original = make_pathname(
         NIL,
         NIL,
@@ -1035,6 +1078,7 @@ fn pathname_namestring_parse_roundtrip() {
 /// Verify host and device are NIL for Unix-style paths.
 #[test]
 fn unix_pathname_host_device_nil() {
+    let _guard = test_guard();
     let path_str = make_pathname_string("/etc/passwd");
     // parse_namestring returns (TorclVal, usize)
     let (pn, _pos) = parse_namestring(path_str, None, None).unwrap();
@@ -1055,6 +1099,7 @@ fn unix_pathname_host_device_nil() {
 /// use them as keys in a hash table.
 #[test]
 fn package_symbols_as_hashtable_keys() {
+    let _guard = test_guard();
     let mut reg = fresh_registry();
     let pkg = reg.make_package("HT-KEYS", &[], &[]).unwrap();
 
@@ -1086,6 +1131,7 @@ fn package_symbols_as_hashtable_keys() {
 /// format-control, and format it.
 #[test]
 fn format_condition_message() {
+    let _guard = test_guard();
     // make_simple_error takes (&str, &[TorclVal]) and returns TorclVal
     let condition = make_simple_error("Error: ~A at position ~D", &[]);
 
@@ -1108,6 +1154,7 @@ fn format_condition_message() {
 /// Stream close: verify stream is open, close it, verify it's closed.
 #[test]
 fn stream_open_close_lifecycle() {
+    let _guard = test_guard();
     let stream = make_string_output_stream(NIL).unwrap();
 
     // open_stream_p returns bool directly
@@ -1123,6 +1170,7 @@ fn stream_open_close_lifecycle() {
 /// then use sequence length on a list of the stored values.
 #[test]
 fn clos_classes_as_hashtable_keys_with_sequence_ops() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
 
     let opts = MakeHashTableOptions {

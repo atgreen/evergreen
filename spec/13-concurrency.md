@@ -95,6 +95,14 @@ and visited by the global root scanner during stop-the-world collection.
 Lexical exit tokens are unique across executions; sharing a closure must not
 make its exit target an unrelated block in the receiving thread.
 
+CLOS class, generic-function, and method definitions are process-wide as well.
+Native worker initialization must preserve existing definitions. Registry
+guards are short-lived and must not span Lisp allocation or evaluation;
+stop-the-world GC scans their relocatable values even after the defining
+execution exits. A method retains its defining lexical locations. Per-execution
+dispatch caches validate against a shared generation, invalidated before a
+definition-table mutation releases its guard.
+
 ---
 
 ## 13.3 Lock Ordering Protocol

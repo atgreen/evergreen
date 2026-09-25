@@ -10,8 +10,8 @@
 //! are actually called at runtime.
 
 use crate::clos::{
-    allocate_instance_pinned_gc, bootstrap_clos, class_direct_superclasses, class_name, class_of,
-    define_class, find_class, initialize_instance, make_instance,
+    allocate_instance_pinned_gc, class_direct_superclasses, class_name, class_of, define_class,
+    ensure_clos_bootstrapped, find_class, initialize_instance, make_instance,
 };
 use crate::streams::make_lisp_string_fresh;
 use torcl_rt::error::TorclError;
@@ -425,7 +425,7 @@ fn ensure_condition_class(name: &str) -> Result<TorclVal, TorclError> {
         return Ok(class);
     }
     if find_class(torcl_rt::value::T).is_none() {
-        let _ = bootstrap_clos();
+        let _ = ensure_clos_bootstrapped();
         if let Some(class) = find_class(sym) {
             return Ok(class);
         }

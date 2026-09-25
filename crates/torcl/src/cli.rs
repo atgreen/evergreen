@@ -1690,10 +1690,9 @@ enum EvalContext {
 }
 
 // ── Environment for variable/function bindings ───────────────────
-// Uses Rc for shared global definitions (classes, methods, closures). Lexical
-// function, macro, and symbol-macro maps retain copy-on-write isolation, while
-// RefCell makes their TorclVal slots legal relocation targets for the moving
-// collector.
+// CLOS definitions are process-global; lexical frames and escaping closures
+// share synchronized storage. Lexical function, macro, and symbol-macro maps
+// retain copy-on-write isolation, with mutable slots for GC relocation.
 #[derive(Clone)]
 struct Env {
     frame: Arc<SharedCell<EnvFrame>>,
@@ -1705,14 +1704,14 @@ struct Env {
     /// visible globally, matching how DEFUN installs into the symbol cell.
     setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: Rc<RefCell<HashMap<u32, TorclVal>>>,
-    // These four are GLOBAL definitions (packages, classes, generic functions,
-    // methods): shared and mutated in place so a definition made inside a child
+    // These are GLOBAL definitions (classes, generic functions, methods):
+    // shared and mutated in place so a definition made inside a child
     // Env (a FLET/MACROLET body, as when ASDF loads a system's files) is visible
     // everywhere, matching CL semantics (bliss-lb6.22). Only `funs`/`macros` are
     // genuinely lexical (FLET/MACROLET locals) and are cloned for child Envs.
-    classes: Rc<RefCell<HashMap<String, ClassDef>>>,
-    generics: Rc<RefCell<HashMap<String, GenericDef>>>,
-    methods: Rc<RefCell<HashMap<String, Vec<MethodDef>>>>,
+    classes: &'static DefinitionTable<HashMap<String, ClassDef>>,
+    generics: &'static DefinitionTable<HashMap<String, GenericDef>>,
+    methods: &'static DefinitionTable<HashMap<String, Vec<MethodDef>>>,
     current_package: String,
     sandbox: bool,
     restarts: Vec<RestartEntry>,
@@ -1862,6 +1861,92 @@ impl<K: PartialEq + std::borrow::Borrow<Q>, Q: PartialEq + ?Sized, V> std::ops::
 #[derive(Default)]
 struct SharedCell<T>(Mutex<T>);
 
+/// Process-wide CLOS definitions. Guards must not span Lisp evaluation,
+/// allocation, or symbol/heap lookups. Mutation invalidates every execution's
+/// derived dispatch caches before the updated table is unlocked.
+struct DefinitionTable<T>(OrderedMutex<T>);
+
+impl<T> DefinitionTable<T> {
+    fn borrow(&self) -> torcl_rt::lock_order::OrderedMutexGuard<'_, T> {
+        self.0.lock().unwrap()
+    }
+
+    fn borrow_mut(&self) -> DefinitionWriteGuard<'_, T> {
+        DefinitionWriteGuard(self.borrow())
+    }
+}
+
+impl<V: Clone> DefinitionTable<HashMap<String, V>> {
+    fn contains_key(&self, name: &str) -> bool {
+        self.borrow().contains_key(name)
+    }
+
+    fn get_cloned(&self, name: &str) -> Option<V> {
+        self.borrow().get(name).cloned()
+    }
+}
+
+struct DefinitionWriteGuard<'a, T>(torcl_rt::lock_order::OrderedMutexGuard<'a, T>);
+
+impl<T> std::ops::Deref for DefinitionWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for DefinitionWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T> Drop for DefinitionWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        invalidate_gf_dispatch_cache();
+    }
+}
+
+static CLASS_DEFINITIONS: LazyLock<DefinitionTable<HashMap<String, ClassDef>>> =
+    LazyLock::new(|| {
+        DefinitionTable(OrderedMutex::new(
+            LockLevel::GcWorld,
+            21,
+            "evaluator classes",
+            HashMap::new(),
+        ))
+    });
+static GENERIC_DEFINITIONS: LazyLock<DefinitionTable<HashMap<String, GenericDef>>> =
+    LazyLock::new(|| {
+        DefinitionTable(OrderedMutex::new(
+            LockLevel::GcWorld,
+            22,
+            "evaluator generics",
+            HashMap::new(),
+        ))
+    });
+static METHOD_DEFINITIONS: LazyLock<DefinitionTable<HashMap<String, Vec<MethodDef>>>> =
+    LazyLock::new(|| {
+        DefinitionTable(OrderedMutex::new(
+            LockLevel::GcWorld,
+            23,
+            "evaluator methods",
+            HashMap::new(),
+        ))
+    });
+static GF_DISPATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Reified compiled method functions keyed by immediate method identity. Shared
+/// with their original bytecode bodies and traced by the global root scanner.
+static METHOD_COMPILED: LazyLock<DefinitionTable<HashMap<u64, TorclVal>>> = LazyLock::new(|| {
+    DefinitionTable(OrderedMutex::new(
+        LockLevel::GcWorld,
+        24,
+        "compiled method functions",
+        HashMap::new(),
+    ))
+});
+
 impl<T> SharedCell<T> {
     fn new(value: T) -> Self {
         Self(Mutex::new(value))
@@ -1906,8 +1991,6 @@ struct FrozenMacroCapture {
     body: TorclVal,
     captured_frame: Arc<FrozenEnvFrame>,
     funs: HashMap<String, FunDef>,
-    classes: HashMap<String, ClassDef>,
-    methods: HashMap<String, Vec<MethodDef>>,
     symbol_macros: HashMap<u32, TorclVal>,
 }
 
@@ -1957,7 +2040,7 @@ struct FunDef {
 
 type LexicalExitNames = (Vec<(String, String)>, Vec<(String, String)>);
 type LexicalExitScope<'a> = (&'a [(String, String)], &'a [(String, String)]);
-type SharedEnvMap<T> = Rc<RefCell<HashMap<String, T>>>;
+type SharedEnvMap<T> = &'static DefinitionTable<HashMap<String, T>>;
 type ClassSlotCells = Arc<Mutex<HashMap<String, Option<TorclVal>>>>;
 
 impl FunDef {
@@ -2063,6 +2146,9 @@ enum SlotAllocation {
 #[derive(Clone)]
 struct MethodDef {
     method_id: TorclVal,
+    /// The original lexical locations travel with the method, including an
+    /// in-flight method retained after another thread replaces its definition.
+    captured_frame: Option<Arc<SharedCell<EnvFrame>>>,
     /// Specializers for the required parameters only (parameters before any
     /// lambda-list keyword). Their count is the number of required parameters.
     specializers: Vec<MethodSpecializer>,
@@ -2250,24 +2336,6 @@ thread_local! {
     /// nested) LOAD, whose frame carries incidental lexical copies (bliss-sdd).
     static TOPLEVEL_FRAME_BASE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 
-    /// Captured lexical environment for a DEFMETHOD written inside a user binding
-    /// form (e.g. cl-ppcre's `(let ((reg-scanner …)) (defmethod
-    /// build-replacement-template …))`). Keyed by the method's `method_id` bits.
-    /// A method with an entry runs its body against this frame instead of the
-    /// caller's. MethodDef itself must stay `Send` (the macro-capture path freezes
-    /// it), so the non-`Send` frame lives here, not in the struct. The frames are
-    /// traced as GC roots by `scan_evaluator_global_roots` (bliss-sdd).
-    static METHOD_CAPTURED_ENV: RefCell<HashMap<u64, Arc<SharedCell<EnvFrame>>>> =
-        RefCell::new(HashMap::new());
-
-    /// Compiled (bytecode) body for a DEFMETHOD, keyed by the method's
-    /// `method_id` bits. When present, `invoke_method` dispatches the method
-    /// through `apply_function` on this reified interpreted-function object — so
-    /// the body runs as tiered bytecode/native instead of `eval_progn`
-    /// (bliss-x5y.20). The value is an interpreted-function object (pinned by the
-    /// allocator); it is also visited as a GC root so it stays live.
-    static METHOD_COMPILED: RefCell<HashMap<u64, TorclVal>> = RefCell::new(HashMap::new());
-
     /// Effective-method dispatch cache (bliss-x5y.20). Standard method
     /// combination with class-only specializers is a pure function of (generic
     /// name, argument classes): the applicable-method set, its ordering, and the
@@ -2278,7 +2346,6 @@ thread_local! {
     /// Cache the four method-id lists (each id is a `from_meta_handle` immediate,
     /// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
     /// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
-    static GF_DISPATCH_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GF_DISPATCH_CACHE: RefCell<HashMap<GfKey, GfDispatchEntry, torcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
 
@@ -2526,10 +2593,10 @@ thread_local! {
     /// Remapped ((SETF place) key, params, params_form_raw, body_raw) records.
     static PENDING_HOST_SETF: RefCell<Vec<SetfRec>> =
         const { RefCell::new(Vec::new()) };
-    /// Rc handles to the saving Env's generics/methods maps, stashed by
+    /// References to the saving Env's global definition tables, stashed by
     /// `save_core_and_die` for the serialize hook (whose signature has no Env).
-    /// Rc clones SHARE the live Env's storage, so the save-time full_gc root
-    /// scan keeps the contained TorclVals current — a deep copy here would go
+    /// The save-time full_gc root scan keeps the contained TorclVals current;
+    /// a deep copy here would go
     /// stale when the compacting GC moves objects (torcl-x0f2.7a).
     static SAVE_GENERICS: RefCell<Option<SharedEnvMap<GenericDef>>> =
         const { RefCell::new(None) };
@@ -2635,7 +2702,7 @@ fn host_serialize_registries() -> Vec<u8> {
     // DEFMETHOD / accessor dispatch lives in the Env's generics/methods maps,
     // which a fresh post-load Env lacks — without this block every GF call in a
     // loaded core is "undefined function". The Env's maps are reached through
-    // the SAVE_GENERICS/SAVE_METHODS stash (Rc shares, still GC-scanned).
+    // the SAVE_GENERICS/SAVE_METHODS stash (shared, globally GC-scanned).
     out.extend_from_slice(b"GFNS");
     let generics: Vec<(String, u64, u8)> = SAVE_GENERICS.with(|g| {
         g.borrow().as_ref().map_or_else(Vec::new, |map| {
@@ -2921,14 +2988,14 @@ fn host_serialize_registries() -> Vec<u8> {
     // ASDF method falls back to source evaluation after restart. Method ids are
     // stable immediate meta-handles; callable pointers must be relocated.
     out.extend_from_slice(b"MCOD");
-    METHOD_COMPILED.with(|methods| {
-        let methods = methods.borrow();
+    {
+        let methods = METHOD_COMPILED.borrow();
         out.extend_from_slice(&(methods.len() as u32).to_le_bytes());
         for (&id, callable) in methods.iter() {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&callable.to_raw().to_le_bytes());
         }
-    });
+    }
     out
 }
 
@@ -3433,7 +3500,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
             compiled_methods.insert(id, TorclVal::from_raw(remap(callable)));
         }
     }
-    METHOD_COMPILED.with(|methods| *methods.borrow_mut() = compiled_methods);
+    *METHOD_COMPILED.borrow_mut() = compiled_methods;
     Ok(())
 }
 
@@ -3490,6 +3557,7 @@ fn drain_pending_host_generics(env: &Env) {
             .into_iter()
             .map(|(mid, ll, body, qual, specs)| MethodDef {
                 method_id: TorclVal::from_raw(mid),
+                captured_frame: None, // Captured-method image persistence: bliss-mxjr.
                 specializers: specs
                     .into_iter()
                     .map(|(tag, cname, eql_raw)| match tag {
@@ -5039,7 +5107,7 @@ fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: O
     // is not found as class-allocated (e.g. transitional/bootstrap classes).
     let bare = symbol_bare_name(slot_name);
     let owner = class_slot_owner(env, class_name, &bare).unwrap_or_else(|| class_name.to_string());
-    if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
+    if let Some(class_def) = env.classes.get_cloned(&owner) {
         // Key by BARE slot name for consistency with reads (bliss-x4p).
         class_def
             .class_slot_values
@@ -5178,7 +5246,7 @@ fn read_slot_value(instance: TorclVal, slot: TorclVal, env: &Env) -> Result<Torc
         // in the OWNING class's cell — not the instance's own class. Reading it
         // from the instance class made an inherited class slot look unbound to
         // subclass instances (bliss-x4p: ASDF's selfward-operation).
-        if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
+        if let Some(class_def) = env.classes.get_cloned(&owner) {
             let values = class_def.class_slot_values.lock().unwrap();
             // Keyed by BARE slot name so a package-qualified declaration and a
             // bare/differently-qualified read agree (bliss-x4p).
@@ -5236,7 +5304,7 @@ fn slot_is_bound(instance: TorclVal, slot: TorclVal, env: &Env) -> Result<bool, 
     let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
     let slot_name = sym_bare_name_rc(slot);
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
-        if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
+        if let Some(class_def) = env.classes.get_cloned(&owner) {
             let values = class_def.class_slot_values.lock().unwrap();
             return Ok(matches!(
                 values
@@ -5280,7 +5348,7 @@ fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
             return;
         }
         order.push(name.to_string());
-        if let Some(class_def) = env.classes.borrow().get(name).cloned() {
+        if let Some(class_def) = env.classes.get_cloned(name) {
             for super_name in &class_def.supers {
                 visit(env, super_name, order, seen);
             }
@@ -5524,7 +5592,8 @@ fn invoke_method(
     // call-next-method — bliss-x5y.20), dispatch it through apply_function so it
     // runs as tiered bytecode/native. The compiled body binds its own params and
     // never consults env.method_context, so `next` is irrelevant here.
-    if let Some(callable) = METHOD_COMPILED.with(|m| m.borrow().get(&method.method_id.0).copied()) {
+    let callable = METHOD_COMPILED.borrow().get(&method.method_id.0).copied();
+    if let Some(callable) = callable {
         // A compiled body binds its own parameters, but it may still contain
         // CALL-NEXT-METHOD / NEXT-METHOD-P, which read env.method_context —
         // so publish the context here exactly as the tree-walked path does,
@@ -5543,8 +5612,9 @@ fn invoke_method(
     }
     // A method defined inside a user binding form runs its body against that
     // captured lexical environment, not the caller's frame (bliss-sdd).
-    let parent = METHOD_CAPTURED_ENV
-        .with(|m| m.borrow().get(&method.method_id.0).cloned())
+    let parent = method
+        .captured_frame
+        .clone()
         .unwrap_or_else(|| Arc::clone(&env.frame));
     if let Some(mut next) = next {
         torcl_rt::rooted_ref!(_next_root = &mut next);
@@ -6027,15 +6097,11 @@ fn run_initialization_aux_methods(
 
 /// True if the generic `name` has at least one method applicable to `args`.
 fn has_applicable_method(env: &Env, name: &str, args: &[TorclVal]) -> bool {
-    env.methods
-        .borrow()
-        .get(name)
-        .map(|methods| {
-            methods
-                .iter()
-                .any(|m| method_specificity_vector(env, m, args).is_some())
-        })
-        .unwrap_or(false)
+    // Applicability resolves symbols/classes and can allocate. Release the
+    // definition-table guard first and root the retained snapshot and arguments.
+    torcl_rt::rooted!(methods = env.methods.get_cloned(name).unwrap_or_default());
+    torcl_rt::rooted!(args = args.to_vec());
+    (0..methods.len()).any(|index| method_specificity_vector(env, &methods[index], &args).is_some())
 }
 
 /// `TORCL_CALLTRACE=1`: print the named-function chain a TYPE-ERROR propagates
@@ -6125,7 +6191,7 @@ struct GfKey {
 /// Invalidate every cached dispatch decision. Cheap (a counter bump); called when
 /// a method or class (re)definition could change applicability or ordering.
 fn invalidate_gf_dispatch_cache() {
-    GF_DISPATCH_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    GF_DISPATCH_GENERATION.fetch_add(1, AtomicOrdering::Release);
 }
 
 /// True if any method on `name` specializes a parameter with `(eql value)` —
@@ -6232,7 +6298,7 @@ fn try_single_primary_fast(
         return None;
     }
     let id = primary_ids[0];
-    let callable = METHOD_COMPILED.with(|m| m.borrow().get(&id.0).copied())?;
+    let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
     Some(apply_function(callable, args, env))
 }
 
@@ -6302,7 +6368,7 @@ fn invoke_generic_function_inner(
     }
 
     let gf_idx = torcl_rt::symbols::find_index(name);
-    let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
+    let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
     // Per-generic metadata memo (bliss-fy37 #3): (combination, cacheable) is a
     // pure function of the generic's definition + its method set, both of which
     // bump GF_DISPATCH_GENERATION when they change (defgeneric at ~28390,
@@ -6713,7 +6779,14 @@ fn visit_class_def_roots(
     }
 }
 
-fn visit_method_def_roots(def: &mut MethodDef, visit: &mut dyn FnMut(*mut TorclVal)) {
+fn visit_method_def_roots(
+    def: &mut MethodDef,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut TorclVal),
+) {
+    if let Some(frame) = &def.captured_frame {
+        visit_env_frame_roots(frame, state, visit);
+    }
     visit(&mut def.method_id);
     for specializer in &mut def.specializers {
         if let MethodSpecializer::Eql(value) = specializer {
@@ -6726,14 +6799,18 @@ fn visit_method_def_roots(def: &mut MethodDef, visit: &mut dyn FnMut(*mut TorclV
 
 impl torcl_rt::gc::TraceHostRoots for MethodDef {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
-        visit_method_def_roots(self, visit);
+        with_env_visit_state(|state| visit_method_def_roots(self, state, visit));
     }
 }
 
-fn visit_next_method_roots(next: &mut NextMethod, visit: &mut dyn FnMut(*mut TorclVal)) {
+fn visit_next_method_roots(
+    next: &mut NextMethod,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut TorclVal),
+) {
     let mut visit_methods = |methods: &mut Vec<MethodDef>| {
         for method in methods {
-            visit_method_def_roots(method, visit);
+            visit_method_def_roots(method, state, visit);
         }
     };
     match next {
@@ -6754,7 +6831,7 @@ fn visit_next_method_roots(next: &mut NextMethod, visit: &mut dyn FnMut(*mut Tor
 
 impl torcl_rt::gc::TraceHostRoots for NextMethod {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
-        visit_next_method_roots(self, visit);
+        with_env_visit_state(|state| visit_next_method_roots(self, state, visit));
     }
 }
 
@@ -6763,7 +6840,7 @@ impl torcl_rt::gc::TraceHostRoots for MethodContext {
         for arg in &mut self.args {
             visit(arg);
         }
-        visit_next_method_roots(&mut self.next, visit);
+        with_env_visit_state(|state| visit_next_method_roots(&mut self.next, state, visit));
     }
 }
 
@@ -6958,6 +7035,19 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
 
     // Shared per-pass visit state (bliss-s56e).
     with_env_visit_state(|state| {
+        // Definitions outlive every Env, including the execution that created
+        // them. Visit them once globally, not once per rooted environment.
+        for class in CLASS_DEFINITIONS.borrow_mut().values_mut() {
+            visit_class_def_roots(class, state, visit);
+        }
+        for generic in GENERIC_DEFINITIONS.borrow_mut().values_mut() {
+            visit(&mut generic.generic_function);
+        }
+        for methods in METHOD_DEFINITIONS.borrow_mut().values_mut() {
+            for method in methods {
+                visit_method_def_roots(method, state, visit);
+            }
+        }
         for closure in closure_registry().borrow_mut().values_mut() {
             visit(&mut closure.params_form);
             visit(&mut closure.body);
@@ -6966,20 +7056,10 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
                 visit_fun_map_roots(funs, state, visit);
             }
         }
-        // Lexical frames captured by DEFMETHODs defined inside binding forms
-        // (bliss-sdd) are roots: the moving collector must rewrite the TorclVals they
-        // hold (e.g. cl-ppcre's REG-SCANNER) so the method body reads live pointers.
-        METHOD_CAPTURED_ENV.with(|m| {
-            for frame in m.borrow().values() {
-                visit_env_frame_roots(frame, state, visit);
-            }
-        });
         // Keep each method's compiled body object live (bliss-x5y.20).
-        METHOD_COMPILED.with(|m| {
-            for callable in m.borrow_mut().values_mut() {
-                visit(callable);
-            }
-        });
+        for callable in METHOD_COMPILED.borrow_mut().values_mut() {
+            visit(callable);
+        }
         GLOBAL_MACROS.with(|macros| {
             for definition in macros.borrow_mut().values_mut() {
                 visit_macro_def_roots(definition, state, visit);
@@ -7019,14 +7099,6 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
             visit_frozen_env_frame_roots(&capture.captured_frame, &mut frozen_frames, visit);
             for definition in capture.funs.values_mut() {
                 visit_fun_def_roots(definition, visit);
-            }
-            for class in capture.classes.values_mut() {
-                visit_class_def_roots(class, state, visit);
-            }
-            for methods in capture.methods.values_mut() {
-                for method in methods {
-                    visit_method_def_roots(method, visit);
-                }
             }
             for expansion in capture.symbol_macros.values_mut() {
                 visit(expansion);
@@ -7068,9 +7140,9 @@ fn install_evaluator_global_root_scanner() {
 /// thread boundary; only `entry` (a `Copy` `TorclVal`) does. Here we build a
 /// *fresh* per-thread environment. Global definitional state that already lives
 /// in shared `torcl-rt` cells (function/value cells) is visible; state still
-/// held in `thread_local!`/`Rc`-local maps (CLOS classes, macros defined at the
-/// REPL) is NOT yet shared and so is invisible on the worker — that migration is
-/// tracked as bliss-nubv. Crucially we use the *non-resetting* constructor:
+/// held in `thread_local!`/`Rc`-local maps (macros defined at the REPL) is NOT
+/// yet shared — that migration is tracked as bliss-nubv. CLOS definitions are
+/// process-global. Crucially we use the *non-resetting* constructor:
 /// `reset_clos=true` would wipe the parent thread's classes and packages.
 fn thread_entry_runner(mut entry: TorclVal) -> Result<TorclVal, TorclError> {
     torcl_rt::rooted_ref!(_entry_root = &mut entry);
@@ -7087,7 +7159,14 @@ fn thread_entry_runner(mut entry: TorclVal) -> Result<TorclVal, TorclError> {
     // (Rc) objects scanned as roots each GC, so rooting the Env in place is what
     // keeps them live and correctly relocated.
     torcl_rt::rooted_ref!(_env_root = &mut env);
-    apply_function(entry, &[], &mut env)
+    // Definitions inside the entry function's bindings must retain those
+    // lexical locations, just as definitions inside a top-level LET do.
+    TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
+    let result = apply_function(entry, &[], &mut env);
+    TOPLEVEL_FRAME_BASE.with(|s| {
+        s.borrow_mut().pop();
+    });
+    result
 }
 
 impl Env {
@@ -7144,17 +7223,6 @@ impl Env {
         for expansion in self.symbol_macros.borrow_mut().values_mut() {
             visit(expansion);
         }
-        for class in self.classes.borrow_mut().values_mut() {
-            visit_class_def_roots(class, state, visit);
-        }
-        for generic in self.generics.borrow_mut().values_mut() {
-            visit(&mut generic.generic_function);
-        }
-        for methods in self.methods.borrow_mut().values_mut() {
-            for method in methods {
-                visit_method_def_roots(method, visit);
-            }
-        }
         for restart in &mut self.restarts {
             visit_restart_function_roots(&mut restart.function, state, visit);
             if let Some(function) = &mut restart.interactive_function {
@@ -7192,7 +7260,7 @@ impl Env {
             for arg in &mut context.args {
                 visit(arg);
             }
-            visit_next_method_roots(&mut context.next, visit);
+            visit_next_method_roots(&mut context.next, state, visit);
         }
     }
 
@@ -7223,6 +7291,9 @@ impl Env {
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = torcl_stdlib::bootstrap_clos();
+            CLASS_DEFINITIONS.borrow_mut().clear();
+            GENERIC_DEFINITIONS.borrow_mut().clear();
+            METHOD_DEFINITIONS.borrow_mut().clear();
         } else {
             let _ = torcl_stdlib::ensure_clos_bootstrapped();
         }
@@ -7248,9 +7319,9 @@ impl Env {
             macros: Rc::new(RefCell::new(HashMap::new())),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
             symbol_macros: Rc::new(RefCell::new(HashMap::new())),
-            classes: Rc::new(RefCell::new(HashMap::new())),
-            generics: Rc::new(RefCell::new(HashMap::new())),
-            methods: Rc::new(RefCell::new(HashMap::new())),
+            classes: &CLASS_DEFINITIONS,
+            generics: &GENERIC_DEFINITIONS,
+            methods: &METHOD_DEFINITIONS,
             current_package: "COMMON-LISP-USER".to_string(),
             sandbox,
             restarts: Vec::new(),
@@ -7283,15 +7354,6 @@ impl Env {
                     if let Some(t) = regs.symbol_macros.upgrade() {
                         env.symbol_macros = t;
                     }
-                    if let Some(t) = regs.classes.upgrade() {
-                        env.classes = t;
-                    }
-                    if let Some(t) = regs.generics.upgrade() {
-                        env.generics = t;
-                    }
-                    if let Some(t) = regs.methods.upgrade() {
-                        env.methods = t;
-                    }
                 }
             });
         } else {
@@ -7300,9 +7362,6 @@ impl Env {
                     funs: Arc::downgrade(&env.funs),
                     setf_expanders: Rc::downgrade(&env.setf_expanders),
                     symbol_macros: Rc::downgrade(&env.symbol_macros),
-                    classes: Rc::downgrade(&env.classes),
-                    generics: Rc::downgrade(&env.generics),
-                    methods: Rc::downgrade(&env.methods),
                 });
             });
         }
@@ -7535,9 +7594,9 @@ impl Env {
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
-            classes: Rc::clone(&self.classes),
-            generics: Rc::clone(&self.generics),
-            methods: Rc::clone(&self.methods),
+            classes: self.classes,
+            generics: self.generics,
+            methods: self.methods,
             current_package: self.current_package.clone(),
             sandbox: self.sandbox,
             restarts: self.restarts.clone(),
@@ -7566,9 +7625,9 @@ impl Env {
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
-            classes: Rc::clone(&self.classes),
-            generics: Rc::clone(&self.generics),
-            methods: Rc::clone(&self.methods),
+            classes: self.classes,
+            generics: self.generics,
+            methods: self.methods,
             current_package: self.current_package.clone(),
             sandbox: self.sandbox,
             restarts: self.restarts.clone(),
@@ -8831,9 +8890,6 @@ struct DefinitionalRegistries {
     funs: std::sync::Weak<SharedCell<HashMap<String, FunDef>>>,
     setf_expanders: std::rc::Weak<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: std::rc::Weak<RefCell<HashMap<u32, TorclVal>>>,
-    classes: std::rc::Weak<RefCell<HashMap<String, ClassDef>>>,
-    generics: std::rc::Weak<RefCell<HashMap<String, GenericDef>>>,
-    methods: std::rc::Weak<RefCell<HashMap<String, Vec<MethodDef>>>>,
 }
 
 thread_local! {
@@ -13918,8 +13974,8 @@ fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     if fn_bound(env, name)
         || macro_defined(env, name)
-        || env.generics.borrow().contains_key(name)
-        || env.methods.borrow().contains_key(name)
+        || env.generics.contains_key(name)
+        || env.methods.contains_key(name)
         || fn_bound(env, bare)
     {
         return true;
@@ -14352,8 +14408,7 @@ fn symbol_function_object_ex(
     // (functionp #'gf) NIL where SBCL says T. Reify the same apply-by-name
     // wrapper used for builtins; dispatch still happens per call, so a method
     // added later is still picked up.
-    let is_generic =
-        env.generics.borrow().contains_key(&fn_name) || env.methods.borrow().contains_key(&fn_name);
+    let is_generic = env.generics.contains_key(&fn_name) || env.methods.contains_key(&fn_name);
     if is_generic {
         // Key the wrapper by the FULL name, not the bare one: that is the
         // env.generics/env.methods key, so builtin_wrapper_name() round-trips
@@ -14685,7 +14740,7 @@ fn order_sensitive_setf_accessor(mut place: TorclVal) -> Option<String> {
 // End both registry borrows before the caller evaluates arguments or allocates.
 fn env_has_setf_generic(env: &Env, place: &str) -> bool {
     let key = format!("(SETF {place})");
-    env.methods.borrow().contains_key(&key) || env.generics.borrow().contains_key(&key)
+    env.methods.contains_key(&key) || env.generics.contains_key(&key)
 }
 
 fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
@@ -15380,7 +15435,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(if is_stream(obj) { T } else { NIL });
             }
             "INPUT-STREAM-P" | "TORCL::%NATIVE-INPUT-STREAM-P"
-                if !env.generics.borrow().contains_key(&name) =>
+                if !env.generics.contains_key(&name) =>
             {
                 // (input-stream-p stream) → T if the stream can be read from.
                 let args = eval_args(cdr, env)?;
@@ -15401,7 +15456,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(torcl_stdlib::stream_element_type(args[0]));
             }
             "OUTPUT-STREAM-P" | "TORCL::%NATIVE-OUTPUT-STREAM-P"
-                if !env.generics.borrow().contains_key(&name) =>
+                if !env.generics.contains_key(&name) =>
             {
                 // (output-stream-p stream) → T if the stream can be written to.
                 let args = eval_args(cdr, env)?;
@@ -15413,7 +15468,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 });
             }
             "OPEN-STREAM-P" | "TORCL::%NATIVE-OPEN-STREAM-P"
-                if !env.generics.borrow().contains_key(&name) =>
+                if !env.generics.contains_key(&name) =>
             {
                 // (open-stream-p stream) → T if the stream is not closed.
                 let args = eval_args(cdr, env)?;
@@ -15424,7 +15479,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     NIL
                 });
             }
-            "CLOSE" | "TORCL::%NATIVE-CLOSE" if !env.generics.borrow().contains_key(&name) => {
+            "CLOSE" | "TORCL::%NATIVE-CLOSE" if !env.generics.contains_key(&name) => {
                 // (close stream &key abort) → T. Closing a non-stream is a no-op.
                 let args = eval_args(cdr, env)?;
                 let stream = if args.is_empty() { NIL } else { args[0] };
@@ -16998,8 +17053,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     let n = sym_name(spec);
                     let bare = symbol_bare_name(&n);
                     if fn_bound(env, &n)
-                        || env.methods.borrow().contains_key(&n)
-                        || env.generics.borrow().contains_key(&n)
+                        || env.methods.contains_key(&n)
+                        || env.generics.contains_key(&n)
                         || macro_defined(env, &n)
                         || is_builtin_function(&bare)
                         // Standard special operators and standard macros that the
@@ -17059,8 +17114,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let bound = cell_bound
                     || setf_writer_bound
                     || fn_bound(env, &name)
-                    || env.methods.borrow().contains_key(&name)
-                    || env.generics.borrow().contains_key(&name)
+                    || env.methods.contains_key(&name)
+                    || env.generics.contains_key(&name)
                     || macro_defined(env, &name)
                     || is_builtin_function(&bare)
                     // Standard special operators and standard macros that the
@@ -18767,8 +18822,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     } else {
                         val_as_str(*name)
                     };
-                    let is_generic = env.generics.borrow().contains_key(&gname)
-                        || env.methods.borrow().contains_key(&gname);
+                    let is_generic =
+                        env.generics.contains_key(&gname) || env.methods.contains_key(&gname);
                     if is_generic {
                         let primary = if name.is_nil() { NIL } else { *name };
                         env.set_mv(vec![primary, NIL, NIL]);
@@ -18789,8 +18844,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                             } else {
                                 val_as_str(*name)
                             };
-                            let fbound = env.generics.borrow().contains_key(&nm)
-                                || env.methods.borrow().contains_key(&nm)
+                            let fbound = env.generics.contains_key(&nm)
+                                || env.methods.contains_key(&nm)
                                 || macro_defined(env, &nm)
                                 || is_builtin_function(&symbol_bare_name(&nm));
                             if fbound {
@@ -22047,9 +22102,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
 
                 let gf_name = if gf.is_symbol() {
                     Some(sym_name(gf))
-                } else if let Some(n) = builtin_wrapper_name(gf).filter(|n| {
-                    env.generics.borrow().contains_key(n) || env.methods.borrow().contains_key(n)
-                }) {
+                } else if let Some(n) = builtin_wrapper_name(gf)
+                    .filter(|n| env.generics.contains_key(n) || env.methods.contains_key(n))
+                {
                     // `#'gf` reifies a FUNCTIONP wrapper rather than the bare
                     // name symbol; map it back to the generic it stands for.
                     Some(n)
@@ -24734,8 +24789,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             eprintln!(
                 "[dispatch] {name}: callable_body={} generics={} methods={} params={} body={}",
                 cb.is_some(),
-                env.generics.borrow().contains_key(&name),
-                env.methods.borrow().contains_key(&name),
+                env.generics.contains_key(&name),
+                env.methods.contains_key(&name),
                 cb.map(|(p, _)| fmt_form_debug(p)).unwrap_or_default(),
                 cb.map(|(_, b)| fmt_form_debug(b)).unwrap_or_default()
             );
@@ -24964,7 +25019,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         }
 
         // Check methods
-        if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
+        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
             let args = eval_args(cdr, env)?;
             return invoke_generic_function(&name, &args, env);
         }
@@ -31256,8 +31311,6 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
         body,
         captured_frame: freeze_env_frame(&env.frame),
         funs: env.funs.borrow().clone(),
-        classes: env.classes.borrow().clone(),
-        methods: env.methods.borrow().clone(),
         symbol_macros: env.symbol_macros.borrow().clone(),
     });
     let current_package = env.current_package.clone();
@@ -31289,7 +31342,7 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
                 package_symbol.as_symbol_index(),
                 *definition_package_value,
             );
-            let (params_form, body, captured_frame, funs, classes, methods, symbol_macros) = {
+            let (params_form, body, captured_frame, funs, symbol_macros) = {
                 let capture = capture
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -31298,8 +31351,6 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
                     capture.body,
                     Arc::clone(&capture.captured_frame),
                     capture.funs.clone(),
-                    capture.classes.clone(),
-                    capture.methods.clone(),
                     capture.symbol_macros.clone(),
                 )
             };
@@ -31313,8 +31364,6 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
             macro_env.funs = Arc::new(SharedCell::new(funs));
             macro_env.macros = Rc::new(RefCell::new(HashMap::new()));
             macro_env.symbol_macros = Rc::new(RefCell::new(symbol_macros));
-            macro_env.classes = Rc::new(RefCell::new(classes));
-            macro_env.methods = Rc::new(RefCell::new(methods));
             macro_env.frame = thaw_env_frame(&captured_frame);
             macro_env.eval_context = eval_context;
             bind_macro_lambda_list(
@@ -31983,8 +32032,6 @@ fn augment_env_with_macros(
                     body: macro_bodies[idx].1,
                     captured_frame,
                     funs: HashMap::new(),
-                    classes: HashMap::new(),
-                    methods: HashMap::new(),
                     symbol_macros: HashMap::new(),
                 });
                 compiler_macroexpand::register_macro_function(
@@ -32470,11 +32517,15 @@ fn eval_defclass(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     torcl_rt::rooted!(direct_supers = direct_supers?);
     // Only :instance-allocated slots get an inline cell in the heap-object
     // instance layout; :class-allocated slots live in ClassDef.class_slot_values.
-    let slot_names: Vec<TorclVal> = env.classes.borrow()[&name]
+    let slot_name_strings: Vec<String> = env.classes.borrow()[&name]
         .slots
         .iter()
         .filter(|slot| slot.allocation == SlotAllocation::Instance)
-        .map(|slot| resolve_sym(&slot.name).unwrap_or(NIL))
+        .map(|slot| slot.name.clone())
+        .collect();
+    let slot_names: Vec<TorclVal> = slot_name_strings
+        .iter()
+        .map(|name| resolve_sym(name).unwrap_or(NIL))
         .collect();
     torcl_stdlib::define_class(name_form, name_form, &direct_supers, &slot_names)?;
 
@@ -32750,8 +32801,8 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
         let mut inh_names: Vec<String> = Vec::new();
         torcl_rt::rooted!(inh_forms = Vec::<TorclVal>::new());
         {
-            let classes = env.classes.borrow();
             let mut worklist = vec![sym_name(parent_sym)];
+            let classes = env.classes.borrow();
             let mut seen_class: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             while let Some(cname) = worklist.pop() {
@@ -33257,6 +33308,13 @@ fn eval_defmethod(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
     torcl_stdlib::clos::add_method(generic_function, method_id)?;
     torcl_stdlib::set_method_specializers(method_id, vec![], qualifier);
 
+    // Capture before publishing the method so a concurrent caller cannot see
+    // its body without the lexical locations against which it must execute.
+    let nested_in_binding = TOPLEVEL_FRAME_BASE.with(|s| {
+        s.borrow()
+            .last()
+            .is_some_and(|&base| base != frame_addr(&env.frame))
+    });
     {
         let mut methods_map = env.methods.borrow_mut();
         let list = methods_map.entry(name.clone()).or_default();
@@ -33268,30 +33326,16 @@ fn eval_defmethod(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
         }) {
             let old_id = list[pos].method_id;
             list.remove(pos);
-            METHOD_COMPILED.with(|m| m.borrow_mut().remove(&old_id.0));
-            METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().remove(&old_id.0));
+            METHOD_COMPILED.borrow_mut().remove(&old_id.0);
         }
         list.push(MethodDef {
             method_id,
+            captured_frame: nested_in_binding.then(|| Arc::clone(&env.frame)),
             specializers,
             lambda_list: *lambda_list,
             qualifier,
             body,
         });
-    }
-    // A method defined inside a user binding form closes over it (like a DEFUN —
-    // bliss-sdd), e.g. cl-ppcre's build-replacement-template over the lexical
-    // REG-SCANNER. Detect nesting exactly as eval_defun (frame differs from the
-    // current top-level base) and record the frame keyed by this method's id.
-    let nested_in_binding = TOPLEVEL_FRAME_BASE.with(|s| {
-        s.borrow()
-            .last()
-            .is_some_and(|&base| base != frame_addr(&env.frame))
-    });
-    if nested_in_binding {
-        METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().insert(method_id.0, Arc::clone(&env.frame)));
-    } else {
-        METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().remove(&method_id.0));
     }
     // A new/redefined method changes applicability and ordering (bliss-x5y.20).
     invalidate_gf_dispatch_cache();
@@ -33303,12 +33347,12 @@ fn eval_defmethod(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
     // CALL-NEXT-METHOD/NEXT-METHOD-P (which need env.method_context, unknown to
     // the bytecode compiler). Everything else keeps tree-walking. A redefinition
     // drops any stale compiled body first.
-    METHOD_COMPILED.with(|m| m.borrow_mut().remove(&method_id.0));
+    METHOD_COMPILED.borrow_mut().remove(&method_id.0);
     if std::env::var_os("TORCL_NO_METHOD_COMPILE").is_none() && !nested_in_binding {
         let compile_ll = method_lambda_list_for_compile(*lambda_list);
         if let Some(callable) = bytecode::compile_and_reify_lambda("METHOD", compile_ll, body, env)
         {
-            METHOD_COMPILED.with(|m| m.borrow_mut().insert(method_id.0, callable));
+            METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
         }
     }
     Ok(name_form)
@@ -33486,7 +33530,10 @@ fn eval_make_instance(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
         .collect();
     let (instance_initargs, class_initargs) = split_initargs_for_class(env, &class_name, &initargs);
-    let instance = torcl_stdlib::make_instance(class, &instance_initargs)?;
+    let mut instance = torcl_stdlib::make_instance(class, &instance_initargs)?;
+    // Initforms and initialization hooks can move the instance. Their local
+    // roots do not update this caller's copy, which is returned to Lisp.
+    torcl_rt::rooted_ref!(_instance_root = &mut instance);
     for (slot_name, value) in class_initargs {
         write_class_slot_value(env, &class_name, &slot_name, Some(value));
     }
@@ -34067,7 +34114,7 @@ fn apply_function(
             }
             return res;
         }
-        if env.generics.borrow().contains_key(&*name) || env.methods.borrow().contains_key(&*name) {
+        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
             return invoke_generic_function(&name, args, env);
         }
         // Fixed-arity builtin arg-count check on EVERY dispatch path, not only the
@@ -36787,9 +36834,9 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Torc
     // Shed dead closures first so the CLSR block (and every restored core's
     // permanent root set) carries only live ones (bliss-uamd).
     prune_closure_registry();
-    SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(Rc::clone(&env.generics)));
-    SAVE_METHODS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.methods)));
-    SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(Rc::clone(&env.classes)));
+    SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(env.generics));
+    SAVE_METHODS.with(|m| *m.borrow_mut() = Some(env.methods));
+    SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(env.classes));
     // Compact so the live set is a dense prefix and garbage is dropped.
     torcl_rt::gc::full_gc()?;
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
@@ -37650,9 +37697,9 @@ mod host_registry_hook_tests {
 
         // Formats 1 and 2 end after PKGS. No association is preferable to a
         // stale pre-restore callable, and ordinary interpreted dispatch remains.
-        METHOD_COMPILED.with(|m| m.borrow_mut().insert(123, NIL));
+        METHOD_COMPILED.borrow_mut().insert(123, NIL);
         host_restore_registries(&bytes[..marker]).unwrap();
-        assert!(METHOD_COMPILED.with(|m| m.borrow().is_empty()));
+        assert!(METHOD_COMPILED.borrow().is_empty());
     }
 
     #[test]
@@ -37666,18 +37713,18 @@ mod host_registry_hook_tests {
         )
         .unwrap();
         let method_id = env.methods.borrow()["IMAGE-COMPILED-METHOD"][0].method_id.0;
-        torcl_rt::rooted!(callable = METHOD_COMPILED.with(|m| m.borrow()[&method_id]));
-        SAVE_METHODS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.methods)));
-        SAVE_GENERICS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.generics)));
+        torcl_rt::rooted!(callable = METHOD_COMPILED.borrow()[&method_id]);
+        SAVE_METHODS.with(|m| *m.borrow_mut() = Some(env.methods));
+        SAVE_GENERICS.with(|m| *m.borrow_mut() = Some(env.generics));
         let bytes = host_serialize_registries();
         SAVE_METHODS.with(|m| *m.borrow_mut() = None);
         SAVE_GENERICS.with(|m| *m.borrow_mut() = None);
-        METHOD_COMPILED.with(|m| m.borrow_mut().remove(&method_id));
+        METHOD_COMPILED.borrow_mut().remove(&method_id);
 
         host_restore_registries(&bytes).unwrap();
         drain_pending_host_generics(&env);
         assert_eq!(
-            METHOD_COMPILED.with(|m| m.borrow().get(&method_id).copied()),
+            METHOD_COMPILED.borrow().get(&method_id).copied(),
             Some(*callable),
             "image restoration must reconnect methods to their compiled bodies"
         );
@@ -37801,6 +37848,7 @@ mod env_gc_root_tests {
     fn method(offset: i64) -> MethodDef {
         MethodDef {
             method_id: marker(offset),
+            captured_frame: None,
             specializers: vec![MethodSpecializer::Eql(marker(offset + 1))],
             lambda_list: marker(offset + 2),
             qualifier: torcl_stdlib::MethodQualifier::Primary,
@@ -37976,7 +38024,7 @@ mod env_gc_root_tests {
         // pass state another unit test left behind (bliss-s56e).
         torcl_rt::gc::advance_root_scan_pass();
         let mut rewritten = HashSet::new();
-        env.visit_gc_roots(&mut |slot| unsafe {
+        let mut rewrite = |slot: *mut TorclVal| unsafe {
             let value = &mut *slot;
             if value.is_fixnum() {
                 let n = value.as_fixnum();
@@ -37985,8 +38033,13 @@ mod env_gc_root_tests {
                     *value = TorclVal::from_fixnum(n + RELOCATION_DELTA);
                 }
             }
-        });
-        assert_eq!(rewritten, expected, "every seeded Env root must be yielded");
+        };
+        env.visit_gc_roots(&mut rewrite);
+        scan_evaluator_global_roots(&mut rewrite);
+        assert_eq!(
+            rewritten, expected,
+            "every seeded execution/global root must be yielded"
+        );
 
         // The env-frame visitor shares one visited-set per root-scan pass
         // (bliss-s56e), so a frame reachable from many roots is walked once per
@@ -38001,12 +38054,22 @@ mod env_gc_root_tests {
         let relocated_expected: HashSet<i64> =
             expected.iter().map(|n| n + RELOCATION_DELTA).collect();
         let mut relocated = HashSet::new();
-        env.visit_gc_roots(&mut |slot| unsafe {
+        let mut observe = |slot: *mut TorclVal| unsafe {
             let value = &*slot;
             if value.is_fixnum() && relocated_expected.contains(&value.as_fixnum()) {
-                assert!(relocated.insert(value.as_fixnum()));
+                let first_visit = relocated.insert(value.as_fixnum());
+                // Shared frames are scanned once per pass. Closure payloads
+                // and function maps may also be reached by the global scanner;
+                // their existing tracing contract permits repeated visits.
+                if (BASE + RELOCATION_DELTA..BASE + RELOCATION_DELTA + 4)
+                    .contains(&value.as_fixnum())
+                {
+                    assert!(first_visit, "shared frame slot was visited twice");
+                }
             }
-        });
+        };
+        env.visit_gc_roots(&mut observe);
+        scan_evaluator_global_roots(&mut observe);
         assert_eq!(
             relocated, relocated_expected,
             "the visitor must expose the mutable slots, not temporary copies"
@@ -38978,13 +39041,18 @@ mod method_block_tests {
         result.unwrap();
         assert!(TOPLEVEL_FRAME_BASE.with(|s| s.borrow().is_empty()));
         let top_id = env.methods.borrow()["FASL-TOP-METHOD"][0].method_id.0;
-        let nested_id = env.methods.borrow()["FASL-NESTED-METHOD"][0].method_id.0;
         assert!(
-            !METHOD_CAPTURED_ENV.with(|m| m.borrow().contains_key(&top_id)),
+            env.methods.borrow()["FASL-TOP-METHOD"][0]
+                .captured_frame
+                .is_none(),
             "a top-level FASL method must not capture the LOAD caller"
         );
-        assert!(METHOD_COMPILED.with(|m| m.borrow().contains_key(&top_id)));
-        assert!(METHOD_CAPTURED_ENV.with(|m| m.borrow().contains_key(&nested_id)));
+        assert!(METHOD_COMPILED.borrow().contains_key(&top_id));
+        assert!(
+            env.methods.borrow()["FASL-NESTED-METHOD"][0]
+                .captured_frame
+                .is_some()
+        );
         assert_eq!(
             read_eval_all_env("(fasl-nested-method 1)", &mut env).unwrap(),
             TorclVal::from_fixnum(42)
@@ -39036,7 +39104,7 @@ mod method_block_tests {
         let name = function_name_key(symbol);
         let method_id = env.methods.borrow()[&name][0].method_id.0;
         assert!(
-            METHOD_COMPILED.with(|methods| methods.borrow().contains_key(&method_id)),
+            METHOD_COMPILED.borrow().contains_key(&method_id),
             "named RETURN-FROM must not force a method back to interpretation"
         );
         assert_eq!(

@@ -2705,7 +2705,7 @@ impl<'e> Lowerer<'e> {
         // typep`) keeps the call so the user's semantics win.
         if symbol_bare_name(name) == "TYPEP"
             && !self.env.funs.borrow().contains_key(name)
-            && !self.env.generics.borrow().contains_key(name)
+            && !self.env.generics.contains_key(name)
         {
             if let Some(class) = typep_inline_class(rest) {
                 // `rest` is rooted (above); its car is the value expression.
@@ -2729,8 +2729,8 @@ impl<'e> Lowerer<'e> {
         // tree-walker fallback and can be predeclared by a future compilation-
         // unit pass without weakening this safety boundary.
         let bare = symbol_bare_name(name);
-        let is_generic = self.env.generics.borrow().contains_key(name)
-            || self.env.methods.borrow().contains_key(name);
+        let is_generic =
+            self.env.generics.contains_key(name) || self.env.methods.contains_key(name);
         let is_user_fn = is_generic
             || self.env.funs.borrow().contains_key(name)
             || super::global_fn(name).is_some();
@@ -3169,8 +3169,8 @@ impl<'e> Lowerer<'e> {
             return None;
         }
         let key = format!("(SETF {})", sym_name(op));
-        let is_generic = self.env.generics.borrow().contains_key(&key)
-            || self.env.methods.borrow().contains_key(&key);
+        let is_generic =
+            self.env.generics.contains_key(&key) || self.env.methods.contains_key(&key);
         if !is_generic {
             return None;
         }
@@ -11232,6 +11232,12 @@ pub(super) fn compile_and_reify_lambda(
     let _bytecode_root = ActiveBytecodeRoot::new(&bf);
     let sym = torcl_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
+    // Reified method functions are shared definitions, just like escaping
+    // compiled closures. Preserve the original body for callers on other
+    // executions, including after the defining thread exits.
+    closure_bodies()
+        .borrow_mut()
+        .insert(sym_idx, Arc::clone(&bf));
     registry_put(sym_idx, Arc::clone(&bf));
     Some(torcl_rt::function::alloc_interpreted(
         lambda_list,
@@ -20269,7 +20275,7 @@ mod method_compilation_tests {
         )
         .unwrap();
         let id = env.methods.borrow()["METHOD-CALLBACK-LTV"][0].method_id.0;
-        let callable = super::super::METHOD_COMPILED.with(|m| m.borrow()[&id]);
+        let callable = super::super::METHOD_COMPILED.borrow()[&id];
         let name = torcl_rt::function::name(callable).as_symbol_index();
         let body = registry_get(name).unwrap();
         assert!(contains_host_eval(&body));
@@ -20298,7 +20304,7 @@ mod method_compilation_tests {
         )
         .unwrap();
         let id = env.methods.borrow()["METHOD-CALLBACK-PROBE"][0].method_id.0;
-        let callable = super::super::METHOD_COMPILED.with(|m| m.borrow()[&id]);
+        let callable = super::super::METHOD_COMPILED.borrow()[&id];
         let name = torcl_rt::function::name(callable).as_symbol_index();
         let body = registry_get(name).unwrap();
         assert!(

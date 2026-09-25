@@ -6,6 +6,14 @@
 
 mod ansi_symbols;
 
+/// Unit fixtures that reset the shared heap or CLOS definitions must not
+/// invalidate another fixture's objects or derived-cache measurements.
+#[cfg(test)]
+pub(crate) fn test_heap_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 // ── Package system & bootstrap ────────────────────────────────────
 pub mod packages;
 

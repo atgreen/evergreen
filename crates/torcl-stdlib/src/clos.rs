@@ -5,9 +5,11 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use torcl_rt::error::TorclError;
+use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 use torcl_rt::object::type_id;
 use torcl_rt::value::{NIL, T, TorclVal, UNBOUND};
 
@@ -59,9 +61,9 @@ struct ClassMeta {
     direct_subs: Vec<TorclVal>,
     /// Direct :instance-allocated slot names (as passed to `define_class`).
     slots: Vec<TorclVal>,
-    /// Current wrapper for this class, or null until finalized. Built-in
-    /// (never-instantiated) classes keep a null wrapper.
-    wrapper: *mut ClassWrapper,
+    /// Frozen, process-lifetime descriptor shared with instances. Built-in
+    /// (never-instantiated) classes have no wrapper.
+    wrapper: Option<&'static ClassWrapper>,
 }
 
 // ── Standard-object instances (heap objects) ───────────────────────
@@ -107,7 +109,7 @@ struct ClassWrapper {
     state: AtomicU8,
     class: TorclVal,
     slot_count: u32,
-    layout: *const SlotLayout,
+    layout: &'static SlotLayout,
 }
 
 /// Follow the forwarding chain to the live object. When `change-class` needs a
@@ -161,8 +163,8 @@ unsafe fn update_if_obsolete(inst: TorclVal) {
         let class = (*w).class;
         // Snapshot surviving (bound) slots from the old frozen layout.
         let mut snap: Vec<(TorclVal, TorclVal)> = Vec::new();
-        if !(*w).layout.is_null() {
-            let ol = &*(*w).layout;
+        {
+            let ol = (*w).layout;
             for (i, &name) in ol.order.iter().enumerate() {
                 let v = *((live.as_ptr().add(16) as *const TorclVal).add(i));
                 if v != UNBOUND {
@@ -185,8 +187,8 @@ unsafe fn update_if_obsolete(inst: TorclVal) {
             Err(_) => return,
         };
         let nw = *(new_inst.as_ptr().add(8) as *const *mut ClassWrapper);
-        if !nw.is_null() && !(*nw).layout.is_null() {
-            let nl = &*(*nw).layout;
+        if !nw.is_null() {
+            let nl = (*nw).layout;
             for (name, val) in &snap {
                 if let Some(&idx) = nl.index.get(name) {
                     *((new_inst.as_ptr().add(16) as *mut TorclVal).add(idx)) = *val;
@@ -240,10 +242,10 @@ unsafe fn slot_cell(inst: TorclVal, idx: usize) -> *mut TorclVal {
 unsafe fn instance_slot_index(inst: TorclVal, slot_name: TorclVal) -> Option<usize> {
     unsafe {
         let w = instance_wrapper(inst);
-        if w.is_null() || (*w).layout.is_null() {
+        if w.is_null() {
             return None;
         }
-        let layout = &*(*w).layout;
+        let layout = (*w).layout;
         if let Some(idx) = layout.index.get(&slot_name).copied() {
             return Some(idx);
         }
@@ -420,40 +422,19 @@ impl ClosState {
     }
 }
 
-thread_local! {
-    static CLOS_STATE: RefCell<ClosState> = RefCell::new(ClosState::new());
-}
+// No Lisp allocation, evaluation, safepoint, or lower-level lock acquisition
+// under this guard. The collector acquires it after stopping mutators, so it
+// scans the same definitions regardless of which thread initiated collection.
+static CLOS_STATE: LazyLock<OrderedMutex<ClosState>> = LazyLock::new(|| {
+    OrderedMutex::new(LockLevel::GcWorld, 8, "CLOS definitions", ClosState::new())
+});
 
 fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
-    CLOS_STATE.with(|state| {
-        // A CLOS operation that allocates while holding CLOS_STATE borrowed (e.g.
-        // make_instance building an instance under with_state_mut) can trigger a
-        // minor GC whose root scan re-enters here — an unconditional borrow_mut
-        // then double-borrow-panics, and via the extern "C" c2i boundary that
-        // aborts the process (bliss-011 sibling). Skip when already borrowed:
-        // nearly all CLOS-state roots are symbols/meta-handles (never relocated)
-        // and any movable value (a reader-built generic lambda list) is long-lived
-        // and thus already promoted out of the nursery, so a SKIPPED minor-GC scan
-        // does not leave a stale pointer in practice. The correct fix is to not
-        // allocate while CLOS_STATE is borrowed (tracked separately); this stopgap
-        // trades a rare theoretical miss for never aborting.
-        let Ok(mut state) = state.try_borrow_mut() else {
-            // Every CLOS op has been restructured to NOT allocate while
-            // CLOS_STATE is borrowed (bliss-wlf), so this skip should be
-            // unreachable. If it fires, some new code path allocates under a
-            // borrow again — shout under the GC fuzzers so it can't hide.
-            static LOUD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *LOUD.get_or_init(|| std::env::var_os("TORCL_GC_STRESS").is_some()) {
-                eprintln!(
-                    "bliss-wlf WARNING: CLOS root scan skipped — allocation \
-                     under a live CLOS_STATE borrow (GC-unsafe call path)"
-                );
-            }
-            return;
-        };
+    {
+        let mut state = CLOS_STATE.lock().unwrap();
         // Discard derived values before relocation rather than retaining and
         // tracing a second copy of every cached class reference. Queries cannot
-        // run concurrently: CLOS state and this scanner are thread-local.
+        // run concurrently while the collector holds this registry's lock.
         state.cpl_cache.get_mut().clear();
         // Registry keys are symbols or private meta-handles and never move.
         // Payloads can include reader-built lambda lists and other heap values.
@@ -524,7 +505,7 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
         visit(&mut state.float_class);
         visit(&mut state.function_class);
         visit(&mut state.heap_object_class);
-    });
+    }
 }
 
 fn install_clos_state_root_scanner() {
@@ -536,21 +517,21 @@ fn with_state<F, R>(f: F) -> R
 where
     F: FnOnce(&ClosState) -> R,
 {
-    CLOS_STATE.with(|cell| f(&cell.borrow()))
+    f(&CLOS_STATE.lock().unwrap())
 }
 
 fn with_state_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ClosState) -> R,
 {
-    CLOS_STATE.with(|cell| {
-        let mut state = cell.borrow_mut();
+    {
+        let mut state = CLOS_STATE.lock().unwrap();
         // Even registration of a different class can change inferred supers.
         // Invalidating here also covers bootstrap, redefinition and restoration
         // without maintaining a separate hierarchy-generation protocol.
         state.cpl_cache.get_mut().clear();
         f(&mut state)
-    })
+    }
 }
 
 // ── Core-image serialization of CLOS state (torcl-x0f2.7a) ─────────────
@@ -781,8 +762,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
     let current: Vec<(TorclVal, usize)> = with_state(|st| {
         st.class_meta
             .iter()
-            .filter(|(_, m)| !m.wrapper.is_null())
-            .map(|(c, m)| (*c, m.wrapper as usize))
+            .filter_map(|(c, m)| m.wrapper.map(|w| (*c, w as *const ClassWrapper as usize)))
             .collect()
     });
     let mut addrs: Vec<usize> = current.iter().map(|(_, w)| *w).collect();
@@ -809,11 +789,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
             out.push((*w).state.load(Ordering::Acquire));
             cs_put_val(&mut out, (*w).class);
             cs_put_u32(&mut out, (*w).slot_count);
-            if (*w).layout.is_null() {
-                cs_put_u32(&mut out, 0);
-            } else {
-                cs_put_vals(&mut out, &(*(*w).layout).order);
-            }
+            cs_put_vals(&mut out, &(*w).layout.order);
         }
     }
     cs_put_u32(&mut out, current.len() as u32);
@@ -872,7 +848,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
                 direct_supers,
                 direct_subs,
                 slots,
-                wrapper: std::ptr::null_mut(),
+                wrapper: None,
             },
         );
     }
@@ -977,15 +953,15 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         for (i, name) in order.iter().enumerate() {
             index.insert(*name, i);
         }
-        let layout: *const SlotLayout = Box::into_raw(Box::new(SlotLayout { order, index }));
-        let wrapper: *mut ClassWrapper = Box::into_raw(Box::new(ClassWrapper {
+        let layout = Box::leak(Box::new(SlotLayout { order, index }));
+        let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
             stamp,
             state: AtomicU8::new(state),
             class,
             slot_count,
             layout,
         }));
-        wrapper_map.insert(old_addr, wrapper as usize);
+        wrapper_map.insert(old_addr, wrapper as *const ClassWrapper as usize);
     }
     // Advance the global stamp counter past every restored stamp.
     let mut cur = CLASS_STAMP.load(Ordering::Relaxed);
@@ -1004,7 +980,8 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         if let (Some(meta), Some(&new_addr)) =
             (st.class_meta.get_mut(&class), wrapper_map.get(&old_addr))
         {
-            meta.wrapper = new_addr as *mut ClassWrapper;
+            // Each address in wrapper_map was just leaked above and is immutable.
+            meta.wrapper = Some(unsafe { &*(new_addr as *const ClassWrapper) });
         }
     }
     with_state_mut(|state| *state = st);
@@ -1122,10 +1099,16 @@ pub fn ensure_clos_bootstrapped() -> Result<(), TorclError> {
     if with_state(|st| st.bootstrapped) {
         return Ok(());
     }
-    bootstrap_clos()
+    initialize_clos(false)
 }
 
+/// Reset CLOS in a quiescent runtime (startup or an isolated test fixture).
+/// Worker entry must use `ensure_clos_bootstrapped` instead.
 pub fn bootstrap_clos() -> Result<(), TorclError> {
+    initialize_clos(true)
+}
+
+fn initialize_clos(reset: bool) -> Result<(), TorclError> {
     install_clos_state_root_scanner();
 
     // Built-in class values (negative fixnums avoid collision with user classes)
@@ -1194,6 +1177,10 @@ pub fn bootstrap_clos() -> Result<(), TorclError> {
     let htbl_nm = nm("HASH-TABLE");
 
     with_state_mut(|st| {
+        // Another thread may have initialized CLOS while we interned names.
+        if !reset && st.bootstrapped {
+            return Ok(());
+        }
         // Full reset so tests are independent
         *st = ClosState::new();
 
@@ -1206,7 +1193,7 @@ pub fn bootstrap_clos() -> Result<(), TorclError> {
                 direct_supers: vec![],
                 direct_subs: vec![],
                 slots: vec![],
-                wrapper: std::ptr::null_mut(),
+                wrapper: None,
             },
         );
 
@@ -1219,7 +1206,7 @@ pub fn bootstrap_clos() -> Result<(), TorclError> {
                 direct_supers: vec![t_cls],
                 direct_subs: vec![],
                 slots: vec![],
-                wrapper: std::ptr::null_mut(),
+                wrapper: None,
             },
         );
 
@@ -1243,7 +1230,7 @@ pub fn bootstrap_clos() -> Result<(), TorclError> {
                     direct_supers: vec![std_obj],
                     direct_subs: vec![],
                     slots: vec![],
-                    wrapper: std::ptr::null_mut(),
+                    wrapper: None,
                 },
             );
         }
@@ -1277,7 +1264,7 @@ pub fn bootstrap_clos() -> Result<(), TorclError> {
                     direct_supers: supers,
                     direct_subs: vec![],
                     slots: vec![],
-                    wrapper: std::ptr::null_mut(),
+                    wrapper: None,
                 },
             );
         }
@@ -1326,14 +1313,15 @@ fn class_name_key(name: TorclVal) -> Option<String> {
 }
 
 pub fn find_class(name: TorclVal) -> Option<TorclVal> {
+    if let Some(class) = with_state(|st| st.class_registry.get(&name).copied()) {
+        return Some(class);
+    }
+    let key = class_name_key(name)?;
     with_state(|st| {
-        if let Some(&class) = st.class_registry.get(&name) {
-            return Some(class);
-        }
         // Fallback: the symbol's identity may have drifted since the class was
         // registered (package RECYCLE/rehome re-interns the name). Match by the
         // bare class name, which is stable across such re-interning.
-        class_name_key(name).and_then(|key| st.class_by_name.get(&key).copied())
+        st.class_by_name.get(&key).copied()
     })
 }
 
@@ -1354,6 +1342,7 @@ pub fn is_structure_class(class: TorclVal) -> bool {
 
 /// Register a class by name.
 pub fn set_find_class(name: TorclVal, class: TorclVal) -> Result<(), TorclError> {
+    let key = class_name_key(name);
     with_state_mut(|st| {
         // Track handle-id registration order (for diamond-hierarchy inference)
         if class.is_meta_handle() {
@@ -1364,7 +1353,7 @@ pub fn set_find_class(name: TorclVal, class: TorclVal) -> Result<(), TorclError>
         }
 
         st.class_registry.insert(name, class);
-        if let Some(key) = class_name_key(name) {
+        if let Some(key) = key {
             st.class_by_name.insert(key, class);
         }
 
@@ -1381,7 +1370,7 @@ pub fn set_find_class(name: TorclVal, class: TorclVal) -> Result<(), TorclError>
                     direct_supers: default_supers,
                     direct_subs: vec![],
                     slots: vec![],
-                    wrapper: std::ptr::null_mut(),
+                    wrapper: None,
                 },
             );
         } else {
@@ -1404,16 +1393,17 @@ pub fn set_find_class(name: TorclVal, class: TorclVal) -> Result<(), TorclError>
 ///
 /// A NIL class removes the association (CLHS).
 pub fn bind_class_name(name: TorclVal, class: TorclVal) -> Result<(), TorclError> {
+    let key = class_name_key(name);
     with_state_mut(|st| {
         if class == NIL {
             st.class_registry.remove(&name);
-            if let Some(key) = class_name_key(name) {
+            if let Some(key) = key {
                 st.class_by_name.remove(&key);
             }
             return Ok(());
         }
         st.class_registry.insert(name, class);
-        if let Some(key) = class_name_key(name) {
+        if let Some(key) = key {
             st.class_by_name.insert(key, class);
         }
         Ok(())
@@ -1432,6 +1422,7 @@ pub fn define_class(
     direct_supers: &[TorclVal],
     slots: &[TorclVal],
 ) -> Result<(), TorclError> {
+    let key = class_name_key(name);
     with_state_mut(|st| {
         // Track handle-id registration order (for diamond-hierarchy inference)
         if class.is_meta_handle() {
@@ -1442,7 +1433,7 @@ pub fn define_class(
         }
 
         st.class_registry.insert(name, class);
-        if let Some(key) = class_name_key(name) {
+        if let Some(key) = key {
             st.class_by_name.insert(key, class);
         }
 
@@ -1467,7 +1458,8 @@ pub fn define_class(
         let prev_wrapper = st
             .class_meta
             .get(&class)
-            .map(|m| m.wrapper)
+            .and_then(|m| m.wrapper)
+            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
             .unwrap_or(std::ptr::null_mut());
 
         st.class_meta.insert(
@@ -1477,7 +1469,7 @@ pub fn define_class(
                 direct_supers: supers,
                 direct_subs: vec![],
                 slots: slots.to_vec(),
-                wrapper: std::ptr::null_mut(),
+                wrapper: None,
             },
         );
 
@@ -1520,8 +1512,8 @@ fn finalize_class_layout(st: &mut ClosState, class: TorclVal) {
         }
     }
     let slot_count = order.len() as u32;
-    let layout: *const SlotLayout = Box::into_raw(Box::new(SlotLayout { order, index }));
-    let wrapper: *mut ClassWrapper = Box::into_raw(Box::new(ClassWrapper {
+    let layout = Box::leak(Box::new(SlotLayout { order, index }));
+    let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
         stamp: next_stamp(),
         state: AtomicU8::new(WRAPPER_CURRENT),
         class,
@@ -1529,7 +1521,7 @@ fn finalize_class_layout(st: &mut ClosState, class: TorclVal) {
         layout,
     }));
     if let Some(meta) = st.class_meta.get_mut(&class) {
-        meta.wrapper = wrapper;
+        meta.wrapper = Some(wrapper);
     }
 }
 
@@ -1547,12 +1539,15 @@ pub fn is_instance(object: TorclVal) -> bool {
 
 /// Get the class of an object.
 pub fn class_of(object: TorclVal) -> TorclVal {
+    // Inspect heap state before taking the root-side-table lock (GC takes
+    // these locks in the opposite direction while scanning definitions).
+    if torcl_rt::gc::heap_object_type_id(object) == Some(type_id::STANDARD_OBJECT) {
+        return unsafe { (*instance_wrapper(object)).class };
+    }
+    if crate::hash_table_p(object) {
+        return TorclVal::from_fixnum(-23);
+    }
     with_state(|st| {
-        // Instances carry their class via the offset-8 wrapper. Gate the deref
-        // on the bounds-checked header type (bliss-334).
-        if torcl_rt::gc::heap_object_type_id(object) == Some(type_id::STANDARD_OBJECT) {
-            return unsafe { (*instance_wrapper(object)).class };
-        }
         if object == NIL {
             return st.null_class;
         }
@@ -1576,12 +1571,6 @@ pub fn class_of(object: TorclVal) -> TorclVal {
         }
         if object.is_function() {
             return st.function_class;
-        }
-        // A hash table is a heap object whose CLOS class is the built-in
-        // HASH-TABLE class (handle -23, registered in `bootstrap_clos`), so
-        // `(class-of ht)` and `(typep ht (find-class 'hash-table))` are correct.
-        if crate::hash_table_p(object) {
-            return TorclVal::from_fixnum(-23);
         }
         if object.is_heap_object() {
             return st.heap_object_class;
@@ -1734,12 +1723,8 @@ fn c3_linearize_guarded(
 ) -> Result<Vec<TorclVal>, TorclError> {
     if visiting.contains(&class) {
         let name = st.class_meta.get(&class).map(|m| m.name).unwrap_or(class);
-        let rendered = if name.is_symbol() {
-            torcl_rt::symbols::symbol_name(name.as_symbol_index())
-                .unwrap_or_else(|| format!("{name:?}"))
-        } else {
-            format!("{name:?}")
-        };
+        // Do not enter the symbol registry while holding the CLOS root lock.
+        let rendered = format!("{name:?}");
         return Err(TorclError::Internal(format!(
             "cyclic class hierarchy: {rendered} appears among its own superclasses"
         )));
@@ -1827,14 +1812,16 @@ pub fn allocate_instance(class: TorclVal) -> Result<TorclVal, TorclError> {
         let mut w = st
             .class_meta
             .get(&class)
-            .map(|m| m.wrapper)
+            .and_then(|m| m.wrapper)
+            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
             .unwrap_or(std::ptr::null_mut());
         if w.is_null() {
             finalize_class_layout(st, class);
             w = st
                 .class_meta
                 .get(&class)
-                .map(|m| m.wrapper)
+                .and_then(|m| m.wrapper)
+                .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
                 .unwrap_or(std::ptr::null_mut());
         }
         let n = if w.is_null() {
@@ -1885,14 +1872,16 @@ pub fn allocate_instance_pinned_gc(class: TorclVal) -> Result<TorclVal, TorclErr
         let mut w = st
             .class_meta
             .get(&class)
-            .map(|m| m.wrapper)
+            .and_then(|m| m.wrapper)
+            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
             .unwrap_or(std::ptr::null_mut());
         if w.is_null() {
             finalize_class_layout(st, class);
             w = st
                 .class_meta
                 .get(&class)
-                .map(|m| m.wrapper)
+                .and_then(|m| m.wrapper)
+                .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
                 .unwrap_or(std::ptr::null_mut());
         }
         let n = if w.is_null() {
@@ -2254,6 +2243,7 @@ fn method_specificity(st: &ClosState, method: TorclVal, arg_classes: &[TorclVal]
 /// are supertypes of the corresponding argument classes, then sorts
 /// most-specific-first using CPL position.
 pub fn compute_applicable_methods(generic_function: TorclVal, args: &[TorclVal]) -> Vec<TorclVal> {
+    let arg_classes: Vec<TorclVal> = args.iter().copied().map(class_of).collect();
     with_state(|st| {
         let gf = match st.generic_functions.get(&generic_function) {
             Some(gf) => gf,
@@ -2263,37 +2253,6 @@ pub fn compute_applicable_methods(generic_function: TorclVal, args: &[TorclVal])
         if gf.methods.is_empty() {
             return Vec::new();
         }
-
-        // Compute argument classes
-        let arg_classes: Vec<TorclVal> = args
-            .iter()
-            .map(|a| {
-                // Inline class_of logic (we already hold the borrow)
-                if torcl_rt::gc::heap_object_type_id(*a) == Some(type_id::STANDARD_OBJECT) {
-                    unsafe { (*instance_wrapper(*a)).class }
-                } else if *a == NIL {
-                    st.null_class
-                } else if *a == T {
-                    st.symbol_class
-                } else if a.is_fixnum() {
-                    st.fixnum_class
-                } else if a.is_character() {
-                    st.character_class
-                } else if a.is_symbol() {
-                    st.symbol_class
-                } else if a.is_cons() {
-                    st.cons_class
-                } else if a.is_single_float() {
-                    st.float_class
-                } else if a.is_function() {
-                    st.function_class
-                } else if a.is_heap_object() {
-                    st.heap_object_class
-                } else {
-                    st.t_class_val
-                }
-            })
-            .collect();
 
         // Filter: keep methods whose specializers match the argument classes
         let mut applicable: Vec<TorclVal> = gf
@@ -2518,8 +2477,8 @@ pub fn change_class(instance: TorclVal, new_class: TorclVal) -> Result<(), Torcl
             (*ow).slot_count as usize
         };
         let mut snap = Vec::new();
-        if !ow.is_null() && !(*ow).layout.is_null() {
-            let ol = &*(*ow).layout;
+        if !ow.is_null() {
+            let ol = (*ow).layout;
             for (i, &name) in ol.order.iter().enumerate() {
                 let v = *slot_cell(instance, i);
                 if v != UNBOUND {
@@ -2535,14 +2494,16 @@ pub fn change_class(instance: TorclVal, new_class: TorclVal) -> Result<(), Torcl
         let mut w = st
             .class_meta
             .get(&new_class)
-            .map(|m| m.wrapper)
+            .and_then(|m| m.wrapper)
+            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
             .unwrap_or(std::ptr::null_mut());
         if w.is_null() {
             finalize_class_layout(st, new_class);
             w = st
                 .class_meta
                 .get(&new_class)
-                .map(|m| m.wrapper)
+                .and_then(|m| m.wrapper)
+                .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
                 .unwrap_or(std::ptr::null_mut());
         }
         let n = if w.is_null() {
@@ -2567,7 +2528,7 @@ pub fn change_class(instance: TorclVal, new_class: TorclVal) -> Result<(), Torcl
             for i in 0..new_count {
                 *slot_cell(instance, i) = UNBOUND;
             }
-            let nl = &*(*new_wrapper).layout;
+            let nl = (*new_wrapper).layout;
             for (name, val) in &snapshot {
                 if let Some(&idx) = nl.index.get(name) {
                     *slot_cell(instance, idx) = *val;
@@ -2588,7 +2549,7 @@ pub fn change_class(instance: TorclVal, new_class: TorclVal) -> Result<(), Torcl
         torcl_rt::rooted_ref!(_snap_root = &mut snapshot);
         let new_inst = allocate_instance(new_class)?;
         unsafe {
-            let nl = &*(*new_wrapper).layout;
+            let nl = (*new_wrapper).layout;
             for (name, val) in &snapshot {
                 if let Some(&idx) = nl.index.get(name) {
                     *slot_cell(new_inst, idx) = *val;
@@ -2606,6 +2567,12 @@ mod cpl_tests {
     use super::*;
     use std::cell::Cell;
 
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::test_heap_guard();
+        with_state_mut(|state| *state = ClosState::new());
+        guard
+    }
+
     thread_local! {
         pub(super) static LINEARIZATIONS: Cell<usize> = const { Cell::new(0) };
     }
@@ -2622,6 +2589,7 @@ mod cpl_tests {
 
     #[test]
     fn repeated_cpl_queries_linearize_once_and_return_independent_vectors() {
+        let _guard = test_guard();
         // R5.67: preserve C3 diamond order without rebuilding the hierarchy
         // on every method applicability query.
         let a = define(50001, &[]);
@@ -2640,6 +2608,7 @@ mod cpl_tests {
 
     #[test]
     fn superclass_redefinition_invalidates_descendant_cpl_and_cycles() {
+        let _guard = test_guard();
         let a = define(51001, &[]);
         let b = define(51002, &[a]);
         let c = define(51003, &[b]);
@@ -2658,6 +2627,7 @@ mod cpl_tests {
 
     #[test]
     fn gc_root_scan_discards_derived_cpl_before_visiting_roots() {
+        let _guard = test_guard();
         let a = define(52001, &[]);
         let b = define(52002, &[a]);
         let expected = vec![b, a];
@@ -2670,6 +2640,7 @@ mod cpl_tests {
 
     #[test]
     fn newly_registered_class_replaces_unknown_cpl() {
+        let _guard = test_guard();
         let a = define(53001, &[]);
         let b = class(53002);
         assert_eq!(compute_class_precedence_list(b).unwrap(), vec![b]);
@@ -2679,6 +2650,7 @@ mod cpl_tests {
 
     #[test]
     fn registration_order_changes_invalidate_inferred_superclasses() {
+        let _guard = test_guard();
         let base = define(54001, &[]);
         with_state_mut(|st| {
             st.standard_object_class = base;
@@ -2707,6 +2679,7 @@ mod cpl_tests {
 
     #[test]
     fn core_restore_rebuilds_cpl_from_restored_metadata() {
+        let _guard = test_guard();
         let a = define(55001, &[]);
         let b = define(55002, &[a]);
         let expected = vec![b, a];

@@ -2,6 +2,13 @@
 use torcl_rt::value::{NIL, T, TorclVal};
 use torcl_stdlib::clos::*;
 
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    bootstrap_clos().unwrap();
+    guard
+}
+
 fn sym(i: u32) -> TorclVal {
     TorclVal::from_symbol_index(i)
 }
@@ -12,6 +19,7 @@ fn fx(i: i64) -> TorclVal {
 
 #[test]
 fn method_combination_variants_distinct() {
+    let _guard = test_guard();
     let v = [
         MethodCombinationType::Standard,
         MethodCombinationType::Plus,
@@ -35,31 +43,40 @@ fn method_combination_variants_distinct() {
 
 #[test]
 fn bootstrap_clos_succeeds() {
+    let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
 }
 
 #[test]
 fn find_class_accepts_immediate_symbol_names_before_bootstrap() {
-    // CLOS state is thread-local, so a fresh thread guarantees that neither
-    // name is already present in the registry.  FIND-CLASS must still treat
-    // NIL and T as symbols without feeding their SPECIAL-tagged values to the
-    // TAG_SYMBOL-only as_symbol_index extractor.
-    std::thread::spawn(|| {
+    // Definitions are process-global. A fresh test process, not a fresh
+    // thread, is required to exercise lookup before bootstrap.
+    if std::env::var_os("TORCL_TEST_FRESH_CLOS").is_some() {
         assert_eq!(find_class(NIL), None);
         assert_eq!(find_class(T), None);
-    })
-    .join()
-    .expect("find_class must not panic for immediate symbols");
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "find_class_accepts_immediate_symbol_names_before_bootstrap",
+        ])
+        .env("TORCL_TEST_FRESH_CLOS", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]
 fn find_class_unknown_none() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     assert!(find_class(sym(9999)).is_none());
 }
 
 #[test]
 fn set_find_class_roundtrip() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let (name, cls) = (sym(100), TorclVal::from_fixnum(42));
     set_find_class(name, cls).unwrap();
@@ -67,7 +84,39 @@ fn set_find_class_roundtrip() {
 }
 
 #[test]
+fn definitions_are_shared_with_an_already_running_worker() {
+    let _guard = test_guard();
+    bootstrap_clos().unwrap();
+    let name = sym(700_001);
+    let alias = sym(700_002);
+    let class = TorclVal::from_meta_handle(700_003);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        ensure_clos_bootstrapped().unwrap();
+        assert_eq!(find_class(name), None);
+        ready_tx.send(()).unwrap();
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(find_class(name), Some(class));
+        bind_class_name(alias, class).unwrap();
+        ensure_clos_bootstrapped().unwrap();
+        assert_eq!(find_class(name), Some(class));
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    define_class(name, class, &[], &[]).unwrap();
+    published_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(find_class(alias), Some(class));
+    assert_eq!(class_name(class), name);
+}
+
+#[test]
 fn class_of_returns_builtin_and_instance_classes_in_constant_observable_time() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = fx(2026);
     let slot = sym(2026);
@@ -102,6 +151,7 @@ fn class_of_returns_builtin_and_instance_classes_in_constant_observable_time() {
 
 #[test]
 fn class_name_roundtrip() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let (name, cls) = (sym(200), TorclVal::from_fixnum(200));
     set_find_class(name, cls).unwrap();
@@ -110,6 +160,7 @@ fn class_name_roundtrip() {
 
 #[test]
 fn cpl_starts_with_self() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(300);
     set_find_class(sym(300), cls).unwrap();
@@ -120,6 +171,7 @@ fn cpl_starts_with_self() {
 
 #[test]
 fn cpl_c3_linearization_diamond() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let class_a = fx(310);
     let class_b = fx(311);
@@ -159,6 +211,7 @@ fn cpl_c3_linearization_diamond() {
 // Issue 1: class_hierarchy_accessors must assert return values, not discard them.
 #[test]
 fn class_hierarchy_accessors() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(301);
     set_find_class(sym(301), cls).unwrap();
@@ -188,6 +241,7 @@ fn class_hierarchy_accessors() {
 
 #[test]
 fn allocate_instance_ok() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(400);
     set_find_class(sym(400), cls).unwrap();
@@ -196,6 +250,7 @@ fn allocate_instance_ok() {
 
 #[test]
 fn make_instance_variants() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(401);
     set_find_class(sym(401), cls).unwrap();
@@ -208,6 +263,7 @@ fn make_instance_variants() {
 // should actually initialize slots from initargs.
 #[test]
 fn initialize_and_shared_initialize_protocol() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(403);
     let slot_name = sym(404);
@@ -242,6 +298,7 @@ fn initialize_and_shared_initialize_protocol() {
 
 #[test]
 fn slot_set_get_roundtrip() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(500);
     let (sn, val) = (sym(501), TorclVal::from_fixnum(42));
@@ -253,6 +310,7 @@ fn slot_set_get_roundtrip() {
 
 #[test]
 fn slot_boundp_and_makunbound() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(502);
     let sn = sym(503);
@@ -267,6 +325,7 @@ fn slot_boundp_and_makunbound() {
 
 #[test]
 fn slot_value_unbound_errors() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = TorclVal::from_fixnum(506);
     set_find_class(sym(506), cls).unwrap();
@@ -275,6 +334,7 @@ fn slot_value_unbound_errors() {
 
 #[test]
 fn generic_function_lifecycle() {
+    let _guard = test_guard();
     let gf = make_generic_function(sym(600), NIL).unwrap();
     let m = TorclVal::from_fixnum(1);
     add_method(gf, m).unwrap();
@@ -283,12 +343,14 @@ fn generic_function_lifecycle() {
 
 #[test]
 fn compute_applicable_methods_empty() {
+    let _guard = test_guard();
     let gf = make_generic_function(sym(602), NIL).unwrap();
     assert!(compute_applicable_methods(gf, &[TorclVal::from_fixnum(1)]).is_empty());
 }
 
 #[test]
 fn compute_effective_method_standard_and_empty() {
+    let _guard = test_guard();
     let gf = make_generic_function(sym(603), NIL).unwrap();
     let m = TorclVal::from_fixnum(1);
     add_method(gf, m).unwrap();
@@ -299,6 +361,7 @@ fn compute_effective_method_standard_and_empty() {
 
 #[test]
 fn compute_effective_method_non_standard_variants() {
+    let _guard = test_guard();
     let gf = make_generic_function(sym(605), NIL).unwrap();
     let around = fx(1);
     let before = fx(2);
@@ -350,6 +413,7 @@ fn compute_effective_method_non_standard_variants() {
 
 #[test]
 fn change_class_succeeds() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let old = fx(700);
     let new = fx(701);
@@ -371,6 +435,7 @@ fn change_class_succeeds() {
 
 #[test]
 fn multi_argument_dispatch_uses_later_specializer_positions() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let first = fx(800);
     let second_base = fx(801);
@@ -411,6 +476,7 @@ fn multi_argument_dispatch_uses_later_specializer_positions() {
 
 #[test]
 fn redefined_instances_keep_existing_state_visible_on_first_and_second_access() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let class = fx(900);
     let old_slot = sym(901);
@@ -430,6 +496,7 @@ fn redefined_instances_keep_existing_state_visible_on_first_and_second_access() 
 
 #[test]
 fn dispatch_surface_reflects_method_mutation_without_stale_results() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let animal = fx(950);
     let dog = fx(951);
@@ -461,6 +528,7 @@ fn dispatch_surface_reflects_method_mutation_without_stale_results() {
 
 #[test]
 fn instances_are_heap_objects_not_fixnums() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let cls = fx(700);
     let s = sym(701);
@@ -482,6 +550,7 @@ fn instances_are_heap_objects_not_fixnums() {
 
 #[test]
 fn change_class_growth_preserves_slots_via_forwarding() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     let a = fx(710);
     let b = fx(711);
@@ -500,6 +569,7 @@ fn change_class_growth_preserves_slots_via_forwarding() {
 
 #[test]
 fn metaobject_handles_are_off_the_fixnum_tag() {
+    let _guard = test_guard();
     bootstrap_clos().unwrap();
     // Generic-function ids are opaque metaobject handles, never fixnums, so a
     // plain integer equal to the id cannot collide with the gf (bliss-dx6).
