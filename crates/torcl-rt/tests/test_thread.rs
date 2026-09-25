@@ -7,6 +7,7 @@ static FIBER_FOREGROUND_READY: AtomicBool = AtomicBool::new(false);
 static FIBER_FOREGROUND_CAN_FINISH: AtomicBool = AtomicBool::new(false);
 static NATIVE_INTERRUPT_READY: AtomicBool = AtomicBool::new(false);
 static NATIVE_INTERRUPT_CAN_FINISH: AtomicBool = AtomicBool::new(false);
+static NATIVE_LIFECYCLE_CAN_FINISH: AtomicBool = AtomicBool::new(false);
 
 fn inspect_mounted_fiber() -> TorclVal {
     let Some(fiber) = current_fiber() else {
@@ -46,6 +47,13 @@ fn wait_for_native_interrupt_entry() -> TorclVal {
         thread_yield();
     }
     NIL
+}
+
+fn wait_for_lifecycle_release() -> TorclVal {
+    while !NATIVE_LIFECYCLE_CAN_FINISH.load(Ordering::Acquire) {
+        thread_yield();
+    }
+    T
 }
 
 fn condition_state_thread_entry() -> TorclVal {
@@ -97,6 +105,36 @@ fn make_thread_creates_and_joins_a_native_os_thread() {
     assert_ne!(id1, id2);
     assert_eq!(join_thread(id1).unwrap(), NIL);
     assert_eq!(join_thread(id2).unwrap(), T);
+}
+
+#[test]
+fn named_thread_lifecycle_and_bounded_join_are_truthful() {
+    NATIVE_LIFECYCLE_CAN_FINISH.store(false, Ordering::Release);
+    let entry =
+        unsafe { TorclVal::from_function_ptr(wait_for_lifecycle_release as *const () as *mut u8) };
+    let id = make_thread_named(entry, Some("runtime lifecycle worker".into())).unwrap();
+
+    let name = thread_name(id);
+    let alive_before = thread_alive(id);
+    let listed_before = live_thread_ids().contains(&id);
+    let first_join = join_thread_timeout(id, Some(std::time::Duration::ZERO)).unwrap();
+
+    // Always release the worker before asserting so a diagnostic failure cannot
+    // leave a live native thread spinning behind the test harness.
+    NATIVE_LIFECYCLE_CAN_FINISH.store(true, Ordering::Release);
+    let second_join = join_thread_timeout(id, Some(std::time::Duration::from_secs(5))).unwrap();
+
+    assert_eq!(name.as_deref(), Some("runtime lifecycle worker"));
+    assert_eq!(alive_before, Some(true));
+    assert!(listed_before);
+    assert_eq!(first_join, None, "a zero timeout must not consume the join");
+    assert_eq!(second_join, Some(T));
+    assert_eq!(
+        thread_alive(id),
+        None,
+        "a joined handle leaves the registry"
+    );
+    assert!(!live_thread_ids().contains(&id));
 }
 
 #[test]

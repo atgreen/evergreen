@@ -14009,6 +14009,9 @@ fn mv_operator_preserves(name: &str) -> bool {
             // Returns three values (lambda expression, closure-p, name);
             // ansi FUNCTION-LAMBDA-EXPRESSION.1/2 count them.
             | "FUNCTION-LAMBDA-EXPRESSION"
+            // Timed JOIN-THREAD returns (value, completed-p), distinguishing a
+            // completed thread whose value is NIL from a deadline expiry.
+            | "JOIN-THREAD"
             // APROPOS is specified to return NO values (CLHS 25.1.1); without
             // this the allowlist classifies it single-value and
             // (multiple-value-list (apropos …)) yields (NIL) instead of ().
@@ -14377,7 +14380,7 @@ fn symbol_function_object_ex(
         return Some(f);
     }
     let bare = symbol_bare_name(&fn_name);
-    if is_builtin_function(&bare) {
+    if is_builtin_function(&fn_name) {
         return Some(builtin_fn_wrapper(env, name_sym, &bare));
     }
     if fn_bound(env, &fn_name) {
@@ -16870,16 +16873,29 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // (torcl-thread:make-thread function &key name) — spawn a
                 // dedicated native OS thread that runs FUNCTION with no
                 // arguments and returns its value to a later JOIN-THREAD
-                // (bliss-q9i1, §13.5.3). NAME is accepted and currently ignored.
+                // (bliss-q9i1, §13.5.3). NAME is retained by both the Lisp
+                // descriptor and the host OS thread (bliss-94kq).
                 // The handle is presently the raw native-thread id as a fixnum;
                 // a distinct first-class THREAD object is tracked as bliss-8z5i.
                 //
                 // The runtime roots the entry until the new thread adopts it.
                 // Preserve a closure cons as-is: reifying it as a fresh function
                 // would discard its local function namespace and EQ identity.
-                let (ff, _) = cp(cdr);
-                let mut fnv = eval_form(ff, env)?;
-                torcl_rt::rooted_ref!(_fnv_root = &mut fnv);
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:MAKE-THREAD requires a function".into(),
+                    ));
+                }
+                for pair in args[1..].chunks(2) {
+                    if !is_keyword_arg(pair[0]) {
+                        return Err(TorclError::ProgramError(
+                            "TORCL-THREAD:MAKE-THREAD argument names must be keywords".into(),
+                        ));
+                    }
+                }
+                validate_builtin_keywords(&args[1..], &["NAME"])?;
+                let fnv = args[0];
                 // Both closure representations resolve their captured state
                 // through process-wide, precisely scanned registries.
                 let shareable = fnv.is_symbol()
@@ -16892,14 +16908,43 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                             .to_string(),
                     ));
                 }
-                let id = torcl_rt::make_thread(fnv)?;
+                let name = args[1..]
+                    .chunks(2)
+                    .find(|pair| key_bare(pair[0]) == "NAME")
+                    .map(|pair| pair[1])
+                    .filter(|value| !value.is_nil())
+                    .map(|value| {
+                        if !is_string_value(value) {
+                            return Err(TorclError::TypeError {
+                                datum: value,
+                                expected: "a string thread name or NIL".to_string(),
+                            });
+                        }
+                        Ok(val_as_str(value))
+                    })
+                    .transpose()?;
+                let id = torcl_rt::make_thread_named(fnv, name)?;
                 return Ok(TorclVal::from_fixnum(id.0 as i64));
             }
             "TORCL-THREAD::JOIN-THREAD" | "TORCL-THREAD:JOIN-THREAD" => {
-                // (torcl-thread:join-thread thread) — block until THREAD's entry
-                // function returns, yielding that value (§13.5.3 Death).
-                let (tf, _) = cp(cdr);
-                let tv = eval_form(tf, env)?;
+                // (torcl-thread:join-thread thread &key timeout) — block until
+                // THREAD's entry function returns, or return NIL/NIL when the
+                // timeout in seconds expires (§13.5.3 Death; bliss-94kq).
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:JOIN-THREAD requires a thread".into(),
+                    ));
+                }
+                for pair in args[1..].chunks(2) {
+                    if !is_keyword_arg(pair[0]) {
+                        return Err(TorclError::ProgramError(
+                            "TORCL-THREAD:JOIN-THREAD argument names must be keywords".into(),
+                        ));
+                    }
+                }
+                validate_builtin_keywords(&args[1..], &["TIMEOUT"])?;
+                let tv = args[0];
                 if !tv.is_fixnum() {
                     return Err(TorclError::TypeError {
                         datum: tv,
@@ -16907,14 +16952,105 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     });
                 }
                 let id = torcl_rt::NativeThreadId(tv.as_fixnum() as u64);
-                return torcl_rt::join_thread(id);
+                let timeout_value = args[1..]
+                    .chunks(2)
+                    .find(|pair| key_bare(pair[0]) == "TIMEOUT")
+                    .map(|pair| pair[1]);
+                let timeout = match timeout_value {
+                    None | Some(NIL) => None,
+                    Some(value) => {
+                        let seconds = num_val(value)?;
+                        if !seconds.is_finite() || seconds < 0.0 {
+                            return Err(TorclError::TypeError {
+                                datum: value,
+                                expected: "a non-negative real timeout in seconds".to_string(),
+                            });
+                        }
+                        Some(
+                            std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
+                                TorclError::TypeError {
+                                    datum: value,
+                                    expected:
+                                        "a representable non-negative real timeout in seconds"
+                                            .to_string(),
+                                }
+                            })?,
+                        )
+                    }
+                };
+                return match torcl_rt::join_thread_timeout(id, timeout)? {
+                    Some(value) => {
+                        env.set_mv(vec![value, T]);
+                        Ok(value)
+                    }
+                    None => {
+                        env.set_mv(vec![NIL, NIL]);
+                        Ok(NIL)
+                    }
+                };
             }
             "TORCL-THREAD::CURRENT-THREAD" | "TORCL-THREAD:CURRENT-THREAD" => {
                 // (torcl-thread:current-thread) — the running thread's handle.
-                let _ = eval_args(cdr, env)?;
+                let args = eval_args(cdr, env)?;
+                if !args.is_empty() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:CURRENT-THREAD takes no arguments".into(),
+                    ));
+                }
                 return Ok(TorclVal::from_fixnum(
                     torcl_rt::current_thread_id().0 as i64,
                 ));
+            }
+            "TORCL-THREAD::THREAD-NAME" | "TORCL-THREAD:THREAD-NAME" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 || !args[0].is_fixnum() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:THREAD-NAME requires one thread handle".into(),
+                    ));
+                }
+                let id = torcl_rt::NativeThreadId(args[0].as_fixnum() as u64);
+                return Ok(torcl_rt::thread_name(id)
+                    .map(|name| arena_str(&name))
+                    .unwrap_or(NIL));
+            }
+            "TORCL-THREAD::THREAD-ALIVE-P" | "TORCL-THREAD:THREAD-ALIVE-P" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 || !args[0].is_fixnum() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:THREAD-ALIVE-P requires one thread handle".into(),
+                    ));
+                }
+                let id = torcl_rt::NativeThreadId(args[0].as_fixnum() as u64);
+                return Ok(if torcl_rt::thread_alive(id).unwrap_or(false) {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "TORCL-THREAD::ALL-THREADS" | "TORCL-THREAD:ALL-THREADS" => {
+                let args = eval_args(cdr, env)?;
+                if !args.is_empty() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:ALL-THREADS takes no arguments".into(),
+                    ));
+                }
+                let mut ids = torcl_rt::live_thread_ids();
+                ids.sort_by_key(|id| id.0);
+                torcl_rt::rooted!(threads = NIL);
+                for id in ids.into_iter().rev() {
+                    *threads = arena_cons(TorclVal::from_fixnum(id.0 as i64), *threads);
+                }
+                return Ok(*threads);
+            }
+            "TORCL-THREAD::THREAD-YIELD" | "TORCL-THREAD:THREAD-YIELD" => {
+                let args = eval_args(cdr, env)?;
+                if !args.is_empty() {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-THREAD:THREAD-YIELD takes no arguments".into(),
+                    ));
+                }
+                torcl_rt::thread_yield();
+                return Ok(NIL);
             }
             "TORCL-INTERNAL::%DEFCONSTANT" | "TORCL-INTERNAL:%DEFCONSTANT" | "%DEFCONSTANT" => {
                 // (%defconstant 'name value) — establish NAME's value and record
@@ -17038,7 +17174,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         || env.methods.contains_key(&n)
                         || env.generics.contains_key(&n)
                         || macro_defined(env, &n)
-                        || is_builtin_function(&bare)
+                        || is_builtin_function(&n)
                         // Standard special operators and standard macros that the
                         // evaluator implements directly are fbound in the CL sense,
                         // so FDEFINITION must not signal (ansi FDEFINITION.2/.3 —
@@ -17099,7 +17235,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     || env.methods.contains_key(&name)
                     || env.generics.contains_key(&name)
                     || macro_defined(env, &name)
-                    || is_builtin_function(&bare)
+                    || is_builtin_function(&name)
                     // Standard special operators and standard macros that the
                     // evaluator implements directly are fbound in the CL sense.
                     // FDEFINITION already consults both — FBOUNDP did not, so the
@@ -18829,7 +18965,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                             let fbound = env.generics.contains_key(&nm)
                                 || env.methods.contains_key(&nm)
                                 || macro_defined(env, &nm)
-                                || is_builtin_function(&symbol_bare_name(&nm));
+                                || is_builtin_function(&nm);
                             if fbound {
                                 let primary = if name.is_nil() { NIL } else { *name };
                                 env.set_mv(vec![primary, NIL, NIL]);
@@ -34326,18 +34462,40 @@ fn apply_function(
     })
 }
 
-/// True if `name` (a bare, upcased function name) denotes a standard function
-/// torcl implements as a builtin operator. Used by FBOUNDP/FDEFINITION so a
+/// True if `name` denotes a function torcl implements as a builtin operator.
+/// Common Lisp names are bare/upcased; extension names are package-qualified.
+/// Used by FBOUNDP/FDEFINITION so a
 /// builtin like FUNCALL is reported bound and `(fdefinition 'funcall)` returns a
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
 fn is_builtin_function(name: &str) -> bool {
+    // TORCL-THREAD is an extension package, not COMMON-LISP. Its names must be
+    // recognized by qualified symbol identity: treating every symbol whose
+    // bare name is MAKE-THREAD as this builtin made
+    // BORDEAUX-THREADS:MAKE-THREAD spuriously FBOUNDP before BT defined it.
+    if matches!(
+        name,
+        "TORCL-THREAD:MAKE-THREAD"
+            | "TORCL-THREAD::MAKE-THREAD"
+            | "TORCL-THREAD:JOIN-THREAD"
+            | "TORCL-THREAD::JOIN-THREAD"
+            | "TORCL-THREAD:CURRENT-THREAD"
+            | "TORCL-THREAD::CURRENT-THREAD"
+            | "TORCL-THREAD:THREAD-NAME"
+            | "TORCL-THREAD::THREAD-NAME"
+            | "TORCL-THREAD:THREAD-ALIVE-P"
+            | "TORCL-THREAD::THREAD-ALIVE-P"
+            | "TORCL-THREAD:ALL-THREADS"
+            | "TORCL-THREAD::ALL-THREADS"
+            | "TORCL-THREAD:THREAD-YIELD"
+            | "TORCL-THREAD::THREAD-YIELD"
+    ) {
+        return true;
+    }
     matches!(
         name,
         // Introspection / devtools
         "DISASSEMBLE"
-            // Native threads (TORCL-THREAD, §13.9; bliss-q9i1)
-            | "MAKE-THREAD" | "JOIN-THREAD" | "CURRENT-THREAD"
             | "TORCL::%NATIVE-MUTEX"
             | "TORCL::%NATIVE-CONDITION"
             // Control / function application

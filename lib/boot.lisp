@@ -3638,6 +3638,11 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; ---------------------------------------------------------------------------
 
 ;;; Native mutex policy lives here; %NATIVE-MUTEX delegates to the stdlib.
+(export (mapcar (lambda (name) (intern name "TORCL-THREAD"))
+                '("MAKE-THREAD" "JOIN-THREAD" "CURRENT-THREAD" "THREAD-NAME"
+                  "THREAD-ALIVE-P" "ALL-THREADS" "THREAD-YIELD"))
+        "TORCL-THREAD")
+
 (defun torcl-thread:make-mutex (&key name recursive)
   (torcl::%native-mutex :make name recursive))
 

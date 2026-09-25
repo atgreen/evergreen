@@ -319,8 +319,22 @@ impl ThreadResult {
         }
     }
 
+    /// Wait at most `timeout` for a result without removing it. Returns true
+    /// when the result is ready. Spurious condition-variable wakeups do not
+    /// turn into false completion reports.
+    fn wait_until_ready_for(&self, timeout: std::time::Duration) -> bool {
+        let guard = self.value.lock().unwrap();
+        if guard.is_some() {
+            return true;
+        }
+        let (guard, _) = self
+            .done
+            .wait_timeout_while(guard, timeout, |value| value.is_none())
+            .unwrap();
+        guard.is_some()
+    }
+
     /// Check if the thread has finished without blocking.
-    #[allow(dead_code)]
     fn is_done(&self) -> bool {
         self.value.lock().unwrap().is_some()
     }
@@ -418,6 +432,14 @@ impl NativeThread {
 
     pub fn is_carrier(&self) -> bool {
         self.carrier
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.result.is_done()
+            && !matches!(
+                self.state(),
+                NativeThreadState::Dead | NativeThreadState::Aborted
+            )
     }
 
     fn is_inactive_auto_registered(&self) -> bool {
@@ -1629,11 +1651,24 @@ fn run_entry(entry: TorclVal) -> Result<TorclVal, TorclError> {
 
 /// Create a dedicated one-to-one OS-backed native thread.
 pub fn make_thread(entry: TorclVal) -> Result<NativeThreadId, TorclError> {
+    make_thread_named(entry, None)
+}
+
+/// Create a named dedicated one-to-one OS-backed native thread.
+///
+/// When no name is supplied the generated name remains stable for the
+/// lifetime of the thread descriptor and is also used as the host thread's
+/// diagnostic name.
+pub fn make_thread_named(
+    entry: TorclVal,
+    name: Option<String>,
+) -> Result<NativeThreadId, TorclError> {
     let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+    let name = name.unwrap_or_else(|| format!("torcl-thread-{}", id.0));
     let result = Arc::new(ThreadResult::new());
     let thread = Arc::new(NativeThread::new(
         id,
-        Some(format!("torcl-thread-{}", id.0)),
+        Some(name.clone()),
         false,
         false,
         entry,
@@ -1645,32 +1680,30 @@ pub fn make_thread(entry: TorclVal) -> Result<NativeThreadId, TorclError> {
         .insert(id, Arc::clone(&thread));
 
     let running = Arc::clone(&thread);
-    let handle = match std::thread::Builder::new()
-        .name(format!("torcl-thread-{}", id.0))
-        .spawn(move || {
-            install_current_native_thread(Arc::clone(&running));
-            running.set_state(NativeThreadState::Running);
-            // An unwinding entry must still publish completion: JOIN waits on
-            // this result before it can inspect the OS join handle. Catch at
-            // the worker boundary; after a panic this worker retires without
-            // evaluating any more Lisp or hiding the failure with an interrupt.
-            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut value = run_entry(running.entry());
-                if let Some(interrupt) = running.take_interrupt() {
-                    value = Ok(interrupt);
-                }
-                value
-            }))
-            .unwrap_or_else(|_| {
-                Err(TorclError::Internal(format!(
-                    "native thread {} panicked",
-                    id.0
-                )))
-            });
-            running.stack.publish_top();
-            result.complete(value);
-            crate::safepoint::retire_native_thread(&running);
-        }) {
+    let handle = match std::thread::Builder::new().name(name).spawn(move || {
+        install_current_native_thread(Arc::clone(&running));
+        running.set_state(NativeThreadState::Running);
+        // An unwinding entry must still publish completion: JOIN waits on
+        // this result before it can inspect the OS join handle. Catch at
+        // the worker boundary; after a panic this worker retires without
+        // evaluating any more Lisp or hiding the failure with an interrupt.
+        let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut value = run_entry(running.entry());
+            if let Some(interrupt) = running.take_interrupt() {
+                value = Ok(interrupt);
+            }
+            value
+        }))
+        .unwrap_or_else(|_| {
+            Err(TorclError::Internal(format!(
+                "native thread {} panicked",
+                id.0
+            )))
+        });
+        running.stack.publish_top();
+        result.complete(value);
+        crate::safepoint::retire_native_thread(&running);
+    }) {
         Ok(handle) => handle,
         Err(error) => {
             native_thread_registry().lock().unwrap().remove(&id);
@@ -1685,6 +1718,21 @@ pub fn make_thread(entry: TorclVal) -> Result<NativeThreadId, TorclError> {
 
 /// Join a dedicated native thread and return its entry value.
 pub fn join_thread(id: NativeThreadId) -> Result<TorclVal, TorclError> {
+    match join_thread_timeout(id, None)? {
+        Some(value) => Ok(value),
+        None => unreachable!("an unbounded native-thread join cannot time out"),
+    }
+}
+
+/// Join a dedicated native thread, optionally bounded by `timeout`.
+///
+/// `Ok(None)` means that the deadline expired. In that case neither the
+/// result nor the OS join handle is consumed, so a later join remains valid.
+/// `Ok(Some(value))` consumes the thread exactly like [`join_thread`].
+pub fn join_thread_timeout(
+    id: NativeThreadId,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<TorclVal>, TorclError> {
     if id == current_thread_id() {
         return Err(TorclError::ProgramError(
             "a thread cannot join itself".into(),
@@ -1700,9 +1748,18 @@ pub fn join_thread(id: NativeThreadId) -> Result<TorclVal, TorclError> {
     };
     // Leave the result in its scanned cell throughout the native wait. The
     // scope's Drop waits out any active collection before we move the value.
-    {
+    let ready = {
         let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
-        thread.result.wait_until_ready();
+        match timeout {
+            Some(timeout) => thread.result.wait_until_ready_for(timeout),
+            None => {
+                thread.result.wait_until_ready();
+                true
+            }
+        }
+    };
+    if !ready {
+        return Ok(None);
     }
     let mut value = thread.result.value.lock().unwrap().take().ok_or_else(|| {
         TorclError::ProgramError(format!("native thread {} was already joined", id.0))
@@ -1719,7 +1776,7 @@ pub fn join_thread(id: NativeThreadId) -> Result<TorclVal, TorclError> {
     }
     native_thread_registry().lock().unwrap().remove(&id);
     drop(_value_root);
-    value
+    value.map(Some)
 }
 
 pub fn current_thread_id() -> NativeThreadId {
@@ -1736,6 +1793,32 @@ pub fn all_thread_ids() -> Vec<NativeThreadId> {
     let mut registry = native_thread_registry().lock().unwrap();
     prune_inactive_auto_registered_threads(&mut registry);
     registry.keys().copied().collect()
+}
+
+/// Return the stable diagnostic name for a registered native thread.
+pub fn thread_name(id: NativeThreadId) -> Option<String> {
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry.get(&id).and_then(|thread| thread.name.clone())
+}
+
+/// Whether a registered native thread has not reached its terminal state.
+/// Missing (including already joined) thread handles return `None`.
+pub fn thread_alive(id: NativeThreadId) -> Option<bool> {
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry.get(&id).map(|thread| thread.is_alive())
+}
+
+/// Snapshot the registered threads that have not reached a terminal state.
+pub fn live_thread_ids() -> Vec<NativeThreadId> {
+    let _ = current_thread_id();
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry
+        .iter()
+        .filter_map(|(id, thread)| thread.is_alive().then_some(*id))
+        .collect()
 }
 
 pub fn thread_is_carrier(id: NativeThreadId) -> Option<bool> {
