@@ -587,9 +587,16 @@ a major version (R7.14).
 The `format_version` field in the header (D7.01) is independent of the
 release version:
 
-The current format is **2**, which adds the opaque mutex heap type (`0x19`).
-Its process-local native pointer is cleared on save; see §13.9 for restart
-semantics. Format-1 images retain the same section layout and remain readable.
+The current format is **3**, which appends an `MCOD` block to the host registry:
+a u32 record count followed by pairs of u64 method-id bits and saved callable
+bits. Method ids are immediate meta-handles; callable pointers are relocated
+through the heap map and rooted before startup allocations. Compiled bodies
+are restored separately through the existing bytecode registry.
+
+Format-2 images added the opaque mutex heap type (`0x19`). Its process-local
+native pointer is cleared on save; see §13.9 for restart semantics. Format-1
+and format-2 images remain readable; absent compiled-method associations keep
+the prior interpreted-dispatch behavior.
 
 | Compat Rule | Behaviour |
 |-------------|-----------|

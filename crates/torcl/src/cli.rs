@@ -2883,6 +2883,19 @@ fn host_serialize_registries() -> Vec<u8> {
     // this block carries the Rust-side structure (names/nicknames/use-lists/
     // shadowing/table refs) a loaded core otherwise lacks.
     out.extend_from_slice(&torcl_stdlib::packages::serialize_package_registry());
+    // The callable objects ride the heap and their code rides BCOD, but method
+    // dispatch needs this association too (bliss-c6td). Without it every saved
+    // ASDF method falls back to source evaluation after restart. Method ids are
+    // stable immediate meta-handles; callable pointers must be relocated.
+    out.extend_from_slice(b"MCOD");
+    METHOD_COMPILED.with(|methods| {
+        let methods = methods.borrow();
+        out.extend_from_slice(&(methods.len() as u32).to_le_bytes());
+        for (&id, callable) in methods.iter() {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&callable.to_raw().to_le_bytes());
+        }
+    });
     out
 }
 
@@ -3364,7 +3377,6 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
         let (consumed, names) =
             torcl_stdlib::packages::restore_package_registry(&data[off..], &remap)?;
         off += consumed;
-        let _ = off;
         for (name, nicknames) in names {
             reader::register_package(&name);
             for nick in nicknames {
@@ -3372,6 +3384,26 @@ fn host_restore_registries(data: &[u8]) -> Result<(), TorclError> {
             }
         }
     }
+    // Install directly into the existing GC-scanned table before any startup
+    // allocation. BCOD is installed later, before user code can call a method.
+    // Older images lack MCOD and retain interpreted method dispatch.
+    let mut compiled_methods = HashMap::new();
+    if off + 4 <= data.len() && &data[off..off + 4] == b"MCOD" {
+        off += 4;
+        let bad = || TorclError::InvalidImage("host registry: truncated (compiled methods)".into());
+        let count_bytes = data.get(off..off + 4).ok_or_else(bad)?;
+        let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+        off += 4;
+        if count > (data.len() - off) / 16 {
+            return Err(bad());
+        }
+        for _ in 0..count {
+            let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let callable = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            compiled_methods.insert(id, TorclVal::from_raw(remap(callable)));
+        }
+    }
+    METHOD_COMPILED.with(|methods| *methods.borrow_mut() = compiled_methods);
     Ok(())
 }
 
@@ -37649,6 +37681,65 @@ mod class_slot_owner_tests {
 #[cfg(test)]
 mod host_registry_hook_tests {
     use super::*;
+
+    #[test]
+    fn host_registry_validates_compiled_method_records_and_accepts_legacy_images() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = Env::new(false);
+        let bytes = host_serialize_registries();
+        let marker = bytes
+            .windows(4)
+            .rposition(|w| w == b"MCOD")
+            .expect("compiled method association block must be saved");
+        let mut truncated = bytes[..marker + 4].to_vec();
+        assert!(matches!(
+            host_restore_registries(&truncated),
+            Err(TorclError::InvalidImage(_))
+        ));
+        truncated.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            host_restore_registries(&truncated),
+            Err(TorclError::InvalidImage(_))
+        ));
+
+        // Formats 1 and 2 end after PKGS. No association is preferable to a
+        // stale pre-restore callable, and ordinary interpreted dispatch remains.
+        METHOD_COMPILED.with(|m| m.borrow_mut().insert(123, NIL));
+        host_restore_registries(&bytes[..marker]).unwrap();
+        assert!(METHOD_COMPILED.with(|m| m.borrow().is_empty()));
+    }
+
+    #[test]
+    fn host_registry_preserves_compiled_method_associations() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env(
+            "(defmethod image-compiled-method ((x t)) (+ x 1))",
+            &mut env,
+        )
+        .unwrap();
+        let method_id = env.methods.borrow()["IMAGE-COMPILED-METHOD"][0].method_id.0;
+        torcl_rt::rooted!(callable = METHOD_COMPILED.with(|m| m.borrow()[&method_id]));
+        SAVE_METHODS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.methods)));
+        SAVE_GENERICS.with(|m| *m.borrow_mut() = Some(Rc::clone(&env.generics)));
+        let bytes = host_serialize_registries();
+        SAVE_METHODS.with(|m| *m.borrow_mut() = None);
+        SAVE_GENERICS.with(|m| *m.borrow_mut() = None);
+        METHOD_COMPILED.with(|m| m.borrow_mut().remove(&method_id));
+
+        host_restore_registries(&bytes).unwrap();
+        drain_pending_host_generics(&env);
+        assert_eq!(
+            METHOD_COMPILED.with(|m| m.borrow().get(&method_id).copied()),
+            Some(*callable),
+            "image restoration must reconnect methods to their compiled bodies"
+        );
+        assert_eq!(
+            read_eval_all_env("(image-compiled-method 41)", &mut env).unwrap(),
+            TorclVal::from_fixnum(42)
+        );
+    }
 
     // bliss-x0f2 M2: the host-registry (de)serialization + pending-buffer + drain
     // round-trips global macros and setf-functions. In-process the heap reloc map

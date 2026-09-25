@@ -5,6 +5,95 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Preserve compiled ASDF methods across image restart (2026-09-24, bliss-13he)
+
+The saved executable was restoring compiled method bodies but dropping
+`METHOD_COMPILED`, the table connecting method identities to their callable
+objects. Consequently, restored ASDF methods returned to source interpretation.
+This was also a correctness defect: a fresh-process regression showed a saved
+compiled method re-expanding a macro that had been redefined after compilation.
+
+Image format **3** now saves those associations in an `MCOD` host-registry block.
+Callable pointers are relocated into the existing GC-scanned table before
+startup allocations; the existing bytecode registry supplies their code.
+Actual format-1 and format-2 images still load, with their previous interpreted
+dispatch behavior. A format-2 runtime rejects format 3 clearly. Rebuild the
+image to obtain the improvement; neither `/usr/local/bin/torcl` nor the default
+`target/torcl` was replaced during this work.
+
+Five alternating CPU-0-pinned fresh processes per library and image, after
+build/test jobs finished, compare a saved **6950da9** release baseline with the
+fix. Both are ordinary ThinLTO release builds, isolating this change from PGO:
+
+| Initial cached load | Before | Fixed | Reduction |
+|---|---:|---:|---:|
+| Babel instructions | 6.328 G | 3.914 G | **38.1%** |
+| Babel CPU cycles | 2.324 G | 1.597 G | **31.3%** |
+| Babel wall median | 1.045 s | 0.761 s | **27.2%** |
+| CL-PPCRE instructions | 2.796 G | 2.007 G | **28.2%** |
+| CL-PPCRE CPU cycles | 0.988 G | 0.750 G | **24.0%** |
+| CL-PPCRE wall median | 0.460 s | 0.355 s | **22.8%** |
+
+The timer/counters surround the **first** ASDF load, not startup or a no-op
+reload. Private FASL caches are populated beforehand, and `COMPILE-FILE` is
+replaced by an error during measured runs. No measured load recompiles a library
+source file; all TorCL windows report zero minor/major GCs. Allocation falls from
+12,094,992 to 10,566,416 bytes for Babel and 4,298,224 to 3,890,480 for CL-PPCRE.
+Whole-process wall medians, including startup, fall 1.29 → 1.01 s and
+0.71 → 0.61 s respectively. Babel wall samples remain clock-sensitive
+(before 0.933–1.088 s, fixed 0.605–0.766 s); counter ranges are much tighter.
+
+The same batch includes five runs of a **freshly trained default-PGO image**
+and five SBCL references per library. These give the current default-build
+gap, not an isolated PGO-before/after measurement for this fix:
+
+| Initial cached load | Fixed PGO image | SBCL | TorCL / SBCL |
+|---|---:|---:|---:|
+| Babel CPU cycles | 1.372 G | 0.628 G | **2.18×** |
+| Babel wall median | 0.660 s | 0.292 s | **2.26×** |
+| CL-PPCRE CPU cycles | 0.638 G | 0.552 G | **1.15×** |
+| CL-PPCRE wall median | 0.306 s | 0.254 s | **1.20×** |
+
+Default-PGO image instructions are 3.149 G / 1.546 G respectively. Its
+instrumented/use compiler passes took 2m20s / 3m32s on cores 6–13. Fresh training
+uses only the dependency-free fixture, not these held-out libraries. The PATH
+`llvm-profdata` version 23.1.1 was correctly rejected; the successful build used
+`LLVM_PROFDATA=/home/linuxbrew/.linuxbrew/Cellar/llvm@21/21.1.8/bin/llvm-profdata`,
+matching rustc's LLVM 21.1.8. No profile-mismatch warnings were emitted.
+
+The image/raw gap is smaller, not eliminated: three current ThinLTO raw-runtime
+controls, using `REQUIRE ASDF` like the image builder, take 3.668 G instructions
+for Babel and 1.937 G for CL-PPCRE. The fixed image still uses **6.7% / 3.6%**
+more instructions. `bliss-c6td` remains open to profile that residual;
+`bliss-mxjr` separately tracks captured lexical method environments. Overall
+SBCL parity is not achieved.
+
+Validation: three host-registry tests cover association restoration, malformed
+counts, and legacy absence. The real save/restart regression checks preserved
+macro-expansion semantics, `CALL-NEXT-METHOD`, multiple values, and redefinition;
+it passes every-allocation GC stress/poison/verification, five normal repeats,
+and forced-T1/T2 configurations. Both normal and PGO images produce all 15,106
+Babel reverse-table entries identically to SBCL, normally and under stress
+stride 20,000 with poison/verification. The PGO method restart check also passes,
+as does a real CL-PPCRE scanner after a verified full GC with poison/verification.
+
+The full workspace gate reports **2,589 passed / 11 failed / 7 ignored**.
+All 358 CLI acceptance tests, 59 FASL tests, and 52 CLI unit tests pass. The
+separate serial runtime gate passes all 626 tests. Existing STRINGP metadata,
+parallel threading handshakes, stale sequence fixtures and Lisp doctests remain
+red. A newly observed list-builder safepoint failure is filed as `bliss-7d8f`:
+the exact binary passes serially and in 20 parallel controls; that is not proof
+the failure is fixed. Clippy still has nine tracked runtime diagnostics, spec
+coverage 14 uncovered stage-5 requirements, and workspace check the tracked
+unused-mut warning. Formatting/diff checks pass and root lint has zero new
+findings. Review was solo, not independent. This is not a full PGO-compiled
+Rust-harness validation; `bliss-lm5f` remains open.
+
+Artifacts: `/tmp/torcl-image-method.Mi1Nzh/` contains baseline/fixed/PGO images,
+private caches, the guarded benchmark scripts and all per-run counters/logs;
+fresh PGO profiles/build logs are in `target/pgo/run.2LX2dN/`. Broad validation
+logs are `/tmp/torcl-image-method-{workspace,runtime-serial,stress}.log`.
+
 ## PGO is the default image build (2026-09-24, bliss-jcr9)
 
 At the user's request, `make image` now runs the guarded PGO pipeline described
