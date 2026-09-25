@@ -95,11 +95,17 @@ fn condition_notify_and_broadcast_wake_parked_fibers() {
     group.submit(first).unwrap();
     group.submit(second).unwrap();
     wait_until(|| COND_READY.load(Ordering::Acquire) == 2);
-    CONDVAR.get().unwrap().notify(1);
+    // READY is incremented while holding the mutex. Taking it proves both
+    // waits have enqueued, so the notification-count assertions are not races.
+    let mutex = COND_MUTEX.get().unwrap();
+    mutex.grab(true, None).unwrap();
+    assert_eq!(CONDVAR.get().unwrap().notify(1), 1);
+    mutex.release().unwrap();
     wait_until(|| COND_DONE.load(Ordering::Acquire) == 1);
-    CONDVAR.get().unwrap().broadcast();
+    assert_eq!(CONDVAR.get().unwrap().broadcast(), 1);
     assert_eq!(group.finish().unwrap(), vec![T, T]);
     assert_eq!(COND_DONE.load(Ordering::Acquire), 2);
+    assert_eq!(CONDVAR.get().unwrap().broadcast(), 0);
 }
 
 static SEMAPHORE: OnceLock<TorclSemaphore> = OnceLock::new();

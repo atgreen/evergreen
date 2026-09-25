@@ -1,20 +1,27 @@
 use super::{BlockingMode, FiberWaiter, TorclMutex, blocking_mode, timer};
 use crate::error::TorclError;
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 struct CondState {
-    generation: u64,
     fiber_waiters: VecDeque<FiberWaiter>,
+    native_waiters: VecDeque<Arc<NativeWaiter>>,
+}
+
+/// Each native wait has its own wake predicate and condvar. A shared generation
+/// cannot distinguish a selected waiter from another wait that merely times out
+/// after NOTIFY. The queue lock serializes selection with timeout removal.
+struct NativeWaiter {
+    notified: AtomicBool,
+    wake: Condvar,
 }
 
 /// Fiber-aware condition variable paired with [`TorclMutex`].
 pub struct TorclCondVar {
     name: Option<String>,
     state: Mutex<CondState>,
-    native_waiters: Condvar,
 }
 
 impl TorclCondVar {
@@ -22,10 +29,9 @@ impl TorclCondVar {
         Self {
             name,
             state: Mutex::new(CondState {
-                generation: 0,
                 fiber_waiters: VecDeque::new(),
+                native_waiters: VecDeque::new(),
             }),
-            native_waiters: Condvar::new(),
         }
     }
 
@@ -76,26 +82,33 @@ impl TorclCondVar {
             }
             BlockingMode::Native => {
                 let mut state = self.state.lock().unwrap();
-                let generation = state.generation;
+                let waiter = Arc::new(NativeWaiter {
+                    notified: AtomicBool::new(false),
+                    wake: Condvar::new(),
+                });
                 mutex.release()?;
+                state.native_waiters.push_back(Arc::clone(&waiter));
                 let notified = loop {
-                    if state.generation != generation {
+                    if waiter.notified.load(Ordering::Acquire) {
                         break true;
                     }
                     state = match deadline {
                         Some(deadline) => {
                             let remaining = deadline.saturating_duration_since(Instant::now());
                             let (new_state, result) =
-                                self.native_waiters.wait_timeout(state, remaining).unwrap();
+                                waiter.wake.wait_timeout(state, remaining).unwrap();
                             state = new_state;
-                            if result.timed_out() && state.generation == generation {
+                            if result.timed_out() && !waiter.notified.load(Ordering::Acquire) {
                                 break false;
                             }
                             continue;
                         }
-                        None => self.native_waiters.wait(state).unwrap(),
+                        None => waiter.wake.wait(state).unwrap(),
                     };
                 };
+                state
+                    .native_waiters
+                    .retain(|entry| !Arc::ptr_eq(entry, &waiter));
                 drop(state);
                 mutex.grab(true, None)?;
                 Ok(notified)
@@ -103,13 +116,14 @@ impl TorclCondVar {
         }
     }
 
-    pub fn notify(&self, count: usize) {
+    /// Select at most `count` waiters and return how many were notified. Pending
+    /// notifications are not permits: a call with no waiters returns zero.
+    pub fn notify(&self, count: usize) -> usize {
         let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         if count == 0 {
-            return;
+            return 0;
         }
         let mut state = self.state.lock().unwrap();
-        state.generation = state.generation.wrapping_add(1);
         let mut remaining = count;
         while remaining > 0 {
             match state.fiber_waiters.pop_front() {
@@ -121,19 +135,20 @@ impl TorclCondVar {
                 None => break,
             }
         }
-        for _ in 0..remaining {
-            self.native_waiters.notify_one();
+        while remaining > 0 {
+            let Some(waiter) = state.native_waiters.pop_front() else {
+                break;
+            };
+            waiter.notified.store(true, Ordering::Release);
+            waiter.wake.notify_one();
+            remaining -= 1;
         }
+        count - remaining
     }
 
-    pub fn broadcast(&self) {
-        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
-        let mut state = self.state.lock().unwrap();
-        state.generation = state.generation.wrapping_add(1);
-        for waiter in state.fiber_waiters.drain(..) {
-            waiter.wake();
-        }
-        self.native_waiters.notify_all();
+    /// Notify every queued waiter, returning the number selected.
+    pub fn broadcast(&self) -> usize {
+        self.notify(usize::MAX)
     }
 }
 
