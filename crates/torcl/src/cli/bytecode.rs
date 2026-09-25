@@ -551,6 +551,10 @@ fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
         generations.insert(sym, next);
     });
     let old = REGISTRY.with(|r| r.borrow_mut().insert(sym, f));
+    // Fresh uninterned closures cannot replace a baked target, and the builtin
+    // memo excludes uninterned symbols. Creating a callback must not invalidate
+    // unrelated native calls. Keep replacements and named installs conservative.
+    let invalidates_direct_calls = old.is_some() || !torcl_rt::symbols::is_uninterned(sym);
     if let Some(old) = old {
         clear_bytecode_profiles(Rc::as_ptr(&old) as usize);
     }
@@ -558,7 +562,9 @@ fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
     // decline for the old body must not suppress compilation of the new one,
     // and no native entry compiled from the old bytecode may remain callable.
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+    if invalidates_direct_calls {
+        bump_direct_call_gen();
+    }
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
@@ -14708,14 +14714,18 @@ extern "C" fn c2i_call_builtin(
 ) -> u64 {
     let sym = idx_and_sym & 0xFFFF_FFFF;
     let slot = (idx_and_sym >> 32) as u32;
-    // Two invalidations, both cheap. The generation catches any redefinition
-    // since this site was baked (bliss-zhvn); the function cell catches a user
-    // taking the name over directly, e.g. (setf (symbol-function 'aref) …).
-    // Either way fall back to the general path, which is always correct.
-    if DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed) != baked_gen
-        || torcl_rt::symbols::symbol_function(sym as u32)
+    // An unrelated definition changes the coarse generation too. Revalidate
+    // stale sites through the current-generation memo instead of permanently
+    // routing unchanged builtins through general dispatch. Both paths check the
+    // live function cell, including direct SYMBOL-FUNCTION replacement; the
+    // stale path also verifies the resolved slot and accepted arity.
+    let still_builtin = if direct_call_gen() == baked_gen {
+        !torcl_rt::symbols::symbol_function(sym as u32)
             .is_some_and(torcl_rt::function::is_interpreted_function)
-    {
+    } else {
+        super::direct_builtin_slot_memoized(sym as u32, n as usize) == Some(slot)
+    };
+    if !still_builtin {
         if direct_builtin_stats_enabled() {
             DIRECT_BUILTIN_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -19567,6 +19577,46 @@ fn symbol_index_of(name: &str) -> Option<u32> {
         // symbols but have no index — yield None instead of panicking (bliss-hkf).
         Ok((sym, _)) => sym.symbol_index(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod direct_call_invalidation_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_anonymous_code_preserves_existing_direct_calls() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        torcl_rt::rooted!(body = reader::read_from_string("(42)").unwrap().0);
+        let generation = direct_call_gen();
+        torcl_rt::rooted!(
+            callable = compile_and_reify_lambda("EPOCH-PROBE", NIL, *body, &env)
+                .expect("compile anonymous function")
+        );
+        assert_eq!(
+            direct_call_gen(),
+            generation,
+            "a fresh uninterned callable cannot replace an existing direct target"
+        );
+        let symbol = torcl_rt::function::name(*callable).as_symbol_index();
+        let code = registry_get(symbol).unwrap();
+        registry_put(symbol, Rc::clone(&code));
+        assert_ne!(direct_call_gen(), generation, "replacement must invalidate");
+        let generation = direct_call_gen();
+        registry_remove(symbol);
+        assert_ne!(direct_call_gen(), generation, "removal must invalidate");
+        let symbol = torcl_rt::symbols::intern("DIRECT-EPOCH-NAMED-PROBE");
+        let generation = direct_call_gen();
+        registry_put(symbol, code);
+        assert_ne!(
+            direct_call_gen(),
+            generation,
+            "named installs remain conservative"
+        );
     }
 }
 

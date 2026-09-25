@@ -5,6 +5,78 @@ says so. If you read one section, read **"How to measure in this codebase"** —
 this system defeats reasoning-from-source with unusual consistency, and most of
 the wasted effort in this investigation came from skipping it.
 
+## Keep native builtin calls fast across definitions (2026-09-25, bliss-lyat)
+
+Registering a fresh uninterned callback used to bump the global direct-call
+generation, invalidating unrelated native targets and builtin dispatch memos.
+Only replacements and interned installs now do that. Native builtin sites whose
+baked generation is stale revalidate through the existing current-generation
+memo instead of permanently falling back to general dispatch. Live function-cell,
+slot, and arity checks remain; actual replacement still takes effect. There is no
+new cache, image/FASL format, tiering threshold, or library-specific path.
+
+Five alternating CPU-0-pinned fresh processes per library/build compare final
+ordinary and freshly trained PGO images with **538d543** controls. Build/test jobs
+had stopped. Timers/counters surround only the first cached ASDF load, and a
+`COMPILE-FILE` error guard forbids recompilation. All 50 runs pass their functional
+checks; all 40 TorCL windows report zero GCs.
+
+| First cached load, CPU cycles | Before | After | Reduction |
+|---|---:|---:|---:|
+| Babel, ordinary ThinLTO | 1.438 G | 1.374 G | 4.5% |
+| CL-PPCRE, ordinary ThinLTO | 0.701 G | 0.678 G | 3.3% |
+| Babel, default PGO | 1.252 G | 1.190 G | 5.0% |
+| CL-PPCRE, default PGO | 0.602 G | 0.587 G | 2.5% |
+
+Ordinary-image instructions fall 3.525 → 3.404 G for Babel and 1.885 → 1.843 G
+for CL-PPCRE. PGO instructions fall 2.835 → 2.733 G and 1.450 → 1.416 G.
+Babel allocation stays at 10,270,032 bytes; CL-PPCRE falls 3,809,456 → 3,804,336.
+An instrumented probe attributes the improvement to native builtin dispatch:
+44,753 fallbacks become zero, with direct calls rising 87,869 → 131,700.
+
+| Current PGO versus SBCL | TorCL | SBCL | Ratio |
+|---|---:|---:|---:|
+| Babel load wall median | 0.580 s | 0.296 s | 1.96× |
+| Babel CPU cycles | 1.190 G | 0.630 G | 1.89× |
+| CL-PPCRE load wall median | 0.280 s | 0.255 s | 1.10× |
+| CL-PPCRE CPU cycles | 0.587 G | 0.556 G | 1.05× |
+
+Wall time still varies with clock regime: PGO Babel spans 0.357–0.596 s and
+CL-PPCRE 0.138–0.282 s. Whole-process PGO medians are 0.840 / 0.540 s versus
+SBCL 0.480 / 0.450 s. **The overall initial-load gap remains open.**
+
+Validation: watched baseline failures prove that fresh anonymous registration
+invalidated existing calls and unchanged builtins kept taking native fallbacks.
+The final **818 CLI unit/integration tests pass**, including 55 units, 358
+acceptance and 59 FASL tests. New tests cover replacement/removal invalidation,
+conservative named installs, builtin revalidation and replacement with multiple
+values. They pass every-allocation GC stress/poison/verification; process tests
+also pass forced T2. Both images produce all 15,106 Babel reverse-table entries
+identically to fresh SBCL output under stress stride 20,000 (13 minor collections
+during the load), and real CL-PPCRE scanners survive two minor plus one major GC.
+
+The full workspace gate is **2,592 passed / 13 failed / 7 ignored**. Existing
+compiler metadata, sequence and doctest failures remain. Five parallel threading
+failures remain tracked by `bliss-z11t`; a newly observed SIGUSR1 safepoint fixture
+failure is `bliss-7zmm`. The exact failing runtime harnesses pass all 31 tests
+serially from their package directory; the separate package-serial runtime gate
+passes 626 tests. Neither result proves the parallel failures fixed. Strict
+Clippy still reports nine runtime diagnostics, spec coverage 14 uncovered MUSTs,
+and workspace check the tracked unused-mut warning. Formatting/diff checks pass;
+root lint has six baseline findings and zero new. Review was adversarial
+self-review, not independent.
+
+A preceding compiler-coverage experiment removed ASDF's EVAL/keyword-destructuring
+bails but saved only about 2% of Babel instructions; it was discarded. That lead
+is `bliss-ev6m`, and a separately reproduced EVAL lexical-scope defect is
+`bliss-e57h`. Neither is part of this change.
+
+Artifacts: `/tmp/torcl-load-next.XmjeGn/` contains `final-image`, `final-pgo-image`,
+`final-compare.sh`, `final-summary.pl`, final counters and validation logs. PGO
+artifacts are `target/pgo/run.swxEIn/` (LLVM 21.1.8, generate 2m34s/use 3m43s,
+all training/verification markers, no profile mismatch warnings). The installed
+`/usr/local/bin/torcl` and default `target/torcl` were not replaced.
+
 ## Compile nested method callbacks (2026-09-25, bliss-fq2q)
 
 A method recorded as compiled could still contain `EvalHost`/`MakeClosureEnv`
