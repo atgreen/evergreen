@@ -7189,13 +7189,22 @@ fn defpackage_shadow_interns_distinct_symbol() {
 /// that only comes out right if nothing went stale.
 #[test]
 fn gc_roots_funcall_callee_and_tagbody_statements() {
-    // FUNCALL: `g` is a fresh young closure; the `(list i i)` argument allocates
-    // (firing the GC) while `g` is the in-flight callee. eval forces the
-    // tree-walker path. Sum of (i+i+i) for i in 0..59 = 3*1770 = 5310.
-    let funcall_prog = "(let ((s 0)) \
+    // FUNCALL: `gg` is a fresh young closure; the `(list ii ii)` argument
+    // allocates (firing the GC) while `gg` is the in-flight callee. eval forces
+    // the tree-walker path. Sum of (i+i+i) for i in 0..59 = 3*1770 = 5310.
+    //
+    // `gg`/`ii` are SPECIAL, not caller lexicals: EVAL evaluates in the null
+    // lexical environment (bliss-e57h), so a lexical `g` is correctly invisible
+    // to the EVAL'd form — SBCL signals UNBOUND-VARIABLE on the earlier
+    // formulation of this program, which had been written against TorCL's old
+    // leaking EVAL. The GC-root coverage is unchanged: still a young closure as
+    // the in-flight callee with an allocating argument.
+    let funcall_prog = "(defvar gg nil) (defvar ii 0) \
+       (let ((s 0)) \
          (dotimes (i 60) \
-           (let ((g (let ((k i)) (lambda (p) (+ k (car p) (cadr p)))))) \
-             (setf s (+ s (eval '(funcall g (list i i))))))) \
+           (setq ii i) \
+           (setq gg (let ((k i)) (lambda (p) (+ k (car p) (cadr p))))) \
+           (setf s (+ s (eval '(funcall gg (list ii ii)))))) \
          (format t \"~s\" s))";
     // TAGBODY: a freshly-consed tagbody form each iteration; a statement allocates
     // mid-body. zz = (cons 0 (list 1 2 3 4 5)) => length 6, over 200 iters = 1200.

@@ -4201,3 +4201,167 @@ fn a_compile_time_defvar_keeps_the_value_its_own_eval_when_computes() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn eval_uses_the_null_lexical_environment() {
+    // bliss-e57h: EVAL reused the caller's env, so `(let ((x 42)) (eval 'x))`
+    // returned 42 where CLHS (EVAL, 3.1.2.1) requires the NULL LEXICAL
+    // environment and every other implementation signals UNBOUND-VARIABLE.
+    //
+    // The lexical half must go — variables, FLET, MACROLET, SYMBOL-MACROLET —
+    // while the DYNAMIC half stays: special bindings, and the handler clusters
+    // that make a HANDLER-CASE around the EVAL still catch what the form
+    // signals. Global definitions made inside the EVAL must still install, and
+    // the inner form's own multiple values must come out while a secondary value
+    // of the ARGUMENT must not leak. Every row was diffed against SBCL.
+    let dir = temp_dir("eval-null-lexical");
+    let script = dir.join("eval-null-lexical.lisp");
+    write_file(
+        &script,
+        "(defvar *dyn* :global)\n\
+         (defun probe (form)\n\
+           (handler-case (eval form)\n\
+             (unbound-variable () :unbound-variable)\n\
+             (undefined-function () :undefined-function)))\n\
+         ;; Reached from COMPILED code too (a DEFUN is lowered), and via EVAL as a\n\
+         ;; function value rather than the special-form path.\n\
+         (defun compiled-lex () (let ((lex 7)) (probe 'lex)))\n\
+         (defun compiled-dyn () (let ((*dyn* :bound)) (eval '*dyn*)))\n\
+         (defun compiled-flet () (flet ((h () 1)) (probe '(h))))\n\
+         (defun via-funcall () (let ((lex 5)) (handler-case (funcall #'eval 'lex)\n\
+                                                (unbound-variable () :unbound-variable))))\n\
+         (eval '(defun installed-by-eval () :installed))\n\
+         (eval '(defvar *made-by-eval* :made))\n\
+         (format t \"EVALNULL=~S\"\n\
+           (list (let ((lex 42)) (probe 'lex))\n\
+                 (let ((*dyn* :bound)) (eval '*dyn*))\n\
+                 (flet ((hidden () 1)) (probe '(hidden)))\n\
+                 (macrolet ((hmac () 1)) (probe '(hmac)))\n\
+                 (symbol-macrolet ((smac 9)) (probe 'smac))\n\
+                 (installed-by-eval)\n\
+                 *made-by-eval*\n\
+                 (multiple-value-list (eval '(values 1 2 3)))\n\
+                 (multiple-value-list (eval '(values)))\n\
+                 (multiple-value-list (eval (read-from-string \"(+ 1 2)\")))\n\
+                 (handler-case (eval '(error \"boom\")) (error () :caught))\n\
+                 (eval '(eval '(+ 2 3)))\n\
+                 (compiled-lex) (compiled-dyn) (compiled-flet) (via-funcall)))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL null-lexical EVAL fixture");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains(
+                "EVALNULL=(:UNBOUND-VARIABLE :BOUND :UNDEFINED-FUNCTION :UNDEFINED-FUNCTION \
+             :UNBOUND-VARIABLE :INSTALLED :MADE (1 2 3) NIL (3) :CAUGHT 5 \
+             :UNBOUND-VARIABLE :BOUND :UNDEFINED-FUNCTION :UNBOUND-VARIABLE)"
+            ),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn unwind_protect_keeps_the_protected_forms_values_across_cleanup() {
+    // bliss-pfgq: the bytecode `CleanupCont::Normal` carried only the PRIMARY
+    // value, so a cleanup body — arbitrary code, which clobbers the
+    // multiple-value register — discarded the rest. `(unwind-protect (values
+    // line 42) (close s))` returned just the line. Only the compiled path was
+    // affected, and only through a fasl, so the probe compiles a file and loads
+    // it. Values diffed against SBCL.
+    let dir = temp_dir("uwp-secondary-values");
+    let data = dir.join("uwp-data.txt");
+    write_file(&data, "hello\nsecond\n");
+    let source = dir.join("uwp-src.lisp");
+    write_file(
+        &source,
+        "(defun via-with-open-file (path)\n\
+           (with-open-file (s path) (values (read-line s) 42)))\n\
+         (defun via-unwind-protect (path)\n\
+           (let ((s (open path)))\n\
+             (unwind-protect (values (read-line s) 42) (close s))))\n\
+         ;; Zero values must stay zero, and a nested cleanup must not clobber\n\
+         ;; the inner form's values either.\n\
+         (defun via-zero () (unwind-protect (values) (list 1)))\n\
+         (defun via-nested (path)\n\
+           (let ((s (open path)))\n\
+             (unwind-protect (unwind-protect (values :a :b) (list 1)) (close s))))\n",
+    );
+    let fasl = dir.join("uwp-src.fasl");
+    let driver = dir.join("driver.lisp");
+    write_file(
+        &driver,
+        &format!(
+            "(compile-file \"{src}\")\n(load \"{fasl}\")\n\
+             (format t \"UWP=~S\"\n\
+               (list (multiple-value-list (via-with-open-file \"{data}\"))\n\
+                     (multiple-value-list (via-unwind-protect \"{data}\"))\n\
+                     (multiple-value-list (via-zero))\n\
+                     (multiple-value-list (via-nested \"{data}\"))))\n",
+            src = source.display(),
+            fasl = fasl.display(),
+            data = data.display()
+        ),
+    );
+
+    let output = torcl()
+        .args(["--load", driver.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL unwind-protect fixture");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("UWP=((\"HELLO\" 42) (\"HELLO\" 42) NIL (:A :B))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn pathname_directory_survives_a_gc_mid_construction() {
+    // bliss-noqr: the result list was accumulated in an UNROOTED Vec while each
+    // component's `make_lisp_string` allocated and `resolve_sym` could intern, so
+    // a relocating GC on a later component left the earlier strings stale and
+    // `vec_to_list` built the answer out of them. This handler runs 2062 times
+    // in a first-load of Babel alone. Values diffed against SBCL; the caller
+    // runs it 200 times so a collection lands mid-construction under stress.
+    assert_eq!(
+        eval_ok(
+            "(let ((r nil))\
+               (dotimes (i 200)\
+                 (setq r (list (pathname-directory #p\"/a/bb/ccc/dddd/eeeee/ffffff/\")\
+                               (pathname-directory #p\"rel/one/two/three/\")\
+                               (pathname-directory #p\"/x/../y/\")\
+                               (pathname-directory #p\"/*/deep/\")\
+                               (pathname-directory #p\"plain.txt\"))))\
+               r)"
+        ),
+        "((:ABSOLUTE \"a\" \"bb\" \"ccc\" \"dddd\" \"eeeee\" \"ffffff\") \
+         (:RELATIVE \"rel\" \"one\" \"two\" \"three\") (:ABSOLUTE \"x\" :UP \"y\") \
+         (:ABSOLUTE :WILD \"deep\") NIL)"
+    );
+}
