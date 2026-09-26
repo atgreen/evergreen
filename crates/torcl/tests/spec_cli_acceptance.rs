@@ -4365,3 +4365,76 @@ fn pathname_directory_survives_a_gc_mid_construction() {
          (:ABSOLUTE :WILD \"deep\") NIL)"
     );
 }
+
+#[test]
+fn redefining_a_function_leaves_the_saved_object_alone() {
+    // bliss-evpx: DEFUN of an already-defined name mutated the existing function
+    // object IN PLACE, "so its identity (and any attached tiering state) is
+    // stable". But a function object IS its definition — CLHS has FDEFINITION
+    // return the function and a later DEFUN install a different one — so a saved
+    // object silently became the new code and the classic wrapper idiom recursed
+    // until the stack overflowed:
+    //
+    //   (defvar *saved* (fdefinition 'target))
+    //   (defun target () (list :wrapper (funcall *saved*)))
+    //
+    // The tiering rationale did not hold either: `redefine` resets tier, entry
+    // and both counters, so that state is discarded whichever way the definition
+    // lands. Every value below was diffed against SBCL, which stack-overflows on
+    // none of it.
+    let dir = temp_dir("redefine-identity");
+    let script = dir.join("redefine-identity.lisp");
+    write_file(
+        &script,
+        "(defun target () :original)\n\
+         (defvar *saved* (fdefinition 'target))\n\
+         (defun target () (list :wrapper (funcall *saved*)))\n\
+         ;; Ordinary redefinition must keep working: self-recursion resolves\n\
+         ;; through the symbol, and a hot loop still promotes and stays correct.\n\
+         (defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))\n\
+         (defvar *fib1* (fib 15))\n\
+         (defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))\n\
+         (defun hot (n) (let ((s 0)) (dotimes (i n) (setq s (+ s i))) s))\n\
+         (defvar *hot1* (hot 200000))\n\
+         (defun hot (n) (let ((s 0)) (dotimes (i n) (setq s (+ s i 0))) s))\n\
+         ;; #' captured BEFORE a redefinition keeps the old code; after, the new.\n\
+         (defun v () :v1)\n\
+         (defvar *before* #'v)\n\
+         (defun v () :v2)\n\
+         ;; A saved (setf place) writer keeps its own definition too.\n\
+         (defun (setf slot-a) (new obj) (setf (car obj) (list :w1 new)) new)\n\
+         (defvar *w* (fdefinition '(setf slot-a)))\n\
+         (defun (setf slot-a) (new obj) (setf (car obj) (list :w2 new)) new)\n\
+         (format t \"REDEF=~S\"\n\
+           (list (funcall *saved*) (target)\n\
+                 *fib1* (fib 15) *hot1* (hot 200000)\n\
+                 (funcall *before*) (funcall #'v) (v)\n\
+                 (let ((o (list nil))) (setf (slot-a o) 7) (car o))\n\
+                 (let ((o (list nil))) (funcall *w* 9 o) (car o))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL redefinition-identity fixture");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains(
+                "REDEF=(:ORIGINAL (:WRAPPER :ORIGINAL) 610 610 19999900000 19999900000 \
+             :V1 :V2 :V2 (:W2 7) (:W1 9))"
+            ),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}

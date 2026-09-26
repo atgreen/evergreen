@@ -30584,19 +30584,24 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     body = mx_each(body, env, 0);
     if name_form.is_symbol() {
         // Ordinary global function → the symbol's heap function cell
-        // (bliss-jtc.6.8). Redefinition updates the existing function object in
-        // place so its identity (and any attached tiering state) is stable.
+        // (bliss-jtc.6.8). Redefinition installs a NEW function object.
+        //
+        // It used to mutate the existing object in place "so its identity (and
+        // any attached tiering state) is stable", but a function object IS its
+        // definition: CLHS has FDEFINITION return the function, and a later DEFUN
+        // of the name install a different one. Mutating in place meant a saved
+        // object silently became the new code, so the classic wrapper idiom
+        //
+        //   (defvar *saved* (fdefinition 'target))
+        //   (defun target () (list :wrapper (funcall *saved*)))
+        //
+        // recursed until the stack overflowed, where SBCL returns
+        // (:WRAPPER :ORIGINAL) (bliss-evpx). The tiering rationale did not hold
+        // either: `redefine` resets tier, entry and both counters, so that state
+        // is discarded whichever way the new definition lands.
         let idx = name_form.as_symbol_index();
-        match torcl_rt::symbols::symbol_function(idx) {
-            Some(existing) if torcl_rt::function::is_interpreted_function(existing) => {
-                // SAFETY: `existing` is an interpreted-function object.
-                unsafe { torcl_rt::function::redefine(existing, params_form, body, NIL) };
-            }
-            _ => {
-                let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
-                torcl_rt::symbols::set_symbol_function(idx, f);
-            }
-        }
+        let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
+        torcl_rt::symbols::set_symbol_function(idx, f);
         // Register the name as present INTERNAL in CL-USER so FIND-SYMBOL reports
         // :INTERNAL, not a fabricated :INHERITED (bliss-v15i).
         home_defined_symbol(env, name_form);
@@ -30654,25 +30659,11 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 if place.is_symbol() {
                     if let Some(msym) = resolve_sym(&setf_writer_symbol_name(&sym_name(place))) {
                         let midx = msym.as_symbol_index();
-                        match torcl_rt::symbols::symbol_function(midx) {
-                            Some(existing)
-                                if torcl_rt::function::is_interpreted_function(existing) =>
-                            {
-                                // SAFETY: `existing` is an interpreted-function object.
-                                unsafe {
-                                    torcl_rt::function::redefine(existing, params_form, body, NIL)
-                                };
-                            }
-                            _ => {
-                                let f = torcl_rt::function::alloc_interpreted(
-                                    params_form,
-                                    body,
-                                    NIL,
-                                    msym,
-                                );
-                                torcl_rt::symbols::set_symbol_function(midx, f);
-                            }
-                        }
+                        // A NEW object, as for the plain-symbol case above: a
+                        // saved `(setf place)` writer must keep its own
+                        // definition (bliss-evpx).
+                        let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, msym);
+                        torcl_rt::symbols::set_symbol_function(midx, f);
                     }
                 }
             }
@@ -39937,10 +39928,10 @@ mod jtc6_8_function_object_tests {
 
     /// bliss-jtc.6.8: DEFUN of an ordinary symbol installs a heap interpreted-
     /// function object in the symbol's function cell (with zeroed FnMeta), the
-    /// call path resolves through it, and redefinition updates the object in
-    /// place — preserving identity — while changing behaviour.
+    /// call path resolves through it, and redefinition installs a NEW object
+    /// (bliss-evpx) while leaving the previous one callable and unchanged.
     #[test]
-    fn defun_installs_identity_stable_function_object_in_the_cell() {
+    fn defun_installs_a_fresh_function_object_in_the_cell() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
 
@@ -39963,17 +39954,51 @@ mod jtc6_8_function_object_tests {
             TorclVal::from_fixnum(5)
         );
 
-        // Redefinition preserves object identity (tiering/IC/deopt key off it)
-        // while changing behaviour.
+        // Redefinition installs a NEW function object and leaves the old one
+        // alone. This assertion used to be the opposite — "redefinition must
+        // reuse the same function object (stable identity)", justified as
+        // "tiering/IC/deopt key off it" — but a function object IS its
+        // definition (CLHS: FDEFINITION returns the function; a later DEFUN
+        // installs a different one), and mutating in place made a saved
+        // `(fdefinition 'f)` silently become the new code, so the standard
+        // wrapper idiom recursed to a stack overflow (bliss-evpx).
+        //
+        // Neither half of the justification held: `function::redefine` resets
+        // tier, entry and both counters, so tiering state is discarded whichever
+        // way the definition lands, and baked direct calls are invalidated by
+        // symbol plus the global DIRECT_CALL_GEN counter (bliss-zhvn), not by
+        // object identity — a promoted function redefined observably does pick up
+        // its new definition, and so does a caller compiled while it was hot.
         read_eval_all_env("(defun c2b-op (x y) (* x y))", &mut env).expect("redefun");
         let f2 = torcl_rt::symbols::symbol_function(idx).expect("still bound");
-        assert_eq!(
+        assert_ne!(
             f2, f,
-            "redefinition must reuse the same function object (stable identity)"
+            "redefinition must install a NEW function object, leaving the saved one intact"
+        );
+        assert!(
+            torcl_rt::function::is_interpreted_function(f2),
+            "the replacement is also a heap interpreted-function object"
+        );
+        assert_eq!(
+            torcl_rt::function::tier(f2),
+            0,
+            "the replacement starts at tier 0"
         );
         assert_eq!(
             read_eval_all_env("(c2b-op 2 3)", &mut env).expect("call2"),
             TorclVal::from_fixnum(6)
+        );
+        // The OLD object still runs the OLD code — the property bliss-evpx is
+        // about, checked here at the object level as well as through Lisp.
+        assert_eq!(
+            apply_function(
+                f,
+                &[TorclVal::from_fixnum(2), TorclVal::from_fixnum(3)],
+                &mut env
+            )
+            .expect("the saved object is still callable"),
+            TorclVal::from_fixnum(5),
+            "the saved object must keep its original definition"
         );
     }
 
