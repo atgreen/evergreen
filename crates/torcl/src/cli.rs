@@ -29572,13 +29572,23 @@ fn subseq_values(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
             "SUBSEQ requires two or three arguments".into(),
         ));
     }
-    let start = num_val(args[1])? as usize;
+    let index = |value: TorclVal| {
+        if value.is_fixnum() && value.as_fixnum() >= 0 {
+            Ok(value.as_fixnum() as usize)
+        } else {
+            Err(TorclError::TypeError {
+                datum: value,
+                expected: "non-negative sequence index".into(),
+            })
+        }
+    };
+    let start = index(args[1])?;
     let end = args
         .get(2)
         .copied()
-        .map(num_val)
-        .transpose()?
-        .map(|n| n as usize);
+        .filter(|value| !value.is_nil())
+        .map(index)
+        .transpose()?;
     torcl_stdlib::subseq(args[0], start, end)
 }
 
@@ -39711,6 +39721,28 @@ mod jtc5_numeric_tests {
                 .unwrap();
             assert_eq!(result, NIL);
             assert!(!env.mv_active);
+        });
+    }
+
+    #[test]
+    fn subseq_accepts_nil_end_and_rejects_noninteger_indices() {
+        with_value_bridge_env(|env| {
+            let result = read_eval_all_env(
+                r#"(progn
+                     (assert (equal (subseq '(1 2 3) 1 nil) '(2 3)))
+                     (assert (equalp (funcall #'subseq #(1 2 3) 1 nil) #(2 3)))
+                     (assert (string= (subseq "abc" 1 nil) "bc"))
+                     (assert (null (subseq nil 0 nil)))
+                     (dolist (index '(0.0 1/2 -1 #c(1 2)))
+                       (assert (handler-case (progn (subseq "abc" index) nil)
+                                 (type-error () t)))
+                       (assert (handler-case (progn (funcall #'subseq "abc" 0 index) nil)
+                                 (type-error () t))))
+                     t)"#,
+                env,
+            )
+            .unwrap();
+            assert_eq!(result, T);
         });
     }
 
