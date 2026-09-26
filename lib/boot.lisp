@@ -3885,6 +3885,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                   "MAKE-SHAREABLE-BYTE-VECTOR" "WITH-POINTER-TO-VECTOR-DATA"
                   "FOREIGN-LIBRARY" "FOREIGN-LIBRARY-P" "LOAD-FOREIGN-LIBRARY"
                   "CLOSE-FOREIGN-LIBRARY" "FOREIGN-SYMBOL-POINTER" "FOREIGN-CALL"
+                  "FOREIGN-CALL-BUFFERED"
                   "FOREIGN-CALLBACK" "FOREIGN-CALLBACK-P" "MAKE-CALLBACK"
                   "CALLBACK-POINTER" "FREE-CALLBACK" "CALLBACK-ERROR"))
         "TORCL-FFI")
@@ -3921,6 +3922,12 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (if variadic-p
       (torcl::%ffi-call pointer return-type argument-types arguments fixed-count)
       (torcl::%ffi-call pointer return-type argument-types arguments)))
+
+(defun torcl-ffi:foreign-call-buffered (pointer return-type argument-types argument-buffers result-buffer
+                                      &optional (fixed-count nil variadic-p))
+  (if variadic-p
+      (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer fixed-count)
+      (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer)))
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
 ;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures

@@ -627,8 +627,8 @@ It shares argument placement with scalar adapters through `ffi/abi.rs`.
 Callers provide native argument and result buffers with the declared C layouts;
 the adapter copies exactly their declared sizes through padded staging storage.
 It does not publish the result buffer when a callback reports failure.
-Scalar callbacks are implemented as described in §2.7.5. Lisp aggregate
-integration, aggregate callbacks, and additional target ABIs remain work under
+Scalar callbacks are implemented as described in §2.7.5. The Lisp buffer interface
+is described below; CFFI integration, aggregate callbacks, and additional target ABIs remain work under
 `bliss-124`; unsupported
 signatures on the generated path signal an FFI error before entering foreign
 code. Other targets temporarily retain the pre-existing bootstrap dispatcher
@@ -686,8 +686,36 @@ objects restore with an invalid token, never a token referring to a new provider
 exposes the generated scalar call path, with a supplied fixed-count selecting
 variadic calling. The caller owns signature correctness and symbol lifetime.
 Generated scalar callbacks use the ownership API in §2.7.5. The complete CFFI
-backend, Lisp aggregate calls, aggregate callbacks, and remaining target ABIs remain work under
+backend, aggregate callbacks, and remaining target ABIs remain work under
 `bliss-124`.
+
+`FOREIGN-CALL-BUFFERED pointer return-type argument-types argument-buffers
+result-buffer &optional fixed-count` exposes native by-value calls without
+imposing a Lisp representation on C structs. Every argument buffer is a foreign
+pointer to the argument's C object representation, including scalars and pointer
+arguments (which therefore require a buffer containing the pointer). Result
+storage receives the exact declared size. The function returns `result-buffer`,
+or `NIL` for `:void`; a void call accepts a null foreign pointer as its result
+buffer. An explicitly supplied fixed count selects variadic calling and trailing
+scalar promotions. The same caller-owned signature and library lifetime contract
+applies as for `FOREIGN-CALL`.
+
+Native descriptors are scalar type names or recursive `(:struct field-type...)`,
+`(:packed-struct field-type...)`, and `(:union variant-type...)` lists. Fields have
+ordinary C alignment, packed structs use byte alignment, and unions overlay
+their variants. `FOREIGN-TYPE-SIZE` and `FOREIGN-TYPE-ALIGNMENT` use the adapter's
+checked layout. Empty aggregates, void fields, improper/cyclic lists, unsupported
+types, nesting beyond 64 levels and oversized layouts signal `FFI-ERROR`.
+
+Owned native buffers are bounds/lifetime checked and copied into stable staging
+storage before entering C. After C returns, copy-back rechecks the destination's
+allocation identity: freeing it in a callback signals `FFI-ERROR`, never a stale
+write. Callback failure leaves result storage unchanged. No allocation-registry
+lock is held across foreign execution. This does not validate borrowed addresses
+or extend the lifetimes of pointers embedded in C objects; those remain the
+caller's responsibility. Sandbox mode denies this entry in both direct and
+function-value dispatch paths. Aggregate descriptors/calls currently target
+SysV AMD64; unsupported targets report `FFI-ERROR`.
 
 ---
 

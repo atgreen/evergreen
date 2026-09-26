@@ -15,6 +15,13 @@ mod buffered;
 #[cfg(all(target_arch = "x86_64", unix))]
 pub use buffered::ffi_call_buffered;
 
+/// Checked native layout, identical to the generated call adapter's layout.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
+    let layout = abi::Layout::new(ty)?;
+    Ok((layout.size as usize, layout.alignment as usize))
+}
+
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call;
 #[cfg(all(target_arch = "x86_64", unix))]

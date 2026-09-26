@@ -7,6 +7,7 @@ use crate::object::{ObjectHeader, type_id};
 use crate::{TorclError, TorclVal};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::{Mutex, OnceLock};
 
 /// An address plus optional allocation identity. Arithmetic preserves identity,
@@ -201,6 +202,37 @@ impl ForeignPointer {
         // invalidate tracked storage during the access. Never allocate Lisp data
         // or call foreign/Lisp code from this closure.
         Ok(access(self.address as *mut u8))
+    }
+
+    /// Check a complete range without dereferencing it. This is not a lease:
+    /// callers must revalidate before a later access, especially after callbacks.
+    pub fn check_range(self, size: usize) -> Result<(), TorclError> {
+        self.with_access(size, |_| ())
+    }
+
+    /// Copy native object bytes, preserving potentially uninitialized C padding.
+    ///
+    /// # Safety
+    /// Borrowed memory must be readable for `size` bytes. No external writer or
+    /// deallocator may race the copy; tracked frees are excluded by the registry.
+    pub unsafe fn read_buffer(self, size: usize) -> Result<Vec<MaybeUninit<u8>>, TorclError> {
+        self.with_access(size, |pointer| {
+            let mut buffer = vec![MaybeUninit::uninit(); size];
+            unsafe { std::ptr::copy_nonoverlapping(pointer.cast(), buffer.as_mut_ptr(), size) };
+            buffer
+        })
+    }
+
+    /// Copy native object bytes back after checking the destination's current
+    /// allocation identity and bounds. Never hold the registry across C/Lisp.
+    ///
+    /// # Safety
+    /// Borrowed memory must be writable for the buffer length and exclusively
+    /// accessible during the copy. The buffer must not overlap the destination.
+    pub unsafe fn write_buffer(self, buffer: &[MaybeUninit<u8>]) -> Result<(), TorclError> {
+        self.with_access(buffer.len(), |pointer| unsafe {
+            std::ptr::copy_nonoverlapping(buffer.as_ptr(), pointer.cast(), buffer.len());
+        })
     }
 
     /// Read raw scalar bits in native byte order, including at unaligned addresses.

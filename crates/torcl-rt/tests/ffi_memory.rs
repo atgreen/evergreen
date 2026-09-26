@@ -10,6 +10,35 @@ fn integer(bits: u8) -> AlienType {
 }
 
 #[test]
+fn native_buffer_copies_check_exact_ranges_and_revalidate_after_free() {
+    use std::mem::MaybeUninit;
+    let pointer = ForeignPointer::allocate(3).unwrap();
+    let bytes = [
+        MaybeUninit::new(7),
+        MaybeUninit::new(8),
+        MaybeUninit::new(9),
+    ];
+    unsafe {
+        pointer.write_buffer(&bytes).unwrap();
+        let read = pointer.read_buffer(3).unwrap();
+        assert_eq!(
+            read.iter().map(|b| b.assume_init()).collect::<Vec<_>>(),
+            [7, 8, 9]
+        );
+        assert!(pointer.read_buffer(4).is_err());
+        assert!(pointer.offset(1).unwrap().write_buffer(&bytes).is_err());
+    }
+    pointer.check_range(3).unwrap();
+    assert!(pointer.check_range(4).is_err());
+    pointer.free().unwrap();
+    assert!(pointer.check_range(3).is_err());
+    unsafe {
+        assert!(pointer.read_buffer(3).is_err());
+        assert!(pointer.write_buffer(&bytes).is_err());
+    }
+}
+
+#[test]
 fn owned_memory_preserves_scalar_bits_even_at_unaligned_offsets() {
     let allocation = ForeignPointer::allocate(32).unwrap();
     assert_ne!(allocation.address(), 0);

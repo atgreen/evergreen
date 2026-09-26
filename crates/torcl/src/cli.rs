@@ -16266,6 +16266,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 env.clear_mv();
                 return torcl_stdlib::ffi::callback_call(&args);
             }
+            "TORCL::%FFI-CALL-BUFFERED" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::buffered_call(&args);
+            }
             "TORCL::%NATIVE-CONDITION" => {
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
@@ -35683,6 +35691,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL::%FOREIGN-MEMORY"
             | "TORCL::%FOREIGN-LIBRARY"
             | "TORCL::%FOREIGN-CALLBACK"
+            | "TORCL::%FFI-CALL-BUFFERED"
             | "TORCL::%NATIVE-CONDITION"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
@@ -36462,6 +36471,12 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
                 return Err(TorclError::SandboxViolation("FFI access denied".into()));
             }
             torcl_stdlib::ffi::callback_call(args)
+        }
+        "TORCL::%FFI-CALL-BUFFERED" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::buffered_call(args)
         }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode

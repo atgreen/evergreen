@@ -41,6 +41,150 @@ pub fn alien_type(keyword: TorclVal) -> Result<AlienType, TorclError> {
     })
 }
 
+/// Walk only proper, acyclic lists; this operation never allocates Lisp data.
+fn foreign_list(mut value: TorclVal) -> Result<Vec<TorclVal>, TorclError> {
+    let mut values = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while !value.is_nil() {
+        if !value.is_cons() || !seen.insert(value.to_raw()) {
+            return Err(TorclError::FfiError(
+                "foreign descriptor/buffer list must be proper and acyclic".into(),
+            ));
+        }
+        let cell = unsafe { &*(value.as_ptr() as *const torcl_rt::object::ConsCell) };
+        values.push(cell.car);
+        value = cell.cdr;
+    }
+    Ok(values)
+}
+
+fn native_type(value: TorclVal, depth: usize) -> Result<AlienType, TorclError> {
+    if depth > 64 {
+        return Err(TorclError::FfiError(
+            "foreign aggregate nesting exceeds 64 levels".into(),
+        ));
+    }
+    if !value.is_cons() {
+        return alien_type(value);
+    }
+    let parts = foreign_list(value)?;
+    let name = symbol_name(parts[0]);
+    let kind = name.rsplit(':').next().unwrap_or_default();
+    if !matches!(kind, "STRUCT" | "PACKED-STRUCT" | "UNION") {
+        return Err(TorclError::FfiError(format!(
+            "unknown native foreign descriptor {name:?}"
+        )));
+    }
+    let fields = parts[1..]
+        .iter()
+        .map(|v| native_type(*v, depth + 1))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(if kind == "UNION" {
+        AlienType::Union { variants: fields }
+    } else {
+        AlienType::Struct {
+            fields,
+            packed: kind == "PACKED-STRUCT",
+        }
+    })
+}
+
+fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        torcl_rt::ffi::native_layout(ty)
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    {
+        if matches!(ty, AlienType::Struct { .. } | AlienType::Union { .. }) {
+            return Err(TorclError::FfiError(
+                "aggregate layouts are not implemented for this target ABI".into(),
+            ));
+        }
+        Ok((ty.size(), ty.alignment()))
+    }
+}
+
+/// All arguments are addresses of native C objects, not Lisp values to marshal.
+/// The caller supplies matching signatures and valid borrowed storage. Tracked
+/// storage is copied under short registry locks; no locks survive a C callback.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub fn buffered_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    if !(5..=6).contains(&args.len()) {
+        return Err(TorclError::ProgramError("FOREIGN-CALL-BUFFERED requires pointer, result type, argument types, argument buffers, result buffer and optional fixed count".into()));
+    }
+    let function = ForeignPointer::from_lisp(args[0])?.call_address()?;
+    let result_type = native_type(args[1], 0)?;
+    let types = foreign_list(args[2])?
+        .into_iter()
+        .map(|v| native_type(v, 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let buffers = foreign_list(args[3])?;
+    let fixed_count = args.get(5).copied().map(unsigned).transpose()?;
+    if function == 0 || types.len() != buffers.len() || fixed_count.is_some_and(|n| n > types.len())
+    {
+        return Err(TorclError::FfiError(
+            "invalid buffered foreign call arguments".into(),
+        ));
+    }
+    let (result_size, _) = native_layout(&result_type)?;
+    let output = ForeignPointer::from_lisp(args[4])?;
+    if result_size != 0 {
+        output.check_range(result_size)?;
+    }
+    // Validate every descriptor and pointer before reading any native storage.
+    let inputs = types
+        .iter()
+        .zip(buffers)
+        .map(|(ty, value)| {
+            let (size, _) = native_layout(ty)?;
+            if size == 0 {
+                return Err(TorclError::FfiError("void is not an argument type".into()));
+            }
+            let pointer = ForeignPointer::from_lisp(value)?;
+            pointer.check_range(size)?;
+            Ok((pointer, size))
+        })
+        .collect::<Result<Vec<_>, TorclError>>()?;
+    let storage = inputs
+        .into_iter()
+        .map(|(pointer, size)| unsafe { pointer.read_buffer(size) })
+        .collect::<Result<Vec<_>, _>>()?;
+    let addresses: Vec<_> = storage
+        .iter()
+        .map(|buffer| buffer.as_ptr().cast())
+        .collect();
+    let mut result = vec![std::mem::MaybeUninit::<u8>::uninit(); result_size];
+    torcl_rt::rooted!(returned_pointer = args[4]);
+    // SAFETY: staging owns stable native buffers. Signature/callee agreement,
+    // borrowed storage and embedded pointer lifetimes are the explicit FFI contract.
+    unsafe {
+        torcl_rt::ffi::ffi_call_buffered(
+            function as *const (),
+            &result_type,
+            &types,
+            &addresses,
+            result.as_mut_ptr().cast(),
+            fixed_count,
+        )?;
+        if result_size != 0 {
+            output.write_buffer(&result)?;
+        }
+    }
+    Ok(if result_size == 0 {
+        NIL
+    } else {
+        *returned_pointer
+    })
+}
+
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub fn buffered_call(_args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    Err(TorclError::FfiError(
+        "buffered calls are not implemented for this target ABI".into(),
+    ))
+}
+
 fn unsigned(value: TorclVal) -> Result<usize, TorclError> {
     Ok(marshal_to_c(
         value,
@@ -340,8 +484,12 @@ pub fn memory_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
             ForeignPointer::from_lisp(*pointer)?.free()?;
             Ok(NIL)
         }
-        ("TYPE-SIZE", [ty]) => Ok(TorclVal::from_fixnum(alien_type(*ty)?.size() as i64)),
-        ("TYPE-ALIGNMENT", [ty]) => Ok(TorclVal::from_fixnum(alien_type(*ty)?.alignment() as i64)),
+        ("TYPE-SIZE", [ty]) => Ok(TorclVal::from_fixnum(
+            native_layout(&native_type(*ty, 0)?)?.0 as i64,
+        )),
+        ("TYPE-ALIGNMENT", [ty]) => Ok(TorclVal::from_fixnum(
+            native_layout(&native_type(*ty, 0)?)?.1 as i64,
+        )),
         ("VECTOR-SIZE", [vector, ty]) => {
             let (_, bytes) = vector_layout(*vector, &alien_type(*ty)?)?;
             unmarshal_from_c(
