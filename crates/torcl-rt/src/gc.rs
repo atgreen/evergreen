@@ -712,7 +712,6 @@ impl NurseryObjectMap {
         true
     }
 
-    #[cfg(test)]
     #[inline]
     fn is_marked(&self, body: usize) -> bool {
         self.position(body)
@@ -954,6 +953,11 @@ thread_local! {
     /// No early return or `?` runs between take and restore.
     static MINOR_OBJECT_MAP: RefCell<NurseryObjectMap> = RefCell::new(NurseryObjectMap::default());
     static MINOR_WORKLIST: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The same scratch for the MAJOR mark phase, kept separate from the minor
+    /// one so the bitmaps do not thrash between nursery-sized and whole-old-gen
+    /// sizes on every cycle (a major collection runs a minor first).
+    static MAJOR_OBJECT_MAP: RefCell<NurseryObjectMap> = RefCell::new(NurseryObjectMap::default());
+    static MAJOR_WORKLIST: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// True if `v` is a tagged heap reference (cons, heap object, or function
@@ -2303,115 +2307,135 @@ impl HeapCollector {
         let region_count = state.regions.len();
         let heap_base_addr = state.heap_base as usize;
         let heap_size = state.config.heap_size;
+        let region_size = state.config.region_size;
         // Record TAMS (Top-At-Mark-Start) per region.
         let mut tams: Vec<usize> = Vec::with_capacity(region_count);
         for region in state.regions.iter() {
             tams.push(region.header.alloc_top as usize);
         }
 
-        // Index each live object body: body_addr -> (total_size, region_idx,
-        // type_id, body_len). type_id/body_len drive precise field tracing.
-        let mut object_index: std::collections::HashMap<usize, (usize, usize, u8, usize)> =
-            std::collections::HashMap::new();
+        // Index each live object START into a granule bitmap, and keep the mark
+        // set in a second bitmap beside it (side tables, not header bits —
+        // R3.17). This is the same `NurseryObjectMap` the minor collector uses,
+        // reset over the old-gen/survivor/large-object regions instead of the
+        // nursery: one `starts` bit and one `marked` bit per 16-byte granule.
+        //
+        // It used to be a `HashMap<body_addr, (total_size, region_idx, type_id,
+        // body_len)>` plus a `HashSet` mark set — roughly 40 bytes of transient
+        // metadata per live object, built before marking even began, and a hash
+        // probe on every traced edge. A full collection over 1.6M live conses
+        // took 3.7 s against SBCL's 0.053 s (71x) and grew SUPER-linearly where
+        // SBCL grows linearly (bliss-ub8a). None of the tuple ever needed
+        // storing: `type_id`/`body_len` come from the object's own header, which
+        // the tracing loop already reads to find the payload offset.
+        let mut object_map = MAJOR_OBJECT_MAP.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let mut marked_regions: Vec<usize> = Vec::new();
         for (idx, region) in state.regions.iter().enumerate() {
-            match region.header.kind {
-                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
-                    let base = region.base as usize;
-                    let top = tams[idx];
-                    if top <= base {
-                        continue;
-                    }
-                    let mut cursor = base;
-                    while cursor + OBJECT_HEADER_SIZE <= top {
-                        let header_ptr = cursor as *const u8;
-                        let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
-                        if body_size == 0 && type_id == 0 {
-                            break;
-                        }
-                        // Footprint from the header so large objects (16-byte
-                        // header + u64 size extension) stride correctly
-                        // (bliss-tjru). The index key stays cursor+8 to match
-                        // ref_body_addr's identity for every heap reference.
-                        let total_size = unsafe { header_total_bytes(header_ptr) };
-                        if !unsafe { header_is_forwarded(header_ptr) } {
-                            let body_addr = cursor + OBJECT_HEADER_SIZE;
-                            object_index
-                                .insert(body_addr, (total_size, idx, type_id, body_size as usize));
-                        }
-                        cursor += total_size;
-                    }
+            if matches!(
+                region.header.kind,
+                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject
+            ) && tams[idx] > region.base as usize
+            {
+                marked_regions.push(idx);
+            }
+        }
+        object_map.reset(heap_base_addr, region_size, region_count, &marked_regions);
+        for &idx in &marked_regions {
+            let region = &state.regions[idx];
+            let base = region.base as usize;
+            let top = tams[idx];
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *const u8;
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
                 }
-                _ => {}
+                // Footprint from the header so large objects (16-byte header +
+                // u64 size extension) stride correctly (bliss-tjru). The indexed
+                // identity stays cursor+8, matching `ref_body_addr` for every
+                // heap reference — which is also what `position` expects.
+                let total_size = unsafe { header_total_bytes(header_ptr) };
+                if !unsafe { header_is_forwarded(header_ptr) } {
+                    object_map.insert(cursor + OBJECT_HEADER_SIZE);
+                }
+                cursor += total_size;
             }
         }
 
-        // Mark set (side table, not header bits — R3.17).
-        let mut marked: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut scan_worklist: Vec<usize> = Vec::new();
+        let mut scan_worklist = MAJOR_WORKLIST.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        scan_worklist.clear();
 
         // Helper: mark a candidate reference if it targets an indexed object.
-        let mark_ref = |v: TorclVal,
-                        marked: &mut std::collections::HashSet<usize>,
-                        worklist: &mut Vec<usize>| {
+        // `mark` returns true only when the target is a known object start that
+        // was not already marked, which is exactly the old
+        // `contains_key(..) && marked.insert(..)` pair — in two bit operations
+        // instead of two hash lookups.
+        let mark_ref = |v: TorclVal, map: &mut NurseryObjectMap, worklist: &mut Vec<usize>| {
             if is_heap_ref(v) {
                 // Resolve persistent (CHANGE-CLASS) forwarding first, as in
                 // the minor collector's mark_ref (bliss-334).
                 let v = resolve_forwarded(v);
                 let target = ref_body_addr(v);
-                if object_index.contains_key(&target) && marked.insert(target) {
+                if map.mark(target) {
                     worklist.push(target);
                 }
             }
         };
 
         // Precise root: the saved entry continuation (§7.2.3).
-        mark_ref(get_entry_continuation(), &mut marked, &mut scan_worklist);
+        mark_ref(
+            get_entry_continuation(),
+            &mut object_map,
+            &mut scan_worklist,
+        );
 
         // Precise CL-stack roots (nmq.3): walk every green thread's TorclStack
         // frames and mark exactly the heap references their slots hold —
         // identified by TorclVal tag, so no non-reference CL data is pinned.
         // Interpreter (T0) and compiled (T1) frames share the §2.4.2 layout, so
         // this one walk covers mixed-tier stacks.
-        Self::scan_cl_stack_roots(|v| mark_ref(v, &mut marked, &mut scan_worklist));
+        Self::scan_cl_stack_roots(|v| mark_ref(v, &mut object_map, &mut scan_worklist));
 
         // Symbol-table roots (bliss-jtc.6 Stage C): every interned/uninterned
         // symbol's cells are roots, so a heap object reachable only through a
         // global symbol (its value/function/plist) survives collection.
         crate::symbols::for_each_root_slot(|slot| {
             let v = unsafe { *slot };
-            mark_ref(v, &mut marked, &mut scan_worklist);
+            mark_ref(v, &mut object_map, &mut scan_worklist);
         });
         // External roots (bliss-jtc.8): TorclVals owned outside the GC heap, e.g.
         // hash-table entries in a Rust Vec.
         scan_external_roots(|slot| {
             let v = unsafe { *slot };
-            mark_ref(v, &mut marked, &mut scan_worklist);
+            mark_ref(v, &mut object_map, &mut scan_worklist);
         });
 
         // Transitive closure: trace only the reference fields of each marked
         // object, following its type_id-specific layout.
         while let Some(obj_addr) = scan_worklist.pop() {
-            if let Some(&(_total, _idx, type_id, body_len)) = object_index.get(&obj_addr) {
-                // The index key is the header+8 identity; the real payload is
-                // header + body_offset (8, or 16 for a large object). Trace the
-                // real payload so a large object's fields are read at the right
-                // offset rather than 8 bytes into its size-extension word
-                // (bliss-tjru).
-                let header_ptr = (obj_addr - OBJECT_HEADER_SIZE) as *const u8;
-                let payload = (obj_addr - OBJECT_HEADER_SIZE) + unsafe { body_offset(header_ptr) };
-                // SAFETY: payload is a live object body of body_len bytes.
-                unsafe {
-                    trace_object(payload as *mut u8, type_id, body_len, |slot| {
-                        mark_ref(*slot, &mut marked, &mut scan_worklist);
-                    });
-                }
+            // `mark` only succeeds for an indexed, non-forwarded object start, so
+            // a worklist entry is always one, and its own header carries the
+            // type_id and body length the old index tuple duplicated.
+            //
+            // The indexed identity is the header+8 address; the real payload is
+            // header + body_offset (8, or 16 for a large object). Trace the real
+            // payload so a large object's fields are read at the right offset
+            // rather than 8 bytes into its size-extension word (bliss-tjru).
+            let header_ptr = (obj_addr - OBJECT_HEADER_SIZE) as *const u8;
+            let (type_id, body_len) = unsafe { read_object_header(header_ptr) };
+            let payload = (obj_addr - OBJECT_HEADER_SIZE) + unsafe { body_offset(header_ptr) };
+            // SAFETY: payload is a live object body of body_len bytes.
+            unsafe {
+                trace_object(payload as *mut u8, type_id, body_len as usize, |slot| {
+                    mark_ref(*slot, &mut object_map, &mut scan_worklist);
+                });
             }
         }
 
         // Compute live_bytes per region from mark results.
         // Also run finalizers for dead objects and break their weak pointers.
         let mut dead_object_vals: Vec<TorclVal> = Vec::new();
-        let region_size = state.config.region_size;
         for (idx, region) in state.regions.iter_mut().enumerate() {
             match region.header.kind {
                 RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
@@ -2447,7 +2471,7 @@ impl HeapCollector {
                             // per-region (a continuation carries no header at
                             // its base, so per-region liveness is meaningless
                             // there).
-                            if marked.contains(&body_addr) {
+                            if object_map.is_marked(body_addr) {
                                 live += total_size as u32;
                             } else {
                                 // Object is dead — queue for finalization.
@@ -2550,7 +2574,7 @@ impl HeapCollector {
 
                 // Only copy non-forwarded, marked (live) objects.
                 let body_addr = cursor + OBJECT_HEADER_SIZE;
-                if !unsafe { header_is_forwarded(header_ptr) } && marked.contains(&body_addr) {
+                if !unsafe { header_is_forwarded(header_ptr) } && object_map.is_marked(body_addr) {
                     let mut copied = false;
                     if let Some(tidx) =
                         Self::find_or_create_target_region(state, RegionKind::OldGen, 0, total_size)
@@ -2767,6 +2791,14 @@ impl HeapCollector {
         );
 
         self.gc_stats = state.stats.clone();
+
+        // Return the mark scratch so the next major collection reuses its bitmap
+        // capacity instead of reallocating over the whole old generation (the
+        // minor collector does the same with MINOR_OBJECT_MAP). An early `?`
+        // above merely loses that capacity: the take leaves a default map, and
+        // the next cycle resets it before use.
+        MAJOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut object_map));
+        MAJOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut scan_worklist));
 
         // Clear marking flag.
         drop(guard);
