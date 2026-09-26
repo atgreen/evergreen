@@ -527,7 +527,7 @@ they use fixed-arity, non-variadic signatures.
 
 | CL type | Alien type | Direction | Notes |
 |---------|-----------|-----------|-------|
-| `FIXNUM` | `Int { signed: true, bits: 64 }` | Both | Unbox tag, reapply on return |
+| `INTEGER` | `Int { signed, bits }` (8–64 bit) | Both | Check the declared C range; return a fixnum or bignum without truncation |
 | `SINGLE-FLOAT` | `Float` | Both | Extract from tagged word |
 | `DOUBLE-FLOAT` | `Double` | Both | Heap-allocated; pass value |
 | `STRING` | `Pointer(Int{8})` | CL→C | UTF-8 copy with null terminator; pinned |

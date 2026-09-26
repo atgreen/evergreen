@@ -257,7 +257,8 @@ fn marshalling_round_trips_integer_float_and_pointer_shapes() {
         marshal_to_c(TorclVal::from_fixnum(12), &AlienType::Double).expect("marshal double");
     let double_round_trip =
         unmarshal_from_c(double_bits, &AlienType::Double).expect("unmarshal double");
-    assert_eq!(double_round_trip, TorclVal::from_fixnum(12));
+    assert!(double_round_trip.is_double_float());
+    assert_eq!(double_round_trip.as_double_float(), 12.0);
 
     let null_pointer =
         marshal_to_c(NIL, &AlienType::Pointer(Box::new(AlienType::Void))).expect("marshal pointer");

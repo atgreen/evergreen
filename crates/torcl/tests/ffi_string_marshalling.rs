@@ -102,3 +102,41 @@ fn ffi_call_marshals_strings_both_ways() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[cfg(all(target_arch = "x86_64", unix))]
+fn ffi_call_preserves_double_and_full_width_integer_values() {
+    let dir = std::env::temp_dir().join(format!("torcl-ffi-numeric-{}", std::process::id()));
+    let src = "
+        double identity_double(double value) { return value; }
+        unsigned long long identity_unsigned(unsigned long long value) { return value; }
+        long long identity_signed(long long value) { return value; }
+    ";
+    let so = build_test_so(&dir, src).expect("C compiler required for numeric FFI test");
+    let so = so.to_str().unwrap();
+    let program = format!(
+        "(let* ((lib (torcl::%load-foreign-library {so:?}))
+                (d (torcl::%foreign-symbol lib \"identity_double\"))
+                (u (torcl::%foreign-symbol lib \"identity_unsigned\"))
+                (s (torcl::%foreign-symbol lib \"identity_signed\"))
+                (result (torcl::%ffi-call d :double '(:double) '(1.0000000000000002d0))))
+           (assert (typep result 'double-float))
+           (assert (= result 1.0000000000000002d0))
+           (assert (= (torcl::%ffi-call u :unsigned-long '(:unsigned-long)
+                       '(18446744073709551615)) 18446744073709551615))
+           (assert (= (torcl::%ffi-call s :long-long '(:long-long)
+                       '(-9223372036854775808)) -9223372036854775808))
+           (format t \"exact-ffi-values-ok~%\"))"
+    );
+    let output = torcl_bin()
+        .args(["--no-init", "--eval", &program])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("exact-ffi-values-ok"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

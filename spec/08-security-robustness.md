@@ -159,7 +159,7 @@ fn validate_ptr<T>(ptr: *const T, context: &str) -> Result<&T, TorclError> {
 
 | CL Type | C Type | Rust Bridge Type | Validation |
 |----------|--------|-----------------|------------|
-| `FIXNUM` | `int64_t` | `i64` | Range check against 61-bit fixnum bounds |
+| `INTEGER` | Signed/unsigned integers, 8–64 bits | Checked integer magnitude → raw `u64` bits | Check the declared C range; box results outside the fixnum range as bignums |
 | `SINGLE-FLOAT` | `float` | `f32` | NaN/Inf pass-through (documented) |
 | `DOUBLE-FLOAT` | `double` | `f64` | NaN/Inf pass-through (documented) |
 | `STRING` | `const char*` | `CStr` | UTF-8 validation, null-terminator check |

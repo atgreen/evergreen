@@ -2,6 +2,7 @@
 //!
 //! See §2.7 of the spec.
 
+use crate::bignum::{BigInt, bigint_from_val};
 use crate::error::TorclError;
 use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 use crate::value::TorclVal;
@@ -167,21 +168,46 @@ pub unsafe fn ffi_call(
 
 // ── Marshalling ────────────────────────────────────────────────────
 
+fn integer_mask(bits: u8) -> Result<u64, TorclError> {
+    match bits {
+        8 | 16 | 32 => Ok((1u64 << bits) - 1),
+        64 => Ok(u64::MAX),
+        _ => Err(TorclError::FfiError(format!(
+            "unsupported foreign integer width: {bits}"
+        ))),
+    }
+}
+
+fn marshal_integer(value: TorclVal, signed: bool, bits: u8) -> Result<u64, TorclError> {
+    let mask = integer_mask(bits)?;
+    // Copy the magnitude into Rust storage. This does not allocate on the Lisp
+    // heap, and no raw pointer into a bignum survives an allocation.
+    let integer = bigint_from_val(value)
+        .ok_or_else(|| TorclError::FfiError("foreign integer argument is not an integer".into()))?;
+    let magnitude = integer.mag.first().copied().unwrap_or(0);
+    let limit = if signed {
+        (1u64 << (bits - 1)) - u64::from(integer.sign >= 0)
+    } else {
+        mask
+    };
+    if integer.mag.len() > 1 || magnitude > limit || (!signed && integer.sign < 0) {
+        return Err(TorclError::FfiError(format!(
+            "integer argument is outside the {} {bits}-bit range",
+            if signed { "signed" } else { "unsigned" },
+        )));
+    }
+    Ok(if integer.sign < 0 {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    })
+}
+
 /// Marshal a TorclVal into a C value for passing to a foreign function.
 pub fn marshal_to_c(value: TorclVal, alien_type: &AlienType) -> Result<u64, TorclError> {
     match alien_type {
         AlienType::Void => Ok(0),
-        AlienType::Int { .. } => {
-            if value.is_fixnum() {
-                Ok(value.as_fixnum() as u64)
-            } else if value.is_nil() {
-                Ok(0)
-            } else {
-                Err(TorclError::FfiError(
-                    "cannot marshal non-fixnum to integer".into(),
-                ))
-            }
-        }
+        AlienType::Int { signed, bits } => marshal_integer(value, *signed, *bits),
         AlienType::Float => {
             if value.is_single_float() {
                 Ok(value.as_single_float().to_bits() as u64)
@@ -192,7 +218,9 @@ pub fn marshal_to_c(value: TorclVal, alien_type: &AlienType) -> Result<u64, Torc
             }
         }
         AlienType::Double => {
-            if value.is_single_float() {
+            if value.is_double_float() {
+                Ok(value.as_double_float().to_bits())
+            } else if value.is_single_float() {
                 Ok(f64::to_bits(value.as_single_float() as f64))
             } else if value.is_fixnum() {
                 Ok(f64::to_bits(value.as_fixnum() as f64))
@@ -225,39 +253,20 @@ pub fn unmarshal_from_c(raw: u64, alien_type: &AlienType) -> Result<TorclVal, To
     match alien_type {
         AlienType::Void => Ok(crate::value::NIL),
         AlienType::Int { signed, bits } => {
-            // Sign-extend if signed
-            let val = if *signed {
-                match bits {
-                    8 => (raw as i8) as i64,
-                    16 => (raw as i16) as i64,
-                    32 => (raw as i32) as i64,
-                    64 => raw as i64,
-                    _ => raw as i64,
-                }
+            let raw = raw & integer_mask(*bits)?;
+            let integer = if *signed {
+                let shift = 64 - bits;
+                BigInt::from_i64(((raw << shift) as i64) >> shift)
             } else {
-                raw as i64
+                BigInt::from_mag(1, vec![raw])
             };
-            Ok(TorclVal::from_fixnum(val))
+            Ok(integer.to_val())
         }
         AlienType::Float => {
             let f = f32::from_bits(raw as u32);
             Ok(TorclVal::from_single_float(f))
         }
-        AlienType::Double => {
-            // Issue #8: Double doesn't fit in single_float. To avoid losing
-            // the fractional part, check if the value fits without loss as an
-            // integer; otherwise, downcast to f32 single-float (lossy but
-            // preserves non-integer values for the bootstrap runtime).
-            // A full implementation would use a heap-allocated double-float.
-            let d = f64::from_bits(raw);
-            if d.fract() == 0.0 && d >= i64::MIN as f64 && d <= i64::MAX as f64 {
-                Ok(TorclVal::from_fixnum(d as i64))
-            } else {
-                // Store as single_float — lossy for large doubles, but preserves
-                // fractional part for typical values.
-                Ok(TorclVal::from_single_float(d as f32))
-            }
-        }
+        AlienType::Double => Ok(crate::gc::alloc_double_float(f64::from_bits(raw))),
         AlienType::Pointer(_) => {
             if raw == 0 {
                 Ok(crate::value::NIL)
