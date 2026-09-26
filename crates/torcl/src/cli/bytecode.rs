@@ -7700,6 +7700,31 @@ fn compile_function_forcing_boxed(
     })
 }
 
+/// Symbols referenced by a lambda list's INIT FORMS (`&optional`, `&key` and
+/// `&aux` defaults, and any supplied-p forms).
+///
+/// CLHS 3.4.1.2: an init form may not refer to the parameter it initializes, so
+/// such a reference names an ENCLOSING binding and must be boxed like any other
+/// capture. Scanning only the body left `(&optional (x x))` resolving `x` to a
+/// global — the shape Alexandria's PARSE-ORDINARY-LAMBDA-LIST uses for
+/// `(&optional (allow-specializers allow-specializers))`, which made
+/// (asdf:load-system :serapeum) fail with UNBOUND-VARIABLE once the file was
+/// COMPILE-FILEd (bliss-fkhc).
+fn collect_lambda_list_init_names(
+    params_form: TorclVal,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for elem in list_to_vec(params_form) {
+        if !elem.is_cons() {
+            continue;
+        }
+        // `(var init …)` or, for &key, `((:keyword var) init …)`: everything
+        // after the variable specifier is a form evaluated in this scope.
+        let (_var, init_forms) = cp(elem);
+        collect_symbol_names(init_forms, out);
+    }
+}
+
 /// Names of variables captured by a nested `(lambda …)` in `body` (an
 /// over-approximation: a nested lambda's free symbols minus its own params).
 /// A function/`let` binding whose name is in this set is boxed into the heap
@@ -7720,6 +7745,7 @@ fn compute_captured_names(body: TorclVal) -> std::collections::HashSet<String> {
                     .map(|p| sym_name(*p))
                     .collect();
                 let mut used = std::collections::HashSet::new();
+                collect_lambda_list_init_names(params_form, &mut used);
                 for f in list_to_vec(lbody) {
                     collect_symbol_names(f, &mut used);
                     walk(f, out); // nested lambdas
@@ -7778,6 +7804,7 @@ fn compute_captured_names(body: TorclVal) -> std::collections::HashSet<String> {
                         .collect::<std::collections::HashSet<_>>();
                     let mut used = std::collections::HashSet::new();
                     collect_symbol_names(fbody, &mut used);
+                    collect_lambda_list_init_names(params_form, &mut used);
                     for name in used {
                         if !params.contains(&name) {
                             out.insert(name);
@@ -12811,7 +12838,18 @@ fn bind_variadic(
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<(), TorclError> {
-    let parent = Arc::clone(&env.frame);
+    // Defaults are evaluated in a child of the CALLEE's environment, not the
+    // caller's: an init form that names an enclosing lexical must find the
+    // binding the function was DEFINED in (CLHS 3.1.2.1.1). `env_frame` is this
+    // activation's heap frame — a closure's captured environment, or a fresh
+    // child of it — so it is the right parent. Parenting the child on the
+    // caller's frame instead left `(&optional (x x))` unable to see the
+    // enclosing `x` at all, and the tree-walked default then fell through to the
+    // global cell and signalled UNBOUND-VARIABLE (bliss-fkhc: Alexandria's
+    // PARSE-ORDINARY-LAMBDA-LIST, reached while macroexpanding Serapeum).
+    let parent = env_frame
+        .map(Arc::clone)
+        .unwrap_or_else(|| Arc::clone(&env.frame));
     // `param_layout` names are frozen into the .bfasl at compile time, but
     // `bind_lambda_list` binds each parameter under its *live* symbol's
     // rendered name (`define_local_symbol` keys `vars` by `sym_name`). A

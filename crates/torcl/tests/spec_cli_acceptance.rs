@@ -1654,6 +1654,153 @@ fn cltl2_declaration_information_reports_user_declarations_and_optimize_policy()
 }
 
 #[test]
+fn stacked_feature_conditionals_each_consume_one_datum() {
+    // CLHS 2.4.8.17: a #+/#- whose test fails returns ZERO VALUES, so the
+    // enclosing read keeps going until a datum is produced. A STACK of them
+    // therefore eats one datum each — the idiom libraries use to comment out a
+    // trailing block (string-case's demo-output section). Every expectation here
+    // was diffed against SBCL (bliss-prts).
+    let cases = [
+        // The failing shape: three conditionals eat the form, the `=>` marker and
+        // the result form.
+        (
+            "(let ((s (make-string-input-stream \"#+bad #+reader #+hack (m) => (r)\")))\n\
+               (list (read s nil :done) (read s nil :done)))",
+            "(:DONE :DONE)",
+        ),
+        // A conditional that eats a list's last element must let the list CLOSE,
+        // not keep scanning past the paren.
+        ("(read-from-string \"(a #+bad b)\")", "(A)"),
+        ("(read-from-string \"(a #+bad b c)\")", "(A C)"),
+        (
+            "(read-from-string \"(#+bad #+reader #+hack x y z)\")",
+            "NIL",
+        ),
+        // A satisfied test is unaffected.
+        ("(read-from-string \"(a #-bad b c)\")", "(A B C)"),
+    ];
+    for (expr, expected) in cases {
+        // Compare the printed value only: `--eval` also echoes the form's value.
+        let printed = eval_ok(&format!("(prin1 {expr})"));
+        assert_eq!(
+            printed.lines().next().unwrap_or_default(),
+            expected,
+            "case: {expr}"
+        );
+    }
+}
+
+#[test]
+fn lambda_list_init_forms_see_the_enclosing_binding_through_compile_file() {
+    // CLHS 3.4.1.2: an init form may not refer to the parameter it initializes,
+    // so `(&optional (x x))` names the ENCLOSING x. Loading the source always
+    // worked; COMPILE-FILE then loading the fasl signalled UNBOUND-VARIABLE,
+    // because the enclosing binding was never boxed and the default was
+    // evaluated against the CALLER's frame rather than the callee's environment.
+    // Alexandria's PARSE-ORDINARY-LAMBDA-LIST has exactly this shape, so nothing
+    // that macroexpanded through it could be compiled (bliss-fkhc). Values match
+    // SBCL.
+    let dir = temp_dir("lambda-list-init-capture");
+    let source = dir.join("init-capture.lisp");
+    write_file(
+        &source,
+        "(defun via-labels (x) (labels ((c (&optional (x x)) x)) (c)))\n\
+         (defun via-flet (&key x) (flet ((c (&optional (x x)) x)) (c)))\n\
+         (defun via-optional (&optional x) (labels ((c (&optional (x x)) x)) (c)))\n\
+         (defun via-closure (y) (lambda (&optional (y y)) y))\n\
+         (defun same-lambda-list (a &optional (b a) &key (c (list a b))) (list a b c))\n",
+    );
+    let script = dir.join("run.lisp");
+    write_file(
+        &script,
+        &format!(
+            "(load (compile-file {source:?}))\n\
+             (format t \"INIT=~S\"\n\
+               (list (via-labels 1)\n\
+                     (via-flet :x 2)\n\
+                     (via-optional 3)\n\
+                     (funcall (via-closure 9))\n\
+                     (same-lambda-list 1)))\n",
+            source = source.to_str().expect("utf8 path")
+        ),
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL lambda-list init fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("INIT=(1 2 3 9 (1 1 (1 1)))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn macro_expansion_preserves_the_expansion_site_package() {
+    // `*PACKAGE*` is dynamic: an expander that INTERNs must build symbols in the
+    // package in force at the CALL SITE, and expanding a macro must not disturb
+    // `*PACKAGE*` for the rest of the load. Each expansion built a fresh
+    // evaluator environment that reset the GLOBAL `*PACKAGE*` cell to CL-USER,
+    // so alexandria:SYMBOLICATE interned into the wrong package — lisp-namespace
+    // then defvar'd CL-USER::*NAMESPACE-TABLE* while its own template read
+    // LISPN::*NAMESPACE-TABLE*, and every CACHED ASDF load of it failed
+    // (bliss-5cc9).
+    let dir = temp_dir("macro-expansion-package");
+    let script = dir.join("expansion-package.lisp");
+    write_file(
+        &script,
+        "(defpackage :zsite (:use :cl))\n\
+         (defmacro intern-here (name)\n\
+           ;; Interned while EXPANDING, so it homes into the site's package.\n\
+           (list 'quote (intern name)))\n\
+         (in-package :zsite)\n\
+         (defvar *made* (cl-user::intern-here \"MADE-BY-EXPANDER\"))\n\
+         (format t \"PKGS=~S\"\n\
+           (list (package-name (symbol-package *made*))\n\
+                 ;; …and the expansion left *PACKAGE* alone.\n\
+                 (package-name *package*)\n\
+                 (package-name (symbol-package (read-from-string \"READ-AFTERWARDS\")))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL expansion-package fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("PKGS=(\"ZSITE\" \"ZSITE\" \"ZSITE\")"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn lisp_finalizers_are_deferred_rooted_cancellable_and_run_once() {
     // R3.12/R3.16: user finalizers are retained without keeping their target
     // alive, run outside the collector, and cannot fire twice.  This is also

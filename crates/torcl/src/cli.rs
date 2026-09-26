@@ -687,6 +687,23 @@ fn effective_package_name(env: &mut Env) -> String {
     env.current_package.clone()
 }
 
+/// The package `*PACKAGE*` currently designates, canonicalized, without needing
+/// an `Env`. `IN-PACKAGE` keeps the value cell in sync (see
+/// `sync_package_value_cell`), so this is the package in force at a load's
+/// current position — what a macro expander must see.
+fn live_package_name() -> Option<String> {
+    let cell = resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()))?;
+    let name = string_designator_name(cell);
+    if name.is_empty() {
+        return None;
+    }
+    Some(
+        torcl_rt::packages::find(&name)
+            .and_then(torcl_rt::packages::package_name)
+            .unwrap_or(name),
+    )
+}
+
 /// The canonical package object for `canonical_name` (nicknames resolved first).
 /// Find-or-create against the registry, so `*PACKAGE*` and package designators
 /// always yield an object; interned by the registry: same name ⇒ same handle.
@@ -983,6 +1000,16 @@ fn read_one_form_from_stream_ws(
                     return Ok(None);
                 }
                 let (form, _) = read_from_string_in_env(&buffer, env)?;
+                // The buffered text can produce NO datum: a `#+feature` whose
+                // test fails consumes its guarded form and yields nothing (CLHS
+                // 2.4.8.17). For READ that is end of file, so the
+                // eof-error-p/eof-value contract governs — returning the
+                // reader's internal EOF sentinel as if it were a datum made
+                // `(read s nil :eof)` answer #<EOF>, and a
+                // `(loop … until (eq f :eof))` never terminated (bliss-fi51).
+                if form == EOF {
+                    return Ok(None);
+                }
                 return Ok(Some(form));
             }
             Some(c) => {
@@ -7528,8 +7555,25 @@ impl Env {
                 torcl_rt::symbols::set_symbol_value(idx, NIL);
             }
         }
-        env.define_local("*PACKAGE*", package_object("COMMON-LISP-USER"));
-        sync_package_value_cell("COMMON-LISP-USER");
+        // A macro expander runs with the package in force AT THE EXPANSION SITE:
+        // `*PACKAGE*` is dynamic, and an expander body that INTERNs depends on
+        // it. This Env is built fresh for each expansion, and resetting the
+        // GLOBAL value cell to CL-USER here did not merely mislead the expander —
+        // it clobbered `*PACKAGE*` for the remainder of the load.
+        //
+        // lisp-namespace showed both halves: DEFINE-NAMESPACE calls
+        // alexandria:SYMBOLICATE, so expanding it under CL-USER defvar'd
+        // CL-USER::*NAMESPACE-TABLE* while the macro's own template read
+        // LISPN::*NAMESPACE-TABLE* — "The variable LISP-NAMESPACE::*NAMESPACE-TABLE*
+        // is unbound" on every cached ASDF load (bliss-5cc9).
+        let package = if for_macro_expansion {
+            live_package_name().unwrap_or_else(|| "COMMON-LISP-USER".to_string())
+        } else {
+            "COMMON-LISP-USER".to_string()
+        };
+        env.current_package = package.clone();
+        env.define_local("*PACKAGE*", package_object(&package));
+        sync_package_value_cell(&package);
         // *READTABLE* holds a REAL (pinned) readtable object so
         // SET-DISPATCH-MACRO-CHARACTER & co. have an identity to key their
         // registrations by (bliss-r4mk). Seeded in the value cell; boot.lisp's
@@ -25486,7 +25530,18 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     if car.is_cons() {
         let (lh, lr) = cp(car);
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
-            let (params_form, body_rest) = cp(lr);
+            // The lambda list and body are source conses of THIS form. `car` is
+            // rooted, but these copies are not, and `eval_args` below evaluates
+            // arbitrary argument forms — allocating, and so possibly relocating
+            // the whole lambda expression out from under them (AGENTS.md GC
+            // invariant 1). The lambda list then read back as garbage and
+            // `bind_lambda_list` panicked in `as_symbol_index`: compiling
+            // Type-I's infer-numbers.lisp under the Serapeum load hit this
+            // deterministically, from a nest of quasiquoted lambda applications
+            // (bliss-98mu).
+            let (mut params_form, mut body_rest) = cp(lr);
+            torcl_rt::rooted_ref!(_params_form_root = &mut params_form);
+            torcl_rt::rooted_ref!(_body_rest_root = &mut body_rest);
             let args = eval_args(cdr, env)?;
             return eval_lambda_call(env, params_form, body_rest, &args, Arc::clone(&env.frame));
         }

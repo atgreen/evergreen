@@ -19,16 +19,28 @@ exercises these forks:
 | trivial-features | https://github.com/atgreen/trivial-features | `26e8d168deb7d70d762d0d7e41b2919eba4321aa` |
 | trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `e55ad7e91aa5aa92408fe082b2e307f8986be080` |
 | usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `5f8ba3596b4be3b3962a26957ff5508d4d02cbcc` |
+| trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
 TorCL client primitives and is not a claim of HTTPS or completions support.
+
+The trivial-cltl2 fork adds only `#+torcl #:torcl-cltl2` to its `:use` list.
+TorCL provides that package — its counterpart of SB-CLTL2 — exporting the part
+of the CLtL2 environment API the implementation can answer truthfully:
+`DEFINE-DECLARATION` and `DECLARATION-INFORMATION` (user declarations, the
+`DECLARATION` key, and the `OPTIMIZE` policy merged from defaults,
+proclamations and lexical declarations). The remaining CLtL2 names are
+deliberately left unbound rather than stubbed, so a caller's own `FBOUNDP`
+guard — Serapeum's `macro-tools` uses one — sees the truth. This is what lets
+Trivia load.
 
 For an existing ocicl project, run there:
 
 ```sh
 ocicl install git+https://github.com/atgreen/trivial-features@26e8d168deb7d70d762d0d7e41b2919eba4321aa
 ocicl install git+https://github.com/atgreen/trivial-gray-streams@e55ad7e91aa5aa92408fe082b2e307f8986be080
+ocicl install git+https://github.com/atgreen/trivial-cltl2@116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691
 ```
 
 Restart TorCL after switching implementations of a protocol library. The fork

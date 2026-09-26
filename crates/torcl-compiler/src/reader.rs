@@ -3122,7 +3122,41 @@ fn cons_parts(val: TorclVal) -> (TorclVal, TorclVal) {
     }
 }
 
-fn skip_form(chars: &[char], pos: usize, depth: usize) -> Result<usize, TorclError> {
+/// Skip one datum-PRODUCING read, the way `read` behaves under
+/// `*read-suppress*`: a `#+`/`#-` whose test fails returns ZERO VALUES, so the
+/// enclosing read keeps going until something is actually produced (CLHS
+/// 2.4.8.17). That is what makes a STACK of conditionals eat one datum each —
+/// `#+bad #+reader #+hack (form) => (result)` consumes all four datums, which is
+/// exactly how libraries use the idiom to comment out a block (string-case's
+/// trailing "demo output" section; bliss-prts). Skipping only the guarded form
+/// left `=>` to be read and evaluated as a variable.
+fn skip_form(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, TorclError> {
+    let mut first = true;
+    loop {
+        // Only the FIRST unit must be a form: a bare `)` there is malformed even
+        // while skipping (read-suppress.error.1). On a later pass the previous
+        // unit was a conditional that produced nothing, so a `)` simply ends the
+        // enclosing list — `(a #+bad b)` must close, not error. Leave it for
+        // `skip_list`.
+        if !first {
+            let next = skip_whitespace_and_comments(chars, pos);
+            if next >= chars.len() || chars[next] == ')' {
+                return Ok(next);
+            }
+            pos = next;
+        }
+        let (next, produced) = skip_form_once(chars, pos, depth)?;
+        pos = next;
+        if produced || pos >= chars.len() {
+            return Ok(pos);
+        }
+        first = false;
+    }
+}
+
+/// Skip one syntactic unit, reporting whether it PRODUCES a datum. Only a
+/// false-testing `#+`/`#-` produces none.
+fn skip_form_once(chars: &[char], pos: usize, depth: usize) -> Result<(usize, bool), TorclError> {
     if depth > MAX_READER_NESTING {
         return Err(TorclError::StreamError(
             "reader nesting limit exceeded".into(),
@@ -3130,25 +3164,26 @@ fn skip_form(chars: &[char], pos: usize, depth: usize) -> Result<usize, TorclErr
     }
     let pos = skip_whitespace_and_comments(chars, pos);
     if pos >= chars.len() {
-        return Ok(pos);
+        return Ok((pos, true));
     }
 
+    let produced = |end: Result<usize, TorclError>| end.map(|end| (end, true));
     match chars[pos] {
-        '(' => skip_list(chars, pos + 1, depth + 1),
+        '(' => produced(skip_list(chars, pos + 1, depth + 1)),
         // A bare `)` where a form is expected is malformed, even while skipping
         // for *read-suppress* or a #+/#- branch (read-suppress.error.1: `')`).
         ')' => Err(TorclError::StreamError("unexpected ')'".into())),
-        '"' => skip_string(chars, pos + 1),
-        '\'' | '`' => skip_form(chars, pos + 1, depth + 1),
-        ',' => {
+        '"' => produced(skip_string(chars, pos + 1)),
+        '\'' | '`' => produced(skip_form(chars, pos + 1, depth + 1)),
+        ',' => produced(
             if pos + 1 < chars.len() && (chars[pos + 1] == '@' || chars[pos + 1] == '.') {
                 skip_form(chars, pos + 2, depth + 1)
             } else {
                 skip_form(chars, pos + 1, depth + 1)
-            }
-        }
-        '#' => skip_sharpsign_form(chars, pos + 1, depth + 1),
-        _ => skip_atom(chars, pos),
+            },
+        ),
+        '#' => skip_sharpsign_once(chars, pos + 1, depth + 1),
+        _ => produced(skip_atom(chars, pos)),
     }
 }
 
@@ -3181,7 +3216,11 @@ fn skip_atom(chars: &[char], pos: usize) -> Result<usize, TorclError> {
     Ok(end)
 }
 
-fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, TorclError> {
+fn skip_sharpsign_once(
+    chars: &[char],
+    mut pos: usize,
+    depth: usize,
+) -> Result<(usize, bool), TorclError> {
     if pos >= chars.len() {
         return Err(TorclError::StreamError("unexpected end after #".into()));
     }
@@ -3197,24 +3236,34 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
     }
 
     let dispatch = chars[pos];
+    let produced = |end: Result<usize, TorclError>| end.map(|end| (end, true));
     match dispatch {
-        '=' => skip_form(chars, pos + 1, depth + 1),
-        '#' => Ok(pos + 1),
-        '\'' | '+' | '-' | '.' => skip_form(chars, pos + 1, depth + 1),
-        '\\' => Ok(skip_char_literal(chars, pos + 1)),
-        ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' | 'r' | 'R' | '*' => skip_atom(chars, pos + 1),
-        '(' => skip_list(chars, pos + 1, depth + 1),
-        'C' | 'c' => skip_form(chars, pos + 1, depth + 1),
+        '=' => produced(skip_form(chars, pos + 1, depth + 1)),
+        '#' => Ok((pos + 1, true)),
+        // A nested conditional consumes its feature expression AND the datum it
+        // guards, then produces nothing itself — see `skip_form`.
+        '+' | '-' => {
+            let after_feature = skip_form(chars, pos + 1, depth + 1)?;
+            let after_form = skip_form(chars, after_feature, depth + 1)?;
+            Ok((after_form, false))
+        }
+        '\'' | '.' => produced(skip_form(chars, pos + 1, depth + 1)),
+        '\\' => Ok((skip_char_literal(chars, pos + 1), true)),
+        ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' | 'r' | 'R' | '*' => {
+            produced(skip_atom(chars, pos + 1))
+        }
+        '(' => produced(skip_list(chars, pos + 1, depth + 1)),
+        'C' | 'c' => produced(skip_form(chars, pos + 1, depth + 1)),
         // #nA(nested…) rank-n array literal: one form follows
         // (bliss-fo0o: `#2a((a b))` inside a #+nil block errored).
-        'a' | 'A' => skip_form(chars, pos + 1, depth + 1),
-        'P' | 'p' | 'S' | 's' => skip_form(chars, pos + 1, depth + 1),
+        'a' | 'A' => produced(skip_form(chars, pos + 1, depth + 1)),
+        'P' | 'p' | 'S' | 's' => produced(skip_form(chars, pos + 1, depth + 1)),
         // `#<` is explicitly unreadable (CLHS 2.4.8.20) — an error even under
         // *read-suppress* (read-suppress.error.2).
-        '|' => skip_block_comment(chars, pos + 1),
+        '|' => produced(skip_block_comment(chars, pos + 1)),
         other if custom_sharp_dispatch_registered(other) => {
             // Suppressed custom dispatch — one-form approximation (bliss-r4mk).
-            skip_form(chars, pos + 1, depth + 1)
+            produced(skip_form(chars, pos + 1, depth + 1))
         }
         other => Err(TorclError::StreamError(format!(
             "unknown # dispatch: {}",
