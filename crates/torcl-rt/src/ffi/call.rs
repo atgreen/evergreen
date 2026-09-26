@@ -112,41 +112,29 @@ pub(super) struct ScalarPlan {
 
 /// The same scalar ABI assignment is used by outbound calls and inbound entries.
 pub(super) fn classify(arguments: &[Scalar]) -> Result<ScalarPlan, TorclError> {
-    if arguments.contains(&Scalar::Void) {
-        return Err(TorclError::FfiError("void is not an argument type".into()));
-    }
     if arguments.len() > (i32::MAX as usize - 16) / 8 {
         return Err(signature_too_large());
     }
-    // SysV AMD64 scalar classification (§3.2.3). Integer and SSE registers
-    // are allocated independently; exhausted classes spill in argument order.
-    const INTEGER_REGISTERS: [u8; 6] = [7, 6, 2, 1, 8, 9];
-    let (mut integers, mut sse, mut stack_bytes) = (0, 0, 0u32);
-    let mut locations = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        let location = match argument {
-            Scalar::Integer { .. } if integers < 6 => {
-                let register = INTEGER_REGISTERS[integers];
-                integers += 1;
-                Location::Integer(register)
-            }
-            Scalar::Float | Scalar::Double if sse < 8 => {
-                let register = sse;
-                sse += 1;
-                Location::Sse(register)
-            }
-            _ => {
-                let offset = stack_bytes;
-                stack_bytes = stack_bytes.checked_add(8).ok_or_else(signature_too_large)?;
-                Location::Stack(offset)
-            }
-        };
-        locations.push(location);
-    }
+    // Scalars are the one-eightbyte case of the same placement used for
+    // aggregates. Callback entries consume this plan as well as outbound calls.
+    let layouts: Vec<_> = arguments
+        .iter()
+        .copied()
+        .map(super::abi::Layout::scalar)
+        .collect();
+    let plan = super::abi::assign(&layouts, false)?;
+    let locations = plan
+        .placements
+        .into_iter()
+        .map(|placement| match placement {
+            super::abi::Placement::Registers(pieces) => pieces.into_iter().next().unwrap().1,
+            super::abi::Placement::Stack(offset) => Location::Stack(offset),
+        })
+        .collect();
     Ok(ScalarPlan {
         locations,
-        stack_bytes,
-        sse,
+        stack_bytes: plan.stack_bytes,
+        sse: plan.sse,
     })
 }
 

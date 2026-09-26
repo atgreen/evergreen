@@ -620,8 +620,16 @@ Implementation status: SysV AMD64 scalar outbound adapters, including variadic
 calls, are implemented in `crates/torcl-rt/src/ffi/call.rs`. Variadic calls retain
 the named-parameter count, promote only trailing arguments, and supply the SysV
 vector-register count. The internal `%ffi-call` primitive accepts an optional
-fifth argument for that named-parameter count. Aggregates, generated callbacks,
-and additional target ABIs remain work under `bliss-124`; unsupported
+fifth argument for that named-parameter count. The runtime `ffi_call_buffered`
+API in `ffi/buffered.rs` supports outbound structs and unions, including packed
+layouts, register-bank rollback, hidden result pointers, and variadic calls.
+It shares argument placement with scalar adapters through `ffi/abi.rs`.
+Callers provide native argument and result buffers with the declared C layouts;
+the adapter copies exactly their declared sizes through padded staging storage.
+It does not publish the result buffer when a callback reports failure.
+Scalar callbacks are implemented as described in §2.7.5. Lisp aggregate
+integration, aggregate callbacks, and additional target ABIs remain work under
+`bliss-124`; unsupported
 signatures on the generated path signal an FFI error before entering foreign
 code. Other targets temporarily retain the pre-existing bootstrap dispatcher
 in `ffi/legacy.rs`; it is not an implementation of the generated-adapter contract.
@@ -678,7 +686,7 @@ objects restore with an invalid token, never a token referring to a new provider
 exposes the generated scalar call path, with a supplied fixed-count selecting
 variadic calling. The caller owns signature correctness and symbol lifetime.
 Generated scalar callbacks use the ownership API in §2.7.5. The complete CFFI
-backend, aggregate calls/callbacks, and remaining target ABIs remain work under
+backend, Lisp aggregate calls, aggregate callbacks, and remaining target ABIs remain work under
 `bliss-124`.
 
 ---

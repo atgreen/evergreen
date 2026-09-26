@@ -256,6 +256,7 @@ requirements that satisfy it.
 | R5.29 | Compiler-generated specialised sequence code |
 | R10.09–R10.12 | cl-bench tracking; benchmark suite on every release |
 | R11.16–R11.17 | Performance targets tracked in CI per phase |
+| R14.20–R14.24, R14.50–R14.55 | Specialized-array SIMD loads/stores; XMM/YMM codegen keeping vectors unboxed across a loop (§14) |
 
 ### G3 — Fast Startup (< 50 ms cold)
 

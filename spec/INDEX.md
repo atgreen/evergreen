@@ -27,6 +27,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `11-phasing-roadmap.md` | §11 | Phasing & Roadmap | Bootstrap phases, milestone criteria, self-hosting path |
 | `12-glossary.md` | §12 | Glossary & Cross-Reference | Term glossary, D/A/R ID index, goal traceability |
 | `13-concurrency.md` | §13 | Concurrency Model | Memory model, lock ordering, green threads, safepoints |
+| `14-simd.md` | §14 | SIMD | SIMD packs, `TORCL-SIMD*` packages, instruction-set dispatch, image portability (R14.01–R14.55) |
 
 ## Compiler Sub-Chapters (§4)
 

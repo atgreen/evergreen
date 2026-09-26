@@ -9,6 +9,13 @@ use crate::value::TorclVal;
 pub mod memory;
 
 #[cfg(all(target_arch = "x86_64", unix))]
+mod abi;
+#[cfg(all(target_arch = "x86_64", unix))]
+mod buffered;
+#[cfg(all(target_arch = "x86_64", unix))]
+pub use buffered::ffi_call_buffered;
+
+#[cfg(all(target_arch = "x86_64", unix))]
 mod call;
 #[cfg(all(target_arch = "x86_64", unix))]
 pub mod callback;
