@@ -175,6 +175,31 @@ impl Environment {
     /// `Arc::make_mut` safely gives this stored environment its own parent chain
     /// when another environment shares a frame.
     pub fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        self.visit_own_gc_roots(visit);
+        // Iterative, like every other parent walk here: the chain is one frame
+        // per augmentation and a deep one would otherwise overflow the control
+        // stack DURING A COLLECTION (bliss-ump7).
+        //
+        // `Arc::make_mut` clones a SHARED parent, so descending into the shared
+        // global-macro base would copy it on every collection. That base holds
+        // only immediate handles, so there is nothing to visit.
+        let mut frame: &mut Environment = self;
+        loop {
+            let descend = match frame.parent {
+                Some(ref parent) => !parent.no_gc_roots,
+                None => false,
+            };
+            if !descend {
+                return;
+            }
+            let parent = frame.parent.as_mut().expect("checked above");
+            frame = Arc::make_mut(parent);
+            frame.visit_own_gc_roots(visit);
+        }
+    }
+
+    /// Visit this frame's own reference slots, without descending.
+    fn visit_own_gc_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         for info in self.variables.values_mut() {
             match info {
                 VariableInfo::Constant(value) | VariableInfo::SymbolMacro(value) => visit(value),
@@ -196,38 +221,41 @@ impl Environment {
                 | DeclInfo::Dynamic(_) => {}
             }
         }
-        if let Some(parent) = &mut self.parent {
-            // `Arc::make_mut` clones a SHARED parent, so descending into the
-            // shared global-macro base would copy it on every collection. That
-            // base holds only immediate handles, so there is nothing to visit.
-            if !parent.no_gc_roots {
-                Arc::make_mut(parent).visit_gc_roots(visit);
-            }
-        }
     }
 
     /// Query variable information (CLtL2 `variable-information`).
     /// Walks the parent chain to find the binding in the nearest enclosing scope.
+    ///
+    /// Every parent walk in this impl is ITERATIVE. The chain is one frame per
+    /// augmentation, so a code walker that augments per binding builds a very
+    /// long one: Serapeum's LOCAL did, and the recursive walk exhausted the
+    /// control stack while its file was compiled (bliss-ump7).
     pub fn variable_information(&self, name: TorclVal) -> Option<VariableInfo> {
-        if let Some(info) = self.variables.get(&name.0) {
-            return Some(info.clone());
+        let mut frame = self;
+        loop {
+            if let Some(info) = frame.variables.get(&name.0) {
+                return Some(info.clone());
+            }
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => return None,
+            }
         }
-        if let Some(ref parent) = self.parent {
-            return parent.variable_information(name);
-        }
-        None
     }
 
     /// Query function information (CLtL2 `function-information`).
     /// Walks the parent chain to find the binding in the nearest enclosing scope.
     pub fn function_information(&self, name: TorclVal) -> Option<FunctionInfo> {
-        if let Some(info) = self.functions.get(&name.0) {
-            return Some(info.clone());
+        let mut frame = self;
+        loop {
+            if let Some(info) = frame.functions.get(&name.0) {
+                return Some(info.clone());
+            }
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => return None,
+            }
         }
-        if let Some(ref parent) = self.parent {
-            return parent.function_information(name);
-        }
-        None
     }
 
     /// Query declaration information (CLtL2 `declaration-information`).
@@ -236,7 +264,20 @@ impl Environment {
     /// - For 'declaration': returns list of valid declaration names.
     ///   Walks the parent chain to find declarations (spec §4.2.9 R4.14).
     pub fn declaration_information(&self, decl_name: TorclVal) -> Option<TorclVal> {
-        // Search this frame's declarations for an optimize entry
+        let mut frame = self;
+        loop {
+            if let Some(found) = frame.declaration_information_here(decl_name) {
+                return Some(found);
+            }
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => return None,
+            }
+        }
+    }
+
+    /// The `declaration_information` answer from THIS frame alone.
+    fn declaration_information_here(&self, decl_name: TorclVal) -> Option<TorclVal> {
         for decl in &self.declarations {
             match decl {
                 DeclInfo::Optimize(qualities) => {
@@ -257,10 +298,6 @@ impl Environment {
                 _ => {}
             }
         }
-        // Walk parent chain
-        if let Some(ref parent) = self.parent {
-            return parent.declaration_information(decl_name);
-        }
         None
     }
 
@@ -272,16 +309,20 @@ impl Environment {
     /// reverse source order within a frame, then walk outward, so the nearest
     /// lexical declaration has precedence.
     pub fn declaration_specifier(&self, decl_name: TorclVal) -> Option<TorclVal> {
-        for decl in self.declarations.iter().rev() {
-            if let DeclInfo::Custom(name_key, specifier) = decl
-                && *name_key == decl_name.0
-            {
-                return Some(*specifier);
+        let mut frame = self;
+        loop {
+            for decl in frame.declarations.iter().rev() {
+                if let DeclInfo::Custom(name_key, specifier) = decl
+                    && *name_key == decl_name.0
+                {
+                    return Some(*specifier);
+                }
+            }
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => return None,
             }
         }
-        self.parent
-            .as_ref()
-            .and_then(|parent| parent.declaration_specifier(decl_name))
     }
 
     /// Every raw declaration specifier named `decl_name` in force here,
@@ -289,10 +330,24 @@ impl Environment {
     /// is what a shadowing declaration needs; a *cumulative* declaration such as
     /// OPTIMIZE needs them all, so its reader can merge outward-to-inward.
     pub fn declaration_specifiers(&self, decl_name: TorclVal) -> Vec<TorclVal> {
-        let mut found = match self.parent {
-            Some(ref parent) => parent.declaration_specifiers(decl_name),
-            None => Vec::new(),
-        };
+        // Collect innermost-first, then reverse: the caller wants outermost-first.
+        let mut inward = Vec::new();
+        let mut frame = self;
+        loop {
+            let start = inward.len();
+            frame.declaration_specifiers_here(decl_name, &mut inward);
+            inward[start..].reverse();
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => break,
+            }
+        }
+        inward.reverse();
+        inward
+    }
+
+    /// The specifiers named `decl_name` in THIS frame, in source order.
+    fn declaration_specifiers_here(&self, decl_name: TorclVal, found: &mut Vec<TorclVal>) {
         for decl in self.declarations.iter() {
             if let DeclInfo::Custom(name_key, specifier) = decl
                 && *name_key == decl_name.0
@@ -300,7 +355,6 @@ impl Environment {
                 found.push(*specifier);
             }
         }
-        found
     }
 
     /// Augment this environment with a variable binding.
@@ -458,31 +512,51 @@ impl Environment {
             }
         }
         if let Some(ref parent) = self.parent {
-            return parent.is_notinline(name);
+            let mut frame = parent.as_ref();
+            loop {
+                for decl in &frame.declarations {
+                    if let DeclInfo::Custom(key, val) = decl
+                        && *key == name.0
+                        && val.0 == NOTINLINE_SENTINEL
+                    {
+                        return true;
+                    }
+                }
+                match frame.parent {
+                    Some(ref next) => frame = next,
+                    None => return false,
+                }
+            }
         }
         false
     }
 
     /// Check if a block name is in scope.
     pub fn has_block(&self, name: TorclVal) -> bool {
-        if self.blocks.contains(&name.0) {
-            return true;
+        let mut frame = self;
+        loop {
+            if frame.blocks.contains(&name.0) {
+                return true;
+            }
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => return false,
+            }
         }
-        if let Some(ref parent) = self.parent {
-            return parent.has_block(name);
-        }
-        false
     }
 
     /// Check if a tag name is in scope.
     pub fn has_tag(&self, name: TorclVal) -> bool {
-        if self.tags.contains(&name.0) {
-            return true;
+        let mut frame = self;
+        loop {
+            if frame.tags.contains(&name.0) {
+                return true;
+            }
+            match frame.parent {
+                Some(ref parent) => frame = parent,
+                None => return false,
+            }
         }
-        if let Some(ref parent) = self.parent {
-            return parent.has_tag(name);
-        }
-        false
     }
 }
 
@@ -1317,6 +1391,13 @@ fn is_known_special_operator(val: TorclVal) -> bool {
             name.as_str(),
             "BLOCK"
                 | "CATCH"
+                // Definers whose LAMBDA LIST binds variables over the body: the
+                // parameters shadow an enclosing symbol macro, and the name,
+                // qualifiers and lambda list are not expressions (bliss-ump7).
+                | "DEFINE-COMPILER-MACRO"
+                | "DEFMACRO"
+                | "DEFMETHOD"
+                | "DEFUN"
                 // COND is lowered directly (not a macro): macroexpand must expand
                 // its clauses so symbol-macros inside them are handled (bliss-x5y.20).
                 | "COND"
@@ -1435,6 +1516,14 @@ fn expand_special_form(
         // environment. Its compiler expands global macros later; walking it
         // here would capture this body's MACROLET/SYMBOL-MACROLET bindings.
         "LOAD-TIME-VALUE" => Ok(form),
+        // A definer's LAMBDA LIST binds variables over its body, so those names
+        // shadow an enclosing SYMBOL-MACROLET (CLHS 3.1.2.1.1). Walking these as
+        // ordinary calls expanded the body without the shadowing, so a symbol
+        // macro whose expansion mentions a parameter re-expanded forever and hit
+        // the circular-expansion guard (bliss-ump7).
+        "DEFUN" | "DEFMETHOD" | "DEFMACRO" | "DEFINE-COMPILER-MACRO" => {
+            expand_definer_body(form, env)
+        }
         // For IF, PROGN, CATCH, THROW, UNWIND-PROTECT, MULTIPLE-VALUE-CALL,
         // MULTIPLE-VALUE-PROG1, PROGV — all subforms are
         // expression positions, so the generic walk is correct.
@@ -1895,6 +1984,81 @@ fn expand_lambda_expression(
     }
 }
 
+/// Expand the body of a definer that binds a lambda list — DEFUN, DEFMETHOD,
+/// DEFMACRO, DEFINE-COMPILER-MACRO — with the parameters shadowing any enclosing
+/// symbol macros, and with the name, qualifiers and lambda list left alone (they
+/// are not expressions).
+///
+/// Serapeum's DEFINE-ENV-METHOD is what needs this: it wraps a DEFMETHOD in a
+/// SYMBOL-MACROLET binding every slot name, including SELF, to
+/// `(slot-value self 'slot)`. Inside the method SELF is a parameter, so the
+/// expansion is final; without the shadowing the walker re-expanded SELF inside
+/// it, looped, and fell back to a path that left the other slot macros
+/// unexpanded — "unbound variable: SLOT" (bliss-ump7).
+fn expand_definer_body(mut form: TorclVal, env: &Environment) -> Result<TorclVal, TorclError> {
+    torcl_rt::rooted_ref!(_form_root = &mut form);
+    // (op name [qualifier…] lambda-list . body): the lambda list is the first
+    // element after the name that is a list — DEFMETHOD qualifiers are symbols.
+    torcl_rt::rooted!(items = cons_to_vec(form));
+    if items.len() < 3 {
+        return Ok(form);
+    }
+    let Some(lambda_list_index) = (2..items.len()).find(|&index| {
+        let item = items[index];
+        item.is_nil() || item.is_cons()
+    }) else {
+        return Ok(form);
+    };
+
+    // Parameter names shadow symbol macros over the body. `(var default)`,
+    // `(var specializer)` and `((:keyword var) default)` all name their variable
+    // in the car (or the cadr of the keyword pair).
+    let mut body_env = env.clone();
+    for param in cons_to_vec(items[lambda_list_index]) {
+        let name = if param.is_symbol() {
+            param
+        } else if param.is_cons() {
+            let first = unsafe { cons_car(param) };
+            if first.is_cons() {
+                // ((:keyword var) …)
+                let rest = unsafe { cons_cdr(param) };
+                if rest.is_cons() {
+                    unsafe { cons_car(rest) }
+                } else {
+                    continue;
+                }
+            } else {
+                first
+            }
+        } else {
+            continue;
+        };
+        if !name.is_symbol() || name.is_nil() {
+            continue;
+        }
+        if get_symbol_name(name).is_some_and(|text| text.starts_with('&')) {
+            continue;
+        }
+        body_env = body_env.augment_variable(name, VariableInfo::Lexical);
+    }
+
+    let mut changed = false;
+    torcl_rt::rooted!(expanded = Vec::<TorclVal>::with_capacity(items.len()));
+    for index in 0..items.len() {
+        if index <= lambda_list_index {
+            expanded.push(items[index]);
+            continue;
+        }
+        let out = macroexpand_all(items[index], &body_env)?;
+        changed |= out != items[index];
+        expanded.push(out);
+    }
+    if !changed {
+        return Ok(form);
+    }
+    Ok(vec_to_cons(&expanded))
+}
+
 /// Expand a lambda call: ((lambda (params...) body...) arg1 arg2 ...)
 /// Expand the lambda body AND the arguments.
 fn expand_lambda_call(
@@ -2340,38 +2504,60 @@ fn is_quote_symbol(val: TorclVal) -> bool {
 fn walk_cons(form: TorclVal, env: &Environment) -> Result<TorclVal, TorclError> {
     debug_assert!(form.is_cons(), "walk_cons called on non-cons value");
 
-    // Root across the allocating expand recursion (moving GC; bliss-noh).
-    // `rooted!` (bliss-a03) is the intrusive lock-free root: O(1) link/unlink
-    // per level, vs. a global mutex + O(n) drop per StackRoot — this recursion
-    // runs once per cons of every macroexpanded form, so the difference is the
-    // O(n²) hot case the design targets.
+    // Root across the allocating expansion (moving GC; bliss-noh). `rooted!`
+    // (bliss-a03) is the intrusive lock-free root: O(1) link/unlink, vs. a global
+    // mutex + O(n) drop per StackRoot — this runs once per cons of every
+    // macroexpanded form, so the difference is the O(n²) hot case it targets.
     torcl_rt::rooted!(form = form);
-    torcl_rt::rooted!(car = unsafe { cons_car(*form) });
-    torcl_rt::rooted!(cdr = unsafe { cons_cdr(*form) });
+    // The SPINE is walked ITERATIVELY. Recursing into the cdr cost one Rust
+    // frame per list ELEMENT, so a machine-generated form overflowed the control
+    // stack and the process took SIGSEGV: Serapeum's LOCAL expands
+    // internal-definitions.lisp into a list of more than 10,000 elements
+    // (bliss-ump7). Nesting still recurses through `macroexpand_all` on each car,
+    // which is bounded by how deeply the source is written.
+    torcl_rt::rooted!(expanded_cars = Vec::<TorclVal>::new());
+    torcl_rt::rooted!(cursor = *form);
+    torcl_rt::rooted!(tail = torcl_rt::value::NIL);
+    let mut changed = false;
+    loop {
+        // Re-read through the rooted cursor each time: the expansion below
+        // allocates and may have relocated this cell.
+        let car = unsafe { cons_car(*cursor) };
+        let expanded_car = macroexpand_all(car, env)?;
+        // Compare against the car AS IT IS NOW, not the pre-expansion copy: a
+        // collection during the expansion would have moved it.
+        changed |= expanded_car != unsafe { cons_car(*cursor) };
+        expanded_cars.push(expanded_car);
+        let next = unsafe { cons_cdr(*cursor) };
+        if next.is_cons() {
+            *cursor = next;
+        } else {
+            *tail = next;
+            break;
+        }
+    }
 
-    // Recursively expand the car
-    torcl_rt::rooted!(expanded_car = macroexpand_all(*car, env)?);
+    // A dotted tail is itself a form; NIL ends a proper list and expands to
+    // itself.
+    if !tail.is_nil() {
+        let (expanded_tail, _) = macroexpand(*tail, env)?;
+        changed |= expanded_tail != *tail;
+        *tail = expanded_tail;
+    }
 
-    // Recursively expand the cdr
-    // The cdr is typically another cons (rest of list) or NIL (end of list),
-    // but could be any value in a dotted pair.
-    let mut expanded_cdr = if cdr.is_cons() {
-        walk_cons(*cdr, env)?
-    } else {
-        // For non-cons cdr (NIL or dotted-pair atom), expand as an atom
-        let (expanded_cdr_val, _) = macroexpand(*cdr, env)?;
-        expanded_cdr_val
-    };
-    torcl_rt::rooted_ref!(_expanded_cdr_root = &mut expanded_cdr);
-
-    // If nothing changed, return the original cons cell to preserve identity
-    // (important for compiler macro decline checks which use pointer equality).
-    if *expanded_car == *car && expanded_cdr == *cdr {
+    // Unchanged: return the original structure so identity is preserved — the
+    // compiler-macro decline check compares pointers.
+    if !changed {
         return Ok(*form);
     }
 
-    // Build a new cons cell with the expanded values (non-destructive).
-    Ok(alloc_cons(*expanded_car, expanded_cdr))
+    // Rebuild from the tail inwards (non-destructive: shared quoted structure
+    // must not be mutated).
+    torcl_rt::rooted!(rebuilt = *tail);
+    for index in (0..expanded_cars.len()).rev() {
+        *rebuilt = alloc_cons(expanded_cars[index], *rebuilt);
+    }
+    Ok(*rebuilt)
 }
 type MacroFn = dyn Fn(TorclVal, &Environment) -> Result<TorclVal, TorclError> + Send + Sync;
 

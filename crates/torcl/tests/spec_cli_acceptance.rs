@@ -2023,6 +2023,65 @@ fn a_local_function_binding_does_not_shadow_a_variable_of_the_same_name() {
 }
 
 #[test]
+fn a_definers_lambda_list_shadows_an_enclosing_symbol_macro() {
+    // CLHS 3.1.2.1.1: a variable binding shadows a SYMBOL-MACROLET of the same
+    // name, so a symbol macro whose expansion mentions a parameter is FINAL
+    // inside that body. The walker treated DEFUN/DEFMETHOD as ordinary calls, so
+    // it re-expanded the parameter inside the expansion, looped into the
+    // circular-expansion guard, and fell back to a path that left the other
+    // symbol macros unexpanded — "unbound variable: SLOT" (bliss-ump7).
+    //
+    // Serapeum's DEFINE-ENV-METHOD is exactly this: it wraps a DEFMETHOD in a
+    // SYMBOL-MACROLET binding every slot name — SELF included — to
+    // `(slot-value self 'slot)`. Values match SBCL.
+    let dir = temp_dir("definer-symbol-macro-shadowing");
+    let script = dir.join("shadowing.lisp");
+    write_file(
+        &script,
+        "(defclass box () ((slot :initarg :slot)))\n\
+         (symbol-macrolet ((self (slot-value self 'self))\n\
+                           (slot (slot-value self 'slot)))\n\
+           (defmethod read-slot ((self box) var) (list var slot)))\n\
+         (symbol-macrolet ((self (list :outer-self self))\n\
+                           (tagged (list :tagged self)))\n\
+           (defun via-defun (self) tagged)\n\
+           (defmethod via-method ((self t)) tagged))\n\
+         ;; A parameter with no symbol macro of its own still works, and a symbol\n\
+         ;; macro NOT shadowed by a parameter still expands.\n\
+         (symbol-macrolet ((free 7))\n\
+           (defun untouched (x) (list x free)))\n\
+         (format t \"SHADOW=~S\"\n\
+           (list (read-slot (make-instance 'box :slot :s) :v)\n\
+                 (via-defun :obj)\n\
+                 (via-method :obj)\n\
+                 (untouched :x)))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL symbol-macro shadowing fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("SHADOW=((:V :S) (:TAGGED :OBJ) (:TAGGED :OBJ) (:X 7))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn lisp_finalizers_are_deferred_rooted_cancellable_and_run_once() {
     // R3.12/R3.16: user finalizers are retained without keeping their target
     // alive, run outside the collector, and cannot fire twice.  This is also
