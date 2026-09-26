@@ -2656,7 +2656,7 @@ fn read_sharpsign_with_base(
             if !read_eval {
                 return Err(TorclError::StreamError("*READ-EVAL* is false".into()));
             }
-            let (form, p) = read_token_with_base(
+            let (mut form, p) = read_token_with_base(
                 chars,
                 pos,
                 labels,
@@ -2665,6 +2665,14 @@ fn read_sharpsign_with_base(
                 read_circular,
                 depth + 1,
             )?;
+            // ROOT the form across its own evaluation: the hook runs the whole
+            // evaluator, which allocates freely (ironclad's `#.(calculate-c-odd)`
+            // builds two 8x256 arrays), and a minor GC there relocates this cons.
+            // Left unrooted, the evaluator was handed a stale pointer — a cons of
+            // zeroed nursery memory, reported as `undefined function: Fixnum(0)`
+            // — which made COMPILE-FILE downgrade whirlpool.lisp to a source-only
+            // artifact that then failed at LOAD time (bliss-6d8f).
+            torcl_rt::rooted_ref!(_form_root = &mut form);
             eval_read_time_form_with_hook(form).map(|value| (value, p))
         }
         other => {
