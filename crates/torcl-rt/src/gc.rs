@@ -1920,6 +1920,23 @@ impl HeapCollector {
         // and payload are still intact (STREAM finalization reads its off-heap
         // state pointer). Survivor side-table keys were forwarded above; every
         // key still in these ranges is genuinely dead.
+        // Weak containers, before the weak pointers and finalizers and for the
+        // same reason: the forwarding pointers are still intact, so a surviving
+        // referent can be relocated and anything still inside an evacuated range
+        // is genuinely dead.
+        process_weak_containers(&|slot: *mut TorclVal| {
+            // SAFETY: the container owns the slot and is quiescent under the
+            // heap lock the collector holds.
+            let value = unsafe { *slot };
+            if !is_heap_ref(value) {
+                return true;
+            }
+            unsafe { relocate_slot(slot, heap_base_addr, heap_end) };
+            let addr = ref_body_addr(unsafe { *slot });
+            !nursery_ranges
+                .iter()
+                .any(|&(base, limit)| addr >= base && addr < limit)
+        });
         break_dead_weak_pointers(&|val: TorclVal| {
             let addr = val.to_raw() as usize;
             nursery_ranges
@@ -2454,6 +2471,13 @@ impl HeapCollector {
             let dead_set: std::collections::HashSet<u64> =
                 dead_object_vals.iter().map(|v| v.to_raw()).collect();
             break_dead_weak_pointers(&|val: TorclVal| dead_set.contains(&val.to_raw()));
+            // Weak containers drop entries for the same dead objects. Nothing has
+            // moved yet at this point in a major cycle, so this pass only decides
+            // liveness; the post-evacuation pass below does the relocating.
+            process_weak_containers(&|slot: *mut TorclVal| {
+                // SAFETY: as for the minor pass above.
+                !dead_set.contains(&unsafe { *slot }.to_raw())
+            });
         }
 
         // Phase 2: Region selection — find old-gen regions with high garbage ratio.
@@ -2562,6 +2586,13 @@ impl HeapCollector {
             relocate_slot(slot, heap_base_addr, heap_end)
         });
         scan_external_roots(|slot| unsafe { relocate_slot(slot, heap_base_addr, heap_end) });
+        // A weak container's own scanner skips its weak slots, so relocate those
+        // here. Liveness was settled by the mark-phase pass above; every referent
+        // still held is live, hence the unconditional `true`.
+        process_weak_containers(&|slot: *mut TorclVal| {
+            unsafe { relocate_slot(slot, heap_base_addr, heap_end) };
+            true
+        });
 
         // Forward finalizer-registry keys and weak-pointer referents for old-gen
         // objects that were evacuated in Phase 3, while the forwarding pointers
@@ -4678,6 +4709,47 @@ impl WeakPointer {
 }
 
 // ── Weak pointer registry ─────────────────────────────────────────
+
+// ── Weak containers (weak hash tables, R3.13) ──────────────────────────────
+//
+// A weak container holds referents the collector must NOT keep alive. Its own
+// root scanner therefore skips those slots, which leaves two jobs for the
+// collector to hand back: relocate a referent that SURVIVED and moved, and tell
+// the container which referents DIED so it can drop those entries.
+//
+// Both are one question per slot, so the collector passes a single resolver:
+// it relocates the slot in place and answers whether the object is still live.
+// This runs at exactly the points where the answer is knowable — while
+// forwarding pointers are intact (minor), at the collector's established death
+// ordering (major mark), and after evacuation (major relocation) — alongside the
+// weak-pointer and finalizer passes.
+
+/// A weak container's collector callback: apply `resolve` to each weak referent
+/// slot and drop every entry whose resolve answered `false`.
+pub type WeakContainerHook = fn(&dyn Fn(*mut TorclVal) -> bool);
+
+fn weak_container_hooks() -> &'static OrderedMutex<Vec<WeakContainerHook>> {
+    static S: std::sync::OnceLock<OrderedMutex<Vec<WeakContainerHook>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 5, "weak container hooks", Vec::new()))
+}
+
+/// Register a weak container kind. Idempotent per function pointer.
+pub fn register_weak_container_hook(hook: WeakContainerHook) {
+    let mut hooks = weak_container_hooks().lock().unwrap();
+    if !hooks.iter().any(|h| std::ptr::fn_addr_eq(*h, hook)) {
+        hooks.push(hook);
+    }
+}
+
+/// Invoke every weak container with `resolve`. The hook list is cloned and the
+/// registry lock released first, so a container may take its own locks.
+fn process_weak_containers(resolve: &dyn Fn(*mut TorclVal) -> bool) {
+    let hooks = weak_container_hooks().lock().unwrap().clone();
+    for hook in hooks {
+        hook(resolve);
+    }
+}
 
 /// Wrapper around raw pointer to WeakPointer for Send/Sync.
 /// Safety: access is always guarded by the registry mutex.

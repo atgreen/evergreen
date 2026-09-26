@@ -28,6 +28,7 @@ static REGISTER_SCANNER: Once = Once::new();
 fn register_live_table(ptr: usize) {
     REGISTER_SCANNER.call_once(|| {
         torcl_rt::gc::register_root_scanner(scan_hash_table_roots);
+        torcl_rt::gc::register_weak_container_hook(process_weak_table_entries);
     });
     LIVE_TABLES
         .lock()
@@ -50,11 +51,83 @@ fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
         // that live for the process; their entry Vec is stable during a GC.
         unsafe {
             let inner = addr as *mut HashTableInner;
+            let weakness = (*inner).weakness;
+            // A WEAK half is deliberately not visited: yielding it here would
+            // make the table keep its own referent alive. The collector calls
+            // `process_weak_table_entries` instead, which relocates survivors and
+            // drops dead entries (R3.13).
+            let key_is_weak = matches!(weakness, Some(Weakness::Key | Weakness::KeyAndValue));
+            let value_is_weak = matches!(weakness, Some(Weakness::Value | Weakness::KeyAndValue));
             for slot in (*inner).entries.iter_mut() {
                 if let Some(entry) = slot.as_mut() {
-                    visit(&mut entry.key as *mut TorclVal);
-                    visit(&mut entry.value as *mut TorclVal);
+                    if !key_is_weak {
+                        visit(&mut entry.key as *mut TorclVal);
+                    }
+                    if !value_is_weak {
+                        visit(&mut entry.value as *mut TorclVal);
+                    }
                 }
+            }
+        }
+    }
+}
+
+/// Collector callback for weak tables (R3.13): relocate each weak referent that
+/// survived and drop every entry whose weak referent died.
+///
+/// `resolve` relocates the slot it is given and answers whether that object is
+/// still live. Runs under the collector's heap lock, so it touches only the table
+/// registry and the (leaked, stable) entry vectors and performs no TorCL
+/// allocation. Removing entries changes bucket occupancy, so a table that lost
+/// any entry is rehashed in place — the same pure reordering
+/// `maybe_rehash_for_gc` performs.
+fn process_weak_table_entries(resolve: &dyn Fn(*mut TorclVal) -> bool) {
+    let guard = LIVE_TABLES.lock().unwrap();
+    let Some(tables) = guard.as_ref() else {
+        return;
+    };
+    for &addr in tables {
+        // SAFETY: as for `scan_hash_table_roots`.
+        unsafe {
+            let inner = addr as *mut HashTableInner;
+            let Some(weakness) = (*inner).weakness else {
+                continue;
+            };
+            let mut removed = 0usize;
+            for slot in (*inner).entries.iter_mut() {
+                let Some(entry) = slot.as_mut() else {
+                    continue;
+                };
+                // Ask only about the weak half/halves; the strong half was
+                // already visited (and so relocated) by the root scanner.
+                let key_live = match weakness {
+                    Weakness::Key | Weakness::KeyAndValue => {
+                        resolve(&mut entry.key as *mut TorclVal)
+                    }
+                    Weakness::Value => true,
+                };
+                let value_live = match weakness {
+                    Weakness::Value | Weakness::KeyAndValue => {
+                        resolve(&mut entry.value as *mut TorclVal)
+                    }
+                    Weakness::Key => true,
+                };
+                let keep = match weakness {
+                    Weakness::Key => key_live,
+                    Weakness::Value => value_live,
+                    // CLHS has no weakness; this follows Trivial-Garbage:
+                    // :key-and-value keeps the entry only while BOTH live.
+                    Weakness::KeyAndValue => key_live && value_live,
+                };
+                if !keep {
+                    *slot = None;
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                (*inner).count -= removed;
+                rehash_in_place(&mut *inner);
+                (*inner).gc_gen = torcl_rt::gc::gc_move_epoch();
             }
         }
     }
@@ -1443,6 +1516,12 @@ pub fn hash_table_count(table: TorclVal) -> Result<usize, TorclError> {
 pub fn hash_table_test(table: TorclVal) -> Result<HashTest, TorclError> {
     let ptr = get_table_inner(table)?;
     Ok(unsafe { (*ptr).test })
+}
+
+/// The table's weakness, or `None` for an ordinary (strong) table. R3.13.
+pub fn hash_table_weakness(table: TorclVal) -> Result<Option<Weakness>, TorclError> {
+    let ptr = get_table_inner(table)?;
+    Ok(unsafe { (*ptr).weakness })
 }
 
 /// Get the hash table size (capacity).

@@ -2542,7 +2542,16 @@ impl<'e> Lowerer<'e> {
                 .map(|(n, _)| !is_here_special(&n) && self.captured_names.contains(&n))
                 .unwrap_or(false)
         });
-        if has_boxed {
+        // LET* establishes each binding before the next init runs, so its child
+        // frame must exist first. A parallel LET must NOT push it yet: the init
+        // forms are evaluated in the ENCLOSING scope, and a closure built by one
+        // of them captures the frame that is current at that moment. Pushing the
+        // child first made such a closure capture the very binding this LET was
+        // about to make, so `(let ((f (lambda (x) (funcall f x)))) …)` called
+        // ITSELF — unbounded recursion, and a stack-overflow SIGSEGV while
+        // compiling Serapeum's macro-tools, whose case-macro expander wraps its
+        // own CONT exactly this way (bliss-txzv).
+        if has_boxed && sequential {
             self.has_env = true;
             self.emit(Instr::PushEnvChild);
         }
@@ -2584,6 +2593,12 @@ impl<'e> Lowerer<'e> {
                 let (name, init) = binding_name_init(binding_forms[bi])?;
                 self.lower_expr(init)?; // compiled against the *current* scope
                 names.push(name);
+            }
+            // Only now, with every init evaluated in the enclosing scope, does
+            // this LET's frame come into existence.
+            if has_boxed {
+                self.has_env = true;
+                self.emit(Instr::PushEnvChild);
             }
             self.enter_scope();
             let mut locs = Vec::with_capacity(names.len());

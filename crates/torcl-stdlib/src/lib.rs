@@ -89,7 +89,8 @@ pub use format::{
 pub use hashtable::{
     HashTest, MakeHashTableOptions, Weakness, clrhash, gethash, hash_table_count,
     hash_table_entries, hash_table_p, hash_table_rehash_size, hash_table_rehash_threshold,
-    hash_table_size, hash_table_test, make_hash_table, maphash, remhash, set_gethash, sxhash,
+    hash_table_size, hash_table_test, hash_table_weakness, make_hash_table, maphash, remhash,
+    set_gethash, sxhash,
 };
 pub use packages::PackageRegistry;
 pub use packages::{

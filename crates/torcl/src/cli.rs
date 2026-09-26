@@ -14663,6 +14663,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "CANCEL-FINALIZATION" => Some((1, 1)),
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
+        "HASH-TABLE-WEAKNESS" => Some((1, 1)),
         // Sequence functions with a fixed shape. Calling a standard function
         // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
         // were reaching their bodies and answering a TYPE-ERROR about NIL, or
@@ -19853,6 +19854,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // (make-hash-table &key test size ...) — honor :test, evaluate
                 // and ignore the rest. Backed by the real stdlib hash table.
                 let mut test = torcl_stdlib::HashTest::Eql;
+                let mut weakness: Option<torcl_stdlib::Weakness> = None;
                 torcl_rt::rooted!(c = cdr);
                 while c.is_cons() {
                     let (kw_form, r) = cp(*c);
@@ -19870,6 +19872,29 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     let v = eval_form(*vf, env)?;
                     if kw.is_symbol() {
                         let kn = sym_name(kw);
+                        // :weakness names which half of an entry the table holds
+                        // WEAKLY (R3.13). Trivial-Garbage's :key-or-value needs an
+                        // ephemeron fixpoint TorCL does not have, so it is
+                        // REJECTED rather than silently downgraded to a strong
+                        // table (bliss-10an).
+                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "WEAKNESS" {
+                            if v.is_nil() {
+                                weakness = None;
+                            } else {
+                                let wn = sym_name(v);
+                                let wb = wn.strip_prefix("KEYWORD:").unwrap_or(&wn).to_uppercase();
+                                weakness = match wb.as_str() {
+                                    "KEY" => Some(torcl_stdlib::Weakness::Key),
+                                    "VALUE" => Some(torcl_stdlib::Weakness::Value),
+                                    "KEY-AND-VALUE" => Some(torcl_stdlib::Weakness::KeyAndValue),
+                                    other => {
+                                        return Err(TorclError::ProgramError(format!(
+                                            "MAKE-HASH-TABLE: unsupported :WEAKNESS :{other}; TorCL supports :KEY, :VALUE and :KEY-AND-VALUE"
+                                        )));
+                                    }
+                                };
+                            }
+                        }
                         if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
                             // :test accepts a function DESIGNATOR — the symbol
                             // (eq/eql/equal/equalp) OR the function `#'equal`,
@@ -19889,6 +19914,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 let opts = torcl_stdlib::MakeHashTableOptions {
                     test,
+                    weakness,
                     ..Default::default()
                 };
                 return torcl_stdlib::make_hash_table(&opts);
@@ -23166,6 +23192,27 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     list = arena_cons(TorclVal::from_symbol_index(name), list);
                 }
                 return Ok(list);
+            }
+            "TORCL-EXT:HASH-TABLE-WEAKNESS" => {
+                // Trivial-Garbage's HASH-TABLE-WEAKNESS reads this; the keyword
+                // spelling matches what MAKE-HASH-TABLE's :WEAKNESS accepts.
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:HASH-TABLE-WEAKNESS requires one argument; got {}",
+                        args.len()
+                    )));
+                }
+                let name = match torcl_stdlib::hash_table_weakness(args[0])? {
+                    None => return Ok(NIL),
+                    Some(torcl_stdlib::Weakness::Key) => "KEY",
+                    Some(torcl_stdlib::Weakness::Value) => "VALUE",
+                    Some(torcl_stdlib::Weakness::KeyAndValue) => "KEY-AND-VALUE",
+                };
+                // Keywords are interned under "KEYWORD:NAME" registry keys.
+                return Ok(TorclVal::from_symbol_index(torcl_rt::symbols::intern(
+                    &format!("KEYWORD:{name}"),
+                )));
             }
             "TORCL-EXT:PROCLAIMED-OPTIMIZE" => {
                 let args = eval_args(cdr, env)?;
@@ -35117,6 +35164,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL-EXT::PROCLAIMED-DECLARATIONS"
             | "TORCL-EXT:PROCLAIMED-OPTIMIZE"
             | "TORCL-EXT::PROCLAIMED-OPTIMIZE"
+            | "TORCL-EXT:HASH-TABLE-WEAKNESS"
+            | "TORCL-EXT::HASH-TABLE-WEAKNESS"
             | "TORCL-THREAD:MAKE-THREAD"
             | "TORCL-THREAD::MAKE-THREAD"
             | "TORCL-THREAD:JOIN-THREAD"

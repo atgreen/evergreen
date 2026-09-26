@@ -1801,6 +1801,150 @@ fn macro_expansion_preserves_the_expansion_site_package() {
 }
 
 #[test]
+fn weak_hash_tables_drop_entries_whose_weak_half_dies() {
+    // R3.13: the collector must not keep a weak table's referent alive. Each
+    // table gets its OWN doomed object (another table holding it would keep it
+    // live, legitimately), and one entry whose weak half is reachable from a
+    // global. Every count below matches SBCL for the same program. TorCL rejects
+    // :KEY-OR-VALUE — keeping an entry while EITHER half lives needs an ephemeron
+    // fixpoint it does not have — rather than downgrading to a strong table
+    // (bliss-10an).
+    let dir = temp_dir("weak-hash-tables");
+    let script = dir.join("weak-hash-tables.lisp");
+    write_file(
+        &script,
+        "(defvar *weak-key* (make-hash-table :weakness :key :test 'eq))\n\
+         (defvar *weak-value* (make-hash-table :weakness :value :test 'eq))\n\
+         (defvar *weak-both* (make-hash-table :weakness :key-and-value :test 'eq))\n\
+         (defvar *strong* (make-hash-table :test 'eq))\n\
+         (defvar *kept-key* (vector :kept-key))\n\
+         (defvar *kept-value* (vector :kept-value))\n\
+         (defun seed ()\n\
+           (setf (gethash (vector :dead-key) *weak-key*) :immediate)\n\
+           (setf (gethash :immediate *weak-value*) (vector :dead-value))\n\
+           (setf (gethash (vector :dead-both) *weak-both*) :immediate)\n\
+           (setf (gethash (vector :dead-strong) *strong*) :immediate)\n\
+           (setf (gethash *kept-key* *weak-key*) :immediate)\n\
+           (setf (gethash :immediate-2 *weak-value*) *kept-value*)\n\
+           (setf (gethash *kept-key* *weak-both*) *kept-value*)\n\
+           nil)\n\
+         (defun churn (n)\n\
+           ;; Reuse the slots and nursery the seeding frame left behind, so a\n\
+           ;; doomed object is unreachable in fact and not merely unreferenced.\n\
+           (let ((acc nil))\n\
+             (dotimes (i n) (setf acc (list (vector i) acc)))\n\
+             (length acc)))\n\
+         (defun counts ()\n\
+           (list (hash-table-count *weak-key*)\n\
+                 (hash-table-count *weak-value*)\n\
+                 (hash-table-count *weak-both*)\n\
+                 (hash-table-count *strong*)))\n\
+         (seed)\n\
+         (let ((before (counts)))\n\
+           (churn 200)\n\
+           (torcl-ext:gc :full t)\n\
+           (format t \"WEAK=~S\"\n\
+             (list before\n\
+                   (counts)\n\
+                   ;; The reachable entries keep their values.\n\
+                   (list (gethash *kept-key* *weak-key*)\n\
+                         (gethash :immediate-2 *weak-value*)\n\
+                         (gethash *kept-key* *weak-both*))\n\
+                   (handler-case (progn (make-hash-table :weakness :key-or-value)\n\
+                                        :accepted)\n\
+                     (error () :rejected)))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL weak-hash-table fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains(
+                "WEAK=((2 2 2 1) (1 1 1 1) (:IMMEDIATE #(:KEPT-VALUE) #(:KEPT-VALUE)) :REJECTED)"
+            ),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_parallel_let_init_closure_captures_the_enclosing_binding() {
+    // CLHS 3.1.2.1.1.1: a LET's init forms run in the ENCLOSING scope, so a
+    // closure one of them builds captures the OUTER binding of a name this LET
+    // rebinds. The lowerer pushed the LET's heap frame before the inits, so such
+    // a closure captured the binding being made and called itself — unbounded
+    // recursion (bliss-txzv). Only COMPILE-FILE'd code was affected, so the
+    // fixture compiles the file. LET* keeps the opposite rule: each init sees the
+    // bindings to its left. Values match SBCL.
+    let dir = temp_dir("let-init-closure-capture");
+    let source = dir.join("let-capture.lisp");
+    write_file(
+        &source,
+        "(defun call-with (cont arg) (funcall cont arg))\n\
+         (defun wrap-escaping (cont)\n\
+           (let ((cont (lambda (x) (funcall cont (list :wrapped x)))))\n\
+             (call-with cont :v)))\n\
+         (defun wrap-direct (cont)\n\
+           (let ((cont (lambda (a b) (funcall cont a b))))\n\
+             (funcall cont 1 2)))\n\
+         (defun sequential-sees-the-left (x)\n\
+           ;; LET*, by contrast, must see the binding it just made.\n\
+           (let* ((x (list :first x))\n\
+                  (y (lambda () x)))\n\
+             (funcall y)))\n",
+    );
+    let script = dir.join("run.lisp");
+    write_file(
+        &script,
+        &format!(
+            "(load (compile-file {source:?}))\n\
+             (format t \"LET=~S\"\n\
+               (list (wrap-escaping (lambda (x) (list :outer x)))\n\
+                     (wrap-direct (lambda (a b) (list :outer a b)))\n\
+                     (sequential-sees-the-left :v)))\n",
+            source = source.to_str().expect("utf8 path")
+        ),
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL let-capture fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("LET=((:OUTER (:WRAPPED :V)) (:OUTER 1 2) (:FIRST :V))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn lisp_finalizers_are_deferred_rooted_cancellable_and_run_once() {
     // R3.12/R3.16: user finalizers are retained without keeping their target
     // alive, run outside the collector, and cannot fire twice.  This is also

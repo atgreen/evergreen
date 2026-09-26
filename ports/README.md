@@ -20,6 +20,7 @@ exercises these forks:
 | trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `e55ad7e91aa5aa92408fe082b2e307f8986be080` |
 | usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `5f8ba3596b4be3b3962a26957ff5508d4d02cbcc` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691` |
+| trivial-garbage | https://github.com/atgreen/trivial-garbage | `0bb7ebd89ec5c8245516c5117f4bc598ebd56e84` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
@@ -41,7 +42,15 @@ For an existing ocicl project, run there:
 ocicl install git+https://github.com/atgreen/trivial-features@26e8d168deb7d70d762d0d7e41b2919eba4321aa
 ocicl install git+https://github.com/atgreen/trivial-gray-streams@e55ad7e91aa5aa92408fe082b2e307f8986be080
 ocicl install git+https://github.com/atgreen/trivial-cltl2@116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691
+ocicl install git+https://github.com/atgreen/trivial-garbage@0bb7ebd89ec5c8245516c5117f4bc598ebd56e84
 ```
+
+The trivial-garbage fork uses TorCL's deferred Lisp finalizers and its native
+weak hash tables (`:key`, `:value`, `:key-and-value`, reported through
+`TORCL-EXT:HASH-TABLE-WEAKNESS`). Its upstream suite passes 9 of 11 tests on
+TorCL with no unexpected failures; weak POINTERS and `:key-or-value` tables are
+reported missing rather than substituted with strong references — the latter
+needs an ephemeron fixpoint the collector does not have.
 
 Restart TorCL after switching implementations of a protocol library. The fork
 source directories differ from registry directories, so ASDF uses distinct cache
