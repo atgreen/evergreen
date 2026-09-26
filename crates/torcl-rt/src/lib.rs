@@ -80,7 +80,7 @@ pub use sandbox::{Sandbox, SandboxPolicy};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerGroup, run_fibers};
 pub use stack::{
     CodeInfo, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry, StackMapEntry,
-    TorclStack, eval_stack_budget, visit_stack_refs,
+    TorclStack, eval_stack_budget, host_stack_budget_exhausted, visit_stack_refs,
 };
 pub use sync::{
     IoInterest, PinnedBlockingAction, TorclCondVar, TorclMutex, TorclSemaphore, fiber_sleep,

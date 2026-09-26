@@ -34811,11 +34811,73 @@ fn apply_numeric_op(name: &str, args: &[TorclVal]) -> Option<Result<TorclVal, To
     })
 }
 
+/// Optional explicit cap on how deeply one Lisp call may nest inside another,
+/// for tests and diagnosis. The default bound is the HOST STACK BUDGET checked
+/// alongside it (see `CallDepthGuard::enter`); `TORCL_MAX_CALL_DEPTH=N` adds a
+/// deterministic limit that does not depend on how much stack a frame happens to
+/// use.
+fn max_call_depth() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("TORCL_MAX_CALL_DEPTH")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+thread_local! {
+    static CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bounds one Lisp call nesting inside another for its lifetime.
+///
+/// Every call that consumes HOST (Rust) stack passes through `apply_function` —
+/// a tree-walked call, and compiled code calling out and back in — and nothing
+/// bounded that nesting: a runaway recursion through FUNCALL exhausted the host
+/// stack and killed the process with SIGSEGV, naming no form. Raising
+/// STORAGE-CONDITION instead is what R2.20 requires, and it is also what lets a
+/// legitimately deep library recover through its own handler — Serapeum's type
+/// walkers do, and could not be loaded at all before this (bliss-3zvm).
+struct CallDepthGuard;
+
+impl CallDepthGuard {
+    fn enter() -> Result<Self, TorclError> {
+        if torcl_rt::host_stack_budget_exhausted() {
+            return Err(TorclError::StackOverflow(
+                torcl_rt::current_fiber_id()
+                    .unwrap_or_else(|| torcl_rt::FiberId(torcl_rt::current_thread_id().0)),
+            ));
+        }
+        let limit = max_call_depth();
+        if limit != 0 {
+            let depth = CALL_DEPTH.with(|d| d.get()) + 1;
+            if depth > limit {
+                return Err(TorclError::StackOverflow(
+                    torcl_rt::current_fiber_id()
+                        .unwrap_or_else(|| torcl_rt::FiberId(torcl_rt::current_thread_id().0)),
+                ));
+            }
+            CALL_DEPTH.with(|d| d.set(depth));
+        }
+        Ok(CallDepthGuard)
+    }
+}
+
+impl Drop for CallDepthGuard {
+    fn drop(&mut self) {
+        if max_call_depth() != 0 {
+            CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+}
+
 fn apply_function(
     mut fn_val: TorclVal,
     args: &[TorclVal],
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
+    let _call_depth = CallDepthGuard::enter()?;
     torcl_rt::rooted_ref!(_fn_val_root = &mut fn_val);
     rooted_args!(args = args);
     // Function could be a lambda form, a symbol naming a function, or a closure

@@ -2082,6 +2082,40 @@ fn a_definers_lambda_list_shadows_an_enclosing_symbol_macro() {
 }
 
 #[test]
+fn runaway_recursion_signals_storage_condition_instead_of_crashing() {
+    // R2.20: exhausting a stack must raise STORAGE-CONDITION, not a
+    // process-killing signal. The TorclStack has a guard page, but nothing
+    // bounded the HOST (Rust) frames a nest of calls consumes, so a runaway
+    // recursion through FUNCALL killed the process — and a legitimately deep
+    // library that recovers from STORAGE-CONDITION through its own handler
+    // (Serapeum's type walkers) could not be loaded at all (bliss-3zvm).
+    //
+    // Both shapes are checked: a direct self-call, which recurses inside the
+    // bytecode loop, and one through FUNCALL, which leaves and re-enters the
+    // runtime on every level.
+    // `--eval` echoes the form's value as well, so compare the printed line.
+    let printed = eval_ok(
+        "(progn
+               (defun runaway-direct (n) (runaway-direct (+ n 1)))
+               (defun runaway-funcall (n) (funcall #'runaway-funcall (+ n 1)))
+               (flet ((probe (thunk)
+                        (handler-case (funcall thunk)
+                          (storage-condition () :storage-condition)
+                          (error (e) (list :other (type-of e))))))
+                 (prin1
+                   (list (probe (lambda () (runaway-direct 0)))
+                         (probe (lambda () (runaway-funcall 0)))
+                         ;; …and a modest recursion still returns its answer.
+                         (labels ((sum-to (n) (if (zerop n) 0 (+ n (sum-to (- n 1))))))
+                           (sum-to 100))))))",
+    );
+    assert_eq!(
+        printed.lines().next().unwrap_or_default(),
+        "(:STORAGE-CONDITION :STORAGE-CONDITION 5050)"
+    );
+}
+
+#[test]
 fn lisp_finalizers_are_deferred_rooted_cancellable_and_run_once() {
     // R3.12/R3.16: user finalizers are retained without keeping their target
     // alive, run outside the collector, and cannot fire twice.  This is also

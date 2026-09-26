@@ -305,6 +305,43 @@ pub fn eval_stack_budget() -> usize {
     DEFAULT
 }
 
+thread_local! {
+    /// The shallowest host-stack frame address this thread has probed. The stack
+    /// grows down, so the distance from it to the current frame is how much host
+    /// stack the thread is using.
+    static HOST_STACK_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// True when this thread has used its whole [`eval_stack_budget`] of HOST (Rust)
+/// stack, so the caller must raise `STORAGE-CONDITION` instead of recursing into
+/// the guard page (R2.20).
+///
+/// The budget leaves a red zone below the OS limit, and this is polled at call
+/// boundaries where at most one call's frames (kilobytes) can be consumed
+/// between polls — so there is always room left to unwind and run a handler.
+///
+/// Unlike the `TorclStack` guard page, which bounds CL frames, nothing bounded
+/// the Rust frames a nest of `apply_function` calls consumes: a runaway Lisp
+/// recursion through FUNCALL killed the process with SIGSEGV, and a legitimately
+/// deep one (Serapeum's type walkers, whose own handlers recover from
+/// STORAGE-CONDITION) could not load at all (bliss-3zvm).
+#[inline]
+pub fn host_stack_budget_exhausted() -> bool {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let local = 0usize;
+    let probe = std::hint::black_box(&local) as *const usize as usize;
+    HOST_STACK_BASE.with(|base| {
+        let recorded = base.get();
+        // A shallower frame than any seen before establishes the reference point:
+        // the first poll on the thread, or a later one from further out.
+        if probe > recorded {
+            base.set(probe);
+            return false;
+        }
+        recorded - probe > *BUDGET.get_or_init(eval_stack_budget)
+    })
+}
+
 /// Round `n` up to the next multiple of `align` (a power of two).
 #[inline]
 fn align_up(n: usize, align: usize) -> usize {
