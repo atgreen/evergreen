@@ -5255,7 +5255,7 @@ impl<'e> Lowerer<'e> {
     /// Lower `(destructuring-bind pattern expr body...)` by expanding it into a
     /// portable `let*` that binds the pattern from a fresh temporary via
     /// `nth`/`nthcdr`. This keeps the form source-free without a dedicated
-    /// runtime binder. Supports required, `&optional` (with defaults),
+    /// runtime binder. Supports required, `&optional` (with defaults and supplied-p),
     /// `&rest`/`&body`, dotted patterns, and nested sub-patterns (recursively);
     /// `&key`, `&aux`, `&whole`, and `&environment` bail so the tree-walker's
     /// full binder handles them.
@@ -6722,22 +6722,24 @@ fn body_uses_return_from(body: TorclVal) -> bool {
 
 /// Append `let*` bindings that destructure `pattern` against the value held in
 /// the symbol `source`, using `nth`/`nthcdr`. Handles required, `&optional`
-/// (with defaults), `&rest`/`&body`, a dotted tail, and nested list
+/// (with defaults and supplied-p), `&rest`/`&body`, a dotted tail, and nested list
 /// sub-patterns (recursively, each through a fresh temporary). `&key`, `&aux`,
 /// `&whole`, and `&environment` bail. Positions are indexed from `source`, so
-/// the emitted bindings are order-independent and safe in a `let*`.
+/// optional defaults and supplied-p bindings retain their lambda-list order.
 fn destructure_pattern(
     pattern: TorclVal,
     source: TorclVal,
     bindings: &mut Vec<TorclVal>,
 ) -> LowerResult<()> {
+    // Source cursors and generated forms survive allocating expansion steps.
+    // The caller roots the binding vector, including during nested recursion.
+    torcl_rt::rooted!(cur = pattern);
     let nth_sym = resolve_sym("NTH").ok_or(Bail)?;
     let nthcdr_sym = resolve_sym("NTHCDR").ok_or(Bail)?;
     let if_sym = resolve_sym("IF").ok_or(Bail)?;
     let nth_at = |i: i64| form_list(&[nth_sym, TorclVal::from_fixnum(i), source]);
     let nthcdr_at = |i: i64| form_list(&[nthcdr_sym, TorclVal::from_fixnum(i), source]);
 
-    let mut cur = pattern;
     let mut index: i64 = 0;
     // 0 = required, 1 = &optional, 2 = &rest/&body
     let mut mode = 0u8;
@@ -6748,23 +6750,24 @@ fn destructure_pattern(
         }
         if cur.is_symbol() {
             // A dotted tail binds the remaining cdr (e.g. `(a . rest)`).
-            bindings.push(form_list(&[cur, nthcdr_at(index)]));
+            let tail = nthcdr_at(index);
+            bindings.push(form_list(&[*cur, tail]));
             break;
         }
         if !cur.is_cons() {
             return Err(Bail);
         }
-        let (elem, next) = cp(cur);
+        let (elem, next) = cp(*cur);
+        *cur = next;
+        torcl_rt::rooted!(elem = elem);
         if elem.is_symbol() {
-            match sym_name(elem).as_str() {
+            match sym_name(*elem).as_str() {
                 "&OPTIONAL" => {
                     mode = 1;
-                    cur = next;
                     continue;
                 }
                 "&REST" | "&BODY" => {
                     mode = 2;
-                    cur = next;
                     continue;
                 }
                 "&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT" => return Err(Bail),
@@ -6774,44 +6777,74 @@ fn destructure_pattern(
         match mode {
             0 => {
                 if elem.is_symbol() {
-                    bindings.push(form_list(&[elem, nth_at(index)]));
+                    let value = nth_at(index);
+                    bindings.push(form_list(&[*elem, value]));
                 } else if elem.is_cons() {
                     // Nested sub-pattern: bind a fresh temporary to this position,
                     // then destructure the sub-pattern against it.
                     let temp_name = next_control_token("__DBIND__").replace(':', "_");
                     let temp = resolve_sym(&temp_name).ok_or(Bail)?;
                     bindings.push(form_list(&[temp, nth_at(index)]));
-                    destructure_pattern(elem, temp, bindings)?;
+                    destructure_pattern(*elem, temp, bindings)?;
                 } else {
                     return Err(Bail);
                 }
                 index += 1;
             }
             1 => {
-                let (var, default) = if elem.is_symbol() {
-                    (elem, NIL)
+                let (var, default, supplied) = if elem.is_symbol() {
+                    (*elem, NIL, NIL)
                 } else if elem.is_cons() {
-                    let (v, drest) = cp(elem);
+                    let (v, drest) = cp(*elem);
                     if !v.is_symbol() {
                         return Err(Bail);
                     }
-                    (v, if drest.is_cons() { cp(drest).0 } else { NIL })
+                    let (default, supplied_rest) = if drest.is_cons() {
+                        cp(drest)
+                    } else {
+                        (NIL, NIL)
+                    };
+                    let supplied = if supplied_rest.is_cons() {
+                        cp(supplied_rest).0
+                    } else {
+                        NIL
+                    };
+                    if !supplied.is_nil() && !supplied.is_symbol() {
+                        return Err(Bail);
+                    }
+                    (v, default, supplied)
                 } else {
                     return Err(Bail);
                 };
-                let guarded = form_list(&[if_sym, nthcdr_at(index), nth_at(index), default]);
-                bindings.push(form_list(&[var, guarded]));
+                torcl_rt::rooted!(parts = [var, default, supplied]);
+                torcl_rt::rooted!(presence = nthcdr_at(index));
+                // Determine presence BEFORE the default can run, but bind the
+                // user's supplied-p variable AFTER its value/default binding.
+                // The default may refer to an outer variable with that name.
+                if !parts[2].is_nil() {
+                    let name = next_control_token("__DBIND_PRESENT__").replace(':', "_");
+                    let present = resolve_sym(&name).ok_or(Bail)?;
+                    let boolean = form_list(&[if_sym, *presence, T, NIL]);
+                    bindings.push(form_list(&[present, boolean]));
+                    *presence = present;
+                }
+                torcl_rt::rooted!(value = nth_at(index));
+                let guarded = form_list(&[if_sym, *presence, *value, parts[1]]);
+                bindings.push(form_list(&[parts[0], guarded]));
+                if !parts[2].is_nil() {
+                    bindings.push(form_list(&[parts[2], *presence]));
+                }
                 index += 1;
             }
             _ => {
                 if rest_bound || !elem.is_symbol() {
                     return Err(Bail);
                 }
-                bindings.push(form_list(&[elem, nthcdr_at(index)]));
+                let tail = nthcdr_at(index);
+                bindings.push(form_list(&[*elem, tail]));
                 rest_bound = true;
             }
         }
-        cur = next;
     }
     Ok(())
 }
