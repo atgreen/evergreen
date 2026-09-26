@@ -1159,6 +1159,7 @@ unsafe fn trace_object(
         //    bodies are raw bits and must never be scanned for pointers. ──
         tid::BIGNUM
         | tid::DOUBLE_FLOAT
+        | tid::FOREIGN_POINTER
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
@@ -5642,7 +5643,11 @@ pub fn serialize_heap_objects() -> Vec<u8> {
         // re-creates the standard ones.
         // Mutexes also own process-local native state. Preserve the Lisp handle
         // but restore it as unavailable, never as a dangling native pointer.
-        if matches!(
+        if type_id == crate::object::type_id::FOREIGN_POINTER {
+            // Neither native addresses nor allocation identities survive an
+            // image restart. Preserve the handle as an ordinary null pointer.
+            out.resize(out.len() + size, 0);
+        } else if matches!(
             type_id,
             crate::object::type_id::STREAM
                 | crate::object::type_id::MUTEX

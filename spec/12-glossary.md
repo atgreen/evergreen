@@ -313,7 +313,7 @@ requirements that satisfy it.
 
 | Requirement | Summary |
 |-------------|---------|
-| R2.11–R2.14 | Platform C ABI; libffi for variadic/struct calls |
+| R2.11–R2.14 | Platform C ABI; TorCL-generated foreign-call and callback adapters |
 | R7.05–R7.06 | Standalone executable; libtorcl.so with stable C-ABI |
 | R7.14 | Shared library follows semantic versioning |
 | R8.03–R8.05 | Unsafe code confined; no raw pointers to CL code |

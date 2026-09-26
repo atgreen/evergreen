@@ -195,6 +195,8 @@ pub mod type_id {
     pub const MUTEX: u8 = 0x19;
     /// Opaque condition-variable handle: one untraced process-local Arc.
     pub const CONDITION_VARIABLE: u8 = 0x1A;
+    /// Foreign address and allocation identity: two untraced native words.
+    pub const FOREIGN_POINTER: u8 = 0x1B;
 }
 
 // ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────

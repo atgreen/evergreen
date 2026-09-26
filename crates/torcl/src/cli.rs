@@ -621,6 +621,7 @@ fn seed_standard_packages_registry() {
     let _ = torcl_stdlib::make_package("KEYWORD", &[], &[]);
     let _ = torcl_stdlib::make_package("TORCL-INTERNAL", &[], &[]);
     let _ = torcl_stdlib::make_package("TORCL-EXT", &[], &["COMMON-LISP"]);
+    let _ = torcl_stdlib::make_package("TORCL-FFI", &[], &["COMMON-LISP"]);
     // Native-thread API package (§13.9). TORCL-THREADS is the deprecated
     // compatibility nickname (spec §13.9.1). Fibers get a separate TORCL-FIBER
     // package (bliss-l3wy).
@@ -634,6 +635,7 @@ fn seed_standard_packages_registry() {
         "KEYWORD",
         "TORCL-INTERNAL",
         "TORCL-EXT",
+        "TORCL-FFI",
         "TORCL-THREAD",
         "TORCL-CLTL2",
     ] {
@@ -4279,6 +4281,10 @@ fn torcl_error_to_condition(
             torcl_stdlib::acquire_preallocated_storage_condition()?
         }
         TorclError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
+        TorclError::FfiError(msg) => {
+            torcl_rt::rooted!(message = arena_str(msg));
+            make_simple_condition("TORCL-FFI::FFI-ERROR", *message, &[], env)?
+        }
         TorclError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
         TorclError::ControlError(_) => build_condition_instance(env, "CONTROL-ERROR", &[])?,
         // A genuine internal error (a builtin's arg-count/validation failure, an
@@ -11285,30 +11291,9 @@ fn string_designator_name(v: TorclVal) -> String {
 
 /// Map an alien-type designator keyword (e.g. `:int`, `:pointer`, `:double`) to
 /// a [`torcl_rt::ffi::AlienType`], for the `%ffi-call` primitive. Integer widths
-/// follow the LP64 C ABI. `:string`/`:pointer` marshal as a raw address.
+/// follow the platform C ABI. `:string`/`:pointer` marshal as a raw address.
 fn alien_type_from_keyword(kw: TorclVal) -> Result<torcl_rt::ffi::AlienType, TorclError> {
-    use torcl_rt::ffi::AlienType;
-    let int = |signed, bits| AlienType::Int { signed, bits };
-    let name = sym_bare_name_rc(kw);
-    Ok(match name.as_ref() {
-        "VOID" => AlienType::Void,
-        "CHAR" | "INT8" | "SIGNED-CHAR" => int(true, 8),
-        "UCHAR" | "UINT8" | "UNSIGNED-CHAR" => int(false, 8),
-        "SHORT" | "INT16" => int(true, 16),
-        "USHORT" | "UINT16" | "UNSIGNED-SHORT" => int(false, 16),
-        "INT" | "INT32" => int(true, 32),
-        "UINT" | "UINT32" | "UNSIGNED-INT" => int(false, 32),
-        "LONG" | "LONG-LONG" | "INT64" => int(true, 64),
-        "ULONG" | "UINT64" | "UNSIGNED-LONG" | "SIZE-T" => int(false, 64),
-        "FLOAT" => AlienType::Float,
-        "DOUBLE" => AlienType::Double,
-        "POINTER" | "STRING" => AlienType::Pointer(Box::new(AlienType::Void)),
-        other => {
-            return Err(TorclError::Internal(format!(
-                "%ffi-call: unknown alien type :{other}"
-            )));
-        }
-    })
+    torcl_stdlib::ffi::alien_type(kw)
 }
 
 /// True if `kw` is the `:string` alien-type keyword. `%ffi-call` handles it
@@ -16225,6 +16210,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 env.clear_mv();
                 return torcl_stdlib::synchronization::call(&args);
             }
+            "TORCL::%FOREIGN-MEMORY" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::memory_call(&args);
+            }
             "TORCL::%NATIVE-CONDITION" => {
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
@@ -16427,6 +16420,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(TorclVal::from_fixnum(std::process::id() as i64));
             }
             "TORCL::%LOAD-FOREIGN-LIBRARY" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
                 // (%load-foreign-library path) → opaque handle (fixnum).
                 // Loads an arbitrary shared library at runtime (via elf_loader,
                 // no dlopen), resolving its imports against the host and running
@@ -16442,6 +16438,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(TorclVal::from_fixnum(handle as usize as i64));
             }
             "TORCL::%FOREIGN-SYMBOL" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
                 // (%foreign-symbol handle name) → function/data address (fixnum).
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 || !args[0].is_fixnum() {
@@ -16457,17 +16456,31 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(TorclVal::from_fixnum(sym as usize as i64));
             }
             "TORCL::%FFI-CALL" => {
-                // (%ffi-call fn-ptr ret-type arg-types args) → result
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                // (%ffi-call fn-ptr ret-type arg-types args &optional fixed-count) → result
                 //   fn-ptr    : address from %foreign-symbol (fixnum)
                 //   ret-type  : an alien-type keyword (see alien_type_from_keyword)
                 //   arg-types : list of alien-type keywords
                 //   args      : list of Lisp values (fixnums/floats/pointers)
                 let args = eval_args(cdr, env)?;
-                if args.len() < 4 || !args[0].is_fixnum() {
+                if !(4..=5).contains(&args.len()) || !args[0].is_fixnum() {
                     return Err(TorclError::Internal(
-                        "%ffi-call requires (fn-ptr ret-type arg-types args)".into(),
+                        "%ffi-call requires (fn-ptr ret-type arg-types args &optional fixed-count)"
+                            .into(),
                     ));
                 }
+                let fixed_count = if args.len() == 5 {
+                    if !args[4].is_fixnum() || args[4].as_fixnum() < 0 {
+                        return Err(TorclError::FfiError(
+                            "%ffi-call: fixed-count must be a nonnegative fixnum".into(),
+                        ));
+                    }
+                    Some(args[4].as_fixnum() as usize)
+                } else {
+                    None
+                };
                 let fn_ptr = args[0].as_fixnum() as usize as *const ();
                 let ret_is_string = is_string_alien_kw(args[1]);
                 let ret_type = alien_type_from_keyword(args[1])?;
@@ -16509,8 +16522,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 // SAFETY: the caller asserts fn-ptr and the type signature match
                 // the real foreign function (the usual C-ABI FFI contract).
-                let raw =
-                    unsafe { torcl_rt::ffi::ffi_call(fn_ptr, &ret_type, &arg_types, &raw_args)? };
+                let raw = unsafe {
+                    match fixed_count {
+                        Some(count) => torcl_rt::ffi::ffi_call_variadic(
+                            fn_ptr, &ret_type, &arg_types, &raw_args, count,
+                        )?,
+                        None => torcl_rt::ffi::ffi_call(fn_ptr, &ret_type, &arg_types, &raw_args)?,
+                    }
+                };
                 // `string_bufs` has outlived the call; drop it now.
                 drop(string_bufs);
                 if ret_is_string {
@@ -35608,6 +35627,7 @@ fn is_builtin_function(name: &str) -> bool {
         // Introspection / devtools
         "DISASSEMBLE"
             | "TORCL::%NATIVE-MUTEX"
+            | "TORCL::%FOREIGN-MEMORY"
             | "TORCL::%NATIVE-CONDITION"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
@@ -36370,6 +36390,12 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
             Ok(proclaimed_optimize_list())
         }
         "TORCL::%NATIVE-MUTEX" => torcl_stdlib::synchronization::call(args),
+        "TORCL::%FOREIGN-MEMORY" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::memory_call(args)
+        }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).

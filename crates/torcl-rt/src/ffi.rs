@@ -2,9 +2,19 @@
 //!
 //! See §2.7 of the spec.
 
+use crate::bignum::{BigInt, bigint_from_val};
 use crate::error::TorclError;
 use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 use crate::value::TorclVal;
+
+pub mod memory;
+
+#[cfg(all(target_arch = "x86_64", unix))]
+mod call;
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+mod legacy;
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub use legacy::{ffi_call, ffi_call_variadic};
 
 // ── Alien type system ──────────────────────────────────────────────
 
@@ -108,11 +118,86 @@ impl AlienType {
 ///
 /// # Safety
 /// `fn_ptr` must point to a valid function with the given signature.
+#[cfg(all(target_arch = "x86_64", unix))]
 pub unsafe fn ffi_call(
     fn_ptr: *const (),
     ret_type: &AlienType,
     arg_types: &[AlienType],
     args: &[u64],
+) -> Result<u64, TorclError> {
+    // SAFETY: forwarded caller contract; this is a non-variadic signature.
+    unsafe { ffi_call_impl(fn_ptr, ret_type, arg_types, args, None) }
+}
+
+/// Call a variadic C function. `fixed_count` is the number of named parameters.
+/// Types and raw slots describe values *before* C default argument promotions:
+/// trailing float arguments become doubles and 8/16-bit integers become ints.
+/// Named parameters retain their declared types.
+///
+/// # Safety
+/// `fn_ptr` must have the named parameter and return types supplied here, and
+/// the callee must consume the trailing arguments using their promoted types.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub unsafe fn ffi_call_variadic(
+    fn_ptr: *const (),
+    ret_type: &AlienType,
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: usize,
+) -> Result<u64, TorclError> {
+    if fixed_count > arg_types.len() || arg_types.len() != args.len() {
+        return Err(TorclError::FfiError(
+            "invalid variadic argument counts".into(),
+        ));
+    }
+    let mut promoted_types = arg_types.to_vec();
+    let mut promoted_args = args.to_vec();
+    for index in fixed_count..arg_types.len() {
+        match &arg_types[index] {
+            AlienType::Float => {
+                promoted_types[index] = AlienType::Double;
+                promoted_args[index] = (f32::from_bits(args[index] as u32) as f64).to_bits();
+            }
+            AlienType::Int {
+                bits: bits @ (8 | 16),
+                signed,
+            } => {
+                let shift = 64 - bits;
+                promoted_args[index] = if *signed {
+                    (((args[index] << shift) as i64) >> shift) as u32 as u64
+                } else {
+                    args[index] & ((1u64 << bits) - 1)
+                };
+                // On SysV AMD64, C int represents every char/short value,
+                // including unsigned char and unsigned short.
+                promoted_types[index] = AlienType::Int {
+                    bits: 32,
+                    signed: true,
+                };
+            }
+            _ => {}
+        }
+    }
+    // SAFETY: argument slots now match the promoted signature; other aspects
+    // of the foreign target's contract remain the caller's responsibility.
+    unsafe {
+        ffi_call_impl(
+            fn_ptr,
+            ret_type,
+            &promoted_types,
+            &promoted_args,
+            Some(fixed_count),
+        )
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe fn ffi_call_impl(
+    fn_ptr: *const (),
+    ret_type: &AlienType,
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: Option<usize>,
 ) -> Result<u64, TorclError> {
     enum NativeStateGuard {
         Fiber(&'static crate::thread::Fiber, FiberState),
@@ -131,6 +216,14 @@ pub unsafe fn ffi_call(
     if fn_ptr.is_null() {
         return Err(TorclError::FfiError("null function pointer".into()));
     }
+    if arg_types.len() != args.len() {
+        return Err(TorclError::FfiError(
+            "foreign argument count does not match signature".into(),
+        ));
+    }
+    // Compile/cache before publishing Native state. The adapter's Arc remains
+    // live across foreign execution; no cache lock is held during callbacks.
+    let adapter = call::CallAdapter::get(ret_type, arg_types, fixed_count)?;
 
     current_stack().publish_top();
     let _state_guard = if let Some(fiber) = current_fiber() {
@@ -144,174 +237,53 @@ pub unsafe fn ffi_call(
         guard
     };
 
-    // Issue #7: Check if the return type or any argument type involves 32-bit int
-    // and dispatch appropriately. For the bootstrap, we handle the common cases
-    // of all-u64 and 32-bit int signatures.
-    let is_ret_i32 = matches!(ret_type, AlienType::Int { bits: 32, .. });
-    let all_args_i32 = !arg_types.is_empty()
-        && arg_types
-            .iter()
-            .all(|t| matches!(t, AlienType::Int { bits: 32, .. }));
-
-    // Issue #6: Extended to support up to 8 arguments.
-    // Issue #7: Type-aware dispatch for i32 signatures.
-    if is_ret_i32 && all_args_i32 {
-        // All-i32 fast path
-        match args.len() {
-            0 => {
-                let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f() as u32 as u64)
-            }
-            1 => {
-                let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32) as u32 as u64)
-            }
-            2 => {
-                let f: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32) as u32 as u64)
-            }
-            3 => {
-                let f: extern "C" fn(i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32) as u32 as u64)
-            }
-            4 => {
-                let f: extern "C" fn(i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                ) as u32 as u64)
-            }
-            5 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                ) as u32 as u64)
-            }
-            6 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                    args[5] as i32,
-                ) as u32 as u64)
-            }
-            7 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                    args[5] as i32,
-                    args[6] as i32,
-                ) as u32 as u64)
-            }
-            8 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                    args[5] as i32,
-                    args[6] as i32,
-                    args[7] as i32,
-                ) as u32 as u64)
-            }
-            _ => Err(TorclError::FfiError(format!(
-                "ffi_call: unsupported argument count {} (max 8)",
-                args.len()
-            ))),
-        }
-    } else {
-        // Generic u64 path (works for pointers, 64-bit ints, etc.)
-        match args.len() {
-            0 => {
-                let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f())
-            }
-            1 => {
-                let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0]))
-            }
-            2 => {
-                let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1]))
-            }
-            3 => {
-                let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2]))
-            }
-            4 => {
-                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3]))
-            }
-            5 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3], args[4]))
-            }
-            6 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
-            }
-            7 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-                ))
-            }
-            8 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
-                ))
-            }
-            _ => Err(TorclError::FfiError(format!(
-                "ffi_call: unsupported argument count {} (max 8)",
-                args.len()
-            ))),
-        }
-    }
+    // SAFETY: the caller supplies a matching C signature; count and supported
+    // types were checked above, and the adapter stays alive through the call.
+    Ok(unsafe { adapter.invoke(fn_ptr, args) })
 }
 
 // ── Marshalling ────────────────────────────────────────────────────
+
+fn integer_mask(bits: u8) -> Result<u64, TorclError> {
+    match bits {
+        8 | 16 | 32 => Ok((1u64 << bits) - 1),
+        64 => Ok(u64::MAX),
+        _ => Err(TorclError::FfiError(format!(
+            "unsupported foreign integer width: {bits}"
+        ))),
+    }
+}
+
+fn marshal_integer(value: TorclVal, signed: bool, bits: u8) -> Result<u64, TorclError> {
+    let mask = integer_mask(bits)?;
+    // Copy the magnitude into Rust storage. This does not allocate on the Lisp
+    // heap, and no raw pointer into a bignum survives an allocation.
+    let integer = bigint_from_val(value)
+        .ok_or_else(|| TorclError::FfiError("foreign integer argument is not an integer".into()))?;
+    let magnitude = integer.mag.first().copied().unwrap_or(0);
+    let limit = if signed {
+        (1u64 << (bits - 1)) - u64::from(integer.sign >= 0)
+    } else {
+        mask
+    };
+    if integer.mag.len() > 1 || magnitude > limit || (!signed && integer.sign < 0) {
+        return Err(TorclError::FfiError(format!(
+            "integer argument is outside the {} {bits}-bit range",
+            if signed { "signed" } else { "unsigned" },
+        )));
+    }
+    Ok(if integer.sign < 0 {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    })
+}
 
 /// Marshal a TorclVal into a C value for passing to a foreign function.
 pub fn marshal_to_c(value: TorclVal, alien_type: &AlienType) -> Result<u64, TorclError> {
     match alien_type {
         AlienType::Void => Ok(0),
-        AlienType::Int { .. } => {
-            if value.is_fixnum() {
-                Ok(value.as_fixnum() as u64)
-            } else if value.is_nil() {
-                Ok(0)
-            } else {
-                Err(TorclError::FfiError(
-                    "cannot marshal non-fixnum to integer".into(),
-                ))
-            }
-        }
+        AlienType::Int { signed, bits } => marshal_integer(value, *signed, *bits),
         AlienType::Float => {
             if value.is_single_float() {
                 Ok(value.as_single_float().to_bits() as u64)
@@ -322,7 +294,9 @@ pub fn marshal_to_c(value: TorclVal, alien_type: &AlienType) -> Result<u64, Torc
             }
         }
         AlienType::Double => {
-            if value.is_single_float() {
+            if value.is_double_float() {
+                Ok(value.as_double_float().to_bits())
+            } else if value.is_single_float() {
                 Ok(f64::to_bits(value.as_single_float() as f64))
             } else if value.is_fixnum() {
                 Ok(f64::to_bits(value.as_fixnum() as f64))
@@ -332,9 +306,11 @@ pub fn marshal_to_c(value: TorclVal, alien_type: &AlienType) -> Result<u64, Torc
                 ))
             }
         }
-        AlienType::Pointer(_) => {
+        AlienType::Pointer(_) | AlienType::FnPtr { .. } => {
             if value.is_nil() {
                 Ok(0)
+            } else if memory::ForeignPointer::is_pointer(value) {
+                Ok(memory::ForeignPointer::from_lisp(value)?.call_address()? as u64)
             } else if value.is_fixnum() {
                 Ok(value.as_fixnum() as u64)
             } else {
@@ -355,45 +331,22 @@ pub fn unmarshal_from_c(raw: u64, alien_type: &AlienType) -> Result<TorclVal, To
     match alien_type {
         AlienType::Void => Ok(crate::value::NIL),
         AlienType::Int { signed, bits } => {
-            // Sign-extend if signed
-            let val = if *signed {
-                match bits {
-                    8 => (raw as i8) as i64,
-                    16 => (raw as i16) as i64,
-                    32 => (raw as i32) as i64,
-                    64 => raw as i64,
-                    _ => raw as i64,
-                }
+            let raw = raw & integer_mask(*bits)?;
+            let integer = if *signed {
+                let shift = 64 - bits;
+                BigInt::from_i64(((raw << shift) as i64) >> shift)
             } else {
-                raw as i64
+                BigInt::from_mag(1, vec![raw])
             };
-            Ok(TorclVal::from_fixnum(val))
+            Ok(integer.to_val())
         }
         AlienType::Float => {
             let f = f32::from_bits(raw as u32);
             Ok(TorclVal::from_single_float(f))
         }
-        AlienType::Double => {
-            // Issue #8: Double doesn't fit in single_float. To avoid losing
-            // the fractional part, check if the value fits without loss as an
-            // integer; otherwise, downcast to f32 single-float (lossy but
-            // preserves non-integer values for the bootstrap runtime).
-            // A full implementation would use a heap-allocated double-float.
-            let d = f64::from_bits(raw);
-            if d.fract() == 0.0 && d >= i64::MIN as f64 && d <= i64::MAX as f64 {
-                Ok(TorclVal::from_fixnum(d as i64))
-            } else {
-                // Store as single_float — lossy for large doubles, but preserves
-                // fractional part for typical values.
-                Ok(TorclVal::from_single_float(d as f32))
-            }
-        }
-        AlienType::Pointer(_) => {
-            if raw == 0 {
-                Ok(crate::value::NIL)
-            } else {
-                Ok(TorclVal::from_fixnum(raw as i64))
-            }
+        AlienType::Double => Ok(crate::gc::alloc_double_float(f64::from_bits(raw))),
+        AlienType::Pointer(_) | AlienType::FnPtr { .. } => {
+            memory::ForeignPointer::from_address(raw as usize).into_lisp()
         }
         _ => Err(TorclError::FfiError(format!(
             "unmarshal_from_c: unsupported alien type {:?}",
