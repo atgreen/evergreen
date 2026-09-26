@@ -16,8 +16,8 @@ strategy that validates all of the above.
 | R8.01 | TorCL MUST provide a *restricted evaluation mode* (sandbox) that disables file I/O, network access, FFI calls, and OS process spawning. | MUST |
 | R8.02 | Sandbox capability grants MUST be whitelist-based; the default set MUST be empty (deny-all). | MUST |
 | R8.03 | All `unsafe` Rust blocks in the runtime MUST be confined to `crates/torcl-rt/src/ffi.rs`, `crates/torcl-rt/src/gc/*.rs`, and `crates/torcl-rt/src/signal.rs`; each block MUST be documented with a `// SAFETY:` comment. | MUST |
-| R8.04 | FFI pointer arguments MUST be validated (non-null, alignment, bounds) before dereference. | MUST |
-| R8.05 | No raw pointer value MUST ever be directly accessible to user CL code. | MUST |
+| R8.04 | Foreign-memory operations MUST reject null addresses, address overflow, and out-of-bounds or freed owned allocations. Typed access MUST honor alignment or use unaligned operations. Borrowed pointers MUST have an explicit caller-owned validity contract. | MUST |
+| R8.05 | Foreign pointers MUST use a distinct Lisp representation, never reinterpret a Lisp object as a C address, and remain unavailable in sandboxed execution. Explicit integer address construction and inspection MAY be provided for CFFI compatibility. | MUST |
 | R8.06 | The runtime MUST enforce a configurable maximum heap size hard cap; allocation beyond the cap MUST signal a `STORAGE-CONDITION`. | MUST |
 | R8.07 | The runtime MUST enforce a configurable stack-depth limit; exceeding it MUST signal a `TORCL-EXT:STACK-OVERFLOW-ERROR` (restartable). | MUST |
 | R8.08 | Sandbox mode MUST support a per-evaluation CPU time limit; exceeding it MUST signal `TORCL-EXT:TIMEOUT-CONDITION`. | MUST |
@@ -138,7 +138,16 @@ locations listed above.
 
 ### 8.3.2  Pointer Validation (R8.04)
 
-Every raw pointer received from C is validated before use:
+TorCL-owned allocations retain their bounds and allocation identity through
+pointer arithmetic. Access checks that identity under the allocation registry
+lock, preventing use-after-free through tracked aliases even when addresses are
+reused. `MEM-REF` and `MEM-SET` use unaligned loads/stores, so packed C layouts
+do not require inventing aligned Rust references.
+
+Imported C pointers have no known bounds or lifetime. Null and overflow checks
+do **not** establish that such a pointer is mapped, live, initialized, or safe
+to access concurrently. The caller must supply those guarantees. APIs forming
+an aligned Rust reference additionally validate alignment:
 
 ```rust
 // A8.01 — FFI pointer validation
@@ -170,12 +179,21 @@ Truncation (e.g., `BIGNUM` → `int32_t`) MUST be explicitly requested via
 `:truncate t` in the FFI declaration and signals a warning when data is
 actually lost.
 
-### 8.3.4  No User-Accessible Raw Pointers (R8.05)
+### 8.3.4  Explicit Foreign Pointers (R8.05)
 
-Foreign pointers are wrapped in a `TORCL-EXT:FOREIGN-POINTER` object that
-is opaque to CL code. The internal address is never exposed via any
-accessor. The object carries a type tag and an optional destructor
-callback for correct resource management.
+Foreign pointers are wrapped in a `TORCL-FFI:FOREIGN-POINTER` object distinct
+from both Lisp integers and Lisp heap references. `MAKE-POINTER` imports an
+integer address as a borrowed pointer; `POINTER-ADDRESS` explicitly retrieves
+the address. Neither operation claims the borrowed address is safe to dereference.
+All public foreign-memory operations are denied in sandboxed execution.
+
+`FOREIGN-ALLOC` creates zeroed, nonmoving native storage. `FOREIGN-FREE` accepts
+only its original allocation pointer (or null); interior pointers, borrowed
+pointers and repeated frees signal errors. Dropping a Lisp wrapper does not
+release native storage: C may retain the address beyond the wrapper's lifetime.
+Memory from a foreign library's allocator must be released by that library's
+matching deallocator, not by `FOREIGN-FREE`. Saved images preserve pointer
+wrappers as null pointers, clearing both addresses and allocation identities.
 
 ---
 

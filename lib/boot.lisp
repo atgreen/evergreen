@@ -3873,3 +3873,32 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 
 (export '(torcl-cltl2:define-declaration torcl-cltl2:declaration-information)
         "TORCL-CLTL2")
+
+;;; Foreign addresses are opaque heap objects, never tagged Lisp addresses.
+;;; Foreign storage has an explicit lifetime: C may retain it after Lisp drops
+;;; its last wrapper. FREE invalidates every tracked alias of an allocation.
+(export (mapcar (lambda (name) (intern name "TORCL-FFI"))
+                '("FOREIGN-POINTER" "POINTERP" "MAKE-POINTER" "POINTER-ADDRESS"
+                  "POINTER-EQ" "NULL-POINTER" "NULL-POINTER-P" "INC-POINTER"
+                  "FOREIGN-ALLOC" "FOREIGN-FREE" "MEM-REF" "MEM-SET"
+                  "FOREIGN-TYPE-SIZE" "FOREIGN-TYPE-ALIGNMENT" "FFI-ERROR"))
+        "TORCL-FFI")
+(define-condition torcl-ffi:ffi-error (simple-error) ())
+(defun torcl-ffi:pointerp (value) (torcl::%foreign-memory :pointerp value))
+(deftype torcl-ffi:foreign-pointer () '(satisfies torcl-ffi:pointerp))
+(defun torcl-ffi:make-pointer (address) (torcl::%foreign-memory :make-pointer address))
+(defun torcl-ffi:pointer-address (pointer) (torcl::%foreign-memory :pointer-address pointer))
+(defun torcl-ffi:pointer-eq (a b) (torcl::%foreign-memory :pointer-eq a b))
+(defun torcl-ffi:null-pointer () (torcl-ffi:make-pointer 0))
+(defun torcl-ffi:null-pointer-p (pointer) (= 0 (torcl-ffi:pointer-address pointer)))
+(defun torcl-ffi:inc-pointer (pointer bytes) (torcl::%foreign-memory :inc-pointer pointer bytes))
+(defun torcl-ffi:foreign-alloc (bytes) (torcl::%foreign-memory :alloc bytes))
+(defun torcl-ffi:foreign-free (pointer) (torcl::%foreign-memory :free pointer))
+(defun torcl-ffi:mem-ref (pointer type &optional (offset 0))
+  (torcl::%foreign-memory :ref pointer type offset))
+(defun torcl-ffi:mem-set (value pointer type &optional (offset 0))
+  (torcl::%foreign-memory :set pointer type offset value))
+(defun (setf torcl-ffi:mem-ref) (value pointer type &optional (offset 0))
+  (torcl-ffi:mem-set value pointer type offset))
+(defun torcl-ffi:foreign-type-size (type) (torcl::%foreign-memory :type-size type))
+(defun torcl-ffi:foreign-type-alignment (type) (torcl::%foreign-memory :type-alignment type))

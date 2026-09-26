@@ -40,6 +40,46 @@ fn build_test_so(dir: &Path, src: &str) -> Option<PathBuf> {
 }
 
 #[test]
+fn foreign_call_accepts_owned_pointer_objects() {
+    let dir = std::env::temp_dir().join(format!("torcl-ffi-memory-{}", std::process::id()));
+    let so = build_test_so(
+        &dir,
+        "#include <stdint.h>\nuint64_t read_word(const uint64_t *p) { return *p; }\nuint64_t *echo_pointer(uint64_t *p) { return p; }",
+    )
+    .expect("C compiler required for foreign-memory integration test");
+    let program = format!(
+        r#"
+      (let* ((library (torcl::%load-foreign-library {:?}))
+             (function (torcl::%foreign-symbol library "read_word"))
+             (echo (torcl::%foreign-symbol library "echo_pointer"))
+             (pointer (torcl-ffi:foreign-alloc 8)))
+        (unwind-protect
+            (progn
+              (setf (torcl-ffi:mem-ref pointer :uint64) 18446744073709551615)
+              (assert (= (torcl::%ffi-call function :uint64 '(:pointer) (list pointer))
+                         18446744073709551615))
+              (let ((returned (torcl::%ffi-call echo :pointer '(:pointer) (list pointer))))
+                (assert (torcl-ffi:pointer-eq returned pointer))
+                (assert (= (torcl-ffi:mem-ref returned :uint64) 18446744073709551615)))
+              (assert (torcl-ffi:null-pointer-p (torcl::%ffi-call echo :pointer '(:pointer) '(nil))))
+              (format t "POINTER-CALL-OK~%"))
+          (torcl-ffi:foreign-free pointer)))
+    "#,
+        so.to_str().unwrap()
+    );
+    let output = torcl_bin()
+        .args(["--no-init", "--eval", &program])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("POINTER-CALL-OK"));
+}
+
+#[test]
 fn ffi_call_marshals_strings_both_ways() {
     let dir = std::env::temp_dir().join(format!("torcl-ffi-str-{}", std::process::id()));
     let src = "

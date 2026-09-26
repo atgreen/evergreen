@@ -132,7 +132,7 @@ fn ffi_rejects_null_function_pointer_instead_of_crashing() {
 
 #[test]
 fn ffi_pointer_marshalling_never_exposes_a_raw_lisp_value_as_a_user_pointer() {
-    // Per R8.05, raw pointers must never be observable from user-facing values.
+    // Per R8.05, Lisp values must never be reinterpreted as C addresses.
     let tagged_value = TorclVal::from_single_float(1.25);
     let err = marshal_to_c(tagged_value, &AlienType::Pointer(Box::new(AlienType::Void)))
         .expect_err("opaque Lisp values must not be reinterpreted as raw pointers");
@@ -263,10 +263,13 @@ fn marshalling_round_trips_integer_float_and_pointer_shapes() {
     let null_pointer =
         marshal_to_c(NIL, &AlienType::Pointer(Box::new(AlienType::Void))).expect("marshal pointer");
     assert_eq!(null_pointer, 0);
+    let pointer = unmarshal_from_c(null_pointer, &AlienType::Pointer(Box::new(AlienType::Void)))
+        .expect("unmarshal pointer");
     assert_eq!(
-        unmarshal_from_c(null_pointer, &AlienType::Pointer(Box::new(AlienType::Void)))
-            .expect("unmarshal pointer"),
-        NIL
+        torcl_rt::ffi::memory::ForeignPointer::from_lisp(pointer)
+            .unwrap()
+            .address(),
+        0
     );
 }
 

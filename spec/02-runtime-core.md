@@ -598,6 +598,34 @@ signatures on the generated path signal an FFI error before entering foreign
 code. Other targets temporarily retain the pre-existing bootstrap dispatcher
 in `ffi/legacy.rs`; it is not an implementation of the generated-adapter contract.
 
+### 2.7.7 Lisp Foreign Memory Interface
+
+`TORCL-FFI` exposes the native memory substrate used by the CFFI port. This
+interface takes byte counts and offsets; CFFI supplies its own typed allocation,
+string translation, and compound-type abstractions above it.
+
+| Operation | Contract |
+|-----------|----------|
+| `FOREIGN-ALLOC bytes`, `FOREIGN-FREE pointer` | Explicitly owned, zeroed native storage; free only the original allocation address |
+| `POINTERP`, `FOREIGN-POINTER` | Predicate and Lisp type for opaque pointer wrappers |
+| `MAKE-POINTER address`, `POINTER-ADDRESS pointer` | Explicit borrowed-address import and full-width integer inspection |
+| `NULL-POINTER`, `NULL-POINTER-P`, `POINTER-EQ` | Null construction/test and address equality (not wrapper identity) |
+| `INC-POINTER pointer bytes` | Checked address arithmetic retaining known allocation identity |
+| `MEM-REF pointer type &optional offset` | Scalar load with known bounds/lifetime validation; offsets need not be aligned |
+| `(SETF MEM-REF)`, `MEM-SET value pointer type &optional offset` | Scalar store with integer range checking |
+| `FOREIGN-TYPE-SIZE type`, `FOREIGN-TYPE-ALIGNMENT type` | Platform scalar layout, including the native C `long` width |
+
+Foreign pointer wrappers contain no Lisp references. They may move during GC,
+but their native storage does not. `FOREIGN-FREE` invalidates all tracked aliases;
+GC never implicitly frees foreign storage C may still retain. Pointer results
+from C become borrowed wrappers, including a boxed null pointer for address zero.
+See §8.3 for borrowed-address safety and image-restart semantics.
+
+Errors from this boundary are catchable as `TORCL-FFI:FFI-ERROR`, a subtype of
+`SIMPLE-ERROR`. Public memory entry points and the internal foreign library,
+symbol, and call primitives are denied in sandboxed evaluation. Library objects,
+scoped vector access, and the complete CFFI backend remain work under `bliss-124`.
+
 ---
 
 ## 2.8 Configuration

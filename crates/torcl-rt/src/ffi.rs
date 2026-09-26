@@ -7,6 +7,8 @@ use crate::error::TorclError;
 use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 use crate::value::TorclVal;
 
+pub mod memory;
+
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call;
 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -304,9 +306,11 @@ pub fn marshal_to_c(value: TorclVal, alien_type: &AlienType) -> Result<u64, Torc
                 ))
             }
         }
-        AlienType::Pointer(_) => {
+        AlienType::Pointer(_) | AlienType::FnPtr { .. } => {
             if value.is_nil() {
                 Ok(0)
+            } else if memory::ForeignPointer::is_pointer(value) {
+                Ok(memory::ForeignPointer::from_lisp(value)?.call_address()? as u64)
             } else if value.is_fixnum() {
                 Ok(value.as_fixnum() as u64)
             } else {
@@ -341,12 +345,8 @@ pub fn unmarshal_from_c(raw: u64, alien_type: &AlienType) -> Result<TorclVal, To
             Ok(TorclVal::from_single_float(f))
         }
         AlienType::Double => Ok(crate::gc::alloc_double_float(f64::from_bits(raw))),
-        AlienType::Pointer(_) => {
-            if raw == 0 {
-                Ok(crate::value::NIL)
-            } else {
-                Ok(TorclVal::from_fixnum(raw as i64))
-            }
+        AlienType::Pointer(_) | AlienType::FnPtr { .. } => {
+            memory::ForeignPointer::from_address(raw as usize).into_lisp()
         }
         _ => Err(TorclError::FfiError(format!(
             "unmarshal_from_c: unsupported alien type {:?}",
