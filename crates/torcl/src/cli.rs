@@ -39312,7 +39312,12 @@ fn run_repl_reader<R: std::io::BufRead>(env: &mut Env, reader: &mut R) -> Result
                         // sessions (piped stdin/scripts) it returns immediately so the
                         // REPL keeps consuming input rather than blocking.
                         let condition = arena_str(&format!("{}", e));
-                        let _ = torcl_stdlib::invoke_debugger_ui(condition, &mut repl_state);
+                        // Pass the REPL's OWN reader: this loop holds the process
+                        // StdinLock, and Rust's stdin lock is not reentrant, so a
+                        // debugger that re-locked stdin deadlocked instantly
+                        // (bliss-bxlq).
+                        let _ =
+                            torcl_stdlib::invoke_debugger_ui(condition, &mut repl_state, reader);
                         // On error, temporary allocations can be freed
                         ARENA.with(|a| {
                             let mut arena = a.borrow_mut();

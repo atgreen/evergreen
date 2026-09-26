@@ -30,9 +30,45 @@ static NATIVE_FFI_FINISHED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "c-ffi")]
 static USLEEP_FN: OnceLock<usize> = OnceLock::new();
 
-fn gc_lock() -> &'static Mutex<()> {
+/// Serializes every test that touches PROCESS-GLOBAL runtime state (bliss-z11t).
+///
+/// `cargo test` runs the tests in one binary concurrently, but the thread
+/// registry, the safepoint handshake and the GC are one per process, and these
+/// tests each drive them as though they owned it. Concurrently they invalidate
+/// each other in three different ways, which is why this target produced three
+/// different symptoms rather than one:
+///
+///   - Count assertions break. `lazily_registered_host_threads_...` samples
+///     `safepoint_participant_count_excluding` before/during/after, and
+///     `make_thread_join_...` bounds `all_thread_ids().len()`; another test
+///     spawning or joining a thread moves those global numbers.
+///   - Stop-the-world assertions break. `stop_the_world_...` and
+///     `t0_alloc_typed_...` call `wait_for_all_threads()` / `resume_all_threads()`
+///     and then assert their thread stayed parked. A concurrent test's
+///     `resume_all_threads()` restarts it, and
+///     `failed_safepoint_handshake_is_reported_and_cleans_up` deliberately
+///     creates a thread that NEVER polls -- so while it runs, every other
+///     rendezvous in the process is meant to fail.
+///   - The run hangs or faults. Two overlapping stop-the-world rendezvous leave
+///     the coordinator waiting on threads the other side already resumed.
+///
+/// So this is interference over a single global coordinator, not a race the
+/// production runtime can reach: there is one collector, and nothing outside a
+/// test harness drives two simultaneous handshakes. Tests that only read
+/// thread-local or per-object state deliberately do NOT take this lock, so they
+/// still run in parallel.
+fn runtime_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Hold the global-state lock for the rest of the test. Poisoning is recovered
+/// rather than propagated: one test panicking must not cascade into spurious
+/// failures in every later test that takes the lock.
+macro_rules! serialize_global_runtime {
+    () => {
+        let _runtime_guard = runtime_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
 }
 
 fn gc_config() -> GcConfig {
@@ -173,6 +209,7 @@ fn fiber_api_design_is_complete_and_distinct_from_exposed_carrier_threads() {
 
 #[test]
 fn make_thread_join_and_registry_cleanup_follow_the_public_thread_api() {
+    serialize_global_runtime!();
     // Per R2.04 and R13.18, user-visible fibers run via the public make/join entrypoints.
     let before = all_thread_ids();
     let id = make_thread(T).expect("thread creation must succeed");
@@ -186,6 +223,7 @@ fn make_thread_join_and_registry_cleanup_follow_the_public_thread_api() {
 
 #[test]
 fn lazily_registered_host_threads_participate_in_gc_safepoints() {
+    serialize_global_runtime!();
     // Host/test threads that enter the runtime through CURRENT-THREAD have no Lisp
     // entry function, but they can still allocate on the GC heap and must be counted
     // as native mutators until their TLS registration is dropped.
@@ -218,6 +256,7 @@ fn lazily_registered_host_threads_participate_in_gc_safepoints() {
 
 #[test]
 fn exited_lazy_host_threads_are_pruned_from_public_registry_views() {
+    serialize_global_runtime!();
     // h6z.6: lazy host/test thread records must not be removed from TLS drop
     // with an OrderedMutex, but they should disappear on later safe registry
     // access once their TLS registration has ended.
@@ -245,6 +284,7 @@ fn exited_lazy_host_threads_are_pruned_from_public_registry_views() {
 
 #[test]
 fn function_entries_execute_on_worker_threads_and_return_values() {
+    serialize_global_runtime!();
     // Per R2.04, fibers are scheduled onto the carrier pool.
     // Per R13.18, MAKE-THREAD and JOIN-THREAD expose observable thread execution.
     let id = make_thread(unsafe { fn_entry(value_returning_entry) }).expect("thread creation");
@@ -254,6 +294,7 @@ fn function_entries_execute_on_worker_threads_and_return_values() {
 
 #[test]
 fn invalid_thread_entry_surfaces_a_result_error_not_a_panic() {
+    serialize_global_runtime!();
     // Per R2.18, runtime failures propagate through Result rather than panicking.
     let id = make_thread(TorclVal::from_fixnum(17)).expect("thread creation");
     let err = join_thread(id).expect_err("non-function, non-special thread entry must fail");
@@ -262,6 +303,7 @@ fn invalid_thread_entry_surfaces_a_result_error_not_a_panic() {
 
 #[test]
 fn thread_local_storage_is_isolated_between_green_threads() {
+    serialize_global_runtime!();
     // Per R2.05, each fiber has its own control/value stack and thread-local state.
     current_thread().tls_set(0, TorclVal::from_fixnum(7));
     let id = make_thread(unsafe { fn_entry(tls_isolated_entry) }).expect("thread creation");
@@ -275,7 +317,7 @@ fn thread_local_storage_is_isolated_between_green_threads() {
 fn native_thread_tls_roots_survive_minor_gc() {
     // h6z.5: native thread-owned TLS slots live outside the heap but must be
     // scanned and rewritten by a moving minor collection.
-    let _guard = gc_lock().lock().unwrap_or_else(|e| e.into_inner());
+    serialize_global_runtime!();
     torcl_rt::init_heap(&gc_config()).expect("init_heap");
 
     const MARKER: u64 = 0x5100_0000_0000_0001;
@@ -289,6 +331,7 @@ fn native_thread_tls_roots_survive_minor_gc() {
 
 #[test]
 fn interrupt_delivery_changes_the_join_result_of_a_live_thread() {
+    serialize_global_runtime!();
     // Per R9.04 and R13.18, INTERRUPT-THREAD is delivered to the target thread.
     SLOW_THREAD_STARTED.store(false, Ordering::Release);
     RELEASE_SLOW_THREAD.store(false, Ordering::Release);
@@ -307,6 +350,7 @@ fn interrupt_delivery_changes_the_join_result_of_a_live_thread() {
 
 #[test]
 fn all_threads_reports_a_live_thread_until_join_completes() {
+    serialize_global_runtime!();
     // Per R9.04 and R13.18, the runtime exposes the set of live thread handles.
     SLOW_THREAD_STARTED.store(false, Ordering::Release);
     RELEASE_SLOW_THREAD.store(false, Ordering::Release);
@@ -324,6 +368,7 @@ fn all_threads_reports_a_live_thread_until_join_completes() {
 
 #[test]
 fn scheduler_group_exposes_carriers_and_runs_real_fibers() {
+    serialize_global_runtime!();
     // Per R2.03, the runtime supports a configurable worker-thread pool.
     // Per R13.08, scheduling is exposed through the runtime scheduler surface.
     let scheduler = Scheduler::init(&SchedulerConfig { num_workers: 3 })
@@ -344,7 +389,7 @@ fn scheduler_group_exposes_carriers_and_runs_real_fibers() {
 fn fiber_interrupt_roots_survive_minor_gc() {
     // h6z.5: fiber-owned interrupt storage is also an external execution root,
     // including while the fiber is only queued in the scheduler registry.
-    let _guard = gc_lock().lock().unwrap_or_else(|e| e.into_inner());
+    serialize_global_runtime!();
     torcl_rt::init_heap(&gc_config()).expect("init_heap");
 
     const MARKER: u64 = 0x5100_0000_0000_0002;
@@ -376,6 +421,7 @@ fn enter_safepoint_publishes_the_current_stack_top() {
 
 #[test]
 fn stop_the_world_waits_for_polling_threads_and_resumes_them() {
+    serialize_global_runtime!();
     // Per R2.07, safepoint polls must be observed by running threads.
     // Per R13.10, stop-the-world uses the safepoint handshake rather than async suspension.
     SAFETY_LOOP_EXIT.store(false, Ordering::Release);
@@ -407,6 +453,7 @@ fn stop_the_world_waits_for_polling_threads_and_resumes_them() {
 
 #[test]
 fn failed_safepoint_handshake_is_reported_and_cleans_up() {
+    serialize_global_runtime!();
     // h6z.4: a moving GC must never proceed after a failed safepoint
     // handshake. A running thread that never polls should make the handshake
     // fail, and the failure path must resume/clear coordination state so the
@@ -432,6 +479,7 @@ fn failed_safepoint_handshake_is_reported_and_cleans_up() {
 
 #[test]
 fn t0_alloc_typed_observes_safepoints_before_touching_its_tlab() {
+    serialize_global_runtime!();
     // h6z.3: T0 allocation is a native-mutator entry point. A thread that only
     // allocates through alloc_typed must still park at a GC safepoint before it
     // touches its TLAB again.
@@ -472,6 +520,7 @@ fn current_thread_identity_is_stable_within_the_calling_thread() {
 
 #[test]
 fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
+    serialize_global_runtime!();
     // Per R2.10, SIGINT must be surfaced to the runtime rather than crashing the process.
     // Per R8.10 and R13.13, signal handlers defer non-trivial work by setting a flag.
     install_signal_handlers().expect("signal handlers must install");
@@ -501,6 +550,7 @@ fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
 #[cfg(feature = "c-ffi")]
 #[test]
 fn safepoint_wait_does_not_block_on_a_thread_executing_native_ffi() {
+    serialize_global_runtime!();
     // Per R2.15 and R13.11, a thread in Native FFI state must not block a safepoint handshake.
     let libc = torcl_rt::ffi::load_foreign_library("libc.so.6")
         .or_else(|_| torcl_rt::ffi::load_foreign_library("libSystem.B.dylib"))

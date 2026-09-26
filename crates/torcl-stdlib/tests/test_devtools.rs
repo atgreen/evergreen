@@ -353,7 +353,12 @@ fn repl_loop_is_callable() {
 #[test]
 fn invoke_debugger_ui_is_callable() {
     let mut state = ReplState::new();
-    let result = invoke_debugger_ui(NIL, &mut state);
+    // An empty reader, never `io::stdin().lock()`: the debugger now takes the
+    // caller's line source precisely because re-locking stdin deadlocks a REPL
+    // that already holds the lock (bliss-bxlq), and a test must not block on the
+    // real stdin either (bliss-z57).
+    let mut input: &[u8] = b"";
+    let result = invoke_debugger_ui(NIL, &mut state, &mut input);
     // invoke_debugger_ui should return Ok or Err (not panic).
     assert!(
         result.is_ok() || result.is_err(),

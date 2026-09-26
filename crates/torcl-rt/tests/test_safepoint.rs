@@ -7,6 +7,25 @@ use torcl_rt::value::T;
 #[cfg(unix)]
 use torcl_rt::{TorclVal, install_signal_handlers, join_thread, make_thread};
 
+/// Serializes these tests (bliss-z11t). The safepoint page is ONE mprotected
+/// page per process and `wait_for_all_threads`/`resume_all_threads` drive one
+/// global handshake, so run concurrently these tests contradict each other:
+/// `safepoint_initially_not_requested` fails while `request_then_resume_cycle`
+/// holds the page requested, and a rendezvous fails whenever another test has
+/// threads running that are not polling. Every test here touches that shared
+/// page, so every one takes the lock. Poisoning is recovered rather than
+/// propagated, so a single panic does not cascade into the rest.
+fn safepoint_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+macro_rules! serialize_safepoint {
+    () => {
+        let _safepoint_guard = safepoint_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
+}
+
 #[cfg(unix)]
 static BLOCKED_READ_FD: AtomicI32 = AtomicI32::new(-1);
 #[cfg(unix)]
@@ -34,11 +53,13 @@ fn blocked_reader() -> TorclVal {
 
 #[test]
 fn safepoint_page_init_succeeds() {
+    serialize_safepoint!();
     assert!(SafepointPage::init().is_ok());
 }
 
 #[test]
 fn safepoint_page_address_non_null_and_aligned() {
+    serialize_safepoint!();
     let page = SafepointPage::init().unwrap();
     let addr = page.address();
     assert!(!addr.is_null());
@@ -47,12 +68,14 @@ fn safepoint_page_address_non_null_and_aligned() {
 
 #[test]
 fn safepoint_initially_not_requested() {
+    serialize_safepoint!();
     let page = SafepointPage::init().unwrap();
     assert!(!page.is_requested());
 }
 
 #[test]
 fn request_then_resume_cycle() {
+    serialize_safepoint!();
     let page = SafepointPage::init().unwrap();
     for _ in 0..3 {
         page.request_safepoint().unwrap();
@@ -64,6 +87,7 @@ fn request_then_resume_cycle() {
 
 #[test]
 fn request_protects_poll_page_and_resume_restores_readability() {
+    serialize_safepoint!();
     let page = SafepointPage::init().unwrap();
 
     page.request_safepoint().unwrap();
@@ -78,29 +102,34 @@ fn request_protects_poll_page_and_resume_restores_readability() {
 
 #[test]
 fn resume_without_request_is_harmless() {
+    serialize_safepoint!();
     let page = SafepointPage::init().unwrap();
     assert!(page.resume().is_ok());
 }
 
 #[test]
 fn wait_and_resume_all_threads() {
+    serialize_safepoint!();
     assert!(wait_for_all_threads().is_ok());
     assert!(resume_all_threads().is_ok());
 }
 
 #[test]
 fn poll_safepoint_does_not_panic() {
+    serialize_safepoint!();
     poll_safepoint();
 }
 
 #[test]
 fn enter_safepoint_does_not_panic() {
+    serialize_safepoint!();
     enter_safepoint();
 }
 
 #[test]
 #[cfg(unix)]
 fn sigusr1_fallback_interrupts_a_blocked_syscall_and_reaches_safepoint() {
+    serialize_safepoint!();
     install_signal_handlers().unwrap();
     BLOCKED_READER_ENTERED.store(false, Ordering::Release);
     BLOCKED_READ_INTERRUPTED.store(false, Ordering::Release);

@@ -703,16 +703,25 @@ fn thread_id_current() -> u64 {
 /// Invoke the debugger on a condition. A6.02.
 /// Walks stack, computes restarts, enters debug REPL at incremented nesting level.
 /// Supports step/next/out/continue commands (R6.13).
+/// `reader` MUST be the caller's existing line source, not a fresh
+/// `io::stdin().lock()`. The REPL holds a `StdinLock` for its whole session
+/// (`run_repl_reader(env, &mut stdin.lock())`), and Rust's stdin lock is NOT
+/// reentrant, so re-locking it here deadlocked the process the instant the
+/// debugger was entered: the `DEBUG[n]>` prompt printed and then accepted
+/// nothing at all -- no restart number, no command -- and Ctrl-C could not
+/// escape either, because the process was blocked acquiring a mutex rather than
+/// evaluating, and the SIGINT handler only sets a flag that the evaluator polls
+/// (bliss-bxlq).
 pub fn invoke_debugger_ui(
     condition: TorclVal,
     repl_state: &mut ReplState,
+    reader: &mut dyn io::BufRead,
 ) -> Result<(), TorclError> {
     if !is_interactive() {
         return Ok(());
     }
 
     let mut stdout = io::stdout();
-    let stdin = io::stdin();
 
     // Display the condition. Conditions surfaced from the REPL are string
     // values (the formatted error text); render that text rather than the raw
@@ -749,7 +758,7 @@ pub fn invoke_debugger_ui(
         stdout.flush().unwrap_or(());
 
         let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
+        match reader.read_line(&mut line) {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(_) => break,
@@ -869,6 +878,32 @@ pub fn invoke_debugger_ui(
                 writeln!(stdout, "  frame (f) N   - Select frame N").unwrap_or(());
                 writeln!(stdout, "  eval (e) FORM - Eval in selected frame").unwrap_or(());
                 writeln!(stdout, "  restart (r) N - Invoke restart N").unwrap_or(());
+                writeln!(stdout, "  N             - Invoke restart N directly").unwrap_or(());
+            }
+            // A BARE restart number. The restart list above is printed as
+            // "0: [ABORT] ..." / "1: [CONTINUE] ...", which is how every other
+            // Lisp presents restarts, so a user types `0` -- not `r 0`. Without
+            // this arm the number fell through to the eval branch below and was
+            // echoed back as the integer 0, which looks like the debugger simply
+            // ignoring the selection (bliss-bxlq).
+            _ if trimmed.parse::<usize>().is_ok() => {
+                let n = trimmed.parse::<usize>().unwrap();
+                match n {
+                    0 => {
+                        writeln!(stdout, "Aborting.").unwrap_or(());
+                        clear_stepping_traps();
+                        break;
+                    }
+                    1 => {
+                        writeln!(stdout, "Continuing.").unwrap_or(());
+                        clear_stepping_traps();
+                        break;
+                    }
+                    _ => {
+                        writeln!(stdout, "Invalid restart: {n}. Type `help` for commands.")
+                            .unwrap_or(());
+                    }
+                }
             }
             _ => {
                 // Try to evaluate as a Lisp form
