@@ -26,10 +26,12 @@ Each run creates and retains a private temporary project with the committed
 Ollama-shaped `/api/chat` server on an ephemeral loopback port, exports the port
 as `TORCL_OLLAMA_PORT`, and runs the Lisp under it:
 
-- Cold: compile and load the graph (455 files), then `dex:post` the endpoint and
-  assert a 200 with the echoed prompt in the body, then load `:completions` and
-  assert `GET-COMPLETION` returns the assistant text and a two-turn history.
-- Cached: repeat the assertions and reject source recompilation.
+- Cold (gated): compile and load the graph (455 files), then `dex:post` the
+  endpoint and assert a 200 with the echoed prompt in the body, then load
+  `:completions` and assert `GET-COMPLETION` returns the assistant text and a
+  two-turn history.
+- Cached (`TORCL_COMPLETIONS_CACHED=1`, currently expected to FAIL — see below):
+  repeat the assertions and reject source recompilation.
 - Optional `SBCL_BIN`: run the same checks on SBCL with a separate cache.
 
 The server **echoes the prompt back** as the assistant's reply, so a malformed
@@ -42,6 +44,35 @@ passing silently. Three real defects were found exactly this way (all now fixed)
   `READ-UNTIL-CRLF*2` dropped every CR of the response (`bliss-4tu2`).
 - `INTERN` minted a second KEYWORD symbol, so cl-json's decoded keys were not
   `EQ` to the keyword literals Completions writes (`bliss-r8kt`).
+
+## Known cached-phase failure (bliss-6d8f)
+
+The cached phase currently fails, on a defect unrelated to the fixes above, so it
+is opt-in rather than gated. Once pure-tls has been loaded, the upfront
+COMPILE-FILE read of ironclad's `src/digests/whirlpool.lisp` is corrupted — the
+form handed to the `#.` on line 149 arrives as `(0 . 0)`, i.e. zeroed nursery
+memory, and the compile reports `undefined function: Fixnum(0)`. COMPILE-FILE
+then downgrades that one file to a source-only artifact, which loads correctly in
+the compiling process but not in a fresh one: replaying the text skips the
+`(eval-when (:compile-toplevel) …)` block that defines its S-box helpers, so the
+cached load dies with `undefined function: S`.
+
+To see it, run the check twice in a retained artifact directory:
+
+```sh
+cd <artifact dir>
+export OCICL_LOCAL_ONLY=1 TORCL_PORT_RUNTIME=... TORCL_PORT_CACHE="$PWD/cache/"
+/path/to/torcl/scripts/torcl-limited.sh python3 fake-ollama.py \
+    /path/to/torcl --no-init --load check.lisp
+```
+
+Compiling ironclad on its own produces a correct fasl every time, so the trigger
+is the extra heap pressure from the pure-tls load, not the file. The failure is
+silent without `TORCL_BFASL_TRACE=1` (bliss-wk2q).
+
+A read timeout on the socket also surfaces as a raw
+`Resource temporarily unavailable` stream error rather than a timeout condition
+(bliss-xm6i); it showed up once in the cold phase while the machine was loaded.
 
 `pure-tls/cl+ssl-compat` is loaded and `cl+ssl` registered immutable so nothing
 pulls the CFFI-based original; the endpoint is plain HTTP either way, so this is
