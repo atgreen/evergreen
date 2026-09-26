@@ -100,6 +100,39 @@ install:
 	  echo "Build it first as your normal user:  make image"; \
 	  echo "then install as root:                sudo make install"; \
 	  exit 1; }
+	@# Refuse to install an image older than the sources it was built from.
+	@# This target deliberately never runs cargo (see above), so it cannot
+	@# rebuild — but it can tell you that what you are about to install is not
+	@# what you just changed. Without this, editing source and running
+	@# `sudo make install` without re-running `make image` installed a STALE
+	@# image and reported success.
+	@#
+	@# `-path '*/target' -prune` matters: crates/*/target/ accumulates fixture
+	@# files written during test runs, and counting those would make every
+	@# image look stale forever.
+	@if [ -z "$(ALLOW_STALE)" ]; then \
+	  stale=$$(find crates lib Cargo.toml Cargo.lock scripts/build-image.lisp \
+	      -path '*/target' -prune -o -type f \
+	      \( -name '*.rs' -o -name '*.lisp' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+	      -newer $(TORCL_EXE) -print 2>/dev/null | head -5); \
+	  if [ -n "$$stale" ]; then \
+	    echo "error: $(TORCL_EXE) is OLDER than these sources:"; \
+	    echo "$$stale" | sed 's/^/  /'; \
+	    echo "It would install a stale image. Rebuild as your normal user:"; \
+	    echo "    make image"; \
+	    echo "then install as root:"; \
+	    echo "    sudo make install"; \
+	    echo "(to install the existing image anyway: make install ALLOW_STALE=1)"; \
+	    exit 1; \
+	  fi; \
+	  if [ -f $(RELEASE_BIN) ] && [ $(RELEASE_BIN) -nt $(TORCL_EXE) ]; then \
+	    echo "error: $(RELEASE_BIN) is NEWER than $(TORCL_EXE)."; \
+	    echo "The release binary was rebuilt but the image was not re-dumped from it."; \
+	    echo "Rebuild the image as your normal user:  make image"; \
+	    echo "(to install the existing image anyway: make install ALLOW_STALE=1)"; \
+	    exit 1; \
+	  fi; \
+	fi
 	$(INSTALL) -d $(BINDIR)
 	$(INSTALL) -m 755 $(TORCL_EXE) $(BINDIR)/torcl
 	@echo "installed $(BINDIR)/torcl"
