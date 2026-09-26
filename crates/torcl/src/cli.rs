@@ -14330,6 +14330,7 @@ fn eval_form(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 true
             }
         };
+
         let result = eval_list(form, env)?;
         if !preserve {
             env.clear_mv();
@@ -32332,13 +32333,45 @@ fn apply_setf_expansion(
     new_value: SetfNewValue,
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
+    // EVERY TorclVal here outlives an allocation, so every one is a root
+    // (bliss-6d8f). `get_setf_expansion` runs a Lisp SETF-expander — the one for
+    // LDB calls GET-SETF-EXPANSION and allocates two gensyms and a quasiquoted
+    // store form — and the subform loop below evaluates arbitrary code. A minor
+    // GC in either relocates the nursery, and an unrooted copy is then a stale
+    // pointer into evacuated (zeroed) space: ironclad's
+    //   (setf (ldb (byte 8 (- 32 (* (1+ k) 8))) result) (gf-mult …))
+    // had its VALUE form orphaned exactly that way, so the evaluator was handed
+    // `(0 . 0)` and reported `undefined function: Fixnum(0)` — which made
+    // COMPILE-FILE abandon whirlpool.lisp for an unloadable source-only artifact.
+    let pending_is_form = matches!(new_value, SetfNewValue::Form(_));
+    let mut pending = match new_value {
+        SetfNewValue::Value(v) => v,
+        SetfNewValue::Form(f) => f,
+    };
+    let mut place = place;
+    torcl_rt::rooted_ref!(_place_root = &mut place);
+    torcl_rt::rooted_ref!(_pending_root = &mut pending);
     let ex = get_setf_expansion(place, env)?;
     let parent = Arc::clone(&env.frame);
     with_child_frame(env, parent, move |env| {
-        for (temp, val_form) in ex.temps.iter().zip(ex.vals.iter()) {
-            let v = eval_form(*val_form, env)?;
+        // Re-root inside the closure: a root records an ADDRESS, and both values
+        // were MOVED in here, so the caller's roots no longer describe them.
+        let mut ex = ex;
+        let mut pending = pending;
+        torcl_rt::rooted_ref!(_temps_root = &mut ex.temps);
+        torcl_rt::rooted_ref!(_vals_root = &mut ex.vals);
+        torcl_rt::rooted_ref!(_stores_root = &mut ex.stores);
+        torcl_rt::rooted_ref!(_store_form_root = &mut ex.store_form);
+        torcl_rt::rooted_ref!(_access_form_root = &mut ex.access_form);
+        torcl_rt::rooted_ref!(_pending_root = &mut pending);
+        // Indexed, not iterator-based: each `eval_form` may relocate the
+        // remaining forms, and re-reading the (rooted) vector each round picks up
+        // the collector's updates instead of walking a snapshot.
+        for index in 0..ex.vals.len().min(ex.temps.len()) {
+            let v = eval_form(ex.vals[index], env)?;
+            let temp = ex.temps[index];
             if temp.is_symbol() {
-                env.define_local_symbol(*temp, v);
+                env.define_local_symbol(temp, v);
             }
         }
         // AFTER the subforms. The only extra bindings in scope are the
@@ -32348,13 +32381,18 @@ fn apply_setf_expansion(
         // from the value form's MULTIPLE VALUES (CLHS 5.5.5). Binding only the
         // first left the rest unbound, so the expansion referenced a gensym
         // nothing had bound (ansi DEFSETF.7A; bliss-669r).
-        let (new_value, values) = match new_value {
-            SetfNewValue::Value(v) => (v, vec![v]),
-            SetfNewValue::Form(form) => eval_form_collecting_values(form, env)?,
+        let (new_value, mut values) = if pending_is_form {
+            eval_form_collecting_values(pending, env)?
+        } else {
+            (pending, vec![pending])
         };
-        for (index, store) in ex.stores.iter().enumerate() {
+        torcl_rt::rooted_ref!(_values_root = &mut values);
+        let mut new_value = new_value;
+        torcl_rt::rooted_ref!(_new_value_root = &mut new_value);
+        for index in 0..ex.stores.len() {
+            let store = ex.stores[index];
             if store.is_symbol() {
-                env.define_local_symbol(*store, values.get(index).copied().unwrap_or(NIL));
+                env.define_local_symbol(store, values.get(index).copied().unwrap_or(NIL));
             }
         }
         let stored = eval_form(ex.store_form, env)?;

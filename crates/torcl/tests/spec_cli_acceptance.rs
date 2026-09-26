@@ -4038,3 +4038,81 @@ fn write_byte_signals_a_type_error_for_a_non_byte() {
         ":TYPE-ERROR"
     );
 }
+
+#[test]
+fn a_setf_expander_keeps_its_value_form_across_its_own_allocations() {
+    // bliss-6d8f: `apply_setf_expansion` held the new value (or its unevaluated
+    // form), and the whole expansion, in unrooted locals across
+    // `get_setf_expansion` — which runs a LISP setf-expander — and across the
+    // place's subform evaluations. A minor GC in either relocated the nursery and
+    // left stale pointers, so ironclad's
+    //   (setf (ldb (byte 8 (- 32 (* (1+ k) 8))) result) (gf-mult …))
+    // had its value form orphaned: the evaluator was handed `(0 . 0)` and reported
+    // `undefined function: Fixnum(0)`, which made COMPILE-FILE abandon
+    // whirlpool.lisp for a source-only artifact that could not be loaded in a
+    // fresh process.
+    //
+    // Every value below was diffed against SBCL. The GC window is timing
+    // dependent, so this fixture pins the SEMANTICS of the rewritten function —
+    // the indexed subform loop and the multiple-store-variable path; the
+    // corruption itself is caught by running the graph under load.
+    let dir = temp_dir("setf-expander-rooting");
+    let script = dir.join("setf-expander-rooting.lisp");
+    write_file(
+        &script,
+        "(defvar *c* (make-array (list 2 4) :initial-element 3))\n\
+         (defun gf (x y) (logand (+ x y) 255))\n\
+         ;; LDB and MASK-FIELD are Lisp DEFINE-SETF-EXPANDERs whose bodies\n\
+         ;; allocate: GET-SETF-EXPANSION, two GENSYMs, a quasiquoted store form.\n\
+         (defun tbl-word (i)\n\
+           (let ((sx 7) (result 0))\n\
+             (dotimes (k 4)\n\
+               (setf (ldb (byte 8 (- 32 (* (1+ k) 8))) result) (gf sx (aref *c* i k))))\n\
+             result))\n\
+         (defun masked (n)\n\
+           (let ((r 0)) (setf (mask-field (byte 4 4) r) n) r))\n\
+         ;; A user expander with TWO store variables takes them from the value\n\
+         ;; form's MULTIPLE VALUES (CLHS 5.5.5).\n\
+         (defvar *pair* (list 0 0))\n\
+         (define-setf-expander both (obj &environment env)\n\
+           (declare (ignore env))\n\
+           (let ((o (gensym)) (a (gensym)) (b (gensym)))\n\
+             (values (list o) (list obj) (list a b)\n\
+                     `(progn (setf (first ,o) ,a) (setf (second ,o) ,b) (list ,a ,b))\n\
+                     `(values (first ,o) (second ,o)))))\n\
+         (defun store-both () (setf (both *pair*) (values 11 22)) *pair*)\n\
+         ;; The place's SUBFORMS run before the value form, left to right.\n\
+         (defvar *order* '())\n\
+         (defun ordered ()\n\
+           (let ((r 0))\n\
+             (setf (ldb (progn (push :spec *order*) (byte 8 0)) r)\n\
+                   (progn (push :value *order*) 7))\n\
+             (list r (reverse *order*))))\n\
+         (format t \"SETFX=~S\"\n\
+           (list (tbl-word 0) (tbl-word 1) (masked 9) (store-both) (ordered)\n\
+                 (eval '(let ((r 0)) (setf (ldb (byte 8 8) r) 255) r))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL setf-expander fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("SETFX=(168430090 168430090 0 (11 22) (7 (:SPEC :VALUE)) 65280)"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
