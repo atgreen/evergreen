@@ -1945,6 +1945,84 @@ fn a_parallel_let_init_closure_captures_the_enclosing_binding() {
 }
 
 #[test]
+fn a_local_function_binding_does_not_shadow_a_variable_of_the_same_name() {
+    // CLHS 3.1.2: FLET and LABELS bind the FUNCTION namespace, so a VARIABLE of
+    // the same name still refers to whatever it referred to outside. The lowerer
+    // stored a capturing local function's closure in the enclosing heap frame
+    // under the plain name, overwriting the variable's binding in that very
+    // frame — so `(funcall cont …)` reached the local function, and the wrapper
+    // idiom made it call ITSELF until the control stack died (bliss-7ex8). Only
+    // COMPILE-FILE'd code was affected, so the fixture compiles the file. Every
+    // value matches SBCL.
+    let dir = temp_dir("local-function-namespace");
+    let source = dir.join("namespaces.lisp");
+    write_file(
+        &source,
+        "(defun probe (cont)\n\
+           (flet ((cont (x) (list :fn x)))\n\
+             (list (funcall cont :as-variable) (cont :as-function))))\n\
+         (defun probe-capturing (cont tag)\n\
+           ;; The local function closes over TAG, so it becomes a real closure.\n\
+           (flet ((cont (x) (list :fn x tag)))\n\
+             (list (funcall cont :as-variable) (cont :as-function))))\n\
+         (defun wrap (cont)\n\
+           ;; The shape that recursed: the local function wraps the variable.\n\
+           (flet ((cont (x) (funcall cont (list :wrapped x))))\n\
+             (cont :v)))\n\
+         (defun wrap-labels (cont)\n\
+           (labels ((cont (x) (funcall cont (list :labels x))))\n\
+             (cont :v)))\n\
+         (defun sharp-quoted (cont)\n\
+           (flet ((cont (x) (list :fn x)))\n\
+             (list (funcall #'cont :sharp) (funcall cont :as-variable))))\n",
+    );
+    let script = dir.join("run.lisp");
+    write_file(
+        &script,
+        &format!(
+            "(load (compile-file {source:?}))\n\
+             (defun outer (&rest xs) (cons :outer xs))\n\
+             (format t \"NS=~S\"\n\
+               (list (probe #'outer)\n\
+                     (probe-capturing #'outer :t)\n\
+                     (wrap #'outer)\n\
+                     (wrap-labels #'outer)\n\
+                     (sharp-quoted #'outer)))\n",
+            source = source.to_str().expect("utf8 path")
+        ),
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL local-function-namespace fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains(
+                "NS=(((:OUTER :AS-VARIABLE) (:FN :AS-FUNCTION)) \
+((:OUTER :AS-VARIABLE) (:FN :AS-FUNCTION :T)) \
+(:OUTER (:WRAPPED :V)) \
+(:OUTER (:LABELS :V)) \
+((:FN :SHARP) (:OUTER :AS-VARIABLE)))"
+            ),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn lisp_finalizers_are_deferred_rooted_cancellable_and_run_once() {
     // R3.12/R3.16: user finalizers are retained without keeping their target
     // alive, run outside the collector, and cannot fire twice.  This is also

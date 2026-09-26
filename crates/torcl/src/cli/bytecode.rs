@@ -2734,9 +2734,26 @@ impl<'e> Lowerer<'e> {
         // name: `(fn args…)` calls it through `funcall`, which dispatches the
         // closure's registered bytecode (with its captured environment installed).
         if self.closure_fns.contains(name) {
-            let funcall = resolve_sym("FUNCALL").ok_or(Bail)?;
-            let call = arena_cons(funcall, arena_cons(op, rest));
-            return self.lower_expr(call);
+            // Load the closure from its FUNCTION-namespace binding and apply it.
+            // Synthesizing `(funcall name …)` instead would resolve `name` as a
+            // VARIABLE, which since bliss-7ex8 correctly looks past this binding
+            // to the variable of the same name.
+            let funcall = resolve_sym("FUNCALL").ok_or(Bail)?.as_symbol_index();
+            let ni = self.intern_name(&closure_fn_binding_key(name));
+            self.emit(Instr::LoadEnvVar(ni));
+            self.push_n(1);
+            torcl_rt::rooted!(args = list_to_vec(rest));
+            for i in 0..args.len() {
+                self.lower_expr(args[i])?;
+            }
+            let nargs = u16::try_from(args.len() + 1).map_err(|_| Bail)?;
+            self.emit(Instr::CallNamed {
+                sym: funcall,
+                nargs,
+            });
+            self.pop_n(nargs);
+            self.push_n(1);
+            return Ok(());
         }
         // A macro: expand one level (with the same macro functions the
         // tree-walker uses) and lower the expansion. lower_expr recurses, so a
@@ -5794,9 +5811,12 @@ impl<'e> Lowerer<'e> {
         let (mut target, _) = cp(rest);
         torcl_rt::rooted_ref!(_target_root = &mut target);
         // `#'localfn` for a capturing flet/labels function is the closure value
-        // itself, held in a boxed binding of its name — load it as a variable.
+        // itself, held in a heap binding of its name in the FUNCTION namespace.
         if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
-            return self.lower_expr(target);
+            let ni = self.intern_name(&closure_fn_binding_key(&sym_name(target)));
+            self.emit(Instr::LoadEnvVar(ni));
+            self.push_n(1);
+            return Ok(());
         }
         // `#'globalname` is just that symbol's function cell — no host eval is
         // needed, and emitting EvalHost here capped EVERY function mentioning
@@ -6065,7 +6085,7 @@ impl<'e> Lowerer<'e> {
         let mut callable = enclosing_callable;
         if is_labels {
             for name in &local_names {
-                captures.insert(name.clone());
+                captures.insert(closure_fn_binding_key(name));
                 callable.insert(name.clone());
             }
         }
@@ -6073,10 +6093,15 @@ impl<'e> Lowerer<'e> {
         // Register the local-function names as boxed closure bindings, visible in
         // the body (calls go through funcall via lower_call's closure_fns path).
         for name in &local_names {
+            // Under a key that CANNOT be a variable name. FLET/LABELS bind the
+            // FUNCTION namespace (CLHS 3.1.2), and this closure value shares the
+            // heap frame with the enclosing lexicals: binding it under the plain
+            // name overwrote a VARIABLE of the same name in that very frame, so
+            // `(flet ((f (x) (funcall f x))) …)` called ITSELF (bliss-7ex8).
             self.scopes
                 .last_mut()
                 .unwrap()
-                .insert(name.clone(), VarLoc::Boxed);
+                .insert(closure_fn_binding_key(name), VarLoc::Boxed);
             self.closure_fns.insert(name.clone());
         }
 
@@ -6126,7 +6151,7 @@ impl<'e> Lowerer<'e> {
                 capture_env: true,
             });
             self.push_n(1);
-            let ni = self.intern_name(&parsed[i].0);
+            let ni = self.intern_name(&closure_fn_binding_key(&parsed[i].0));
             self.emit(Instr::DefineEnvVar(ni));
             self.pop_n(1);
         }
@@ -6911,6 +6936,20 @@ fn references_local_fn_value(form: TorclVal, names: &std::collections::HashSet<S
 /// True if `name` (a symbol name, possibly package-qualified) is spelled as a
 /// special variable by the earmuff convention `*…*`. Matches the tree-walker's
 /// `is_special_var` so the two agree on which LET bindings are dynamic.
+/// The heap-frame key under which a capturing FLET/LABELS function's closure
+/// value is stored.
+///
+/// FLET and LABELS bind the FUNCTION namespace (CLHS 3.1.2), but the closure
+/// value has to live in the same heap frame as the enclosing lexicals, whose
+/// bindings are keyed by variable name. Sharing the plain name let the closure
+/// OVERWRITE a variable of that name in that frame — `(flet ((f (x) (funcall f
+/// x))) …)` then funcalled itself instead of the variable, recursing until the
+/// control stack died. The `#'` prefix cannot be produced by a variable
+/// reference, so the two namespaces stay apart (bliss-7ex8).
+fn closure_fn_binding_key(name: &str) -> String {
+    format!("#'{name}")
+}
+
 fn is_special_name(name: &str) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     let b = bare.as_bytes();
