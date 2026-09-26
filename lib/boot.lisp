@@ -229,21 +229,21 @@
   (let ((place (macroexpand place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
-      (declare (ignore newval setter))
       (let ((d (gensym)))
         `(let* (,@(mapcar (function list) dummies vals)
                 (,d ,(if delta (car delta) 1)))
-           (setf ,getter (+ ,getter ,d)))))))
+           (multiple-value-bind ,newval (+ ,getter ,d)
+             ,setter))))))
 
 (defmacro decf (place &rest delta &environment env)
   (let ((place (macroexpand place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
-      (declare (ignore newval setter))
       (let ((d (gensym)))
         `(let* (,@(mapcar (function list) dummies vals)
                 (,d ,(if delta (car delta) 1)))
-           (setf ,getter (- ,getter ,d)))))))
+           (multiple-value-bind ,newval (- ,getter ,d)
+             ,setter))))))
 
 ;; with-hash-table-iterator: (with-hash-table-iterator (name table) . body)
 ;; Within BODY, calling (name) returns (values more-p key value), advancing over
@@ -3076,15 +3076,16 @@
 (define-setf-expander ldb (bytespec place &environment env)
   (multiple-value-bind (dummies vals newval setter getter)
       (get-setf-expansion place env)
-    (declare (ignore newval setter))
     (let ((btemp (gensym)) (store (gensym)))
       (values (cons btemp dummies)
               (cons bytespec vals)
               (list store)
-              ;; The GETTER mentions only expansion temporaries, so this SETF
-              ;; neither re-evaluates the inner place nor depends on its concrete
-              ;; writer representation.
-              `(progn (setf ,getter (dpb ,store ,btemp ,getter)) ,store)
+              ;; A getter is an expression, not necessarily a settable place.
+              ;; Bind the inner store variables and invoke its actual writer.
+              `(progn
+                 (multiple-value-bind ,newval (dpb ,store ,btemp ,getter)
+                   ,setter)
+                 ,store)
               `(ldb ,btemp ,getter)))))
 
 ;; (setf (mask-field bytespec place) new) — same shape, but NEW is taken in
@@ -3092,12 +3093,14 @@
 (define-setf-expander mask-field (bytespec place &environment env)
   (multiple-value-bind (dummies vals newval setter getter)
       (get-setf-expansion place env)
-    (declare (ignore newval setter))
     (let ((btemp (gensym)) (store (gensym)))
       (values (cons btemp dummies)
               (cons bytespec vals)
               (list store)
-              `(progn (setf ,getter (deposit-field ,store ,btemp ,getter)) ,store)
+              `(progn
+                 (multiple-value-bind ,newval (deposit-field ,store ,btemp ,getter)
+                   ,setter)
+                 ,store)
               `(mask-field ,btemp ,getter)))))
 
 ;;; --- misc numeric functions -------------------------------------------------

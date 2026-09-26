@@ -1277,14 +1277,27 @@ fn function_name_key(name_form: TorclVal) -> String {
 /// it instead of a designator symbol — which is what makes them satisfy FUNCTIONP
 /// and `(typep … 'function)` rather than merely being callable (ansi
 /// FUNCTION.7 / FUNCTIONP.7; bliss-sqvh).
-fn setf_writer_function_object(place: TorclVal) -> Option<TorclVal> {
+fn setf_writer_function_object(env: &mut Env, place: TorclVal) -> Option<TorclVal> {
     if !place.is_symbol() {
         return None;
     }
     let symbol = resolve_sym(&setf_writer_symbol_name(&sym_name(place)))?;
-    let function = torcl_rt::symbols::symbol_function(symbol.symbol_index()?)?;
-    (function != torcl_rt::value::UNBOUND && torcl_rt::function::is_interpreted_function(function))
-        .then_some(function)
+    if let Some(function) = torcl_rt::symbols::symbol_function(symbol.symbol_index()?)
+        && function != torcl_rt::value::UNBOUND
+        && torcl_rt::function::is_interpreted_function(function)
+    {
+        return Some(function);
+    }
+    // SETF generics (including DEFCLASS accessors) have methods, not a plain
+    // writer function cell. Reify the same apply-by-name wrapper as ordinary
+    // generics so FUNCTION/FDEFINITION return a callable object and later
+    // method changes still participate in dispatch (bliss-ksqc).
+    let key = format!("(SETF {})", sym_name(place));
+    if env.generics.contains_key(&key) || env.methods.contains_key(&key) {
+        let writer = TorclVal::from_symbol_index(reader::intern_symbol(&key));
+        return Some(builtin_fn_wrapper(env, writer, &key));
+    }
+    None
 }
 
 pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
@@ -17850,7 +17863,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     )));
                 }
                 let (sf, _) = cp(cdr);
-                let spec = eval_form(sf, env)?;
+                let mut spec = eval_form(sf, env)?;
+                torcl_rt::rooted_ref!(_spec_root = &mut spec);
                 // SYMBOL-FUNCTION requires a symbol; a non-symbol is a TYPE-ERROR
                 // (symbol-function.error.3). FDEFINITION accepts any function-name
                 // designator (a symbol or `(setf symbol)`) and must TYPE-ERROR on
@@ -17869,7 +17883,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     if spec.is_cons()
                         && let (_setf, tail) = cp(spec)
                         && tail.is_cons()
-                        && let Some(object) = setf_writer_function_object(cp(tail).0)
+                        && let Some(object) = setf_writer_function_object(env, cp(tail).0)
                     {
                         return Ok(object);
                     }
@@ -18453,6 +18467,15 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                             String::new()
                         };
                         let user_expander = env.setf_expanders.borrow().contains_key(&pacc_name);
+                        // THE wraps a place; use its five-value expansion before
+                        // evaluating the new value. Unwrapping it later bypasses
+                        // compound-place handling (notably GETF writeback).
+                        if pacc_name == "THE" {
+                            result =
+                                apply_setf_expansion(*place, SetfNewValue::Form(*val_form), env)?;
+                            *c = *r2;
+                            continue;
+                        }
                         // (setf (apply #'f a1 … an) v) => (apply #'(setf f) v a1 … an)
                         // (CLHS 5.1.2.5; bliss-hzen). The last argument is the
                         // spread list, which APPLY already handles, and the
@@ -18565,6 +18588,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                 torcl_rt::rooted!(access_form = ex.access_form);
                                 let mut temps = ex.temps.clone();
                                 let mut vals = ex.vals.clone();
+                                let mut stores = ex.stores;
+                                let store_form = ex.store_form;
                                 let parent = Arc::clone(&env.frame);
                                 let val_form_v = *val_form;
                                 let ind_form_v = *indform;
@@ -18576,6 +18601,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                     // during any eval_form here can relocate.
                                     torcl_rt::rooted_ref!(_t = &mut temps);
                                     torcl_rt::rooted_ref!(_vv = &mut vals);
+                                    torcl_rt::rooted_ref!(_stores = &mut stores);
+                                    torcl_rt::rooted!(store_form = store_form);
                                     torcl_rt::rooted!(val_form_v = val_form_v);
                                     torcl_rt::rooted!(ind_form_v = ind_form_v);
                                     torcl_rt::rooted!(def_form_v = def_form_v);
@@ -18620,21 +18647,18 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                                     }
                                     if !found {
                                         torcl_rt::rooted!(tail = arena_cons(*v, *plist));
-                                        torcl_rt::rooted!(newhead = arena_cons(*ind, *tail));
-                                        // Store the new head back through the getter
-                                        // place: (setf <access-form> (quote newhead)).
-                                        let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
-                                        torcl_rt::rooted!(
-                                            quoted =
-                                                arena_cons(quote_sym, arena_cons(*newhead, NIL))
-                                        );
-                                        let setf_form = vec_to_list(&[
-                                            resolve_sym("SETF").unwrap_or(NIL),
-                                            *access_v,
-                                            *quoted,
-                                        ]);
-                                        eval_form(setf_form, env)?;
+                                        *plist = arena_cons(*ind, *tail);
                                     }
+                                    // The getter may be any expression (PROGN,
+                                    // IF, ...), not another SETF place. Write
+                                    // back through the expansion's storing form.
+                                    for (index, store) in stores.iter().enumerate() {
+                                        env.define_local_symbol(
+                                            *store,
+                                            if index == 0 { *plist } else { NIL },
+                                        );
+                                    }
+                                    eval_form(*store_form, env)?;
                                     Ok(*v)
                                 })?;
                                 result = rv;
@@ -18679,23 +18703,6 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         }
                         env.set_var_symbol(*place, *val);
                     } else if place.is_cons() {
-                        // (setf (the TYPE PLACE) val) ≡ (setf PLACE val): THE is a
-                        // type assertion, not a place of its own. Unwrap it (and any
-                        // nesting) before dispatching (bliss-9q4; cl-ppcre's
-                        // `(incf (the fixnum pos))`).
-                        while {
-                            let (head, _) = cp(*place);
-                            head.is_symbol() && sym_name(head) == "THE"
-                        } {
-                            // place = (THE type inner); inner = (caddr place)
-                            *place = cp(cp(cp(*place).1).1).0;
-                        }
-                        if place.is_symbol() {
-                            env.set_var_symbol(*place, *val);
-                            result = *val;
-                            *c = *r2;
-                            continue;
-                        }
                         let (accessor, aargs) = cp(*place);
                         let acc = if accessor.is_symbol() {
                             sym_name(accessor)
@@ -19511,7 +19518,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             "DEFMETHOD" => return eval_defmethod(cdr, env),
             "MAKE-INSTANCE" => return eval_make_instance(cdr, env),
             "FUNCTION" => {
-                let (name_form, _) = cp(cdr);
+                let (mut name_form, _) = cp(cdr);
+                torcl_rt::rooted_ref!(_name_root = &mut name_form);
                 if name_form.is_symbol() {
                     // `#'name` → the function object (a lexical closure, global
                     // function object, or reified builtin wrapper), so it is
@@ -19534,6 +19542,13 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 if name_form.is_cons() {
                     let (sh, st) = cp(name_form);
                     if sh.is_symbol() && sym_bare_name_rc(sh).as_ref() == "SETF" && st.is_cons() {
+                        let key = function_name_key(name_form);
+                        // FUNCTION observes FLET/LABELS; FDEFINITION deliberately
+                        // uses only the global lookup. Resolve a lexical writer
+                        // before reifying a global SETF generic.
+                        if let Some(object) = local_fn_closure(env, &key) {
+                            return Ok(object);
+                        }
                         // Intern the key VERBATIM: it contains parens and a
                         // package marker, so resolve_sym's tokenizer rejects it
                         // and the registry holds no such symbol until we make one.
@@ -19541,10 +19556,13 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         // result satisfies FUNCTIONP (bliss-sqvh); the designator
                         // symbol remains the fallback for writers that live only
                         // in GLOBAL_SETF_FNS.
-                        if let Some(object) = setf_writer_function_object(cp(st).0) {
+                        // local_fn_closure can collect: reread the rooted name
+                        // rather than retaining ST across that lookup.
+                        if let Some(object) =
+                            setf_writer_function_object(env, cp(cp(name_form).1).0)
+                        {
                             return Ok(object);
                         }
-                        let key = function_name_key(name_form);
                         let writer = TorclVal::from_symbol_index(
                             torcl_compiler::reader::intern_symbol(&key),
                         );
@@ -32335,11 +32353,10 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
         // update the variable (or place) P, not a copy of its value. The generic
         // cons fallback below lifts P into a value temporary and stores via a
         // `(funcall (setf getf) …)` writer that does not exist, so it neither
-        // updates P nor evaluates. Expand P recursively as a sub-place and
-        // delegate the store to operator SETF on the reconstructed GETF place,
-        // which already knows how to write the new plist head back to P
-        // (CLHS getf, 5.1.2.2). An optional default form gets its own temp so it
-        // is evaluated once for the read.
+        // updates P nor evaluates. Expand P recursively, update a temporary
+        // plist using the primitive GETF place, then invoke P's storing form.
+        // Its access form need not itself be settable. An optional default form
+        // gets its own temp so it is evaluated once for the read.
         if acc == "GETF" {
             // Every TorclVal held across the gensym/list allocations below can be
             // relocated by a minor GC, so root each one (moving GC; bliss-8qf).
@@ -32350,6 +32367,8 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                 let mut sub = get_setf_expansion(place_form, env)?;
                 torcl_rt::rooted_ref!(_sub_temps = &mut sub.temps);
                 torcl_rt::rooted_ref!(_sub_vals = &mut sub.vals);
+                torcl_rt::rooted_ref!(_sub_stores = &mut sub.stores);
+                torcl_rt::rooted!(p_store = sub.store_form);
                 torcl_rt::rooted!(p_access = sub.access_form);
                 let ind_temp = gensym_symbol("A");
                 let store = gensym_symbol("NEW");
@@ -32359,7 +32378,7 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                 torcl_rt::rooted_ref!(_vals = &mut vals);
                 temps.push(ind_temp);
                 vals.push(arg_forms.get(1).copied().unwrap_or(NIL));
-                let mut access_items = vec![accessor, *p_access, ind_temp];
+                torcl_rt::rooted!(access_items = vec![accessor, *p_access, ind_temp]);
                 if arg_forms.len() >= 3 {
                     let def_temp = gensym_symbol("A");
                     temps.push(def_temp);
@@ -32367,9 +32386,30 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                     access_items.push(def_temp);
                 }
                 torcl_rt::rooted!(access_form = vec_to_list(&access_items));
-                torcl_rt::rooted!(getf_place = vec_to_list(&[accessor, *p_access, ind_temp]));
-                let store_form =
-                    vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *getf_place, store]);
+                let plist_temp = gensym_symbol("PLIST");
+                torcl_rt::rooted!(binding = vec_to_list(&[plist_temp, *p_access]));
+                torcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
+                torcl_rt::rooted!(getf_place = vec_to_list(&[accessor, plist_temp, ind_temp]));
+                torcl_rt::rooted!(
+                    update =
+                        vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *getf_place, store,])
+                );
+                torcl_rt::rooted!(store_vars = vec_to_list(&sub.stores));
+                torcl_rt::rooted!(
+                    writeback = vec_to_list(&[
+                        resolve_sym("MULTIPLE-VALUE-BIND").unwrap_or(NIL),
+                        *store_vars,
+                        plist_temp,
+                        *p_store,
+                    ])
+                );
+                let store_form = vec_to_list(&[
+                    resolve_sym("LET").unwrap_or(NIL),
+                    *bindings,
+                    *update,
+                    *writeback,
+                    store,
+                ]);
                 return Ok(SetfExpansion {
                     temps,
                     vals,
@@ -32618,7 +32658,16 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                 .is_some_and(|middle| {
                     middle.len() >= 2 && middle.chars().all(|ch| ch == 'A' || ch == 'D')
                 }));
-        let store_form = if common_lisp_builtin_setf_place {
+        // Native class/structure accessors have a direct SETF store path, but
+        // need not have a callable #'(SETF accessor) function. Updating macros
+        // must receive an executable storing form for those places too. Keep
+        // explicit lexical/global writers and SETF generics on their call path.
+        let native_accessor_setf_place = n == 1
+            && accessor_slot_name(env, &acc).is_some()
+            && local_setf_writer(env, &acc).is_none()
+            && !env_has_setf_writer(&acc)
+            && !env_has_setf_generic(env, &acc);
+        let store_form = if common_lisp_builtin_setf_place || native_accessor_setf_place {
             // ACCESS-FORM contains only fresh temporaries, so SETF cannot
             // re-evaluate any original place subform (bliss-42iv).
             vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *access_form, *store])
