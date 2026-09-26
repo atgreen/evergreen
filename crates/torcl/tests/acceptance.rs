@@ -2314,6 +2314,27 @@ fn an_arithmetic_loop_variable_is_the_iteration_counter() {
             "(loop for x from 5 to 3 do (progn) finally (return x))",
             "5",
         ),
+        // `for nil` is a legal driver that discards its value (LOOP.1.50-53).
+        // NIL and T answer is_symbol() but are SPECIAL immediates rather than
+        // TAG_SYMBOL values, so reading or binding them through the symbol index
+        // PANICS — which is what stepping-from-the-variable first did here, and
+        // it took the whole ansi-test `iteration` chapter down with it.
+        (
+            "(let ((i 0)) (loop for nil from 10 to 15 collect (incf i)))",
+            "(1 2 3 4 5 6)",
+        ),
+        (
+            "(let ((i 0)) (loop for nil from 10 below 15 collect (incf i)))",
+            "(1 2 3 4 5)",
+        ),
+        ("(loop for nil from 10 to 0 collect 'a)", "NIL"),
+        (
+            "(let ((i 0)) (loop for nil from 0 to 10 by 2 collect (incf i)))",
+            "(1 2 3 4 5 6)",
+        ),
+        // `for t` is a program error SBCL rejects at compile time; TorCL does not
+        // signal it yet (bliss-pj0n), but it must not crash the process.
+        ("(loop for t from 1 to 3 collect 1)", "(1 1 1)"),
     ];
     run_expression_cases(&cases);
 }

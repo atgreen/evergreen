@@ -26739,7 +26739,15 @@ impl std::ops::Deref for RootedVals {
 /// Bind a (possibly destructuring / dotted) pattern against a value.
 fn loop_bind(pattern: TorclVal, value: TorclVal, env: &mut Env) {
     if pattern.is_symbol() {
-        if sym_name(pattern) != "NIL" {
+        // NIL and T answer `is_symbol()` but are SPECIAL immediates, not
+        // TAG_SYMBOL, so the `as_symbol_index` inside `define_local_symbol`
+        // panics on them. `loop for nil from 10 to 15` is legal — the clause
+        // drives the iteration and discards the value (LOOP.1.50-53) — and
+        // `loop for t ...` is a program error that SBCL rejects at compile time;
+        // neither may crash the process, which a panic here does (and, reached
+        // through the c2i adapters, aborts it). Signalling a PROGRAM-ERROR for
+        // the constant case is bliss-pj0n.
+        if pattern != NIL && pattern != T {
             // Bind through the symbol-indexed store as well, so the loop
             // variable properly shadows any outer lexical binding of the same
             // name (symbol lookup consults symbol_vars before the name map).
@@ -28058,7 +28066,14 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                         // lowerer matches. The COLLECTED values agree with SBCL
                         // either way.
                         if !first {
-                            let mut prev = if pat.is_symbol() {
+                            // `loop for nil from 10 to 15` is legal — the clause
+                            // drives the iteration and discards the value, so
+                            // there is no binding to read back (LOOP.1.50-53).
+                            // NIL and T answer `is_symbol()` but are SPECIAL
+                            // immediates, not TAG_SYMBOL, so `as_symbol_index`
+                            // inside the lookup would panic on them.
+                            let named = pat.is_symbol() && *pat != NIL && *pat != T;
+                            let mut prev = if named {
                                 env.lookup_var_symbol(*pat).unwrap_or(*current)
                             } else {
                                 *current
