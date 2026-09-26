@@ -45,9 +45,9 @@ use super::{
     DynBind, Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
     RestartFunction, SharedCell, apply_function, arena_cons, arena_str, condition_matches_handler,
     cp, eval_form, handler_case_token, list_to_vec, next_control_token, resolve_sym,
-    restart_invoked_name, run_handler_bind_handlers, signal_raw_error_in_context,
-    store_control_value, sym_bare_name_rc, sym_name, symbol_bare_name, tag_key, take_control_value,
-    torcl_error_to_condition, val_as_str, vec_to_list,
+    run_handler_bind_handlers, signal_raw_error_in_context, store_control_value, sym_bare_name_rc,
+    sym_name, symbol_bare_name, tag_key, take_control_value, torcl_error_to_condition, val_as_str,
+    vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use torcl_rt::asm::{Asm, Cc, Label};
@@ -3823,7 +3823,7 @@ impl<'e> Lowerer<'e> {
         let mut has_then = false;
 
         torcl_rt::rooted!(bindings = Vec::<TorclVal>::new());
-        torcl_rt::rooted!(top_tests = Vec::<TorclVal>::new());
+
         torcl_rt::rooted!(pre = Vec::<TorclVal>::new());
         torcl_rt::rooted!(body = Vec::<TorclVal>::new());
         torcl_rt::rooted!(steps = Vec::<TorclVal>::new());
@@ -3905,7 +3905,7 @@ impl<'e> Lowerer<'e> {
                             bindings.push(form_list(&[var, NIL]));
                             torcl_rt::rooted!(done = form_list(&[s(">=")?, index, length]));
                             torcl_rt::rooted!(exit = form_list(&[s("GO")?, end]));
-                            top_tests.push(form_list(&[s("WHEN")?, *done, *exit]));
+                            pre.push(form_list(&[s("WHEN")?, *done, *exit]));
                             torcl_rt::rooted!(element = form_list(&[s("AREF")?, vector, index]));
                             pre.push(form_list(&[s("SETQ")?, var, *element]));
                             torcl_rt::rooted!(next = form_list(&[s("1+")?, index]));
@@ -3950,7 +3950,7 @@ impl<'e> Lowerer<'e> {
                             torcl_rt::rooted_ref!(_end_test_root = &mut end_test);
                             let mut go_form = form_list(&[s("GO")?, end]);
                             torcl_rt::rooted_ref!(_go_form_root = &mut go_form);
-                            top_tests.push(form_list(&[s("WHEN")?, end_test, go_form]));
+                            pre.push(form_list(&[s("WHEN")?, end_test, go_form]));
                             let cur = if on {
                                 lst
                             } else {
@@ -4089,7 +4089,7 @@ impl<'e> Lowerer<'e> {
                                 torcl_rt::rooted_ref!(_test_form_root = &mut test_form);
                                 let mut go_form = form_list(&[s("GO")?, end]);
                                 torcl_rt::rooted_ref!(_go_form_root = &mut go_form);
-                                top_tests.push(form_list(&[s("WHEN")?, test_form, go_form]));
+                                pre.push(form_list(&[s("WHEN")?, test_form, go_form]));
                             }
                             // Republish the in-range counter into VAR at the top of
                             // the iteration (in driver source order), matching the
@@ -4116,7 +4116,7 @@ impl<'e> Lowerer<'e> {
                     torcl_rt::rooted_ref!(_done_test_root = &mut done_test);
                     let mut go_form = form_list(&[s("GO")?, end]);
                     torcl_rt::rooted_ref!(_go_form_root = &mut go_form);
-                    top_tests.push(form_list(&[s("WHEN")?, done_test, go_form]));
+                    pre.push(form_list(&[s("WHEN")?, done_test, go_form]));
                     steps.push(form_list(&[
                         s("SETQ")?,
                         counter,
@@ -4125,14 +4125,19 @@ impl<'e> Lowerer<'e> {
                     i += 2;
                 }
                 Some("WHILE") => {
-                    // `while`/`until` execute in TEXTUAL order relative to the
-                    // `for VAR = FORM` re-evaluation, which lands in `pre` (runs
-                    // after `top_tests`). Emitting the test here (into `pre`)
-                    // rather than `top_tests` makes `(loop :for x = (next)
-                    // :until (done x) :collect x)` test the CURRENT `x`, so the
-                    // terminating value is not collected (CLHS 6.1.2.1 / 6.1.9;
-                    // was: an off-by-one that collected the sentinel — e.g. asdf's
-                    // slurp-stream-forms appended its EOF marker).
+                    // `while`/`until` are MAIN clauses: they execute in TEXTUAL
+                    // order among the body's other main clauses, after the
+                    // variable stepping of this iteration (CLHS 6.1.2.1 /
+                    // 6.1.9). So the test goes wherever the clause was written
+                    // — into `pre` while only variable clauses have been seen
+                    // (that keeps `(loop for x = (next) until (done x) collect
+                    // x)` testing the CURRENT `x`), and into `body` once a main
+                    // clause has been emitted. Always emitting into `pre` put
+                    // the test ahead of an earlier `do`, so dexador's
+                    // READ-UNTIL-CRLF*2 — `do (fast-write-byte byte buf) until
+                    // (= byte (char-code #\Return))` — dropped every CR it read
+                    // and fast-http then rejected its own response headers
+                    // (bliss-4tu2).
                     let mut test = *forms.get(i + 1).ok_or(Bail)?;
                     torcl_rt::rooted_ref!(_test_root = &mut test);
                     // Root each sub-list before the next allocates (bliss-sqpi).
@@ -4140,13 +4145,23 @@ impl<'e> Lowerer<'e> {
                     torcl_rt::rooted_ref!(_not_form_root = &mut not_form);
                     let mut go_form = form_list(&[s("GO")?, end]);
                     torcl_rt::rooted_ref!(_go_form_root = &mut go_form);
-                    pre.push(form_list(&[s("WHEN")?, not_form, go_form]));
+                    let test_form = form_list(&[s("WHEN")?, not_form, go_form]);
+                    if body.is_empty() {
+                        pre.push(test_form);
+                    } else {
+                        body.push(test_form);
+                    }
                     i += 2;
                 }
                 Some("UNTIL") => {
                     let mut test = *forms.get(i + 1).ok_or(Bail)?;
                     torcl_rt::rooted_ref!(_test_root = &mut test);
-                    pre.push(form_list(&[s("WHEN")?, test, form_list(&[s("GO")?, end])]));
+                    let test_form = form_list(&[s("WHEN")?, test, form_list(&[s("GO")?, end])]);
+                    if body.is_empty() {
+                        pre.push(test_form);
+                    } else {
+                        body.push(test_form);
+                    }
                     i += 2;
                 }
                 Some("DO") | Some("DOING") => {
@@ -4295,9 +4310,17 @@ impl<'e> Lowerer<'e> {
         };
         torcl_rt::rooted!(result = result);
 
-        // (tagbody %top <tests> <pre> <body> <steps> (go %top) %end)
+        // (tagbody %top <prologue> <body> <steps> (go %top) %end)
+        //
+        // `pre` is ONE prologue in clause order: each driver's stepping and its
+        // termination test sit where the clause was written (CLHS 6.1.2.1). Tests
+        // used to be collected separately and emitted BEFORE every assignment, so
+        // on the pass where one driver ended, an earlier `for VAR = INIT then STEP`
+        // never took its step — fast-io's CONCAT-BUFFER reads that variable in its
+        // FINALLY and passed NIL as a :START1, which is what stopped Dexador from
+        // writing a request (bliss-uy9t). It is also why WHILE/UNTIL had to be
+        // emitted into `pre` by hand to keep textual order.
         torcl_rt::rooted!(tb = vec![s("TAGBODY")?, top]);
-        tb.extend(top_tests.iter().copied());
         tb.extend(pre.iter().copied());
         tb.extend(body.iter().copied());
         tb.extend(steps.iter().copied());
@@ -14519,14 +14542,41 @@ fn initiate_unwind(
                 cluster_frame,
             }) => {
                 acts[top].handlers.pop();
+                // A restart invoked by a handler unwinds to here; NOW apply its
+                // clause, in this construct's environment (CLHS 9.1.4.2) — mirror
+                // eval_restart_case. Keyed by the restart BINDING id, because the
+                // same name can be established at several depths at once, and the
+                // entry is taken BEFORE the restarts are truncated (bliss-fzvv).
+                let invoked = match &pending {
+                    Pending::Propagate(error) => super::restart_invoked_id(error).and_then(|id| {
+                        env.restarts[restart_base..]
+                            .iter()
+                            .find(|entry| entry.id == id)
+                            .cloned()
+                    }),
+                    _ => None,
+                };
                 env.restarts.truncate(restart_base);
                 pop_condition_cluster_frame(stack, cluster_frame);
-                // A restart invoked (by a handler) unwinds here carrying its
-                // stored result — mirror eval_restart_case.
-                let delivered = match &pending {
-                    Pending::Propagate(error) => restart_invoked_name(error)
-                        .map(|name| take_control_value(&format!("RESTART-RESULT:{name}"))),
-                    _ => None,
+                let delivered = match invoked {
+                    Some(entry) => {
+                        let args = super::take_restart_args(entry.id);
+                        match super::invoke_restart_function_in(
+                            &entry.function,
+                            &args,
+                            env,
+                            Some((&entry.captured_blocks, &entry.captured_tags)),
+                        ) {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                // The clause itself transferred or failed: keep
+                                // unwinding with that instead.
+                                pending = error_to_pending(error, env);
+                                None
+                            }
+                        }
+                    }
+                    None => None,
                 };
                 if let Some(v) = delivered {
                     let act = &mut acts[top];

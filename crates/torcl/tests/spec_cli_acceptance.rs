@@ -3826,3 +3826,215 @@ fn builtins_are_first_class_functions() {
         "15"
     );
 }
+
+#[test]
+fn typep_honours_an_array_type_specifiers_element_type() {
+    // bliss-ubb2: the VECTOR/ARRAY/SIMPLE-ARRAY arm of TYPEP treated the element
+    // type as wild and checked only the length, so `(typep "abc" '(simple-array
+    // (unsigned-byte 8) (*)))` answered T. Dexador guards a header value with
+    // exactly that test — `(if (typep value 'octets) value (ascii-string-to-octets
+    // (princ-to-string value)))` — and so wrote its User-Agent STRING into a
+    // binary buffer. Every row below was diffed against SBCL.
+    //
+    // The spec's element type is compared UPGRADED: `(unsigned-byte 8)` upgrades
+    // to T because torcl stores byte arrays as general vectors (bliss-iqyv), so a
+    // byte buffer still satisfies the specifier while a string no longer does.
+    assert_eq!(
+        eval_ok(
+            "(let ((s \"abc\")\
+                   (b (make-array 3 :element-type '(unsigned-byte 8) :initial-element 0))\
+                   (bv #*101)\
+                   (fp (make-array 3 :fill-pointer 3 :element-type '(unsigned-byte 8))))\
+               (list (typep s '(simple-array (unsigned-byte 8) (*)))\
+                     (typep b '(simple-array (unsigned-byte 8) (*)))\
+                     (typep bv '(simple-array (unsigned-byte 8) (*)))\
+                     (typep fp '(simple-array (unsigned-byte 8) (*)))))"
+        ),
+        "(NIL T NIL NIL)"
+    );
+    // A character element type accepts any string (whether a literal landed in
+    // 1-byte or 4-byte storage is the reader's choice), and rejects non-strings.
+    assert_eq!(
+        eval_ok(
+            "(list (typep \"abc\" '(simple-array character (*)))\
+                   (typep \"abc\" '(simple-array character (3)))\
+                   (typep \"abc\" '(simple-array character (4)))\
+                   (typep \"abc\" '(vector t))\
+                   (typep (vector 1 2 3) '(vector t))\
+                   (typep #*101 '(vector t)))"
+        ),
+        "(T T NIL NIL T NIL)"
+    );
+    // Dimensions are part of the test too: `(*)` is rank 1, so a 2-D array fails
+    // it, and a vector fails a rank-2 specifier.
+    assert_eq!(
+        eval_ok(
+            "(let ((md (make-array '(2 2))) (v (vector 1 2 3)))\
+               (list (typep md '(array t (2 2)))\
+                     (typep md '(array t (*)))\
+                     (typep md '(array t))\
+                     (typep md 'vector)\
+                     (typep v '(array t (2 2)))\
+                     (typep v '(simple-array t (3)))))"
+        ),
+        "(T NIL T NIL NIL T)"
+    );
+    // A specifier's size names the array's DIMENSION, not its active length, so
+    // a fill-pointer vector matches its capacity. Comparing against LENGTH had
+    // these exactly the other way round from SBCL.
+    assert_eq!(
+        eval_ok(
+            "(let ((v (make-array 5 :fill-pointer 2))                   (s (make-array 5 :element-type 'character :fill-pointer 2))                   (b (make-array 5 :element-type 'bit :fill-pointer 2)))               (list (typep v '(array t (5))) (typep v '(array t (2)))                     (typep v '(vector t 5)) (typep v '(vector t 2))                     (typep s '(string 5)) (typep s '(string 2))                     (typep b '(bit-vector 5)) (typep b '(bit-vector 2))))"
+        ),
+        "(T NIL T NIL T NIL T NIL)"
+    );
+}
+
+#[test]
+fn interning_an_existing_keyword_returns_the_readers_keyword() {
+    // bliss-r8kt: KEYWORD symbols are keyed `KEYWORD:<name>` in the shared symbol
+    // registry — where the reader mints them and where FIND-SYMBOL looks them up —
+    // but INTERN went straight to the package registry's symbol tables and so
+    // allocated a SECOND symbol of the same name. cl-json interns its decoded
+    // object keys, so `(assoc :message decoded)` answered NIL for callers that
+    // write keyword literals, and completions read every Ollama reply as NIL.
+    assert_eq!(
+        eval_ok(
+            "(list (eq :model (intern \"MODEL\" :keyword))\
+                   (eq :model (intern \"MODEL\" (find-package \"KEYWORD\")))\
+                   (eq (intern \"MODEL\" :keyword) (find-symbol \"MODEL\" :keyword))\
+                   (nth-value 1 (intern \"MODEL\" :keyword)))"
+        ),
+        "(T T T :EXTERNAL)"
+    );
+    // A keyword INTERN creates gets status NIL and is then the reader's keyword.
+    assert_eq!(
+        eval_ok(
+            "(list (nth-value 1 (intern \"ZZTOP\" :keyword))\
+                   (nth-value 1 (intern \"ZZTOP\" :keyword))\
+                   (eq (intern \"ZZTOP\" :keyword) (read-from-string \":zztop\")))"
+        ),
+        "(NIL :EXTERNAL T)"
+    );
+    // INTERN is case-SENSITIVE: "abc" names :|abc|, not :ABC.
+    assert_eq!(
+        eval_ok(
+            "(list (symbol-name (intern \"abc\" :keyword))\
+                   (eq (intern \"abc\" :keyword) :|abc|)\
+                   (eq (intern \"abc\" :keyword) :abc)\
+                   (keywordp (intern \"abc\" :keyword)))"
+        ),
+        "(\"abc\" T NIL T)"
+    );
+    // Exactly one symbol of that name is present in KEYWORD afterwards.
+    assert_eq!(
+        eval_ok(
+            "(progn (intern \"MODEL\" :keyword)\
+               (let ((n 0))\
+                 (do-symbols (s :keyword) (when (string= (symbol-name s) \"MODEL\") (incf n)))\
+                 n))"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn a_loop_termination_test_runs_after_an_earlier_body_clause() {
+    // bliss-4tu2: the lowerer emitted every WHILE/UNTIL test into the iteration
+    // prologue, so a test written AFTER a body clause ran BEFORE it. Dexador's
+    // READ-UNTIL-CRLF*2 is `do (fast-write-byte byte buf) until (= byte 13)`, so
+    // every CR was dropped from the response it read and fast-http rejected its
+    // own headers with "maybe invalid header".
+    //
+    // Written as DEFUNs loaded from a file so the bytecode tier really compiles
+    // them (an EVAL wrapper would only ever exercise the tree-walker, which was
+    // already correct); the trailing --eval row covers the tree-walker. Values
+    // diffed against SBCL.
+    let dir = temp_dir("loop-termination-order");
+    let script = dir.join("loop-termination-order.lisp");
+    write_file(
+        &script,
+        "(defun after-do ()\n\
+           (let ((acc '()))\n\
+             (loop for x in '(1 2 3 4) do (push x acc) until (= x 2))\n\
+             (nreverse acc)))\n\
+         (defun after-do-stepped ()\n\
+           (let ((acc '()) (n 0))\n\
+             (loop for x = (incf n) do (push x acc) until (= x 3))\n\
+             (nreverse acc)))\n\
+         (defun before-do ()\n\
+           (let ((acc '()))\n\
+             (loop for x in '(1 2 3 4) until (= x 2) do (push x acc))\n\
+             (nreverse acc)))\n\
+         (defun while-after-when ()\n\
+           (let ((acc '()) (n 0))\n\
+             (loop for x = (incf n) when (> x 0) do (push x acc) while (< x 3))\n\
+             (nreverse acc)))\n\
+         ;; The reason the tests were hoisted in the first place: an UNTIL that\n\
+         ;; PRECEDES the body must still see the CURRENT value of a stepped var,\n\
+         ;; so the terminating value is not collected.\n\
+         (defun until-before-collect ()\n\
+           (let ((n 0))\n\
+             (loop for x = (incf n) until (= x 4) collect x)))\n\
+         (format t \"LOOP=~S\"\n\
+           (list (after-do) (after-do-stepped) (before-do)\n\
+                 (while-after-when) (until-before-collect)))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL loop-termination fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("LOOP=((1 2) (1 2 3) (1) (1 2 3) (1 2 3))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The tree-walker answers the same.
+    assert_eq!(
+        eval_ok(
+            "(let ((acc '()))\
+               (loop for x in '(1 2 3 4) do (push x acc) until (= x 2))\
+               (nreverse acc))"
+        ),
+        "(1 2)"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn write_byte_signals_a_type_error_for_a_non_byte() {
+    // WRITE-BYTE used to reach `as_fixnum()` on whatever it was handed, so a
+    // character (or any non-integer) PANICKED the host instead of signalling a
+    // condition the program can handle. Found when dexador wrote a string into a
+    // binary buffer (bliss-ubb2): the panic hid the real defect.
+    assert_eq!(
+        eval_ok(
+            "(handler-case (with-output-to-string (s) (write-byte #\\D s))\
+               (type-error () :type-error)\
+               (error () :other))"
+        ),
+        ":TYPE-ERROR"
+    );
+    assert_eq!(
+        eval_ok(
+            "(handler-case (with-output-to-string (s) (write-byte 300 s))\
+               (type-error () :type-error)\
+               (error () :other))"
+        ),
+        ":TYPE-ERROR"
+    );
+}

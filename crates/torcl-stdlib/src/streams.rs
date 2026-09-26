@@ -752,7 +752,22 @@ impl GrayStream for StreamMutableState {
 
     fn stream_write_byte(&mut self, byte: TorclVal) -> Result<(), TorclError> {
         self.check_output()?;
-        let b = byte.as_fixnum() as u8;
+        // CLHS WRITE-BYTE: a non-integer (or one outside the element type) is a
+        // TYPE-ERROR the program can handle — never a host panic.
+        if !byte.is_fixnum() {
+            return Err(TorclError::TypeError {
+                datum: byte,
+                expected: "(UNSIGNED-BYTE 8)".into(),
+            });
+        }
+        let value = byte.as_fixnum();
+        if !(0..=255).contains(&value) {
+            return Err(TorclError::TypeError {
+                datum: byte,
+                expected: "(UNSIGNED-BYTE 8)".into(),
+            });
+        }
+        let b = value as u8;
         let comps = self.components();
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {

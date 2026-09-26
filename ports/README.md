@@ -21,10 +21,21 @@ exercises these forks:
 | usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `5f8ba3596b4be3b3962a26957ff5508d4d02cbcc` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `0bb7ebd89ec5c8245516c5117f4bc598ebd56e84` |
+| bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `0251844d5e9482eb5fc91fa4686a05aacd24d9b4` |
+| precise-time | https://github.com/atgreen/precise-time | `deadbdeb95ee98cd743c538e649880181e8416f7` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
-TorCL client primitives and is not a claim of HTTPS or completions support.
+TorCL client primitives and is not a claim of HTTPS support.
+
+The [Completions scenario](../tests/completions/README.md) is the end-to-end
+client: it drives Dexador and Completions through a real HTTP request/response
+cycle against an Ollama-shaped local server that echoes the prompt back, so a
+malformed request or a mis-decoded reply fails an assertion. It imports all of
+the forks above (bordeaux-threads, precise-time, trivial-cltl2,
+trivial-features, trivial-garbage, trivial-gray-streams and usocket) by
+immutable commit. The endpoint is plain HTTP, so it is not a claim of HTTPS
+support.
 
 The trivial-cltl2 fork adds only `#+torcl #:torcl-cltl2` to its `:use` list.
 TorCL provides that package — its counterpart of SB-CLTL2 — exporting the part
@@ -43,6 +54,9 @@ ocicl install git+https://github.com/atgreen/trivial-features@26e8d168deb7d70d76
 ocicl install git+https://github.com/atgreen/trivial-gray-streams@e55ad7e91aa5aa92408fe082b2e307f8986be080
 ocicl install git+https://github.com/atgreen/trivial-cltl2@116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691
 ocicl install git+https://github.com/atgreen/trivial-garbage@0bb7ebd89ec5c8245516c5117f4bc598ebd56e84
+ocicl install git+https://github.com/atgreen/usocket@5f8ba3596b4be3b3962a26957ff5508d4d02cbcc
+ocicl install git+https://github.com/atgreen/bordeaux-threads@0251844d5e9482eb5fc91fa4686a05aacd24d9b4
+ocicl install git+https://github.com/atgreen/precise-time@deadbdeb95ee98cd743c538e649880181e8416f7
 ```
 
 The trivial-garbage fork uses TorCL's deferred Lisp finalizers and its native

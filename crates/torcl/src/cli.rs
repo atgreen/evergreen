@@ -3956,9 +3956,8 @@ fn take_control_value(token: &str) -> TorclVal {
 /// Store a control-token value together with the full multiple-value list live
 /// on `env`, so a RETURN / RETURN-FROM out of a BLOCK carries ALL values (not
 /// just the primary) to the block's exit — `(return-from foo (values a b))`
-/// must yield two values, and `(return (values))` zero. Mirrors
-/// `store_restart_result`: the values are wrapped in a leading cons so their
-/// presence (even zero values) is unambiguous.
+/// must yield two values, and `(return (values))` zero. The values are wrapped
+/// in a leading cons so their presence (even zero values) is unambiguous.
 fn store_control_mv(token: &str, primary: TorclVal, env: &Env) {
     store_control_value(token, primary);
     let values = if env.mv_active {
@@ -4002,33 +4001,22 @@ fn take_control_mv(token: &str, env: &mut Env) -> TorclVal {
     primary
 }
 
-/// Stash the primary value AND the full multiple-value list produced by an
-/// invoked (unwinding) restart clause, so the establishing RESTART-CASE can
-/// republish them as its own values (RESTART-CASE.16, WITH-SIMPLE-RESTART.5).
-/// The value list is wrapped in a leading cons (`(T . values)`) so its presence
-/// is unambiguous even when the clause returned zero values.
-fn store_restart_result(name: &str, result: TorclVal, env: &Env) {
-    store_control_value(&format!("RESTART-RESULT:{name}"), result);
-    let values = if env.mv_active {
-        env.mv.clone()
-    } else {
-        vec![result]
-    };
-    torcl_rt::rooted!(list = vec_to_list(&values));
-    let token = format!("RESTART-MV:{name}");
-    store_control_value(&token, arena_cons(T, *list));
+/// Stash the arguments an invoked (unwinding) restart was given, for the
+/// establishing construct to apply to its clause body once the stack has
+/// unwound. Keyed by the restart BINDING id, like the result.
+fn store_restart_args(id: u64, args: &[TorclVal]) {
+    torcl_rt::rooted!(list = vec_to_list(args));
+    store_control_value(&format!("RESTART-ARGS:{id}"), arena_cons(T, *list));
 }
 
-/// Retrieve a restart clause's stashed values (see `store_restart_result`),
-/// republishing the multiple-value state on `env`, and return the primary value.
-fn take_restart_result(name: &str, env: &mut Env) -> TorclVal {
-    let result = take_control_value(&format!("RESTART-RESULT:{name}"));
-    let wrapped = take_control_value(&format!("RESTART-MV:{name}"));
+/// Retrieve the arguments stashed by [`store_restart_args`].
+fn take_restart_args(id: u64) -> Vec<TorclVal> {
+    let wrapped = take_control_value(&format!("RESTART-ARGS:{id}"));
     if wrapped.is_cons() {
-        let values = list_to_vec(cp(wrapped).1);
-        env.set_mv(values);
+        list_to_vec(cp(wrapped).1)
+    } else {
+        Vec::new()
     }
-    result
 }
 
 fn handler_case_token(error: &TorclError) -> Option<String> {
@@ -4040,13 +4028,39 @@ fn handler_case_token(error: &TorclError) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The control token an invoked (unwinding) restart raises. It names the restart
+/// AND identifies the exact binding, because the same name can be established at
+/// several depths at once: a clause that re-signals lets an outer handler invoke
+/// the OUTER restart while the inner one is still unwinding, and keying the
+/// clause's stashed result by name alone made the inner RESTART-CASE return the
+/// outer clause's value — cl-json's alist fallback then wrote its object twice
+/// (bliss-fzvv).
+fn restart_invoked_token(id: u64, name: &str) -> String {
+    format!("__RESTART_INVOKED__:{id}:{name}")
+}
+
+/// The NAME in a restart-invoked token, for the callers that only care which
+/// restart fired (CONTINUE / MUFFLE-WARNING).
 fn restart_invoked_name(error: &TorclError) -> Option<String> {
     let TorclError::Internal(message) = error else {
         return None;
     };
-    message
-        .strip_prefix("__RESTART_INVOKED__:")
-        .map(ToString::to_string)
+    let rest = message.strip_prefix("__RESTART_INVOKED__:")?;
+    Some(match rest.split_once(':') {
+        Some((_id, name)) => name.to_string(),
+        None => rest.to_string(),
+    })
+}
+
+/// The restart BINDING id in a restart-invoked token, so an establishing
+/// construct claims only the restarts it established itself.
+fn restart_invoked_id(error: &TorclError) -> Option<u64> {
+    let TorclError::Internal(message) = error else {
+        return None;
+    };
+    let rest = message.strip_prefix("__RESTART_INVOKED__:")?;
+    let (id, _name) = rest.split_once(':')?;
+    id.parse().ok()
 }
 
 fn make_simple_condition(
@@ -5641,10 +5655,75 @@ fn builtin_type_specializer_distance(name: &str, arg: TorclVal) -> Option<usize>
         // PATHNAME is a distinct built-in type (not a CLOS instance); ASDF's
         // source-registry dispatches methods on it (bliss-lb6.14).
         "PATHNAME" => torcl_stdlib::is_pathname(arg).then_some(1),
+        // The ARRAY/SEQUENCE side of the built-in hierarchy. Without these a
+        // method on VECTOR, ARRAY or SEQUENCE never applied — a vector, string or
+        // bit vector fell through to the T method — so cl-json could not encode
+        // the vectors Completions builds every request from, and its
+        // `(defmethod encode-json ((s sequence)) …)` was dead code (bliss-qvv3).
+        //
+        // Distances follow the CPL depth CLHS gives these classes: for a string,
+        // STRING < VECTOR < ARRAY < SEQUENCE < T.
+        "SIMPLE-VECTOR" => (torcl_rt::types::vectorp(arg)
+            && !is_string_value(arg)
+            && !torcl_rt::types::bit_vector_p(arg)
+            && torcl_rt::types::md_array_rank(arg).is_none())
+        .then_some(1),
+        "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => torcl_rt::types::bit_vector_p(arg).then_some(1),
+        // A rank-1 array only: a multidimensional array is an ARRAY but not a
+        // VECTOR, and not a SEQUENCE either.
+        "VECTOR" => (torcl_rt::types::vectorp(arg)
+            && torcl_rt::types::md_array_rank(arg).is_none())
+        .then_some(2),
+        "ARRAY" | "SIMPLE-ARRAY" => torcl_rt::types::arrayp(arg).then_some(3),
+        "SEQUENCE" => ((arg.is_list() && !is_function_value(arg))
+            || (torcl_rt::types::vectorp(arg) && torcl_rt::types::md_array_rank(arg).is_none()))
+        .then_some(4),
+        "HASH-TABLE" => torcl_stdlib::hash_table_p(arg).then_some(1),
+        "PACKAGE" => torcl_rt::types::packagep(arg).then_some(1),
+        "STREAM" => torcl_rt::types::streamp(arg).then_some(1),
         "ATOM" => (!arg.is_cons() || is_function_value(arg)).then_some(6),
         "T" => Some(usize::MAX / 4),
         _ => None,
     }
+}
+
+/// The built-in type discriminator for one dispatch argument: the bits of
+/// `GfKey::builtin`. Two values that agree here answer every specializer in
+/// `builtin_type_specializer_distance` identically.
+fn dispatch_builtin_discriminator(arg: TorclVal) -> u32 {
+    if torcl_stdlib::is_instance(arg) {
+        // A CLOS instance dispatches through its class, which the key already
+        // holds exactly.
+        return 0;
+    }
+    let mut bits = 0u32;
+    let mut set = |condition: bool, bit: u32| {
+        if condition {
+            bits |= 1 << bit;
+        }
+    };
+    set(is_string_value(arg), 0);
+    set(is_base_string_value(arg), 1);
+    set(torcl_rt::types::bit_vector_p(arg), 2);
+    set(torcl_rt::types::md_array_rank(arg).is_some(), 3);
+    set(torcl_rt::types::vectorp(arg), 4);
+    set(is_keyword_arg(arg), 5);
+    set(is_function_value(arg), 6);
+    set(torcl_stdlib::is_pathname(arg), 7);
+    set(torcl_rt::types::streamp(arg), 8);
+    set(torcl_rt::types::packagep(arg), 9);
+    set(torcl_stdlib::hash_table_p(arg), 10);
+    set(torcl_rt::types::integerp(arg), 11);
+    set(torcl_rt::types::rationalp(arg), 12);
+    set(torcl_rt::types::floatp(arg), 13);
+    set(torcl_rt::types::complexp(arg), 14);
+    set(arg.is_single_float(), 15);
+    set(arg.is_fixnum(), 16);
+    set(arg.is_character(), 17);
+    set(arg.is_cons(), 18);
+    set(arg.is_symbol(), 19);
+    set(arg.is_nil(), 20);
+    bits
 }
 
 fn method_specificity_vector(
@@ -5666,29 +5745,47 @@ fn method_specificity_vector(
                 distances.push(0);
             }
             MethodSpecializer::Class(name) => {
-                let specializer_sym = resolve_sym(name).unwrap_or(NIL);
-                let arg_class = torcl_stdlib::class_of(*arg);
-                // Prefer a genuine CLOS-class match via the argument's class
-                // precedence list; fall back to built-in immediate types (integer,
-                // string, …) whose classes are not user-registered by name.
-                let clos_distance = resolve_class_metaobject(env, specializer_sym)
-                    .ok()
-                    .and_then(|specializer_class| {
-                        torcl_stdlib::compute_class_precedence_list(arg_class)
-                            .ok()
-                            .and_then(|cpl| {
-                                cpl.iter().position(|&class| class == specializer_class)
-                            })
-                            .map(|pos| pos + 1)
-                    });
-                let distance = match clos_distance {
-                    Some(distance) => distance,
-                    // A CLOS instance is a tagged fixnum id; never let it match a
-                    // built-in immediate-type specializer (integer, symbol, …).
-                    None if !torcl_stdlib::is_instance(*arg) => {
-                        builtin_type_specializer_distance(name, *arg)?
-                    }
-                    None => return None,
+                // A CLOS INSTANCE dispatches through its class precedence list;
+                // anything else through the built-in type table.
+                //
+                // The table comes FIRST for non-instances because `class_of`
+                // answers one catch-all class for every heap object — a string, a
+                // vector, a bignum and a stream all report the same class — so a
+                // CPL lookup made a STRING method applicable to ANY heap object,
+                // and `(defmethod enc ((x string)))` swallowed vectors
+                // (bliss-qvv3). The table knows the real predicates and gives the
+                // CLHS precedence order among them.
+                let distance = if torcl_stdlib::is_instance(*arg) {
+                    let specializer_sym = resolve_sym(name).unwrap_or(NIL);
+                    let arg_class = torcl_stdlib::class_of(*arg);
+                    resolve_class_metaobject(env, specializer_sym)
+                        .ok()
+                        .and_then(|specializer_class| {
+                            torcl_stdlib::compute_class_precedence_list(arg_class)
+                                .ok()
+                                .and_then(|cpl| {
+                                    cpl.iter().position(|&class| class == specializer_class)
+                                })
+                                .map(|pos| pos + 1)
+                        })?
+                } else if let Some(builtin) = builtin_type_specializer_distance(name, *arg) {
+                    builtin
+                } else {
+                    // Not a name the table knows: fall back to the class graph, so
+                    // a method on a class a non-instance value still belongs to
+                    // (STRUCTURE-OBJECT, a condition class, …) keeps working.
+                    let specializer_sym = resolve_sym(name).unwrap_or(NIL);
+                    let arg_class = torcl_stdlib::class_of(*arg);
+                    resolve_class_metaobject(env, specializer_sym)
+                        .ok()
+                        .and_then(|specializer_class| {
+                            torcl_stdlib::compute_class_precedence_list(arg_class)
+                                .ok()
+                                .and_then(|cpl| {
+                                    cpl.iter().position(|&class| class == specializer_class)
+                                })
+                                .map(|pos| pos + 1)
+                        })?
                 };
                 distances.push(distance);
             }
@@ -6314,6 +6411,17 @@ struct GfKey {
     gf: u32,
     n: u8,
     classes: [u64; GF_KEY_MAX_ARGS],
+    /// Per-argument built-in type discriminator, alongside the class identity.
+    ///
+    /// `class_of` answers ONE catch-all class for every heap object that is not a
+    /// CLOS instance — a string, a vector, a bignum, a stream and a pathname all
+    /// report the same class — and keying the cache on that alone let one type
+    /// reuse another's effective method: with methods on both VECTOR and STRING,
+    /// the first heap argument dispatched decided for every later one, so
+    /// cl-json encoded a string with its VECTOR method (bliss-qvv3). Immediates
+    /// collide too: a keyword and a plain symbol share SYMBOL's class, and an
+    /// interpreter closure is a CONS.
+    builtin: [u32; GF_KEY_MAX_ARGS],
 }
 
 /// Invalidate every cached dispatch decision. Cheap (a counter bump); called when
@@ -6556,13 +6664,16 @@ fn invoke_generic_function_inner(
     let dispatch_key = if cacheable && args.len() <= GF_KEY_MAX_ARGS {
         gf_idx.map(|gf| {
             let mut classes = [0u64; GF_KEY_MAX_ARGS];
-            for (slot, a) in classes.iter_mut().zip(args.iter()) {
+            let mut builtin = [0u32; GF_KEY_MAX_ARGS];
+            for ((slot, bits), a) in classes.iter_mut().zip(builtin.iter_mut()).zip(args.iter()) {
                 *slot = torcl_stdlib::class_of(*a).0;
+                *bits = dispatch_builtin_discriminator(*a);
             }
             GfKey {
                 gf,
                 n: args.len() as u8,
                 classes,
+                builtin,
             }
         })
     } else {
@@ -6957,6 +7068,29 @@ impl torcl_rt::gc::TraceHostRoots for MethodContext {
             visit(arg);
         }
         with_env_visit_state(|state| visit_next_method_roots(&mut self.next, state, visit));
+    }
+}
+
+/// A RESTART-CASE's own restart entries, retained across the unwind so the clause
+/// can be applied afterwards (bliss-fzvv). They hold heap references — the clause
+/// body form, its captured frame, the report — so the collector must see them.
+struct RetainedRestarts(Vec<RestartEntry>);
+
+impl torcl_rt::gc::TraceHostRoots for RetainedRestarts {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        with_env_visit_state(|state| {
+            for entry in &mut self.0 {
+                visit_restart_function_roots(&mut entry.function, state, visit);
+                if let Some(function) = &mut entry.interactive_function {
+                    visit_restart_function_roots(function, state, visit);
+                }
+                if let Some(function) = &mut entry.test_function {
+                    visit_restart_function_roots(function, state, visit);
+                }
+                visit(&mut entry.restart_obj);
+                visit(&mut entry.report);
+            }
+        });
     }
 }
 
@@ -9979,6 +10113,18 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 // registry and intentionally have no home package. Keep those
                 // callable by their existing bare symbol rather than minting a
                 // package-local lookalike with no builtin/function cell.
+                //
+                // This arm is WRONG for a read in a user package and is kept
+                // deliberately: boot.lisp is read in COMMON-LISP with no
+                // IN-PACKAGE, so every name it mentions — including
+                // lambda-list variables like A, N, SEQ, ACC and VALUE — is a
+                // homeless bare identity that this arm then hands to a bare
+                // read in ANY package. Restricting it to COMMON-LISP /
+                // COMMON-LISP-USER fixes that (and `(intern "A")` vs the read
+                // `a`), but it also makes ironclad's whirlpool.lisp fail its
+                // upfront compile-file read and fall back to a source-only
+                // fasl that then calls a compile-time-only function at load.
+                // See bliss-nn6f for the diagnosis and the two candidate fixes.
                 reader::find_symbol_index(name)
                     .filter(|idx| {
                         torcl_rt::symbols::symbol_package(*idx)
@@ -12545,6 +12691,93 @@ fn array_subtypep(t1: TorclVal, t2: TorclVal) -> Option<(bool, bool)> {
     Some((simple_ok && elt_ok && dims_ok, true))
 }
 
+// ── TYPEP against an array type specifier (bliss-ubb2) ────────────
+//
+// `SUBTYPEP` models element types (`parse_arr_type` / `upgrade_elt`); `TYPEP`
+// used to treat them as wild and check only the length, so `(typep "abc"
+// '(simple-array (unsigned-byte 8) (*)))` answered T. dexador guards a header
+// value with exactly that test — `(if (typep value 'octets) value
+// (ascii-string-to-octets (princ-to-string value)))` — and so wrote the
+// User-Agent *string* into its binary buffer.
+
+/// The element-type class torcl actually stores `object`'s elements in.
+///
+/// Everything that is not a string or a bit vector reports general (T) storage,
+/// because torcl builds no packed numeric arrays (bliss-iqyv) and `upgrade_elt`
+/// upgrades `(unsigned-byte 8)` and friends to T for exactly that reason. The
+/// two sides therefore meet: a byte buffer built by `MAKE-ARRAY :element-type
+/// '(unsigned-byte 8)` still satisfies `(simple-array (unsigned-byte 8) (*))`,
+/// while a string no longer does.
+fn object_elt_class(object: TorclVal) -> Elt {
+    if is_string_value(object) {
+        Elt::AnyString
+    } else if is_bit_vector_value(object) {
+        Elt::Up(EltU::Bit)
+    } else {
+        Elt::Up(EltU::T)
+    }
+}
+
+/// Does an array whose elements live in class `obj` satisfy a specifier asking
+/// for element type `spec`?
+///
+/// Character element types compare LENIENTLY in both directions: whether a
+/// literal lands in 1-byte or 4-byte storage is the reader's choice, so an
+/// exact match would make `(typep "abc" '(simple-array character (*)))` false
+/// for an ASCII literal that SBCL stores as CHARACTER. Every other class must
+/// agree — that is what makes a string fail an `(unsigned-byte 8)` specifier.
+fn arr_elt_admits(obj: Elt, spec: Elt) -> bool {
+    fn charish(e: Elt) -> bool {
+        matches!(
+            e,
+            Elt::AnyString
+                | Elt::Up(EltU::Character)
+                | Elt::Up(EltU::BaseChar)
+                | Elt::Up(EltU::Nil)
+        )
+    }
+    match (obj, spec) {
+        (_, Elt::Star) => true,
+        (o, s) if charish(o) || charish(s) => charish(o) && charish(s),
+        (Elt::Up(a), Elt::Up(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Does a rank-1 array satisfy a parsed ARRAY dimension specifier? `(*)` and
+/// `1` accept any length; `(5)` demands that length.
+fn vector_dims_match(object: TorclVal, dims: &Dims) -> bool {
+    match dims {
+        Dims::Star => true,
+        Dims::Rank(n) => *n == 1,
+        Dims::List(axes) => {
+            axes.len() == 1
+                && match axes[0] {
+                    None => true,
+                    Some(n) => vector_dimension(object) == Some(n),
+                }
+        }
+    }
+}
+
+/// Does a multidimensional array satisfy a parsed ARRAY dimension specifier?
+fn md_array_dims_match(object: TorclVal, dims: &Dims) -> bool {
+    let Ok(actual) = md_dims(object) else {
+        return false;
+    };
+    match dims {
+        Dims::Star => true,
+        Dims::Rank(n) => *n == actual.len(),
+        Dims::List(axes) => {
+            axes.len() == actual.len()
+                && axes
+                    .iter()
+                    .zip(actual.iter())
+                    .all(|(want, &got)| want.is_none_or(|w| w == got))
+        }
+    }
+}
+
 // ── CONS-type SUBTYPEP algebra (torcl types-and-classes) ──────────────
 //
 // `(cons a d)` is the set of conses whose car ∈ a and cdr ∈ d — covariant in
@@ -12957,6 +13190,18 @@ fn subtypep_relation(t1: TorclVal, t2: TorclVal) -> (bool, bool) {
 /// True if `object`'s length satisfies a vector/array type's size argument list.
 /// An empty list or a `*` wildcard matches any length; a fixnum must equal the
 /// object's length.
+/// A rank-1 array's DIMENSION — its total size, which for a fill-pointer /
+/// adjustable vector is its backing capacity, not its active length. A type
+/// specifier's size names the dimension (CLHS 4.2.3), so `(typep (make-array 5
+/// :fill-pointer 2) '(array t (5)))` is true; comparing against LENGTH answered
+/// that NIL and `(array t (2))` T — the other way round from SBCL.
+fn vector_dimension(object: TorclVal) -> Option<usize> {
+    if torcl_stdlib::is_complex_vector(object) {
+        return Some(torcl_stdlib::cvec_capacity(object));
+    }
+    torcl_stdlib::length(object).ok()
+}
+
 fn vector_length_matches(size_args: &[TorclVal], object: TorclVal) -> bool {
     let Some(size) = size_args.first().copied() else {
         return true;
@@ -12965,7 +13210,7 @@ fn vector_length_matches(size_args: &[TorclVal], object: TorclVal) -> bool {
         return true;
     }
     if size.is_fixnum() {
-        return torcl_stdlib::length(object)
+        return vector_dimension(object)
             .map(|len| len as i64 == size.as_fixnum())
             .unwrap_or(false);
     }
@@ -13294,27 +13539,47 @@ fn typep_matches(
             Ok(vector_length_matches(&list_to_vec(args), object))
         }
         "VECTOR" | "SIMPLE-ARRAY" | "ARRAY" => {
-            // (vector element-type size) / (array element-type dims): accept a
-            // general vector or a string, checking the size/length when given.
-            // Element-type is not tracked, so it is treated as wild.
+            // (vector element-type size) / (array element-type dims). The
+            // element type is part of the test, not decoration (bliss-ubb2):
+            // it is compared UPGRADED against the class the object's elements
+            // really live in, so a string fails `(unsigned-byte 8)` while a
+            // general byte buffer still satisfies it.
+            let arg_vec = list_to_vec(args);
+            let spec_elt = parse_elt_arg(arg_vec.first().copied());
             // A multidimensional array satisfies ARRAY/SIMPLE-ARRAY but not
-            // VECTOR (rank ≥ 2). Dimension specs are treated as wild here.
+            // VECTOR (rank ≥ 2), and torcl stores its elements generally.
             if torcl_rt::types::md_array_p(object) {
-                return Ok(op.as_ref() != "VECTOR");
+                if op.as_ref() == "VECTOR" {
+                    return Ok(false);
+                }
+                if !arr_elt_admits(Elt::Up(EltU::T), spec_elt) {
+                    return Ok(false);
+                }
+                let dims = parse_array_dims(arg_vec.get(1).copied()).unwrap_or(Dims::Star);
+                return Ok(md_array_dims_match(object, &dims));
             }
             if !is_vector_value(object) {
                 return Ok(false);
             }
-            // The size/length is the LAST argument (element-type precedes it).
-            let arg_vec = list_to_vec(args);
-            let size_args = if arg_vec.len() >= 2 {
-                arg_vec[1..].to_vec()
-            } else if op.as_ref() == "VECTOR" {
-                arg_vec.clone()
-            } else {
-                Vec::new()
-            };
-            Ok(vector_length_matches(&size_args, object))
+            // A fill-pointer / adjustable / displaced vector is not SIMPLE.
+            if op.as_ref() == "SIMPLE-ARRAY" && torcl_stdlib::is_complex_vector(object) {
+                return Ok(false);
+            }
+            if !arr_elt_admits(object_elt_class(object), spec_elt) {
+                return Ok(false);
+            }
+            if op.as_ref() == "VECTOR" {
+                // The size is the LAST argument (element-type precedes it);
+                // a lone argument is tolerated as either one.
+                let size_args = if arg_vec.len() >= 2 {
+                    arg_vec[1..].to_vec()
+                } else {
+                    arg_vec.clone()
+                };
+                return Ok(vector_length_matches(&size_args, object));
+            }
+            let dims = parse_array_dims(arg_vec.get(1).copied()).unwrap_or(Dims::Star);
+            Ok(vector_dims_match(object, &dims))
         }
         // The (MEMBER …) type specifier compares with EQL (CLHS 4.2.3), not EQUAL.
         "COMPLEX" => {
@@ -22829,17 +23094,25 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         // restarts (and anything dynamically inside) BEFORE running
                         // the clause body, so a body that re-invokes the same name
                         // does not re-find itself (restart-case.12).
-                        env.restarts.truncate(restart.group_base);
-                        let result = invoke_restart_function_in(
-                            &restart.function,
-                            &args,
-                            env,
-                            Some((&restart.captured_blocks, &restart.captured_tags)),
-                        )?;
-                        store_restart_result(&restart_name, result, env);
-                        return Err(TorclError::Internal(format!(
-                            "__RESTART_INVOKED__:{}",
-                            restart_name
+                        // Do NOT run the clause here, and do not truncate the
+                        // restart stack either: the establishing construct needs to
+                        // find this entry as it unwinds, and it truncates before
+                        // running the clause — so a clause that re-invokes its own
+                        // name still cannot re-find itself (restart-case.12).
+                        // Do NOT run the clause here. CLHS 9.1.4.2: a RESTART-CASE
+                        // clause runs after the dynamic state has been unwound to
+                        // the RESTART-CASE — so it is the establishing construct
+                        // that applies it, to these arguments. Running it at INVOKE
+                        // time put it inside the handler (with that handler's
+                        // cluster disestablished, in a child Env) and, worse, ran it
+                        // BEFORE the forms it was meant to replace finished
+                        // unwinding: cl-json's array attempt completed and wrote its
+                        // partial output after the fallback had already written the
+                        // object (bliss-fzvv).
+                        store_restart_args(restart.id, &args);
+                        return Err(TorclError::Internal(restart_invoked_token(
+                            restart.id,
+                            &restart_name,
                         )));
                     }
                     // RESTART-BIND: the function runs in the dynamic environment of
@@ -22890,12 +23163,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     // Unwind the establishing construct before running the clause
                     // body (see INVOKE-RESTART above); interactive args were already
                     // computed in the current dynamic environment.
-                    env.restarts.truncate(entry.group_base);
-                    let result = invoke_restart_function(&entry.function, &interactive_args, env)?;
-                    store_restart_result(&restart_name, result, env);
-                    return Err(TorclError::Internal(format!(
-                        "__RESTART_INVOKED__:{}",
-                        restart_name
+                    // As for INVOKE-RESTART: the establishing construct runs the
+                    // clause once unwound, and truncates first (bliss-fzvv).
+                    store_restart_args(entry.id, &interactive_args);
+                    return Err(TorclError::Internal(restart_invoked_token(
+                        entry.id,
+                        &restart_name,
                     )));
                 }
                 return invoke_restart_function(&entry.function, &interactive_args, env);
@@ -24592,6 +24865,29 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 } else {
                     effective_package_name(env)
                 };
+                // KEYWORD is the one package whose symbols do NOT live in a
+                // package's symbol tables: they are keyed `KEYWORD:<name>` in
+                // the shared symbol registry, which is where the reader mints
+                // them and where FIND-SYMBOL looks them up
+                // (`present_symbol_with_status`). Interning one through the
+                // package registry minted a SECOND symbol of the same name that
+                // was not EQ to the reader's — so cl-json's decoded keys did not
+                // match the `:message` / `:content` literals its callers write,
+                // and completions read every Ollama reply as NIL (bliss-r8kt).
+                // The registry key is the VERBATIM name: INTERN is
+                // case-sensitive, so `(intern "abc" :keyword)` must name `:|abc|`.
+                if pkg_name == "KEYWORD" {
+                    let key = format!("KEYWORD:{name_str}");
+                    let existed = reader::find_symbol_index(&key).is_some();
+                    let sym = TorclVal::from_symbol_index(reader::intern_symbol(&key));
+                    let status = if existed {
+                        package_status_symbol("EXTERNAL")
+                    } else {
+                        NIL
+                    };
+                    env.set_mv(vec![sym, status]);
+                    return Ok(sym);
+                }
                 // Package behavior belongs to torcl-stdlib. Ensure the package
                 // exists, then let its registry perform the exact-case lookup,
                 // inherited-symbol handling, allocation, and insertion.
@@ -27539,6 +27835,9 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                     ForState::Eq { pat, init, then } => {
                         let f = if first { *init } else { then.unwrap_or(*init) };
                         let v = eval_form(f, env)?;
+                        if std::env::var_os("TORCL_DEBUG_LOOP").is_some() {
+                            eprintln!("[loop-eq] first={first} value={}", format_val(v));
+                        }
                         loop_bind(*pat, v, env);
                     }
                     ForState::From {
@@ -36806,9 +37105,18 @@ fn eval_restart_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
     // to SIGNAL/ERROR/CERROR/WARN, the restarts this RESTART-CASE just
     // established are associated with the condition it signals. Arm a one-shot
     // that signal_condition_object consumes (restart-case.25-31).
+    // The bindings this RESTART-CASE established. A token naming one of THESE is
+    // ours to claim; a same-named restart established elsewhere is not
+    // (bliss-fzvv).
+    let own_ids: Vec<u64> = env.restarts[base_len..].iter().map(|r| r.id).collect();
+    // Kept so the clause can be applied AFTER the unwind (bliss-fzvv): the
+    // restarts themselves are truncated away before the clause runs, exactly so a
+    // clause that re-invokes the same name cannot re-find itself
+    // (restart-case.12).
+    let mut own_entries = RetainedRestarts(env.restarts[base_len..].to_vec());
+    torcl_rt::rooted_ref!(_own_entries_root = &mut own_entries);
     if restart_form_signals_condition(restartable_form, env) {
-        let ids: Vec<u64> = env.restarts[base_len..].iter().map(|r| r.id).collect();
-        PENDING_SIGNAL_RESTART_IDS.with(|c| *c.borrow_mut() = Some(ids));
+        PENDING_SIGNAL_RESTART_IDS.with(|c| *c.borrow_mut() = Some(own_ids.clone()));
     }
     let result = eval_form(restartable_form, env);
     // Disarm the one-shot in case the form did not signal after all.
@@ -36824,8 +37132,22 @@ fn eval_restart_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
-            if let Some(name) = restart_invoked_name(&error) {
-                return Ok(take_restart_result(&name, env));
+            if let Some(id) = restart_invoked_id(&error)
+                && own_ids.contains(&id)
+            {
+                // The dynamic state is unwound to here; NOW run the clause, in
+                // this construct's own environment (CLHS 9.1.4.2).
+                let Some(entry) = own_entries.0.iter().find(|entry| entry.id == id) else {
+                    return Err(error);
+                };
+                let mut args = take_restart_args(id);
+                torcl_rt::rooted_ref!(_restart_args_root = &mut args);
+                return invoke_restart_function_in(
+                    &entry.function,
+                    &args,
+                    env,
+                    Some((&entry.captured_blocks, &entry.captured_tags)),
+                );
             }
             Err(error)
         }
