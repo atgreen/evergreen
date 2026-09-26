@@ -11,6 +11,8 @@ pub mod memory;
 
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call;
+#[cfg(all(target_arch = "x86_64", unix))]
+pub mod callback;
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 mod legacy;
 #[cfg(not(all(target_arch = "x86_64", unix)))]

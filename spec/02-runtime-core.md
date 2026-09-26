@@ -557,17 +557,28 @@ the thread's CL stack is quiescent and scannable without cooperation.
 
 When C code needs to call back into CL:
 
-1. `TORCL-FFI:MAKE-CALLBACK` allocates an executable trampoline (a
-   small code stub on a writable+executable page).
-2. The trampoline saves C callee-save registers, transitions the
-   thread from `Native` to `Runnable`, pushes a trampoline frame on
-   the CL stack, and calls the CL closure.
-3. On return, the trampoline restores C registers, transitions back
-   to `Native`, and returns the marshalled result.
+1. Callback creation retains the Lisp closure as a precise root and generates
+   a distinct C entry with stable native context. Code is written and then made
+   executable through the W^X allocator; no writable+executable mapping is used.
+2. The entry captures C arguments according to the same target ABI plan used by
+   outbound calls. Its dispatcher enters runnable Lisp state, roots marshalled
+   arguments, and invokes the retained function, independent of its current tier.
+3. On return, the dispatcher restores the preceding runtime state, and the entry
+   places the marshalled result in the C ABI's return location. Lisp nonlocal exits
+   and Rust panics must be contained before they can unwind through foreign frames.
 
-Trampolines are allocated from a pool of executable pages (one page =
-~100 trampolines at 40 bytes each). They are freed when the CL
-callback object is GC'd (weak reference + destructor).
+Callback storage has an explicit foreign lifetime. C may retain its entry after
+Lisp drops its last wrapper, so GC must not implicitly release executable code or
+its closure root. Before explicit release, the caller must retire retained C
+references and finish every active invocation.
+
+Implementation status: `ffi/callback.rs` generates the SysV AMD64 scalar native
+entry, sharing register/stack classification with outbound calls. Its raw-slot
+dispatcher API requires a stable context and a no-unwind contract; it does not
+itself invoke Lisp or perform GC state transitions. The old `Callback` API still
+uses its bootstrap trampoline until the rooted Lisp dispatcher and public callback
+registry are implemented under `bliss-124.3`. Passing native-entry tests alone is
+not evidence of complete Lisp callback support.
 
 ### 2.7.6 Compiled Foreign Signatures (R2.14)
 
