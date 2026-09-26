@@ -6,6 +6,46 @@ use torcl_rt::ffi::{
 };
 
 #[test]
+fn library_imports_real_host_math_symbols_with_global_pointer_identity() {
+    let dir = std::env::temp_dir().join(format!("torcl-library-math-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("math.c");
+    let library = dir.join("math.so");
+    std::fs::write(
+        &source,
+        r#"
+        #include <stdlib.h>
+        #include <math.h>
+        int (*torcl_fixture_abs_address(void))(int) { return abs; }
+        double torcl_fixture_math(int n, double x) { return abs(n) + sqrt(x); }
+        "#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-fno-builtin"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let handle = load_foreign_library(library.to_str().unwrap()).unwrap();
+    unsafe {
+        let abs_address: extern "C" fn() -> *const () =
+            std::mem::transmute(foreign_symbol(handle, "torcl_fixture_abs_address").unwrap());
+        assert_eq!(abs_address(), foreign_symbol_global("abs").unwrap());
+        let math: extern "C" fn(i32, f64) -> f64 =
+            std::mem::transmute(foreign_symbol(handle, "torcl_fixture_math").unwrap());
+        assert_eq!(math(-37, 25.0), 42.0);
+        assert_eq!(math(3, 2.25), 4.5);
+        assert!(math(0, -1.0).is_nan());
+        close_foreign_library(handle).unwrap();
+    }
+}
+
+#[test]
 fn library_close_runs_destructors_and_invalidates_only_its_handle() {
     let dir = std::env::temp_dir().join(format!("torcl-library-lifetime-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
