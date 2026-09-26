@@ -27079,9 +27079,12 @@ enum ForClause {
         /// `:downfrom` counts downward: default step is -1 and a plain `:to` /
         /// `:below` limit is read as its descending counterpart.
         descending: bool,
-        /// True if `by` appeared before the limit keyword in the source, so the
-        /// step form is evaluated before the limit form (CLHS left-to-right).
-        step_first: bool,
+        /// The three subclauses in the order they were WRITTEN. Each subform is
+        /// evaluated exactly once, in that order (CLHS left-to-right;
+        /// LOOP.1.29-32 pin all four permutations), which a canonicalised
+        /// from/to/by triple cannot express. A subclause that was not written
+        /// still occupies a slot and simply has nothing to evaluate.
+        order: [LoopArithPart; 3],
     },
     Across {
         pat: TorclVal,
@@ -27197,6 +27200,16 @@ enum ForState {
         items: Vec<TorclVal>,
         idx: usize,
     },
+}
+
+/// Which subclause of an arithmetic `for` a slot in the evaluation order refers
+/// to. CLHS 6.1.2.1.1 lets `from`/`to`/`by` be written in any order, so the
+/// order has to be recorded rather than assumed (bliss-cnf2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopArithPart {
+    Start,
+    Limit,
+    Step,
 }
 
 #[derive(Clone, Copy)]
@@ -27546,68 +27559,88 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                         Some("FROM") | Some("UPFROM") | Some("DOWNFROM") | Some("BELOW")
                         | Some("TO") | Some("UPTO") | Some("ABOVE") | Some("DOWNTO")
                         | Some("BY") => {
-                            let lead = p.peek_kw();
-                            let has_from = matches!(
-                                lead.as_deref(),
-                                Some("FROM") | Some("UPFROM") | Some("DOWNFROM")
-                            );
-                            // Descending for :downfrom, or — with no explicit start
-                            // — a downward limit keyword (:above / :downto).
-                            let descending = lead.as_deref() == Some("DOWNFROM")
-                                || (!has_from
-                                    && matches!(lead.as_deref(), Some("ABOVE") | Some("DOWNTO")));
-                            let start = if has_from {
-                                p.advance();
-                                p.read_form()?
-                            } else {
-                                // Leave the limit/step keyword for the tail loop.
-                                TorclVal::from_fixnum(0)
-                            };
+                            // All three subclauses are parsed in ONE loop, so
+                            // they may be written in any order — `for x to 10
+                            // from 1`, `for x above 6 from 14 by 2` (CLHS
+                            // 6.1.2.1.1; LOOP.1.11-13/17/24/27/31/32). `from`
+                            // used to be accepted only in the lead position and
+                            // anything else signalled "unsupported clause FROM".
+                            // `order` records the sequence written, because each
+                            // subform is evaluated exactly once in that order
+                            // (LOOP.1.29-32) and that is not recoverable once the
+                            // clause has been canonicalised.
+                            let mut start = None;
                             let mut step = None;
                             let mut limit = None;
-                            // Track whether `by` appears before the limit keyword,
-                            // so the executor evaluates the subforms in true
-                            // source order (LOOP.1.18/19/29/30).
-                            let mut step_first = false;
+                            let mut saw_downfrom = false;
+                            let mut order: Vec<LoopArithPart> = Vec::with_capacity(3);
                             loop {
-                                match p.peek_kw().as_deref() {
-                                    Some("BY") => {
+                                let kw = p.peek_kw();
+                                match kw.as_deref() {
+                                    Some("FROM") | Some("UPFROM") | Some("DOWNFROM")
+                                        if start.is_none() =>
+                                    {
+                                        saw_downfrom = kw.as_deref() == Some("DOWNFROM");
                                         p.advance();
-                                        if limit.is_none() {
-                                            step_first = true;
-                                        }
+                                        start = Some(p.read_form()?);
+                                        order.push(LoopArithPart::Start);
+                                    }
+                                    Some("BY") if step.is_none() => {
+                                        p.advance();
                                         step = Some(p.read_form()?);
+                                        order.push(LoopArithPart::Step);
                                     }
-                                    Some("BELOW") => {
+                                    Some("BELOW") | Some("TO") | Some("UPTO") | Some("ABOVE")
+                                    | Some("DOWNTO")
+                                        if limit.is_none() =>
+                                    {
+                                        let kind = match kw.as_deref() {
+                                            Some("BELOW") => LoopForLimit::Below,
+                                            Some("TO") => LoopForLimit::To,
+                                            Some("UPTO") => LoopForLimit::Upto,
+                                            Some("ABOVE") => LoopForLimit::Above,
+                                            _ => LoopForLimit::Downto,
+                                        };
                                         p.advance();
-                                        limit = Some((LoopForLimit::Below, p.read_form()?));
-                                    }
-                                    Some("TO") => {
-                                        p.advance();
-                                        limit = Some((LoopForLimit::To, p.read_form()?));
-                                    }
-                                    Some("UPTO") => {
-                                        p.advance();
-                                        limit = Some((LoopForLimit::Upto, p.read_form()?));
-                                    }
-                                    Some("ABOVE") => {
-                                        p.advance();
-                                        limit = Some((LoopForLimit::Above, p.read_form()?));
-                                    }
-                                    Some("DOWNTO") => {
-                                        p.advance();
-                                        limit = Some((LoopForLimit::Downto, p.read_form()?));
+                                        limit = Some((kind, p.read_form()?));
+                                        order.push(LoopArithPart::Limit);
                                     }
                                     _ => break,
                                 }
                             }
+                            // Give every subclause a slot so the executor walks a
+                            // single list; an unwritten one has nothing to
+                            // evaluate. An omitted start is 0 — `for i below 5` is
+                            // `for i from 0 below 5` (bliss-h7ay).
+                            for part in [
+                                LoopArithPart::Start,
+                                LoopArithPart::Limit,
+                                LoopArithPart::Step,
+                            ] {
+                                if !order.contains(&part) {
+                                    order.push(part);
+                                }
+                            }
+                            // `:downfrom` counts down wherever it appears. So does
+                            // a downward limit keyword when NO start was written
+                            // (`for i above 5`); with a start present the limit
+                            // keyword alone still makes the loop descend, but that
+                            // is decided by `down` at execution so the `to`→`downto`
+                            // keyword remap stays keyed on `:downfrom` only.
+                            let descending = saw_downfrom
+                                || (start.is_none()
+                                    && matches!(
+                                        limit,
+                                        Some((LoopForLimit::Above, _))
+                                            | Some((LoopForLimit::Downto, _))
+                                    ));
                             for_clauses.push(ForClause::From {
                                 pat,
-                                start,
+                                start: start.unwrap_or(TorclVal::from_fixnum(0)),
                                 step,
                                 limit,
                                 descending,
-                                step_first,
+                                order: [order[0], order[1], order[2]],
                             });
                         }
                         _ => {
@@ -27828,22 +27861,18 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                     step,
                     limit,
                     descending,
-                    step_first,
+                    order,
                 } => {
-                    // Root across the limit/step evals: a bignum/float start is a
-                    // moving heap object (moving GC; bliss-4bp).
-                    torcl_rt::rooted!(current_r = eval_form(*start, env)?);
                     // `:downfrom`, or a DOWNTO/ABOVE limit, counts down by default.
                     let down = *descending
                         || matches!(
                             limit,
                             Some((LoopForLimit::Downto, _)) | Some((LoopForLimit::Above, _))
                         );
-                    // Evaluate the start, then the limit, then the step — in the
-                    // order they appear in `from … to … by …` (CLHS: LOOP
-                    // subforms are evaluated left to right; LOOP.1.18/29). The
-                    // limit KEYWORD (adjusted for a descending loop) is a Copy
-                    // enum resolved without evaluating anything.
+                    // The limit KEYWORD (adjusted for a descending loop) is a Copy
+                    // enum resolved without evaluating anything, so it is settled
+                    // before any subform runs — which is what lets the step be
+                    // negated in whichever slot it occupies below.
                     let limit_kind = limit.as_ref().map(|(kind, _)| {
                         // Under `:downfrom`, a plain ascending limit is read as
                         // its descending counterpart (`to`→`downto`,
@@ -27858,32 +27887,41 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                             *kind
                         }
                     });
-                    // `:by` is a positive step magnitude; a descending loop
-                    // applies it as a decrement, so negate an explicit step (and
-                    // default to -1) when counting down. Evaluate the step and
-                    // limit forms in the order they appear in source (`from … by
-                    // … to …` vs `from … to … by …`) — LOOP.1.18/19/29/30.
+                    // Evaluate the start, limit and step subforms in the order they
+                    // were WRITTEN, each exactly once (CLHS left-to-right;
+                    // LOOP.1.29-32 pin all four permutations of from/to/by). Every
+                    // slot is rooted before the next subform is evaluated: a
+                    // bignum, ratio or float value is a moving heap object and the
+                    // next subform can allocate (moving GC; bliss-4bp).
+                    torcl_rt::rooted!(start_v = NIL);
                     torcl_rt::rooted!(limit_v = NIL);
                     torcl_rt::rooted!(step_v = NIL);
-                    if !*step_first {
-                        if let Some((_, expr)) = limit {
-                            *limit_v = eval_form(*expr, env)?;
+                    let mut have_step = false;
+                    for part in order {
+                        match part {
+                            LoopArithPart::Start => *start_v = eval_form(*start, env)?,
+                            LoopArithPart::Limit => {
+                                if let Some((_, expr)) = limit {
+                                    *limit_v = eval_form(*expr, env)?;
+                                }
+                            }
+                            // `:by` is a positive step magnitude; a descending loop
+                            // applies it as a decrement, so negate an explicit step
+                            // when counting down.
+                            LoopArithPart::Step => {
+                                if let Some(expr) = step {
+                                    let s = eval_form(*expr, env)?;
+                                    *step_v = if down { loop_negate_number(s)? } else { s };
+                                    have_step = true;
+                                }
+                            }
                         }
                     }
-                    *step_v = match step {
-                        Some(expr) => {
-                            let s = eval_form(*expr, env)?;
-                            if down { loop_negate_number(s)? } else { s }
-                        }
-                        None => TorclVal::from_fixnum(if down { -1 } else { 1 }),
-                    };
-                    if *step_first {
-                        if let Some((_, expr)) = limit {
-                            *limit_v = eval_form(*expr, env)?;
-                        }
+                    if !have_step {
+                        *step_v = TorclVal::from_fixnum(if down { -1 } else { 1 });
                     }
                     let step = *step_v;
-                    let current = *current_r;
+                    let current = *start_v;
                     let limit = limit_kind.map(|kind| (kind, *limit_v));
                     // Bind the driver variable to its start value up front so a
                     // zero-iteration loop (start already past the limit) still

@@ -2339,6 +2339,73 @@ fn an_arithmetic_loop_variable_is_the_iteration_counter() {
     run_expression_cases(&cases);
 }
 
+/// CLHS 6.1.2.1.1 lets an arithmetic FOR's start/limit/step subclauses be
+/// written in ANY order (bliss-cnf2). TorCL accepted `from` only in the lead
+/// position and otherwise signalled a hard "LOOP: unsupported clause `FROM`",
+/// so `(loop for x to 10 from 1 collect x)` did not run at all.
+///
+/// The evaluation-ORDER rows are the point of the test, not a bonus: each
+/// subform must be evaluated exactly once, in the order written, which a
+/// canonicalised from/to/by triple cannot express. All four permutations are
+/// pinned (ansi-test LOOP.1.29-32) by recording which `(incf i)` ran first.
+#[test]
+fn an_arithmetic_loops_subclauses_may_be_written_in_any_order() {
+    let cases = [
+        // `from` after the limit, and after both the limit and the step.
+        (
+            "(loop for x to 10 from 1 collect x)",
+            "(1 2 3 4 5 6 7 8 9 10)",
+        ),
+        ("(loop for x to 10 by 2 from 1 collect x)", "(1 3 5 7 9)"),
+        ("(loop for x by 2 to 10 from 1 collect x)", "(1 3 5 7 9)"),
+        ("(loop for x below 5 from 2 collect x)", "(2 3 4)"),
+        // A descending limit keyword with the start written last.
+        (
+            "(loop for x above 6 from 14 by 2 collect x)",
+            "(14 12 10 8)",
+        ),
+        ("(loop for x above 0 from 3 collect x)", "(3 2 1)"),
+        // The limit form is evaluated BEFORE the start form here, so `n` is
+        // still 0 when `(+ n 5)` runs and 1 by the time the start is taken.
+        (
+            "(let ((n 0)) (loop for x to (+ n 5) from (incf n) collect x))",
+            "(1 2 3 4 5)",
+        ),
+        // All four permutations of from/to/by: the trailing list is
+        // (result a b c i) where a/b/c record which position each subform ran in.
+        (
+            "(let (a b c (i 0)) (list (loop for x from (progn (setq a (incf i)) 0)                below (progn (setq b (incf i)) 9) by (progn (setq c (incf i)) 2) collect x)                a b c i))",
+            "((0 2 4 6 8) 1 2 3 3)",
+        ),
+        (
+            "(let (a b c (i 0)) (list (loop for x from (progn (setq a (incf i)) 0)                by (progn (setq c (incf i)) 2) below (progn (setq b (incf i)) 9) collect x)                a b c i))",
+            "((0 2 4 6 8) 1 3 2 3)",
+        ),
+        (
+            "(let (a b c (i 0)) (list (loop for x below (progn (setq b (incf i)) 9)                by (progn (setq c (incf i)) 2) from (progn (setq a (incf i)) 0) collect x)                a b c i))",
+            "((0 2 4 6 8) 3 1 2 3)",
+        ),
+        (
+            "(let (a b c (i 0)) (list (loop for x by (progn (setq c (incf i)) 2)                below (progn (setq b (incf i)) 9) from (progn (setq a (incf i)) 0) collect x)                a b c i))",
+            "((0 2 4 6 8) 3 2 1 3)",
+        ),
+        // The canonical orders and the omitted-start default keep working.
+        ("(loop for i from 1 to 5 collect i)", "(1 2 3 4 5)"),
+        ("(loop for i below 4 collect i)", "(0 1 2 3)"),
+        ("(loop for i from 10 downto 7 collect i)", "(10 9 8 7)"),
+        (
+            "(loop for x downfrom 16 above 7 by 3 collect x)",
+            "(16 13 10)",
+        ),
+        // A bignum start, limit and step still step exactly.
+        (
+            "(loop for x to (expt 2 63) from (expt 2 62) by (expt 2 61) collect x)",
+            "(4611686018427387904 6917529027641081856 9223372036854775808)",
+        ),
+    ];
+    run_expression_cases(&cases);
+}
+
 #[test]
 fn loop_while_until_repeat_drivers() {
     let cases = [
