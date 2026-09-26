@@ -16197,6 +16197,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 env.clear_mv();
                 return torcl_stdlib::ffi::memory_call(&args);
             }
+            "TORCL::%FOREIGN-LIBRARY" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::library_call(&args);
+            }
             "TORCL::%NATIVE-CONDITION" => {
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
@@ -16430,7 +16438,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let handle = args[0].as_fixnum() as usize as *mut ();
                 let name = val_as_str(args[1]);
                 // SAFETY: `handle` came from %load-foreign-library; the library
-                // is kept alive for the process lifetime.
+                // must remain loaded while the returned symbol is used.
                 let sym = unsafe { torcl_rt::ffi::foreign_symbol(handle, &name)? };
                 return Ok(TorclVal::from_fixnum(sym as usize as i64));
             }
@@ -16439,12 +16447,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     return Err(TorclError::SandboxViolation("FFI access denied".into()));
                 }
                 // (%ffi-call fn-ptr ret-type arg-types args &optional fixed-count) → result
-                //   fn-ptr    : address from %foreign-symbol (fixnum)
+                //   fn-ptr    : opaque pointer or legacy fixnum address
                 //   ret-type  : an alien-type keyword (see alien_type_from_keyword)
                 //   arg-types : list of alien-type keywords
                 //   args      : list of Lisp values (fixnums/floats/pointers)
                 let args = eval_args(cdr, env)?;
-                if !(4..=5).contains(&args.len()) || !args[0].is_fixnum() {
+                if !(4..=5).contains(&args.len()) {
                     return Err(TorclError::Internal(
                         "%ffi-call requires (fn-ptr ret-type arg-types args &optional fixed-count)"
                             .into(),
@@ -16460,7 +16468,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 } else {
                     None
                 };
-                let fn_ptr = args[0].as_fixnum() as usize as *const ();
+                let fn_ptr = if args[0].is_fixnum() {
+                    args[0].as_fixnum() as usize as *const ()
+                } else {
+                    torcl_rt::ffi::memory::ForeignPointer::from_lisp(args[0])?.call_address()?
+                        as *const ()
+                };
                 let ret_is_string = is_string_alien_kw(args[1]);
                 let ret_type = alien_type_from_keyword(args[1])?;
                 let arg_type_vals = list_to_vec(args[2]);
@@ -35607,6 +35620,7 @@ fn is_builtin_function(name: &str) -> bool {
         "DISASSEMBLE"
             | "TORCL::%NATIVE-MUTEX"
             | "TORCL::%FOREIGN-MEMORY"
+            | "TORCL::%FOREIGN-LIBRARY"
             | "TORCL::%NATIVE-CONDITION"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
@@ -36374,6 +36388,12 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
                 return Err(TorclError::SandboxViolation("FFI access denied".into()));
             }
             torcl_stdlib::ffi::memory_call(args)
+        }
+        "TORCL::%FOREIGN-LIBRARY" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::library_call(args)
         }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode

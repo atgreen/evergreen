@@ -3,12 +3,22 @@ use torcl_rt::ffi::memory::ForeignPointer;
 
 #[test]
 fn boxed_pointer_survives_moving_gc_and_serializes_without_native_addresses() {
+    let body = torcl_rt::gc::alloc_typed(8, torcl_rt::object::type_id::FOREIGN_LIBRARY).unwrap();
+    let library = unsafe {
+        (body as *mut u64).write(0xfedcba9876543210);
+        torcl_rt::TorclVal::from_heap_ptr(body.sub(8))
+    };
+    torcl_rt::rooted!(library = library);
     let pointer = ForeignPointer::allocate(8).unwrap();
     torcl_rt::rooted!(value = pointer.into_lisp().unwrap());
     for _ in 0..20 {
         let _ = torcl_rt::gc::alloc_double_float(1.0);
     }
     torcl_rt::gc::full_gc().unwrap();
+    assert_eq!(
+        unsafe { (library.as_ptr().add(8) as *const u64).read() },
+        0xfedcba9876543210
+    );
     assert_eq!(ForeignPointer::from_lisp(*value).unwrap(), pointer);
     assert!(!ForeignPointer::is_pointer(torcl_rt::value::NIL));
     for address in [0, 1, usize::MAX] {
@@ -23,6 +33,7 @@ fn boxed_pointer_survives_moving_gc_and_serializes_without_native_addresses() {
     let image = torcl_rt::gc::serialize_heap_objects();
     let mut records = image.as_slice();
     let mut found = false;
+    let mut library_found = false;
     while !records.is_empty() {
         let kind = records[8];
         let size = u32::from_le_bytes(records[9..13].try_into().unwrap()) as usize;
@@ -31,11 +42,19 @@ fn boxed_pointer_survives_moving_gc_and_serializes_without_native_addresses() {
             assert!(body.iter().all(|byte| *byte == 0));
             found = true;
         }
+        if kind == torcl_rt::object::type_id::FOREIGN_LIBRARY {
+            assert!(body.iter().all(|byte| *byte == 0));
+            library_found = true;
+        }
         records = &records[13 + size..];
     }
     assert!(
         found,
         "foreign pointer must be preserved as a null handle in images"
+    );
+    assert!(
+        library_found,
+        "foreign library must restore with an invalid token"
     );
     pointer.free().unwrap();
     assert!(

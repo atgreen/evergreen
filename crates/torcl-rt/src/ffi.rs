@@ -560,7 +560,7 @@ mod elf_backend {
         relocation::RelocationArch,
         tls::TlsResolver,
     };
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// A loaded foreign library, type-erased so the registry need not carry
     /// elf_loader's generic parameters.
@@ -583,20 +583,27 @@ mod elf_backend {
         }
     }
 
-    /// Loaded libraries, kept alive for the process lifetime (matching dlopen's
-    /// no-`dlclose` model). A handle is a 1-based index; 0 is reserved as null.
-    static LIBS: Mutex<Vec<Box<dyn ForeignLib>>> = Mutex::new(Vec::new());
+    /// Non-reused 1-based tokens. Closed entries remain empty, so a stale token
+    /// cannot accidentally resolve into a later library.
+    static LIBS: Mutex<Vec<Option<Arc<dyn ForeignLib>>>> = Mutex::new(Vec::new());
 
     /// Host symbols a loaded library may import from us — statically linked into
     /// this binary from musl. Deliberately minimal (the libc surface plugins
     /// commonly need); grow this list on demand. An unresolved import produces a
     /// clear "cannot link" error naming the missing symbol.
     fn host_symbols() -> Vec<SyntheticSymbol> {
+        host_symbol_addresses()
+            .into_iter()
+            .map(|(name, address)| SyntheticSymbol::function(name, address))
+            .collect()
+    }
+
+    fn host_symbol_addresses() -> Vec<(&'static str, *const ())> {
         macro_rules! host_syms {
             ($($name:ident),* $(,)?) => {{
                 // Opaque decls: we only take addresses, so signatures are moot.
                 unsafe extern "C" { $( fn $name(); )* }
-                vec![ $( SyntheticSymbol::function(stringify!($name), $name as *const ()) ),* ]
+                vec![ $( (stringify!($name), $name as *const ()) ),* ]
             }};
         }
         host_syms![
@@ -620,31 +627,96 @@ mod elf_backend {
             .map_err(|e| TorclError::FfiError(format!("cannot link '{name}': {e}")))?;
         // relocate() already ran the library's DT_INIT_ARRAY constructors.
         let mut libs = LIBS.lock().unwrap();
-        libs.push(Box::new(lib));
+        libs.push(Some(Arc::new(lib)));
         Ok(libs.len() as *mut ()) // 1-based handle
     }
 
     /// Look up a symbol in a previously loaded library.
     ///
     /// # Safety
-    /// The returned pointer is valid only while the process lives (libraries are
-    /// never unloaded); calling through it obeys the usual FFI safety rules.
+    /// The library must remain loaded while any returned pointer is used.
     pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), TorclError> {
         let handle = library as usize;
         if handle == 0 {
             return Err(TorclError::FfiError("null library handle".into()));
         }
-        let libs = LIBS.lock().unwrap();
-        let lib = libs
+        if name.contains('\0') {
+            return Err(TorclError::FfiError(
+                "symbol name contains null byte".into(),
+            ));
+        }
+        let lib = LIBS
+            .lock()
+            .unwrap()
             .get(handle - 1)
-            .ok_or_else(|| TorclError::FfiError("invalid library handle".into()))?;
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or_else(|| TorclError::FfiError("invalid or closed library handle".into()))?;
         lib.symbol(name)
+            .ok_or_else(|| TorclError::FfiError(format!("symbol '{name}' not found")))
+    }
+
+    /// # Safety
+    /// No foreign call, callback or retained symbol may use this library after close.
+    pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), TorclError> {
+        let lib = {
+            let mut libs = LIBS.lock().unwrap();
+            (library as usize)
+                .checked_sub(1)
+                .and_then(|i| libs.get_mut(i))
+                .and_then(Option::take)
+                .ok_or_else(|| TorclError::FfiError("invalid or closed library handle".into()))?
+        };
+        // Dropping LoadedCore runs DT_FINI_ARRAY and releases its mappings.
+        // Never hold the registry lock while arbitrary C destructors execute.
+        drop(lib);
+        Ok(())
+    }
+
+    /// Search open libraries, then the statically linked host export surface.
+    /// # Safety
+    /// The provider must remain loaded while the returned pointer is used.
+    pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), TorclError> {
+        if name.contains('\0') {
+            return Err(TorclError::FfiError(
+                "symbol name contains null byte".into(),
+            ));
+        }
+        let libs: Vec<_> = LIBS.lock().unwrap().iter().flatten().cloned().collect();
+        for lib in libs {
+            if let Some(symbol) = lib.symbol(name) {
+                return Ok(symbol);
+            }
+        }
+        host_symbol_addresses()
+            .into_iter()
+            .find(|(symbol, _)| *symbol == name)
+            .map(|(_, address)| address)
             .ok_or_else(|| TorclError::FfiError(format!("symbol '{name}' not found")))
     }
 }
 
 #[cfg(not(feature = "c-ffi"))]
-pub use elf_backend::{foreign_symbol, load_foreign_library};
+pub use elf_backend::{
+    close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
+};
+
+#[cfg(feature = "c-ffi")]
+struct DynamicLibrary(usize);
+
+#[cfg(feature = "c-ffi")]
+impl Drop for DynamicLibrary {
+    fn drop(&mut self) {
+        // SAFETY: each instance owns exactly one successful dlopen reference.
+        unsafe {
+            libc::dlclose(self.0 as *mut libc::c_void);
+        }
+    }
+}
+
+#[cfg(feature = "c-ffi")]
+static DYNAMIC_LIBRARIES: std::sync::Mutex<Vec<Option<std::sync::Arc<DynamicLibrary>>>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Load a shared library by name or path.
 #[cfg(feature = "c-ffi")]
@@ -669,7 +741,9 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), TorclError> {
             name, err
         )))
     } else {
-        Ok(handle as *mut ())
+        let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
+        libraries.push(Some(std::sync::Arc::new(DynamicLibrary(handle as usize))));
+        Ok(libraries.len() as *mut ())
     }
 }
 
@@ -682,12 +756,25 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
     if library.is_null() {
         return Err(TorclError::FfiError("null library handle".into()));
     }
+    let library = DYNAMIC_LIBRARIES
+        .lock()
+        .unwrap()
+        .get(library as usize - 1)
+        .and_then(Option::as_ref)
+        .cloned()
+        .ok_or_else(|| TorclError::FfiError("invalid or closed library handle".into()))?;
+    // SAFETY: the Arc retains a live dlopen reference through lookup.
+    unsafe { dynamic_symbol(library.0 as *mut libc::c_void, name) }
+}
+
+#[cfg(feature = "c-ffi")]
+unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*const (), TorclError> {
     let c_name = std::ffi::CString::new(name)
         .map_err(|_| TorclError::FfiError("symbol name contains null byte".into()))?;
 
     // Clear any existing error
     unsafe { libc::dlerror() };
-    let sym = unsafe { libc::dlsym(library as *mut libc::c_void, c_name.as_ptr()) };
+    let sym = unsafe { libc::dlsym(library, c_name.as_ptr()) };
     let err = unsafe { libc::dlerror() };
     if !err.is_null() {
         let msg = unsafe { std::ffi::CStr::from_ptr(err) }
@@ -700,4 +787,41 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
     } else {
         Ok(sym as *const ())
     }
+}
+
+/// Close one owned loader reference and invalidate its token.
+/// # Safety
+/// No foreign call, callback or retained symbol may use this library after close.
+#[cfg(feature = "c-ffi")]
+pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), TorclError> {
+    let library = {
+        let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
+        (library as usize)
+            .checked_sub(1)
+            .and_then(|i| libraries.get_mut(i))
+            .and_then(Option::take)
+            .ok_or_else(|| TorclError::FfiError("invalid or closed library handle".into()))?
+    };
+    // Destructors can reenter the loader, so release the registry lock first.
+    drop(library);
+    Ok(())
+}
+
+/// Look up a symbol in the loader's global namespace.
+/// # Safety
+/// The provider must remain loaded while the returned pointer is used.
+#[cfg(feature = "c-ffi")]
+pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), TorclError> {
+    // RTLD_DEFAULT makes glibc add a lookup dependency from this executable to
+    // the provider (elf/dl-sym.c: DL_LOOKUP_ADD_DEPENDENCY), preventing explicit
+    // unload after a global lookup. A process handle searches the same global
+    // scope without silently acquiring that process-lifetime dependency.
+    let handle = unsafe { libc::dlopen(std::ptr::null(), libc::RTLD_NOW) };
+    if handle.is_null() {
+        return Err(TorclError::FfiError(
+            "cannot open process symbol scope".into(),
+        ));
+    }
+    let process = DynamicLibrary(handle as usize);
+    unsafe { dynamic_symbol(process.0 as *mut libc::c_void, name) }
 }

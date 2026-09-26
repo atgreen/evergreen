@@ -533,8 +533,8 @@ they use fixed-arity, non-variadic signatures.
 | `STRING` | `Pointer(Int{8})` | CL→C | UTF-8 copy with null terminator; pinned |
 | `(ALIEN *)` | `Pointer` | Both | Raw pointer, no GC tracking |
 | `STRUCT` | `Struct` by value | Both | Classified into registers or memory by TorCL's target ABI planner (R2.14) |
-| `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` | `Pointer(Int{8})` + length | CL→C | Data pointer into the array's backing store (pinned for duration of call); length passed as a separate `size_t` argument. Caller must declare layout via `DEFINE-ALIEN-ROUTINE`. |
-| `(SIMPLE-ARRAY <element-type>)` | `Pointer(<alien>)` + length | CL→C | Same pin-and-pass strategy; element type maps per this table. The C side receives a raw pointer to contiguous element data. |
+| `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` | `Pointer(Int{8})` + length | Both | Scoped copy-in/copy-out to stable native storage; length passed separately. Lisp storage is never exposed as a stable C address. |
+| Numeric vector | `Pointer(<alien>)` + length | Both | Same scoped copy, with explicit scalar element layout rather than inferring C layout from upgraded Lisp array element types. |
 
 ### 2.7.4 Call Flow
 
@@ -623,8 +623,34 @@ See §8.3 for borrowed-address safety and image-restart semantics.
 
 Errors from this boundary are catchable as `TORCL-FFI:FFI-ERROR`, a subtype of
 `SIMPLE-ERROR`. Public memory entry points and the internal foreign library,
-symbol, and call primitives are denied in sandboxed evaluation. Library objects,
-scoped vector access, and the complete CFFI backend remain work under `bliss-124`.
+symbol, and call primitives are denied in sandboxed evaluation.
+
+`WITH-POINTER-TO-VECTOR-DATA (pointer vector &optional scalar-type)` evaluates
+the vector and type once, copies its entire array storage (ignoring fill pointers)
+into a native buffer, and copies back and frees on normal or nonlocal exit.
+The default layout is `:UNSIGNED-CHAR`; `MAKE-SHAREABLE-BYTE-VECTOR size` creates
+a zero-initialized byte vector. Explicit numeric scalar types permit other C
+layouts. Failed copy-in never copies partially initialized native storage back.
+The body must not resize the vector, free the buffer, or let C retain the pointer
+past the scope. Changes to the Lisp vector during the scope are overwritten by
+copy-out. Multiple values from the body are preserved.
+
+`LOAD-FOREIGN-LIBRARY path` returns an opaque `FOREIGN-LIBRARY` object, distinct
+from a pointer. `FOREIGN-SYMBOL-POINTER name &optional library` searches the named
+library, or the global lookup scope when omitted. In static builds the global
+scope is open libraries followed by the loader's explicit host export surface;
+dynamic builds use the system loader's default scope. The result is a borrowed
+pointer. `CLOSE-FOREIGN-LIBRARY` invalidates its non-reused registry token and
+releases its loader reference, running unload destructors when the last reference
+is released. Before close, callers must retire all calls, callbacks, and retained
+symbol uses from that library. GC does not unload libraries; saved-image library
+objects restore with an invalid token, never a token referring to a new provider.
+
+`FOREIGN-CALL pointer return-type argument-types arguments &optional fixed-count`
+exposes the generated scalar call path, with a supplied fixed-count selecting
+variadic calling. The caller owns signature correctness and symbol lifetime.
+The complete CFFI backend, aggregate calls, and generated callbacks remain work
+under `bliss-124`.
 
 ---
 

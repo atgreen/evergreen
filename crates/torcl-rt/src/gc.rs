@@ -1160,6 +1160,7 @@ unsafe fn trace_object(
         tid::BIGNUM
         | tid::DOUBLE_FLOAT
         | tid::FOREIGN_POINTER
+        | tid::FOREIGN_LIBRARY
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
@@ -5643,9 +5644,13 @@ pub fn serialize_heap_objects() -> Vec<u8> {
         // re-creates the standard ones.
         // Mutexes also own process-local native state. Preserve the Lisp handle
         // but restore it as unavailable, never as a dangling native pointer.
-        if type_id == crate::object::type_id::FOREIGN_POINTER {
+        if matches!(
+            type_id,
+            crate::object::type_id::FOREIGN_POINTER | crate::object::type_id::FOREIGN_LIBRARY
+        ) {
             // Neither native addresses nor allocation identities survive an
-            // image restart. Preserve the handle as an ordinary null pointer.
+            // image restart. Restore pointers as null and library tokens as
+            // invalid; a restored token must never name a new library.
             out.resize(out.len() + size, 0);
         } else if matches!(
             type_id,
