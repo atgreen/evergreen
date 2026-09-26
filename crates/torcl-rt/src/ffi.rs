@@ -12,7 +12,7 @@ mod call;
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 mod legacy;
 #[cfg(not(all(target_arch = "x86_64", unix)))]
-pub use legacy::ffi_call;
+pub use legacy::{ffi_call, ffi_call_variadic};
 
 // ── Alien type system ──────────────────────────────────────────────
 
@@ -123,6 +123,80 @@ pub unsafe fn ffi_call(
     arg_types: &[AlienType],
     args: &[u64],
 ) -> Result<u64, TorclError> {
+    // SAFETY: forwarded caller contract; this is a non-variadic signature.
+    unsafe { ffi_call_impl(fn_ptr, ret_type, arg_types, args, None) }
+}
+
+/// Call a variadic C function. `fixed_count` is the number of named parameters.
+/// Types and raw slots describe values *before* C default argument promotions:
+/// trailing float arguments become doubles and 8/16-bit integers become ints.
+/// Named parameters retain their declared types.
+///
+/// # Safety
+/// `fn_ptr` must have the named parameter and return types supplied here, and
+/// the callee must consume the trailing arguments using their promoted types.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub unsafe fn ffi_call_variadic(
+    fn_ptr: *const (),
+    ret_type: &AlienType,
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: usize,
+) -> Result<u64, TorclError> {
+    if fixed_count > arg_types.len() || arg_types.len() != args.len() {
+        return Err(TorclError::FfiError(
+            "invalid variadic argument counts".into(),
+        ));
+    }
+    let mut promoted_types = arg_types.to_vec();
+    let mut promoted_args = args.to_vec();
+    for index in fixed_count..arg_types.len() {
+        match &arg_types[index] {
+            AlienType::Float => {
+                promoted_types[index] = AlienType::Double;
+                promoted_args[index] = (f32::from_bits(args[index] as u32) as f64).to_bits();
+            }
+            AlienType::Int {
+                bits: bits @ (8 | 16),
+                signed,
+            } => {
+                let shift = 64 - bits;
+                promoted_args[index] = if *signed {
+                    (((args[index] << shift) as i64) >> shift) as u32 as u64
+                } else {
+                    args[index] & ((1u64 << bits) - 1)
+                };
+                // On SysV AMD64, C int represents every char/short value,
+                // including unsigned char and unsigned short.
+                promoted_types[index] = AlienType::Int {
+                    bits: 32,
+                    signed: true,
+                };
+            }
+            _ => {}
+        }
+    }
+    // SAFETY: argument slots now match the promoted signature; other aspects
+    // of the foreign target's contract remain the caller's responsibility.
+    unsafe {
+        ffi_call_impl(
+            fn_ptr,
+            ret_type,
+            &promoted_types,
+            &promoted_args,
+            Some(fixed_count),
+        )
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe fn ffi_call_impl(
+    fn_ptr: *const (),
+    ret_type: &AlienType,
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: Option<usize>,
+) -> Result<u64, TorclError> {
     enum NativeStateGuard {
         Fiber(&'static crate::thread::Fiber, FiberState),
         Thread(&'static crate::thread::NativeThread, NativeThreadState),
@@ -147,7 +221,7 @@ pub unsafe fn ffi_call(
     }
     // Compile/cache before publishing Native state. The adapter's Arc remains
     // live across foreign execution; no cache lock is held during callbacks.
-    let adapter = call::CallAdapter::get(ret_type, arg_types)?;
+    let adapter = call::CallAdapter::get(ret_type, arg_types, fixed_count)?;
 
     current_stack().publish_top();
     let _state_guard = if let Some(fiber) = current_fiber() {

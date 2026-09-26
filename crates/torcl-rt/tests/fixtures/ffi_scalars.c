@@ -1,4 +1,27 @@
 #include <stdint.h>
+#include <stdarg.h>
+
+double torcl_ffi_varargs(int count, ...) {
+    va_list arguments;
+    va_start(arguments, count);
+    double result = 0;
+    for (int i = 0; i < count; ++i) {
+        int multiplier = va_arg(arguments, int);
+        double value = va_arg(arguments, double);
+        result += multiplier * value;
+    }
+    va_end(arguments);
+    return result;
+}
+
+double torcl_ffi_fixed_float(float fixed, int count, ...) {
+    va_list arguments;
+    va_start(arguments, count);
+    double result = fixed;
+    for (int i = 0; i < count; ++i) result += va_arg(arguments, double);
+    va_end(arguments);
+    return result;
+}
 
 /* Clang may implement widening with a plain 32-bit register move, relying
  * on caller extension. Inspect the incoming register to test that contract

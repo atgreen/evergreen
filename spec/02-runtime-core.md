@@ -588,9 +588,12 @@ retains its adapter even if the cache evicts it. No adapter-cache lock is held
 while foreign code executes or reenters Lisp. GC root publication and native
 state transitions remain runtime responsibilities at both sides of the boundary.
 
-Implementation status: SysV AMD64 scalar outbound adapters are implemented in
-`crates/torcl-rt/src/ffi/call.rs`. Variadic signatures, aggregates, generated
-callbacks, and additional target ABIs remain work under `bliss-124`; unsupported
+Implementation status: SysV AMD64 scalar outbound adapters, including variadic
+calls, are implemented in `crates/torcl-rt/src/ffi/call.rs`. Variadic calls retain
+the named-parameter count, promote only trailing arguments, and supply the SysV
+vector-register count. The internal `%ffi-call` primitive accepts an optional
+fifth argument for that named-parameter count. Aggregates, generated callbacks,
+and additional target ABIs remain work under `bliss-124`; unsupported
 signatures on the generated path signal an FFI error before entering foreign
 code. Other targets temporarily retain the pre-existing bootstrap dispatcher
 in `ffi/legacy.rs`; it is not an implementation of the generated-adapter contract.

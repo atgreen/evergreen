@@ -6,6 +6,22 @@ use super::{
 };
 use crate::error::TorclError;
 
+/// Variadic calls require the target's generated adapter implementation.
+///
+/// # Safety
+/// The foreign function and values must match the supplied C signature.
+pub unsafe fn ffi_call_variadic(
+    _fn_ptr: *const (),
+    _ret_type: &AlienType,
+    _arg_types: &[AlienType],
+    _args: &[u64],
+    _fixed_count: usize,
+) -> Result<u64, TorclError> {
+    Err(TorclError::FfiError(
+        "variadic calls are not implemented for this target ABI".into(),
+    ))
+}
+
 /// Call a foreign function via pointer.
 ///
 /// The green thread transitions to `Native` state during the call

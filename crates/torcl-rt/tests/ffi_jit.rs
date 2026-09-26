@@ -3,7 +3,61 @@
 //! aggregate, variadic, callback, or non-SysV support.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use torcl_rt::ffi::{AlienType, ffi_call};
+use torcl_rt::ffi::{AlienType, ffi_call, ffi_call_variadic};
+
+#[test]
+fn variadic_calls_promote_only_arguments_after_the_fixed_prefix() {
+    let result = unsafe {
+        ffi_call_variadic(
+            c_symbol("torcl_ffi_fixed_float"),
+            &AlienType::Double,
+            &[AlienType::Float, int(32), AlienType::Float],
+            &[1.25f32.to_bits() as u64, 1, 2.5f32.to_bits() as u64],
+            2,
+        )
+    }
+    .unwrap();
+    assert_eq!(f64::from_bits(result), 3.75);
+}
+
+#[test]
+fn variadic_default_promotions_and_spills_match_c_va_arg() {
+    let integers = [-7i64, 255, -1234, 65535, 1, 2, 3, 4, 5, 6];
+    let widths = [8, 8, 16, 16, 32, 32, 32, 32, 32, 32];
+    let mut types = vec![int(32)];
+    let mut args = vec![integers.len() as u64];
+    let mut expected = 0.0;
+    for (index, (value, bits)) in integers.into_iter().zip(widths).enumerate() {
+        let signed = index != 1 && index != 3;
+        types.push(AlienType::Int { signed, bits });
+        types.push(AlienType::Float);
+        args.push(value as u64 & ((1u64 << bits) - 1));
+        let multiplier = index as f32 + 0.25;
+        args.push(multiplier.to_bits() as u64);
+        expected += value as f64 * multiplier as f64;
+    }
+    let result = unsafe {
+        ffi_call_variadic(
+            c_symbol("torcl_ffi_varargs"),
+            &AlienType::Double,
+            &types,
+            &args,
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(f64::from_bits(result), expected);
+}
+
+#[test]
+fn variadic_calls_validate_fixed_count_and_argument_count() {
+    let target = c_symbol("torcl_ffi_varargs");
+    assert!(unsafe { ffi_call_variadic(target, &AlienType::Double, &[int(32)], &[0], 2) }.is_err());
+    assert!(unsafe { ffi_call_variadic(target, &AlienType::Double, &[int(32)], &[], 1) }.is_err());
+    let result =
+        unsafe { ffi_call_variadic(target, &AlienType::Double, &[int(32)], &[0], 1) }.unwrap();
+    assert_eq!(f64::from_bits(result), 0.0);
+}
 
 fn c_symbol(name: &str) -> *const () {
     use std::{process::Command, sync::OnceLock};

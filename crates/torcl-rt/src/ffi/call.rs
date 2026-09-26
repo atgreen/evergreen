@@ -42,6 +42,7 @@ impl Scalar {
 struct Signature {
     result: Scalar,
     arguments: Vec<Scalar>,
+    fixed_count: Option<usize>,
 }
 
 pub(super) struct CallAdapter {
@@ -54,8 +55,10 @@ impl CallAdapter {
     pub(super) fn get(
         result: &AlienType,
         arguments: &[AlienType],
+        fixed_count: Option<usize>,
     ) -> Result<Arc<Self>, TorclError> {
         let signature = Signature {
+            fixed_count,
             result: Scalar::from_type(result)?,
             arguments: arguments
                 .iter()
@@ -182,6 +185,13 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
             }
         }
     }
+    if signature.fixed_count.is_some() {
+        // SysV variadic calls pass the number of used vector registers in AL,
+        // including those occupied by named arguments. All argument moves are
+        // complete, so eax is available as scratch without clobbering a value.
+        code.push(0xb8); // mov eax,imm32
+        code.extend_from_slice(&(sse as u32).to_le_bytes());
+    }
     code.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11
     match signature.result {
         Scalar::Void => code.extend_from_slice(&[0x31, 0xc0]), // xor eax,eax
@@ -214,7 +224,7 @@ mod tests {
             bits: 64,
             signed: false,
         };
-        let adapter = CallAdapter::get(&ty, &[]).unwrap();
+        let adapter = CallAdapter::get(&ty, &[], None).unwrap();
         // Simulate eviction while an invocation owns the adapter. This is
         // deterministic even when other tests are accessing the shared cache.
         CACHE.get().unwrap().lock().unwrap().clear();

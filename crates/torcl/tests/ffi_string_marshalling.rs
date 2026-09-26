@@ -140,3 +140,49 @@ fn ffi_call_preserves_double_and_full_width_integer_values() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("exact-ffi-values-ok"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[cfg(all(target_arch = "x86_64", unix))]
+fn ffi_call_variadic_preserves_fixed_float_and_promotes_trailing_values() {
+    let dir = std::env::temp_dir().join(format!("torcl-ffi-varargs-{}", std::process::id()));
+    let so = build_test_so(
+        &dir,
+        "
+        #include <stdarg.h>
+        double mixed(float fixed, int count, ...) {
+            va_list args;
+            va_start(args, count);
+            double result = fixed;
+            for (int i = 0; i < count; ++i) {
+                int multiplier = va_arg(args, int);
+                double value = va_arg(args, double);
+                result += multiplier * value;
+            }
+            va_end(args);
+            return result;
+        }
+    ",
+    )
+    .expect("C compiler required for variadic FFI test");
+    let so = so.to_str().unwrap();
+    let program = format!(
+        "(let* ((lib (torcl::%load-foreign-library {so:?}))
+                (fn (torcl::%foreign-symbol lib \"mixed\"))
+                (result (torcl::%ffi-call fn :double
+                          '(:float :int :char :float :unsigned-short :double)
+                          '(1.25 2 -7 2.5 65535 0.5d0) 2)))
+           (assert (= result 32751.25d0))
+           (format t \"variadic-ffi-ok~%\"))"
+    );
+    let output = torcl_bin()
+        .args(["--no-init", "--eval", &program])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("variadic-ffi-ok"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

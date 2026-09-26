@@ -16435,17 +16435,28 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(TorclVal::from_fixnum(sym as usize as i64));
             }
             "TORCL::%FFI-CALL" => {
-                // (%ffi-call fn-ptr ret-type arg-types args) → result
+                // (%ffi-call fn-ptr ret-type arg-types args &optional fixed-count) → result
                 //   fn-ptr    : address from %foreign-symbol (fixnum)
                 //   ret-type  : an alien-type keyword (see alien_type_from_keyword)
                 //   arg-types : list of alien-type keywords
                 //   args      : list of Lisp values (fixnums/floats/pointers)
                 let args = eval_args(cdr, env)?;
-                if args.len() < 4 || !args[0].is_fixnum() {
+                if !(4..=5).contains(&args.len()) || !args[0].is_fixnum() {
                     return Err(TorclError::Internal(
-                        "%ffi-call requires (fn-ptr ret-type arg-types args)".into(),
+                        "%ffi-call requires (fn-ptr ret-type arg-types args &optional fixed-count)"
+                            .into(),
                     ));
                 }
+                let fixed_count = if args.len() == 5 {
+                    if !args[4].is_fixnum() || args[4].as_fixnum() < 0 {
+                        return Err(TorclError::FfiError(
+                            "%ffi-call: fixed-count must be a nonnegative fixnum".into(),
+                        ));
+                    }
+                    Some(args[4].as_fixnum() as usize)
+                } else {
+                    None
+                };
                 let fn_ptr = args[0].as_fixnum() as usize as *const ();
                 let ret_is_string = is_string_alien_kw(args[1]);
                 let ret_type = alien_type_from_keyword(args[1])?;
@@ -16487,8 +16498,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 // SAFETY: the caller asserts fn-ptr and the type signature match
                 // the real foreign function (the usual C-ABI FFI contract).
-                let raw =
-                    unsafe { torcl_rt::ffi::ffi_call(fn_ptr, &ret_type, &arg_types, &raw_args)? };
+                let raw = unsafe {
+                    match fixed_count {
+                        Some(count) => torcl_rt::ffi::ffi_call_variadic(
+                            fn_ptr, &ret_type, &arg_types, &raw_args, count,
+                        )?,
+                        None => torcl_rt::ffi::ffi_call(fn_ptr, &ret_type, &arg_types, &raw_args)?,
+                    }
+                };
                 // `string_bufs` has outlived the call; drop it now.
                 drop(string_bufs);
                 if ret_is_string {
