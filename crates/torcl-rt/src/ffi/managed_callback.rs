@@ -89,15 +89,28 @@ unsafe extern "C" fn dispatch(context: *mut (), slots: *const u64) -> u64 {
     let error = match result {
         Ok(Ok(value)) => return value,
         Ok(Err(error)) => error,
-        Err(panic) => panic
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| {
-                panic
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_owned())
-            })
-            .unwrap_or_else(|| "Rust panic in Lisp callback".into()),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                })
+                .unwrap_or_else(|| "Rust panic in Lisp callback".into());
+            // panic_any permits arbitrary destructors. Reclaim the payload,
+            // but contain a destructor's own panic before returning through C.
+            if let Err(secondary) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic)))
+            {
+                // Its destructor may panic again indefinitely. Retaining this
+                // exceptional secondary payload is preferable to aborting at
+                // the C boundary; ordinary payloads are always reclaimed.
+                std::mem::forget(secondary);
+            }
+            message
+        }
     };
     context.record_error(format!("foreign callback failed: {error}"));
     // A defined zero C result lets foreign frames return normally. The enclosing

@@ -7,7 +7,20 @@ use torcl_rt::ffi::{
 };
 use torcl_rt::thread::NativeThreadState;
 static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
 use torcl_rt::{TorclError, TorclVal};
+
+struct CallbackPanicPayload(bool);
+impl Drop for CallbackPanicPayload {
+    fn drop(&mut self) {
+        PAYLOAD_DROPS.fetch_add(1, Ordering::SeqCst);
+        if self.0 {
+            // A second payload with the same destructor prevents a fix that
+            // merely moves the uncontained panic to dropping the second one.
+            std::panic::panic_any(CallbackPanicPayload(true));
+        }
+    }
+}
 
 fn runner(closure: TorclVal, arguments: &[TorclVal]) -> Result<TorclVal, TorclError> {
     assert_eq!(
@@ -15,6 +28,9 @@ fn runner(closure: TorclVal, arguments: &[TorclVal]) -> Result<TorclVal, TorclEr
         NativeThreadState::Running
     );
     INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+    if closure == TorclVal::from_fixnum(-4) || closure == TorclVal::from_fixnum(-5) {
+        std::panic::panic_any(CallbackPanicPayload(closure == TorclVal::from_fixnum(-5)));
+    }
     if closure == TorclVal::from_fixnum(-1) {
         panic!("callback panic fixture");
     }
@@ -107,6 +123,61 @@ fn callback_errors_and_panics_are_reported_after_c_returns() {
             NativeThreadState::Running
         );
     }
+}
+
+#[test]
+fn callback_panic_payload_destructors_cannot_unwind_into_c() {
+    const CHILD: &str = "TORCL_CALLBACK_PANIC_PAYLOAD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "callback_panic_payload_destructors_cannot_unwind_into_c",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    set_callback_runner(runner);
+    for closure in [-4, -5] {
+        let before = PAYLOAD_DROPS.load(Ordering::SeqCst);
+        let callback = LispCallback::new(
+            TorclVal::from_fixnum(closure),
+            AlienType::Double,
+            vec![AlienType::Double],
+        )
+        .unwrap();
+        let error = call(&callback).unwrap_err();
+        assert!(matches!(error, TorclError::FfiError(_)));
+        assert!(error.to_string().contains("Rust panic in Lisp callback"));
+        assert!(
+            callback
+                .take_error()
+                .unwrap()
+                .contains("Rust panic in Lisp callback")
+        );
+        assert_eq!(PAYLOAD_DROPS.load(Ordering::SeqCst), before + 1);
+        assert_eq!(
+            torcl_rt::thread::current_thread().state(),
+            NativeThreadState::Running
+        );
+    }
+    let callback = LispCallback::new(
+        TorclVal::from_fixnum(-3),
+        AlienType::Double,
+        vec![AlienType::Double],
+    )
+    .unwrap();
+    assert_eq!(f64::from_bits(call(&callback).unwrap()), 42.0);
+    assert!(callback.take_error().is_none());
 }
 
 #[test]
