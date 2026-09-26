@@ -1,10 +1,9 @@
 //! Existing bootstrap dispatcher, retained on targets awaiting JIT ABI adapters.
 //! Do not extend this path; new FFI support belongs in the generated adapters.
 
-use super::{
-    AlienType, FiberState, NativeThreadState, current_fiber, current_stack, current_thread,
-};
+use super::AlienType;
 use crate::error::TorclError;
+use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 
 /// Variadic calls require the target's generated adapter implementation.
 ///

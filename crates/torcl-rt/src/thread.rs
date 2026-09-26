@@ -684,6 +684,10 @@ fn install_current_native_thread(thread: Arc<NativeThread>) {
 }
 
 fn ensure_current_native_thread() -> Arc<NativeThread> {
+    ensure_current_native_thread_in_state(NativeThreadState::Running)
+}
+
+fn ensure_current_native_thread_in_state(initial_state: NativeThreadState) -> Arc<NativeThread> {
     install_execution_root_scanner();
     CURRENT_NATIVE_THREAD.with(|slot| {
         if let Some(current) = slot.borrow().as_ref() {
@@ -699,7 +703,7 @@ fn ensure_current_native_thread() -> Arc<NativeThread> {
             NIL,
             result,
         ));
-        thread.set_state(NativeThreadState::Running);
+        thread.set_state(initial_state);
         native_thread_registry()
             .lock()
             .unwrap()
@@ -1785,6 +1789,14 @@ pub fn current_thread_id() -> NativeThreadId {
 
 pub fn current_thread() -> &'static NativeThread {
     let thread = ensure_current_native_thread();
+    unsafe { &*Arc::as_ptr(&thread) }
+}
+
+/// A foreign-created thread starts quiescent. Its callback entry joins the
+/// collector's Running participant set only under the safepoint transition lock.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub(crate) fn current_thread_for_foreign_entry() -> &'static NativeThread {
+    let thread = ensure_current_native_thread_in_state(NativeThreadState::Native);
     unsafe { &*Arc::as_ptr(&thread) }
 }
 

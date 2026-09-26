@@ -4116,3 +4116,88 @@ fn a_setf_expander_keeps_its_value_form_across_its_own_allocations() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn a_compile_time_defvar_keeps_the_value_its_own_eval_when_computes() {
+    // bliss-2pmq: `seed_compile_time_definitions` scans a top-level form BEFORE
+    // that form's compile-time processing runs, so a DEFVAR nested in an
+    // `(eval-when (:compile-toplevel …) …)` was reached before the helpers defined
+    // ahead of it in the same body existed. The failing init form was swallowed
+    // (`unwrap_or(NIL)`) and NIL seeded — and since DEFVAR assigns only when the
+    // name is UNBOUND, that NIL was permanent for the whole process.
+    //
+    // This is dexador's `+crlf+`, defined in exactly this shape, so every
+    // `(fast-write-sequence +crlf+ buffer)` wrote ZERO bytes and a cold
+    // compile-and-load sent HTTP requests with no CRLF anywhere. Verified against
+    // SBCL, which yields #(13 10) whether the file is compiled and loaded in one
+    // process or loaded from its fasl in a fresh one.
+    let dir = temp_dir("compile-time-defvar-seed");
+    let source = dir.join("compile-time-defvar-seed.lisp");
+    write_file(
+        &source,
+        "(eval-when (:compile-toplevel :load-toplevel :execute)\n\
+           (defun %a2o (string)\n\
+             (let ((result (make-array (length string) :element-type '(unsigned-byte 8))))\n\
+               (dotimes (i (length string) result)\n\
+                 (setf (aref result i) (char-code (aref string i))))))\n\
+           (defun a2o (string) (%a2o string))\n\
+           (defvar +crlf+ (a2o (format nil \"~C~C\" #\\Return #\\Newline))))\n\
+         (defun report () (format t \"SEEDED=(~S ~S)\" (coerce +crlf+ 'list) (length +crlf+)))\n",
+    );
+    let driver = dir.join("driver.lisp");
+    let fasl = dir.join("compile-time-defvar-seed.fasl");
+    write_file(
+        &driver,
+        &format!(
+            "(compile-file \"{src}\")\n(load \"{fasl}\")\n(report)\n",
+            src = source.display(),
+            fasl = fasl.display()
+        ),
+    );
+
+    // COMPILE-FILE and LOAD in ONE process is the path that failed: the
+    // compile-time seed had already claimed the name.
+    let output = torcl()
+        .args(["--load", driver.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL compile-time DEFVAR fixture");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SEEDED=((13 10) 2)"),
+        "compile-and-load in one process; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Loading the same fasl in a FRESH process must agree.
+    let warm = dir.join("warm.lisp");
+    write_file(
+        &warm,
+        &format!("(load \"{fasl}\")\n(report)\n", fasl = fasl.display()),
+    );
+    let output = torcl()
+        .args(["--load", warm.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL warm-load fixture");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SEEDED=((13 10) 2)"),
+        "fasl load in a fresh process; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}

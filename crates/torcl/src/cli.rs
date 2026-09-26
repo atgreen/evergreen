@@ -10547,10 +10547,25 @@ fn seed_compile_time_definitions(form: TorclVal, env: &mut Env) {
                 let (symbol, rest) = cp(cdr);
                 if symbol.is_symbol() {
                     if rest.is_cons() {
-                        // (defvar name value): seed the binding if unbound.
+                        // (defvar name value): seed the binding if unbound — but
+                        // ONLY if the init form actually evaluates. This scan runs
+                        // BEFORE the form's own compile-time processing, so a
+                        // DEFVAR nested in an `(eval-when (:compile-toplevel …) …)`
+                        // is reached before the helpers defined ahead of it in that
+                        // same body exist. Seeding NIL on failure is far worse than
+                        // seeding nothing: DEFVAR assigns only when the name is
+                        // UNBOUND, so the NIL sticks for the whole process and
+                        // neither the eval-when body nor the later fasl load can
+                        // replace it. dexador defines
+                        //   (defvar +crlf+ (ascii-string-to-octets (format nil "~C~C" …)))
+                        // that way, so +crlf+ became NIL, every
+                        // `(fast-write-sequence +crlf+ …)` wrote ZERO bytes, and
+                        // TorCL sent HTTP requests with no CRLF anywhere — one
+                        // unparseable line that servers reject (bliss-2pmq).
                         if env.lookup_var_symbol(symbol).is_none() {
-                            let value = eval_form(cp(rest).0, env).unwrap_or(NIL);
-                            seed_compile_time_binding(env, symbol, value);
+                            if let Ok(value) = eval_form(cp(rest).0, env) {
+                                seed_compile_time_binding(env, symbol, value);
+                            }
                         }
                     } else {
                         // (defvar name) with no value only proclaims NAME special;
@@ -10566,12 +10581,18 @@ fn seed_compile_time_definitions(form: TorclVal, env: &mut Env) {
             "DEFPARAMETER" | "DEFCONSTANT" => {
                 let (symbol, rest) = cp(cdr);
                 if symbol.is_symbol() {
-                    let value = if rest.is_cons() {
-                        eval_form(cp(rest).0, env).unwrap_or(NIL)
+                    if rest.is_cons() {
+                        // As for DEFVAR above: an init form that cannot be
+                        // evaluated yet seeds nothing. DEFPARAMETER would at least
+                        // be re-assigned later, but a seeded NIL is still visible
+                        // to every compile-time form in between, and DEFCONSTANT
+                        // makes it permanent (bliss-2pmq).
+                        if let Ok(value) = eval_form(cp(rest).0, env) {
+                            seed_compile_time_binding(env, symbol, value);
+                        }
                     } else {
-                        NIL
-                    };
-                    seed_compile_time_binding(env, symbol, value);
+                        seed_compile_time_binding(env, symbol, NIL);
+                    }
                 }
                 return;
             }

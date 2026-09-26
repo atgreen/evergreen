@@ -4,7 +4,6 @@
 
 use crate::bignum::{BigInt, bigint_from_val};
 use crate::error::TorclError;
-use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 use crate::value::TorclVal;
 
 pub mod memory;
@@ -15,6 +14,8 @@ mod call;
 pub mod callback;
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 mod legacy;
+#[cfg(all(target_arch = "x86_64", unix))]
+pub mod managed_callback;
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
@@ -201,20 +202,6 @@ unsafe fn ffi_call_impl(
     args: &[u64],
     fixed_count: Option<usize>,
 ) -> Result<u64, TorclError> {
-    enum NativeStateGuard {
-        Fiber(&'static crate::thread::Fiber, FiberState),
-        Thread(&'static crate::thread::NativeThread, NativeThreadState),
-    }
-
-    impl Drop for NativeStateGuard {
-        fn drop(&mut self) {
-            match self {
-                NativeStateGuard::Fiber(fiber, previous) => fiber.set_state(*previous),
-                NativeStateGuard::Thread(thread, previous) => thread.set_state(*previous),
-            }
-        }
-    }
-
     if fn_ptr.is_null() {
         return Err(TorclError::FfiError("null function pointer".into()));
     }
@@ -227,21 +214,15 @@ unsafe fn ffi_call_impl(
     // live across foreign execution; no cache lock is held during callbacks.
     let adapter = call::CallAdapter::get(ret_type, arg_types, fixed_count)?;
 
-    current_stack().publish_top();
-    let _state_guard = if let Some(fiber) = current_fiber() {
-        let guard = NativeStateGuard::Fiber(fiber, fiber.state());
-        fiber.set_state(FiberState::Native);
-        guard
-    } else {
-        let thread = current_thread();
-        let guard = NativeStateGuard::Thread(thread, thread.state());
-        thread.set_state(NativeThreadState::Native);
-        guard
-    };
+    let errors = managed_callback::ForeignCallErrors::enter();
+    let state_guard = crate::safepoint::ForeignStateScope::native();
 
     // SAFETY: the caller supplies a matching C signature; count and supported
     // types were checked above, and the adapter stays alive through the call.
-    Ok(unsafe { adapter.invoke(fn_ptr, args) })
+    let result = unsafe { adapter.invoke(fn_ptr, args) };
+    drop(state_guard);
+    errors.finish()?;
+    Ok(result)
 }
 
 // ── Marshalling ────────────────────────────────────────────────────

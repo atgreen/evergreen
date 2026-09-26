@@ -196,6 +196,103 @@ fn global_safepoint_page() -> &'static SafepointPage {
 
 // ── Public coordination functions ────────────────────────────────────
 
+/// A foreign call/callback transition serialized with GC participant snapshots.
+/// Fibers remain pinned while foreign frames are live, including nested entries.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub(crate) struct ForeignStateScope {
+    thread: &'static crate::thread::NativeThread,
+    previous: crate::thread::NativeThreadState,
+    fiber: Option<(&'static crate::thread::Fiber, crate::thread::FiberState)>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl ForeignStateScope {
+    pub(crate) fn native() -> Self {
+        Self::enter(
+            crate::thread::current_thread(),
+            crate::thread::NativeThreadState::Native,
+        )
+    }
+
+    pub(crate) fn lisp() -> Self {
+        Self::enter(
+            crate::thread::current_thread_for_foreign_entry(),
+            crate::thread::NativeThreadState::Running,
+        )
+    }
+
+    fn enter(
+        thread: &'static crate::thread::NativeThread,
+        next: crate::thread::NativeThreadState,
+    ) -> Self {
+        let previous = thread.state();
+        let fiber = crate::thread::current_fiber().map(|fiber| {
+            fiber.pin();
+            (fiber, fiber.state())
+        });
+        transition_foreign_state(thread, next);
+        if let Some((fiber, _)) = fiber {
+            fiber.set_state(if next == crate::thread::NativeThreadState::Native {
+                crate::thread::FiberState::Native
+            } else {
+                crate::thread::FiberState::Runnable
+            });
+        }
+        Self {
+            thread,
+            previous,
+            fiber,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn transition_foreign_state(
+    thread: &crate::thread::NativeThread,
+    next: crate::thread::NativeThreadState,
+) {
+    use crate::thread::NativeThreadState;
+    if next != NativeThreadState::Running {
+        crate::thread::current_stack().publish_top();
+        crate::gc::retire_current_t0_tlab_for_safepoint();
+    }
+    let coord = coordinator();
+    let mut transition = coord.park_mutex.lock().unwrap();
+    if next == NativeThreadState::Running {
+        if thread.state() != NativeThreadState::Running {
+            while coord.parked.load(Ordering::SeqCst) {
+                transition = coord.park_condvar.wait(transition).unwrap();
+            }
+            thread.set_state(next);
+        }
+    } else {
+        let counted =
+            thread.state() == NativeThreadState::Running && coord.parked.load(Ordering::SeqCst);
+        thread.set_state(next);
+        drop(transition);
+        if counted {
+            let _arrival = coord.arrival_mutex.lock().unwrap();
+            coord.arrived.fetch_add(1, Ordering::SeqCst);
+            coord.arrival_condvar.notify_all();
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl Drop for ForeignStateScope {
+    fn drop(&mut self) {
+        transition_foreign_state(self.thread, self.previous);
+        if let Some((fiber, previous)) = self.fiber {
+            fiber.set_state(previous);
+            // The matching entry added exactly one pin. Do not introduce a
+            // panic in this boundary's destructor while containing an unwind.
+            let _ = fiber.unpin();
+        }
+    }
+}
+
 /// A native-only synchronization region containing no Lisp heap accesses.
 /// Unpinned fibers keep using their cooperative park protocol instead.
 pub(crate) struct NativeBlockingScope {
