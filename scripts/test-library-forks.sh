@@ -24,6 +24,11 @@ done
 # otherwise keep passing while every non-ASCII character was rejected.
 "$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check-utf8.lisp >utf8.log 2>&1
 grep -Fxq 'MULTIBYTE-UTF8-OK' utf8.log
+# The atgreen/fset fork's TorCL lock layer (bliss-q00o). Also its own phase: it
+# loads check.lisp itself, and fset is the first fork here that needs mutexes
+# rather than only feature/stream shims.
+"$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check-fset.lisp >fset.log 2>&1
+grep -Fxq 'FSET-TORCL-OK' fset.log
 if grep -qi 'compiling file' cached.log; then
     echo "Cached load unexpectedly compiled source; see $work/cached.log" >&2
     exit 1
@@ -36,6 +41,10 @@ if [[ ${TORCL_PORT_STRESS:-0} == 1 ]]; then
         "$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check-utf8.lisp \
         >utf8-stress.log 2>&1
     grep -Fxq 'MULTIBYTE-UTF8-OK' utf8-stress.log
+    TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1 \
+        "$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check-fset.lisp \
+        >fset-stress.log 2>&1
+    grep -Fxq 'FSET-TORCL-OK' fset-stress.log
 fi
 if [[ -n ${SBCL_BIN:-} ]]; then
     TORCL_PORT_CACHE="$work/sbcl-cache/" "$repo/scripts/torcl-limited.sh" "$SBCL_BIN" \
@@ -45,5 +54,9 @@ if [[ -n ${SBCL_BIN:-} ]]; then
         --noinform --no-sysinit --no-userinit --non-interactive --load check-utf8.lisp \
         >utf8-sbcl.log 2>&1
     grep -Fxq 'MULTIBYTE-UTF8-OK' utf8-sbcl.log
+    TORCL_PORT_CACHE="$work/sbcl-cache/" "$repo/scripts/torcl-limited.sh" "$SBCL_BIN" \
+        --noinform --no-sysinit --no-userinit --non-interactive --load check-fset.lisp \
+        >fset-sbcl.log 2>&1
+    grep -Fxq 'FSET-TORCL-OK' fset-sbcl.log
 fi
-echo "LIBRARY-FORKS-PASS: cold and cached loads, multibyte UTF-8; artifacts in $work"
+echo "LIBRARY-FORKS-PASS: cold and cached loads, multibyte UTF-8, fset locks; artifacts in $work"

@@ -1,4 +1,5 @@
 alexandria, ghcr.io/ocicl/alexandria@sha256:407634b0781b2d8fc3e55a30432bcb5d0c042af2feb2d1d72de825940b0fb0df, alexandria-20260812-f283e25/alexandria.asd
+autoload, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/autoload/autoload.asd
 babel, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel.asd
 babel-streams, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel-streams.asd
 babel-tests, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel-tests.asd
@@ -9,8 +10,20 @@ cffi-libffi, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec28
 cffi-tests, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/cffi-tests.asd
 cffi-toolchain, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/cffi-toolchain.asd
 cffi-uffi-compat, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/cffi-uffi-compat.asd
+dref, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/dref/dref.asd
+dref-test, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/dref/dref-test.asd
+dref-test-package-inferred, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/dref/test/data/dref-test-package-inferred.asd
 flexi-streams, ghcr.io/ocicl/flexi-streams@sha256:95005b06a8a95c82780c75ead53810bcb273d07fcf5fe76b527f1856df9923f2, flexi-streams-20240503-4951d57/flexi-streams.asd
 flexi-streams-test, ghcr.io/ocicl/flexi-streams@sha256:95005b06a8a95c82780c75ead53810bcb273d07fcf5fe76b527f1856df9923f2, flexi-streams-20240503-4951d57/flexi-streams-test.asd
+fset, git+https://github.com/atgreen/fset@60a28fe91abfddfc8c2a3f6971933a0c2c5b20aa#ref=60a28fe91abfddfc8c2a3f6971933a0c2c5b20aa, fset-60a28fe/fset.asd
+mgl-pax, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/mgl-pax.asd
+mgl-pax-bootstrap, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/mgl-pax-bootstrap.asd
+mgl-pax-test, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/mgl-pax-test.asd
+mgl-pax.asdf, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/mgl-pax.asdf.asd
+misc-extensions, ghcr.io/ocicl/misc-extensions@sha256:54322949cfba2ca8d8a2621e0f7719c1ad4fdf0f456d4b6434af99e207f74477, misc-extensions-20260815-c35c739/misc-extensions.asd
+mt19937, ghcr.io/ocicl/mt19937@sha256:49c0a25a535cd22212343c67e17635b8e05675ad9cc20aa75ce75e35e842bbe3, MT19937-20240503-78f0419/mt19937.asd
+named-readtables, ghcr.io/ocicl/named-readtables@sha256:9c467a5a6d7b4e928d4ca48986e14312cf29cd5a71347be0ebb515ebb964ced2, named-readtables-20260701-9b774b5/named-readtables.asd
+named-readtables-test, ghcr.io/ocicl/named-readtables@sha256:9c467a5a6d7b4e928d4ca48986e14312cf29cd5a71347be0ebb515ebb964ced2, named-readtables-20260701-9b774b5/named-readtables-test.asd
 rt, ghcr.io/ocicl/rt@sha256:e3e71ac89d5dae840a65665b918a9ee40c3863b1efe2761469138bf9c7f4028a, rt-20240503-a6a7503/rt.asd
 trivial-features, git+https://github.com/atgreen/trivial-features@26e8d168deb7d70d762d0d7e41b2919eba4321aa#ref=26e8d168deb7d70d762d0d7e41b2919eba4321aa, trivial-features-26e8d16/trivial-features.asd
 trivial-features-tests, git+https://github.com/atgreen/trivial-features@26e8d168deb7d70d762d0d7e41b2919eba4321aa#ref=26e8d168deb7d70d762d0d7e41b2919eba4321aa, trivial-features-26e8d16/trivial-features-tests.asd

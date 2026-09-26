@@ -23,6 +23,7 @@ exercises these forks:
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `0bb7ebd89ec5c8245516c5117f4bc598ebd56e84` |
 | bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `0251844d5e9482eb5fc91fa4686a05aacd24d9b4` |
 | precise-time | https://github.com/atgreen/precise-time | `deadbdeb95ee98cd743c538e649880181e8416f7` |
+| fset | https://github.com/atgreen/fset | `60a28fe91abfddfc8c2a3f6971933a0c2c5b20aa` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new

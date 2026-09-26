@@ -7676,7 +7676,20 @@ impl Env {
         env.define_local("*LOAD-HOOKS*", NIL);
         // *features*: :TORCL plus the host OS so portable code (e.g. UIOP's
         // DETECT-OS) can identify the platform via FEATUREP.
-        let mut features = vec![resolve_sym(":TORCL").unwrap_or(NIL)];
+        //
+        // :COMMON-LISP and :ANSI-CL come first because portable libraries use
+        // them as the PORTABLE branch of a platform dispatch, not as a triviality.
+        // named-readtables' define-cruft asserts that at least one `#+platform`
+        // alternative survived reading, and its fallbacks are spelled
+        // `#+ :common-lisp` — so without these every such form read as a
+        // docstring with no body and loading died on a bare "Assertion failed"
+        // (bliss-hv77). CLHS does not mandate either name, but SBCL, CCL, CLISP,
+        // ECL and ABCL all publish them, which is what portable code targets.
+        let mut features = vec![
+            resolve_sym(":TORCL").unwrap_or(NIL),
+            resolve_sym(":COMMON-LISP").unwrap_or(NIL),
+            resolve_sym(":ANSI-CL").unwrap_or(NIL),
+        ];
         #[cfg(unix)]
         features.push(resolve_sym(":UNIX").unwrap_or(NIL));
         #[cfg(target_os = "linux")]
@@ -35739,6 +35752,38 @@ fn apply_function(
                 && (is_ansi_special_operator(&bare) || is_ansi_standard_macro(&bare))
             {
                 return Err(TorclError::UndefinedFunction(fn_val));
+            }
+        }
+        // An UNINTERNED symbol's NAME identifies nothing. GENSYM hands out
+        // distinct symbols that share a name, so none of the name-keyed lookups
+        // above could find THIS one's function, and the synthesize-`(NAME 'arg…)`
+        // -and-evaluate fallback just below is actively wrong for it: it re-reads
+        // the name and reaches a DIFFERENT, interned symbol. Only the symbol's own
+        // function cell can answer, so consult it and dispatch through the OBJECT.
+        //
+        // That asymmetry is exactly what the bug looked like from Lisp: (fboundp s)
+        // and (symbol-function s) answered correctly and the function was even EQ
+        // to #'s, while (funcall s) and (apply s …) signalled UNDEFINED-FUNCTION,
+        // because only those two went through the name (bliss-8rb7). Reached via
+        // misc-extensions' gmap, which defuns a GENSYM and then calls it through
+        // the symbol — so every library above it broke, but only once loaded from
+        // a fasl, since the interpreted path installs an interpreted body that the
+        // designator lookup above does find.
+        if fn_val != NIL
+            && fn_val != T
+            && torcl_rt::symbols::is_uninterned(fn_val.as_symbol_index())
+        {
+            // Use the same reifying accessor SYMBOL-FUNCTION/FDEFINITION use, not
+            // the raw cell: a cell can hold a representation (e.g. a bytecode
+            // function loaded from a fasl) that the function-OBJECT path below
+            // does not accept, and this helper hands back the callable `#'name`
+            // object instead — which is why (funcall (symbol-function s)) worked
+            // all along while the raw cell produced a bare TYPE-ERROR.
+            if let Some(object) = symbol_global_function_object(env, fn_val) {
+                // Guard against a self-referential cell recursing forever.
+                if object != fn_val {
+                    return apply_function(object, args, env);
+                }
             }
         }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
