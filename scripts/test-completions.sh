@@ -17,24 +17,15 @@ export OCICL_LOCAL_ONLY=1 TORCL_PORT_RUNTIME="$runtime"
 "$repo/scripts/torcl-limited.sh" "$ocicl" install >install.log 2>&1
 cmp -- "$repo/tests/completions/ocicl.csv" ocicl.csv
 export TORCL_PORT_CACHE="$work/cache/"
-# The gated phase is COLD: compiling the graph (455 files) is slow, so give it
-# more room than the defaults.
-#
-# The CACHED phase is opt-in (TORCL_COMPLETIONS_CACHED=1) because it currently
-# FAILS on a known, unrelated defect: the upfront COMPILE-FILE read of ironclad's
-# whirlpool.lisp is corrupted once pure-tls has been loaded, so that file is
-# written as a source-only artifact which cannot be re-loaded in a fresh process
-# (bliss-6d8f). See tests/completions/README.md.
-phases=cold
-[[ ${TORCL_COMPLETIONS_CACHED:-0} == 1 ]] && phases="cold cached"
-for phase in $phases; do
+# Compiling the graph (455 files) is slow; give it more room than the defaults.
+for phase in cold cached; do
     TORCL_MEM_MAX="${TORCL_MEM_MAX:-8G}" TORCL_TIMEOUT="${TORCL_TIMEOUT:-2400}" \
         "$repo/scripts/torcl-limited.sh" python3 fake-ollama.py \
         "$torcl" --no-init --load check.lisp >"$phase.log" 2>&1
     grep -Fxq 'COMPLETIONS-DEXADOR-OK' "$phase.log"
     grep -Fxq 'COMPLETIONS-OK' "$phase.log"
 done
-if [[ -f cached.log ]] && grep -qi 'compiling file' cached.log; then
+if grep -qi 'compiling file' cached.log; then
     echo "Cached load unexpectedly compiled source; see $work/cached.log" >&2
     exit 1
 fi
@@ -46,4 +37,4 @@ if [[ -n ${SBCL_BIN:-} ]]; then
     grep -Fxq 'COMPLETIONS-DEXADOR-OK' sbcl.log
     grep -Fxq 'COMPLETIONS-OK' sbcl.log
 fi
-echo "COMPLETIONS-PASS: $phases HTTP round trip(s); artifacts in $work"
+echo "COMPLETIONS-PASS: cold and cached HTTP round trips; artifacts in $work"
