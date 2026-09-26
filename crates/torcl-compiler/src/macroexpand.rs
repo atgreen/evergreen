@@ -264,6 +264,45 @@ impl Environment {
         None
     }
 
+    /// Return the nearest raw declaration specifier named `decl_name`.
+    ///
+    /// This is the lossless bridge used by implementation-level CLtL2
+    /// adapters: a declaration handler needs the complete source specifier,
+    /// not the compiler's normalized representation.  Search entries in
+    /// reverse source order within a frame, then walk outward, so the nearest
+    /// lexical declaration has precedence.
+    pub fn declaration_specifier(&self, decl_name: TorclVal) -> Option<TorclVal> {
+        for decl in self.declarations.iter().rev() {
+            if let DeclInfo::Custom(name_key, specifier) = decl
+                && *name_key == decl_name.0
+            {
+                return Some(*specifier);
+            }
+        }
+        self.parent
+            .as_ref()
+            .and_then(|parent| parent.declaration_specifier(decl_name))
+    }
+
+    /// Every raw declaration specifier named `decl_name` in force here,
+    /// OUTERMOST first. `declaration_specifier` answers the innermost one, which
+    /// is what a shadowing declaration needs; a *cumulative* declaration such as
+    /// OPTIMIZE needs them all, so its reader can merge outward-to-inward.
+    pub fn declaration_specifiers(&self, decl_name: TorclVal) -> Vec<TorclVal> {
+        let mut found = match self.parent {
+            Some(ref parent) => parent.declaration_specifiers(decl_name),
+            None => Vec::new(),
+        };
+        for decl in self.declarations.iter() {
+            if let DeclInfo::Custom(name_key, specifier) = decl
+                && *name_key == decl_name.0
+            {
+                found.push(*specifier);
+            }
+        }
+        found
+    }
+
     /// Augment this environment with a variable binding.
     /// Returns a new Environment frame with only the new binding; the current
     /// environment becomes the parent (O(1) per augmentation via parent chain).
@@ -1063,19 +1102,75 @@ fn expand_body(mut forms: TorclVal, env: &Environment) -> Result<TorclVal, Torcl
     torcl_rt::rooted_ref!(_forms_root = &mut forms);
     torcl_rt::rooted!(items = cons_to_vec(forms));
     torcl_rt::rooted!(expanded_items = Vec::with_capacity(items.len()));
-    let mut changed = false;
-    for i in 0..items.len() {
-        let exp = macroexpand_all(items[i], env)?;
-        if exp != items[i] {
-            changed = true;
-        }
-        expanded_items.push(exp);
-    }
+
+    // A declaration governs every form in the containing body.  Preserve the
+    // DECLARE forms themselves, but augment the macro-expansion environment
+    // before expanding the executable forms so an &ENVIRONMENT parameter sees
+    // the same lexical declarations as the compiler.  The optional leading
+    // string accounts for function/macro docstrings.
+    let (declaration_end, declarations) = collect_body_declarations(&items);
+    let changed = if declarations.is_empty() {
+        expand_body_items(&items, declaration_end, env, &mut expanded_items)?
+    } else {
+        let mut body_env = env.augment_declarations(declarations);
+        // Custom declaration payloads are raw source conses.  They must move
+        // with the nursery while a later macro expansion allocates.
+        torcl_rt::rooted_ref!(_body_env_root = &mut body_env);
+        expand_body_items(&items, declaration_end, &body_env, &mut expanded_items)?
+    };
     if !changed {
         Ok(forms)
     } else {
         Ok(vec_to_cons(&expanded_items))
     }
+}
+
+/// Collect the leading declaration specifiers in a body and return the index
+/// of its first executable form.  Every specifier is retained verbatim as a
+/// `Custom` declaration; implementation compatibility layers decide how to
+/// interpret it.
+fn collect_body_declarations(items: &[TorclVal]) -> (usize, Vec<DeclInfo>) {
+    let mut index = usize::from(items.first().is_some_and(|form| form.is_string()));
+    let mut declarations = Vec::new();
+
+    while let Some(&form) = items.get(index) {
+        if !form.is_cons() || !is_symbol_named(unsafe { cons_car(form) }, "DECLARE") {
+            break;
+        }
+        let mut specifiers = unsafe { cons_cdr(form) };
+        while specifiers.is_cons() {
+            let specifier = unsafe { cons_car(specifiers) };
+            if specifier.is_cons() {
+                let name = unsafe { cons_car(specifier) };
+                if name.is_symbol() {
+                    declarations.push(DeclInfo::Custom(name.0, specifier));
+                }
+            }
+            specifiers = unsafe { cons_cdr(specifiers) };
+        }
+        index += 1;
+    }
+
+    (index, declarations)
+}
+
+fn expand_body_items(
+    items: &[TorclVal],
+    declaration_end: usize,
+    env: &Environment,
+    expanded_items: &mut Vec<TorclVal>,
+) -> Result<bool, TorclError> {
+    let mut changed = false;
+    for (index, &item) in items.iter().enumerate() {
+        let expanded = if index < declaration_end {
+            item
+        } else {
+            macroexpand_all(item, env)?
+        };
+        changed |= expanded != item;
+        expanded_items.push(expanded);
+    }
+    Ok(changed)
 }
 
 /// Check if operator is a lambda expression: (LAMBDA params body...)
@@ -2106,44 +2201,14 @@ fn expand_locally(mut form: TorclVal, env: &Environment) -> Result<TorclVal, Tor
     torcl_rt::rooted_ref!(_form_root = &mut form);
     let mut operator = unsafe { cons_car(form) };
     torcl_rt::rooted_ref!(_operator_root = &mut operator);
-    let body = unsafe { cons_cdr(form) };
+    let mut body = unsafe { cons_cdr(form) };
+    torcl_rt::rooted_ref!(_body_root = &mut body);
+    let expanded_body = expand_body(body, env)?;
 
-    // Skip declarations (forms starting with DECLARE), expand the rest
-    let items = cons_to_vec(body);
-    torcl_rt::rooted!(decls = Vec::new());
-    torcl_rt::rooted!(body_forms = Vec::new());
-    let mut in_decls = true;
-    for item in &items {
-        if in_decls && item.is_cons() {
-            let car = unsafe { cons_car(*item) };
-            if is_symbol_named(car, "DECLARE") {
-                decls.push(*item);
-                continue;
-            }
-        }
-        in_decls = false;
-        body_forms.push(*item);
-    }
-
-    torcl_rt::rooted!(expanded_body_forms = Vec::with_capacity(body_forms.len()));
-    let mut changed = false;
-    for i in 0..body_forms.len() {
-        let bf = body_forms[i];
-        let exp = macroexpand_all(bf, env)?;
-        if exp != bf {
-            changed = true;
-        }
-        expanded_body_forms.push(exp);
-    }
-
-    if !changed {
+    if expanded_body == body {
         Ok(form)
     } else {
-        let mut all_items: Vec<TorclVal> =
-            Vec::with_capacity(decls.len() + expanded_body_forms.len());
-        all_items.extend(decls.iter().copied());
-        all_items.extend(expanded_body_forms.iter().copied());
-        Ok(alloc_cons(operator, vec_to_cons(&all_items)))
+        Ok(alloc_cons(operator, expanded_body))
     }
 }
 

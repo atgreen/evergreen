@@ -625,6 +625,9 @@ fn seed_standard_packages_registry() {
     // compatibility nickname (spec §13.9.1). Fibers get a separate TORCL-FIBER
     // package (bliss-l3wy).
     let _ = torcl_stdlib::make_package("TORCL-THREAD", &["TORCL-THREADS"], &["COMMON-LISP"]);
+    // CLtL2 lexical-environment access (§4.14), the package a portability layer
+    // such as trivial-cltl2 USEs — TorCL's counterpart of SB-CLTL2.
+    let _ = torcl_stdlib::make_package("TORCL-CLTL2", &[], &["COMMON-LISP"]);
     for name in [
         "COMMON-LISP",
         "COMMON-LISP-USER",
@@ -632,6 +635,7 @@ fn seed_standard_packages_registry() {
         "TORCL-INTERNAL",
         "TORCL-EXT",
         "TORCL-THREAD",
+        "TORCL-CLTL2",
     ] {
         reader::register_package(name);
     }
@@ -1742,6 +1746,15 @@ struct Env {
     /// thread-local — so it is lexical: a function called from the body builds
     /// its Env from its own closure env and is unaffected (bliss-9kww).
     locally_specials: Vec<u32>,
+    /// The raw source specifiers of user-defined declarations (`(declaration
+    /// foo)` proclaimed names) that lexically enclose the form being evaluated,
+    /// outermost first. A macro's `&ENVIRONMENT` value carries these so a CLtL2
+    /// compatibility layer can answer DECLARATION-INFORMATION (R4.14); nothing
+    /// else consults them. Only proclaimed names are retained, so a program
+    /// that declares none pays one emptiness test per body.
+    ///
+    /// These are live heap conses, visited by `visit_gc_roots_with`.
+    active_declarations: Vec<TorclVal>,
 }
 
 /// A tiny insertion-ordered map backed by a `Vec`, for env-frame variable
@@ -3810,6 +3823,62 @@ fn load_macroexpand_environment(handle: TorclVal) -> Option<MacroexpandEnv> {
         return None;
     }
     MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().get(&(id as u64)).cloned())
+}
+
+/// Lossless declaration lookup for implementation compatibility libraries.
+/// The environment handle has dynamic extent (CLHS 3.1.1.4), matching the
+/// registry lifetime above; NIL denotes the null lexical environment.
+fn macroexpand_declaration_specifier(
+    name: TorclVal,
+    environment: TorclVal,
+) -> Result<TorclVal, TorclError> {
+    if !name.is_symbol() {
+        return Err(TorclError::TypeError {
+            datum: name,
+            expected: "SYMBOL".into(),
+        });
+    }
+    if environment.is_nil() {
+        return Ok(NIL);
+    }
+    let macro_env = load_macroexpand_environment(environment).ok_or_else(|| {
+        TorclError::ProgramError(
+            "TORCL-EXT:DECLARATION-SPECIFIER received an invalid lexical environment".into(),
+        )
+    })?;
+    Ok(macro_env.declaration_specifier(name).unwrap_or(NIL))
+}
+
+/// Every declaration specifier named `name` in force in `environment`, outermost
+/// first — the cumulative counterpart of `macroexpand_declaration_specifier`,
+/// used for OPTIMIZE, whose qualities merge across nested declarations.
+fn macroexpand_declaration_specifiers(
+    name: TorclVal,
+    environment: TorclVal,
+) -> Result<TorclVal, TorclError> {
+    if !name.is_symbol() {
+        return Err(TorclError::TypeError {
+            datum: name,
+            expected: "SYMBOL".into(),
+        });
+    }
+    if environment.is_nil() {
+        return Ok(NIL);
+    }
+    let macro_env = load_macroexpand_environment(environment).ok_or_else(|| {
+        TorclError::ProgramError(
+            "TORCL-EXT:DECLARATION-SPECIFIERS received an invalid lexical environment".into(),
+        )
+    })?;
+    // The specifiers are live conses already reachable from the environment;
+    // root the collected Vec anyway, since building the result list allocates.
+    torcl_rt::rooted!(specifiers = macro_env.declaration_specifiers(name));
+    let mut list = NIL;
+    torcl_rt::rooted_ref!(_list_root = &mut list);
+    for specifier in specifiers.iter().rev() {
+        list = arena_cons(*specifier, list);
+    }
+    Ok(list)
 }
 
 fn store_control_value(token: &str, value: TorclVal) {
@@ -7265,6 +7334,12 @@ impl Env {
         for value in &mut self.mv {
             visit(value);
         }
+        // Raw declaration specifiers are source conses copied out of a body; the
+        // body's own root does not cover this independent copy (AGENTS.md GC
+        // invariant 1), so visit them here.
+        for specifier in &mut self.active_declarations {
+            visit(specifier);
+        }
         for closure in self.closures.borrow_mut().values_mut() {
             visit(&mut closure.params_form);
             visit(&mut closure.body);
@@ -7356,6 +7431,7 @@ impl Env {
             method_context: Vec::new(),
             eval_context: EvalContext::Repl,
             locally_specials: Vec::new(),
+            active_declarations: Vec::new(),
         };
         // Definitional-registry sharing (bliss-nc3b): a macro-expansion env
         // ADOPTS the live top-level env's tables so expanders see the loading
@@ -7631,6 +7707,7 @@ impl Env {
             method_context: self.method_context.clone(),
             eval_context: self.eval_context,
             locally_specials: self.locally_specials.clone(),
+            active_declarations: self.active_declarations.clone(),
         }
     }
 
@@ -7662,6 +7739,7 @@ impl Env {
             method_context: self.method_context.clone(),
             eval_context: self.eval_context,
             locally_specials: self.locally_specials.clone(),
+            active_declarations: self.active_declarations.clone(),
         }
     }
 
@@ -7675,6 +7753,7 @@ impl Env {
         child.block_stack.clear();
         child.tag_stack.clear();
         child.locally_specials.clear();
+        child.active_declarations.clear();
         child.method_context.clear();
         child.clear_mv();
         child
@@ -8147,14 +8226,26 @@ fn eval_lambda_call_ex(
         // a free declaration applies to the body, not to the init-forms, which
         // is what makes `(defun f (&aux (y x)) (declare (special x)) …)` see the
         // lexical X in Y's init and the dynamic X in the body (ansi DEFUN.5/6/7).
-        let specials = let_body_special_decls(body_through_implicit_block(*body));
+        let inner_body = body_through_implicit_block(*body);
+        let mut specials = let_body_special_decls(inner_body);
+        // A parameter whose NAME is special binds dynamically too, exactly like a
+        // name the body declares special (CLHS 3.1.2.1.1; bliss-pw4d).
+        for idx in lambda_list_special_params(*params_form) {
+            if !specials.contains(&idx) {
+                specials.push(idx);
+            }
+        }
+        let declarations = enter_body_declarations(env, inner_body);
         if specials.is_empty() {
-            return eval_progn(*body, env);
+            let result = eval_progn(*body, env);
+            leave_body_declarations(env, declarations);
+            return result;
         }
         torcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
         let saved_locally = enter_body_special_decls(env, specials, &mut dyn_binds);
         let result = eval_progn(*body, env);
         env.locally_specials = saved_locally;
+        leave_body_declarations(env, declarations);
         result
     });
     if let Some((blocks, tags)) = saved {
@@ -10144,7 +10235,14 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<TorclVal, TorclError
         TOPLEVEL_FRAME_BASE.with(|s| {
             s.borrow_mut().pop();
         });
-        last = eval_result?;
+        let mut value = eval_result?;
+        torcl_rt::rooted_ref!(_value_root = &mut value);
+        // A collection triggered anywhere inside the completed form may have
+        // discovered dead objects with Lisp finalizers.  Invoke them only now,
+        // after the evaluator has unwound to a safe boundary and the collector
+        // owns no locks.  Keep the form's result rooted across those calls.
+        run_deferred_lisp_finalizers(env);
+        last = value;
         if let Some(t1) = t1 {
             eval_ns += t1.elapsed().as_nanos();
         }
@@ -10158,6 +10256,29 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<TorclVal, TorclError
         );
     }
     Ok(last)
+}
+
+/// Invoke callbacks queued by the collector, outside every GC lock.
+///
+/// The queue is a runtime external root until `take_deferred_finalizers`; root
+/// the returned vector immediately because each callback can allocate and move
+/// the callbacks that follow it.  Finalizer conditions are reported and
+/// isolated so one bad callback cannot suppress the rest (R3.16).  Preserve the
+/// interrupted evaluation's multiple-value register as well.
+fn run_deferred_lisp_finalizers(env: &mut Env) {
+    torcl_rt::rooted!(callbacks = torcl_rt::take_deferred_finalizers());
+    if callbacks.is_empty() {
+        return;
+    }
+    let saved_mv_active = env.mv_active;
+    torcl_rt::rooted!(saved_mv = std::mem::take(&mut env.mv));
+    for i in 0..callbacks.len() {
+        if let Err(error) = apply_function(callbacks[i], &[], env) {
+            eprintln!("; Warning: error in finalizer: {error}");
+        }
+    }
+    env.mv = std::mem::take(&mut *saved_mv);
+    env.mv_active = saved_mv_active;
 }
 
 fn read_forms_for_compile(
@@ -14494,6 +14615,10 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
     }
     match bare {
         "CONS" | "RPLACA" | "RPLACD" | "SET-CAR" | "SET-CDR" => Some((2, 2)),
+        "FINALIZE" => Some((2, 4)),
+        "CANCEL-FINALIZATION" => Some((1, 1)),
+        "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
+        "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
         // Sequence functions with a fixed shape. Calling a standard function
         // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
         // were reaching their bodies and answering a TYPE-ERROR about NIL, or
@@ -14918,9 +15043,15 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             "LOCALLY" => {
                 // `(declare (special v))` here binds nothing; it redirects
                 // references in the body to the dynamic value (bliss-9kww).
+                // A user-proclaimed declaration is recorded for the body's
+                // extent so a macro expanded inside it can read it back
+                // (TORCL-CLTL2:DECLARATION-INFORMATION).
                 let names = let_body_special_decls(cdr);
+                let declarations = enter_body_declarations(env, cdr);
                 if names.is_empty() {
-                    return eval_progn(cdr, env);
+                    let result = eval_progn(cdr, env);
+                    leave_body_declarations(env, declarations);
+                    return result;
                 }
                 let saved = env.locally_specials.clone();
                 env.locally_specials.extend(names);
@@ -14928,6 +15059,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // of the body.
                 let result = eval_progn(cdr, env);
                 env.locally_specials = saved;
+                leave_body_declarations(env, declarations);
                 return result;
             }
             "DECLARE" => return Ok(NIL),
@@ -19217,6 +19349,39 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(NIL);
             }
+            "TORCL-INTERNAL::%PROCLAIM-DECLARATION"
+            | "TORCL-INTERNAL:%PROCLAIM-DECLARATION"
+            | "%PROCLAIM-DECLARATION" => {
+                // (%proclaim-declaration (name …)) — the runtime half of
+                // `(proclaim '(declaration name …))`. Naming a declaration is
+                // what makes a body's `(declare (name …))` specifier visible to
+                // TORCL-CLTL2:DECLARATION-INFORMATION.
+                let (arg, _) = cp(cdr);
+                let mut list = eval_form(arg, env)?;
+                torcl_rt::rooted_ref!(_list_root = &mut list);
+                while list.is_cons() {
+                    let (sym, rest) = cp(list);
+                    proclaim_declaration(sym);
+                    list = rest;
+                }
+                return Ok(NIL);
+            }
+            "TORCL-INTERNAL::%PROCLAIM-OPTIMIZE"
+            | "TORCL-INTERNAL:%PROCLAIM-OPTIMIZE"
+            | "%PROCLAIM-OPTIMIZE" => {
+                // (%proclaim-optimize (quality-or-pair …)) — the runtime half of
+                // `(proclaim '(optimize …))`. The qualities are advisory here,
+                // but TORCL-CLTL2:DECLARATION-INFORMATION must report them.
+                let (arg, _) = cp(cdr);
+                let mut list = eval_form(arg, env)?;
+                torcl_rt::rooted_ref!(_list_root = &mut list);
+                while list.is_cons() {
+                    let (spec, rest) = cp(list);
+                    proclaim_optimize(spec);
+                    list = rest;
+                }
+                return Ok(NIL);
+            }
             "TORCL-INTERNAL::%MAKE-COMPLEX-VECTOR"
             | "TORCL-INTERNAL:%MAKE-COMPLEX-VECTOR"
             | "%MAKE-COMPLEX-VECTOR" => {
@@ -22934,6 +23099,110 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let name = module_designator_name(module_val);
                 record_module(env, &name);
                 return Ok(module_val);
+            }
+            "TORCL-EXT:DECLARATION-SPECIFIER" => {
+                let args = eval_args(cdr, env)?;
+                return macroexpand_declaration_specifier(args[0], args[1]);
+            }
+            "TORCL-EXT:DECLARATION-SPECIFIERS" => {
+                let args = eval_args(cdr, env)?;
+                return macroexpand_declaration_specifiers(args[0], args[1]);
+            }
+            "TORCL-EXT:PROCLAIMED-DECLARATIONS" => {
+                let args = eval_args(cdr, env)?;
+                if !args.is_empty() {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:PROCLAIMED-DECLARATIONS requires no arguments; got {}",
+                        args.len()
+                    )));
+                }
+                let mut list = NIL;
+                torcl_rt::rooted_ref!(_list_root = &mut list);
+                for name in proclaimed_declaration_names() {
+                    list = arena_cons(TorclVal::from_symbol_index(name), list);
+                }
+                return Ok(list);
+            }
+            "TORCL-EXT:PROCLAIMED-OPTIMIZE" => {
+                let args = eval_args(cdr, env)?;
+                if !args.is_empty() {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:PROCLAIMED-OPTIMIZE requires no arguments; got {}",
+                        args.len()
+                    )));
+                }
+                return Ok(proclaimed_optimize_list());
+            }
+            "TORCL-EXT:FINALIZE" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 2 && args.len() != 4 {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:FINALIZE requires object, function, and optional :DONT-SAVE value; got {} arguments",
+                        args.len()
+                    )));
+                }
+                if args.len() == 4
+                    && (!args[2].is_symbol() || sym_bare_name_rc(args[2]).as_ref() != "DONT-SAVE")
+                {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-EXT:FINALIZE only accepts the :DONT-SAVE keyword".into(),
+                    ));
+                }
+                if !is_function_value(args[1]) {
+                    return Err(TorclError::TypeError {
+                        datum: args[1],
+                        expected: "FUNCTION".into(),
+                    });
+                }
+                let key = torcl_rt::finalizer_key(args[0])?;
+                torcl_rt::register_deferred_finalizer(key, args[1])?;
+                return Ok(args[0]);
+            }
+            "TORCL-EXT:CANCEL-FINALIZATION" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:CANCEL-FINALIZATION requires one argument; got {}",
+                        args.len()
+                    )));
+                }
+                let key = torcl_rt::finalizer_key(args[0])?;
+                torcl_rt::cancel_deferred_finalizers(key);
+                return Ok(NIL);
+            }
+            "TORCL-EXT:GC" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() % 2 != 0 {
+                    return Err(TorclError::ProgramError(
+                        "TORCL-EXT:GC keyword arguments must be paired".into(),
+                    ));
+                }
+                let mut full = false;
+                let mut i = 0;
+                while i < args.len() {
+                    if !args[i].is_symbol() {
+                        return Err(TorclError::ProgramError(
+                            "TORCL-EXT:GC expected a keyword argument".into(),
+                        ));
+                    }
+                    match sym_bare_name_rc(args[i]).as_ref() {
+                        "FULL" => full = !args[i + 1].is_nil(),
+                        "VERBOSE" => {}
+                        other => {
+                            return Err(TorclError::ProgramError(format!(
+                                "TORCL-EXT:GC does not accept :{other}"
+                            )));
+                        }
+                    }
+                    i += 2;
+                }
+                if full {
+                    torcl_rt::full_gc()?;
+                } else {
+                    torcl_rt::collect_t0_minor()?;
+                }
+                run_deferred_lisp_finalizers(env);
+                return Ok(NIL);
             }
             "TORCL-EXT:GETENV" => {
                 let (name_form, _) = cp(cdr);
@@ -29160,6 +29429,150 @@ thread_local! {
         RefCell::new(std::collections::HashSet::new());
 }
 
+thread_local! {
+    /// Symbol indices proclaimed as DECLARATION names — `(proclaim
+    /// '(declaration foo))` / `(declaim (declaration foo))`. CLtL2's
+    /// DECLARATION-INFORMATION is defined only for such names (plus the standard
+    /// ones), so this set is what decides which specifiers a body keeps in
+    /// `Env::active_declarations`. Keyed by symbol identity, like
+    /// `PROCLAIMED_SPECIAL`: two packages' same-spelling names are distinct
+    /// declarations.
+    static PROCLAIMED_DECLARATIONS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// Globally proclaimed OPTIMIZE qualities: (quality symbol index, value).
+    /// Latest proclamation of a quality wins, as CLHS 3.3.4 requires of a global
+    /// proclamation. Values are small integers, so no GC roots are involved.
+    static PROCLAIMED_OPTIMIZE: RefCell<Vec<(u32, i64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record `(proclaim '(optimize …))`. `quality` may be a bare symbol, which CLHS
+/// 3.3.4 reads as the value 3.
+fn proclaim_optimize(spec: TorclVal) {
+    let (quality, value) = if spec.is_symbol() {
+        (spec, 3)
+    } else if spec.is_cons() {
+        let (quality, rest) = cp(spec);
+        let value = if rest.is_cons() {
+            let (value, _) = cp(rest);
+            if !value.is_fixnum() {
+                return;
+            }
+            value.as_fixnum()
+        } else {
+            3
+        };
+        (quality, value)
+    } else {
+        return;
+    };
+    if !quality.is_symbol() {
+        return;
+    }
+    let idx = quality.as_symbol_index();
+    PROCLAIMED_OPTIMIZE.with(|qualities| {
+        let mut qualities = qualities.borrow_mut();
+        match qualities.iter_mut().find(|(q, _)| *q == idx) {
+            Some(entry) => entry.1 = value,
+            None => qualities.push((idx, value)),
+        }
+    });
+}
+
+/// The globally proclaimed OPTIMIZE qualities, as `((quality value) …)`.
+/// Allocates, so it must not run under a live borrow of GC-scanned state.
+fn proclaimed_optimize_list() -> TorclVal {
+    let qualities = PROCLAIMED_OPTIMIZE.with(|qualities| qualities.borrow().clone());
+    let mut list = NIL;
+    torcl_rt::rooted_ref!(_list_root = &mut list);
+    for (quality, value) in qualities.iter().rev() {
+        let entry = arena_cons(
+            TorclVal::from_symbol_index(*quality),
+            arena_cons(TorclVal::from_fixnum(*value), NIL),
+        );
+        list = arena_cons(entry, list);
+    }
+    list
+}
+
+/// Register `sym` as a user-defined declaration name (idempotent).
+fn proclaim_declaration(sym: TorclVal) {
+    if sym.is_symbol() {
+        let idx = sym.as_symbol_index();
+        PROCLAIMED_DECLARATIONS.with(|d| d.borrow_mut().insert(idx));
+    }
+}
+
+/// Every name proclaimed as a declaration, for `DECLARATION-INFORMATION` of the
+/// standard `DECLARATION` key.
+fn proclaimed_declaration_names() -> Vec<u32> {
+    PROCLAIMED_DECLARATIONS.with(|d| d.borrow().iter().copied().collect())
+}
+
+/// True when some `(declaration …)` proclamation has been made. Every body entry
+/// tests this first, so a program that proclaims none pays nothing.
+fn any_proclaimed_declarations() -> bool {
+    PROCLAIMED_DECLARATIONS.with(|d| !d.borrow().is_empty())
+}
+
+/// The leading `(declare (name …))` specifiers of `body` that the environment
+/// must retain: OPTIMIZE, plus every name proclaimed a declaration. Pure
+/// list-walk over live conses — no allocation of TorCL objects, so it cannot GC.
+fn body_custom_declarations(body: TorclVal) -> Vec<TorclVal> {
+    let mut found = Vec::new();
+    let mut cursor = body;
+    while cursor.is_cons() {
+        let (form, rest) = cp(cursor);
+        if !form.is_cons() {
+            break;
+        }
+        let (head, specifiers) = cp(form);
+        if !(head.is_symbol() && sym_bare_name_rc(head).as_ref() == "DECLARE") {
+            break;
+        }
+        let mut d = specifiers;
+        while d.is_cons() {
+            let (specifier, drest) = cp(d);
+            d = drest;
+            if !specifier.is_cons() {
+                continue;
+            }
+            let (name, _) = cp(specifier);
+            if !name.is_symbol() {
+                continue;
+            }
+            // OPTIMIZE is retained unconditionally: DECLARATION-INFORMATION must
+            // report the policy in force, and no proclamation introduces it.
+            let retain = sym_bare_name_rc(name).as_ref() == "OPTIMIZE"
+                || (any_proclaimed_declarations()
+                    && PROCLAIMED_DECLARATIONS
+                        .with(|set| set.borrow().contains(&name.as_symbol_index())));
+            if retain {
+                found.push(specifier);
+            }
+        }
+        cursor = rest;
+    }
+    found
+}
+
+/// Make `body`'s user-declaration specifiers visible to macros expanded inside
+/// it. Returns the mark to pass to [`leave_body_declarations`] on every exit
+/// path, including an error unwinding out of the body.
+fn enter_body_declarations(env: &mut Env, body: TorclVal) -> usize {
+    let mark = env.active_declarations.len();
+    let specifiers = body_custom_declarations(body);
+    env.active_declarations.extend(specifiers);
+    mark
+}
+
+/// Restore the declaration scope recorded by [`enter_body_declarations`].
+fn leave_body_declarations(env: &mut Env, mark: usize) {
+    env.active_declarations.truncate(mark);
+}
+
 /// Register `sym` as globally special (idempotent). No-op for non-symbols.
 fn proclaim_special(sym: TorclVal) {
     if sym.is_symbol() {
@@ -29243,6 +29656,87 @@ fn let_body_special_decls(body: TorclVal) -> Vec<u32> {
         cursor = rest;
     }
     specials
+}
+
+/// Evaluate a macro / expander body, with any special-named parameter of its
+/// lambda list bound DYNAMICALLY for the expansion's extent (CLHS 3.1.2.1.1;
+/// bliss-pw4d). The lexical binding the macro binder just made carries the
+/// value; `enter_body_special_decls` converts it to a dynamic one, and the
+/// guards are dropped when the expansion returns.
+fn eval_expander_body(
+    params_form: TorclVal,
+    body: TorclVal,
+    env: &mut Env,
+) -> Result<TorclVal, TorclError> {
+    let specials = lambda_list_special_params(params_form);
+    if specials.is_empty() {
+        return eval_progn(body, env);
+    }
+    // Rooted: each guard's saved cell must stay precise across the expansion,
+    // which allocates heavily (moving GC; bliss-8qf).
+    torcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+    let saved_locally = enter_body_special_decls(env, specials, &mut dyn_binds);
+    let result = eval_progn(body, env);
+    env.locally_specials = saved_locally;
+    result
+}
+
+/// The parameter names in `params_form` that are SPECIAL variables — earmuffed
+/// or proclaimed. Binding such a name establishes a DYNAMIC binding, so a
+/// function the body calls sees the argument value through the value cell (CLHS
+/// 3.1.2.1.1; bliss-pw4d). Trivia's `(defmacro match0 (*what* &body clauses
+/// &environment *env*) …)` is exactly this: its expander body calls helpers that
+/// read `*what*`.
+///
+/// Feeding the result to [`enter_body_special_decls`] alongside the body's own
+/// `(declare (special v))` names is what converts the just-made lexical binding
+/// into a dynamic one carrying the same value.
+///
+/// Walks the lambda list only, over live conses — no allocation, so it cannot GC.
+fn lambda_list_special_params(params_form: TorclVal) -> Vec<u32> {
+    let mut specials = Vec::new();
+    let mut cursor = params_form;
+    while cursor.is_cons() {
+        let (elem, rest) = cp(cursor);
+        cursor = rest;
+        // A lambda-list keyword names no variable.
+        if elem.is_symbol() && sym_bare_name_rc(elem).starts_with('&') {
+            continue;
+        }
+        // `var`, `(var default)`, `(var default supplied-p)`, or for &key
+        // `((:keyword var) default …)`. Destructuring patterns nest arbitrarily
+        // deep in a macro lambda list, so recurse through conses.
+        let mut names = Vec::new();
+        collect_lambda_list_names(elem, &mut names);
+        for name in names {
+            if is_special_var(name) {
+                specials.push(name.as_symbol_index());
+            }
+        }
+    }
+    specials
+}
+
+/// Every symbol bound by one lambda-list element, including nested
+/// destructuring patterns and `supplied-p` variables.
+fn collect_lambda_list_names(elem: TorclVal, names: &mut Vec<TorclVal>) {
+    if elem.is_symbol() {
+        if !elem.is_nil() && !sym_bare_name_rc(elem).starts_with('&') {
+            names.push(elem);
+        }
+        return;
+    }
+    if !elem.is_cons() {
+        return;
+    }
+    let (car, cdr) = cp(elem);
+    // `((:keyword var) …)`: the keyword is the indicator, not a variable.
+    if is_keyword_arg(car) {
+        collect_lambda_list_names(cdr, names);
+        return;
+    }
+    collect_lambda_list_names(car, names);
+    collect_lambda_list_names(cdr, names);
 }
 
 /// Apply a body's leading `(declare (special v))` to bindings the enclosing form
@@ -29435,7 +29929,11 @@ fn eval_let(cdr: TorclVal, env: &mut Env, sequential: bool) -> Result<TorclVal, 
                     }
                 }
             }
+            // The body's user-proclaimed declarations govern the body only, not
+            // the init forms — which have all run above.
+            let declarations = enter_body_declarations(env, *body);
             let result = eval_progn(*body, env);
+            leave_body_declarations(env, declarations);
             env.locally_specials = saved_locally;
             result
         });
@@ -29491,7 +29989,9 @@ fn eval_let(cdr: TorclVal, env: &mut Env, sequential: bool) -> Result<TorclVal, 
                 env.define_local(&sym_name(symbol), val);
             }
         }
+        let declarations = enter_body_declarations(env, body);
         let result = eval_progn(body, env);
+        leave_body_declarations(env, declarations);
         env.locally_specials = saved_locally;
         result
     })
@@ -31159,7 +31659,7 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                             Some(*place),
                             None,
                         )?;
-                        eval_progn(*body, &mut child)?
+                        eval_expander_body(*params_form, *body, &mut child)?
                     };
                     let mut values = if child.mv_active {
                         std::mem::take(&mut child.mv)
@@ -31546,7 +32046,7 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
                 Some(*form),
                 None,
             )?;
-            eval_progn(*body, &mut macro_env)
+            eval_expander_body(*params_form, *body, &mut macro_env)
         }),
     );
 
@@ -31913,7 +32413,7 @@ fn expand_macro(
                             dyn_binds.push(DynBind::establish(sym, value));
                         }
                     }
-                    let result = eval_progn(*body, &mut child_env);
+                    let result = eval_expander_body(*params_form, *body, &mut child_env);
                     dyn_binds.clear();
                     result
                 }
@@ -31997,11 +32497,25 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     });
 
     // Only lexical MACROLET macros remain to fold in (globals are in the base).
-    if env.macros.borrow().is_empty() {
+    let macro_env = if env.macros.borrow().is_empty() {
+        macro_env
+    } else {
+        let all_macros: HashMap<String, MacroDef> = env.macros.borrow().clone();
+        augment_env_with_macros(macro_env, &all_macros)
+    };
+
+    // The user-proclaimed declarations lexically in force, innermost last, so a
+    // macro's `&ENVIRONMENT` value answers TORCL-CLTL2:DECLARATION-INFORMATION
+    // with the nearest one (R4.14). Empty for a program that proclaims none.
+    if env.active_declarations.is_empty() {
         return macro_env;
     }
-    let all_macros: HashMap<String, MacroDef> = env.macros.borrow().clone();
-    augment_env_with_macros(macro_env, &all_macros)
+    let declarations = env
+        .active_declarations
+        .iter()
+        .map(|specifier| compiler_macroexpand::DeclInfo::Custom(cp(*specifier).0.0, *specifier))
+        .collect();
+    macro_env.augment_declarations(declarations)
 }
 
 /// The cached MacroexpandEnv whose function map holds every global macro
@@ -32241,7 +32755,7 @@ fn augment_env_with_macros(
                             Some(form),
                             None,
                         )?;
-                        eval_progn(body, &mut macro_env)
+                        eval_expander_body(params_form, body, &mut macro_env)
                     }),
                 );
                 let symbol = global_macro_name_symbol(name);
@@ -34534,6 +35048,20 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         "TORCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "TORCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
+            | "TORCL-EXT:FINALIZE"
+            | "TORCL-EXT::FINALIZE"
+            | "TORCL-EXT:CANCEL-FINALIZATION"
+            | "TORCL-EXT::CANCEL-FINALIZATION"
+            | "TORCL-EXT:GC"
+            | "TORCL-EXT::GC"
+            | "TORCL-EXT:DECLARATION-SPECIFIER"
+            | "TORCL-EXT::DECLARATION-SPECIFIER"
+            | "TORCL-EXT:DECLARATION-SPECIFIERS"
+            | "TORCL-EXT::DECLARATION-SPECIFIERS"
+            | "TORCL-EXT:PROCLAIMED-DECLARATIONS"
+            | "TORCL-EXT::PROCLAIMED-DECLARATIONS"
+            | "TORCL-EXT:PROCLAIMED-OPTIMIZE"
+            | "TORCL-EXT::PROCLAIMED-OPTIMIZE"
             | "TORCL-THREAD:MAKE-THREAD"
             | "TORCL-THREAD::MAKE-THREAD"
             | "TORCL-THREAD:JOIN-THREAD"
@@ -35296,6 +35824,27 @@ fn apply_builtin_fast(
 
 fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclVal, TorclError> {
     match name {
+        "TORCL-EXT:DECLARATION-SPECIFIER" | "TORCL-EXT::DECLARATION-SPECIFIER" => {
+            if args.len() != 2 {
+                return Err(TorclError::ProgramError(format!(
+                    "TORCL-EXT:DECLARATION-SPECIFIER requires two arguments; got {}",
+                    args.len()
+                )));
+            }
+            macroexpand_declaration_specifier(args[0], args[1])
+        }
+        "TORCL-EXT:DECLARATION-SPECIFIERS" | "TORCL-EXT::DECLARATION-SPECIFIERS" => {
+            if args.len() != 2 {
+                return Err(TorclError::ProgramError(format!(
+                    "TORCL-EXT:DECLARATION-SPECIFIERS requires two arguments; got {}",
+                    args.len()
+                )));
+            }
+            macroexpand_declaration_specifiers(args[0], args[1])
+        }
+        "TORCL-EXT:PROCLAIMED-OPTIMIZE" | "TORCL-EXT::PROCLAIMED-OPTIMIZE" => {
+            Ok(proclaimed_optimize_list())
+        }
         "TORCL::%NATIVE-MUTEX" => torcl_stdlib::synchronization::call(args),
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
@@ -35616,7 +36165,9 @@ fn eval_multiple_value_bind(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, To
         for idx in &body_specials {
             expose_locally_special(env, TorclVal::from_symbol_index(*idx));
         }
+        let declarations = enter_body_declarations(env, body);
         let result = eval_progn(body, env);
+        leave_body_declarations(env, declarations);
         env.locally_specials = saved_locally;
         result
     })

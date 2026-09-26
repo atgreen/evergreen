@@ -320,17 +320,37 @@
 (defmacro declaim (&rest specs)
   (let ((forms nil))
     (dolist (spec specs)
-      (when (and (consp spec) (eq (car spec) 'special))
-        (push (list 'torcl-internal::%proclaim-special (list 'quote (cdr spec)))
-              forms)))
+      (when (consp spec)
+        (case (car spec)
+          (special
+           (push (list 'torcl-internal::%proclaim-special (list 'quote (cdr spec)))
+                 forms))
+          ;; (declaration name …) names declarations the implementation must
+          ;; accept; the environment then records them for
+          ;; TORCL-CLTL2:DECLARATION-INFORMATION.
+          (declaration
+           (push (list 'torcl-internal::%proclaim-declaration (list 'quote (cdr spec)))
+                 forms))
+          ;; The qualities are advisory to this compiler, but the global policy
+          ;; is reported by TORCL-CLTL2:DECLARATION-INFORMATION.
+          (optimize
+           (push (list 'torcl-internal::%proclaim-optimize (list 'quote (cdr spec)))
+                 forms)))))
     (if forms (cons 'progn (nreverse forms)) nil)))
 
 ;; proclaim: the run-time counterpart (ANSI 3.8). Non-special declarations are
 ;; accepted and ignored; (special x …) registers the variables as special.
-(defun proclaim (declaration-specifier)
-  (when (and (consp declaration-specifier)
-             (eq (car declaration-specifier) 'special))
-    (torcl-internal::%proclaim-special (cdr declaration-specifier)))
+;; The parameter is deliberately NOT named DECLARATION-SPECIFIER: boot.lisp is
+;; read into COMMON-LISP, so every name it mentions mints a bare, home-package-
+;; less symbol identity, and a qualified read of the same name (e.g.
+;; TORCL-EXT:DECLARATION-SPECIFIER) then resolves to that bare identity instead
+;; of the extension package's symbol.
+(defun proclaim (decl-spec)
+  (when (consp decl-spec)
+    (case (car decl-spec)
+      (special (torcl-internal::%proclaim-special (cdr decl-spec)))
+      (declaration (torcl-internal::%proclaim-declaration (cdr decl-spec)))
+      (optimize (torcl-internal::%proclaim-optimize (cdr decl-spec)))))
   nil)
 
 ;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
@@ -3770,3 +3790,86 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
         (t (error 'simple-parse-error
                   :format-control "PARSE-INTEGER: not an integer: ~s"
                   :format-arguments (list (subseq string start end))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; TORCL-CLTL2 — CLtL2 lexical-environment access (R4.14).
+;;;
+;;; TorCL's counterpart of SB-CLTL2: the package a portability layer such as
+;;; trivial-cltl2 USEs. Only what TorCL can answer truthfully is defined here.
+;;; The rest of the CLtL2 environment API — VARIABLE-INFORMATION,
+;;; FUNCTION-INFORMATION, AUGMENT-ENVIRONMENT, PARSE-MACRO, ENCLOSE,
+;;; COMPILER-LET — is deliberately ABSENT rather than stubbed, so a caller's own
+;;; FBOUNDP guard (as Serapeum's macro-tools uses) sees the truth instead of a
+;;; function that lies (bliss-powf).
+;;; ---------------------------------------------------------------------------
+
+(defvar torcl-cltl2::*declaration-handlers* (make-hash-table :test 'eq))
+
+;; A declaration handler is installed by DEFINE-DECLARATION and invoked when
+;; DECLARATION-INFORMATION is asked about its name, with the raw source
+;; specifier the environment recorded and the environment itself.
+(defmacro torcl-cltl2:define-declaration (name lambda-list &rest body)
+  (list 'eval-when '(:compile-toplevel :load-toplevel :execute)
+        (list 'proclaim (list 'quote (list 'declaration name)))
+        (list 'setf
+              (list 'gethash (list 'quote name) 'torcl-cltl2::*declaration-handlers*)
+              (cons 'lambda (cons lambda-list body)))
+        (list 'quote name)))
+
+;; (quality value) for `item`, which CLtL2 permits as a bare quality symbol or a
+;; (quality) list — both meaning the value 3.
+(defun torcl-cltl2::%optimize-entry (item)
+  (cond ((symbolp item) (list item 3))
+        ((and (consp item) (null (cdr item))) (list (car item) 3))
+        ((consp item) (list (car item) (car (cdr item))))
+        (t nil)))
+
+;; The OPTIMIZE policy in force: the standard qualities at their default value
+;; of 1, overridden by global proclamations, then by the lexical declarations of
+;; `env` from outermost to innermost.
+(defun torcl-cltl2::%optimize-policy (env)
+  (let ((policy (list (list 'compilation-speed 1)
+                      (list 'debug 1)
+                      (list 'safety 1)
+                      (list 'space 1)
+                      (list 'speed 1))))
+    (flet ((note (item)
+             (let ((entry (torcl-cltl2::%optimize-entry item)))
+               (when entry
+                 (let ((existing (assoc (car entry) policy)))
+                   (if existing
+                       (rplaca (cdr existing) (car (cdr entry)))
+                       (setf policy (append policy (list entry)))))))))
+      (dolist (entry (torcl-ext:proclaimed-optimize))
+        (note entry))
+      (dolist (specifier (torcl-ext:declaration-specifiers 'optimize env))
+        (dolist (item (cdr specifier))
+          (note item))))
+    policy))
+
+(defun torcl-cltl2:declaration-information (decl-name &optional env)
+  (cond
+    ((eq decl-name 'optimize)
+     (torcl-cltl2::%optimize-policy env))
+    ((eq decl-name 'declaration)
+     (torcl-ext:proclaimed-declarations))
+    (t
+     (let ((handler (gethash decl-name torcl-cltl2::*declaration-handlers*)))
+       (cond
+         (handler
+          (let ((specifier (torcl-ext:declaration-specifier decl-name env)))
+            (when specifier
+              (multiple-value-bind (kind info) (funcall handler specifier env)
+                (cond
+                  ((eq kind :declare) (cdr info))
+                  (t (error "TORCL-CLTL2: the ~s declaration kind returned by the ~s handler is not supported on TorCL"
+                            kind decl-name)))))))
+         ((member decl-name (torcl-ext:proclaimed-declarations))
+          ;; Proclaimed, but nothing was taught how to read it.
+          nil)
+         (t
+          (error "TORCL-CLTL2:DECLARATION-INFORMATION: ~s does not name a declaration TorCL can report"
+                 decl-name)))))))
+
+(export '(torcl-cltl2:define-declaration torcl-cltl2:declaration-information)
+        "TORCL-CLTL2")

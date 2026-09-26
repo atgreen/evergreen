@@ -4525,14 +4525,18 @@ fn special_declared_macro_parameters_bind_dynamically() {
                             (%m (t)))))))",
             "T",
         ),
-        // A parameter NOT declared special stays lexical and must not leak into
-        // the dynamic environment.
+        // A parameter that needs no DECLARE because DEFVAR already made the name
+        // GLOBALLY special: binding it is still a dynamic binding, so the
+        // expander's (symbol-value '*x3*) sees the argument (CLHS 3.1.2.1.1;
+        // bliss-pw4d). This row read ":OUTER" until the lambda-list binders
+        // learned that rule; SBCL prints :INNER for exactly this program, so the
+        // old expectation contradicted the comment it was written under.
         (
             "(progn (defvar *x3* :outer) \
                (defmacro %gm3 (*x3*) (declare (ignorable *x3*)) \
                  (list 'quote (symbol-value '*x3*))) \
                (%gm3 :inner))",
-            ":OUTER",
+            ":INNER",
         ),
         // An ordinary macro is unaffected.
         ("(progn (defmacro %gm4 (a b) `(+ ,a ,b)) (%gm4 2 3))", "5"),

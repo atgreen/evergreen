@@ -1131,6 +1131,53 @@ fn stage_two_gate_loads_a_real_file_with_user_macros_standard_macros_and_environ
 }
 
 #[test]
+fn macro_environment_exposes_nearest_lexical_declaration_specifier() {
+    // R4.14: an &ENVIRONMENT value must carry declarations visible at the
+    // macro call site.  trivial-cltl2 uses this to implement
+    // DECLARATION-INFORMATION for Trivia's lexical OPTIMIZER declaration.
+    let dir = temp_dir("macro-declaration-env");
+    let script = dir.join("macro-declaration-env.lisp");
+    write_file(
+        &script,
+        "(proclaim '(declaration demo))\n\
+         (defmacro declaration-probe (&environment env)\n\
+           `(quote ,(torcl-ext::declaration-specifier 'demo env)))\n\
+         (format t \"DECLS=~S\"\n\
+           (list\n\
+             (declaration-probe)\n\
+             (locally (declare (demo :inner)) (declaration-probe))\n\
+             (locally (declare (demo :outer))\n\
+               (locally (declare (demo :inner)) (declaration-probe)))\n\
+             (let ((x 1))\n\
+               (declare (ignore x) (demo :let))\n\
+               (declaration-probe))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL declaration-environment fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("DECLS=(NIL (DEMO :INNER) (DEMO :INNER) (DEMO :LET))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn stage_three_gate_runs_a_library_heavy_program_through_the_real_cli() {
     // Per spec/stages.json stage 3, the real CLI gate is a library-heavy
     // program with observable string/sequence/hash-table/format results.
@@ -1489,6 +1536,161 @@ fn eval_no_bootstrap_ok(expr: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn special_named_lambda_list_parameters_bind_dynamically_in_both_tiers() {
+    // CLHS 3.1.2.1.1: binding a name that is globally special establishes a
+    // DYNAMIC binding, so a function the body calls sees the value through the
+    // value cell. Every case is written WITHOUT an EVAL wrapper and run through
+    // --load, so the bytecode tier really compiles (or declines) each definition;
+    // the trailing --eval row covers the tree-walker (bliss-pw4d).
+    //
+    // Live cases: Trivia's `(defmacro match0 (*what* …))`, whose helpers read
+    // `*what*`, and Type-I's `(defun all-compound-types (compound &optional
+    // (*compound-infer-level* 0)) …)`.
+    let dir = temp_dir("special-lambda-params");
+    let script = dir.join("special-lambda-params.lisp");
+    write_file(
+        &script,
+        "(defvar *p*)\n\
+         (defvar *q*)\n\
+         (defvar *r*)\n\
+         (defvar *lvl*)\n\
+         (defun read-p () *p*)\n\
+         (defun read-q () *q*)\n\
+         (defun read-r () *r*)\n\
+         (defun read-lvl () *lvl*)\n\
+         (defun required-param (*p*) (read-p))\n\
+         (defun optional-param (x &optional (*lvl* 0)) (list x (read-lvl)))\n\
+         (defmacro macro-param (*q*) (read-q))\n\
+         (defmacro macro-rest (&rest *r*) (list 'quote (read-r)))\n\
+         (format t \"DYN=~S\"\n\
+           (list (required-param 42)\n\
+                 (optional-param :a)\n\
+                 (optional-param :b 5)\n\
+                 (macro-param 7)\n\
+                 (macro-rest 1 2)\n\
+                 ;; The dynamic bindings are unwound when the call returns.\n\
+                 (list (boundp '*p*) (boundp '*q*) (boundp '*lvl*))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL special-parameter fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("DYN=(42 (:A 0) (:B 5) 7 (1 2) (NIL NIL NIL))"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cltl2_declaration_information_reports_user_declarations_and_optimize_policy() {
+    // R4.14: TORCL-CLTL2 is TorCL's SB-CLTL2 — the package trivial-cltl2 USEs.
+    // The values below were diffed against SBCL's sb-cltl2 for the same program
+    // (SBCL additionally reports its own implementation qualities, which is
+    // permitted). Trivia declares OPTIMIZER exactly this way (bliss-powf).
+    let dir = temp_dir("cltl2-declaration-information");
+    let script = dir.join("cltl2-declaration-information.lisp");
+    write_file(
+        &script,
+        "(proclaim '(declaration optimizer))\n\
+         (torcl-cltl2:define-declaration optimizer (specifier env)\n\
+           (declare (ignorable env))\n\
+           (values :declare (cons 'optimizer (second specifier))))\n\
+         (defmacro probe () `(quote ,(torcl-cltl2:declaration-information 'optimizer nil)))\n\
+         (defmacro probe-env (&environment env)\n\
+           `(quote ,(torcl-cltl2:declaration-information 'optimizer env)))\n\
+         (defmacro policy (&environment env)\n\
+           `(quote ,(torcl-cltl2:declaration-information 'optimize env)))\n\
+         (declaim (optimize (speed 3) (safety 0)))\n\
+         (format t \"CLTL2=~S\"\n\
+           (list (probe)\n\
+                 (probe-env)\n\
+                 (locally (declare (optimizer :balland2006)) (probe-env))\n\
+                 (let ((x 1)) (declare (ignore x) (optimizer :trivial)) (probe-env))\n\
+                 (torcl-cltl2:declaration-information 'declaration nil)\n\
+                 (locally (declare (optimize (safety 3) (debug 2))) (policy))))\n",
+    );
+
+    let output = torcl()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL CLtL2 fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(
+        stdout.contains(
+            "CLTL2=(NIL NIL :BALLAND2006 :TRIVIAL (OPTIMIZER) ((COMPILATION-SPEED 1) (DEBUG 2) (SAFETY 3) (SPACE 1) (SPEED 3)))"
+        ),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn lisp_finalizers_are_deferred_rooted_cancellable_and_run_once() {
+    // R3.12/R3.16: user finalizers are retained without keeping their target
+    // alive, run outside the collector, and cannot fire twice.  This is also
+    // the contract required by Trivial-Garbage/Dexador response wrappers.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defvar *finalizer-log* nil)
+               (defun make-test-finalizer (value)
+                 (let ((captured (vector value)))
+                   (lambda () (push (aref captured 0) *finalizer-log*))))
+               (defun register-doomed-finalizers ()
+                 (let ((target (vector :target)))
+                   (torcl-ext:finalize target (make-test-finalizer 42))
+                   (torcl-ext:finalize target (make-test-finalizer :second)))
+                 nil)
+               (defun register-cancelled-finalizer ()
+                 (let ((target (vector :cancelled)))
+                   (torcl-ext:finalize target (make-test-finalizer :cancelled))
+                   (torcl-ext:cancel-finalization target))
+                 nil)
+               (register-doomed-finalizers)
+               (register-cancelled-finalizer)
+               (let ((live (vector :live)))
+                 (torcl-ext:finalize live (make-test-finalizer :live))
+                 (torcl-ext:gc :full t)
+                 (torcl-ext:cancel-finalization live))
+               (torcl-ext:gc :full t)
+               (torcl-ext:gc :full t)
+               (list (count 42 *finalizer-log*)
+                     (count :second *finalizer-log*)
+                     (count :cancelled *finalizer-log*)
+                     (count :live *finalizer-log*)
+                     (length *finalizer-log*)))"
+        ),
+        "(1 1 0 0 2)"
+    );
 }
 
 #[test]

@@ -4776,7 +4776,7 @@ fn forwarded_side_key(key: TorclVal, heap_base: usize, heap_end: usize) -> Optio
 fn relocate_side_tables(heap_base: usize, heap_end: usize) {
     {
         let mut reg = finalizer_registry().lock().unwrap();
-        for e in reg.iter_mut() {
+        for e in &mut reg.entries {
             if let Some(new_key) = forwarded_side_key(e.object, heap_base, heap_end) {
                 e.object = new_key;
             }
@@ -4806,7 +4806,8 @@ fn fire_finalizers_in_ranges(ranges: &[(usize, usize)]) {
     // Snapshot dead keys first; `run_finalizers_for` re-locks the registry.
     let dead: Vec<TorclVal> = {
         let reg = finalizer_registry().lock().unwrap();
-        reg.iter()
+        reg.entries
+            .iter()
             .filter(|e| {
                 let addr = e.object.to_raw() as usize;
                 ranges
@@ -4827,15 +4828,53 @@ fn fire_finalizers_in_ranges(ranges: &[(usize, usize)]) {
 struct FinalizerEntry {
     object: TorclVal,
     finalizer: TorclVal,
+    /// Lisp callbacks must run after the collector has released the heap lock;
+    /// native resource destructors must run immediately while their dead
+    /// object's payload is still intact.
+    deferred: bool,
     /// Rust-level callback that performs the actual invocation of the finalizer.
     /// This is set by `set_finalizer_dispatch` and called with (finalizer, object).
     callback: Option<fn(TorclVal, TorclVal)>,
 }
 
+#[derive(Default)]
+struct FinalizerState {
+    entries: Vec<FinalizerEntry>,
+    /// Lisp functions whose targets died during a collection.  These remain
+    /// precise external roots until the evaluator takes and invokes them at a
+    /// safe boundary outside the collector.
+    deferred: Vec<TorclVal>,
+}
+
 /// Global finalizer registry.
-fn finalizer_registry() -> &'static OrderedMutex<Vec<FinalizerEntry>> {
-    static REGISTRY: OnceLock<OrderedMutex<Vec<FinalizerEntry>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 7, "GC finalizers", Vec::new()))
+fn finalizer_registry() -> &'static OrderedMutex<FinalizerState> {
+    static REGISTRY: OnceLock<OrderedMutex<FinalizerState>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            7,
+            "GC finalizers",
+            FinalizerState::default(),
+        )
+    })
+}
+
+/// Trace callback functions retained by the finalizer registry and deferred
+/// queue.  Target objects are deliberately NOT visited: doing so would turn
+/// finalization into a strong reference and the target could never die.
+fn scan_finalizer_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    let mut state = finalizer_registry().lock().unwrap();
+    for entry in &mut state.entries {
+        visit(&mut entry.finalizer);
+    }
+    for finalizer in &mut state.deferred {
+        visit(finalizer);
+    }
+}
+
+fn install_finalizer_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| register_root_scanner(scan_finalizer_roots));
 }
 
 /// Global finalizer dispatch function. Set by the runtime during startup
@@ -4866,20 +4905,90 @@ pub fn set_stream_trace_fn(f: fn(*mut u8, &mut dyn FnMut(*mut TorclVal))) {
 /// Register a finalizer for a heap object.
 /// The finalizer function will be called when the object is about to be collected.
 pub fn register_finalizer(object: TorclVal, finalizer: TorclVal) -> Result<(), TorclError> {
+    install_finalizer_root_scanner();
     let dispatch = FINALIZER_DISPATCH.get().copied();
-    let mut registry = finalizer_registry().lock().unwrap();
-    // Replace existing finalizer for the same object, or add new entry
-    if let Some(entry) = registry.iter_mut().find(|e| e.object == object) {
+    let mut state = finalizer_registry().lock().unwrap();
+    // Replace the subsystem destructor for the same object, but never replace
+    // user callbacks registered through `register_deferred_finalizer`: both may
+    // legitimately coexist on a Lisp-visible stream wrapper.
+    if let Some(entry) = state
+        .entries
+        .iter_mut()
+        .find(|e| e.object == object && !e.deferred)
+    {
         entry.finalizer = finalizer;
         entry.callback = dispatch;
     } else {
-        registry.push(FinalizerEntry {
+        state.entries.push(FinalizerEntry {
             object,
             finalizer,
+            deferred: false,
             callback: dispatch,
         });
     }
     Ok(())
+}
+
+/// Convert a Lisp heap value into the opaque, untagged body key used by the
+/// finalizer side table.  Keeping this representation out of ordinary root
+/// scanning is what makes the association weak.  The helper also handles the
+/// extended header used by large heap objects.
+pub fn finalizer_key(object: TorclVal) -> Result<TorclVal, TorclError> {
+    if object.is_cons() {
+        // A cons-tagged value points directly at its two-word body.
+        return Ok(TorclVal::from_raw(unsafe { object.as_ptr() } as u64));
+    }
+    if object.is_heap_object() {
+        // General heap values point at their header; finalizer keys point at
+        // the payload, matching alloc_typed and the collector's side-table code.
+        let header = unsafe { object.as_ptr() };
+        let offset = unsafe { body_offset(header) };
+        return Ok(TorclVal::from_raw(unsafe { header.add(offset) } as u64));
+    }
+    Err(TorclError::TypeError {
+        datum: object,
+        expected: "heap object".into(),
+    })
+}
+
+/// Register a Lisp callback to run after `object` becomes unreachable.
+///
+/// Unlike [`register_finalizer`], registrations stack: Trivial-Garbage permits
+/// multiple finalizers on one object.  The callback is a strong external root,
+/// while the opaque object key is intentionally weak.  Collection only queues
+/// the callback; the evaluator invokes it later, outside collector locks.
+pub fn register_deferred_finalizer(
+    object: TorclVal,
+    finalizer: TorclVal,
+) -> Result<(), TorclError> {
+    install_finalizer_root_scanner();
+    finalizer_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .push(FinalizerEntry {
+            object,
+            finalizer,
+            deferred: true,
+            callback: None,
+        });
+    Ok(())
+}
+
+/// Cancel all deferred Lisp callbacks registered for `object`.
+/// Native resource destructors are intentionally unaffected.
+pub fn cancel_deferred_finalizers(object: TorclVal) {
+    finalizer_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .retain(|entry| !entry.deferred || entry.object != object);
+}
+
+/// Take the Lisp callbacks queued by completed collections.  The returned
+/// values must be rooted by the caller before invoking any allocating code.
+pub fn take_deferred_finalizers() -> Vec<TorclVal> {
+    std::mem::take(&mut finalizer_registry().lock().unwrap().deferred)
 }
 
 /// Run all registered finalizers for the given object (called during collection
@@ -4889,30 +4998,40 @@ pub fn register_finalizer(object: TorclVal, finalizer: TorclVal) -> Result<(), T
 /// Per R3.16, finalizer errors must not corrupt GC state — any panic or error
 /// from a finalizer invocation is caught and silently discarded.
 pub fn run_finalizers_for(object: TorclVal) -> Vec<TorclVal> {
-    let mut registry = finalizer_registry().lock().unwrap();
+    let mut state = finalizer_registry().lock().unwrap();
     let mut matching = Vec::new();
-    let mut retained = Vec::with_capacity(registry.len());
-    for entry in registry.drain(..) {
+    let mut retained = Vec::with_capacity(state.entries.len());
+    for entry in state.entries.drain(..) {
         if entry.object == object {
             matching.push(entry);
         } else {
             retained.push(entry);
         }
     }
-    *registry = retained;
-    drop(registry);
+    state.entries = retained;
+
+    // Queue arbitrary Lisp before releasing the registry lock.  This performs
+    // no Lisp allocation and the queue itself is traced as an external root.
+    for entry in &matching {
+        if entry.deferred {
+            state.deferred.push(entry.finalizer);
+        }
+    }
+    drop(state);
 
     // Finalizers are arbitrary subsystem callbacks. Never invoke one while the
     // GC registry is locked: stream finalization, for example, must acquire the
     // lower-ranked per-stream lock to close its file descriptor.
     let mut invoked = Vec::with_capacity(matching.len());
     for entry in matching {
-        let dispatch = entry.callback.or_else(|| FINALIZER_DISPATCH.get().copied());
-        if let Some(dispatch) = dispatch {
-            // R3.16: finalizer errors must not corrupt GC state.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                dispatch(entry.finalizer, object);
-            }));
+        if !entry.deferred {
+            let dispatch = entry.callback.or_else(|| FINALIZER_DISPATCH.get().copied());
+            if let Some(dispatch) = dispatch {
+                // R3.16: native destructor panics must not corrupt GC state.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(entry.finalizer, object);
+                }));
+            }
         }
         invoked.push(entry.finalizer);
     }
@@ -4924,13 +5043,20 @@ pub fn run_finalizers_for(object: TorclVal) -> Vec<TorclVal> {
 /// Shutdown uses this to honor the lifecycle contract even when no GC cycle
 /// happens to collect the associated objects first.
 pub fn run_pending_finalizers() -> Vec<(TorclVal, TorclVal)> {
-    let mut registry = finalizer_registry().lock().unwrap();
-    let entries: Vec<_> = registry.drain(..).collect();
-    drop(registry);
+    let mut state = finalizer_registry().lock().unwrap();
+    let entries: Vec<_> = state.entries.drain(..).collect();
+    for entry in &entries {
+        if entry.deferred {
+            state.deferred.push(entry.finalizer);
+        }
+    }
+    drop(state);
 
     let mut invoked = Vec::with_capacity(entries.len());
     for entry in entries {
-        if let Some(dispatch) = entry.callback.or_else(|| FINALIZER_DISPATCH.get().copied()) {
+        if !entry.deferred
+            && let Some(dispatch) = entry.callback.or_else(|| FINALIZER_DISPATCH.get().copied())
+        {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 dispatch(entry.finalizer, entry.object);
             }));

@@ -1563,6 +1563,16 @@ struct Lowerer<'e> {
     /// Lazily-built macro-expansion environment (mirrors `env`'s macros), used
     /// to compile macro forms by expanding then lowering.
     macro_env: Option<MacroexpandEnv>,
+    /// Raw source specifiers of user-proclaimed declarations (`(declaration
+    /// foo)`) lexically in force at the form being lowered, outermost first.
+    /// `macro_env` is built once and cached, but declarations are per-scope, so
+    /// they are kept here and augmented onto a child environment at each
+    /// expansion (see `declaration_scoped_macro_env`). The tree-walker keeps the
+    /// same list on `Env::active_declarations`; both tiers must agree or a macro
+    /// reading DECLARATION-INFORMATION expands differently per tier.
+    ///
+    /// Live heap conses, visited by this Lowerer's `trace_host_roots`.
+    declared_specifiers: Vec<TorclVal>,
     /// Whether this function needs a heap `EnvFrame` (has a boxed local).
     has_env: bool,
     /// Next free local slot index.
@@ -1640,6 +1650,9 @@ struct TagScope {
 impl torcl_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         torcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.macro_env, visit);
+        for specifier in &mut self.declared_specifiers {
+            visit(specifier as *mut TorclVal);
+        }
         for (_, form) in &mut self.load_time_values {
             visit(form as *mut TorclVal);
         }
@@ -1674,6 +1687,7 @@ impl<'e> Lowerer<'e> {
             local_fns: std::collections::HashMap::new(),
             closure_fns: std::collections::HashSet::new(),
             macro_env: None,
+            declared_specifiers: Vec::new(),
             has_env: false,
             next_local: 0,
             n_locals: 0,
@@ -1787,6 +1801,36 @@ impl<'e> Lowerer<'e> {
     fn exit_scope(&mut self, saved_next_local: u16) {
         self.scopes.pop();
         self.next_local = saved_next_local;
+    }
+
+    /// Record `body`'s user-proclaimed declaration specifiers for its extent, so
+    /// a macro expanded while lowering the body sees them through its
+    /// `&ENVIRONMENT` value. Returns the mark for `leave_body_declarations`.
+    fn enter_body_declarations(&mut self, body: TorclVal) -> usize {
+        let mark = self.declared_specifiers.len();
+        let specifiers = super::body_custom_declarations(body);
+        self.declared_specifiers.extend(specifiers);
+        mark
+    }
+
+    fn leave_body_declarations(&mut self, mark: usize) {
+        self.declared_specifiers.truncate(mark);
+    }
+
+    /// `self.macro_env` augmented with the declarations in force here, or `None`
+    /// when there are none (the overwhelmingly common case, which then expands
+    /// with the cached environment unchanged). Call only with `macro_env` built.
+    fn declaration_scoped_macro_env(&self) -> Option<MacroexpandEnv> {
+        if self.declared_specifiers.is_empty() {
+            return None;
+        }
+        let base = self.macro_env.as_ref()?;
+        let declarations = self
+            .declared_specifiers
+            .iter()
+            .map(|specifier| compiler_macroexpand::DeclInfo::Custom(cp(*specifier).0.0, *specifier))
+            .collect();
+        Some(base.augment_declarations(declarations))
     }
 
     /// Enter/leave a dynamic `(declare (special …))` scope, tracked as per-name
@@ -2443,12 +2487,16 @@ impl<'e> Lowerer<'e> {
     /// re-exposes a name a nested lexical binding shadowed (bliss-9kww).
     fn lower_locally(&mut self, rest: TorclVal) -> LowerResult<()> {
         let decl_special = body_declared_special(rest);
+        let declarations = self.enter_body_declarations(rest);
         if decl_special.is_empty() {
-            return self.lower_progn(rest);
+            let result = self.lower_progn(rest);
+            self.leave_body_declarations(declarations);
+            return result;
         }
         self.push_declared_special(&decl_special);
         let result = self.lower_progn(rest);
         self.pop_declared_special(&decl_special);
+        self.leave_body_declarations(declarations);
         result
     }
 
@@ -2565,6 +2613,9 @@ impl<'e> Lowerer<'e> {
         // body: a reference to one reads the dynamic value even if an outer
         // lexical binding shadows it (bliss-x5y.23). Scope this around the body.
         self.push_declared_special(&decl_special);
+        // A user-proclaimed declaration governs the body, not the inits, which
+        // were lowered above.
+        let declarations = self.enter_body_declarations(body);
 
         // Body as an implicit progn.
         torcl_rt::rooted!(body_forms = list_to_vec(body));
@@ -2583,6 +2634,7 @@ impl<'e> Lowerer<'e> {
             }
         }
         self.pop_declared_special(&decl_special);
+        self.leave_body_declarations(declarations);
         self.unshadow_declared_special(shadowed);
         self.exit_scope(saved_next_local);
         if special_count != 0 {
@@ -2616,7 +2668,11 @@ impl<'e> Lowerer<'e> {
         if self.macro_env.is_none() {
             self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
         }
-        let menv = self.macro_env.as_ref().unwrap();
+        let mut scoped = self.declaration_scoped_macro_env();
+        torcl_rt::rooted_ref!(_scoped_root = &mut scoped);
+        let menv = scoped
+            .as_ref()
+            .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
         let expanded = match compiler_macroexpand::macroexpand_all(form, menv) {
             Ok(expanded) => expanded,
             Err(_) => return Err(record_bail(|| "macroexpand:macrolet".to_string())),
@@ -2677,7 +2733,14 @@ impl<'e> Lowerer<'e> {
             if self.macro_env.is_none() {
                 self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
             }
-            let menv = self.macro_env.as_ref().unwrap();
+            // A user declaration in force here must reach the expander's
+            // `&ENVIRONMENT` value, so expand through a child of the cached
+            // environment carrying it (rooted: it holds source conses).
+            let mut scoped = self.declaration_scoped_macro_env();
+            torcl_rt::rooted_ref!(_scoped_root = &mut scoped);
+            let menv = scoped
+                .as_ref()
+                .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
             match compiler_macroexpand::macroexpand_1(form, menv) {
                 Ok((expanded, true)) => return self.lower_expr(expanded),
                 _ => return Err(record_bail(|| format!("macroexpand:{name}"))),
@@ -2692,9 +2755,12 @@ impl<'e> Lowerer<'e> {
         if self.macro_env.is_none() {
             self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
         }
-        if let Ok((expanded, true)) =
-            compiler_macroexpand::compiler_macroexpand_1(form, self.macro_env.as_ref().unwrap())
-        {
+        let mut scoped = self.declaration_scoped_macro_env();
+        torcl_rt::rooted_ref!(_scoped_root = &mut scoped);
+        let menv = scoped
+            .as_ref()
+            .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
+        if let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv) {
             return self.lower_expr(expanded);
         }
         // Inline `(typep x 'SIMPLE-TYPE)` as a direct tag check instead of a c2i
@@ -5362,6 +5428,7 @@ impl<'e> Lowerer<'e> {
         // Free declarations (a name the M-V-B did not bind) redirect references
         // in the body, exactly as in LET.
         self.push_declared_special(&decl_special);
+        let declarations = self.enter_body_declarations(body);
         // ...and a variable bound LEXICALLY here shadows an enclosing
         // `(declare (special v))` for the body, the same rule lower_let follows:
         // without this `(let ((z 0)) (declare (special z)) (m-v-b (z) (values 3)
@@ -5376,6 +5443,7 @@ impl<'e> Lowerer<'e> {
         }
         let lowered = self.lower_progn(body); // body value (+1)
         self.unshadow_declared_special(shadowed);
+        self.leave_body_declarations(declarations);
         self.pop_declared_special(&decl_special);
         lowered?;
         self.exit_scope(saved_next_local);
@@ -7462,6 +7530,22 @@ fn compile_function_forcing_boxed(
         }
     };
 
+    // A parameter whose NAME is a special variable must be bound DYNAMICALLY
+    // (CLHS 3.1.2.1.1; bliss-pw4d): the callee — or, for a macro, the expander's
+    // helper functions — read it through the value cell, while a compiled body
+    // binds its parameters into slots and boxes. Saving and restoring the cell
+    // across every exit is the prologue/epilogue work this instruction set has no
+    // form for (the same reason a `(declare (special p))` parameter is declined
+    // just below; bliss-fju9 tracks native support), so decline and let the
+    // tree-walker bind it. Two live cases: Trivia's `(defmacro match0 (*what*
+    // &body clauses &environment *env*) …)`, whose `parse-patterns` reads
+    // `*what*`, and Type-I's `(defun all-compound-types (compound &optional
+    // (*compound-infer-level* 0)) …)`.
+    if param_names.iter().any(|n| is_special_name(n)) {
+        let _ = record_bail(|| "lambda-list:special-parameter-name".to_string());
+        return None;
+    }
+
     // If the body contains a local `macrolet`/`symbol-macrolet`, fully expand it
     // up front (macroexpand_all installs the local definitions, expands their
     // uses, and strips the wrapper while preserving ordinary special forms). This
@@ -7576,7 +7660,9 @@ fn compile_function_forcing_boxed(
     // Body as an implicit progn producing the return value, with any free
     // special declarations in force over it (bliss-g97k).
     lo.push_declared_special(&decl_special);
+    let declarations = lo.enter_body_declarations(super::body_through_implicit_block(*body));
     let lowered = lower_body(&mut lo, *body);
+    lo.leave_body_declarations(declarations);
     lo.pop_declared_special(&decl_special);
     if lowered.is_err() {
         return None;
