@@ -3884,7 +3884,9 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                   "FOREIGN-TYPE-SIZE" "FOREIGN-TYPE-ALIGNMENT" "FFI-ERROR"
                   "MAKE-SHAREABLE-BYTE-VECTOR" "WITH-POINTER-TO-VECTOR-DATA"
                   "FOREIGN-LIBRARY" "FOREIGN-LIBRARY-P" "LOAD-FOREIGN-LIBRARY"
-                  "CLOSE-FOREIGN-LIBRARY" "FOREIGN-SYMBOL-POINTER" "FOREIGN-CALL"))
+                  "CLOSE-FOREIGN-LIBRARY" "FOREIGN-SYMBOL-POINTER" "FOREIGN-CALL"
+                  "FOREIGN-CALLBACK" "FOREIGN-CALLBACK-P" "MAKE-CALLBACK"
+                  "CALLBACK-POINTER" "FREE-CALLBACK" "CALLBACK-ERROR"))
         "TORCL-FFI")
 (define-condition torcl-ffi:ffi-error (simple-error) ())
 (defun torcl-ffi:pointerp (value) (torcl::%foreign-memory :pointerp value))
@@ -3919,6 +3921,19 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (if variadic-p
       (torcl::%ffi-call pointer return-type argument-types arguments fixed-count)
       (torcl::%ffi-call pointer return-type argument-types arguments)))
+
+;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
+;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures
+;;; return zero to C, then signal FFI-ERROR after the enclosing foreign call;
+;;; CALLBACK-ERROR consumes diagnostic text, also for foreign-thread failures.
+(defun torcl-ffi:foreign-callback-p (value) (torcl::%foreign-callback :p value))
+(deftype torcl-ffi:foreign-callback () '(satisfies torcl-ffi:foreign-callback-p))
+(defun torcl-ffi:make-callback (function return-type argument-types)
+  (check-type function function)
+  (torcl::%foreign-callback :make function return-type argument-types))
+(defun torcl-ffi:callback-pointer (callback) (torcl::%foreign-callback :pointer callback))
+(defun torcl-ffi:free-callback (callback) (torcl::%foreign-callback :free callback))
+(defun torcl-ffi:callback-error (callback) (torcl::%foreign-callback :error callback))
 
 ;;; Copying is deliberate: Lisp storage can move, and upgraded array element
 ;;; types need not have C layout. The pointer is valid only inside this scope.

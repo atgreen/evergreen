@@ -143,6 +143,111 @@ fn foreign_name(value: TorclVal) -> Result<String, TorclError> {
     String::from_utf8(bytes).map_err(|_| TorclError::FfiError("foreign name is not UTF-8".into()))
 }
 
+/// Explicit callback ownership, independent of the lifetime of its Lisp wrapper.
+/// The caller must retire all foreign pointer uses before FREE; the active check
+/// additionally rejects a callback trying to release its own executable entry.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub fn callback_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    use std::sync::{Mutex, OnceLock};
+    use torcl_rt::ffi::managed_callback::LispCallback;
+    static CALLBACKS: OnceLock<Mutex<Vec<Option<LispCallback>>>> = OnceLock::new();
+    let registry = CALLBACKS.get_or_init(|| Mutex::new(Vec::new()));
+    let is_callback = |value: TorclVal| {
+        value.is_heap_object()
+            && unsafe {
+                (*(value.as_ptr() as *const ObjectHeader)).type_id() == type_id::FOREIGN_CALLBACK
+            }
+    };
+    let operation = args.first().copied().map(symbol_name).unwrap_or_default();
+    let rest = &args[args.len().min(1)..];
+    match (operation.rsplit(':').next().unwrap_or_default(), rest) {
+        ("P", [value]) => Ok(if is_callback(*value) { T } else { NIL }),
+        ("MAKE", [function, result, arguments]) => {
+            let result = alien_type(*result)?;
+            let mut arguments = *arguments;
+            let mut types = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            while !arguments.is_nil() {
+                if !arguments.is_cons() || !seen.insert(arguments.to_raw()) {
+                    return Err(TorclError::FfiError(
+                        "callback argument types must be a proper list".into(),
+                    ));
+                }
+                // No Lisp allocation while translating this list to native types.
+                let cell = unsafe { &*(arguments.as_ptr() as *const torcl_rt::object::ConsCell) };
+                types.push(alien_type(cell.car)?);
+                arguments = cell.cdr;
+            }
+            let callback = LispCallback::new(*function, result, types)?;
+            // Callback already roots the function; never allocate under the registry lock.
+            let body =
+                torcl_rt::gc::alloc_typed(8, type_id::FOREIGN_CALLBACK).ok_or(TorclError::Oom)?;
+            let mut callbacks = registry.lock().unwrap_or_else(|error| error.into_inner());
+            callbacks.push(Some(callback));
+            let token = callbacks.len(); // one-based, never reused; zero is invalid after restore
+            unsafe {
+                (body as *mut usize).write(token);
+                Ok(TorclVal::from_heap_ptr(body.sub(8)))
+            }
+        }
+        (action @ ("POINTER" | "FREE" | "ERROR"), [value]) => {
+            if !is_callback(*value) {
+                return Err(TorclError::TypeError {
+                    datum: *value,
+                    expected: "TORCL-FFI:FOREIGN-CALLBACK".into(),
+                });
+            }
+            let token = unsafe { (value.as_ptr().add(8) as *const usize).read() };
+            let mut callbacks = registry.lock().unwrap_or_else(|error| error.into_inner());
+            let slot = token
+                .checked_sub(1)
+                .and_then(|index| callbacks.get_mut(index))
+                .filter(|slot| slot.is_some())
+                .ok_or_else(|| {
+                    TorclError::FfiError(
+                        "callback is freed or unavailable after image restore".into(),
+                    )
+                })?;
+            let callback = slot.as_ref().unwrap();
+            match action {
+                "POINTER" => {
+                    let address = callback.as_fn_ptr() as usize;
+                    drop(callbacks);
+                    ForeignPointer::from_address(address).into_lisp()
+                }
+                "FREE" => {
+                    if callback.is_active() {
+                        return Err(TorclError::FfiError(
+                            "cannot free an active callback".into(),
+                        ));
+                    }
+                    let released = slot.take();
+                    drop(callbacks);
+                    drop(released);
+                    Ok(NIL)
+                }
+                _ => {
+                    let error = callback.take_error();
+                    drop(callbacks);
+                    Ok(error.map_or(NIL, |message| {
+                        crate::streams::make_lisp_string_fresh(&message)
+                    }))
+                }
+            }
+        }
+        _ => Err(TorclError::ProgramError(format!(
+            "invalid foreign callback operation {operation:?}"
+        ))),
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub fn callback_call(_args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    Err(TorclError::FfiError(
+        "callbacks are not implemented for this target ABI".into(),
+    ))
+}
+
 /// Explicit library lifetime, like CFFI: the caller must stop using retained
 /// symbols before closing their provider. GC never implicitly unloads it.
 pub fn library_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {

@@ -572,13 +572,30 @@ Lisp drops its last wrapper, so GC must not implicitly release executable code o
 its closure root. Before explicit release, the caller must retire retained C
 references and finish every active invocation.
 
-Implementation status: `ffi/callback.rs` generates the SysV AMD64 scalar native
-entry, sharing register/stack classification with outbound calls. Its raw-slot
-dispatcher API requires a stable context and a no-unwind contract; it does not
-itself invoke Lisp or perform GC state transitions. The old `Callback` API still
-uses its bootstrap trampoline until the rooted Lisp dispatcher and public callback
-registry are implemented under `bliss-124.3`. Passing native-entry tests alone is
-not evidence of complete Lisp callback support.
+The `TORCL-FFI` scalar callback API is:
+
+- `(make-callback function result-type argument-types)` retains a function and
+  returns an opaque `foreign-callback` handle.
+- `(callback-pointer callback)` returns its borrowed C entry pointer.
+- `(free-callback callback)` releases the retained function and executable code.
+  Reentrant release while active is rejected; callers must also prevent future
+  or concurrent C entry before freeing. Raw pointer aliases cannot enforce this.
+- `(callback-error callback)` consumes the latest failure's diagnostic string,
+  or returns `NIL`. This is diagnostic text, not the original Lisp condition.
+
+A failed callback supplies a zero C result and permits C to finish its frames.
+An enclosing foreign call on that thread then signals `FFI-ERROR`; calls on a
+foreign-created thread report through `callback-error`. Handled nested call
+failures do not poison the outer call. Callbacks restored from images are invalid
+and must be recreated, rather than accidentally naming newly allocated entries.
+
+Implementation status: `ffi/callback.rs` generates the SysV AMD64 scalar entry,
+sharing ABI classification with outbound calls. `ffi/managed_callback.rs` retains
+precise closure roots, coordinates GC state transitions, and contains failures;
+the standard-library registry owns entries until explicit release. The evaluator
+supplies rooted function dispatch. Aggregate callbacks, other target ABIs, and
+replacement of the separate legacy Rust `Callback` bootstrap API remain under
+`bliss-124.3` / `bliss-124.5`.
 
 ### 2.7.6 Compiled Foreign Signatures (R2.14)
 
@@ -660,8 +677,9 @@ objects restore with an invalid token, never a token referring to a new provider
 `FOREIGN-CALL pointer return-type argument-types arguments &optional fixed-count`
 exposes the generated scalar call path, with a supplied fixed-count selecting
 variadic calling. The caller owns signature correctness and symbol lifetime.
-The complete CFFI backend, aggregate calls, and generated callbacks remain work
-under `bliss-124`.
+Generated scalar callbacks use the ownership API in §2.7.5. The complete CFFI
+backend, aggregate calls/callbacks, and remaining target ABIs remain work under
+`bliss-124`.
 
 ---
 

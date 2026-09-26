@@ -10,6 +10,28 @@ static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
 use torcl_rt::{TorclError, TorclVal};
 
+// These fixtures deliberately manipulate the process-global GC coordinator.
+// Keep Cargo's parallel harness out of that protocol, while retaining each
+// fixture's intentional callback/collector concurrency inside its child.
+fn run_isolated(name: &str) -> bool {
+    const CHILD: &str = "TORCL_CALLBACK_RUNTIME_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 struct CallbackPanicPayload(bool);
 impl Drop for CallbackPanicPayload {
     fn drop(&mut self) {
@@ -87,6 +109,9 @@ fn call(callback: &LispCallback) -> Result<u64, TorclError> {
 
 #[test]
 fn retained_closure_and_arguments_survive_gc_with_native_state_restored() {
+    if run_isolated("retained_closure_and_arguments_survive_gc_with_native_state_restored") {
+        return;
+    }
     set_callback_runner(runner);
     let closure = torcl_rt::gc::alloc_double_float(2.5);
     let callback = LispCallback::new(closure, AlienType::Double, vec![AlienType::Double]).unwrap();
@@ -102,6 +127,9 @@ fn retained_closure_and_arguments_survive_gc_with_native_state_restored() {
 
 #[test]
 fn callback_errors_and_panics_are_reported_after_c_returns() {
+    if run_isolated("callback_errors_and_panics_are_reported_after_c_returns") {
+        return;
+    }
     set_callback_runner(runner);
     for (closure, expected) in [
         (-1, "callback panic fixture"),
@@ -182,6 +210,9 @@ fn callback_panic_payload_destructors_cannot_unwind_into_c() {
 
 #[test]
 fn errors_without_an_outbound_frame_are_available_on_the_callback() {
+    if run_isolated("errors_without_an_outbound_frame_are_available_on_the_callback") {
+        return;
+    }
     set_callback_runner(runner);
     let callback = LispCallback::new(
         TorclVal::from_fixnum(-2),
@@ -202,6 +233,9 @@ fn errors_without_an_outbound_frame_are_available_on_the_callback() {
 
 #[test]
 fn a_handled_nested_callback_error_does_not_poison_the_outer_call() {
+    if run_isolated("a_handled_nested_callback_error_does_not_poison_the_outer_call") {
+        return;
+    }
     set_callback_runner(runner);
     let callback = LispCallback::new(
         TorclVal::from_fixnum(-3),
@@ -215,6 +249,9 @@ fn a_handled_nested_callback_error_does_not_poison_the_outer_call() {
 
 #[test]
 fn foreign_threads_attach_quiescent_and_wait_for_an_active_gc_pause() {
+    if run_isolated("foreign_threads_attach_quiescent_and_wait_for_an_active_gc_pause") {
+        return;
+    }
     set_callback_runner(runner);
     extern "C" fn probe(pointer: *const ()) -> u64 {
         let pointer = pointer as usize;
@@ -263,6 +300,9 @@ fn foreign_threads_attach_quiescent_and_wait_for_an_active_gc_pause() {
 
 #[test]
 fn callback_root_reads_cooperate_with_a_competing_collector() {
+    if run_isolated("callback_root_reads_cooperate_with_a_competing_collector") {
+        return;
+    }
     set_callback_runner(runner);
     extern "C" fn probe(pointer: *const ()) -> u64 {
         let address = pointer as usize;

@@ -1161,6 +1161,7 @@ unsafe fn trace_object(
         | tid::DOUBLE_FLOAT
         | tid::FOREIGN_POINTER
         | tid::FOREIGN_LIBRARY
+        | tid::FOREIGN_CALLBACK
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
@@ -5712,7 +5713,9 @@ pub fn serialize_heap_objects() -> Vec<u8> {
         // but restore it as unavailable, never as a dangling native pointer.
         if matches!(
             type_id,
-            crate::object::type_id::FOREIGN_POINTER | crate::object::type_id::FOREIGN_LIBRARY
+            crate::object::type_id::FOREIGN_POINTER
+                | crate::object::type_id::FOREIGN_LIBRARY
+                | crate::object::type_id::FOREIGN_CALLBACK
         ) {
             // Neither native addresses nor allocation identities survive an
             // image restart. Restore pointers as null and library tokens as

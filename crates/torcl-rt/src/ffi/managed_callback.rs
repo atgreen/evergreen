@@ -2,6 +2,7 @@
 use super::{AlienType, callback::CallbackAdapter, marshal_to_c, unmarshal_from_c};
 use crate::{TorclError, TorclVal, gc::CrossThreadRoot, value::NIL};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub type CallbackRunner = fn(TorclVal, &[TorclVal]) -> Result<TorclVal, TorclError>;
@@ -43,6 +44,7 @@ struct Context {
     result: AlienType,
     arguments: Vec<AlienType>,
     error: Mutex<Option<String>>,
+    active: AtomicUsize,
 }
 
 impl Context {
@@ -81,6 +83,14 @@ unsafe extern "C" fn dispatch(context: *mut (), slots: *const u64) -> u64 {
     // SAFETY: LispCallback owns this stable box and its executable entry. The
     // foreign lifetime contract forbids destruction while an entry is active.
     let context = unsafe { &*context.cast::<Context>() };
+    struct ActiveEntry<'a>(&'a AtomicUsize);
+    impl Drop for ActiveEntry<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    context.active.fetch_add(1, Ordering::SeqCst);
+    let _active = ActiveEntry(&context.active);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _state = crate::safepoint::ForeignStateScope::lisp();
         let slots = unsafe { std::slice::from_raw_parts(slots, context.arguments.len()) };
@@ -136,6 +146,7 @@ impl LispCallback {
             result,
             arguments,
             error: Mutex::new(None),
+            active: AtomicUsize::new(0),
         });
         let address = (&mut *context as *mut Context).cast();
         let adapter = CallbackAdapter::new(&context.result, &context.arguments, address, dispatch)?;
@@ -144,6 +155,12 @@ impl LispCallback {
 
     pub fn as_fn_ptr(&self) -> *const () {
         self.adapter.as_fn_ptr()
+    }
+
+    /// Reject reentrant release. Foreign callers must still stop publishing or
+    /// entering the C pointer before release; this is not a reclamation barrier.
+    pub fn is_active(&self) -> bool {
+        self.context.active.load(Ordering::SeqCst) != 0
     }
 
     /// Consume the most recent failure, including calls made without an active

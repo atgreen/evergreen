@@ -7385,7 +7385,39 @@ fn install_evaluator_global_root_scanner() {
         // thread (bliss-q9i1): torcl-rt is the lower layer and cannot call the
         // interpreter directly, so it invokes this host callback.
         torcl_rt::set_thread_entry_runner(thread_entry_runner);
+        #[cfg(all(target_arch = "x86_64", unix))]
+        torcl_rt::ffi::managed_callback::set_callback_runner(foreign_callback_runner);
     });
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn foreign_callback_runner(
+    entry: TorclVal,
+    arguments: &[TorclVal],
+) -> Result<TorclVal, TorclError> {
+    torcl_rt::rooted!(entry = entry);
+    rooted_args!(arguments = arguments);
+    let mut env = Env::new_impl(false, false, false);
+    torcl_rt::rooted_ref!(_env_root = &mut env);
+    // Foreign frames cannot carry Lisp nonlocal exits. Keep caller tokens, but
+    // discard values belonging to an exit that failed to leave this callback.
+    struct CallbackExtent(std::collections::HashSet<String>);
+    impl Drop for CallbackExtent {
+        fn drop(&mut self) {
+            TOPLEVEL_FRAME_BASE.with(|frames| {
+                frames.borrow_mut().pop();
+            });
+            CONTROL_VALUES.with(|values| {
+                values
+                    .borrow_mut()
+                    .retain(|token, _| self.0.contains(token))
+            });
+        }
+    }
+    let tokens = CONTROL_VALUES.with(|values| values.borrow().keys().cloned().collect());
+    TOPLEVEL_FRAME_BASE.with(|frames| frames.borrow_mut().push(frame_addr(&env.frame)));
+    let _extent = CallbackExtent(tokens);
+    apply_function(*entry, arguments, &mut env)
 }
 
 /// Run a Lisp function value to completion on the *current* (freshly spawned)
@@ -16225,6 +16257,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
                 return torcl_stdlib::ffi::library_call(&args);
+            }
+            "TORCL::%FOREIGN-CALLBACK" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::callback_call(&args);
             }
             "TORCL::%NATIVE-CONDITION" => {
                 let args = eval_args(cdr, env)?;
@@ -35642,6 +35682,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL::%NATIVE-MUTEX"
             | "TORCL::%FOREIGN-MEMORY"
             | "TORCL::%FOREIGN-LIBRARY"
+            | "TORCL::%FOREIGN-CALLBACK"
             | "TORCL::%NATIVE-CONDITION"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
@@ -36415,6 +36456,12 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
                 return Err(TorclError::SandboxViolation("FFI access denied".into()));
             }
             torcl_stdlib::ffi::library_call(args)
+        }
+        "TORCL::%FOREIGN-CALLBACK" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::callback_call(args)
         }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
