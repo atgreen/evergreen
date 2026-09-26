@@ -6,6 +6,13 @@ use crate::error::TorclError;
 use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 use crate::value::TorclVal;
 
+#[cfg(all(target_arch = "x86_64", unix))]
+mod call;
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+mod legacy;
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub use legacy::ffi_call;
+
 // ── Alien type system ──────────────────────────────────────────────
 
 /// Descriptor for a C/foreign type. D2.03.
@@ -108,6 +115,7 @@ impl AlienType {
 ///
 /// # Safety
 /// `fn_ptr` must point to a valid function with the given signature.
+#[cfg(all(target_arch = "x86_64", unix))]
 pub unsafe fn ffi_call(
     fn_ptr: *const (),
     ret_type: &AlienType,
@@ -131,6 +139,14 @@ pub unsafe fn ffi_call(
     if fn_ptr.is_null() {
         return Err(TorclError::FfiError("null function pointer".into()));
     }
+    if arg_types.len() != args.len() {
+        return Err(TorclError::FfiError(
+            "foreign argument count does not match signature".into(),
+        ));
+    }
+    // Compile/cache before publishing Native state. The adapter's Arc remains
+    // live across foreign execution; no cache lock is held during callbacks.
+    let adapter = call::CallAdapter::get(ret_type, arg_types)?;
 
     current_stack().publish_top();
     let _state_guard = if let Some(fiber) = current_fiber() {
@@ -144,155 +160,9 @@ pub unsafe fn ffi_call(
         guard
     };
 
-    // Issue #7: Check if the return type or any argument type involves 32-bit int
-    // and dispatch appropriately. For the bootstrap, we handle the common cases
-    // of all-u64 and 32-bit int signatures.
-    let is_ret_i32 = matches!(ret_type, AlienType::Int { bits: 32, .. });
-    let all_args_i32 = !arg_types.is_empty()
-        && arg_types
-            .iter()
-            .all(|t| matches!(t, AlienType::Int { bits: 32, .. }));
-
-    // Issue #6: Extended to support up to 8 arguments.
-    // Issue #7: Type-aware dispatch for i32 signatures.
-    if is_ret_i32 && all_args_i32 {
-        // All-i32 fast path
-        match args.len() {
-            0 => {
-                let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f() as u32 as u64)
-            }
-            1 => {
-                let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32) as u32 as u64)
-            }
-            2 => {
-                let f: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32) as u32 as u64)
-            }
-            3 => {
-                let f: extern "C" fn(i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32) as u32 as u64)
-            }
-            4 => {
-                let f: extern "C" fn(i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                ) as u32 as u64)
-            }
-            5 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                ) as u32 as u64)
-            }
-            6 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                    args[5] as i32,
-                ) as u32 as u64)
-            }
-            7 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                    args[5] as i32,
-                    args[6] as i32,
-                ) as u32 as u64)
-            }
-            8 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0] as i32,
-                    args[1] as i32,
-                    args[2] as i32,
-                    args[3] as i32,
-                    args[4] as i32,
-                    args[5] as i32,
-                    args[6] as i32,
-                    args[7] as i32,
-                ) as u32 as u64)
-            }
-            _ => Err(TorclError::FfiError(format!(
-                "ffi_call: unsupported argument count {} (max 8)",
-                args.len()
-            ))),
-        }
-    } else {
-        // Generic u64 path (works for pointers, 64-bit ints, etc.)
-        match args.len() {
-            0 => {
-                let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f())
-            }
-            1 => {
-                let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0]))
-            }
-            2 => {
-                let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1]))
-            }
-            3 => {
-                let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2]))
-            }
-            4 => {
-                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3]))
-            }
-            5 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3], args[4]))
-            }
-            6 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
-            }
-            7 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-                ))
-            }
-            8 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                    unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(
-                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
-                ))
-            }
-            _ => Err(TorclError::FfiError(format!(
-                "ffi_call: unsupported argument count {} (max 8)",
-                args.len()
-            ))),
-        }
-    }
+    // SAFETY: the caller supplies a matching C signature; count and supported
+    // types were checked above, and the adapter stays alive through the call.
+    Ok(unsafe { adapter.invoke(fn_ptr, args) })
 }
 
 // ── Marshalling ────────────────────────────────────────────────────

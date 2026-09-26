@@ -25,7 +25,7 @@ Source lives in `crates/torcl-rt/src/` (see §0 directory map).
 | R2.11 | FFI calls to C functions MUST use the platform C ABI (System V AMD64 / AAPCS64). | MUST |
 | R2.12 | The FFI bridge MUST support callbacks from C into CL (closure trampolines). | MUST |
 | R2.13 | Alien type marshalling MUST handle: signed/unsigned integers (8–64 bit), float, double, pointer, struct-by-value, and `void`. | MUST |
-| R2.14 | The runtime SHOULD use `libffi` for variadic and struct-by-value calls; hand-rolled stubs MAY be used for hot-path leaf calls. | SHOULD |
+| R2.14 | Foreign calls and callbacks MUST use TorCL-generated ABI adapters, including variadic and struct-by-value calls. The runtime MUST NOT depend on `libffi`. Compiled call sites MAY lower the same ABI plan directly. | MUST |
 | R2.15 | FFI calls MUST transition the calling fiber to a "native" state that does not block GC safepoints; a plain native thread publishes equivalent root state. | MUST |
 | R2.16 | Environment variables listed in §2.8 MUST be read before any heap allocation. | MUST |
 | R2.17 | Shutdown MUST run all registered finalizers, finish fibers, join carrier/native threads, and exit with a CL-controlled exit code. | MUST |
@@ -532,7 +532,7 @@ they use fixed-arity, non-variadic signatures.
 | `DOUBLE-FLOAT` | `Double` | Both | Heap-allocated; pass value |
 | `STRING` | `Pointer(Int{8})` | CL→C | UTF-8 copy with null terminator; pinned |
 | `(ALIEN *)` | `Pointer` | Both | Raw pointer, no GC tracking |
-| `STRUCT` | `Struct` by value | Both | Stack copy via `libffi` (R2.14) |
+| `STRUCT` | `Struct` by value | Both | Classified into registers or memory by TorCL's target ABI planner (R2.14) |
 | `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` | `Pointer(Int{8})` + length | CL→C | Data pointer into the array's backing store (pinned for duration of call); length passed as a separate `size_t` argument. Caller must declare layout via `DEFINE-ALIEN-ROUTINE`. |
 | `(SIMPLE-ARRAY <element-type>)` | `Pointer(<alien>)` + length | CL→C | Same pin-and-pass strategy; element type maps per this table. The C side receives a raw pointer to contiguous element data. |
 
@@ -569,16 +569,31 @@ Trampolines are allocated from a pool of executable pages (one page =
 ~100 trampolines at 40 bytes each). They are freed when the CL
 callback object is GC'd (weak reference + destructor).
 
-### 2.7.6 libffi vs Hand-Rolled Stubs (R2.14)
+### 2.7.6 Compiled Foreign Signatures (R2.14)
 
 | Path | Mechanism | When |
 |------|-----------|------|
-| General calls (variadic, struct-by-value, unknown arity) | `libffi` `ffi_call` | Default path |
-| Known-arity leaf calls (≤ 6 integer/pointer args, no struct) | Direct `call` via fn ptr | Compiler emits inline stub when alien type signature is static |
+| Dynamic calls | Cached TorCL-generated adapter for the target ABI and normalized signature | First use compiles; later uses reuse the adapter |
+| Statically known signatures | Direct call lowering using the same ABI classification | Compiler may eliminate the intermediate argument slots |
+| Callbacks | A C-entry adapter with an explicitly retained Lisp closure | Foreign code calls a stable entry independent of the closure's current Lisp tier |
 
-The compiler decides at compile time based on the `DEFINE-ALIEN-ROUTINE`
-declaration. Hand-rolled stubs avoid the ~50 ns overhead of
-`libffi_call` for hot foreign calls.
+The ABI plan assigns each argument and result to registers or memory, including
+aggregate classification, stack alignment, and variadic promotions and metadata.
+Dynamic signatures are compiled at runtime; they do not require an interpreted
+call engine. The target function address is separate from the signature so
+different foreign functions can share an outbound adapter.
+
+Adapter code uses the runtime's W^X executable-memory allocator. An active call
+retains its adapter even if the cache evicts it. No adapter-cache lock is held
+while foreign code executes or reenters Lisp. GC root publication and native
+state transitions remain runtime responsibilities at both sides of the boundary.
+
+Implementation status: SysV AMD64 scalar outbound adapters are implemented in
+`crates/torcl-rt/src/ffi/call.rs`. Variadic signatures, aggregates, generated
+callbacks, and additional target ABIs remain work under `bliss-124`; unsupported
+signatures on the generated path signal an FFI error before entering foreign
+code. Other targets temporarily retain the pre-existing bootstrap dispatcher
+in `ffi/legacy.rs`; it is not an implementation of the generated-adapter contract.
 
 ---
 
