@@ -11020,6 +11020,21 @@ fn compile_file_in_package_name(form: TorclVal) -> Option<String> {
     )
 }
 
+/// Whether COMPILE-FILE must evaluate this top-level form at COMPILE time
+/// (CLHS 3.2.3.1): the definition forms whose effects the compiler itself needs
+/// to see, plus EVAL-WHEN, whose situation list decides for itself.
+///
+/// It used to answer `true` for ANY form whose operator is a macro, and
+/// `process_compile_toplevel_form` then evaluated the ORIGINAL form. INCF is a
+/// macro, so a file containing only `(incf *counter*)` bumped the counter during
+/// compilation AND again at load, where SBCL bumps it once (bliss-t4qs). The
+/// standard says a macro call at top level is MACROEXPANDED and its expansion
+/// processed as a top-level form — which `process_compile_toplevel_form` now
+/// does, so a macro that expands into an EVAL-WHEN or a definition is still
+/// handled, without running macros that merely compute.
+///
+/// SETQ and SETF were on this list too and are gone with it: an assignment has
+/// no compile-time semantics.
 fn compile_toplevel_form_has_effect(form: TorclVal, env: &Env) -> bool {
     if !form.is_cons() {
         return false;
@@ -11029,13 +11044,10 @@ fn compile_toplevel_form_has_effect(form: TorclVal, env: &Env) -> bool {
         return false;
     }
     let name = sym_name(op);
-    if macro_defined(env, &name) {
-        return true;
-    }
+    let _ = env;
     matches!(
         symbol_leaf_name(&name),
         "EVAL-WHEN"
-            | "PROGN"
             | "DEFUN"
             | "DEFMACRO"
             | "DEFINE-COMPILER-MACRO"
@@ -11056,17 +11068,66 @@ fn compile_toplevel_form_has_effect(form: TorclVal, env: &Env) -> bool {
             | "IMPORT"
             | "SHADOW"
             | "SHADOWING-IMPORT"
-            | "SETQ"
-            | "SETF"
     )
 }
 
 fn process_compile_toplevel_form(form: TorclVal, env: &mut Env) -> Result<(), TorclError> {
+    process_compile_toplevel_form_at(form, env, 0)
+}
+
+/// Process one top-level form for its COMPILE-time effects (CLHS 3.2.3.1).
+///
+/// The three recursive cases are what make this more than a table lookup:
+///
+///   - PROGN: its subforms are themselves top-level forms, so they are processed
+///     INDIVIDUALLY. Evaluating the whole PROGN would run its ordinary forms at
+///     compile time — the same defect as the macro case below.
+///   - a macro call: MACROEXPAND it and process the expansion, so a macro that
+///     expands into an EVAL-WHEN or a definition still has its compile-time
+///     effect, while one that merely computes does not run (bliss-t4qs).
+///   - everything else: evaluated only if it is on the R3.2.3.1 list.
+fn process_compile_toplevel_form_at(
+    form: TorclVal,
+    env: &mut Env,
+    depth: u32,
+) -> Result<(), TorclError> {
+    // Macro expansion is bounded like every other expansion path here; a macro
+    // that expands to itself must not spin during compilation.
+    if depth > 100 {
+        return Ok(());
+    }
     if form.is_cons() {
         let (op, cdr) = cp(form);
-        if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "DEFINE-PACKAGE" {
-            eval_defpackage(cdr, env)?;
-            return Ok(());
+        if op.is_symbol() {
+            let name = sym_name(op);
+            match symbol_leaf_name(&name) {
+                "DEFINE-PACKAGE" => {
+                    eval_defpackage(cdr, env)?;
+                    return Ok(());
+                }
+                // A top-level PROGN's subforms are top-level forms.
+                "PROGN" => {
+                    let mut rest = cdr;
+                    torcl_rt::rooted_ref!(_rest_root = &mut rest);
+                    while rest.is_cons() {
+                        let (sub, tail) = cp(rest);
+                        process_compile_toplevel_form_at(sub, env, depth + 1)?;
+                        rest = tail;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+            // A macro call is expanded, then its expansion processed.
+            if let Some(mdef) = lookup_macro(env, &name) {
+                if let Ok(mut expanded) = expand_macro(&mdef, cdr, env, form) {
+                    torcl_rt::rooted_ref!(_expanded_root = &mut expanded);
+                    return process_compile_toplevel_form_at(expanded, env, depth + 1);
+                }
+                // An expander that fails here is left to the ordinary load-time
+                // path, exactly as `macroexpand_all` does.
+                return Ok(());
+            }
         }
     }
     if compile_toplevel_form_has_effect(form, env) {

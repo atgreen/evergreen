@@ -4438,3 +4438,91 @@ fn redefining_a_function_leaves_the_saved_object_alone() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn compile_file_runs_only_compile_time_top_level_forms() {
+    // bliss-t4qs: `compile_toplevel_form_has_effect` answered true for ANY form
+    // whose operator is a macro, and the original form was then evaluated. INCF is
+    // a macro, so a file containing only `(incf *counter*)` bumped the counter
+    // during compilation AND again at load — SBCL bumps it once. SETQ and SETF
+    // were on the list too, though an assignment has no compile-time semantics.
+    //
+    // CLHS 3.2.3.1 instead: a macro call at top level is MACROEXPANDED and its
+    // expansion processed, and a top-level PROGN's subforms are each top-level
+    // forms. So a macro expanding into an EVAL-WHEN or a definition keeps its
+    // compile-time effect while one that merely computes does not run. Every
+    // value below was diffed against SBCL.
+    let dir = temp_dir("compile-time-toplevel");
+    let source = dir.join("ct-source.lisp");
+    write_file(
+        &source,
+        "(defmacro def-ct-flag (name)\n\
+           `(eval-when (:compile-toplevel :load-toplevel :execute)\n\
+              (defparameter ,name :set-by-macro)))\n\
+         (def-ct-flag *via-macro*)\n\
+         ;; An ordinary form must NOT run at compile time.\n\
+         (incf cl-user::*plain*)\n\
+         (setq cl-user::*assigned* :assigned)\n\
+         ;; A top-level PROGN: only its compile-time subforms are processed.\n\
+         (progn\n\
+           (incf cl-user::*plain-in-progn*)\n\
+           (defmacro inner-mac () :inner)\n\
+           (eval-when (:compile-toplevel) (setq cl-user::*ct-seen* t)))\n\
+         ;; A macro that merely COMPUTES must not run at compile time.\n\
+         (defmacro compute-only () (list 'incf 'cl-user::*macro-computed*))\n\
+         (compute-only)\n",
+    );
+    let fasl = dir.join("ct-source.fasl");
+    let driver = dir.join("driver.lisp");
+    write_file(
+        &driver,
+        &format!(
+            "(defvar cl-user::*plain* 0)\n\
+             (defvar cl-user::*plain-in-progn* 0)\n\
+             (defvar cl-user::*macro-computed* 0)\n\
+             (defvar cl-user::*ct-seen* nil)\n\
+             (defvar cl-user::*assigned* nil)\n\
+             (compile-file \"{src}\")\n\
+             (defvar *at-compile*\n\
+               (list cl-user::*plain* cl-user::*plain-in-progn* cl-user::*macro-computed*\n\
+                     cl-user::*ct-seen* cl-user::*assigned*\n\
+                     (if (boundp 'cl-user::*via-macro*) cl-user::*via-macro* :unbound)\n\
+                     (if (macro-function 'cl-user::inner-mac) :defined :absent)))\n\
+             (load \"{fasl}\")\n\
+             (format t \"CTTL=~S\"\n\
+               (list *at-compile*\n\
+                     (list cl-user::*plain* cl-user::*plain-in-progn*\n\
+                           cl-user::*macro-computed* cl-user::*assigned*\n\
+                           cl-user::*via-macro*)))\n",
+            src = source.display(),
+            fasl = fasl.display()
+        ),
+    );
+
+    let output = torcl()
+        .args(["--load", driver.to_str().expect("utf8 path")])
+        .output()
+        .expect("run TorCL compile-time top-level fixture");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains(
+                // At compile time: nothing ordinary ran; the EVAL-WHEN inside the
+                // PROGN and the macro-produced DEFPARAMETER did; INNER-MAC is known
+                // to the compiler. At load: each ordinary form ran exactly once.
+                "CTTL=((0 0 0 T NIL :SET-BY-MACRO :DEFINED) (1 1 1 :ASSIGNED :SET-BY-MACRO))"
+            ),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
