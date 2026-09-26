@@ -37,13 +37,22 @@ are disabled, so missing manifest dependencies fail instead of silently using a
 different version. This is a compatibility scenario, not a full CL-Unicode build
 or a claim that either library's complete upstream suite passes on TorCL.
 
-## Known multibyte regression
+## Multibyte UTF-8
 
-`check-utf8.lisp` additionally reads valid two-byte and three-byte UTF-8
-characters. It currently fails on TorCL with an “overlong” sequence error
-(`bliss-bsjw`), independently of the Gray symbol import fix. Keep this regression
-visible; the passing ASCII scenario does not establish complete UTF-8 support.
-To reproduce it, enter a retained artifact directory and run:
+`check-utf8.lisp` is a separate phase of the run: it loads the same scenario and
+then decodes two-byte and three-byte characters through **both** decoders — a
+Babel `string-to-octets`/`octets-to-string` round trip and a Flexi Streams read
+off a binary stream. It is its own phase because the phases above are
+deliberately ASCII-only, so they would keep passing while every non-ASCII
+character was rejected — which is exactly what happened: both decoders were
+broken for months behind a green ASCII scenario (`bliss-rnd7`, `bliss-bsjw`).
+Their shared cause was in TorCL's LOOP, not in either library: an arithmetic
+`for` variable was stepped from a private counter, so babel's decoder — `for i
+fixnum from start below end` with an `(incf i)` for each continuation byte it
+consumes — revisited every continuation byte and rejected it as a starter byte.
+
+SBCL passes this file unchanged, and it runs under GC stress with
+`TORCL_PORT_STRESS=1`. To run it by hand in a retained artifact directory:
 
 ```sh
 TORCL_PORT_RUNTIME="$HOME/git/ocicl/runtime/ocicl-runtime.lisp" \
@@ -51,6 +60,9 @@ TORCL_PORT_CACHE="$PWD/cache/" \
   /path/to/torcl/scripts/torcl-limited.sh /path/to/torcl/target/torcl \
     --no-init --load check-utf8.lisp
 ```
+
+This still is not a claim of complete UTF-8 or CL-Unicode support; it pins the
+shapes listed above.
 
 Refresh pins deliberately with `ocicl install git+URL@SHA` in an isolated
 project, rerun this scenario, and update the committed CSV and port documentation.

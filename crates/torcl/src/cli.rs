@@ -11057,6 +11057,21 @@ fn compile_file_in_package_name(form: TorclVal) -> Option<String> {
     )
 }
 
+/// Whether COMPILE-FILE must evaluate this top-level form at COMPILE time
+/// (CLHS 3.2.3.1): the definition forms whose effects the compiler itself needs
+/// to see, plus EVAL-WHEN, whose situation list decides for itself.
+///
+/// It used to answer `true` for ANY form whose operator is a macro, and
+/// `process_compile_toplevel_form` then evaluated the ORIGINAL form. INCF is a
+/// macro, so a file containing only `(incf *counter*)` bumped the counter during
+/// compilation AND again at load, where SBCL bumps it once (bliss-t4qs). The
+/// standard says a macro call at top level is MACROEXPANDED and its expansion
+/// processed as a top-level form — which `process_compile_toplevel_form` now
+/// does, so a macro that expands into an EVAL-WHEN or a definition is still
+/// handled, without running macros that merely compute.
+///
+/// SETQ and SETF were on this list too and are gone with it: an assignment has
+/// no compile-time semantics.
 fn compile_toplevel_form_has_effect(form: TorclVal, env: &Env) -> bool {
     if !form.is_cons() {
         return false;
@@ -11066,13 +11081,10 @@ fn compile_toplevel_form_has_effect(form: TorclVal, env: &Env) -> bool {
         return false;
     }
     let name = sym_name(op);
-    if macro_defined(env, &name) {
-        return true;
-    }
+    let _ = env;
     matches!(
         symbol_leaf_name(&name),
         "EVAL-WHEN"
-            | "PROGN"
             | "DEFUN"
             | "DEFMACRO"
             | "DEFINE-COMPILER-MACRO"
@@ -11093,17 +11105,66 @@ fn compile_toplevel_form_has_effect(form: TorclVal, env: &Env) -> bool {
             | "IMPORT"
             | "SHADOW"
             | "SHADOWING-IMPORT"
-            | "SETQ"
-            | "SETF"
     )
 }
 
 fn process_compile_toplevel_form(form: TorclVal, env: &mut Env) -> Result<(), TorclError> {
+    process_compile_toplevel_form_at(form, env, 0)
+}
+
+/// Process one top-level form for its COMPILE-time effects (CLHS 3.2.3.1).
+///
+/// The three recursive cases are what make this more than a table lookup:
+///
+///   - PROGN: its subforms are themselves top-level forms, so they are processed
+///     INDIVIDUALLY. Evaluating the whole PROGN would run its ordinary forms at
+///     compile time — the same defect as the macro case below.
+///   - a macro call: MACROEXPAND it and process the expansion, so a macro that
+///     expands into an EVAL-WHEN or a definition still has its compile-time
+///     effect, while one that merely computes does not run (bliss-t4qs).
+///   - everything else: evaluated only if it is on the R3.2.3.1 list.
+fn process_compile_toplevel_form_at(
+    form: TorclVal,
+    env: &mut Env,
+    depth: u32,
+) -> Result<(), TorclError> {
+    // Macro expansion is bounded like every other expansion path here; a macro
+    // that expands to itself must not spin during compilation.
+    if depth > 100 {
+        return Ok(());
+    }
     if form.is_cons() {
         let (op, cdr) = cp(form);
-        if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "DEFINE-PACKAGE" {
-            eval_defpackage(cdr, env)?;
-            return Ok(());
+        if op.is_symbol() {
+            let name = sym_name(op);
+            match symbol_leaf_name(&name) {
+                "DEFINE-PACKAGE" => {
+                    eval_defpackage(cdr, env)?;
+                    return Ok(());
+                }
+                // A top-level PROGN's subforms are top-level forms.
+                "PROGN" => {
+                    let mut rest = cdr;
+                    torcl_rt::rooted_ref!(_rest_root = &mut rest);
+                    while rest.is_cons() {
+                        let (sub, tail) = cp(rest);
+                        process_compile_toplevel_form_at(sub, env, depth + 1)?;
+                        rest = tail;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+            // A macro call is expanded, then its expansion processed.
+            if let Some(mdef) = lookup_macro(env, &name) {
+                if let Ok(mut expanded) = expand_macro(&mdef, cdr, env, form) {
+                    torcl_rt::rooted_ref!(_expanded_root = &mut expanded);
+                    return process_compile_toplevel_form_at(expanded, env, depth + 1);
+                }
+                // An expander that fails here is left to the ordinary load-time
+                // path, exactly as `macroexpand_all` does.
+                return Ok(());
+            }
         }
     }
     if compile_toplevel_form_has_effect(form, env) {
@@ -26766,7 +26827,15 @@ impl std::ops::Deref for RootedVals {
 /// Bind a (possibly destructuring / dotted) pattern against a value.
 fn loop_bind(pattern: TorclVal, value: TorclVal, env: &mut Env) {
     if pattern.is_symbol() {
-        if sym_name(pattern) != "NIL" {
+        // NIL and T answer `is_symbol()` but are SPECIAL immediates, not
+        // TAG_SYMBOL, so the `as_symbol_index` inside `define_local_symbol`
+        // panics on them. `loop for nil from 10 to 15` is legal — the clause
+        // drives the iteration and discards the value (LOOP.1.50-53) — and
+        // `loop for t ...` is a program error that SBCL rejects at compile time;
+        // neither may crash the process, which a panic here does (and, reached
+        // through the c2i adapters, aborts it). Signalling a PROGRAM-ERROR for
+        // the constant case is bliss-pj0n.
+        if pattern != NIL && pattern != T {
             // Bind through the symbol-indexed store as well, so the loop
             // variable properly shadows any outer lexical binding of the same
             // name (symbol lookup consults symbol_vars before the name map).
@@ -28061,19 +28130,50 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                         step,
                         limit,
                     } => {
-                        // Test the CURRENT value before binding it: on the
-                        // iteration whose value passes the limit, bind it and step
-                        // for next time; when it fails, exit WITHOUT rebinding, so
-                        // FINALLY sees the last in-range value — `from 1 to 5`
-                        // ends at 5, `from 1 below 5` at 4 (LOOP.1.40-43). The
-                        // variable was pre-bound to the start value, covering a
-                        // zero-iteration loop.
+                        // Step from the variable's CURRENT value, not from a
+                        // private copy (bliss-rnd7): a body that assigns to the
+                        // loop variable moves the iteration with it. That is not
+                        // an exotic corner — babel's UTF-8 decoder is `for i
+                        // fixnum from start below end` with an `(incf i)` per
+                        // continuation byte it consumes, and a counter that
+                        // ignored `i` re-read every continuation byte as a starter
+                        // byte, so octets-to-string signalled
+                        // INVALID-UTF8-STARTER-BYTE on bytes string-to-octets had
+                        // just produced. Only the ARITHMETIC driver behaves this
+                        // way; `across`/`in`/`on`/`repeat` step private state, so
+                        // assigning to their variable does not move them.
+                        //
+                        // `current` is still kept separately, because it — not the
+                        // variable — is what the limit test consumes: when the
+                        // stepped value passes the limit the loop exits WITHOUT
+                        // rebinding, so FINALLY sees the last IN-RANGE value
+                        // (`from 1 to 5` ends at 5, `from 1 below 5` at 4). That
+                        // is ansi-test LOOP.1.40-43, which those tests tag
+                        // `:ansi-spec-problem` and SBCL answers the stepped-past
+                        // way; TorCL follows ansi-test here (bliss-uj7m) and the
+                        // lowerer matches. The COLLECTED values agree with SBCL
+                        // either way.
+                        if !first {
+                            // `loop for nil from 10 to 15` is legal — the clause
+                            // drives the iteration and discards the value, so
+                            // there is no binding to read back (LOOP.1.50-53).
+                            // NIL and T answer `is_symbol()` but are SPECIAL
+                            // immediates, not TAG_SYMBOL, so `as_symbol_index`
+                            // inside the lookup would panic on them.
+                            let named = pat.is_symbol() && *pat != NIL && *pat != T;
+                            let mut prev = if named {
+                                env.lookup_var_symbol(*pat).unwrap_or(*current)
+                            } else {
+                                *current
+                            };
+                            torcl_rt::rooted_ref!(_prev_root = &mut prev);
+                            *current = loop_add_numbers(prev, *step)?;
+                        }
                         if loop_from_exhausted(*current, limit.as_ref())? {
                             exhausted = true;
                             break;
                         }
                         loop_bind(*pat, *current, env);
-                        *current = loop_add_numbers(*current, *step)?;
                     }
                     ForState::Across { pat, items, idx } => {
                         if *idx >= items.len() {
