@@ -117,6 +117,28 @@ types. `TORCL-THREAD:MAKE-THREAD` creates a one-to-one OS-backed thread;
 `TORCL-FIBER:MAKE-FIBER` creates a lightweight fiber. Scheduler-group carrier
 threads MUST be observable through both thread introspection and the group.
 
+#### Execution-context register — approved direction (2026-09-26)
+
+Generated Lisp code will reserve a register pointing to the **current Lisp
+execution context**, not directly to OS-thread TLS. The context identifies the
+current fiber, or native-thread Lisp execution when no fiber is mounted, and
+provides access to its dynamic bindings, Lisp execution state, current carrier,
+and managed/foreign boundary state and published roots. This shared internal
+interface does not merge the distinct public thread and fiber types (R2.21).
+
+Fiber-local state follows the fiber across migration; the carrier association
+is refreshed before Lisp execution resumes on another OS thread. Foreign-entry
+and callback adapters establish or restore the appropriate Lisp context, and
+nested Lisp→foreign→Lisp calls restore the enclosing context on exit. Boundary
+root publication and GC participation remain governed by §2.7; a context
+pointer alone does not make a transition GC-safe.
+
+This is an approved design direction, **not an implemented ABI**. The concrete
+context layout, ownership/lifetime and transition protocol, and physical
+register assignments remain subject to the T1/T2 and boundary-adapter audit
+tracked in `bliss-q861` (§4.7.4.2). No JVM or CPython integration is implied by
+recording this decision.
+
 ### 2.3.2 State Machine
 
 ```text

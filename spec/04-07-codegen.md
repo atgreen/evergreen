@@ -118,7 +118,15 @@ pub struct MachBlock {
 | Arg count | `RCX` |
 | First 4 Lisp args | `RDI`, `RSI`, `RDX`, `R8` |
 | Return value | `RAX` |
-| Thread pointer | `R14` (pinned, callee-saved) |
+| Execution-context pointer | Dedicated register; physical assignment pending ABI audit (§2.3.1) |
+
+**Approved direction (2026-09-26):** the dedicated register points to the
+current Lisp execution context, not directly to carrier-thread TLS. See §2.3.1
+for fiber migration and foreign/callback entry semantics. The earlier `R14`
+assignment is withdrawn pending `bliss-q861`: current T1 uses `R14` for frame
+slots and `R15` for the operand stack, while T2 can allocate `R14` as an ordinary
+value register. The audit must coordinate reservation with tier transitions,
+runtime/foreign adapters and fiber switches before this convention is installed.
 
 ### 4.7.4.3 Float Operations
 
@@ -174,7 +182,8 @@ the rounding mode for subsequent FP instructions.
 | Stack alignment | 16-byte at all times |
 
 **TorCL-internal (AArch64):** Closure=`X20`, argc=`X2`, args=`X0,X1,X3,X4`,
-return=`X0`, thread=`X21` (all pinned callee-saved).
+return=`X0`. The dedicated execution-context register follows §2.3.1;
+the earlier thread=`X21` assignment is provisional pending the same ABI audit.
 
 NEON float: `FADD/FSUB/FMUL/FDIV/FCMP` scalar double. `FCMP` sets NZCV;
 MUST check V flag for NaN. Conversions: `SCVTF`, `FCVTZS`. FPCR default
