@@ -4,6 +4,54 @@
 use std::process::Command;
 
 #[test]
+fn host_qsort_calls_allocating_lisp_comparators_and_contains_errors() {
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
+          (let* ((qsort (torcl-ffi:foreign-symbol-pointer "qsort"))
+                 (array (torcl-ffi:foreign-alloc 40))
+                 (calls 0)
+                 (compare (torcl-ffi:make-callback
+                   (lambda (a b)
+                     (incf calls)
+                     (let ((pair (list (torcl-ffi:mem-ref a :int)
+                                       (torcl-ffi:mem-ref b :int))))
+                       (- (car pair) (cadr pair))))
+                   :int '(:pointer :pointer))))
+            (loop for value in '(7 2 10 4 3 5 1 6 9 8) for i from 0
+                  do (torcl-ffi:mem-set value array :int (* 4 i)))
+            (torcl-ffi:foreign-call qsort :void '(:pointer :unsigned-long :unsigned-long :pointer)
+              (list array 10 4 (torcl-ffi:callback-pointer compare)))
+            (assert (> calls 0))
+            (assert (equal (loop for i below 10 collect (torcl-ffi:mem-ref array :int (* 4 i)))
+                           '(1 2 3 4 5 6 7 8 9 10)))
+            (torcl-ffi:free-callback compare)
+            (let ((bad (torcl-ffi:make-callback (lambda (a b) (error "comparator failed"))
+                                               :int '(:pointer :pointer))))
+              (assert (handler-case
+                        (progn (torcl-ffi:foreign-call qsort :void
+                                 '(:pointer :unsigned-long :unsigned-long :pointer)
+                                 (list array 10 4 (torcl-ffi:callback-pointer bad))) nil)
+                        (torcl-ffi:ffi-error () t)))
+              (torcl-ffi:free-callback bad))
+            (torcl-ffi:foreign-free array))
+          (format t "QSORT-OK~%")
+        "#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("QSORT-OK"));
+}
+
+#[test]
 fn callbacks_are_denied_in_sandbox_in_direct_and_funcall_paths() {
     for form in [
         "(torcl-ffi:make-callback (lambda () 1) :int nil)",

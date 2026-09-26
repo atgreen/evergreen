@@ -605,7 +605,7 @@ mod elf_backend {
         }
         host_syms![
             malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp, strlen, strcmp,
-            strncmp, strcpy, strncpy, strncat, strcat, abort, abs, sqrt,
+            strncmp, strcpy, strncpy, strncat, strcat, abort, abs, sqrt, qsort,
         ]
     }
 
