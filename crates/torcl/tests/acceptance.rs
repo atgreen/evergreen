@@ -2225,6 +2225,99 @@ fn loop_numeric_iteration_and_accumulation() {
 }
 
 /// Regression for LOOP while/until/repeat driver clauses (bliss-2pt.10).
+/// An arithmetic LOOP variable IS the iteration counter: a body that assigns to
+/// it moves the iteration with it (bliss-rnd7). babel's UTF-8 decoder is
+/// `for i fixnum from start below end` with an `(incf i)` for every continuation
+/// byte it consumes, so with a private counter it re-read each continuation byte
+/// as a starter byte and `babel:octets-to-string` signalled
+/// INVALID-UTF8-STARTER-BYTE on octets `babel:string-to-octets` had just made.
+///
+/// Two separate drivers had the bug and both are covered here, because
+/// `run_expression_cases` runs every case compiled AND tree-walked: the
+/// lowerer's general LOOP compiler (cli/bytecode.rs `lower_loop_general`) and
+/// the tree-walker's `ForState::From`. The `of-type` rows matter — `of-type`
+/// is what decides which of the two handles a clause.
+///
+/// Only the ARITHMETIC driver is mutation-sensitive. `across`/`in`/`on`/`repeat`
+/// step private state, so assigning to their variable must NOT move them; those
+/// rows pin that down. The collected values here all match SBCL.
+#[test]
+fn an_arithmetic_loop_variable_is_the_iteration_counter() {
+    let cases = [
+        // Skipping an index from the body: the reduced form of the babel bug.
+        (
+            "(loop for i from 0 below 6 collect i do (incf i))",
+            "(0 2 4)",
+        ),
+        ("(loop for i from 0 to 5 collect i do (incf i))", "(0 2 4)"),
+        (
+            "(loop for i fixnum from 0 below 6 collect i do (incf i))",
+            "(0 2 4)",
+        ),
+        // `by` composes with the mutation: 0, then (1+2)=3, then 4+2=6 exits.
+        (
+            "(loop for i from 0 below 6 by 2 collect i do (incf i))",
+            "(0 3)",
+        ),
+        // Descending steps from the mutated value too.
+        (
+            "(loop for i downfrom 6 above 0 collect i do (decf i))",
+            "(6 4 2)",
+        ),
+        // A second driver keeps its own independent stepping.
+        (
+            "(loop for d from 10 for i from 0 below 4 collect (list d i) do (incf i))",
+            "((10 0) (11 2))",
+        ),
+        // The babel decoder's shape: a starter byte consumes its continuation
+        // byte and the loop must not revisit it.
+        (
+            "(let ((v #(104 195 169 108)))               (loop for i fixnum from 0 below 4                     collect (let ((u1 (aref v i)))                               (if (> u1 127) (list u1 (aref v (incf i))) u1))))",
+            "(104 (195 169) 108)",
+        ),
+        // The non-arithmetic drivers must NOT follow their variable.
+        (
+            "(loop for x across #(1 2 3) collect x do (setq x 99))",
+            "(1 2 3)",
+        ),
+        (
+            "(loop for x in '(1 2 3) collect x do (setq x 99))",
+            "(1 2 3)",
+        ),
+        (
+            "(loop for x on '(1 2) collect (car x) do (setq x nil))",
+            "(1 2)",
+        ),
+        // A LOOP that does not touch its variable is unchanged, including the
+        // last-in-range value FINALLY sees (ansi-test LOOP.1.40-43, which those
+        // tests tag :ansi-spec-problem; SBCL answers the stepped-past way and
+        // TorCL follows ansi-test — see bliss-uj7m).
+        ("(loop for i from 1 to 5 collect i)", "(1 2 3 4 5)"),
+        (
+            "(loop for x from 1 to 5 do (progn) finally (return x))",
+            "5",
+        ),
+        (
+            "(loop for x from 1 below 5 do (progn) finally (return x))",
+            "4",
+        ),
+        (
+            "(loop for x from 10 downto 0 do (progn) finally (return x))",
+            "0",
+        ),
+        (
+            "(loop for x from 10 above 0 do (progn) finally (return x))",
+            "1",
+        ),
+        // A zero-iteration loop still leaves the start value.
+        (
+            "(loop for x from 5 to 3 do (progn) finally (return x))",
+            "5",
+        ),
+    ];
+    run_expression_cases(&cases);
+}
+
 #[test]
 fn loop_while_until_repeat_drivers() {
     let cases = [

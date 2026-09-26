@@ -28034,19 +28034,43 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                         step,
                         limit,
                     } => {
-                        // Test the CURRENT value before binding it: on the
-                        // iteration whose value passes the limit, bind it and step
-                        // for next time; when it fails, exit WITHOUT rebinding, so
-                        // FINALLY sees the last in-range value — `from 1 to 5`
-                        // ends at 5, `from 1 below 5` at 4 (LOOP.1.40-43). The
-                        // variable was pre-bound to the start value, covering a
-                        // zero-iteration loop.
+                        // Step from the variable's CURRENT value, not from a
+                        // private copy (bliss-rnd7): a body that assigns to the
+                        // loop variable moves the iteration with it. That is not
+                        // an exotic corner — babel's UTF-8 decoder is `for i
+                        // fixnum from start below end` with an `(incf i)` per
+                        // continuation byte it consumes, and a counter that
+                        // ignored `i` re-read every continuation byte as a starter
+                        // byte, so octets-to-string signalled
+                        // INVALID-UTF8-STARTER-BYTE on bytes string-to-octets had
+                        // just produced. Only the ARITHMETIC driver behaves this
+                        // way; `across`/`in`/`on`/`repeat` step private state, so
+                        // assigning to their variable does not move them.
+                        //
+                        // `current` is still kept separately, because it — not the
+                        // variable — is what the limit test consumes: when the
+                        // stepped value passes the limit the loop exits WITHOUT
+                        // rebinding, so FINALLY sees the last IN-RANGE value
+                        // (`from 1 to 5` ends at 5, `from 1 below 5` at 4). That
+                        // is ansi-test LOOP.1.40-43, which those tests tag
+                        // `:ansi-spec-problem` and SBCL answers the stepped-past
+                        // way; TorCL follows ansi-test here (bliss-uj7m) and the
+                        // lowerer matches. The COLLECTED values agree with SBCL
+                        // either way.
+                        if !first {
+                            let mut prev = if pat.is_symbol() {
+                                env.lookup_var_symbol(*pat).unwrap_or(*current)
+                            } else {
+                                *current
+                            };
+                            torcl_rt::rooted_ref!(_prev_root = &mut prev);
+                            *current = loop_add_numbers(prev, *step)?;
+                        }
                         if loop_from_exhausted(*current, limit.as_ref())? {
                             exhausted = true;
                             break;
                         }
                         loop_bind(*pat, *current, env);
-                        *current = loop_add_numbers(*current, *step)?;
                     }
                     ForState::Across { pat, items, idx } => {
                         if *idx >= items.len() {

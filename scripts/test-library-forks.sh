@@ -19,6 +19,11 @@ for phase in cold cached; do
     "$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check.lisp >"$phase.log" 2>&1
     grep -Fxq 'LIBRARY-FORKS-OK' "$phase.log"
 done
+# Multibyte UTF-8 through Babel's and Flexi's decoders (bliss-rnd7, bliss-bsjw).
+# Its own phase because it loads check.lisp itself; the ASCII phases above would
+# otherwise keep passing while every non-ASCII character was rejected.
+"$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check-utf8.lisp >utf8.log 2>&1
+grep -Fxq 'MULTIBYTE-UTF8-OK' utf8.log
 if grep -qi 'compiling file' cached.log; then
     echo "Cached load unexpectedly compiled source; see $work/cached.log" >&2
     exit 1
@@ -27,10 +32,18 @@ if [[ ${TORCL_PORT_STRESS:-0} == 1 ]]; then
     TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1 \
         "$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check.lisp >stress.log 2>&1
     grep -Fxq 'LIBRARY-FORKS-OK' stress.log
+    TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1 \
+        "$repo/scripts/torcl-limited.sh" "$torcl" --no-init --load check-utf8.lisp \
+        >utf8-stress.log 2>&1
+    grep -Fxq 'MULTIBYTE-UTF8-OK' utf8-stress.log
 fi
 if [[ -n ${SBCL_BIN:-} ]]; then
     TORCL_PORT_CACHE="$work/sbcl-cache/" "$repo/scripts/torcl-limited.sh" "$SBCL_BIN" \
         --noinform --no-sysinit --no-userinit --non-interactive --load check.lisp >sbcl.log 2>&1
     grep -Fxq 'LIBRARY-FORKS-OK' sbcl.log
+    TORCL_PORT_CACHE="$work/sbcl-cache/" "$repo/scripts/torcl-limited.sh" "$SBCL_BIN" \
+        --noinform --no-sysinit --no-userinit --non-interactive --load check-utf8.lisp \
+        >utf8-sbcl.log 2>&1
+    grep -Fxq 'MULTIBYTE-UTF8-OK' utf8-sbcl.log
 fi
-echo "LIBRARY-FORKS-PASS: cold and cached loads; artifacts in $work"
+echo "LIBRARY-FORKS-PASS: cold and cached loads, multibyte UTF-8; artifacts in $work"

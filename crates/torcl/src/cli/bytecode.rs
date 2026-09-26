@@ -4096,10 +4096,22 @@ impl<'e> Lowerer<'e> {
                             // tree-walker's bind-then-step order.
                             pre.push(form_list(&[s("SETQ")?, var, ctr]));
                             let op = if descending { "-" } else { "+" };
+                            // Advance from VAR, not from CTR: a body that assigns
+                            // to the loop variable moves the iteration with it
+                            // (bliss-rnd7). babel's UTF-8 decoder is `for i fixnum
+                            // from start below end` with an `(incf i)` per
+                            // continuation byte it consumes; stepping a counter
+                            // that ignored `i` re-read every continuation byte as a
+                            // starter byte, so octets-to-string signalled
+                            // INVALID-UTF8-STARTER-BYTE on bytes string-to-octets
+                            // had just produced. CTR stays a separate variable
+                            // because it, not VAR, is what the limit test above
+                            // consumes — that is what leaves VAR holding the last
+                            // IN-RANGE value on exit (bliss-uj7m / LOOP.1.40-43).
                             steps.push(form_list(&[
                                 s("SETQ")?,
                                 ctr,
-                                form_list(&[s(op)?, ctr, step]),
+                                form_list(&[s(op)?, var, step]),
                             ]));
                             i += adv;
                         }
