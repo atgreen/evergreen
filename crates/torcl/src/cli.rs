@@ -10250,6 +10250,7 @@ fn reader_macro_invoker(
     sub: char,
     infix: Option<i64>,
 ) -> Result<(Vec<TorclVal>, usize), TorclError> {
+    torcl_rt::rooted!(handler = handler);
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() {
         return Err(TorclError::StreamError(
@@ -10270,7 +10271,7 @@ fn reader_macro_invoker(
             &text.chars().take(40).collect::<String>()
         );
     }
-    let result = apply_function(handler, &[*stream, sub_val, arg_val], env);
+    let result = apply_function(*handler, &[*stream, sub_val, arg_val], env);
     if dbg {
         match &result {
             Ok(v) => eprintln!(
@@ -16051,12 +16052,34 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         args[0].as_char()
                     )));
                 }
-                return Ok(reader::get_dispatch_macro_character(
-                    rt,
-                    args[0].as_char(),
-                    args[1].as_char(),
-                )?
-                .unwrap_or(NIL));
+                if let Some(handler) =
+                    reader::get_dispatch_macro_character(rt, args[0].as_char(), args[1].as_char())?
+                {
+                    return Ok(handler);
+                }
+                if args[0].as_char() == '#' && args[1].as_char() == '\\' {
+                    let name = resolve_sym("TORCL::%STANDARD-CHARACTER-READER").unwrap();
+                    return Ok(symbol_function_object(env, name).unwrap_or(NIL));
+                }
+                return Ok(NIL);
+            }
+            "TORCL::%STANDARD-CHARACTER-READER" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 3 {
+                    return Err(TorclError::ProgramError(
+                        "standard character reader requires stream, sub-character and argument"
+                            .into(),
+                    ));
+                }
+                let suppress = env
+                    .lookup_var("*READ-SUPPRESS*")
+                    .is_some_and(|v| !v.is_nil());
+                if !args[2].is_nil() && !suppress {
+                    return Err(TorclError::StreamError(
+                        "#\\ does not accept a numeric argument".into(),
+                    ));
+                }
+                return torcl_stdlib::streams::read_character_literal(args[0], suppress);
             }
             "MAKE-DISPATCH-MACRO-CHARACTER" => {
                 let args = eval_args(cdr, env)?;
@@ -35652,6 +35675,9 @@ fn apply_function(
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
 fn is_builtin_function(name: &str) -> bool {
+    if name == "TORCL::%STANDARD-CHARACTER-READER" {
+        return true;
+    }
     // TORCL-THREAD is an extension package, not COMMON-LISP. Its names must be
     // recognized by qualified symbol identity: treating every symbol whose
     // bare name is MAKE-THREAD as this builtin made
