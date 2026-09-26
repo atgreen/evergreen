@@ -7189,13 +7189,22 @@ fn defpackage_shadow_interns_distinct_symbol() {
 /// that only comes out right if nothing went stale.
 #[test]
 fn gc_roots_funcall_callee_and_tagbody_statements() {
-    // FUNCALL: `g` is a fresh young closure; the `(list i i)` argument allocates
-    // (firing the GC) while `g` is the in-flight callee. eval forces the
-    // tree-walker path. Sum of (i+i+i) for i in 0..59 = 3*1770 = 5310.
-    let funcall_prog = "(let ((s 0)) \
+    // FUNCALL: `gg` is a fresh young closure; the `(list ii ii)` argument
+    // allocates (firing the GC) while `gg` is the in-flight callee. eval forces
+    // the tree-walker path. Sum of (i+i+i) for i in 0..59 = 3*1770 = 5310.
+    //
+    // `gg`/`ii` are SPECIAL, not caller lexicals: EVAL evaluates in the null
+    // lexical environment (bliss-e57h), so a lexical `g` is correctly invisible
+    // to the EVAL'd form — SBCL signals UNBOUND-VARIABLE on the earlier
+    // formulation of this program, which had been written against TorCL's old
+    // leaking EVAL. The GC-root coverage is unchanged: still a young closure as
+    // the in-flight callee with an allocating argument.
+    let funcall_prog = "(defvar gg nil) (defvar ii 0) \
+       (let ((s 0)) \
          (dotimes (i 60) \
-           (let ((g (let ((k i)) (lambda (p) (+ k (car p) (cadr p)))))) \
-             (setf s (+ s (eval '(funcall g (list i i))))))) \
+           (setq ii i) \
+           (setq gg (let ((k i)) (lambda (p) (+ k (car p) (cadr p))))) \
+           (setf s (+ s (eval '(funcall gg (list ii ii)))))) \
          (format t \"~s\" s))";
     // TAGBODY: a freshly-consed tagbody form each iteration; a statement allocates
     // mid-body. zz = (cons 0 (list 1 2 3 4 5)) => length 6, over 200 iters = 1200.
@@ -15463,12 +15472,32 @@ fn builtin_function_objects_dispatch_correctly() {
             "(funcall (lambda (x y) (list :mine x y)) 1 2)",
             "(:MINE 1 2)",
         ),
-        // Dispatch-by-name semantics: a captured #'f must see a LATER redefinition,
-        // because the wrapper dispatches at call time rather than capturing code.
+        // A captured function OBJECT keeps its own definition: `#'f` yields the
+        // functional value of `f` at that moment, and a later DEFUN installs a
+        // different object rather than rewriting this one (CLHS FUNCTION /
+        // FDEFINITION; bliss-evpx). This row previously expected 15 — the NEW
+        // definition — on the rationale that "the wrapper dispatches at call time
+        // rather than capturing code", which was describing TorCL's in-place
+        // redefinition rather than the standard, and is what made the classic
+        // `(defvar *saved* (fdefinition 'f))` wrapper idiom recurse to a stack
+        // overflow.
+        //
+        // NOT a portability claim: SBCL answers 15 for this exact program and 10
+        // for the same shape written with FDEFINITION, because it resolves `#'f`
+        // within a SINGLE top-level form as one compilation unit. Split across two
+        // top-level forms, SBCL captures too. 10 is the conforming reading of an
+        // evaluated PROGN, and it is what TorCL now answers for both spellings.
         (
             "(progn (defun redefme (x) (* x 2))
                     (let ((f #'redefme)) (defun redefme (x) (* x 3)) (funcall f 5)))",
-            "15",
+            "10",
+        ),
+        (
+            "(progn (defun redefme2 (x) (* x 2))
+                    (let ((f (fdefinition 'redefme2)))
+                      (defun redefme2 (x) (* x 3))
+                      (funcall f 5)))",
+            "10",
         ),
         // Arities the kernel declines still reach the general path and signal.
         ("(handler-case (funcall #'car 1 2) (error () :err))", ":ERR"),

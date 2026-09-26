@@ -12701,9 +12701,19 @@ struct RuntimeClause {
 
 /// What to do when a cleanup body finishes (`CleanupReturn`).
 enum CleanupCont {
-    /// Normal completion of `unwind-protect`: restore the protected value and
-    /// resume at `resume_bcp`.
-    Normal { resume_bcp: u32, value: TorclVal },
+    /// Normal completion of `unwind-protect`: restore the protected form's
+    /// values and resume at `resume_bcp`.
+    ///
+    /// `values` carries the WHOLE multiple-value state, not just `value`: the
+    /// cleanup body is arbitrary code and clobbers `env.mv` — `(unwind-protect
+    /// (values line 42) (close s))` lost the 42 because `CleanupReturn` restored
+    /// only the primary (bliss-pfgq). `None` means the protected form produced
+    /// exactly one value, so there is no multiple-value state to republish.
+    Normal {
+        resume_bcp: u32,
+        value: TorclVal,
+        values: Option<Vec<TorclVal>>,
+    },
     /// The cleanup ran during an unwind: resume that unwind afterwards.
     Resume(Pending),
 }
@@ -12747,7 +12757,16 @@ impl torcl_rt::gc::TraceHostRoots for Pending {
 impl torcl_rt::gc::TraceHostRoots for CleanupCont {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         match self {
-            CleanupCont::Normal { value, .. } => visit(value),
+            CleanupCont::Normal { value, values, .. } => {
+                visit(value);
+                // The saved value list survives the cleanup body, which
+                // allocates freely, so every element is a root (bliss-pfgq).
+                if let Some(values) = values {
+                    for v in values.iter_mut() {
+                        visit(v);
+                    }
+                }
+            }
             CleanupCont::Resume(pending) => visit_pending_roots(pending, visit),
         }
     }
@@ -14144,10 +14163,20 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 cleanup_bcp,
                 resume_bcp,
             } => {
+                // Capture the protected form's multiple-value state BEFORE the
+                // cleanup body runs and overwrites it (bliss-pfgq).
+                let values = if env.mv_active {
+                    Some(env.mv.clone())
+                } else {
+                    None
+                };
                 let act = &mut acts[top_idx];
                 let value = act.pop_op();
-                act.cleanup_conts
-                    .push(CleanupCont::Normal { resume_bcp, value });
+                act.cleanup_conts.push(CleanupCont::Normal {
+                    resume_bcp,
+                    value,
+                    values,
+                });
                 act.bcp = cleanup_bcp as usize;
             }
             Instr::CleanupReturn => {
@@ -14156,7 +14185,17 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     .pop()
                     .expect("CleanupReturn without a pending cleanup continuation");
                 match cont {
-                    CleanupCont::Normal { resume_bcp, value } => {
+                    CleanupCont::Normal {
+                        resume_bcp,
+                        value,
+                        values,
+                    } => {
+                        // Republish the protected form's values over whatever the
+                        // cleanup body left in the register (bliss-pfgq).
+                        match values {
+                            Some(values) => env.set_mv(values),
+                            None => env.clear_mv(),
+                        }
                         let act = &mut acts[top_idx];
                         act.push_op(value);
                         act.bcp = resume_bcp as usize;

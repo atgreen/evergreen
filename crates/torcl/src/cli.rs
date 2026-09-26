@@ -10514,8 +10514,21 @@ fn run_deferred_lisp_finalizers(env: &mut Env) {
     env.mv_active = saved_mv_active;
 }
 
+/// Pre-read a source file's top-level forms for COMPILE-FILE, processing
+/// compile-time effects as it goes.
+///
+/// `compile_time_failure` distinguishes the two ways this can fail, which must
+/// not be conflated (bliss-wk2q). It is left `None` when the file simply cannot
+/// be pre-read — its READER state depends on its own compile-time effects, as
+/// when iterate installs a `#L` dispatch macro from a mid-file eval-when — and
+/// the caller then legitimately downgrades to a source-only artifact. It is set
+/// when a compile-time evaluation SIGNALLED, which is a failed compilation the
+/// caller must propagate instead of writing an artifact that pretends the file
+/// compiled.
 fn read_forms_for_compile(
     source: &str,
+    src_path: &str,
+    compile_time_failure: &mut Option<()>,
     env: &mut Env,
 ) -> Result<(Vec<TorclVal>, Vec<String>), TorclError> {
     with_eval_context(env, EvalContext::CompileFile, |env| {
@@ -10551,11 +10564,34 @@ fn read_forms_for_compile(
             // the package in which the expander was defined.
             let definition_package = env.current_package.clone();
             seed_compile_time_definitions(val, env);
+            // A compile-time effect that FAILS is a failed compilation, not a
+            // footnote. This used to discard the error, mentioning it only under
+            // TORCL_BFASL_TRACE, so a file whose whole body was
+            // `(eval-when (:compile-toplevel) (error "…"))` compiled
+            // "successfully" and returned (pathname NIL NIL) where SBCL
+            // propagates the error (bliss-wk2q). Silence here is also what hid
+            // bliss-6d8f for a whole session.
+            //
+            // Measured before changing this: a full ironclad build plus
+            // alexandria, cl-ppcre, babel and iterate swallow ZERO compile-time
+            // errors between them, so nothing was relying on the tolerance.
+            // A compile-time effect that FAILS is a failed compilation, not a
+            // footnote. This used to discard the error, mentioning it only under
+            // TORCL_BFASL_TRACE, so a file whose whole body was
+            // `(eval-when (:compile-toplevel) (error "…"))` compiled
+            // "successfully" and returned (pathname NIL NIL) where SBCL
+            // propagates the error (bliss-wk2q). Silence here is also what hid
+            // bliss-6d8f for a whole session.
+            //
+            // Measured before changing this: a full ironclad build plus
+            // alexandria, cl-ppcre, babel and iterate swallow ZERO compile-time
+            // errors between them, so nothing relied on the tolerance.
             if let Err(e) = process_compile_toplevel_form(val, env) {
-                if std::env::var_os("TORCL_BFASL_TRACE").is_some() {
-                    let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
-                    eprintln!("[bfasl] ignored compile-time effect near line {line}: {e}");
-                }
+                let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
+                *compile_time_failure = Some(());
+                return Err(TorclError::FileError(format!(
+                    "{src_path}: compile-time evaluation failed near line {line}: {e}"
+                )));
             }
             let load_forms = compile_file_load_forms(val, env)?;
             let mut effective_package = definition_package;
@@ -14147,25 +14183,46 @@ fn build_bfasl_from_source(
     // pre-read as forms. Downgrade to the source-only artifact: the loader
     // re-reads the text form-by-form WITH evaluation, so the compile-time
     // reader state exists when the custom syntax is reached (bliss-tzc2).
-    let (mut forms, definition_packages) = match read_forms_for_compile(source, env) {
-        Ok(forms) => forms,
-        Err(e) => {
-            if std::env::var_os("TORCL_BFASL_TRACE").is_some() {
-                eprintln!("[bfasl] {src_path}: upfront read failed ({e}); source-only artifact");
+    let mut compile_time_failure = None;
+    let (mut forms, definition_packages) =
+        match read_forms_for_compile(source, src_path, &mut compile_time_failure, env) {
+            Ok(forms) => forms,
+            // A compile-time evaluation that signalled is a FAILED COMPILATION —
+            // propagate it, as SBCL does, rather than writing an artifact that
+            // pretends the file compiled (bliss-wk2q).
+            Err(e) if compile_time_failure.is_some() => return Err(e),
+            Err(e) => {
+                // This downgrade IS load-bearing — iterate installs its `#L` reader
+                // macro from a mid-file eval-when the upfront pass cannot honour — but
+                // it must not be SILENT. It used to say nothing without
+                // TORCL_BFASL_TRACE, so ironclad's whirlpool.lisp quietly became an
+                // artifact that could not be re-loaded in a fresh process, and the
+                // real defect (an unrooted `#.` value, bliss-6d8f) took a whole
+                // session to find. Warn on *error-output* and name the cause
+                // (bliss-wk2q).
+                eprintln!(
+                    "; warning: {src_path}: could not pre-read this file ({e}); \
+                 writing a source-only artifact, which re-reads the text at load \
+                 time and may fail there"
+                );
+                if std::env::var_os("TORCL_BFASL_TRACE").is_some() {
+                    eprintln!(
+                        "[bfasl] {src_path}: upfront read failed ({e}); source-only artifact"
+                    );
+                }
+                return Ok(torcl_rt::bfasl::BfaslBuilder::new()
+                    .content_hash(torcl_rt::bfasl::content_hash(source.as_bytes()))
+                    .section(
+                        torcl_rt::bfasl::section::TOPLEVEL_FORMS,
+                        source.as_bytes().to_vec(),
+                    )
+                    .section(
+                        torcl_rt::bfasl::section::SOURCE_MAP,
+                        src_path.as_bytes().to_vec(),
+                    )
+                    .build());
             }
-            return Ok(torcl_rt::bfasl::BfaslBuilder::new()
-                .content_hash(torcl_rt::bfasl::content_hash(source.as_bytes()))
-                .section(
-                    torcl_rt::bfasl::section::TOPLEVEL_FORMS,
-                    source.as_bytes().to_vec(),
-                )
-                .section(
-                    torcl_rt::bfasl::section::SOURCE_MAP,
-                    src_path.as_bytes().to_vec(),
-                )
-                .build());
-        }
-    };
+        };
     torcl_rt::rooted_ref!(_forms_root = &mut forms);
     match bytecode::build_bbu_from_forms(&forms, &definition_packages, src_path, source, env)? {
         Some(bytecode_unit) => Ok(torcl_rt::bfasl::BfaslBuilder::new()
@@ -19479,11 +19536,21 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             "EVAL" => {
                 // (eval form): evaluate the argument to obtain the form, then
-                // evaluate that form. CL specifies the null lexical environment;
-                // the tree-walker evaluates in the current env, which suffices
-                // for the global/dynamic forms ASDF passes to EVAL.
+                // evaluate that form in the NULL LEXICAL ENVIRONMENT (CLHS EVAL,
+                // 3.1.2.1). It used to reuse the caller's env, so
+                // `(let ((x 42)) (eval 'x))` returned 42 where every other
+                // implementation signals UNBOUND-VARIABLE (bliss-e57h).
+                //
+                // `null_lexical_child` drops exactly the lexical half — variables,
+                // FLET/MACROLET functions, symbol macros, BLOCK/TAGBODY exit
+                // points, LOCALLY specials and declarations — while
+                // `child_with_parent` carries the DYNAMIC half forward: special
+                // bindings live in symbol value cells, and handler clusters,
+                // restarts and dynamic binds are cloned, so a HANDLER-CASE around
+                // the EVAL still catches what the form signals.
                 let (form_form, _) = cp(cdr);
-                let form = eval_form(form_form, env)?;
+                let mut form = eval_form(form_form, env)?;
+                torcl_rt::rooted_ref!(_form_root = &mut form);
                 // The argument is a single-value context: a producer used as the
                 // argument (e.g. READ-FROM-STRING, which returns the object AND
                 // the position) must not leak its secondary values into EVAL's
@@ -19491,7 +19558,18 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // client's `(multiple-value-list (eval (read-from-string …)))`
                 // otherwise showed a spurious extra value).
                 env.clear_mv();
-                return eval_form(form, env);
+                let mut child = env.null_lexical_child();
+                torcl_rt::rooted_ref!(_child_root = &mut child);
+                let result = eval_form(form, &mut child)?;
+                // The inner form's OWN values are EVAL's values, so republish the
+                // child's multiple-value state on the caller.
+                if child.mv_active {
+                    let values = child.mv.clone();
+                    env.set_mv(values);
+                } else {
+                    env.clear_mv();
+                }
+                return Ok(result);
             }
             "COMPILE" => {
                 // (compile name &optional definition) — CLHS 3.2. torcl functions
@@ -21613,6 +21691,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     Some((absolute, comps)) => {
                         let kw = |s: &str| resolve_sym(s).unwrap_or(NIL);
                         let mut elems = Vec::with_capacity(comps.len() + 1);
+                        // Root the accumulator in place: each `make_lisp_string`
+                        // below allocates and `resolve_sym` can intern, so a
+                        // relocating minor GC on component N would leave the
+                        // strings already pushed for components < N as stale
+                        // pointers, and `vec_to_list` would then build the result
+                        // out of them. This handler runs 2062 times during a
+                        // first-load of Babel alone (bliss-noqr).
+                        torcl_rt::rooted_ref!(_elems_root = &mut elems);
                         elems.push(kw(if absolute { ":ABSOLUTE" } else { ":RELATIVE" }));
                         for c in comps {
                             elems.push(match c {
@@ -30596,19 +30682,24 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     body = mx_each(body, env, 0);
     if name_form.is_symbol() {
         // Ordinary global function → the symbol's heap function cell
-        // (bliss-jtc.6.8). Redefinition updates the existing function object in
-        // place so its identity (and any attached tiering state) is stable.
+        // (bliss-jtc.6.8). Redefinition installs a NEW function object.
+        //
+        // It used to mutate the existing object in place "so its identity (and
+        // any attached tiering state) is stable", but a function object IS its
+        // definition: CLHS has FDEFINITION return the function, and a later DEFUN
+        // of the name install a different one. Mutating in place meant a saved
+        // object silently became the new code, so the classic wrapper idiom
+        //
+        //   (defvar *saved* (fdefinition 'target))
+        //   (defun target () (list :wrapper (funcall *saved*)))
+        //
+        // recursed until the stack overflowed, where SBCL returns
+        // (:WRAPPER :ORIGINAL) (bliss-evpx). The tiering rationale did not hold
+        // either: `redefine` resets tier, entry and both counters, so that state
+        // is discarded whichever way the new definition lands.
         let idx = name_form.as_symbol_index();
-        match torcl_rt::symbols::symbol_function(idx) {
-            Some(existing) if torcl_rt::function::is_interpreted_function(existing) => {
-                // SAFETY: `existing` is an interpreted-function object.
-                unsafe { torcl_rt::function::redefine(existing, params_form, body, NIL) };
-            }
-            _ => {
-                let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
-                torcl_rt::symbols::set_symbol_function(idx, f);
-            }
-        }
+        let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
+        torcl_rt::symbols::set_symbol_function(idx, f);
         // Register the name as present INTERNAL in CL-USER so FIND-SYMBOL reports
         // :INTERNAL, not a fabricated :INHERITED (bliss-v15i).
         home_defined_symbol(env, name_form);
@@ -30666,25 +30757,11 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 if place.is_symbol() {
                     if let Some(msym) = resolve_sym(&setf_writer_symbol_name(&sym_name(place))) {
                         let midx = msym.as_symbol_index();
-                        match torcl_rt::symbols::symbol_function(midx) {
-                            Some(existing)
-                                if torcl_rt::function::is_interpreted_function(existing) =>
-                            {
-                                // SAFETY: `existing` is an interpreted-function object.
-                                unsafe {
-                                    torcl_rt::function::redefine(existing, params_form, body, NIL)
-                                };
-                            }
-                            _ => {
-                                let f = torcl_rt::function::alloc_interpreted(
-                                    params_form,
-                                    body,
-                                    NIL,
-                                    msym,
-                                );
-                                torcl_rt::symbols::set_symbol_function(midx, f);
-                            }
-                        }
+                        // A NEW object, as for the plain-symbol case above: a
+                        // saved `(setf place)` writer must keep its own
+                        // definition (bliss-evpx).
+                        let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, msym);
+                        torcl_rt::symbols::set_symbol_function(midx, f);
                     }
                 }
             }
@@ -39995,10 +40072,10 @@ mod jtc6_8_function_object_tests {
 
     /// bliss-jtc.6.8: DEFUN of an ordinary symbol installs a heap interpreted-
     /// function object in the symbol's function cell (with zeroed FnMeta), the
-    /// call path resolves through it, and redefinition updates the object in
-    /// place — preserving identity — while changing behaviour.
+    /// call path resolves through it, and redefinition installs a NEW object
+    /// (bliss-evpx) while leaving the previous one callable and unchanged.
     #[test]
-    fn defun_installs_identity_stable_function_object_in_the_cell() {
+    fn defun_installs_a_fresh_function_object_in_the_cell() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
 
@@ -40021,17 +40098,51 @@ mod jtc6_8_function_object_tests {
             TorclVal::from_fixnum(5)
         );
 
-        // Redefinition preserves object identity (tiering/IC/deopt key off it)
-        // while changing behaviour.
+        // Redefinition installs a NEW function object and leaves the old one
+        // alone. This assertion used to be the opposite — "redefinition must
+        // reuse the same function object (stable identity)", justified as
+        // "tiering/IC/deopt key off it" — but a function object IS its
+        // definition (CLHS: FDEFINITION returns the function; a later DEFUN
+        // installs a different one), and mutating in place made a saved
+        // `(fdefinition 'f)` silently become the new code, so the standard
+        // wrapper idiom recursed to a stack overflow (bliss-evpx).
+        //
+        // Neither half of the justification held: `function::redefine` resets
+        // tier, entry and both counters, so tiering state is discarded whichever
+        // way the definition lands, and baked direct calls are invalidated by
+        // symbol plus the global DIRECT_CALL_GEN counter (bliss-zhvn), not by
+        // object identity — a promoted function redefined observably does pick up
+        // its new definition, and so does a caller compiled while it was hot.
         read_eval_all_env("(defun c2b-op (x y) (* x y))", &mut env).expect("redefun");
         let f2 = torcl_rt::symbols::symbol_function(idx).expect("still bound");
-        assert_eq!(
+        assert_ne!(
             f2, f,
-            "redefinition must reuse the same function object (stable identity)"
+            "redefinition must install a NEW function object, leaving the saved one intact"
+        );
+        assert!(
+            torcl_rt::function::is_interpreted_function(f2),
+            "the replacement is also a heap interpreted-function object"
+        );
+        assert_eq!(
+            torcl_rt::function::tier(f2),
+            0,
+            "the replacement starts at tier 0"
         );
         assert_eq!(
             read_eval_all_env("(c2b-op 2 3)", &mut env).expect("call2"),
             TorclVal::from_fixnum(6)
+        );
+        // The OLD object still runs the OLD code — the property bliss-evpx is
+        // about, checked here at the object level as well as through Lisp.
+        assert_eq!(
+            apply_function(
+                f,
+                &[TorclVal::from_fixnum(2), TorclVal::from_fixnum(3)],
+                &mut env
+            )
+            .expect("the saved object is still callable"),
+            TorclVal::from_fixnum(5),
+            "the saved object must keep its original definition"
         );
     }
 
