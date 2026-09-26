@@ -7397,7 +7397,11 @@ fn foreign_callback_runner(
 ) -> Result<TorclVal, TorclError> {
     torcl_rt::rooted!(entry = entry);
     rooted_args!(arguments = arguments);
-    let mut env = Env::new_impl(false, false, false);
+    // A reentrant callback needs a fresh control environment, not a new
+    // definition registry. Adopt this thread's live definitions just as a
+    // macro-expansion environment does; replacing them loses SETF expanders
+    // inside the callback and leaves later expansions with dead weak tables.
+    let mut env = Env::new_impl(false, false, true);
     torcl_rt::rooted_ref!(_env_root = &mut env);
     // Foreign frames cannot carry Lisp nonlocal exits. Keep caller tokens, but
     // discard values belonging to an exit that failed to leave this callback.

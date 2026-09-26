@@ -4,6 +4,51 @@
 use std::process::Command;
 
 #[test]
+fn callbacks_reuse_live_setf_expanders_across_nested_entries() {
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
+          (defun callback-cell (cell) (car cell))
+          (defun store-callback-cell (cell value) (setf (car cell) value))
+          (defsetf callback-cell store-callback-cell)
+          (let* ((inner (torcl-ffi:make-callback
+                          (lambda ()
+                            (eval '(let ((cell (list 0)))
+                                     (setf (callback-cell cell) 7)
+                                     (callback-cell cell))))
+                          :int nil))
+                 (outer (torcl-ffi:make-callback
+                          (lambda ()
+                            (torcl-ffi:foreign-call
+                              (torcl-ffi:callback-pointer inner) :int nil nil))
+                          :int nil)))
+            (dotimes (i 3)
+              (assert (= 7 (torcl-ffi:foreign-call
+                             (torcl-ffi:callback-pointer outer) :int nil nil))))
+            (torcl-ffi:free-callback outer)
+            (torcl-ffi:free-callback inner))
+          (assert (= 9 (funcall (compile nil
+                         '(lambda ()
+                            (let ((cell (list 0)))
+                              (setf (callback-cell cell) 9)
+                              (callback-cell cell)))))))
+          (format t "CALLBACK-SETF-OK~%")
+        "#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CALLBACK-SETF-OK"));
+}
+
+#[test]
 fn host_qsort_calls_allocating_lisp_comparators_and_contains_errors() {
     let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
         .args([
