@@ -197,6 +197,10 @@ pub mod type_id {
     pub const CONDITION_VARIABLE: u8 = 0x1A;
     /// Foreign address and allocation identity: two untraced native words.
     pub const FOREIGN_POINTER: u8 = 0x1B;
+    /// Foreign library registry token: one untraced process-local word.
+    pub const FOREIGN_LIBRARY: u8 = 0x1C;
+    /// Retained callback registry token: one untraced process-local word.
+    pub const FOREIGN_CALLBACK: u8 = 0x1D;
 }
 
 // ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────

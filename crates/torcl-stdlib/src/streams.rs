@@ -14,6 +14,35 @@ use torcl_rt::value::{EOF, NIL, T, TorclVal};
 
 // ── Gray streams protocol ──────────────────────────────────────────
 
+/// Read a standard character literal from just after its sharp-backslash prefix.
+/// Keep the parser shared with the compiler reader and leave its delimiter unread.
+pub fn read_character_literal(stream: TorclVal, suppress: bool) -> Result<TorclVal, TorclError> {
+    torcl_rt::rooted!(stream = stream);
+    let first = stream_read_char(*stream)?;
+    if first == EOF {
+        return Err(TorclError::StreamError("unexpected end after #\\".into()));
+    }
+    let mut token = vec![first.as_char()];
+    if token[0].is_ascii_alphabetic() {
+        loop {
+            let next = stream_read_char(*stream)?;
+            if next == EOF {
+                break;
+            }
+            if torcl_compiler::reader::character_literal_delimiter(next.as_char()) {
+                stream_unread_char(*stream, next)?;
+                break;
+            }
+            token.push(next.as_char());
+        }
+    }
+    if suppress {
+        Ok(NIL)
+    } else {
+        torcl_compiler::reader::read_char_literal(&token, 0).map(|(value, _)| value)
+    }
+}
+
 /// Gray stream operations trait. R5.23 / R5.113.
 pub trait GrayStream {
     fn stream_read_char(&mut self) -> Result<TorclVal, TorclError>;

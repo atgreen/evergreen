@@ -533,8 +533,8 @@ they use fixed-arity, non-variadic signatures.
 | `STRING` | `Pointer(Int{8})` | CL→C | UTF-8 copy with null terminator; pinned |
 | `(ALIEN *)` | `Pointer` | Both | Raw pointer, no GC tracking |
 | `STRUCT` | `Struct` by value | Both | Classified into registers or memory by TorCL's target ABI planner (R2.14) |
-| `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` | `Pointer(Int{8})` + length | CL→C | Data pointer into the array's backing store (pinned for duration of call); length passed as a separate `size_t` argument. Caller must declare layout via `DEFINE-ALIEN-ROUTINE`. |
-| `(SIMPLE-ARRAY <element-type>)` | `Pointer(<alien>)` + length | CL→C | Same pin-and-pass strategy; element type maps per this table. The C side receives a raw pointer to contiguous element data. |
+| `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` | `Pointer(Int{8})` + length | Both | Scoped copy-in/copy-out to stable native storage; length passed separately. Lisp storage is never exposed as a stable C address. |
+| Numeric vector | `Pointer(<alien>)` + length | Both | Same scoped copy, with explicit scalar element layout rather than inferring C layout from upgraded Lisp array element types. |
 
 ### 2.7.4 Call Flow
 
@@ -557,17 +557,45 @@ the thread's CL stack is quiescent and scannable without cooperation.
 
 When C code needs to call back into CL:
 
-1. `TORCL-FFI:MAKE-CALLBACK` allocates an executable trampoline (a
-   small code stub on a writable+executable page).
-2. The trampoline saves C callee-save registers, transitions the
-   thread from `Native` to `Runnable`, pushes a trampoline frame on
-   the CL stack, and calls the CL closure.
-3. On return, the trampoline restores C registers, transitions back
-   to `Native`, and returns the marshalled result.
+1. Callback creation retains the Lisp closure as a precise root and generates
+   a distinct C entry with stable native context. Code is written and then made
+   executable through the W^X allocator; no writable+executable mapping is used.
+2. The entry captures C arguments according to the same target ABI plan used by
+   outbound calls. Its dispatcher enters runnable Lisp state, roots marshalled
+   arguments, and invokes the retained function, independent of its current tier.
+3. On return, the dispatcher restores the preceding runtime state, and the entry
+   places the marshalled result in the C ABI's return location. Lisp nonlocal exits
+   and Rust panics must be contained before they can unwind through foreign frames.
 
-Trampolines are allocated from a pool of executable pages (one page =
-~100 trampolines at 40 bytes each). They are freed when the CL
-callback object is GC'd (weak reference + destructor).
+Callback storage has an explicit foreign lifetime. C may retain its entry after
+Lisp drops its last wrapper, so GC must not implicitly release executable code or
+its closure root. Before explicit release, the caller must retire retained C
+references and finish every active invocation.
+
+The `TORCL-FFI` scalar callback API is:
+
+- `(make-callback function result-type argument-types)` retains a function and
+  returns an opaque `foreign-callback` handle.
+- `(callback-pointer callback)` returns its borrowed C entry pointer.
+- `(free-callback callback)` releases the retained function and executable code.
+  Reentrant release while active is rejected; callers must also prevent future
+  or concurrent C entry before freeing. Raw pointer aliases cannot enforce this.
+- `(callback-error callback)` consumes the latest failure's diagnostic string,
+  or returns `NIL`. This is diagnostic text, not the original Lisp condition.
+
+A failed callback supplies a zero C result and permits C to finish its frames.
+An enclosing foreign call on that thread then signals `FFI-ERROR`; calls on a
+foreign-created thread report through `callback-error`. Handled nested call
+failures do not poison the outer call. Callbacks restored from images are invalid
+and must be recreated, rather than accidentally naming newly allocated entries.
+
+Implementation status: `ffi/callback.rs` generates the SysV AMD64 scalar entry,
+sharing ABI classification with outbound calls. `ffi/managed_callback.rs` retains
+precise closure roots, coordinates GC state transitions, and contains failures;
+the standard-library registry owns entries until explicit release. The evaluator
+supplies rooted function dispatch. Aggregate callbacks, other target ABIs, and
+replacement of the separate legacy Rust `Callback` bootstrap API remain under
+`bliss-124.3` / `bliss-124.5`.
 
 ### 2.7.6 Compiled Foreign Signatures (R2.14)
 
@@ -592,8 +620,16 @@ Implementation status: SysV AMD64 scalar outbound adapters, including variadic
 calls, are implemented in `crates/torcl-rt/src/ffi/call.rs`. Variadic calls retain
 the named-parameter count, promote only trailing arguments, and supply the SysV
 vector-register count. The internal `%ffi-call` primitive accepts an optional
-fifth argument for that named-parameter count. Aggregates, generated callbacks,
-and additional target ABIs remain work under `bliss-124`; unsupported
+fifth argument for that named-parameter count. The runtime `ffi_call_buffered`
+API in `ffi/buffered.rs` supports outbound structs and unions, including packed
+layouts, register-bank rollback, hidden result pointers, and variadic calls.
+It shares argument placement with scalar adapters through `ffi/abi.rs`.
+Callers provide native argument and result buffers with the declared C layouts;
+the adapter copies exactly their declared sizes through padded staging storage.
+It does not publish the result buffer when a callback reports failure.
+Scalar callbacks are implemented as described in §2.7.5. The Lisp buffer interface
+is described below; CFFI integration, aggregate callbacks, and additional target ABIs remain work under
+`bliss-124`; unsupported
 signatures on the generated path signal an FFI error before entering foreign
 code. Other targets temporarily retain the pre-existing bootstrap dispatcher
 in `ffi/legacy.rs`; it is not an implementation of the generated-adapter contract.
@@ -623,8 +659,63 @@ See §8.3 for borrowed-address safety and image-restart semantics.
 
 Errors from this boundary are catchable as `TORCL-FFI:FFI-ERROR`, a subtype of
 `SIMPLE-ERROR`. Public memory entry points and the internal foreign library,
-symbol, and call primitives are denied in sandboxed evaluation. Library objects,
-scoped vector access, and the complete CFFI backend remain work under `bliss-124`.
+symbol, and call primitives are denied in sandboxed evaluation.
+
+`WITH-POINTER-TO-VECTOR-DATA (pointer vector &optional scalar-type)` evaluates
+the vector and type once, copies its entire array storage (ignoring fill pointers)
+into a native buffer, and copies back and frees on normal or nonlocal exit.
+The default layout is `:UNSIGNED-CHAR`; `MAKE-SHAREABLE-BYTE-VECTOR size` creates
+a zero-initialized byte vector. Explicit numeric scalar types permit other C
+layouts. Failed copy-in never copies partially initialized native storage back.
+The body must not resize the vector, free the buffer, or let C retain the pointer
+past the scope. Changes to the Lisp vector during the scope are overwritten by
+copy-out. Multiple values from the body are preserved.
+
+`LOAD-FOREIGN-LIBRARY path` returns an opaque `FOREIGN-LIBRARY` object, distinct
+from a pointer. `FOREIGN-SYMBOL-POINTER name &optional library` searches the named
+library, or the global lookup scope when omitted. In static builds the global
+scope is open libraries followed by the loader's explicit host export surface;
+dynamic builds use the system loader's default scope. The result is a borrowed
+pointer. `CLOSE-FOREIGN-LIBRARY` invalidates its non-reused registry token and
+releases its loader reference, running unload destructors when the last reference
+is released. Before close, callers must retire all calls, callbacks, and retained
+symbol uses from that library. GC does not unload libraries; saved-image library
+objects restore with an invalid token, never a token referring to a new provider.
+
+`FOREIGN-CALL pointer return-type argument-types arguments &optional fixed-count`
+exposes the generated scalar call path, with a supplied fixed-count selecting
+variadic calling. The caller owns signature correctness and symbol lifetime.
+Generated scalar callbacks use the ownership API in §2.7.5. The complete CFFI
+backend, aggregate callbacks, and remaining target ABIs remain work under
+`bliss-124`.
+
+`FOREIGN-CALL-BUFFERED pointer return-type argument-types argument-buffers
+result-buffer &optional fixed-count` exposes native by-value calls without
+imposing a Lisp representation on C structs. Every argument buffer is a foreign
+pointer to the argument's C object representation, including scalars and pointer
+arguments (which therefore require a buffer containing the pointer). Result
+storage receives the exact declared size. The function returns `result-buffer`,
+or `NIL` for `:void`; a void call accepts a null foreign pointer as its result
+buffer. An explicitly supplied fixed count selects variadic calling and trailing
+scalar promotions. The same caller-owned signature and library lifetime contract
+applies as for `FOREIGN-CALL`.
+
+Native descriptors are scalar type names or recursive `(:struct field-type...)`,
+`(:packed-struct field-type...)`, and `(:union variant-type...)` lists. Fields have
+ordinary C alignment, packed structs use byte alignment, and unions overlay
+their variants. `FOREIGN-TYPE-SIZE` and `FOREIGN-TYPE-ALIGNMENT` use the adapter's
+checked layout. Empty aggregates, void fields, improper/cyclic lists, unsupported
+types, nesting beyond 64 levels and oversized layouts signal `FFI-ERROR`.
+
+Owned native buffers are bounds/lifetime checked and copied into stable staging
+storage before entering C. After C returns, copy-back rechecks the destination's
+allocation identity: freeing it in a callback signals `FFI-ERROR`, never a stale
+write. Callback failure leaves result storage unchanged. No allocation-registry
+lock is held across foreign execution. This does not validate borrowed addresses
+or extend the lifetimes of pointers embedded in C objects; those remain the
+caller's responsibility. Sandbox mode denies this entry in both direct and
+function-value dispatch paths. Aggregate descriptors/calls currently target
+SysV AMD64; unsupported targets report `FFI-ERROR`.
 
 ---
 

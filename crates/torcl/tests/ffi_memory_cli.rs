@@ -47,6 +47,8 @@ fn foreign_memory_is_denied_in_sandbox_even_through_funcall() {
     for form in [
         "(torcl-ffi:foreign-alloc 8)",
         "(funcall #'torcl-ffi:make-pointer 1)",
+        "(torcl-ffi:load-foreign-library \"/nonexistent-ffi-sandbox-probe.so\")",
+        "(funcall #'torcl::%foreign-library :symbol \"unused\" nil)",
         "(torcl::%load-foreign-library \"/nonexistent-ffi-sandbox-probe.so\")",
         "(torcl::%foreign-symbol 0 \"unused\")",
         "(torcl::%ffi-call 0 :void nil nil)",
@@ -62,4 +64,73 @@ fn foreign_memory_is_denied_in_sandbox_even_through_funcall() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn scoped_vector_copies_survive_gc_and_copy_back_on_nonlocal_exit() {
+    let program = r#"
+      (let ((vector (torcl-ffi:make-shareable-byte-vector 3)) (saved nil) (evaluations 0))
+        (setf (aref vector 0) 42)
+        (assert (= 17
+          (catch 'done
+            (torcl-ffi:with-pointer-to-vector-data (pointer (progn (incf evaluations) vector))
+              (setf saved pointer)
+              (assert (= 42 (torcl-ffi:mem-ref pointer :uint8)))
+              (dotimes (i 30) (list i i i))
+              (setf (torcl-ffi:mem-ref pointer :uint8 1) 255)
+              (throw 'done 17)))))
+        (assert (= evaluations 1))
+        (assert (equalp vector #(42 255 0)))
+        (assert (handler-case (progn (torcl-ffi:mem-ref saved :uint8) nil) (torcl-ffi:ffi-error () t))))
+      (let ((vector (vector 1.25d0 2.5d0)))
+        (assert (equal '(7 8)
+          (multiple-value-list
+            (torcl-ffi:with-pointer-to-vector-data (pointer vector :double)
+              (assert (= 2.5d0 (torcl-ffi:mem-ref pointer :double 8)))
+              (setf (torcl-ffi:mem-ref pointer :double) 3.75d0)
+              (values 7 8)))))
+        (assert (= 3.75d0 (aref vector 0))))
+      (let ((invalid (vector 1 999)))
+        (assert (handler-case
+                  (progn (torcl-ffi:with-pointer-to-vector-data (pointer invalid)
+                           (error "body must not execute")) nil)
+                  (torcl-ffi:ffi-error () t)))
+        (assert (equalp invalid #(1 999))))
+      (let* ((base (vector 1 2 3 4))
+             (view (make-array 2 :displaced-to base :displaced-index-offset 1)))
+        (torcl-ffi:with-pointer-to-vector-data (pointer view)
+          (assert (= 2 (torcl-ffi:mem-ref pointer :uint8)))
+          (setf (torcl-ffi:mem-ref pointer :uint8) 9))
+        (assert (equalp base #(1 9 3 4))))
+      (let ((vector (make-array 3 :fill-pointer 1 :initial-contents '(1 2 3))))
+        (torcl-ffi:with-pointer-to-vector-data (pointer vector)
+          (setf (torcl-ffi:mem-ref pointer :uint8 2) 7))
+        (assert (= 1 (length vector)))
+        (assert (= 7 (aref vector 2))))
+      (let ((vector (vector 18446744073709551615 0 18446744073709551614)))
+        (torcl-ffi:with-pointer-to-vector-data (pointer vector :uint64)
+          (assert (= 18446744073709551615 (torcl-ffi:mem-ref pointer :uint64)))
+          (setf (torcl-ffi:mem-ref pointer :uint64 8) 18446744073709551613))
+        (assert (equalp vector #(18446744073709551615 18446744073709551613 18446744073709551614))))
+      (assert (null (torcl-ffi:with-pointer-to-vector-data (pointer (vector 0)))))
+      (let ((vector (vector 1 2)) (original nil))
+        (torcl-ffi:with-pointer-to-vector-data (pointer vector)
+          (setf original pointer)
+          (setf pointer (torcl-ffi:inc-pointer pointer 1))
+          (setf (torcl-ffi:mem-ref pointer :uint8) 3))
+        (assert (equalp vector #(1 3)))
+        (assert (handler-case (progn (torcl-ffi:mem-ref original :uint8) nil)
+                  (torcl-ffi:ffi-error () t))))
+      (format t "FOREIGN-VECTOR-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", program])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FOREIGN-VECTOR-OK"));
 }

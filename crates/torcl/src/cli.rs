@@ -7385,7 +7385,43 @@ fn install_evaluator_global_root_scanner() {
         // thread (bliss-q9i1): torcl-rt is the lower layer and cannot call the
         // interpreter directly, so it invokes this host callback.
         torcl_rt::set_thread_entry_runner(thread_entry_runner);
+        #[cfg(all(target_arch = "x86_64", unix))]
+        torcl_rt::ffi::managed_callback::set_callback_runner(foreign_callback_runner);
     });
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn foreign_callback_runner(
+    entry: TorclVal,
+    arguments: &[TorclVal],
+) -> Result<TorclVal, TorclError> {
+    torcl_rt::rooted!(entry = entry);
+    rooted_args!(arguments = arguments);
+    // A reentrant callback needs a fresh control environment, not a new
+    // definition registry. Adopt this thread's live definitions just as a
+    // macro-expansion environment does; replacing them loses SETF expanders
+    // inside the callback and leaves later expansions with dead weak tables.
+    let mut env = Env::new_impl(false, false, true);
+    torcl_rt::rooted_ref!(_env_root = &mut env);
+    // Foreign frames cannot carry Lisp nonlocal exits. Keep caller tokens, but
+    // discard values belonging to an exit that failed to leave this callback.
+    struct CallbackExtent(std::collections::HashSet<String>);
+    impl Drop for CallbackExtent {
+        fn drop(&mut self) {
+            TOPLEVEL_FRAME_BASE.with(|frames| {
+                frames.borrow_mut().pop();
+            });
+            CONTROL_VALUES.with(|values| {
+                values
+                    .borrow_mut()
+                    .retain(|token, _| self.0.contains(token))
+            });
+        }
+    }
+    let tokens = CONTROL_VALUES.with(|values| values.borrow().keys().cloned().collect());
+    TOPLEVEL_FRAME_BASE.with(|frames| frames.borrow_mut().push(frame_addr(&env.frame)));
+    let _extent = CallbackExtent(tokens);
+    apply_function(*entry, arguments, &mut env)
 }
 
 /// Run a Lisp function value to completion on the *current* (freshly spawned)
@@ -10218,6 +10254,7 @@ fn reader_macro_invoker(
     sub: char,
     infix: Option<i64>,
 ) -> Result<(Vec<TorclVal>, usize), TorclError> {
+    torcl_rt::rooted!(handler = handler);
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() {
         return Err(TorclError::StreamError(
@@ -10238,7 +10275,7 @@ fn reader_macro_invoker(
             &text.chars().take(40).collect::<String>()
         );
     }
-    let result = apply_function(handler, &[*stream, sub_val, arg_val], env);
+    let result = apply_function(*handler, &[*stream, sub_val, arg_val], env);
     if dbg {
         match &result {
             Ok(v) => eprintln!(
@@ -16137,12 +16174,34 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         args[0].as_char()
                     )));
                 }
-                return Ok(reader::get_dispatch_macro_character(
-                    rt,
-                    args[0].as_char(),
-                    args[1].as_char(),
-                )?
-                .unwrap_or(NIL));
+                if let Some(handler) =
+                    reader::get_dispatch_macro_character(rt, args[0].as_char(), args[1].as_char())?
+                {
+                    return Ok(handler);
+                }
+                if args[0].as_char() == '#' && args[1].as_char() == '\\' {
+                    let name = resolve_sym("TORCL::%STANDARD-CHARACTER-READER").unwrap();
+                    return Ok(symbol_function_object(env, name).unwrap_or(NIL));
+                }
+                return Ok(NIL);
+            }
+            "TORCL::%STANDARD-CHARACTER-READER" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 3 {
+                    return Err(TorclError::ProgramError(
+                        "standard character reader requires stream, sub-character and argument"
+                            .into(),
+                    ));
+                }
+                let suppress = env
+                    .lookup_var("*READ-SUPPRESS*")
+                    .is_some_and(|v| !v.is_nil());
+                if !args[2].is_nil() && !suppress {
+                    return Err(TorclError::StreamError(
+                        "#\\ does not accept a numeric argument".into(),
+                    ));
+                }
+                return torcl_stdlib::streams::read_character_literal(args[0], suppress);
             }
             "MAKE-DISPATCH-MACRO-CHARACTER" => {
                 let args = eval_args(cdr, env)?;
@@ -16335,6 +16394,30 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
                 return torcl_stdlib::ffi::memory_call(&args);
+            }
+            "TORCL::%FOREIGN-LIBRARY" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::library_call(&args);
+            }
+            "TORCL::%FOREIGN-CALLBACK" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::callback_call(&args);
+            }
+            "TORCL::%FFI-CALL-BUFFERED" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation("FFI access denied".into()));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::ffi::buffered_call(&args);
             }
             "TORCL::%NATIVE-CONDITION" => {
                 let args = eval_args(cdr, env)?;
@@ -16569,7 +16652,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let handle = args[0].as_fixnum() as usize as *mut ();
                 let name = val_as_str(args[1]);
                 // SAFETY: `handle` came from %load-foreign-library; the library
-                // is kept alive for the process lifetime.
+                // must remain loaded while the returned symbol is used.
                 let sym = unsafe { torcl_rt::ffi::foreign_symbol(handle, &name)? };
                 return Ok(TorclVal::from_fixnum(sym as usize as i64));
             }
@@ -16578,12 +16661,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     return Err(TorclError::SandboxViolation("FFI access denied".into()));
                 }
                 // (%ffi-call fn-ptr ret-type arg-types args &optional fixed-count) → result
-                //   fn-ptr    : address from %foreign-symbol (fixnum)
+                //   fn-ptr    : opaque pointer or legacy fixnum address
                 //   ret-type  : an alien-type keyword (see alien_type_from_keyword)
                 //   arg-types : list of alien-type keywords
                 //   args      : list of Lisp values (fixnums/floats/pointers)
                 let args = eval_args(cdr, env)?;
-                if !(4..=5).contains(&args.len()) || !args[0].is_fixnum() {
+                if !(4..=5).contains(&args.len()) {
                     return Err(TorclError::Internal(
                         "%ffi-call requires (fn-ptr ret-type arg-types args &optional fixed-count)"
                             .into(),
@@ -16599,7 +16682,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 } else {
                     None
                 };
-                let fn_ptr = args[0].as_fixnum() as usize as *const ();
+                let fn_ptr = if args[0].is_fixnum() {
+                    args[0].as_fixnum() as usize as *const ()
+                } else {
+                    torcl_rt::ffi::memory::ForeignPointer::from_lisp(args[0])?.call_address()?
+                        as *const ()
+                };
                 let ret_is_string = is_string_alien_kw(args[1]);
                 let ret_type = alien_type_from_keyword(args[1])?;
                 let arg_type_vals = list_to_vec(args[2]);
@@ -29735,13 +29823,23 @@ fn subseq_values(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
             "SUBSEQ requires two or three arguments".into(),
         ));
     }
-    let start = num_val(args[1])? as usize;
+    let index = |value: TorclVal| {
+        if value.is_fixnum() && value.as_fixnum() >= 0 {
+            Ok(value.as_fixnum() as usize)
+        } else {
+            Err(TorclError::TypeError {
+                datum: value,
+                expected: "non-negative sequence index".into(),
+            })
+        }
+    };
+    let start = index(args[1])?;
     let end = args
         .get(2)
         .copied()
-        .map(num_val)
-        .transpose()?
-        .map(|n| n as usize);
+        .filter(|value| !value.is_nil())
+        .map(index)
+        .transpose()?;
     torcl_stdlib::subseq(args[0], start, end)
 }
 
@@ -35796,6 +35894,9 @@ fn apply_function(
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
 fn is_builtin_function(name: &str) -> bool {
+    if name == "TORCL::%STANDARD-CHARACTER-READER" {
+        return true;
+    }
     // TORCL-THREAD is an extension package, not COMMON-LISP. Its names must be
     // recognized by qualified symbol identity: treating every symbol whose
     // bare name is MAKE-THREAD as this builtin made
@@ -35843,6 +35944,9 @@ fn is_builtin_function(name: &str) -> bool {
         "DISASSEMBLE"
             | "TORCL::%NATIVE-MUTEX"
             | "TORCL::%FOREIGN-MEMORY"
+            | "TORCL::%FOREIGN-LIBRARY"
+            | "TORCL::%FOREIGN-CALLBACK"
+            | "TORCL::%FFI-CALL-BUFFERED"
             | "TORCL::%NATIVE-CONDITION"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
@@ -36610,6 +36714,24 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
                 return Err(TorclError::SandboxViolation("FFI access denied".into()));
             }
             torcl_stdlib::ffi::memory_call(args)
+        }
+        "TORCL::%FOREIGN-LIBRARY" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::library_call(args)
+        }
+        "TORCL::%FOREIGN-CALLBACK" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::callback_call(args)
+        }
+        "TORCL::%FFI-CALL-BUFFERED" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation("FFI access denied".into()));
+            }
+            torcl_stdlib::ffi::buffered_call(args)
         }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
@@ -39844,6 +39966,28 @@ mod jtc5_numeric_tests {
                 .unwrap();
             assert_eq!(result, NIL);
             assert!(!env.mv_active);
+        });
+    }
+
+    #[test]
+    fn subseq_accepts_nil_end_and_rejects_noninteger_indices() {
+        with_value_bridge_env(|env| {
+            let result = read_eval_all_env(
+                r#"(progn
+                     (assert (equal (subseq '(1 2 3) 1 nil) '(2 3)))
+                     (assert (equalp (funcall #'subseq #(1 2 3) 1 nil) #(2 3)))
+                     (assert (string= (subseq "abc" 1 nil) "bc"))
+                     (assert (null (subseq nil 0 nil)))
+                     (dolist (index '(0.0 1/2 -1 #c(1 2)))
+                       (assert (handler-case (progn (subseq "abc" index) nil)
+                                 (type-error () t)))
+                       (assert (handler-case (progn (funcall #'subseq "abc" 0 index) nil)
+                                 (type-error () t))))
+                     t)"#,
+                env,
+            )
+            .unwrap();
+            assert_eq!(result, T);
         });
     }
 

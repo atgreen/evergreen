@@ -1164,6 +1164,8 @@ unsafe fn trace_object(
         tid::BIGNUM
         | tid::DOUBLE_FLOAT
         | tid::FOREIGN_POINTER
+        | tid::FOREIGN_LIBRARY
+        | tid::FOREIGN_CALLBACK
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
@@ -3334,6 +3336,72 @@ impl<T: TraceHostRoots + Send + 'static> CrossThreadRoot<T> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         inspect(&value)
+    }
+
+    /// Inspect from a registered Running mutator. Unlike the non-mutator
+    /// reader, this must acknowledge a collector while waiting for its gate:
+    /// the collector owns that gate before asking Running threads to park.
+    /// The same no-allocation/no-unrooted-value-escape contract applies.
+    pub fn with_gc_stable_mutator<R>(&self, inspect: impl FnOnce(&T) -> R) -> R {
+        let _gc_stable = loop {
+            match cross_thread_root_gc_gate().try_read() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    crate::safepoint::poll_safepoint();
+                    std::thread::yield_now();
+                }
+            }
+        };
+        let value = self
+            .inner
+            .value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        inspect(&value)
+    }
+}
+
+#[cfg(test)]
+mod callback_root_admission_tests {
+    use super::*;
+
+    #[test]
+    fn a_running_root_reader_acknowledges_gc_while_waiting_for_the_gate() {
+        const CHILD: &str = "TORCL_CALLBACK_ROOT_GATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::callback_root_admission_tests::a_running_root_reader_acknowledges_gc_while_waiting_for_the_gate", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        ensure_heap_initialized();
+        crate::thread::current_thread_id();
+        let root = CrossThreadRoot::new(TorclVal::from_fixnum(42));
+        let gate = cross_thread_root_gc_gate().write().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            crate::thread::current_thread_id();
+            ready_tx.send(()).unwrap();
+            root.with_gc_stable_mutator(|value| value.as_fixnum())
+        });
+        ready_rx.recv().unwrap();
+        let paused = crate::safepoint::wait_for_all_threads();
+        if paused.is_ok() {
+            crate::safepoint::resume_all_threads().unwrap();
+        }
+        drop(gate);
+        assert_eq!(reader.join().unwrap(), 42);
+        assert!(
+            paused.is_ok(),
+            "a participating reader must poll instead of blocking its collector: {paused:?}"
+        );
     }
 }
 
@@ -5675,9 +5743,15 @@ pub fn serialize_heap_objects() -> Vec<u8> {
         // re-creates the standard ones.
         // Mutexes also own process-local native state. Preserve the Lisp handle
         // but restore it as unavailable, never as a dangling native pointer.
-        if type_id == crate::object::type_id::FOREIGN_POINTER {
+        if matches!(
+            type_id,
+            crate::object::type_id::FOREIGN_POINTER
+                | crate::object::type_id::FOREIGN_LIBRARY
+                | crate::object::type_id::FOREIGN_CALLBACK
+        ) {
             // Neither native addresses nor allocation identities survive an
-            // image restart. Preserve the handle as an ordinary null pointer.
+            // image restart. Restore pointers as null and library tokens as
+            // invalid; a restored token must never name a new library.
             out.resize(out.len() + size, 0);
         } else if matches!(
             type_id,

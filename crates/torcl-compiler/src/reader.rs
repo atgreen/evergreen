@@ -2450,6 +2450,19 @@ fn read_sharpsign_with_base(
                 ));
             }
         };
+        if let Some(result) = try_custom_sharp_dispatch(
+            chars,
+            pos + 1,
+            chars[pos],
+            Some(num as i64),
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth,
+        ) {
+            return result;
+        }
         match chars[pos].to_ascii_uppercase() {
             'R' => {
                 pos += 1;
@@ -2549,6 +2562,19 @@ fn read_sharpsign_with_base(
     }
     let dispatch = chars[pos];
     pos += 1;
+    if let Some(result) = try_custom_sharp_dispatch(
+        chars,
+        pos,
+        dispatch,
+        None,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth,
+    ) {
+        return result;
+    }
     match dispatch {
         '\'' => {
             let (mut val, p) = read_token_with_base(
@@ -2697,7 +2723,14 @@ fn read_sharpsign_with_base(
     }
 }
 
-fn read_char_literal(chars: &[char], pos: usize) -> Result<(TorclVal, usize), TorclError> {
+/// A delimiter following a character-name token, shared with stream readers.
+pub fn character_literal_delimiter(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '(' | ')' | '"' | '\'' | '`' | ',' | ';')
+}
+
+/// Parse the token following standard sharp-backslash syntax, without consulting
+/// user dispatch handlers. Also used by the callable standard stream handler.
+pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(TorclVal, usize), TorclError> {
     if pos >= chars.len() {
         return Err(TorclError::StreamError("unexpected end after #\\".into()));
     }
@@ -2711,10 +2744,7 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(TorclVal, usize), To
     // A non-alphabetic first character is the character itself (`#\)`,
     // `#\\`, etc.); only an alphabetic start introduces a named character.
     if chars[pos].is_ascii_alphabetic() {
-        while end < chars.len()
-            && !chars[end].is_whitespace()
-            && !matches!(chars[end], '(' | ')' | '"' | '\'' | '`' | ',' | ';')
-        {
+        while end < chars.len() && !character_literal_delimiter(chars[end]) {
             end += 1;
         }
     }

@@ -3881,7 +3881,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                 '("FOREIGN-POINTER" "POINTERP" "MAKE-POINTER" "POINTER-ADDRESS"
                   "POINTER-EQ" "NULL-POINTER" "NULL-POINTER-P" "INC-POINTER"
                   "FOREIGN-ALLOC" "FOREIGN-FREE" "MEM-REF" "MEM-SET"
-                  "FOREIGN-TYPE-SIZE" "FOREIGN-TYPE-ALIGNMENT" "FFI-ERROR"))
+                  "FOREIGN-TYPE-SIZE" "FOREIGN-TYPE-ALIGNMENT" "FFI-ERROR"
+                  "MAKE-SHAREABLE-BYTE-VECTOR" "WITH-POINTER-TO-VECTOR-DATA"
+                  "FOREIGN-LIBRARY" "FOREIGN-LIBRARY-P" "LOAD-FOREIGN-LIBRARY"
+                  "CLOSE-FOREIGN-LIBRARY" "FOREIGN-SYMBOL-POINTER" "FOREIGN-CALL"
+                  "FOREIGN-CALL-BUFFERED"
+                  "FOREIGN-CALLBACK" "FOREIGN-CALLBACK-P" "MAKE-CALLBACK"
+                  "CALLBACK-POINTER" "FREE-CALLBACK" "CALLBACK-ERROR"))
         "TORCL-FFI")
 (define-condition torcl-ffi:ffi-error (simple-error) ())
 (defun torcl-ffi:pointerp (value) (torcl::%foreign-memory :pointerp value))
@@ -3902,3 +3908,58 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (torcl-ffi:mem-set value pointer type offset))
 (defun torcl-ffi:foreign-type-size (type) (torcl::%foreign-memory :type-size type))
 (defun torcl-ffi:foreign-type-alignment (type) (torcl::%foreign-memory :type-alignment type))
+
+(defun torcl-ffi:make-shareable-byte-vector (size)
+  (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
+
+(defun torcl-ffi:foreign-library-p (value) (torcl::%foreign-library :p value))
+(deftype torcl-ffi:foreign-library () '(satisfies torcl-ffi:foreign-library-p))
+(defun torcl-ffi:load-foreign-library (path) (torcl::%foreign-library :load path))
+(defun torcl-ffi:close-foreign-library (library) (torcl::%foreign-library :close library))
+(defun torcl-ffi:foreign-symbol-pointer (name &optional library)
+  (torcl::%foreign-library :symbol name library))
+(defun torcl-ffi:foreign-call (pointer return-type argument-types arguments &optional (fixed-count nil variadic-p))
+  (if variadic-p
+      (torcl::%ffi-call pointer return-type argument-types arguments fixed-count)
+      (torcl::%ffi-call pointer return-type argument-types arguments)))
+
+(defun torcl-ffi:foreign-call-buffered (pointer return-type argument-types argument-buffers result-buffer
+                                      &optional (fixed-count nil variadic-p))
+  (if variadic-p
+      (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer fixed-count)
+      (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer)))
+
+;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
+;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures
+;;; return zero to C, then signal FFI-ERROR after the enclosing foreign call;
+;;; CALLBACK-ERROR consumes diagnostic text, also for foreign-thread failures.
+(defun torcl-ffi:foreign-callback-p (value) (torcl::%foreign-callback :p value))
+(deftype torcl-ffi:foreign-callback () '(satisfies torcl-ffi:foreign-callback-p))
+(defun torcl-ffi:make-callback (function return-type argument-types)
+  (check-type function function)
+  (torcl::%foreign-callback :make function return-type argument-types))
+(defun torcl-ffi:callback-pointer (callback) (torcl::%foreign-callback :pointer callback))
+(defun torcl-ffi:free-callback (callback) (torcl::%foreign-callback :free callback))
+(defun torcl-ffi:callback-error (callback) (torcl::%foreign-callback :error callback))
+
+;;; Copying is deliberate: Lisp storage can move, and upgraded array element
+;;; types need not have C layout. The pointer is valid only inside this scope.
+(defmacro torcl-ffi:with-pointer-to-vector-data ((pointer vector &optional (type :unsigned-char)) &body body)
+  (let ((v (gensym "VECTOR")) (ty (gensym "TYPE")) (ready (gensym "COPIED"))
+        (storage (gensym "STORAGE")))
+    `(let* ((,v ,vector)
+            (,ty ,type)
+            (,storage (torcl-ffi:foreign-alloc (torcl::%foreign-memory :vector-size ,v ,ty)))
+            (,pointer ,storage)
+            (,ready nil))
+       ;; Keep all values in the protected form's primary value across cleanup
+       ;; (also on bytecode, whose general MV cleanup issue is bliss-pfgq).
+       (values-list
+         (unwind-protect
+             (progn
+               (torcl::%foreign-memory :copy-in ,storage ,v ,ty)
+               (setf ,ready t)
+               (multiple-value-list (progn ,@body)))
+           (unwind-protect
+               (when ,ready (torcl::%foreign-memory :copy-out ,storage ,v ,ty))
+             (torcl-ffi:foreign-free ,storage)))))))

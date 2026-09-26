@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum Scalar {
+pub(super) enum Scalar {
     Void,
     Integer { bits: u8, signed: bool },
     Float,
@@ -15,7 +15,7 @@ enum Scalar {
 }
 
 impl Scalar {
-    fn from_type(ty: &AlienType) -> Result<Self, TorclError> {
+    pub(super) fn from_type(ty: &AlienType) -> Result<Self, TorclError> {
         match ty {
             AlienType::Void => Ok(Self::Void),
             AlienType::Int {
@@ -98,39 +98,50 @@ impl CallAdapter {
 }
 
 #[derive(Clone, Copy)]
-enum Location {
+pub(super) enum Location {
     Integer(u8),
     Sse(u8),
     Stack(u32),
 }
 
-fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
-    // SysV AMD64 scalar classification (§3.2.3). Integer and SSE registers
-    // are allocated independently; exhausted classes spill in argument order.
-    const INTEGER_REGISTERS: [u8; 6] = [7, 6, 2, 1, 8, 9];
-    let (mut integers, mut sse, mut stack_bytes) = (0, 0, 0u32);
-    let mut locations = Vec::with_capacity(signature.arguments.len());
-    for argument in &signature.arguments {
-        let location = match argument {
-            Scalar::Integer { .. } if integers < 6 => {
-                let register = INTEGER_REGISTERS[integers];
-                integers += 1;
-                Location::Integer(register)
-            }
-            Scalar::Float | Scalar::Double if sse < 8 => {
-                let register = sse;
-                sse += 1;
-                Location::Sse(register)
-            }
-            _ => {
-                let offset = stack_bytes;
-                stack_bytes = stack_bytes.checked_add(8).ok_or_else(signature_too_large)?;
-                Location::Stack(offset)
-            }
-        };
-        locations.push(location);
+pub(super) struct ScalarPlan {
+    pub(super) locations: Vec<Location>,
+    pub(super) stack_bytes: u32,
+    pub(super) sse: u8,
+}
+
+/// The same scalar ABI assignment is used by outbound calls and inbound entries.
+pub(super) fn classify(arguments: &[Scalar]) -> Result<ScalarPlan, TorclError> {
+    if arguments.len() > (i32::MAX as usize - 16) / 8 {
+        return Err(signature_too_large());
     }
-    let frame_bytes = stack_bytes
+    // Scalars are the one-eightbyte case of the same placement used for
+    // aggregates. Callback entries consume this plan as well as outbound calls.
+    let layouts: Vec<_> = arguments
+        .iter()
+        .copied()
+        .map(super::abi::Layout::scalar)
+        .collect();
+    let plan = super::abi::assign(&layouts, false)?;
+    let locations = plan
+        .placements
+        .into_iter()
+        .map(|placement| match placement {
+            super::abi::Placement::Registers(pieces) => pieces.into_iter().next().unwrap().1,
+            super::abi::Placement::Stack(offset) => Location::Stack(offset),
+        })
+        .collect();
+    Ok(ScalarPlan {
+        locations,
+        stack_bytes: plan.stack_bytes,
+        sse: plan.sse,
+    })
+}
+
+fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
+    let plan = classify(&signature.arguments)?;
+    let frame_bytes = plan
+        .stack_bytes
         .checked_add(15)
         .ok_or_else(signature_too_large)?
         & !15;
@@ -148,7 +159,7 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
         0x48, 0x81, 0xec, // sub rsp,frame_bytes
     ];
     code.extend_from_slice(&frame_bytes.to_le_bytes());
-    for (index, location) in locations.iter().enumerate() {
+    for (index, location) in plan.locations.iter().enumerate() {
         code.extend_from_slice(&[0x49, 0x8b, 0x82]); // mov rax,[r10+disp32]
         code.extend_from_slice(&((index * 8) as u32).to_le_bytes());
         // Extend narrow C integers to 32 bits. Clang callees may rely on the
@@ -190,7 +201,7 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
         // including those occupied by named arguments. All argument moves are
         // complete, so eax is available as scratch without clobbering a value.
         code.push(0xb8); // mov eax,imm32
-        code.extend_from_slice(&(sse as u32).to_le_bytes());
+        code.extend_from_slice(&(plan.sse as u32).to_le_bytes());
     }
     code.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11
     match signature.result {
