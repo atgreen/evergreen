@@ -5664,9 +5664,26 @@ impl<'e> Lowerer<'e> {
         }
         let enclosing: std::collections::HashSet<&String> =
             self.scopes.iter().flat_map(|s| s.keys()).collect();
-        used.into_iter()
-            .filter(|u| !params.contains(u) && enclosing.contains(u))
-            .collect()
+        let mut captured = Vec::new();
+        for name in used {
+            if params.contains(&name) {
+                continue;
+            }
+            if enclosing.contains(&name) {
+                captured.push(name);
+                continue;
+            }
+            // A visible local FUNCTION this closure calls is captured too — the
+            // closure reaches it through the same heap frame. Its binding is keyed
+            // in the function namespace, so the plain name the body mentions does
+            // not match a scope key (bliss-7ex8); report the key, which is what
+            // the caller checks for boxing and passes on as a capture.
+            let key = closure_fn_binding_key(&name);
+            if enclosing.contains(&key) {
+                captured.push(key);
+            }
+        }
+        captured
     }
 
     /// Emit a closure value for `form` (a `(lambda …)` / `(function …)` form)

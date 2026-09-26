@@ -1974,7 +1974,13 @@ fn a_local_function_binding_does_not_shadow_a_variable_of_the_same_name() {
              (cont :v)))\n\
          (defun sharp-quoted (cont)\n\
            (flet ((cont (x) (list :fn x)))\n\
-             (list (funcall #'cont :sharp) (funcall cont :as-variable))))\n",
+             (list (funcall #'cont :sharp) (funcall cont :as-variable))))\n\
+         (defun closure-in-body (things)\n\
+           ;; A closure in the FLET BODY calling the local function must still\n\
+           ;; reach it: the binding is in the function namespace, so the plain\n\
+           ;; name the closure body mentions has to count as a capture.\n\
+           (flet ((str (x) (string x)))\n\
+             (mapcar (lambda (x) (str x)) things)))\n",
     );
     let script = dir.join("run.lisp");
     write_file(
@@ -1987,7 +1993,8 @@ fn a_local_function_binding_does_not_shadow_a_variable_of_the_same_name() {
                      (probe-capturing #'outer :t)\n\
                      (wrap #'outer)\n\
                      (wrap-labels #'outer)\n\
-                     (sharp-quoted #'outer)))\n",
+                     (sharp-quoted #'outer)\n\
+                     (closure-in-body '(a bb))))\n",
             source = source.to_str().expect("utf8 path")
         ),
     );
@@ -2012,7 +2019,8 @@ fn a_local_function_binding_does_not_shadow_a_variable_of_the_same_name() {
 ((:OUTER :AS-VARIABLE) (:FN :AS-FUNCTION :T)) \
 (:OUTER (:WRAPPED :V)) \
 (:OUTER (:LABELS :V)) \
-((:FN :SHARP) (:OUTER :AS-VARIABLE)))"
+((:FN :SHARP) (:OUTER :AS-VARIABLE)) \
+(\"A\" \"BB\"))"
             ),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout),
