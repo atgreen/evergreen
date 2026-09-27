@@ -3,12 +3,12 @@
 TorCL can be cross-built on Linux as a Windows console executable:
 `target/x86_64-pc-windows-gnu/release/torcl.exe`.
 
-The port supports the interpreter, T0 bytecode, native T1 compilation, and
-T0-to-T1 on-stack replacement (OSR). T1 preserves moving-GC roots, resumes
-bytecode at failed speculation guards, and supports direct native calls.
-Optimizing T2 compilation, fiber switching, and structured-exception recovery
-are not supported yet. Forcing T2 retains T1 where eligible, with bytecode
-fallback for unsupported shapes. DLL loading and symbol lookup are available; global
+The port supports the interpreter, T0 bytecode, native T1 and optimizing T2
+compilation, and on-stack replacement (OSR) from T0 to T1 and T1 to T2.
+Native code preserves moving-GC roots, resumes bytecode at failed speculation
+guards, and supports direct native calls. Unsupported compilation shapes retain
+their lower tier. Fiber switching and structured-exception recovery are not
+supported yet. DLL loading and symbol lookup are available; global
 Unix-style symbol lookup requires choosing a DLL explicitly on Windows.
 
 Foreign calls and callbacks use generated Win64 adapters. They support
@@ -21,8 +21,9 @@ returned by value, including variadic calls. Indirect aggregate arguments use
 private aligned copies so C cannot overwrite the caller's original object.
 
 Generated adapters use write-then-execute protection, probe large stack frames,
-and retain registered Win64 unwind metadata for their lifetime. Native T1
-functions also register unwind ranges for their normal and OSR entries.
+and retain registered Win64 unwind metadata for their lifetime. Native T1 and
+T2 functions register unwind ranges for their normal, compiled-register (T2),
+and OSR entries. T2 probes large spill frames and temporary deoptimization buffers.
 
 ## Build on Linux
 
@@ -101,10 +102,12 @@ scripts/windows-port.sh test
 This builds the release executable and creates a temporary, isolated Wine
 prefix. It runs Windows memory/protection, timing/thread, DLL-lifetime and stack
 budget tests, then the CLI functional tests in interpreter, bytecode, default,
-and forced-T2 fallback modes. Native tests assert T1 promotion and OSR entry,
+and forced-T2 modes. Native tests assert T1/T2 promotion and OSR entry,
 compare arithmetic and deoptimization against interpretation, exercise direct
 calls and error propagation under GC stress, and unwind normal/OSR frames and
-temporary direct-call stack saves. Runtime tests also execute small Win64 functions,
+temporary direct-call stack saves. T2 tests check large deoptimization buffers
+and OS unwinding at every decoded instruction boundary across multiple frame
+sizes, including stack probes. Runtime tests also execute small Win64 functions,
 check read/execute protection and release, and exercise the OS unwinder at
 generated prologue/epilogue boundaries. Additional checks cover `USERPROFILE` without
 `HOME`, catchable recursive stack exhaustion, moving-GC stress with poison,

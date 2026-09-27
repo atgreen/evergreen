@@ -16721,6 +16721,8 @@ impl torcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 
 struct T2Artifact {
     code: Vec<u8>,
+    #[cfg(all(target_arch = "x86_64", windows))]
+    windows_unwind: Vec<torcl_compiler::t2::emit::WindowsUnwindRange>,
     compiled_entry: usize,
     osr_entries: Vec<(u32, usize)>,
     /// Sparse bytecode→native map for the viewer (bliss-zmmb).
@@ -17331,6 +17333,24 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
             deopt_bodies: std::mem::take(&mut artifact.deopt_bodies),
         }))
     };
+    #[cfg(all(target_arch = "x86_64", windows))]
+    let buf = {
+        let ranges: Vec<_> = artifact
+            .windows_unwind
+            .iter()
+            .map(|range| torcl_rt::jit::WindowsUnwindInfo {
+                begin: range.begin,
+                end: range.end,
+                unwind_info: &range.unwind_info,
+            })
+            .collect();
+        // Every T2 entry shares the emitter's fixed-RBP frame, but each
+        // prologue has its own RUNTIME_FUNCTION range in this allocation.
+        unsafe {
+            torcl_rt::jit::JitBuffer::new_with_windows_unwind_ranges(&artifact.code, &ranges)
+        }?
+    };
+    #[cfg(not(all(target_arch = "x86_64", windows)))]
     let buf = torcl_rt::jit::JitBuffer::new(&artifact.code)?;
     let entry = buf.leak();
     maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
@@ -19440,11 +19460,6 @@ macro_rules! t2_log {
 }
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
-    // The framed T2 emitter still uses SysV calls and lacks Win64 unwind data.
-    // T1 becoming available must not publish that code on Windows.
-    if cfg!(windows) {
-        return None;
-    }
     let sym = input.sym;
     let bf = input.body.as_ref();
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
@@ -19669,6 +19684,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
 
     Some(T2Artifact {
         code,
+        #[cfg(all(target_arch = "x86_64", windows))]
+        windows_unwind: framed.windows_unwind,
         compiled_entry: framed.compiled_entry,
         osr_entries: framed.osr_entries,
         bcp_offsets: framed.bcp_offsets,
@@ -21054,6 +21071,8 @@ mod jtc4_stack_map_tests {
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
         let valid = T2Artifact {
             code: vec![0x90; 8],
+            #[cfg(all(target_arch = "x86_64", windows))]
+            windows_unwind: vec![],
             compiled_entry: 0,
             osr_entries: vec![],
             bcp_offsets: vec![],

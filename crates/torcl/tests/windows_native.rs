@@ -27,6 +27,37 @@ fn run_with_stderr(program: &str, env: &[(&str, &str)]) -> (String, String) {
 }
 
 #[test]
+fn windows_t2_allocations_and_precise_deopt_preserve_roots_and_effects() {
+    let program = r#"
+      (setq *native-t2-count* 0)
+      (defun native-t2-alloc (x)
+        (let ((tail (cons x nil)))
+          (setq *native-t2-count* (+ *native-t2-count* 1))
+          (cons (+ x 1) tail)))
+      (dotimes (i 40) (native-t2-alloc i))
+      (format t "~D~%" (torcl-ext:function-tier 'native-t2-alloc))
+      (setq *native-t2-count* 0)
+      (let ((before (torcl-ext:deopt-count)))
+        (format t "~S ~D ~S~%" (native-t2-alloc 0.5) *native-t2-count*
+          (> (torcl-ext:deopt-count) before)))
+    "#;
+    for stress in ["0", "1"] {
+        assert_eq!(
+            run(
+                program,
+                &[
+                    ("TORCL_DISABLE_T2", "0"),
+                    ("TORCL_FORCE_TIER", "t2"),
+                    ("TORCL_GC_STRESS", stress),
+                    ("TORCL_GC_POISON", "1"),
+                ]
+            ),
+            "2\n(1.5 0.5) 1 T\nNIL\n"
+        );
+    }
+}
+
+#[test]
 fn windows_direct_native_call_stops_at_a_callee_error() {
     let program = r#"
       (defun native-pair (x) (cons x nil))

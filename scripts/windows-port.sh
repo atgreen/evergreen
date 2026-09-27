@@ -43,9 +43,10 @@ TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked
 scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test ffi_aggregate_cli
 scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --lib windows_t1_frame_restores_nonvolatile_state_at_all_boundaries
 scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test windows_native --test t1_native --test t1_deopt --test t1_fuzz --test direct_call_invalidation
-scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test native_transfer_cli -- --skip t2_calls_stop_before_later_side_effects
+scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test native_transfer_cli --test tier_observability
 scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target" --lib declines_sysv_code_on_windows
 scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target" --lib runtime_helper
+scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target" --lib windows_t2
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test test_tcp_streams --test test_process -- --test-threads=1
 child="${CARGO_TARGET_DIR:-target}/$target/release/windows-process-child.exe"

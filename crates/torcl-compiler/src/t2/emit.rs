@@ -19,6 +19,10 @@ use crate::t2::ir::Function;
 use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 use crate::t2::slot_map;
 
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "frame_tests.rs"]
+mod frame_tests;
+
 /// Why emission could not complete (the function stays at T1, spec R4.28/R4.42).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmitError {
@@ -549,11 +553,15 @@ fn float_operand_to_xmm(
 ///   a compiled caller skips the frame load entirely. Result in rax.
 pub struct FramedCode {
     pub code: Vec<u8>,
+    /// Owned unwind records for the independently callable Windows entries.
+    #[cfg(all(target_arch = "x86_64", windows))]
+    pub windows_unwind: Vec<WindowsUnwindRange>,
     /// Byte offset of the compiled-caller entry within `code`.
     pub compiled_entry: usize,
     /// Bytecode loop-header bcp to alternate entry offset.  Each entry accepts
-    /// the live frame-slot pointer in rdi, reconstructs SSA registers, and
-    /// enters the optimized loop without restarting the function.
+    /// the live frame-slot pointer through the platform C ABI (RDI on SysV,
+    /// RCX on Win64), reconstructs SSA registers, and enters the optimized loop
+    /// without restarting the function.
     pub osr_entries: Vec<(u32, usize)>,
     /// Bytecode→native position map for the tiered-JIT viewer (bliss-zmmb):
     /// `bcp_offsets[bcp]` is the earliest native offset carrying that bytecode
@@ -583,6 +591,121 @@ pub struct FramedCode {
     /// True iff the code contains a speculation-guard deopt point (bliss-zhvn):
     /// a non-deopting T2 function is eligible for a direct native→native call.
     pub has_deopt: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", windows))]
+pub struct WindowsUnwindRange {
+    pub begin: u32,
+    pub end: u32,
+    pub unwind_info: Vec<u8>,
+}
+
+/// Common Win64 layout for interpreter, compiled-register and OSR entries.
+/// Spill homes remain RSP-relative; RBP anchors unwinding across temporary
+/// argument/deopt buffers and runtime helper home-space reservations.
+#[cfg(all(target_arch = "x86_64", windows))]
+struct WindowsFrame {
+    saved: Vec<u8>,
+    allocation: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", windows))]
+impl WindowsFrame {
+    fn new(saved: &[u8], spill_bytes: usize) -> Result<Self, EmitError> {
+        let mut saved = saved.to_vec();
+        // Templates use RSI/RDI even when regalloc did not choose them as homes.
+        saved.extend([5, 6, 7]);
+        saved.sort_unstable();
+        saved.dedup();
+        let pad = if saved.len() % 2 == 0 { 8 } else { 0 };
+        let allocation = spill_bytes
+            .checked_add(pad)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or(EmitError::UnsupportedOp(0xFD))? as u32;
+        Ok(Self { saved, allocation })
+    }
+
+    fn prologue(&self, a: &mut Asm) -> Vec<u8> {
+        let start = a.here();
+        let mut codes = Vec::new();
+        for &reg in &self.saved {
+            push_reg(a, reg);
+            codes.push(vec![(a.here() - start) as u8, reg << 4]);
+        }
+        probe_windows_stack(a, self.allocation);
+        if self.allocation != 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+            a.extend_from_slice(&self.allocation.to_le_bytes());
+            let offset = (a.here() - start) as u8;
+            let alloc = self.allocation;
+            if alloc <= 128 {
+                codes.push(vec![offset, (((alloc - 8) / 8) as u8) << 4 | 2]);
+            } else if alloc / 8 <= u16::MAX as u32 {
+                let mut code = vec![offset, 1]; // UWOP_ALLOC_LARGE, scaled u16
+                code.extend_from_slice(&((alloc / 8) as u16).to_le_bytes());
+                codes.push(code);
+            } else {
+                let mut code = vec![offset, 0x11]; // UWOP_ALLOC_LARGE, unscaled u32
+                code.extend_from_slice(&alloc.to_le_bytes());
+                codes.push(code);
+            }
+        }
+        mov_rr(a, 5, 4); // mov rbp, rsp
+        let prologue_len = (a.here() - start) as u8;
+        codes.push(vec![prologue_len, 3]); // UWOP_SET_FPREG
+        let slots: usize = codes.iter().map(|code| code.len() / 2).sum();
+        let mut info = vec![1, prologue_len, slots as u8, 5];
+        for code in codes.into_iter().rev() {
+            info.extend(code);
+        }
+        info.resize((info.len() + 3) & !3, 0);
+        info
+    }
+
+    fn epilogue(&self, a: &mut Asm) {
+        // This exact LEA + POP* + RET form is recognized by RtlVirtualUnwind.
+        a.extend_from_slice(&[0x48, 0x8D, 0xA5]); // lea rsp, [rbp+disp32]
+        a.extend_from_slice(&self.allocation.to_le_bytes());
+        for &reg in self.saved.iter().rev() {
+            pop_reg(a, reg);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", windows))]
+fn probe_windows_stack(a: &mut Asm, allocation: u32) {
+    if allocation >= 4096 {
+        // Probe each intervening page without changing RSP or any entry
+        // argument (including custom compiled arg3 in R10). Stable value homes
+        // exclude both scratch registers, so this also works before temporary
+        // deopt/move buffers. In a prologue, only the earlier pushes need undoing
+        // if a probe faults, before ALLOC and SET_FPREG take effect.
+        mov_rr(a, 11, 4);
+        mov_imm32(a, RAX, allocation);
+        let page = a.label();
+        let last = a.label();
+        a.bind(page);
+        a.extend_from_slice(&[0x48, 0x3D, 0, 16, 0, 0]); // cmp rax, 4096
+        a.jcc(Cc::L, last); // allocation is a checked, nonnegative i32
+        a.extend_from_slice(&[0x49, 0x81, 0xEB, 0, 16, 0, 0]); // sub r11, 4096
+        a.extend_from_slice(&[0x41, 0xF6, 0x03, 0]); // test byte [r11], 0
+        a.extend_from_slice(&[0x48, 0x2D, 0, 16, 0, 0]); // sub rax, 4096
+        a.jmp(page);
+        a.bind(last);
+        alu_rr(a, 0x29, 11, RAX); // sub r11, rax
+        a.extend_from_slice(&[0x41, 0xF6, 0x03, 0]);
+    }
+}
+
+fn jump_to_shared_body(a: &mut Asm, target: torcl_rt::asm::Label) {
+    if cfg!(windows) {
+        // An unconditional jump outside the current RUNTIME_FUNCTION is a
+        // tail return to the Windows unwinder. This still has a live frame.
+        a.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax (scratch)
+        a.jcc(Cc::E, target);
+    } else {
+        a.jmp(target);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -774,6 +897,8 @@ fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)])
         return;
     }
     let bytes = ((moves.len() * 8) + 15) & !15;
+    #[cfg(all(target_arch = "x86_64", windows))]
+    probe_windows_stack(a, bytes as u32);
     a.extend_from_slice(&[0x48, 0x81, 0xEC]);
     a.extend_from_slice(&(bytes as i32).to_le_bytes());
     for (i, (_, src)) in moves.iter().enumerate() {
@@ -3059,17 +3184,45 @@ fn emit_framed_inner(
         s.sort_unstable();
         s
     };
+    #[cfg(not(all(target_arch = "x86_64", windows)))]
     let pad = has_calls && saved.len() % 2 == 0;
+    #[cfg(all(target_arch = "x86_64", windows))]
+    let windows_frame = WindowsFrame::new(&saved, spill_bytes)?;
+    let emit_prologue = |a: &mut Asm| {
+        #[cfg(all(target_arch = "x86_64", windows))]
+        {
+            windows_frame.prologue(a)
+        }
+        #[cfg(not(all(target_arch = "x86_64", windows)))]
+        {
+            for &r in &saved {
+                push_reg(a, r);
+            }
+            if pad {
+                a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
+            }
+            if spill_bytes != 0 {
+                a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+                a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+            }
+            Vec::<u8>::new()
+        }
+    };
     let emit_epilogue = |a: &mut Asm| {
-        if spill_bytes != 0 {
-            a.extend_from_slice(&[0x48, 0x81, 0xC4]);
-            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
-        }
-        if pad {
-            a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
-        }
-        for &r in saved.iter().rev() {
-            pop_reg(a, r);
+        #[cfg(all(target_arch = "x86_64", windows))]
+        windows_frame.epilogue(a);
+        #[cfg(not(all(target_arch = "x86_64", windows)))]
+        {
+            if spill_bytes != 0 {
+                a.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+            }
+            if pad {
+                a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+            }
+            for &r in saved.iter().rev() {
+                pop_reg(a, r);
+            }
         }
     };
 
@@ -3089,15 +3242,9 @@ fn emit_framed_inner(
     // Interpreter entry (offset 0): with calls, push the callee-saved value
     // registers and pad; then load entry params from the frame slots into their
     // value registers and fall (or jump) into the entry block.
-    for &r in &saved {
-        push_reg(&mut a, r);
-    }
-    if pad {
-        a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
-    }
-    if spill_bytes != 0 {
-        a.extend_from_slice(&[0x48, 0x81, 0xEC]);
-        a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+    let _unwind_info = emit_prologue(&mut a);
+    if cfg!(windows) {
+        mov_rr(&mut a, 7, 1); // Win64 entry RCX -> preserved frame base RDI
     }
     if let Some(home) = frame_base_home {
         store_home(&mut a, home, 7 /* rdi */, 0);
@@ -3114,28 +3261,34 @@ fn emit_framed_inner(
     }
     let compiled_entry;
     if has_reg_entry {
-        a.jmp(block_label[&entry]); // skip the register entry
+        jump_to_shared_body(&mut a, block_label[&entry]); // skip register entry
         a.bind(reg_entry_label);
         compiled_entry = a.here();
         // Register entry: same prologue, but args arrive in the arg registers and
         // move into the (callee-saved) value registers; then fall into the body.
-        for &r in &saved {
-            push_reg(&mut a, r);
-        }
-        if pad {
-            a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
-        }
-        if spill_bytes != 0 {
-            a.extend_from_slice(&[0x48, 0x81, 0xEC]);
-            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
-        }
-        for (i, &p) in f.block(entry).params.iter().enumerate() {
-            let home = *homes.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            store_home(&mut a, home, arg_regs[i], 0);
-        }
+        emit_prologue(&mut a);
+        let entry_moves = f
+            .block(entry)
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                Ok((
+                    *homes.get(p).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                    HomeMoveSrc::Home(FramedHome::Reg(arg_regs[i])),
+                ))
+            })
+            .collect::<Result<Vec<_>, EmitError>>()?;
+        // Allocated homes can overlap any unread incoming argument. Resolve
+        // these as one simultaneous move, including register cycles/spills.
+        parallel_home_move(&mut a, &entry_moves);
     } else {
         // Frameless: the body starts here with args already in their value regs.
-        compiled_entry = if has_calls { 0 } else { a.here() };
+        compiled_entry = if has_calls || cfg!(windows) {
+            0
+        } else {
+            a.here()
+        };
     }
 
     let mut root_sync_sites = Vec::new();
@@ -3589,13 +3742,19 @@ fn emit_framed_inner(
     // ignored on deopt). After the epilogue rsp%16==8 (as at entry), so one
     // sub/add aligns the call.
     a.bind(deopt);
-    emit_epilogue(&mut a);
-    a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+    if !cfg!(windows) {
+        emit_epilogue(&mut a);
+        a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+    }
     mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
     // Deopt stubs have their own temporary stack layout and return immediately;
     // they must finish that cleanup instead of taking the normal transfer exit.
     emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
-    a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    if cfg!(windows) {
+        emit_epilogue(&mut a);
+    } else {
+        a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    }
     a.push(0xC3); // ret
 
     // Precise per-guard deopt stubs (bliss-mba). Each serialises every logical
@@ -3687,6 +3846,8 @@ fn emit_framed_inner(
         let alloc = ((n_words * 8) + 15) & !15; // 16-aligned buffer bytes
 
         a.bind(label);
+        #[cfg(all(target_arch = "x86_64", windows))]
+        probe_windows_stack(&mut a, alloc as u32);
         if alloc > 0 {
             a.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
             a.extend_from_slice(&(alloc as i32).to_le_bytes());
@@ -3763,15 +3924,9 @@ fn emit_framed_inner(
             continue;
         }
         let offset = a.here();
-        for &r in &saved {
-            push_reg(&mut a, r);
-        }
-        if pad {
-            a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
-        }
-        if spill_bytes != 0 {
-            a.extend_from_slice(&[0x48, 0x81, 0xEC]);
-            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+        emit_prologue(&mut a);
+        if cfg!(windows) {
+            mov_rr(&mut a, 7, 1);
         }
         if let Some(home) = frame_base_home {
             store_home(&mut a, home, 7 /* rdi */, 0);
@@ -3826,7 +3981,7 @@ fn emit_framed_inner(
                 }
             }
         }
-        a.jmp(block_label[&osr.block]);
+        jump_to_shared_body(&mut a, block_label[&osr.block]);
         osr_entries.push((osr.bcp, offset));
     }
 
@@ -3840,6 +3995,25 @@ fn emit_framed_inner(
             .values()
             .any(|&label| a.label_is_referenced(label));
     let code = a.finish().ok_or(EmitError::BadBranch)?;
+    #[cfg(all(target_arch = "x86_64", windows))]
+    let windows_unwind = {
+        let mut starts = vec![0usize];
+        if has_reg_entry {
+            starts.push(compiled_entry);
+        }
+        starts.extend(osr_entries.iter().map(|&(_, offset)| offset));
+        starts.push(code.len());
+        starts
+            .windows(2)
+            .map(|range| {
+                Ok(WindowsUnwindRange {
+                    begin: u32::try_from(range[0]).map_err(|_| EmitError::BadBranch)?,
+                    end: u32::try_from(range[1]).map_err(|_| EmitError::BadBranch)?,
+                    unwind_info: _unwind_info.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, EmitError>>()?
+    };
     // Per-bcp native offset map (bliss-zmmb): the earliest native offset carrying
     // each bytecode position. Sparse — only bcps with a frame-state instruction
     // appear; the rest stay u32::MAX. Same shape as the T1 map so the viewer can
@@ -3860,6 +4034,8 @@ fn emit_framed_inner(
     heap_constant_slots.dedup();
     Ok(FramedCode {
         code,
+        #[cfg(all(target_arch = "x86_64", windows))]
+        windows_unwind,
         compiled_entry,
         osr_entries,
         bcp_offsets,
@@ -4140,6 +4316,69 @@ mod tests {
             code.windows(5).any(|bytes| bytes == [mov_arg0, 1, 0, 0, 0]),
             "production helper crossing must restore native recovery after Rust"
         );
+    }
+
+    #[cfg(all(target_arch = "x86_64", windows))]
+    #[test]
+    fn windows_t2_framed_entries_execute_and_deopt() {
+        use torcl_rt::jit::{JitBuffer, WindowsUnwindInfo};
+        use torcl_rt::value::{NIL, TorclVal};
+        extern "C" fn deopt() -> u64 {
+            0x1234_5678_ABCD_EF00
+        }
+        let mut f = build_mul_ranged(5, None);
+        let entry = f.entry();
+        let value = f.block(entry).params[0];
+        let frame_state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![crate::t2::frame_state::FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![crate::t2::frame_state::ValueSource::Value {
+                    value,
+                    repr: crate::t2::ir::ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(crate::t2::ir::OsrEntry {
+            bcp: 0,
+            block: entry,
+            frame_state,
+        });
+        let framed = emit_framed(&f, deopt as *const () as u64, 0, 0, 0, 0, 0, 0, 0, None)
+            .expect("framed Windows multiply");
+        let ranges: Vec<_> = framed
+            .windows_unwind
+            .iter()
+            .map(|range| WindowsUnwindInfo {
+                begin: range.begin,
+                end: range.end,
+                unwind_info: &range.unwind_info,
+            })
+            .collect();
+        assert_eq!(
+            ranges.len(),
+            3,
+            "interpreter, compiled-register and OSR entries"
+        );
+        let code = unsafe { JitBuffer::new_with_windows_unwind_ranges(&framed.code, &ranges) }
+            .expect("register T2 unwind ranges");
+        let interpreted: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+        // A single custom compiled argument is already in RCX, matching Win64.
+        let compiled: extern "C" fn(u64) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr().add(framed.compiled_entry)) };
+        let osr: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr().add(framed.osr_entries[0].1)) };
+        let mut slots = [TorclVal::from_fixnum(7).0];
+        assert_eq!(interpreted(slots.as_mut_ptr()), TorclVal::from_fixnum(35).0);
+        assert_eq!(compiled(slots[0]), TorclVal::from_fixnum(35).0);
+        assert_eq!(osr(slots.as_mut_ptr()), TorclVal::from_fixnum(35).0);
+        slots[0] = NIL.0;
+        assert_eq!(interpreted(slots.as_mut_ptr()), deopt());
+        assert_eq!(compiled(slots[0]), deopt());
+        assert_eq!(osr(slots.as_mut_ptr()), deopt());
     }
 
     #[cfg(all(target_arch = "x86_64", windows))]
@@ -4656,7 +4895,10 @@ mod tests {
 
     /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
     /// the given inferred range — i.e. what inlining/the caller ABI would supply.
-    fn build_mul_ranged(c: i64, range: Option<crate::t2::ir::Range>) -> crate::t2::ir::Function {
+    pub(super) fn build_mul_ranged(
+        c: i64,
+        range: Option<crate::t2::ir::Range>,
+    ) -> crate::t2::ir::Function {
         use crate::t2::ir::{
             AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
         };
