@@ -43,9 +43,11 @@ static NAME_IDS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 /// Each recorded sample is a bottom→top stack of packed frames.
 static SAMPLES: Mutex<Vec<Box<[u32]>>> = Mutex::new(Vec::new());
 
+/// The active Lisp call chain, bottom→top; each entry is `(name_id<<3)|tier`.
+static SHADOW: torcl_rt::execution_local::ExecutionLocal<std::cell::RefCell<Vec<u32>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| std::cell::RefCell::new(Vec::new()))
+};
 thread_local! {
-    /// The active Lisp call chain, bottom→top; each entry is `(name_id<<3)|tier`.
-    static SHADOW: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Cache of symbol id → interned name id, so a compiled call needn't
     /// re-resolve + re-intern the name every invocation.
     static SYM_NAME_ID: std::cell::RefCell<HashMap<u32, u32>> =

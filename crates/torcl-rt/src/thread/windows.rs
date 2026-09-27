@@ -19,13 +19,13 @@ pub(super) struct FiberExecutionContext {
 }
 
 impl FiberExecutionContext {
-    pub(super) fn new() -> Result<Self, TorclError> {
+    pub(super) fn new(stack_size: usize) -> Result<Self, TorclError> {
         // Commit a small initial stack; Windows grows it using guard pages up
-        // to the same 512 KiB native-stack reservation used by the Unix backend.
+        // to the requested reservation (the default is 512 KiB).
         let handle = unsafe {
             CreateFiberEx(
                 16 * 1024,
-                512 * 1024,
+                stack_size,
                 FIBER_FLAG_FLOAT_SWITCH,
                 Some(start),
                 std::ptr::null(),

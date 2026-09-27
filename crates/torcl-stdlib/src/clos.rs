@@ -808,6 +808,8 @@ pub fn serialize_clos_state() -> Vec<u8> {
 /// number of bytes consumed so the caller can parse blocks appended after this
 /// one in the same section.
 pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usize, TorclError> {
+    // The restore rewrites wrapper addresses, including preallocated reserves.
+    crate::conditions::reset_storage_condition_pool();
     let bad = || TorclError::InvalidImage("CLOS state section: truncated".into());
     if data.len() < 8 || &data[..4] != b"CLST" {
         return Err(TorclError::InvalidImage(
@@ -1105,6 +1107,7 @@ pub fn ensure_clos_bootstrapped() -> Result<(), TorclError> {
 /// Reset CLOS in a quiescent runtime (startup or an isolated test fixture).
 /// Worker entry must use `ensure_clos_bootstrapped` instead.
 pub fn bootstrap_clos() -> Result<(), TorclError> {
+    crate::conditions::reset_storage_condition_pool();
     initialize_clos(true)
 }
 

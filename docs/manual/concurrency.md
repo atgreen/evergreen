@@ -1,12 +1,9 @@
 # Threads and synchronization
 
 TorCL distinguishes native operating-system threads from the runtime's managed
-fibers. The Lisp interface documented here is `TORCL-THREAD`. The runtime has
-fiber scheduling machinery, but the proposed `TORCL-FIBER` Lisp package and its
-full public dictionary are not installed by the current bootstrap. See
-[Fibers and scheduler groups](fibers.md) for the proposed Lisp dictionary and
-[Runtime fiber API](contributing/reference/fibers.md) for the implemented Rust
-interface and a working example.
+fibers. The interface documented here is `TORCL-THREAD`; managed executions
+use the separate [TORCL-FIBER API](fibers.md). The
+[Runtime fiber API](contributing/reference/fibers.md) documents the Rust layer.
 
 ## Native thread lifecycle
 

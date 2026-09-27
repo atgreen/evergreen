@@ -27,6 +27,7 @@ pub mod conditions;
 
 // ── Streams ───────────────────────────────────────────────────────
 pub mod ffi;
+pub mod fibers;
 pub mod process;
 pub mod streams;
 pub mod synchronization;

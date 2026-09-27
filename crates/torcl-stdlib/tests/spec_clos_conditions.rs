@@ -558,14 +558,11 @@ fn real_allocator_oom_signals_preallocated_storage_condition() {
 // invariant, never a lazy allocator.
 #[test]
 fn storage_condition_acquire_without_init_is_a_hard_error_not_lazy_alloc() {
-    // Serialize against the other tests (bliss-110), but do NOT reset_state():
-    // this test deliberately exercises uninitialized thread-local condition
-    // state, so it must not bootstrap here.
+    // The emergency reserve is process-wide: a new carrier must reuse it.
+    // Explicitly clear it under the suite lock to exercise missing startup
+    // initialization without depending on test order or thread-local state.
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    // A freshly spawned thread has fresh thread-local condition state: the
-    // STORAGE-CONDITION pool has never been initialized there. Acquiring on the
-    // storage-failure path must fail hard rather than lazily defining classes or
-    // allocating an instance (the bug bliss-uh4.2 fixes).
+    conditions::reset_storage_condition_pool();
     let result = thread::spawn(conditions::acquire_preallocated_storage_condition)
         .join()
         .unwrap();

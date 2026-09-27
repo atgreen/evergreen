@@ -3575,6 +3575,7 @@ fn install_host_root_scanner() {
 /// invalidate the registered address.
 pub struct HostRoot<T: TraceHostRoots> {
     thread: ThreadId,
+    fiber: Option<crate::thread::FiberId>,
     value: Box<T>,
     address: usize,
     _not_send: PhantomData<Rc<()>>,
@@ -3597,6 +3598,7 @@ impl<T: TraceHostRoots> HostRoot<T> {
             });
         Self {
             thread,
+            fiber: crate::thread::current_fiber_id(),
             value,
             address,
             _not_send: PhantomData,
@@ -3678,11 +3680,19 @@ impl<T: TraceHostRoots> DerefMut for HostRoot<T> {
 
 impl<T: TraceHostRoots> Drop for HostRoot<T> {
     fn drop(&mut self) {
-        assert_eq!(
-            self.thread,
-            std::thread::current().id(),
-            "host roots are thread-affine"
-        );
+        if let Some(fiber) = self.fiber {
+            assert_eq!(
+                Some(fiber),
+                crate::thread::current_fiber_id(),
+                "host root belongs to another fiber"
+            );
+        } else {
+            assert_eq!(
+                self.thread,
+                std::thread::current().id(),
+                "native host roots are thread-affine"
+            );
+        }
         let mut roots = host_roots().lock().unwrap_or_else(|e| e.into_inner());
         let remove_thread = if let Some(entries) = roots.get_mut(&self.thread) {
             let index = entries
@@ -4516,6 +4526,14 @@ thread_local! {
 /// compare their cached epoch before every allocation and lazily replace a stale
 /// TLAB. Keeping the old allocator installed throughout collection preserves
 /// the region's walkable reservation frontier.
+// Changes only when all heap identities are replaced, not on collections.
+static HEAP_IDENTITY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Detect stale process-lifetime reserves after heap reset or image restore.
+pub fn heap_identity_epoch() -> u64 {
+    HEAP_IDENTITY_EPOCH.load(Ordering::Acquire)
+}
+
 static GC_MOVE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Monotone counter bumped on every collection that may relocate objects
@@ -5651,6 +5669,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), TorclError> {
         std::sync::atomic::Ordering::Relaxed,
     );
     *heap_state().lock().unwrap() = Some(state);
+    HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
     Ok(())
@@ -6060,6 +6079,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), TorclError> {
     let state = guard
         .as_mut()
         .ok_or_else(|| TorclError::Internal("heap not initialized".into()))?;
+    HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
     clear_heap_objects(state);
     // The pre-restore region set is gone: every cached per-thread T0 allocator
     // still holds a TLAB carved from it, and the reset region alloc_tops will

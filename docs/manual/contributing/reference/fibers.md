@@ -1,7 +1,7 @@
 # Runtime fiber API
 
 This page documents the implemented Rust interfaces in `torcl_rt`. The
-[proposed Lisp interface](../../fibers.md) is not installed by the bootstrap.
+[public Lisp interface](../../fibers.md) is installed by the bootstrap and uses these runtime fibers.
 The runtime API is under development; treat IDs as process-local handles.
 
 ## Run two fibers { #example }

@@ -31,6 +31,7 @@ static SAFEPOINT_PAGE_LEN: AtomicUsize = AtomicUsize::new(0);
 /// ordinary code observes this flag at its next safepoint poll.
 static SIGUSR1_PENDING: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 pub(crate) extern "C" fn sigusr1_handler(_signal: i32) {
     SIGUSR1_PENDING.store(true, Ordering::Relaxed);
 }
@@ -143,6 +144,7 @@ pub fn safepoint_page_contains(addr: usize) -> bool {
     base != 0 && addr.wrapping_sub(base) < len
 }
 
+#[cfg(unix)]
 pub(crate) fn recover_poll_page_sigsegv() -> bool {
     let base = SAFEPOINT_PAGE_ADDR.load(Ordering::Acquire);
     let len = SAFEPOINT_PAGE_LEN.load(Ordering::Acquire);

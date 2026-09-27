@@ -237,17 +237,17 @@ fn register_bytecode_roots(function: &Arc<BytecodeFunction>) {
         .or_insert_with(|| Arc::downgrade(function));
 }
 
-thread_local! {
-    /// Bytecode functions keyed by symbol index. A `CallNamed` checks this
-    /// first; a hit runs as a native frame on the `TorclStack`, a miss falls
-    /// back to `apply_function` (builtins, generics, tree-walker functions).
-    static REGISTRY: RefCell<HashMap<u32, Arc<BytecodeFunction>, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Definition generations reject background compilations that finish after
-    /// a DEFUN has replaced their bytecode snapshot.
-    static REGISTRY_GENERATION: RefCell<HashMap<u32, u64, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-}
+/// Bytecode functions keyed by symbol index. A `CallNamed` checks this
+/// first; a hit runs as a native frame on the `TorclStack`, a miss falls
+/// back to `apply_function` (builtins, generics, tree-walker functions).
+static REGISTRY: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, Arc<BytecodeFunction>, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Definition generations reject background compilations that finish after
+/// a DEFUN has replaced their bytecode snapshot.
+static REGISTRY_GENERATION: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, u64, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
 
 unsafe fn trace_bytecode_function(
     function: *mut BytecodeFunction,
@@ -284,6 +284,21 @@ unsafe fn trace_bytecode_function(
 }
 
 fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    // SAFETY: the collector stopped every execution, including suspended fibers.
+    unsafe {
+        NATIVE_ERROR.scan(|error| {
+            use torcl_rt::gc::TraceHostRoots;
+            error.borrow_mut().trace_host_roots(visit);
+        });
+        NATIVE_ENV_FRAME.scan(|frame| {
+            if let Some(frame) = frame.borrow().as_ref() {
+                super::with_env_visit_state(|state| {
+                    super::visit_env_frame_roots(frame, state, visit)
+                });
+            }
+        });
+    }
+
     live_bytecode_bodies().borrow_mut().retain(|_, weak| {
         let Some(function) = weak.upgrade() else {
             return false;
@@ -1221,14 +1236,13 @@ struct TierSnap {
     t2_map: Vec<u32>,
 }
 
-thread_local! {
-    /// Snapshot of each function's T1 / T2 native disassembly, captured at
-    /// compile time so the tiered-JIT viewer can show a representation that has
-    /// since been uninstalled (e.g. a function that deoptimised back to T0). Only
-    /// populated while the event stream is recording, so there is no cost off the
-    /// profiling path.
-    static TIER_DISASM: RefCell<HashMap<u32, TierSnap>> = RefCell::new(HashMap::new());
-}
+/// Snapshot of each function's T1 / T2 native disassembly, captured at
+/// compile time so the tiered-JIT viewer can show a representation that has
+/// since been uninstalled (e.g. a function that deoptimised back to T0). Only
+/// populated while the event stream is recording, so there is no cost off the
+/// profiling path.
+static TIER_DISASM: torcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<u32, TierSnap>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
 /// Capture `nc`'s native listing (and, for T1, its bcp→native map) under `sym`.
 /// Called from `publish_native` (the single install point) while the code is
@@ -1253,12 +1267,11 @@ fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
     });
 }
 
-thread_local! {
-    /// The original Lisp source form (rendered to text) of each defun'd function,
-    /// captured at definition time so the viewer can show the "treewalk" source
-    /// alongside its T0/T1/T2 representations. Populated only while recording.
-    static SOURCE_TEXT: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
-}
+/// The original Lisp source form (rendered to text) of each defun'd function,
+/// captured at definition time so the viewer can show the "treewalk" source
+/// alongside its T0/T1/T2 representations. Populated only while recording.
+static SOURCE_TEXT: torcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<u32, String>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
 /// Pin `sym` to the T0 interpreter for deterministic profiling (bliss-xgr5):
 /// add it to the pin set and, if it is already native, revert it to T0 the same
@@ -1377,15 +1390,15 @@ struct Bail;
 
 type LowerResult<T> = Result<T, Bail>;
 
-thread_local! {
-    /// Histogram of *why* the bytecode lowerer bailed, keyed by a short reason
-    /// (e.g. "call:MAKE-HASH-TABLE", "special:HANDLER-CASE"), for the
-    /// compile-coverage diagnostic (bliss-x5y.1). Populated only when
-    /// TORCL_BAIL_TRACE is set; read via `torcl-ext:bail-report`.
-    static BAIL_LOG: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
-    /// Most recent lowering failure, used by the opt-in named compile trace.
-    static LAST_BAIL_REASON: RefCell<Option<String>> = const { RefCell::new(None) };
-}
+/// Histogram of *why* the bytecode lowerer bailed, keyed by a short reason
+/// (e.g. "call:MAKE-HASH-TABLE", "special:HANDLER-CASE"), for the
+/// compile-coverage diagnostic (bliss-x5y.1). Populated only when
+/// TORCL_BAIL_TRACE is set; read via `torcl-ext:bail-report`.
+static BAIL_LOG: torcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<String, u32>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+/// Most recent lowering failure, used by the opt-in named compile trace.
+static LAST_BAIL_REASON: torcl_rt::execution_local::ExecutionLocal<RefCell<Option<String>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn bail_trace_on() -> bool {
     // Unified logging (bliss-89rd): tag "bail" (TORCL_LOG=bail=trace, or the
@@ -7609,10 +7622,14 @@ fn compile_function(
 // parameters, which are already in slots by then. Rather than give up, the
 // closure records what it needed here and `compile_function_in` recompiles the
 // whole function with those names boxed (bliss-ptv4).
-thread_local! {
-    static BOX_REQUEST: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
-}
+
+static BOX_REQUEST: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<String>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || RefCell::new(std::collections::HashSet::new()),
+    )
+};
 
 fn request_boxing(names: impl IntoIterator<Item = String>) {
     BOX_REQUEST.with(|r| r.borrow_mut().extend(names));
@@ -11245,12 +11262,15 @@ pub(super) fn lazy_compile_threshold() -> u32 {
     })
 }
 
-thread_local! {
-    /// DEFUN symbols whose lazy compile already bailed — don't retry every call.
-    /// Cleared for a symbol when it is (re)defined.
-    static LAZY_DECLINED: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-}
+/// DEFUN symbols whose lazy compile already bailed — don't retry every call.
+/// Cleared for a symbol when it is (re)defined.
+static LAZY_DECLINED: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<u32>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || RefCell::new(std::collections::HashSet::new()),
+    )
+};
 
 /// True if a function body syntactically contains a loop construct (LOOP,
 /// DOTIMES, DOLIST, DO/DO*, TAGBODY, PROG/PROG*). Such functions benefit from
@@ -13235,8 +13255,7 @@ fn run_with_binding(
     // genuinely returns multiple values re-establishes them via SetValues before
     // its Return.
     env.clear_mv();
-    let thread = torcl_rt::current_thread();
-    let stack = thread.stack();
+    let stack = torcl_rt::current_stack();
 
     let frame = stack
         .push_frame(
@@ -13503,8 +13522,7 @@ fn native_sigsegv_recovery_ip() -> usize {
 }
 
 fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, TorclError> {
-    let thread = torcl_rt::current_thread();
-    let stack = thread.stack();
+    let stack = torcl_rt::current_stack();
 
     loop {
         if let Some(error) = pending_signal_error_for_current_execution() {
@@ -14857,16 +14875,26 @@ fn unmatched_error(pending: Pending) -> TorclError {
 // frames stay on the one TorclStack (the interpreter still pushes D2.03 frames);
 // results are identical to pure interpretation (differential-verified).
 
-thread_local! {
-    /// The `Env` in scope while native T1 code runs, so a c2i callback can
-    /// invoke interpreted functions. Set by `run_native` around the call.
-    static NATIVE_ENV: std::cell::Cell<*mut Env> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-    /// Captured lexical environment for the currently executing native
-    /// activation. Nested native calls save/restore this just like NATIVE_ENV.
-    static NATIVE_ENV_FRAME: RefCell<Option<Arc<SharedCell<EnvFrame>>>> = const { RefCell::new(None) };
-    /// Metadata owner of the executing code, including a T1-to-T2 OSR entry.
-    static ACTIVE_NATIVE_CODE: std::cell::Cell<*const NativeCode> = const { std::cell::Cell::new(std::ptr::null()) };
-}
+/// The `Env` in scope while native T1 code runs, so a c2i callback can
+/// invoke interpreted functions. Set by `run_native` around the call.
+static NATIVE_ENV: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<*mut Env>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| {
+        const { std::cell::Cell::new(std::ptr::null_mut()) }
+    })
+};
+/// Captured lexical environment for the currently executing native
+/// activation. Nested native calls save/restore this just like NATIVE_ENV.
+static NATIVE_ENV_FRAME: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<Arc<SharedCell<EnvFrame>>>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
+/// Metadata owner of the executing code, including a T1-to-T2 OSR entry.
+static ACTIVE_NATIVE_CODE: torcl_rt::execution_local::ExecutionLocal<
+    std::cell::Cell<*const NativeCode>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || const { std::cell::Cell::new(std::ptr::null()) },
+    )
+};
 
 struct ActiveNativeCode<'a> {
     previous: *const NativeCode,
@@ -15665,30 +15693,34 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
     }
 }
 
-thread_local! {
-    /// Error raised by a c2i callback, re-raised by `run_native` after the
-    /// native call returns.
-    static NATIVE_ERROR: RefCell<Option<TorclError>> = const { RefCell::new(None) };
-    /// Set by native (T1) code when a speculative guard fails (bliss-jtc.27): a
-    /// non-fixnum operand or a fixnum-overflowing arithmetic result. `run_native`
-    /// observes it, discards the native result, and re-runs the function in the
-    /// interpreter (T0) — a deoptimization that returns the correct value.
-    static NATIVE_DEOPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Where a speculative guard failed, for state-transfer deopt (bliss-izt.2):
-    /// `(bcp, operand_depth)`. Set alongside `NATIVE_DEOPT` by `c2i_deopt_state`.
-    /// `run_native` reads it to resume T0 at that exact bytecode position on the
-    /// SAME frame — locals and the operand stack are already in the shared frame
-    /// slots — instead of re-running the whole function from the top. `None`
-    /// falls back to the re-run path (e.g. a legacy non-state-recording guard).
-    static NATIVE_DEOPT_RESUME: RefCell<Option<NativeDeoptResume>> = const { RefCell::new(None) };
-    /// Current native (T1) call-stack depth (bliss-x5y.4). Non-leaf T1 functions
-    /// call through c2i, and although those calls run in the interpreter (which
-    /// is TorclStack-bounded, not native-recursive), this counter bounds any
-    /// native re-entry defensively: past `native_depth_cap()` the dispatcher
-    /// runs the callee in T0 instead of pushing another native frame, so the
-    /// real C stack can never run away.
-    static NATIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
+/// Error raised by a c2i callback, re-raised by `run_native` after the
+/// native call returns.
+static NATIVE_ERROR: torcl_rt::execution_local::ExecutionLocal<RefCell<Option<TorclError>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
+/// Set by native (T1) code when a speculative guard fails (bliss-jtc.27): a
+/// non-fixnum operand or a fixnum-overflowing arithmetic result. `run_native`
+/// observes it, discards the native result, and re-runs the function in the
+/// interpreter (T0) — a deoptimization that returns the correct value.
+static NATIVE_DEOPT: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
+/// Where a speculative guard failed, for state-transfer deopt (bliss-izt.2):
+/// `(bcp, operand_depth)`. Set alongside `NATIVE_DEOPT` by `c2i_deopt_state`.
+/// `run_native` reads it to resume T0 at that exact bytecode position on the
+/// SAME frame — locals and the operand stack are already in the shared frame
+/// slots — instead of re-running the whole function from the top. `None`
+/// falls back to the re-run path (e.g. a legacy non-state-recording guard).
+static NATIVE_DEOPT_RESUME: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<NativeDeoptResume>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
+/// Current native (T1) call-stack depth (bliss-x5y.4). Non-leaf T1 functions
+/// call through c2i, and although those calls run in the interpreter (which
+/// is TorclStack-bounded, not native-recursive), this counter bounds any
+/// native re-entry defensively: past `native_depth_cap()` the dispatcher
+/// runs the callee in T0 instead of pushing another native frame, so the
+/// real C stack can never run away.
+static NATIVE_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<u32>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 enum NativeDeoptResume {
     Single {
@@ -15847,8 +15879,7 @@ extern "C" fn c2i_t1_backedge(
     }
     #[cfg(target_arch = "s390x")]
     {
-        let thread = torcl_rt::current_thread();
-        let stack = thread.stack();
+        let stack = torcl_rt::current_stack();
         let frame = stack.fp();
         // Grow only the still-current T1 activation. The mmap-backed stack
         // keeps its frame and slot addresses stable; new shadow slots start
@@ -16121,8 +16152,7 @@ extern "C" fn c2i_deopt_state(bcp: u64, depth: u64) {
 /// resumes T0 on the reconstructed activation chain, so committed caller side
 /// effects are not repeated.
 extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserved: u64) {
-    let thread = torcl_rt::current_thread();
-    let stack = thread.stack();
+    let stack = torcl_rt::current_stack();
     let outer = stack.fp() as *mut Frame;
     let fail = |message: &'static str| {
         NATIVE_ERROR.with(|c| {
@@ -16364,18 +16394,23 @@ fn is_arith_speculatable(sym: u32) -> bool {
     inlinable_fixnum_op(sym).is_some()
 }
 
-thread_local! {
-    /// Functions promoted to native and not yet deoptimized since that promotion.
-    /// Used to decay the profile exactly once per promotion when a speculation
-    /// fails, so a phase change adapts fast without thrashing.
-    static PROMOTED_FRESH: std::cell::RefCell<std::collections::HashSet<u32>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-    /// Per-site speculation types invalidated by the current native version's
-    /// first deopt. Used to distinguish a supported numeric phase change from
-    /// repeatedly failing the same specialization (for example, fixnum overflow).
-    static LAST_FAILED_SPECULATION: RefCell<HashMap<u32, Vec<(u32, SpecType)>>> =
-        RefCell::new(HashMap::new());
-}
+/// Functions promoted to native and not yet deoptimized since that promotion.
+/// Used to decay the profile exactly once per promotion when a speculation
+/// fails, so a phase change adapts fast without thrashing.
+static PROMOTED_FRESH: torcl_rt::execution_local::ExecutionLocal<
+    std::cell::RefCell<std::collections::HashSet<u32>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| {
+        std::cell::RefCell::new(std::collections::HashSet::new())
+    })
+};
+/// Per-site speculation types invalidated by the current native version's
+/// first deopt. Used to distinguish a supported numeric phase change from
+/// repeatedly failing the same specialization (for example, fixnum overflow).
+type FailedSpeculations = HashMap<u32, Vec<(u32, SpecType)>>;
+static LAST_FAILED_SPECULATION: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<FailedSpeculations>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
 /// A speculation for `func_ptr` just failed. Zero the currently-dominant type at
 /// each of its sites — that is the type we bet on and lost — so the new phase's
@@ -16737,70 +16772,97 @@ fn clear_bytecode_profiles(func_ptr: usize) {
     });
 }
 
-thread_local! {
-    /// Operand-type profiles keyed by (bytecode-function pointer, CallNamed bcp).
-    static TYPE_PROFILE: RefCell<HashMap<(usize, u32), TypeProfile, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// T0/T1 entries per saved bytecode body. This is the denominator for
-    /// call-site frequency and advances in the same sampling window as calls.
-    static FUNCTION_SAMPLE_PROFILE: RefCell<HashMap<usize, u32, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Executions per `(saved bytecode body, CallNamed bcp)`.
-    static CALL_SITE_PROFILE:
-        RefCell<HashMap<(usize, u32), &'static RuntimeCallSiteProfile, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Receiver class/type profiles keyed by generic function name.
-    static GENERIC_RECEIVER_PROFILE:
-        RefCell<HashMap<String, &'static ReceiverTypeProfile, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Installed T1/T2 code keyed by the same symbol index as the bytecode registry.
-    static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Per-function invocation counters driving T0→T1 promotion.
-    static INVOKE_COUNTS: RefCell<HashMap<u32, u32, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Per-function speculative-deopt counters (bliss-jtc.27). When a function
-    /// deopts more than the backoff threshold, its speculative native code is
-    /// uninstalled and it is blacklisted from re-promotion — HotSpot's policy of
-    /// not repeatedly recompiling code that keeps deoptimizing.
-    static DEOPT_COUNTS: RefCell<HashMap<u32, u32, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Functions whose speculation proved unprofitable; kept in T0 thereafter.
-    static DEOPT_BLACKLIST: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-    /// Functions pinned to T0 by the deterministic profiler (bliss-xgr5): the
-    /// tiering counters only count invocations until a function promotes to
-    /// native (the native prologue stops bumping them). To make PROFILE's call
-    /// counts EXACT — the way SBCL's sb-profile encapsulation adds overhead but
-    /// counts every call — a profiled function is held in the interpreter, where
-    /// every invocation is recorded. UNPROFILE releases it.
-    static PROFILE_PIN: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-    /// Bodies that the optimising compiler cannot currently handle.  Remember
-    /// the decline so a hot T1 function does not synchronously retry T2 on every
-    /// invocation.  Redefining/removing the function clears this bit.
-    static T2_DECLINED: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-    /// Symbols whose T1 compilation was declined for a STRUCTURAL reason — an
-    /// unsupported opcode, a non-local GO/RETURN-FROM target, or an arity past
-    /// the activation slots. Those are properties of the compiled bytecode and
-    /// cannot change until the function is redefined, but T1 had no memo (unlike
-    /// T2 above), so every dispatch past the threshold re-ran the whole T1 front
-    /// end just to fail at the same instruction: CTAK re-declined 127,213 times
-    /// in one benchmark run (bliss-yy9m). Redefining the function clears this.
-    static T1_DECLINED: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-    /// Symbols with one outstanding background T2 request.  Coalescing here
-    /// prevents a hot dispatch/back-edge from flooding the global queue.
-    static T2_QUEUED: RefCell<HashMap<u32, u64, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
-    /// Each mutator owns its completion channel. Workers return relocatable
-    /// code bytes; executable-memory and tier publication remain on the owner.
-    static T2_COMPLETIONS: RefCell<Option<(
-        std::sync::mpsc::Sender<T2Completion>,
-        std::sync::mpsc::Receiver<T2Completion>,
-    )>> = const { RefCell::new(None) };
-}
+/// Operand-type profiles keyed by (bytecode-function pointer, CallNamed bcp).
+type SiteProfiles<T> = HashMap<(usize, u32), T, torcl_rt::fxhash::FxBuildHasher>;
+static TYPE_PROFILE: torcl_rt::execution_local::ExecutionLocal<RefCell<SiteProfiles<TypeProfile>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// T0/T1 entries per saved bytecode body. This is the denominator for
+/// call-site frequency and advances in the same sampling window as calls.
+static FUNCTION_SAMPLE_PROFILE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<usize, u32, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Executions per `(saved bytecode body, CallNamed bcp)`.
+static CALL_SITE_PROFILE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<SiteProfiles<&'static RuntimeCallSiteProfile>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Receiver class/type profiles keyed by generic function name.
+static GENERIC_RECEIVER_PROFILE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<String, &'static ReceiverTypeProfile, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Installed T1/T2 code keyed by the same symbol index as the bytecode registry.
+static NATIVE_REGISTRY: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, Rc<NativeCode>, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Per-function invocation counters driving T0→T1 promotion.
+static INVOKE_COUNTS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, u32, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Per-function speculative-deopt counters (bliss-jtc.27). When a function
+/// deopts more than the backoff threshold, its speculative native code is
+/// uninstalled and it is blacklisted from re-promotion — HotSpot's policy of
+/// not repeatedly recompiling code that keeps deoptimizing.
+static DEOPT_COUNTS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, u32, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Functions whose speculation proved unprofitable; kept in T0 thereafter.
+static DEOPT_BLACKLIST: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<u32>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || RefCell::new(std::collections::HashSet::new()),
+    )
+};
+/// Functions pinned to T0 by the deterministic profiler (bliss-xgr5): the
+/// tiering counters only count invocations until a function promotes to
+/// native (the native prologue stops bumping them). To make PROFILE's call
+/// counts EXACT — the way SBCL's sb-profile encapsulation adds overhead but
+/// counts every call — a profiled function is held in the interpreter, where
+/// every invocation is recorded. UNPROFILE releases it.
+static PROFILE_PIN: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<u32>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || RefCell::new(std::collections::HashSet::new()),
+    )
+};
+/// Bodies that the optimising compiler cannot currently handle.  Remember
+/// the decline so a hot T1 function does not synchronously retry T2 on every
+/// invocation.  Redefining/removing the function clears this bit.
+static T2_DECLINED: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<u32>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || RefCell::new(std::collections::HashSet::new()),
+    )
+};
+/// Symbols whose T1 compilation was declined for a STRUCTURAL reason — an
+/// unsupported opcode, a non-local GO/RETURN-FROM target, or an arity past
+/// the activation slots. Those are properties of the compiled bytecode and
+/// cannot change until the function is redefined, but T1 had no memo (unlike
+/// T2 above), so every dispatch past the threshold re-ran the whole T1 front
+/// end just to fail at the same instruction: CTAK re-declined 127,213 times
+/// in one benchmark run (bliss-yy9m). Redefining the function clears this.
+static T1_DECLINED: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<u32>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(
+        || RefCell::new(std::collections::HashSet::new()),
+    )
+};
+/// Symbols with one outstanding background T2 request.  Coalescing here
+/// prevents a hot dispatch/back-edge from flooding the global queue.
+static T2_QUEUED: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, u64, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// Each mutator owns its completion channel. Workers return relocatable
+/// code bytes; executable-memory and tier publication remain on the owner.
+type T2CompletionChannel = (
+    std::sync::mpsc::Sender<T2Completion>,
+    std::sync::mpsc::Receiver<T2Completion>,
+);
+static T2_COMPLETIONS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<T2CompletionChannel>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 #[derive(Clone)]
 struct T2BodySnapshot {
@@ -17752,8 +17814,7 @@ fn run_native(
     env.clear_mv();
     NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
     let _depth_guard = NativeDepthGuard;
-    let thread = torcl_rt::current_thread();
-    let stack = thread.stack();
+    let stack = torcl_rt::current_stack();
     let frame = stack
         .push_frame(
             NIL,
@@ -17993,8 +18054,7 @@ fn resume_in_t0(
     env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
-    let thread = torcl_rt::current_thread();
-    let stack = thread.stack();
+    let stack = torcl_rt::current_stack();
 
     let entry_fn_val = TorclVal::from_symbol_index(sym);
     let fn_obj = Some(entry_fn_val).filter(|&v| torcl_rt::function::is_interpreted_function(v));
@@ -18105,7 +18165,7 @@ fn resume_inlined_in_t0(
     _metadata: Arc<T2InstalledMetadata>,
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
-    let stack = torcl_rt::current_thread().stack();
+    let stack = torcl_rt::current_stack();
     let mut acts = Vec::with_capacity(scopes.len());
     for scope in scopes {
         let entry = scope.body;
@@ -19329,7 +19389,7 @@ enum FixnumOp {
 /// still go through the original name comparison, so a symbol interned later is
 /// classified correctly the first time it is seen.
 fn memoized_by_sym<T: Copy>(
-    memo: &'static std::thread::LocalKey<RefCell<Vec<Option<T>>>>,
+    memo: &'static torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<Option<T>>>>,
     sym: u32,
     compute: impl FnOnce(u32) -> T,
 ) -> T {
@@ -19348,13 +19408,21 @@ fn memoized_by_sym<T: Copy>(
     value
 }
 
-thread_local! {
-    static FIXNUM_OP_MEMO: RefCell<Vec<Option<Option<FixnumOp>>>> = const { RefCell::new(Vec::new()) };
-    static UNARY_FIXNUM_OP_MEMO: RefCell<Vec<Option<Option<UnaryFixnumOp>>>> =
-        const { RefCell::new(Vec::new()) };
-    static FIXNUM_PRED_MEMO: RefCell<Vec<Option<Option<FixnumPred>>>> =
-        const { RefCell::new(Vec::new()) };
-}
+static FIXNUM_OP_MEMO: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<Option<FixnumOp>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+static UNARY_FIXNUM_OP_MEMO: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<Option<UnaryFixnumOp>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+static FIXNUM_PRED_MEMO: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<Option<FixnumPred>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
 
 fn inlinable_fixnum_op(sym: u32) -> Option<FixnumOp> {
     memoized_by_sym(&FIXNUM_OP_MEMO, sym, inlinable_fixnum_op_uncached)
@@ -19941,28 +20009,31 @@ struct OsrCompilation {
     code: Option<Rc<OsrCode>>,
 }
 
-thread_local! {
-    /// Compiled OSR code per function symbol (bliss-izt.1).
-    static OSR_REGISTRY: RefCell<HashMap<u32, OsrCompilation>> =
-        RefCell::new(HashMap::new());
-    /// Compiled OSR code for ANONYMOUS activations (top-level forms, gensym
-    /// lambdas) that have no registry symbol, keyed by the bytecode function's
-    /// Rc pointer. Top-level forms are `sym==u32::MAX` and were excluded from
-    /// OSR entirely, so a hot loop in one (e.g. babel's 13886-entry encoding-
-    /// table build) never tiered — it ran the whole load interpreted. Keying by
-    /// the live `Arc<BytecodeFunction>` address lets those loops OSR too
-    /// (bliss-pohq / bliss-izt).
-    static ANON_OSR_REGISTRY: RefCell<HashMap<usize, Option<Rc<OsrCode>>>> =
-        RefCell::new(HashMap::new());
-    /// Back-edge counts for anonymous activations (no `fn_obj` to hold the
-    /// count), keyed by the bytecode function's Rc pointer + loop-header bcp.
-    static ANON_BACK_EDGES: RefCell<HashMap<(usize, u32), u32>> = RefCell::new(HashMap::new());
-    /// How many times each function ENTERED native code via OSR. FnMeta's tier
-    /// does not reflect OSR (OSR code lives here, not in NATIVE_REGISTRY), so
-    /// tests need this to assert promotion actually happened — output parity
-    /// alone masked OSR being structurally dead (bliss-j1o7 / bliss-f88w).
-    static OSR_ENTRY_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
-}
+/// Compiled OSR code per function symbol (bliss-izt.1).
+static OSR_REGISTRY: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, OsrCompilation>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+/// Compiled OSR code for ANONYMOUS activations (top-level forms, gensym
+/// lambdas) that have no registry symbol, keyed by the bytecode function's
+/// Rc pointer. Top-level forms are `sym==u32::MAX` and were excluded from
+/// OSR entirely, so a hot loop in one (e.g. babel's 13886-entry encoding-
+/// table build) never tiered — it ran the whole load interpreted. Keying by
+/// the live `Arc<BytecodeFunction>` address lets those loops OSR too
+/// (bliss-pohq / bliss-izt).
+static ANON_OSR_REGISTRY: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<usize, Option<Rc<OsrCode>>>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+/// Back-edge counts for anonymous activations (no `fn_obj` to hold the
+/// count), keyed by the bytecode function's Rc pointer + loop-header bcp.
+static ANON_BACK_EDGES: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<(usize, u32), u32>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+/// How many times each function ENTERED native code via OSR. FnMeta's tier
+/// does not reflect OSR (OSR code lives here, not in NATIVE_REGISTRY), so
+/// tests need this to assert promotion actually happened — output parity
+/// alone masked OSR being structurally dead (bliss-j1o7 / bliss-f88w).
+static OSR_ENTRY_COUNTS: torcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<u32, u32>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
 /// The number of OSR native entries recorded for `sym` on this thread
 /// (`torcl-ext:function-osr-count`).
@@ -20177,7 +20248,7 @@ fn run_native_osr(
     let f: extern "C" fn(*mut u64, *const u8) -> u64 = unsafe { std::mem::transmute(entry_addr) };
     let ret = f(
         slots,
-        std::ptr::from_ref(torcl_rt::current_thread().stack()) as *const u8,
+        std::ptr::from_ref(torcl_rt::current_stack()) as *const u8,
     );
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
