@@ -1438,16 +1438,62 @@ fn emit_transfer_check(a: &mut Asm, check: Option<NativeTransferCheck>) {
     // This callback must not allocate, safepoint, or invoke Lisp: the primary
     // result is temporarily saved on the native stack, not in a GC root. Other
     // live values already have call-preserved homes. Leave multiple values alone.
-    a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
-    a.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    let shadow_bytes = if cfg!(windows) { 32 } else { 0 };
+    let alloc = shadow_bytes + 16;
+    a.extend_from_slice(&[0x48, 0x83, 0xEC, alloc]);
+    store_to_rsp(a, RAX, shadow_bytes as i32);
     mov_imm64(a, RAX, check.pending_addr as i64);
     a.extend_from_slice(&[0xFF, 0xD0]); // call rax
     a.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-    a.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
-    a.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp+16]
+    load_from_rsp(a, RAX, shadow_bytes as i32);
+    a.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, alloc]); // preserve test flags
     a.jcc(torcl_rt::asm::Cc::Ne, check.exit);
 }
 
+#[cfg(windows)]
+fn emit_runtime_helper_call(
+    a: &mut Asm,
+    c2i_recovery_toggle_addr: u64,
+    transfer_check: Option<NativeTransferCheck>,
+) {
+    // Templates arrange up to six word arguments in rdi/rsi/rdx/rcx/r8/r9.
+    // At the C boundary translate to Win64's four registers and two stack args.
+    // Reserve 32 bytes of callee-owned shadow space, 16 bytes of stack args,
+    // and 56 bytes for saved operands/target, rounded to 16-byte alignment.
+    // The enclosing Windows frame must use a fixed nonvolatile frame pointer
+    // in its unwind info so these temporary RSP adjustments are unwindable.
+    a.extend_from_slice(&[0x48, 0x83, 0xEC, 112]);
+    for (i, r) in [7, 6, 2, 1, 8, 9, RAX].into_iter().enumerate() {
+        store_to_rsp(a, r, 48 + i as i32 * 8);
+    }
+    if c2i_recovery_toggle_addr != 0 {
+        mov_imm32(a, 1, 0);
+        mov_imm64(a, RAX, c2i_recovery_toggle_addr as i64);
+        a.extend_from_slice(&[0xFF, 0xD0]);
+    }
+    for (i, r) in [1, 2, 8, 9].into_iter().enumerate() {
+        load_from_rsp(a, r, 48 + i as i32 * 8);
+    }
+    for i in 0..2 {
+        load_from_rsp(a, RAX, 80 + i * 8);
+        store_to_rsp(a, RAX, 32 + i * 8);
+    }
+    load_from_rsp(a, RAX, 96);
+    a.extend_from_slice(&[0xFF, 0xD0]);
+    if c2i_recovery_toggle_addr != 0 {
+        // Recovery toggles are leaf, nonallocating callbacks: raw operands and
+        // the primary result may live here across them, never across a GC.
+        store_to_rsp(a, RAX, 48);
+        mov_imm32(a, 1, 1);
+        mov_imm64(a, RAX, c2i_recovery_toggle_addr as i64);
+        a.extend_from_slice(&[0xFF, 0xD0]);
+        load_from_rsp(a, RAX, 48);
+    }
+    a.extend_from_slice(&[0x48, 0x83, 0xC4, 112]);
+    emit_transfer_check(a, transfer_check);
+}
+
+#[cfg(not(windows))]
 fn emit_runtime_helper_call(
     a: &mut Asm,
     c2i_recovery_toggle_addr: u64,
@@ -4085,14 +4131,145 @@ mod tests {
                 .count(),
             3
         );
+        let mov_arg0 = if cfg!(windows) { 0xB9 } else { 0xBF };
         assert!(
-            code.windows(5).any(|bytes| bytes == [0xBF, 0, 0, 0, 0]),
+            code.windows(5).any(|bytes| bytes == [mov_arg0, 0, 0, 0, 0]),
             "production helper crossing must disable native recovery before Rust"
         );
         assert!(
-            code.windows(5).any(|bytes| bytes == [0xBF, 1, 0, 0, 0]),
+            code.windows(5).any(|bytes| bytes == [mov_arg0, 1, 0, 0, 0]),
             "production helper crossing must restore native recovery after Rust"
         );
+    }
+
+    #[cfg(all(target_arch = "x86_64", windows))]
+    #[test]
+    fn windows_runtime_helper_passes_six_arguments() {
+        for toggle in [false, true] {
+            for pending in [None, Some(false), Some(true)] {
+                check_windows_runtime_helper(toggle, pending);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", windows))]
+    fn check_windows_runtime_helper(toggle: bool, pending: Option<bool>) {
+        use torcl_rt::jit::JitBuffer;
+
+        const FIRST_ARGUMENT: u64 = 0x1020_3040_5060_7080;
+        const RESULT: u64 = 0xFEDC_BA98_7654_3210;
+        // Each leaf intentionally destroys all volatile GPRs and home slots.
+        // The wrapper must preserve its operands/result outside callee storage.
+        fn leaf_return(a: &mut Asm, result: u64) {
+            for r in [1, 2, 8, 9, 10, 11] {
+                mov_imm64(a, r, 0x1234_5678);
+            }
+            for offset in [8, 16, 24, 32] {
+                store_to_rsp(a, 11, offset);
+            }
+            mov_imm64(a, RAX, result as i64);
+            a.push(0xC3);
+        }
+
+        let mut observed = [0u64; 15];
+        observed[8] = u64::MAX; // recovery state before the first toggle
+        let address = observed.as_mut_ptr() as i64;
+        let mut helper = Asm::new();
+        mov_imm64(&mut helper, 10, address);
+        for (i, r) in [1, 2, 8, 9].into_iter().enumerate() {
+            store_mem64_disp(&mut helper, 10, i as i32 * 8, r);
+        }
+        for i in 4..6 {
+            load_from_rsp(&mut helper, RAX, (i + 1) * 8);
+            store_mem64_disp(&mut helper, 10, i * 8, RAX);
+        }
+        mov_rr(&mut helper, RAX, 4);
+        helper.extend_from_slice(&[0x48, 0x83, 0xE0, 15]); // and rax, 15
+        store_mem64_disp(&mut helper, 10, 48, RAX);
+        load_mem64_disp(&mut helper, RAX, 10, 64);
+        store_mem64_disp(&mut helper, 10, 56, RAX); // recovery at helper entry
+        leaf_return(&mut helper, RESULT);
+        let helper = JitBuffer::new(&helper.finish().unwrap()).unwrap();
+
+        let mut recovery = Asm::new();
+        mov_imm64(&mut recovery, 10, address);
+        store_mem64_disp(&mut recovery, 10, 64, 1); // record RCX recovery flag
+        load_mem64_disp(&mut recovery, RAX, 10, 72);
+        recovery.extend_from_slice(&[0x48, 0x83, 0xC0, 1]); // add rax, 1
+        store_mem64_disp(&mut recovery, 10, 72, RAX); // number of toggles
+        leaf_return(&mut recovery, 0xBAD);
+        let recovery = JitBuffer::new(&recovery.finish().unwrap()).unwrap();
+
+        let mut probe = Asm::new();
+        mov_imm64(&mut probe, 10, address);
+        load_mem64_disp(&mut probe, RAX, 10, 64);
+        store_mem64_disp(&mut probe, 10, 80, RAX); // recovery at transfer probe
+        mov_rr(&mut probe, RAX, 4);
+        probe.extend_from_slice(&[0x48, 0x83, 0xE0, 15]);
+        store_mem64_disp(&mut probe, 10, 88, RAX);
+        leaf_return(&mut probe, u64::from(pending == Some(true)));
+        let probe = JitBuffer::new(&probe.finish().unwrap()).unwrap();
+
+        let mut caller = Asm::new();
+        for r in [5, 6, 7] {
+            push_reg(&mut caller, r);
+        }
+        // Fixed RBP allows the helper crossing to reserve transient stack space.
+        // Extra locals also keep the pre-fix callee's home writes off saved regs.
+        caller.extend_from_slice(&[0x48, 0x83, 0xEC, 64]);
+        mov_rr(&mut caller, 5, 4);
+        mov_imm64(&mut caller, RAX, 0xCAFE);
+        for offset in [0, 56] {
+            store_to_rsp(&mut caller, RAX, offset);
+        }
+        for (i, r) in [7, 6, 2, 1, 8, 9].into_iter().enumerate() {
+            mov_imm64(&mut caller, r, FIRST_ARGUMENT as i64 + i as i64);
+        }
+        mov_imm64(&mut caller, RAX, helper.as_ptr() as i64);
+        let exit = caller.label();
+        emit_runtime_helper_call(
+            &mut caller,
+            if toggle { recovery.as_ptr() as u64 } else { 0 },
+            pending.map(|_| NativeTransferCheck {
+                pending_addr: probe.as_ptr() as u64,
+                exit,
+            }),
+        );
+        mov_imm64(&mut caller, 10, address);
+        mov_imm64(&mut caller, 11, 1);
+        store_mem64_disp(&mut caller, 10, 96, 11); // later side effect
+        caller.bind(exit);
+        mov_imm64(&mut caller, 10, address);
+        for (i, offset) in [0, 56].into_iter().enumerate() {
+            load_from_rsp(&mut caller, 11, offset);
+            store_mem64_disp(&mut caller, 10, 104 + i as i32 * 8, 11);
+        }
+        caller.extend_from_slice(&[0x48, 0x8D, 0x65, 64]); // lea rsp, [rbp+64]
+        for r in [7, 6, 5] {
+            pop_reg(&mut caller, r);
+        }
+        caller.push(0xC3);
+        let bytes = caller.finish().unwrap();
+        let unwind = [1, 10, 5, 5, 10, 3, 7, 0x72, 3, 0x70, 2, 0x60, 1, 0x50, 0, 0];
+        // SAFETY: the metadata describes the fixed frame above, including RBP,
+        // RSI and RDI saves. The helper is a leaf and only clobbers volatile regs.
+        let caller = unsafe { JitBuffer::new_with_windows_unwind(&bytes, &unwind) }.unwrap();
+        let call: extern "C" fn() -> u64 = unsafe { std::mem::transmute(caller.as_ptr()) };
+        assert_eq!(call(), RESULT);
+        assert_eq!(
+            &observed[..6],
+            &[0, 1, 2, 3, 4, 5].map(|i| FIRST_ARGUMENT + i)
+        );
+        assert_eq!(observed[6], 8);
+        assert_eq!(observed[7], if toggle { 0 } else { u64::MAX });
+        assert_eq!(observed[8], if toggle { 1 } else { u64::MAX });
+        assert_eq!(observed[9], if toggle { 2 } else { 0 });
+        if pending.is_some() {
+            assert_eq!(observed[10], if toggle { 1 } else { u64::MAX });
+            assert_eq!(observed[11], 8);
+        }
+        assert_eq!(observed[12], u64::from(pending != Some(true)));
+        assert_eq!(&observed[13..], &[0xCAFE, 0xCAFE]);
     }
 
     /// The real milestone: emit a T2 function and EXECUTE it. `() -> 12345` must
