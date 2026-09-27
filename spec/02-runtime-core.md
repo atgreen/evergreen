@@ -136,8 +136,10 @@ pointer alone does not make a transition GC-safe.
 This is an approved design direction, **not an implemented ABI**. The concrete
 context layout, ownership/lifetime and transition protocol, and physical
 register assignments remain subject to the T1/T2 and boundary-adapter audit
-tracked in `bliss-q861` (§4.7.4.2). No JVM or CPython integration is implied by
-recording this decision.
+tracked in `bliss-q861` (§4.7.4.2). This records a register convention only: it
+does not by itself define an ABI for embedding another language runtime.
+Embedding CPython is recorded separately as an approved direction in §2.7.8; no
+JVM integration is implied or planned.
 
 ### 2.3.2 State Machine
 
@@ -521,10 +523,16 @@ signal handler.
 
 ### 2.7.1 Calling Convention (R2.11)
 
-TorCL-generated native code uses the platform C ABI (System V AMD64 on
-Linux/macOS x86-64; AAPCS64 on aarch64). This means CL-compiled
-functions can be called directly from C without wrapper overhead when
-they use fixed-arity, non-variadic signatures.
+TorCL-generated native code uses the platform C ABI: System V AMD64 on
+Linux/macOS x86-64, Win64 on Windows x86-64, AAPCS64 on aarch64, and ELFv2 on
+ppc64le. This means CL-compiled functions can be called directly from C without
+wrapper overhead when they use fixed-arity, non-variadic signatures.
+
+Outbound scalar calls are implemented for each of those ABIs. Targets without a
+per-ABI module — currently s390x — reach foreign code through the bootstrap
+dispatcher's fixed set of call shapes, which supports neither mixed
+floating-point signatures nor variadic calls. Callbacks (§2.7.5) and aggregate
+arguments are implemented for x86-64 only.
 
 ### 2.7.2 Alien Type System (R2.13)
 
@@ -738,6 +746,58 @@ or extend the lifetimes of pointers embedded in C objects; those remain the
 caller's responsibility. Sandbox mode denies this entry in both direct and
 function-value dispatch paths. Aggregate descriptors/calls currently target
 SysV AMD64; unsupported targets report `FFI-ERROR`.
+
+---
+
+### 2.7.8 Embedded language runtimes — approved direction (2026-09-27)
+
+TorCL intends to embed **CPython** through its C API so that Python is usable as
+a second object system rather than as a conventional foreign-function surface:
+Lisp owns the process, and callers see `py:import`, `py:call` and `py:getattr`
+rather than `PyImport_Import` and `PyObject_Call`. Tracked as `bliss-nnp5e`.
+
+Four properties of this runtime shape the design, and each is a constraint
+rather than a preference.
+
+**Transitions reuse the existing boundary mechanism.** A crossing into Python is
+a managed→foreign transition (§2.7, §2.5) and publishes Native state exactly as
+any other foreign call does, so a collection can proceed while Python runs. The
+VM MUST NOT acquire lock-specific knowledge of CPython's concurrency model:
+what a crossing does differs between a conventional build and a free-threaded
+one, so that belongs behind the transition rather than spread through generated
+code. Python-created threads calling into Lisp are attached as Lisp threads by
+the same path a foreign callback entry uses.
+
+**Reference counting meets a moving collector.** A Lisp proxy holding a
+`PyObject *` owns a Python reference, but the matching release cannot run from
+an arbitrary Lisp GC or finalizer context: it may run arbitrary Python code,
+including `__del__`, and re-enter CPython at a point where no safe state has
+been published. Releases are therefore queued and drained at a safepoint. In the
+other direction, a Python object referring to a Lisp object MUST NOT hold a raw
+address, because the collector relocates (§3); it holds a stable handle. Cycles
+spanning both runtimes are visible to neither collector, and are addressed by
+documented ownership and strong/weak handles before any attempt at shared
+reachability.
+
+**Signals are arbitrated by the Lisp runtime.** Two runtimes MUST NOT both
+believe they own `SIGINT`, `SIGTERM` or `SIGCHLD`. The sharper hazard is
+specific to TorCL rather than to CPython: TorCL uses `SIGSEGV` for native-frame
+recovery (§2.6.2), so a fault taken inside CPython must not be redirected to an
+epilogue that unwinds a Lisp frame. Recovery is disabled while a foreign frame
+is on top, and the Python transition is subject to that same rule.
+
+**Zero-copy numeric interchange depends on non-moving storage.** Exposing Lisp
+array storage through Python's buffer protocol requires that the storage not
+relocate while a view exists, which rests on the pinning and large-object
+mechanisms in §3. Strings are copied rather than shared: Python's Unicode
+representation and TorCL's string representation are not worth reconciling.
+
+Availability follows the FFI. Lisp→Python works wherever the per-ABI scalar path
+does; Python→Lisp requires callbacks (§2.7.5) and is therefore x86-64 only until
+those are ported. Staging the two directions separately is deliberate.
+
+This is an approved design direction, **not an implemented ABI**. No JVM
+integration is implied or planned.
 
 ---
 
