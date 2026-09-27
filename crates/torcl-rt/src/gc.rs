@@ -1170,6 +1170,7 @@ unsafe fn trace_object(
         | tid::FOREIGN_POINTER
         | tid::FOREIGN_LIBRARY
         | tid::FOREIGN_CALLBACK
+        | tid::PYTHON_OBJECT
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
@@ -5948,6 +5949,12 @@ pub fn serialize_heap_objects() -> Vec<u8> {
             crate::object::type_id::FOREIGN_POINTER
                 | crate::object::type_id::FOREIGN_LIBRARY
                 | crate::object::type_id::FOREIGN_CALLBACK
+                // A PyObject address names an object in an interpreter that does
+                // not outlive this process, so it must be nulled rather than
+                // carried: a restored proxy reports itself dead, which every
+                // accessor already handles, instead of dereferencing an address
+                // that now means something else entirely.
+                | crate::object::type_id::PYTHON_OBJECT
         ) {
             // Neither native addresses nor allocation identities survive an
             // image restart. Restore pointers as null and library tokens as

@@ -47,6 +47,50 @@ struct Api {
     import_add_module: unsafe extern "C" fn(*const i8) -> *mut PyObject,
     module_get_dict: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     dict_get_item_string: unsafe extern "C" fn(*mut PyObject, *const i8) -> *mut PyObject,
+
+    // ── the object model (§the object model, below) ──
+    import_module: unsafe extern "C" fn(*const i8) -> *mut PyObject,
+    object_get_attr_string: unsafe extern "C" fn(*mut PyObject, *const i8) -> *mut PyObject,
+    object_set_attr_string: unsafe extern "C" fn(*mut PyObject, *const i8, *mut PyObject) -> i32,
+    object_call:
+        unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+    object_str: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    object_repr: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    object_type: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    object_is_instance: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> i32,
+    object_is_true: unsafe extern "C" fn(*mut PyObject) -> i32,
+    tuple_new: unsafe extern "C" fn(isize) -> *mut PyObject,
+    /// STEALS the reference it is given. See [`PythonScope::call`].
+    tuple_set_item: unsafe extern "C" fn(*mut PyObject, isize, *mut PyObject) -> i32,
+    long_from_longlong: unsafe extern "C" fn(i64) -> *mut PyObject,
+    /// Reports "too large for the C type" through the out-parameter rather than by
+    /// setting an exception, which is why this rather than `PyLong_AsLongLong`.
+    long_as_longlong_and_overflow: unsafe extern "C" fn(*mut PyObject, *mut i32) -> i64,
+    float_from_double: unsafe extern "C" fn(f64) -> *mut PyObject,
+    float_as_double: unsafe extern "C" fn(*mut PyObject) -> f64,
+    bool_from_long: unsafe extern "C" fn(i64) -> *mut PyObject,
+    unicode_from_string_and_size: unsafe extern "C" fn(*const i8, isize) -> *mut PyObject,
+    /// Returns a buffer BORROWED from the object, valid only while it lives.
+    unicode_as_utf8_and_size: unsafe extern "C" fn(*mut PyObject, *mut isize) -> *const i8,
+
+    // ── errors ──
+    err_occurred: unsafe extern "C" fn() -> *mut PyObject,
+    err_clear: unsafe extern "C" fn(),
+    /// 3.12 and later: the raised exception, normalized, as one owned reference.
+    /// `None` on 3.11, which has only the three-part form below.
+    err_get_raised_exception: Option<unsafe extern "C" fn() -> *mut PyObject>,
+    err_fetch:
+        unsafe extern "C" fn(*mut *mut PyObject, *mut *mut PyObject, *mut *mut PyObject),
+
+    // ── singletons and types, which are DATA symbols ──
+    //
+    // `Py_None` and `PyLong_Type` are macros for the addresses of static structs,
+    // so what is resolved here is the struct itself and its address IS the object.
+    none: *mut PyObject,
+    long_type: *mut PyObject,
+    float_type: *mut PyObject,
+    unicode_type: *mut PyObject,
+    bool_type: *mut PyObject,
 }
 
 // SAFETY: every field is a code pointer into a library that stays loaded for the
@@ -112,6 +156,29 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
             }
         }};
     }
+    /// Resolve a symbol that need not exist, for an entry point that arrived in a
+    /// particular CPython version. A missing one is a `None` to fall back from,
+    /// not a failure to load the library.
+    macro_rules! optional {
+        ($name:literal) => {{
+            // SAFETY: as `symbol!`, for a symbol that may legitimately be absent.
+            unsafe { crate::ffi::foreign_symbol(library, $name) }
+                .ok()
+                // SAFETY: transmuting a resolved code address to the Option's
+                // declared signature.
+                .map(|found| unsafe { std::mem::transmute(found) })
+        }};
+    }
+    /// Resolve a DATA symbol, whose address is the value rather than something to
+    /// call. `Py_None` and the type objects are macros for exactly this.
+    macro_rules! data {
+        ($name:literal) => {{
+            // SAFETY: the handle came from a successful load above.
+            unsafe { crate::ffi::foreign_symbol(library, $name) }
+                .map_err(|error| format!("{name} has no {}: {error}", $name))?
+                as *mut PyObject
+        }};
+    }
     Ok(Api {
         initialize_ex: symbol!("Py_InitializeEx"),
         finalize_ex: symbol!("Py_FinalizeEx"),
@@ -125,6 +192,33 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
         import_add_module: symbol!("PyImport_AddModule"),
         module_get_dict: symbol!("PyModule_GetDict"),
         dict_get_item_string: symbol!("PyDict_GetItemString"),
+        import_module: symbol!("PyImport_ImportModule"),
+        object_get_attr_string: symbol!("PyObject_GetAttrString"),
+        object_set_attr_string: symbol!("PyObject_SetAttrString"),
+        object_call: symbol!("PyObject_Call"),
+        object_str: symbol!("PyObject_Str"),
+        object_repr: symbol!("PyObject_Repr"),
+        object_type: symbol!("PyObject_Type"),
+        object_is_instance: symbol!("PyObject_IsInstance"),
+        object_is_true: symbol!("PyObject_IsTrue"),
+        tuple_new: symbol!("PyTuple_New"),
+        tuple_set_item: symbol!("PyTuple_SetItem"),
+        long_from_longlong: symbol!("PyLong_FromLongLong"),
+        long_as_longlong_and_overflow: symbol!("PyLong_AsLongLongAndOverflow"),
+        float_from_double: symbol!("PyFloat_FromDouble"),
+        float_as_double: symbol!("PyFloat_AsDouble"),
+        bool_from_long: symbol!("PyBool_FromLong"),
+        unicode_from_string_and_size: symbol!("PyUnicode_FromStringAndSize"),
+        unicode_as_utf8_and_size: symbol!("PyUnicode_AsUTF8AndSize"),
+        err_occurred: symbol!("PyErr_Occurred"),
+        err_clear: symbol!("PyErr_Clear"),
+        err_get_raised_exception: optional!("PyErr_GetRaisedException"),
+        err_fetch: symbol!("PyErr_Fetch"),
+        none: data!("_Py_NoneStruct"),
+        long_type: data!("PyLong_Type"),
+        float_type: data!("PyFloat_Type"),
+        unicode_type: data!("PyUnicode_Type"),
+        bool_type: data!("PyBool_Type"),
     })
 }
 
@@ -441,6 +535,15 @@ impl PyRef {
     }
 }
 
+impl std::fmt::Debug for PyRef {
+    /// The address, not the object. Formatting a Python object means calling
+    /// `repr`, which needs the GIL, and `Debug` has no way to prove a crossing is
+    /// in force — see [`PythonScope::represent`] for the useful form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PyRef({:p})", self.pointer)
+    }
+}
+
 impl Drop for PyRef {
     fn drop(&mut self) {
         // Deliberately does NOT call Py_DecRef. See the module note: this may run
@@ -623,4 +726,595 @@ pub fn held_lisp_handles() -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+// ── The object model ───────────────────────────────────────────────
+//
+// What crosses, and in which direction, is a policy rather than an accretion of
+// special cases:
+//
+//   Lisp integer/float  ←→  int/float        by value
+//   Lisp string         ←→  str              BY COPY, deliberately
+//   NIL / T             ←→  None / True      NIL is None outbound, and inbound
+//                                            None and False both arrive as NIL
+//   anything else       ←→  PYTHON-OBJECT    a proxy owning one reference
+//
+// Strings are copied because Python's Unicode representation and TorCL's are not
+// worth trying to share: the conversion is O(n) either way, and sharing would buy
+// a lifetime problem for nothing. Numeric arrays are the case where copying is the
+// wrong answer, and they get the buffer protocol instead (bliss-s8wrr).
+//
+// NIL maps to None outbound, which is the mapping that makes `(py:call f nil)`
+// read correctly; the ambiguity with false is inherent to Lisp's one-false-value
+// and is resolved the only way it can be — inbound False also yields NIL.
+
+/// What a fixnum can hold: the tag takes three bits, so an integer outside this
+/// range has to stay a Python object rather than be silently truncated.
+const FIXNUM_RANGE: std::ops::Range<i64> = -(1i64 << 60)..(1i64 << 60);
+
+/// Enough of a Lisp value's kind to make a conversion failure actionable.
+fn describe(value: crate::value::TorclVal) -> &'static str {
+    if value.is_cons() {
+        "a list"
+    } else if value.is_symbol() {
+        "a symbol"
+    } else if value.is_function() {
+        "a function"
+    } else if value.is_heap_object() {
+        "this object"
+    } else {
+        "this value"
+    }
+}
+
+/// Report a Python exception as a TorCL error, clearing it, or `Ok` if none is
+/// set. Every entry point below funnels through this: CPython signals failure by
+/// returning null *and* setting an exception, and an exception left set leaks into
+/// whatever the next call happens to be.
+///
+/// The message is best-effort on purpose. Turning an exception into a real
+/// condition with its traceback and Python frames is a separate concern
+/// (bliss-wq5tw); the requirement here is only that a failure never looks like
+/// success and never reports the wrong operation's error.
+fn check(api: &'static Api, fallback: &str) -> Result<(), TorclError> {
+    // SAFETY: resolved entry points, called on a thread holding the GIL (every
+    // caller has a live PythonScope).
+    unsafe {
+        if (api.err_occurred)().is_null() {
+            return Ok(());
+        }
+        let raised = match api.err_get_raised_exception {
+            // 3.12+: one normalized exception instance, ours to own.
+            Some(get) => PyRef::from_owned(get()),
+            // 3.11: the three-part form. The value is not normalized, so it may be
+            // the argument rather than the instance — which still stringifies to
+            // something recognisable, and is why this path is the fallback.
+            None => {
+                let mut kind = std::ptr::null_mut();
+                let mut value = std::ptr::null_mut();
+                let mut traceback = std::ptr::null_mut();
+                (api.err_fetch)(&mut kind, &mut value, &mut traceback);
+                let _kind = PyRef::from_owned(kind);
+                let _traceback = PyRef::from_owned(traceback);
+                PyRef::from_owned(value)
+            }
+        };
+        (api.err_clear)();
+        let described = raised.and_then(|raised| {
+            let kind = PyRef::from_owned((api.object_type)(raised.pointer))
+                .and_then(|kind| utf8_of(api, &PyRef::from_owned((api.object_str)(kind.pointer))?))
+                .unwrap_or_else(|| "Python exception".to_string());
+            let text = utf8_of(api, &PyRef::from_owned((api.object_str)(raised.pointer))?)?;
+            // `<class 'ValueError'>` is what str() of a type gives; the bare name
+            // is what a reader wants to see.
+            let kind = kind
+                .rsplit_once('\'')
+                .and_then(|(head, _)| head.rsplit_once('\'').map(|(_, name)| name.to_string()))
+                .unwrap_or(kind);
+            Some(format!("{kind}: {text}"))
+        });
+        Err(TorclError::FfiError(
+            described.unwrap_or_else(|| fallback.to_string()),
+        ))
+    }
+}
+
+/// The UTF-8 text of a Python `str`, copied out of CPython's buffer.
+///
+/// The buffer belongs to the object and is only valid while it lives, so this
+/// copies rather than returning a borrow — the copy is the point (see the policy
+/// note above).
+fn utf8_of(api: &'static Api, text: &PyRef) -> Option<String> {
+    let mut length: isize = 0;
+    // SAFETY: a resolved entry point under the GIL; the returned buffer is valid
+    // while `text` holds its reference, which outlives the copy below.
+    unsafe {
+        let bytes = (api.unicode_as_utf8_and_size)(text.pointer, &mut length);
+        if bytes.is_null() || length < 0 {
+            (api.err_clear)();
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(bytes as *const u8, length as usize);
+        std::str::from_utf8(slice).ok().map(str::to_string)
+    }
+}
+
+/// Adopt a call's result: an owned reference, or the exception that explains why
+/// there isn't one.
+fn adopt(
+    api: &'static Api,
+    pointer: *mut PyObject,
+    what: &str,
+) -> Result<PyRef, TorclError> {
+    // SAFETY: the caller has just produced `pointer` from a C-API call and is
+    // handing over ownership of it.
+    match unsafe { PyRef::from_owned(pointer) } {
+        Some(reference) => Ok(reference),
+        None => {
+            check(api, what)?;
+            // Null with no exception set is a CPython contract violation rather
+            // than a Python-level failure; report it as ours, not theirs.
+            Err(TorclError::FfiError(format!(
+                "{what} returned no object and set no exception"
+            )))
+        }
+    }
+}
+
+impl PythonScope {
+    /// Import a module: `py:import`.
+    pub fn import(&self, name: &str) -> Result<PyRef, TorclError> {
+        let cname = CString::new(name)
+            .map_err(|_| TorclError::FfiError("a module name contains a null byte".into()))?;
+        // SAFETY: a resolved entry point, a valid string, GIL held by `self`.
+        let module = unsafe { (self.api.import_module)(cname.as_ptr()) };
+        adopt(self.api, module, &format!("importing {name}"))
+    }
+
+    /// Resolve a dotted name such as `numpy.mean` or `scipy.optimize.minimize`.
+    ///
+    /// Which segments are modules and which are attributes is not knowable from
+    /// the name — `numpy.mean` is a module and a function, `scipy.optimize` is two
+    /// modules — so this imports the longest prefix that IS a module and reaches
+    /// the rest by attribute. Python's own import system answers the same question
+    /// the same way.
+    pub fn resolve(&self, dotted: &str) -> Result<PyRef, TorclError> {
+        if dotted.is_empty() {
+            return Err(TorclError::FfiError("an empty Python name".into()));
+        }
+        let segments: Vec<&str> = dotted.split('.').collect();
+        for split in (1..=segments.len()).rev() {
+            let prefix = segments[..split].join(".");
+            let Ok(mut object) = self.import(&prefix) else {
+                // A failed import leaves an exception set, which would otherwise
+                // surface as the error for a later, unrelated call.
+                self.clear_error();
+                continue;
+            };
+            for attribute in &segments[split..] {
+                object = self.getattr(&object, attribute)?;
+            }
+            return Ok(object);
+        }
+        // Nothing in the name is a module, so it is a builtin: `repr`, `int`,
+        // `str.upper`. Python resolves these through the builtins namespace and so
+        // must this, or the shortest and most obvious names would be the ones that
+        // do not work.
+        let mut object = self.import("builtins")?;
+        for attribute in &segments {
+            object = self.getattr(&object, attribute).map_err(|_| {
+                self.clear_error();
+                TorclError::FfiError(format!(
+                    "{dotted} is neither a module nor a builtin: no module in it \
+                     could be imported, and builtins has no {attribute}"
+                ))
+            })?;
+        }
+        Ok(object)
+    }
+
+    /// `py:getattr`.
+    pub fn getattr(&self, object: &PyRef, name: &str) -> Result<PyRef, TorclError> {
+        let cname = CString::new(name)
+            .map_err(|_| TorclError::FfiError("an attribute name contains a null byte".into()))?;
+        // SAFETY: resolved entry point, live reference, valid string, GIL held.
+        let attribute =
+            unsafe { (self.api.object_get_attr_string)(object.pointer, cname.as_ptr()) };
+        adopt(self.api, attribute, &format!("reading attribute {name}"))
+    }
+
+    /// `(setf (py:getattr x "name") v)`.
+    pub fn setattr(&self, object: &PyRef, name: &str, value: &PyRef) -> Result<(), TorclError> {
+        let cname = CString::new(name)
+            .map_err(|_| TorclError::FfiError("an attribute name contains a null byte".into()))?;
+        // SAFETY: as above; SetAttrString borrows the value rather than stealing it.
+        let status = unsafe {
+            (self.api.object_set_attr_string)(object.pointer, cname.as_ptr(), value.pointer)
+        };
+        if status != 0 {
+            check(self.api, &format!("setting attribute {name}"))?;
+            return Err(TorclError::FfiError(format!(
+                "setting attribute {name} failed without an exception"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Call a Python callable.
+    ///
+    /// Takes the arguments BY VALUE because `PyTuple_SETITEM` steals a reference:
+    /// consuming them makes the transfer visible in the signature instead of
+    /// leaving a caller holding references the tuple now owns.
+    pub fn call(&self, callable: &PyRef, arguments: Vec<PyRef>) -> Result<PyRef, TorclError> {
+        let count = arguments.len();
+        // SAFETY: resolved entry points under the GIL. Each SetItem steals the
+        // reference it is given, which is why `into_raw` rather than `as_ptr`; the
+        // tuple owns them from that point and releases them when it dies.
+        let result = unsafe {
+            let tuple = adopt(self.api, (self.api.tuple_new)(count as isize), "building arguments")?;
+            for (index, argument) in arguments.into_iter().enumerate() {
+                let status =
+                    (self.api.tuple_set_item)(tuple.pointer, index as isize, argument.into_raw());
+                if status != 0 {
+                    check(self.api, "building arguments")?;
+                    return Err(TorclError::FfiError("building arguments failed".into()));
+                }
+            }
+            (self.api.object_call)(callable.pointer, tuple.pointer, std::ptr::null_mut())
+        };
+        adopt(self.api, result, "calling a Python object")
+    }
+
+    /// `py:call-method`: the attribute, then the call.
+    pub fn call_method(
+        &self,
+        object: &PyRef,
+        name: &str,
+        arguments: Vec<PyRef>,
+    ) -> Result<PyRef, TorclError> {
+        let method = self.getattr(object, name)?;
+        self.call(&method, arguments)
+    }
+
+    /// `str(object)`, for printing and for `py:str`.
+    pub fn display(&self, object: &PyRef) -> Result<String, TorclError> {
+        // SAFETY: resolved entry point, live reference, GIL held.
+        let text = adopt(
+            self.api,
+            unsafe { (self.api.object_str)(object.pointer) },
+            "stringifying a Python object",
+        )?;
+        utf8_of(self.api, &text)
+            .ok_or_else(|| TorclError::FfiError("a Python string was not valid UTF-8".into()))
+    }
+
+    /// `repr(object)`, which is what a Lisp printer wants: unambiguous.
+    pub fn represent(&self, object: &PyRef) -> Result<String, TorclError> {
+        // SAFETY: as `display`.
+        let text = adopt(
+            self.api,
+            unsafe { (self.api.object_repr)(object.pointer) },
+            "representing a Python object",
+        )?;
+        utf8_of(self.api, &text)
+            .ok_or_else(|| TorclError::FfiError("a Python repr was not valid UTF-8".into()))
+    }
+
+    /// `py:type-of`: the object's type, as a proxy for the type object itself —
+    /// not its name, so the result can be called, compared, and asked for its own
+    /// attributes the way Python code would.
+    pub fn type_of(&self, object: &PyRef) -> Result<PyRef, TorclError> {
+        // SAFETY: resolved entry point, live reference, GIL held.
+        adopt(
+            self.api,
+            unsafe { (self.api.object_type)(object.pointer) },
+            "taking the type of a Python object",
+        )
+    }
+
+    /// `py:typep`, with the class named the way Python names it:
+    /// `(py:typep x "numpy.ndarray")`.
+    pub fn is_instance(&self, object: &PyRef, class: &str) -> Result<bool, TorclError> {
+        let class = self.resolve(class)?;
+        // SAFETY: resolved entry point, two live references, GIL held.
+        let status = unsafe { (self.api.object_is_instance)(object.pointer, class.pointer) };
+        if status < 0 {
+            check(self.api, "testing a Python type")?;
+            return Err(TorclError::FfiError("testing a Python type failed".into()));
+        }
+        Ok(status == 1)
+    }
+
+    /// Discard a pending exception. Used where a failure is a legitimate answer
+    /// rather than an error — probing an import, above.
+    fn clear_error(&self) {
+        // SAFETY: a resolved entry point, GIL held.
+        unsafe { (self.api.err_clear)() };
+    }
+
+    /// Is this object Python's `None`?
+    fn is_none(&self, object: *mut PyObject) -> bool {
+        self.api.none == object
+    }
+
+    fn is_instance_of_type(&self, object: *mut PyObject, class: *mut PyObject) -> bool {
+        // SAFETY: a resolved entry point and two live objects, GIL held. A negative
+        // result sets an exception, which is cleared rather than reported: this is
+        // used to CLASSIFY a value, and failing to classify it is not an error.
+        unsafe {
+            let status = (self.api.object_is_instance)(object, class);
+            if status < 0 {
+                (self.api.err_clear)();
+                return false;
+            }
+            status == 1
+        }
+    }
+
+    /// A Lisp value as a Python object, by the policy at the top of this section.
+    pub fn to_python(&self, value: crate::value::TorclVal) -> Result<PyRef, TorclError> {
+        if value == crate::value::NIL {
+            // NIL is the empty list, false, and "nothing" all at once; None is the
+            // mapping that makes an omitted argument read correctly.
+            return self.none();
+        }
+        if value == crate::value::T {
+            return adopt(
+                self.api,
+                unsafe { (self.api.bool_from_long)(1) },
+                "making a Python bool",
+            );
+        }
+        if let Some(reference) = self.proxy_reference(value) {
+            // A proxy going back is the object it proxies, not a description of it.
+            return reference;
+        }
+        if value.is_fixnum() {
+            // SAFETY: a resolved entry point under the GIL.
+            return adopt(
+                self.api,
+                unsafe { (self.api.long_from_longlong)(value.as_fixnum()) },
+                "making a Python int",
+            );
+        }
+        if value.is_double_float() || value.is_single_float() {
+            let double = if value.is_double_float() {
+                value.as_double_float()
+            } else {
+                // Python has one float type, so a single-float widens. The widening
+                // is exact; the narrowing on the way back is not, which is why
+                // inbound floats are always double-floats.
+                f64::from(value.as_single_float())
+            };
+            // SAFETY: as above.
+            return adopt(
+                self.api,
+                unsafe { (self.api.float_from_double)(double) },
+                "making a Python float",
+            );
+        }
+        if value.is_string() {
+            let text = value.as_string();
+            // SAFETY: a resolved entry point under the GIL; the pointer and length
+            // describe `text`, which outlives the call.
+            return adopt(
+                self.api,
+                unsafe {
+                    (self.api.unicode_from_string_and_size)(
+                        text.as_ptr() as *const i8,
+                        text.len() as isize,
+                    )
+                },
+                "making a Python str",
+            );
+        }
+        if value.is_character() {
+            // A character becomes a one-character string: Python has no character
+            // type, and `str` of length one is what its own APIs expect.
+            let text = value.as_char().to_string();
+            return adopt(
+                self.api,
+                unsafe {
+                    (self.api.unicode_from_string_and_size)(
+                        text.as_ptr() as *const i8,
+                        text.len() as isize,
+                    )
+                },
+                "making a Python str",
+            );
+        }
+        Err(TorclError::FfiError(format!(
+            "no Python equivalent for {}: pass a number, string, character, NIL, T, \
+             or a PYTHON-OBJECT",
+            describe(value)
+        )))
+    }
+
+    /// Python's `None`, as an owned reference.
+    fn none(&self) -> Result<PyRef, TorclError> {
+        // SAFETY: `none` is the address of CPython's immortal None singleton,
+        // resolved once; adding a reference to it is valid and (since 3.12)
+        // a no-op.
+        unsafe { (self.api.inc_ref)(self.api.none) };
+        unsafe { PyRef::from_owned(self.api.none) }
+            .ok_or_else(|| TorclError::FfiError("CPython's None was not resolved".into()))
+    }
+
+    /// A Python object as a Lisp value, by the same policy.
+    ///
+    /// Consumes the reference: whatever comes back either carries it (a proxy) or
+    /// does not need it (an immediate), and leaving the caller holding one is how
+    /// a bridge leaks.
+    pub fn from_python(&self, object: PyRef) -> Result<crate::value::TorclVal, TorclError> {
+        if self.is_none(object.pointer) {
+            return Ok(crate::value::NIL);
+        }
+        // Booleans BEFORE integers: Python's bool is a subclass of int, so the
+        // integer test matches True and would turn it into 1.
+        if self.is_instance_of_type(object.pointer, self.api.bool_type) {
+            // SAFETY: a resolved entry point, a live bool, GIL held.
+            let truth = unsafe { (self.api.object_is_true)(object.pointer) };
+            return Ok(if truth == 1 {
+                crate::value::T
+            } else {
+                crate::value::NIL
+            });
+        }
+        if self.is_instance_of_type(object.pointer, self.api.long_type) {
+            let mut overflow = 0i32;
+            // SAFETY: as above. The overflow flag is how CPython reports an
+            // integer too large for the C type, without setting an exception.
+            let value =
+                unsafe { (self.api.long_as_longlong_and_overflow)(object.pointer, &mut overflow) };
+            if overflow == 0 && FIXNUM_RANGE.contains(&value) {
+                return Ok(crate::value::TorclVal::from_fixnum(value));
+            }
+            // Python's integers are unbounded and TorCL's fixnums are not. A
+            // bignum conversion belongs with the numeric tower rather than here,
+            // so an integer that does not fit stays a proxy — visible and exact —
+            // rather than being silently truncated or turned into a float.
+            return self.proxy(object);
+        }
+        if self.is_instance_of_type(object.pointer, self.api.float_type) {
+            // SAFETY: a resolved entry point, a live float, GIL held.
+            let value = unsafe { (self.api.float_as_double)(object.pointer) };
+            check(self.api, "converting a Python float")?;
+            return Ok(crate::gc::alloc_double_float(value));
+        }
+        if self.is_instance_of_type(object.pointer, self.api.unicode_type) {
+            let text = utf8_of(self.api, &object).ok_or_else(|| {
+                TorclError::FfiError("a Python string was not valid UTF-8".into())
+            })?;
+            // Copied, per the policy: the Lisp string owns its own storage and the
+            // Python object's death cannot invalidate it.
+            return Ok(crate::gc::alloc_character_string(&text));
+        }
+        self.proxy(object)
+    }
+}
+
+// ── PYTHON-OBJECT: the Lisp-visible proxy ──────────────────────────
+//
+// One untraced word holding the `PyObject *` this proxy owns a reference to.
+// Nulled when the reference has been handed back, which is how a proxy that has
+// outlived its interpreter (or an image restore) reports itself rather than
+// dereferencing an address that now means something else.
+//
+// The release is driven by the collector through the ordinary finalizer registry —
+// the same mechanism streams and mutexes use for native state — because that
+// registry's association with the object is deliberately weak, so holding a proxy
+// in the table would not be what keeps it alive. What the destructor must NOT do
+// is call CPython: it runs inside the GC pause under the heap lock, and a decref
+// can run `__del__`. It enqueues instead, which is what [`PyRef`] already does.
+
+impl PyRef {
+    /// Give up ownership without releasing, for handing the reference to something
+    /// that will own it (a tuple slot, or a proxy object's body word).
+    fn into_raw(self) -> *mut PyObject {
+        let pointer = self.pointer;
+        std::mem::forget(self);
+        pointer
+    }
+}
+
+/// Is this Lisp value a Python proxy?
+pub fn is_proxy(value: crate::value::TorclVal) -> bool {
+    value.is_heap_object()
+        // SAFETY: a heap-object tag guarantees a readable header.
+        && unsafe {
+            (*(value.as_ptr() as *const crate::object::ObjectHeader)).type_id()
+                == crate::object::type_id::PYTHON_OBJECT
+        }
+}
+
+impl PythonScope {
+    /// Wrap an owned reference as a Lisp `PYTHON-OBJECT`.
+    ///
+    /// The allocation can move objects, which is why the reference is consumed
+    /// only after it succeeds: a failed allocation must not lose the reference,
+    /// and a moved object must not be reached through a stale wrapper.
+    pub fn proxy(&self, object: PyRef) -> Result<crate::value::TorclVal, TorclError> {
+        let body = crate::gc::alloc_typed(8, crate::object::type_id::PYTHON_OBJECT)
+            .ok_or(TorclError::Oom)?;
+        // SAFETY: a fresh 8-byte body, initialised before anything else can run.
+        // No Lisp reference is stored here, so the GC never traces this word.
+        let value = unsafe {
+            (body as *mut u64).write(object.into_raw() as u64);
+            crate::value::TorclVal::from_heap_ptr(body.sub(8))
+        };
+        // NIL as the finalizer, not the proxy: the registry keys weakly on the
+        // body address but roots the finalizer VALUE strongly, so registering the
+        // proxy there would make it immortal and its reference would never be
+        // released. The destructor needs only the body address, which the dispatch
+        // already passes (matching how streams and mutexes register native state).
+        crate::gc::register_finalizer(
+            crate::value::TorclVal::from_raw(body as u64),
+            crate::value::NIL,
+        )?;
+        Ok(value)
+    }
+
+    /// The object a proxy names, as a fresh owned reference, or `None` if `value`
+    /// is not a proxy (or is one whose reference has already been given back).
+    fn proxy_reference(
+        &self,
+        value: crate::value::TorclVal,
+    ) -> Option<Result<PyRef, TorclError>> {
+        if !is_proxy(value) {
+            return None;
+        }
+        // SAFETY: the type discriminator selects exactly this one untraced word.
+        let pointer = unsafe { (value.as_ptr().add(8) as *const u64).read() } as *mut PyObject;
+        if pointer.is_null() {
+            return Some(Err(TorclError::FfiError(
+                "this PYTHON-OBJECT no longer refers to anything: its interpreter \
+                 has been shut down, or it was restored from a saved image"
+                    .into(),
+            )));
+        }
+        // SAFETY: the proxy owns a reference, so the object is live and adding a
+        // reference to it is valid; `self` proves the GIL is held.
+        Some(
+            unsafe { PyRef::from_borrowed(pointer, self) }
+                .ok_or_else(|| TorclError::FfiError("a PYTHON-OBJECT with no object".into())),
+        )
+    }
+
+    /// The object a proxy names, as an owned reference — the entry point every
+    /// Lisp-facing operation on a proxy goes through.
+    pub fn unwrap_proxy(&self, value: crate::value::TorclVal) -> Result<PyRef, TorclError> {
+        self.proxy_reference(value).unwrap_or_else(|| {
+            Err(TorclError::TypeError {
+                datum: value,
+                expected: "PY:OBJECT".into(),
+            })
+        })
+    }
+}
+
+/// Release a dead proxy's reference. Called by the collector's finalizer dispatch
+/// with the proxy's untagged body address.
+///
+/// Runs inside the GC pause under the heap lock, so it must neither allocate on
+/// the Lisp heap nor call CPython. It does neither: the reference is queued, and
+/// the body word is nulled so that a later trace or a stray access through a
+/// now-dead proxy finds nothing rather than a pointer CPython may already have
+/// reused.
+///
+/// # Safety
+/// `body` must be the body address of a live `PYTHON_OBJECT` whose proxy the
+/// collector has determined to be unreachable.
+pub unsafe fn finalize_proxy(body: *mut u8) {
+    // SAFETY: the caller guarantees this is a PYTHON_OBJECT body, whose single
+    // word is the owned pointer.
+    unsafe {
+        let pointer = (body as *const u64).read() as *mut PyObject;
+        if pointer.is_null() {
+            return;
+        }
+        (body as *mut u64).write(0);
+        // Constructing a PyRef and dropping it is exactly the queueing path, so
+        // the release rule lives in one place rather than two.
+        drop(PyRef::from_owned(pointer));
+    }
 }

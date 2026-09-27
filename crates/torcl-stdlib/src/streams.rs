@@ -2625,6 +2625,15 @@ fn stdlib_gc_finalize(_finalizer: TorclVal, object: TorclVal) {
             crate::synchronization::finalize_condition_variable(body);
             return;
         }
+        // A dead Python proxy owes CPython a reference. Releasing it HERE would be
+        // wrong — this runs in the GC pause under the heap lock, and a decref can
+        // run __del__, i.e. arbitrary Python — so the destructor only queues it,
+        // for the next thread that crosses into Python to release.
+        #[cfg(feature = "python")]
+        if header.type_id() == type_id::PYTHON_OBJECT {
+            torcl_rt::python::finalize_proxy(body);
+            return;
+        }
         if header.type_id() != type_id::STREAM {
             return; // not a stream — leave for other finalizer kinds
         }
