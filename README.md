@@ -40,8 +40,15 @@ cargo build -p torcl
 ```
 
 For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
-[cross-compilation and QEMU validation](docs/cross-compilation.md). These initial
-ports run the interpreter and bytecode engine; native JIT support is separate.
+[cross-compilation and QEMU validation](docs/cross-compilation.md). All three
+ports run the interpreter and T0 bytecode engine. Linux s390x (IBM Z) also
+supports the native T1 baseline and T2 optimizing JITs, on-stack replacement
+(OSR) for running loops, and precise deoptimization. Its native runtime calls
+and loops support the moving garbage collector; validation under QEMU includes
+GC stress and poisoning, compiled-file loading, and saved-image round trips.
+AArch64 and ppc64le currently use T0 for native-tier requests. Foreign
+calls/callbacks and fiber context switching remain unported on these targets.
+
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
 The Android AArch64 CLI is built and validated the same way — same kernel, a
 different libc — and is
