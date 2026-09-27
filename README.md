@@ -11,6 +11,23 @@ long-term design is documented in `spec/`, including the object model, runtime,
 garbage collector, compiler tiers, standard library, developer tools, security
 model, and self-hosting roadmap.
 
+## Manual
+
+The [TorCL manual](docs/manual/index.md) covers running Lisp, ASDF systems,
+saved executables, cross-target tools, Android applications, and runtime
+contributions. It follows the Gloopy manual's Material for MkDocs and Diátaxis
+structure. Preview it locally:
+
+```sh
+python3 -m venv .venv-docs
+. .venv-docs/bin/activate
+pip install -r requirements-docs.txt
+make docs-serve
+```
+
+Use `make docs` for a strict build. Online publication is not enabled yet.
+See [Writing documentation](docs/manual/meta/documentation-guidelines.md).
+
 ## Workspace
 
 This is a Cargo workspace using Rust 2024 and requiring Rust 1.85 or newer.
@@ -57,7 +74,9 @@ supports the native T1 baseline and T2 optimizing JITs, on-stack replacement
 (OSR) for running loops, and precise deoptimization. Its native runtime calls
 and loops support the moving garbage collector; validation under QEMU includes
 GC stress and poisoning, compiled-file loading, and saved-image round trips.
-AArch64 and ppc64le currently use T0 for native-tier requests. AArch64 supports scalar foreign calls through AAPCS64. Foreign callbacks and
+AArch64 now has a partial T1 baseline backend; unsupported shapes stay at T0.
+It does not yet have a T2 backend. ppc64le currently uses T0 for native-tier
+requests. AArch64 supports scalar foreign calls through AAPCS64. Foreign callbacks and
 fiber context switching remain unported there; ppc64le also lacks foreign calls.
 
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).

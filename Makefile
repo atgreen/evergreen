@@ -149,3 +149,13 @@ clean:
 ## help: list available targets
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
+
+.PHONY: docs docs-serve
+## docs: build the manual (install requirements-docs.txt first)
+docs:
+	python3 scripts/test_docs.py
+	mkdocs build --strict
+
+## docs-serve: preview the manual on http://127.0.0.1:8000/torcl/
+docs-serve:
+	mkdocs serve --dev-addr 127.0.0.1:8000

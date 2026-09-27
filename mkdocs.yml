@@ -1,0 +1,97 @@
+site_name: TorCL
+site_description: Common Lisp with a tiered JIT, saved applications, and cross-target tooling.
+# Intended address; publication is not enabled by this configuration.
+site_url: https://atgreen.github.io/torcl/
+repo_url: https://cave.moxielogic.com/atgreen/bliss
+repo_name: TorCL source
+edit_uri: _edit/main/docs/manual/
+docs_dir: docs/manual
+site_dir: site
+strict: true
+hooks:
+  - docs/hooks.py
+theme:
+  name: material
+  font: false
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+extra_css:
+  - stylesheets/extra.css
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+nav:
+  - Home: index.md
+  - User guide:
+      - user/index.md
+      - Tutorials:
+          - Your first program: user/tutorials/first-program.md
+      - How-to guides:
+          - Build from source: user/how-to/build.md
+          - Load an ASDF system: user/how-to/asdf.md
+          - Save an executable: user/how-to/save-executable.md
+          - Build for another platform: user/how-to/cross-build.md
+          - Build an Android app: user/how-to/android.md
+      - Reference:
+          - Command line: user/reference/cli.md
+          - Platform support: user/reference/platforms.md
+          - Saved images: user/reference/images.md
+          - Runtime extensions: user/reference/extensions.md
+          - Android projects: user/reference/android.md
+      - Explanation:
+          - How Lisp runs: user/explanation/execution.md
+          - Images and applications: user/explanation/images.md
+  - Contributing:
+      - contributing/index.md
+      - How-to guides:
+          - Change the runtime: contributing/how-to/change-runtime.md
+          - Keep values safe across GC: contributing/how-to/gc-safety.md
+          - Measure performance: contributing/how-to/performance.md
+      - Reference:
+          - Repository map: contributing/reference/repository.md
+      - Explanation:
+          - Runtime architecture: contributing/explanation/architecture.md
+  - Writing docs: meta/documentation-guidelines.md

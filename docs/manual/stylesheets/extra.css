@@ -1,0 +1,6 @@
+:root { --md-text-font: system-ui, sans-serif; --md-code-font: ui-monospace, monospace; }
+.md-typeset { font-size: .82rem; line-height: 1.65; }
+.md-typeset h1 { font-weight: 650; letter-spacing: -.025em; }
+.md-typeset h2 { font-weight: 600; }
+.md-typeset .lead { font-size: 1.15rem; max-width: 40rem; }
+.md-typeset .md-button { border-radius: .25rem; margin: .3rem .4rem .3rem 0; }

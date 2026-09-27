@@ -84,3 +84,8 @@ GOAL.md
 hellos
 target-android/
 target-cross/
+
+# Documentation toolchain and generated site
+.venv-docs/
+/site/
+docs/__pycache__/

@@ -1,5 +1,10 @@
 # TorCL-specific Lisp API
 
+> Historical extension inventory: implementation-status labels below reflect
+> an earlier development stage. The [new manual](manual/index.md) contains
+> current task guides and a focused reference; check source/tests before
+> relying on status labels in this inventory.
+
 This manual is the user-facing reference for Lisp interfaces that are specific
 to TorCL. It covers the callable bootstrap API and the extension packages in
 the staged TorCL specification. ANSI Common Lisp is outside its scope.
@@ -17,8 +22,8 @@ section therefore carries one of these labels:
 
 The status in this document reflects Stage 5 (`spec/stages.json`) on
 2026-08-20. The technical specification remains normative for future behavior;
-this manual is authoritative about what users can call in the current
-bootstrap.
+the availability labels below have not been comprehensively re-audited against
+the current bootstrap.
 
 ## Package map
 
