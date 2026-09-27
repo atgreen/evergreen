@@ -7,6 +7,7 @@
 
 // ── Object model ──────────────────────────────────────────────────
 pub mod asm;
+pub mod asm_ppc64le;
 pub mod asm_s390x;
 pub mod bfasl;
 pub mod bignum;
