@@ -1,6 +1,9 @@
 use super::{BlockingMode, blocking_mode, timer};
 use crate::error::TorclError;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+type RawFd = i32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -12,6 +15,7 @@ pub enum IoInterest {
     ReadWrite,
 }
 
+#[cfg(unix)]
 fn poll_events(interest: IoInterest) -> i16 {
     use crate::syscall::{POLLIN, POLLOUT};
     match interest {
@@ -21,6 +25,7 @@ fn poll_events(interest: IoInterest) -> i16 {
     }
 }
 
+#[cfg(unix)]
 fn native_poll(
     fd: RawFd,
     interest: IoInterest,
@@ -555,4 +560,15 @@ mod kqueue {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn native_poll(
+    _fd: RawFd,
+    _interest: IoInterest,
+    _timeout: Option<Duration>,
+) -> Result<bool, TorclError> {
+    Err(TorclError::StreamError(
+        "Unix file-descriptor readiness is unavailable on Windows".into(),
+    ))
 }

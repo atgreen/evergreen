@@ -390,15 +390,28 @@ fn nil_if_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// User home as a physical namestring, using the native platform convention.
+pub fn user_home_namestring() -> Option<String> {
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").ok()?;
+    #[cfg(windows)]
+    let home = home.replace('\\', "/");
+    Some(home)
+}
+
 fn resolve_home_path(input: &str) -> Result<String, TorclError> {
     if let Some(rest) = input.strip_prefix("~/") {
-        let home = std::env::var("HOME")
-            .map_err(|_| TorclError::FileError("HOME is not set".to_string()))?;
+        let home = user_home_namestring()
+            .ok_or_else(|| TorclError::FileError("user home directory is not set".to_string()))?;
         return Ok(format!("{}/{}", home.trim_end_matches('/'), rest));
     }
     if input == "~" {
-        let home = std::env::var("HOME")
-            .map_err(|_| TorclError::FileError("HOME is not set".to_string()))?;
+        let home = user_home_namestring()
+            .ok_or_else(|| TorclError::FileError("user home directory is not set".to_string()))?;
         return Ok(home);
     }
     Ok(input.to_string())
@@ -448,7 +461,16 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, TorclError> {
     }
 
     let expanded = resolve_home_path(s)?;
+    #[cfg(windows)]
+    let expanded = expanded.replace('\\', "/");
     let absolute = expanded.starts_with('/');
+    #[cfg(windows)]
+    let absolute = absolute
+        || (expanded.as_bytes().get(1..3) == Some(b":/")
+            && expanded
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic));
     let trailing_slash = expanded.ends_with('/');
     let tokens: Vec<&str> = expanded
         .split('/')
@@ -589,6 +611,14 @@ fn parse_namestring_model(s: &str, host: Option<TorclVal>) -> Result<ParsedPathn
         .map(|value| !value.is_empty() && !value.starts_with('/'))
         .unwrap_or(false);
 
+    // A Windows drive prefix is physical, not a one-letter logical host.
+    #[cfg(windows)]
+    if !forced_logical
+        && s.as_bytes().get(1) == Some(&b':')
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+    {
+        return parse_physical_namestring(s);
+    }
     if forced_logical || (!s.starts_with('/') && s.contains(':')) {
         parse_logical_namestring(s, host_string)
     } else {
@@ -684,7 +714,14 @@ fn render_directory(directory: &DirectorySpec, logical: bool) -> String {
         out
     } else {
         let mut out = String::new();
-        if directory.absolute {
+        // Drive roots already carry their leading component (C:). They are
+        // absolute for merging, but their namestring must not start with /C:.
+        #[cfg(windows)]
+        let drive_root = matches!(directory.parts.first(), Some(DirPart::Literal(s))
+            if s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.ends_with(':'));
+        #[cfg(not(windows))]
+        let drive_root = false;
+        if directory.absolute && !drive_root {
             out.push('/');
         }
         for part in &directory.parts {
@@ -1590,6 +1627,19 @@ fn pathname_from_fs_path(path: &Path) -> Result<TorclVal, TorclError> {
         .canonicalize()
         .map_err(|e| TorclError::FileError(format!("{}: {}", path.display(), e)))?;
     let mut canon_str = canon.to_string_lossy().to_string();
+    // std::fs emits verbatim drive paths (\\?\C:\...) on Windows. Keep
+    // ordinary local canonical paths physical when converting back to Lisp.
+    #[cfg(windows)]
+    if let Some(drive_path) = canon_str.strip_prefix(r"\\?\") {
+        if drive_path.as_bytes().get(1) == Some(&b':')
+            && drive_path
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
+            canon_str = drive_path.to_owned();
+        }
+    }
     // A directory resolves to a directory pathname (trailing slash) so its final
     // component lands in the directory list and MERGE-PATHNAMES against it keeps
     // that component — e.g. (truename ".") must be ".../torcl/", not ".../torcl"

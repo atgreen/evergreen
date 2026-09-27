@@ -5325,13 +5325,13 @@ unsafe impl Send for HeapState {}
 impl Drop for HeapState {
     fn drop(&mut self) {
         if !self.heap_base.is_null() {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             // SAFETY: heap_base/size came from the anonymous mmap in init_heap.
             unsafe {
                 let _ = crate::syscall::munmap(self.heap_base, self.heap_layout.size());
             }
             // Safety: heap_base was allocated with heap_layout in init_heap.
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             unsafe {
                 std::alloc::dealloc(self.heap_base, self.heap_layout);
             }
@@ -5391,7 +5391,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), TorclError> {
     // objects are actually allocated — important for the T0 evaluator, which
     // sizes a big no-collection heap but usually touches only a few MB. mmap
     // returns page-aligned memory, satisfying `align`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let heap_base = {
         // SAFETY: standard anonymous mapping; a mapping failure returns Err.
         unsafe {
@@ -5407,7 +5407,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), TorclError> {
         }
     };
     // Safety: layout is valid (non-zero size, power-of-two alignment).
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let heap_base = unsafe { std::alloc::alloc_zeroed(heap_layout) };
     if heap_base.is_null() {
         return Err(TorclError::Oom);

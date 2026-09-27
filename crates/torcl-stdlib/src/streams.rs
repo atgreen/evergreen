@@ -2523,7 +2523,10 @@ pub fn install_gc_hooks() {
 // the FileIo machinery over the socket's file descriptor — so all the Gray-stream
 // I/O (read-char, read-line, write-string, force-output, …) works unchanged.
 use std::cell::{Cell, RefCell};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::net::ToSocketAddrs;
+use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 thread_local! {
@@ -2562,6 +2565,7 @@ pub fn socket_close_listener(id: u64) {
 /// Connect a TCP client and return an owned bidirectional octet stream.
 /// The optional timeout bounds connection attempts across all resolved addresses;
 /// system hostname resolution precedes that deadline.
+#[cfg(unix)]
 pub fn socket_connect(
     host: &str,
     port: u16,
@@ -2600,6 +2604,7 @@ pub fn socket_connect(
 
 /// Accept a connection on listener `id`, returning a bidirectional octet
 /// stream over the new socket (blocks until a client connects).
+#[cfg(unix)]
 pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
     let stream = SOCKET_LISTENERS.with(|m| {
         let map = m.borrow();
@@ -2615,6 +2620,7 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
 }
 
 /// Transfer sole descriptor ownership to the standard stream/finalizer machinery.
+#[cfg(unix)]
 fn socket_stream(stream: TcpStream) -> TorclVal {
     let _ = stream.set_nodelay(true);
     let fd = stream.into_raw_fd();
@@ -2645,6 +2651,7 @@ fn socket_stream(stream: TcpStream) -> TorclVal {
 // Duplicate under the stream lock: CLOSE cannot invalidate the descriptor
 // between lookup and an option syscall. Dropping this handle closes only the
 // duplicate, while socket options affect the shared underlying socket.
+#[cfg(unix)]
 fn socket_option_handle(stream: TorclVal) -> Result<TcpStream, TorclError> {
     let guard = lock_stream(stream)?;
     let StreamInner::FileIo { file, .. } = &guard.inner else {
@@ -2674,6 +2681,7 @@ pub fn socket_set_read_timeout(
 }
 
 /// The raw file descriptor backing a file/socket IO stream, or None.
+#[cfg(unix)]
 pub fn stream_raw_fd(stream: TorclVal) -> Option<i32> {
     let guard = lock_stream(stream).ok()?;
     match &guard.inner {
@@ -2687,6 +2695,7 @@ pub fn stream_raw_fd(stream: TorclVal) -> Option<i32> {
 /// Block until `stream` has input available, or `timeout_ms` elapses (None =
 /// wait forever). Returns true if readable, false on timeout. Buffered input is
 /// reported immediately; otherwise the underlying fd is polled.
+#[cfg(unix)]
 pub fn stream_wait_for_input(
     stream: TorclVal,
     timeout_ms: Option<i32>,
@@ -2773,4 +2782,42 @@ pub fn two_way_stream_output_stream(stream: TorclVal) -> Option<TorclVal> {
     } else {
         None
     }
+}
+
+// Windows sockets are not CRT file descriptors and cannot be owned by File.
+// Until streams own a distinct socket variant, fail explicitly at the boundary.
+#[cfg(windows)]
+pub fn socket_connect(
+    _host: &str,
+    _port: u16,
+    _timeout: Option<std::time::Duration>,
+) -> Result<TorclVal, TorclError> {
+    Err(TorclError::StreamError(
+        "Windows socket streams are not yet supported".into(),
+    ))
+}
+#[cfg(windows)]
+pub fn socket_accept(_id: u64) -> Result<TorclVal, TorclError> {
+    Err(TorclError::StreamError(
+        "Windows socket streams are not yet supported".into(),
+    ))
+}
+#[cfg(windows)]
+fn socket_option_handle(_stream: TorclVal) -> Result<TcpStream, TorclError> {
+    Err(TorclError::StreamError(
+        "Windows socket streams are not yet supported".into(),
+    ))
+}
+#[cfg(windows)]
+pub fn stream_raw_fd(_stream: TorclVal) -> Option<i32> {
+    None
+}
+#[cfg(windows)]
+pub fn stream_wait_for_input(
+    _stream: TorclVal,
+    _timeout_ms: Option<i32>,
+) -> Result<bool, TorclError> {
+    Err(TorclError::StreamError(
+        "Windows stream readiness is not yet supported".into(),
+    ))
 }

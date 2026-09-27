@@ -24,6 +24,7 @@ pub enum Os {
     Linux = 1,
     MacOS = 2,
     FreeBSD = 3,
+    Windows = 4,
 }
 
 /// Encode architecture and OS into a 64-bit platform tag.
@@ -55,7 +56,14 @@ pub fn current_platform_tag() -> u64 {
     let os = Os::MacOS;
     #[cfg(target_os = "freebsd")]
     let os = Os::FreeBSD;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    #[cfg(windows)]
+    let os = Os::Windows;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    )))]
     let os = Os::Linux; // fallback
 
     platform_tag(arch, os)
