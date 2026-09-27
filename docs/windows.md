@@ -105,6 +105,14 @@ the error policy rejects the operation before starting a child.
 Interactive subprocess streams, asynchronous process management, and alternate
 console code-page decoding are not provided by this API.
 
+The standard-library backend can now own child stdin/stdout/stderr pipes as
+buffered character or octet streams. Blocking pipe I/O runs on a helper for
+managed fibers and admits GC for native callers. Pipe position and length
+queries return `NIL`; closing stdin sends EOF, and closing an input pipe cancels
+outstanding readiness waits. Windows pipe readiness uses
+[PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe).
+The Lisp launch/wait/terminate interface remains to be wired to this backend.
+
 ## Validate under Wine
 
 Install Wine and Python 3.11 or newer. From a Linux session with the user

@@ -1176,9 +1176,19 @@ impl GrayStream for StreamMutableState {
             col,
             unread,
             ..
+        }
+        | StreamInner::FileInput {
+            file,
+            read_buf,
+            buf_pos,
+            buf_fill,
+            line,
+            col,
+            unread,
+            ..
         } = &mut self.inner
         {
-            if matches!(file, StreamHandle::Socket(_)) {
+            if matches!(file, StreamHandle::Socket(_) | StreamHandle::Pipe(_)) {
                 // Do not flush pending writes: a NO-HANG input call must not
                 // block on a peer that has stopped reading our output.
                 return file_read_char_buffered(
@@ -2256,7 +2266,15 @@ pub fn file_position(stream: TorclVal) -> Result<TorclVal, TorclError> {
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::FileInput {
@@ -2332,7 +2350,15 @@ pub fn set_file_position(stream: TorclVal, position: TorclVal) -> Result<TorclVa
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::FileInput {
@@ -2416,7 +2442,15 @@ pub fn set_file_position_to_end(stream: TorclVal) -> Result<TorclVal, TorclError
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::StringInput {
@@ -2490,7 +2524,15 @@ pub fn file_length_fn(stream: TorclVal) -> Result<TorclVal, TorclError> {
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::FileInput { file, .. }
@@ -2728,6 +2770,64 @@ fn socket_stream(stream: TcpStream) -> TorclVal {
             col: 0,
             unread: None,
             external_format: ExternalFormat::Utf8,
+        },
+        vec![],
+    )
+}
+
+// Transfer ownership through the platform's safe owned-handle conversion.
+#[cfg(unix)]
+use std::os::fd::OwnedFd as OwnedPipe;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedPipe;
+
+/// Own the child's stdin as a buffered output stream. Closing it sends EOF.
+pub fn process_stdin_stream(
+    pipe: std::process::ChildStdin,
+    element_type: StreamElementType,
+) -> TorclVal {
+    alloc_stream(
+        element_type,
+        StreamInner::FileOutput {
+            file: StreamHandle::pipe(std::fs::File::from(OwnedPipe::from(pipe))),
+            write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+            external_format: ExternalFormat::Utf8,
+            line: 0,
+            col: 0,
+        },
+        vec![],
+    )
+}
+
+/// Own the child's stdout as a nonseekable buffered input stream.
+pub fn process_stdout_stream(
+    pipe: std::process::ChildStdout,
+    element_type: StreamElementType,
+) -> TorclVal {
+    process_input_stream(OwnedPipe::from(pipe), element_type)
+}
+
+/// Own the child's stderr independently so callers can drain both outputs.
+pub fn process_stderr_stream(
+    pipe: std::process::ChildStderr,
+    element_type: StreamElementType,
+) -> TorclVal {
+    process_input_stream(OwnedPipe::from(pipe), element_type)
+}
+
+fn process_input_stream(pipe: OwnedPipe, element_type: StreamElementType) -> TorclVal {
+    alloc_stream(
+        element_type,
+        StreamInner::FileInput {
+            file: StreamHandle::pipe(std::fs::File::from(pipe)),
+            read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+            buf_pos: 0,
+            buf_fill: 0,
+            line: 0,
+            col: 0,
+            unread: None,
+            external_format: ExternalFormat::Utf8,
+            element_type,
         },
         vec![],
     )
