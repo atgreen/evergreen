@@ -53,8 +53,9 @@ const SLOTS: a64::Reg = 28;
 const F0: a64::Fpr = 0;
 const F1: a64::Fpr = 1;
 
-/// Bytes the prologue's save area occupies: the frame record plus x19–x28.
-const SAVE_BYTES: i32 = 96;
+/// Bytes the prologue's save area occupies. Shared with T1 and with the SIGSEGV
+/// recovery epilogue, which must be able to unwind either tier.
+const SAVE_BYTES: i32 = a64::JIT_SAVE_BYTES;
 
 /// Back-edge polls run one in this many iterations. Matching the System Z
 /// emitter: frequent enough that a hot loop reaches a collection promptly,
@@ -280,10 +281,7 @@ impl Emitter<'_> {
         self.asm
             .word(a64::stp_pre(a64::FP, a64::LR, a64::SP, -SAVE_BYTES).ok_or_else(unsupported)?);
         self.asm.word(a64::mov_from_sp(a64::FP));
-        for (index, (first, second)) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)]
-            .into_iter()
-            .enumerate()
-        {
+        for (index, (first, second)) in a64::JIT_SAVED_PAIRS.into_iter().enumerate() {
             self.asm.word(
                 a64::stp(first, second, a64::SP, 16 + index as i32 * 16).ok_or_else(unsupported)?,
             );
@@ -300,10 +298,7 @@ impl Emitter<'_> {
 
     fn epilogue(&mut self) -> Result<(), EmitError> {
         self.asm.word(a64::mov_to_sp(a64::FP));
-        for (index, (first, second)) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)]
-            .into_iter()
-            .enumerate()
-        {
+        for (index, (first, second)) in a64::JIT_SAVED_PAIRS.into_iter().enumerate() {
             self.asm.word(
                 a64::ldp(first, second, a64::SP, 16 + index as i32 * 16).ok_or_else(unsupported)?,
             );

@@ -32,9 +32,9 @@ use super::{
     BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_alloc_cons, c2i_call_builtin,
     c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
     c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
-    c2i_store_env, c2i_store_global, c2i_t1_backedge, c2i_take_values, c2i_transfer_pending,
-    c2i_typep_class, c2i_values_to_list, call_site_profile_token, registry_get, resolve_sym,
-    t2_backedge_threshold,
+    c2i_set_native_sigsegv_recovery, c2i_store_env, c2i_store_global, c2i_t1_backedge,
+    c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
+    call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
 };
 use torcl_rt::asm::a64;
 use torcl_rt::asm::{Asm, Cc};
@@ -54,9 +54,11 @@ const ACC: a64::Reg = 0;
 const SCRATCH: a64::Reg = 16;
 const SCRATCH2: a64::Reg = 17;
 
-/// Bytes the prologue claims: the frame record plus the three activation
-/// registers, rounded to the 16-byte stack alignment AAPCS64 requires at a call.
-const FRAME_BYTES: i32 = 48;
+/// Bytes the prologue claims. This is the shared JIT save area, not the three
+/// registers T1 actually needs: one SIGSEGV recovery epilogue has to unwind
+/// whichever tier faulted, so T1 and T2 keep a single layout. See
+/// `a64::JIT_SAVE_BYTES`.
+const FRAME_BYTES: i32 = a64::JIT_SAVE_BYTES;
 
 /// Compile `bf` to native AArch64 T1 code, or `None` if it uses an opcode this
 /// baseline does not handle.
@@ -153,6 +155,8 @@ pub(super) fn emit_native_a64(
     let builtin_addr =
         c2i_call_builtin as extern "C" fn(u64, u64, *const TorclVal, u64) -> u64 as usize as u64;
     let transfer_addr = c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64;
+    let recovery_toggle_addr =
+        c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
@@ -190,8 +194,9 @@ pub(super) fn emit_native_a64(
     let emit_prologue = |c: &mut Asm| -> Option<()> {
         c.word(a64::stp_pre(a64::FP, a64::LR, a64::SP, -FRAME_BYTES).expect("fixed frame size"));
         c.word(a64::mov_from_sp(a64::FP));
-        c.word(a64::stp(SLOTS, OPSP, a64::SP, 16).expect("fixed frame offset"));
-        c.word(a64::str_imm(STACK, a64::SP, 32).expect("fixed frame offset"));
+        for (index, (first, second)) in a64::JIT_SAVED_PAIRS.into_iter().enumerate() {
+            c.word(a64::stp(first, second, a64::SP, 16 + index as i32 * 16).expect("fixed offset"));
+        }
         c.word(a64::mov(SLOTS, 0));
         c.word(a64::mov(STACK, 1));
         emit_add_disp(c, OPSP, SLOTS, 8 * n_locals)
@@ -267,7 +272,7 @@ pub(super) fn emit_native_a64(
                 } else {
                     c2i_addr
                 };
-                emit_c2i_call(&mut c, target, transfer_addr)?;
+                emit_c2i_call(&mut c, target, transfer_addr, recovery_toggle_addr)?;
                 // Drop the arguments and push the result.
                 c.word(encode!(
                     format_args!("dropping {nargs} call arguments"),
@@ -280,7 +285,7 @@ pub(super) fn emit_native_a64(
                 // not value-preserving. The accumulator is dead between
                 // statements, and the activation registers are callee-saved
                 // across the call, so this needs no spilling.
-                emit_c2i_call(&mut c, clear_mv_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, clear_mv_addr, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::SetValues(n) => {
                 // Route through the ordinary VALUES function so native code and
@@ -290,7 +295,7 @@ pub(super) fn emit_native_a64(
                 emit_mov_imm(&mut c, 1, u64::from(*n));
                 emit_sub_disp(&mut c, 2, OPSP, 8 * i32::from(*n))?;
                 emit_mov_imm(&mut c, 3, 0);
-                emit_c2i_call(&mut c, c2i_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, c2i_addr, transfer_addr, recovery_toggle_addr)?;
                 c.word(encode!(
                     format_args!("dropping {n} values"),
                     a64::sub_imm(OPSP, OPSP, 8 * u64::from(*n))
@@ -303,7 +308,7 @@ pub(super) fn emit_native_a64(
             Instr::LoadEnvVar(name_idx) => {
                 emit_mov_imm(&mut c, 0, std::ptr::from_ref(bf) as u64);
                 emit_mov_imm(&mut c, 1, u64::from(u32::from(*name_idx)));
-                emit_c2i_call(&mut c, load_env_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, load_env_addr, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c);
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
@@ -315,7 +320,7 @@ pub(super) fn emit_native_a64(
                 } else {
                     define_env_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::PushEnvChild | Instr::PopEnvChild => {
                 let helper = if matches!(instr, Instr::PushEnvChild) {
@@ -323,13 +328,13 @@ pub(super) fn emit_native_a64(
                 } else {
                     pop_env_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::AllocCons => {
                 // The cdr is on top, so it pops first.
                 emit_pop(&mut c, 1);
                 emit_pop(&mut c, 0);
-                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c);
             }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
@@ -345,44 +350,74 @@ pub(super) fn emit_native_a64(
                 } else {
                     make_closure_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c);
             }
             Instr::TakeValuesToLocals { nvars, slot_base } => {
                 emit_pop(&mut c, 0);
                 emit_add_disp(&mut c, 1, SLOTS, 8 * i32::from(*slot_base))?;
                 emit_mov_imm(&mut c, 2, u64::from(*nvars));
-                emit_c2i_call(&mut c, take_values_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    take_values_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
             }
             // Read a global or special variable's value cell and push it.
             Instr::LoadGlobal(sym) => {
                 emit_mov_imm(&mut c, 0, u64::from(*sym));
-                emit_c2i_call(&mut c, load_global_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    load_global_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c);
             }
             // `#'f` — the same shape, reading the symbol's FUNCTION cell.
             Instr::LoadFunction(sym) => {
                 emit_mov_imm(&mut c, 0, u64::from(*sym));
-                emit_c2i_call(&mut c, load_function_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    load_function_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c);
             }
             // Consumes the operand and pushes nothing; SETQ reloads for its value.
             Instr::StoreGlobal(sym) => {
                 emit_pop(&mut c, 1);
                 emit_mov_imm(&mut c, 0, u64::from(*sym));
-                emit_c2i_call(&mut c, store_global_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    store_global_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
             }
             Instr::ValuesToList => {
                 // Reads env.mv and allocates; the helper roots the primary before
                 // allocating (bliss-rwiv).
                 emit_pop(&mut c, 0);
-                emit_c2i_call(&mut c, values_to_list_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    values_to_list_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c);
             }
             Instr::TypeP(class) => {
                 emit_pop(&mut c, 0);
                 emit_mov_imm(&mut c, 1, u64::from(*class as u32));
-                emit_c2i_call(&mut c, typep_class_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    typep_class_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c);
             }
             Instr::Br(target) => {
@@ -472,7 +507,7 @@ pub(super) fn emit_native_a64(
                         emit_mov_imm(&mut c, 3, std::ptr::from_ref(bf) as u64);
                         t2_backedge_addr
                     };
-                    emit_c2i_call(&mut c, helper, transfer_addr)?;
+                    emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
                     emit_cmp_imm(&mut c, ACC, 0);
                     c.jcc(Cc::E, keep);
                     // Leaving the loop: T2 finished, or a signal is pending. The
@@ -547,8 +582,9 @@ fn emit_pop(c: &mut Asm, d: a64::Reg) {
 
 fn emit_epilogue(c: &mut Asm) {
     c.word(a64::mov_to_sp(a64::FP));
-    c.word(a64::ldr_imm(STACK, a64::SP, 32).expect("fixed frame offset"));
-    c.word(a64::ldp(SLOTS, OPSP, a64::SP, 16).expect("fixed frame offset"));
+    for (index, (first, second)) in a64::JIT_SAVED_PAIRS.into_iter().enumerate() {
+        c.word(a64::ldp(first, second, a64::SP, 16 + index as i32 * 16).expect("fixed offset"));
+    }
     c.word(a64::ldp_post(a64::FP, a64::LR, a64::SP, FRAME_BYTES).expect("fixed frame size"));
     c.word(a64::ret());
 }
@@ -607,9 +643,41 @@ fn emit_cmp_imm(c: &mut Asm, n: a64::Reg, value: u64) {
 /// every non-x86-64 target, so both sides of the toggle would install the same
 /// zero. Recovery is simply not available on AArch64 yet (bliss-7t9a4), and
 /// pretending to toggle it would cost two calls per c2i call for nothing.
-fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64) -> Option<()> {
+fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64, recovery_toggle: u64) -> Option<()> {
+    // Disable native-frame SIGSEGV recovery while a Rust helper frame is active.
+    // Recovery redirects a fault to an epilogue that unwinds a JIT frame; with a
+    // helper frame on top that would restore the wrong registers and return to the
+    // wrong place. The arguments are spilled around the toggle because it is an
+    // ordinary call that clobbers them.
+    let spill = |c: &mut Asm, store: bool| {
+        for (index, register) in [0u8, 1, 2, 3].into_iter().enumerate() {
+            let offset = 8 * index as i32;
+            c.word(if store {
+                a64::str_imm(register, a64::SP, offset as u64).expect("fixed offset")
+            } else {
+                a64::ldr_imm(register, a64::SP, offset as u64).expect("fixed offset")
+            });
+        }
+    };
+    c.word(a64::sub_imm(a64::SP, a64::SP, 48).expect("fixed frame"));
+    spill(c, true);
+    c.word(a64::str_imm(SCRATCH2, a64::SP, 32).expect("fixed offset"));
+    emit_mov_imm(c, 0, 0);
+    emit_mov_imm(c, SCRATCH, recovery_toggle);
+    c.word(a64::blr(SCRATCH));
+    spill(c, false);
+    c.word(a64::ldr_imm(SCRATCH2, a64::SP, 32).expect("fixed offset"));
+    c.word(a64::add_imm(a64::SP, a64::SP, 48).expect("fixed frame"));
+
     emit_mov_imm(c, SCRATCH, target);
     c.word(a64::blr(SCRATCH));
+
+    // Re-enable recovery, preserving the call's result across the toggle.
+    c.word(a64::str_pre(ACC, a64::SP, -16).expect("16 is in the unscaled range"));
+    emit_mov_imm(c, 0, 1);
+    emit_mov_imm(c, SCRATCH, recovery_toggle);
+    c.word(a64::blr(SCRATCH));
+    c.word(a64::ldr_post(ACC, a64::SP, 16).expect("16 is in the unscaled range"));
 
     // Stop T1 at a call that initiated an error, THROW or RETURN-FROM. The c2i
     // helper stashes the condition and returns NIL, so without this check native

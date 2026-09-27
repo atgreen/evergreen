@@ -13415,7 +13415,44 @@ fn native_sigsegv_recovery_ip() -> usize {
     native_sigsegv_recovery_epilogue as *const () as usize
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+/// The AArch64 counterpart (bliss-7t9a4). A fault anywhere in native code is
+/// redirected here, so this must unwind whichever tier was running — which is why
+/// T1 and T2 share one save-area layout (`a64::JIT_SAVE_BYTES`). Restoring the
+/// stack pointer from the frame pointer rather than from where the fault happened
+/// makes it independent of how much of the frame the body had claimed.
+///
+/// Returns the sentinel 7 that the x86 epilogue returns, which `run_native` reads
+/// as "this activation faulted".
+#[cfg(all(target_arch = "aarch64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn native_sigsegv_recovery_epilogue() {
+    core::arch::naked_asm!(
+        "mov x0, #7",
+        "mov sp, x29",
+        "ldp x19, x20, [sp, #16]",
+        "ldp x21, x22, [sp, #32]",
+        "ldp x23, x24, [sp, #48]",
+        "ldp x25, x26, [sp, #64]",
+        "ldp x27, x28, [sp, #80]",
+        "ldp x29, x30, [sp], #96",
+        "ret",
+    )
+}
+
+/// The epilogue above hard-codes the save-area offsets, so a change to the shared
+/// layout must break the build rather than the recovery path.
+#[cfg(all(target_arch = "aarch64", unix))]
+const _: () = assert!(
+    torcl_rt::asm::a64::JIT_SAVE_BYTES == 96,
+    "the AArch64 recovery epilogue's offsets assume a 96-byte save area"
+);
+
+#[cfg(all(target_arch = "aarch64", unix))]
+fn native_sigsegv_recovery_ip() -> usize {
+    native_sigsegv_recovery_epilogue as *const () as usize
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", unix), all(target_arch = "aarch64", unix))))]
 fn native_sigsegv_recovery_ip() -> usize {
     0
 }

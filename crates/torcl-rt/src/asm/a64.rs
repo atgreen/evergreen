@@ -26,6 +26,21 @@ pub type Reg = u8;
 /// A SIMD/FP register number, used here only as a double.
 pub type Fpr = u8;
 
+/// Bytes of save area every AArch64 JIT tier claims on entry, holding the frame
+/// record at `[sp, #0]` and x19–x28 in consecutive pairs from `[sp, #16]`.
+///
+/// T1, T2 and the SIGSEGV recovery epilogue must agree on this exactly. The
+/// recovery epilogue is why: a fault anywhere in native code is redirected to a
+/// single address that has to unwind whichever tier was running, so one layout is
+/// the difference between recovering and returning to a caller whose callee-saved
+/// registers are somebody else's. T1 needs only three of these registers, and
+/// saves all ten anyway to keep that one layout true.
+pub const JIT_SAVE_BYTES: i32 = 96;
+
+/// The register pairs `JIT_SAVE_BYTES` holds, in the order they are stored from
+/// `[sp, #16]` onwards.
+pub const JIT_SAVED_PAIRS: [(Reg, Reg); 5] = [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)];
+
 pub const XZR: Reg = 31;
 pub const SP: Reg = 31;
 /// The link register: `BL`/`BLR` write it and `RET` reads it.
