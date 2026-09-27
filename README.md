@@ -43,6 +43,11 @@ For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
 [cross-compilation and QEMU validation](docs/cross-compilation.md). These initial
 ports run the interpreter and bytecode engine; native JIT support is separate.
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
+The Android AArch64 CLI is built and validated the same way — same kernel, a
+different libc — and is
+[documented alongside the Linux ports](docs/cross-compilation.md#android-aarch64),
+including how the installable executable is dumped under emulation, since
+`make image` runs the target binary and so cannot cross-compile.
 
 Build the standalone `torcl` executable with ASDF preloaded, then install it:
 
