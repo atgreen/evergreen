@@ -14919,11 +14919,13 @@ fn emit_c2i_helper_call(c: &mut Asm) {
     emit_native_transfer_check(c);
 }
 
-/// This leaf only inspects the pending transfer: it cannot allocate, collect,
-/// or invoke Lisp. The emitter may therefore preserve its result on the native
-/// stack without creating a GC root.
+/// Check pending transfers and claim process signals at every native runtime
+/// call boundary. Slow allocating calls can spread sampled back-edge polls
+/// beyond the shutdown deadline. This leaf cannot allocate Lisp objects,
+/// collect, or invoke Lisp; the emitter may keep its result unrooted on the
+/// native stack during the check.
 extern "C" fn c2i_transfer_pending() -> u64 {
-    NATIVE_ERROR.with(|error| u64::from(error.borrow().is_some()))
+    native_loop_should_exit()
 }
 
 /// Stop T1 at the call that initiated an error/THROW/RETURN-FROM. Returning a

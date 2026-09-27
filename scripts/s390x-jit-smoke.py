@@ -342,25 +342,32 @@ def main():
       (jit-t2-spin -1)
       (format t "FELL-THROUGH~%")
     """
-    env = dict(base, TORCL_FORCE_TIER="t2", TORCL_LAZY_COMPILE="0")
-    child = subprocess.Popen(command + ["--no-init", "--no-bootstrap", "--eval", spin],
-                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        with selectors.DefaultSelector() as ready:
-            ready.register(child.stdout, selectors.EVENT_READ)
-            assert ready.select(timeout=30), "optimized spin did not become ready"
-            assert child.stdout.readline().strip() == "READY", "optimized spin failed before ready"
-        # Let it enter the native loop; shutdown must beat the runtime's 5s
-        # hard SIGTERM deadline, which alone would not prove cooperative polls.
-        time.sleep(0.1)
-        child.terminate()
-        output, errors = child.communicate(timeout=2)
-        assert child.returncode >= 0 and "FELL-THROUGH" not in output, (child.returncode, output, errors)
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.communicate()
-    print("s390x: call-free T2 loop responds promptly to SIGTERM", flush=True)
+    # Slow allocating iterations can put sampled back-edge polls farther apart
+    # than the shutdown deadline. Runtime-call boundaries must poll too.
+    allocating_spin = spin.replace("(setq i (1+ i))", "(list i i) (setq i (1+ i))")
+    for name, source, stress in [
+        ("call-free", spin, {}),
+        ("allocating stress", allocating_spin, {"TORCL_GC_STRESS": "1", "TORCL_GC_POISON": "1"}),
+    ]:
+        env = dict(base, TORCL_FORCE_TIER="t2", TORCL_LAZY_COMPILE="0", **stress)
+        child = subprocess.Popen(command + ["--no-init", "--no-bootstrap", "--eval", source],
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                assert ready.select(timeout=30), "optimized spin did not become ready"
+                assert child.stdout.readline().strip() == "READY", "optimized spin failed before ready"
+            # Let it enter the native loop; shutdown must beat the runtime's 5s
+            # hard SIGTERM deadline, which alone would not prove cooperative polls.
+            time.sleep(0.1)
+            child.terminate()
+            output, errors = child.communicate(timeout=2)
+            assert child.returncode >= 0 and "FELL-THROUGH" not in output, (child.returncode, output, errors)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+        print(f"s390x: {name} T2 loop responds promptly to SIGTERM", flush=True)
 
 
 if __name__ == "__main__":
