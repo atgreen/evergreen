@@ -8,14 +8,14 @@ rust-version.workspace = true
 
 # Declared rlib, built as a cdylib on demand:
 #
-#   cross rustc --release -p torcl-android --target x86_64-linux-android \
+#   cargo rustc --release -p torcl-android --target x86_64-linux-android \
 #         --crate-type cdylib
 #
 # A cdylib IS the point — Android hands a drawable surface only to code inside
 # the app process, never to a spawned executable — but the workspace's default
 # target is static musl, which cannot produce one at all. Saying "cdylib" here
 # would break `cargo build --workspace` for everybody, and making the crate
-# standalone instead puts its path dependencies outside the container mount.
+# standalone would also duplicate workspace configuration.
 [lib]
 crate-type = ["rlib"]
 

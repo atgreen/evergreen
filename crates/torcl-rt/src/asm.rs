@@ -3,6 +3,10 @@
 //! `torcl-rt` so both tiers emit through the same assembler without a dependency
 //! cycle (same rationale as the relocated bytecode types).
 //!
+//! AArch64 selects its own branch encodings here. Other hosts retain the x86
+//! encoding API so the shared T2 emitter can compile; System Z execution uses
+//! the separate `asm_s390x` assembler.
+//!
 //! The emitter used to carry three parallel hand-rolled fixup tables — branch
 //! targets (`offsets`/`patches`), guard→deopt-stub sites (`deopt_sites`), and
 //! the OSR entry stubs — each recomputing `rel32 = target - (site + 4)` and
@@ -75,7 +79,7 @@ impl Cc {
     }
 
     /// The `0F`-prefixed opcode byte for the near (`rel32`) form.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn opcode2(self) -> u8 {
         match self {
             Cc::E => 0x84,
@@ -111,7 +115,7 @@ impl Cc {
 #[derive(Clone, Copy)]
 enum FixupKind {
     /// x86-64 `rel32`, measured from the END of the four-byte field.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     Rel32,
     /// A64 `imm26` (`B`, `BL`): `(target - instruction) / 4`, ±128 MiB.
     #[cfg(target_arch = "aarch64")]
@@ -262,14 +266,14 @@ impl Asm {
     }
 
     /// `jmp rel32` to `l` (opcode `E9`), reserving the displacement for `finish`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn jmp(&mut self, l: Label) {
         self.code.push(0xE9);
         self.reserve_rel32(l);
     }
 
     /// `jcc rel32` to `l` (opcode `0F 8x`), reserving the displacement.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn jcc(&mut self, cc: Cc, l: Label) {
         self.code.extend_from_slice(&[0x0F, cc.opcode2()]);
         self.reserve_rel32(l);
@@ -277,7 +281,7 @@ impl Asm {
 
     /// `call rel32` to `l` (opcode `E8`) — a direct near call to another point in
     /// this buffer (e.g. a self-recursive call to the function's own entry).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn call(&mut self, l: Label) {
         self.code.push(0xE8);
         self.reserve_rel32(l);
@@ -301,7 +305,7 @@ impl Asm {
 
     /// Reserve a 4-byte `rel32` slot at the current position, to be patched to
     /// reach `l` in `finish`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn reserve_rel32(&mut self, l: Label) {
         self.fixups.push(Fixup {
             site: self.code.len(),
@@ -348,7 +352,7 @@ impl Asm {
         for fx in &self.fixups {
             let target = (*self.labels.get(fx.label.0)?)? as i64;
             match fx.kind {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(not(target_arch = "aarch64"))]
                 FixupKind::Rel32 => {
                     let rel = target - (fx.site as i64 + 4);
                     let rel32 = i32::try_from(rel).ok()?;
@@ -375,13 +379,13 @@ mod tests {
     use super::*;
 
     // Decode the little-endian rel32 that starts at `site`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn rel32_at(code: &[u8], site: usize) -> i32 {
         i32::from_le_bytes(code[site..site + 4].try_into().unwrap())
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn forward_branch_resolves_to_signed_offset() {
         let mut a = Asm::new();
         let done = a.label();
@@ -397,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn backward_branch_is_negative() {
         let mut a = Asm::new();
         let top = a.label();
@@ -410,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn jcc_emits_two_byte_opcode() {
         let mut a = Asm::new();
         let l = a.label();
@@ -437,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(target_arch = "aarch64"))]
     fn many_labels_to_one_target_all_resolve() {
         // Mirrors several guards sharing one deopt stub.
         let mut a = Asm::new();

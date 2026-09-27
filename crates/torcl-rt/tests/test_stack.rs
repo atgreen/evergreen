@@ -2,6 +2,66 @@ use torcl_rt::stack::*;
 use torcl_rt::value::{NIL, TorclVal};
 
 #[test]
+fn growing_top_frame_preserves_addresses_and_scans_new_roots() {
+    let stack = TorclStack::new(4096);
+    let caller = stack.push_frame(NIL, std::ptr::null(), 1, 0).unwrap();
+    let frame = stack.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+    let bitmap = Box::leak(vec![0xff_u8, 0xff].into_boxed_slice());
+    let entries = Box::leak(
+        vec![StackMapEntry {
+            pc_offset: 0,
+            bytes: bitmap.as_ptr() as usize,
+            len: bitmap.len(),
+        }]
+        .into_boxed_slice(),
+    );
+    let info = CodeInfo::new(&[], entries);
+    unsafe {
+        TorclStack::frame_slots_mut(caller)[0] = TorclVal::from_fixnum(99);
+        TorclStack::frame_slots_mut(frame)[0] = TorclVal(0x1001);
+    }
+    assert_eq!(stack.grow_top_frame(12, info), Some(frame));
+    assert_eq!(stack.fp(), frame);
+    unsafe {
+        let slots = TorclStack::frame_slots_mut(frame);
+        assert_eq!(slots[0], TorclVal(0x1001));
+        assert!(slots[2..].iter().all(|value| *value == NIL));
+        slots[11] = TorclVal(0x2001);
+        visit_stack_refs(frame, |value| value.0 += 0x10000);
+        assert_eq!(TorclStack::frame_slots_mut(frame)[0], TorclVal(0x11001));
+        assert_eq!(TorclStack::frame_slots_mut(frame)[11], TorclVal(0x12001));
+        assert_eq!(
+            TorclStack::frame_slots_mut(caller)[0],
+            TorclVal::from_fixnum(99)
+        );
+    }
+    let grown_end = stack.sp();
+    let callee = stack.push_frame(NIL, std::ptr::null(), 1, 0).unwrap();
+    assert!(callee as usize >= grown_end as usize);
+    stack.pop_frame();
+    assert_eq!(stack.sp(), grown_end);
+    stack.pop_frame();
+    assert_eq!(stack.fp(), caller);
+}
+
+#[test]
+fn failed_frame_growth_leaves_stack_unchanged() {
+    let stack = TorclStack::new(4096);
+    let info = CodeInfo::new(&[], &[]);
+    assert_eq!(stack.grow_top_frame(4, info), None);
+    let frame = stack.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+    let used = stack.used();
+    assert_eq!(stack.grow_top_frame(1, info), None);
+    assert_eq!(stack.grow_top_frame(u16::MAX, info), None);
+    assert_eq!(stack.used(), used);
+    assert_eq!(stack.fp(), frame);
+    unsafe {
+        assert_eq!((*frame).num_locals, 2);
+        assert!((*frame).code_info.is_null());
+    }
+}
+
+#[test]
 fn stack_capacity_matches_requested() {
     let stack = TorclStack::new(4096);
     assert_eq!(stack.capacity(), 4096);

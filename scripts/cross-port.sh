@@ -56,6 +56,10 @@ PY
     fi
     scripts/torcl-limited.sh python3 scripts/portability-smoke.py "$arch" -- \
         "qemu-$arch" -L "$sysroot" "$binary"
+    if [[ $arch == s390x ]]; then
+        scripts/torcl-limited.sh python3 scripts/s390x-jit-smoke.py -- \
+            qemu-s390x -L "$sysroot" "$binary"
+    fi
     rm -rf -- "$sysroot"
     trap - EXIT
 done
