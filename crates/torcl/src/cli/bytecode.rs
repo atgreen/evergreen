@@ -19557,9 +19557,9 @@ macro_rules! t2_log {
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // Only targets with an optimizing native emitter may publish T2 code.
-    if !cfg!(all(
-        any(target_arch = "x86_64", target_arch = "s390x"),
-        unix
+    if !cfg!(any(
+        all(target_arch = "x86_64", any(unix, windows)),
+        all(target_arch = "s390x", unix)
     )) {
         return None;
     }

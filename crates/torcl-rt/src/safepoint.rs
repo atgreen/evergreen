@@ -315,7 +315,7 @@ impl Drop for ForeignStateScope {
 
 /// A native-only synchronization region containing no Lisp heap accesses.
 /// Unpinned fibers keep using their cooperative park protocol instead.
-pub(crate) struct NativeBlockingScope {
+pub struct NativeBlockingScope {
     thread: Option<&'static crate::thread::NativeThread>,
     // State must be restored by the execution that entered the region.
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -330,7 +330,7 @@ impl NativeBlockingScope {
     /// change its root slots, allocate Lisp values, or invoke Lisp. Keep any
     /// referenced synchronization state alive independently of moving handles.
     /// Do not enter from the collector while it owns a stop-the-world pause.
-    pub(crate) unsafe fn enter() -> Self {
+    pub unsafe fn enter() -> Self {
         let inactive = Self {
             thread: None,
             _not_send: std::marker::PhantomData,

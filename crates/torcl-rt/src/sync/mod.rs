@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BlockingMode {
+pub enum BlockingMode {
     Fiber,
     Native,
 }
@@ -62,7 +62,9 @@ fn pinned_blocking_action() -> PinnedBlockingAction {
 }
 
 /// Select cooperative or native blocking for the current execution.
-pub(crate) fn blocking_mode(operation: &str) -> Result<BlockingMode, TorclError> {
+/// This only applies the pinned-blocking policy; native I/O must additionally
+/// publish roots with `NativeBlockingScope` for the duration of the operation.
+pub fn blocking_mode(operation: &str) -> Result<BlockingMode, TorclError> {
     let Some(fiber) = current_fiber() else {
         return Ok(BlockingMode::Native);
     };

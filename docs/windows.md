@@ -93,6 +93,9 @@ stdout, and stderr. A list supplies an executable and its arguments directly;
 a string supplies shell syntax to `COMSPEC` (normally `cmd.exe`) with
 `/D /S /C`. Both output pipes are drained concurrently, and stdin receives EOF.
 Captured bytes are decoded as UTF-8 with replacement for invalid sequences.
+Waiting publishes native callers' GC roots and parks unpinned fibers, allowing
+other fibers to run. Pinned callers follow the configured blocking policy;
+the error policy rejects the operation before starting a child.
 Interactive subprocess streams, asynchronous process management, and alternate
 console code-page decoding are not provided by this API.
 
