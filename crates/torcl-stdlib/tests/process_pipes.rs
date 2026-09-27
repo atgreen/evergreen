@@ -10,6 +10,9 @@ fn pipe_peer() {
     }
     println!("READY");
     std::io::stdout().flush().unwrap();
+    if std::env::var("TORCL_PIPE_PEER").as_deref() == Ok("exit") {
+        std::process::exit(0);
+    }
     if std::env::var("TORCL_PIPE_PEER").as_deref() == Ok("binary") {
         std::io::stdout().write_all(&[0, 128, 255]).unwrap();
         std::io::stdout().flush().unwrap();
@@ -109,6 +112,7 @@ mod scheduling {
     use torcl_rt::thread::{FiberState, fiber_state, make_fiber};
     use torcl_rt::{SchedulerConfig, SchedulerGroup, TorclVal};
 
+    static PIN_CLOSE: AtomicBool = AtomicBool::new(false);
     static PRESSURE: AtomicBool = AtomicBool::new(false);
     static WAIT_ONLY: AtomicBool = AtomicBool::new(false);
     static INPUT: AtomicU64 = AtomicU64::new(0);
@@ -151,6 +155,37 @@ mod scheduling {
         stream_write_string(*output, text, 0, None).unwrap();
         stream_finish_output(*output).unwrap();
         NIL
+    }
+
+    fn pinned_closer() -> TorclVal {
+        use torcl_rt::sync::{PinnedBlockingAction, set_pinned_blocking_action};
+        torcl_rt::rooted!(output = TorclVal::from_raw(OUTPUT.load(Ordering::Acquire)));
+        let text = make_lisp_string("cooperative\n");
+        stream_write_string(*output, text, 0, None).unwrap();
+        set_pinned_blocking_action(PinnedBlockingAction::Error);
+        let fiber = torcl_rt::thread::current_fiber().unwrap();
+        fiber.pin();
+        let result = close(*output, false);
+        fiber.unpin().unwrap();
+        assert!(
+            result.is_err(),
+            "pinned policy rejection must reach CLOSE's caller"
+        );
+        assert!(open_stream_p(*output));
+        close(*output, false).unwrap();
+        NIL
+    }
+
+    #[test]
+    fn pinned_close_keeps_output_for_retry_after_unpinning() {
+        if std::env::var_os("TORCL_PIPE_SCHEDULER_CHILD").is_some() {
+            PIN_CLOSE.store(true, Ordering::Release);
+        }
+        run_case(
+            "scheduling::pinned_close_keeps_output_for_retry_after_unpinning",
+            false,
+            false,
+        );
     }
 
     fn entry(f: fn() -> TorclVal) -> TorclVal {
@@ -235,6 +270,19 @@ mod scheduling {
         INPUT.store(input.to_raw(), Ordering::Release);
         OUTPUT.store(output.to_raw(), Ordering::Release);
         let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
+        if PIN_CLOSE.load(Ordering::Acquire) {
+            group
+                .submit(make_fiber(entry(pinned_closer)).unwrap())
+                .unwrap();
+            group.finish().unwrap();
+            let (line, _) = stream_read_line(*input).unwrap();
+            assert_eq!(string_text(line), "reply:cooperative");
+            assert_eq!(stream_read_char(*input).unwrap(), EOF);
+            assert!(child.wait().unwrap().success());
+            close(*input, false).unwrap();
+            return;
+        }
+
         let waiting = make_fiber(entry(if pressure { writer } else { reader })).unwrap();
         group.submit(waiting).unwrap();
         while fiber_state(waiting) != Some(FiberState::Blocked) {
@@ -424,4 +472,37 @@ fn abandoned_pipe_is_closed_without_flushing_during_gc() {
     assert_eq!(stream_read_char(*input).unwrap(), EOF);
     assert!(child.wait().unwrap().success());
     close(*input, false).unwrap();
+}
+
+#[test]
+fn close_reports_broken_pipe_and_abort_releases_it() {
+    install_gc_hooks();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pipe_peer", "--nocapture"])
+        .env("TORCL_PIPE_PEER", "exit")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    assert!(child.wait().unwrap().success());
+    torcl_rt::rooted!(output = process_stdin_stream(stdin, StreamElementType::Character));
+    let text = make_lisp_string("pending output");
+    stream_write_string(*output, text, 0, None).unwrap();
+    assert!(matches!(
+        close(*output, false),
+        Err(torcl_rt::TorclError::StreamError(_))
+    ));
+    assert!(
+        open_stream_p(*output),
+        "failed flush must leave explicit abort possible"
+    );
+    assert!(
+        stream_finish_output(*output).is_err(),
+        "failed bytes must remain pending"
+    );
+    close(*output, true).unwrap();
+    assert!(!open_stream_p(*output));
+    close(*output, false).unwrap();
 }

@@ -451,16 +451,23 @@ fn file_read_byte_raw(
 }
 
 /// Flush a write buffer to file.
-fn file_flush_write_buf(
-    file: &mut StreamHandle,
-    write_buf: &mut Vec<u8>,
-) -> Result<(), TorclError> {
-    if !write_buf.is_empty() {
-        file.write_all(write_buf)
-            .map_err(|e| TorclError::StreamError(format!("file write error: {}", e)))?;
-        write_buf.clear();
-    }
-    Ok(())
+fn file_flush_write_buf(file: &mut impl Write, write_buf: &mut Vec<u8>) -> Result<(), TorclError> {
+    let mut written = 0;
+    let result = loop {
+        if written == write_buf.len() {
+            break Ok(());
+        }
+        match file.write(&write_buf[written..]) {
+            Ok(0) => break Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        }
+    };
+    // A retry must not duplicate the prefix already accepted by the OS.
+    // Keep the unwritten suffix even when the error aborts CLOSE or FINISH-OUTPUT.
+    write_buf.drain(..written);
+    result.map_err(|e| TorclError::StreamError(format!("file write error: {e}")))
 }
 
 // ── Helper: extract string as &str for character-index slicing ────
@@ -1985,7 +1992,7 @@ pub fn close(stream: TorclVal, abort: bool) -> Result<(), TorclError> {
                 | StreamInner::FileIo {
                     file, write_buf, ..
                 } => {
-                    let _ = file_flush_write_buf(file, write_buf);
+                    file_flush_write_buf(file, write_buf)?;
                 }
                 _ => {}
             }
@@ -2972,4 +2979,59 @@ pub fn two_way_stream_output_stream(stream: TorclVal) -> Option<TorclVal> {
 #[cfg(windows)]
 pub fn stream_raw_fd(_stream: TorclVal) -> Option<i32> {
     None
+}
+
+#[cfg(test)]
+mod output_flush_tests {
+    use super::file_flush_write_buf;
+    use std::collections::VecDeque;
+    use std::io::{self, Write};
+
+    struct ShortWriter {
+        steps: VecDeque<io::Result<usize>>,
+        delivered: Vec<u8>,
+    }
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = self.steps.pop_front().unwrap_or(Ok(bytes.len()))?;
+            assert!(count <= bytes.len());
+            self.delivered.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_flush_retains_only_the_unwritten_suffix() {
+        let mut writer = ShortWriter {
+            steps: VecDeque::from([
+                Ok(3),
+                Err(io::ErrorKind::Interrupted.into()),
+                Ok(2),
+                Err(io::ErrorKind::WouldBlock.into()),
+            ]),
+            delivered: Vec::new(),
+        };
+        let mut pending = b"abcdefghi".to_vec();
+        assert!(file_flush_write_buf(&mut writer, &mut pending).is_err());
+        assert_eq!(writer.delivered, b"abcde");
+        assert_eq!(pending, b"fghi");
+        file_flush_write_buf(&mut writer, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(writer.delivered, b"abcdefghi");
+    }
+
+    #[test]
+    fn zero_write_is_an_error_and_preserves_pending_bytes() {
+        let mut writer = ShortWriter {
+            steps: VecDeque::from([Ok(0)]),
+            delivered: Vec::new(),
+        };
+        let mut pending = b"pending".to_vec();
+        assert!(file_flush_write_buf(&mut writer, &mut pending).is_err());
+        assert_eq!(pending, b"pending");
+        assert!(writer.delivered.is_empty());
+    }
 }

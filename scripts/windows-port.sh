@@ -59,6 +59,7 @@ scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test test_tcp_streams --test test_process -- --test-threads=1
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling --test process_pipes
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::output_flush_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::fiber_tests
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::fiber_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test stream_roots_cli
