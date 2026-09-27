@@ -12,7 +12,18 @@ pub struct JitBuffer {
     len: usize,
     #[cfg(all(windows, target_arch = "x86_64"))]
     unwind:
-        Option<Box<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY>>,
+        Option<Box<[windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY]>>,
+}
+
+/// One native-code range and its serialized Win64 UNWIND_INFO.
+/// Offsets are relative to the beginning of the owning code buffer.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub struct WindowsUnwindInfo<'a> {
+    pub begin: u32,
+    /// Exclusive end of the function's instruction range.
+    pub end: u32,
+    pub unwind_info: &'a [u8],
 }
 
 // SAFETY: after `new` the mapping is read+execute only; the pointer is never
@@ -92,31 +103,74 @@ impl JitBuffer {
     /// and stack walks through this code must finish before dropping the buffer.
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub unsafe fn new_with_windows_unwind(code: &[u8], unwind_info: &[u8]) -> Option<Self> {
+        let range = WindowsUnwindInfo {
+            begin: 0,
+            end: u32::try_from(code.len()).ok()?,
+            unwind_info,
+        };
+        // SAFETY: the caller supplies valid metadata for this whole-code range.
+        unsafe { Self::new_with_windows_unwind_ranges(code, &[range]) }
+    }
+
+    /// Install code containing multiple independently described unwind ranges.
+    /// Ranges must be nonempty, sorted, disjoint, and contained in `code`.
+    /// Gaps are allowed; callers must ensure they require no unwind entry.
+    /// Each metadata record is copied after the code at a DWORD-aligned offset.
+    /// The entire function table remains registered until this buffer is dropped.
+    ///
+    /// # Safety
+    /// Each record must be valid Windows x64 UNWIND_INFO describing the machine
+    /// state throughout its range, including prologue, body and epilogues.
+    /// Embedded handler/chained RVAs are relative to the returned code pointer;
+    /// they are not relocated. All executions and stack walks through this code
+    /// must finish before dropping the buffer.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub unsafe fn new_with_windows_unwind_ranges(
+        code: &[u8],
+        ranges: &[WindowsUnwindInfo<'_>],
+    ) -> Option<Self> {
         use windows_sys::Win32::System::Diagnostics::Debug::*;
 
-        if code.is_empty() || unwind_info.len() < 4 {
+        if code.is_empty() || ranges.is_empty() {
             return None;
         }
         let code_len = u32::try_from(code.len()).ok()?;
-        let unwind_offset = code_len.checked_add(3)? & !3;
-        let total = (unwind_offset as usize).checked_add(unwind_info.len())?;
-        u32::try_from(total).ok()?;
+        let count = u32::try_from(ranges.len()).ok()?;
+        let mut total = code_len;
+        let mut previous_end = 0;
+        let mut table = Vec::new();
+        table.try_reserve_exact(ranges.len()).ok()?;
+        for range in ranges {
+            if range.begin < previous_end
+                || range.begin >= range.end
+                || range.end > code_len
+                || range.unwind_info.len() < 4
+            {
+                return None;
+            }
+            previous_end = range.end;
+            let unwind_offset = total.checked_add(3)? & !3;
+            total = unwind_offset.checked_add(u32::try_from(range.unwind_info.len()).ok()?)?;
+            table.push(IMAGE_RUNTIME_FUNCTION_ENTRY {
+                BeginAddress: range.begin,
+                EndAddress: range.end,
+                Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 {
+                    UnwindInfoAddress: unwind_offset,
+                },
+            });
+        }
         let mut image = Vec::new();
-        image.try_reserve_exact(total).ok()?;
+        image.try_reserve_exact(total as usize).ok()?;
         image.extend_from_slice(code);
-        image.resize(unwind_offset as usize, 0);
-        image.extend_from_slice(unwind_info);
+        for (entry, range) in table.iter().zip(ranges) {
+            // SAFETY: every entry was initialized with UnwindInfoAddress above.
+            image.resize(unsafe { entry.Anonymous.UnwindInfoAddress } as usize, 0);
+            image.extend_from_slice(range.unwind_info);
+        }
         let mut buffer = Self::new(&image)?;
-        // The OS retains this table address: a Box keeps it stable when the
-        // owning JitBuffer moves into an adapter/cache.
-        let table = Box::new(IMAGE_RUNTIME_FUNCTION_ENTRY {
-            BeginAddress: 0,
-            EndAddress: code_len,
-            Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 {
-                UnwindInfoAddress: unwind_offset,
-            },
-        });
-        if !unsafe { RtlAddFunctionTable(&*table, 1, buffer.ptr as u64) } {
+        // Box before registration: the OS retains the table's stable address.
+        let table = table.into_boxed_slice();
+        if !unsafe { RtlAddFunctionTable(table.as_ptr(), count, buffer.ptr as u64) } {
             return None;
         }
         buffer.unwind = Some(table);
@@ -148,7 +202,9 @@ impl Drop for JitBuffer {
         if let Some(table) = self.unwind.take() {
             // Unregister before freeing either the table or its code/xdata.
             if !unsafe {
-                windows_sys::Win32::System::Diagnostics::Debug::RtlDeleteFunctionTable(&*table)
+                windows_sys::Win32::System::Diagnostics::Debug::RtlDeleteFunctionTable(
+                    table.as_ptr(),
+                )
             } {
                 // A retained OS registration must never point into freed
                 // storage. Conservatively retain both allocations on failure.

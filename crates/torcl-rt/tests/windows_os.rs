@@ -102,6 +102,160 @@ fn windows_jit_frame_unwinds_at_each_instruction_boundary() {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn windows_jit_multiple_entries_have_independent_unwind_ranges() {
+    use torcl_rt::jit::{JitBuffer, WindowsUnwindInfo};
+    use windows_sys::Win32::System::Diagnostics::Debug::*;
+
+    // Two independently callable entries, separated by three unregistered bytes.
+    // The first saves RBP; the second has only a 40-byte stack allocation.
+    let bytes = [
+        0x55, 0x48, 0x83, 0xec, 32, 0xb8, 42, 0, 0, 0, 0x48, 0x83, 0xc4, 32, 0x5d, 0xc3, 0xcc,
+        0xcc, 0xcc, 0x48, 0x83, 0xec, 40, 0xb8, 43, 0, 0, 0, 0x48, 0x83, 0xc4, 40, 0xc3,
+    ];
+    let entries = [
+        WindowsUnwindInfo {
+            begin: 0,
+            end: 16,
+            unwind_info: &[1, 5, 2, 0, 5, 0x32, 1, 0x50],
+        },
+        WindowsUnwindInfo {
+            begin: 19,
+            end: 33,
+            unwind_info: &[1, 4, 1, 0, 4, 0x42, 0, 0],
+        },
+    ];
+    let code = unsafe { JitBuffer::new_with_windows_unwind_ranges(&bytes, &entries) }.unwrap();
+    let address = code.as_ptr() as u64;
+    unsafe {
+        let mut base = 0;
+        let mut metadata = Vec::new();
+        for (range, expected) in entries.iter().zip([42, 43]) {
+            let function: extern "C" fn() -> u32 =
+                std::mem::transmute(code.as_ptr().add(range.begin as usize));
+            assert_eq!(function(), expected);
+            for offset in range.begin..range.end {
+                let entry = RtlLookupFunctionEntry(
+                    address + u64::from(offset),
+                    &mut base,
+                    std::ptr::null_mut(),
+                );
+                assert!(!entry.is_null(), "missing range at {offset}");
+                assert_eq!(base, address);
+                assert_eq!((*entry).BeginAddress, range.begin);
+                assert_eq!((*entry).EndAddress, range.end);
+                assert_eq!((*entry).Anonymous.UnwindInfoAddress % 4, 0);
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        (base + u64::from((*entry).Anonymous.UnwindInfoAddress)) as *const u8,
+                        range.unwind_info.len()
+                    ),
+                    range.unwind_info,
+                );
+            }
+            let entry = RtlLookupFunctionEntry(
+                address + u64::from(range.begin),
+                &mut base,
+                std::ptr::null_mut(),
+            );
+            metadata.push((*entry).Anonymous.UnwindInfoAddress);
+        }
+        assert_ne!(metadata[0], metadata[1]);
+        for offset in [16, 17, 18, 33] {
+            assert!(
+                RtlLookupFunctionEntry(address + offset, &mut base, std::ptr::null_mut()).is_null()
+            );
+        }
+
+        let stack = [0u64, 0, 0, 0, 0x1234_5678, 0x9876_5432, 0];
+        let bottom = stack.as_ptr() as u64;
+        // Actual instruction boundaries, including both epilogues. At entry
+        // and after allocation the same stack contents model both functions.
+        for (offset, rsp_slot) in [
+            (0, 5),
+            (1, 4),
+            (5, 0),
+            (10, 0),
+            (14, 4),
+            (15, 5),
+            (19, 5),
+            (23, 0),
+            (28, 0),
+            (32, 5),
+        ] {
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = address + offset;
+            context.Rsp = bottom + rsp_slot * 8;
+            context.Rbp = stack[4];
+            let entry = RtlLookupFunctionEntry(context.Rip, &mut base, std::ptr::null_mut());
+            let mut handler_data = std::ptr::null_mut();
+            let mut establisher = 0;
+            RtlVirtualUnwind(
+                0,
+                base,
+                context.Rip,
+                entry,
+                &mut context,
+                &mut handler_data,
+                &mut establisher,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(context.Rip, stack[5], "RIP at {offset}");
+            assert_eq!(context.Rsp, bottom + 48, "RSP at {offset}");
+            assert_eq!(context.Rbp, stack[4], "RBP at {offset}");
+        }
+        drop(code);
+        for offset in [5, 23] {
+            assert!(
+                RtlLookupFunctionEntry(address + offset, &mut base, std::ptr::null_mut()).is_null()
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn windows_jit_rejects_invalid_unwind_ranges() {
+    use torcl_rt::jit::{JitBuffer, WindowsUnwindInfo};
+    let leaf = WindowsUnwindInfo {
+        begin: 0,
+        end: 1,
+        unwind_info: &[1, 0, 0, 0],
+    };
+    let code = [0xc3; 8];
+    for ranges in [
+        vec![],
+        vec![WindowsUnwindInfo { end: 0, ..leaf }],
+        vec![WindowsUnwindInfo { begin: 2, ..leaf }],
+        vec![WindowsUnwindInfo { end: 9, ..leaf }],
+        vec![WindowsUnwindInfo {
+            unwind_info: &[1, 0, 0],
+            ..leaf
+        }],
+        vec![leaf, leaf],
+        vec![
+            WindowsUnwindInfo {
+                begin: 4,
+                end: 5,
+                ..leaf
+            },
+            leaf,
+        ],
+        vec![
+            WindowsUnwindInfo { end: 5, ..leaf },
+            WindowsUnwindInfo {
+                begin: 4,
+                end: 6,
+                ..leaf
+            },
+        ],
+    ] {
+        assert!(unsafe { JitBuffer::new_with_windows_unwind_ranges(&code, &ranges) }.is_none());
+    }
+    assert!(unsafe { JitBuffer::new_with_windows_unwind_ranges(&[], &[leaf]) }.is_none());
+}
+
 #[test]
 fn windows_memory_and_thread_services() {
     let page = os::page_size();
