@@ -477,6 +477,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "torcl-android"
+version = "0.1.0"
+dependencies = [
+ "torcl",
+ "torcl-rt",
+]
+
+[[package]]
 name = "torcl-compiler"
 version = "0.1.0"
 dependencies = [

@@ -18,3 +18,9 @@ image = "ghcr.io/cross-rs/s390x-unknown-linux-gnu:0.2.5"
 # edge image carries a new enough NDK.
 [target.aarch64-linux-android]
 image = "ghcr.io/cross-rs/aarch64-linux-android:main"
+
+# The emulator on an x86-64 host runs an x86-64 system image with KVM, so the
+# GUI work targets this rather than aarch64: full CPU emulation of a 100 MB+
+# Lisp image is not a usable inner loop.
+[target.x86_64-linux-android]
+image = "ghcr.io/cross-rs/x86_64-linux-android:main"
