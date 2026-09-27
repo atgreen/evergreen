@@ -526,6 +526,10 @@ impl Allocator for HeapAllocator {
         if size == 0 {
             return Err(TorclError::Internal("zero-size allocation".into()));
         }
+        // alloc_typed can hold the carrier's T0_ALLOCATOR borrow here. Waiting
+        // for collector admission must still acknowledge GC, but must not
+        // suspend that borrow or resume it on another carrier.
+        let _carrier_pin = crate::thread::FiberPin::current();
         // Anything that cannot fit a fresh TLAB goes through alloc_large. The old
         // `size > region_size / 2` threshold stranded the "medium" range
         // (tlab_size, region_size/2]: alloc_fast fails (footprint exceeds a TLAB),
@@ -3223,10 +3227,117 @@ fn acquire_gc_admission() -> std::sync::RwLockWriteGuard<'static, ()> {
             Ok(guard) => return guard,
             Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
+                allocator_admission_tests::before_poll();
                 crate::safepoint::poll_safepoint();
                 std::thread::yield_now();
             }
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
+mod allocator_admission_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static REACHED: AtomicBool = AtomicBool::new(false);
+    static OBSERVER_QUEUED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn before_poll() {
+        if ARMED.load(Ordering::Acquire)
+            && T0_ALLOCATOR.with(|cell| cell.try_borrow_mut().is_err())
+            && ARMED.swap(false, Ordering::AcqRel)
+        {
+            crate::thread::current_fiber().unwrap().request_yield();
+            REACHED.store(true, Ordering::Release);
+            while !OBSERVER_QUEUED.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn allocating() -> TorclVal {
+        while !REACHED.load(Ordering::Acquire) {
+            if alloc_typed(1024, crate::object::type_id::DOUBLE_FLOAT).is_none() {
+                return TorclVal::from_fixnum(2);
+            }
+        }
+        TorclVal::from_fixnum(!crate::thread::current_fiber().unwrap().can_yield() as i64)
+    }
+
+    fn observing() -> TorclVal {
+        TorclVal::from_fixnum(T0_ALLOCATOR.with(|cell| cell.try_borrow_mut().is_err()) as i64)
+    }
+
+    #[test]
+    fn collector_admission_does_not_suspend_a_borrowed_carrier_allocator() {
+        const CHILD: &str = "TORCL_ALLOCATOR_ADMISSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::allocator_admission_tests::collector_admission_does_not_suspend_a_borrowed_carrier_allocator", "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove("TORCL_GC_STRESS")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        init_heap(&GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 16 * 1024 * 1024,
+            nursery_size: 64 * 1024,
+            tlab_size: 4096,
+            region_size: 4096,
+            promotion_threshold: 3,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 32,
+            old_occupancy_trigger: 0.9,
+        })
+        .unwrap();
+        let gate = cross_thread_root_gc_gate().read().unwrap();
+        let group =
+            crate::SchedulerGroup::init(&crate::SchedulerConfig { num_workers: 1 }).unwrap();
+        let function = unsafe { TorclVal::from_function_ptr(allocating as *const () as *mut u8) };
+        group
+            .submit(crate::thread::make_fiber(function).unwrap())
+            .unwrap();
+        ARMED.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !REACHED.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "allocator never waited for admission"
+            );
+            std::thread::yield_now();
+        }
+        let observer = unsafe { TorclVal::from_function_ptr(observing as *const () as *mut u8) };
+        group
+            .submit(crate::thread::make_fiber(observer).unwrap())
+            .unwrap();
+        OBSERVER_QUEUED.store(true, Ordering::Release);
+        // A pinned allocator must still acknowledge another collector while
+        // waiting for admission; otherwise pinning trades the borrow bug for
+        // a stop-the-world deadlock.
+        let paused = crate::safepoint::wait_for_all_threads();
+        if paused.is_ok() {
+            crate::safepoint::resume_all_threads().unwrap();
+        }
+        // The test driver is now a registered mutator. Stay quiescent while
+        // the worker collects and we wait for its immediate-valued results.
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+        drop(gate);
+        assert_eq!(group.finish().unwrap(), vec![TorclVal::from_fixnum(0); 2]);
+        assert!(
+            paused.is_ok(),
+            "pinned allocator missed the GC pause: {paused:?}"
+        );
     }
 }
 

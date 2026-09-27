@@ -3,6 +3,10 @@
 //! `torcl-rt` so both tiers emit through the same assembler without a dependency
 //! cycle (same rationale as the relocated bytecode types).
 //!
+//! AArch64 selects its own branch encodings here. Other hosts retain the x86
+//! encoding API so the shared T2 emitter can compile; System Z execution uses
+//! the separate `asm_s390x` assembler.
+//!
 //! The emitter used to carry three parallel hand-rolled fixup tables — branch
 //! targets (`offsets`/`patches`), guard→deopt-stub sites (`deopt_sites`), and
 //! the OSR entry stubs — each recomputing `rel32 = target - (site + 4)` and
@@ -43,6 +47,10 @@ pub enum Cc {
     Ne,
     /// OF=1 (signed overflow) — the fixnum-overflow guard edge.
     O,
+    /// OF=0 (no signed overflow). Exists so that `inverse` is total: a partial
+    /// inversion that quietly returns the condition unchanged is a wrong-branch
+    /// bug waiting for its first caller.
+    No,
     /// Signed less (SF≠OF).
     L,
     /// Signed less-or-equal (ZF=1 or SF≠OF).
@@ -54,12 +62,30 @@ pub enum Cc {
 }
 
 impl Cc {
+    /// The AArch64 condition field (C4.1, `cond`), for `B.cond` and the
+    /// conditional-select family. Every code the emitter uses has a direct
+    /// counterpart; `O` is AArch64's `VS`.
+    pub(crate) fn a64_cond(self) -> u32 {
+        match self {
+            Cc::E => 0b0000,  // EQ
+            Cc::Ne => 0b0001, // NE
+            Cc::O => 0b0110,  // VS
+            Cc::No => 0b0111, // VC
+            Cc::Ge => 0b1010, // GE
+            Cc::L => 0b1011,  // LT
+            Cc::G => 0b1100,  // GT
+            Cc::Le => 0b1101, // LE
+        }
+    }
+
     /// The `0F`-prefixed opcode byte for the near (`rel32`) form.
+    #[cfg(not(target_arch = "aarch64"))]
     fn opcode2(self) -> u8 {
         match self {
             Cc::E => 0x84,
             Cc::Ne => 0x85,
             Cc::O => 0x80,
+            Cc::No => 0x81,
             Cc::L => 0x8C,
             Cc::Ge => 0x8D,
             Cc::Le => 0x8E,
@@ -73,7 +99,8 @@ impl Cc {
         match self {
             Cc::E => Cc::Ne,
             Cc::Ne => Cc::E,
-            Cc::O => Cc::O, // no NO code listed; unused for inversion
+            Cc::O => Cc::No,
+            Cc::No => Cc::O,
             Cc::L => Cc::Ge,
             Cc::Ge => Cc::L,
             Cc::Le => Cc::G,
@@ -82,14 +109,66 @@ impl Cc {
     }
 }
 
-/// A pending `rel32` displacement: the byte offset of its 4-byte slot, and the
-/// label it must reach.
+/// Which displacement field a fixup patches. The architectures disagree about
+/// both the field's width and what the displacement is measured from, so the
+/// kind travels with the site rather than being assumed.
+#[derive(Clone, Copy)]
+enum FixupKind {
+    /// x86-64 `rel32`, measured from the END of the four-byte field.
+    #[cfg(not(target_arch = "aarch64"))]
+    Rel32,
+    /// A64 `imm26` (`B`, `BL`): `(target - instruction) / 4`, ±128 MiB.
+    #[cfg(target_arch = "aarch64")]
+    Imm26,
+    /// A64 `imm19` (`B.cond`): `(target - instruction) / 4`, ±1 MiB — a much
+    /// tighter reach than the unconditional form, and the one a large function
+    /// runs out of first.
+    #[cfg(target_arch = "aarch64")]
+    Imm19,
+}
+
+/// A pending displacement: where to patch, what shape, and the label to reach.
+/// `site` is the four-byte field on x86-64 and the instruction itself on A64,
+/// because that is what each displacement is relative to.
 struct Fixup {
     site: usize,
     label: Label,
+    kind: FixupKind,
 }
 
-/// A growable x86-64 code buffer with deferred branch resolution.
+/// AArch64 instruction encoding. Compiled on every host — the encoders are pure
+/// functions and their tests are the only thing pinning them to the manual, so
+/// they must not be reachable only from an AArch64 build.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub mod a64;
+
+/// OR a resolved displacement into the instruction already at `site`. A free
+/// function rather than a method: the fixup loop borrows `self.fixups`, so a
+/// `&mut self` method would conflict with it.
+#[cfg(target_arch = "aarch64")]
+fn patch_a64(code: &mut [u8], site: usize, bits: u32) {
+    let word = u32::from_le_bytes(code[site..site + 4].try_into().unwrap());
+    code[site..site + 4].copy_from_slice(&(word | bits).to_le_bytes());
+}
+
+/// A64 branch displacements count INSTRUCTIONS, not bytes, and are relative to
+/// the branch itself. Returns `None` — the emitter's bail-on-anything-odd
+/// contract — for a misaligned target or one out of the field's signed range.
+#[cfg(target_arch = "aarch64")]
+fn branch_words(target: i64, site: usize, bits: u32) -> Option<u32> {
+    let rel = target - site as i64;
+    if rel % 4 != 0 {
+        return None;
+    }
+    let words = rel / 4;
+    let limit = 1i64 << (bits - 1);
+    if words < -limit || words >= limit {
+        return None;
+    }
+    Some(words as u32)
+}
+
+/// A growable code buffer with deferred branch resolution.
 pub struct Asm {
     code: Vec<u8>,
     /// Bound offset of each label, or `None` while still forward-referenced.
@@ -187,12 +266,14 @@ impl Asm {
     }
 
     /// `jmp rel32` to `l` (opcode `E9`), reserving the displacement for `finish`.
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn jmp(&mut self, l: Label) {
         self.code.push(0xE9);
         self.reserve_rel32(l);
     }
 
     /// `jcc rel32` to `l` (opcode `0F 8x`), reserving the displacement.
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn jcc(&mut self, cc: Cc, l: Label) {
         self.code.extend_from_slice(&[0x0F, cc.opcode2()]);
         self.reserve_rel32(l);
@@ -200,19 +281,68 @@ impl Asm {
 
     /// `call rel32` to `l` (opcode `E8`) — a direct near call to another point in
     /// this buffer (e.g. a self-recursive call to the function's own entry).
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn call(&mut self, l: Label) {
         self.code.push(0xE8);
         self.reserve_rel32(l);
     }
 
+    /// Append one A64 instruction word. Instructions are fixed-width and
+    /// little-endian, so this is the only way code enters the buffer between
+    /// branches.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub fn word(&mut self, word: u32) {
+        self.code.extend_from_slice(&word.to_le_bytes());
+    }
+
+    /// Append a run of A64 instruction words, e.g. a constant materialisation.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub fn words(&mut self, words: &[u32]) {
+        for word in words {
+            self.word(*word);
+        }
+    }
+
     /// Reserve a 4-byte `rel32` slot at the current position, to be patched to
     /// reach `l` in `finish`.
+    #[cfg(not(target_arch = "aarch64"))]
     fn reserve_rel32(&mut self, l: Label) {
         self.fixups.push(Fixup {
             site: self.code.len(),
             label: l,
+            kind: FixupKind::Rel32,
         });
         self.code.extend_from_slice(&[0, 0, 0, 0]);
+    }
+
+    /// `B` to `l` (spec §4.7.5.1). Every A64 branch is one 4-byte instruction
+    /// whose displacement is relative to the instruction itself, so the whole
+    /// instruction is reserved rather than a field inside it.
+    #[cfg(target_arch = "aarch64")]
+    pub fn jmp(&mut self, l: Label) {
+        self.reserve_a64(l, 0x1400_0000, FixupKind::Imm26);
+    }
+
+    /// `B.cond` to `l`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn jcc(&mut self, cc: Cc, l: Label) {
+        self.reserve_a64(l, 0x5400_0000 | cc.a64_cond(), FixupKind::Imm19);
+    }
+
+    /// `BL` to `l` — a direct call within this buffer.
+    #[cfg(target_arch = "aarch64")]
+    pub fn call(&mut self, l: Label) {
+        self.reserve_a64(l, 0x9400_0000, FixupKind::Imm26);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn reserve_a64(&mut self, l: Label, template: u32, kind: FixupKind) {
+        self.fixups.push(Fixup {
+            site: self.code.len(),
+            label: l,
+            kind,
+        });
+        self.code.extend_from_slice(&template.to_le_bytes());
     }
 
     /// Resolve every branch and return the finished machine code. Returns `None`
@@ -221,9 +351,24 @@ impl Asm {
     pub fn finish(mut self) -> Option<Vec<u8>> {
         for fx in &self.fixups {
             let target = (*self.labels.get(fx.label.0)?)? as i64;
-            let rel = target - (fx.site as i64 + 4);
-            let rel32 = i32::try_from(rel).ok()?;
-            self.code[fx.site..fx.site + 4].copy_from_slice(&rel32.to_le_bytes());
+            match fx.kind {
+                #[cfg(not(target_arch = "aarch64"))]
+                FixupKind::Rel32 => {
+                    let rel = target - (fx.site as i64 + 4);
+                    let rel32 = i32::try_from(rel).ok()?;
+                    self.code[fx.site..fx.site + 4].copy_from_slice(&rel32.to_le_bytes());
+                }
+                #[cfg(target_arch = "aarch64")]
+                FixupKind::Imm26 => {
+                    let imm = branch_words(target, fx.site, 26)?;
+                    patch_a64(&mut self.code, fx.site, imm & 0x03FF_FFFF);
+                }
+                #[cfg(target_arch = "aarch64")]
+                FixupKind::Imm19 => {
+                    let imm = branch_words(target, fx.site, 19)?;
+                    patch_a64(&mut self.code, fx.site, (imm & 0x0007_FFFF) << 5);
+                }
+            }
         }
         Some(self.code)
     }
@@ -234,11 +379,13 @@ mod tests {
     use super::*;
 
     // Decode the little-endian rel32 that starts at `site`.
+    #[cfg(not(target_arch = "aarch64"))]
     fn rel32_at(code: &[u8], site: usize) -> i32 {
         i32::from_le_bytes(code[site..site + 4].try_into().unwrap())
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn forward_branch_resolves_to_signed_offset() {
         let mut a = Asm::new();
         let done = a.label();
@@ -254,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn backward_branch_is_negative() {
         let mut a = Asm::new();
         let top = a.label();
@@ -266,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn jcc_emits_two_byte_opcode() {
         let mut a = Asm::new();
         let l = a.label();
@@ -292,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn many_labels_to_one_target_all_resolve() {
         // Mirrors several guards sharing one deopt stub.
         let mut a = Asm::new();
@@ -318,5 +468,99 @@ mod tests {
         let never = a.label();
         a.jmp(never);
         assert!(a.finish().is_none());
+    }
+
+    /// Decode the 4-byte instruction at `site`.
+    #[cfg(target_arch = "aarch64")]
+    fn word_at(code: &[u8], site: usize) -> u32 {
+        u32::from_le_bytes(code[site..site + 4].try_into().unwrap())
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn forward_b_counts_instructions_from_itself() {
+        let mut a = Asm::new();
+        let done = a.label();
+        a.jmp(done); // B occupies bytes 0..4
+        a.extend_from_slice(&0xd503_201fu32.to_le_bytes()); // NOP
+        a.extend_from_slice(&0xd503_201fu32.to_le_bytes()); // NOP
+        a.bind(done);
+        let code = a.finish().unwrap();
+        // target = 12; rel = 12 - 0 = 12 bytes = 3 instructions.
+        assert_eq!(word_at(&code, 0), 0x1400_0000 | 3);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn backward_b_is_negative_in_two_s_complement() {
+        let mut a = Asm::new();
+        let top = a.label();
+        a.bind(top);
+        for _ in 0..3 {
+            a.extend_from_slice(&0xd503_201fu32.to_le_bytes());
+        }
+        a.jmp(top); // at offset 12; rel = -12 = -3 instructions
+        let code = a.finish().unwrap();
+        assert_eq!(
+            word_at(&code, 12),
+            0x1400_0000 | (((-3i32) as u32) & 0x03FF_FFFF)
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn bcond_places_the_condition_and_imm19() {
+        let mut a = Asm::new();
+        let l = a.label();
+        a.jcc(Cc::O, l); // B.VS
+        a.extend_from_slice(&0xd503_201fu32.to_le_bytes());
+        a.bind(l);
+        let code = a.finish().unwrap();
+        // cond=VS=0b0110 in bits 0..3, imm19=2 instructions in bits 5..23.
+        assert_eq!(word_at(&code, 0), 0x5400_0000 | (2 << 5) | 0b0110);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn call_is_bl_not_b() {
+        let mut a = Asm::new();
+        let entry = a.label();
+        a.bind(entry);
+        a.call(entry); // self-recursive call at offset 0... bound at 0
+        let code = a.finish().unwrap();
+        assert_eq!(word_at(&code, 0), 0x9400_0000);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn misaligned_target_bails() {
+        let mut a = Asm::new();
+        let odd = a.label();
+        a.jmp(odd);
+        a.push(0x00); // pushes the label off a 4-byte boundary
+        a.bind(odd);
+        assert!(a.finish().is_none());
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn bcond_runs_out_of_reach_before_b_does() {
+        // B.cond reaches ±1 MiB and B reaches ±128 MiB, so a span that is fine
+        // for one is not for the other. A T1 function long enough to hit this
+        // must bail rather than emit a branch that lands somewhere else.
+        let span = 1usize << 20;
+        let mut near = Asm::new();
+        let far = near.label();
+        near.jcc(Cc::E, far);
+        near.extend_from_slice(&vec![0u8; span]);
+        near.bind(far);
+        assert!(near.finish().is_none());
+
+        let mut wide = Asm::new();
+        let far = wide.label();
+        wide.jmp(far);
+        wide.extend_from_slice(&vec![0u8; span]);
+        wide.bind(far);
+        assert!(wide.finish().is_some());
     }
 }
