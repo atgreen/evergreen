@@ -30,6 +30,10 @@ default = []
 # C-ABI FFI: dlopen-based foreign-library loading. Requires a dynamic loader, so
 # it is incompatible with a fully static executable — off by default.
 c-ffi = ["dep:libc"]
+# Embedded CPython (spec 2.7.8). Resolved through the foreign-library loader
+# rather than linked, so it needs c-ffi and a target whose loader can open
+# libpython -- which in practice means glibc, not the default static musl.
+python = ["c-ffi"]
 
 [dev-dependencies]
 # Tests exercise runtime self-hosting by calling libc directly (raise a signal,

@@ -42,6 +42,8 @@ pub mod thread;
 
 // ── FFI ───────────────────────────────────────────────────────────
 pub mod ffi;
+#[cfg(feature = "python")]
+pub mod python;
 
 // ── Image persistence ─────────────────────────────────────────────
 pub mod image;
