@@ -118,15 +118,48 @@ pub struct MachBlock {
 | Arg count | `RCX` |
 | First 4 Lisp args | `RDI`, `RSI`, `RDX`, `R8` |
 | Return value | `RAX` |
-| Execution-context pointer | Dedicated register; physical assignment pending ABI audit (§2.3.1) |
+| Execution-context pointer | `R13` (reserved in generated code, callee-saved) |
 
-**Approved direction (2026-09-26):** the dedicated register points to the
-current Lisp execution context, not directly to carrier-thread TLS. See §2.3.1
-for fiber migration and foreign/callback entry semantics. The earlier `R14`
-assignment is withdrawn pending `bliss-q861`: current T1 uses `R14` for frame
-slots and `R15` for the operand stack, while T2 can allocate `R14` as an ordinary
-value register. The audit must coordinate reservation with tier transitions,
-runtime/foreign adapters and fiber switches before this convention is installed.
+**R4.72** Generated Lisp code MUST reserve `R13` for the current Lisp execution
+context pointer (§2.3.1). `R14` and `R15` MUST NOT be used for it: T1 holds the
+frame-slots pointer in `R14` and the operand-stack pointer in `R15`, and the T2
+emitter maps its `regalloc2` edit scratch onto `R15`. T2 MUST exclude `R13` from
+its allocatable pool. [S6]
+
+**Why `R13`** (ABI audit, `bliss-q861`, 2026-09-26). The choice is settled by
+fiber switching, not by instruction cost:
+
+- The fiber context switch (`torcl-rt/src/context.rs`) already saves and
+  restores the callee-saved set — `rbp rbx r12 r13 r14 r15` — on each fiber's
+  own stack. A context pointer in `R13` therefore **travels with the fiber for
+  free**: it is saved when the fiber swaps out and restored when it resumes,
+  including onto a *different* carrier, so migration requires no action and
+  there is no per-switch bookkeeping to omit. A thread-local slot is per
+  *carrier* instead, so it would have to be rewritten at every mount, unmount,
+  migration and nested foreign→Lisp re-entry, and a single missed store would
+  make generated code read another fiber's context.
+- Measured on Meteorlake: for the realistic one-read-per-region pattern,
+  `mov r, %fs:disp` and `mov r, [reg+disp]` are indistinguishable (1.44 vs
+  1.45 cycles/iteration). Segment-prefixed loads lose only when saturated
+  (2.5–3× lower throughput at eight loads per iteration). Performance does not
+  decide this.
+- `R13` rather than `R12`: `R12` encodes as an alias of `RSP` in ModRM, forcing
+  a SIB byte for fixed displacements. SBCL documents exactly this reason for the
+  same choice (`src/compiler/x86-64/vm.lisp`).
+- Prior art agrees: HotSpot pins `r15` (`assembler_x86.hpp`), Go pins `R14`, and
+  SBCL pins `r13`. Go's ABI notes it keeps a TLS copy on amd64 yet still pins the
+  register "for simplicity and for consistency with other architectures".
+
+**R4.73** Rust code MUST NOT read `R13` via inline assembly to obtain the
+context: `rustc` allocates `R13` freely, so a Rust function may already have
+clobbered it. Generated code MUST pass the context pointer as an ordinary
+argument to the runtime helpers it calls; where the runtime needs it without
+such a call (GC root scanning, signal handlers), it MUST come from the
+scheduler's per-carrier record of the mounted fiber, not from the register. [S6]
+
+`R13` is callee-saved under SysV, so generated code may rely on it surviving
+calls into the runtime — the same property T1 already depends on for `R14`/`R15`
+across `c2i`.
 
 ### 4.7.4.3 Float Operations
 
@@ -183,7 +216,10 @@ the rounding mode for subsequent FP instructions.
 
 **TorCL-internal (AArch64):** Closure=`X20`, argc=`X2`, args=`X0,X1,X3,X4`,
 return=`X0`. The dedicated execution-context register follows §2.3.1;
-the earlier thread=`X21` assignment is provisional pending the same ABI audit.
+the execution-context register is `X21`, confirmed by the same audit
+(`bliss-q861`): it matches SBCL's arm64 thread register and is not otherwise
+reserved here, and AArch64's callee-saved range makes it ride fiber switches the
+same way `R13` does on x86-64.
 
 NEON float: `FADD/FSUB/FMUL/FDIV/FCMP` scalar double. `FCMP` sets NZCV;
 MUST check V flag for NaN. Conversions: `SCVTF`, `FCVTZS`. FPCR default
