@@ -143,6 +143,7 @@ fn narrow_result(scalar: Scalar, raw: u64) -> u64 {
 /// # Safety
 /// `fn_ptr` must point to a function with exactly this signature, and `args` must
 /// hold one raw value per argument type.
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
 pub unsafe fn ffi_call(
     fn_ptr: *const (),
     ret_type: &AlienType,
@@ -158,6 +159,7 @@ pub unsafe fn ffi_call(
 /// # Safety
 /// As [`ffi_call`], and the callee must consume the trailing arguments using their
 /// promoted types.
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
 pub unsafe fn ffi_call_variadic(
     fn_ptr: *const (),
     ret_type: &AlienType,
@@ -176,6 +178,7 @@ pub unsafe fn ffi_call_variadic(
 
 /// # Safety
 /// As [`ffi_call`].
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
 unsafe fn call(
     fn_ptr: *const (),
     ret_type: &AlienType,

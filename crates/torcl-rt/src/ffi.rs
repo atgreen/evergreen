@@ -33,7 +33,7 @@ mod aapcs64;
 /// ELFv2 foreign calls. Compiled on every host — the placement rules are pure
 /// logic, and their tests are what pin the difference from AAPCS64 that would
 /// otherwise be found only by running on POWER. Only the trampolines and the
-/// re-export below are architecture-gated.
+/// callable entry points and re-export below are architecture-gated.
 #[cfg_attr(
     not(all(target_arch = "powerpc64", target_endian = "little")),
     allow(
