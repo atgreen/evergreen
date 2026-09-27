@@ -37,8 +37,26 @@ pub const FP: Reg = 29;
 // Moves
 
 /// `MOV Xd, Xm` — architecturally `ORR Xd, XZR, Xm`.
+///
+/// Register 31 is XZR here, NOT the stack pointer: the logical instructions read
+/// it as the zero register, so `mov(d, SP)` silently assembles as `MOV Xd, XZR`
+/// and hands you zero. Moving to or from SP is a different instruction family
+/// entirely — use [`mov_from_sp`] and [`mov_to_sp`].
 pub fn mov(d: Reg, m: Reg) -> u32 {
     orr(d, XZR, m)
+}
+
+/// `MOV Xd, SP` — architecturally `ADD Xd, SP, #0`, because register 31 means
+/// the stack pointer in the add-immediate encoding and the zero register in the
+/// logical one. Saving the frame base is this, not [`mov`].
+pub fn mov_from_sp(d: Reg) -> u32 {
+    add_imm(d, SP, 0).expect("zero is an add-immediate")
+}
+
+/// `MOV SP, Xn` — likewise `ADD SP, Xn, #0`. Restoring the stack pointer from a
+/// frame base is this.
+pub fn mov_to_sp(n: Reg) -> u32 {
+    add_imm(SP, n, 0).expect("zero is an add-immediate")
 }
 
 /// `MOVZ Xd, #imm16, LSL #(16*hw)`.
@@ -280,6 +298,17 @@ pub fn sub(d: Reg, n: Reg, m: Reg) -> u32 {
 /// `SUBS Xd, Xn, Xm` — subtract, setting the flags.
 pub fn subs(d: Reg, n: Reg, m: Reg) -> u32 {
     addsub_reg(0xEB00_0000, d, n, m, Shift::NONE)
+}
+
+/// `SUBS Wd, Wn, Wm` — 32-bit, flag-setting.
+pub fn subs_w(d: Reg, n: Reg, m: Reg) -> u32 {
+    addsub_reg(0x6B00_0000, d, n, m, Shift::NONE)
+}
+
+/// `CMP Wn, Wm` — 32-bit compare. The register form has no immediate range to
+/// exceed, which matters for counters whose threshold is an arbitrary `u32`.
+pub fn cmp_w(n: Reg, m: Reg) -> u32 {
+    subs_w(XZR, n, m)
 }
 
 /// `CMP Xn, Xm` — `SUBS` discarding the result.
@@ -681,6 +710,10 @@ mod tests {
             ("movz x5, #0x1234, lsl #16", 0xD2A24685, movz(5, 0x1234, 1)),
             ("movk x5, #0xbeef", 0xF297DDE5, movk(5, 0xbeef, 0)),
             ("movn x9, #0", 0x92800009, movn(9, 0, 0)),
+            ("mov x0, xzr", 0xAA1F03E0, mov(0, XZR)),
+            // The trap this pair exists for: `mov x29, sp` is not an ORR.
+            ("mov x29, sp", 0x910003FD, mov_from_sp(FP)),
+            ("mov sp, x29", 0x910003BF, mov_to_sp(FP)),
         ]);
     }
 
@@ -703,6 +736,8 @@ mod tests {
             ("sub x1, x2, x3", 0xCB030041, sub(1, 2, 3)),
             ("subs x1, x2, x3", 0xEB030041, subs(1, 2, 3)),
             ("cmp x2, x3", 0xEB03005F, cmp(2, 3)),
+            ("subs w1, w2, w3", 0x6B030041, subs_w(1, 2, 3)),
+            ("cmp w17, w16", 0x6B10023F, cmp_w(17, 16)),
             ("neg x8, x9", 0xCB0903E8, neg(8, 9)),
             (
                 "add x1, x2, x3, lsl #2",

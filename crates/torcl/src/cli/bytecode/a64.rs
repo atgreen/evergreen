@@ -29,8 +29,11 @@
 //! could disagree with T0.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_call_builtin, c2i_call_slice,
-    c2i_t1_backedge, c2i_transfer_pending, call_site_profile_token, registry_get,
+    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_alloc_cons, c2i_call_builtin,
+    c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
+    c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
+    c2i_store_env, c2i_store_global, c2i_t1_backedge, c2i_take_values, c2i_transfer_pending,
+    c2i_typep_class, c2i_values_to_list, call_site_profile_token, registry_get, resolve_sym,
     t2_backedge_threshold,
 };
 use torcl_rt::asm::a64;
@@ -72,12 +75,23 @@ pub(super) fn emit_native_a64(
         }};
     }
 
-    // OSR compilation asks for alternate entry stubs at loop headers, which this
-    // slice does not emit (bliss-cerlf). Declining leaves the loop at T0 rather
-    // than installing code whose osr_entries promise entries that do not exist.
-    if sym == u32::MAX {
-        decline!("OSR entry stubs are not implemented for AArch64 yet");
+    /// Take an encoder's result, declining with a reason when the operand does
+    /// not fit its field. Never use a bare `?` on an encoder: a silent decline
+    /// reads as "this function never got hot", which is indistinguishable from a
+    /// bug -- exactly the confusion the back-edge threshold caused above.
+    macro_rules! encode {
+        ($what:expr, $e:expr) => {
+            match $e {
+                Some(word) => word,
+                None => decline!("cannot encode {}", $what),
+            }
+        };
     }
+
+    // `sym == u32::MAX` marks the OSR compile path, whose back-edge poll is the
+    // signal-only helper and whose entry points are the loop headers rather than
+    // the function's start.
+    let is_osr = sym == u32::MAX;
     if bf.arity > bf.num_slots() {
         decline!(
             "required arity {} exceeds activation slots {}",
@@ -86,6 +100,10 @@ pub(super) fn emit_native_a64(
         );
     }
     let n_locals = bf.n_locals as i32;
+    // Set when a back-edge poll can hand this activation to T2, which means it can
+    // leave the loop mid-flight. `has_deopt` must report that: a caller's direct
+    // call cannot handle a callee that resumes elsewhere.
+    let mut can_osr_to_t2 = false;
 
     // Where each block's RETURN-FROM resumes, and each tagbody's entry depth.
     let mut block_targets: std::collections::HashMap<u32, (u32, u16)> =
@@ -111,11 +129,51 @@ pub(super) fn emit_native_a64(
         }
     }
 
+    // OSR-eligible loop headers: the target of a backward `Go` whose tagbody sits
+    // at an empty operand stack (sp_restore == 0). Entering there needs no value
+    // transfer — the live locals are already in the shared frame slots.
+    let mut osr_headers: Vec<u32> = Vec::new();
+    for (i, instr) in bf.code.iter().enumerate() {
+        if let Instr::Go {
+            tagbody_id,
+            target_bcp,
+        } = instr
+        {
+            if (*target_bcp as usize) < i
+                && tag_sp.get(tagbody_id) == Some(&0)
+                && !osr_headers.contains(target_bcp)
+            {
+                osr_headers.push(*target_bcp);
+            }
+        }
+    }
+
     let c2i_addr =
         c2i_call_slice as extern "C" fn(u64, u64, *const TorclVal, u64) -> u64 as usize as u64;
     let builtin_addr =
         c2i_call_builtin as extern "C" fn(u64, u64, *const TorclVal, u64) -> u64 as usize as u64;
     let transfer_addr = c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64;
+    let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
+    let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
+    let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
+    let load_env_addr =
+        c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
+    let store_env_addr =
+        c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+    let define_env_addr =
+        c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+    let push_env_addr = c2i_push_env_child as extern "C" fn() as usize as u64;
+    let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
+    let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
+    let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
+    let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
+    let take_values_addr =
+        c2i_take_values as extern "C" fn(u64, *mut TorclVal, u64) as usize as u64;
+    let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
+    let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
+    let values_sym = resolve_sym("VALUES")?.as_symbol_index();
+    let osr_backedge_addr = c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64;
     let t2_backedge_addr = c2i_t1_backedge
         as extern "C" fn(u64, u64, *mut u64, *const BytecodeFunction) -> u64
         as usize as u64;
@@ -124,16 +182,21 @@ pub(super) fn emit_native_a64(
     let bcp_labels: Vec<_> = bf.code.iter().map(|_| c.label()).collect();
 
     // ── Prologue ───────────────────────────────────────────────
-    // x0 = frame slots, x1 = TorclStack. x29 records the frame base so the
-    // epilogue restores SP from it rather than trusting the body to have left SP
-    // balanced.
-    c.word(a64::stp_pre(a64::FP, a64::LR, a64::SP, -FRAME_BYTES)?);
-    c.word(a64::mov(a64::FP, a64::SP));
-    c.word(a64::stp(SLOTS, OPSP, a64::SP, 16)?);
-    c.word(a64::str_imm(STACK, a64::SP, 32)?);
-    c.word(a64::mov(SLOTS, 0));
-    c.word(a64::mov(STACK, 1));
-    emit_add_disp(&mut c, OPSP, SLOTS, 8 * n_locals)?;
+    // Shared by the normal entry and every OSR entry stub: both are called as
+    // `fn(*mut u64, *const u8) -> u64` and must set up the activation registers
+    // identically, so the one Return epilogue balances either. x29 records the
+    // frame base, so the epilogue restores SP from it rather than trusting the
+    // body to have left SP balanced.
+    let emit_prologue = |c: &mut Asm| -> Option<()> {
+        c.word(a64::stp_pre(a64::FP, a64::LR, a64::SP, -FRAME_BYTES).expect("fixed frame size"));
+        c.word(a64::mov_from_sp(a64::FP));
+        c.word(a64::stp(SLOTS, OPSP, a64::SP, 16).expect("fixed frame offset"));
+        c.word(a64::str_imm(STACK, a64::SP, 32).expect("fixed frame offset"));
+        c.word(a64::mov(SLOTS, 0));
+        c.word(a64::mov(STACK, 1));
+        emit_add_disp(c, OPSP, SLOTS, 8 * n_locals)
+    };
+    emit_prologue(&mut c)?;
 
     for (bcp_idx, instr) in bf.code.iter().enumerate() {
         c.bind(bcp_labels[bcp_idx]);
@@ -151,27 +214,31 @@ pub(super) fn emit_native_a64(
                     // that this code is keyed to.
                     let slot = &bf.constants[*k as usize] as *const TorclVal;
                     emit_mov_imm(&mut c, ACC, slot as u64);
-                    c.word(a64::ldr_imm(ACC, ACC, 0)?);
+                    c.word(a64::ldr_imm(ACC, ACC, 0).expect("zero offset"));
                 } else {
                     emit_mov_imm(&mut c, ACC, val.0);
                 }
                 emit_push(&mut c);
             }
             Instr::LoadLocal(i) => {
-                c.word(a64::ldr_imm(ACC, SLOTS, 8 * u64::from(*i)).or_else(|| {
-                    None // a frame deeper than the scaled load reaches
-                })?);
+                c.word(encode!(
+                    format_args!("LoadLocal {i}: frame slot beyond the scaled load"),
+                    a64::ldr_imm(ACC, SLOTS, 8 * u64::from(*i))
+                ));
                 emit_push(&mut c);
             }
             Instr::StoreLocal(i) => {
                 emit_pop(&mut c, ACC);
-                c.word(a64::str_imm(ACC, SLOTS, 8 * u64::from(*i))?);
+                c.word(encode!(
+                    format_args!("StoreLocal {i}: frame slot beyond the scaled store"),
+                    a64::str_imm(ACC, SLOTS, 8 * u64::from(*i))
+                ));
             }
             Instr::Pop => {
-                c.word(a64::sub_imm(OPSP, OPSP, 8)?);
+                c.word(encode!("Pop", a64::sub_imm(OPSP, OPSP, 8)));
             }
             Instr::Dup => {
-                c.word(a64::ldur(ACC, OPSP, -8)?);
+                c.word(encode!("Dup", a64::ldur(ACC, OPSP, -8)));
                 emit_push(&mut c);
             }
             Instr::CallNamed { sym: callee, nargs } => {
@@ -202,16 +269,138 @@ pub(super) fn emit_native_a64(
                 };
                 emit_c2i_call(&mut c, target, transfer_addr)?;
                 // Drop the arguments and push the result.
-                c.word(a64::sub_imm(OPSP, OPSP, 8 * u64::from(*nargs))?);
+                c.word(encode!(
+                    format_args!("dropping {nargs} call arguments"),
+                    a64::sub_imm(OPSP, OPSP, 8 * u64::from(*nargs))
+                ));
+                emit_push(&mut c);
+            }
+            Instr::ClearMv => {
+                // Reset the thread's multiple-values state; SETQ and friends are
+                // not value-preserving. The accumulator is dead between
+                // statements, and the activation registers are callee-saved
+                // across the call, so this needs no spilling.
+                emit_c2i_call(&mut c, clear_mv_addr, transfer_addr)?;
+            }
+            Instr::SetValues(n) => {
+                // Route through the ordinary VALUES function so native code and
+                // the interpreter share one multiple-values contract. The values
+                // sit contiguously below the operand-stack top.
+                emit_mov_imm(&mut c, 0, u64::from(values_sym));
+                emit_mov_imm(&mut c, 1, u64::from(*n));
+                emit_sub_disp(&mut c, 2, OPSP, 8 * i32::from(*n))?;
+                emit_mov_imm(&mut c, 3, 0);
+                emit_c2i_call(&mut c, c2i_addr, transfer_addr)?;
+                c.word(encode!(
+                    format_args!("dropping {n} values"),
+                    a64::sub_imm(OPSP, OPSP, 8 * u64::from(*n))
+                ));
+                emit_push(&mut c);
+            }
+            // Name indexes belong to this exact code version, not to whatever the
+            // symbol is bound to now: NativeCode retains this body across a
+            // redefinition, so the original is what the helper must consult.
+            Instr::LoadEnvVar(name_idx) => {
+                emit_mov_imm(&mut c, 0, std::ptr::from_ref(bf) as u64);
+                emit_mov_imm(&mut c, 1, u64::from(u32::from(*name_idx)));
+                emit_c2i_call(&mut c, load_env_addr, transfer_addr)?;
+                emit_push(&mut c);
+            }
+            Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
+                emit_pop(&mut c, 2);
+                emit_mov_imm(&mut c, 0, std::ptr::from_ref(bf) as u64);
+                emit_mov_imm(&mut c, 1, u64::from(u32::from(*name_idx)));
+                let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
+                    store_env_addr
+                } else {
+                    define_env_addr
+                };
+                emit_c2i_call(&mut c, helper, transfer_addr)?;
+            }
+            Instr::PushEnvChild | Instr::PopEnvChild => {
+                let helper = if matches!(instr, Instr::PushEnvChild) {
+                    push_env_addr
+                } else {
+                    pop_env_addr
+                };
+                emit_c2i_call(&mut c, helper, transfer_addr)?;
+            }
+            Instr::AllocCons => {
+                // The cdr is on top, so it pops first.
+                emit_pop(&mut c, 1);
+                emit_pop(&mut c, 0);
+                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr)?;
+                emit_push(&mut c);
+            }
+            Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
+                // Like Const: the form is a movable heap cons, so it is read
+                // through the GC-rewritten constants slot, never baked in.
+                let Some(slot) = bf.constants.get(*index as usize) else {
+                    decline!("constant index {index} is out of range");
+                };
+                emit_mov_imm(&mut c, 0, slot as *const TorclVal as u64);
+                c.word(a64::ldr_imm(0, 0, 0).expect("zero offset"));
+                let helper = if matches!(instr, Instr::EvalHost(_)) {
+                    eval_host_addr
+                } else {
+                    make_closure_addr
+                };
+                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_push(&mut c);
+            }
+            Instr::TakeValuesToLocals { nvars, slot_base } => {
+                emit_pop(&mut c, 0);
+                emit_add_disp(&mut c, 1, SLOTS, 8 * i32::from(*slot_base))?;
+                emit_mov_imm(&mut c, 2, u64::from(*nvars));
+                emit_c2i_call(&mut c, take_values_addr, transfer_addr)?;
+            }
+            // Read a global or special variable's value cell and push it.
+            Instr::LoadGlobal(sym) => {
+                emit_mov_imm(&mut c, 0, u64::from(*sym));
+                emit_c2i_call(&mut c, load_global_addr, transfer_addr)?;
+                emit_push(&mut c);
+            }
+            // `#'f` — the same shape, reading the symbol's FUNCTION cell.
+            Instr::LoadFunction(sym) => {
+                emit_mov_imm(&mut c, 0, u64::from(*sym));
+                emit_c2i_call(&mut c, load_function_addr, transfer_addr)?;
+                emit_push(&mut c);
+            }
+            // Consumes the operand and pushes nothing; SETQ reloads for its value.
+            Instr::StoreGlobal(sym) => {
+                emit_pop(&mut c, 1);
+                emit_mov_imm(&mut c, 0, u64::from(*sym));
+                emit_c2i_call(&mut c, store_global_addr, transfer_addr)?;
+            }
+            Instr::ValuesToList => {
+                // Reads env.mv and allocates; the helper roots the primary before
+                // allocating (bliss-rwiv).
+                emit_pop(&mut c, 0);
+                emit_c2i_call(&mut c, values_to_list_addr, transfer_addr)?;
+                emit_push(&mut c);
+            }
+            Instr::TypeP(class) => {
+                emit_pop(&mut c, 0);
+                emit_mov_imm(&mut c, 1, u64::from(*class as u32));
+                emit_c2i_call(&mut c, typep_class_addr, transfer_addr)?;
                 emit_push(&mut c);
             }
             Instr::Br(target) => {
-                c.jmp(*bcp_labels.get(*target as usize)?);
+                c.jmp(match bcp_labels.get(*target as usize) {
+                    Some(l) => *l,
+                    None => decline!("Br target {target} is out of range"),
+                });
             }
             Instr::BrIfFalse(target) => {
                 emit_pop(&mut c, ACC);
                 emit_cmp_imm(&mut c, ACC, torcl_rt::value::NIL_BITS);
-                c.jcc(Cc::E, *bcp_labels.get(*target as usize)?);
+                c.jcc(
+                    Cc::E,
+                    match bcp_labels.get(*target as usize) {
+                        Some(l) => *l,
+                        None => decline!("BrIfFalse target {target} is out of range"),
+                    },
+                );
             }
             Instr::Return => {
                 emit_pop(&mut c, ACC);
@@ -230,10 +419,13 @@ pub(super) fn emit_native_a64(
                     Some(&t) => t,
                     None => decline!("RETURN-FROM references non-local block {block_id}"),
                 };
-                c.word(a64::ldur(ACC, OPSP, -8)?);
+                c.word(encode!("RETURN-FROM value", a64::ldur(ACC, OPSP, -8)));
                 emit_add_disp(&mut c, OPSP, SLOTS, 8 * (n_locals + i32::from(sp)))?;
                 emit_push(&mut c);
-                c.jmp(*bcp_labels.get(resume_bcp as usize)?);
+                c.jmp(match bcp_labels.get(resume_bcp as usize) {
+                    Some(l) => *l,
+                    None => decline!("RETURN-FROM resume {resume_bcp} is out of range"),
+                });
             }
             Instr::Go {
                 tagbody_id,
@@ -253,30 +445,50 @@ pub(super) fn emit_native_a64(
                     emit_mov_imm(&mut c, SCRATCH, backedge_counter);
                     // The counter is an AtomicU32, so these must be 32-bit
                     // accesses: a 64-bit one would touch the next four bytes.
-                    c.word(a64::ldr_w_imm(SCRATCH2, SCRATCH, 0)?);
-                    c.word(a64::add_imm_w(SCRATCH2, SCRATCH2, 1)?);
-                    c.word(a64::str_w_imm(SCRATCH2, SCRATCH, 0)?);
-                    c.word(a64::cmp_imm_w(
-                        SCRATCH2,
-                        u64::from(t2_backedge_threshold()),
-                    )?);
+                    c.word(a64::ldr_w_imm(SCRATCH2, SCRATCH, 0).expect("zero offset"));
+                    c.word(a64::add_imm_w(SCRATCH2, SCRATCH2, 1).expect("increment of one"));
+                    c.word(a64::str_w_imm(SCRATCH2, SCRATCH, 0).expect("zero offset"));
+                    // The threshold is an arbitrary u32 (10,000 by default), so
+                    // it gets a register rather than an immediate field: 10,000
+                    // is neither under 4096 nor a multiple of it, so the
+                    // add-immediate form cannot hold it. The accumulator is dead
+                    // here — Go yields no value — and the helper's arguments are
+                    // set below, past this branch.
+                    emit_mov_imm(&mut c, ACC, u64::from(t2_backedge_threshold()));
+                    c.word(a64::cmp_w(SCRATCH2, ACC));
                     c.jcc(Cc::L, keep);
-                    c.word(a64::str_w_imm(a64::XZR, SCRATCH, 0)?); // reset the sample
-                    emit_mov_imm(&mut c, 0, u64::from(sym));
-                    emit_mov_imm(&mut c, 1, u64::from(*target_bcp));
-                    c.word(a64::mov(2, SLOTS));
-                    emit_mov_imm(&mut c, 3, std::ptr::from_ref(bf) as u64);
-                    emit_c2i_call(&mut c, t2_backedge_addr, transfer_addr)?;
+                    // Reset the sample.
+                    c.word(a64::str_w_imm(a64::XZR, SCRATCH, 0).expect("zero offset"));
+                    let helper = if is_osr {
+                        // Signal-only: an OSR loop has no T1 tier to promote
+                        // from, but must still be terminable and still reach GC
+                        // stop-the-world.
+                        osr_backedge_addr
+                    } else {
+                        can_osr_to_t2 = true;
+                        emit_mov_imm(&mut c, 0, u64::from(sym));
+                        emit_mov_imm(&mut c, 1, u64::from(*target_bcp));
+                        c.word(a64::mov(2, SLOTS));
+                        emit_mov_imm(&mut c, 3, std::ptr::from_ref(bf) as u64);
+                        t2_backedge_addr
+                    };
+                    emit_c2i_call(&mut c, helper, transfer_addr)?;
                     emit_cmp_imm(&mut c, ACC, 0);
                     c.jcc(Cc::E, keep);
                     // Leaving the loop: T2 finished, or a signal is pending. The
                     // shared epilogue returns the first operand slot; the Rust
                     // caller re-raises any stashed error before using it.
-                    c.word(a64::ldr_imm(ACC, SLOTS, 8 * n_locals as u64)?);
+                    c.word(encode!(
+                        "first operand slot for the loop-exit epilogue",
+                        a64::ldr_imm(ACC, SLOTS, 8 * n_locals as u64)
+                    ));
                     emit_epilogue(&mut c);
                     c.bind(keep);
                 }
-                c.jmp(*bcp_labels.get(*target_bcp as usize)?);
+                c.jmp(match bcp_labels.get(*target_bcp as usize) {
+                    Some(l) => *l,
+                    None => decline!("GO target {target_bcp} is out of range"),
+                });
             }
             other => decline!("unsupported opcode {other:?}"),
         }
@@ -287,29 +499,54 @@ pub(super) fn emit_native_a64(
     c.word(a64::mov(ACC, a64::XZR));
     emit_epilogue(&mut c);
 
+    // One alternate entry per eligible loop header: the shared prologue, then a
+    // branch straight into the body. `finish` patches displacements in place, so
+    // an offset captured now is still correct in the returned buffer.
+    let mut osr_entries: Vec<(u32, usize)> = Vec::new();
+    for header in osr_headers {
+        let Some(&target) = bcp_labels.get(header as usize) else {
+            decline!("OSR header {header} is out of range");
+        };
+        let stub_off = c.here();
+        emit_prologue(&mut c)?;
+        c.jmp(target);
+        osr_entries.push((header, stub_off));
+    }
+
+    // Bytecode→native position map for the tier viewer: each bcp's label was
+    // bound at that instruction's first native byte. u32::MAX marks a bcp that
+    // emitted no code.
+    let bcp_offsets: Vec<u32> = bcp_labels
+        .iter()
+        .map(|&l| c.label_offset(l).map_or(u32::MAX, |o| o as u32))
+        .collect();
+
+    // `finish` resolves every branch, and gives up only if one is out of reach --
+    // for A64 that means a conditional branch spanning more than 1 MiB.
+    let Some(code) = c.finish() else {
+        decline!("a branch displacement is out of range (function too large)");
+    };
     Some(NativeEmission {
-        code: c.finish()?,
-        osr_entries: Vec::new(),
-        bcp_offsets: Vec::new(),
-        has_deopt: false,
+        code,
+        osr_entries,
+        bcp_offsets,
+        has_deopt: can_osr_to_t2,
         direct_calls: Vec::new(),
     })
 }
 
 /// `str ACC, [OPSP], #8` — store and post-increment, i.e. push the accumulator.
 fn emit_push(c: &mut Asm) {
-    // `str_pre`'s sibling: the post-index form adjusts after the access, which is
-    // exactly a push onto an upward-growing stack.
-    c.word(0xF800_8400 | ((8u32 & 0x1ff) << 12) | ((OPSP as u32) << 5) | ACC as u32);
+    c.word(a64::str_post(ACC, OPSP, 8).expect("8 is in the unscaled range"));
 }
 
 /// Pop into `d`: retreat the stack top, then load from it.
 fn emit_pop(c: &mut Asm, d: a64::Reg) {
-    c.word(0xF800_8C00 | ((-8i32 as u32 & 0x1ff) << 12) | ((OPSP as u32) << 5) | d as u32);
+    c.word(a64::ldr_pre(d, OPSP, -8).expect("-8 is in the unscaled range"));
 }
 
 fn emit_epilogue(c: &mut Asm) {
-    c.word(a64::mov(a64::SP, a64::FP));
+    c.word(a64::mov_to_sp(a64::FP));
     c.word(a64::ldr_imm(STACK, a64::SP, 32).expect("fixed frame offset"));
     c.word(a64::ldp(SLOTS, OPSP, a64::SP, 16).expect("fixed frame offset"));
     c.word(a64::ldp_post(a64::FP, a64::LR, a64::SP, FRAME_BYTES).expect("fixed frame size"));
@@ -379,13 +616,14 @@ fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64) -> Option<()> {
     // execution would continue into code that must not run — a store after the
     // error lands, and a later error superseding the real one.
     let resume = c.label();
-    c.word(a64::str_pre(ACC, a64::SP, -16)?); // keep SP 16-aligned
+    // Spill the result, keeping SP 16-aligned for the call below.
+    c.word(a64::str_pre(ACC, a64::SP, -16).expect("16 is in the unscaled range"));
     emit_mov_imm(c, SCRATCH, transfer_addr);
     c.word(a64::blr(SCRATCH));
-    c.word(a64::cmp_imm(ACC, 0)?);
+    c.word(a64::cmp_imm(ACC, 0).expect("zero is an add-immediate"));
     // Neither the load nor the stack adjustment disturbs the flags, so the
     // comparison above still decides the branch below.
-    c.word(a64::ldr_post(ACC, a64::SP, 16)?);
+    c.word(a64::ldr_post(ACC, a64::SP, 16).expect("16 is in the unscaled range"));
     c.jcc(Cc::E, resume);
     emit_epilogue(c);
     c.bind(resume);

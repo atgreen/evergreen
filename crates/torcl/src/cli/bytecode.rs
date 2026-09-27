@@ -49,7 +49,9 @@ use super::{
     sym_name, symbol_bare_name, tag_key, take_control_value, torcl_error_to_condition, val_as_str,
     vec_to_list,
 };
-// Label-based assembler backing the native (T1) code emitter (see cli::asm).
+// Label-based assembler backing the x86-64 T1 emitter. The AArch64 emitter is a
+// submodule with its own imports, so on other targets nothing here uses these.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 use torcl_rt::asm::{Asm, Cc, Label};
 
 // ── Backend selection ──────────────────────────────────────────────
@@ -1111,67 +1113,97 @@ fn format_native_listing(nc: &NativeCode) -> String {
         es.sort_unstable();
         let _ = writeln!(out, "; OSR loop-header entry bcps: {es:?}");
     }
-    let _ = writeln!(out, "; {} bytes of x86-64:", nc.code_len);
-    let base = nc.entry as u64;
-    let len = nc.code_len as u64;
     let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
 
-    // Pass 1: decode everything, then locate the cold deopt-stub section. A
-    // failed speculation guard — an overflow `jo`/`jno`, or a `jne`/`je` right
-    // after a `test rX,7` tag check — jumps FORWARD into the deopt stubs, which
-    // the emitter lays out contiguously at the tail. The lowest such target is
-    // where that cold section begins (reached only on guard failure).
-    let mut dec = iced_x86::Decoder::with_ip(64, bytes, base, iced_x86::DecoderOptions::NONE);
-    let mut insns: Vec<iced_x86::Instruction> = Vec::new();
-    while dec.can_decode() {
-        let mut i = iced_x86::Instruction::default();
-        dec.decode_out(&mut i);
-        insns.push(i);
-    }
-    let mut deopt_start: Option<u64> = None;
-    for (k, insn) in insns.iter().enumerate() {
-        let is_overflow = matches!(
-            insn.mnemonic(),
-            iced_x86::Mnemonic::Jo | iced_x86::Mnemonic::Jno
+    // The decoder below is x86-64 only, and feeding it another architecture's
+    // code does not fail — it prints confident nonsense, which is worse than
+    // printing nothing. On other targets list the instruction words instead:
+    // fixed-width, so the offsets are still the ones a branch displacement or a
+    // bcp_offsets entry refers to. (bliss-xvhij would decode them properly.)
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+    {
+        let _ = writeln!(
+            out,
+            "; {} bytes of {} machine code, not disassembled:",
+            nc.code_len,
+            std::env::consts::ARCH
         );
-        let is_type_guard = k > 0
-            && is_tag_guard(&insns[k - 1])
-            && matches!(
-                insn.mnemonic(),
-                iced_x86::Mnemonic::Jne | iced_x86::Mnemonic::Je
-            );
-        if is_overflow || is_type_guard {
-            let tgt = insn.near_branch_target();
-            if tgt > insn.ip() && tgt < base + len {
-                deopt_start = Some(deopt_start.map_or(tgt, |d| d.min(tgt)));
-            }
-        }
-    }
-
-    // Pass 2: format, resolving branch targets and marking the deopt section.
-    let mut fmt = iced_x86::NasmFormatter::new();
-    let mut line = String::new();
-    for (k, insn) in insns.iter().enumerate() {
-        if Some(insn.ip()) == deopt_start {
+        for (index, word) in bytes.chunks(4).enumerate() {
+            let mut whole = [0u8; 4];
+            whole[..word.len()].copy_from_slice(word);
             let _ = writeln!(
                 out,
-                "; ── deoptimization stubs (cold — reached only when a guard fails; rebuild the T0 frame and resume) ──"
+                "  +{:04x}:  {:08x}",
+                index * 4,
+                u32::from_le_bytes(whole)
             );
         }
-        line.clear();
-        use iced_x86::Formatter;
-        fmt.format(insn, &mut line);
-        let prev = (k > 0).then(|| &insns[k - 1]);
-        match native_insn_annotation(insn, prev, base, len, &nc.osr_entries, deopt_start) {
-            Some(ann) => {
-                let _ = writeln!(out, "  +{:04x}:  {line}    ; {ann}", insn.ip() - base);
-            }
-            None => {
-                let _ = writeln!(out, "  +{:04x}:  {line}", insn.ip() - base);
+        return out;
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let _ = writeln!(out, "; {} bytes of x86-64:", nc.code_len);
+        let base = nc.entry as u64;
+        let len = nc.code_len as u64;
+
+        // Pass 1: decode everything, then locate the cold deopt-stub section. A
+        // failed speculation guard — an overflow `jo`/`jno`, or a `jne`/`je` right
+        // after a `test rX,7` tag check — jumps FORWARD into the deopt stubs, which
+        // the emitter lays out contiguously at the tail. The lowest such target is
+        // where that cold section begins (reached only on guard failure).
+        let mut dec = iced_x86::Decoder::with_ip(64, bytes, base, iced_x86::DecoderOptions::NONE);
+        let mut insns: Vec<iced_x86::Instruction> = Vec::new();
+        while dec.can_decode() {
+            let mut i = iced_x86::Instruction::default();
+            dec.decode_out(&mut i);
+            insns.push(i);
+        }
+        let mut deopt_start: Option<u64> = None;
+        for (k, insn) in insns.iter().enumerate() {
+            let is_overflow = matches!(
+                insn.mnemonic(),
+                iced_x86::Mnemonic::Jo | iced_x86::Mnemonic::Jno
+            );
+            let is_type_guard = k > 0
+                && is_tag_guard(&insns[k - 1])
+                && matches!(
+                    insn.mnemonic(),
+                    iced_x86::Mnemonic::Jne | iced_x86::Mnemonic::Je
+                );
+            if is_overflow || is_type_guard {
+                let tgt = insn.near_branch_target();
+                if tgt > insn.ip() && tgt < base + len {
+                    deopt_start = Some(deopt_start.map_or(tgt, |d| d.min(tgt)));
+                }
             }
         }
+
+        // Pass 2: format, resolving branch targets and marking the deopt section.
+        let mut fmt = iced_x86::NasmFormatter::new();
+        let mut line = String::new();
+        for (k, insn) in insns.iter().enumerate() {
+            if Some(insn.ip()) == deopt_start {
+                let _ = writeln!(
+                    out,
+                    "; ── deoptimization stubs (cold — reached only when a guard fails; rebuild the T0 frame and resume) ──"
+                );
+            }
+            line.clear();
+            use iced_x86::Formatter;
+            fmt.format(insn, &mut line);
+            let prev = (k > 0).then(|| &insns[k - 1]);
+            match native_insn_annotation(insn, prev, base, len, &nc.osr_entries, deopt_start) {
+                Some(ann) => {
+                    let _ = writeln!(out, "  +{:04x}:  {line}    ; {ann}", insn.ip() - base);
+                }
+                None => {
+                    let _ = writeln!(out, "  +{:04x}:  {line}", insn.ip() - base);
+                }
+            }
+        }
+        out
     }
-    out
 }
 
 /// Compile-time snapshot of a function's native tiers for the viewer.
