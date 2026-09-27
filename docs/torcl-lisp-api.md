@@ -93,13 +93,17 @@ Returns `NIL` if the host query fails.
 
 Runs a subprocess synchronously and captures both output streams.
 
-- A string command is executed by `/bin/sh -c`.
+- A string command is executed by `/bin/sh -c` on Unix or `COMSPEC` with
+  `/D /S /C` on Windows.
 - A list of strings is executed directly. Its first element is the program and
   the remaining elements are arguments.
 - `exit-code` is `-1` if the process ended without a host exit code.
 - Captured byte output is decoded with replacement for invalid UTF-8.
 - Host launch failures signal `FILE-ERROR`.
 - Sandbox mode denies the operation with a sandbox violation.
+- Waiting permits garbage collection. Unpinned fibers park and release their
+  carrier; pinned fibers follow the configured blocking policy. The error
+  policy rejects capture before starting a child.
 
 Prefer the list form when shell parsing is not required:
 

@@ -1842,6 +1842,11 @@ impl WorkerPool {
             if let Some(t) = self.workers[victim].deferred.lock().unwrap().pop_front() {
                 return Some(t);
             }
+            // External submissions (including timer wakes) go to an inbox.
+            // Its owner may be pinned in native I/O and unable to drain it.
+            if let Some(t) = self.workers[victim].pending.lock().unwrap().pop_front() {
+                return Some(t);
+            }
         }
         None
     }
@@ -3064,6 +3069,18 @@ mod chase_lev_tests {
         assert_eq!(number(&deque.pop().unwrap()), 2);
         assert!(deque.pop().is_none());
         assert!(deque.steal().is_none());
+    }
+
+    #[test]
+    fn idle_carrier_steals_external_work_from_blocked_peer() {
+        let pool = WorkerPool::new(2);
+        // External wakeups land in pending, not the owner-only local deque.
+        // Carrier 0 may be in native I/O and unable to drain its inbox.
+        let wakeup = task(41);
+        pool.workers[0].pending.lock().unwrap().push_back(wakeup);
+        assert_eq!(number(&pool.pop_or_steal(1).expect("stranded wakeup")), 41);
+        assert!(pool.pop_or_steal(0).is_none());
+        assert!(pool.pop_or_steal(1).is_none());
     }
 
     #[test]

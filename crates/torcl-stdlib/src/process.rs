@@ -1,6 +1,8 @@
 //! Synchronous subprocess execution for TORCL-EXT:RUN-PROGRAM.
 use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
 use torcl_rt::error::TorclError;
+use torcl_rt::sync::{BlockingMode, TorclSemaphore, blocking_mode};
 
 pub enum ProcessCommand {
     Shell(String),
@@ -21,9 +23,49 @@ pub fn run_program(spec: ProcessCommand) -> Result<Output, TorclError> {
             command
         }
     };
-    command
-        .output()
-        .map_err(|e| TorclError::FileError(format!("run-program: {e}")))
+    // Apply the pinned policy before starting a child with observable effects.
+    let output = match blocking_mode("RUN-PROGRAM")? {
+        BlockingMode::Native => {
+            // SAFETY: command/output contain owned Rust data only. No Lisp
+            // values, root slots, or callbacks are accessed while waiting.
+            let _blocked = unsafe { torcl_rt::safepoint::NativeBlockingScope::enter() };
+            command.output()
+        }
+        BlockingMode::Fiber => capture_on_worker(command)?,
+    };
+    output.map_err(|e| TorclError::FileError(format!("run-program: {e}")))
+}
+
+/// std::process drains both pipes with blocking OS operations. Keep those
+/// operations on a helper and park the caller through the runtime semaphore.
+fn capture_on_worker(mut command: Command) -> Result<std::io::Result<Output>, TorclError> {
+    let completed = Arc::new(TorclSemaphore::new(None, 0)?);
+    let result = Arc::new(Mutex::new(None));
+    let worker_completed = Arc::clone(&completed);
+    let worker_result = Arc::clone(&result);
+    std::thread::Builder::new()
+        .name("torcl-process-capture".into())
+        .spawn(move || {
+            // A panic must publish a failure too, rather than strand the fiber.
+            let output =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| command.output()))
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::other("process capture worker panicked"))
+                    });
+            *worker_result.lock().unwrap() = Some(output);
+            worker_completed
+                .signal(1)
+                .expect("single completion permit");
+        })
+        .map_err(|e| TorclError::FileError(format!("run-program: capture worker: {e}")))?;
+    completed.wait(None)?;
+    // The helper has published all its data and only releases owned Rust
+    // storage after signaling. Joining its OS teardown would block the carrier.
+    result
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| TorclError::Internal("process capture completed without a result".into()))
 }
 
 #[cfg(unix)]
