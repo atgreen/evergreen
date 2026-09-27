@@ -4695,6 +4695,29 @@ fn method_combination_from_name(name: &str) -> Option<torcl_stdlib::MethodCombin
 /// function) and an ordinary data cons (e.g. `(make-instance c)`) are NOT
 /// functions, so `(typep '(make-instance c) 'function)` is correctly NIL and
 /// UIOP's ENSURE-FUNCTION etypecase falls through to its CONS clause (bliss-lb6).
+/// The hidden instance slot holding a funcallable instance's function
+/// (bliss-cr53). Spelled like the private restart class's `%RESTART-REPORT`: a
+/// leading `%` marks it internal so it cannot collide with a user slot.
+const FUNCALLABLE_FUNCTION_SLOT: &str = "%FUNCALLABLE-FUNCTION";
+
+/// An instance of a class whose metaclass is FUNCALLABLE-STANDARD-CLASS. True
+/// from the moment the instance exists, installed function or not: AMOP makes
+/// such an instance a FUNCTION either way, and `iparse` (via closer-mop) builds
+/// one and then installs its function in a second step.
+fn is_funcallable_instance(v: TorclVal) -> bool {
+    resolve_sym(FUNCALLABLE_FUNCTION_SLOT).is_some_and(|slot| torcl_stdlib::slot_present_p(v, slot))
+}
+
+/// The function installed in a funcallable instance, or None when this is not a
+/// funcallable instance or nothing has been installed yet.
+fn funcallable_instance_function(v: TorclVal) -> Option<TorclVal> {
+    let slot = resolve_sym(FUNCALLABLE_FUNCTION_SLOT)?;
+    if !torcl_stdlib::slot_present_p(v, slot) {
+        return None;
+    }
+    torcl_stdlib::slot_value(v, slot).ok()
+}
+
 fn is_function_value(v: TorclVal) -> bool {
     if v.is_function() {
         return true;
@@ -4712,6 +4735,12 @@ fn is_function_value(v: TorclVal) -> bool {
     if v.is_cons() {
         let (h, t) = cp(v);
         return h.is_symbol() && sym_name(h) == "TORCL::CLOSURE" && t.is_fixnum();
+    }
+    // A funcallable instance IS a function (bliss-cr53) — checked last, and
+    // behind the cheap heap-object tag test, so ATOM/LISTP/CONSP on a fixnum or a
+    // cons never reach the instance registry.
+    if v.is_heap_object() && torcl_stdlib::is_instance(v) && is_funcallable_instance(v) {
+        return true;
     }
     false
 }
@@ -24130,6 +24159,40 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(arena_str(&value));
             }
+            "TORCL-EXT:SET-FUNCALLABLE-INSTANCE-FUNCTION" => {
+                // (set-funcallable-instance-function instance function) — AMOP.
+                // The only way to fill a funcallable instance's function cell, and
+                // what closer-mop's TorCL arm calls (bliss-cr53). Returns the
+                // function; AMOP leaves the value unspecified.
+                let (inst_form, rest) = cp(cdr);
+                torcl_rt::rooted!(inst = eval_form(inst_form, env)?);
+                let (fn_form, _) = cp(rest);
+                torcl_rt::rooted!(function = eval_form(fn_form, env)?);
+                let Some(slot) = resolve_sym(FUNCALLABLE_FUNCTION_SLOT) else {
+                    // The slot symbol only exists once some class has been defined
+                    // with the funcallable metaclass, so its absence means this
+                    // cannot be a funcallable instance.
+                    return Err(TorclError::TypeError {
+                        datum: *inst,
+                        expected: "FUNCALLABLE-INSTANCE".to_string(),
+                    });
+                };
+                if !torcl_stdlib::slot_present_p(*inst, slot) {
+                    return Err(TorclError::TypeError {
+                        datum: *inst,
+                        expected: "FUNCALLABLE-INSTANCE".to_string(),
+                    });
+                }
+                torcl_stdlib::set_slot_value(*inst, slot, *function)?;
+                return Ok(*function);
+            }
+            "TORCL-EXT:FUNCALLABLE-INSTANCE-FUNCTION" => {
+                // The reader half, for symmetry and for closer-mop's
+                // FUNCALLABLE-INSTANCE-FUNCTION: NIL when nothing is installed.
+                let (inst_form, _) = cp(cdr);
+                torcl_rt::rooted!(inst = eval_form(inst_form, env)?);
+                return Ok(funcallable_instance_function(*inst).unwrap_or(NIL));
+            }
             "TORCL-EXT:UNSETENV" => {
                 // (torcl-ext:unsetenv name) — the unset arm of the same
                 // (defsetf getenv) table (bliss-po88). Removing a variable that
@@ -34109,12 +34172,30 @@ fn eval_defclass(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     // when the ClassDef is built (bliss-wlf).
     let mut default_initarg_names: Vec<String> = Vec::new();
     torcl_rt::rooted!(default_initarg_forms = Vec::<TorclVal>::new());
+    // (:metaclass funcallable-standard-class) makes every instance of the class a
+    // FUNCTION with an installable function cell (AMOP; bliss-cr53). Matched on
+    // the BARE symbol name because every portability layer spells the metaclass
+    // in its own package — closer-mop's `c2mop:funcallable-standard-class` (what
+    // iparse writes), `sb-mop:`, or the bare name — and they all mean this.
+    let mut funcallable = false;
     for option in list_to_vec(class_options) {
         if !option.is_cons() {
             continue;
         }
         let (opt_key, opt_rest) = cp(option);
-        if !opt_key.is_symbol() || sym_bare_name_rc(opt_key).as_ref() != "DEFAULT-INITARGS" {
+        if !opt_key.is_symbol() {
+            continue;
+        }
+        if sym_bare_name_rc(opt_key).as_ref() == "METACLASS" {
+            let (metaclass, _) = cp(opt_rest);
+            if metaclass.is_symbol()
+                && sym_bare_name_rc(metaclass).as_ref() == "FUNCALLABLE-STANDARD-CLASS"
+            {
+                funcallable = true;
+            }
+            continue;
+        }
+        if sym_bare_name_rc(opt_key).as_ref() != "DEFAULT-INITARGS" {
             continue;
         }
         let pairs = list_to_vec(opt_rest);
@@ -34287,6 +34368,28 @@ fn eval_defclass(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 allocation: SlotAllocation::Instance,
             });
         }
+    }
+
+    // The function cell of a funcallable instance is an ordinary hidden instance
+    // slot, so it needs no change to the heap-object layout or to
+    // ALLOCATE-INSTANCE — the same trick the private restart class uses for
+    // %RESTART-REPORT. Its PRESENCE is what makes FUNCTIONP true (an instance of
+    // a funcallable class is a FUNCTION before anything is installed); its being
+    // BOUND is what makes a call succeed (bliss-cr53).
+    if funcallable
+        && !slots
+            .iter()
+            .any(|slot| slot.name == FUNCALLABLE_FUNCTION_SLOT)
+    {
+        slots.push(SlotDef {
+            name: FUNCALLABLE_FUNCTION_SLOT.to_string(),
+            initargs: Vec::new(),
+            accessor: None,
+            readers: Vec::new(),
+            writers: Vec::new(),
+            initform: None,
+            allocation: SlotAllocation::Instance,
+        });
     }
 
     let mut class_slot_values = HashMap::new();
@@ -36242,6 +36345,20 @@ fn apply_function(
         let parent =
             bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Arc::clone(&env.frame));
         return eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh);
+    }
+    // A funcallable instance applies the function installed in its hidden cell
+    // (bliss-cr53). This sits at the END of the dispatch, so an ordinary
+    // instance — or a funcallable one with nothing installed yet — still reaches
+    // the TYPE-ERROR below, and no other call shape pays for the check.
+    if fn_val.is_heap_object() && torcl_stdlib::is_instance(fn_val) {
+        if let Some(mut installed) = funcallable_instance_function(fn_val) {
+            // The installed function is read out of a GC-heap slot and then
+            // applied, and apply_function allocates freely — root it, and let
+            // the recursive call root the arguments again as it does for every
+            // caller.
+            torcl_rt::rooted_ref!(_installed_root = &mut installed);
+            return apply_function(installed, args, env);
+        }
     }
     if std::env::var_os("TORCL_APPLY_DBG").is_some() && fn_val.is_cons() {
         let (h, t) = cp(fn_val);
