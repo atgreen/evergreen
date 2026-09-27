@@ -16,8 +16,8 @@ The s390x T2 backend emits optimized guarded integer arithmetic, branches,
 loops, runtime calls and multiple-value transfers. Native register and spill
 roots are synchronized through GC-scanned activation slots at runtime calls
 and sampled loop safepoints. Live T1-to-T2 OSR grows the activation in place
-and imports its live locals. Deopt rematerialization and multiply/float
-templates remain in progress;
+and imports its live locals. Deoptimization reconstructs shared tagged-value
+recipes from their live inputs. Multiply/float templates remain in progress;
 unsupported functions stay at T1. AArch64 and POWER still
 use T0 for native-tier requests. Foreign calls/callbacks and fiber context
 switching are not yet ported; this is not a claim of full architecture parity.

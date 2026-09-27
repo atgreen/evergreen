@@ -1,7 +1,7 @@
 //! System Z emission for the optimized SSA pipeline.
 
 use super::emit::{EmitError, FramedCode, RootSyncSite};
-use super::frame_state::{FrameState, FrameStateId, ValueSource};
+use super::frame_state::{FrameState, FrameStateId, RematOp, ValueSource};
 use super::ir::{
     AuxData, Block, BlockCall, Function, Inst, InstData, Opcode, TypeBits, Value,
     ValueRepresentation,
@@ -54,6 +54,7 @@ struct Emitter<'a> {
     frame_bytes: i32,
     edge_base: i32,
     deopt_base: i32,
+    remat_base: i32,
     runtime: RuntimeCalls,
     activation_slots: u16,
     root_slots: u16,
@@ -68,6 +69,45 @@ struct Emitter<'a> {
 
 fn unsupported() -> EmitError {
     EmitError::UnsupportedOp(0x390)
+}
+
+/// Order shared recipes before their users without recursive host calls or
+/// exponential re-emission. Public emitter callers may supply unverified IR,
+/// so reject missing dependencies and cycles here as well as in the verifier.
+fn rematerialization_order(state: &FrameState) -> Result<Vec<usize>, EmitError> {
+    let mut marks = vec![0; state.remat.len()];
+    let mut order = Vec::new();
+    let roots = state
+        .scopes
+        .iter()
+        .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+        .filter_map(|source| match source {
+            ValueSource::Remat(id) => Some(id.0 as usize),
+            _ => None,
+        });
+    for root in roots {
+        let mut pending = vec![(root, false)];
+        while let Some((index, finish)) = pending.pop() {
+            let mark = marks.get_mut(index).ok_or_else(unsupported)?;
+            if finish {
+                *mark = 2;
+                order.push(index);
+                continue;
+            }
+            match *mark {
+                2 => continue,
+                1 => return Err(unsupported()),
+                _ => *mark = 1,
+            }
+            pending.push((index, true));
+            for input in state.remat[index].inputs.iter().rev() {
+                if let ValueSource::Remat(id) = input {
+                    pending.push((id.0 as usize, false));
+                }
+            }
+        }
+    }
+    Ok(order)
 }
 
 impl Emitter<'_> {
@@ -370,7 +410,7 @@ impl Emitter<'_> {
         self.store(result, 2)
     }
 
-    fn deopt_source(&mut self, source: &ValueSource) -> Result<(), EmitError> {
+    fn deopt_source(&mut self, source: &ValueSource, state: &FrameState) -> Result<(), EmitError> {
         match source {
             ValueSource::Value {
                 value,
@@ -386,11 +426,48 @@ impl Emitter<'_> {
                 self.asm.imm64(2, UNBOUND.0);
                 Ok(())
             }
+            ValueSource::Remat(id) if (id.0 as usize) < state.remat.len() => {
+                self.asm.load(2, 15, self.remat_base + id.0 as i32 * 8);
+                Ok(())
+            }
             _ => Err(unsupported()),
         }
     }
 
     fn deopt(&mut self, state: &FrameState, callback: u64) -> Result<(), EmitError> {
+        for index in rematerialization_order(state)? {
+            let recipe = &state.remat[index];
+            if recipe.result_repr != ValueRepresentation::Tagged {
+                return Err(unsupported());
+            }
+            match recipe.op {
+                RematOp::Const
+                | RematOp::BoxFixnum
+                | RematOp::UnboxFixnum
+                | RematOp::BoxFloat
+                | RematOp::UnboxFloat => {
+                    if recipe.inputs.len() != 1 {
+                        return Err(unsupported());
+                    }
+                    self.deopt_source(&recipe.inputs[0], state)?;
+                }
+                RematOp::FixnumAdd | RematOp::FixnumSub => {
+                    if recipe.inputs.len() != 2 {
+                        return Err(unsupported());
+                    }
+                    self.deopt_source(&recipe.inputs[0], state)?;
+                    self.asm.mov(3, 2);
+                    self.deopt_source(&recipe.inputs[1], state)?;
+                    if recipe.op == RematOp::FixnumAdd {
+                        self.asm.add(2, 3);
+                    } else {
+                        self.asm.sub(3, 2);
+                        self.asm.mov(2, 3);
+                    }
+                }
+            }
+            self.asm.store(2, 15, self.remat_base + index as i32 * 8);
+        }
         let mut words = 0;
         for scope in &state.scopes {
             for header in [
@@ -404,7 +481,7 @@ impl Emitter<'_> {
                 words += 1;
             }
             for source in scope.locals.iter().chain(&scope.stack) {
-                self.deopt_source(source)?;
+                self.deopt_source(source, state)?;
                 self.asm.store(2, 15, self.deopt_base + words * 8);
                 words += 1;
             }
@@ -481,6 +558,7 @@ pub fn emit_framed_with_runtime(
         frame_bytes: 0,
         edge_base: 0,
         deopt_base: 0,
+        remat_base: 0,
         runtime,
         activation_slots,
         root_slots: 0,
@@ -654,7 +732,13 @@ pub fn emit_framed_with_runtime(
         })
         .max()
         .unwrap_or(0);
-    let frame_words = spill_slots as usize + edge_words + deopt_words + 2;
+    let remat_words = function
+        .frame_states
+        .iter()
+        .map(|(_, state)| state.remat.len())
+        .max()
+        .unwrap_or(0);
+    let frame_words = spill_slots as usize + edge_words + deopt_words + remat_words + 2;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported());
@@ -662,6 +746,7 @@ pub fn emit_framed_with_runtime(
     emitter.frame_bytes = (frame_words * 8) as i32;
     emitter.edge_base = 160 + spill_slots as i32 * 8;
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
+    emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.result_offset = 160 + (frame_words as i32 - 2) * 8;
     emitter.poll_offset = emitter.result_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
@@ -701,9 +786,10 @@ pub fn emit_framed_with_runtime(
             continue;
         }
         let specs = super::slot_map::slot_specs(scope, state);
-        if specs.iter().any(|spec| {
-            spec.repr != ValueRepresentation::Tagged || matches!(spec.source, ValueSource::Remat(_))
-        }) {
+        if specs
+            .iter()
+            .any(|spec| spec.repr != ValueRepresentation::Tagged)
+        {
             continue;
         }
         let Some(&block_index) = positions.get(&osr.block) else {
@@ -1125,6 +1211,147 @@ mod tests {
                 TorclVal::from_fixnum(210).0
             );
         }
+    }
+
+    fn rematerialized_guard() -> (Function, FrameStateId) {
+        use crate::t2::frame_state::{RematOp, RematRecipe, RematRecipeId};
+        let mut f = Function::new("z-rematerialized-deopt");
+        let block = f.entry();
+        let values: Vec<_> = (0..21)
+            .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
+            .collect();
+        let source = |value| ValueSource::Value {
+            value,
+            repr: ValueRepresentation::Tagged,
+        };
+        // Forward references deliberately exercise dependency ordering. The
+        // sum's twenty deopt-live inputs also force native spills.
+        let mut recipes = vec![RematRecipe {
+            op: RematOp::FixnumSub,
+            inputs: vec![
+                ValueSource::Remat(RematRecipeId(1)),
+                ValueSource::Const(TorclVal::from_fixnum(10)),
+            ],
+            result_repr: ValueRepresentation::Tagged,
+        }];
+        for index in 0..19 {
+            recipes.push(RematRecipe {
+                op: RematOp::FixnumAdd,
+                inputs: vec![
+                    source(values[index]),
+                    if index == 18 {
+                        source(values[19])
+                    } else {
+                        ValueSource::Remat(RematRecipeId(index as u32 + 2))
+                    },
+                ],
+                result_repr: ValueRepresentation::Tagged,
+            });
+        }
+        recipes.push(RematRecipe {
+            op: RematOp::Const,
+            inputs: vec![ValueSource::Remat(RematRecipeId(0))],
+            result_repr: ValueRepresentation::Tagged,
+        });
+        recipes.push(RematRecipe {
+            op: RematOp::FixnumAdd,
+            inputs: vec![
+                ValueSource::Remat(RematRecipeId(20)),
+                ValueSource::Remat(RematRecipeId(0)),
+            ],
+            result_repr: ValueRepresentation::Tagged,
+        });
+        let locals = vec![
+            ValueSource::Remat(RematRecipeId(0)),
+            ValueSource::Remat(RematRecipeId(21)),
+        ];
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 74,
+                bcp: 9,
+                locals,
+                stack: vec![source(values[20])],
+            }],
+            remat: recipes,
+        });
+        let (_, guarded) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![values[20]],
+                results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![guarded[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        (f, state)
+    }
+
+    #[test]
+    fn reconstructs_nested_shared_recipes_from_registers_and_spills() {
+        thread_local! { static RECONSTRUCTED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
+        extern "C" fn deopt(scopes: u64, words: u64, pointer: *const u64, _: u64) {
+            assert_eq!(scopes, 1);
+            RECONSTRUCTED.with(|out| {
+                *out.borrow_mut() =
+                    unsafe { std::slice::from_raw_parts(pointer, words as usize) }.to_vec()
+            });
+        }
+        let (f, _) = rematerialized_guard();
+        let compiled = emit_framed(&f, deopt as *const () as usize as u64, 21)
+            .expect("emit rematerialized frame state");
+        assert!(compiled.regalloc_spill_slots > 0);
+        #[cfg(target_arch = "s390x")]
+        {
+            let buffer = torcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            let entry: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut slots: Vec<_> = (1..=20)
+                .map(|n| TorclVal::from_fixnum(n).0)
+                .chain([NIL.0])
+                .collect();
+            assert_eq!(entry(slots.as_mut_ptr()), NIL.0);
+            let mut expected = vec![74, 9, 2, 1];
+            expected.extend([
+                TorclVal::from_fixnum(200).0,
+                TorclVal::from_fixnum(400).0,
+                NIL.0,
+            ]);
+            RECONSTRUCTED.with(|out| assert_eq!(*out.borrow(), expected));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rematerialization_dependencies() {
+        use crate::t2::frame_state::RematRecipeId;
+        let (mut f, state) = rematerialized_guard();
+        f.frame_states.get_mut(state).remat[0].inputs[0] = ValueSource::Remat(RematRecipeId(0));
+        assert!(
+            emit_framed(&f, 0, 21).is_err(),
+            "cyclic recipe must decline"
+        );
+        f.frame_states.get_mut(state).remat[0].inputs[0] = ValueSource::Remat(RematRecipeId(999));
+        assert!(
+            emit_framed(&f, 0, 21).is_err(),
+            "missing recipe must decline"
+        );
     }
 
     #[cfg(all(target_arch = "s390x", unix))]
