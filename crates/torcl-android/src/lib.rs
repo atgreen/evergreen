@@ -9,6 +9,10 @@
 //! looks for, remember the window pointer, and start the interpreter on a form
 //! that passes that pointer to Lisp. It contains no EGL whatsoever.
 
+// NativeActivity and libandroid are available only on Android. Keep this
+// workspace member empty on host targets so workspace tests can link there.
+#![cfg(target_os = "android")]
+
 use std::ffi::{c_char, c_int, c_void};
 use std::os::raw::c_ulong;
 use std::sync::atomic::{AtomicI32, Ordering};

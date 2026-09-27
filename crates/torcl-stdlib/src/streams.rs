@@ -292,6 +292,9 @@ impl StreamMutableState {
 const FILE_BUF_SIZE: usize = 8192;
 
 /// Read a single UTF-8 char from a buffered file input, refilling buffer as needed.
+// These are the disjoint mutable fields of a file stream plus its wait policy;
+// borrowing the whole stream here would conflict with the caller's field borrows.
+#[allow(clippy::too_many_arguments)]
 fn file_read_char_buffered(
     file: &mut StreamHandle,
     read_buf: &mut Vec<u8>,
