@@ -19353,9 +19353,11 @@ macro_rules! t2_log {
 }
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
-    // The current optimized emitter emits x86 instructions. A newly enabled
-    // baseline backend must never install those bytes on another ISA.
-    if !cfg!(all(target_arch = "x86_64", unix)) {
+    // Only targets with an optimizing native emitter may publish T2 code.
+    if !cfg!(all(
+        any(target_arch = "x86_64", target_arch = "s390x"),
+        unix
+    )) {
         return None;
     }
     let sym = input.sym;

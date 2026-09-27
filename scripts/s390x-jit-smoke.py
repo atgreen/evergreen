@@ -182,6 +182,35 @@ def main():
         assert found, "no code-load record for JIT-DIAGNOSTICS"
     print("s390x: native listings and perf jitdump identify System Z", flush=True)
 
+    optimized = r"""
+      (defun jit-t2-add (x) (+ x 1))
+      (defun jit-t2-branch (x) (if (< x 0) (- x 1) (+ x 1)))
+      (defun jit-t2-neg (x) (- x))
+      (defun jit-t2-literal (x) (if (< x 0) '(constant negative) '(constant positive)))
+      (jit-t2-add 10) (jit-t2-add 11)
+      (jit-t2-branch -2) (jit-t2-branch 2)
+      (jit-t2-neg 1) (jit-t2-literal 1)
+      (format t "~S~%" (list (jit-t2-add 41) (jit-t2-branch -5) (jit-t2-branch 5)
+                             (jit-t2-neg -4) (jit-t2-literal -1) (jit-t2-literal 1)))
+    """
+    tiers = r"""
+      (if (= (torcl-ext:function-tier 'jit-t2-add) 2) nil (error "ADD missed T2"))
+      (if (= (torcl-ext:function-tier 'jit-t2-branch) 2) nil (error "BRANCH missed T2"))
+      (if (= (torcl-ext:function-tier 'jit-t2-neg) 2) nil (error "NEG missed T2"))
+      (if (= (torcl-ext:function-tier 'jit-t2-literal) 2) nil (error "LITERAL missed T2"))
+    """
+    traps = r"""
+      (format t "~S~%" (jit-t2-add 1152921504606846975))
+      (format t "~S~%" (jit-t2-branch 1.5))
+      (format t "~S~%" (jit-t2-neg -1152921504606846976))
+    """
+    reference = run(optimized + traps, TORCL_FORCE_TIER="t0")
+    native = run(optimized + tiers + traps, TORCL_FORCE_TIER="t2")
+    stressed = run(optimized + tiers + traps, TORCL_FORCE_TIER="t2",
+                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    assert reference == native == stressed, (reference, native, stressed)
+    print("s390x: optimized T2 arithmetic, branches and guard exits match T0", flush=True)
+
 
 if __name__ == "__main__":
     main()

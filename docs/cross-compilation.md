@@ -12,7 +12,9 @@ TorCL's CLI can be built on x86-64 for these Linux targets:
 These are dynamically linked glibc executables, suitable for Fedora. They run
 the interpreter and T0 bytecode engine. s390x also supports native T1 compilation
 and T0-to-T1 OSR, including guarded fixnum arithmetic and precise deoptimization.
-The s390x optimizing T2 backend remains in progress. AArch64 and POWER still
+The s390x T2 backend emits optimized guarded integer arithmetic and forward
+branches. Runtime calls, optimized loops/OSR, and floating-point templates
+remain in progress; unsupported functions stay at T1. AArch64 and POWER still
 use T0 for native-tier requests. Foreign calls/callbacks and fiber context
 switching are not yet ported; this is not a claim of full architecture parity.
 Library loading uses the system dynamic
@@ -60,7 +62,7 @@ containers also receive a memory cap. `TORCL_MEM_MAX` and `TORCL_TIMEOUT` retain
 their usual meanings.
 
 The CLI regression compares interpreter, bytecode, default tiering, and forced
-T2 (which currently falls back to T1 on s390x and bytecode on the other targets)
+T2 (with T1 fallback for unsupported s390x functions and bytecode fallback on the other targets)
 output. A focused raw-runtime
 program runs with and without GC stress/poison, comparing output byte-for-byte.
 It uses `--no-bootstrap` to avoid stressing prelude loading under emulation;
@@ -77,6 +79,10 @@ errors, and overflow deoptimization. Every-allocation GC stress with poisoning
 must produce identical output. The OSR cases also cover uncommon traps with
 active condition handlers. The runtime and CLI unit suites contain s390x
 instruction-encoding, ABI execution, native frame and deoptimization tests.
+T2 checks require actual tier-2 installation for arithmetic and branches, then
+compare overflow/type guard exits against T0 under GC stress. Compiler tests
+also execute optimized code with register spills and check precise guard
+reconstruction. Until back-edge polling is implemented, T2 declines loops.
 Validation currently uses QEMU; native IBM Z hardware performance is unmeasured.
 
 s390x perf jitdump files identify their code as `EM_S390` and encode fields in

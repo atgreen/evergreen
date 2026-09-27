@@ -2349,6 +2349,9 @@ pub fn emit_framed_with_activation_slots(
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
+    if cfg!(target_arch = "s390x") {
+        return super::emit_s390x::emit_framed(f, c2i_deopt_t2_addr, activation_slots);
+    }
     emit_framed_inner(
         f,
         c2i_deopt_addr,
