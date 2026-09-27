@@ -12,14 +12,13 @@ TorCL's CLI can be built on x86-64 for these Linux targets:
 These are dynamically linked glibc executables, suitable for Fedora. They run
 the interpreter and T0 bytecode engine. s390x also supports native T1 compilation
 and T0-to-T1 OSR, including guarded fixnum arithmetic and precise deoptimization.
-The s390x T2 backend emits optimized guarded integer arithmetic, branches,
-loops, runtime calls and multiple-value transfers. Native register and spill
+The s390x T2 backend emits optimized guarded fixnum and single-float arithmetic,
+branches, loops, runtime calls and multiple-value transfers. Native register and spill
 roots are synchronized through GC-scanned activation slots at runtime calls
 and sampled loop safepoints. Live T1-to-T2 OSR grows the activation in place
 and imports its live locals. Deoptimization reconstructs shared tagged-value
-recipes from their live inputs. Multiply/float templates remain in progress;
-unsupported functions stay at T1. AArch64 and POWER still
-use T0 for native-tier requests. Foreign calls/callbacks and fiber context
+recipes from their live inputs. Unsupported functions stay at T1. AArch64 and
+POWER still use T0 for native-tier requests. Foreign calls/callbacks and fiber context
 switching are not yet ported; this is not a claim of full architecture parity.
 Library loading uses the system dynamic
 loader. Saved images have distinct architecture tags; do not move heap images

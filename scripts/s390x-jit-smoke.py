@@ -213,6 +213,40 @@ def main():
     assert reference == native == stressed, (reference, native, stressed)
     print("s390x: optimized T2 arithmetic, branches and guard exits match T0", flush=True)
 
+    numeric = r"""
+      (defun jit-t2-mul (a b) (* a b))
+      (defun jit-t2-fadd (a b) (+ a b))
+      (defun jit-t2-fsub (a b) (- a b))
+      (defun jit-t2-fmul (a b) (* a b))
+      (defun jit-t2-fscale (a) (* a 2))
+      (jit-t2-mul 3 7) (jit-t2-mul 4 -8)
+      (jit-t2-fadd 1.5 2.25) (jit-t2-fadd 2.5 -1.25)
+      (jit-t2-fsub 1.5 2.25) (jit-t2-fsub 2.5 -1.25)
+      (jit-t2-fmul 1.5 2.25) (jit-t2-fmul 2.5 -1.25)
+      (jit-t2-fscale 1.5) (jit-t2-fscale 2.5)
+      (format t "~S~%" (list (jit-t2-mul -123456789 123456789)
+                             (jit-t2-mul -1152921504606846976 1)
+                             (jit-t2-fadd 1.5 2.25) (jit-t2-fsub 1.5 2.25)
+                             (jit-t2-fmul -0.0 2.5) (jit-t2-fscale 3.25)))
+    """
+    numeric_tiers = "\n".join(
+        f"(if (= (torcl-ext:function-tier '{name}) 2) nil (error \"{name} missed T2\"))"
+        for name in ["jit-t2-mul", "jit-t2-fadd", "jit-t2-fsub", "jit-t2-fmul", "jit-t2-fscale"]
+    )
+    numeric_traps = r"""
+      (format t "~S~%" (list (jit-t2-mul 1152921504606846975 2)
+                             (jit-t2-mul -1152921504606846976 -1)
+                             (jit-t2-mul 1.5 2.0)
+                             (jit-t2-fadd 1.0d0 2.0d0)
+                             (jit-t2-fsub 9 3) (jit-t2-fmul 4 5)))
+    """
+    reference = run(numeric + numeric_traps, TORCL_FORCE_TIER="t0")
+    native = run(numeric + numeric_tiers + numeric_traps, TORCL_FORCE_TIER="t2")
+    stressed = run(numeric + numeric_tiers + numeric_traps, TORCL_FORCE_TIER="t2",
+                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    assert reference == native == stressed, (reference, native, stressed)
+    print("s390x: T2 multiplication and single-float arithmetic match T0 through guard exits", flush=True)
+
     calls = r"""
       (defun jit-t2-roots (x)
         (let ((a (list x x)))

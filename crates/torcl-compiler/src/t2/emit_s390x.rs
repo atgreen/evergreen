@@ -291,6 +291,58 @@ impl Emitter<'_> {
         self.asm.branch(6, deopt);
     }
 
+    fn guard_single_float(&mut self, register: u8, deopt: Label) {
+        self.asm.mov(4, register);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, 4);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, deopt);
+    }
+
+    fn float_operand(&mut self, value: Value, register: u8, deopt: Label) -> Result<(), EmitError> {
+        if let Some(&bits) = self.constants.get(&value) {
+            let constant = TorclVal(bits);
+            if constant.is_fixnum() {
+                self.asm.imm64(
+                    register,
+                    TorclVal::from_single_float(constant.as_fixnum() as f32).0,
+                );
+                return Ok(());
+            }
+        }
+        self.load(value, register)?;
+        self.guard_single_float(register, deopt);
+        Ok(())
+    }
+
+    fn multiply_fixnums(&mut self, deopt: Label) {
+        // Multiply a signed untagged lhs by the tagged rhs. MLGR supplies
+        // the full unsigned 128-bit product on every z10-compatible CPU.
+        // Correct its high half for signed operands, then require that high
+        // half to equal the low half's sign extension. No allocated home is
+        // modified before the overflow exit, so deopt retains both inputs.
+        self.asm.shift_right_signed(5, 2, 3);
+        self.asm.mov(4, 3);
+        self.asm.mov(3, 5);
+        self.asm.multiply_unsigned_wide(2, 4);
+        self.asm.imm64(0, 0);
+        let lhs_nonnegative = self.asm.label();
+        self.asm.compare(5, 0);
+        self.asm.branch(10, lhs_nonnegative);
+        self.asm.sub(2, 4);
+        self.asm.bind(lhs_nonnegative);
+        let rhs_nonnegative = self.asm.label();
+        self.asm.compare(4, 0);
+        self.asm.branch(10, rhs_nonnegative);
+        self.asm.sub(2, 5);
+        self.asm.bind(rhs_nonnegative);
+        self.asm.shift_right_signed(4, 3, 63);
+        self.asm.compare(2, 4);
+        self.asm.branch(6, deopt);
+        self.asm.mov(2, 3);
+    }
+
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
         let parameters = self.function.block(edge.block).params.clone();
         if parameters.len() != edge.args.len() {
@@ -360,12 +412,33 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, 2)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM) => {
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT) =>
+            {
                 let deopt = self.deopt_label(data)?;
-                self.guard_fixnum(2, deopt);
+                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM) {
+                    self.guard_fixnum(2, deopt);
+                } else {
+                    self.guard_single_float(2, deopt);
+                }
             }
-            FixnumAdd | FixnumSub | FixnumNeg | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe
-            | FixnumCmpGt | FixnumCmpGe => {
+            FloatAdd | FloatSub | FloatMul => {
+                let deopt = self.deopt_label(data)?;
+                self.float_operand(first, 2, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or_else(unsupported)?, 3, deopt)?;
+                self.asm.load_float_bits(0, 2);
+                self.asm.load_float_bits(2, 3);
+                match data.opcode {
+                    FloatAdd => self.asm.add_single(0, 2),
+                    FloatSub => self.asm.sub_single(0, 2),
+                    _ => self.asm.multiply_single(0, 2),
+                }
+                self.asm.store_float_bits(2, 0);
+                self.asm.imm64(3, 0xffff_ffff_0000_0000);
+                self.asm.and(2, 3);
+                self.asm.add_imm(2, 4);
+            }
+            FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt
+            | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                 let deopt = self.deopt_label(data)?;
                 self.guard_fixnum(2, deopt);
                 if data.opcode != FixnumNeg {
@@ -375,6 +448,10 @@ impl Emitter<'_> {
                 match data.opcode {
                     FixnumAdd => self.asm.add(2, 3),
                     FixnumSub => self.asm.sub(2, 3),
+                    FixnumMul => {
+                        self.multiply_fixnums(deopt);
+                        return self.store(result, 2);
+                    }
                     FixnumNeg => {
                         self.asm.imm64(3, 0);
                         self.asm.sub(3, 2);
@@ -1210,6 +1287,148 @@ mod tests {
                 unsafe { entry(slots.as_mut_ptr()) },
                 TorclVal::from_fixnum(210).0
             );
+        }
+    }
+
+    fn binary_numeric(opcode: Opcode) -> Function {
+        let mut f = Function::new("z-numeric");
+        let block = f.entry();
+        let values: Vec<_> = (0..2)
+            .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
+            .collect();
+        let sources: Vec<_> = values
+            .iter()
+            .map(|&value| ValueSource::Value {
+                value,
+                repr: ValueRepresentation::Tagged,
+            })
+            .collect();
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 75,
+                bcp: 5,
+                locals: sources.clone(),
+                stack: sources,
+            }],
+            remat: vec![],
+        });
+        let (_, result) = f.push_inst(
+            block,
+            InstData {
+                opcode,
+                args: values,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![result[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        f
+    }
+
+    #[test]
+    fn multiplies_fixnums_with_exact_signed_overflow_guards() {
+        thread_local! { static SAVED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
+        extern "C" fn deopt(_: u64, words: u64, pointer: *const u64, _: u64) {
+            SAVED.with(|out| {
+                *out.borrow_mut() =
+                    unsafe { std::slice::from_raw_parts(pointer, words as usize) }.to_vec()
+            });
+        }
+        let compiled = emit_framed(
+            &binary_numeric(Opcode::FixnumMul),
+            deopt as *const () as usize as u64,
+            2,
+        )
+        .expect("emit guarded multiply");
+        assert!(compiled.has_deopt);
+        #[cfg(target_arch = "s390x")]
+        {
+            let buffer = torcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            let entry: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let min = -(1_i64 << 60);
+            let max = (1_i64 << 60) - 1;
+            for lhs in [min, min + 1, -123456789, -2, -1, 0, 1, 2, 123456789, max] {
+                for rhs in [min, min + 1, -2, -1, 0, 1, 2, max] {
+                    SAVED.with(|out| out.borrow_mut().clear());
+                    let mut slots = [TorclVal::from_fixnum(lhs).0, TorclVal::from_fixnum(rhs).0];
+                    let product = i128::from(lhs) * i128::from(rhs);
+                    let result = entry(slots.as_mut_ptr());
+                    if (i128::from(min)..=i128::from(max)).contains(&product) {
+                        assert_eq!(
+                            result,
+                            TorclVal::from_fixnum(product as i64).0,
+                            "{lhs} * {rhs}"
+                        );
+                        SAVED.with(|out| assert!(out.borrow().is_empty()));
+                    } else {
+                        assert_eq!(result, NIL.0);
+                        SAVED.with(|out| {
+                            assert_eq!(
+                                *out.borrow(),
+                                [75, 5, 2, 2, slots[0], slots[1], slots[0], slots[1]]
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn executes_tagged_single_float_arithmetic() {
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {}
+        for opcode in [Opcode::FloatAdd, Opcode::FloatSub, Opcode::FloatMul] {
+            let compiled = emit_framed(
+                &binary_numeric(opcode),
+                deopt as *const () as usize as u64,
+                2,
+            )
+            .expect("emit single-float arithmetic");
+            assert!(compiled.has_deopt);
+            #[cfg(target_arch = "s390x")]
+            {
+                let buffer = torcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                let entry: extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(buffer.as_ptr()) };
+                for lhs in [-9.5_f32, -0.0, 0.0, 1.25, f32::MIN_POSITIVE, f32::MAX] {
+                    for rhs in [-2.0_f32, -0.0, 0.0, 2.5] {
+                        let expected = match opcode {
+                            Opcode::FloatAdd => lhs + rhs,
+                            Opcode::FloatSub => lhs - rhs,
+                            _ => lhs * rhs,
+                        };
+                        let mut slots = [
+                            TorclVal::from_single_float(lhs).0,
+                            TorclVal::from_single_float(rhs).0,
+                        ];
+                        assert_eq!(
+                            entry(slots.as_mut_ptr()),
+                            TorclVal::from_single_float(expected).0,
+                            "{opcode:?}: {lhs} and {rhs}"
+                        );
+                    }
+                }
+                let mut wrong_type = [TorclVal::from_fixnum(2).0, NIL.0];
+                assert_eq!(entry(wrong_type.as_mut_ptr()), NIL.0);
+            }
         }
     }
 

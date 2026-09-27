@@ -37,30 +37,56 @@ impl Asm {
         self.labels.get(label.0).copied().flatten()
     }
 
-    fn rre(&mut self, opcode: u8, dst: u8, src: u8) {
+    fn rre(&mut self, opcode: u16, dst: u8, src: u8) {
         assert!(dst < 16 && src < 16);
-        self.code
-            .extend_from_slice(&[0xb9, opcode, 0, dst << 4 | src]);
+        self.code.extend_from_slice(&opcode.to_be_bytes());
+        self.code.extend_from_slice(&[0, dst << 4 | src]);
     }
 
     pub fn mov(&mut self, dst: u8, src: u8) {
-        self.rre(0x04, dst, src);
+        self.rre(0xb904, dst, src);
     }
 
     pub fn compare(&mut self, lhs: u8, rhs: u8) {
-        self.rre(0x20, lhs, rhs);
+        self.rre(0xb920, lhs, rhs);
     }
 
     pub fn add(&mut self, dst: u8, src: u8) {
-        self.rre(0x08, dst, src);
+        self.rre(0xb908, dst, src);
     }
 
     pub fn sub(&mut self, dst: u8, src: u8) {
-        self.rre(0x09, dst, src);
+        self.rre(0xb909, dst, src);
     }
 
     pub fn and(&mut self, dst: u8, src: u8) {
-        self.rre(0x80, dst, src);
+        self.rre(0xb980, dst, src);
+    }
+
+    /// Multiply the unsigned low half (even + 1) by src into an even/odd pair.
+    pub fn multiply_unsigned_wide(&mut self, even: u8, src: u8) {
+        assert!(even < 15 && even % 2 == 0);
+        self.rre(0xb986, even, src);
+    }
+
+    pub fn load_float_bits(&mut self, float_dst: u8, general_src: u8) {
+        self.rre(0xb3c1, float_dst, general_src);
+    }
+
+    pub fn store_float_bits(&mut self, general_dst: u8, float_src: u8) {
+        self.rre(0xb3cd, general_dst, float_src);
+    }
+
+    pub fn add_single(&mut self, dst: u8, src: u8) {
+        self.rre(0xb30a, dst, src);
+    }
+
+    pub fn sub_single(&mut self, dst: u8, src: u8) {
+        self.rre(0xb30b, dst, src);
+    }
+
+    pub fn multiply_single(&mut self, dst: u8, src: u8) {
+        self.rre(0xb317, dst, src);
     }
 
     pub fn shift_right_signed(&mut self, dst: u8, src: u8, bits: u8) {
@@ -236,6 +262,25 @@ mod tests {
                 0xb9, 0x20, 0, 0x23, 0xb9, 0x08, 0, 0x23, 0xb9, 0x09, 0, 0x23, 0xb9, 0x80, 0, 0x40,
                 0xeb, 0x33, 0, 3, 0, 0x0a, 0xe3, 0x90, 0x8f, 0xf8, 0x7f, 0x71, 0xe3, 0x20, 0x10, 0,
                 0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_multiply_and_single_float_encodings_match_llvm_z10() {
+        let mut a = Asm::new();
+        a.multiply_unsigned_wide(2, 4);
+        a.load_float_bits(0, 2);
+        a.load_float_bits(2, 3);
+        a.store_float_bits(2, 0);
+        a.add_single(0, 2);
+        a.sub_single(0, 2);
+        a.multiply_single(0, 2);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xb9, 0x86, 0, 0x24, 0xb3, 0xc1, 0, 0x02, 0xb3, 0xc1, 0, 0x23, 0xb3, 0xcd, 0, 0x20,
+                0xb3, 0x0a, 0, 0x02, 0xb3, 0x0b, 0, 0x02, 0xb3, 0x17, 0, 0x02,
             ]
         );
     }
