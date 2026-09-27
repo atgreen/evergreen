@@ -186,9 +186,11 @@ pub(super) fn emit_native_ppc64le(
     let emit_prologue = |c: &mut Asm| -> Option<()> {
         c.move_from_link(LINK_TEMP);
         c.store(LINK_TEMP, 1, frame::LINK_SLOT)?;
-        c.store_update(1, 1, -frame::BYTES)?;
-        for (register, offset) in frame::SAVED {
-            c.store(register, 1, offset)?;
+        c.store_update(1, 1, -frame::T1_BYTES)?;
+        // Saved at the top of the frame, so their addresses are fixed relative to
+        // the caller's stack pointer rather than to this frame's size.
+        for (index, register) in frame::SAVED.into_iter().enumerate() {
+            c.store(register, 1, frame::saved_offset(frame::T1_BYTES, index))?;
         }
         c.mov(SLOTS, 3);
         c.mov(STACK, 4);
@@ -500,10 +502,10 @@ fn emit_pop(c: &mut Asm, register: u8) -> Option<()> {
 }
 
 fn emit_epilogue(c: &mut Asm) -> Option<()> {
-    for (register, offset) in frame::SAVED {
-        c.load(register, 1, offset)?;
+    for (index, register) in frame::SAVED.into_iter().enumerate() {
+        c.load(register, 1, frame::saved_offset(frame::T1_BYTES, index))?;
     }
-    c.addi(1, 1, frame::BYTES as i16);
+    c.addi(1, 1, frame::T1_BYTES as i16);
     c.load(LINK_TEMP, 1, frame::LINK_SLOT)?;
     c.move_to_link(LINK_TEMP);
     c.ret();

@@ -15,28 +15,58 @@
 
 use crate::asm::Cc;
 
-/// The frame every ppc64le JIT tier claims, and the offsets within it.
+/// The frame convention every ppc64le JIT tier follows.
 ///
-/// T1, T2 and the SIGSEGV recovery epilogue must agree on this exactly: a fault
-/// anywhere in native code is redirected to a single address that has to unwind
-/// whichever tier was running. On AArch64 that agreement was reached late and cost
-/// a change to both emitters (bliss-7t9a4); here it is settled first.
+/// T1, T2 and a future SIGSEGV recovery epilogue must agree, because a fault
+/// anywhere in native code is redirected to one address that has to unwind
+/// whichever tier was running. T2's frame is sized per function while T1's is
+/// fixed, so agreeing on a frame SIZE — the approach taken on AArch64, where it
+/// was reached late and cost a change to both emitters (bliss-7t9a4) — would not
+/// work here.
 ///
-/// The layout follows the ELFv2 frame, so an unwinder and a debugger can both
-/// follow it: the back chain at 0, a link-register slot for this frame's own
-/// callees at 16 and a TOC slot at 24 — while THIS frame's return address lives in
-/// the *caller's* slot, written before the frame is claimed.
+/// ELFv2 supplies the answer: nonvolatile registers are saved at the TOP of the
+/// frame, so their addresses are fixed relative to the CALLER's stack pointer
+/// rather than to this frame's size. An epilogue can therefore follow the back
+/// chain at `0(r1)` to recover the caller's pointer and restore from there,
+/// whatever size frame it lands in.
 pub mod frame {
-    /// Total frame size. A multiple of 16, as the ABI requires at every call.
-    pub const BYTES: i32 = 96;
-    /// Where a callee of this frame saves its caller's (our) link register.
+    /// Where a callee of this frame saves its caller's (our) link register. This
+    /// frame's own return address lives in the *caller's* slot, written before the
+    /// frame is claimed.
     pub const LINK_SLOT: i32 = 16;
     /// The TOC save slot, preserved around calls that may set up their own.
     pub const TOC_SLOT: i32 = 24;
-    /// Nonvolatile registers the JIT uses, and where each is saved.
-    pub const SAVED: [(u8, i32); 3] = [(14, 32), (15, 40), (16, 48)];
     /// A scratch doubleword for spilling a result across a helper call.
-    pub const SCRATCH_SLOT: i32 = 56;
+    pub const SCRATCH_SLOT: i32 = 32;
+    /// The back-edge poll counter.
+    pub const POLL_SLOT: i32 = 40;
+    /// First byte available for a tier's own slots.
+    pub const LOCALS_BASE: i32 = 48;
+
+    /// Every nonvolatile register a JIT tier may use: the three activation
+    /// registers, then the optimizing tier's allocation pool.
+    ///
+    /// BOTH tiers save all of them, although T1 needs only the first three. A
+    /// recovery epilogue cannot know which tier it is unwinding, so it cannot know
+    /// how many to restore — and restoring a register a tier never saved would
+    /// hand the caller a word of uninitialised stack. Ten redundant stores buy that
+    /// whole class of bug away, the same trade taken on AArch64.
+    pub const SAVED: [u8; 13] = [14, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29];
+
+    /// Bytes the save area occupies at the top of the frame.
+    pub const SAVED_BYTES: i32 = 8 * SAVED.len() as i32;
+
+    /// Where `SAVED[index]` lives in a frame of `size` bytes. Measured down from
+    /// the top, so the address is fixed relative to the CALLER's stack pointer and
+    /// an epilogue can find it through the back chain at `0(r1)` without knowing
+    /// this frame's size.
+    pub const fn saved_offset(size: i32, index: usize) -> i32 {
+        size - 8 * (index as i32 + 1)
+    }
+
+    /// T1's fixed frame: its own slots plus the shared save area, rounded to the 16
+    /// bytes the ABI requires at every call.
+    pub const T1_BYTES: i32 = (LOCALS_BASE + SAVED_BYTES + 15) & !15;
 }
 
 /// A word-aligned branch destination in one assembler.
