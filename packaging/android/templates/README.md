@@ -3,6 +3,7 @@
 Edit `assets/app.lisp`, then build and install:
 
 ```sh
+make install-tools   # first-time SDK setup
 make doctor
 make
 make install
@@ -13,8 +14,20 @@ make logcat
 Requires `torcl-target-android`, Python 3, GNU Make, a JDK (`keytool`), and
 Android SDK build-tools, platform-tools and platform 34. No TorCL source
 checkout, Rust compiler, NDK, Gradle or containers are needed for application
-builds. The RPM supplies both native libraries. SDK components can be installed
-with `sdkmanager 'platforms;android-34' 'build-tools;35.0.0' 'platform-tools'`.
+builds. The RPM supplies both native libraries.
+
+Run `make install-tools` to install SDK platform-tools, build-tools 35.0.0 and the
+platform matching `targetSdkVersion` in the manifest. It reuses `sdkmanager` when
+available, otherwise downloads a pinned, SHA-256-verified copy of Google's Linux
+command-line tools. SDK license prompts are interactive; read and accept them
+if you agree. This target requires network access and a JDK; on Fedora install
+the JDK with `sudo dnf install java-21-openjdk-devel`. It does not use sudo or
+install system packages itself. Ordinary builds do not download tools.
+
+The default SDK directory is `~/Android/Sdk` unless an SDK environment variable
+is set. Use `make install-tools SDK=/path/to/sdk` to select another writable
+directory, and use the same SDK for subsequent builds. Set `SDK_BUILD_TOOLS`
+to select a different build-tools version (for example, `34.0.0`).
 
 Set `SDK` in an ignored `local.mk`, or export `ANDROID_HOME`/`ANDROID_SDK_ROOT`.
 `BUILD_TOOLS` and `ANDROID_JAR` can override the selected SDK paths.

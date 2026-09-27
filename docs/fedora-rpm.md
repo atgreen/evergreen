@@ -71,8 +71,8 @@ Install matching releases of the native package and whichever target packages
 you need. For Android with the current local build:
 
 ```sh
-sudo dnf install target/fedora-rpm/RPMS/x86_64/torcl-0.1.0-2.fc44.x86_64.rpm \
-    target/fedora-rpm/RPMS/x86_64/torcl-target-android-0.1.0-2.fc44.x86_64.rpm
+sudo dnf install target/fedora-rpm/RPMS/x86_64/torcl-0.1.0-3.fc44.x86_64.rpm \
+    target/fedora-rpm/RPMS/x86_64/torcl-target-android-0.1.0-3.fc44.x86_64.rpm
 ```
 
 For example, put this in `build.lisp` after your application's loading code:
@@ -123,6 +123,13 @@ on touch; `--template=minimal` logs messages and input without drawing. Generate
 projects include the runtime bindings, Makefile, editable manifest, runtime
 version metadata, signing instructions and their own README. `make release`
 uses an explicitly supplied keystore; `make clean` preserves the debug key.
+Run `make install-tools` once to install SDK platform-tools, build-tools and the
+platform selected by the manifest. It bootstraps checksum-verified Google
+command-line tools if needed and prompts for SDK licenses. Install a JDK first
+(`sudo dnf install java-21-openjdk-devel` on Fedora). Use `SDK=/path/to/sdk`
+for a custom writable SDK directory, and `SDK_BUILD_TOOLS=35.0.0` to select the
+build-tools version. Ordinary builds do not download tools.
+
 SDK paths and device selection can be stored in ignored `local.mk`.
 
 APKs are separated by host under `build/`. `install` rejects a device/ABI mismatch.

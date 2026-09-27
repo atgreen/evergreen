@@ -9,11 +9,15 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
 HOSTS = {'aarch64-linux-android': ('arm64-v8a', 183), 'x86_64-linux-android': ('x86_64', 62)}
 NS = '{http://schemas.android.com/apk/res/android}'
+COMMANDLINE_TOOLS_URL = 'https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip'
+COMMANDLINE_TOOLS_SHA256 = '4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583'
 
 
 def run(command, **kwargs):
@@ -23,6 +27,56 @@ def run(command, **kwargs):
 def newest(directory):
     choices = [p for p in directory.glob('*') if p.is_dir() and re.fullmatch(r'[0-9.]+', p.name)]
     return max(choices, key=lambda p: tuple(map(int, p.name.split('.')))) if choices else directory / 'missing'
+
+
+def bootstrap_sdkmanager(sdk):
+    parent = sdk / 'cmdline-tools'
+    destination = parent / 'latest'
+    if destination.exists():
+        raise ValueError(f'No executable sdkmanager in {destination}; repair or move that directory first')
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.download-', dir=parent) as temporary:
+        directory = Path(temporary)
+        archive = directory / 'tools.zip'
+        print(f'Downloading {COMMANDLINE_TOOLS_URL}', flush=True)
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(COMMANDLINE_TOOLS_URL, timeout=60) as response, archive.open('wb') as output:
+            while chunk := response.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != COMMANDLINE_TOOLS_SHA256:
+            raise ValueError('Android command-line tools checksum mismatch; download was not installed')
+        with zipfile.ZipFile(archive) as zipped:
+            for name in zipped.namelist():
+                path = Path(name)
+                if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] != 'cmdline-tools':
+                    raise ValueError(f'Invalid command-line tools archive path: {name}')
+            zipped.extractall(directory / 'unpacked')
+        unpacked = directory / 'unpacked/cmdline-tools'
+        if not (unpacked / 'bin/sdkmanager').is_file():
+            raise ValueError('Command-line tools archive has no sdkmanager')
+        for executable in (unpacked / 'bin').iterdir():
+            if executable.is_file(): executable.chmod(0o755)
+        unpacked.rename(destination)
+    return destination / 'bin/sdkmanager'
+
+
+def install_tools(args, manifest):
+    if not all(shutil.which(tool) for tool in ('java', 'keytool')):
+        raise ValueError('Missing JDK; on Fedora run: sudo dnf install java-21-openjdk-devel')
+    if not re.fullmatch(r'\d+\.\d+\.\d+', args.sdk_build_tools):
+        raise ValueError('SDK_BUILD_TOOLS must be a version such as 35.0.0')
+    target = int(manifest.find('uses-sdk').get(NS + 'targetSdkVersion'))
+    sdk = args.sdk.expanduser().resolve()
+    candidates = [sdk / 'cmdline-tools/latest/bin/sdkmanager',
+                  *sorted(sdk.glob('cmdline-tools/*/bin/sdkmanager'), reverse=True)]
+    if found := shutil.which('sdkmanager'): candidates.append(Path(found))
+    manager = next((p for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
+    if manager is None: manager = bootstrap_sdkmanager(sdk)
+    # Inherit the terminal so SDK licenses remain the user's explicit choice.
+    run([manager, f'--sdk_root={sdk}', '--install', 'platform-tools',
+         f'platforms;android-{target}', f'build-tools;{args.sdk_build_tools}'])
+    print('SDK manager finished. Run make doctor to check application build prerequisites.')
 
 
 def runtime_libraries(root, hosts, config):
@@ -117,11 +171,12 @@ def sign(tools, unsigned, output, release, project):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('apk', 'release', 'verify', 'doctor', 'install', 'run', 'logcat'))
+    parser.add_argument('command', choices=('apk', 'release', 'verify', 'doctor', 'install-tools', 'install', 'run', 'logcat'))
     parser.add_argument('--runtime', type=Path, required=True)
     parser.add_argument('--hosts', required=True)
     parser.add_argument('--sdk', type=Path, required=True)
     parser.add_argument('--build-tools', default='')
+    parser.add_argument('--sdk-build-tools', default='35.0.0')
     parser.add_argument('--android-jar', default='')
     parser.add_argument('--serial', default='')
     args = parser.parse_args()
@@ -132,6 +187,9 @@ def main():
     config = json.loads((project / 'app.json').read_text())
     tree = ET.parse(project / 'AndroidManifest.xml')
     manifest = tree.getroot()
+    if args.command == 'install-tools':
+        install_tools(args, manifest)
+        return
     package = manifest.get('package', '')
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+', package):
         raise ValueError('Invalid package ID in AndroidManifest.xml')
@@ -183,5 +241,5 @@ def main():
 
 if __name__ == '__main__':
     try: main()
-    except (OSError, ValueError, KeyError, ET.ParseError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, ET.ParseError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
         sys.exit(f'torcl-android: {error}')

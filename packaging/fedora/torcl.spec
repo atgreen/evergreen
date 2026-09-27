@@ -11,7 +11,7 @@
 
 Name: torcl
 Version: %{torcl_version}
-Release: 2%{?dist}
+Release: 3%{?dist}
 Summary: Common Lisp with a tiered JIT and saved executable images
 License: MIT OR Apache-2.0
 URL: https://github.com/atgreen/torcl
@@ -83,6 +83,7 @@ python3 torcl-source/packaging/android/build-runtime.py \
 %check
 python3 torcl-source/packaging/android/test_generator.py
 python3 torcl-source/packaging/android/test_build.py
+python3 torcl-source/packaging/android/test_install_tools.py
 
 %install
 mkdir -p %{buildroot}
