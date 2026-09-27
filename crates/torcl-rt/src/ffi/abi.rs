@@ -1,10 +1,9 @@
-//! SysV AMD64 layouts and placements for the supported C scalar/aggregate types.
-//! Classification follows psABI §3.2.3. There are no vector or x87 descriptors,
+//! C layouts shared by x86-64 targets, plus SysV AMD64 argument placement.
+//! SysV classification follows psABI §3.2.3. There are no vector or x87 descriptors,
 //! so aggregates above two eightbytes use MEMORY rather than SSEUP registers.
-use super::{
-    AlienType,
-    call::{Location, Scalar},
-};
+#[cfg(unix)]
+use super::call::Location;
+use super::{AlienType, call::Scalar};
 use crate::TorclError;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -163,16 +162,19 @@ fn shape_field(ty: &AlienType, depth: usize) -> Result<Shape, TorclError> {
     Ok(shape)
 }
 
+#[cfg(unix)]
 pub(super) enum Placement {
     Registers(Vec<(u32, Location)>),
     Stack(u32),
 }
+#[cfg(unix)]
 pub(super) struct Assignment {
     pub placements: Vec<Placement>,
     pub stack_bytes: u32,
     pub sse: u8,
 }
 
+#[cfg(unix)]
 pub(super) fn assign(arguments: &[Layout], hidden_result: bool) -> Result<Assignment, TorclError> {
     const GPRS: [u8; 6] = [7, 6, 2, 1, 8, 9];
     let mut integer = usize::from(hidden_result);

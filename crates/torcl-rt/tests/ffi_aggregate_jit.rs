@@ -1,5 +1,5 @@
 //! R2.13/R2.14: native struct-by-value adapters checked against C compilation.
-#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 use torcl_rt::ffi::{AlienType, ffi_call_buffered};
 
 fn integer(bits: u8) -> AlienType {
@@ -20,29 +20,185 @@ fn pair(a: AlienType, b: AlienType) -> AlienType {
 fn address<T>(value: &T) -> *const u8 {
     (value as *const T).cast()
 }
+
+#[test]
+fn small_aggregates_and_unions_use_their_target_return_convention() {
+    unsafe {
+        let one = structure(vec![integer(8)]);
+        assert_eq!(
+            invoke::<u8>(
+                "aggregate_small1",
+                &one,
+                std::slice::from_ref(&one),
+                &[address(&211u8)],
+                None
+            ),
+            214
+        );
+        let two = structure(vec![integer(16)]);
+        assert_eq!(
+            invoke::<u16>(
+                "aggregate_small2",
+                &two,
+                std::slice::from_ref(&two),
+                &[address(&1234u16)],
+                None
+            ),
+            2234
+        );
+        let four = structure(vec![AlienType::Float]);
+        assert_eq!(
+            invoke::<f32>(
+                "aggregate_float1",
+                &four,
+                std::slice::from_ref(&four),
+                &[address(&1.25f32)],
+                None
+            ),
+            2.5
+        );
+        let eight = structure(vec![AlienType::Float; 2]);
+        assert_eq!(
+            invoke::<[f32; 2]>(
+                "aggregate_float2",
+                &eight,
+                std::slice::from_ref(&eight),
+                &[address(&[1.25f32, 2.5])],
+                None
+            ),
+            [3.5, 3.25]
+        );
+        let union = AlienType::Union {
+            variants: vec![integer(64), AlienType::Double],
+        };
+        assert_eq!(
+            invoke::<u64>(
+                "aggregate_union8",
+                &union,
+                std::slice::from_ref(&union),
+                &[address(&u64::MAX)],
+                None
+            ),
+            u64::MAX ^ 0x123456789abcdef0
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn indirect_aggregate_arguments_are_aligned_private_copies() {
+    let big = structure(vec![integer(64); 3]);
+    // Deliberately give the bridge an unaligned original object.
+    let mut source = [0xa5u8; 40];
+    let start = if source.as_ptr() as usize % 16 == 0 {
+        1
+    } else {
+        0
+    };
+    let original = source;
+    let alignment: u64 = unsafe {
+        invoke(
+            "aggregate_copy_alignment",
+            &integer(64),
+            &[big],
+            &[source.as_mut_ptr().add(start)],
+            None,
+        )
+    };
+    assert_eq!(alignment, 0);
+    assert_eq!(
+        source, original,
+        "C may only modify the by-value staging copy"
+    );
+}
+
+#[test]
+fn hidden_return_pointer_shifts_mixed_argument_positions() {
+    let big = structure(vec![integer(64); 3]);
+    let result: [u64; 3] = unsafe {
+        invoke(
+            "aggregate_sret_mixed",
+            &big,
+            &[
+                AlienType::Double,
+                integer(64),
+                AlienType::Float,
+                big.clone(),
+                AlienType::Double,
+            ],
+            &[
+                address(&2.0f64),
+                address(&3u64),
+                address(&4.0f32),
+                address(&[10u64, 20, 30]),
+                address(&5.0f64),
+            ],
+            None,
+        )
+    };
+    assert_eq!(result, [12, 27, 35]);
+}
+
+#[test]
+fn variadic_hidden_return_preserves_named_float_and_promotes_trailing_float() {
+    let big = structure(vec![integer(64); 3]);
+    let pair = structure(vec![integer(64); 2]);
+    let result: [u64; 3] = unsafe {
+        invoke(
+            "aggregate_variadic_sret",
+            &big,
+            &[
+                AlienType::Float,
+                integer(32),
+                AlienType::Float,
+                pair.clone(),
+                AlienType::Double,
+                pair,
+            ],
+            &[
+                address(&3.5f32),
+                address(&2i32),
+                address(&5.5f32),
+                address(&[10u64, 20]),
+                address(&7.5f64),
+                address(&[30u64, 40]),
+            ],
+            Some(2),
+        )
+    };
+    assert_eq!(result, [3, 12, 100]);
+}
 fn symbol(name: &str) -> *const () {
     static LIBRARY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let library = *LIBRARY.get_or_init(|| {
-        let directory =
-            std::env::temp_dir().join(format!("torcl-ffi-aggregate-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("aggregate.so");
-        let result = std::process::Command::new("cc")
-            .args(["-shared", "-fPIC", "-O2"])
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/ffi_aggregates.c"
-            ))
-            .arg("-o")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        torcl_rt::ffi::load_foreign_library(path.to_str().unwrap()).unwrap() as usize
+        #[cfg(windows)]
+        {
+            let path = std::env::var("TORCL_FFI_AGGREGATES_DLL").expect("prebuilt MinGW C fixture");
+            torcl_rt::ffi::load_foreign_library(&path).unwrap() as usize
+        }
+        #[cfg(unix)]
+        {
+            let directory =
+                std::env::temp_dir().join(format!("torcl-ffi-aggregate-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("aggregate.so");
+            let result = std::process::Command::new("cc")
+                .args(["-shared", "-fPIC", "-O2"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/ffi_aggregates.c"
+                ))
+                .arg("-o")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            torcl_rt::ffi::load_foreign_library(path.to_str().unwrap()).unwrap() as usize
+        }
     });
     unsafe { torcl_rt::ffi::foreign_symbol(library as *mut (), name) }.unwrap()
 }
@@ -466,29 +622,33 @@ fn malformed_signatures_fail_before_reading_native_buffers() {
 #[test]
 fn argument_and_result_buffers_may_end_exactly_at_a_guard_page() {
     struct Guarded {
-        base: *mut libc::c_void,
+        base: *mut u8,
         page: usize,
     }
     impl Guarded {
         fn new() -> Self {
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let page = torcl_rt::syscall::page_size();
             assert!(page.is_power_of_two());
             let base = unsafe {
-                libc::mmap(
+                torcl_rt::syscall::mmap(
                     std::ptr::null_mut(),
                     page * 2,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    torcl_rt::syscall::PROT_READ | torcl_rt::syscall::PROT_WRITE,
+                    torcl_rt::syscall::MAP_PRIVATE | torcl_rt::syscall::MAP_ANONYMOUS,
                     -1,
                     0,
                 )
-            };
-            assert_ne!(base, libc::MAP_FAILED);
+            }
+            .unwrap();
             assert_eq!(
                 unsafe {
-                    libc::mprotect(base.cast::<u8>().add(page).cast(), page, libc::PROT_NONE)
+                    torcl_rt::syscall::mprotect(
+                        base.cast::<u8>().add(page).cast(),
+                        page,
+                        torcl_rt::syscall::PROT_NONE,
+                    )
                 },
-                0
+                Ok(())
             );
             Self { base, page }
         }
@@ -499,7 +659,7 @@ fn argument_and_result_buffers_may_end_exactly_at_a_guard_page() {
     impl Drop for Guarded {
         fn drop(&mut self) {
             unsafe {
-                libc::munmap(self.base, self.page * 2);
+                torcl_rt::syscall::munmap(self.base, self.page * 2).unwrap();
             }
         }
     }
@@ -547,6 +707,27 @@ fn argument_and_result_buffers_may_end_exactly_at_a_guard_page() {
 
 #[test]
 fn aggregate_calls_preserve_callback_gc_transitions_and_error_containment() {
+    // This fixture controls the process-global GC participant set. Other Rust
+    // harness threads are not Lisp mutators and do not execute safepoint polls.
+    const CHILD: &str = "TORCL_AGGREGATE_CALLBACK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "aggregate_calls_preserve_callback_gc_transitions_and_error_containment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     use torcl_rt::ffi::managed_callback::{LispCallback, set_callback_runner};
     use torcl_rt::{TorclError, TorclVal};
     fn runner(closure: TorclVal, _arguments: &[TorclVal]) -> Result<TorclVal, TorclError> {
@@ -600,12 +781,8 @@ fn aggregate_calls_preserve_callback_gc_transitions_and_error_containment() {
             torcl_rt::thread::NativeThreadState::Running
         );
         if fails {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("aggregate callback fixture")
-            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("aggregate callback fixture"), "{error}");
             assert_eq!(
                 output, [0xa5; 3],
                 "do not publish a result from a failed call"

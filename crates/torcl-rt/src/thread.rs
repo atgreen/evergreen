@@ -20,6 +20,12 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
+#[cfg(all(target_arch = "x86_64", windows))]
+#[path = "thread/windows.rs"]
+mod windows;
+#[cfg(all(target_arch = "x86_64", windows))]
+use windows::FiberExecutionContext;
+
 /// Unique identifier for a lightweight managed fiber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FiberId(pub u64);
@@ -86,10 +92,10 @@ impl FiberExecutionContext {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 struct FiberExecutionContext;
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 impl FiberExecutionContext {
     fn new() -> Result<Self, TorclError> {
         Ok(Self)
@@ -762,11 +768,14 @@ pub struct Fiber {
     /// The CL function (entry point) this fiber was created to execute.
     entry: AtomicU64,
     state: OrderedMutex<FiberState>,
+    // Unregister roots before either stack is destroyed (field drop order).
+    host_roots: crate::gc::FiberRoots,
     stack: TorclStack,
     continuation: FiberContinuation,
     execution_context: FiberExecutionContext,
-    /// Pointer (as usize) to the mounting carrier's on-stack scheduler context,
-    /// set on each mount and read when the fiber swaps back. Stored on the fiber
+    /// Native return context: a pointer to the carrier's saved-SP cell on Unix,
+    /// or its Windows fiber handle. Set on each mount and read on suspension.
+    /// Stored on the fiber
     /// — NOT in a thread-local — because a fiber can be preempted on one carrier
     /// and resumed on another, and a compiler-cached thread-local address would
     /// then be stale (reads the wrong/cleared carrier slot). See bliss-bca.5.
@@ -1462,6 +1471,7 @@ impl CarrierPool {
 fn worker_loop(pool: Arc<WorkerPool>, idx: usize) {
     WORKER_CONTEXT.with(|context| context.set(Some((pool.id, idx))));
     loop {
+        crate::safepoint::poll_safepoint();
         if pool.shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -1479,11 +1489,14 @@ fn worker_loop(pool: Arc<WorkerPool>, idx: usize) {
         if pool.any_work() {
             continue;
         }
-        current_thread().set_state(NativeThreadState::Blocked);
+        // Coordinate both entry and wakeup with an in-progress collection.
+        // Merely storing Blocked/Running can miss the collector's snapshot or
+        // let a waking carrier mutate a root list while GC scans it.
+        let blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         let _ = pool
             .park_cv
             .wait_timeout(guard, std::time::Duration::from_millis(5));
-        current_thread().set_state(NativeThreadState::Running);
+        drop(blocked);
     }
 }
 
@@ -1516,6 +1529,10 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         *slot.borrow_mut() = Some(Arc::clone(&thread));
     });
 
+    // This scope stays on the carrier stack. A suspended fiber's registered
+    // root chain remains live independently of whichever carrier resumes it.
+    let mounted_roots = unsafe { thread.host_roots.mount() };
+
     #[cfg(all(target_arch = "x86_64", unix))]
     unsafe {
         // Save the scheduler (carrier) context and switch to the fiber. The
@@ -1532,7 +1549,13 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         thread.scheduler_return.store(0, Ordering::Release);
     }
 
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(all(target_arch = "x86_64", windows))]
+    if let Err(error) = unsafe { thread.execution_context.resume(&thread.scheduler_return) } {
+        thread.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
+        thread.result.complete(Err(error));
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
     {
         let result = run_fiber_entry(&thread);
         thread.stack.publish_top();
@@ -1545,6 +1568,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         thread.result.complete(result);
     }
 
+    drop(mounted_roots);
     ACTIVE_FIBER.with(|slot| {
         *slot.borrow_mut() = None;
     });
@@ -1587,7 +1611,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     }
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 extern "C" fn fiber_context_trampoline() {
     let Some(fiber) = current_fiber() else {
         crate::syscall::abort()
@@ -1624,6 +1648,11 @@ unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), TorclError> {
     // SAFETY: `scheduler` points at the carrier's live on-stack context.
     unsafe { crate::context::swap(fiber.execution_context.as_ptr(), *scheduler) };
     Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", windows))]
+unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), TorclError> {
+    unsafe { windows::suspend(&fiber.scheduler_return) }
 }
 
 fn run_fiber_entry(thread: &Fiber) -> Result<TorclVal, TorclError> {
@@ -1831,7 +1860,12 @@ pub fn current_thread() -> &'static NativeThread {
 
 /// A foreign-created thread starts quiescent. Its callback entry joins the
 /// collector's Running participant set only under the safepoint transition lock.
-#[cfg(all(target_arch = "x86_64", unix))]
+// Reached from AArch64's FFI too (spec §4.7.5.2); the body is registry
+// bookkeeping with nothing architecture-specific in it.
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 pub(crate) fn current_thread_for_foreign_entry() -> &'static NativeThread {
     let thread = ensure_current_native_thread_in_state(NativeThreadState::Native);
     unsafe { &*Arc::as_ptr(&thread) }
@@ -2021,6 +2055,7 @@ pub fn make_fiber(entry: TorclVal) -> Result<FiberId, TorclError> {
         stack: TorclStack::new(default_stack_size()),
         continuation: FiberContinuation::default(),
         execution_context: FiberExecutionContext::new()?,
+        host_roots: crate::gc::FiberRoots::new(),
         scheduler_return: AtomicUsize::new(0),
         scheduler_pool: OrderedMutex::new(
             LockLevel::ExecutionObject,
@@ -2161,7 +2196,10 @@ pub fn join_fiber(id: FiberId) -> Result<TorclVal, TorclError> {
         .map(|fiber| Arc::clone(&fiber.result))
         .ok_or_else(|| TorclError::Internal(format!("no fiber with id {}", id.0)))?;
     let value = result.wait()?;
-    fiber_registry().lock().unwrap().remove(&id);
+    // Dropping the final owner unregisters host roots (GcWorld). Release the
+    // higher-level execution registry lock before running that destructor.
+    let removed = fiber_registry().lock().unwrap().remove(&id);
+    drop(removed);
     Ok(value)
 }
 
@@ -2212,14 +2250,14 @@ pub fn fiber_yield() -> Result<(), TorclError> {
         fiber.stack.published_fp() as usize,
     );
 
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     {
         fiber.suspend_reason.store(SUSPEND_YIELD, Ordering::Release);
         fiber.set_state(FiberState::Suspended);
         unsafe { swap_fiber_to_scheduler(fiber)? };
     }
 
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
     std::thread::yield_now();
 
     Ok(())
@@ -2274,10 +2312,10 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), TorclError> {
     // unread there. The binding still earns its keep on every target: it is the
     // "called outside a fiber" check, and dropping it would turn a caller's bug
     // into a silent no-op (bliss-w2vp).
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
     let _ = &fiber;
 
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     {
         if !matches!(fiber.state(), FiberState::Blocked | FiberState::Waiting) {
             return Err(TorclError::Internal(
@@ -2287,7 +2325,7 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), TorclError> {
         unsafe { swap_fiber_to_scheduler(fiber)? };
     }
 
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
     std::thread::yield_now();
 
     Ok(())

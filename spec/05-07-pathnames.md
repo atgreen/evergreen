@@ -6,7 +6,11 @@ component representation, parsing and reconstruction algorithms,
 logical pathname translation, pathname merging, wildcard matching,
 and file-system interaction. TorCL targets ANSI X3.226-1994 §19
 with POSIX-oriented physical pathnames and a TorCL-specific `~`
-expansion extension.
+expansion extension. On Windows, physical pathnames additionally support drive
+and UNC volumes: a drive letter occupies the device component; a UNC server
+and share occupy host and device. Directory lists exclude these volume
+components. See [Windows pathname conventions](../docs/windows.md) for the
+platform's rendering, merging, and case-comparison rules.
 
 ---
 

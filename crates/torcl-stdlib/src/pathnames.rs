@@ -37,6 +37,8 @@ enum ComponentSpec {
 struct ParsedPathname {
     is_logical: bool,
     host_name: Option<String>,
+    // Derived from the existing device slot when restoring an image.
+    device_name: Option<String>,
     directory: Option<DirectorySpec>,
     name: Option<ComponentSpec>,
     type_field: Option<ComponentSpec>,
@@ -449,11 +451,55 @@ fn canonicalize_dir_parts(parts: &[&str]) -> Result<Vec<DirPart>, TorclError> {
     Ok(out)
 }
 
+/// Split a Windows volume prefix without putting it in the directory list.
+#[cfg(windows)]
+fn windows_path_prefix(s: &str) -> Result<(Option<String>, Option<String>, &str), TorclError> {
+    let s = if let Some(rest) = s.strip_prefix("//?/") {
+        if rest
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("UNC/"))
+        {
+            return windows_unc_prefix(&rest[4..]);
+        }
+        if rest.as_bytes().get(1..3) != Some(b":/") {
+            return Err(TorclError::FileError(
+                "unsupported Windows device namespace".into(),
+            ));
+        }
+        rest
+    } else {
+        s
+    };
+    if let Some(rest) = s.strip_prefix("//") {
+        return windows_unc_prefix(rest);
+    }
+    if s.as_bytes().get(1) == Some(&b':')
+        && s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+    {
+        return Ok((None, Some(s[..1].to_ascii_uppercase()), &s[2..]));
+    }
+    Ok((None, None, s))
+}
+
+#[cfg(windows)]
+fn windows_unc_prefix(s: &str) -> Result<(Option<String>, Option<String>, &str), TorclError> {
+    let (host, rest) = s
+        .split_once('/')
+        .ok_or_else(|| TorclError::FileError("UNC pathname requires a server and share".into()))?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    let share = &rest[..end];
+    if host.is_empty() || host == "." || host == "?" || share.is_empty() {
+        return Err(TorclError::FileError("invalid UNC server or share".into()));
+    }
+    Ok((Some(host.into()), Some(share.into()), &rest[end..]))
+}
+
 fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, TorclError> {
     if s.is_empty() {
         return Ok(ParsedPathname {
             is_logical: false,
             host_name: None,
+            device_name: None,
             directory: None,
             name: None,
             type_field: None,
@@ -463,19 +509,13 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, TorclError> {
     let expanded = resolve_home_path(s)?;
     #[cfg(windows)]
     let expanded = expanded.replace('\\', "/");
-    let absolute = expanded.starts_with('/');
     #[cfg(windows)]
-    let absolute = absolute
-        || (expanded.as_bytes().get(1..3) == Some(b":/")
-            && expanded
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_alphabetic));
-    let trailing_slash = expanded.ends_with('/');
-    let tokens: Vec<&str> = expanded
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect();
+    let (host_name, device_name, body) = windows_path_prefix(&expanded)?;
+    #[cfg(not(windows))]
+    let (host_name, device_name, body) = (None, None, expanded.as_str());
+    let absolute = body.starts_with('/') || host_name.is_some();
+    let trailing_slash = body.ends_with('/');
+    let tokens: Vec<&str> = body.split('/').filter(|part| !part.is_empty()).collect();
 
     let (dir_tokens, final_token) = if trailing_slash || tokens.is_empty() {
         (tokens.as_slice(), None)
@@ -516,7 +556,8 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, TorclError> {
 
     Ok(ParsedPathname {
         is_logical: false,
-        host_name: None,
+        host_name,
+        device_name,
         directory,
         name,
         type_field,
@@ -598,6 +639,7 @@ fn parse_logical_namestring(
     Ok(ParsedPathname {
         is_logical: true,
         host_name: Some(host_name),
+        device_name: None,
         directory,
         name,
         type_field,
@@ -617,6 +659,10 @@ fn parse_namestring_model(s: &str, host: Option<TorclVal>) -> Result<ParsedPathn
         && s.as_bytes().get(1) == Some(&b':')
         && s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
     {
+        return parse_physical_namestring(s);
+    }
+    #[cfg(windows)]
+    if !forced_logical && s.starts_with('\\') {
         return parse_physical_namestring(s);
     }
     if forced_logical || (!s.starts_with('/') && s.contains(':')) {
@@ -714,14 +760,7 @@ fn render_directory(directory: &DirectorySpec, logical: bool) -> String {
         out
     } else {
         let mut out = String::new();
-        // Drive roots already carry their leading component (C:). They are
-        // absolute for merging, but their namestring must not start with /C:.
-        #[cfg(windows)]
-        let drive_root = matches!(directory.parts.first(), Some(DirPart::Literal(s))
-            if s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.ends_with(':'));
-        #[cfg(not(windows))]
-        let drive_root = false;
-        if directory.absolute && !drive_root {
+        if directory.absolute {
             out.push('/');
         }
         for part in &directory.parts {
@@ -763,6 +802,18 @@ fn render_namestring_from_parsed(parsed: &ParsedPathname) -> String {
         out
     } else {
         let mut out = String::new();
+        #[cfg(windows)]
+        if let Some(device) = &parsed.device_name {
+            if let Some(host) = &parsed.host_name {
+                out.push_str("//");
+                out.push_str(host);
+                out.push('/');
+                out.push_str(device);
+            } else {
+                out.push_str(device);
+                out.push(':');
+            }
+        }
         if let Some(dir) = &parsed.directory {
             out.push_str(&render_directory(dir, false));
         }
@@ -791,22 +842,59 @@ fn normalize_record(
     type_field: TorclVal,
     version: TorclVal,
 ) -> Result<PathnameRecord, TorclError> {
-    let host_name = lookup_string(host);
+    let host_name = component_string(host);
     let is_logical = host_name
         .as_ref()
         .map(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
         .unwrap_or(false);
 
+    #[cfg(windows)]
+    let is_logical = is_logical && component_string(device).is_none();
+    let device_name = component_string(device).map(|s| {
+        if cfg!(windows) && !is_logical && host_name.is_none() {
+            s.to_ascii_uppercase()
+        } else {
+            s
+        }
+    });
+    let directory_spec = directory_from_val(directory, is_logical)?;
+    #[cfg(windows)]
+    let directory_spec = if !is_logical && host_name.is_some() && device_name.is_some() {
+        match directory_spec {
+            Some(dir) if !dir.absolute => {
+                return Err(TorclError::FileError(
+                    "UNC pathname directory must be absolute".into(),
+                ));
+            }
+            Some(dir) => Some(dir),
+            None => Some(DirectorySpec {
+                absolute: true,
+                parts: Vec::new(),
+            }),
+        }
+    } else {
+        directory_spec
+    };
     let parsed = ParsedPathname {
+        device_name,
         is_logical,
         host_name: host_name
             .clone()
             .map(|s| if is_logical { s.to_uppercase() } else { s }),
-        directory: directory_from_val(directory, is_logical)?,
+        directory: directory_spec,
         name: component_from_val(name, is_logical),
         type_field: component_from_val(type_field, is_logical),
     };
 
+    #[cfg(windows)]
+    let device = parsed
+        .device_name
+        .as_deref()
+        .map(make_string_bv)
+        .unwrap_or(device);
+
+    #[cfg(windows)]
+    let directory = stringify_directory(&parsed.directory, is_logical);
     let namestring = Some(render_namestring_from_parsed(&parsed));
 
     Ok(PathnameRecord {
@@ -825,7 +913,7 @@ fn build_record_from_namestring(
     parsed: ParsedPathname,
     supplied_host: Option<TorclVal>,
 ) -> PathnameRecord {
-    let host = if let Some(host) = supplied_host {
+    let host = if let Some(host) = supplied_host.filter(|host| *host != NIL) {
         host
     } else if let Some(host_name) = &parsed.host_name {
         make_string_bv(host_name)
@@ -838,7 +926,11 @@ fn build_record_from_namestring(
     let namestring = Some(render_namestring_from_parsed(&parsed));
     PathnameRecord {
         host,
-        device: NIL,
+        device: parsed
+            .device_name
+            .as_deref()
+            .map(make_string_bv)
+            .unwrap_or(NIL),
         directory,
         name,
         type_field,
@@ -923,7 +1015,42 @@ pub fn merge_pathnames(
         expected: "pathname".to_string(),
     })?;
 
-    let merged_dir = match (&primary.parsed.directory, &def.parsed.directory) {
+    let inherit_host = !(cfg!(windows)
+        && !primary.parsed.is_logical
+        && primary.parsed.device_name.is_some()
+        && primary.parsed.host_name.is_none());
+    let host_name = primary.parsed.host_name.clone().or_else(|| {
+        if inherit_host {
+            def.parsed.host_name.clone()
+        } else {
+            None
+        }
+    });
+    let device_name = primary
+        .parsed
+        .device_name
+        .clone()
+        .or_else(|| def.parsed.device_name.clone());
+    let same_volume = !cfg!(windows)
+        || primary.parsed.is_logical
+        || ((primary.parsed.device_name.is_none()
+            || primary
+                .parsed
+                .device_name
+                .as_deref()
+                .zip(def.parsed.device_name.as_deref())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)))
+            && match (&host_name, &def.parsed.host_name) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            });
+    let default_dir = if same_volume {
+        def.parsed.directory.as_ref()
+    } else {
+        None
+    };
+    let merged_dir = match (&primary.parsed.directory, default_dir) {
         (Some(dir), Some(default_dir)) if !dir.absolute => {
             let mut parts = default_dir.parts.clone();
             parts.extend(dir.parts.clone());
@@ -957,7 +1084,7 @@ pub fn merge_pathnames(
     };
 
     let merged = PathnameRecord {
-        host: if primary.host == NIL {
+        host: if primary.host == NIL && inherit_host {
             def.host
         } else {
             primary.host
@@ -980,11 +1107,8 @@ pub fn merge_pathnames(
         version,
         parsed: ParsedPathname {
             is_logical: primary.parsed.is_logical || def.parsed.is_logical,
-            host_name: primary
-                .parsed
-                .host_name
-                .clone()
-                .or_else(|| def.parsed.host_name.clone()),
+            host_name,
+            device_name,
             directory: merged_dir,
             name: primary
                 .parsed
@@ -1024,6 +1148,15 @@ fn record_namestring(rec: &PathnameRecord) -> std::borrow::Cow<'_, str> {
     }
 }
 
+fn pathname_equal_key(rec: &PathnameRecord) -> std::borrow::Cow<'_, str> {
+    let key = record_namestring(rec);
+    if cfg!(windows) && !rec.parsed.is_logical {
+        std::borrow::Cow::Owned(key.to_ascii_lowercase())
+    } else {
+        key
+    }
+}
+
 /// CL `EQUAL` on two pathnames, comparing namestrings **without allocating on
 /// the GC heap** — the GC-safe replacement for comparing the results of
 /// [`namestring`] (which allocates a Lisp string and can relocate the nursery
@@ -1034,7 +1167,7 @@ pub fn pathnames_equal(a: TorclVal, b: TorclVal) -> bool {
     // Both records under ONE lock: with_pathname_store is a plain Mutex, so two
     // nested with_record calls would deadlock.
     with_pathname_store(|store| match (store.get(&a.0), store.get(&b.0)) {
-        (Some(ra), Some(rb)) => record_namestring(ra) == record_namestring(rb),
+        (Some(ra), Some(rb)) => pathname_equal_key(ra) == pathname_equal_key(rb),
         _ => false,
     })
 }
@@ -1052,7 +1185,7 @@ pub fn pathnames_equal(a: TorclVal, b: TorclVal) -> bool {
 /// Takes a closure rather than returning a `String` so the hot EQUAL path keeps
 /// comparing a borrowed `Cow` without allocating on the Rust or GC heap.
 pub fn with_pathname_equal_key<T>(val: TorclVal, f: impl FnOnce(&str) -> T) -> Option<T> {
-    with_record(val, |rec| f(&record_namestring(rec)))
+    with_record(val, |rec| f(&pathname_equal_key(rec)))
 }
 
 pub fn pathname_host(pathname: TorclVal) -> TorclVal {
@@ -1110,7 +1243,19 @@ pub fn pathname_version(pathname: TorclVal) -> TorclVal {
     with_record(pathname, |r| r.version).unwrap_or(NIL)
 }
 
-fn match_glob(value: &str, pattern: &str) -> Option<Vec<String>> {
+fn match_glob(value: &str, pattern: &str, ignore_case: bool) -> Option<Vec<String>> {
+    // ASCII folding preserves byte offsets, so wildcard captures retain the
+    // original spelling (including any non-ASCII characters).
+    let original = value;
+    let folded_value;
+    let folded_pattern;
+    let (value, pattern) = if ignore_case {
+        folded_value = value.to_ascii_lowercase();
+        folded_pattern = pattern.to_ascii_lowercase();
+        (folded_value.as_str(), folded_pattern.as_str())
+    } else {
+        (value, pattern)
+    };
     if !pattern.contains('*') {
         return if value == pattern {
             Some(Vec::new())
@@ -1139,7 +1284,7 @@ fn match_glob(value: &str, pattern: &str) -> Option<Vec<String>> {
             continue;
         }
         let pos = value[cursor..].find(piece)?;
-        captures.push(value[cursor..cursor + pos].to_string());
+        captures.push(original[cursor..cursor + pos].to_string());
         cursor += pos + piece.len();
         first = false;
         if idx == pieces.len() - 1 && !ends_with_star && cursor != value.len() {
@@ -1148,7 +1293,7 @@ fn match_glob(value: &str, pattern: &str) -> Option<Vec<String>> {
     }
 
     if ends_with_star {
-        captures.push(value[cursor..].to_string());
+        captures.push(original[cursor..].to_string());
         Some(captures)
     } else if cursor == value.len() {
         Some(captures)
@@ -1170,6 +1315,7 @@ struct MatchCaptures {
 fn match_component(
     value: &Option<ComponentSpec>,
     pattern: &Option<ComponentSpec>,
+    ignore_case: bool,
 ) -> Option<(Option<String>, Vec<String>)> {
     match pattern {
         None => {
@@ -1189,12 +1335,11 @@ fn match_component(
         )),
         Some(ComponentSpec::Literal(pattern_text)) => match value {
             Some(ComponentSpec::Literal(text)) => {
-                let fragments = match_glob(text, pattern_text)?;
+                let fragments = match_glob(text, pattern_text, ignore_case)?;
                 Some((Some(text.clone()), fragments))
             }
-            Some(ComponentSpec::Wild) => {
-                match_glob("*", pattern_text).map(|fragments| (Some("*".to_string()), fragments))
-            }
+            Some(ComponentSpec::Wild) => match_glob("*", pattern_text, ignore_case)
+                .map(|fragments| (Some("*".to_string()), fragments)),
             None => None,
         },
     }
@@ -1204,6 +1349,7 @@ fn match_directory_parts(
     value: &[DirPart],
     pattern: &[DirPart],
     captures: &mut MatchCaptures,
+    ignore_case: bool,
 ) -> bool {
     if pattern.is_empty() {
         return value.is_empty();
@@ -1220,7 +1366,7 @@ fn match_directory_parts(
                 DirPart::WildInferiors => "**".to_string(),
             };
             captures.directory_wilds.push(capture);
-            if match_directory_parts(&value[1..], &pattern[1..], captures) {
+            if match_directory_parts(&value[1..], &pattern[1..], captures, ignore_case) {
                 return true;
             }
             captures.directory_wilds.pop();
@@ -1238,7 +1384,7 @@ fn match_directory_parts(
                     })
                     .collect::<Vec<_>>();
                 captures.directory_inferiors.extend(consumed.clone());
-                if match_directory_parts(&value[len..], &pattern[1..], captures) {
+                if match_directory_parts(&value[len..], &pattern[1..], captures, ignore_case) {
                     return true;
                 }
                 for _ in 0..consumed.len() {
@@ -1249,14 +1395,18 @@ fn match_directory_parts(
         }
         DirPart::Literal(expected) => {
             if let Some(DirPart::Literal(actual)) = value.first() {
-                actual == expected && match_directory_parts(&value[1..], &pattern[1..], captures)
+                (if ignore_case {
+                    actual.eq_ignore_ascii_case(expected)
+                } else {
+                    actual == expected
+                }) && match_directory_parts(&value[1..], &pattern[1..], captures, ignore_case)
             } else {
                 false
             }
         }
         DirPart::Up => {
             matches!(value.first(), Some(DirPart::Up))
-                && match_directory_parts(&value[1..], &pattern[1..], captures)
+                && match_directory_parts(&value[1..], &pattern[1..], captures, ignore_case)
         }
     }
 }
@@ -1278,8 +1428,17 @@ fn pathname_match_with_captures(
             return None;
         }
     }
-    if wildcard.device != NIL && pathname.device != wildcard.device {
-        return None;
+    if wildcard.device != NIL && !is_wild(wildcard.device) {
+        let device_eq = match (&pathname.parsed.device_name, &wildcard.parsed.device_name) {
+            (Some(a), Some(b)) if cfg!(windows) && !pathname.parsed.is_logical => {
+                a.eq_ignore_ascii_case(b)
+            }
+            (Some(a), Some(b)) => a == b,
+            _ => pathname.device == wildcard.device,
+        };
+        if !device_eq {
+            return None;
+        }
     }
     // `:wild` matches any version; `:newest` is likewise permissive (torcl's
     // filesystem model carries no version numbers, and ASDF's `*wild-asd*`
@@ -1292,11 +1451,12 @@ fn pathname_match_with_captures(
         return None;
     }
 
+    let ignore_case = cfg!(windows) && !pathname.parsed.is_logical && !wildcard.parsed.is_logical;
     let mut captures = MatchCaptures::default();
     match (&pathname.parsed.directory, &wildcard.parsed.directory) {
         (_, None) => {}
         (Some(actual), Some(pattern)) if actual.absolute == pattern.absolute => {
-            if !match_directory_parts(&actual.parts, &pattern.parts, &mut captures) {
+            if !match_directory_parts(&actual.parts, &pattern.parts, &mut captures, ignore_case) {
                 return None;
             }
         }
@@ -1305,12 +1465,15 @@ fn pathname_match_with_captures(
     }
 
     let (name_capture, name_fragments) =
-        match_component(&pathname.parsed.name, &wildcard.parsed.name)?;
+        match_component(&pathname.parsed.name, &wildcard.parsed.name, ignore_case)?;
     captures.name = name_capture;
     captures.name_fragments = name_fragments;
 
-    let (type_capture, type_fragments) =
-        match_component(&pathname.parsed.type_field, &wildcard.parsed.type_field)?;
+    let (type_capture, type_fragments) = match_component(
+        &pathname.parsed.type_field,
+        &wildcard.parsed.type_field,
+        ignore_case,
+    )?;
     captures.type_field = type_capture;
     captures.type_fragments = type_fragments;
 
@@ -1476,6 +1639,7 @@ fn translate_pathname_with_patterns(
     let parsed = ParsedPathname {
         is_logical: to_pattern.parsed.is_logical,
         host_name: to_pattern.parsed.host_name.clone(),
+        device_name: to_pattern.parsed.device_name.clone(),
         directory: apply_directory_capture(&to_pattern.parsed.directory, &captures),
         name: apply_component_capture(
             &to_pattern.parsed.name,
@@ -1685,26 +1849,19 @@ pub fn truename(pathname: TorclVal) -> Result<TorclVal, TorclError> {
 }
 
 fn wildcard_root(parsed: &ParsedPathname) -> PathBuf {
-    let mut root = if parsed
-        .directory
-        .as_ref()
-        .map(|d| d.absolute)
-        .unwrap_or(false)
-    {
-        PathBuf::from("/")
-    } else {
-        PathBuf::from(".")
-    };
-    if let Some(dir) = &parsed.directory {
-        for part in &dir.parts {
-            match part {
-                DirPart::Literal(text) => root.push(text),
-                DirPart::Up => root.push(".."),
-                DirPart::Wild | DirPart::WildInferiors => break,
-            }
-        }
+    let mut prefix = parsed.clone();
+    prefix.name = None;
+    prefix.type_field = None;
+    if let Some(dir) = &mut prefix.directory {
+        dir.parts.truncate(
+            dir.parts
+                .iter()
+                .position(|part| matches!(part, DirPart::Wild | DirPart::WildInferiors))
+                .unwrap_or(dir.parts.len()),
+        );
     }
-    root
+    let rendered = render_namestring_from_parsed(&prefix);
+    PathBuf::from(if rendered.is_empty() { "." } else { &rendered })
 }
 
 fn collect_candidates(
@@ -2010,6 +2167,7 @@ fn pn_get_parsed(data: &[u8], off: &mut usize) -> Option<ParsedPathname> {
     }
     let [name, type_field] = comps;
     Some(ParsedPathname {
+        device_name: None,
         is_logical,
         host_name,
         directory,
@@ -2104,6 +2262,66 @@ pub fn allocate_pathnames(data: &[u8]) -> Vec<(usize, usize)> {
     pairs
 }
 
+// The initial Windows port stored the drive as directory component zero.
+// Merged records have no cached namestring, so migrate the parsed form itself.
+#[cfg(windows)]
+fn restore_windows_volume(parsed: &mut ParsedPathname, namestring: Option<&str>) {
+    if parsed.is_logical || parsed.device_name.is_some() {
+        return;
+    }
+    if let Some(dir) = &mut parsed.directory {
+        if dir.absolute {
+            if let Some(DirPart::Literal(drive)) = dir.parts.first() {
+                if drive.len() == 2
+                    && drive.as_bytes()[0].is_ascii_alphabetic()
+                    && drive.ends_with(':')
+                {
+                    parsed.device_name = Some(drive[..1].to_ascii_uppercase());
+                    dir.parts.remove(0);
+                    return;
+                }
+            }
+        }
+    }
+    if let Some(text) = namestring {
+        if let Ok(restored) = parse_physical_namestring(text) {
+            *parsed = restored;
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_image_tests {
+    use super::*;
+
+    #[test]
+    fn restores_legacy_merged_drive_without_cached_namestring() {
+        // This is the parsed image payload emitted by the initial port for a
+        // merged C:/Work/demo.lisp; its outer device slot and cache were NIL.
+        let legacy = ParsedPathname {
+            is_logical: false,
+            host_name: None,
+            device_name: None,
+            directory: Some(DirectorySpec {
+                absolute: true,
+                parts: vec![
+                    DirPart::Literal("C:".into()),
+                    DirPart::Literal("Work".into()),
+                ],
+            }),
+            name: Some(ComponentSpec::Literal("demo".into())),
+            type_field: Some(ComponentSpec::Literal("lisp".into())),
+        };
+        let mut bytes = Vec::new();
+        pn_put_parsed(&mut bytes, &legacy);
+        let mut parsed = pn_get_parsed(&bytes, &mut 0).unwrap();
+        restore_windows_volume(&mut parsed, None);
+        assert_eq!(parsed.device_name.as_deref(), Some("C"));
+        assert_eq!(parsed.directory.as_ref().unwrap().parts.len(), 1);
+        assert_eq!(render_namestring_from_parsed(&parsed), "C:/Work/demo.lisp");
+    }
+}
+
 /// Phase 2: resolve each pending record's component slots (raw words through
 /// `remap`, off-heap strings re-created via `make_string_bv`, which also
 /// repopulates the string registries) and insert the records into the
@@ -2111,15 +2329,27 @@ pub fn allocate_pathnames(data: &[u8]) -> Vec<(usize, usize)> {
 pub fn populate_pathnames(remap: &dyn Fn(u64) -> u64) {
     install_pathname_global_root_scanner();
     let pending = PENDING_PATHNAMES.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    for (bv, slots, parsed, namestring) in pending {
+    for (bv, slots, mut parsed, namestring) in pending {
         let resolve = |slot: &PnSlot| match slot {
             PnSlot::Raw(raw) => TorclVal(remap(*raw)),
             PnSlot::Str(s) => make_string_bv(s),
         };
+        let device = resolve(&slots[1]);
+        parsed.device_name = component_string(device);
+        #[cfg(windows)]
+        restore_windows_volume(&mut parsed, namestring.as_deref());
+        #[cfg(windows)]
+        let directory = stringify_directory(&parsed.directory, parsed.is_logical);
+        #[cfg(not(windows))]
+        let directory = resolve(&slots[2]);
         let rec = PathnameRecord {
             host: resolve(&slots[0]),
-            device: resolve(&slots[1]),
-            directory: resolve(&slots[2]),
+            device: parsed
+                .device_name
+                .as_deref()
+                .map(make_string_bv)
+                .unwrap_or(device),
+            directory,
             name: resolve(&slots[3]),
             type_field: resolve(&slots[4]),
             version: resolve(&slots[5]),

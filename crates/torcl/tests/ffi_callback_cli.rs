@@ -1,7 +1,96 @@
 //! Per R2.12, Lisp closures are callable through generated C entries, with
 //! contained exits and native-thread admission. Per R8.01, sandbox denies entry.
-#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 use std::process::Command;
+
+#[test]
+fn raw_runtime_callback_survives_gc_stress_and_poison() {
+    let program = r#"
+      (let ((callback (torcl::%foreign-callback :make
+                        (lambda (x) (let ((values (list x 1))) (+ (car values) (car (cdr values)))))
+                        :int '(:int))))
+        (print (torcl::%ffi-call (torcl::%foreign-callback :pointer callback)
+                               :int '(:int) '(41)))
+        (torcl::%foreign-callback :free callback))
+    "#;
+    let mut baseline = None;
+    for stress in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_torcl"));
+        command.args(["--no-init", "--no-bootstrap", "--eval", program]);
+        command
+            .env_remove("TORCL_GC_STRESS")
+            .env_remove("TORCL_GC_POISON");
+        if stress {
+            command
+                .env("TORCL_GC_STRESS", "1")
+                .env("TORCL_GC_POISON", "1");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "stress={stress}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("42"));
+        if let Some(expected) = baseline.as_ref() {
+            assert_eq!(&output.stdout, expected);
+        } else {
+            baseline = Some(output.stdout);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_dll_calls_and_allocating_callbacks_round_trip_through_lisp() {
+    let scalars = std::env::var("TORCL_FFI_SCALARS_DLL")
+        .unwrap()
+        .replace('\\', "/");
+    let callbacks = std::env::var("TORCL_FFI_CALLBACKS_DLL")
+        .unwrap()
+        .replace('\\', "/");
+    let program = format!(
+        r#"
+      (let* ((scalars (torcl-ffi:load-foreign-library {scalars:?}))
+             (callbacks (torcl-ffi:load-foreign-library {callbacks:?}))
+             (mixed (torcl-ffi:foreign-symbol-pointer "torcl_ffi_mixed" scalars))
+             (variadic (torcl-ffi:foreign-symbol-pointer "torcl_ffi_fixed_float" scalars))
+             (invoke (torcl-ffi:foreign-symbol-pointer "torcl_callback_float" callbacks))
+             (callback (torcl-ffi:make-callback
+               (lambda (x) (let ((numbers (list x 2.5))) (+ (car numbers) (cadr numbers))))
+               :float '(:float))))
+        (assert (= 29d0 (torcl-ffi:foreign-call mixed :double
+                          '(:int64 :double :float :int) '(2 3.25d0 1.5 4))))
+        (assert (= 3.75d0 (torcl-ffi:foreign-call variadic :double
+                            '(:float :int :float) '(1.25 1 2.5) 2)))
+        (assert (= 1086324736 (torcl-ffi:foreign-call invoke :uint64 '(:pointer)
+                               (list (torcl-ffi:callback-pointer callback)))))
+        (torcl-ffi:free-callback callback)
+        (let ((bad (torcl-ffi:make-callback (lambda (x) (error "contained")) :float '(:float))))
+          (assert (handler-case
+                    (progn (torcl-ffi:foreign-call invoke :uint64 '(:pointer)
+                             (list (torcl-ffi:callback-pointer bad))) nil)
+                    (torcl-ffi:ffi-error () t)))
+          (assert (torcl-ffi:callback-error bad))
+          (torcl-ffi:free-callback bad))
+        (torcl-ffi:close-foreign-library callbacks)
+        (torcl-ffi:close-foreign-library scalars))
+      (format t "WINDOWS-FFI-OK~%")
+    "#
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", &program])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("WINDOWS-FFI-OK"));
+}
 
 #[test]
 fn callbacks_reuse_live_setf_expanders_across_nested_entries() {
@@ -48,6 +137,7 @@ fn callbacks_reuse_live_setf_expanders_across_nested_entries() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("CALLBACK-SETF-OK"));
 }
 
+#[cfg(unix)]
 #[test]
 fn host_qsort_calls_allocating_lisp_comparators_and_contains_errors() {
     let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
@@ -115,6 +205,7 @@ fn callbacks_are_denied_in_sandbox_in_direct_and_funcall_paths() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn lisp_closures_cross_real_c_frames_with_explicit_callback_lifetimes() {
     let dir = std::env::temp_dir().join(format!("torcl-callback-cli-{}", std::process::id()));
@@ -239,6 +330,7 @@ fn callbacks_preserve_dynamic_bindings_and_contain_lexical_exits() {
 }
 
 #[cfg(target_env = "gnu")]
+#[cfg(unix)]
 #[test]
 fn foreign_created_thread_can_invoke_a_retained_lisp_closure() {
     let dir =

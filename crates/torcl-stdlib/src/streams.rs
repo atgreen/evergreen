@@ -12,6 +12,9 @@ use torcl_rt::lock_order::{LockLevel, OrderedMutex, OrderedMutexGuard};
 use torcl_rt::object::{ObjectHeader, type_id};
 use torcl_rt::value::{EOF, NIL, T, TorclVal};
 
+mod transport;
+use transport::StreamHandle;
+
 // ── Gray streams protocol ──────────────────────────────────────────
 
 /// Read a standard character literal from just after its sharp-backslash prefix.
@@ -173,7 +176,7 @@ enum StreamInner {
         col: u64,
     },
     FileInput {
-        file: std::fs::File,
+        file: StreamHandle,
         read_buf: Vec<u8>,
         buf_pos: usize,
         buf_fill: usize,
@@ -184,14 +187,14 @@ enum StreamInner {
         element_type: StreamElementType,
     },
     FileOutput {
-        file: std::fs::File,
+        file: StreamHandle,
         write_buf: Vec<u8>,
         external_format: ExternalFormat,
         line: u64,
         col: u64,
     },
     FileIo {
-        file: std::fs::File,
+        file: StreamHandle,
         read_buf: Vec<u8>,
         buf_pos: usize,
         buf_fill: usize,
@@ -289,59 +292,66 @@ impl StreamMutableState {
 const FILE_BUF_SIZE: usize = 8192;
 
 /// Read a single UTF-8 char from a buffered file input, refilling buffer as needed.
+// These are the disjoint mutable fields of a file stream plus its wait policy;
+// borrowing the whole stream here would conflict with the caller's field borrows.
+#[allow(clippy::too_many_arguments)]
 fn file_read_char_buffered(
-    file: &mut std::fs::File,
+    file: &mut StreamHandle,
     read_buf: &mut Vec<u8>,
     buf_pos: &mut usize,
     buf_fill: &mut usize,
     line: &mut u64,
     col: &mut u64,
     unread: &mut Option<char>,
+    wait: bool,
 ) -> Result<TorclVal, TorclError> {
     if let Some(c) = unread.take() {
         return Ok(TorclVal::from_char(c));
     }
-    let mut char_buf = [0u8; 4];
-    let mut char_len = 0usize;
     loop {
-        if *buf_pos >= *buf_fill {
-            read_buf.resize(FILE_BUF_SIZE, 0);
-            let n = file
-                .read(&mut read_buf[..])
-                .map_err(|e| TorclError::StreamError(format!("file read error: {}", e)))?;
-            if n == 0 {
-                if char_len > 0 {
-                    return Err(TorclError::StreamError(
-                        "incomplete UTF-8 sequence at EOF".into(),
-                    ));
+        // Decode without consuming an incomplete prefix. NO-HANG can return
+        // NIL between any two bytes of a character and resume on its next call.
+        for length in 1..=(*buf_fill - *buf_pos).min(4) {
+            match std::str::from_utf8(&read_buf[*buf_pos..*buf_pos + length]) {
+                Ok(text) => {
+                    let ch = text.chars().next().unwrap();
+                    *buf_pos += length;
+                    track_col(ch, line, col);
+                    return Ok(TorclVal::from_char(ch));
                 }
-                return Ok(EOF);
-            }
-            *buf_pos = 0;
-            *buf_fill = n;
-        }
-        char_buf[char_len] = read_buf[*buf_pos];
-        char_len += 1;
-        *buf_pos += 1;
-        match std::str::from_utf8(&char_buf[..char_len]) {
-            Ok(s) => {
-                let c = s.chars().next().unwrap();
-                if c == '\n' {
-                    *line += 1;
-                    *col = 0;
-                } else {
-                    *col += 1;
-                }
-                return Ok(TorclVal::from_char(c));
-            }
-            Err(e) => {
-                if char_len >= 4 || e.error_len().is_some() {
+                Err(error) if error.error_len().is_some() || length == 4 => {
+                    *buf_pos += length;
                     return Err(TorclError::StreamError(
                         "invalid UTF-8 in file stream".into(),
                     ));
                 }
+                Err(_) => {}
             }
         }
+        if !wait
+            && !file
+                .wait_readable(Some(0))
+                .map_err(|e| TorclError::StreamError(format!("read-char-no-hang: {e}")))?
+        {
+            return Ok(NIL);
+        }
+        let remaining = *buf_fill - *buf_pos;
+        read_buf.copy_within(*buf_pos..*buf_fill, 0);
+        read_buf.resize(FILE_BUF_SIZE, 0);
+        *buf_pos = 0;
+        *buf_fill = remaining;
+        let count = file
+            .read(&mut read_buf[remaining..])
+            .map_err(|e| TorclError::StreamError(format!("file read error: {e}")))?;
+        if count == 0 {
+            if remaining != 0 {
+                return Err(TorclError::StreamError(
+                    "incomplete UTF-8 sequence at EOF".into(),
+                ));
+            }
+            return Ok(EOF);
+        }
+        *buf_fill += count;
     }
 }
 
@@ -354,7 +364,7 @@ fn file_read_char_buffered(
 /// therefore complete UTF-8 and decode as one `String`. Returns `(line,
 /// missing-newline-p)`; `(EOF, true)` at end of input with nothing buffered.
 fn file_read_line_buffered(
-    file: &mut std::fs::File,
+    file: &mut StreamHandle,
     read_buf: &mut Vec<u8>,
     buf_pos: &mut usize,
     buf_fill: &mut usize,
@@ -414,7 +424,7 @@ fn file_read_line_buffered(
 
 /// Read a single raw byte from a buffered file input (for binary streams). Issue #10.
 fn file_read_byte_raw(
-    file: &mut std::fs::File,
+    file: &mut StreamHandle,
     read_buf: &mut Vec<u8>,
     buf_pos: &mut usize,
     buf_fill: &mut usize,
@@ -437,7 +447,7 @@ fn file_read_byte_raw(
 
 /// Flush a write buffer to file.
 fn file_flush_write_buf(
-    file: &mut std::fs::File,
+    file: &mut StreamHandle,
     write_buf: &mut Vec<u8>,
 ) -> Result<(), TorclError> {
     if !write_buf.is_empty() {
@@ -513,7 +523,9 @@ impl GrayStream for StreamMutableState {
                 col,
                 unread,
                 ..
-            } => file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread),
+            } => {
+                file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread, true)
+            }
             StreamInner::FileIo {
                 file,
                 read_buf,
@@ -526,7 +538,7 @@ impl GrayStream for StreamMutableState {
                 ..
             } => {
                 file_flush_write_buf(file, write_buf)?;
-                file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread)
+                file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread, true)
             }
             // Issue #1: Handle TwoWay and Echo as separate arms to avoid
             // borrow-checker conflict when reading from input then writing to output.
@@ -1068,17 +1080,25 @@ impl GrayStream for StreamMutableState {
                 ..
             } => Ok(unread.is_some() || *position < *end),
             StreamInner::FileInput {
+                file,
                 buf_pos,
                 buf_fill,
                 unread,
                 ..
             }
             | StreamInner::FileIo {
+                file,
                 buf_pos,
                 buf_fill,
                 unread,
                 ..
-            } => Ok(unread.is_some() || *buf_pos < *buf_fill),
+            } => {
+                if unread.is_some() || *buf_pos < *buf_fill {
+                    return Ok(true);
+                }
+                file.socket_has_input()
+                    .map_err(|e| TorclError::StreamError(format!("listen: {e}")))
+            }
             StreamInner::Concatenated { cursor } => Ok(*cursor < comps.len()),
             StreamInner::TwoWay | StreamInner::Echo => crate::streams::stream_listen(comps[0]),
             StreamInner::Synonym => {
@@ -1120,6 +1140,25 @@ impl GrayStream for StreamMutableState {
 
     fn stream_read_char_no_hang(&mut self) -> Result<TorclVal, TorclError> {
         self.check_input()?;
+        if let StreamInner::FileIo {
+            file,
+            read_buf,
+            buf_pos,
+            buf_fill,
+            line,
+            col,
+            unread,
+            ..
+        } = &mut self.inner
+        {
+            if matches!(file, StreamHandle::Socket(_)) {
+                // Do not flush pending writes: a NO-HANG input call must not
+                // block on a peer that has stopped reading our output.
+                return file_read_char_buffered(
+                    file, read_buf, buf_pos, buf_fill, line, col, unread, false,
+                );
+            }
+        }
         // For string streams, if exhausted return NIL.
         // For file streams, reads never block on regular files, so just call stream_read_char.
         if let StreamInner::StringInput { position, end, .. } = &self.inner {
@@ -1758,7 +1797,7 @@ pub fn open(
             Ok(alloc_stream(
                 elt,
                 StreamInner::FileInput {
-                    file,
+                    file: StreamHandle::File(file),
                     read_buf: Vec::with_capacity(FILE_BUF_SIZE),
                     buf_pos: 0,
                     buf_fill: 0,
@@ -1809,7 +1848,7 @@ pub fn open(
             Ok(alloc_stream(
                 elt,
                 StreamInner::FileOutput {
-                    file,
+                    file: StreamHandle::File(file),
                     write_buf: Vec::with_capacity(FILE_BUF_SIZE),
                     external_format,
                     line: 0,
@@ -1864,7 +1903,7 @@ pub fn open(
             Ok(alloc_stream(
                 elt,
                 StreamInner::FileIo {
-                    file,
+                    file: StreamHandle::File(file),
                     read_buf: Vec::with_capacity(FILE_BUF_SIZE),
                     buf_pos: 0,
                     buf_fill: 0,
@@ -1895,6 +1934,12 @@ pub fn close(stream: TorclVal, abort: bool) -> Result<(), TorclError> {
             }
             _ => {}
         }
+    }
+    match &mut guard.inner {
+        StreamInner::FileInput { file, .. }
+        | StreamInner::FileOutput { file, .. }
+        | StreamInner::FileIo { file, .. } => file.close(),
+        _ => {}
     }
     guard.open = false;
     Ok(())
@@ -2189,6 +2234,10 @@ pub fn file_position(stream: TorclVal) -> Result<TorclVal, TorclError> {
     guard.check_open()?;
     let comps = guard.components();
     match &mut guard.inner {
+        StreamInner::FileIo {
+            file: StreamHandle::Socket(_),
+            ..
+        } => Ok(NIL),
         StreamInner::FileInput {
             file,
             buf_pos,
@@ -2255,6 +2304,10 @@ pub fn set_file_position(stream: TorclVal, position: TorclVal) -> Result<TorclVa
     guard.check_open()?;
     let comps = guard.components();
     match &mut guard.inner {
+        StreamInner::FileIo {
+            file: StreamHandle::Socket(_),
+            ..
+        } => Ok(NIL),
         StreamInner::FileInput {
             file,
             buf_pos,
@@ -2330,6 +2383,10 @@ pub fn set_file_position_to_end(stream: TorclVal) -> Result<TorclVal, TorclError
     guard.check_open()?;
     let comps = guard.components();
     match &mut guard.inner {
+        StreamInner::FileIo {
+            file: StreamHandle::Socket(_),
+            ..
+        } => Ok(NIL),
         StreamInner::StringInput {
             position: pos,
             end,
@@ -2395,6 +2452,10 @@ pub fn file_length_fn(stream: TorclVal) -> Result<TorclVal, TorclError> {
     guard.check_open()?;
     let comps = guard.components();
     match &mut guard.inner {
+        StreamInner::FileIo {
+            file: StreamHandle::Socket(_),
+            ..
+        } => Ok(NIL),
         StreamInner::FileInput { file, .. }
         | StreamInner::FileOutput { file, .. }
         | StreamInner::FileIo { file, .. } => {
@@ -2520,14 +2581,13 @@ pub fn install_gc_hooks() {
 // A *listening* socket is an opaque integer id into a thread-local registry (it
 // is never read/written as a stream, only accept/close/local-port). An *accepted
 // connection* is returned as an ordinary bidirectional character stream, reusing
-// the FileIo machinery over the socket's file descriptor — so all the Gray-stream
+// the FileIo machinery over its owned TCP transport — so all the Gray-stream
 // I/O (read-char, read-line, write-string, force-output, …) works unchanged.
 use std::cell::{Cell, RefCell};
-#[cfg(unix)]
 use std::net::ToSocketAddrs;
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 
 thread_local! {
     static SOCKET_LISTENERS: RefCell<HashMap<u64, TcpListener>> = RefCell::new(HashMap::new());
@@ -2565,7 +2625,6 @@ pub fn socket_close_listener(id: u64) {
 /// Connect a TCP client and return an owned bidirectional octet stream.
 /// The optional timeout bounds connection attempts across all resolved addresses;
 /// system hostname resolution precedes that deadline.
-#[cfg(unix)]
 pub fn socket_connect(
     host: &str,
     port: u16,
@@ -2604,7 +2663,6 @@ pub fn socket_connect(
 
 /// Accept a connection on listener `id`, returning a bidirectional octet
 /// stream over the new socket (blocks until a client connects).
-#[cfg(unix)]
 pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
     let stream = SOCKET_LISTENERS.with(|m| {
         let map = m.borrow();
@@ -2619,18 +2677,10 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
     Ok(socket_stream(stream))
 }
 
-/// Transfer sole descriptor ownership to the standard stream/finalizer machinery.
-#[cfg(unix)]
+/// Transfer the owned socket to the common stream/finalizer machinery.
 fn socket_stream(stream: TcpStream) -> TorclVal {
     let _ = stream.set_nodelay(true);
-    let fd = stream.into_raw_fd();
-    // SAFETY: `fd` is a freshly-owned socket descriptor; `File` takes sole
-    // ownership and closes it on drop via the stream's GC finalizer, exactly as
-    // for a file stream. read()/write() on a socket fd are valid on Unix.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    // A byte (unsigned-byte 8) stream: the SLIME/slynk protocol frames its
-    // messages with raw octet I/O (read-sequence into a byte buffer, write-byte /
-    // write-sequence of octets); it does its own UTF-8 conversion in Lisp.
+    let file = StreamHandle::Socket(stream);
     alloc_stream(
         StreamElementType::UnsignedByte8,
         StreamInner::FileIo {
@@ -2648,21 +2698,22 @@ fn socket_stream(stream: TcpStream) -> TorclVal {
     )
 }
 
-// Duplicate under the stream lock: CLOSE cannot invalidate the descriptor
-// between lookup and an option syscall. Dropping this handle closes only the
-// duplicate, while socket options affect the shared underlying socket.
-#[cfg(unix)]
+// Duplicate under the stream lock so CLOSE cannot invalidate an option call.
 fn socket_option_handle(stream: TorclVal) -> Result<TcpStream, TorclError> {
     let guard = lock_stream(stream)?;
-    let StreamInner::FileIo { file, .. } = &guard.inner else {
+    guard.check_open()?;
+    let StreamInner::FileIo {
+        file: StreamHandle::Socket(socket),
+        ..
+    } = &guard.inner
+    else {
         return Err(TorclError::StreamError(
             "not a bidirectional socket stream".into(),
         ));
     };
-    let file = file
+    socket
         .try_clone()
-        .map_err(|e| TorclError::StreamError(format!("socket option: {e}")))?;
-    Ok(TcpStream::from(std::os::fd::OwnedFd::from(file)))
+        .map_err(|e| TorclError::StreamError(format!("socket option: {e}")))
 }
 
 pub fn socket_read_timeout(stream: TorclVal) -> Result<Option<std::time::Duration>, TorclError> {
@@ -2684,6 +2735,7 @@ pub fn socket_set_read_timeout(
 #[cfg(unix)]
 pub fn stream_raw_fd(stream: TorclVal) -> Option<i32> {
     let guard = lock_stream(stream).ok()?;
+    guard.check_open().ok()?;
     match &guard.inner {
         StreamInner::FileIo { file, .. } => Some(file.as_raw_fd()),
         StreamInner::FileInput { file, .. } => Some(file.as_raw_fd()),
@@ -2692,16 +2744,15 @@ pub fn stream_raw_fd(stream: TorclVal) -> Option<i32> {
     }
 }
 
-/// Block until `stream` has input available, or `timeout_ms` elapses (None =
-/// wait forever). Returns true if readable, false on timeout. Buffered input is
-/// reported immediately; otherwise the underlying fd is polled.
-#[cfg(unix)]
+/// Wait for buffered or OS input, including EOF. Duplicate the handle under
+/// the lock so a concurrent CLOSE cannot recycle it while the wait is running.
 pub fn stream_wait_for_input(
     stream: TorclVal,
     timeout_ms: Option<i32>,
 ) -> Result<bool, TorclError> {
-    let fd = {
+    let handle = {
         let guard = lock_stream(stream)?;
+        guard.check_input()?;
         match &guard.inner {
             StreamInner::FileIo {
                 file,
@@ -2720,25 +2771,19 @@ pub fn stream_wait_for_input(
                 if unread.is_some() || *buf_pos < *buf_fill {
                     return Ok(true);
                 }
-                file.as_raw_fd()
+                file.try_clone()
+                    .map_err(|e| TorclError::StreamError(format!("wait-for-input: {e}")))?
             }
             _ => {
                 return Err(TorclError::StreamError(
-                    "wait-for-input: not an input stream".into(),
+                    "wait-for-input: not an OS input stream".into(),
                 ));
             }
         }
     };
-    let mut pfd = torcl_rt::syscall::PollFd {
-        fd,
-        events: torcl_rt::syscall::POLLIN,
-        revents: 0,
-    };
-    let timeout = timeout_ms.unwrap_or(-1);
-    // SAFETY: pfd is a valid single-element PollFd array for the call's duration.
-    let rc = unsafe { torcl_rt::syscall::poll(&mut pfd, 1, timeout) }
-        .map_err(|_| TorclError::FileError("wait-for-input: poll failed".into()))?;
-    Ok(rc > 0 && (pfd.revents & torcl_rt::syscall::POLLIN) != 0)
+    handle
+        .wait_readable(timeout_ms)
+        .map_err(|e| TorclError::StreamError(format!("wait-for-input: {e}")))
 }
 
 // ── Composite-stream accessors (synonym / two-way) ─────────────────
@@ -2784,40 +2829,8 @@ pub fn two_way_stream_output_stream(stream: TorclVal) -> Option<TorclVal> {
     }
 }
 
-// Windows sockets are not CRT file descriptors and cannot be owned by File.
-// Until streams own a distinct socket variant, fail explicitly at the boundary.
-#[cfg(windows)]
-pub fn socket_connect(
-    _host: &str,
-    _port: u16,
-    _timeout: Option<std::time::Duration>,
-) -> Result<TorclVal, TorclError> {
-    Err(TorclError::StreamError(
-        "Windows socket streams are not yet supported".into(),
-    ))
-}
-#[cfg(windows)]
-pub fn socket_accept(_id: u64) -> Result<TorclVal, TorclError> {
-    Err(TorclError::StreamError(
-        "Windows socket streams are not yet supported".into(),
-    ))
-}
-#[cfg(windows)]
-fn socket_option_handle(_stream: TorclVal) -> Result<TcpStream, TorclError> {
-    Err(TorclError::StreamError(
-        "Windows socket streams are not yet supported".into(),
-    ))
-}
+// A Windows SOCKET cannot be represented as a Unix file descriptor.
 #[cfg(windows)]
 pub fn stream_raw_fd(_stream: TorclVal) -> Option<i32> {
     None
-}
-#[cfg(windows)]
-pub fn stream_wait_for_input(
-    _stream: TorclVal,
-    _timeout_ms: Option<i32>,
-) -> Result<bool, TorclError> {
-    Err(TorclError::StreamError(
-        "Windows stream readiness is not yet supported".into(),
-    ))
 }

@@ -3806,12 +3806,9 @@ mod shadow_root_scope_tests {
 // must for the mutex-guarded registries above; no separate per-safepoint
 // republication is needed because the cell's address never changes.
 //
-// Fiber caveat (same constraint as StackRoot/HostRoot, inherited not new): a
-// root guard links onto the CARRIER thread's list, so a fiber must not suspend
-// (context-switch off its carrier) while a Rooted/RootedRef guard is live —
-// unlinking on a different carrier would corrupt both lists. Evaluator code
-// holding these guards runs to completion on one carrier today; revisit under
-// bliss-h6z.5 if guard scopes ever span suspension points.
+// Each fiber owns a separately registered head. Mounting selects that head in
+// carrier TLS; unmounting restores the carrier's head. Suspended lists remain
+// registered, and guards resume on the same list after carrier migration.
 //
 // A linked node must not move (the list holds its address), which plain Rust
 // cannot express for a by-value local — so the ONLY blessed constructor is the
@@ -3837,6 +3834,8 @@ pub struct RootLink {
 }
 
 thread_local! {
+    static ACTIVE_ROOTED_HEAD: std::cell::Cell<*const std::cell::Cell<*mut RootLink>> =
+        const { std::cell::Cell::new(std::ptr::null()) };
     /// Head of this thread's intrusive root list. The cell's ADDRESS is stable
     /// for the thread's lifetime and is what the global registry records.
     static ROOTED_HEAD: std::cell::Cell<*mut RootLink> =
@@ -3866,14 +3865,75 @@ struct RootedHeadRegistration {
 
 impl RootedHeadRegistration {
     fn install() -> Self {
+        let head_address = ROOTED_HEAD.with(|cell| cell as *const _ as usize);
+        Self::register(head_address)
+    }
+
+    fn register(head_address: usize) -> Self {
         static INSTALL: Once = Once::new();
         INSTALL.call_once(|| register_root_scanner(scan_rooted_lists));
-        let head_address = ROOTED_HEAD.with(|cell| cell as *const _ as usize);
         rooted_heads()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(head_address);
         Self { head_address }
+    }
+}
+
+/// Stable, registered host roots for a fiber, including while it is suspended.
+/// The scheduler's exclusive mount and GC safepoint protocol protect the cell.
+pub(crate) struct FiberRoots {
+    // Unregister before freeing the cell (fields drop in declaration order).
+    _registration: RootedHeadRegistration,
+    head: Box<std::cell::Cell<*mut RootLink>>,
+}
+
+impl FiberRoots {
+    pub(crate) fn new() -> Self {
+        let head = Box::new(std::cell::Cell::new(std::ptr::null_mut()));
+        let registration = RootedHeadRegistration::register(&*head as *const _ as usize);
+        Self {
+            _registration: registration,
+            head,
+        }
+    }
+
+    /// Select only while exclusively mounting this fiber. The returned scope
+    /// must stay on the carrier stack, outliving the switch into the fiber.
+    pub(crate) unsafe fn mount(&self) -> MountedFiberRoots<'_> {
+        let previous = ACTIVE_ROOTED_HEAD.with(|active| active.replace(&*self.head));
+        MountedFiberRoots {
+            previous,
+            _roots: self,
+        }
+    }
+}
+
+pub(crate) struct MountedFiberRoots<'a> {
+    previous: *const std::cell::Cell<*mut RootLink>,
+    _roots: &'a FiberRoots,
+}
+
+impl Drop for MountedFiberRoots<'_> {
+    fn drop(&mut self) {
+        ACTIVE_ROOTED_HEAD.with(|active| active.set(self.previous));
+    }
+}
+
+// A fiber may resume on another OS thread. Keep the TLS lookup in a separate
+// call so LLVM cannot cache a carrier's TLS address across a suspension in the
+// caller. Optimized musl code reused the address across an allocating call and
+// linked a RootedRef into the old carrier's list; its later drop then failed.
+#[inline(never)]
+fn with_rooted_head<R>(f: impl FnOnce(&std::cell::Cell<*mut RootLink>) -> R) -> R {
+    let active = ACTIVE_ROOTED_HEAD.with(|head| head.get());
+    if active.is_null() {
+        ROOTED_HEAD_REGISTRATION.with(|_| {});
+        ROOTED_HEAD.with(f)
+    } else {
+        // The carrier's mount scope borrows the owning FiberRoots and the
+        // scheduler prevents another carrier from using it concurrently.
+        f(unsafe { &*active })
     }
 }
 
@@ -3990,8 +4050,7 @@ pub struct RootedGuard<'r, T: TraceHostRoots> {
 
 impl<'r, T: TraceHostRoots> RootedGuard<'r, T> {
     pub fn new(node: &'r mut Rooted<T>) -> Self {
-        ROOTED_HEAD_REGISTRATION.with(|_| {});
-        ROOTED_HEAD.with(|head| {
+        with_rooted_head(|head| {
             node.link.next = head.get();
             head.set(&mut node.link as *mut RootLink);
         });
@@ -4015,7 +4074,7 @@ impl<T: TraceHostRoots> DerefMut for RootedGuard<'_, T> {
 impl<T: TraceHostRoots> Drop for RootedGuard<'_, T> {
     fn drop(&mut self) {
         let target = &mut self.node.link as *mut RootLink;
-        ROOTED_HEAD.with(|head| {
+        with_rooted_head(|head| {
             let first = head.get();
             if first == target {
                 // LIFO fast path: normal lexical scoping.
@@ -4102,8 +4161,7 @@ pub struct RootedRefGuard<'r, T: TraceHostRoots> {
 
 impl<'r, T: TraceHostRoots> RootedRefGuard<'r, T> {
     pub fn new(node: &'r mut RootedRef<T>) -> Self {
-        ROOTED_HEAD_REGISTRATION.with(|_| {});
-        ROOTED_HEAD.with(|head| {
+        with_rooted_head(|head| {
             node.link.next = head.get();
             head.set(&mut node.link as *mut RootLink);
         });
@@ -4114,7 +4172,7 @@ impl<'r, T: TraceHostRoots> RootedRefGuard<'r, T> {
 impl<T: TraceHostRoots> Drop for RootedRefGuard<'_, T> {
     fn drop(&mut self) {
         let target = &mut self.node.link as *mut RootLink;
-        ROOTED_HEAD.with(|head| {
+        with_rooted_head(|head| {
             let first = head.get();
             if first == target {
                 head.set(self.node.link.next);
@@ -4156,7 +4214,7 @@ mod rooted_tests {
 
     fn list_len() -> usize {
         let mut n = 0;
-        ROOTED_HEAD.with(|head| {
+        with_rooted_head(|head| {
             let mut node = head.get();
             while !node.is_null() {
                 n += 1;
@@ -4169,7 +4227,7 @@ mod rooted_tests {
     /// Trace only THIS thread's list. `scan_rooted_lists` is process-wide and
     /// relies on STW quiescence, which parallel test threads don't provide.
     fn scan_local(visit: &mut dyn FnMut(*mut TorclVal)) {
-        ROOTED_HEAD.with(|head| {
+        with_rooted_head(|head| {
             let mut node = head.get();
             while !node.is_null() {
                 unsafe {

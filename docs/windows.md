@@ -3,11 +3,33 @@
 TorCL can be cross-built on Linux as a Windows console executable:
 `target/x86_64-pc-windows-gnu/release/torcl.exe`.
 
-This is an initial interpreter/T0 bytecode port. Native T1/T2/OSR compilation,
-Win64 foreign-call adapters/callbacks, fiber switching, structured-exception
-recovery, and socket streams/readiness are not supported yet. Forcing T2 safely
-falls back to bytecode. DLL loading and symbol lookup are available; global
+The port supports the interpreter, T0 bytecode, native T1 and optimizing T2
+compilation, and on-stack replacement (OSR) from T0 to T1 and T1 to T2.
+Native code preserves moving-GC roots, resumes bytecode at failed speculation
+guards, and supports direct native calls. Unsupported compilation shapes retain
+their lower tier. Structured-exception recovery is not supported yet.
+DLL loading and symbol lookup are available; global
 Unix-style symbol lookup requires choosing a DLL explicitly on Windows.
+
+Foreign calls and callbacks use generated Win64 adapters. They support
+integers, pointers, single/double floats, mixed register and stack arguments,
+and variadic calls with C argument promotions. Callbacks retain Lisp closures,
+participate in moving GC, admit foreign threads, and contain Lisp errors and
+nonlocal exits before returning through C. Callback signatures are scalar.
+Buffered foreign calls support structs, packed structs, and unions passed and
+returned by value, including variadic calls. Indirect aggregate arguments use
+private aligned copies so C cannot overwrite the caller's original object.
+
+Generated adapters use write-then-execute protection, probe large stack frames,
+and retain registered Win64 unwind metadata for their lifetime. Native T1 and
+T2 functions register unwind ranges for their normal, compiled-register (T2),
+and OSR entries. T2 probes large spill frames and temporary deoptimization buffers.
+
+The runtime scheduler uses Windows-owned fiber stacks for suspension, carrier
+migration, and cooperative preemption. Mutex, condition-variable, semaphore,
+and timer waits release their carrier. Each fiber retains its registered GC
+root list while suspended and after migration. Windows descriptor-readiness
+integration and catchable native stack exhaustion remain unfinished.
 
 ## Build on Linux
 
@@ -38,11 +60,41 @@ no MinGW runtime DLL needs to be copied alongside it.
 `*FEATURES*` includes `:WINDOWS`, `:X86-64`, and `:LITTLE-ENDIAN`. Home-directory
 and default `.torclrc` discovery use `USERPROFILE` (with `HOME` as a fallback).
 Use forward slashes inside Lisp path strings, for example `C:/work/demo.lisp`.
-Absolute drive paths and relative paths are supported. Drive-relative paths
-(`C:demo.lisp`), UNC shares, and full ANSI device-component semantics remain
-follow-up work.
+Physical pathnames support absolute drives (`C:/work/demo.lisp`), drive-relative
+paths (`C:demo.lisp`), root-relative paths, UNC shares (`//server/share/file`),
+and ordinary relative paths. Backslashes and verbatim drive/UNC prefixes are
+accepted and namestrings use forward slashes. The drive letter is the device
+component, normalized to uppercase. UNC pathnames use the server as host and
+the share as device; their directory is absolute. `MAKE-PATHNAME` rejects a
+relative UNC directory and supplies a root when its directory is nil.
+`MERGE-PATHNAMES` inherits directories only within the same volume.
+
+Physical pathname equality, hashing and wildcard matching ignore ASCII case
+while preserving original namestring spelling and wildcard captures. Non-ASCII
+case equivalence and Windows device namespaces such as `//./` are not supported.
+UNC parsing and reconstruction are tested; live network-share access has not
+been validated.
 Saved images carry a Windows platform tag and cannot be exchanged with Linux
 images. Ctrl+C and Ctrl+Break request cooperative Lisp interruption.
+
+## Networking and subprocesses
+
+TCP client and accepted connections are owned bidirectional octet streams.
+The existing `torcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
+`%socket-read-timeout`, and `%socket-wait-for-input` primitives work on Windows.
+Buffered input, readiness timeouts, EOF, `LISTEN`, and explicit `CLOSE` are
+supported; closing releases the socket without waiting for GC. Socket position
+and length queries return `NIL`. Windows sockets are not Unix descriptors, so
+`%socket-fd` returns `NIL`; descriptor-based fiber waits remain unsupported.
+Socket readiness uses [Winsock WSAPoll](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll).
+
+`torcl-ext:run-program` runs synchronously and returns three values: exit status,
+stdout, and stderr. A list supplies an executable and its arguments directly;
+a string supplies shell syntax to `COMSPEC` (normally `cmd.exe`) with
+`/D /S /C`. Both output pipes are drained concurrently, and stdin receives EOF.
+Captured bytes are decoded as UTF-8 with replacement for invalid sequences.
+Interactive subprocess streams, asynchronous process management, and alternate
+console code-page decoding are not provided by this API.
 
 ## Validate under Wine
 
@@ -56,9 +108,27 @@ scripts/windows-port.sh test
 This builds the release executable and creates a temporary, isolated Wine
 prefix. It runs Windows memory/protection, timing/thread, DLL-lifetime and stack
 budget tests, then the CLI functional tests in interpreter, bytecode, default,
-and forced-T2 fallback modes. Additional checks cover `USERPROFILE` without
+and forced-T2 modes. Native tests assert T1/T2 promotion and OSR entry,
+compare arithmetic and deoptimization against interpretation, exercise direct
+calls and error propagation under GC stress, and unwind normal/OSR frames and
+temporary direct-call stack saves. T2 tests check large deoptimization buffers
+and OS unwinding at every decoded instruction boundary across multiple frame
+sizes, including stack probes. Runtime tests also execute small Win64 functions,
+check read/execute protection and release, and exercise the OS unwinder at
+generated prologue/epilogue boundaries. Additional checks cover `USERPROFILE` without
 `HOME`, catchable recursive stack exhaustion, moving-GC stress with poison,
-and compiled-file and heap-image round trips in fresh processes.
+TCP connect/accept, buffering, timeouts, EOF, immediate close, split UTF-8
+nonblocking reads, subprocess quoting and concurrent output pipes,
+pathname components, construction, merging, wildcard searches, equality/hashing,
+and compiled-file and heap-image pathname round trips in fresh processes.
+
+MinGW-built C DLL fixtures check scalar and aggregate foreign calls, varargs, callbacks,
+large frames and all three stack-allocation unwind encodings. Managed callback
+tests cover moving GC, foreign-thread admission, nested entry and error
+containment; CLI tests exercise allocating Lisp closures and checked aggregate
+buffers through C DLL calls. Aggregate tests also check packed objects ending
+at guard pages, hidden return pointers, small aggregate register returns, and
+alignment and isolation of indirect copies.
 
 The GC stress probe uses `--no-bootstrap` and stresses every allocation in the
 probe; the broader functional tests load the normal prelude. Tests use

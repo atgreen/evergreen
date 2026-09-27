@@ -147,9 +147,14 @@ CROSS_CONTAINER_OPTS="-e TORCL_IMAGE_OUT=/target/torcl-android-image" \
       --no-init --load scripts/build-image.lisp
 ```
 
-Verify it is self-contained by running it with the source tree ABSENT — the
-plain `cargo build` binary reads `lib/boot.lisp` from disk, so mounting the repo
-would hide the difference:
+Verify it is self-contained by running it with the source tree ABSENT. The
+prelude is not the reason to check: `lib/boot.lisp` is embedded at compile time
+(`EMBEDDED_BOOT_LISP`), so the plain binary never needs it on disk. ASDF is the
+reason — `bundled_asdf_path()` resolves `lib/asdf.lisp` through
+`env!("CARGO_MANIFEST_DIR")`, a *build-time absolute path*, so a plain
+cross-compiled binary can only `(require :asdf)` on a machine where that build
+directory still exists (bliss-bp4q). The dumped image has ASDF inside it and does
+not care:
 
 ```sh
 podman run --rm -v "$PWD/target-android:/img:ro" -w /img \
@@ -175,3 +180,55 @@ running inside an app. That last one is not packaging: Android blocks executing
 binaries from app-writable storage, so an in-app TorCL has to become a JNI
 library, and bionic's limited static-TLS surplus for `dlopen`'d libraries bears
 directly on the execution-context design (spec R4.72/R4.73). See bliss-w2vp.
+
+### Driving a GUI: TorCL as a NativeActivity
+
+The CLI shape above cannot draw. Android hands a drawable surface only to code
+running inside the app's own process, so a spawned `torcl` binary — however it is
+packaged — can never obtain one. `crates/torcl-android` is the other shape: the
+runtime linked INTO the activity as a shared library.
+
+```sh
+export CROSS_CONTAINER_ENGINE=podman CARGO_TARGET_DIR="$PWD/target-android"
+cross rustc --release -p torcl-android --target x86_64-linux-android \
+      --crate-type cdylib
+```
+
+Note `cargo rustc --crate-type cdylib` rather than declaring it in the manifest.
+The crate says `crate-type = ["rlib"]` because the workspace's default target is
+static musl, which cannot produce a cdylib at all — declaring one breaks
+`cargo build --workspace` for everybody. Making the crate standalone instead puts
+its path dependencies outside the container mount, which breaks the cross build.
+Asking for the crate type on the command line avoids both.
+
+The APK needs no Java and no dex (`android:hasCode="false"`); the activity IS the
+Lisp runtime:
+
+```xml
+<activity android:name="android.app.NativeActivity" android:exported="true">
+    <meta-data android:name="android.app.lib_name" android:value="torcl_android" />
+</activity>
+```
+
+The Rust half is deliberately thin and contains no EGL: it exports
+`ANativeActivity_onCreate`, captures the `ANativeWindow*` when the surface
+arrives, and starts the interpreter on a thread with that address in the form.
+Everything else — `eglGetDisplay`, `eglChooseConfig`,
+`ANativeWindow_setBuffersGeometry`, `eglCreateWindowSurface`, `eglCreateContext`,
+`eglMakeCurrent`, `glClearColor`, `eglSwapBuffers` — is Lisp calling through
+`torcl-ffi:foreign-call` (see `crates/torcl-android/src/egl.lisp`).
+
+Surface lifetime is the one piece Lisp cannot decide for itself. Rust keeps an
+`AtomicI32` that `onNativeWindowDestroyed` clears and Lisp reads with `mem-ref`
+each frame; drawing into a destroyed surface crashes, and Android destroys it on
+rotate, backgrounding and exit.
+
+Verified on the emulator: the activity loads, EGL initializes, and successive
+screenshots show the clear colour advancing — red rising, green falling, blue
+pinned at the hardcoded 0.35 (89/255) — with the runtime's own thread alive in
+the app's process and no child process anywhere.
+
+What this does NOT yet cover: input (native_app_glue polls via `ALooper`, so
+callbacks — which are JIT-generated and x86-64-only — are not needed), loading a
+dumped image rather than an embedded source string, and arm64, where there is no
+native JIT.

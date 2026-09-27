@@ -3584,6 +3584,9 @@
 
 (defun directory-namestring (p)
   "The directory portion of pathname P as a string."
+  #+windows
+  (return-from directory-namestring
+    (namestring (make-pathname :defaults (pathname p) :name nil :type nil :version nil)))
   (let* ((p (pathname p))
          (dir (pathname-directory p)))
     (if (null dir)
