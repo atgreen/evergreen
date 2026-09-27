@@ -26376,7 +26376,20 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 )));
             }
             let (inst_form, _) = cp(cdr);
-            let inst = eval_form(inst_form, env)?;
+            // Root the object across the applicable-method search below.
+            // `has_applicable_method` roots its OWN copy of the arguments, which
+            // does nothing for the caller's, and its doc comment says
+            // applicability "resolves symbols/classes and can allocate" — so a
+            // bare local here would be relying on that not happening. It happens
+            // not to today: for a NON-instance argument (all this branch sees)
+            // specificity takes the built-in type-table path and never interns,
+            // and the slot symbol the fall-through resolves was interned by the
+            // DEFCLASS. So this is the invariant held deliberately rather than a
+            // reproduced failure — the assumption is one line away from being
+            // false, and the object is frequently a STRING designator, which
+            // moves (bliss-zfma; the same shape as bliss-phgt, where the
+            // equivalent window WAS open and silently wrong).
+            torcl_rt::rooted!(inst = eval_form(inst_form, env)?);
             // A reader on a non-instance defers to an applicable explicit method
             // (e.g. ASDF's system-source-file on STRING/SYMBOL); read_slot_value
             // itself yields NIL for a non-instance rather than crashing. The
@@ -26385,8 +26398,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             // find designator methods registered under the defining package's
             // spelling, or the defer check silently misses and the reader
             // returns NIL (bliss-d0b: ASDF:SYSTEM-SOURCE-FILE on :quri).
-            if !torcl_stdlib::is_instance(inst) {
-                let args = [inst];
+            if !torcl_stdlib::is_instance(*inst) {
+                let mut args = vec![*inst];
+                torcl_rt::rooted_ref!(_args_root = &mut args);
                 let method_key = {
                     let methods = env.methods.borrow();
                     if methods.contains_key(&name) {
@@ -26404,7 +26418,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     }
                 }
             }
-            return read_slot_value(inst, resolve_sym(&slot_name).unwrap_or(NIL), env);
+            // RESOLVE_SYM interns, which can allocate and therefore move INST,
+            // and Rust evaluates a call's first argument BEFORE the second — so
+            // resolve the slot symbol first and read INST back through its root
+            // afterwards, rather than handing over a copy taken beforehand.
+            let slot_sym = resolve_sym(&slot_name).unwrap_or(NIL);
+            return read_slot_value(*inst, slot_sym, env);
         }
 
         // Check methods
