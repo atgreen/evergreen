@@ -451,16 +451,23 @@ fn file_read_byte_raw(
 }
 
 /// Flush a write buffer to file.
-fn file_flush_write_buf(
-    file: &mut StreamHandle,
-    write_buf: &mut Vec<u8>,
-) -> Result<(), TorclError> {
-    if !write_buf.is_empty() {
-        file.write_all(write_buf)
-            .map_err(|e| TorclError::StreamError(format!("file write error: {}", e)))?;
-        write_buf.clear();
-    }
-    Ok(())
+fn file_flush_write_buf(file: &mut impl Write, write_buf: &mut Vec<u8>) -> Result<(), TorclError> {
+    let mut written = 0;
+    let result = loop {
+        if written == write_buf.len() {
+            break Ok(());
+        }
+        match file.write(&write_buf[written..]) {
+            Ok(0) => break Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        }
+    };
+    // A retry must not duplicate the prefix already accepted by the OS.
+    // Keep the unwritten suffix even when the error aborts CLOSE or FINISH-OUTPUT.
+    write_buf.drain(..written);
+    result.map_err(|e| TorclError::StreamError(format!("file write error: {e}")))
 }
 
 // ── Helper: extract string as &str for character-index slicing ────
@@ -1176,9 +1183,19 @@ impl GrayStream for StreamMutableState {
             col,
             unread,
             ..
+        }
+        | StreamInner::FileInput {
+            file,
+            read_buf,
+            buf_pos,
+            buf_fill,
+            line,
+            col,
+            unread,
+            ..
         } = &mut self.inner
         {
-            if matches!(file, StreamHandle::Socket(_)) {
+            if matches!(file, StreamHandle::Socket(_) | StreamHandle::Pipe(_)) {
                 // Do not flush pending writes: a NO-HANG input call must not
                 // block on a peer that has stopped reading our output.
                 return file_read_char_buffered(
@@ -1975,7 +1992,7 @@ pub fn close(stream: TorclVal, abort: bool) -> Result<(), TorclError> {
                 | StreamInner::FileIo {
                     file, write_buf, ..
                 } => {
-                    let _ = file_flush_write_buf(file, write_buf);
+                    file_flush_write_buf(file, write_buf)?;
                 }
                 _ => {}
             }
@@ -2256,7 +2273,15 @@ pub fn file_position(stream: TorclVal) -> Result<TorclVal, TorclError> {
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::FileInput {
@@ -2332,7 +2357,15 @@ pub fn set_file_position(stream: TorclVal, position: TorclVal) -> Result<TorclVa
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::FileInput {
@@ -2416,7 +2449,15 @@ pub fn set_file_position_to_end(stream: TorclVal) -> Result<TorclVal, TorclError
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::StringInput {
@@ -2490,7 +2531,15 @@ pub fn file_length_fn(stream: TorclVal) -> Result<TorclVal, TorclError> {
         torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
             StreamInner::FileIo {
-                file: StreamHandle::Socket(_),
+                file: StreamHandle::Socket(_) | StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileInput {
+                file: StreamHandle::Pipe(_),
+                ..
+            }
+            | StreamInner::FileOutput {
+                file: StreamHandle::Pipe(_),
                 ..
             } => Ok(NIL),
             StreamInner::FileInput { file, .. }
@@ -2733,6 +2782,64 @@ fn socket_stream(stream: TcpStream) -> TorclVal {
     )
 }
 
+// Transfer ownership through the platform's safe owned-handle conversion.
+#[cfg(unix)]
+use std::os::fd::OwnedFd as OwnedPipe;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedPipe;
+
+/// Own the child's stdin as a buffered output stream. Closing it sends EOF.
+pub fn process_stdin_stream(
+    pipe: std::process::ChildStdin,
+    element_type: StreamElementType,
+) -> TorclVal {
+    alloc_stream(
+        element_type,
+        StreamInner::FileOutput {
+            file: StreamHandle::pipe(std::fs::File::from(OwnedPipe::from(pipe))),
+            write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+            external_format: ExternalFormat::Utf8,
+            line: 0,
+            col: 0,
+        },
+        vec![],
+    )
+}
+
+/// Own the child's stdout as a nonseekable buffered input stream.
+pub fn process_stdout_stream(
+    pipe: std::process::ChildStdout,
+    element_type: StreamElementType,
+) -> TorclVal {
+    process_input_stream(OwnedPipe::from(pipe), element_type)
+}
+
+/// Own the child's stderr independently so callers can drain both outputs.
+pub fn process_stderr_stream(
+    pipe: std::process::ChildStderr,
+    element_type: StreamElementType,
+) -> TorclVal {
+    process_input_stream(OwnedPipe::from(pipe), element_type)
+}
+
+fn process_input_stream(pipe: OwnedPipe, element_type: StreamElementType) -> TorclVal {
+    alloc_stream(
+        element_type,
+        StreamInner::FileInput {
+            file: StreamHandle::pipe(std::fs::File::from(pipe)),
+            read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+            buf_pos: 0,
+            buf_fill: 0,
+            line: 0,
+            col: 0,
+            unread: None,
+            external_format: ExternalFormat::Utf8,
+            element_type,
+        },
+        vec![],
+    )
+}
+
 // Duplicate under the stream lock so CLOSE cannot invalidate an option call.
 fn socket_option_handle(stream: TorclVal) -> Result<TcpStream, TorclError> {
     torcl_rt::rooted!(stream = stream);
@@ -2872,4 +2979,59 @@ pub fn two_way_stream_output_stream(stream: TorclVal) -> Option<TorclVal> {
 #[cfg(windows)]
 pub fn stream_raw_fd(_stream: TorclVal) -> Option<i32> {
     None
+}
+
+#[cfg(test)]
+mod output_flush_tests {
+    use super::file_flush_write_buf;
+    use std::collections::VecDeque;
+    use std::io::{self, Write};
+
+    struct ShortWriter {
+        steps: VecDeque<io::Result<usize>>,
+        delivered: Vec<u8>,
+    }
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = self.steps.pop_front().unwrap_or(Ok(bytes.len()))?;
+            assert!(count <= bytes.len());
+            self.delivered.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_flush_retains_only_the_unwritten_suffix() {
+        let mut writer = ShortWriter {
+            steps: VecDeque::from([
+                Ok(3),
+                Err(io::ErrorKind::Interrupted.into()),
+                Ok(2),
+                Err(io::ErrorKind::WouldBlock.into()),
+            ]),
+            delivered: Vec::new(),
+        };
+        let mut pending = b"abcdefghi".to_vec();
+        assert!(file_flush_write_buf(&mut writer, &mut pending).is_err());
+        assert_eq!(writer.delivered, b"abcde");
+        assert_eq!(pending, b"fghi");
+        file_flush_write_buf(&mut writer, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(writer.delivered, b"abcdefghi");
+    }
+
+    #[test]
+    fn zero_write_is_an_error_and_preserves_pending_bytes() {
+        let mut writer = ShortWriter {
+            steps: VecDeque::from([Ok(0)]),
+            delivered: Vec::new(),
+        };
+        let mut pending = b"pending".to_vec();
+        assert!(file_flush_write_buf(&mut writer, &mut pending).is_err());
+        assert_eq!(pending, b"pending");
+        assert!(writer.delivered.is_empty());
+    }
 }
