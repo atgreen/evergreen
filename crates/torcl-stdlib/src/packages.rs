@@ -72,12 +72,29 @@ type HashSet<T> = std::collections::HashSet<T, FxBuild>;
 
 // ── Internal package data ─────────────────────────────────────────
 
-thread_local! {
-    static CURRENT_STORE: RefCell<Option<Arc<RegistryStore>>> = const { RefCell::new(None) };
-}
+static CURRENT_STORE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<Arc<RegistryStore>>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn swap_current_store(new_store: Option<Arc<RegistryStore>>) -> Option<Arc<RegistryStore>> {
     CURRENT_STORE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new_store))
+}
+
+/// A shareable package namespace inherited by a new Lisp execution.
+#[derive(Clone)]
+pub struct PackageContext(Arc<RegistryStore>);
+impl PackageContext {
+    pub fn capture() -> Result<Self, TorclError> {
+        current_store().map(Self)
+    }
+    pub fn activate(&self) -> ActivePackageRegistryGuard {
+        ActivePackageRegistryGuard {
+            previous_store: swap_current_store(Some(self.0.clone())),
+        }
+    }
+}
+pub fn has_active_registry() -> bool {
+    CURRENT_STORE.with(|slot| slot.borrow().is_some())
 }
 
 struct RegistryStore {
@@ -690,15 +707,8 @@ impl Default for PackageRegistry {
 
 impl Drop for PackageRegistry {
     fn drop(&mut self) {
-        // Use `try_with`: at thread/process teardown the CURRENT_STORE
-        // thread-local may already be destroyed (a PackageRegistry lives *in*
-        // CURRENT_STORE, so its drop can run during that same TLS's
-        // destruction). `with` would panic there — `cannot access a Thread
-        // Local Storage value during or after destruction` — and a panic in a
-        // drop glue on a worker thread aborts the whole process (surfaced when
-        // spawning native threads, bliss-q9i1). There is nothing to restore once
-        // the TLS is gone, so silently skip. (Normal, non-teardown drops still
-        // restore the previous store.)
+        // Native execution retirement may precede this registry's TLS drop.
+        // Restore only an existing live slot; never revive retired host state.
         let _ = CURRENT_STORE.try_with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot
@@ -714,7 +724,7 @@ impl Drop for PackageRegistry {
 impl Drop for ActivePackageRegistryGuard {
     fn drop(&mut self) {
         let previous_store = self.previous_store.take();
-        let _ = swap_current_store(previous_store);
+        let _ = CURRENT_STORE.try_with(|cell| *cell.borrow_mut() = previous_store);
     }
 }
 

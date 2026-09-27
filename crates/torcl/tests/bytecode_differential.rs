@@ -380,6 +380,9 @@ fn control_flow_programs_run_on_bytecode() {
             .arg(program)
             .env("TORCL_BACKEND", "bytecode")
             .env("TORCL_BYTECODE_TRACE", "1")
+            // Definition-only cases must compile eagerly; otherwise the last
+            // trace can belong to a bootstrap library instead of this program.
+            .env("TORCL_LAZY_COMPILE", "0")
             .output()
             .expect("spawn");
         let stderr = String::from_utf8_lossy(&out.stderr);

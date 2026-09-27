@@ -22,11 +22,10 @@ pub fn set_print_object_hook(hook: Option<PrintObjectHook>) {
     *PRINT_OBJECT_HOOK.lock().unwrap() = hook;
 }
 
-thread_local! {
-    /// Structural nesting depth for *PRINT-LEVEL* (0 at the top level).
-    /// Incremented around each list body; balanced, so it returns to 0.
-    static PRINT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+/// Structural nesting depth for *PRINT-LEVEL* (0 at the top level).
+/// Incremented around each list body; balanced, so it returns to 0.
+static PRINT_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 fn dispatch_print_object(v: TorclVal, escapep: bool) -> Option<String> {
     let hook = *PRINT_OBJECT_HOOK.lock().unwrap();
@@ -368,12 +367,8 @@ pub fn print_gensym() -> bool {
 //   per cons, whether to emit a `#N=` label (first visit of a shared node),
 //   a `#N#` back-reference (subsequent visit — do NOT recurse), or nothing.
 //
-// The table keys on raw addresses, holds no `TorclVal` roots, and is only
-// valid while a single print is in flight — printing plain lists/vectors does
-// not allocate, so nothing moves. (A user `print-object` method that both
-// allocates and is reached under `*print-circle*` t could invalidate an
-// address; that exotic combination is out of scope and matches the pre-existing
-// assumption that the printers deref cons pointers directly.)
+// Circle identities are relocated by the root scanner, including tables
+// belonging to fibers suspended inside a user PRINT-OBJECT method.
 
 /// What to emit for a given cons under `*print-circle*`.
 pub enum CircleMark {
@@ -455,18 +450,43 @@ impl CircleTable {
     }
 }
 
-thread_local! {
-    static CIRCLE: std::cell::RefCell<Option<CircleTable>> =
-        const { std::cell::RefCell::new(None) };
-    /// Re-entrancy depth so the table is built once at the outermost print and
-    /// torn down when it returns, even though the printers recurse through the
-    /// same entry points.
-    static CIRCLE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+static CIRCLE: torcl_rt::execution_local::ExecutionLocal<std::cell::RefCell<Option<CircleTable>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::RefCell::new(None) })
+};
+/// Re-entrancy depth so the table is built once at the outermost print and
+/// torn down when it returns, even though the printers recurse through the
+/// same entry points.
+static CIRCLE_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 /// Enter a (possibly nested) print. At the outermost level, build the circle
 /// table from `root` if `*print-circle*` is active. Pair with [`circle_exit`].
 pub fn circle_enter(root: TorclVal) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        torcl_rt::gc::register_root_scanner(|visit| {
+            // SAFETY: all mutators are stopped while registered scanners run.
+            unsafe {
+                CIRCLE.scan(|slot| {
+                    if let Some(table) = slot.borrow_mut().as_mut() {
+                        let mut counts = std::collections::HashMap::new();
+                        let mut labels = std::collections::HashMap::new();
+                        for (address, count) in table.counts.drain() {
+                            let mut value = TorclVal::from_cons_ptr(address as *mut u8);
+                            visit(&mut value);
+                            let relocated = value.as_ptr() as usize;
+                            counts.insert(relocated, count);
+                            if let Some(label) = table.labels.remove(&address) {
+                                labels.insert(relocated, label);
+                            }
+                        }
+                        table.counts = counts;
+                        table.labels = labels;
+                    }
+                })
+            };
+        })
+    });
     let d = CIRCLE_DEPTH.with(|c| {
         let n = c.get() + 1;
         c.set(n);
@@ -529,13 +549,13 @@ pub fn fixnum_to_radix(n: i64, radix: u32) -> String {
     format_integer(n, radix, false, false, 0, ' ', ',', 3)
 }
 
-thread_local! {
-    // Set while printing a rational's numerator/denominator so those integer
-    // components are NOT individually radix-decorated: a ratio takes a single
-    // leading radix specifier around the whole `num/den`, not a per-part
-    // decoration (CLHS 22.1.3.1.1; bliss-6i2z).
-    static SUPPRESS_INT_RADIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+// Set while printing a rational's numerator/denominator so those integer
+// components are NOT individually radix-decorated: a ratio takes a single
+// leading radix specifier around the whole `num/den`, not a per-part
+// decoration (CLHS 22.1.3.1.1; bliss-6i2z).
+static SUPPRESS_INT_RADIX: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
 
 /// The current `*PRINT-RADIX*` flag, read from the value cell via `find_index`
 /// (like [`print_base`]). Defaults to NIL. bliss-6i2z.
@@ -1293,9 +1313,10 @@ fn torclval_to_print_inner(v: TorclVal, escapep: bool) -> String {
 /// than as a condition object (bliss-egj6 sweep).
 fn format_instance(v: TorclVal, escapep: bool) -> String {
     use std::cell::Cell;
-    thread_local! {
-        static DEPTH: Cell<u32> = const { Cell::new(0) };
-    }
+
+    static DEPTH: torcl_rt::execution_local::ExecutionLocal<Cell<u32>> =
+        unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
+
     if DEPTH.with(|d| d.get()) > 8 {
         return instance_class_tag(v);
     }
@@ -1398,7 +1419,7 @@ fn format_cons(v: TorclVal, escapep: bool) -> String {
         }
     }
     out.push('(');
-    let mut current = v;
+    torcl_rt::rooted!(current = v);
     let mut count = 0usize;
     let mut first = true;
     loop {
@@ -1406,9 +1427,9 @@ fn format_cons(v: TorclVal, escapep: bool) -> String {
             // A shared/circular cons reached in the cdr position prints as a
             // dotted tail so its own #N=/#N# label appears (the head cons,
             // `first`, was already labelled above).
-            if !first && circle && circle_is_shared(current) {
+            if !first && circle && circle_is_shared(*current) {
                 out.push_str(" . ");
-                out.push_str(&torclval_to_print_string(current, escapep));
+                out.push_str(&torclval_to_print_string(*current, escapep));
                 break;
             }
             if limit.is_some_and(|n| count >= n) {
@@ -1424,7 +1445,8 @@ fn format_cons(v: TorclVal, escapep: bool) -> String {
                     out.push(' ');
                 }
                 out.push_str(&torclval_to_print_string((*ptr).car, escapep));
-                current = (*ptr).cdr;
+                // PRINT-OBJECT may allocate or suspend; reload the relocated cons.
+                *current = (*(current.as_ptr() as *const torcl_rt::object::ConsCell)).cdr;
             }
             count += 1;
             first = false;
@@ -1432,7 +1454,7 @@ fn format_cons(v: TorclVal, escapep: bool) -> String {
             break;
         } else {
             out.push_str(" . ");
-            out.push_str(&torclval_to_print_string(current, escapep));
+            out.push_str(&torclval_to_print_string(*current, escapep));
             break;
         }
     }
@@ -3646,9 +3668,9 @@ pub enum NewlineKind {
 /// Tracks the current indentation in columns; used by pprint_indent
 /// and consumed when newlines are emitted.
 use std::cell::Cell;
-thread_local! {
-    static PPRINT_INDENT_LEVEL: Cell<i32> = const { Cell::new(0) };
-}
+
+static PPRINT_INDENT_LEVEL: torcl_rt::execution_local::ExecutionLocal<Cell<i32>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
 
 /// Adjust indentation (PPRINT-INDENT). R5.41.
 pub fn pprint_indent(relative: bool, n: i32, _stream: TorclVal) -> Result<(), TorclError> {

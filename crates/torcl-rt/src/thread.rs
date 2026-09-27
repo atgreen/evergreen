@@ -70,17 +70,25 @@ struct FiberExecutionContext {
     // The fiber's saved stack pointer. Updated in place each time the fiber
     // suspends (crate::context::swap writes through this cell).
     context: Box<UnsafeCell<crate::context::Context>>,
-    _native_stack: Box<[u8]>,
+    _native_stack: TorclStack,
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
 impl FiberExecutionContext {
-    fn new() -> Result<Self, TorclError> {
-        const NATIVE_STACK_SIZE: usize = 512 * 1024;
-        let mut native_stack = vec![0_u8; NATIVE_STACK_SIZE].into_boxed_slice();
+    fn new(stack_size: usize) -> Result<Self, TorclError> {
+        let native_stack = TorclStack::new(stack_size);
+        let page = crate::syscall::page_size();
+        let guard = unsafe { native_stack.base().sub(page) as *mut u8 };
+        // TorclStack protects the high end for upward-growing Lisp frames.
+        // A host stack grows downward, so protect the low reservation too.
+        unsafe { crate::syscall::mprotect(guard, page, crate::syscall::PROT_NONE) }
+            .map_err(|error| TorclError::Internal(format!("fiber stack guard: {error}")))?;
+        crate::runtime::register_sigsegv_stack_guard_range(guard as usize, page);
         // Portable context switch (no libc ucontext): lay down an initial frame
         // on the native stack that enters the trampoline on first swap-in.
-        let sp = crate::context::make(&mut native_stack, fiber_context_trampoline);
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(native_stack.base() as *mut u8, stack_size) };
+        let sp = crate::context::make(bytes, fiber_context_trampoline);
         Ok(Self {
             context: Box::new(UnsafeCell::new(sp)),
             _native_stack: native_stack,
@@ -92,12 +100,20 @@ impl FiberExecutionContext {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", unix))]
+impl Drop for FiberExecutionContext {
+    fn drop(&mut self) {
+        let low = self._native_stack.base() as usize - crate::syscall::page_size();
+        crate::runtime::unregister_sigsegv_stack_guard_range(low);
+    }
+}
+
 #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 struct FiberExecutionContext;
 
 #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 impl FiberExecutionContext {
-    fn new() -> Result<Self, TorclError> {
+    fn new(_stack_size: usize) -> Result<Self, TorclError> {
         Ok(Self)
     }
 }
@@ -626,6 +642,7 @@ pub struct NativeThread {
     published_sp: AtomicUsize,
     published_fp: AtomicUsize,
     /// `pthread_t` for directed SIGUSR1 delivery on Unix (zero until mounted).
+    #[cfg(unix)]
     os_thread_id: AtomicUsize,
     pending_signals: AtomicU8,
 }
@@ -685,6 +702,7 @@ impl NativeThread {
             gc_participates: AtomicBool::new(false),
             published_sp: AtomicUsize::new(0),
             published_fp: AtomicUsize::new(0),
+            #[cfg(unix)]
             os_thread_id: AtomicUsize::new(0),
             pending_signals: AtomicU8::new(0),
         }
@@ -948,6 +966,7 @@ impl CurrentNativeThread {
 
 impl Drop for CurrentNativeThread {
     fn drop(&mut self) {
+        crate::execution_local::retire_native(std::thread::current().id());
         crate::safepoint::retire_native_thread(&self.thread);
     }
 }
@@ -1188,12 +1207,14 @@ pub struct Fiber {
     /// The CL function (entry point) this fiber was created to execute.
     entry: AtomicU64,
     state: OrderedMutex<FiberState>,
+    lisp_frames: Mutex<Vec<(usize, String)>>,
     // Unregister roots before either stack is destroyed (field drop order).
     host_roots: crate::gc::FiberRoots,
     native_faults: crate::runtime::FiberFaultState,
     stack: TorclStack,
     continuation: FiberContinuation,
     execution_context: FiberExecutionContext,
+    native_stack_size: usize,
     /// Native return context: a pointer to the carrier's saved-SP cell on Unix,
     /// or its Windows fiber handle. Set on each mount and read on suspension.
     /// Stored on the fiber
@@ -1252,6 +1273,21 @@ impl Fiber {
 
     pub fn continuation(&self) -> &FiberContinuation {
         &self.continuation
+    }
+
+    pub fn native_stack_size(&self) -> usize {
+        self.native_stack_size
+    }
+    pub fn native_stack_bounds(&self) -> Option<(usize, usize)> {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let low = self.execution_context._native_stack.base() as usize;
+            Some((low, low + self.native_stack_size))
+        }
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        {
+            None
+        }
     }
 
     pub fn dynamic_bindings(&self) -> Vec<(TorclVal, TorclVal)> {
@@ -1328,6 +1364,12 @@ impl Fiber {
             self.published_sp.load(Ordering::Acquire),
             self.published_fp.load(Ordering::Acquire),
         )
+    }
+}
+
+impl Drop for Fiber {
+    fn drop(&mut self) {
+        crate::execution_local::retire_fiber(self.id);
     }
 }
 
@@ -1658,6 +1700,7 @@ static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 struct WorkerPool {
     id: u64,
     workers: Vec<Worker>,
+    idle_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Parking coordination for idle workers (separate from the run queues).
     park_mutex: Mutex<()>,
     park_cv: Condvar,
@@ -1696,6 +1739,7 @@ impl WorkerPool {
         WorkerPool {
             id,
             workers,
+            idle_hook: Mutex::new(None),
             park_mutex: Mutex::new(()),
             park_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -1918,6 +1962,11 @@ impl CarrierPool {
         Self { pool }
     }
 
+    pub(crate) fn set_idle_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.pool.idle_hook.lock().unwrap() = hook;
+        self.pool.park_cv.notify_all();
+    }
+
     pub(crate) fn carrier_thread_ids(&self) -> Vec<NativeThreadId> {
         self.pool.carrier_ids()
     }
@@ -1943,6 +1992,10 @@ fn worker_loop(pool: Arc<WorkerPool>, idx: usize) {
         if let Some(task) = pool.pop_or_steal(idx) {
             run_worker_task(&pool, idx, task);
             continue;
+        }
+        let hook = pool.idle_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
         }
         // Nothing runnable: park until woken by a submission or a short timeout.
         // The timeout bounds any wakeup lost in the window between the empty scan
@@ -2133,18 +2186,7 @@ unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), TorclError> {
 
 fn run_fiber_entry(thread: &Fiber) -> Result<TorclVal, TorclError> {
     let entry = thread.entry();
-    let mut result = if entry.is_function() {
-        let fn_addr = entry.0 & !crate::value::TAG_MASK;
-        let func: fn() -> TorclVal = unsafe { std::mem::transmute(fn_addr) };
-        Ok(func())
-    } else if matches!(entry.0, crate::value::NIL_BITS | crate::value::T_BITS) {
-        Ok(entry)
-    } else {
-        Err(TorclError::TypeError {
-            datum: entry,
-            expected: "function".to_string(),
-        })
-    };
+    let mut result = run_entry(entry);
 
     if thread.has_interrupt() {
         result = Ok(thread.take_interrupt().unwrap_or(NIL));
@@ -2171,7 +2213,7 @@ pub fn set_thread_entry_runner(runner: ThreadEntryRunner) {
     let _ = THREAD_ENTRY_RUNNER.set(runner);
 }
 
-fn run_entry(entry: TorclVal) -> Result<TorclVal, TorclError> {
+pub fn run_entry(entry: TorclVal) -> Result<TorclVal, TorclError> {
     if entry.is_function() {
         // A bare native code entry point (`TAG_FUNCTION` = an untagged code
         // address). Interpreted/bytecode function objects are heap objects, not
@@ -2521,6 +2563,20 @@ pub fn thread_yield() {
 
 /// Allocate a fiber in `Created` state. It does not run until submitted.
 pub fn make_fiber(entry: TorclVal) -> Result<FiberId, TorclError> {
+    make_fiber_with_stack_size(entry, 512 * 1024)
+}
+
+/// Allocate a fiber with an explicit native stack reservation in bytes.
+pub fn make_fiber_with_stack_size(
+    entry: TorclVal,
+    stack_size: usize,
+) -> Result<FiberId, TorclError> {
+    if !(64 * 1024..=1024 * 1024 * 1024).contains(&stack_size) {
+        return Err(TorclError::ProgramError(
+            "fiber stack size must be between 64 KiB and 1 GiB".into(),
+        ));
+    }
+
     let id = FiberId(NEXT_FIBER_ID.fetch_add(1, Ordering::Relaxed));
     let result = Arc::new(ThreadResult::new());
     let fiber = Arc::new(Fiber {
@@ -2538,9 +2594,11 @@ pub fn make_fiber(entry: TorclVal) -> Result<FiberId, TorclError> {
             "fiber state",
             FiberState::Created,
         ),
+        lisp_frames: Mutex::new(Vec::new()),
         stack: TorclStack::new(default_stack_size()),
         continuation: FiberContinuation::default(),
-        execution_context: FiberExecutionContext::new()?,
+        execution_context: FiberExecutionContext::new(stack_size)?,
+        native_stack_size: stack_size,
         host_roots: crate::gc::FiberRoots::new(),
         native_faults: crate::runtime::FiberFaultState::default(),
         scheduler_return: AtomicUsize::new(0),
@@ -2707,11 +2765,14 @@ pub fn join_fiber(id: FiberId) -> Result<TorclVal, TorclError> {
 }
 
 pub fn current_fiber() -> Option<&'static Fiber> {
-    ACTIVE_FIBER.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|fiber| unsafe { &*Arc::as_ptr(fiber) })
-    })
+    ACTIVE_FIBER
+        .try_with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|fiber| unsafe { &*Arc::as_ptr(fiber) })
+        })
+        .ok()
+        .flatten()
 }
 
 pub fn current_fiber_id() -> Option<FiberId> {
@@ -2732,6 +2793,96 @@ pub fn fiber_carrier_thread(id: FiberId) -> Option<NativeThreadId> {
         .unwrap()
         .get(&id)
         .and_then(|fiber| fiber.carrier_id())
+}
+
+fn lookup_fiber(id: FiberId) -> Result<Arc<Fiber>, TorclError> {
+    fiber_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| TorclError::ProgramError("unknown fiber".into()))
+}
+pub fn fiber_pin(id: FiberId) -> Result<(), TorclError> {
+    lookup_fiber(id)?.pin();
+    Ok(())
+}
+pub fn fiber_unpin(id: FiberId) -> Result<(), TorclError> {
+    lookup_fiber(id)?.unpin()
+}
+pub fn fiber_can_yield(id: FiberId) -> Result<bool, TorclError> {
+    Ok(lookup_fiber(id)?.can_yield())
+}
+
+/// A tree-walker frame recorded without retaining movable Lisp objects.
+pub struct FiberCallFrame(Option<Arc<Fiber>>);
+impl FiberCallFrame {
+    pub fn enter(name: &str) -> Self {
+        let fiber = current_fiber_id().and_then(|id| lookup_fiber(id).ok());
+        if let Some(fiber) = &fiber {
+            fiber
+                .lisp_frames
+                .lock()
+                .unwrap()
+                .push((current_stack().fp() as usize, name.to_owned()));
+        }
+        Self(fiber)
+    }
+}
+impl Drop for FiberCallFrame {
+    fn drop(&mut self) {
+        if let Some(fiber) = &self.0 {
+            fiber.lisp_frames.lock().unwrap().pop();
+        }
+    }
+}
+
+/// Snapshot an unmounted continuation. None means its stack is still running.
+/// The state lock prevents a worker from mounting the stack during the copy.
+pub fn fiber_backtrace(id: FiberId, count: usize) -> Result<Option<Vec<String>>, TorclError> {
+    let fiber = lookup_fiber(id)?;
+    let mut functions = Vec::new();
+    crate::rooted_ref!(_functions = &mut functions);
+    let mut interpreted;
+    let mut addresses = Vec::new();
+    {
+        let state = fiber.state.lock().unwrap();
+        if fiber.mounted.load(Ordering::Acquire) || *state == FiberState::Running {
+            return Ok(None);
+        }
+        interpreted = fiber.lisp_frames.lock().unwrap().clone();
+        // SAFETY: Arc owns the stack; the mount/state lock excludes a mutator.
+        for frame in
+            unsafe { crate::stack::FrameWalker::new(fiber.stack.published_fp()) }.take(count)
+        {
+            addresses.push(frame as usize);
+            functions.push(unsafe { (*frame).function });
+        }
+        if *state == FiberState::Created && count != 0 {
+            addresses.push(0);
+            functions.push(fiber.entry());
+        }
+    }
+    let mut names = Vec::new();
+    for (address, function) in addresses.into_iter().zip(functions.iter()) {
+        while interpreted
+            .last()
+            .is_some_and(|(anchor, _)| *anchor == address)
+        {
+            names.push(interpreted.pop().unwrap().1);
+        }
+        let name = if crate::function::is_interpreted_function(*function) {
+            crate::function::name(*function)
+        } else {
+            *function
+        };
+        names.push(
+            crate::symbols::symbol_name_of(name).unwrap_or_else(|| "<anonymous function>".into()),
+        );
+    }
+    names.extend(interpreted.into_iter().rev().map(|(_, name)| name));
+    names.truncate(count);
+    Ok(Some(names))
 }
 
 pub fn fiber_yield() -> Result<(), TorclError> {

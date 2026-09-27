@@ -391,9 +391,9 @@ impl Drop for Arena {
 }
 
 // Thread-local arena so alloc functions can be called from anywhere in the evaluator.
-thread_local! {
-    static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
-}
+
+static ARENA: torcl_rt::execution_local::ExecutionLocal<RefCell<Arena>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(Arena::new())) };
 
 thread_local! {
     /// Deterministic call-count profiler (bliss-xgr5, the sb-profile analog):
@@ -605,7 +605,7 @@ fn reset_package_registry() {
 /// `ensure_clos_bootstrapped`: macro / compiler-macro expansion environments
 /// share the caller's live packages rather than wiping them.
 fn ensure_package_registry() {
-    let missing = PACKAGE_REGISTRY.with(|cell| cell.borrow().is_none());
+    let missing = !torcl_stdlib::packages::has_active_registry();
     if missing {
         reset_package_registry();
     }
@@ -626,6 +626,7 @@ fn seed_standard_packages_registry() {
     // compatibility nickname (spec §13.9.1). Fibers get a separate TORCL-FIBER
     // package (bliss-l3wy).
     let _ = torcl_stdlib::make_package("TORCL-THREAD", &["TORCL-THREADS"], &["COMMON-LISP"]);
+    let _ = torcl_stdlib::make_package("TORCL-FIBER", &[], &["COMMON-LISP"]);
     // CLtL2 lexical-environment access (§4.14), the package a portability layer
     // such as trivial-cltl2 USEs — TorCL's counterpart of SB-CLTL2.
     let _ = torcl_stdlib::make_package("TORCL-CLTL2", &[], &["COMMON-LISP"]);
@@ -637,6 +638,7 @@ fn seed_standard_packages_registry() {
         "TORCL-EXT",
         "TORCL-FFI",
         "TORCL-THREAD",
+        "TORCL-FIBER",
         "TORCL-CLTL2",
     ] {
         reader::register_package(name);
@@ -1371,7 +1373,7 @@ pub(in crate::cli) fn accessor_slot_name(env: &Env, accessor: &str) -> Option<St
 
 pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
     let key = format!("(SETF {place_name})");
-    if GLOBAL_SETF_FNS.with(|m| m.borrow().contains_key(&key)) {
+    if with_global_setf_fns(|m| m.borrow().contains_key(&key)) {
         return true;
     }
     // A `(defun (setf place) …)` writer loaded from a `.bfasl` installs its
@@ -1465,7 +1467,7 @@ fn callable_body_inner_ex(
         return Some((fdef.params_form, fdef.body));
     }
     // Global `(setf place)` writers registered by a top-level defun (any file).
-    if let Some(pb) = GLOBAL_SETF_FNS.with(|m| {
+    if let Some(pb) = with_global_setf_fns(|m| {
         m.borrow()
             .get(name)
             .map(|fdef| (fdef.params_form, fdef.body))
@@ -1638,7 +1640,7 @@ fn reject_assignment_to_constant(target: TorclVal) -> Result<(), TorclError> {
         "a keyword"
     } else if !target.is_symbol() {
         "a non-symbol"
-    } else if CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(target))) {
+    } else if with_constant_vars(|c| c.borrow().contains(&sym_name(target))) {
         "a constant defined by DEFCONSTANT"
     } else {
         return Ok(());
@@ -2289,20 +2291,16 @@ struct RestartEntry {
     report: TorclVal,
 }
 
-thread_local! {
-    static NEXT_RESTART_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-    /// One-shot: the restart ids that the NEXT `signal_condition_object` call
-    /// should associate with the condition it signals — set by
-    /// `eval_restart_case` when the restart-case body is a signalling form.
-    static PENDING_SIGNAL_RESTART_IDS: RefCell<Option<Vec<u64>>> = const { RefCell::new(None) };
-}
+/// One-shot: the restart ids that the NEXT `signal_condition_object` call
+/// should associate with the condition it signals — set by
+/// `eval_restart_case` when the restart-case body is a signalling form.
+static PENDING_SIGNAL_RESTART_IDS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<Vec<u64>>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn next_restart_id() -> u64 {
-    NEXT_RESTART_ID.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    })
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 #[derive(Clone)]
@@ -2381,42 +2379,55 @@ static MACRO_FN_CACHE: LazyLock<OrderedMutex<HashMap<String, MacroFnCacheEntry>>
     });
 static MACRO_ENV_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    static CONTROL_VALUES: RefCell<HashMap<String, TorclVal>> = RefCell::new(HashMap::new());
-    /// Stack of the innermost-enclosing LOOP's own implicit-block return token.
-    /// The LOOP `return` clause and `loop-finish` unwind THIS block (nil for an
-    /// unnamed loop, else the named block) — distinct from the Lisp RETURN
-    /// special form, which always targets a lexical `block nil`. `loop named
-    /// foo` establishes only block foo (no implicit nil), so a bare
-    /// `(return x)` in its body escapes to an OUTER nil block (LOOP.13.*).
-    static LOOP_RETURN_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    /// Stack of the innermost-enclosing extended-LOOP's `loop-finish` token.
-    /// `(loop-finish)` stops iteration of that loop and proceeds to its
-    /// `finally` clause + accumulated result (CLHS: local macro established by
-    /// LOOP), distinct from `return` which skips `finally`.
-    static LOOP_FINISH_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    static MACROEXPAND_ENVIRONMENTS: RefCell<HashMap<u64, MacroexpandEnv>> = RefCell::new(HashMap::new());
-    static NEXT_MACROEXPAND_ENVIRONMENT_ID: RefCell<u64> = const { RefCell::new(1) };
-    /// Identity (pointer address) of the lexical frame current at the start of
-    /// each top-level form under evaluation, one entry per active load/eval
-    /// nesting level. A DEFUN closes over its enclosing lexicals only when its
-    /// frame is NOT this base — i.e. it is genuinely nested inside a user binding
-    /// form (LET/FLET/lambda body/…), not merely at the top level of a (possibly
-    /// nested) LOAD, whose frame carries incidental lexical copies (bliss-sdd).
-    static TOPLEVEL_FRAME_BASE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+static CONTROL_VALUES: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<String, TorclVal>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+/// Stack of the innermost-enclosing LOOP's own implicit-block return token.
+/// The LOOP `return` clause and `loop-finish` unwind THIS block (nil for an
+/// unnamed loop, else the named block) — distinct from the Lisp RETURN
+/// special form, which always targets a lexical `block nil`. `loop named
+/// foo` establishes only block foo (no implicit nil), so a bare
+/// `(return x)` in its body escapes to an OUTER nil block (LOOP.13.*).
+static LOOP_RETURN_TOKENS: torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<String>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+/// Stack of the innermost-enclosing extended-LOOP's `loop-finish` token.
+/// `(loop-finish)` stops iteration of that loop and proceeds to its
+/// `finally` clause + accumulated result (CLHS: local macro established by
+/// LOOP), distinct from `return` which skips `finally`.
+static LOOP_FINISH_TOKENS: torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<String>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+static MACROEXPAND_ENVIRONMENTS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u64, MacroexpandEnv>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+static NEXT_MACROEXPAND_ENVIRONMENT_ID: torcl_rt::execution_local::ExecutionLocal<RefCell<u64>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(1)) };
+/// Identity (pointer address) of the lexical frame current at the start of
+/// each top-level form under evaluation, one entry per active load/eval
+/// nesting level. A DEFUN closes over its enclosing lexicals only when its
+/// frame is NOT this base — i.e. it is genuinely nested inside a user binding
+/// form (LET/FLET/lambda body/…), not merely at the top level of a (possibly
+/// nested) LOAD, whose frame carries incidental lexical copies (bliss-sdd).
+static TOPLEVEL_FRAME_BASE: torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<usize>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
 
-    /// Effective-method dispatch cache (bliss-x5y.20). Standard method
-    /// combination with class-only specializers is a pure function of (generic
-    /// name, argument classes): the applicable-method set, its ordering, and the
-    /// around/before/primary/after split never change unless a method or class
-    /// is (re)defined. Recomputing it per call — cloning the whole method vector,
-    /// computing specificity, sorting, and building the effective method — is the
-    /// dominant cost of a method call and made compiling method bodies pointless.
-    /// Cache the four method-id lists (each id is a `from_meta_handle` immediate,
-    /// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
-    /// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
-    static GF_DISPATCH_CACHE: RefCell<HashMap<GfKey, GfDispatchEntry, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
+/// Effective-method dispatch cache (bliss-x5y.20). Standard method
+/// combination with class-only specializers is a pure function of (generic
+/// name, argument classes): the applicable-method set, its ordering, and the
+/// around/before/primary/after split never change unless a method or class
+/// is (re)defined. Recomputing it per call — cloning the whole method vector,
+/// computing specificity, sorting, and building the effective method — is the
+/// dominant cost of a method call and made compiling method bodies pointless.
+/// Cache the four method-id lists (each id is a `from_meta_handle` immediate,
+/// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
+/// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
+static GF_DISPATCH_CACHE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<GfKey, GfDispatchEntry, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+thread_local! {
+
 
     /// Per-generic dispatch metadata memo (bliss-fy37 #3), keyed by the generic's
     /// interned symbol index and stamped with the same GF_DISPATCH_GENERATION as
@@ -2425,33 +2436,32 @@ thread_local! {
     /// iterates every method of the generic, on every dispatch.
     static GF_META_CACHE: RefCell<HashMap<u32, GfMeta, torcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
-
-    /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
-    /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
-    /// `(setf place)` defun is a *global* definition and must survive the
-    /// throwaway child Envs used during compile/load — storing it in a per-Env
-    /// `funs` map lost it across files, so `(setf (place …) v)` in a later file
-    /// failed with "SETF: unsupported place" even though the writer was defined
-    /// (bliss-d0b). FLET-local `(setf place)` writers stay lexical in `Env.funs`.
-    static GLOBAL_SETF_FNS: RefCell<HashMap<String, FunDef>> = RefCell::new(HashMap::new());
-
-    /// Names of variables established by DEFCONSTANT — torcl models a constant as
-    /// an ordinary global binding, so this set is how CONSTANTP (and library code
-    /// like alexandria's DEFINE-CONSTANT, used by babel) can tell a defconstant'd
-    /// symbol from a defparameter.
-    static CONSTANT_VARS: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
-
-    /// Cached `(generation, env)` where `env` holds every global macro in its
-    /// function map. `macroexpand_environment_from_cli` was rebuilding this for
-    /// EVERY compiled form — cloning all of GLOBAL_MACROS and re-augmenting once
-    /// per macro — which dominated load compile time and blocked any per-closure
-    /// macro-aware analysis (bliss-usb2 / bliss-9u6d). The function-map values are
-    /// immediate macro handles (`from_macro_handle`), so this env holds no movable
-    /// GC pointers and is safe to retain across collections without tracing.
-    static CLI_GLOBAL_MACRO_ENV: RefCell<Option<(u64, Arc<MacroexpandEnv>)>> =
-        const { RefCell::new(None) };
 }
+/// Global SETF writers are shared by every execution and scanned once per GC.
+static GLOBAL_SETF_FNS: LazyLock<SharedCell<HashMap<String, FunDef>>> =
+    LazyLock::new(|| SharedCell::new(HashMap::new()));
+/// DEFCONSTANT metadata is process-wide, like the symbol value cells.
+static CONSTANT_VARS: LazyLock<SharedCell<std::collections::HashSet<String>>> =
+    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
+
+fn with_global_setf_fns<R>(f: impl FnOnce(&SharedCell<HashMap<String, FunDef>>) -> R) -> R {
+    f(&GLOBAL_SETF_FNS)
+}
+fn with_constant_vars<R>(f: impl FnOnce(&SharedCell<std::collections::HashSet<String>>) -> R) -> R {
+    f(&CONSTANT_VARS)
+}
+
+/// Cached `(generation, env)` where `env` holds every global macro in its
+/// function map. `macroexpand_environment_from_cli` was rebuilding this for
+/// EVERY compiled form — cloning all of GLOBAL_MACROS and re-augmenting once
+/// per macro — which dominated load compile time and blocked any per-closure
+/// macro-aware analysis (bliss-usb2 / bliss-9u6d). The function-map values are
+/// immediate macro handles (`from_macro_handle`), so this env holds no movable
+/// GC pointers and is safe to retain across collections without tracing.
+type CachedMacroEnvironment = (u64, Arc<MacroexpandEnv>);
+static CLI_GLOBAL_MACRO_ENV: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<CachedMacroEnvironment>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn bump_macro_env_generation() {
     MACRO_ENV_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2593,7 +2603,7 @@ pub(crate) fn global_macro_source(name: &str) -> Option<(TorclVal, TorclVal)> {
 /// e.g. ASDF's `(setf (operate-level) …)`).
 #[allow(dead_code)] // image setf-writer retention API (bliss-cje1); build_image_from_runtime
 pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
-    GLOBAL_SETF_FNS.with(|m| {
+    with_global_setf_fns(|m| {
         m.borrow()
             .keys()
             .filter_map(|k| {
@@ -2610,7 +2620,7 @@ pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
 #[allow(dead_code)] // image setf-writer retention API (bliss-cje1); build_image_from_runtime
 pub(crate) fn global_setf_fn_source(place: &str) -> Option<(TorclVal, TorclVal)> {
     let key = format!("(SETF {place})");
-    GLOBAL_SETF_FNS.with(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
+    with_global_setf_fns(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
 }
 
 // ── Host-registry image hook (bliss-x0f2 M2) ───────────────────────────
@@ -2727,7 +2737,7 @@ fn host_serialize_registries() -> Vec<u8> {
         out.extend_from_slice(&body_raw.to_le_bytes());
     }
     // Setf-functions.
-    let setfs: Vec<(String, Vec<String>, u64, u64)> = GLOBAL_SETF_FNS.with(|m| {
+    let setfs: Vec<(String, Vec<String>, u64, u64)> = with_global_setf_fns(|m| {
         m.borrow()
             .iter()
             .map(|(k, f)| {
@@ -3580,7 +3590,7 @@ fn drain_pending_host_registries(root_frame: &Arc<SharedCell<EnvFrame>>) {
     }
     let setfs = PENDING_HOST_SETF.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (key, params, params_raw, body_raw) in setfs {
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().insert(
                 key,
                 FunDef::plain(
@@ -4304,7 +4314,7 @@ fn torcl_error_to_condition(
         TorclError::StackOverflow(_) => {
             // Control-stack overflow must use the same no-allocation
             // STORAGE-CONDITION payload as heap exhaustion (D5.13 / bliss-7z8).
-            // Env::new reseeds the thread-local pool with CLI-native instances,
+            // Env::new initializes the shared reserve with canonical condition classes,
             // so handler matching still sees the CLI-recognized class.
             torcl_stdlib::acquire_preallocated_storage_condition()?
         }
@@ -7336,24 +7346,26 @@ fn register_frozen_macro_capture(
 }
 
 fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
-    CONTROL_VALUES.with(|values| {
-        for value in values.borrow_mut().values_mut() {
+    // SAFETY: registered root scanners run with all mutators stopped.
+    unsafe {
+        CONTROL_VALUES.scan(|values| {
+            for value in values.borrow_mut().values_mut() {
+                visit(value);
+            }
+        });
+        // The cached `#'<builtin>` wrapper conses (bliss-hb0q). Visiting them is
+        // what lets the cache hold a TorclVal at all: the collector rewrites each
+        // entry in place, so a cached `#'car` stays valid across a relocation
+        // instead of becoming a stale pointer.
+        for value in builtin_wrapper_cache().borrow_mut().values.values_mut() {
             visit(value);
         }
-    });
-    // The cached `#'<builtin>` wrapper conses (bliss-hb0q). Visiting them is
-    // what lets the cache hold a TorclVal at all: the collector rewrites each
-    // entry in place, so a cached `#'car` stays valid across a relocation
-    // instead of becoming a stale pointer.
-    for value in builtin_wrapper_cache().borrow_mut().values.values_mut() {
-        visit(value);
+        MACROEXPAND_ENVIRONMENTS.scan(|environments| {
+            for environment in environments.borrow_mut().values_mut() {
+                environment.visit_gc_roots(visit);
+            }
+        });
     }
-    MACROEXPAND_ENVIRONMENTS.with(|environments| {
-        for environment in environments.borrow_mut().values_mut() {
-            environment.visit_gc_roots(visit);
-        }
-    });
-
     // Shared per-pass visit state (bliss-s56e).
     with_env_visit_state(|state| {
         // Definitions outlive every Env, including the execution that created
@@ -7386,7 +7398,7 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
                 visit_macro_def_roots(definition, state, visit);
             }
         }
-        GLOBAL_SETF_FNS.with(|functions| {
+        with_global_setf_fns(|functions| {
             for definition in functions.borrow_mut().values_mut() {
                 visit_fun_def_roots(definition, visit);
             }
@@ -7502,6 +7514,8 @@ fn foreign_callback_runner(
 /// bliss-nubv. Crucially we use the *non-resetting* constructor:
 /// `reset_clos=true` would wipe the parent thread's classes and packages.
 fn thread_entry_runner(mut entry: TorclVal) -> Result<TorclVal, TorclError> {
+    let _packages = torcl_stdlib::fibers::activate_packages();
+    BOOT_COMPLETE.with(|ready| ready.set(true));
     torcl_rt::rooted_ref!(_entry_root = &mut entry);
     let mut env = Env::new_impl(false, false, false);
     // Root the worker's whole Env in place, exactly as the main thread does at
@@ -7957,33 +7971,6 @@ impl Env {
         ensure_global("*CONDITION-DEFINITIONS*", NIL);
         env.define_local("*BREAK-ON-SIGNALS*", NIL);
 
-        // bliss-5mf: reseed the STORAGE-CONDITION pool with CLI-native instances
-        // whose class the CLI's condition matcher and TYPE-OF recognize (the
-        // stdlib preallocated them under its own hardcoded condition-symbol class,
-        // which the CLI reads back as a different symbol). They stay pinned in the
-        // GC heap and immortal (D5.13). Runs after the env is functional and
-        // before any user code; best-effort — a failure leaves the stdlib pool.
-        {
-            let n = torcl_stdlib::conditions::storage_condition_pool_size();
-            let mut pool = Vec::with_capacity(n);
-            // Each build_condition_instance_impl allocates; the instances
-            // already accumulated in this Rust-local Vec must be rooted across
-            // those allocations or they relocate out from under it (bliss-wlf).
-            torcl_rt::rooted_ref!(_pool_root = &mut pool);
-            let mut ok = true;
-            for _ in 0..n {
-                match build_condition_instance_impl(&mut env, "STORAGE-CONDITION", &[], true) {
-                    Ok(inst) => pool.push(inst),
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                let _ = torcl_stdlib::conditions::set_storage_condition_pool(&pool);
-            }
-        }
         drop(env_guard);
         env
     }
@@ -8459,6 +8446,7 @@ fn eval_named_call_ex(
     // Lisp-aware statistical profiler (bliss-sc4t): this is the tree-walked call
     // path — record the Lisp frame so a sampled stack shows the function, not the
     // interpreter. The guard pops on every exit (return, `?`, non-local).
+    let _fiber_frame = torcl_rt::thread::FiberCallFrame::enter(name);
     let _sf = sprof::Frame::name(name, sprof::TREEWALK);
     sprof::maybe_sample();
     // Clone the FLET function's captured scope out (releasing the env.funs
@@ -8501,11 +8489,8 @@ fn eval_lambda_call_ex(
     parent: Arc<SharedCell<EnvFrame>>,
     control: LexicalControl,
 ) -> Result<TorclVal, TorclError> {
-    // The interim host-stack depth guard (commit ddba528) is retired (nmq.6):
-    // with the bytecode backend the default, deep recursion runs on the
-    // per-green-thread TorclStack and is bounded by TORCL_STACK_SIZE, raising a
-    // catchable STORAGE-CONDITION (R2.20). This tree-walker path is now the
-    // fallback for forms the compiler does not yet handle.
+    let _call_depth = CallDepthGuard::enter()?;
+    // Tree-walker frames consume the fiber's bounded native stack too.
     torcl_rt::rooted!(params_form = params_form);
     torcl_rt::rooted!(body = body);
     rooted_args!(args = args);
@@ -8620,12 +8605,11 @@ fn print_md_nested(base: *const u8, dims: &[usize], start: usize, out: &mut Stri
     consumed
 }
 
-thread_local! {
-    /// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
-    /// Incremented around each list body; balanced, so it returns to 0 after a
-    /// top-level print.
-    static PRINT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+/// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
+/// Incremented around each list body; balanced, so it returns to 0 after a
+/// top-level print.
+static PRINT_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 fn print_val(val: TorclVal, out: &mut String) {
     // Establish the *print-circle* label table at the outermost print so shared
@@ -9063,34 +9047,40 @@ fn princ_val_env(val: TorclVal, env: &mut Env, out: &mut String) {
 }
 
 // ── Symbol name lookup ────────────────────────────────────────────
-thread_local! {
-    /// Interned symbol index -> its name, so the hot call path can borrow a
-    /// name instead of allocating one.
-    ///
-    /// `sym_name` returns an owned `String`, so every interpreted call through a
-    /// symbol callee paid a malloc + copy + free just to obtain a `&str` it uses
-    /// for a few map lookups and drops. A symbol's name only changes when
-    /// RENAME-PACKAGE rewrites its qualifier (`rekey_renamed_symbols`
-    /// invalidates the affected entries on this thread), and the registry pins
-    /// its objects, so the mapping is otherwise stable for the process.
-    /// Indices are dense and small for interned symbols, so a Vec is the right
-    /// shape; uninterned indices (the high range) are not cached.
-    static SYM_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> = const { RefCell::new(Vec::new()) };
 
-    /// The BARE (package-qualifier-stripped, upcased) name, memoized the same
-    /// way and invalidated at the same two points as `SYM_NAME_CACHE`.
-    ///
-    /// `symbol_bare_name` allocates a fresh String on every call — it upcases
-    /// unconditionally, and `trim_start_matches` showed up as the single
-    /// hottest symbol in two unrelated profiles. Operator dispatch called it
-    /// TWICE per evaluated form (the lexical-shadowing test and the
-    /// fixed-arity-builtin guard), and `apply_function` once more per call, so
-    /// an interpreted loop minted several Strings per operator. Under musl,
-    /// whose allocator does not return freed spans to the OS, that churn shows
-    /// up as unbounded RSS growth (bliss-7x7o, bliss-edzd).
-    static SYM_BARE_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> =
-        const { RefCell::new(Vec::new()) };
-}
+/// Interned symbol index -> its name, so the hot call path can borrow a
+/// name instead of allocating one.
+///
+/// `sym_name` returns an owned `String`, so every interpreted call through a
+/// symbol callee paid a malloc + copy + free just to obtain a `&str` it uses
+/// for a few map lookups and drops. A symbol's name only changes when
+/// RENAME-PACKAGE rewrites its qualifier (`rekey_renamed_symbols`
+/// invalidates the affected entries on this thread), and the registry pins
+/// its objects, so the mapping is otherwise stable for the process.
+/// Indices are dense and small for interned symbols, so a Vec is the right
+/// shape; uninterned indices (the high range) are not cached.
+static SYM_NAME_CACHE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<std::rc::Rc<str>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+
+/// The BARE (package-qualifier-stripped, upcased) name, memoized the same
+/// way and invalidated at the same two points as `SYM_NAME_CACHE`.
+///
+/// `symbol_bare_name` allocates a fresh String on every call — it upcases
+/// unconditionally, and `trim_start_matches` showed up as the single
+/// hottest symbol in two unrelated profiles. Operator dispatch called it
+/// TWICE per evaluated form (the lexical-shadowing test and the
+/// fixed-arity-builtin guard), and `apply_function` once more per call, so
+/// an interpreted loop minted several Strings per operator. Under musl,
+/// whose allocator does not return freed spans to the OS, that churn shows
+/// up as unbounded RSS growth (bliss-7x7o, bliss-edzd).
+static SYM_BARE_NAME_CACHE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<std::rc::Rc<str>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
 
 /// The bare name of a SYMBOL value, memoized by symbol index.
 ///
@@ -9316,10 +9306,9 @@ struct DefinitionalRegistries {
     symbol_macros: std::rc::Weak<RefCell<HashMap<u32, TorclVal>>>,
 }
 
-thread_local! {
-    static LIVE_DEFINITIONAL_REGISTRIES: RefCell<Option<DefinitionalRegistries>> =
-        const { RefCell::new(None) };
-}
+static LIVE_DEFINITIONAL_REGISTRIES: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<DefinitionalRegistries>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn resolve_sym(name: &str) -> Option<TorclVal> {
     // An exact registry key resolves to that symbol directly. `name` is often
@@ -10038,31 +10027,44 @@ fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
 // this thread-local. It is set to point at the loop's `&mut Env` only for the
 // duration of each top-level read (during which the outer `env` binding is not
 // otherwise touched) and cleared afterwards. Evaluation is single-threaded.
-thread_local! {
-    static READ_EVAL_ENV: std::cell::Cell<*mut Env> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
-    // Re-entrancy guard for the package-aware symbol resolver. Package lookup
-    // can reach name helpers that read symbols; nested reads must take the
-    // reader's default path rather than recurse into the resolver (bliss-lb6.12).
-    static RESOLVING_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // False while the bootstrap prelude (lib/boot.lisp) is loading, true once it
-    // finishes. The prelude defines the standard library with bare (nominally
-    // COMMON-LISP) symbols in the CL-USER context, so `home_defined_symbol` must
-    // NOT home those into CL-USER; only user-level DEFUN/DEFVAR after boot should
-    // be registered present there (bliss-v15i).
-    static BOOT_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // Printing an instance may dispatch a user `print-object` method, which needs
-    // the live env. Like READ_EVAL_ENV, the print entry points park their `&mut
-    // Env` here for the span of one print. PRINT_ESCAPE carries `*print-escape*`
-    // (prin1/write => true, princ => false) to the dispatched method; the
-    // PRINTING_OBJECT guard stops a method that itself prints another instance
-    // from re-entering dispatch (which would alias the parked `&mut`), so nested
-    // instances fall back to the `#<CLASS>` form.
-    static PRINT_ENV: std::cell::Cell<*mut Env> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
-    static PRINT_ESCAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static PRINTING_OBJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+
+static READ_EVAL_ENV: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<*mut Env>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| {
+        const { std::cell::Cell::new(std::ptr::null_mut()) }
+    })
+};
+// Re-entrancy guard for the package-aware symbol resolver. Package lookup
+// can reach name helpers that read symbols; nested reads must take the
+// reader's default path rather than recurse into the resolver (bliss-lb6.12).
+static RESOLVING_SYMBOL: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
+// False while the bootstrap prelude (lib/boot.lisp) is loading, true once it
+// finishes. The prelude defines the standard library with bare (nominally
+// COMMON-LISP) symbols in the CL-USER context, so `home_defined_symbol` must
+// NOT home those into CL-USER; only user-level DEFUN/DEFVAR after boot should
+// be registered present there (bliss-v15i).
+static BOOT_COMPLETE: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
+// Printing an instance may dispatch a user `print-object` method, which needs
+// the live env. Like READ_EVAL_ENV, the print entry points park their `&mut
+// Env` here for the span of one print. PRINT_ESCAPE carries `*print-escape*`
+// (prin1/write => true, princ => false) to the dispatched method; the
+// PRINTING_OBJECT guard stops a method that itself prints another instance
+// from re-entering dispatch (which would alias the parked `&mut`), so nested
+// instances fall back to the `#<CLASS>` form.
+static PRINT_ENV: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<*mut Env>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| {
+        const { std::cell::Cell::new(std::ptr::null_mut()) }
+    })
+};
+static PRINT_ESCAPE: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(true) })
+};
+static PRINTING_OBJECT: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
 
 /// Print `val` with the given `*print-escape*` value, dispatching user
 /// `print-object` methods for instances by parking `env` for the printer. The
@@ -11378,7 +11380,7 @@ fn rekey_renamed_symbols(env: &Env, renamed: &[(u32, String, String)]) {
         rekey(&mut macros, renamed);
         bump_macro_env_generation();
     }
-    GLOBAL_SETF_FNS.with(|m| rekey(&mut m.borrow_mut(), renamed));
+    with_global_setf_fns(|m| rekey(&mut m.borrow_mut(), renamed));
     // The macro-expander cache is keyed by macro name; entries under the old
     // name are unreachable now — drop them rather than serving stale expanders.
     {
@@ -15801,41 +15803,35 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
             }
             "PROGV" => {
-                // (progv symbols values body*) — evaluate SYMBOLS and VALUES (two
-                // lists), then dynamically bind each symbol to the corresponding
-                // value for the extent of BODY. Excess symbols become unbound;
-                // excess values are ignored (CLHS). Bindings are the symbols'
-                // global value cells, saved and restored (unwind-safe).
+                // PROGV bindings belong to this execution, like LET special
+                // bindings. Preserve the source across evaluating both lists.
                 let (syms_form, rest) = cp(cdr);
-                let (vals_form, body) = cp(rest);
-                let mut syms_v = eval_form(syms_form, env)?;
-                torcl_rt::rooted_ref!(_syms_root = &mut syms_v);
-                let mut vals_v = eval_form(vals_form, env)?;
-                torcl_rt::rooted_ref!(_vals_root = &mut vals_v);
-                let syms = list_to_vec(syms_v);
-                let vals = list_to_vec(vals_v);
-                // The saved old values leave their value cells (a GC root) once we
-                // overwrite them, so they must be rooted across BODY's evaluation.
-                let mut saved_idx: Vec<u32> = Vec::new();
-                torcl_rt::rooted!(saved_val = Vec::<TorclVal>::new());
-                for (i, s) in syms.iter().enumerate() {
-                    if !s.is_symbol() {
-                        continue;
+                let (mut vals_form, mut body) = cp(rest);
+                torcl_rt::rooted_ref!(_vals_form_root = &mut vals_form);
+                torcl_rt::rooted_ref!(_body_root = &mut body);
+                torcl_rt::rooted!(syms_v = eval_form(syms_form, env)?);
+                torcl_rt::rooted!(vals_v = eval_form(vals_form, env)?);
+                let syms = list_to_vec(*syms_v);
+                let vals = list_to_vec(*vals_v);
+                for sym in &syms {
+                    if !sym.is_symbol() || *sym == NIL || *sym == T {
+                        return Err(TorclError::TypeError {
+                            datum: *sym,
+                            expected: "SYMBOL".into(),
+                        });
                     }
-                    let idx = s.as_symbol_index();
-                    let old =
-                        torcl_rt::symbols::symbol_value(idx).unwrap_or(torcl_rt::value::UNBOUND);
-                    saved_idx.push(idx);
-                    saved_val.push(old);
-                    let newv = vals.get(i).copied().unwrap_or(torcl_rt::value::UNBOUND);
-                    torcl_rt::symbols::set_symbol_value(idx, newv);
+                }
+                torcl_rt::rooted!(bindings = Vec::<DynBind>::new());
+                for (i, sym) in syms.iter().enumerate() {
+                    let value = vals.get(i).copied().unwrap_or(torcl_rt::value::UNBOUND);
+                    bindings.push(DynBind::establish(*sym, value));
                 }
                 let result = eval_progn(body, env);
-                for k in (0..saved_idx.len()).rev() {
-                    torcl_rt::symbols::set_symbol_value(saved_idx[k], saved_val[k]);
-                }
+                // Duplicate symbols unwind in reverse binding order.
+                while bindings.pop().is_some() {}
                 return result;
             }
+
             "THROW" => {
                 let (tag_form, rest) = cp(cdr);
                 let (val_form, _) = cp(rest);
@@ -16535,6 +16531,16 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
                 return torcl_stdlib::synchronization::call(&args);
+            }
+            "TORCL::%NATIVE-FIBER" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation(
+                        "fiber runtime access denied".into(),
+                    ));
+                }
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return torcl_stdlib::fibers::call(&args);
             }
             "TORCL::%FOREIGN-MEMORY" => {
                 if env.sandbox {
@@ -17731,7 +17737,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     let (h, _) = cp(v);
                     h.is_symbol() && sym_bare_name_rc(h).as_ref() == "QUOTE"
                 } else if v.is_symbol() {
-                    is_keyword_arg(v) || CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(v)))
+                    is_keyword_arg(v) || with_constant_vars(|c| c.borrow().contains(&sym_name(v)))
                 } else {
                     // Numbers, characters, strings, and other self-evaluating
                     // heap atoms are constant.
@@ -17949,7 +17955,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 if name.is_symbol() {
                     env.set_var_symbol(name, *val);
                     let n = sym_name(name);
-                    CONSTANT_VARS.with(|c| c.borrow_mut().insert(n));
+                    with_constant_vars(|c| c.borrow_mut().insert(n));
                     home_defined_symbol(env, name);
                 }
                 return Ok(*val);
@@ -17962,7 +17968,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 if v.is_symbol() {
-                    CONSTANT_VARS.with(|c| c.borrow_mut().insert(sym_name(v)));
+                    with_constant_vars(|c| c.borrow_mut().insert(sym_name(v)));
                     // DEFCONSTANT routes its name here; home it present INTERNAL
                     // in CL-USER so FIND-SYMBOL reports :INTERNAL (bliss-v15i).
                     home_defined_symbol(env, v);
@@ -18022,6 +18028,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         "KEYWORD:{name}"
                     )))
                 };
+                // GC can rewrite this rooted vector during each allocation;
+                // re-read fields by index instead of retaining a slot reference.
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..slots.len() {
                     // Each of these allocates; build the sub-lists into rooted
                     // Vecs before assembling the plist so a collection mid-build
@@ -18252,7 +18261,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     if tail.is_cons() {
                         let place = cp(tail).0;
                         if place.is_symbol() {
-                            GLOBAL_SETF_FNS.with(|m| {
+                            with_global_setf_fns(|m| {
                                 m.borrow_mut().remove(&name);
                             });
                             if let Some(index) =
@@ -18521,30 +18530,34 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             "WHEN" => {
                 let (test, body) = cp(cdr);
+                torcl_rt::rooted!(body = body);
                 let tv = eval_form(test, env)?;
                 if !tv.is_nil() {
-                    return eval_progn(body, env);
+                    return eval_progn(*body, env);
                 }
                 return Ok(NIL);
             }
             "UNLESS" => {
                 let (test, body) = cp(cdr);
+                torcl_rt::rooted!(body = body);
                 let tv = eval_form(test, env)?;
                 if tv.is_nil() {
-                    return eval_progn(body, env);
+                    return eval_progn(*body, env);
                 }
                 return Ok(NIL);
             }
             "DESTRUCTURING-BIND" => {
                 let (pattern, rest) = cp(cdr);
                 let (value_form, body) = cp(rest);
+                torcl_rt::rooted!(pattern = pattern);
+                torcl_rt::rooted!(body = body);
                 let value = eval_form(value_form, env)?;
                 let parent = Arc::clone(&env.frame);
-                return with_child_frame(env, parent, move |env| {
+                return with_child_frame(env, parent, |env| {
                     // Use the full destructuring binder so &optional/&rest/&key
                     // work in the pattern (not just plain structural matching).
-                    bind_macro_param(pattern, value, env, None)?;
-                    eval_progn(body, env)
+                    bind_macro_param(*pattern, value, env, None)?;
+                    eval_progn(*body, env)
                 });
             }
             "COND" => {
@@ -30569,49 +30582,44 @@ fn sort_sequence(
 // DEFUN, or DEFMETHOD nested in a LET — would copy-on-write into the discarded
 // child and never reach the caller. Keeping one env also lets multiple values
 // and dynamic state flow out of the body naturally.
-thread_local! {
-    // Symbol names proclaimed globally SPECIAL via `(declaim (special x))` /
-    // `(proclaim '(special x))`. Consulted by `is_special_var` (tree-walker) and
-    // `bytecode::is_special_name` (compiler) in addition to the earmuff
-    // convention, so a non-earmuffed proclaimed-special variable `let`-binds
-    // DYNAMICALLY on BOTH backends (bliss-7na). Populated by the
-    // `%PROCLAIM-SPECIAL` builtin.
-    //
-    // Keyed by the FULL (package-qualified) name. It was keyed by the BARE name
-    // to match the earmuff checks, which made proclaiming leak across packages:
-    // `(defvar zzp::zvar 1)` made every package's ZVAR special, so an unrelated
-    // `(let ((zvar 42)) ...)` bound DYNAMICALLY. That is not a near-miss -- it
-    // silently breaks closures, because the binding is unwound on exit:
-    // `(defun mk () (let ((zvar 7)) (lambda () zvar)))` then signalled "unbound
-    // variable: ZVAR" when the closure was called (bliss-eq72).
-    //
-    // The earmuff test stays bare-name -- it is about SPELLING, and `*x*` is
-    // spelled that way in every package. Only the proclaimed set is an identity
-    // question, so only it is keyed by identity. Both lookup sites derive the
-    // key with `sym_name`/`sym_name_rc` from the same interned symbol the
-    // proclamation used, so the two spellings cannot drift.
-    static PROCLAIMED_SPECIAL: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
-}
+// Symbol names proclaimed globally SPECIAL via `(declaim (special x))` /
+// `(proclaim '(special x))`. Consulted by `is_special_var` (tree-walker) and
+// `bytecode::is_special_name` (compiler) in addition to the earmuff
+// convention, so a non-earmuffed proclaimed-special variable `let`-binds
+// DYNAMICALLY on BOTH backends (bliss-7na). Populated by the
+// `%PROCLAIM-SPECIAL` builtin.
+//
+// Keyed by the FULL (package-qualified) name. It was keyed by the BARE name
+// to match the earmuff checks, which made proclaiming leak across packages:
+// `(defvar zzp::zvar 1)` made every package's ZVAR special, so an unrelated
+// `(let ((zvar 42)) ...)` bound DYNAMICALLY. That is not a near-miss -- it
+// silently breaks closures, because the binding is unwound on exit:
+// `(defun mk () (let ((zvar 7)) (lambda () zvar)))` then signalled "unbound
+// variable: ZVAR" when the closure was called (bliss-eq72).
+//
+// The earmuff test stays bare-name -- it is about SPELLING, and `*x*` is
+// spelled that way in every package. Only the proclaimed set is an identity
+// question, so only it is keyed by identity. Both lookup sites derive the
+// key with `sym_name`/`sym_name_rc` from the same interned symbol the
+// proclamation used, so the two spellings cannot drift.
+static PROCLAIMED_SPECIAL: LazyLock<SharedCell<std::collections::HashSet<String>>> =
+    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
 
-thread_local! {
-    /// Symbol indices proclaimed as DECLARATION names — `(proclaim
-    /// '(declaration foo))` / `(declaim (declaration foo))`. CLtL2's
-    /// DECLARATION-INFORMATION is defined only for such names (plus the standard
-    /// ones), so this set is what decides which specifiers a body keeps in
-    /// `Env::active_declarations`. Keyed by symbol identity, like
-    /// `PROCLAIMED_SPECIAL`: two packages' same-spelling names are distinct
-    /// declarations.
-    static PROCLAIMED_DECLARATIONS: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-}
+/// Symbol indices proclaimed as DECLARATION names — `(proclaim
+/// '(declaration foo))` / `(declaim (declaration foo))`. CLtL2's
+/// DECLARATION-INFORMATION is defined only for such names (plus the standard
+/// ones), so this set is what decides which specifiers a body keeps in
+/// `Env::active_declarations`. Keyed by symbol identity, like
+/// `PROCLAIMED_SPECIAL`: two packages' same-spelling names are distinct
+/// declarations.
+static PROCLAIMED_DECLARATIONS: LazyLock<SharedCell<std::collections::HashSet<u32>>> =
+    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
 
-thread_local! {
-    /// Globally proclaimed OPTIMIZE qualities: (quality symbol index, value).
-    /// Latest proclamation of a quality wins, as CLHS 3.3.4 requires of a global
-    /// proclamation. Values are small integers, so no GC roots are involved.
-    static PROCLAIMED_OPTIMIZE: RefCell<Vec<(u32, i64)>> = const { RefCell::new(Vec::new()) };
-}
+/// Globally proclaimed OPTIMIZE qualities: (quality symbol index, value).
+/// Latest proclamation of a quality wins, as CLHS 3.3.4 requires of a global
+/// proclamation. Values are small integers, so no GC roots are involved.
+static PROCLAIMED_OPTIMIZE: LazyLock<SharedCell<Vec<(u32, i64)>>> =
+    LazyLock::new(|| SharedCell::new(Vec::new()));
 
 /// Record `(proclaim '(optimize …))`. `quality` may be a bare symbol, which CLHS
 /// 3.3.4 reads as the value 3.
@@ -30637,19 +30645,17 @@ fn proclaim_optimize(spec: TorclVal) {
         return;
     }
     let idx = quality.as_symbol_index();
-    PROCLAIMED_OPTIMIZE.with(|qualities| {
-        let mut qualities = qualities.borrow_mut();
-        match qualities.iter_mut().find(|(q, _)| *q == idx) {
-            Some(entry) => entry.1 = value,
-            None => qualities.push((idx, value)),
-        }
-    });
+    let mut qualities = PROCLAIMED_OPTIMIZE.borrow_mut();
+    match qualities.iter_mut().find(|(q, _)| *q == idx) {
+        Some(entry) => entry.1 = value,
+        None => qualities.push((idx, value)),
+    }
 }
 
 /// The globally proclaimed OPTIMIZE qualities, as `((quality value) …)`.
 /// Allocates, so it must not run under a live borrow of GC-scanned state.
 fn proclaimed_optimize_list() -> TorclVal {
-    let qualities = PROCLAIMED_OPTIMIZE.with(|qualities| qualities.borrow().clone());
+    let qualities = PROCLAIMED_OPTIMIZE.borrow().clone();
     let mut list = NIL;
     torcl_rt::rooted_ref!(_list_root = &mut list);
     for (quality, value) in qualities.iter().rev() {
@@ -30666,20 +30672,20 @@ fn proclaimed_optimize_list() -> TorclVal {
 fn proclaim_declaration(sym: TorclVal) {
     if sym.is_symbol() {
         let idx = sym.as_symbol_index();
-        PROCLAIMED_DECLARATIONS.with(|d| d.borrow_mut().insert(idx));
+        PROCLAIMED_DECLARATIONS.borrow_mut().insert(idx);
     }
 }
 
 /// Every name proclaimed as a declaration, for `DECLARATION-INFORMATION` of the
 /// standard `DECLARATION` key.
 fn proclaimed_declaration_names() -> Vec<u32> {
-    PROCLAIMED_DECLARATIONS.with(|d| d.borrow().iter().copied().collect())
+    PROCLAIMED_DECLARATIONS.borrow().iter().copied().collect()
 }
 
 /// True when some `(declaration …)` proclamation has been made. Every body entry
 /// tests this first, so a program that proclaims none pays nothing.
 fn any_proclaimed_declarations() -> bool {
-    PROCLAIMED_DECLARATIONS.with(|d| !d.borrow().is_empty())
+    !PROCLAIMED_DECLARATIONS.borrow().is_empty()
 }
 
 /// The leading `(declare (name …))` specifiers of `body` that the environment
@@ -30713,7 +30719,8 @@ fn body_custom_declarations(body: TorclVal) -> Vec<TorclVal> {
             let retain = sym_bare_name_rc(name).as_ref() == "OPTIMIZE"
                 || (any_proclaimed_declarations()
                     && PROCLAIMED_DECLARATIONS
-                        .with(|set| set.borrow().contains(&name.as_symbol_index())));
+                        .borrow()
+                        .contains(&name.as_symbol_index()));
             if retain {
                 found.push(specifier);
             }
@@ -30742,7 +30749,7 @@ fn leave_body_declarations(env: &mut Env, mark: usize) {
 fn proclaim_special(sym: TorclVal) {
     if sym.is_symbol() {
         let full = sym_name_rc(sym).to_string();
-        PROCLAIMED_SPECIAL.with(|s| s.borrow_mut().insert(full));
+        PROCLAIMED_SPECIAL.borrow_mut().insert(full);
     }
 }
 
@@ -30752,7 +30759,7 @@ fn proclaim_special(sym: TorclVal) {
 /// by identity so a proclamation in one package does not make every package's
 /// same-bare-name symbol special (bliss-eq72).
 pub(super) fn is_proclaimed_special(name: &str) -> bool {
-    PROCLAIMED_SPECIAL.with(|s| s.borrow().contains(name))
+    PROCLAIMED_SPECIAL.borrow().contains(name)
 }
 
 /// True if `sym` names a special (dynamically-scoped) variable. torcl follows
@@ -30977,27 +30984,26 @@ fn let_binding_is_dynamic(sym: TorclVal, body_specials: &[u32]) -> bool {
 }
 
 /// RAII guard for a dynamic (special-variable) binding: it saves the symbol's
-/// current global value cell and restores it on drop, so the binding is undone
+/// current execution-local value and restores it on drop, so the binding is undone
 /// on every exit path from the `let` — normal return or an error unwinding
 /// through `?`.
 struct DynBind {
     idx: u32,
-    saved: TorclVal,
+    saved: Option<TorclVal>,
 }
 
 impl DynBind {
     /// Establish a dynamic binding of `sym` to `val`, returning the guard.
     fn establish(sym: TorclVal, val: TorclVal) -> Self {
         let idx = sym.as_symbol_index();
-        let saved = torcl_rt::symbols::symbol_value(idx).unwrap_or(torcl_rt::value::UNBOUND);
-        torcl_rt::symbols::set_symbol_value(idx, val);
+        let saved = torcl_rt::symbols::bind_symbol_value(idx, val);
         DynBind { idx, saved }
     }
 }
 
 impl Drop for DynBind {
     fn drop(&mut self) {
-        torcl_rt::symbols::set_symbol_value(self.idx, self.saved);
+        torcl_rt::symbols::restore_symbol_binding(self.idx, self.saved);
     }
 }
 
@@ -31006,7 +31012,9 @@ impl Drop for DynBind {
 /// drop writes back a relocated — not stale — value (moving GC; bliss-8qf).
 impl torcl_rt::gc::TraceHostRoots for DynBind {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
-        visit(&mut self.saved);
+        if let Some(saved) = self.saved.as_mut() {
+            visit(saved);
+        }
     }
 }
 
@@ -31279,7 +31287,7 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             eprintln!("[setf-dbg] eval_defun registers GLOBAL_SETF_FNS key: {name}");
         }
         let params = extract_params(params_form);
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut()
                 .insert(name, FunDef::plain(params, params_form, body))
         });
@@ -35988,9 +35996,8 @@ fn max_call_depth() -> usize {
     })
 }
 
-thread_local! {
-    static CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+static CALL_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 /// Bounds one Lisp call nesting inside another for its lifetime.
 ///
@@ -36461,6 +36468,7 @@ fn is_builtin_function(name: &str) -> bool {
         // Introspection / devtools
         "DISASSEMBLE"
             | "TORCL::%NATIVE-MUTEX"
+            | "TORCL::%NATIVE-FIBER"
             | "TORCL::%FOREIGN-MEMORY"
             | "TORCL::%FOREIGN-LIBRARY"
             | "TORCL::%FOREIGN-CALLBACK"
@@ -37265,6 +37273,14 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
             torcl_stdlib::ffi::buffered_call(args)
         }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
+        "TORCL::%NATIVE-FIBER" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation(
+                    "fiber runtime access denied".into(),
+                ));
+            }
+            torcl_stdlib::fibers::call(args)
+        }
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
         "DISASSEMBLE" => {
@@ -39313,6 +39329,10 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // homed present in CL-USER (bliss-v15i).
     BOOT_COMPLETE.with(|c| c.set(true));
 
+    if !ca.no_bootstrap && !core_loaded {
+        read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
+    }
+
     // A saved `:executable` binary carries its image appended to itself. Detect
     // and load it like `--image`, but treat the process as that saved program:
     // skip the user init file and run its recorded top-level entry point.
@@ -39957,7 +39977,7 @@ mod host_registry_hook_tests {
         torcl_rt::rooted!(setf_body = arena_cons(*setf_v2, NIL));
         let setf_params_form = *setf_params_form;
         let setf_body = *setf_body;
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().insert(
                 setf_key.into(),
                 FunDef::plain(vec!["V".into()], setf_params_form, setf_body),
@@ -39968,7 +39988,7 @@ mod host_registry_hook_tests {
 
         // Forget our entries, then restore + drain them back.
         global_macro_remove(name);
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().remove(setf_key);
         });
         assert!(
@@ -40005,7 +40025,7 @@ mod host_registry_hook_tests {
 
         // Cleanup so we don't leak into other same-thread tests.
         global_macro_remove(name);
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().remove(setf_key);
         });
     }
@@ -40965,8 +40985,7 @@ mod jtc3_unified_tiering_tests {
 mod jtc5mf_storage_condition_pool_tests {
     use super::*;
 
-    /// bliss-5mf: after Env::new reseeds the STORAGE-CONDITION pool with
-    /// CLI-native instances, a preallocated pool condition carries the *same*
+    /// The stdlib preallocated pool condition carries the *same*
     /// condition class the CLI builds for `(make-condition 'storage-condition)`.
     /// Because TYPE-OF and HANDLER-CASE type matching both derive from that
     /// class, the pooled instance is recognized identically — it reports
@@ -40976,7 +40995,7 @@ mod jtc5mf_storage_condition_pool_tests {
     #[test]
     fn pooled_storage_condition_shares_the_cli_condition_class() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Env::new reseeds the thread-local pool with CLI-native instances.
+        // Env::new initializes the shared reserve.
         let mut env = Env::new(false);
 
         let pooled = torcl_stdlib::acquire_preallocated_storage_condition()
@@ -40991,7 +41010,7 @@ mod jtc5mf_storage_condition_pool_tests {
         );
     }
 
-    /// The reseeded pool instances survive a GC (they are pinned + immortal),
+    /// The shared pool instances survive a GC (they are pinned + immortal),
     /// and re-acquire keeps returning class-correct instances.
     #[test]
     fn pooled_storage_condition_survives_gc_and_stays_recognized() {

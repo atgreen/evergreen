@@ -481,9 +481,9 @@ contract keeps `TORCL-THREADS` only as a deprecated nickname for
 
 ## Fibers
 
-All entries in `TORCL-FIBER` are **Specified**. The Rust scheduler and fiber
-data structures are under active development, but there is no public Lisp
-package or callable fiber object in the bootstrap yet.
+The `TORCL-FIBER` lifecycle, waiting, pinning, and observation APIs are installed
+by the standard bootstrap on x86-64 Unix and Windows. See the
+[fiber manual](manual/fibers.md) for result, timeout, stack-size, and error semantics.
 
 Fibers are lightweight managed executions multiplexed over a scheduler group's
 OS carrier threads. A fiber is not a thread, and `TORCL-THREAD` functions do

@@ -343,7 +343,12 @@ pub fn eval_stack_budget() -> usize {
     #[cfg(windows)]
     {
         let (low, high) = crate::syscall::thread_stack_limits();
-        high.saturating_sub(low).saturating_sub(RED_ZONE)
+        let red_zone = if crate::thread::current_fiber_id().is_some() {
+            128 * 1024
+        } else {
+            RED_ZONE
+        };
+        high.saturating_sub(low).saturating_sub(red_zone)
     }
     #[cfg(not(windows))]
     {
@@ -351,12 +356,11 @@ pub fn eval_stack_budget() -> usize {
     }
 }
 
-thread_local! {
-    /// The shallowest host-stack frame address this thread has probed. The stack
-    /// grows down, so the distance from it to the current frame is how much host
-    /// stack the thread is using.
-    static HOST_STACK_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+/// The shallowest host-stack frame address this thread has probed. The stack
+/// grows down, so the distance from it to the current frame is how much host
+/// stack the thread is using.
+static HOST_STACK_BASE: crate::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { crate::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(0)) };
 
 /// True when this thread has used its whole [`eval_stack_budget`] of HOST (Rust)
 /// stack, so the caller must raise `STORAGE-CONDITION` instead of recursing into
@@ -377,13 +381,25 @@ pub fn host_stack_budget_exhausted() -> bool {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let local = 0usize;
     let probe = std::hint::black_box(&local) as *const usize as usize;
+    if let Some((low, high)) =
+        crate::thread::current_fiber().and_then(|fiber| fiber.native_stack_bounds())
+    {
+        if probe < low || probe > high || probe.saturating_sub(low) < 128 * 1024 {
+            return true;
+        }
+    }
     // Windows threads can have different reservations. Check the actual
     // remaining stack as well as an optional user budget; never let a large
     // override move the guard below the thread's allocation boundary.
     #[cfg(windows)]
     {
         let (low, high) = crate::syscall::thread_stack_limits();
-        if probe < low || probe > high || probe.saturating_sub(low) < 1024 * 1024 {
+        let reserve = if crate::thread::current_fiber().is_some() {
+            128 * 1024
+        } else {
+            1024 * 1024
+        };
+        if probe < low || probe > high || probe.saturating_sub(low) < reserve {
             return true;
         }
     }
@@ -397,11 +413,15 @@ pub fn host_stack_budget_exhausted() -> bool {
         }
         #[cfg(windows)]
         let budget = {
-            thread_local! { static BUDGET: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() }; }
+            static BUDGET: crate::execution_local::ExecutionLocal<std::cell::OnceCell<usize>> =
+                unsafe { crate::execution_local::ExecutionLocal::new(std::cell::OnceCell::new) };
             BUDGET.with(|b| *b.get_or_init(eval_stack_budget))
         };
         #[cfg(not(windows))]
         let budget = *BUDGET.get_or_init(eval_stack_budget);
+        let budget = crate::thread::current_fiber()
+            .map(|fiber| budget.min(fiber.native_stack_size().saturating_sub(128 * 1024)))
+            .unwrap_or(budget);
         recorded - probe > budget
     })
 }

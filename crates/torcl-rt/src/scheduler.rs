@@ -53,6 +53,11 @@ impl SchedulerGroup {
         })
     }
 
+    /// Called on an idle native carrier, outside all scheduler locks.
+    pub fn set_idle_hook(&self, hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        self.pool.set_idle_hook(hook);
+    }
+
     pub fn submit(&self, fiber: FiberId) -> Result<(), TorclError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(TorclError::ProgramError(

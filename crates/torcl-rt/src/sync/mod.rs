@@ -41,6 +41,20 @@ pub fn set_pinned_blocking_action(action: PinnedBlockingAction) {
 }
 
 fn pinned_blocking_action() -> PinnedBlockingAction {
+    if let Some(value) = crate::symbols::find_index("TORCL-FIBER::*PINNED-BLOCKING-ACTION*")
+        .or_else(|| crate::symbols::find_index("TORCL-FIBER:*PINNED-BLOCKING-ACTION*"))
+        .and_then(crate::symbols::symbol_value)
+    {
+        if value == crate::value::NIL {
+            return PinnedBlockingAction::Native;
+        }
+        match crate::symbols::symbol_name_of(value).as_deref() {
+            Some("KEYWORD:WARN") => return PinnedBlockingAction::Warn,
+            Some("KEYWORD:ERROR") => return PinnedBlockingAction::Error,
+            _ => {}
+        }
+    }
+
     match PINNED_BLOCKING_ACTION.load(Ordering::Acquire) {
         1 => PinnedBlockingAction::Warn,
         2 => PinnedBlockingAction::Error,
