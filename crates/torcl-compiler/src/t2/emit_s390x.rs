@@ -1,14 +1,39 @@
 //! System Z emission for the optimized SSA pipeline.
 
-use super::emit::{EmitError, FramedCode};
+use super::emit::{EmitError, FramedCode, RootSyncSite};
 use super::frame_state::{FrameState, FrameStateId, ValueSource};
 use super::ir::{
-    AuxData, Block, BlockCall, Function, InstData, Opcode, TypeBits, Value, ValueRepresentation,
+    AuxData, Block, BlockCall, Function, Inst, InstData, Opcode, TypeBits, Value,
+    ValueRepresentation,
 };
 use super::mach::{Location, RegClass};
 use std::collections::HashMap;
 use torcl_rt::asm_s390x::{Asm, Label};
 use torcl_rt::value::{NIL, T, TorclVal, UNBOUND};
+
+/// C-ABI runtime adapters used by optimized code. `transfer_pending` is a
+/// nonallocating leaf; the primary result is temporarily unrooted during it.
+#[derive(Clone, Copy, Default)]
+pub struct RuntimeCalls {
+    pub call_slice: u64,
+    pub load_global: u64,
+    pub load_function: u64,
+    pub store_global: u64,
+    pub multiple_values: u64,
+    pub transfer_pending: u64,
+}
+
+fn calls_runtime(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Call
+            | Opcode::SymbolValue
+            | Opcode::SymbolFunction
+            | Opcode::SetSymbolValue
+            | Opcode::ClearMv
+            | Opcode::TakeValuesToLocals
+    )
+}
 
 #[derive(Clone, Copy)]
 enum Home {
@@ -27,6 +52,14 @@ struct Emitter<'a> {
     frame_bytes: i32,
     edge_base: i32,
     deopt_base: i32,
+    runtime: RuntimeCalls,
+    activation_slots: u16,
+    root_slots: u16,
+    argument_slots: u16,
+    roots: HashMap<Inst, Vec<Value>>,
+    root_sites: Vec<RootSyncSite>,
+    result_offset: i32,
+    transfer_exit: Option<Label>,
 }
 
 fn unsupported() -> EmitError {
@@ -34,6 +67,121 @@ fn unsupported() -> EmitError {
 }
 
 impl Emitter<'_> {
+    fn runtime_call(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
+        let roots = self
+            .roots
+            .get(&instruction)
+            .ok_or_else(unsupported)?
+            .clone();
+        let root_base = i32::from(self.activation_slots) * 8;
+        let argument_base = root_base + i32::from(self.root_slots) * 8;
+        // Clear unused shadows too: an earlier call may have had more live
+        // roots or arguments. Dead objects need not be retained indefinitely.
+        self.asm.imm64(2, NIL.0);
+        for index in 0..u32::from(self.root_slots) + u32::from(self.argument_slots) {
+            self.asm.store(2, 13, root_base + index as i32 * 8);
+        }
+        for (index, &value) in roots.iter().enumerate() {
+            self.load(value, 2)?;
+            self.asm.store(2, 13, root_base + index as i32 * 8);
+        }
+        let helper = match data.opcode {
+            Opcode::Call => {
+                let AuxData::CallTarget(symbol) = data.aux else {
+                    return Err(unsupported());
+                };
+                for (index, &arg) in data.args.iter().enumerate() {
+                    self.load(arg, 2)?;
+                    self.asm.store(2, 13, argument_base + index as i32 * 8);
+                }
+                self.asm.imm64(2, u64::from(symbol));
+                self.asm.imm64(3, data.args.len() as u64);
+                self.asm.address(4, 13, argument_base);
+                self.asm.imm64(5, 0);
+                self.runtime.call_slice
+            }
+            Opcode::SymbolValue | Opcode::SymbolFunction | Opcode::SetSymbolValue => {
+                let AuxData::SymbolRef(symbol) = data.aux else {
+                    return Err(unsupported());
+                };
+                if data.opcode == Opcode::SetSymbolValue {
+                    self.load(*data.args.first().ok_or_else(unsupported)?, 3)?;
+                }
+                self.asm.imm64(2, u64::from(symbol));
+                match data.opcode {
+                    Opcode::SymbolValue => self.runtime.load_global,
+                    Opcode::SymbolFunction => self.runtime.load_function,
+                    _ => self.runtime.store_global,
+                }
+            }
+            Opcode::ClearMv => {
+                self.asm.imm64(2, NIL.0);
+                self.asm.imm64(3, 0);
+                self.asm.imm64(4, 0);
+                self.runtime.multiple_values
+            }
+            Opcode::TakeValuesToLocals => {
+                let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
+                    return Err(unsupported());
+                };
+                if usize::from(nvars) != data.results.len()
+                    || slot_base
+                        .checked_add(nvars)
+                        .is_none_or(|end| end > self.activation_slots)
+                {
+                    return Err(unsupported());
+                }
+                self.load(*data.args.first().ok_or_else(unsupported)?, 2)?;
+                self.asm.address(3, 13, i32::from(slot_base) * 8);
+                self.asm.imm64(4, u64::from(nvars));
+                self.runtime.multiple_values
+            }
+            _ => return Err(unsupported()),
+        };
+        if helper == 0 {
+            return Err(unsupported());
+        }
+        let offset = self.asm.here();
+        self.asm.imm64(1, helper);
+        self.asm.call_reg(1);
+        self.asm.store(2, 15, self.result_offset);
+        if self.runtime.transfer_pending != 0 {
+            self.asm.imm64(1, self.runtime.transfer_pending);
+            self.asm.call_reg(1);
+            self.asm.imm64(3, 0);
+            self.asm.compare(2, 3);
+            let exit = *self.transfer_exit.get_or_insert_with(|| self.asm.label());
+            self.asm.branch(6, exit);
+        }
+        // Restore roots before assigning results. A dying argument may share
+        // its home with the call result, but must never overwrite that result.
+        for (index, &value) in roots.iter().enumerate() {
+            self.asm.load(2, 13, root_base + index as i32 * 8);
+            self.store(value, 2)?;
+        }
+        if let AuxData::ValuesLocals { slot_base, .. } = data.aux {
+            for (index, &value) in data.results.iter().enumerate() {
+                self.asm
+                    .load(2, 13, (i32::from(slot_base) + index as i32) * 8);
+                self.store(value, 2)?;
+            }
+        } else if let Some(&result) = data.results.first() {
+            self.asm.load(2, 15, self.result_offset);
+            self.store(result, 2)?;
+        }
+        let register_roots = roots
+            .iter()
+            .filter(|value| matches!(self.homes.get(value), Some(Home::Register(_))))
+            .count();
+        self.root_sites.push(RootSyncSite {
+            code_offset: u32::try_from(offset).map_err(|_| unsupported())?,
+            live_roots: roots.len() as u16,
+            register_roots: register_roots as u16,
+            spill_roots: (roots.len() - register_roots) as u16,
+        });
+        Ok(())
+    }
+
     fn load(&mut self, value: Value, register: u8) -> Result<(), EmitError> {
         if let Some(bits) = self.constants.get(&value) {
             self.asm.imm64(register, *bits);
@@ -104,8 +252,11 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    fn instruction(&mut self, data: &InstData) -> Result<(), EmitError> {
+    fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
+        if calls_runtime(data.opcode) {
+            return self.runtime_call(instruction, data);
+        }
         if data
             .results
             .first()
@@ -241,14 +392,30 @@ impl Emitter<'_> {
     }
 }
 
-/// Emit the supported integer SSA operations using the System Z C entry ABI.
-/// Runtime calls, backward CFG edges and unboxed representations currently decline compilation;
-/// precise guard exits serialize all virtual scopes for the shared T0 resume
-/// adapter. That adapter must copy the stream into roots before allocating.
+/// Emit without ordinary runtime adapters. Calls decline compilation; guards
+/// can still serialize virtual scopes for the precise T0 resume adapter.
 pub fn emit_framed(
     function: &Function,
     deopt_t2: u64,
     activation_slots: u16,
+) -> Result<FramedCode, EmitError> {
+    emit_framed_with_runtime(
+        function,
+        deopt_t2,
+        activation_slots,
+        RuntimeCalls::default(),
+    )
+}
+
+/// Emit optimized System Z code with native roots synchronized through extra
+/// activation slots at runtime calls. Precise guard exits serialize virtual
+/// scopes for the T0 adapter, which must root the stream before allocating.
+/// Backward edges still decline until loop polling is implemented.
+pub fn emit_framed_with_runtime(
+    function: &Function,
+    deopt_t2: u64,
+    activation_slots: u16,
+    runtime: RuntimeCalls,
 ) -> Result<FramedCode, EmitError> {
     // Backward edges need a signal/GC poll with synchronized native roots.
     // Until that call path exists, keep these functions in the polling T1
@@ -283,6 +450,14 @@ pub fn emit_framed(
         frame_bytes: 0,
         edge_base: 0,
         deopt_base: 0,
+        runtime,
+        activation_slots,
+        root_slots: 0,
+        argument_slots: 0,
+        roots: HashMap::new(),
+        root_sites: Vec::new(),
+        result_offset: 0,
+        transfer_exit: None,
     };
     for &block in function.block_order() {
         let label = emitter.asm.label();
@@ -340,6 +515,54 @@ pub fn emit_framed(
         };
         emitter.homes.insert(value, home);
     }
+    // The same precise regalloc2 ranges that choose native homes determine
+    // roots at each actual runtime call. Include dying early arguments, and
+    // exclude results that do not exist until the callback returns.
+    for (index, inst) in machine.insts.iter().enumerate() {
+        let Some(source) = inst.source_inst else {
+            continue;
+        };
+        if !calls_runtime(function.inst(source).opcode) {
+            continue;
+        }
+        let after = u32::try_from(index).map_err(|_| unsupported())? * 2 + 1;
+        let mut roots: Vec<Value> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= after && after < range.end
+            })
+            .map(|range| range.vreg)
+            .chain(inst.uses.iter().copied())
+            .filter(|v| v.class == RegClass::Gpr && !inst.defs.contains(v))
+            .map(|v| Value(v.num))
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        roots.sort_by_key(|value| value.0);
+        roots.dedup();
+        emitter.roots.insert(source, roots);
+    }
+    emitter.root_slots = u16::try_from(emitter.roots.values().map(Vec::len).max().unwrap_or(0))
+        .map_err(|_| unsupported())?;
+    emitter.argument_slots = u16::try_from(
+        function
+            .block_order()
+            .iter()
+            .flat_map(|&block| &function.block(block).insts)
+            .map(|&inst| function.inst(inst))
+            .filter(|data| data.opcode == Opcode::Call)
+            .map(|data| data.args.len())
+            .max()
+            .unwrap_or(0),
+    )
+    .map_err(|_| unsupported())?;
+    let shadow_root_slots = emitter
+        .root_slots
+        .checked_add(emitter.argument_slots)
+        .ok_or_else(unsupported)?;
+    activation_slots
+        .checked_add(shadow_root_slots)
+        .ok_or_else(unsupported)?;
     let edge_words = function
         .block_order()
         .iter()
@@ -358,7 +581,7 @@ pub fn emit_framed(
         })
         .max()
         .unwrap_or(0);
-    let frame_words = spill_slots as usize + edge_words + deopt_words;
+    let frame_words = spill_slots as usize + edge_words + deopt_words + 1;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported());
@@ -366,6 +589,7 @@ pub fn emit_framed(
     emitter.frame_bytes = (frame_words * 8) as i32;
     emitter.edge_base = 160 + spill_slots as i32 * 8;
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
+    emitter.result_offset = 160 + (frame_words as i32 - 1) * 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported());
     }
@@ -387,10 +611,15 @@ pub fn emit_framed(
                     *offset = (*offset).min(emitter.asm.here() as u32);
                 }
             }
-            emitter.instruction(data)?;
+            emitter.instruction(instruction, data)?;
         }
     }
     let has_deopt = !emitter.deopts.is_empty();
+    if let Some(exit) = emitter.transfer_exit {
+        emitter.asm.bind(exit);
+        emitter.asm.imm64(2, NIL.0);
+        emitter.epilogue();
+    }
     for (state, label) in std::mem::take(&mut emitter.deopts) {
         emitter.asm.bind(label);
         emitter.deopt(function.frame_states.get(state), deopt_t2)?;
@@ -403,9 +632,9 @@ pub fn emit_framed(
         native_spill_slots: frame_words as u32,
         regalloc_spill_slots: machine.num_spill_slots,
         allocation_edits: machine.allocation_edits.len(),
-        shadow_root_slots: 0,
-        emitted_safepoints: 0,
-        root_sync_sites: Vec::new(),
+        shadow_root_slots,
+        emitted_safepoints: emitter.root_sites.len(),
+        root_sync_sites: emitter.root_sites,
         heap_constant_slots: emitter.heap_constants.values().copied().collect(),
         has_deopt,
     })
@@ -476,6 +705,94 @@ mod tests {
         assert!(code.has_deopt);
         assert_ne!(code.bcp_offsets[9], u32::MAX);
         assert_eq!(code.shadow_root_slots, 0);
+    }
+
+    #[test]
+    fn calls_reload_relocated_register_and_spill_roots_without_losing_results() {
+        thread_local! {
+            static FRAME: std::cell::Cell<(*mut u64, usize)> = const { std::cell::Cell::new((std::ptr::null_mut(), 0)) };
+        }
+        extern "C" fn callback(_: u64, _: u64, _: *const TorclVal, _: u64) -> u64 {
+            FRAME.with(|frame| {
+                let (pointer, count) = frame.get();
+                // Simulate a moving collector updating every scanned slot.
+                for slot in unsafe { std::slice::from_raw_parts_mut(pointer, count) } {
+                    if *slot == 0x4001 {
+                        *slot = 0x5001;
+                    }
+                }
+            });
+            0x9001
+        }
+        for return_original in [true, false] {
+            let mut f = Function::new("z-calling-roots");
+            let block = f.entry();
+            let args: Vec<_> = (0..20)
+                .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
+                .collect();
+            let (_, result) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::Call,
+                    args: args.clone(),
+                    results: vec![],
+                    aux: AuxData::CallTarget(71),
+                    flags: InstFlags {
+                        call: true,
+                        safepoint: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![if return_original { args[0] } else { result[0] }],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            let compiled = emit_framed_with_runtime(
+                &f,
+                0,
+                20,
+                RuntimeCalls {
+                    call_slice: callback as *const () as u64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(compiled.emitted_safepoints, 1);
+            assert_eq!(compiled.root_sync_sites[0].live_roots, 20);
+            assert!(compiled.root_sync_sites[0].spill_roots > 0);
+            assert!(compiled.root_sync_sites[0].register_roots > 0);
+            assert!(compiled.shadow_root_slots >= 40);
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let code = torcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated C-ABI entry, and the
+                // activation includes every shadow slot advertised by it.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let mut slots = vec![0x4001; 20 + compiled.shadow_root_slots as usize];
+                FRAME.with(|frame| frame.set((slots.as_mut_ptr(), slots.len())));
+                assert_eq!(
+                    unsafe { entry(slots.as_mut_ptr()) },
+                    if return_original { 0x5001 } else { 0x9001 }
+                );
+                FRAME.with(|frame| frame.set((std::ptr::null_mut(), 0)));
+            }
+        }
     }
 
     #[test]

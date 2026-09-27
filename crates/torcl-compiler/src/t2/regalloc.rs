@@ -247,7 +247,7 @@ struct Adapter {
 }
 
 impl Adapter {
-    fn build(mf: &MachFunc, call_clobbers: PRegSet) -> Adapter {
+    fn build(mf: &MachFunc, call_clobbers: PRegSet, stack_call_operands: bool) -> Adapter {
         let mut map: HashMap<VReg, usize> = HashMap::new();
         let mut reverse: Vec<VReg> = Vec::new();
         let mut intern = |v: VReg| -> Ra2VReg {
@@ -265,10 +265,37 @@ impl Adapter {
             let mut ops =
                 Vec::with_capacity(inst.defs.len() + inst.uses.len() + inst.deopt_uses.len());
             for &d in &inst.defs {
-                ops.push(Operand::reg_def(intern(d)));
+                if stack_call_operands
+                    && inst.op == crate::t2::lower::op::CALL_RUNTIME
+                    && inst.defs.len() > 1
+                {
+                    // Multiple values are copied from the activation to their
+                    // homes one at a time; they need not all fit in registers.
+                    ops.push(Operand::new(
+                        intern(d),
+                        OperandConstraint::Any,
+                        OperandKind::Def,
+                        OperandPos::Late,
+                    ));
+                } else {
+                    ops.push(Operand::reg_def(intern(d)));
+                }
             }
             for &u in &inst.uses {
-                ops.push(Operand::reg_use(intern(u)));
+                if stack_call_operands && inst.op == crate::t2::lower::op::CALL {
+                    // The System Z framed emitter copies arbitrary-arity call
+                    // arguments from their homes to a scanned slice. Requiring
+                    // every argument in a GPR simultaneously would make calls
+                    // wider than the register bank impossible to allocate.
+                    ops.push(Operand::new(
+                        intern(u),
+                        OperandConstraint::Any,
+                        OperandKind::Use,
+                        OperandPos::Early,
+                    ));
+                } else {
+                    ops.push(Operand::reg_use(intern(u)));
+                }
             }
             // Frame-state liveness extension (bliss-ad1e): a value a deopt may
             // reconstruct must stay locatable AT AND AFTER this instruction —
@@ -538,13 +565,22 @@ pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), RegAllocError> {
     for reg in 0..=7 {
         clobbers.add(PReg::new(reg, Ra2RegClass::Float));
     }
-    allocate_with_env(mf, env, clobbers)
+    allocate_with_call_operands(mf, env, clobbers, true)
 }
 
 fn allocate_with_env(
     mf: &mut MachFunc,
     env: MachineEnv,
     call_clobbers: PRegSet,
+) -> Result<(), RegAllocError> {
+    allocate_with_call_operands(mf, env, call_clobbers, false)
+}
+
+fn allocate_with_call_operands(
+    mf: &mut MachFunc,
+    env: MachineEnv,
+    call_clobbers: PRegSet,
+    stack_call_operands: bool,
 ) -> Result<(), RegAllocError> {
     mf.allocation.clear();
     mf.inst_allocations.clear();
@@ -557,7 +593,7 @@ fn allocate_with_env(
         return Ok(());
     }
 
-    let adapter = Adapter::build(mf, call_clobbers);
+    let adapter = Adapter::build(mf, call_clobbers, stack_call_operands);
 
     let options = RegallocOptions {
         verbose_log: false,
