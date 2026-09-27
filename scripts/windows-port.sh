@@ -38,7 +38,9 @@ scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --te
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib allocator_admission_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib registration_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib join_completion_tests
+scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib idle_carrier_steals_external_work_from_blocked_peer
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test fiber_fault_state --test fiber_preemption_state --test test_scheduler --test test_fiber_sync
+scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_ordered_locks
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_join_gc --test fiber_native_join --test fiber_finish_error --test fiber_join_managed
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_join_gc --test fiber_native_join --test fiber_finish_error --test fiber_join_managed
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test fiber_preemption_state
@@ -56,6 +58,11 @@ scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target
 scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target" --lib windows_t2
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test test_tcp_streams --test test_process -- --test-threads=1
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::fiber_tests
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::fiber_tests
+scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test stream_roots_cli
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling
 child="${CARGO_TARGET_DIR:-target}/$target/release/windows-process-child.exe"
 rustc --edition=2024 --target "$target" scripts/windows-process-child.rs -o "$child"
 scripts/torcl-limited.sh python3 scripts/windows-io-smoke.py "$binary" "$child"

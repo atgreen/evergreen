@@ -79,6 +79,12 @@ images. Ctrl+C and Ctrl+Break request cooperative Lisp interruption.
 
 ## Networking and subprocesses
 
+Stream operations retain exclusive ownership when a fiber parks or migrates.
+Fibers waiting for that ownership park without blocking their carrier, and
+stream handles, composite components, and returned Lisp values remain rooted
+through waits and unlocks. Native runtime mutex guards pin their owning fiber
+until the guard is released.
+
 TCP client and accepted connections are owned bidirectional octet streams.
 The existing `torcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
 `%socket-read-timeout`, and `%socket-wait-for-input` primitives work on Windows.
@@ -93,6 +99,9 @@ stdout, and stderr. A list supplies an executable and its arguments directly;
 a string supplies shell syntax to `COMSPEC` (normally `cmd.exe`) with
 `/D /S /C`. Both output pipes are drained concurrently, and stdin receives EOF.
 Captured bytes are decoded as UTF-8 with replacement for invalid sequences.
+Waiting publishes native callers' GC roots and parks unpinned fibers, allowing
+other fibers to run. Pinned callers follow the configured blocking policy;
+the error policy rejects the operation before starting a child.
 Interactive subprocess streams, asynchronous process management, and alternate
 console code-page decoding are not provided by this API.
 

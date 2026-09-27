@@ -1,0 +1,89 @@
+# Symbol index
+
+This index covers the symbols documented in this manual. It is not an inventory
+of every exported symbol or of all ANSI Common Lisp operators. Entries are
+alphabetized by unqualified name and display their package explicitly.
+
+| Symbol | Reference |
+| --- | --- |
+| `*command-line-args*` | [Dictionary entry](user/reference/extensions.md#command-line-args) |
+| `torcl-thread:all-threads` | [Dictionary entry](concurrency.md#thread-observations) |
+| `torcl-ext:bail-report` | [Dictionary entry](compiler.md#bail-report) |
+| `torcl-ffi:callback-error` | [Dictionary entry](foreign.md#callbacks) |
+| `torcl-ffi:callback-pointer` | [Dictionary entry](foreign.md#callbacks) |
+| `torcl-ext:cancel-finalization` | [Dictionary entry](memory.md#cancel-finalization) |
+| `torcl-ffi:close-foreign-library` | [Dictionary entry](foreign.md#libraries) |
+| `compile` | [Dictionary entry](compiler.md#compile) |
+| `compile-file` | [Dictionary entry](compiler.md#compile-file) |
+| `compile-file-pathname` | [Dictionary entry](compiler.md#compile-file-pathname) |
+| `torcl-thread:condition-broadcast` | [Dictionary entry](concurrency.md#condition-notify) |
+| `torcl-thread:condition-notify` | [Dictionary entry](concurrency.md#condition-notify) |
+| `torcl-thread:condition-variable-p` | [Dictionary entry](concurrency.md#condition-wait) |
+| `torcl-thread:condition-wait` | [Dictionary entry](concurrency.md#condition-wait) |
+| `torcl-thread:current-thread` | [Dictionary entry](concurrency.md#thread-observations) |
+| `torcl-ext:deopt-count` | [Dictionary entry](compiler.md#counters) |
+| `torcl-ext:events-count` | [Dictionary entry](profiling.md#events) |
+| `torcl-ext:events-json` | [Dictionary entry](profiling.md#events) |
+| `torcl-ext:events-report` | [Dictionary entry](profiling.md#events) |
+| `torcl-ext:events-reset` | [Dictionary entry](profiling.md#events) |
+| `torcl-ext:events-start` | [Dictionary entry](profiling.md#events) |
+| `torcl-ext:events-stop` | [Dictionary entry](profiling.md#events) |
+| `torcl-ext:events-summary` | [Dictionary entry](profiling.md#events) |
+| `torcl-ffi:ffi-error` | [Dictionary entry](foreign.md#conditions-and-sandboxing) |
+| `torcl-ext:finalize` | [Dictionary entry](memory.md#finalize) |
+| `torcl-ffi:foreign-alloc` | [Dictionary entry](foreign.md#foreign-alloc) |
+| `torcl-ffi:foreign-call` | [Dictionary entry](foreign.md#foreign-call) |
+| `torcl-ffi:foreign-callback-p` | [Dictionary entry](foreign.md#callbacks) |
+| `torcl-ffi:foreign-free` | [Dictionary entry](foreign.md#foreign-alloc) |
+| `torcl-ffi:foreign-library-p` | [Dictionary entry](foreign.md#libraries) |
+| `torcl-ffi:foreign-symbol-pointer` | [Dictionary entry](foreign.md#libraries) |
+| `torcl-ffi:foreign-type-alignment` | [Dictionary entry](foreign.md#foreign-types) |
+| `torcl-ffi:foreign-type-size` | [Dictionary entry](foreign.md#foreign-types) |
+| `torcl-ffi:free-callback` | [Dictionary entry](foreign.md#callbacks) |
+| `torcl-ext:function-back-edge-count` | [Dictionary entry](compiler.md#counters) |
+| `torcl-ext:function-invoke-count` | [Dictionary entry](compiler.md#counters) |
+| `torcl-ext:function-osr-count` | [Dictionary entry](compiler.md#counters) |
+| `torcl-ext:function-tier` | [Dictionary entry](compiler.md#function-tier) |
+| `torcl-ext:gc` | [Dictionary entry](memory.md#gc) |
+| `torcl-ext:getcwd` | [Dictionary entry](user/reference/extensions.md#getcwd) |
+| `torcl-ext:getenv` | [Dictionary entry](user/reference/extensions.md#getenv) |
+| `torcl-thread:grab-mutex` | [Dictionary entry](concurrency.md#grab-mutex) |
+| `torcl-ffi:inc-pointer` | [Dictionary entry](foreign.md#pointers) |
+| `torcl-thread:join-thread` | [Dictionary entry](concurrency.md#join-thread) |
+| `torcl-ffi:load-foreign-library` | [Dictionary entry](foreign.md#libraries) |
+| `android:log` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
+| `torcl-ffi:make-callback` | [Dictionary entry](foreign.md#callbacks) |
+| `torcl-thread:make-condition-variable` | [Dictionary entry](concurrency.md#condition-wait) |
+| `torcl-thread:make-mutex` | [Dictionary entry](concurrency.md#make-mutex) |
+| `torcl-ffi:make-pointer` | [Dictionary entry](foreign.md#pointers) |
+| `torcl-thread:make-thread` | [Dictionary entry](concurrency.md#make-thread) |
+| `torcl-ffi:mem-ref` | [Dictionary entry](foreign.md#mem-ref) |
+| `torcl-ffi:mem-set` | [Dictionary entry](foreign.md#mem-ref) |
+| `torcl-thread:mutex` | [Dictionary entry](concurrency.md#make-mutex) |
+| `torcl-thread:mutex-p` | [Dictionary entry](concurrency.md#make-mutex) |
+| `torcl-ffi:null-pointer` | [Dictionary entry](foreign.md#pointers) |
+| `torcl-ffi:null-pointer-p` | [Dictionary entry](foreign.md#pointers) |
+| `android:paused-p` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
+| `torcl-ffi:pointer-address` | [Dictionary entry](foreign.md#pointers) |
+| `torcl-ffi:pointer-eq` | [Dictionary entry](foreign.md#pointers) |
+| `torcl-ffi:pointerp` | [Dictionary entry](foreign.md#pointers) |
+| `android:poll-touch` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
+| `torcl-ext:profile` | [Dictionary entry](profiling.md#profile) |
+| `torcl-ext:profile-report` | [Dictionary entry](profiling.md#profile-report) |
+| `torcl-ext:profile-report-calls` | [Dictionary entry](profiling.md#profile) |
+| `torcl-ext:profile-reset` | [Dictionary entry](profiling.md#profile) |
+| `torcl-ext:raw-command-line-arguments` | [Dictionary entry](user/reference/extensions.md#raw-command-line-arguments) |
+| `torcl-thread:release-mutex` | [Dictionary entry](concurrency.md#grab-mutex) |
+| `torcl-ext:run-program` | [Dictionary entry](user/reference/extensions.md#run-program) |
+| `android:running-p` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
+| `save-image-and-die` | [Dictionary entry](user/reference/images.md#save-lisp-and-die) |
+| `save-lisp-and-die` | [Dictionary entry](user/reference/images.md#save-lisp-and-die) |
+| `torcl-ext:sprof-fold` | [Dictionary entry](profiling.md#sprof) |
+| `torcl-ext:sprof-start` | [Dictionary entry](profiling.md#sprof) |
+| `torcl-ext:sprof-stop` | [Dictionary entry](profiling.md#sprof) |
+| `torcl-thread:thread-alive-p` | [Dictionary entry](concurrency.md#thread-observations) |
+| `torcl-thread:thread-name` | [Dictionary entry](concurrency.md#thread-observations) |
+| `torcl-thread:thread-yield` | [Dictionary entry](concurrency.md#thread-observations) |
+| `torcl-ext:unprofile` | [Dictionary entry](profiling.md#profile) |
+| `torcl-thread:with-mutex` | [Dictionary entry](concurrency.md#with-mutex) |
+| `torcl-ffi:with-pointer-to-vector-data` | [Dictionary entry](foreign.md#vector-data) |

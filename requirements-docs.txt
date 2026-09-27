@@ -1,0 +1,3 @@
+# Verified documentation toolchain; install in an isolated virtual environment.
+mkdocs==1.6.1
+mkdocs-material==9.7.7

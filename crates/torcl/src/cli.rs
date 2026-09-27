@@ -763,6 +763,8 @@ fn resolve_input_stream(designator: TorclVal, env: &Env) -> TorclVal {
 
 /// Write a string to a resolved output stream via the stdlib stream API.
 fn write_str_to(stream: TorclVal, s: &str) -> Result<(), TorclError> {
+    let mut stream = stream;
+    torcl_rt::rooted_ref!(_stream_root = &mut stream);
     check_pending_sigpipe_for_output()?;
     let sv = torcl_stdlib::make_lisp_string(s);
     torcl_stdlib::stream_write_string(stream, sv, 0, None)
@@ -994,6 +996,8 @@ fn read_one_form_from_stream_ws(
     env: &mut Env,
     preserve_whitespace: bool,
 ) -> Result<Option<TorclVal>, TorclError> {
+    let mut stream = stream;
+    torcl_rt::rooted_ref!(_stream_root = &mut stream);
     let mut buffer = String::new();
     loop {
         match stream_next_char(stream, env)? {
@@ -1016,7 +1020,8 @@ fn read_one_form_from_stream_ws(
             }
             Some(c) => {
                 buffer.push(c);
-                if let Ok((form, consumed)) = read_from_string_in_env(&buffer, env) {
+                if let Ok((mut form, consumed)) = read_from_string_in_env(&buffer, env) {
+                    torcl_rt::rooted_ref!(_form_root = &mut form);
                     let total = buffer.chars().count();
                     if consumed < total {
                         let mut excess: Vec<char> = buffer.chars().skip(consumed).collect();
@@ -10384,7 +10389,8 @@ fn reader_macro_invoker(
             Err(e) => eprintln!(";; rdmac ERR: {e}"),
         }
     }
-    let result = result?;
+    let mut result = result?;
+    torcl_rt::rooted_ref!(_result_root = &mut result);
     let zero_values = env.mv_active && env.mv.is_empty();
     let consumed = torcl_stdlib::file_position(*stream)?.as_fixnum().max(0) as usize;
     env.clear_mv();
@@ -10405,6 +10411,8 @@ fn reader_plain_macro_invoker(
     text: &str,
     ch: char,
 ) -> Result<(Vec<TorclVal>, usize), TorclError> {
+    let mut handler = handler;
+    torcl_rt::rooted_ref!(_handler_root = &mut handler);
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() {
         return Err(TorclError::StreamError(
@@ -10415,7 +10423,8 @@ fn reader_plain_macro_invoker(
     torcl_rt::rooted!(text_val = arena_str(text));
     torcl_rt::rooted!(stream = torcl_stdlib::make_string_input_stream(*text_val, 0, None)?);
     let char_val = TorclVal::from_char(ch);
-    let result = apply_function(handler, &[*stream, char_val], env)?;
+    let mut result = apply_function(handler, &[*stream, char_val], env)?;
+    torcl_rt::rooted_ref!(_result_root = &mut result);
     let zero_values = env.mv_active && env.mv.is_empty();
     let consumed = torcl_stdlib::file_position(*stream)?.as_fixnum().max(0) as usize;
     env.clear_mv();
@@ -16730,7 +16739,6 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 let inp = resolve_input_stream(args[0], env);
                 let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
-                let eof_value = args.get(2).copied().unwrap_or(NIL);
                 let b = if is_gray_stream(inp) {
                     invoke_generic_function("STREAM-READ-BYTE", &[inp], env)?
                 } else {
@@ -16740,7 +16748,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     if eof_error {
                         return Err(TorclError::StreamError("end of file on READ-BYTE".into()));
                     }
-                    return Ok(eof_value);
+                    return Ok(args.get(2).copied().unwrap_or(NIL));
                 }
                 return Ok(b);
             }
@@ -17114,7 +17122,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let peek_type = args.first().copied().unwrap_or(NIL);
                 let stream = args.get(1).copied().unwrap_or(NIL);
                 let eof_error_p = args.get(2).copied().unwrap_or(T);
-                let in_stream = resolve_input_stream(stream, env);
+                let mut in_stream = resolve_input_stream(stream, env);
+                torcl_rt::rooted_ref!(_stream_root = &mut in_stream);
                 let skip_ws = peek_type == T;
                 let until = if peek_type.is_character() {
                     Some(peek_type.as_char())
@@ -23727,7 +23736,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 if args.is_empty() {
                     return Err(TorclError::Internal("LOAD requires a pathname".into()));
                 }
-                let path_val = args[0];
+                let mut path_val = args[0];
+                torcl_rt::rooted_ref!(_path_root = &mut path_val);
                 // :if-does-not-exist nil → return NIL for a missing file instead
                 // of erroring (CLHS; slynk's load-user-init-file relies on this).
                 let mut if_missing_nil = false;
@@ -24665,8 +24675,10 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     ));
                 }
                 let vals = eval_forms(args.iter().copied(), env)?;
-                let seq = vals[0];
-                let inp = resolve_input_stream(vals[1], env);
+                let mut seq = vals[0];
+                torcl_rt::rooted_ref!(_seq_root = &mut seq);
+                let mut inp = resolve_input_stream(vals[1], env);
+                torcl_rt::rooted_ref!(_input_root = &mut inp);
                 let seq_len = torcl_stdlib::length(seq)?;
                 let (start, end) = read_start_end_keys(&vals[2..], seq_len);
                 let count = end - start;
@@ -24708,26 +24720,38 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     ));
                 }
                 let vals = eval_forms(args.iter().copied(), env)?;
-                let seq = vals[0];
-                let out = resolve_output_stream(vals[1], env);
+                let mut seq = vals[0];
+                torcl_rt::rooted_ref!(_seq_root = &mut seq);
+                let mut out = resolve_output_stream(vals[1], env);
+                torcl_rt::rooted_ref!(_output_root = &mut out);
                 check_pending_sigpipe_for_output()?;
                 let seq_len = torcl_stdlib::length(seq)?;
                 let (start, end) = read_start_end_keys(&vals[2..], seq_len);
-                let elems: Vec<TorclVal> = (start..end)
-                    .map(|i| torcl_stdlib::elt(seq, i))
-                    .collect::<Result<_, _>>()?;
+                let mut elems = Vec::with_capacity(end - start);
+                torcl_rt::rooted_ref!(_elements_root = &mut elems);
+                for i in start..end {
+                    elems.push(torcl_stdlib::elt(seq, i)?);
+                }
                 if is_gray_stream(out) {
-                    for el in &elems {
+                    // GC can update the rooted vector during a child call; do not
+                    // retain an iterator borrow across that call.
+                    #[allow(clippy::needless_range_loop)]
+                    for index in 0..elems.len() {
+                        let el = elems[index];
                         let gf = if el.is_character() {
                             "STREAM-WRITE-CHAR"
                         } else {
                             "STREAM-WRITE-BYTE"
                         };
-                        invoke_generic_function(gf, &[out, *el], env)?;
+                        invoke_generic_function(gf, &[out, el], env)?;
                     }
                 } else if torcl_stdlib::is_byte_stream(out) {
-                    for el in &elems {
-                        torcl_stdlib::stream_write_byte(out, *el)?;
+                    // GC can update the rooted vector during a child call; do not
+                    // retain an iterator borrow across that call.
+                    #[allow(clippy::needless_range_loop)]
+                    for index in 0..elems.len() {
+                        let el = elems[index];
+                        torcl_stdlib::stream_write_byte(out, el)?;
                     }
                 } else {
                     torcl_stdlib::stream_write_sequence(out, &elems)?;
@@ -24756,14 +24780,16 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let chars: Vec<char> = full.chars().collect();
                 let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
                 let s: String = chars[kstart..kend].iter().collect();
-                let out = resolve_output_stream(stream, env);
+                let mut out = resolve_output_stream(stream, env);
+                torcl_rt::rooted_ref!(_output_root = &mut out);
                 check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     // Dispatch to the Gray stream-write-string generic (start 0,
                     // end nil → whole string), passing the already-bounded slice.
+                    torcl_rt::rooted!(text = arena_str(&s));
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
-                        &[out, arena_str(&s), TorclVal::from_fixnum(0), NIL],
+                        &[out, *text, TorclVal::from_fixnum(0), NIL],
                         env,
                     )?;
                     return Ok(args[0]);
@@ -24789,12 +24815,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let chars: Vec<char> = full.chars().collect();
                 let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
                 let s: String = chars[kstart..kend].iter().collect();
-                let out = resolve_output_stream(stream, env);
+                let mut out = resolve_output_stream(stream, env);
+                torcl_rt::rooted_ref!(_output_root = &mut out);
                 check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
+                    torcl_rt::rooted!(text = arena_str(&s));
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
-                        &[out, arena_str(&s), TorclVal::from_fixnum(0), NIL],
+                        &[out, *text, TorclVal::from_fixnum(0), NIL],
                         env,
                     )?;
                     invoke_generic_function("STREAM-TERPRI", &[out], env)?;
@@ -38336,14 +38364,16 @@ fn eval_with_open_file(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclEr
     let parent = Arc::clone(&env.frame);
     // Evaluate body in a fresh frame on the same env, then close the stream
     // (unwind-protect style) whether the body returned or unwound.
-    let result = with_child_frame(env, parent, move |env| {
+    let mut result = with_child_frame(env, parent, move |env| {
         env.define_local(&var_name, stream_val);
         eval_progn(body, env)
     });
+    torcl_rt::rooted_ref!(_result_root = &mut result);
     // `:if-does-not-exist nil` yields a NIL "stream"; there is nothing to close.
     if !stream_val.is_nil() {
         torcl_stdlib::close(stream_val, false)?;
     }
+    drop(_result_root);
     result
 }
 

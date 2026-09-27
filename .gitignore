@@ -85,3 +85,8 @@ hellos
 target-android/
 target-cross/
 target-android16k/
+
+# Documentation toolchain and generated site
+.venv-docs/
+/site/
+docs/__pycache__/

@@ -1,0 +1,104 @@
+site_name: TorCL
+site_description: Common Lisp with a tiered JIT, saved applications, and cross-target tooling.
+# Intended address; publication is not enabled by this configuration.
+site_url: https://atgreen.github.io/torcl/
+repo_url: https://cave.moxielogic.com/atgreen/bliss
+repo_name: TorCL source
+edit_uri: _edit/main/docs/manual/
+docs_dir: docs/manual
+site_dir: site
+strict: true
+hooks:
+  - docs/hooks.py
+theme:
+  name: material
+  font: false
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+extra_css:
+  - stylesheets/extra.css
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+nav:
+  - Contents: index.md
+  - 1. Introduction:
+      - introduction.md
+      - Platform support: user/reference/platforms.md
+      - Build and install: user/how-to/build.md
+  - 2. Starting and stopping:
+      - starting.md
+      - Command-line options: user/reference/cli.md
+  - 3. Compilation:
+      - compiler.md
+      - Execution tiers: user/explanation/execution.md
+      - ASDF systems: user/how-to/asdf.md
+  - 4. Conditions and debugging: debugger.md
+  - 5. Memory and garbage collection: memory.md
+  - 6. Foreign function interface: foreign.md
+  - 7. Threads and synchronization: concurrency.md
+  - 8. Operating-system interface: user/reference/extensions.md
+  - 9. Profiling and efficiency:
+      - profiling.md
+      - Measurement procedure: contributing/how-to/performance.md
+  - 10. Application delivery:
+      - user/explanation/images.md
+      - Image dictionary: user/reference/images.md
+      - Save an executable: user/how-to/save-executable.md
+      - Cross-target executables: user/how-to/cross-build.md
+      - Android applications: user/how-to/android.md
+      - Android project dictionary: user/reference/android.md
+  - Examples:
+      - user/index.md
+      - First program: user/tutorials/first-program.md
+  - Appendix A. Runtime contributors:
+      - contributing/index.md
+      - Architecture: contributing/explanation/architecture.md
+      - Repository map: contributing/reference/repository.md
+      - Change the runtime: contributing/how-to/change-runtime.md
+      - GC safety: contributing/how-to/gc-safety.md
+  - Appendix B. Symbol index: symbol-index.md
+  - Appendix C. Concept index: concept-index.md
+  - Writing the manual: meta/documentation-guidelines.md

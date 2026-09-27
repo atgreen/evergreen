@@ -19604,13 +19604,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // a function whose shape the emitter DID encode would have gone through
     // (bliss-z2qrz). Reachable only once a target has T1, since T2 is entered
     // from an installed T1's back-edge poll.
-    if !cfg!(all(
-        any(
-            target_arch = "x86_64",
-            target_arch = "s390x",
-            target_arch = "aarch64"
-        ),
-        unix
+    if !cfg!(any(
+        all(target_arch = "x86_64", any(unix, windows)),
+        all(target_arch = "s390x", unix),
+        all(target_arch = "aarch64", unix)
     )) {
         return None;
     }
