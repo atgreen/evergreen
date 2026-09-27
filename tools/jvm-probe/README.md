@@ -14,7 +14,7 @@ cargo build --target x86_64-unknown-linux-gnu --features torcl-rt/c-ffi -p torcl
 # Optional: point at a particular local JDK or TorCL executable.
 export TORCL_JAVA_HOME=/path/to/jdk
 # export TORCL_PROBE_BIN=/path/to/dynamic/torcl
-tools/jvm-probe/run.sh
+TORCL_JVM_PROBE_JSIG="$TORCL_JAVA_HOME/lib/libjsig.so" tools/jvm-probe/run.sh
 ```
 
 The script prints and retains a unique `/tmp/torcl-jvm-probe.*` directory with
@@ -50,3 +50,9 @@ This is a diagnostic bridge, not the implementation of a supported Java API.
 There are no CLOS proxies, JVM image serialization, cross-heap cycle collection,
 or arbitrary Java method resolution here. See
 [the coexistence contract](../../docs/design/jvm-coexistence.md).
+
+The runtime now preserves process handlers after its first installation and uses
+per-thread alternate stacks. JVM-first startup requires preloaded `libjsig.so`;
+without `TORCL_JVM_PROBE_JSIG`, that case is expected to be refused and this
+script returns nonzero. For the Lisp API and its ownership tests, see
+[torcl-jvm](../../lib/torcl-jvm/README.md).

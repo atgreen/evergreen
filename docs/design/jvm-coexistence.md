@@ -1,6 +1,9 @@
 # JVM coexistence contract and feasibility findings
 
-Status: design and diagnostic probe, **not a supported Java interface**.
+Status: coexistence design and historical diagnostic findings. An experimental
+native API now lives in [torcl-jvm](../../lib/torcl-jvm/README.md), tracked by
+`bliss-b4f28`. It implements checked calls, interface callbacks, explicit reference
+ownership and JVM lifecycle; it does not merge collectors or CLOS metaclasses.
 Tracked by `bliss-brbpc`. Scope is native x86-64 Linux on the developer's laptop.
 The Android comparison below is an architectural boundary only; the user asked
 that execution testing stay on the laptop. No phone app was installed or launched.
@@ -12,11 +15,27 @@ explicit native boundary. Do not merge collectors, object layouts, stack walkers
 or JIT code ownership. JNI is the supported execution boundary. Class integration
 and compiler call-site optimization come after coexistence is demonstrated.
 
-The immediate feasibility result is mixed: native Lisp-first embedding passes
-useful workloads, but JVM-first embedding crashes because TorCL overwrites
-HotSpot's fault handlers. The same installer is reachable from a safepoint timeout
-fallback, so startup ordering alone cannot constitute a supported solution.
-The crash is tracked in `bliss-95g0b`.
+The initial feasibility result at `1fa4fd9` was mixed: native Lisp-first embedding passed
+useful workloads, but JVM-first embedding crashed because TorCL overwrote
+HotSpot's fault handlers. The same installer was reachable from a safepoint timeout
+fallback, so startup ordering alone could not constitute a supported solution.
+The crash was tracked in `bliss-95g0b` (now fixed as described below).
+
+## Implementation update
+
+The native package adds per-thread alternate stacks, preserves an enabled host
+stack, and prevents safepoint fallback from reinstalling process handlers.
+GNU/c-ffi builds use interposable `sigaction`. JVM-first initialization requires
+preloaded JDK `libjsig.so`; detected JVM-first startup without it reports a
+condition before TorCL changes dispositions. Image saving is inhibited before
+bridge loading, and native entry rejects switched fiber stacks.
+
+The package tests run on the laptop with OpenJDK 26.0.2.1 and checked JNI.
+They include Java-created-thread callbacks, callback revocation, nested calls,
+explicit weak/strong handles and shutdown refusal with live resources. The guest
+test verifies that detaching TorCL leaves the host JVM usable, then lets the host
+destroy it. These results supersede the original signal/alternate-stack failures
+below; the original table remains a record of the investigation.
 
 ## Reproduction and evidence
 

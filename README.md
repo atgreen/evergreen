@@ -80,6 +80,11 @@ It does not yet have a T2 backend. ppc64le currently uses T0 for native-tier
 requests. AArch64 supports scalar foreign calls through AAPCS64. Foreign callbacks and
 fiber context switching remain unported there; ppc64le also lacks foreign calls.
 
+For in-process Java calls and Java interfaces implemented by Lisp functions,
+see the experimental [torcl-jvm package](lib/torcl-jvm/README.md). The initial
+implementation uses a native x86-64 glibc build and a local JDK, with explicit
+reference ownership and checks for JVM startup, signals, callbacks, and shutdown.
+
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
 The Android AArch64 CLI is built and validated the same way — same kernel, a
 different libc — and is

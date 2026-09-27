@@ -208,3 +208,11 @@ this interface. Sandbox mode denies foreign access; using `funcall` instead of
 a direct call does not bypass that policy.
 
 Implementation reference: [Public FFI wrappers](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/boot.lisp).
+
+## Java integration
+
+The experimental [torcl-jvm package](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/torcl-jvm/README.md) embeds HotSpot
+on native x86-64 glibc Linux. It provides checked Java calls, explicitly owned
+object references, and Java interfaces implemented by Lisp callbacks. Its guide
+covers JDK setup, signatures, ownership, signal chaining, and the restriction on
+saving images after JVM startup.
