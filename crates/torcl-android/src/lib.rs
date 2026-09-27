@@ -1,32 +1,23 @@
-//! TorCL as an Android NativeActivity (bliss-w2vp spike).
-//!
-//! Android hands a drawable surface only to code in the app's own process, so a
-//! spawned `torcl` binary — the shape of the REPL app — can never draw. This
-//! library is the other shape: the runtime linked INTO the activity, handed the
-//! `ANativeWindow*`, with every EGL call made from Lisp through TorCL's FFI.
-//!
-//! Deliberately thin. Rust does three things: export the entry point Android
-//! looks for, remember the window pointer, and start the interpreter on a form
-//! that passes that pointer to Lisp. It contains no EGL whatsoever.
-
-// NativeActivity and libandroid are available only on Android. Keep this
-// workspace member empty on host targets so workspace tests can link there.
+//! Reusable Android NativeActivity host. Application Lisp is supplied as APK assets.
 #![cfg(target_os = "android")]
 
-use std::ffi::{c_char, c_int, c_void};
-use std::os::raw::c_ulong;
-use std::sync::atomic::{AtomicI32, Ordering};
+mod lifecycle;
+use lifecycle::ActivityState;
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::JoinHandle;
 
-/// Non-zero while the surface is alive. Lisp reads this through its own FFI
-/// every frame and stops when it clears, which is what makes an endless render
-/// loop safe: drawing into a destroyed surface is a crash, and Android destroys
-/// it on rotate, background, or exit. Rust owns the flag because Android's
-/// callback is the only thing that knows.
-static RUNNING: AtomicI32 = AtomicI32::new(0);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+struct Activity {
+    state: Arc<ActivityState>,
+    worker: Option<JoinHandle<()>>,
+    window: *mut c_void,
+}
 
-/// `ANativeActivityCallbacks` (android/native_activity.h). Only the field
-/// ORDER matters — Android writes function pointers into this struct, so the
-/// layout has to match exactly even though this spike sets just one.
 #[repr(C)]
 pub struct ANativeActivityCallbacks {
     pub on_start: Option<extern "C" fn(*mut ANativeActivity)>,
@@ -64,76 +55,15 @@ pub struct ANativeActivity {
     pub obb_path: *const c_char,
 }
 
-/// The Lisp half. Embedded rather than read from disk: a file would reintroduce
-/// exactly the baked-path problem that stopped `(require :asdf)` on a device
-/// (bliss-bp4q).
-const EGL_LISP: &str = include_str!("egl.lisp");
-
-/// The scene — a Lisp list — and the walker that turns it into GLSL. Separate
-/// from the plumbing because this is the interesting half: change the list and
-/// the shader changes with it.
-const SCENE_LISP: &str = include_str!("scene.lisp");
-
-/// Android calls this when the activity starts; the symbol name is fixed.
-///
-/// # Safety
-/// `activity` is Android's, valid for the call, and its `callbacks` struct is
-/// ours to populate — that is the documented contract of this entry point.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ANativeActivity_onCreate(
-    activity: *mut ANativeActivity,
-    _saved_state: *mut c_void,
-    _saved_state_size: usize,
-) {
-    if activity.is_null() {
-        return;
-    }
-    let callbacks = unsafe { (*activity).callbacks };
-    if !callbacks.is_null() {
-        unsafe {
-            (*callbacks).on_native_window_created = Some(on_native_window_created);
-            (*callbacks).on_native_window_destroyed = Some(on_native_window_destroyed);
-            (*callbacks).on_input_queue_created = Some(on_input_queue_created);
-            (*callbacks).on_input_queue_destroyed = Some(on_input_queue_destroyed);
-        };
-    }
-}
-
-/// The surface exists. Start the interpreter on a thread of its own and give
-/// Lisp the window address; everything after this is Lisp calling EGL.
-extern "C" fn on_native_window_created(_activity: *mut ANativeActivity, window: *mut c_void) {
-    let address = window as c_ulong;
-    let running = (&RUNNING as *const AtomicI32) as c_ulong;
-    RUNNING.store(1, Ordering::SeqCst);
-    std::thread::Builder::new()
-        .name("torcl-egl".into())
-        // The runtime publishes a 6 MiB self-call guard from near the base of
-        // its thread's stack, so give it a stack that can hold one.
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            let form =
-                format!("(progn {SCENE_LISP}\n{EGL_LISP}\n(torcl-egl-demo {address} {running}))");
-            let args = vec![
-                "torcl".to_string(),
-                "--no-init".to_string(),
-                "--eval".to_string(),
-                form,
-            ];
-            match torcl::run(&args) {
-                Ok(code) => log(&format!("torcl exited {code}")),
-                Err(e) => log(&format!("torcl error: {e}")),
-            }
-        })
-        .map(|_| ())
-        .unwrap_or_else(|e| log(&format!("cannot spawn torcl thread: {e}")));
-}
-
-// libandroid's looper and input queue. NativeActivity REQUIRES the native side
-// to service the input queue: events that are never consumed make the input
-// dispatcher time out and Android kills the app with "isn't responding", even
-// though the render thread is perfectly healthy.
 #[link(name = "android")]
 unsafe extern "C" {
+    fn ANativeActivity_finish(activity: *mut ANativeActivity);
+    fn ANativeWindow_acquire(window: *mut c_void);
+    fn ANativeWindow_release(window: *mut c_void);
+    fn AAssetManager_open(manager: *mut c_void, name: *const c_char, mode: c_int) -> *mut c_void;
+    fn AAsset_getLength64(asset: *mut c_void) -> i64;
+    fn AAsset_read(asset: *mut c_void, buffer: *mut c_void, count: usize) -> c_int;
+    fn AAsset_close(asset: *mut c_void);
     fn ALooper_forThread() -> *mut c_void;
     fn AInputQueue_attachLooper(
         queue: *mut c_void,
@@ -146,53 +76,260 @@ unsafe extern "C" {
     fn AInputQueue_getEvent(queue: *mut c_void, event: *mut *mut c_void) -> i32;
     fn AInputQueue_preDispatchEvent(queue: *mut c_void, event: *mut c_void) -> i32;
     fn AInputQueue_finishEvent(queue: *mut c_void, event: *mut c_void, handled: c_int);
+    fn AInputEvent_getType(event: *const c_void) -> i32;
+    fn AMotionEvent_getAction(event: *const c_void) -> i32;
+    fn AMotionEvent_getX(event: *const c_void, index: usize) -> f32;
+    fn AMotionEvent_getY(event: *const c_void, index: usize) -> f32;
 }
 
-/// Drain the queue. The spike does nothing with the events yet — it only has to
-/// consume them, which is what keeps Android from declaring the app hung.
+fn read_asset(manager: *mut c_void, name: &str) -> Result<Vec<u8>, String> {
+    let name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
+    let asset = unsafe { AAssetManager_open(manager, name.as_ptr(), 2) };
+    if asset.is_null() {
+        return Err(format!("missing APK asset {name:?}"));
+    }
+    let result = (|| {
+        let size = unsafe { AAsset_getLength64(asset) };
+        if !(0..=64 * 1024 * 1024).contains(&size) {
+            return Err("asset exceeds 64 MiB".into());
+        }
+        let mut bytes = vec![0; size as usize];
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let count = unsafe {
+                AAsset_read(
+                    asset,
+                    bytes[offset..].as_mut_ptr().cast(),
+                    bytes.len() - offset,
+                )
+            };
+            if count <= 0 {
+                return Err(format!("cannot read APK asset {name:?}"));
+            }
+            offset += count as usize;
+        }
+        Ok(bytes)
+    })();
+    unsafe { AAsset_close(asset) };
+    result
+}
+
+// Extract the explicitly indexed assets into this app's private directory so
+// ordinary Lisp LOAD and file APIs work for nested application resources.
+fn unpack_assets(activity: &ANativeActivity) -> Result<PathBuf, String> {
+    let index = read_asset(activity.asset_manager, "torcl-assets.txt")?;
+    let index = std::str::from_utf8(&index).map_err(|e| e.to_string())?;
+    let mut lines = index.lines();
+    if lines.next() != Some("torcl-android-assets-v1") {
+        return Err("incompatible asset protocol".into());
+    }
+    let root = PathBuf::from(
+        unsafe { CStr::from_ptr(activity.internal_data_path) }
+            .to_string_lossy()
+            .as_ref(),
+    )
+    .join("torcl-assets");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    for name in lines {
+        let path = Path::new(name);
+        if name.is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_))) {
+            return Err(format!("invalid asset path {name:?}"));
+        }
+        let bytes = read_asset(activity.asset_manager, name)?;
+        let destination = root.join(path);
+        std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(destination, bytes).map_err(|e| e.to_string())?;
+    }
+    Ok(root)
+}
+
+/// # Safety
+/// Android supplies a valid NativeActivity and callback table for its lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ANativeActivity_onCreate(
+    activity: *mut ANativeActivity,
+    _saved_state: *mut c_void,
+    _saved_state_size: usize,
+) {
+    if activity.is_null() {
+        return;
+    }
+    if ACTIVE.swap(true, Ordering::SeqCst) {
+        log("only one TorCL Activity may run in a process");
+        unsafe { ANativeActivity_finish(activity) };
+        return;
+    }
+    let result = (|| -> Result<(), String> {
+        let root = unpack_assets(unsafe { &*activity })?;
+        let state = Arc::new(ActivityState::default());
+        state.set_paused(true);
+        let worker_state = state.clone();
+        let worker = std::thread::Builder::new().name("torcl-android".into())
+            .stack_size(16 * 1024 * 1024).spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    std::env::set_current_dir(root).map_err(|e| e.to_string())?;
+                    let form = format!("(progn (load \"android.lisp\") (load \"app.lisp\") (funcall (find-symbol \"RUN\" \"TORCL-ANDROID\") {}))", Arc::as_ptr(&worker_state) as usize);
+                    torcl::run(&["torcl".into(), "--no-init".into(), "--eval".into(), form])
+                        .map_err(|e| e.to_string())
+                });
+                log(&format!("Lisp worker finished: {result:?}"));
+                worker_state.shutdown();
+                worker_state.finish_window();
+            }).map_err(|e| e.to_string())?;
+        let context = Box::new(Activity {
+            state,
+            worker: Some(worker),
+            window: std::ptr::null_mut(),
+        });
+        unsafe {
+            (*activity).instance = Box::into_raw(context).cast();
+            let callbacks = &mut *(*activity).callbacks;
+            callbacks.on_native_window_created = Some(window_created);
+            callbacks.on_native_window_destroyed = Some(window_destroyed);
+            callbacks.on_input_queue_created = Some(input_created);
+            callbacks.on_input_queue_destroyed = Some(input_destroyed);
+            callbacks.on_pause = Some(paused);
+            callbacks.on_resume = Some(resumed);
+            callbacks.on_destroy = Some(destroyed);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        log(&format!("Activity startup failed: {error}"));
+        ACTIVE.store(false, Ordering::SeqCst);
+        unsafe { ANativeActivity_finish(activity) };
+    }
+}
+
+fn context(activity: *mut ANativeActivity) -> &'static mut Activity {
+    // Only Android's serialized main-thread callbacks access the Activity box.
+    unsafe { &mut *((*activity).instance as *mut Activity) }
+}
+extern "C" fn window_created(activity: *mut ANativeActivity, window: *mut c_void) {
+    let context = context(activity);
+    unsafe { ANativeWindow_acquire(window) };
+    context.window = window;
+    context.state.set_window(window as usize);
+}
+extern "C" fn window_destroyed(activity: *mut ANativeActivity, _window: *mut c_void) {
+    let context = context(activity);
+    context.state.destroy_window(); // Lisp has released EGL before this returns.
+    if !context.window.is_null() {
+        unsafe { ANativeWindow_release(context.window) };
+        context.window = std::ptr::null_mut();
+    }
+}
+extern "C" fn paused(activity: *mut ANativeActivity) {
+    context(activity).state.set_paused(true);
+}
+extern "C" fn resumed(activity: *mut ANativeActivity) {
+    context(activity).state.set_paused(false);
+}
+extern "C" fn destroyed(activity: *mut ANativeActivity) {
+    let mut context = unsafe { Box::from_raw((*activity).instance as *mut Activity) };
+    context.state.shutdown();
+    if let Some(worker) = context.worker.take() {
+        let _ = worker.join();
+    }
+    if !context.window.is_null() {
+        unsafe { ANativeWindow_release(context.window) };
+    }
+    unsafe { (*activity).instance = std::ptr::null_mut() };
+    ACTIVE.store(false, Ordering::SeqCst);
+}
+
 extern "C" fn drain_input(_fd: c_int, _events: c_int, data: *mut c_void) -> c_int {
-    let queue = data;
+    let activity = data as *mut ANativeActivity;
+    // Input queue is passed through the Activity's main-thread callback state.
+    let queue = INPUT_QUEUE.with(|q| q.get());
     loop {
-        let mut event: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `queue` is the one Android handed to onInputQueueCreated and
-        // is live until onInputQueueDestroyed detaches it.
+        let mut event = std::ptr::null_mut();
         if unsafe { AInputQueue_getEvent(queue, &mut event) } < 0 {
             break;
         }
         if unsafe { AInputQueue_preDispatchEvent(queue, event) } != 0 {
             continue;
         }
-        unsafe { AInputQueue_finishEvent(queue, event, 0) };
+        let handled = if unsafe { AInputEvent_getType(event) } == 2 {
+            context(activity).state.touch(
+                unsafe { AMotionEvent_getAction(event) } & 255,
+                unsafe { AMotionEvent_getX(event, 0) },
+                unsafe { AMotionEvent_getY(event, 0) },
+            );
+            1
+        } else {
+            0
+        };
+        unsafe { AInputQueue_finishEvent(queue, event, handled) };
     }
-    1 // keep the callback registered
+    1
 }
-
-extern "C" fn on_input_queue_created(_activity: *mut ANativeActivity, queue: *mut c_void) {
-    // This callback runs on the main thread, so its looper is the one to attach.
-    unsafe { AInputQueue_attachLooper(queue, ALooper_forThread(), 1, Some(drain_input), queue) };
+thread_local! { static INPUT_QUEUE: std::cell::Cell<*mut c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) }; }
+extern "C" fn input_created(activity: *mut ANativeActivity, queue: *mut c_void) {
+    INPUT_QUEUE.with(|q| q.set(queue));
+    unsafe {
+        AInputQueue_attachLooper(
+            queue,
+            ALooper_forThread(),
+            1,
+            Some(drain_input),
+            activity.cast(),
+        )
+    };
 }
-
-extern "C" fn on_input_queue_destroyed(_activity: *mut ANativeActivity, queue: *mut c_void) {
+extern "C" fn input_destroyed(_activity: *mut ANativeActivity, queue: *mut c_void) {
     unsafe { AInputQueue_detachLooper(queue) };
+    INPUT_QUEUE.with(|q| q.set(std::ptr::null_mut()));
 }
 
-/// The surface is going away. Clear the flag and let the Lisp loop notice on
-/// its next frame; returning from this callback while Lisp still held the
-/// surface would tear it down underneath a live EGL context.
-extern "C" fn on_native_window_destroyed(_activity: *mut ANativeActivity, _window: *mut c_void) {
-    RUNNING.store(0, Ordering::SeqCst);
+// Private ABI v1, consumed by the bundled android.lisp. All pointers are valid
+// only while the interpreter worker is running and the Activity owns its Arc.
+#[unsafe(no_mangle)]
+pub extern "C" fn torcl_android_api_version() -> i32 {
+    1
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_wait_window(state: *const ActivityState) -> usize {
+    unsafe { &*state }.wait_window()
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_finish_window(state: *const ActivityState) {
+    unsafe { &*state }.finish_window();
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_running(state: *const ActivityState) -> i32 {
+    unsafe { &*state }.running() as i32
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_paused(state: *const ActivityState) -> i32 {
+    unsafe { &*state }.paused() as i32
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_touch(state: *const ActivityState, output: *mut f32) -> i32 {
+    if let Some((action, x, y)) = unsafe { &*state }.poll_touch() {
+        unsafe {
+            *output = x;
+            *output.add(1) = y;
+        }
+        action
+    } else {
+        -1
+    }
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_log(text: *const c_char) {
+    log(&unsafe { CStr::from_ptr(text) }.to_string_lossy());
 }
 
-/// Android's log, so output survives having no stdout.
 fn log(message: &str) {
+    #[link(name = "log")]
     unsafe extern "C" {
         fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
     }
-    if let (Ok(tag), Ok(text)) = (
-        std::ffi::CString::new("torcl"),
-        std::ffi::CString::new(message),
-    ) {
-        // SAFETY: both pointers are NUL-terminated and live for the call.
-        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+    if let Ok(text) = std::ffi::CString::new(message) {
+        unsafe { __android_log_write(4, c"torcl".as_ptr(), text.as_ptr()) };
     }
 }
