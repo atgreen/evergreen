@@ -3,6 +3,26 @@ use torcl_rt::error::TorclError;
 use torcl_rt::value::{NIL, TorclVal};
 use torcl_stdlib::numbers::{ash, minusp, plusp, zerop};
 
+/// Serializes every test in this target that touches the heap (bliss-ifho).
+/// `zero_sign_kernels_do_not_allocate_lisp_values` measures its own allocation
+/// with `heap_stats().bytes_allocated`, which counts the whole PROCESS, so a
+/// sibling test allocating a bignum on another thread lands inside its bracket
+/// and it fails with somebody else's bytes. Cargo runs the tests in a target in
+/// parallel threads, so without this the no-allocation assertion is a lottery
+/// the whole workspace run pays for.
+///
+/// Poisoning is recovered rather than propagated so one panic does not cascade.
+fn heap_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+macro_rules! serialize_heap_use {
+    () => {
+        let _global_guard = heap_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
+}
+
 fn check(value: TorclVal, expected: (bool, bool, bool)) {
     assert_eq!(
         (
@@ -16,6 +36,7 @@ fn check(value: TorclVal, expected: (bool, bool, bool)) {
 
 #[test]
 fn zero_sign_kernels_do_not_allocate_lisp_values() {
+    serialize_heap_use!();
     let before = torcl_rt::heap_stats().bytes_allocated;
     for n in -1000..1000 {
         check(TorclVal::from_fixnum(n), (n == 0, n > 0, n < 0));
@@ -36,6 +57,7 @@ fn zero_sign_kernels_do_not_allocate_lisp_values() {
 
 #[test]
 fn exact_ratio_signs_do_not_round_to_float_zero() {
+    serialize_heap_use!();
     torcl_rt::rooted!(den = ash(TorclVal::from_fixnum(1), TorclVal::from_fixnum(2000)).unwrap());
     check(*den, (false, true, false));
     for num in [-1, 0, 1] {
