@@ -35,8 +35,8 @@ export TORCL_FFI_SCALARS_DLL="Z:$WINEPREFIX/ffi-scalars.dll"
 export TORCL_FFI_CALLBACKS_DLL="Z:$WINEPREFIX/ffi-callbacks.dll"
 export TORCL_FFI_AGGREGATES_DLL="Z:$WINEPREFIX/ffi-aggregates.dll"
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test windows_os --test test_jit
-scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test test_scheduler --test test_fiber_sync
-TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots
+scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test fiber_fault_state --test fiber_preemption_state --test test_scheduler --test test_fiber_sync
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test fiber_preemption_state
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test ffi_jit --test ffi_callback_jit --test ffi_callback_runtime
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test ffi_callback_runtime
 scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test ffi_callback_cli
