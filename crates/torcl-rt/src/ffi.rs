@@ -549,6 +549,7 @@ impl Drop for Callback {
 // backend by default because elf_loader has no native relocation support there.
 
 #[cfg(all(
+    unix,
     not(feature = "c-ffi"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
@@ -725,6 +726,7 @@ mod elf_backend {
 }
 
 #[cfg(all(
+    unix,
     not(feature = "c-ffi"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
@@ -732,15 +734,21 @@ pub use elf_backend::{
     close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
 };
 
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 struct DynamicLibrary(usize);
 
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 impl Drop for DynamicLibrary {
     fn drop(&mut self) {
@@ -751,17 +759,23 @@ impl Drop for DynamicLibrary {
     }
 }
 
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 static DYNAMIC_LIBRARIES: std::sync::Mutex<Vec<Option<std::sync::Arc<DynamicLibrary>>>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Load a shared library by name or path.
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 pub fn load_foreign_library(name: &str) -> Result<*mut (), TorclError> {
     use std::ffi::CString;
@@ -794,9 +808,12 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), TorclError> {
 ///
 /// # Safety
 /// The returned pointer is only valid while the library remains loaded.
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), TorclError> {
     if library.is_null() {
@@ -813,9 +830,12 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
     unsafe { dynamic_symbol(library.0 as *mut libc::c_void, name) }
 }
 
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*const (), TorclError> {
     let c_name = std::ffi::CString::new(name)
@@ -841,9 +861,12 @@ unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*cons
 /// Close one owned loader reference and invalidate its token.
 /// # Safety
 /// No foreign call, callback or retained symbol may use this library after close.
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), TorclError> {
     let library = {
@@ -862,9 +885,12 @@ pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), TorclError> 
 /// Look up a symbol in the loader's global namespace.
 /// # Safety
 /// The provider must remain loaded while the returned pointer is used.
-#[cfg(any(
-    feature = "c-ffi",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
 ))]
 pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), TorclError> {
     // RTLD_DEFAULT makes glibc add a lookup dependency from this executable to
@@ -880,3 +906,10 @@ pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), TorclError>
     let process = DynamicLibrary(handle as usize);
     unsafe { dynamic_symbol(process.0 as *mut libc::c_void, name) }
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{
+    close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
+};

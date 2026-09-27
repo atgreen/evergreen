@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 ARCHES = {
+    "win64": ("X86-64", "X86-64", "LITTLE-ENDIAN"),
     "x86_64": ("X86-64", "X86-64", "LITTLE-ENDIAN"),
     "aarch64": ("ARM64", "ARM64", "LITTLE-ENDIAN"),
     "ppc64le": ("PPC64LE", "PPC64", "LITTLE-ENDIAN"),
@@ -25,10 +26,20 @@ def main():
     command = sys.argv[2:]
     if command[0] == "--":
         command = command[1:]
+    def target_path(path):
+        path = Path(path).resolve()
+        if arch == "win64" and os.name != "nt":
+            # Wine's default Z: drive maps the Unix filesystem root.
+            return "Z:" + path.as_posix()
+        return path.as_posix()
+
     source = Path(__file__).with_name("portability-smoke.lisp").read_text()
     source = (f'(assert (string= (machine-type) "{machine}"))\n'
               f'(assert (member :{feature} *features*))\n'
               f'(assert (member :{endian} *features*))\n' + source)
+
+    if arch == "win64":
+        source = '(assert (member :windows *features*))\n(assert (not (member :unix *features*)))\n' + source
 
     def run(args, env):
         result = subprocess.run(command + ["--no-init"] + args, env=env,
@@ -37,7 +48,7 @@ def main():
             raise RuntimeError(f"exit {result.returncode}\n{result.stdout}\n{result.stderr}")
         return result.stdout
 
-    with tempfile.TemporaryDirectory(prefix="torcl-portability-") as directory:
+    with tempfile.TemporaryDirectory(prefix="torcl portability-" if arch == "win64" else "torcl-portability-") as directory:
         script = Path(directory) / "smoke.lisp"
         script.write_text(source)
         outputs = []
@@ -48,20 +59,47 @@ def main():
                     del env[key]
             if tier:
                 env["TORCL_FORCE_TIER"] = tier
-            output = run(["--load", str(script)], env)
+            output = run(["--load", target_path(script)], env)
             assert "PORTABILITY-OK" in output, output
             outputs.append(output)
             print(f"{arch}: {tier or 'default'}: OK", flush=True)
         assert all(output == outputs[0] for output in outputs), outputs
+
+        if arch == "win64":
+            home_env = env.copy()
+            home_env.pop("HOME", None)
+            home = target_path(directory) + "/"
+            profile = target_path(directory).replace("/", "\\").replace("\\", "\\\\")
+            output = run(["--eval", f'(progn (torcl-ext:setenv "USERPROFILE" "{profile}") '
+                          f'(assert (string= (namestring (user-homedir-pathname)) "{home}")) '
+                          f'(assert (string= (namestring (parse-namestring "~/probe.txt")) "{home}probe.txt")) '
+                          '(format t "HOME-OK~%"))'], home_env)
+            assert "HOME-OK" in output, output
+            print(f"{arch}: Windows profile home directory: OK", flush=True)
+            output = run(["--eval", f'(let ((p (truename "{target_path(script)}"))) '
+                          '(assert (not (typep p (quote logical-pathname)))) '
+                          '(assert (probe-file p)) '
+                          '(with-open-file (s p) (assert (read-line s nil nil))) '
+                          '(format t "TRUENAME-OK~%"))'], home_env)
+            assert "TRUENAME-OK" in output, output
+            print(f"{arch}: canonical pathname reopens its file: OK", flush=True)
+            for tier in ["interp", "t0"]:
+                home_env["TORCL_FORCE_TIER"] = tier
+                output = run(["--eval", '(progn (defun recurse (n) (if (= n 0) 0 '
+                              '(1+ (funcall (symbol-function (quote recurse)) (1- n))))) '
+                              '(handler-case (recurse 10000) (storage-condition () '
+                              '(format t "STACK-CAUGHT~%"))))'], home_env)
+                assert "STACK-CAUGHT" in output, output
+            print(f"{arch}: recursive stack exhaustion is catchable: OK", flush=True)
 
         # Stress every allocation in a focused raw-runtime program. Stressing
         # the entire Lisp prelude under software emulation takes minutes before
         # the test starts; --no-bootstrap avoids that cost without a SKIP knob.
         stress_script = Path(__file__).with_name("portability-stress.lisp").resolve()
         env["TORCL_FORCE_TIER"] = "t0"
-        reference = run(["--no-bootstrap", "--load", str(stress_script)], env)
+        reference = run(["--no-bootstrap", "--load", target_path(stress_script)], env)
         env.update(TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
-        stressed = run(["--no-bootstrap", "--load", str(stress_script)], env)
+        stressed = run(["--no-bootstrap", "--load", target_path(stress_script)], env)
         assert "STRESS-OK" in stressed and stressed == reference, (reference, stressed)
         print(f"{arch}: raw-runtime GC stress + poison matches baseline: OK", flush=True)
         del env["TORCL_GC_STRESS"]
@@ -71,15 +109,15 @@ def main():
         fasl_source = Path(directory) / "compiled.lisp"
         fasl_source.write_text('(defun portable-fasl (x) (+ x 17))\n')
         fasl = Path(directory) / "compiled.bfasl"
-        run(["--eval", f'(compile-file "{fasl_source}" :output-file "{fasl}")'], env)
-        output = run(["--eval", f'(progn (load "{fasl}") '
+        run(["--eval", f'(compile-file "{target_path(fasl_source)}" :output-file "{target_path(fasl)}")'], env)
+        output = run(["--eval", f'(progn (load "{target_path(fasl)}") '
                       '(assert (= (portable-fasl 25) 42)) (format t "FASL-OK~%"))'], env)
         assert "FASL-OK" in output, output
         print(f"{arch}: fresh-process compiled-file round trip: OK", flush=True)
 
         image = Path(directory) / "saved.image"
-        run(["--eval", f'(progn (defun portable-image () 42) (save-image "{image}"))'], env)
-        output = run(["--image", str(image), "--eval",
+        run(["--eval", f'(progn (defun portable-image () 42) (save-image "{target_path(image)}"))'], env)
+        output = run(["--image", target_path(image), "--eval",
                       '(progn (assert (= (portable-image) 42)) (format t "IMAGE-OK~%"))'], env)
         assert "IMAGE-OK" in output, output
         print(f"{arch}: fresh-process heap-image round trip: OK", flush=True)

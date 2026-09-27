@@ -280,7 +280,9 @@ pub fn eval_stack_budget() -> usize {
     // single call's worth of host frames (kilobytes) — 1 MiB is ample headroom
     // to unwind and run a handler after the guard fires.
     const RED_ZONE: usize = 1024 * 1024;
+    #[cfg(unix)]
     const FLOOR: usize = 1024 * 1024;
+    #[cfg(not(windows))]
     const DEFAULT: usize = 7 * 1024 * 1024;
 
     if let Ok(v) = std::env::var("TORCL_MAX_EVAL_STACK_BYTES") {
@@ -302,7 +304,15 @@ pub fn eval_stack_budget() -> usize {
         }
     }
 
-    DEFAULT
+    #[cfg(windows)]
+    {
+        let (low, high) = crate::syscall::thread_stack_limits();
+        high.saturating_sub(low).saturating_sub(RED_ZONE)
+    }
+    #[cfg(not(windows))]
+    {
+        DEFAULT
+    }
 }
 
 thread_local! {
@@ -327,9 +337,20 @@ thread_local! {
 /// STORAGE-CONDITION) could not load at all (bliss-3zvm).
 #[inline]
 pub fn host_stack_budget_exhausted() -> bool {
+    #[cfg(not(windows))]
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let local = 0usize;
     let probe = std::hint::black_box(&local) as *const usize as usize;
+    // Windows threads can have different reservations. Check the actual
+    // remaining stack as well as an optional user budget; never let a large
+    // override move the guard below the thread's allocation boundary.
+    #[cfg(windows)]
+    {
+        let (low, high) = crate::syscall::thread_stack_limits();
+        if probe < low || probe > high || probe.saturating_sub(low) < 1024 * 1024 {
+            return true;
+        }
+    }
     HOST_STACK_BASE.with(|base| {
         let recorded = base.get();
         // A shallower frame than any seen before establishes the reference point:
@@ -338,7 +359,14 @@ pub fn host_stack_budget_exhausted() -> bool {
             base.set(probe);
             return false;
         }
-        recorded - probe > *BUDGET.get_or_init(eval_stack_budget)
+        #[cfg(windows)]
+        let budget = {
+            thread_local! { static BUDGET: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() }; }
+            BUDGET.with(|b| *b.get_or_init(eval_stack_budget))
+        };
+        #[cfg(not(windows))]
+        let budget = *BUDGET.get_or_init(eval_stack_budget);
+        recorded - probe > budget
     })
 }
 

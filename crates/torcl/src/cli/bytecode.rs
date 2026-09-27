@@ -13369,18 +13369,18 @@ fn pending_signal_error_for_current_execution() -> Option<TorclError> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", unix))]
 #[unsafe(naked)]
 unsafe extern "C" fn native_sigsegv_recovery_epilogue() {
     core::arch::naked_asm!("mov rax, 7", "pop r12", "pop r15", "pop r14", "ret",)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", unix))]
 fn native_sigsegv_recovery_ip() -> usize {
     native_sigsegv_recovery_epilogue as *const () as usize
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", unix)))]
 fn native_sigsegv_recovery_ip() -> usize {
     0
 }
@@ -15696,7 +15696,7 @@ fn timestamp_nanos() -> u64 {
 }
 
 fn elf_machine() -> u32 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     {
         62
     }
@@ -15704,7 +15704,7 @@ fn elf_machine() -> u32 {
     {
         183
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(all(target_arch = "x86_64", unix), target_arch = "aarch64")))]
     {
         0
     }
@@ -17840,7 +17840,7 @@ fn resume_inlined_in_t0(
 /// TorclStack bounds guard caps direct recursion before the C stack fills.
 /// Errors propagate through the enclosing `run_native`'s `NATIVE_ERROR`; the
 /// emit-time `has_deopt` gate excludes callees that could resume T0 mid-call.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", unix))]
 fn emit_direct_native_call(
     c: &mut Asm,
     entry: u64,
@@ -18000,7 +18000,7 @@ fn emit_direct_native_call(
 /// to the interpreter through the c2i adapter — so a T1 function's arithmetic,
 /// calls, and conditionals produce results identical to pure interpretation,
 /// while the dispatch/operand-stack plumbing runs as native code (nmq.2).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", unix))]
 /// Emit native x86-64 for `bf`. `allow_speculation` enables the speculative
 /// fixnum fast paths, whose guards deoptimize via state-transfer: they
 /// PEEK-guard-commit and record `(bcp, depth)` so a failure resumes T0 at the
@@ -19170,7 +19170,7 @@ fn is_inlinable_eq(sym: u32) -> bool {
     torcl_rt::symbols::symbol_name(sym).as_deref() == Some("EQ")
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", unix)))]
 fn emit_native_x86(
     _bf: &BytecodeFunction,
     _allow_speculation: bool,
@@ -20298,7 +20298,7 @@ fn symbol_index_of(name: &str) -> Option<u32> {
 mod direct_call_invalidation_tests {
     use super::*;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_caller_handles_callee_osr_deoptimization() {
         let _lock = super::super::heap_test_lock()
@@ -20378,7 +20378,7 @@ mod direct_call_invalidation_tests {
         registry_remove(callee_symbol);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn active_t1_loop_cannot_enter_replacement_t2_code() {
         let _lock = super::super::heap_test_lock()
@@ -20446,7 +20446,7 @@ mod direct_call_invalidation_tests {
         registry_remove(symbol);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn selected_native_code_uses_its_original_environment_names() {
         let _lock = super::super::heap_test_lock()
@@ -20536,7 +20536,7 @@ mod direct_call_invalidation_tests {
         registry_remove(symbol);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn selected_native_code_retains_its_original_bytecode_body() {
         let _lock = super::super::heap_test_lock()
@@ -20570,7 +20570,7 @@ mod direct_call_invalidation_tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn direct_native_caller_retains_its_embedded_callee() {
         let _lock = super::super::heap_test_lock()

@@ -54,7 +54,7 @@ fn image_tag_identifies_the_target() {
     // The OS half is not always Linux: Android runs the same kernel with a
     // different libc, and an image saved under bionic must not load in a glibc or
     // musl TorCL, so it carries its own tag (Os::Android = 4; bliss-w2vp).
-    let os = if cfg!(target_os = "android") { 4 } else { 1 };
+    let os = if cfg!(target_os = "android") { 5 } else { 1 };
     assert_eq!(torcl_rt::current_platform_tag(), (arch << 32) | os);
 }
 

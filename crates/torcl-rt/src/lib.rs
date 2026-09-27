@@ -20,7 +20,8 @@ pub mod fxhash;
 pub mod object;
 pub mod packages;
 pub mod symbols;
-/// Direct Linux syscalls (no libc) for runtime-internal OS services (bliss-bca.5).
+/// Runtime OS services: Linux syscall wrappers or the Windows backend.
+#[cfg_attr(windows, path = "syscall/windows.rs")]
 pub mod syscall;
 pub mod types;
 pub mod value;

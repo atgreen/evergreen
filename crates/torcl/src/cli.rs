@@ -11298,7 +11298,8 @@ fn boot_prelude_source() -> Result<String, TorclError> {
 // default cache location stays defined in one place until `require`/ASDF is live.
 #[allow(dead_code)]
 fn default_asdf_output_translations() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home =
+        torcl_stdlib::pathnames::user_home_namestring().unwrap_or_else(|| "/tmp".to_string());
     format!("{home}/.cache/torcl/asdf/")
 }
 
@@ -21474,7 +21475,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 );
             }
             "USER-HOMEDIR-PATHNAME" => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                let home = torcl_stdlib::pathnames::user_home_namestring()
+                    .unwrap_or_else(|| "/".to_string());
                 let dir = if home.ends_with('/') {
                     home
                 } else {
@@ -24223,8 +24225,13 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     .ok()
                     .and_then(|p| std::fs::metadata(&p).ok())
                     .map(|m| {
-                        use std::os::unix::fs::MetadataExt;
-                        m.size() ^ (m.mtime() as u64).wrapping_mul(0x100000001b3)
+                        let seconds = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        m.len() ^ seconds.wrapping_mul(0x100000001b3)
                     })
                     .unwrap_or(0);
                 return Ok(arena_str(&format!("{:08x}", fp & 0xffff_ffff)));
@@ -38918,9 +38925,9 @@ fn vals_equalp(a: TorclVal, b: TorclVal) -> bool {
 fn load_init_file(env: &mut Env) {
     let path = match std::env::var("TORCL_INIT_FILE") {
         Ok(p) => p,
-        Err(_) => match std::env::var("HOME") {
-            Ok(home) => format!("{}/.torclrc", home),
-            Err(_) => return,
+        Err(_) => match torcl_stdlib::pathnames::user_home_namestring() {
+            Some(home) => format!("{}/.torclrc", home),
+            None => return,
         },
     };
     let Ok(contents) = std::fs::read_to_string(&path) else {

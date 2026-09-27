@@ -691,6 +691,7 @@ static SIGSEGV_STACK_GUARD_ADDRS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
 static SIGSEGV_STACK_GUARD_LENS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
+#[cfg(unix)]
 static SIGNAL_ALT_STACK: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,6 +920,7 @@ pub fn unregister_sigsegv_stack_guard_range(addr: usize) {
 
 /// Install signal handlers (SIGSEGV, SIGINT, SIGTERM, etc.). §2.6.
 /// Issue #11: actually install at least SIGINT and SIGTERM using libc.
+#[cfg(unix)]
 pub fn install_signal_handlers() -> Result<(), TorclError> {
     use crate::syscall;
     let alt_stack = SIGNAL_ALT_STACK.get_or_init(|| vec![0_u8; 64 * 1024].into_boxed_slice());
@@ -990,8 +992,10 @@ extern "C" fn sigint_handler(_sig: i32) {
 }
 
 /// Grace period between SIGTERM and the SIGALRM hard exit (seconds).
+#[cfg(unix)]
 const SIGTERM_GRACE_SECS: u32 = 5;
 
+#[cfg(unix)]
 extern "C" fn sigterm_handler(_sig: i32) {
     SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     mark_process_signal_activity();
@@ -1004,6 +1008,7 @@ extern "C" fn sigterm_handler(_sig: i32) {
     let _ = crate::syscall::alarm(SIGTERM_GRACE_SECS);
 }
 
+#[cfg(unix)]
 extern "C" fn sigalrm_handler(_sig: i32) {
     // Only armed by sigterm_handler. Still alive => the cooperative shutdown
     // never ran (or stalled); terminate every thread now.
@@ -1011,16 +1016,19 @@ extern "C" fn sigalrm_handler(_sig: i32) {
     crate::syscall::exit_group(128 + crate::syscall::SIGTERM);
 }
 
+#[cfg(unix)]
 extern "C" fn sigfpe_handler(_sig: i32) {
     SIGFPE_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     mark_process_signal_activity();
 }
 
+#[cfg(unix)]
 extern "C" fn sigpipe_handler(_sig: i32) {
     SIGPIPE_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     mark_process_signal_activity();
 }
 
+#[cfg(unix)]
 extern "C" fn sigsegv_handler(
     _sig: i32,
     _info: *mut core::ffi::c_void,
@@ -1314,6 +1322,7 @@ fn sigsegv_stack_guard_contains(addr: usize) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
     if info.is_null() {
         return usize::MAX;
@@ -2643,4 +2652,26 @@ fn arith_builtin(args: &[TorclVal], op: ArithOp) -> Result<TorclVal, TorclError>
         };
     }
     Ok(TorclVal::from_fixnum(acc))
+}
+
+/// Register cooperative console interruption without Unix signal layouts.
+#[cfg(windows)]
+pub fn install_signal_handlers() -> Result<(), TorclError> {
+    use windows_sys::Win32::System::Console::*;
+    unsafe extern "system" fn handler(event: u32) -> i32 {
+        match event {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                sigint_handler(0);
+                1
+            }
+            _ => 0,
+        }
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+        return Err(TorclError::Internal(format!(
+            "console handler: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
