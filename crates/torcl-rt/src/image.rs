@@ -13,6 +13,8 @@ use crate::value::TorclVal;
 pub enum Arch {
     X86_64 = 1,
     Aarch64 = 2,
+    Powerpc64le = 3,
+    S390x = 4,
 }
 
 /// Operating system.
@@ -35,7 +37,16 @@ pub fn current_platform_tag() -> u64 {
     let arch = Arch::X86_64;
     #[cfg(target_arch = "aarch64")]
     let arch = Arch::Aarch64;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    let arch = Arch::Powerpc64le;
+    #[cfg(target_arch = "s390x")]
+    let arch = Arch::S390x;
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "powerpc64", target_endian = "little"),
+        target_arch = "s390x"
+    )))]
     let arch = Arch::X86_64; // fallback
 
     #[cfg(target_os = "linux")]

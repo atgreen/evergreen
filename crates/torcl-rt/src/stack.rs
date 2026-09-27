@@ -350,7 +350,7 @@ fn align_up(n: usize, align: usize) -> usize {
 
 #[inline]
 fn stack_page_size() -> usize {
-    4096
+    crate::syscall::page_size()
 }
 
 // ── Frame layout ───────────────────────────────────────────────────
