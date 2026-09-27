@@ -174,61 +174,50 @@ size, mapped memory and errno, a returning signal handler, and epoll — which w
 cfg'd out entirely before the `target_os` fix), `portability-smoke.lisp` end to
 end, and a dumped image that starts with ASDF preloaded and no source tree.
 
-NOT established: anything on real hardware (no device or emulator was attached),
-16 KiB-page behaviour, the seccomp filter Android applies to app processes, and
-running inside an app. That last one is not packaging: Android blocks executing
-binaries from app-writable storage, so an in-app TorCL has to become a JNI
-library, and bionic's limited static-TLS surplus for `dlopen`'d libraries bears
-directly on the execution-context design (spec R4.72/R4.73). See bliss-w2vp.
+Those CLI checks do not establish 16 KiB-page behaviour or every Android app
+sandbox interaction. In-process ARM64 application execution is now verified on
+a physical Pixel; see the NativeActivity workflow below.
 
 ### Driving a GUI: TorCL as a NativeActivity
 
-The CLI shape above cannot draw. Android hands a drawable surface only to code
-running inside the app's own process, so a spawned `torcl` binary — however it is
-packaged — can never obtain one. `crates/torcl-android` is the other shape: the
-runtime linked INTO the activity as a shared library.
+`crates/torcl-android` embeds TorCL in an Android NativeActivity shared library.
+The reusable host loads `android.lisp` and `app.lisp` from the APK's indexed
+assets into one Lisp worker. EGL and GLES calls stay in Lisp, using the dynamic
+FFI. Both ARM64 and x86-64 libraries are packaged by the Fedora RPM.
 
 ```sh
-export CROSS_CONTAINER_ENGINE=podman CARGO_TARGET_DIR="$PWD/target-android"
-cross rustc --release -p torcl-android --target x86_64-linux-android \
-      --crate-type cdylib
+# After installing torcl-target-android and Android SDK/JDK tools:
+torcl-android-new hello --host=aarch64-linux-android --template egl
+cd hello
+make install
+make run
+# Build for an x86-64 emulator:
+make HOST=x86_64-linux-android
 ```
 
-Note `cargo rustc --crate-type cdylib` rather than declaring it in the manifest.
-The crate says `crate-type = ["rlib"]` because the workspace's default target is
-static musl, which cannot produce a cdylib at all — declaring one breaks
-`cargo build --workspace` for everybody. Making the crate standalone instead puts
-its path dependencies outside the container mount, which breaks the cross build.
-Asking for the crate type on the command line avoids both.
+See [Fedora packaging](fedora-rpm.md#android-application-projects) for prerequisites,
+SDK paths, universal APKs and signing. To build the libraries from source with
+a local NDK, without containers:
 
-The APK needs no Java and no dex (`android:hasCode="false"`); the activity IS the
-Lisp runtime:
-
-```xml
-<activity android:name="android.app.NativeActivity" android:exported="true">
-    <meta-data android:name="android.app.lib_name" android:value="torcl_android" />
-</activity>
+```sh
+python3 packaging/android/build-runtime.py --ndk /path/to/android-ndk-r27d \
+    --stage target/android-stage
 ```
 
-The Rust half is deliberately thin and contains no EGL: it exports
-`ANativeActivity_onCreate`, captures the `ANativeWindow*` when the surface
-arrives, and starts the interpreter on a thread with that address in the form.
-Everything else — `eglGetDisplay`, `eglChooseConfig`,
-`ANativeWindow_setBuffersGeometry`, `eglCreateWindowSurface`, `eglCreateContext`,
-`eglMakeCurrent`, `glClearColor`, `eglSwapBuffers` — is Lisp calling through
-`torcl-ffi:foreign-call` (see `crates/torcl-android/src/egl.lisp`).
+The builder explicitly requests `cargo rustc --crate-type cdylib` for each Android
+target. The manifest remains `rlib` so the default static-musl workspace build
+continues to work. The resulting APK needs no Java source, dex or Gradle.
 
-Surface lifetime is the one piece Lisp cannot decide for itself. Rust keeps an
-`AtomicI32` that `onNativeWindowDestroyed` clears and Lisp reads with `mem-ref`
-each frame; drawing into a destroyed surface crashes, and Android destroys it on
-rotate, backgrounding and exit.
+The Activity host exposes window lifetime, pause state and primary-pointer touch
+events. Lisp's `android-main` checks `android:running-p`, cleans up its EGL context
+and returns when the surface is going away. Android's destruction callback waits
+for that release before freeing the native window; the same interpreter handles
+the next surface. `packaging/android/templates/egl.lisp` owns EGL setup/cleanup,
+and `egl-app.lisp` demonstrates rendering and touch input.
 
-Verified on the emulator: the activity loads, EGL initializes, and successive
-screenshots show the clear colour advancing — red rising, green falling, blue
-pinned at the hardcoded 0.35 (89/255) — with the runtime's own thread alive in
-the app's process and no child process anywhere.
-
-What this does NOT yet cover: input (native_app_glue polls via `ALooper`, so
-callbacks — which are JIT-generated and x86-64-only — are not needed), loading a
-dumped image rather than an embedded source string, and arm64, where there is no
-native JIT.
+Validation includes ARM64 rendering and touch on a Pixel, repeated surface
+recreation and Activity relaunch, both ELF architectures and 16 KiB segment
+alignment, and ARM64/x86-64/universal APK packaging. The installed emulator
+37.1.11 currently crashes before boot on the Fedora host (bliss-d97ij), so the new
+x86-64 runtime has not been execution-tested there. Actual 16 KiB-page device
+execution and saved-image APK payloads remain unverified/unsupported respectively.

@@ -11,11 +11,16 @@
 
 Name: torcl
 Version: %{torcl_version}
-Release: 1%{?dist}
+Release: 2%{?dist}
 Summary: Common Lisp with a tiered JIT and saved executable images
 License: MIT OR Apache-2.0
 URL: https://github.com/atgreen/torcl
 Source0: torcl-payload.tar.gz
+Source1: torcl-android-source.tar.gz
+BuildRequires: python3
+%if !0%{?torcl_rustup}
+BuildRequires: cargo
+%endif
 ExclusiveArch: x86_64
 
 %description
@@ -50,21 +55,34 @@ Requires: /usr/bin/wine
 A Windows x86-64 TorCL runtime and a Wine launcher with a private Wine prefix.
 
 %package target-android
-Summary: TorCL image-dumping tools for Android AArch64
+Summary: TorCL Android application runtimes and project generator
 License: (MIT OR Apache-2.0) AND BSD-2-Clause AND BSD-3-Clause
 Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-aarch64
+Requires: python3
+Requires: make
 
 %description target-android
-An Android AArch64 TorCL runtime statically linked with bionic, and a QEMU
-launcher. Produces Android command-line executables, not APKs. Dynamic Android
-library loading is unavailable in this static profile.
+Reusable Android NativeActivity libraries for ARM64 phones and x86-64 emulators,
+plus torcl-android-new and Makefile templates for building signed APKs on Linux.
+The Android SDK and a JDK are needed for APK packaging; Rust and the NDK are
+needed only when building these RPMs. Also includes the static AArch64
+command-line runtime and QEMU launcher.
 
 %prep
-%setup -q -n payload
+%setup -q -n payload -a 1
 
 %build
-# Payload was compiled, stripped, image-dumped and verified before rpmbuild.
+# Existing command-line payloads were image-dumped before rpmbuild. Compile
+# both reusable application libraries here from Source1, using vendored crates
+# and an explicitly supplied local NDK. No network or containers in this step.
+%{!?android_ndk:%{error:Pass --define 'android_ndk /absolute/path/to/android-ndk' (r27d or newer)}}
+python3 torcl-source/packaging/android/build-runtime.py \
+    --ndk "%{android_ndk}" --stage "$PWD" --offline
+
+%check
+python3 torcl-source/packaging/android/test_generator.py
+python3 torcl-source/packaging/android/test_build.py
 
 %install
 mkdir -p %{buildroot}
@@ -91,5 +109,6 @@ cp -a usr %{buildroot}/
 
 %files target-android
 %{_bindir}/torcl-android
+%{_bindir}/torcl-android-new
 %{_libexecdir}/torcl/android
 %license %{_datadir}/licenses/torcl-target-android

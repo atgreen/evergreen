@@ -43,6 +43,13 @@ For native x86-64 Fedora RPMs with optional s390x Linux, AArch64 Linux,
 Windows, and Android image-dumping tools, see
 [container-free Fedora packaging](docs/fedora-rpm.md).
 
+The Android RPM also provides `torcl-android-new` and shared runtimes for ARM64
+phones and x86-64 emulators. Generate an EGL app with
+`torcl-android-new hello --host=aarch64-linux-android --template egl`, then run
+`make install` and `make run` in `hello`. Use `make HOST=x86_64-linux-android`
+to build for an emulator. App builds use the installed runtime and Android SDK;
+they do not require rebuilding TorCL.
+
 For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
 [cross-compilation and QEMU validation](docs/cross-compilation.md). All three
 ports run the interpreter and T0 bytecode engine. Linux s390x (IBM Z) also
@@ -50,8 +57,8 @@ supports the native T1 baseline and T2 optimizing JITs, on-stack replacement
 (OSR) for running loops, and precise deoptimization. Its native runtime calls
 and loops support the moving garbage collector; validation under QEMU includes
 GC stress and poisoning, compiled-file loading, and saved-image round trips.
-AArch64 and ppc64le currently use T0 for native-tier requests. Foreign
-calls/callbacks and fiber context switching remain unported on these targets.
+AArch64 and ppc64le currently use T0 for native-tier requests. AArch64 supports scalar foreign calls through AAPCS64. Foreign callbacks and
+fiber context switching remain unported there; ppc64le also lacks foreign calls.
 
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
 The Android AArch64 CLI is built and validated the same way — same kernel, a

@@ -2,6 +2,7 @@
 """Build container-free Fedora RPM payloads from this checkout."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -137,19 +138,50 @@ def build(args):
     return stage
 
 
-def package(output, stage):
+def android_source_archive(output, sources):
+    """Include current source plus locked, vendored crates for RPM %build."""
+    snapshot = output / 'android-source' / 'torcl-source'
+    snapshot.mkdir(parents=True, exist_ok=True)
+    for name in ('Cargo.toml', 'Cargo.lock'):
+        copy(ROOT / name, snapshot / name)
+    for name in ('crates', 'lib', 'packaging/android'):
+        destination = snapshot / name
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(ROOT / name, destination,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    # Workspace membership includes the linter even though only torcl-android
+    # is built. Cargo still needs every member manifest when reading the lock.
+    shutil.copytree(ROOT / 'tools/gc-root-lint', snapshot / 'tools/gc-root-lint',
+                    dirs_exist_ok=True)
+    config = subprocess.check_output(
+        ['cargo', 'vendor', '--locked', '--offline', '--versioned-dirs', 'vendor'],
+        cwd=snapshot, text=True)
+    (snapshot / '.cargo').mkdir(exist_ok=True)
+    (snapshot / '.cargo/config.toml').write_text(config)
+    with tarfile.open(sources / 'torcl-android-source.tar.gz', 'w:gz') as archive:
+        archive.add(snapshot, arcname='torcl-source')
+
+
+def package(output, stage, ndk):
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
     sources = output / 'SOURCES'
     sources.mkdir(parents=True, exist_ok=True)
+    copy(ROOT / 'docs/fedora-rpm.md', stage / 'usr/share/doc/torcl/fedora-rpm.md')
     with tarfile.open(sources / 'torcl-payload.tar.gz', 'w:gz') as archive:
         archive.add(stage, arcname='payload')
+    android_source_archive(output, sources)
     run(['rpmbuild', '-bb', ROOT / 'packaging/fedora/torcl.spec',
-         '--define', f'_topdir {output}', '--define', f'torcl_version {version}'])
+         '--define', f'_topdir {output}', '--define', f'torcl_version {version}',
+         '--define', 'torcl_rustup 1',
+         '--define', f'android_ndk {ndk.resolve()}'])
     extract_and_verify(output, stage)
 
 
 def extract_and_verify(output, stage):
     extracted = output / 'extracted'
+    if extracted.exists():
+        shutil.rmtree(extracted)
     extracted.mkdir(parents=True, exist_ok=True)
     for rpm in sorted((output / 'RPMS/x86_64').glob('*.rpm')):
         # cpio can exit before rpm2cpio has flushed its archive padding, giving
@@ -167,6 +199,17 @@ def extract_and_verify(output, stage):
             if path.read_bytes() != installed.read_bytes():
                 raise RuntimeError(f'RPM changed payload file: {path}')
     run(['python3', ROOT / 'packaging/fedora/verify.py', extracted])
+    metadata = json.loads((extracted / 'usr/libexec/torcl/android/runtime.json').read_text())
+    checker_spec = importlib.util.spec_from_file_location(
+        'android_runtime', ROOT / 'packaging/android/build-runtime.py')
+    checker = importlib.util.module_from_spec(checker_spec)
+    checker_spec.loader.exec_module(checker)
+    for host, (_, machine) in checker.HOSTS.items():
+        library = extracted / 'usr/libexec/torcl/android' / host / 'libtorcl_android.so'
+        checker.check_elf(library, machine)
+        if hashlib.sha256(library.read_bytes()).hexdigest() != metadata['hosts'][host]['sha256']:
+            raise RuntimeError(f'RPM changed Android library: {library}')
+    run(['python3', extracted / 'usr/bin/torcl-android-new', '--help'])
     print(f'RPMs built and verified: {output / "RPMS/x86_64"}')
 
 
@@ -181,4 +224,4 @@ if __name__ == '__main__':
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     stage = output / 'stage' if args.package_only else build(args)
-    package(output, stage)
+    package(output, stage, args.android_ndk)
