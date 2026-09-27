@@ -29,4 +29,8 @@ scripts/torcl-limited.sh wineboot -u
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test windows_os
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test test_tcp_streams --test test_process -- --test-threads=1
+child="${CARGO_TARGET_DIR:-target}/$target/release/windows-process-child.exe"
+rustc --edition=2024 --target "$target" scripts/windows-process-child.rs -o "$child"
+scripts/torcl-limited.sh python3 scripts/windows-io-smoke.py "$binary" "$child"
 scripts/torcl-limited.sh python3 scripts/portability-smoke.py win64 -- wine "$binary"
