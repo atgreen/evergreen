@@ -4,6 +4,9 @@ Start with the [runtime architecture](explanation/architecture.md) and
 [repository map](reference/repository.md). Then follow
 [Change the runtime](how-to/change-runtime.md) for a small, validated change.
 
+For embedding and scheduler work, see the [runtime fiber API](reference/fibers.md),
+including creation, joins, pinning, cooperative waits, and a complete example.
+
 Two practices matter especially in this codebase:
 
 - [Keep values safe across GC](how-to/gc-safety.md). Allocating code can move

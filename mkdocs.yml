@@ -78,7 +78,9 @@ nav:
   - 4. Conditions and debugging: debugger.md
   - 5. Memory and garbage collection: memory.md
   - 6. Foreign function interface: foreign.md
-  - 7. Threads and synchronization: concurrency.md
+  - 7. Threads and fibers:
+      - Threads and synchronization: concurrency.md
+      - Fibers and scheduler groups: fibers.md
   - 8. Operating-system interface: user/reference/extensions.md
   - 9. Profiling and efficiency:
       - profiling.md
@@ -97,6 +99,7 @@ nav:
       - contributing/index.md
       - Architecture: contributing/explanation/architecture.md
       - Repository map: contributing/reference/repository.md
+      - Runtime fiber API: contributing/reference/fibers.md
       - Change the runtime: contributing/how-to/change-runtime.md
       - GC safety: contributing/how-to/gc-safety.md
   - Appendix B. Symbol index: symbol-index.md

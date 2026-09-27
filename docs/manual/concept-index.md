@@ -19,7 +19,10 @@
 | Environment variables | [Environment](user/reference/extensions.md#environment) |
 | Event recording | [Event stream](profiling.md#events) |
 | FASL files | [File compilation](compiler.md#file-compilation) |
-| Fibers versus native threads | [Threads and synchronization](concurrency.md) |
+| Fibers versus native threads | [Fibers and scheduler groups](fibers.md) |
+| Fiber API, Rust | [Runtime dictionary](contributing/reference/fibers.md) |
+| Fiber pinning | [Pinning and native blocking](contributing/reference/fibers.md#pinning) |
+| Scheduler groups | [Creation and ownership](contributing/reference/fibers.md#groups) |
 | Finalizers | [Finalization](memory.md#finalization) |
 | Foreign storage | [Allocation and release](foreign.md#foreign-alloc) |
 | Garbage collection | [Explicit collection](memory.md#gc) |
