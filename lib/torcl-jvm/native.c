@@ -26,7 +26,7 @@ typedef struct Callback {
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static JavaVM *vm;
 static void *jvm_library;
-static jclass helper;
+static jclass helper, ambiguity_type;
 static jmethodID dispatch_id, box_id, kind_id, integer_id, real_id;
 static Reference *references;
 static Callback *callbacks;
@@ -52,7 +52,7 @@ static int exception(JNIEnv *env) {
     jthrowable cause = (*env)->ExceptionOccurred(env);
     (*env)->ExceptionClear(env);
     fail("Java exception (diagnostic unavailable)");
-    error_kind = 2;
+    error_kind = ambiguity_type && (*env)->IsInstanceOf(env, cause, ambiguity_type) ? 3 : 2;
     jclass cls = (*env)->GetObjectClass(env, cause);
     jmethodID to_string = cls ? (*env)->GetMethodID(env, cls, "toString", "()Ljava/lang/String;") : NULL;
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return 1; }
@@ -208,7 +208,7 @@ Handle tj_call(int op, Handle target, Handle name, Handle signature, const Handl
     Entry entry; if (!enter(&entry)) return 0;
     JNIEnv *env = entry.env;
     Handle result = 0;
-    if (op < 0 || op > 7 || count < 0 || count > 1024 || (count && !arguments)) fail("Invalid call arguments");
+    if (op < 0 || op > 23 || count < 0 || count > 1024 || (count && !arguments)) fail("Invalid call arguments");
     else if ((*env)->EnsureLocalCapacity(env, count + 32) != JNI_OK) exception(env);
     if (!error_kind) {
         jobject receiver = local(env, target, 0);
@@ -386,7 +386,13 @@ static void *start_worker(void *argument) {
         owns_vm = 1;
     }
     if ((*env)->PushLocalFrame(env, 32) != JNI_OK) { exception(env); (*vm)->DetachCurrentThread(vm); goto done; }
-    jclass local_class = (*env)->DefineClass(env, "org/torcl/jvm/Bridge", NULL,
+    jclass ambiguity_local = (*env)->DefineClass(env, "org/torcl/jvm/AmbiguousCall", NULL,
+        (const jbyte *)ambiguouscall_class, (jsize)sizeof(ambiguouscall_class));
+    if (!exception(env) && ambiguity_local) ambiguity_type = (*env)->NewGlobalRef(env, ambiguity_local);
+    jclass api_local = exception(env) || error_kind ? NULL : (*env)->DefineClass(env, "org/torcl/jvm/Api", NULL,
+        (const jbyte *)api_class, (jsize)sizeof(api_class));
+    if (api_local) (*env)->DeleteLocalRef(env, api_local);
+    jclass local_class = exception(env) || error_kind ? NULL : (*env)->DefineClass(env, "org/torcl/jvm/Bridge", NULL,
         (const jbyte *)bridge_class, (jsize)sizeof(bridge_class));
     if (!exception(env) && local_class) {
         helper = (*env)->NewGlobalRef(env, local_class);
@@ -443,10 +449,19 @@ static void *stop_worker(void *unused) {
     JNIEnv *env = NULL;
     int rc = (*vm)->AttachCurrentThreadAsDaemon(vm, (void **)&env, NULL);
     if (rc == JNI_OK) {
+        jclass api = (*env)->FindClass(env, "org/torcl/jvm/Api");
+        if (api) {
+            jmethodID clear = (*env)->GetStaticMethodID(env, api, "clear", "()V");
+            if (clear) (*env)->CallStaticVoidMethod(env, api, clear);
+            (*env)->DeleteLocalRef(env, api);
+        }
+        exception(env);
         rc = (*env)->UnregisterNatives(env, helper);
         if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         (*env)->DeleteGlobalRef(env, helper);
         helper = NULL;
+        (*env)->DeleteGlobalRef(env, ambiguity_type);
+        ambiguity_type = NULL;
         if (owns_vm) rc = (*vm)->DestroyJavaVM(vm);
         else rc = (*vm)->DetachCurrentThread(vm);
     }

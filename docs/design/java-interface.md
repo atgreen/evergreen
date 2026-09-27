@@ -1,8 +1,11 @@
 # A more idiomatic Java interface for TorCL
 
-Research and proposal, 2026-09-27. Tracked in `bliss-jd785`.
-**The examples below are proposed syntax, not implemented functionality.**
-The existing [torcl-jvm API](../../lib/torcl-jvm/README.md) remains unchanged.
+Research and design, 2026-09-27. Research: `bliss-jd785`; implementation: `bliss-of7zk`.
+The primary `JAVA` API now implements dynamic calls, named bindings, scopes,
+callbacks, collection copies, SETF array/field access, resource cleanup and member
+inspection. See the [package guide](../../lib/torcl-jvm/README.md) for the actual
+public API. The descriptor-based `TORCL-JVM` interface remains available.
+The research below records the rationale and distinguishes longer-term ideas.
 
 The recommendation is a small, ordinary Common Lisp interface combining dynamic
 calls, named Lisp bindings, and explicit lifetime scopes. Keep the existing
@@ -32,8 +35,8 @@ supply a solution to our cross-heap cycles or native callback lifetimes.
 
 ## Package boundary and compatibility
 
-Keep `TORCL-JVM` as the explicit, descriptor-based interface. Add an optional
-ASDF system `torcl-jvm/api` exposing `TORCL-JAVA`. Use `JAVA` as its short name
+Keep `TORCL-JVM` as the explicit, descriptor-based interface. Load the primary
+ASDF system `torcl-jvm`, which exposes `TORCL-JAVA`. Use `JAVA` as its short name
 in applications; installation must detect an existing conflicting package,
 not change another library's `JAVA` package. Applications can always use the
 full `TORCL-JAVA` name.
@@ -53,10 +56,10 @@ aliases introduce Lisp names without guessing capitalization:
     (java:call items "add" "hello")
     (java:call items "add" 42)
     (java:to-list items)))
-;; proposed result: ("hello" 42)
+;; => ("hello" 42)
 
 (java:static "java.lang.Integer" "parseInt" "42")
-;; proposed result: 42
+;; => 42
 ```
 
 `define-class` records metadata under an explicitly chosen Lisp symbol; it does
@@ -128,7 +131,7 @@ an entire Java package into the current Lisp package:
   :static t :parameters ("java.lang.String") :returns :int)
 
 (mapcar #'parse-int '("10" "20" "30"))
-;; proposed result: (10 20 30)
+;; => (10 20 30)
 ```
 
 Instance bindings take the receiver first. Defining a binding stores metadata;
@@ -151,7 +154,7 @@ A functional-interface adapter should not expose a method-name argument:
           (java:lambda "java.util.function.IntUnaryOperator" (x)
             (1+ x))))
     (java:call increment "applyAsInt" 41)))
-;; proposed result: 42
+;; => 42
 ```
 
 `java:lambda` is a package-local macro name distinct from `cl:lambda`. It checks
@@ -166,11 +169,11 @@ form covers richer interfaces:
 
 The comparator returns an integer, not Lisp truth. Method selectors can carry
 parameter types for overloaded interface methods. The native callback protocol
-must therefore include method signature information; the current name-only
-callback protocol is insufficient. Validate missing methods, arities and return
+includes method signature information; the low-level name-only callback
+protocol remains available for existing code. Validate missing methods, arities and return
 conversions at adapter creation where possible, and fail clearly at invocation
-otherwise. Multiple interfaces, default-method dispatch and concrete-class
-subclassing can follow separately.
+otherwise. Default-method dispatch is supported. Multiple interfaces and
+concrete-class subclassing can follow separately.
 
 Do not automatically turn arbitrary Lisp functions into persistent Java
 callbacks in phase one. A library may retain its argument, so a temporary
@@ -194,11 +197,11 @@ still have scoped proxy lifetimes. A later iteration macro can avoid bulk copies
 
 Callback retention needs a stronger operation than copying its Java object
 handle: the registration and rooted Lisp closure must share a reference-counted
-lease until all owners release it. The current low-level `retain` does not do
-that. Implement this before advertising escape of callbacks from a scope.
+lease until all owners release it. Both the high-level and low-level APIs now
+share those leases, including callback references returned through Java.
 
-Releasing a JNI reference does not invoke Java `close()`. A later
-`with-open-resource` should call AutoCloseable.close and then release the proxy,
+Releasing a JNI reference does not invoke Java `close()`.
+`with-resource` calls close and then releases the proxy,
 while preserving the primary exception if cleanup also fails. Explicit release
 remains available. Finalizers could eventually enqueue best-effort cleanup on
 an attached thread; they must not enter Java from Lisp collector locks and do
@@ -213,7 +216,7 @@ interface-precedence and loader-identity decisions. Ordinary calls plus binding
 macros offer substantial improvement using familiar Common Lisp tools and a
 smaller implementation surface. That is the recommended starting point.
 
-Implementation should proceed in three bounded pieces after design review:
+The implementation follows these three pieces:
 
 1. Shared resolver, exact selectors, type annotations, dynamic calls and named
    bindings. Preserve the old API and test ambiguous null, numeric ranges,
@@ -223,5 +226,6 @@ Implementation should proceed in three bounded pieces after design review:
 3. SETF field/array accessors, explicit collection traversal, resource scopes and
    interactive inspection. Consider reader syntax and CLOS integration separately.
 
-The combined examples represent the intended interface after the first two
-pieces, not a claim that all of this is a thin macro layer over today's bridge.
+Reader syntax, Java/CLOS metaclasses, live-object inspection, generated bulk
+bindings, and shared-heap collection remain separate future work. Member inspection
+is available through `java:describe-class`; binding checks through `java:verify`.

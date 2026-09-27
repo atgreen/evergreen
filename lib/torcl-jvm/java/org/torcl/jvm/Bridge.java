@@ -12,10 +12,11 @@ import java.lang.reflect.Proxy;
 /** Private adapter. User-supplied types never become unchecked JNI signatures. */
 public final class Bridge implements InvocationHandler {
     private final long callback;
-    private Bridge(long callback) { this.callback = callback; }
+    private final boolean signed;
+    private Bridge(long callback, boolean signed) { this.callback = callback; this.signed = signed; }
     private static native Object invokeLisp(long callback, String name, Object[] args);
 
-    private static Class<?> resolve(Object type, ClassLoader loader) throws ClassNotFoundException {
+    static Class<?> resolve(Object type, ClassLoader loader) throws ClassNotFoundException {
         if (type instanceof Class<?>) return (Class<?>) type;
         if (!(type instanceof String)) throw new IllegalArgumentException("Expected a class name or Class object");
         return Class.forName((String) type, true, loader);
@@ -27,7 +28,7 @@ public final class Bridge implements InvocationHandler {
         for (int i = 0; i < args.length; ++i) result[i] = convert(types[i], args[i]);
         return result;
     }
-    private static Object convert(Class<?> type, Object value) {
+    static Object convert(Class<?> type, Object value) {
         if (type == void.class) return null;
         if (!type.isPrimitive()) {
             if (value != null && !type.isInstance(value))
@@ -39,6 +40,7 @@ public final class Bridge implements InvocationHandler {
             return value;
         }
         if (type == char.class && value instanceof Character) return value;
+        if (value instanceof Character) value = Integer.valueOf((Character)value);
         if (!(value instanceof Number)) throw new IllegalArgumentException("Expected a number for " + type);
         Number number = (Number) value;
         if (type == double.class) return number.doubleValue();
@@ -61,7 +63,7 @@ public final class Bridge implements InvocationHandler {
     }
     // Collections and other libraries return private implementation classes.
     // Invoke their public contract without opening modules or suppressing access checks.
-    private static Method accessibleMethod(Class<?> type, Method requested, Object receiver) {
+    static Method accessibleMethod(Class<?> type, Method requested, Object receiver) {
         try {
             Method candidate = type.getMethod(requested.getName(), requested.getParameterTypes());
             if (candidate.getReturnType() == requested.getReturnType() && candidate.canAccess(receiver))
@@ -75,13 +77,10 @@ public final class Bridge implements InvocationHandler {
     }
     public static Object dispatch(int op, Object target, String name, String signature, Object[] args) throws Throwable {
         try {
+            if (op >= 8) return Api.dispatch(op, target, name, signature, args);
             if (op == 3) return resolve(target, args.length == 0 ? loader() : (ClassLoader)args[0]);
             if (op == 4) {
-                Class<?> iface = resolve(target, loader());
-                if (!iface.isInterface() || !Modifier.isPublic(iface.getModifiers()))
-                    throw new IllegalArgumentException("Expected a public Java interface");
-                return Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
-                    new Bridge(((Number)args[0]).longValue()));
+                return proxy(resolve(target, loader()), ((Number)args[0]).longValue(), false);
             }
             if (op == 5) return Array.getLength(target);
             if (op == 6) return Array.get(target, (Integer)convert(int.class, args[0]));
@@ -107,7 +106,17 @@ public final class Bridge implements InvocationHandler {
             return method.invoke(op == 2 ? null : target, converted);
         } catch (InvocationTargetException e) { throw e.getCause(); }
     }
-    @Override public Object invoke(Object proxy, Method method, Object[] args) {
+    static long callbackToken(Object value) {
+        if (value == null || !Proxy.isProxyClass(value.getClass())) return 0;
+        InvocationHandler handler = Proxy.getInvocationHandler(value);
+        return handler instanceof Bridge ? ((Bridge)handler).callback : 0;
+    }
+    static Object proxy(Class<?> iface, long callback, boolean signed) {
+        if (!iface.isInterface() || !Modifier.isPublic(iface.getModifiers()))
+            throw new IllegalArgumentException("Expected a public Java interface");
+        return Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface}, new Bridge(callback, signed));
+    }
+    @Override public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
         if (method.getDeclaringClass() == Object.class) {
             switch (method.getName()) {
                 case "hashCode": return System.identityHashCode(proxy);
@@ -116,7 +125,8 @@ public final class Bridge implements InvocationHandler {
                 default: throw new AssertionError(method);
             }
         }
-        return convert(method.getReturnType(), invokeLisp(callback, method.getName(), args == null ? new Object[0] : args));
+        if (signed && method.isDefault()) return InvocationHandler.invokeDefault(proxy, method, args == null ? new Object[0] : args);
+        return convert(method.getReturnType(), invokeLisp(callback, signed ? Api.callbackKey(proxy.getClass().getInterfaces()[0], method) : method.getName(), args == null ? new Object[0] : args));
     }
     public static Object box(int kind, long integer, double real, String text) {
         switch (kind) {
@@ -133,6 +143,7 @@ public final class Bridge implements InvocationHandler {
         }
     }
     public static int kind(Object value) {
+        if (value == Api.VOID) return 8;
         if (value == null) return 0;
         if (value instanceof String) return 3;
         if (value instanceof Boolean) return 4;

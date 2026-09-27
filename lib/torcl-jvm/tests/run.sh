@@ -25,3 +25,16 @@ TORCL_TIMEOUT="${TORCL_TIMEOUT:-180}" scripts/torcl-limited.sh \
   "$TORCL_JVM_BIN" --no-init --load lib/torcl-jvm/tests/startup-error.lisp >"$startup_log" 2>&1
 cat "$startup_log"
 grep -qx JVM-STARTUP-ERROR-PASS "$startup_log"
+
+for scenario in ergonomic package-conflict; do
+  scenario_log=$(mktemp "/tmp/torcl-java-${scenario}.XXXXXX.log")
+  printf 'Java %s test log: %s\n' "$scenario" "$scenario_log"
+  TORCL_TIMEOUT="${TORCL_TIMEOUT:-180}" scripts/torcl-limited.sh \
+    "$TORCL_JVM_BIN" --no-init --load "lib/torcl-jvm/tests/${scenario}.lisp" >"$scenario_log" 2>&1
+  cat "$scenario_log"
+  case "$scenario" in
+    ergonomic) grep -qx JAVA-ERGONOMIC-PASS "$scenario_log" ;;
+    package-conflict) grep -qx JAVA-PACKAGE-CONFLICT-PASS "$scenario_log" ;;
+  esac
+  if grep -Eq 'WARNING.*JNI|FATAL ERROR|WARNING in native method' "$scenario_log"; then exit 1; fi
+done

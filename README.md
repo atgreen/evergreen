@@ -84,6 +84,8 @@ For in-process Java calls and Java interfaces implemented by Lisp functions,
 see the experimental [torcl-jvm package](lib/torcl-jvm/README.md). The initial
 implementation uses a native x86-64 glibc build and a local JDK, with explicit
 reference ownership and checks for JVM startup, signals, callbacks, and shutdown.
+The primary `JAVA` API provides inferred calls, named bindings, Lisp callbacks
+and `with-scope` cleanup; the explicit `TORCL-JVM` descriptor API remains available.
 
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
 The Android AArch64 CLI is built and validated the same way — same kernel, a
