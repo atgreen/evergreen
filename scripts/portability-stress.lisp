@@ -16,3 +16,13 @@
   (portable-check (= (+ (car (cdr numbers)) 2.5d0) 3.75d0))
   (portable-check (= (portable-last numbers) 1/3)))
 (format t "STRESS-OK~%")
+#+windows
+(let* ((p (parse-namestring "C:/Work/Demo.lisp"))
+       (q (merge-pathnames "next" p))
+       (u (make-pathname :host "server" :device "share"
+                         :directory '(:absolute "Work") :name "Demo" :type "lisp")))
+  (portable-check (equal (pathname-device p) "C"))
+  (portable-check (string= (namestring q) "C:/Work/next.lisp"))
+  (portable-check (string= (namestring u) "//server/share/Work/Demo.lisp"))
+  (portable-check (equal u (parse-namestring "//SERVER/SHARE/work/demo.LISP")))
+  (format t "PATHNAME-STRESS-OK~%"))

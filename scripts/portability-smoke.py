@@ -83,6 +83,13 @@ def main():
                           '(format t "TRUENAME-OK~%"))'], home_env)
             assert "TRUENAME-OK" in output, output
             print(f"{arch}: canonical pathname reopens its file: OK", flush=True)
+            output = run(["--eval", f'(let* ((p (pathname "{target_path(script)}")) '
+                          '(pattern (make-pathname :defaults p :name :wild))) '
+                          '(assert (find (truename p) (directory pattern) :test (function equal))) '
+                          '(assert (equal (pathname-device (truename p)) (pathname-device p))) '
+                          '(format t "DIRECTORY-OK~%"))'], home_env)
+            assert "DIRECTORY-OK" in output, output
+            print(f"{arch}: wildcard directory preserves its drive: OK", flush=True)
             for tier in ["interp", "t0"]:
                 home_env["TORCL_FORCE_TIER"] = tier
                 output = run(["--eval", '(progn (defun recurse (n) (if (= n 0) 0 '
@@ -105,20 +112,37 @@ def main():
         del env["TORCL_GC_STRESS"]
         del env["TORCL_GC_POISON"]
 
+        if arch == "win64":
+            paths = Path(__file__).with_name("windows-pathnames.lisp").resolve()
+            for tier in ["interp", "t0"]:
+                env["TORCL_FORCE_TIER"] = tier
+                output = run(["--load", target_path(paths)], env)
+                assert "WINDOWS-PATHNAMES-OK" in output, output
+            print(f"{arch}: pathname components, merging, matching and hashing: OK", flush=True)
+
         # A compiled artifact must load and execute in a fresh process.
         fasl_source = Path(directory) / "compiled.lisp"
-        fasl_source.write_text('(defun portable-fasl (x) (+ x 17))\n')
+        pathname_setup = ('(defparameter *portable-drive* #p"C:/Work/demo.lisp") '
+                          '(defparameter *portable-unc* #p"//server/share/Work/demo.lisp") '
+                          if arch == "win64" else '')
+        pathname_check = ('(assert (equal (pathname-device *portable-drive*) "C")) '
+                          '(assert (equal (pathname-directory *portable-drive*) (quote (:absolute "Work")))) '
+                          '(assert (equal (pathname-host *portable-unc*) "server")) '
+                          '(assert (equal (pathname-device *portable-unc*) "share")) '
+                          '(assert (string= (namestring (make-pathname :defaults *portable-unc* :name "new")) '
+                          '"//server/share/Work/new.lisp")) ' if arch == "win64" else '')
+        fasl_source.write_text('(defun portable-fasl (x) (+ x 17))\n' + pathname_setup)
         fasl = Path(directory) / "compiled.bfasl"
         run(["--eval", f'(compile-file "{target_path(fasl_source)}" :output-file "{target_path(fasl)}")'], env)
         output = run(["--eval", f'(progn (load "{target_path(fasl)}") '
-                      '(assert (= (portable-fasl 25) 42)) (format t "FASL-OK~%"))'], env)
+                      f'{pathname_check}(assert (= (portable-fasl 25) 42)) (format t "FASL-OK~%"))'], env)
         assert "FASL-OK" in output, output
         print(f"{arch}: fresh-process compiled-file round trip: OK", flush=True)
 
         image = Path(directory) / "saved.image"
-        run(["--eval", f'(progn (defun portable-image () 42) (save-image "{target_path(image)}"))'], env)
+        run(["--eval", f'(progn {pathname_setup}(defun portable-image () 42) (save-lisp-and-die "{target_path(image)}"))'], env)
         output = run(["--image", target_path(image), "--eval",
-                      '(progn (assert (= (portable-image) 42)) (format t "IMAGE-OK~%"))'], env)
+                      f'(progn {pathname_check}(assert (= (portable-image) 42)) (format t "IMAGE-OK~%"))'], env)
         assert "IMAGE-OK" in output, output
         print(f"{arch}: fresh-process heap-image round trip: OK", flush=True)
 

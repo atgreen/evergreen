@@ -38,9 +38,20 @@ no MinGW runtime DLL needs to be copied alongside it.
 `*FEATURES*` includes `:WINDOWS`, `:X86-64`, and `:LITTLE-ENDIAN`. Home-directory
 and default `.torclrc` discovery use `USERPROFILE` (with `HOME` as a fallback).
 Use forward slashes inside Lisp path strings, for example `C:/work/demo.lisp`.
-Absolute drive paths and relative paths are supported. Drive-relative paths
-(`C:demo.lisp`), UNC shares, and full ANSI device-component semantics remain
-follow-up work.
+Physical pathnames support absolute drives (`C:/work/demo.lisp`), drive-relative
+paths (`C:demo.lisp`), root-relative paths, UNC shares (`//server/share/file`),
+and ordinary relative paths. Backslashes and verbatim drive/UNC prefixes are
+accepted and namestrings use forward slashes. The drive letter is the device
+component, normalized to uppercase. UNC pathnames use the server as host and
+the share as device; their directory is absolute. `MAKE-PATHNAME` rejects a
+relative UNC directory and supplies a root when its directory is nil.
+`MERGE-PATHNAMES` inherits directories only within the same volume.
+
+Physical pathname equality, hashing and wildcard matching ignore ASCII case
+while preserving original namestring spelling and wildcard captures. Non-ASCII
+case equivalence and Windows device namespaces such as `//./` are not supported.
+UNC parsing and reconstruction are tested; live network-share access has not
+been validated.
 Saved images carry a Windows platform tag and cannot be exchanged with Linux
 images. Ctrl+C and Ctrl+Break request cooperative Lisp interruption.
 
@@ -58,7 +69,8 @@ prefix. It runs Windows memory/protection, timing/thread, DLL-lifetime and stack
 budget tests, then the CLI functional tests in interpreter, bytecode, default,
 and forced-T2 fallback modes. Additional checks cover `USERPROFILE` without
 `HOME`, catchable recursive stack exhaustion, moving-GC stress with poison,
-and compiled-file and heap-image round trips in fresh processes.
+pathname components, construction, merging, wildcard searches, equality/hashing,
+and compiled-file and heap-image pathname round trips in fresh processes.
 
 The GC stress probe uses `--no-bootstrap` and stresses every allocation in the
 probe; the broader functional tests load the normal prelude. Tests use
