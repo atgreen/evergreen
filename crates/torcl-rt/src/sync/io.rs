@@ -72,7 +72,10 @@ pub fn wait_fd(
     }
 }
 
-#[cfg(target_os = "linux")]
+// Android is a Linux kernel with epoll; its target_os is "android", so a bare
+// `target_os = "linux"` would drop it into the no-poller fallback below and
+// silently degrade fiber I/O (bliss-w2vp).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn fiber_wait_fd(
     fd: RawFd,
     interest: IoInterest,
@@ -136,6 +139,7 @@ fn fiber_wait_fd(
 
 #[cfg(not(any(
     target_os = "linux",
+    target_os = "android",
     target_os = "macos",
     target_os = "freebsd",
     target_os = "openbsd",
@@ -176,7 +180,7 @@ fn fiber_wait_fd(
     Ok(ready.load(Ordering::Acquire))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod epoll {
     use super::{IoInterest, RawFd};
     use crate::error::TorclError;

@@ -8,7 +8,11 @@ use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::stack::TorclStack;
 use crate::value::{NIL, TorclVal};
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::RefCell;
+// Only the x86-64 fiber context uses an UnsafeCell; importing it
+// unconditionally warns on every other port (bliss-w2vp).
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
 use std::sync::atomic::{
@@ -2266,6 +2270,12 @@ pub(crate) fn prepare_current_fiber_park(state: FiberState) -> Result<(FiberId, 
 pub(crate) fn park_prepared_current_fiber() -> Result<(), TorclError> {
     let fiber = current_fiber()
         .ok_or_else(|| TorclError::ProgramError("fiber park outside a fiber".into()))?;
+    // Ports without the native context switch only yield below, so FIBER goes
+    // unread there. The binding still earns its keep on every target: it is the
+    // "called outside a fiber" check, and dropping it would turn a caller's bug
+    // into a silent no-op (bliss-w2vp).
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    let _ = &fiber;
 
     #[cfg(all(target_arch = "x86_64", unix))]
     {
