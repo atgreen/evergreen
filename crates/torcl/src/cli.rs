@@ -7445,12 +7445,12 @@ fn install_evaluator_global_root_scanner() {
         // thread (bliss-q9i1): torcl-rt is the lower layer and cannot call the
         // interpreter directly, so it invokes this host callback.
         torcl_rt::set_thread_entry_runner(thread_entry_runner);
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
         torcl_rt::ffi::managed_callback::set_callback_runner(foreign_callback_runner);
     });
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn foreign_callback_runner(
     entry: TorclVal,
     arguments: &[TorclVal],

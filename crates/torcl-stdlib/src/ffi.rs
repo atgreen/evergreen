@@ -290,7 +290,7 @@ fn foreign_name(value: TorclVal) -> Result<String, TorclError> {
 /// Explicit callback ownership, independent of the lifetime of its Lisp wrapper.
 /// The caller must retire all foreign pointer uses before FREE; the active check
 /// additionally rejects a callback trying to release its own executable entry.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub fn callback_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     use std::sync::{Mutex, OnceLock};
     use torcl_rt::ffi::managed_callback::LispCallback;
@@ -385,7 +385,7 @@ pub fn callback_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 pub fn callback_call(_args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     Err(TorclError::FfiError(
         "callbacks are not implemented for this target ABI".into(),

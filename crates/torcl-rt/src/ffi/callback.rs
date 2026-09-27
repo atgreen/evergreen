@@ -32,16 +32,21 @@ impl CallbackAdapter {
             .map(Scalar::from_type)
             .collect::<Result<Vec<_>, _>>()?;
         let plan = classify(&arguments)?;
-        let frame_bytes = (arguments.len() * 8).div_ceil(16) * 16;
+        let shadow_bytes = if cfg!(windows) { 32 } else { 0 };
+        let frame_bytes = (shadow_bytes + arguments.len() * 8).div_ceil(16) * 16;
         // Incoming rsp points at the C return address. Establish an aligned
         // local slot vector without touching any argument register.
+        #[cfg(unix)]
         let mut code = vec![
             0xf3, 0x0f, 0x1e, 0xfa, // endbr64
             0x55, // push rbp
             0x48, 0x89, 0xe5, // mov rbp,rsp
             0x48, 0x81, 0xec, // sub rsp,frame_bytes
         ];
+        #[cfg(unix)]
         code.extend_from_slice(&(frame_bytes as u32).to_le_bytes());
+        #[cfg(windows)]
+        let (mut code, unwind) = super::win64::prologue(frame_bytes as u32)?;
         for (index, location) in plan.locations.iter().enumerate() {
             match location {
                 Location::Integer(register) => {
@@ -58,7 +63,8 @@ impl CallbackAdapter {
                 }
                 Location::Stack(offset) => {
                     code.extend_from_slice(&[0x48, 0x8b, 0x85]); // mov rax,[rbp+disp32]
-                    code.extend_from_slice(&(16 + offset).to_le_bytes());
+                    let incoming_base = if cfg!(windows) { frame_bytes as u32 } else { 0 };
+                    code.extend_from_slice(&(incoming_base + 16 + offset).to_le_bytes());
                 }
             }
             // Upper argument bits are unspecified by the C ABI. Normalize each
@@ -72,11 +78,15 @@ impl CallbackAdapter {
                 _ => {}
             }
             code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]); // mov [rsp+disp32],rax
-            code.extend_from_slice(&((index * 8) as u32).to_le_bytes());
+            code.extend_from_slice(&((shadow_bytes + index * 8) as u32).to_le_bytes());
         }
-        code.extend_from_slice(&[0x48, 0xbf]); // movabs rdi,context
+        // The dispatcher uses the platform C ABI too.
+        code.extend_from_slice(&[0x48, if cfg!(windows) { 0xb9 } else { 0xbf }]);
         code.extend_from_slice(&(context as usize as u64).to_le_bytes());
+        #[cfg(unix)]
         code.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov rsi,rsp
+        #[cfg(windows)]
+        code.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 32]); // lea rdx,[rsp+32]
         code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,dispatcher
         code.extend_from_slice(&(dispatcher as usize as u64).to_le_bytes());
         code.extend_from_slice(&[0xff, 0xd0]); // call rax
@@ -102,8 +112,14 @@ impl CallbackAdapter {
             Scalar::Void => code.extend_from_slice(&[0x31, 0xc0]),
             _ => {}
         }
-        code.extend_from_slice(&[0xc9, 0xc3]); // leave; ret
-        let code = JitBuffer::new(&code)
+        #[cfg(unix)]
+        let buffer = {
+            code.extend_from_slice(&[0xc9, 0xc3]); // leave; ret
+            JitBuffer::new(&code)
+        };
+        #[cfg(windows)]
+        let buffer = super::win64::finish(code, frame_bytes as u32, &unwind);
+        let code = buffer
             .ok_or_else(|| TorclError::FfiError("cannot allocate callback adapter".into()))?;
         Ok(Self { code })
     }

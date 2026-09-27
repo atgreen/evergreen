@@ -1831,7 +1831,7 @@ pub fn current_thread() -> &'static NativeThread {
 
 /// A foreign-created thread starts quiescent. Its callback entry joins the
 /// collector's Running participant set only under the safepoint transition lock.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub(crate) fn current_thread_for_foreign_entry() -> &'static NativeThread {
     let thread = ensure_current_native_thread_in_state(NativeThreadState::Native);
     unsafe { &*Arc::as_ptr(&thread) }

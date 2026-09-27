@@ -26,11 +26,16 @@ double torcl_ffi_fixed_float(float fixed, int count, ...) {
 /* Clang may implement widening with a plain 32-bit register move, relying
  * on caller extension. Inspect the incoming register to test that contract
  * even when this fixture is built with a compiler that extends again. */
+#ifdef _WIN32
+#define FIRST_INT_REGISTER "%%ecx"
+#else
+#define FIRST_INT_REGISTER "%%edi"
+#endif
 #define NARROW_ARGUMENT(name, type) \
     uint32_t name(type value) { \
         uint32_t incoming; \
         (void)value; \
-        __asm__("movl %%edi, %0" : "=r"(incoming)); \
+        __asm__("movl " FIRST_INT_REGISTER ", %0" : "=r"(incoming)); \
         return incoming; \
     }
 NARROW_ARGUMENT(torcl_ffi_i8, int8_t)

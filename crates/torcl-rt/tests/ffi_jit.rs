@@ -1,9 +1,30 @@
 //! Exercise generated adapters against independently compiled C-ABI functions.
 //! R2.11 and the scalar outbound subset of R2.14; this suite does not certify
-//! aggregate, variadic, callback, or non-SysV support.
-#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
+//! aggregate or callback support.
+#![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 
 use torcl_rt::ffi::{AlienType, ffi_call, ffi_call_variadic};
+
+#[test]
+fn large_variadic_frame_crosses_multiple_stack_pages() {
+    let mut types = vec![int(32)];
+    let mut args = vec![1024];
+    for i in 0..1024 {
+        types.extend([int(32), AlienType::Double]);
+        args.extend([i, 0.5f64.to_bits()]);
+    }
+    let result = unsafe {
+        ffi_call_variadic(
+            c_symbol("torcl_ffi_varargs"),
+            &AlienType::Double,
+            &types,
+            &args,
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(f64::from_bits(result), (1023 * 1024 / 2) as f64 * 0.5);
+}
 
 #[test]
 fn variadic_calls_promote_only_arguments_after_the_fixed_prefix() {
@@ -60,31 +81,42 @@ fn variadic_calls_validate_fixed_count_and_argument_count() {
 }
 
 fn c_symbol(name: &str) -> *const () {
-    use std::{process::Command, sync::OnceLock};
+    #[cfg(unix)]
+    use std::process::Command;
+    use std::sync::OnceLock;
     static LIBRARY: OnceLock<usize> = OnceLock::new();
     let library = *LIBRARY.get_or_init(|| {
-        let directory = std::env::temp_dir().join(format!("torcl-ffi-jit-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let output = directory.join("scalars.so");
-        let compilation = Command::new("cc")
-            .args(["-shared", "-fPIC", "-O2"])
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/ffi_scalars.c"
-            ))
-            .arg("-o")
-            .arg(&output)
-            .output()
-            .expect("C compiler required for ABI oracle");
-        assert!(
-            compilation.status.success(),
-            "{}",
-            String::from_utf8_lossy(&compilation.stderr)
-        );
-        let library = torcl_rt::ffi::load_foreign_library(output.to_str().unwrap()).unwrap();
-        std::fs::remove_file(output).unwrap();
-        std::fs::remove_dir(directory).unwrap();
-        library as usize
+        #[cfg(windows)]
+        {
+            let path = std::env::var("TORCL_FFI_SCALARS_DLL").expect("prebuilt MinGW C fixture");
+            torcl_rt::ffi::load_foreign_library(&path).unwrap() as usize
+        }
+        #[cfg(unix)]
+        {
+            let directory =
+                std::env::temp_dir().join(format!("torcl-ffi-jit-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let output = directory.join("scalars.so");
+            let compilation = Command::new("cc")
+                .args(["-shared", "-fPIC", "-O2"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/ffi_scalars.c"
+                ))
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("C compiler required for ABI oracle");
+            assert!(
+                compilation.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compilation.stderr)
+            );
+            let library = torcl_rt::ffi::load_foreign_library(output.to_str().unwrap()).unwrap();
+            std::fs::remove_file(output).unwrap();
+            std::fs::remove_dir(directory).unwrap();
+            library as usize
+        }
     });
     unsafe { torcl_rt::ffi::foreign_symbol(library as *mut (), name) }.unwrap()
 }
