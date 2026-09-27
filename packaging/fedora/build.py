@@ -46,6 +46,7 @@ def build(args):
     targets = [('native', 'x86_64-unknown-linux-gnu'),
                ('s390x-linux', 's390x-unknown-linux-gnu'),
                ('aarch64-linux', 'aarch64-unknown-linux-gnu'),
+               ('ppc64le-linux', 'powerpc64le-unknown-linux-gnu'),
                ('windows', 'x86_64-pc-windows-gnu'),
                ('android', 'aarch64-linux-android')]
     provenance = {'git': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
@@ -60,14 +61,15 @@ def build(args):
         runner = []
         if name.endswith('-linux'):
             arch = name.split('-')[0]
+            compiler_arch = 'powerpc64le' if arch == 'ppc64le' else arch
             sysroot = tools / 'usr' / f'{arch}-redhat-linux/sys-root' / args.sysroot_release
-            crossbin = tools / 'usr' / f'{arch}-linux-gnu/bin'
+            crossbin = tools / 'usr' / f'{compiler_arch}-linux-gnu/bin'
             gcc_lib = tools / 'targets' / arch / 'lib64'
             gcc_so = gcc_lib / 'libgcc_s.so'
             if not gcc_so.exists():
                 gcc_so.symlink_to('libgcc_s.so.1')
             linker = output / f'{arch}-link'
-            compiler = tools / 'usr/bin' / f'{arch}-linux-gnu-gcc'
+            compiler = tools / 'usr/bin' / f'{compiler_arch}-linux-gnu-gcc'
             linker.write_text('#!/bin/sh\nexec ' + shlex.join([
                 str(compiler), '-fuse-ld=bfd', f'-B{crossbin}/',
                 f'--sysroot={sysroot}', f'-L{gcc_lib}']) + ' "$@"\n')
@@ -109,6 +111,7 @@ def build(args):
             'native': 'strip',
             'windows': 'x86_64-w64-mingw32-strip',
             'android': ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip',
+            'ppc64le-linux': tools / 'usr/bin/powerpc64le-linux-gnu-strip',
             's390x-linux': tools / 'usr/bin/s390x-linux-gnu-strip',
             'aarch64-linux': tools / 'usr/bin/aarch64-linux-gnu-strip',
         }

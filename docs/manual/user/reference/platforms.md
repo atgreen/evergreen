@@ -9,7 +9,7 @@ Tiers are defined in [How Lisp runs](../explanation/execution.md).
 | Linux x86-64 | T1 and T2, OSR and deoptimization | Static musl build or dynamic glibc RPM; host tests |
 | Linux s390x | T1 and T2, OSR and deoptimization | Fedora target RPM; QEMU JIT, image, and GC stress checks |
 | Linux AArch64 | T1 for supported opcode shapes; no AArch64 T2 backend | Fedora target RPM; baseline backend is under development |
-| Linux ppc64le | Interpreter and T0; no native backend | Source cross-build path |
+| Linux ppc64le | T1 and T2 for supported shapes | Fedora target RPM; QEMU image and GC stress checks |
 | Windows x86-64 | T1 and T2 for supported shapes | Target RPM runs via Wine; native OS validation remains distinct |
 | Android ARM64 CLI | Static runtime; current source includes partial AArch64 T1 | `torcl-android`; QEMU image checks |
 | Android ARM64 APK | Dynamic NativeActivity runtime | EGL demo checked on an ARM64 phone |
@@ -27,6 +27,7 @@ foreign-callback implementations. This is not full architecture parity.
 | `torcl` | `torcl` | Native x86-64 |
 | `torcl-target-s390x-linux` | `torcl-s390x-linux` | QEMU s390x |
 | `torcl-target-aarch64-linux` | `torcl-aarch64-linux` | QEMU AArch64 |
+| `torcl-target-ppc64le-linux` | `torcl-ppc64le-linux` | QEMU little-endian POWER |
 | `torcl-target-windows` | `torcl-windows` | Wine |
 | `torcl-target-android` | `torcl-android` | QEMU ARM64 CLI |
 | `torcl-target-android` | `torcl-android-new` | Native Python project generator |

@@ -11,7 +11,7 @@
 
 Name: torcl
 Version: %{torcl_version}
-Release: 4%{?dist}
+Release: 5%{?dist}
 Summary: Common Lisp with a tiered JIT and saved executable images
 License: MIT OR Apache-2.0
 URL: https://github.com/atgreen/torcl
@@ -56,6 +56,15 @@ Requires: /usr/bin/qemu-aarch64
 %description target-aarch64-linux
 An AArch64 TorCL runtime, private Fedora runtime libraries, and a QEMU launcher.
 
+%package target-ppc64le-linux
+Summary: TorCL image-dumping tools for little-endian POWER Linux
+License: (MIT OR Apache-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
+Requires: %{name} = %{version}-%{release}
+Requires: /usr/bin/qemu-ppc64le
+
+%description target-ppc64le-linux
+A ppc64le TorCL runtime, private Fedora runtime libraries, and a QEMU launcher.
+
 %package target-windows
 Summary: TorCL image-dumping tools for Windows x86-64
 Requires: %{name} = %{version}-%{release}
@@ -96,6 +105,7 @@ python3 torcl-source/packaging/android/build-runtime.py \
 
 %check
 python3 torcl-source/packaging/fedora/test-native-content.py
+python3 torcl-source/packaging/fedora/test-cross-launcher.py
 python3 torcl-source/packaging/android/test_generator.py
 python3 torcl-source/packaging/android/test_build.py
 python3 torcl-source/packaging/android/test_install_tools.py
@@ -122,6 +132,11 @@ cp -a usr %{buildroot}/
 %{_bindir}/torcl-aarch64-linux
 %{_libexecdir}/torcl/aarch64-linux
 %license %{_datadir}/licenses/torcl-target-aarch64-linux
+
+%files target-ppc64le-linux
+%{_bindir}/torcl-ppc64le-linux
+%{_libexecdir}/torcl/ppc64le-linux
+%license %{_datadir}/licenses/torcl-target-ppc64le-linux
 
 %files target-windows
 %{_bindir}/torcl-windows

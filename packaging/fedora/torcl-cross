@@ -8,6 +8,7 @@ directory=$root/$target
 runtime=$directory/torcl
 case "$target" in
     s390x-linux) runner=(qemu-s390x -L "$directory/sysroot") ;;
+    ppc64le-linux) runner=(qemu-ppc64le -L "$directory/sysroot") ;;
     aarch64-linux) runner=(qemu-aarch64 -L "$directory/sysroot") ;;
     android) runner=(qemu-aarch64) ;;
     windows)
