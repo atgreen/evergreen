@@ -26,13 +26,25 @@ pub fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
 mod call;
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod callback;
-#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+// AArch64 gets a real ABI backend rather than the legacy dispatcher's eighteen
+// hardcoded shapes (spec §4.7.5.2). Everything else non-x86 still falls back.
+#[cfg(all(target_arch = "aarch64", unix))]
+mod aapcs64;
+#[cfg(not(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+)))]
 mod legacy;
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod managed_callback;
 #[cfg(all(target_arch = "x86_64", windows))]
 mod win64;
-#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+#[cfg(all(target_arch = "aarch64", unix))]
+pub use aapcs64::{ffi_call, ffi_call_variadic};
+#[cfg(not(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+)))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
 // ── Alien type system ──────────────────────────────────────────────
