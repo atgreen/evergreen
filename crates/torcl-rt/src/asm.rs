@@ -78,6 +78,59 @@ impl Cc {
         }
     }
 
+    /// The POWER condition-register bit this tests, and whether it branches when
+    /// that bit is set.
+    ///
+    /// POWER has no flags register: a compare writes one of eight condition
+    /// register FIELDS, each holding LT/GT/EQ/SO, and `bc` names a bit and a
+    /// sense. That looked at first like a reason this shared enum could not serve
+    /// POWER — but the mapping is exact, not approximate. The architecture's eight
+    /// branch aliases disassemble as four bits times two senses:
+    ///
+    /// ```text
+    ///   beq -> bt 2   bne -> bf 2      (bit 2 = EQ)
+    ///   blt -> bt 0   bge -> bf 0      (bit 0 = LT)
+    ///   bgt -> bt 1   ble -> bf 1      (bit 1 = GT)
+    ///   bso -> bt 3   bns -> bf 3      (bit 3 = SO)
+    /// ```
+    ///
+    /// which is exactly this enum's eight variants, with [`Cc::inverse`]'s pairs
+    /// being exactly the sense flips. So POWER reuses `Cc` as AArch64 does, rather
+    /// than keeping a private vocabulary as the System Z assembler does with its
+    /// 4-bit masks.
+    ///
+    /// The field is the caller's to choose. A backend that only ever compares into
+    /// CR0 can ignore the distinction; using several fields is what lets POWER keep
+    /// more than one comparison live, and is an optimisation, not a requirement.
+    ///
+    /// `O`/`No` are a trap here and should not be used on POWER. The SO bit is
+    /// copied from `XER[SO]`, which is STICKY — it stays set until explicitly
+    /// cleared — and the instruction that cheaply cleared it, `mcrxr`, does not
+    /// exist in the ISA level ppc64le targets (an assembler rejects it outright).
+    /// An overflow guard there should compute overflow arithmetically instead —
+    /// `mulhd` against the low half's sign for multiply, the sign test for add and
+    /// subtract — and branch on an ordinary compare, exactly as AArch64 must use
+    /// `SMULH` because it has no flag-setting multiply.
+    #[cfg_attr(
+        not(target_arch = "powerpc64"),
+        allow(
+            dead_code,
+            reason = "consumed by the ppc64le encoder (bliss-jflix); pinned by test"
+        )
+    )]
+    pub(crate) fn ppc_condition(self) -> (u32, bool) {
+        match self {
+            Cc::L => (0, true),
+            Cc::Ge => (0, false),
+            Cc::G => (1, true),
+            Cc::Le => (1, false),
+            Cc::E => (2, true),
+            Cc::Ne => (2, false),
+            Cc::O => (3, true),
+            Cc::No => (3, false),
+        }
+    }
+
     /// The `0F`-prefixed opcode byte for the near (`rel32`) form.
     #[cfg(not(target_arch = "aarch64"))]
     fn opcode2(self) -> u8 {
@@ -382,6 +435,41 @@ mod tests {
     #[cfg(not(target_arch = "aarch64"))]
     fn rel32_at(code: &[u8], site: usize) -> i32 {
         i32::from_le_bytes(code[site..site + 4].try_into().unwrap())
+    }
+
+    /// The eight conditions are four POWER condition-register bits times two
+    /// senses, and inversion is exactly the sense flip. The ppc backend's branch
+    /// encoding rests on both halves of that, so both are pinned here.
+    #[test]
+    fn ppc_conditions_are_four_bits_times_two_senses() {
+        let all = [Cc::E, Cc::Ne, Cc::L, Cc::Ge, Cc::G, Cc::Le, Cc::O, Cc::No];
+        let mut seen: Vec<(u32, bool)> = all.iter().map(|cc| cc.ppc_condition()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            8,
+            "every condition must be a distinct (bit, sense)"
+        );
+        assert!(
+            seen.iter().all(|(bit, _)| *bit < 4),
+            "a condition register field holds only bits 0..3"
+        );
+        for cc in all {
+            let (bit, sense) = cc.ppc_condition();
+            let (inverse_bit, inverse_sense) = cc.inverse().ppc_condition();
+            assert_eq!(bit, inverse_bit, "{cc:?}: inversion must keep the bit");
+            assert_ne!(
+                sense, inverse_sense,
+                "{cc:?}: inversion must flip the sense"
+            );
+        }
+        // The architecture's own alias names, as an assembler disassembles them.
+        assert_eq!(Cc::E.ppc_condition(), (2, true), "beq is bt 2");
+        assert_eq!(Cc::Ne.ppc_condition(), (2, false), "bne is bf 2");
+        assert_eq!(Cc::L.ppc_condition(), (0, true), "blt is bt 0");
+        assert_eq!(Cc::G.ppc_condition(), (1, true), "bgt is bt 1");
+        assert_eq!(Cc::O.ppc_condition(), (3, true), "bso is bt 3");
     }
 
     #[test]
