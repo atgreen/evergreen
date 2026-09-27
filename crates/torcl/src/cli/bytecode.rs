@@ -11463,37 +11463,52 @@ pub(super) fn lazy_compile_defun(
     // lexicals) that otherwise runs interpreted (bliss-mr4p). Only reached when
     // the fast path already declined, so it never slows a function that compiles
     // opportunistically; a genuinely unsupported form bails in both modes.
-    let compiled = match compile_function(name, params, body, env, false, false) {
-        Some(fast) if contains_host_eval(&fast) => {
-            // The opportunistic compiler can call a result "compiled" while
-            // leaving a capturing lambda behind as MakeClosureEnv. Executing
-            // that instruction re-enters eval_form to build a tree-walked
-            // closure, so the hottest part of the function never reaches
-            // bytecode at all. ASDF's TRAVERSE-ACTION is exactly this shape:
-            // its outer callback captures the traversal state and contains the
-            // recursive VISIT-ACTION LABELS function.
-            //
-            // Portable lowering compiles the closure body as a nested
-            // BytecodeFunction. Prefer that complete result when available;
-            // retain the opportunistic result as the correctness fallback for
-            // forms whose constants cannot be represented portably.
-            reset_last_bail_reason();
-            match compile_function(name, params, body, env, true, false) {
-                Some(portable) => Some(portable),
-                None => {
-                    trace_named(name, "portable retry bailed", last_bail_reason().as_deref());
-                    Some(fast)
+    // NOTE the Arc: every arm yields an `Arc<BytecodeFunction>` rather than a bare
+    // one, so the opportunistic result can be ROOTED across the portable retry
+    // below (bliss-e3op). `ActiveBytecodeRoot` takes `&Arc`, which is why this
+    // path was previously unrooted — `compile_function` hands back a bare value,
+    // and the Arc was only created at the `publish_bytecode` call at the end.
+    let compiled: Option<Arc<BytecodeFunction>> =
+        match compile_function(name, params, body, env, false, false) {
+            Some(fast) if contains_host_eval(&fast) => {
+                // The opportunistic compiler can call a result "compiled" while
+                // leaving a capturing lambda behind as MakeClosureEnv. Executing
+                // that instruction re-enters eval_form to build a tree-walked
+                // closure, so the hottest part of the function never reaches
+                // bytecode at all. ASDF's TRAVERSE-ACTION is exactly this shape:
+                // its outer callback captures the traversal state and contains the
+                // recursive VISIT-ACTION LABELS function.
+                //
+                // Portable lowering compiles the closure body as a nested
+                // BytecodeFunction. Prefer that complete result when available;
+                // retain the opportunistic result as the correctness fallback for
+                // forms whose constants cannot be represented portably.
+                // Root `fast` for the duration of the retry. `compile_function` in
+                // portable mode allocates — it expands macros and builds constants —
+                // so a minor GC there relocates any nursery `TorclVal` that only
+                // `fast` holds, and the `None` arm below hands exactly that `fast`
+                // back as the correctness fallback. Every sibling site that holds a
+                // BytecodeFunction across an allocation does this (see lines ~8855,
+                // ~11150, ~11573); this one did not (bliss-e3op).
+                let fast = Arc::new(fast);
+                let _fast_root = ActiveBytecodeRoot::new(&fast);
+                reset_last_bail_reason();
+                match compile_function(name, params, body, env, true, false) {
+                    Some(portable) => Some(Arc::new(portable)),
+                    None => {
+                        trace_named(name, "portable retry bailed", last_bail_reason().as_deref());
+                        Some(fast)
+                    }
                 }
             }
-        }
-        Some(fast) => Some(fast),
-        None => {
-            reset_last_bail_reason();
-            compile_function(name, params, body, env, true, false)
-        }
-    };
+            Some(fast) => Some(Arc::new(fast)),
+            None => {
+                reset_last_bail_reason();
+                compile_function(name, params, body, env, true, false).map(Arc::new)
+            }
+        };
     match compiled.filter(|function| !contains_load_time_values(function)) {
-        Some(bf) => publish_bytecode(sym, Arc::new(bf), Some(generation)) || is_registered(sym),
+        Some(bf) => publish_bytecode(sym, bf, Some(generation)) || is_registered(sym),
         None => {
             let registered = is_registered(sym);
             let current = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
