@@ -65,6 +65,11 @@ pub struct ANativeActivity {
 /// (bliss-bp4q).
 const EGL_LISP: &str = include_str!("egl.lisp");
 
+/// The scene — a Lisp list — and the walker that turns it into GLSL. Separate
+/// from the plumbing because this is the interesting half: change the list and
+/// the shader changes with it.
+const SCENE_LISP: &str = include_str!("scene.lisp");
+
 /// Android calls this when the activity starts; the symbol name is fixed.
 ///
 /// # Safety
@@ -84,6 +89,8 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
         unsafe {
             (*callbacks).on_native_window_created = Some(on_native_window_created);
             (*callbacks).on_native_window_destroyed = Some(on_native_window_destroyed);
+            (*callbacks).on_input_queue_created = Some(on_input_queue_created);
+            (*callbacks).on_input_queue_destroyed = Some(on_input_queue_destroyed);
         };
     }
 }
@@ -100,7 +107,8 @@ extern "C" fn on_native_window_created(_activity: *mut ANativeActivity, window: 
         // its thread's stack, so give it a stack that can hold one.
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
-            let form = format!("(progn {EGL_LISP}\n(torcl-egl-demo {address} {running}))");
+            let form =
+                format!("(progn {SCENE_LISP}\n{EGL_LISP}\n(torcl-egl-demo {address} {running}))");
             let args = vec![
                 "torcl".to_string(),
                 "--no-init".to_string(),
@@ -114,6 +122,54 @@ extern "C" fn on_native_window_created(_activity: *mut ANativeActivity, window: 
         })
         .map(|_| ())
         .unwrap_or_else(|e| log(&format!("cannot spawn torcl thread: {e}")));
+}
+
+// libandroid's looper and input queue. NativeActivity REQUIRES the native side
+// to service the input queue: events that are never consumed make the input
+// dispatcher time out and Android kills the app with "isn't responding", even
+// though the render thread is perfectly healthy.
+#[link(name = "android")]
+unsafe extern "C" {
+    fn ALooper_forThread() -> *mut c_void;
+    fn AInputQueue_attachLooper(
+        queue: *mut c_void,
+        looper: *mut c_void,
+        ident: c_int,
+        callback: Option<extern "C" fn(c_int, c_int, *mut c_void) -> c_int>,
+        data: *mut c_void,
+    );
+    fn AInputQueue_detachLooper(queue: *mut c_void);
+    fn AInputQueue_getEvent(queue: *mut c_void, event: *mut *mut c_void) -> i32;
+    fn AInputQueue_preDispatchEvent(queue: *mut c_void, event: *mut c_void) -> i32;
+    fn AInputQueue_finishEvent(queue: *mut c_void, event: *mut c_void, handled: c_int);
+}
+
+/// Drain the queue. The spike does nothing with the events yet — it only has to
+/// consume them, which is what keeps Android from declaring the app hung.
+extern "C" fn drain_input(_fd: c_int, _events: c_int, data: *mut c_void) -> c_int {
+    let queue = data;
+    loop {
+        let mut event: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `queue` is the one Android handed to onInputQueueCreated and
+        // is live until onInputQueueDestroyed detaches it.
+        if unsafe { AInputQueue_getEvent(queue, &mut event) } < 0 {
+            break;
+        }
+        if unsafe { AInputQueue_preDispatchEvent(queue, event) } != 0 {
+            continue;
+        }
+        unsafe { AInputQueue_finishEvent(queue, event, 0) };
+    }
+    1 // keep the callback registered
+}
+
+extern "C" fn on_input_queue_created(_activity: *mut ANativeActivity, queue: *mut c_void) {
+    // This callback runs on the main thread, so its looper is the one to attach.
+    unsafe { AInputQueue_attachLooper(queue, ALooper_forThread(), 1, Some(drain_input), queue) };
+}
+
+extern "C" fn on_input_queue_destroyed(_activity: *mut ANativeActivity, queue: *mut c_void) {
+    unsafe { AInputQueue_detachLooper(queue) };
 }
 
 /// The surface is going away. Clear the flag and let the Lisp loop notice on
