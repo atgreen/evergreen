@@ -4277,7 +4277,17 @@ fn torcl_error_to_condition(
             };
             build_condition_instance(env, type_name, &initargs)?
         }
-        TorclError::FileError(_) => build_condition_instance(env, "FILE-ERROR", &[])?,
+        TorclError::FileError(msg) => {
+            // The message was DISCARDED here (note the `_`), which is the whole
+            // of the bare "FILE-ERROR" report: every FileError in the tree
+            // carries a description of what failed, including the compile-time
+            // failure text from bliss-wk2q ("compile-time evaluation failed near
+            // line N: …"), which was constructed correctly and then printed as
+            // the bare type name (bliss-kk0i).
+            let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            torcl_rt::rooted!(control = arena_str(msg));
+            build_condition_instance(env, "SIMPLE-FILE-ERROR", &[control_kw, *control])?
+        }
         TorclError::Interrupt => build_condition_instance(env, "INTERRUPT-CONDITION", &[])?,
         TorclError::Timeout => build_condition_instance(env, "TIMEOUT-CONDITION", &[])?,
         TorclError::Oom => {
@@ -4298,8 +4308,16 @@ fn torcl_error_to_condition(
             torcl_rt::rooted!(message = arena_str(msg));
             make_simple_condition("TORCL-FFI::FFI-ERROR", *message, &[], env)?
         }
-        TorclError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
-        TorclError::ControlError(_) => build_condition_instance(env, "CONTROL-ERROR", &[])?,
+        TorclError::ProgramError(msg) => {
+            let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            torcl_rt::rooted!(control = arena_str(msg));
+            build_condition_instance(env, "SIMPLE-PROGRAM-ERROR", &[control_kw, *control])?
+        }
+        TorclError::ControlError(msg) => {
+            let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            torcl_rt::rooted!(control = arena_str(msg));
+            build_condition_instance(env, "SIMPLE-CONTROL-ERROR", &[control_kw, *control])?
+        }
         // A genuine internal error (a builtin's arg-count/validation failure, an
         // unimplemented path) is a real error and must be catchable by
         // HANDLER-CASE/IGNORE-ERRORS as a SIMPLE-ERROR — otherwise it aborts the
@@ -11865,6 +11883,24 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         // This mirrors SIMPLE-TYPE-ERROR above, and is what SBCL signals here.
         "SIMPLE-PACKAGE-ERROR" => Some((
             vec!["PACKAGE-ERROR".into(), "SIMPLE-CONDITION".into()],
+            vec![],
+        )),
+        // FILE-ERROR has only a PATHNAME slot and nowhere to put a message, so
+        // every file failure reported as a bare "FILE-ERROR" while the text it
+        // was built with was thrown away (bliss-kk0i) — the same defect
+        // SIMPLE-PACKAGE-ERROR above fixed for package failures, and SBCL
+        // likewise signals a simple-file-error here.
+        "SIMPLE-FILE-ERROR" => Some((vec!["FILE-ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
+        // Same family, same defect: PROGRAM-ERROR and CONTROL-ERROR have no slot
+        // for a message, so every one reported as its bare type name even though
+        // the evaluator built a description (bliss-kk0i). SBCL signals the
+        // simple- variants here too.
+        "SIMPLE-PROGRAM-ERROR" => Some((
+            vec!["PROGRAM-ERROR".into(), "SIMPLE-CONDITION".into()],
+            vec![],
+        )),
+        "SIMPLE-CONTROL-ERROR" => Some((
+            vec!["CONTROL-ERROR".into(), "SIMPLE-CONDITION".into()],
             vec![],
         )),
         "PARSE-ERROR" => Some((vec!["ERROR".into()], vec![])),

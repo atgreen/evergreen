@@ -2512,6 +2512,64 @@ fn class_slots_and_slot_definition_accessors_are_available() {
     run_expression_cases(&cases);
 }
 
+/// FILE-ERROR, PROGRAM-ERROR and CONTROL-ERROR must report the message they were
+/// built with, not their bare type name (bliss-kk0i).
+///
+/// None of these classes has a slot for a message, so the text was discarded and
+/// every one printed as "FILE-ERROR" / "PROGRAM-ERROR" / "CONTROL-ERROR". Mixing
+/// SIMPLE-CONDITION in supplies FORMAT-CONTROL, exactly as SIMPLE-PACKAGE-ERROR
+/// already did for package failures.
+///
+/// The typep and handler rows are the regression that matters: the fix changes
+/// which CLASS is instantiated, so code written against FILE-ERROR must still
+/// catch it.
+#[test]
+fn file_program_and_control_errors_report_their_message() {
+    let cases = [
+        // A message, not the bare type name.
+        (
+            "(let ((s (princ-to-string (handler-case (open \"/nonexistent/zz\") (error (e) e))))) (and (search \"zz\" s) t))",
+            "T",
+        ),
+        (
+            "(princ-to-string (handler-case (car 1 2) (error (e) e)))",
+            "\"CAR called with 2 argument(s); requires 1\"",
+        ),
+        // A CONTROL-ERROR names the offending tag rather than reporting nothing.
+        (
+            "(let ((s (princ-to-string (handler-case (throw 'nope 1) (error (e) e))))) (and (search \"NOPE\" s) t))",
+            "T",
+        ),
+        // Still the right classes, so existing handlers keep working.
+        (
+            "(typep (handler-case (open \"/nonexistent/zz\") (error (e) e)) 'file-error)",
+            "T",
+        ),
+        (
+            "(typep (handler-case (car 1 2) (error (e) e)) 'program-error)",
+            "T",
+        ),
+        (
+            "(typep (handler-case (throw 'nope 1) (error (e) e)) 'control-error)",
+            "T",
+        ),
+        // And still caught by a handler for the specific class, not just ERROR.
+        (
+            "(handler-case (open \"/nonexistent/zz\") (file-error () :caught))",
+            ":CAUGHT",
+        ),
+        (
+            "(handler-case (car 1 2) (program-error () :caught))",
+            ":CAUGHT",
+        ),
+        (
+            "(handler-case (throw 'nope 1) (control-error () :caught))",
+            ":CAUGHT",
+        ),
+    ];
+    run_expression_cases(&cases);
+}
+
 #[test]
 fn loop_while_until_repeat_drivers() {
     let cases = [
