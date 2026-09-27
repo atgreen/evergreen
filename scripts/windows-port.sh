@@ -58,12 +58,13 @@ scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target
 scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target" --lib windows_t2
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test test_tcp_streams --test test_process -- --test-threads=1
-scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling --test process_pipes
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling --test process_pipes --test process_lifecycle
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib process::tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::output_flush_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::fiber_tests
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib streams::fiber_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl --target "$target" --test stream_roots_cli
-TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling --test process_pipes
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test process_scheduling --test process_pipes --test process_lifecycle
 child="${CARGO_TARGET_DIR:-target}/$target/release/windows-process-child.exe"
 rustc --edition=2024 --target "$target" scripts/windows-process-child.rs -o "$child"
 scripts/torcl-limited.sh python3 scripts/windows-io-smoke.py "$binary" "$child"

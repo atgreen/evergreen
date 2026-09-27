@@ -111,7 +111,21 @@ managed fibers and admits GC for native callers. Pipe position and length
 queries return `NIL`; closing stdin sends EOF, and closing an input pipe cancels
 outstanding readiness waits. Windows pipe readiness uses
 [PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe).
-The Lisp launch/wait/terminate interface remains to be wired to this backend.
+The Rust `torcl_stdlib::process::launch_program` API returns an owned `Process`
+with separately transferable stdin/stdout/stderr pipes. `try_wait` observes exit
+without blocking; `wait` supports an optional timeout and retains exit status
+for repeated or concurrent waiters. A timeout leaves the child running.
+`terminate` requests immediate termination of the child, not its descendants;
+call `wait` separately to observe completion. Callers must drain stdout and
+stderr concurrently when either may fill, and close stdin when the child needs
+EOF. Waiting never drains or closes a pipe implicitly.
+
+Dropping the owner closes pipes still held by it without killing or waiting for
+the child. A native reaper retains ownership until exit (or a permanent OS wait
+error). This initial backend uses one reaper thread per live child and polls
+status every two milliseconds; managed waiters suspend through the scheduler.
+The Lisp process object and launch/wait/terminate interface remain to be wired
+to this backend.
 
 `CLOSE` reports output-flush failures and leaves the stream open. After correcting
 the cause, retry `FINISH-OUTPUT` or `CLOSE`; successfully written bytes are not
