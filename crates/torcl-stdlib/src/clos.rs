@@ -2100,6 +2100,24 @@ pub fn slot_boundp(instance: TorclVal, slot_name: TorclVal) -> Result<bool, Torc
     }
 }
 
+/// Is `slot_name` part of this instance's class layout, bound or not?
+///
+/// Distinct from [`slot_boundp`], which answers `false` for both an unbound slot
+/// and a slot the class does not have. Funcallable instances need the layout
+/// question on its own: an instance of a FUNCALLABLE-STANDARD-CLASS is of type
+/// FUNCTION from the moment it exists (AMOP), before anything has been installed
+/// in its function cell, so FUNCTIONP keys on the cell being PRESENT while the
+/// call path keys on it being BOUND (bliss-cr53).
+pub fn slot_present_p(instance: TorclVal, slot_name: TorclVal) -> bool {
+    if !is_instance(instance) {
+        return false;
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        instance_slot_index(instance, slot_name).is_some()
+    }
+}
+
 /// Make a slot unbound (SLOT-MAKUNBOUND).
 pub fn slot_makunbound(instance: TorclVal, slot_name: TorclVal) -> Result<(), TorclError> {
     if !is_instance(instance) {

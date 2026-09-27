@@ -59,7 +59,7 @@ pub use clos::{
     generic_function_name, initialize_instance, is_instance, is_structure_class,
     make_generic_function, make_instance, reinitialize_instance, set_find_class,
     set_method_specializers, set_slot_value, set_structure_class, shared_initialize,
-    shared_initialize_with_list, slot_boundp, slot_makunbound, slot_value,
+    shared_initialize_with_list, slot_boundp, slot_makunbound, slot_present_p, slot_value,
 };
 pub use conditions::{
     HandlerBinding, RestartSpec, acquire_preallocated_storage_condition, clear_funcall_hook,
