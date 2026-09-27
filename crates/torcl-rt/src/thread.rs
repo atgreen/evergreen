@@ -770,6 +770,7 @@ pub struct Fiber {
     state: OrderedMutex<FiberState>,
     // Unregister roots before either stack is destroyed (field drop order).
     host_roots: crate::gc::FiberRoots,
+    native_faults: crate::runtime::FiberFaultState,
     stack: TorclStack,
     continuation: FiberContinuation,
     execution_context: FiberExecutionContext,
@@ -1533,39 +1534,50 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     // root chain remains live independently of whichever carrier resumes it.
     let mounted_roots = unsafe { thread.host_roots.mount() };
 
-    #[cfg(all(target_arch = "x86_64", unix))]
-    unsafe {
-        // Save the scheduler (carrier) context and switch to the fiber. The
-        // fiber resumes at its trampoline (first mount) or where it last
-        // suspended; control returns here when it swaps back. The return context
-        // is recorded on the FIBER (not a thread-local) so it survives the fiber
-        // migrating to a different carrier between suspend and resume.
-        let mut scheduler_context: crate::context::Context = crate::context::NULL;
-        thread
-            .scheduler_return
-            .store(&mut scheduler_context as *mut _ as usize, Ordering::Release);
-        let fiber_sp = *thread.execution_context.as_ptr();
-        crate::context::swap(&mut scheduler_context, fiber_sp);
-        thread.scheduler_return.store(0, Ordering::Release);
-    }
+    match thread.native_faults.mount() {
+        Ok(mounted_faults) => {
+            #[cfg(all(target_arch = "x86_64", unix))]
+            unsafe {
+                // Save the scheduler (carrier) context and switch to the fiber. The
+                // fiber resumes at its trampoline (first mount) or where it last
+                // suspended; control returns here when it swaps back. The return context
+                // is recorded on the FIBER (not a thread-local) so it survives the fiber
+                // migrating to a different carrier between suspend and resume.
+                let mut scheduler_context: crate::context::Context = crate::context::NULL;
+                thread
+                    .scheduler_return
+                    .store(&mut scheduler_context as *mut _ as usize, Ordering::Release);
+                let fiber_sp = *thread.execution_context.as_ptr();
+                crate::context::swap(&mut scheduler_context, fiber_sp);
+                thread.scheduler_return.store(0, Ordering::Release);
+            }
 
-    #[cfg(all(target_arch = "x86_64", windows))]
-    if let Err(error) = unsafe { thread.execution_context.resume(&thread.scheduler_return) } {
-        thread.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
-        thread.result.complete(Err(error));
-    }
+            #[cfg(all(target_arch = "x86_64", windows))]
+            if let Err(error) = unsafe { thread.execution_context.resume(&thread.scheduler_return) }
+            {
+                thread.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
+                thread.result.complete(Err(error));
+            }
 
-    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
-    {
-        let result = run_fiber_entry(&thread);
-        thread.stack.publish_top();
-        thread.continuation.save(
-            thread.stack.published_sp(),
-            thread.stack.published_fp() as usize,
-            0,
-        );
-        thread.set_state(FiberState::Dead);
-        thread.result.complete(result);
+            #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+            {
+                let result = run_fiber_entry(&thread);
+                thread.stack.publish_top();
+                thread.continuation.save(
+                    thread.stack.published_sp(),
+                    thread.stack.published_fp() as usize,
+                    0,
+                );
+                thread.set_state(FiberState::Dead);
+                thread.result.complete(result);
+            }
+
+            drop(mounted_faults);
+        }
+        Err(error) => {
+            thread.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
+            thread.result.complete(Err(error));
+        }
     }
 
     drop(mounted_roots);
@@ -2056,6 +2068,7 @@ pub fn make_fiber(entry: TorclVal) -> Result<FiberId, TorclError> {
         continuation: FiberContinuation::default(),
         execution_context: FiberExecutionContext::new()?,
         host_roots: crate::gc::FiberRoots::new(),
+        native_faults: crate::runtime::FiberFaultState::default(),
         scheduler_return: AtomicUsize::new(0),
         scheduler_pool: OrderedMutex::new(
             LockLevel::ExecutionObject,

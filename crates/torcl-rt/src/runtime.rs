@@ -877,6 +877,114 @@ pub fn current_sigsegv_stack_guard_recovery_ip() -> usize {
     sigsegv_stack_guard_recovery_ip_for_tid(crate::syscall::cached_tid() as usize)
 }
 
+/// Fault state belongs to an execution, while signal handlers find the mounted
+/// execution through its carrier's existing allocation-free TID slot.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct NativeFaultState {
+    null_ip: usize,
+    stack_ip: usize,
+    null_pending: bool,
+    stack_pending: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct FiberFaultState(std::cell::Cell<NativeFaultState>);
+
+impl FiberFaultState {
+    /// Called only by the carrier with exclusive ownership of this mount. The
+    /// scope stays on the carrier stack and ends after the fiber switches out.
+    pub(crate) fn mount(&self) -> Result<MountedFiberFaultState<'_>, TorclError> {
+        let carrier = exchange_native_fault_state(self.0.get())?;
+        Ok(MountedFiberFaultState {
+            fiber: self,
+            carrier,
+        })
+    }
+}
+
+pub(crate) struct MountedFiberFaultState<'a> {
+    fiber: &'a FiberFaultState,
+    carrier: NativeFaultState,
+}
+
+impl Drop for MountedFiberFaultState<'_> {
+    fn drop(&mut self) {
+        // A slot used by this mount remains owned until the carrier exits, so
+        // restoring its original state cannot need a new slot allocation.
+        let saved = exchange_native_fault_state(self.carrier)
+            .expect("mounted carrier lost its native fault slot");
+        self.fiber.0.set(saved);
+    }
+}
+
+fn exchange_native_fault_state(incoming: NativeFaultState) -> Result<NativeFaultState, TorclError> {
+    use std::sync::atomic::Ordering;
+
+    let tid = crate::syscall::gettid() as usize;
+    let slot = match sigsegv_recovery_slot_index(tid) {
+        Some(slot) => slot,
+        // Fibers that never arm native recovery must not consume a scarce TID
+        // slot merely by running. The exit exchange detects a slot first claimed
+        // inside the fiber, and saves that execution's state as usual.
+        None if incoming == NativeFaultState::default() => return Ok(incoming),
+        None => sigsegv_recovery_slot_for_tid(tid).ok_or_else(|| {
+            TorclError::Internal("no native fault slot available for fiber resume".into())
+        })?,
+    };
+    let outgoing = NativeFaultState {
+        null_ip: SIGSEGV_NULL_GUARD_RECOVERY_IPS[slot].swap(incoming.null_ip, Ordering::AcqRel),
+        stack_ip: SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot].swap(incoming.stack_ip, Ordering::AcqRel),
+        null_pending: SIGSEGV_NULL_GUARD_RECEIVED_SLOTS[slot]
+            .swap(incoming.null_pending, Ordering::AcqRel),
+        stack_pending: SIGSEGV_STACK_GUARD_RECEIVED_SLOTS[slot]
+            .swap(incoming.stack_pending, Ordering::AcqRel),
+    };
+    if incoming.null_pending || incoming.stack_pending {
+        // Another fiber may already have drained this carrier's activity epoch.
+        // Re-publish the restored pending flags so their owner will check them.
+        mark_process_signal_activity();
+    }
+    Ok(outgoing)
+}
+
+#[cfg(test)]
+mod fiber_fault_tests {
+    use super::*;
+
+    #[test]
+    fn mounting_preserves_the_carrier_and_republishes_pending_fiber_faults() {
+        std::thread::spawn(|| {
+            set_sigsegv_recovery_ips(0x1000, 0x2000);
+            post_sigsegv_null_guard();
+            let fiber = FiberFaultState::default();
+            {
+                let _mounted = fiber.mount().unwrap();
+                assert_eq!(current_sigsegv_null_guard_recovery_ip(), 0);
+                assert_eq!(current_sigsegv_stack_guard_recovery_ip(), 0);
+                set_sigsegv_recovery_ips(0x3000, 0x4000);
+                post_sigsegv_stack_guard();
+            }
+            assert_eq!(current_sigsegv_null_guard_recovery_ip(), 0x1000);
+            assert_eq!(current_sigsegv_stack_guard_recovery_ip(), 0x2000);
+            assert!(check_sigsegv_null_guard());
+            // Simulate a different execution draining the carrier's epoch
+            // before the fault's owning fiber is remounted.
+            take_process_signal_activity();
+            {
+                let _mounted = fiber.mount().unwrap();
+                assert_eq!(current_sigsegv_null_guard_recovery_ip(), 0x3000);
+                assert_eq!(current_sigsegv_stack_guard_recovery_ip(), 0x4000);
+                assert!(take_process_signal_activity());
+                assert!(check_sigsegv_stack_guard());
+            }
+            assert_eq!(current_sigsegv_null_guard_recovery_ip(), 0x1000);
+            assert_eq!(current_sigsegv_stack_guard_recovery_ip(), 0x2000);
+        })
+        .join()
+        .unwrap();
+    }
+}
+
 pub fn register_sigsegv_stack_guard_range(addr: usize, len: usize) {
     if addr == 0 || len == 0 {
         return;
