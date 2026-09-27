@@ -1,4 +1,4 @@
-# User guide
+# Examples and recipes
 
 Start with [Your first program](tutorials/first-program.md). It takes you through
 running Lisp, defining a function, and passing arguments to a script.
@@ -15,7 +15,7 @@ running Lisp, defining a function, and passing arguments to a script.
 
 The reference covers the [command line](reference/cli.md),
 [platform support](reference/platforms.md), [saved images](reference/images.md),
-[selected runtime extensions](reference/extensions.md), and
+[operating-system interface](reference/extensions.md), and
 [Android projects](reference/android.md).
 
 ## Understand the runtime

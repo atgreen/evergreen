@@ -1,7 +1,8 @@
 # Writing documentation
 
 Use these rules when adding or changing the TorCL manual. They follow the
-Gloopy manual's docs-as-code and Diátaxis approach.
+Gloopy manual's docs-as-code tooling and the SBCL manual's subject-oriented
+implementation-reference structure.
 
 ## Build and preview
 
@@ -20,29 +21,39 @@ Open `http://127.0.0.1:8000/torcl/`. The static output is in `site/`. Both the v
 environment and generated output are ignored by Git. The build uses
 [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/).
 
-## Choose one page type
+## Organize by implementation subject
 
-| Type | Reader's need | Write it as |
-| --- | --- | --- |
-| Tutorial | Learn by doing | One tested path, with expected results |
-| How-to | Complete a task | A recipe for a reader who knows the goal |
-| Reference | Look up a fact | Structured syntax, arguments, defaults, and limits |
-| Explanation | Understand | Connected reasoning, context, and tradeoffs |
+The primary reader knows Common Lisp and needs to know how TorCL behaves.
+Organize the manual into subjects such as startup, compilation, debugging,
+foreign calls, memory, and concurrency. The
+[SBCL manual](https://www.sbcl.org/manual/) is the structural inspiration:
+chapters lead to specific behavior and dictionary entries, with symbol and
+concept indexes for direct lookup.
 
-Navigation landing pages only direct readers to those pages. Every content page
-has one primary type. State the type when describing a documentation change.
-Move option catalogs out of tutorials and rationale out of reference pages.
+Keep the useful distinction between tutorials, recipes, explanations, and
+reference, but do not make readers choose a documentation category before they
+can find a subject. A chapter may explain the subject and then present its
+dictionary. Standalone tutorials still take one tested path; task guides still
+solve a specific problem.
 
-## Two entry points, shared concepts
+## Write an implementation dictionary
 
-The **User guide** serves Lisp programmers and application builders.
-**Contributing** serves people changing the runtime, compiler, and library.
-Define execution tiers and images once in the user explanation pages; link
-there from platform, deployment, and contributor pages.
+An API entry names the package and whether it is a function, macro, variable,
+or type. Include the actual lambda list, return values (including secondary
+values), units, ownership, lifetime, error behavior, and target restrictions
+when they affect the caller. Similar spelling to SBCL is not proof of the same
+contract. Read source and tests before describing compatibility.
 
-Keep proposals and historical investigations in `docs/design/` or `spec/`.
-Link to them when useful, with their status made explicit. Do not present a
-specification's planned API as an implemented public interface.
+Every documented interface belongs in the symbol index and every major topic
+in the concept index. Use stable explicit anchors for dictionary entries.
+Document each contract once and link to it from recipes.
+
+## Keep internal development separate
+
+The main chapters serve Lisp programmers. Runtime contributor notes belong in
+an appendix. Keep proposals and historical investigations in `docs/design/` or
+`spec/`, and identify their status when linking to them. An implementation
+manual must not present a proposed API as an existing callable interface.
 
 ## Keep reference near its source
 

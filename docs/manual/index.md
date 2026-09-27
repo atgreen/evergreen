@@ -1,39 +1,52 @@
-# TorCL manual
+# TorCL User Manual
 
-Common Lisp, from a first expression to a saved application.
-{ .lead }
+This manual describes TorCL's implementation of Common Lisp and its extensions.
+It concentrates on behavior specific to TorCL: startup, compilation, debugging,
+memory, foreign calls, concurrency, and application delivery.
 
-TorCL is a Common Lisp implementation written in Rust, with a tiered execution
-engine and tools for building applications for Linux, Windows, and Android.
-This manual describes the development version in this checkout. TorCL is still
-under active development; its goal of ANSI Common Lisp compatibility is not a
-claim of complete conformance.
+The manual follows the development checkout. For differences between targets,
+consult [Platform support](user/reference/platforms.md). For a particular
+operator, use the [Symbol index](symbol-index.md); for a topic, use the
+[Concept index](concept-index.md).
 
-[Run your first program](user/tutorials/first-program.md){ .md-button .md-button--primary }
-[Build an Android app](user/how-to/android.md){ .md-button }
+## Contents
 
-## Use TorCL
+1. [Introduction](introduction.md) — conformance, compatibility, public packages,
+   implementation characteristics, and reporting problems.
+2. [Starting and stopping](starting.md) — invocation modes, initialization,
+   batch behavior, command-line arguments, and saved worlds.
+3. [Compilation](compiler.md) — function and file compilation, native tiers,
+   declarations, diagnostics, and compiler observations.
+4. [Conditions and debugging](debugger.md) — condition handling, restarts,
+   debugger commands, frame inspection, and error reproduction.
+5. [Memory and garbage collection](memory.md) — Lisp and foreign memory,
+   explicit collection, finalization, and measurement.
+6. [Foreign function interface](foreign.md) — C types, pointers, allocation,
+   shared libraries, calls, callbacks, and lifetime rules.
+7. [Threads and synchronization](concurrency.md) — native threads, joins,
+   mutexes, condition variables, and the distinction from managed fibers.
+8. [Operating-system interface](user/reference/extensions.md) — environment,
+   current directory, subprocesses, and process arguments.
+9. [Profiling and efficiency](profiling.md) — engine reports, exact counts,
+   event recording, sampling, and measurement effects.
+10. [Application delivery](user/explanation/images.md) — core images,
+    executables, cross-target creation, and Android's application lifecycle.
 
-Start with the [user guide](user/index.md) to run Lisp, load libraries, save an
-executable, or build for another machine. The [platform table](user/reference/platforms.md)
-distinguishes execution support from native compiler support.
+## Recipes and supplementary reference
 
-## Work on TorCL
+- [Build and install TorCL](user/how-to/build.md)
+- [Run a first Lisp program](user/tutorials/first-program.md)
+- [Load an ASDF system](user/how-to/asdf.md)
+- [Save an executable](user/how-to/save-executable.md)
+- [Build for another platform](user/how-to/cross-build.md)
+- [Build an Android app](user/how-to/android.md)
+- [Command-line options](user/reference/cli.md)
+- [Image dictionary](user/reference/images.md)
+- [Android project dictionary](user/reference/android.md)
 
-The [contributor guide](contributing/index.md) covers the runtime's architecture,
-GC rules, validation, and performance measurement. The implementation and the
-longer-term specification have different roles: a planned interface is not
-necessarily a callable interface.
+## Appendices
 
-## Find the right kind of page
-
-| If you want to… | Read… |
-| --- | --- |
-| Learn by completing a small program | A tutorial |
-| Finish a particular task | A how-to guide |
-| Look up syntax, options, or support | Reference |
-| Understand why the system behaves this way | Explanation |
-
-The manual follows the [same documentation rules](meta/documentation-guidelines.md)
-throughout. Search is available in the header; the theme switch changes between
-light and dark mode.
+- [Runtime contributor notes](contributing/index.md)
+- [Symbol index](symbol-index.md)
+- [Concept index](concept-index.md)
+- [Writing and building the manual](meta/documentation-guidelines.md)

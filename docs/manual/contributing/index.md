@@ -1,4 +1,4 @@
-# Contributing to TorCL
+# Runtime contributor notes
 
 Start with the [runtime architecture](explanation/architecture.md) and
 [repository map](reference/repository.md). Then follow

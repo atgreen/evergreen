@@ -27,7 +27,7 @@ their effects. Do not rely on them to change the output format or startup.
 | Artifact | Consumer | Contents |
 | --- | --- | --- |
 | Lisp source (`.lisp`) | `load` or the CLI | Readable forms |
-| Compiled file (`.bfasl`) | `load` | Compiled-file data |
+| Compiled file (`.fasl`, BFASL contents) | `load` | Compiled-file data |
 | Core image | `--image` | Live heap and registered runtime state |
 | Saved executable | Operating system | Runtime binary plus embedded core |
 | Android APK | Android package installer | Native runtime, manifest, and Lisp assets |

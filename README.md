@@ -15,8 +15,9 @@ model, and self-hosting roadmap.
 
 The [TorCL manual](docs/manual/index.md) covers running Lisp, ASDF systems,
 saved executables, cross-target tools, Android applications, and runtime
-contributions. It follows the Gloopy manual's Material for MkDocs and Diátaxis
-structure. Preview it locally:
+contributions. It uses Material for MkDocs with a subject-oriented implementation
+reference inspired by the SBCL manual, plus symbol and concept indexes. Preview
+it locally:
 
 ```sh
 python3 -m venv .venv-docs

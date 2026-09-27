@@ -29,7 +29,6 @@ theme:
         icon: material/weather-sunny
         name: Switch to dark mode
   features:
-    - navigation.tabs
     - navigation.sections
     - navigation.indexes
     - navigation.top
@@ -64,34 +63,42 @@ validation:
     anchors: warn
     unrecognized_links: warn
 nav:
-  - Home: index.md
-  - User guide:
+  - Contents: index.md
+  - 1. Introduction:
+      - introduction.md
+      - Platform support: user/reference/platforms.md
+      - Build and install: user/how-to/build.md
+  - 2. Starting and stopping:
+      - starting.md
+      - Command-line options: user/reference/cli.md
+  - 3. Compilation:
+      - compiler.md
+      - Execution tiers: user/explanation/execution.md
+      - ASDF systems: user/how-to/asdf.md
+  - 4. Conditions and debugging: debugger.md
+  - 5. Memory and garbage collection: memory.md
+  - 6. Foreign function interface: foreign.md
+  - 7. Threads and synchronization: concurrency.md
+  - 8. Operating-system interface: user/reference/extensions.md
+  - 9. Profiling and efficiency:
+      - profiling.md
+      - Measurement procedure: contributing/how-to/performance.md
+  - 10. Application delivery:
+      - user/explanation/images.md
+      - Image dictionary: user/reference/images.md
+      - Save an executable: user/how-to/save-executable.md
+      - Cross-target executables: user/how-to/cross-build.md
+      - Android applications: user/how-to/android.md
+      - Android project dictionary: user/reference/android.md
+  - Examples:
       - user/index.md
-      - Tutorials:
-          - Your first program: user/tutorials/first-program.md
-      - How-to guides:
-          - Build from source: user/how-to/build.md
-          - Load an ASDF system: user/how-to/asdf.md
-          - Save an executable: user/how-to/save-executable.md
-          - Build for another platform: user/how-to/cross-build.md
-          - Build an Android app: user/how-to/android.md
-      - Reference:
-          - Command line: user/reference/cli.md
-          - Platform support: user/reference/platforms.md
-          - Saved images: user/reference/images.md
-          - Runtime extensions: user/reference/extensions.md
-          - Android projects: user/reference/android.md
-      - Explanation:
-          - How Lisp runs: user/explanation/execution.md
-          - Images and applications: user/explanation/images.md
-  - Contributing:
+      - First program: user/tutorials/first-program.md
+  - Appendix A. Runtime contributors:
       - contributing/index.md
-      - How-to guides:
-          - Change the runtime: contributing/how-to/change-runtime.md
-          - Keep values safe across GC: contributing/how-to/gc-safety.md
-          - Measure performance: contributing/how-to/performance.md
-      - Reference:
-          - Repository map: contributing/reference/repository.md
-      - Explanation:
-          - Runtime architecture: contributing/explanation/architecture.md
-  - Writing docs: meta/documentation-guidelines.md
+      - Architecture: contributing/explanation/architecture.md
+      - Repository map: contributing/reference/repository.md
+      - Change the runtime: contributing/how-to/change-runtime.md
+      - GC safety: contributing/how-to/gc-safety.md
+  - Appendix B. Symbol index: symbol-index.md
+  - Appendix C. Concept index: concept-index.md
+  - Writing the manual: meta/documentation-guidelines.md
