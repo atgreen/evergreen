@@ -138,18 +138,19 @@ def build(args):
     return stage
 
 
-def android_source_archive(output, sources):
+def source_archive(output, sources):
     """Include current source plus locked, vendored crates for RPM %build."""
-    snapshot = output / 'android-source' / 'torcl-source'
+    snapshot = output / 'rpm-source' / 'torcl-source'
     snapshot.mkdir(parents=True, exist_ok=True)
-    for name in ('Cargo.toml', 'Cargo.lock'):
+    for name in ('Cargo.toml', 'Cargo.lock', 'mkdocs.yml'):
         copy(ROOT / name, snapshot / name)
-    for name in ('crates', 'lib', 'packaging/android'):
+    for name in ('crates', 'lib', 'packaging/android', 'packaging/fedora', 'docs/manual'):
         destination = snapshot / name
         if destination.exists():
             shutil.rmtree(destination)
         shutil.copytree(ROOT / name, destination,
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'build', '*.fasl'))
+    copy(ROOT / 'docs/hooks.py', snapshot / 'docs/hooks.py')
     # Workspace membership includes the linter even though only torcl-android
     # is built. Cargo still needs every member manifest when reading the lock.
     shutil.copytree(ROOT / 'tools/gc-root-lint', snapshot / 'tools/gc-root-lint',
@@ -159,7 +160,7 @@ def android_source_archive(output, sources):
         cwd=snapshot, text=True)
     (snapshot / '.cargo').mkdir(exist_ok=True)
     (snapshot / '.cargo/config.toml').write_text(config)
-    with tarfile.open(sources / 'torcl-android-source.tar.gz', 'w:gz') as archive:
+    with tarfile.open(sources / 'torcl-source.tar.gz', 'w:gz') as archive:
         archive.add(snapshot, arcname='torcl-source')
 
 
@@ -170,7 +171,7 @@ def package(output, stage, ndk):
     copy(ROOT / 'docs/fedora-rpm.md', stage / 'usr/share/doc/torcl/fedora-rpm.md')
     with tarfile.open(sources / 'torcl-payload.tar.gz', 'w:gz') as archive:
         archive.add(stage, arcname='payload')
-    android_source_archive(output, sources)
+    source_archive(output, sources)
     run(['rpmbuild', '-bb', ROOT / 'packaging/fedora/torcl.spec',
          '--define', f'_topdir {output}', '--define', f'torcl_version {version}',
          '--define', 'torcl_rustup 1',
@@ -199,6 +200,7 @@ def extract_and_verify(output, stage):
             if path.read_bytes() != installed.read_bytes():
                 raise RuntimeError(f'RPM changed payload file: {path}')
     run(['python3', ROOT / 'packaging/fedora/verify.py', extracted])
+    run(['python3', ROOT / 'packaging/fedora/verify-native-content.py', extracted])
     metadata = json.loads((extracted / 'usr/libexec/torcl/android/runtime.json').read_text())
     checker_spec = importlib.util.spec_from_file_location(
         'android_runtime', ROOT / 'packaging/android/build-runtime.py')

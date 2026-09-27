@@ -4,7 +4,12 @@ In-process Java integration for TorCL. The [Java integration chapter](../../docs
 in the main manual documents setup, the primary `JAVA` API, the descriptor-based
 `TORCL-JVM` API, ownership, callbacks, conditions, and JVM lifecycle.
 
-The package requires a native x86-64 glibc TorCL with `torcl-rt/c-ffi` and a JDK
+The native Fedora `torcl` RPM includes this ASDF system and a prebuilt bridge.
+With the RPM installed, use `(asdf:load-system :torcl-jvm)` from any directory;
+only a Java runtime (17+) is needed. The installed manual is at
+`/usr/share/doc/torcl/manual/index.html`.
+
+Building from source requires a native x86-64 glibc TorCL with `torcl-rt/c-ffi` and a JDK
 (17 or newer). Set `JAVA_HOME` to the JDK root containing `bin/javac`, JNI headers,
 and `lib/server/libjvm.so`. Build the private bridge from the repository root:
 

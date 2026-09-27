@@ -24,7 +24,8 @@ Install host prerequisites (Rust through rustup):
 
 ```sh
 sudo dnf install gcc binutils rpm-build rpm cpio python3 curl unzip \
-    qemu-user wine mingw64-gcc mingw64-binutils glibc
+    qemu-user wine mingw64-gcc mingw64-binutils glibc make java-devel \
+    python3-mkdocs python3-mkdocs-material
 rustup toolchain install 1.94.1 --profile minimal
 rustup target add --toolchain 1.94.1 x86_64-unknown-linux-gnu s390x-unknown-linux-gnu \
     aarch64-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-linux-android x86_64-linux-android
@@ -41,6 +42,23 @@ Use `ANDROID_NDK_HOME` to supply an existing NDK and avoid that download; pass t
 same directory to `build.py --android-ndk`.
 
 The build uses ordinary `cargo`, native MinGW, Fedora cross-GCC and the NDK.
+The native RPM includes the `JAVA` and `TORCL-JVM` APIs as the ASDF system
+`torcl-jvm`, and `/usr/lib64/torcl/libtorcl_jvm.so` with its Java helper classes
+embedded. `%build` compiles this bridge from source using a JDK (17+) and builds
+the HTML manual with MkDocs. Installed users need only a Java runtime; starting
+the JVM never invokes a compiler. Load it from any directory:
+
+```lisp
+(asdf:load-system :torcl-jvm)
+(defparameter *jvm* (java:start-jvm))
+(java:static "java.lang.Integer" "parseInt" "42")
+(java:stop-jvm *jvm*)
+```
+
+The manual is RPM documentation at `/usr/share/doc/torcl/manual/index.html`.
+It includes local assets and explicit HTML links for browsing without a server.
+Java integration is for the native glibc binary, not the cross-target runtimes.
+
 The Android app libraries are compiled by the spec's `%build`, from a source
 archive with locked, vendored Cargo dependencies (`--offline`). The local builder
 sets `torcl_rustup=1` because Rust is installed through rustup; direct rpmbuild
@@ -68,11 +86,11 @@ when deliberately reusing that stage's CLI binaries.
 ## Install and use
 
 Install matching releases of the native package and whichever target packages
-you need. For Android with the current local build:
+you need. After building release 4, for example:
 
 ```sh
-sudo dnf install target/fedora-rpm/RPMS/x86_64/torcl-0.1.0-3.fc44.x86_64.rpm \
-    target/fedora-rpm/RPMS/x86_64/torcl-target-android-0.1.0-3.fc44.x86_64.rpm
+sudo dnf install target/fedora-rpm/RPMS/x86_64/torcl-0.1.0-4.fc44.x86_64.rpm \
+    target/fedora-rpm/RPMS/x86_64/torcl-target-android-0.1.0-4.fc44.x86_64.rpm
 ```
 
 For example, put this in `build.lisp` after your application's loading code:

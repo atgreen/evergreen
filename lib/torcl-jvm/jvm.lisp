@@ -94,9 +94,18 @@
       (error () (%fail "Use a current native Linux TorCL build with torcl-rt/c-ffi and JVM coexistence support")))
     ;; Native VM state cannot be serialized, including state left after shutdown.
     (torcl::%foreign-library :inhibit-image)
-    (let ((root (asdf:system-source-directory :torcl-jvm)))
-      (uiop:run-program (list "make" "-C" (namestring root) (concatenate 'string "JAVA_HOME=" (namestring java-home))) :output *standard-output* :error-output *error-output*)
-      (setf *backend* (torcl-ffi:load-foreign-library (namestring (merge-pathnames "build/libtorcl_jvm.so" root)))))))
+    (let* ((root (asdf:system-source-directory :torcl-jvm))
+           (installed (merge-pathnames "libtorcl_jvm.so" root))
+           (library
+             (cond ((probe-file installed) installed)
+                   ((probe-file (merge-pathnames "Makefile" root))
+                    (uiop:run-program
+                     (list "make" "-C" (namestring root)
+                           (concatenate 'string "JAVA_HOME=" (namestring java-home)))
+                     :output *standard-output* :error-output *error-output*)
+                    (merge-pathnames "build/libtorcl_jvm.so" root))
+                   (t (%fail "Missing installed JVM bridge in ~A; reinstall torcl" root)))))
+      (setf *backend* (torcl-ffi:load-foreign-library (namestring library))))))
 (defun %java-home (home)
   (or home (torcl-ext:getenv "JAVA_HOME")
       (let* ((binary (string-trim '(#\Space #\Newline #\Return #\Tab)

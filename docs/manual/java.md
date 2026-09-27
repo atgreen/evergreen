@@ -7,13 +7,18 @@ explicit descriptor-based calls. Both are loaded by the same ASDF system.
 The two runtimes keep their own heaps and collectors. This is a checked API
 boundary, not a sandbox for untrusted Java or native code.
 
-The supported target is **native x86-64 Linux with glibc**. Use a TorCL built from
-this checkout with `torcl-rt/c-ffi`; the static musl executable and Android ART
-are not supported.
+The supported target is **native x86-64 Linux with glibc**. Install
+the native Fedora RPM, or build this checkout with `torcl-rt/c-ffi`. The static
+musl executable and Android ART are not supported.
 
 ## Setup and first calls { #setup }
 
-Install a JDK (17 or newer, including `javac` and JNI headers), a C compiler,
+The native Fedora `torcl` RPM includes both APIs and a prebuilt bridge, and
+requires a Java runtime (17 or newer). Start `torcl` from any directory and load
+`(asdf:load-system :torcl-jvm)`; no compiler or JDK is needed. The installed HTML
+manual starts at `/usr/share/doc/torcl/manual/index.html`.
+
+For a source checkout, install a JDK (17 or newer, including `javac` and JNI headers), a C compiler,
 Make and Python 3. Select the JDK root containing `bin/javac`, `include/jni.h`,
 and `lib/server/libjvm.so`:
 
@@ -48,8 +53,9 @@ From the repository root:
 available for existing code and precise low-level calls. Loading diagnoses an
 existing, unrelated package named `JAVA` rather than modifying it.
 
-ASDF loads the Lisp API. The first `start-jvm` runs Make if necessary and loads
-the private bridge; its source directory must be writable for an initial build.
+ASDF loads the Lisp API. The first `start-jvm` loads the installed bridge
+without running build tools. In a source checkout it runs Make to update the
+bridge; that source directory must be writable.
 `:java-home` overrides `JAVA_HOME`, which overrides Java found on `PATH`.
 `:classpath` is a list of directory/JAR names; `:options` is a list of JVM option
 strings. Options are trusted configuration, not an isolation boundary. The
