@@ -24588,7 +24588,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             "TORCL-EXT:RUN-PROGRAM" => {
                 // (torcl-ext:run-program command) — run a subprocess synchronously,
                 // capturing stdout/stderr. COMMAND is a list of strings (program +
-                // args, executed directly) or a string (run via `/bin/sh -c`).
+                // args, executed directly) or a string (run via the platform shell).
                 // Returns (values exit-code stdout-string stderr-string). UIOP's
                 // RUN-PROGRAM builds on this for #+torcl.
                 if env.sandbox {
@@ -24598,38 +24598,23 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 let (cmd_form, _) = cp(cdr);
                 let cmd_val = eval_form(cmd_form, env)?;
-                let mut command = if is_string_value(cmd_val) {
-                    let mut c = std::process::Command::new("/bin/sh");
-                    c.arg("-c").arg(val_as_str(cmd_val));
-                    c
+                use torcl_stdlib::process::{ProcessCommand, run_program};
+                let command = if is_string_value(cmd_val) {
+                    ProcessCommand::Shell(val_as_str(cmd_val))
                 } else {
-                    let parts: Vec<String> = list_to_vec(cmd_val)
-                        .iter()
-                        .map(|v| val_as_str(*v))
-                        .collect();
-                    if parts.is_empty() {
-                        return Err(TorclError::Internal("run-program: empty command".into()));
-                    }
-                    let mut c = std::process::Command::new(&parts[0]);
-                    c.args(&parts[1..]);
-                    c
+                    ProcessCommand::Argv(
+                        list_to_vec(cmd_val)
+                            .iter()
+                            .map(|v| val_as_str(*v))
+                            .collect(),
+                    )
                 };
-                match command.output() {
-                    Ok(out) => {
-                        let code = out.status.code().unwrap_or(-1);
-                        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-                        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-                        env.set_mv(vec![
-                            TorclVal::from_fixnum(code as i64),
-                            arena_str(&stdout),
-                            arena_str(&stderr),
-                        ]);
-                        return Ok(TorclVal::from_fixnum(code as i64));
-                    }
-                    Err(e) => {
-                        return Err(TorclError::FileError(format!("run-program: {e}")));
-                    }
-                }
+                let output = run_program(command)?;
+                let code = TorclVal::from_fixnum(output.status.code().unwrap_or(-1) as i64);
+                torcl_rt::rooted!(stdout = arena_str(&String::from_utf8_lossy(&output.stdout)));
+                torcl_rt::rooted!(stderr = arena_str(&String::from_utf8_lossy(&output.stderr)));
+                env.set_mv(vec![code, *stdout, *stderr]);
+                return Ok(code);
             }
             "TORCL-EXT:RAW-COMMAND-LINE-ARGUMENTS" => {
                 // The process argv as a list of strings (program name first),

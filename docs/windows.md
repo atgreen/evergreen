@@ -4,8 +4,8 @@ TorCL can be cross-built on Linux as a Windows console executable:
 `target/x86_64-pc-windows-gnu/release/torcl.exe`.
 
 This is an initial interpreter/T0 bytecode port. Native T1/T2/OSR compilation,
-Win64 foreign-call adapters/callbacks, fiber switching, structured-exception
-recovery, and socket streams/readiness are not supported yet. Forcing T2 safely
+Win64 foreign-call adapters/callbacks, fiber switching, and structured-exception
+recovery are not supported yet. Forcing T2 safely
 falls back to bytecode. DLL loading and symbol lookup are available; global
 Unix-style symbol lookup requires choosing a DLL explicitly on Windows.
 
@@ -55,6 +55,25 @@ been validated.
 Saved images carry a Windows platform tag and cannot be exchanged with Linux
 images. Ctrl+C and Ctrl+Break request cooperative Lisp interruption.
 
+## Networking and subprocesses
+
+TCP client and accepted connections are owned bidirectional octet streams.
+The existing `torcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
+`%socket-read-timeout`, and `%socket-wait-for-input` primitives work on Windows.
+Buffered input, readiness timeouts, EOF, `LISTEN`, and explicit `CLOSE` are
+supported; closing releases the socket without waiting for GC. Socket position
+and length queries return `NIL`. Windows sockets are not Unix descriptors, so
+`%socket-fd` returns `NIL`; descriptor-based fiber waits remain unsupported.
+Socket readiness uses [Winsock WSAPoll](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll).
+
+`torcl-ext:run-program` runs synchronously and returns three values: exit status,
+stdout, and stderr. A list supplies an executable and its arguments directly;
+a string supplies shell syntax to `COMSPEC` (normally `cmd.exe`) with
+`/D /S /C`. Both output pipes are drained concurrently, and stdin receives EOF.
+Captured bytes are decoded as UTF-8 with replacement for invalid sequences.
+Interactive subprocess streams, asynchronous process management, and alternate
+console code-page decoding are not provided by this API.
+
 ## Validate under Wine
 
 Install Wine and Python 3.11 or newer. From a Linux session with the user
@@ -69,6 +88,8 @@ prefix. It runs Windows memory/protection, timing/thread, DLL-lifetime and stack
 budget tests, then the CLI functional tests in interpreter, bytecode, default,
 and forced-T2 fallback modes. Additional checks cover `USERPROFILE` without
 `HOME`, catchable recursive stack exhaustion, moving-GC stress with poison,
+TCP connect/accept, buffering, timeouts, EOF, immediate close, split UTF-8
+nonblocking reads, subprocess quoting and concurrent output pipes,
 pathname components, construction, merging, wildcard searches, equality/hashing,
 and compiled-file and heap-image pathname round trips in fresh processes.
 

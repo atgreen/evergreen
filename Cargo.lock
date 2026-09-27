@@ -501,6 +501,7 @@ dependencies = [
  "rustyline",
  "torcl-compiler",
  "torcl-rt",
+ "windows-sys",
 ]
 
 [[package]]
