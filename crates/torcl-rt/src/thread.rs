@@ -911,6 +911,35 @@ impl Fiber {
     }
 }
 
+/// Prevent suspension while a carrier-bound resource is borrowed. This does
+/// not suppress safepoint handshakes, and composes with existing foreign pins.
+pub(crate) struct FiberPin {
+    fiber: Option<&'static Fiber>,
+    _carrier_bound: std::marker::PhantomData<*mut ()>,
+}
+
+impl FiberPin {
+    pub(crate) fn current() -> Self {
+        let fiber = current_fiber();
+        if let Some(fiber) = fiber {
+            fiber.pin();
+        }
+        Self {
+            fiber,
+            _carrier_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for FiberPin {
+    fn drop(&mut self) {
+        if let Some(fiber) = self.fiber {
+            // This scope owns exactly one pin, including on error exits.
+            let _ = fiber.unpin();
+        }
+    }
+}
+
 /// Number of live (non-`Dead`) managed fibers in the registry — the M in the
 /// N-native-workers × M-managed-fibers model (bliss-jtc.14.2).
 pub fn live_fiber_count() -> usize {
