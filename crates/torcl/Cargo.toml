@@ -36,3 +36,6 @@ torcl-rt.workspace = true
 torcl-compiler.workspace = true
 torcl-stdlib.workspace = true
 iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "nasm", "std"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }

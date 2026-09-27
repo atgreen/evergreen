@@ -90,11 +90,11 @@ fn native_type(value: TorclVal, depth: usize) -> Result<AlienType, TorclError> {
 }
 
 fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     {
         torcl_rt::ffi::native_layout(ty)
     }
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
     {
         if matches!(ty, AlienType::Struct { .. } | AlienType::Union { .. }) {
             return Err(TorclError::FfiError(
@@ -108,7 +108,7 @@ fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
 /// All arguments are addresses of native C objects, not Lisp values to marshal.
 /// The caller supplies matching signatures and valid borrowed storage. Tracked
 /// storage is copied under short registry locks; no locks survive a C callback.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub fn buffered_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     if !(5..=6).contains(&args.len()) {
         return Err(TorclError::ProgramError("FOREIGN-CALL-BUFFERED requires pointer, result type, argument types, argument buffers, result buffer and optional fixed count".into()));
@@ -178,7 +178,7 @@ pub fn buffered_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     })
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 pub fn buffered_call(_args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     Err(TorclError::FfiError(
         "buffered calls are not implemented for this target ABI".into(),
@@ -290,7 +290,7 @@ fn foreign_name(value: TorclVal) -> Result<String, TorclError> {
 /// Explicit callback ownership, independent of the lifetime of its Lisp wrapper.
 /// The caller must retire all foreign pointer uses before FREE; the active check
 /// additionally rejects a callback trying to release its own executable entry.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub fn callback_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     use std::sync::{Mutex, OnceLock};
     use torcl_rt::ffi::managed_callback::LispCallback;
@@ -385,7 +385,7 @@ pub fn callback_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 pub fn callback_call(_args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     Err(TorclError::FfiError(
         "callbacks are not implemented for this target ABI".into(),

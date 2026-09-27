@@ -72,9 +72,7 @@ impl CallAdapter {
         if let Some(adapter) = cache.get(&signature) {
             return Ok(Arc::clone(adapter));
         }
-        let bytes = emit(&signature)?;
-        let code = JitBuffer::new(&bytes)
-            .ok_or_else(|| TorclError::FfiError("cannot allocate foreign call adapter".into()))?;
+        let code = emit(&signature)?;
         let adapter = Arc::new(Self { code });
         // Bound retained executable mappings. An evicted adapter remains alive
         // until its active calls release their Arc, including reentrant calls.
@@ -107,10 +105,12 @@ pub(super) enum Location {
 pub(super) struct ScalarPlan {
     pub(super) locations: Vec<Location>,
     pub(super) stack_bytes: u32,
+    #[cfg(unix)]
     pub(super) sse: u8,
 }
 
 /// The same scalar ABI assignment is used by outbound calls and inbound entries.
+#[cfg(unix)]
 pub(super) fn classify(arguments: &[Scalar]) -> Result<ScalarPlan, TorclError> {
     if arguments.len() > (i32::MAX as usize - 16) / 8 {
         return Err(signature_too_large());
@@ -138,7 +138,35 @@ pub(super) fn classify(arguments: &[Scalar]) -> Result<ScalarPlan, TorclError> {
     })
 }
 
-fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
+#[cfg(windows)]
+pub(super) fn classify(arguments: &[Scalar]) -> Result<ScalarPlan, TorclError> {
+    if arguments.contains(&Scalar::Void) {
+        return Err(TorclError::FfiError("void is not an argument type".into()));
+    }
+    // Callback displacements include both the local slots and incoming stack.
+    if arguments.len() > (i32::MAX as usize - 64) / 16 {
+        return Err(signature_too_large());
+    }
+    let locations = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, scalar)| {
+            if index >= 4 {
+                Location::Stack(index as u32 * 8)
+            } else if matches!(scalar, Scalar::Float | Scalar::Double) {
+                Location::Sse(index as u8)
+            } else {
+                Location::Integer(super::win64::ARGUMENT_REGISTERS[index])
+            }
+        })
+        .collect();
+    Ok(ScalarPlan {
+        locations,
+        stack_bytes: arguments.len().max(4) as u32 * 8,
+    })
+}
+
+fn emit(signature: &Signature) -> Result<JitBuffer, TorclError> {
     let plan = classify(&signature.arguments)?;
     let frame_bytes = plan
         .stack_bytes
@@ -150,6 +178,7 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
     }
     // Entry: rdi=target, rsi=slots. Keep these in caller-saved scratch registers
     // while constructing arguments. push rbp aligns rsp to 16 before the call.
+    #[cfg(unix)]
     let mut code = vec![
         0xf3, 0x0f, 0x1e, 0xfa, // endbr64 (also valid without CET)
         0x55, // push rbp
@@ -158,7 +187,15 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
         0x49, 0x89, 0xf2, // mov r10,rsi
         0x48, 0x81, 0xec, // sub rsp,frame_bytes
     ];
+    #[cfg(unix)]
     code.extend_from_slice(&frame_bytes.to_le_bytes());
+    #[cfg(windows)]
+    let (mut code, unwind) = super::win64::prologue(frame_bytes)?;
+    #[cfg(windows)]
+    code.extend_from_slice(&[
+        0x49, 0x89, 0xcb, // mov r11,rcx (target)
+        0x49, 0x89, 0xd2, // mov r10,rdx (slots)
+    ]);
     for (index, location) in plan.locations.iter().enumerate() {
         code.extend_from_slice(&[0x49, 0x8b, 0x82]); // mov rax,[r10+disp32]
         code.extend_from_slice(&((index * 8) as u32).to_le_bytes());
@@ -189,6 +226,11 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
             }
             Location::Sse(register) => {
                 code.extend_from_slice(&[0x66, 0x48, 0x0f, 0x6e, 0xc0 | (register << 3)]);
+                #[cfg(windows)]
+                if signature.fixed_count.is_some() {
+                    let gpr = super::win64::ARGUMENT_REGISTERS[*register as usize];
+                    code.extend_from_slice(&[0x48 | (gpr >> 3), 0x89, 0xc0 | (gpr & 7)]);
+                }
             }
             Location::Stack(offset) => {
                 code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]); // mov [rsp+disp32],rax
@@ -196,6 +238,7 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
             }
         }
     }
+    #[cfg(unix)]
     if signature.fixed_count.is_some() {
         // SysV variadic calls pass the number of used vector registers in AL,
         // including those occupied by named arguments. All argument moves are
@@ -213,8 +256,14 @@ fn emit(signature: &Signature) -> Result<Vec<u8>, TorclError> {
         Scalar::Integer { bits: 32, .. } => code.extend_from_slice(&[0x89, 0xc0]), // mov eax,eax
         Scalar::Integer { .. } => {}
     }
-    code.extend_from_slice(&[0xc9, 0xc3]); // leave; ret
-    Ok(code)
+    #[cfg(unix)]
+    let buffer = {
+        code.extend_from_slice(&[0xc9, 0xc3]); // leave; ret
+        JitBuffer::new(&code)
+    };
+    #[cfg(windows)]
+    let buffer = super::win64::finish(code, frame_bytes, &unwind);
+    buffer.ok_or_else(|| TorclError::FfiError("cannot allocate foreign call adapter".into()))
 }
 
 fn signature_too_large() -> TorclError {

@@ -474,6 +474,7 @@ dependencies = [
  "torcl-compiler",
  "torcl-rt",
  "torcl-stdlib",
+ "windows-sys",
 ]
 
 [[package]]

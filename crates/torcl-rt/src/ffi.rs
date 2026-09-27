@@ -8,29 +8,31 @@ use crate::value::TorclVal;
 
 pub mod memory;
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 mod abi;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 mod buffered;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub use buffered::ffi_call_buffered;
 
 /// Checked native layout, identical to the generated call adapter's layout.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
     let layout = abi::Layout::new(ty)?;
     Ok((layout.size as usize, layout.alignment as usize))
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 mod call;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod callback;
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 mod legacy;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod managed_callback;
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(all(target_arch = "x86_64", windows))]
+mod win64;
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
 // ── Alien type system ──────────────────────────────────────────────
@@ -135,7 +137,7 @@ impl AlienType {
 ///
 /// # Safety
 /// `fn_ptr` must point to a valid function with the given signature.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub unsafe fn ffi_call(
     fn_ptr: *const (),
     ret_type: &AlienType,
@@ -154,7 +156,7 @@ pub unsafe fn ffi_call(
 /// # Safety
 /// `fn_ptr` must have the named parameter and return types supplied here, and
 /// the callee must consume the trailing arguments using their promoted types.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub unsafe fn ffi_call_variadic(
     fn_ptr: *const (),
     ret_type: &AlienType,
@@ -185,7 +187,7 @@ pub unsafe fn ffi_call_variadic(
                 } else {
                     args[index] & ((1u64 << bits) - 1)
                 };
-                // On SysV AMD64, C int represents every char/short value,
+                // On the supported x86-64 ABIs, C int represents every char/short value,
                 // including unsigned char and unsigned short.
                 promoted_types[index] = AlienType::Int {
                     bits: 32,
@@ -208,7 +210,7 @@ pub unsafe fn ffi_call_variadic(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 unsafe fn ffi_call_impl(
     fn_ptr: *const (),
     ret_type: &AlienType,

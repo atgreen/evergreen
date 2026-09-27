@@ -1,5 +1,5 @@
 //! Managed callback roots, runtime transitions, and errors contained inside C.
-#![cfg(all(target_arch = "x86_64", unix))]
+#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use torcl_rt::ffi::{
     AlienType, ffi_call,
