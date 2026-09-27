@@ -12,10 +12,12 @@ TorCL's CLI can be built on x86-64 for these Linux targets:
 These are dynamically linked glibc executables, suitable for Fedora. They run
 the interpreter and T0 bytecode engine. s390x also supports native T1 compilation
 and T0-to-T1 OSR, including guarded fixnum arithmetic and precise deoptimization.
-The s390x T2 backend emits optimized guarded integer arithmetic, forward
-branches, runtime calls and multiple-value transfers. Native register and spill
-roots are synchronized through GC-scanned activation slots at runtime calls.
-Optimized loops/OSR and floating-point templates remain in progress;
+The s390x T2 backend emits optimized guarded integer arithmetic, branches,
+loops, runtime calls and multiple-value transfers. Native register and spill
+roots are synchronized through GC-scanned activation slots at runtime calls
+and sampled loop safepoints. Live T1-to-T2 OSR grows the activation in place
+and imports its live locals. Deopt rematerialization and multiply/float
+templates remain in progress;
 unsupported functions stay at T1. AArch64 and POWER still
 use T0 for native-tier requests. Foreign calls/callbacks and fiber context
 switching are not yet ported; this is not a claim of full architecture parity.
@@ -84,7 +86,10 @@ instruction-encoding, ABI execution, native frame and deoptimization tests.
 T2 checks require actual tier-2 installation for arithmetic and branches, then
 compare overflow/type guard exits against T0 under GC stress. Compiler tests
 also execute optimized code with register spills and check precise guard
-reconstruction. Until back-edge polling is implemented, T2 declines loops.
+reconstruction. Optimized-loop checks require live T1-to-T2 OSR, exercise
+moving GC in the grown activation, and verify a late overflow resumes without
+replaying earlier effects. A call-free T2 loop must respond to SIGTERM before
+the runtime's hard shutdown deadline.
 The native call checks include wide argument lists, twelve-value returns,
 spilled heap roots across allocations, function redefinition, and error/nonlocal
 exits that must stop before subsequent side effects.
