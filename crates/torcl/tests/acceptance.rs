@@ -2406,6 +2406,53 @@ fn an_arithmetic_loops_subclauses_may_be_written_in_any_order() {
     run_expression_cases(&cases);
 }
 
+/// ALLOCATE-INSTANCE and SLOT-MAKUNBOUND (CLHS 7.7.1), wired to the stdlib
+/// implementations that already had the right semantics (bliss-2icv).
+///
+/// The defining property of ALLOCATE-INSTANCE is what it does NOT do: every slot
+/// comes back unbound, with no initforms, no initargs and no
+/// INITIALIZE-INSTANCE. The `:initform 1` row is the one that matters — a naive
+/// wiring to MAKE-INSTANCE would pass everything else and fail that.
+///
+/// SLOT-MAKUNBOUND was already implemented in operator position; what was broken
+/// is that neither name was in the builtin list, so FBOUNDP answered NIL and
+/// FUNCALL/APPLY could not reach them. Those rows are the regression.
+#[test]
+fn allocate_instance_and_slot_makunbound_are_available() {
+    let cases = [
+        // Every slot unbound, initform NOT run.
+        (
+            "(progn (defclass ai () ((a :initform 1) (b)))                (let ((i (allocate-instance (find-class 'ai))))                  (list (slot-boundp i 'a) (slot-boundp i 'b))))",
+            "(NIL NIL)",
+        ),
+        // MAKE-INSTANCE is unaffected: it still runs initforms.
+        (
+            "(progn (defclass ai2 () ((a :initform 7)))                (slot-value (make-instance 'ai2) 'a))",
+            "7",
+        ),
+        // SLOT-MAKUNBOUND unbinds and returns the INSTANCE, not the value.
+        (
+            "(progn (defclass ai3 () ((a :initform 1)))                (let ((i (make-instance 'ai3)))                  (list (eq i (slot-makunbound i 'a)) (slot-boundp i 'a))))",
+            "(T NIL)",
+        ),
+        // Both must be FBOUND and reachable as function designators — this is
+        // what was actually missing.
+        (
+            "(list (not (null (fboundp 'allocate-instance)))                    (not (null (fboundp 'slot-makunbound))))",
+            "(T T)",
+        ),
+        (
+            "(progn (defclass ai4 () ((a :initform 1)))                (slot-boundp (funcall #'allocate-instance (find-class 'ai4)) 'a))",
+            "NIL",
+        ),
+        (
+            "(progn (defclass ai5 () ((a :initform 1)))                (slot-boundp (apply #'allocate-instance (list (find-class 'ai5))) 'a))",
+            "NIL",
+        ),
+    ];
+    run_expression_cases(&cases);
+}
+
 #[test]
 fn loop_while_until_repeat_drivers() {
     let cases = [

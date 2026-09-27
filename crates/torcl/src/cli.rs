@@ -22957,6 +22957,26 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     NIL
                 });
             }
+            // (ALLOCATE-INSTANCE class &rest initargs) — CLHS 7.7.1. Returns a
+            // new instance with EVERY slot unbound: no initforms, no initargs,
+            // no INITIALIZE-INSTANCE. MAKE-INSTANCE is defined in terms of it,
+            // and the stdlib already provides exactly these semantics, so this
+            // wires to it rather than reimplementing (AGENTS.md architecture
+            // principle). The initargs are accepted and ignored here, as they
+            // are by the standard primary method (bliss-2icv).
+            "ALLOCATE-INSTANCE" => {
+                let args = eval_args(cdr, env)?;
+                let class_input = args.first().copied().unwrap_or(NIL);
+                // Resolved the same way MAKE-INSTANCE resolves it, deliberately.
+                // SBCL rejects `(allocate-instance 'foo)` because there a class
+                // and its name are different objects — but TorCL's FIND-CLASS
+                // RETURNS THE SYMBOL (classes are not yet distinct metaobjects),
+                // so rejecting symbols here would reject the only thing a caller
+                // can obtain. Tightening this is bliss-rj5o, and belongs with
+                // real class metaobjects rather than here.
+                let class = resolve_class_metaobject(env, class_input)?;
+                return torcl_stdlib::clos::allocate_instance(class);
+            }
             "CLASS-OF" => {
                 let (object_form, _) = cp(cdr);
                 let object = eval_form(object_form, env)?;
@@ -36160,6 +36180,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"
             | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "FIND-METHOD" | "SLOT-VALUE" | "SLOT-BOUNDP"
+            | "ALLOCATE-INSTANCE" | "SLOT-MAKUNBOUND"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
             // Debug introspection (bliss-zz6w)
             | "TORCL::%FN-BODY" | "TORCL::%FN-LAMBDA-LIST"
@@ -36257,6 +36278,18 @@ fn apply_builtin_fast(
         "SLOT-BOUNDP" if args.len() == 2 => {
             env.clear_mv();
             Some(slot_is_bound(args[0], args[1], env).map(|b| if b { T } else { NIL }))
+        }
+        // Reachable through FUNCALL/APPLY/MAPCAR, not only operator position.
+        "ALLOCATE-INSTANCE" if !args.is_empty() => {
+            env.clear_mv();
+            match resolve_class_metaobject(env, args[0]) {
+                Ok(class) => Some(torcl_stdlib::clos::allocate_instance(class)),
+                Err(e) => Some(Err(e)),
+            }
+        }
+        "SLOT-MAKUNBOUND" if args.len() == 2 => {
+            env.clear_mv();
+            Some(torcl_stdlib::clos::slot_makunbound(args[0], args[1]).map(|()| args[0]))
         }
         "CLASS-OF" if args.len() == 1 => {
             env.clear_mv();
