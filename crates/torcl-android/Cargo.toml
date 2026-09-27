@@ -19,7 +19,8 @@ rust-version.workspace = true
 [lib]
 crate-type = ["rlib"]
 
-[dependencies]
+# Do not enable the Android dynamic-loader backend in host workspace builds.
+[target.'cfg(target_os = "android")'.dependencies]
 torcl = { path = "../torcl" }
 # dlopen-based FFI: the Lisp half reaches libEGL/libGLESv2/libandroid through it,
 # and on Android the system libraries are bionic's, so the bundled ELF loader is
