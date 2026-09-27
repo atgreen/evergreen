@@ -17846,6 +17846,112 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(v);
             }
+            // (%class-slot-descriptors class-designator) — the raw EFFECTIVE slot
+            // data for CLASS, one plist per slot, in class-precedence order:
+            //   (:name S :initargs (:a :b) :initform FORM :allocation :instance
+            //    :readers (R …) :writers (W …))
+            // boot.lisp wraps these in SLOT-DEFINITION instances and exposes
+            // CLASS-SLOTS plus the SLOT-DEFINITION-* accessors, so the Lisp-level
+            // MOP surface lives in Lisp rather than growing cli.rs (AGENTS.md
+            // architecture principle; bliss-h1mx).
+            //
+            // Takes a class DESIGNATOR, like MAKE-INSTANCE and ALLOCATE-INSTANCE:
+            // FIND-CLASS returns the symbol here (bliss-rj5o), so a caller has no
+            // separate class object to pass.
+            "TORCL-INTERNAL::%CLASS-SLOT-DESCRIPTORS"
+            | "TORCL-INTERNAL:%CLASS-SLOT-DESCRIPTORS"
+            | "%CLASS-SLOT-DESCRIPTORS" => {
+                let (af, rest) = cp(cdr);
+                let class_input = eval_form(af, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                let class_name = sym_name(class);
+                // Optional second argument: non-NIL asks for this class's DIRECT
+                // slots only. AMOP draws a real distinction here — CLASS-SLOTS
+                // yields effective slot definitions, CLASS-DIRECT-SLOTS yields
+                // direct ones, and SLOT-DEFINITION-READERS / -WRITERS are only
+                // defined on the DIRECT ones (SBCL signals no-applicable-method
+                // for them on an effective slot definition). So both shapes are
+                // exposed rather than aliasing one to the other.
+                let direct_only = if rest.is_cons() {
+                    !eval_form(cp(rest).0, env)?.is_nil()
+                } else {
+                    false
+                };
+                let mut slots = if direct_only {
+                    env.classes
+                        .borrow()
+                        .get(&class_name)
+                        .map(|c| c.slots.clone())
+                        .unwrap_or_default()
+                } else {
+                    // effective_slots_for_class already walks the class precedence
+                    // list and shadows by name, so this does not reimplement it.
+                    effective_slots_for_class(env, &class_name)
+                };
+                // SlotDef::initform is a TorclVal and every list built below
+                // allocates, so root the whole Vec: SlotDef's TraceHostRoots impl
+                // exists for exactly this (moving GC; bliss-wlf).
+                torcl_rt::rooted_ref!(_slots_root = &mut slots);
+                let mut out: Vec<TorclVal> = Vec::with_capacity(slots.len());
+                torcl_rt::rooted_ref!(_out_root = &mut out);
+                let kw = |name: &str| {
+                    TorclVal::from_symbol_index(torcl_rt::symbols::intern(&format!(
+                        "KEYWORD:{name}"
+                    )))
+                };
+                for i in 0..slots.len() {
+                    // Each of these allocates; build the sub-lists into rooted
+                    // Vecs before assembling the plist so a collection mid-build
+                    // cannot strand a finished piece (bliss-sqpi).
+                    let mut initargs: Vec<TorclVal> = Vec::new();
+                    torcl_rt::rooted_ref!(_initargs_root = &mut initargs);
+                    for a in &slots[i].initargs {
+                        initargs.push(kw(a));
+                    }
+                    let mut readers: Vec<TorclVal> = Vec::new();
+                    torcl_rt::rooted_ref!(_readers_root = &mut readers);
+                    for r in &slots[i].readers {
+                        readers.push(resolve_sym(r).unwrap_or(NIL));
+                    }
+                    let mut writers: Vec<TorclVal> = Vec::new();
+                    torcl_rt::rooted_ref!(_writers_root = &mut writers);
+                    for w in &slots[i].writers {
+                        writers.push(resolve_sym(w).unwrap_or(NIL));
+                    }
+                    // An `:accessor foo` declares BOTH a reader and a writer, but
+                    // eval_defclass records it only in `readers` plus the separate
+                    // `accessor` field — nothing lands in `writers`. CLHS says
+                    // SLOT-DEFINITION-WRITERS is ((setf foo)) for an accessor, a
+                    // function NAME list rather than a symbol, so synthesize it
+                    // here instead of reporting no writer at all.
+                    if let Some(accessor) = &slots[i].accessor {
+                        let mut setf_name: Vec<TorclVal> = Vec::new();
+                        torcl_rt::rooted_ref!(_setf_root = &mut setf_name);
+                        setf_name.push(resolve_sym("SETF").unwrap_or(NIL));
+                        setf_name.push(resolve_sym(accessor).unwrap_or(NIL));
+                        writers.push(vec_to_list(&setf_name));
+                    }
+                    let mut entry: Vec<TorclVal> = Vec::new();
+                    torcl_rt::rooted_ref!(_entry_root = &mut entry);
+                    entry.push(kw("NAME"));
+                    entry.push(resolve_sym(&slots[i].name).unwrap_or(NIL));
+                    entry.push(kw("INITARGS"));
+                    entry.push(vec_to_list(&initargs));
+                    entry.push(kw("INITFORM"));
+                    entry.push(slots[i].initform.unwrap_or(NIL));
+                    entry.push(kw("ALLOCATION"));
+                    entry.push(kw(match slots[i].allocation {
+                        SlotAllocation::Instance => "INSTANCE",
+                        SlotAllocation::Class => "CLASS",
+                    }));
+                    entry.push(kw("READERS"));
+                    entry.push(vec_to_list(&readers));
+                    entry.push(kw("WRITERS"));
+                    entry.push(vec_to_list(&writers));
+                    out.push(vec_to_list(&entry));
+                }
+                return Ok(vec_to_list(&out));
+            }
             "TORCL-INTERNAL::%HOME-SYMBOL" | "TORCL-INTERNAL:%HOME-SYMBOL" | "%HOME-SYMBOL" => {
                 // (%home-symbol 'name) — register NAME present INTERNAL in the
                 // current package (CL-USER), for Lisp-level definers (e.g. the

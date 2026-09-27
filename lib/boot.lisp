@@ -3966,3 +3966,53 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
            (unwind-protect
                (when ,ready (torcl::%foreign-memory :copy-out ,storage ,v ,ty))
              (torcl-ffi:foreign-free ,storage)))))))
+
+;;; ── CLOS slot-definition metaobjects (bliss-h1mx) ─────────────────────────
+;;;
+;;; closer-mop needs CLASS-SLOTS to return objects it can hand to the
+;;; SLOT-DEFINITION-* accessors. The raw data comes from
+;;; TORCL-INTERNAL::%CLASS-SLOT-DESCRIPTORS — one plist per EFFECTIVE slot, in
+;;; class-precedence order, built from the same effective_slots_for_class walk
+;;; MAKE-INSTANCE uses. The Lisp-visible surface lives here rather than in
+;;; cli.rs, per the architecture principle: the interpreter exposes data, the
+;;; library shapes it.
+;;;
+;;; CLASS-SLOTS takes a class DESIGNATOR, like MAKE-INSTANCE and
+;;; ALLOCATE-INSTANCE, because FIND-CLASS returns the class NAME here
+;;; (bliss-rj5o) — a caller has no separate class object to pass.
+;;;
+;;; AMOP distinguishes EFFECTIVE from DIRECT slot definitions, and so does this:
+;;; CLASS-SLOTS walks the class precedence list, CLASS-DIRECT-SLOTS reports only
+;;; the slots the class itself declared. That distinction is not cosmetic —
+;;; SLOT-DEFINITION-READERS and -WRITERS are defined by AMOP only on DIRECT slot
+;;; definitions, and SBCL signals NO-APPLICABLE-METHOD if you call them on an
+;;; effective one. TorCL answers them for both, which is a permissive superset
+;;; rather than a different answer.
+;;;
+;;; One honest limit: SLOT-DEFINITION-TYPE answers T for every slot, because
+;;; DEFCLASS currently discards the :type option (bliss-52ze). T is the correct
+;;; default, and wrong for a slot that declared a type.
+(defclass slot-definition ()
+  ((name :initarg :name :reader slot-definition-name)
+   (initargs :initarg :initargs :reader slot-definition-initargs)
+   (initform :initarg :initform :reader slot-definition-initform)
+   (allocation :initarg :allocation :reader slot-definition-allocation)
+   (readers :initarg :readers :reader slot-definition-readers)
+   (writers :initarg :writers :reader slot-definition-writers)))
+
+(defun class-slots (class)
+  "Effective slot definitions of CLASS, in class-precedence order."
+  (mapcar (lambda (descriptor)
+            (apply #'make-instance 'slot-definition descriptor))
+          (torcl-internal::%class-slot-descriptors class)))
+
+(defun class-direct-slots (class)
+  "Slot definitions CLASS itself declares, excluding inherited slots."
+  (mapcar (lambda (descriptor)
+            (apply #'make-instance 'slot-definition descriptor))
+          (torcl-internal::%class-slot-descriptors class t)))
+
+(defun slot-definition-type (slot)
+  "Declared type of SLOT. Always T: DEFCLASS discards :type (bliss-52ze)."
+  (declare (ignore slot))
+  t)

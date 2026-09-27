@@ -2453,6 +2453,65 @@ fn allocate_instance_and_slot_makunbound_are_available() {
     run_expression_cases(&cases);
 }
 
+/// CLOS slot-definition metaobjects: CLASS-SLOTS, CLASS-DIRECT-SLOTS and the
+/// SLOT-DEFINITION-* accessors (bliss-h1mx), the surface closer-mop needs.
+///
+/// The effective-vs-direct distinction is the point, not decoration: AMOP defines
+/// SLOT-DEFINITION-READERS/-WRITERS only on DIRECT slot definitions (SBCL signals
+/// no-applicable-method on an effective one), so aliasing the two would be wrong
+/// even though both would "work" for simple classes.
+///
+/// `:accessor` is checked specifically because DEFCLASS records it in `readers`
+/// and in a separate `accessor` field but NEVER in `writers` — so the writer
+/// ((setf name)) is synthesized, and a naive exposure reports no writer at all.
+#[test]
+fn class_slots_and_slot_definition_accessors_are_available() {
+    let cases = [
+        // Effective slots include inherited ones, in class-precedence order.
+        (
+            "(progn (defclass mb () ((a :initform 1)(sh :allocation :class)))                (defclass md (mb) ((b)))                (mapcar #'slot-definition-name (class-slots (find-class 'md))))",
+            "(B A SH)",
+        ),
+        // Direct slots exclude inherited ones.
+        (
+            "(progn (defclass mb2 () ((a)(sh))) (defclass md2 (mb2) ((b)))                (mapcar #'slot-definition-name (class-direct-slots (find-class 'md2))))",
+            "(B)",
+        ),
+        // Every initarg a slot declares, not just the first.
+        (
+            "(progn (defclass mi () ((a :initarg :a :initarg :aye)))                (slot-definition-initargs (car (class-direct-slots (find-class 'mi)))))",
+            "(:A :AYE)",
+        ),
+        // :accessor implies a reader AND the (setf name) writer.
+        (
+            "(progn (defclass mac () ((a :accessor mac-a)))                (let ((s (car (class-direct-slots (find-class 'mac)))))                  (list (slot-definition-readers s) (slot-definition-writers s))))",
+            "((MAC-A) ((SETF MAC-A)))",
+        ),
+        // :reader gives no writer; :writer gives no reader.
+        (
+            "(progn (defclass mrw () ((r :reader mrw-r) (w :writer set-mrw-w)))                (mapcar (lambda (s) (list (slot-definition-readers s)                                          (slot-definition-writers s)))                        (class-direct-slots (find-class 'mrw))))",
+            "(((MRW-R) NIL) (NIL (SET-MRW-W)))",
+        ),
+        // Allocation and initform are reported.
+        (
+            "(progn (defclass mal () ((i :initform 42) (c :allocation :class)))                (mapcar (lambda (s) (list (slot-definition-allocation s)                                          (slot-definition-initform s)))                        (class-direct-slots (find-class 'mal))))",
+            "((:INSTANCE 42) (:CLASS NIL))",
+        ),
+        // A class designator is accepted, as for MAKE-INSTANCE/ALLOCATE-INSTANCE,
+        // because FIND-CLASS returns the name here (bliss-rj5o).
+        (
+            "(progn (defclass mdes () ((a)))                (equal (mapcar #'slot-definition-name (class-slots 'mdes))                       (mapcar #'slot-definition-name (class-slots (find-class 'mdes)))))",
+            "T",
+        ),
+        // Every accessor is FBOUND and reachable as a function designator.
+        (
+            "(every (lambda (f) (not (null (fboundp f))))                '(class-slots class-direct-slots slot-definition-name                  slot-definition-initargs slot-definition-initform                  slot-definition-allocation slot-definition-readers                  slot-definition-writers slot-definition-type))",
+            "T",
+        ),
+    ];
+    run_expression_cases(&cases);
+}
+
 #[test]
 fn loop_while_until_repeat_drivers() {
     let cases = [
