@@ -19437,6 +19437,9 @@ fn is_inlinable_eq(sym: u32) -> bool {
 #[cfg(all(target_arch = "aarch64", unix))]
 mod a64;
 
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+mod ppc64le;
+
 /// Emit T1 native code for the host. Each architecture's baseline emitter
 /// decides for itself what it can lower; a host with no emitter never promotes
 /// and every function stays in the counting interpreter.
@@ -19449,14 +19452,20 @@ fn emit_native_t1(
 ) -> Option<NativeEmission> {
     #[cfg(all(target_arch = "aarch64", unix))]
     return a64::emit_native_a64(bf, allow_speculation, sym, backedge_counter, allow_traps);
-    #[cfg(not(all(target_arch = "aarch64", unix)))]
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+    return ppc64le::emit_native_ppc64le(bf, allow_speculation, sym, backedge_counter, allow_traps);
+    #[cfg(not(any(
+        all(target_arch = "aarch64", unix),
+        all(target_arch = "powerpc64", target_endian = "little", unix)
+    )))]
     emit_native(bf, allow_speculation, sym, backedge_counter, allow_traps)
 }
 
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
-    all(target_arch = "s390x", unix)
+    all(target_arch = "s390x", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 fn emit_native(
     _bf: &BytecodeFunction,

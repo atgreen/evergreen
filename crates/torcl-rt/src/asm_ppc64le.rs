@@ -15,6 +15,30 @@
 
 use crate::asm::Cc;
 
+/// The frame every ppc64le JIT tier claims, and the offsets within it.
+///
+/// T1, T2 and the SIGSEGV recovery epilogue must agree on this exactly: a fault
+/// anywhere in native code is redirected to a single address that has to unwind
+/// whichever tier was running. On AArch64 that agreement was reached late and cost
+/// a change to both emitters (bliss-7t9a4); here it is settled first.
+///
+/// The layout follows the ELFv2 frame, so an unwinder and a debugger can both
+/// follow it: the back chain at 0, a link-register slot for this frame's own
+/// callees at 16 and a TOC slot at 24 — while THIS frame's return address lives in
+/// the *caller's* slot, written before the frame is claimed.
+pub mod frame {
+    /// Total frame size. A multiple of 16, as the ABI requires at every call.
+    pub const BYTES: i32 = 96;
+    /// Where a callee of this frame saves its caller's (our) link register.
+    pub const LINK_SLOT: i32 = 16;
+    /// The TOC save slot, preserved around calls that may set up their own.
+    pub const TOC_SLOT: i32 = 24;
+    /// Nonvolatile registers the JIT uses, and where each is saved.
+    pub const SAVED: [(u8, i32); 3] = [(14, 32), (15, 40), (16, 48)];
+    /// A scratch doubleword for spilling a result across a helper call.
+    pub const SCRATCH_SLOT: i32 = 56;
+}
+
 /// A word-aligned branch destination in one assembler.
 #[derive(Clone, Copy, Debug)]
 pub struct Label(usize);
