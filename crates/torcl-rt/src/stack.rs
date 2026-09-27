@@ -201,6 +201,42 @@ impl TorclStack {
         Some(frame_ptr)
     }
 
+    /// Grow the current activation in place for an optimized OSR entry and
+    /// install its stack map. Existing frame/slot addresses remain stable;
+    /// added slots are initialized to NIL before the larger frame is visible.
+    /// The supplied map must describe the tagged slots used by the new code.
+    /// No allocation or safepoint occurs. Failure leaves the stack unchanged.
+    pub fn grow_top_frame(
+        &self,
+        num_slots: u16,
+        code_info: &'static CodeInfo,
+    ) -> Option<*mut Frame> {
+        let frame = self.fp.get();
+        if frame.is_null() {
+            return None;
+        }
+        // SAFETY: the current frame is owned by this stack's sole mutator.
+        let old_slots = unsafe { (*frame).num_locals };
+        let extra =
+            usize::from(num_slots.checked_sub(old_slots)?) * std::mem::size_of::<TorclVal>();
+        let end = self.sp_offset.get().checked_add(extra)?;
+        if end > self.capacity {
+            return None;
+        }
+        // SAFETY: no younger frame exists, the added range fits in the stack,
+        // and the GC only reads snapshots published at explicit safepoints.
+        unsafe {
+            let slots = frame.add(1) as *mut TorclVal;
+            for index in old_slots..num_slots {
+                slots.add(usize::from(index)).write(crate::value::NIL);
+            }
+            (*frame).num_locals = num_slots;
+            (*frame).code_info = code_info;
+        }
+        self.sp_offset.set(end);
+        Some(frame)
+    }
+
     /// Pop the current frame, restoring `fp` to its `prev_fp` and rewinding
     /// `sp` to just below the popped frame.
     ///
