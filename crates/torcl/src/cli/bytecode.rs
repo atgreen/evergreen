@@ -19517,6 +19517,17 @@ macro_rules! t2_log {
 }
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
+    // t2/emit.rs encodes x86-64 and nothing else. Until an AArch64 emitter
+    // exists (bliss-iz2gn), attempting T2 on another architecture is not merely
+    // useless, it is dangerous: the pipeline would install x86 bytes as native
+    // code and the first entry would execute them on the wrong CPU. It currently
+    // fails for accidental reasons ("emit_framed failed: BadBranch") rather than
+    // by design, and a function whose shape the emitter DOES encode would get
+    // through — a hazard that only became reachable once T1 started promoting on
+    // AArch64, because T2 is entered from an installed T1's back-edge poll.
+    if !cfg!(target_arch = "x86_64") {
+        return None;
+    }
     let sym = input.sym;
     let bf = input.body.as_ref();
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
