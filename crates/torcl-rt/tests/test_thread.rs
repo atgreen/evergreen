@@ -168,6 +168,33 @@ fn make_fiber_is_unscheduled_until_explicit_submission() {
     assert_eq!(join_fiber(id).unwrap(), T);
 }
 
+/// `Fiber`'s carrier association and yield flag now live IN its Lisp execution
+/// context (§2.3.1, R4.72) rather than in fields beside it. This exercises that
+/// through the public id-keyed API, so it fails if the accessors were left
+/// reading a separate copy — the duplicate-state hazard the register design
+/// exists to avoid. (Context address stability across a carrier refresh is
+/// covered by the `exec_context` unit tests, which can hold a `&` to it.)
+#[test]
+fn fiber_carrier_and_yield_state_read_through_the_execution_context() {
+    serialize_thread_state!();
+    let id = make_fiber(T).unwrap();
+
+    // Not yet mounted: the context's carrier is 0, which the accessor maps to None.
+    assert_eq!(fiber_carrier_thread(id), None);
+
+    // The yield flag round-trips, and is taken exactly once.
+    assert!(
+        request_fiber_yield(id),
+        "a live fiber accepts a yield request"
+    );
+    assert!(request_fiber_yield(id), "requesting twice is idempotent");
+
+    // An unknown fiber is still reported as such rather than panicking on a
+    // missing context.
+    assert!(!request_fiber_yield(FiberId(u64::MAX)));
+    assert_eq!(fiber_carrier_thread(FiberId(u64::MAX)), None);
+}
+
 #[test]
 fn mounted_fiber_tracks_carrier_continuation_and_pin_state() {
     serialize_thread_state!();

@@ -358,7 +358,11 @@ pub struct NativeThread {
     join_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
     interrupt_pending: AtomicBool,
     interrupt_value: OrderedMutex<TorclVal>,
-    yield_requested: AtomicBool,
+    /// Lisp execution context (§2.3.1, R4.72) — the state generated code will
+    /// reach through the reserved register. It OWNS the yield flag; there is
+    /// deliberately no second copy on this struct, because generated code and
+    /// the runtime must not be able to disagree about which is current.
+    execution: crate::exec_context::LispExecutionContext,
     gc_participates: AtomicBool,
     published_sp: AtomicUsize,
     published_fp: AtomicUsize,
@@ -413,7 +417,12 @@ impl NativeThread {
                 "native thread interrupt",
                 NIL,
             ),
-            yield_requested: AtomicBool::new(false),
+            // A bare native thread is its own carrier.
+            execution: crate::exec_context::LispExecutionContext::new(
+                crate::exec_context::ExecutionKind::NativeThread,
+                id.0,
+                id.0,
+            ),
             gc_participates: AtomicBool::new(false),
             published_sp: AtomicUsize::new(0),
             published_fp: AtomicUsize::new(0),
@@ -503,7 +512,14 @@ impl NativeThread {
     }
 
     pub fn check_and_clear_yield(&self) -> bool {
-        self.yield_requested.swap(false, Ordering::SeqCst)
+        self.execution.take_yield_request()
+    }
+
+    /// The Lisp execution context for this thread (§2.3.1). Its address is what
+    /// generated code will eventually hold in the reserved register, so it is
+    /// stable for the life of the thread object.
+    pub fn execution(&self) -> &crate::exec_context::LispExecutionContext {
+        &self.execution
     }
 
     pub(crate) fn set_gc_participates(&self, participates: bool) {
@@ -772,9 +788,13 @@ pub struct Fiber {
     restart_stack: OrderedMutex<Vec<TorclVal>>,
     condition_state: OrderedMutex<ThreadConditionState>,
     pin_count: AtomicUsize,
-    carrier_id: AtomicU64,
-    /// Per-thread yield flag for cooperative preemption at safepoints (§2.5.3 step 4).
-    yield_requested: AtomicBool,
+    /// Lisp execution context (§2.3.1, R4.72). It OWNS both the carrier
+    /// association — refreshed on each mount, since a fiber can resume on a
+    /// different carrier — and the cooperative-preemption yield flag (§2.5.3
+    /// step 4). Neither is duplicated on this struct: a cached register value
+    /// and a struct field disagreeing is the failure the register design exists
+    /// to prevent.
+    execution: crate::exec_context::LispExecutionContext,
     /// Shared result cell — written by the executing thread, read by joiners.
     result: Arc<ThreadResult>,
     /// Flag indicating an interrupt has been requested.
@@ -845,10 +865,18 @@ impl Fiber {
     }
 
     pub fn carrier_id(&self) -> Option<NativeThreadId> {
-        match self.carrier_id.load(Ordering::Acquire) {
+        match self.execution.carrier_id() {
             0 => None,
             id => Some(NativeThreadId(id)),
         }
+    }
+
+    /// The Lisp execution context for this fiber (§2.3.1). Its address is stable
+    /// across migration — only the carrier field inside it changes — which is
+    /// what lets a pointer cached in the reserved register survive a fiber
+    /// switch.
+    pub fn execution(&self) -> &crate::exec_context::LispExecutionContext {
+        &self.execution
     }
 
     /// Publish this fiber's stack roots (SP/FP) at a safepoint, before it parks,
@@ -886,7 +914,9 @@ pub fn request_fiber_yield(id: FiberId) -> bool {
     let reg = fiber_registry().lock().unwrap();
     match reg.get(&id) {
         Some(t) => {
-            t.yield_requested.store(true, Ordering::Release);
+            // Was a Release store; the context publishes SeqCst, matching the
+            // swap on the consuming side rather than being weaker than it.
+            t.execution.request_yield();
             true
         }
         None => false,
@@ -936,12 +966,12 @@ impl Fiber {
     /// Check and clear the per-thread yield flag (§2.5.3 step 4).
     /// Returns `true` if a yield was requested.
     pub fn check_and_clear_yield(&self) -> bool {
-        self.yield_requested.swap(false, Ordering::SeqCst)
+        self.execution.take_yield_request()
     }
 
     /// Request this thread to yield at its next safepoint.
     pub fn request_yield(&self) {
-        self.yield_requested.store(true, Ordering::SeqCst);
+        self.execution.request_yield();
     }
 
     /// Set this thread's TLS slot at the given index.
@@ -1468,9 +1498,12 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         *state = FiberState::Running;
     }
     task.thread.publish_stack(0, 0);
+    // Refresh the carrier association before Lisp resumes on this OS thread
+    // (§2.3.1). The context's ADDRESS does not change here — only this field —
+    // which is why a cached context pointer stays valid across migration.
     task.thread
-        .carrier_id
-        .store(current_thread_id().0, Ordering::Release);
+        .execution()
+        .set_carrier_id(current_thread_id().0);
     let thread = Arc::clone(&task.thread);
     pool.workers[carrier_index]
         .current_fiber
@@ -2026,8 +2059,12 @@ pub fn make_fiber(entry: TorclVal) -> Result<FiberId, TorclError> {
             ThreadConditionState::new(),
         ),
         pin_count: AtomicUsize::new(0),
-        carrier_id: AtomicU64::new(0),
-        yield_requested: AtomicBool::new(false),
+        // Carrier 0 = not yet mounted; set by the carrier's mount handshake.
+        execution: crate::exec_context::LispExecutionContext::new(
+            crate::exec_context::ExecutionKind::Fiber,
+            id.0,
+            0,
+        ),
         result,
         interrupt_pending: AtomicBool::new(false),
         interrupt_value: OrderedMutex::new(
