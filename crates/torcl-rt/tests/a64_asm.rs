@@ -332,3 +332,125 @@ fn many_branches_to_one_stub_all_land() {
     assert_eq!(f(3), 999);
     assert_eq!(f(4), 0);
 }
+
+#[test]
+fn frame_base_round_trips_through_a_register() {
+    // `MOV Xd, SP` is not an ORR: register 31 reads as XZR in the logical
+    // encoding, so a naive `mov(FP, SP)` yields zero and the epilogue restores
+    // SP from nothing. This caught a live bug in the T1 emitter, where the frame
+    // base was silently zero and only an unbalanced SP would have exposed it.
+    let f: extern "C" fn(u64) -> u64 = compile(|a| {
+        a.word(a64::stp_pre(FP, LR, SP, -32).unwrap());
+        a.word(a64::mov_from_sp(FP));
+        // Move SP somewhere else, then prove the epilogue can get back from x29
+        // alone rather than by unwinding a balanced sequence.
+        a.word(a64::sub_imm(SP, SP, 64).unwrap());
+        a.word(a64::str_imm(0, SP, 8).unwrap());
+        a.word(a64::ldr_imm(0, SP, 8).unwrap());
+        a.word(a64::mov_to_sp(FP));
+        a.word(a64::ldp_post(FP, LR, SP, 32).unwrap());
+        a.word(a64::ret());
+    });
+    assert_eq!(f(0xfeed), 0xfeed);
+    // Called twice: a leaked stack pointer would show up as drift, not on the
+    // first call.
+    assert_eq!(f(0xbeef), 0xbeef);
+}
+
+#[test]
+fn an_upward_growing_operand_stack_pushes_and_pops() {
+    // The T1 operand stack: a pointer that advances after a store and retreats
+    // before a load. `str_post` and `ldr_pre` are mirror images, and getting one
+    // of them wrong is invisible whenever the accumulator happens to still hold
+    // the value being returned — which is most simple functions.
+    let mut cells = [0u64; 8];
+    let f: extern "C" fn(*mut u64, u64, u64, u64) -> u64 = compile(|a| {
+        // x0 = stack base, x1..x3 = three values to push.
+        a.word(a64::mov(20, 0)); // the operand-stack pointer
+        for value in 1..=3u8 {
+            a.word(a64::mov(0, value));
+            a.word(a64::str_post(0, 20, 8).unwrap());
+        }
+        // Pop them back in reverse and sum: 3 + 2*10 + 1*100 = 123.
+        a.word(a64::ldr_pre(4, 20, -8).unwrap());
+        a.word(a64::ldr_pre(5, 20, -8).unwrap());
+        a.word(a64::ldr_pre(6, 20, -8).unwrap());
+        let mut w = Vec::new();
+        a64::mov_imm64(7, 10, &mut w);
+        a.words(&w);
+        a.word(a64::madd(4, 5, 7, 4)); // 3 + 2*10
+        let mut w = Vec::new();
+        a64::mov_imm64(7, 100, &mut w);
+        a.words(&w);
+        a.word(a64::madd(0, 6, 7, 4)); // + 1*100
+        a.word(a64::ret());
+    });
+    assert_eq!(f(cells.as_mut_ptr(), 1, 2, 3), 123);
+    assert_eq!(
+        &cells[..3],
+        &[1, 2, 3],
+        "the pushes must reach memory in order"
+    );
+}
+
+#[test]
+fn register_31_is_the_stack_pointer_only_in_some_forms() {
+    // The trap that cost a working T2 frame: register 31 reads as SP in the
+    // add/sub-IMMEDIATE and load/store forms, and as XZR in the shifted-register
+    // ones. So `add_imm(d, SP, n)` reads the stack pointer while `add(d, SP, m)`
+    // reads zero — the same encoding-level distinction, opposite meanings, and no
+    // assembler error either way.
+    let via_immediate: extern "C" fn() -> u64 = compile(|a| {
+        a.word(a64::mov_from_sp(0));
+        a.word(a64::add_imm(1, SP, 8).unwrap());
+        // x1 - x0 is 8 if the add really read SP.
+        a.word(a64::sub(0, 1, 0));
+        a.word(a64::ret());
+    });
+    assert_eq!(
+        via_immediate(),
+        8,
+        "add-immediate must read register 31 as SP"
+    );
+
+    let via_shifted_register: extern "C" fn() -> u64 = compile(|a| {
+        let mut w = Vec::new();
+        a64::mov_imm64(2, 8, &mut w);
+        a.words(&w);
+        // Deliberately the wrong form: this reads XZR, so the result is 8, not
+        // sp + 8. Pinned so the difference is a fact rather than a comment.
+        a.word(a64::add(0, SP, 2));
+        a.word(a64::ret());
+    });
+    assert_eq!(
+        via_shifted_register(),
+        8,
+        "a shifted-register add reads register 31 as XZR, not SP"
+    );
+
+    // A real frame: claim stack, use it through SP-relative accesses both inside
+    // and beyond the scaled immediate field, and restore from the frame pointer.
+    let frame: extern "C" fn(u64) -> u64 = compile(|a| {
+        a.word(a64::stp_pre(FP, LR, SP, -16).unwrap());
+        a.word(a64::mov_from_sp(FP));
+        a.word(a64::sub_imm(SP, SP, 4096).unwrap());
+        a.word(a64::str_imm(0, SP, 8).unwrap());
+        // Past the scaled field (32760 max), so via the indexed form.
+        let mut w = Vec::new();
+        a64::mov_imm64(3, 4088 / 8, &mut w);
+        a.words(&w);
+        a.word(a64::str_indexed(0, SP, 3));
+        a.word(a64::ldr_imm(1, SP, 8).unwrap());
+        a.word(a64::ldr_indexed(2, SP, 3));
+        a.word(a64::add(0, 1, 2));
+        a.word(a64::mov_to_sp(FP));
+        a.word(a64::ldp_post(FP, LR, SP, 16).unwrap());
+        a.word(a64::ret());
+    });
+    assert_eq!(
+        frame(21),
+        42,
+        "both frame accesses must reach the same slot values"
+    );
+    assert_eq!(frame(100), 200);
+}

@@ -74,7 +74,7 @@ fn unsupported() -> EmitError {
 /// Order shared recipes before their users without recursive host calls or
 /// exponential re-emission. Public emitter callers may supply unverified IR,
 /// so reject missing dependencies and cycles here as well as in the verifier.
-fn rematerialization_order(state: &FrameState) -> Result<Vec<usize>, EmitError> {
+pub(super) fn rematerialization_order(state: &FrameState) -> Result<Vec<usize>, EmitError> {
     let mut marks = vec![0; state.remat.len()];
     let mut order = Vec::new();
     let roots = state

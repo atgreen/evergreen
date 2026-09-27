@@ -84,6 +84,7 @@ GOAL.md
 hellos
 target-android/
 target-cross/
+target-android16k/
 
 # Documentation toolchain and generated site
 .venv-docs/
