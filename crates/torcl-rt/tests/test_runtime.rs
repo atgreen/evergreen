@@ -6,6 +6,22 @@ use torcl_rt::runtime::*;
 
 // ── RuntimeConfig::from_env ───────────────────────────────────────
 
+/// Serializes these tests (bliss-z11t). Signal handlers and runtime shutdown are
+/// process-global: `runtime_shutdown_idempotent` tears the runtime down while
+/// `install_signal_handlers_succeeds` installs handlers into the same process.
+///
+/// Poisoning is recovered rather than propagated so one panic does not cascade.
+fn runtime_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+macro_rules! serialize_runtime {
+    () => {
+        let _global_guard = runtime_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
+}
+
 #[test]
 fn from_env_returns_sane_defaults() {
     let cfg = RuntimeConfig::from_env().expect("from_env");
@@ -184,6 +200,7 @@ fn runtime_run_returns_exit_code() {
 
 #[test]
 fn runtime_shutdown_idempotent() {
+    serialize_runtime!();
     let mut rt = Runtime::init(RuntimeConfig::from_env().expect("from_env")).expect("init");
     assert!(rt.shutdown().is_ok());
     assert!(rt.shutdown().is_ok());
@@ -193,6 +210,7 @@ fn runtime_shutdown_idempotent() {
 
 #[test]
 fn install_signal_handlers_succeeds() {
+    serialize_runtime!();
     assert!(install_signal_handlers().is_ok());
 }
 

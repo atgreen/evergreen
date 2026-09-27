@@ -7,6 +7,30 @@ use torcl_rt::thread::{
 };
 use torcl_rt::value::{T, TorclVal};
 
+/// Serializes the tests that stand up a real scheduler group (bliss-z11t).
+///
+/// Each of these creates carrier OS threads and drives fibers, and both the
+/// safepoint handshake and the thread registry are per PROCESS. Run
+/// concurrently they perturb each other: `time_slice_expiry_...` requests
+/// preemption process-wide, carriers from one test compete for CPU with
+/// another's, and `scheduler_group_exposes_real_native_carrier_threads`
+/// observes `all_thread_ids()` including the other test's carriers. The
+/// observed failure was `yield_unmounts_and_later_resumes_after_the_call_site`
+/// asserting a yield ORDER of [1,2,3,4], which another test's carriers can
+/// reorder by delaying a resume.
+///
+/// Poisoning is recovered rather than propagated so one panic does not cascade.
+fn scheduler_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+macro_rules! serialize_scheduler {
+    () => {
+        let _scheduler_guard = scheduler_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
+}
+
 static YIELD_TRACE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static PARK_PROGRESS: AtomicUsize = AtomicUsize::new(0);
 static PREEMPT_HOG_STARTED: AtomicUsize = AtomicUsize::new(0);
@@ -62,11 +86,13 @@ fn scheduler_config_clone_debug() {
 
 #[test]
 fn scheduler_group_requires_at_least_one_carrier() {
+    serialize_scheduler!();
     assert!(SchedulerGroup::init(&SchedulerConfig { num_workers: 0 }).is_err());
 }
 
 #[test]
 fn scheduler_group_exposes_real_native_carrier_threads() {
+    serialize_scheduler!();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 3 }).unwrap();
     assert_eq!(group.requested_carrier_count(), 3);
     assert_eq!(group.carrier_thread_ids().len(), 3);
@@ -88,6 +114,7 @@ fn scheduler_group_exposes_real_native_carrier_threads() {
 
 #[test]
 fn submit_runs_a_created_fiber_and_finish_preserves_order() {
+    serialize_scheduler!();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 2 }).unwrap();
     let first = make_fiber(T).unwrap();
     let second = make_fiber(T).unwrap();
@@ -99,6 +126,7 @@ fn submit_runs_a_created_fiber_and_finish_preserves_order() {
 
 #[test]
 fn scheduler_rejects_unknown_or_duplicate_fibers() {
+    serialize_scheduler!();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 2 }).unwrap();
     assert!(group.submit(FiberId(u64::MAX)).is_err());
     let fiber = make_fiber(T).unwrap();
@@ -109,6 +137,7 @@ fn scheduler_rejects_unknown_or_duplicate_fibers() {
 
 #[test]
 fn submission_after_shutdown_is_rejected() {
+    serialize_scheduler!();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 2 }).unwrap();
     group.shutdown().unwrap();
     assert!(group.submit(make_fiber(T).unwrap()).is_err());
@@ -116,6 +145,7 @@ fn submission_after_shutdown_is_rejected() {
 
 #[test]
 fn many_fibers_complete_over_a_smaller_carrier_set() {
+    serialize_scheduler!();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 2 }).unwrap();
     let fibers: Vec<_> = (0..200).map(|_| make_fiber(T).unwrap()).collect();
     for &fiber in &fibers {
@@ -128,6 +158,7 @@ fn many_fibers_complete_over_a_smaller_carrier_set() {
 
 #[test]
 fn yield_unmounts_and_later_resumes_after_the_call_site() {
+    serialize_scheduler!();
     YIELD_TRACE.lock().unwrap().clear();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
     let a = make_fiber(unsafe {
@@ -150,6 +181,7 @@ fn yield_unmounts_and_later_resumes_after_the_call_site() {
 
 #[test]
 fn parked_fiber_unmounts_until_explicit_unpark() {
+    serialize_scheduler!();
     PARK_PROGRESS.store(0, Ordering::Release);
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
     let fiber =
@@ -169,6 +201,7 @@ fn parked_fiber_unmounts_until_explicit_unpark() {
 
 #[test]
 fn time_slice_expiry_preempts_at_safepoints_on_one_carrier() {
+    serialize_scheduler!();
     PREEMPT_HOG_STARTED.store(0, Ordering::Release);
     PREEMPT_HOG_DONE.store(0, Ordering::Release);
     PREEMPT_PEER_RAN_EARLY.store(0, Ordering::Release);

@@ -79,6 +79,23 @@ fn condition_state_fiber_entry() -> TorclVal {
     }
 }
 
+/// Serializes the tests that create fibers or read the thread registry
+/// (bliss-z11t). `native_thread_registry_includes_current_and_carriers`
+/// asserts over `all_thread_ids()`, which is per PROCESS, so a fiber or carrier
+/// created by any concurrently running test in this binary changes what it sees.
+///
+/// Poisoning is recovered rather than propagated so one panic does not cascade.
+fn thread_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+macro_rules! serialize_thread_state {
+    () => {
+        let _global_guard = thread_lock().lock().unwrap_or_else(|e| e.into_inner());
+    };
+}
+
 #[test]
 fn native_thread_and_fiber_ids_are_distinct_types() {
     assert_ne!(
@@ -144,6 +161,7 @@ fn join_thread_invalid_native_id_fails() {
 
 #[test]
 fn make_fiber_is_unscheduled_until_explicit_submission() {
+    serialize_thread_state!();
     let id = make_fiber(T).unwrap();
     assert_eq!(fiber_state(id), Some(FiberState::Created));
     submit_fiber(id).unwrap();
@@ -152,6 +170,7 @@ fn make_fiber_is_unscheduled_until_explicit_submission() {
 
 #[test]
 fn mounted_fiber_tracks_carrier_continuation_and_pin_state() {
+    serialize_thread_state!();
     let entry =
         unsafe { TorclVal::from_function_ptr(inspect_mounted_fiber as *const () as *mut u8) };
     let id = make_fiber(entry).unwrap();
@@ -216,6 +235,7 @@ fn pending_signal_bits_are_execution_local_and_one_shot() {
 
 #[test]
 fn condition_state_is_execution_local_empty_and_runtime_owned() {
+    serialize_thread_state!();
     let current = current_thread();
     current.with_condition_state_mut(|state| {
         state
@@ -292,6 +312,7 @@ fn foreground_pending_signal_targets_registered_execution() {
 
 #[test]
 fn foreground_pending_signal_can_target_mounted_fiber() {
+    serialize_thread_state!();
     FIBER_FOREGROUND_READY.store(false, Ordering::Release);
     FIBER_FOREGROUND_CAN_FINISH.store(false, Ordering::Release);
 
@@ -312,6 +333,7 @@ fn foreground_pending_signal_can_target_mounted_fiber() {
 
 #[test]
 fn native_thread_registry_includes_current_and_carriers() {
+    serialize_thread_state!();
     assert!(all_thread_ids().contains(&current_thread_id()));
     let carriers = carrier_thread_ids();
     assert!(!carriers.is_empty());
