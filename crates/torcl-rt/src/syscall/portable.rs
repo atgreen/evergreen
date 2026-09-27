@@ -31,9 +31,25 @@ pub mod nr {
     pub const EPOLL_CTL: usize = libc::SYS_epoll_ctl as usize;
 }
 
+/// The thread-local errno, whatever the platform calls its accessor. bionic
+/// spells it `__errno`, glibc and musl `__errno_location`, and the libc crate
+/// exposes each only where it exists — so this is the single place that has to
+/// know (bliss-w2vp).
+///
+/// # Safety
+/// Reads the calling thread's errno; only meaningful immediately after a failed
+/// libc call on that same thread.
+unsafe fn errno() -> i32 {
+    #[cfg(target_os = "android")]
+    let value = *libc::__errno();
+    #[cfg(not(target_os = "android"))]
+    let value = *libc::__errno_location();
+    value
+}
+
 unsafe fn negative_errno(ret: libc::c_long) -> isize {
     if ret == -1 {
-        -(*libc::__errno_location() as isize)
+        -(errno() as isize)
     } else {
         ret as isize
     }
@@ -72,7 +88,7 @@ pub unsafe fn mmap(
 ) -> Result<*mut u8, i32> {
     let ptr = libc::mmap(addr.cast(), len, prot, flags, fd, offset);
     if ptr == libc::MAP_FAILED {
-        Err(*libc::__errno_location())
+        Err(errno())
     } else {
         Ok(ptr.cast())
     }

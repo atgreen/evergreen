@@ -2146,7 +2146,7 @@ pub struct TimeResult {
 /// Get process CPU times (user, system) in nanoseconds.
 /// Reads /proc/self/stat on Linux, falls back to wall-clock on other systems.
 fn get_cpu_times() -> (u64, u64) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
             let fields: Vec<&str> = stat.split_whitespace().collect();
@@ -2162,7 +2162,7 @@ fn get_cpu_times() -> (u64, u64) {
         }
         (0, 0)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         (0, 0)
     }
@@ -2171,7 +2171,7 @@ fn get_cpu_times() -> (u64, u64) {
 /// Get page fault count.
 /// Reads /proc/self/stat on Linux.
 fn get_page_faults() -> u64 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
             let fields: Vec<&str> = stat.split_whitespace().collect();
@@ -2184,7 +2184,7 @@ fn get_page_faults() -> u64 {
         }
         0
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         0
     }

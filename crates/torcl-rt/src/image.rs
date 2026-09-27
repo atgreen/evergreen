@@ -25,6 +25,14 @@ pub enum Os {
     MacOS = 2,
     FreeBSD = 3,
     Windows = 4,
+    /// Android gets its OWN tag rather than reusing Linux: the kernel is the
+    /// same but the libc is not, so an image saved under bionic must not load in
+    /// a glibc or musl TorCL (bliss-w2vp).
+    ///
+    /// 5 rather than 4 only because the Windows port claimed 4 first and its
+    /// tests assert that number; neither tag has shipped, so the numbering is
+    /// arbitrary beyond staying stable from here on.
+    Android = 5,
 }
 
 /// Encode architecture and OS into a 64-bit platform tag.
@@ -52,6 +60,8 @@ pub fn current_platform_tag() -> u64 {
 
     #[cfg(target_os = "linux")]
     let os = Os::Linux;
+    #[cfg(target_os = "android")]
+    let os = Os::Android;
     #[cfg(target_os = "macos")]
     let os = Os::MacOS;
     #[cfg(target_os = "freebsd")]
@@ -60,6 +70,7 @@ pub fn current_platform_tag() -> u64 {
     let os = Os::Windows;
     #[cfg(not(any(
         target_os = "linux",
+        target_os = "android",
         target_os = "macos",
         target_os = "freebsd",
         windows

@@ -7752,8 +7752,14 @@ impl Env {
         ];
         #[cfg(unix)]
         features.push(resolve_sym(":UNIX").unwrap_or(NIL));
-        #[cfg(target_os = "linux")]
+        // Android gets BOTH :LINUX and :ANDROID. Portable CL code tests
+        // #+linux for kernel facilities (/proc, epoll, signals) and all of
+        // those hold; :ANDROID is what code needs to branch on the platform
+        // itself (no exec from app storage, bionic rather than glibc).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         features.push(resolve_sym(":LINUX").unwrap_or(NIL));
+        #[cfg(target_os = "android")]
+        features.push(resolve_sym(":ANDROID").unwrap_or(NIL));
         #[cfg(target_os = "macos")]
         features.push(resolve_sym(":DARWIN").unwrap_or(NIL));
         #[cfg(windows)]
@@ -38952,7 +38958,7 @@ const EXE_IMAGE_MAGIC: &[u8; 8] = b"TORCLEXE";
 /// magic link still refers to the live inode. Fall back to `current_exe` on
 /// other platforms or if `/proc` is unavailable.
 fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Ok(bytes) = std::fs::read("/proc/self/exe") {
             return Ok(bytes);

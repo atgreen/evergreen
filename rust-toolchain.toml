@@ -1,0 +1,32 @@
+# Pin the Rust toolchain for everyone working in this repo.
+#
+# Why: the toolchain was a shared, mutable, machine-wide setting. When this
+# machine's rustup default moved off 1.94.1, `cargo build -p torcl` broke in every
+# checkout at once (bliss-cice: rustc 1.98 rejects torcl-rt's opaque declarations
+# of the runtime symbols std relies on). Two dev sessions on one laptop have
+# separate working trees and separate target/ dirs, but they share ~/.rustup — so
+# one `rustup update` changes the compiler under both. This file removes that
+# coupling: rustup honours it over the default toolchain for any cargo invoked
+# inside the repo.
+#
+# 1.94.1 rather than latest stable: scripts/cross-port.sh already pins exactly
+# this version for the AArch64/POWER/IBM Z bring-up ("cross otherwise updates
+# stable"), so this keeps one answer to "which compiler builds TorCL" instead of
+# two. An explicit `cargo +stable …`, or RUSTUP_TOOLCHAIN in the environment,
+# still overrides this file when you deliberately want another compiler — which
+# is how cross-port.sh sets its own.
+#
+# The cost is that CI, which uses dtolnay/rust-toolchain@stable, now follows this
+# pin too and so stops noticing new-compiler breakage on its own. That is exactly
+# what bliss-cice was, and it is worth a separate CI job that overrides
+# RUSTUP_TOOLCHAIN=stable to keep catching drift deliberately rather than by
+# accident (bliss-75yx).
+[toolchain]
+channel = "1.94.1"
+# rustfmt and clippy are both gates: `make fmt-check` and CI's
+# `cargo clippy --workspace --all-targets -- -D warnings`.
+components = ["rustfmt", "clippy"]
+# .cargo/config.toml builds for musl by default, so a fresh checkout needs this
+# target before anything compiles. The cross-compiled ports get their targets from
+# cross's container images (Cross.toml), not from here.
+targets = ["x86_64-unknown-linux-musl"]
