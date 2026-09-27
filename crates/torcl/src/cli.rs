@@ -7769,6 +7769,13 @@ impl Env {
         features.push(resolve_sym(":X86-64").unwrap_or(NIL));
         #[cfg(target_arch = "aarch64")]
         features.push(resolve_sym(":ARM64").unwrap_or(NIL));
+        #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+        {
+            features.push(resolve_sym(":PPC64").unwrap_or(NIL));
+            features.push(resolve_sym(":PPC64LE").unwrap_or(NIL));
+        }
+        #[cfg(target_arch = "s390x")]
+        features.push(resolve_sym(":S390X").unwrap_or(NIL));
         #[cfg(target_endian = "little")]
         features.push(resolve_sym(":LITTLE-ENDIAN").unwrap_or(NIL));
         #[cfg(target_endian = "big")]
@@ -24225,6 +24232,10 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     "X86-64"
                 } else if cfg!(target_arch = "aarch64") {
                     "ARM64"
+                } else if cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
+                    "PPC64LE"
+                } else if cfg!(target_arch = "s390x") {
+                    "S390X"
                 } else if cfg!(target_arch = "x86") {
                     "X86"
                 } else if cfg!(target_arch = "riscv64") {

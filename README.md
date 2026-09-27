@@ -39,6 +39,10 @@ Build the CLI binary:
 cargo build -p torcl
 ```
 
+For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
+[cross-compilation and QEMU validation](docs/cross-compilation.md). These initial
+ports run the interpreter and bytecode engine; native JIT support is separate.
+
 Build the standalone `torcl` executable with ASDF preloaded, then install it:
 
 ```sh

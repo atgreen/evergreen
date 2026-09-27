@@ -39,7 +39,7 @@ use crate::error::TorclError;
 
 /// Handle to the safepoint page.
 pub struct SafepointPage {
-    /// Page-aligned memory buffer (4096 bytes).
+    /// Page-aligned memory buffer (one native kernel page).
     page: *mut u8,
     /// Whether a safepoint is currently requested.
     requested: AtomicBool,
@@ -54,7 +54,7 @@ unsafe impl Sync for SafepointPage {}
 impl Drop for SafepointPage {
     fn drop(&mut self) {
         if !self.page.is_null() {
-            let _ = unsafe { crate::syscall::munmap(self.page, 4096) };
+            let _ = unsafe { crate::syscall::munmap(self.page, crate::syscall::page_size()) };
         }
     }
 }
@@ -65,7 +65,7 @@ impl SafepointPage {
         let page = unsafe {
             crate::syscall::mmap(
                 std::ptr::null_mut(),
-                4096,
+                crate::syscall::page_size(),
                 crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
                 crate::syscall::MAP_PRIVATE | crate::syscall::MAP_ANONYMOUS,
                 -1,
@@ -74,7 +74,7 @@ impl SafepointPage {
         }
         .map_err(|errno| TorclError::Internal(format!("safepoint mmap failed: errno {errno}")))?;
         SAFEPOINT_PAGE_ADDR.store(page as usize, Ordering::Release);
-        SAFEPOINT_PAGE_LEN.store(4096, Ordering::Release);
+        SAFEPOINT_PAGE_LEN.store(crate::syscall::page_size(), Ordering::Release);
         Ok(SafepointPage {
             page,
             requested: AtomicBool::new(false),
@@ -92,9 +92,16 @@ impl SafepointPage {
     /// Sets the `requested` flag so that `poll_safepoint()` will cause
     /// mutator threads to enter the safepoint and park.
     pub fn request_safepoint(&self) -> Result<(), TorclError> {
-        unsafe { crate::syscall::mprotect(self.page, 4096, crate::syscall::PROT_NONE) }.map_err(
-            |errno| TorclError::Internal(format!("safepoint mprotect failed: errno {errno}")),
-        )?;
+        unsafe {
+            crate::syscall::mprotect(
+                self.page,
+                crate::syscall::page_size(),
+                crate::syscall::PROT_NONE,
+            )
+        }
+        .map_err(|errno| {
+            TorclError::Internal(format!("safepoint mprotect failed: errno {errno}"))
+        })?;
         self.protected.store(true, Ordering::SeqCst);
         self.requested.store(true, Ordering::SeqCst);
         Ok(())
@@ -108,7 +115,7 @@ impl SafepointPage {
         unsafe {
             crate::syscall::mprotect(
                 self.page,
-                4096,
+                crate::syscall::page_size(),
                 crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
             )
         }

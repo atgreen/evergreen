@@ -545,9 +545,13 @@ impl Drop for Callback {
 // relocation. `ffi_call`/marshalling (which need no loader) are unchanged.
 //
 // The `c-ffi` build instead uses libc `dlopen` (below) — for dynamically-linked
-// targets that load system (glibc) libraries.
+// targets that load system (glibc) libraries. POWER and IBM Z also use this
+// backend by default because elf_loader has no native relocation support there.
 
-#[cfg(not(feature = "c-ffi"))]
+#[cfg(all(
+    not(feature = "c-ffi"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod elf_backend {
     use crate::error::TorclError;
     use elf_loader::{
@@ -720,15 +724,24 @@ mod elf_backend {
     }
 }
 
-#[cfg(not(feature = "c-ffi"))]
+#[cfg(all(
+    not(feature = "c-ffi"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub use elf_backend::{
     close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
 };
 
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 struct DynamicLibrary(usize);
 
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 impl Drop for DynamicLibrary {
     fn drop(&mut self) {
         // SAFETY: each instance owns exactly one successful dlopen reference.
@@ -738,12 +751,18 @@ impl Drop for DynamicLibrary {
     }
 }
 
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 static DYNAMIC_LIBRARIES: std::sync::Mutex<Vec<Option<std::sync::Arc<DynamicLibrary>>>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Load a shared library by name or path.
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 pub fn load_foreign_library(name: &str) -> Result<*mut (), TorclError> {
     use std::ffi::CString;
     let c_name = CString::new(name)
@@ -775,7 +794,10 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), TorclError> {
 ///
 /// # Safety
 /// The returned pointer is only valid while the library remains loaded.
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), TorclError> {
     if library.is_null() {
         return Err(TorclError::FfiError("null library handle".into()));
@@ -791,7 +813,10 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
     unsafe { dynamic_symbol(library.0 as *mut libc::c_void, name) }
 }
 
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*const (), TorclError> {
     let c_name = std::ffi::CString::new(name)
         .map_err(|_| TorclError::FfiError("symbol name contains null byte".into()))?;
@@ -816,7 +841,10 @@ unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*cons
 /// Close one owned loader reference and invalidate its token.
 /// # Safety
 /// No foreign call, callback or retained symbol may use this library after close.
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), TorclError> {
     let library = {
         let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
@@ -834,7 +862,10 @@ pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), TorclError> 
 /// Look up a symbol in the loader's global namespace.
 /// # Safety
 /// The provider must remain loaded while the returned pointer is used.
-#[cfg(feature = "c-ffi")]
+#[cfg(any(
+    feature = "c-ffi",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), TorclError> {
     // RTLD_DEFAULT makes glibc add a lookup dependency from this executable to
     // the provider (elf/dl-sym.c: DL_LOOKUP_ADD_DEPENDENCY), preventing explicit

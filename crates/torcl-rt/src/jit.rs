@@ -25,7 +25,7 @@ impl JitBuffer {
         if code.is_empty() {
             return None;
         }
-        let page = 4096usize;
+        let page = crate::syscall::page_size();
         let len = code.len().div_ceil(page) * page;
         // SAFETY: standard anonymous mmap; a mapping failure returns Err.
         unsafe {

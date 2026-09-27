@@ -5,9 +5,9 @@
 //! going through `libc` wrappers. This module is the single place that knows the
 //! syscall ABI; everything else calls the safe-ish typed helpers below.
 //!
-//! Scope: Linux only. Each `raw::N` argument arm matches the x86-64 / aarch64
-//! kernel calling convention. Callers that need another platform must add an
-//! arch arm here; there is deliberately no libc fallback (that is the point).
+//! Scope: Linux only. x86-64 uses direct syscalls; other Linux architectures
+//! use libc's target ABI definitions and wrappers (including errno conversion).
+//! The default x86-64 static build remains independent of libc wrappers.
 #![allow(dead_code)]
 // Every function here is inherently unsafe (raw syscalls / inline asm); the
 // `unsafe fn` marker is the safety boundary and re-nesting `unsafe {}` inside
@@ -15,10 +15,22 @@
 // this module only.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_arch = "x86_64")]
 use core::arch::asm;
 
+#[cfg(not(target_arch = "x86_64"))]
+mod portable;
+#[cfg(not(target_arch = "x86_64"))]
+pub use portable::*;
+
+/// Base page size of the running kernel (x86-64 Linux always uses 4 KiB).
+#[cfg(target_arch = "x86_64")]
+pub fn page_size() -> usize {
+    4096
+}
+
 // ── Syscall numbers (Linux) ──────────────────────────────────────────────────
-// x86-64 numbers. aarch64 differs and is added when that target is built.
+// x86-64 numbers. Other architectures obtain their numbers from libc in portable.
 #[cfg(target_arch = "x86_64")]
 pub mod nr {
     pub const READ: usize = 0;
@@ -211,6 +223,7 @@ pub const MAP_FIXED: i32 = 0x10;
 /// `addr`/`len`/`prot`/`flags`/`fd`/`offset` must form a valid mmap
 /// request; the returned mapping is unmanaged (free with [`munmap`]).
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn mmap(
     addr: *mut u8,
     len: usize,
@@ -381,6 +394,7 @@ pub const SIGTERM: i32 = 15;
 /// Async-signal-safe (a plain syscall); returns the previous alarm's remaining
 /// seconds.
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub fn alarm(seconds: u32) -> u32 {
     // SAFETY: no pointer arguments.
     unsafe { syscall1(nr::ALARM, seconds as usize) as u32 }
@@ -540,6 +554,7 @@ pub struct PollFd {
 ///
 /// `fds`/`nfds` must describe a valid, writable slice of `PollFd`.
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> Result<usize, i32> {
     let r = syscall3(nr::POLL, fds as usize, nfds, timeout_ms as isize as usize);
     check(r)
@@ -556,8 +571,10 @@ pub const EPOLL_CLOEXEC: i32 = 0x8_0000; // == O_CLOEXEC
 
 /// `struct epoll_event`. On x86-64 the kernel layout is **packed** (12 bytes: a
 /// u32 `events` immediately followed by a u64 `data`, no padding). Getting this
-/// wrong silently misreads the data cookie, so keep `repr(C, packed)`.
-#[repr(C, packed)]
+/// wrong silently misreads the data cookie. Other supported targets use natural
+/// C alignment (16 bytes).
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(not(target_arch = "x86_64"), repr(C))]
 #[derive(Clone, Copy)]
 pub struct EpollEvent {
     pub events: u32,
@@ -595,6 +612,7 @@ pub unsafe fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut EpollEvent) -> 
 ///
 /// `events`/`maxevents` must describe a valid, writable buffer.
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn epoll_wait(
     epfd: i32,
     events: *mut EpollEvent,
