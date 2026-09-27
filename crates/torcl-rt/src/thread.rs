@@ -2349,7 +2349,8 @@ pub fn current_thread() -> &'static NativeThread {
 // bookkeeping with nothing architecture-specific in it.
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix)
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 pub(crate) fn current_thread_for_foreign_entry() -> &'static NativeThread {
     let thread = ensure_current_native_thread_in_state(NativeThreadState::Native);

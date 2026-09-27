@@ -90,3 +90,6 @@ target-android16k/
 .venv-docs/
 /site/
 docs/__pycache__/
+
+# qemu writes core dumps beside the test binary when emitted code faults
+qemu_*.core
