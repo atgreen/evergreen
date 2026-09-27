@@ -79,6 +79,12 @@ images. Ctrl+C and Ctrl+Break request cooperative Lisp interruption.
 
 ## Networking and subprocesses
 
+Stream operations retain exclusive ownership when a fiber parks or migrates.
+Fibers waiting for that ownership park without blocking their carrier, and
+stream handles, composite components, and returned Lisp values remain rooted
+through waits and unlocks. Native runtime mutex guards pin their owning fiber
+until the guard is released.
+
 TCP client and accepted connections are owned bidirectional octet streams.
 The existing `torcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
 `%socket-read-timeout`, and `%socket-wait-for-input` primitives work on Windows.

@@ -8,7 +8,12 @@ use std::io::{Read, Seek, Write};
 use std::sync::OnceLock;
 
 use torcl_rt::error::TorclError;
-use torcl_rt::lock_order::{LockLevel, OrderedMutex, OrderedMutexGuard};
+use torcl_rt::lock_order::{
+    LockLevel, OrderedExecutionMutex, OrderedExecutionMutexGuard, OrderedMutex,
+};
+
+#[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
+mod fiber_tests;
 use torcl_rt::object::{ObjectHeader, type_id};
 use torcl_rt::value::{EOF, NIL, T, TorclVal};
 
@@ -134,7 +139,7 @@ struct StreamAlloc {
     components: Box<[TorclVal]>,
     /// Per-stream mutex — every operation spanning multiple elements is atomic
     /// under this lock (R5.120).
-    state: OrderedMutex<StreamMutableState>,
+    state: OrderedExecutionMutex<StreamMutableState>,
 }
 
 /// Mutable portion of stream state, protected by the per-stream mutex.
@@ -488,7 +493,8 @@ fn extract_string_str(val: TorclVal) -> Result<String, TorclError> {
 impl GrayStream for StreamMutableState {
     fn stream_read_char(&mut self) -> Result<TorclVal, TorclError> {
         self.check_input()?;
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::StringInput {
                 chars,
@@ -548,10 +554,9 @@ impl GrayStream for StreamMutableState {
             }
             StreamInner::Echo => {
                 let inp = comps[0];
-                let out = comps[1];
                 let result = crate::streams::stream_read_char(inp)?;
                 if result != EOF {
-                    crate::streams::stream_write_char(out, result)?;
+                    crate::streams::stream_write_char(comps[1], result)?;
                 }
                 Ok(result)
             }
@@ -594,7 +599,8 @@ impl GrayStream for StreamMutableState {
     fn stream_unread_char(&mut self, ch: TorclVal) -> Result<(), TorclError> {
         self.check_input()?;
         let c = ch.as_char();
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::StringInput {
                 unread, line, col, ..
@@ -704,7 +710,8 @@ impl GrayStream for StreamMutableState {
     fn stream_write_char(&mut self, ch: TorclVal) -> Result<(), TorclError> {
         self.check_output()?;
         let c = ch.as_char();
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 let mut buf = [0u8; 4];
@@ -761,7 +768,11 @@ impl GrayStream for StreamMutableState {
                 Ok(())
             }
             StreamInner::Broadcast => {
-                for &s in comps.iter() {
+                // GC can update the rooted vector during a child call; do not
+                // retain an iterator borrow across that call.
+                #[allow(clippy::needless_range_loop)]
+                for index in 0..comps.len() {
+                    let s = comps[index];
                     crate::streams::stream_write_char(s, ch)?;
                 }
                 Ok(())
@@ -809,7 +820,8 @@ impl GrayStream for StreamMutableState {
             });
         }
         let b = value as u8;
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 buffer.push(b);
@@ -860,7 +872,11 @@ impl GrayStream for StreamMutableState {
                 Ok(())
             }
             StreamInner::Broadcast => {
-                for &s in comps.iter() {
+                // GC can update the rooted vector during a child call; do not
+                // retain an iterator borrow across that call.
+                #[allow(clippy::needless_range_loop)]
+                for index in 0..comps.len() {
+                    let s = comps[index];
                     crate::streams::stream_write_byte(s, byte)?;
                 }
                 Ok(())
@@ -893,6 +909,8 @@ impl GrayStream for StreamMutableState {
         start: usize,
         end: Option<usize>,
     ) -> Result<(), TorclError> {
+        let mut string = string;
+        torcl_rt::rooted_ref!(_string_root = &mut string);
         self.check_output()?;
         // Extract string as &str so we can index by character position.
         let s = extract_string_str(string)?;
@@ -914,7 +932,8 @@ impl GrayStream for StreamMutableState {
         };
         let slice = &s.as_bytes()[byte_start..byte_end];
         let str_slice = &s[byte_start..byte_end];
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 buffer.extend_from_slice(slice);
@@ -971,7 +990,11 @@ impl GrayStream for StreamMutableState {
                 Ok(())
             }
             StreamInner::Broadcast => {
-                for &s in comps.iter() {
+                // GC can update the rooted vector during a child call; do not
+                // retain an iterator borrow across that call.
+                #[allow(clippy::needless_range_loop)]
+                for index in 0..comps.len() {
+                    let s = comps[index];
                     crate::streams::stream_write_string(s, string, start, Some(actual_end))?;
                 }
                 Ok(())
@@ -1003,7 +1026,8 @@ impl GrayStream for StreamMutableState {
 
     fn stream_force_output(&mut self) -> Result<(), TorclError> {
         self.check_open()?;
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::FileOutput {
                 file, write_buf, ..
@@ -1021,7 +1045,8 @@ impl GrayStream for StreamMutableState {
 
     fn stream_finish_output(&mut self) -> Result<(), TorclError> {
         self.check_open()?;
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::FileOutput {
                 file, write_buf, ..
@@ -1042,7 +1067,8 @@ impl GrayStream for StreamMutableState {
     }
 
     fn stream_clear_input(&mut self) -> Result<(), TorclError> {
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::FileInput {
                 buf_pos,
@@ -1071,7 +1097,8 @@ impl GrayStream for StreamMutableState {
 
     fn stream_listen(&self) -> Result<bool, TorclError> {
         self.check_open()?;
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &self.inner {
             StreamInner::StringInput {
                 position,
@@ -1244,7 +1271,8 @@ impl GrayStream for StreamMutableState {
 
     fn stream_clear_output(&mut self) -> Result<(), TorclError> {
         self.check_open()?;
-        let comps = self.components();
+        let mut comps = self.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::FileOutput { write_buf, .. } | StreamInner::FileIo { write_buf, .. } => {
                 write_buf.clear();
@@ -1281,6 +1309,7 @@ impl GrayStream for StreamMutableState {
     fn stream_read_sequence(&mut self, count: usize) -> Result<Vec<TorclVal>, TorclError> {
         self.check_input()?;
         let mut result = Vec::with_capacity(count);
+        torcl_rt::rooted_ref!(_result_root = &mut result);
         for _ in 0..count {
             let ch = self.stream_read_char()?;
             if ch == EOF {
@@ -1288,6 +1317,7 @@ impl GrayStream for StreamMutableState {
             }
             result.push(ch);
         }
+        drop(_result_root);
         Ok(result)
     }
 
@@ -1568,7 +1598,7 @@ fn alloc_stream(
     // to it for the composite op arms.
     let mut boxed = Box::new(StreamAlloc {
         components: components.into_boxed_slice(),
-        state: OrderedMutex::new(
+        state: OrderedExecutionMutex::new(
             LockLevel::Stream,
             NEXT_STREAM_ORDER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
             "stream state",
@@ -1581,7 +1611,7 @@ fn alloc_stream(
         ),
     });
     let cptr: *const [TorclVal] = &*boxed.components;
-    boxed.state.get_mut().unwrap().components_ptr = cptr;
+    boxed.state.get_mut().components_ptr = cptr;
 
     // The Lisp-visible stream value is a GC-heap handle whose single body word
     // holds the box pointer. Being a normal collectible heap object, its GC
@@ -1734,9 +1764,24 @@ fn get_stream_alloc(stream: TorclVal) -> Result<&'static StreamAlloc, TorclError
 /// Lock the per-stream mutex and return a guard. R5.120.
 fn lock_stream(
     stream: TorclVal,
-) -> Result<OrderedMutexGuard<'static, StreamMutableState>, TorclError> {
+) -> Result<OrderedExecutionMutexGuard<'static, StreamMutableState>, TorclError> {
     let alloc = get_stream_alloc(stream)?;
-    Ok(alloc.state.lock().unwrap())
+    alloc.state.lock()
+}
+
+/// Keep the stream alive while waiting, and retain any Lisp result/error
+/// through unlock: releasing an execution mutex can admit a moving collection.
+fn with_stream<T: torcl_rt::gc::TraceHostRoots>(
+    stream: TorclVal,
+    operation: impl FnOnce(&mut StreamMutableState) -> Result<T, TorclError>,
+) -> Result<T, TorclError> {
+    torcl_rt::rooted!(stream = stream);
+    let mut guard = lock_stream(*stream)?;
+    let mut result = operation(&mut guard);
+    torcl_rt::rooted_ref!(_result_root = &mut result);
+    drop(guard);
+    drop(_result_root);
+    result
 }
 
 // ── Stream constructors ────────────────────────────────────────────
@@ -1920,29 +1965,30 @@ pub fn open(
 }
 
 pub fn close(stream: TorclVal, abort: bool) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    // Flush write buffers before closing (unless abort)
-    if guard.open && !abort {
+    with_stream(stream, |guard| {
+        // Flush write buffers before closing (unless abort)
+        if guard.open && !abort {
+            match &mut guard.inner {
+                StreamInner::FileOutput {
+                    file, write_buf, ..
+                }
+                | StreamInner::FileIo {
+                    file, write_buf, ..
+                } => {
+                    let _ = file_flush_write_buf(file, write_buf);
+                }
+                _ => {}
+            }
+        }
         match &mut guard.inner {
-            StreamInner::FileOutput {
-                file, write_buf, ..
-            }
-            | StreamInner::FileIo {
-                file, write_buf, ..
-            } => {
-                let _ = file_flush_write_buf(file, write_buf);
-            }
+            StreamInner::FileInput { file, .. }
+            | StreamInner::FileOutput { file, .. }
+            | StreamInner::FileIo { file, .. } => file.close(),
             _ => {}
         }
-    }
-    match &mut guard.inner {
-        StreamInner::FileInput { file, .. }
-        | StreamInner::FileOutput { file, .. }
-        | StreamInner::FileIo { file, .. } => file.close(),
-        _ => {}
-    }
-    guard.open = false;
-    Ok(())
+        guard.open = false;
+        Ok(())
+    })
 }
 
 pub fn make_string_input_stream(
@@ -1990,8 +2036,7 @@ pub fn make_string_output_stream(_element_type: TorclVal) -> Result<TorclVal, To
 }
 
 pub fn get_output_stream_string(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    match &mut guard.inner {
+    with_stream(stream, |guard| match &mut guard.inner {
         StreamInner::StringOutput { buffer, col, line } => {
             let s = std::str::from_utf8(buffer)
                 .map_err(|_| TorclError::StreamError("invalid UTF-8 in output buffer".into()))?;
@@ -2002,7 +2047,7 @@ pub fn get_output_stream_string(stream: TorclVal) -> Result<TorclVal, TorclError
             Ok(result)
         }
         _ => Err(TorclError::StreamError("not a string output stream".into())),
-    }
+    })
 }
 
 pub fn make_broadcast_stream(streams: &[TorclVal]) -> Result<TorclVal, TorclError> {
@@ -2048,28 +2093,20 @@ pub fn make_synonym_stream(symbol: TorclVal) -> Result<TorclVal, TorclError> {
 // ── Stream queries ─────────────────────────────────────────────────
 
 pub fn open_stream_p(stream: TorclVal) -> bool {
-    match lock_stream(stream) {
-        Ok(guard) => guard.open,
-        Err(_) => false,
-    }
+    with_stream(stream, |guard| Ok(guard.open)).unwrap_or(false)
 }
 
 pub fn input_stream_p(stream: TorclVal) -> bool {
-    match lock_stream(stream) {
-        Ok(guard) => guard.is_input(),
-        Err(_) => false,
-    }
+    with_stream(stream, |guard| Ok(guard.is_input())).unwrap_or(false)
 }
 
 pub fn output_stream_p(stream: TorclVal) -> bool {
-    match lock_stream(stream) {
-        Ok(guard) => guard.is_output(),
-        Err(_) => false,
-    }
+    with_stream(stream, |guard| Ok(guard.is_output())).unwrap_or(false)
 }
 
 pub fn stream_element_type(stream: TorclVal) -> TorclVal {
-    match lock_stream(stream) {
+    torcl_rt::rooted!(stream = stream);
+    match lock_stream(*stream) {
         Ok(guard) => match guard.element_type {
             StreamElementType::Character => T,
             StreamElementType::UnsignedByte8 => TorclVal::from_fixnum(8),
@@ -2082,36 +2119,38 @@ pub fn stream_element_type(stream: TorclVal) -> TorclVal {
 // Each wrapper acquires the per-stream mutex (R5.120).
 
 pub fn stream_read_char(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_read_char()
+    with_stream(stream, |guard| guard.stream_read_char())
 }
 
 pub fn stream_unread_char(stream: TorclVal, ch: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_unread_char(ch)
+    let mut ch = ch;
+    torcl_rt::rooted_ref!(_ch_root = &mut ch);
+    with_stream(stream, |guard| guard.stream_unread_char(ch))
 }
 
 pub fn stream_read_byte(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_read_byte()
+    with_stream(stream, |guard| guard.stream_read_byte())
 }
 
 /// True if STREAM has element-type (unsigned-byte 8), so sequence I/O over it
 /// should transfer octets rather than characters.
 pub fn is_byte_stream(stream: TorclVal) -> bool {
-    lock_stream(stream)
-        .map(|g| g.element_type == StreamElementType::UnsignedByte8)
-        .unwrap_or(false)
+    with_stream(stream, |guard| {
+        Ok(guard.element_type == StreamElementType::UnsignedByte8)
+    })
+    .unwrap_or(false)
 }
 
 pub fn stream_write_char(stream: TorclVal, ch: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_write_char(ch)
+    let mut ch = ch;
+    torcl_rt::rooted_ref!(_ch_root = &mut ch);
+    with_stream(stream, |guard| guard.stream_write_char(ch))
 }
 
 pub fn stream_write_byte(stream: TorclVal, byte: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_write_byte(byte)
+    let mut byte = byte;
+    torcl_rt::rooted_ref!(_byte_root = &mut byte);
+    with_stream(stream, |guard| guard.stream_write_byte(byte))
 }
 
 pub fn stream_write_string(
@@ -2120,107 +2159,88 @@ pub fn stream_write_string(
     start: usize,
     end: Option<usize>,
 ) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_write_string(string, start, end)
+    let mut string = string;
+    torcl_rt::rooted_ref!(_string_root = &mut string);
+    with_stream(stream, |guard| {
+        guard.stream_write_string(string, start, end)
+    })
 }
 
 pub fn stream_force_output(stream: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_force_output()
+    with_stream(stream, |guard| guard.stream_force_output())
 }
 
 pub fn stream_finish_output(stream: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_finish_output()
+    with_stream(stream, |guard| guard.stream_finish_output())
 }
 
 pub fn stream_clear_input(stream: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_clear_input()
+    with_stream(stream, |guard| guard.stream_clear_input())
 }
 
 pub fn stream_listen(stream: TorclVal) -> Result<bool, TorclError> {
-    let guard = lock_stream(stream)?;
-    guard.stream_listen()
+    with_stream(stream, |guard| guard.stream_listen())
 }
 
 pub fn stream_line_number(stream: TorclVal) -> Option<u64> {
-    match lock_stream(stream) {
-        Ok(guard) => guard.stream_line_number(),
-        Err(_) => None,
-    }
+    with_stream(stream, |guard| Ok(guard.stream_line_number())).unwrap_or(None)
 }
 
 pub fn stream_line_column(stream: TorclVal) -> Option<u64> {
-    match lock_stream(stream) {
-        Ok(guard) => guard.stream_line_column(),
-        Err(_) => None,
-    }
+    with_stream(stream, |guard| Ok(guard.stream_line_column())).unwrap_or(None)
 }
 
 // ── R5.113 additional Gray protocol free-function wrappers ────────
 
 pub fn stream_read_char_no_hang(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_read_char_no_hang()
+    with_stream(stream, |guard| guard.stream_read_char_no_hang())
 }
 
 pub fn stream_peek_char(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_peek_char()
+    with_stream(stream, |guard| guard.stream_peek_char())
 }
 
 pub fn stream_read_line(stream: TorclVal) -> Result<(TorclVal, bool), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_read_line()
+    with_stream(stream, |guard| guard.stream_read_line())
 }
 
 pub fn stream_terpri(stream: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_terpri()
+    with_stream(stream, |guard| guard.stream_terpri())
 }
 
 pub fn stream_fresh_line(stream: TorclVal) -> Result<bool, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_fresh_line()
+    with_stream(stream, |guard| guard.stream_fresh_line())
 }
 
 pub fn stream_clear_output(stream: TorclVal) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_clear_output()
+    with_stream(stream, |guard| guard.stream_clear_output())
 }
 
 pub fn stream_advance_to_column(stream: TorclVal, col: u64) -> Result<bool, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_advance_to_column(col)
+    with_stream(stream, |guard| guard.stream_advance_to_column(col))
 }
 
 pub fn stream_start_line_p(stream: TorclVal) -> bool {
-    match lock_stream(stream) {
-        Ok(guard) => guard.stream_start_line_p(),
-        Err(_) => false,
-    }
+    with_stream(stream, |guard| Ok(guard.stream_start_line_p())).unwrap_or(false)
 }
 
 pub fn stream_read_sequence(stream: TorclVal, count: usize) -> Result<Vec<TorclVal>, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_read_sequence(count)
+    with_stream(stream, |guard| guard.stream_read_sequence(count))
 }
 
 pub fn stream_write_sequence(stream: TorclVal, elements: &[TorclVal]) -> Result<(), TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.stream_write_sequence(elements)
+    let mut elements = elements.to_vec();
+    torcl_rt::rooted_ref!(_elements_root = &mut elements);
+    with_stream(stream, |guard| guard.stream_write_sequence(&elements))
 }
 
 pub fn interactive_stream_p(stream: TorclVal) -> bool {
-    match lock_stream(stream) {
-        Ok(guard) => guard.interactive_stream_p(),
-        Err(_) => false,
-    }
+    with_stream(stream, |guard| Ok(guard.interactive_stream_p())).unwrap_or(false)
 }
 
 pub fn stream_external_format(stream: TorclVal) -> ExternalFormat {
-    match lock_stream(stream) {
+    torcl_rt::rooted!(stream = stream);
+    match lock_stream(*stream) {
         Ok(guard) => guard.stream_external_format(),
         Err(_) => ExternalFormat::Utf8,
     }
@@ -2230,246 +2250,264 @@ pub fn stream_external_format(stream: TorclVal) -> ExternalFormat {
 
 /// Return the current file position, or `NIL` for non-positionable streams. R5.124.
 pub fn file_position(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.check_open()?;
-    let comps = guard.components();
-    match &mut guard.inner {
-        StreamInner::FileIo {
-            file: StreamHandle::Socket(_),
-            ..
-        } => Ok(NIL),
-        StreamInner::FileInput {
-            file,
-            buf_pos,
-            buf_fill,
-            ..
-        } => {
-            // The OS position is ahead of our logical position by the buffered-but-unread bytes.
-            let os_pos = file
-                .stream_position()
-                .map_err(|e| TorclError::StreamError(format!("file-position error: {}", e)))?;
-            let buffered_unread = (*buf_fill - *buf_pos) as u64;
-            Ok(TorclVal::from_fixnum((os_pos - buffered_unread) as i64))
+    with_stream(stream, |guard| {
+        guard.check_open()?;
+        let mut comps = guard.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
+        match &mut guard.inner {
+            StreamInner::FileIo {
+                file: StreamHandle::Socket(_),
+                ..
+            } => Ok(NIL),
+            StreamInner::FileInput {
+                file,
+                buf_pos,
+                buf_fill,
+                ..
+            } => {
+                // The OS position is ahead of our logical position by the buffered-but-unread bytes.
+                let os_pos = file
+                    .stream_position()
+                    .map_err(|e| TorclError::StreamError(format!("file-position error: {}", e)))?;
+                let buffered_unread = (*buf_fill - *buf_pos) as u64;
+                Ok(TorclVal::from_fixnum((os_pos - buffered_unread) as i64))
+            }
+            StreamInner::FileOutput {
+                file, write_buf, ..
+            } => {
+                let os_pos = file
+                    .stream_position()
+                    .map_err(|e| TorclError::StreamError(format!("file-position error: {}", e)))?;
+                let pending = write_buf.len() as u64;
+                Ok(TorclVal::from_fixnum((os_pos + pending) as i64))
+            }
+            StreamInner::FileIo {
+                file,
+                buf_pos,
+                buf_fill,
+                write_buf,
+                ..
+            } => {
+                let os_pos = file
+                    .stream_position()
+                    .map_err(|e| TorclError::StreamError(format!("file-position error: {}", e)))?;
+                let buffered_unread = (*buf_fill - *buf_pos) as u64;
+                let pending_write = write_buf.len() as u64;
+                Ok(TorclVal::from_fixnum(
+                    (os_pos - buffered_unread + pending_write) as i64,
+                ))
+            }
+            StreamInner::StringInput {
+                position, unread, ..
+            } => {
+                // A pending UNREAD-CHAR logically rewinds the stream one character;
+                // reporting the raw counter made a reader-macro caller (which
+                // measures how much the handler consumed via FILE-POSITION,
+                // bliss-r4mk) overshoot by one and swallow the delimiter the
+                // handler pushed back.
+                let pending = usize::from(unread.is_some());
+                Ok(TorclVal::from_fixnum(
+                    position.saturating_sub(pending) as i64
+                ))
+            }
+            StreamInner::StringOutput { buffer, .. } => {
+                Ok(TorclVal::from_fixnum(buffer.len() as i64))
+            }
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
+                file_position(target)
+            }
+            _ => Ok(NIL), // non-positionable
         }
-        StreamInner::FileOutput {
-            file, write_buf, ..
-        } => {
-            let os_pos = file
-                .stream_position()
-                .map_err(|e| TorclError::StreamError(format!("file-position error: {}", e)))?;
-            let pending = write_buf.len() as u64;
-            Ok(TorclVal::from_fixnum((os_pos + pending) as i64))
-        }
-        StreamInner::FileIo {
-            file,
-            buf_pos,
-            buf_fill,
-            write_buf,
-            ..
-        } => {
-            let os_pos = file
-                .stream_position()
-                .map_err(|e| TorclError::StreamError(format!("file-position error: {}", e)))?;
-            let buffered_unread = (*buf_fill - *buf_pos) as u64;
-            let pending_write = write_buf.len() as u64;
-            Ok(TorclVal::from_fixnum(
-                (os_pos - buffered_unread + pending_write) as i64,
-            ))
-        }
-        StreamInner::StringInput {
-            position, unread, ..
-        } => {
-            // A pending UNREAD-CHAR logically rewinds the stream one character;
-            // reporting the raw counter made a reader-macro caller (which
-            // measures how much the handler consumed via FILE-POSITION,
-            // bliss-r4mk) overshoot by one and swallow the delimiter the
-            // handler pushed back.
-            let pending = usize::from(unread.is_some());
-            Ok(TorclVal::from_fixnum(
-                position.saturating_sub(pending) as i64
-            ))
-        }
-        StreamInner::StringOutput { buffer, .. } => Ok(TorclVal::from_fixnum(buffer.len() as i64)),
-        StreamInner::Synonym => {
-            let target = resolve_synonym(comps[0])?;
-            file_position(target)
-        }
-        _ => Ok(NIL), // non-positionable
-    }
+    })
 }
 
 /// Set the file position. Returns T on success, NIL if not positionable. R5.124.
 pub fn set_file_position(stream: TorclVal, position: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.check_open()?;
-    let comps = guard.components();
-    match &mut guard.inner {
-        StreamInner::FileIo {
-            file: StreamHandle::Socket(_),
-            ..
-        } => Ok(NIL),
-        StreamInner::FileInput {
-            file,
-            buf_pos,
-            buf_fill,
-            unread,
-            ..
-        } => {
-            // Invalidate read buffer on seek.
-            *buf_pos = 0;
-            *buf_fill = 0;
-            *unread = None;
-            let pos = position.as_fixnum() as u64;
-            file.seek(std::io::SeekFrom::Start(pos))
-                .map_err(|e| TorclError::StreamError(format!("set-file-position error: {}", e)))?;
-            Ok(T)
-        }
-        StreamInner::FileOutput {
-            file, write_buf, ..
-        } => {
-            file_flush_write_buf(file, write_buf)?;
-            let pos = position.as_fixnum() as u64;
-            file.seek(std::io::SeekFrom::Start(pos))
-                .map_err(|e| TorclError::StreamError(format!("set-file-position error: {}", e)))?;
-            Ok(T)
-        }
-        StreamInner::FileIo {
-            file,
-            read_buf: _,
-            buf_pos,
-            buf_fill,
-            write_buf,
-            unread,
-            ..
-        } => {
-            file_flush_write_buf(file, write_buf)?;
-            *buf_pos = 0;
-            *buf_fill = 0;
-            *unread = None;
-            let pos = position.as_fixnum() as u64;
-            file.seek(std::io::SeekFrom::Start(pos))
-                .map_err(|e| TorclError::StreamError(format!("set-file-position error: {}", e)))?;
-            Ok(T)
-        }
-        StreamInner::StringInput {
-            position: pos,
-            end,
-            unread,
-            ..
-        } => {
-            // Seek within an in-memory input string (R5.124). Clamp to [0, end];
-            // a negative or unparseable index is a failed positioning (NIL).
-            let requested = position.as_fixnum();
-            if requested < 0 {
-                return Ok(NIL);
+    let mut position = position;
+    torcl_rt::rooted_ref!(_position_root = &mut position);
+    with_stream(stream, |guard| {
+        guard.check_open()?;
+        let mut comps = guard.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
+        match &mut guard.inner {
+            StreamInner::FileIo {
+                file: StreamHandle::Socket(_),
+                ..
+            } => Ok(NIL),
+            StreamInner::FileInput {
+                file,
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            } => {
+                // Invalidate read buffer on seek.
+                *buf_pos = 0;
+                *buf_fill = 0;
+                *unread = None;
+                let pos = position.as_fixnum() as u64;
+                file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
+                    TorclError::StreamError(format!("set-file-position error: {}", e))
+                })?;
+                Ok(T)
             }
-            *pos = (requested as usize).min(*end);
-            *unread = None;
-            Ok(T)
+            StreamInner::FileOutput {
+                file, write_buf, ..
+            } => {
+                file_flush_write_buf(file, write_buf)?;
+                let pos = position.as_fixnum() as u64;
+                file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
+                    TorclError::StreamError(format!("set-file-position error: {}", e))
+                })?;
+                Ok(T)
+            }
+            StreamInner::FileIo {
+                file,
+                read_buf: _,
+                buf_pos,
+                buf_fill,
+                write_buf,
+                unread,
+                ..
+            } => {
+                file_flush_write_buf(file, write_buf)?;
+                *buf_pos = 0;
+                *buf_fill = 0;
+                *unread = None;
+                let pos = position.as_fixnum() as u64;
+                file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
+                    TorclError::StreamError(format!("set-file-position error: {}", e))
+                })?;
+                Ok(T)
+            }
+            StreamInner::StringInput {
+                position: pos,
+                end,
+                unread,
+                ..
+            } => {
+                // Seek within an in-memory input string (R5.124). Clamp to [0, end];
+                // a negative or unparseable index is a failed positioning (NIL).
+                let requested = position.as_fixnum();
+                if requested < 0 {
+                    return Ok(NIL);
+                }
+                *pos = (requested as usize).min(*end);
+                *unread = None;
+                Ok(T)
+            }
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
+                set_file_position(target, position)
+            }
+            _ => Ok(NIL),
         }
-        StreamInner::Synonym => {
-            let target = resolve_synonym(comps[0])?;
-            set_file_position(target, position)
-        }
-        _ => Ok(NIL),
-    }
+    })
 }
 
 /// Position a stream at its end — the `:end` designator of `(setf file-position)`
 /// (R5.124). Kept in the stdlib because only it knows each stream variant's end.
 /// Returns `T` on success, `NIL` for a non-positionable stream.
 pub fn set_file_position_to_end(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.check_open()?;
-    let comps = guard.components();
-    match &mut guard.inner {
-        StreamInner::FileIo {
-            file: StreamHandle::Socket(_),
-            ..
-        } => Ok(NIL),
-        StreamInner::StringInput {
-            position: pos,
-            end,
-            unread,
-            ..
-        } => {
-            *pos = *end;
-            *unread = None;
-            Ok(T)
+    with_stream(stream, |guard| {
+        guard.check_open()?;
+        let mut comps = guard.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
+        match &mut guard.inner {
+            StreamInner::FileIo {
+                file: StreamHandle::Socket(_),
+                ..
+            } => Ok(NIL),
+            StreamInner::StringInput {
+                position: pos,
+                end,
+                unread,
+                ..
+            } => {
+                *pos = *end;
+                *unread = None;
+                Ok(T)
+            }
+            StreamInner::FileInput {
+                file,
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            } => {
+                *buf_pos = 0;
+                *buf_fill = 0;
+                *unread = None;
+                file.seek(std::io::SeekFrom::End(0)).map_err(|e| {
+                    TorclError::StreamError(format!("set-file-position error: {}", e))
+                })?;
+                Ok(T)
+            }
+            StreamInner::FileOutput {
+                file, write_buf, ..
+            } => {
+                file_flush_write_buf(file, write_buf)?;
+                file.seek(std::io::SeekFrom::End(0)).map_err(|e| {
+                    TorclError::StreamError(format!("set-file-position error: {}", e))
+                })?;
+                Ok(T)
+            }
+            StreamInner::FileIo {
+                file,
+                buf_pos,
+                buf_fill,
+                write_buf,
+                unread,
+                ..
+            } => {
+                file_flush_write_buf(file, write_buf)?;
+                *buf_pos = 0;
+                *buf_fill = 0;
+                *unread = None;
+                file.seek(std::io::SeekFrom::End(0)).map_err(|e| {
+                    TorclError::StreamError(format!("set-file-position error: {}", e))
+                })?;
+                Ok(T)
+            }
+            // A string-output stream is always logically at its end.
+            StreamInner::StringOutput { .. } => Ok(T),
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
+                set_file_position_to_end(target)
+            }
+            _ => Ok(NIL),
         }
-        StreamInner::FileInput {
-            file,
-            buf_pos,
-            buf_fill,
-            unread,
-            ..
-        } => {
-            *buf_pos = 0;
-            *buf_fill = 0;
-            *unread = None;
-            file.seek(std::io::SeekFrom::End(0))
-                .map_err(|e| TorclError::StreamError(format!("set-file-position error: {}", e)))?;
-            Ok(T)
-        }
-        StreamInner::FileOutput {
-            file, write_buf, ..
-        } => {
-            file_flush_write_buf(file, write_buf)?;
-            file.seek(std::io::SeekFrom::End(0))
-                .map_err(|e| TorclError::StreamError(format!("set-file-position error: {}", e)))?;
-            Ok(T)
-        }
-        StreamInner::FileIo {
-            file,
-            buf_pos,
-            buf_fill,
-            write_buf,
-            unread,
-            ..
-        } => {
-            file_flush_write_buf(file, write_buf)?;
-            *buf_pos = 0;
-            *buf_fill = 0;
-            *unread = None;
-            file.seek(std::io::SeekFrom::End(0))
-                .map_err(|e| TorclError::StreamError(format!("set-file-position error: {}", e)))?;
-            Ok(T)
-        }
-        // A string-output stream is always logically at its end.
-        StreamInner::StringOutput { .. } => Ok(T),
-        StreamInner::Synonym => {
-            let target = resolve_synonym(comps[0])?;
-            set_file_position_to_end(target)
-        }
-        _ => Ok(NIL),
-    }
+    })
 }
 
 /// Return the length of the file underlying the stream, or NIL for
 /// non-positionable streams. R5.124.
 pub fn file_length_fn(stream: TorclVal) -> Result<TorclVal, TorclError> {
-    let mut guard = lock_stream(stream)?;
-    guard.check_open()?;
-    let comps = guard.components();
-    match &mut guard.inner {
-        StreamInner::FileIo {
-            file: StreamHandle::Socket(_),
-            ..
-        } => Ok(NIL),
-        StreamInner::FileInput { file, .. }
-        | StreamInner::FileOutput { file, .. }
-        | StreamInner::FileIo { file, .. } => {
-            let metadata = file
-                .metadata()
-                .map_err(|e| TorclError::StreamError(format!("file-length error: {}", e)))?;
-            Ok(TorclVal::from_fixnum(metadata.len() as i64))
+    with_stream(stream, |guard| {
+        guard.check_open()?;
+        let mut comps = guard.components().to_vec();
+        torcl_rt::rooted_ref!(_components_root = &mut comps);
+        match &mut guard.inner {
+            StreamInner::FileIo {
+                file: StreamHandle::Socket(_),
+                ..
+            } => Ok(NIL),
+            StreamInner::FileInput { file, .. }
+            | StreamInner::FileOutput { file, .. }
+            | StreamInner::FileIo { file, .. } => {
+                let metadata = file
+                    .metadata()
+                    .map_err(|e| TorclError::StreamError(format!("file-length error: {}", e)))?;
+                Ok(TorclVal::from_fixnum(metadata.len() as i64))
+            }
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
+                file_length_fn(target)
+            }
+            _ => Ok(NIL),
         }
-        StreamInner::Synonym => {
-            let target = resolve_synonym(comps[0])?;
-            file_length_fn(target)
-        }
-        _ => Ok(NIL),
-    }
+    })
 }
 
 // ── GC integration (torcl-jtc.7a) ─────────────────────────────────
@@ -2551,10 +2589,7 @@ fn stdlib_gc_finalize(_finalizer: TorclVal, object: TorclVal) {
         // collector holds the level-8 heap lock would invert the global order.
         let mut alloc = Box::from_raw(box_ptr);
         if warn_unclosed_enabled() {
-            let state = alloc
-                .state
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = alloc.state.get_mut();
             if state.open && inner_is_file(&state.inner) {
                 eprintln!("; Warning: file stream was garbage-collected without being closed");
             }
@@ -2700,7 +2735,8 @@ fn socket_stream(stream: TcpStream) -> TorclVal {
 
 // Duplicate under the stream lock so CLOSE cannot invalidate an option call.
 fn socket_option_handle(stream: TorclVal) -> Result<TcpStream, TorclError> {
-    let guard = lock_stream(stream)?;
+    torcl_rt::rooted!(stream = stream);
+    let guard = lock_stream(*stream)?;
     guard.check_open()?;
     let StreamInner::FileIo {
         file: StreamHandle::Socket(socket),
@@ -2734,7 +2770,8 @@ pub fn socket_set_read_timeout(
 /// The raw file descriptor backing a file/socket IO stream, or None.
 #[cfg(unix)]
 pub fn stream_raw_fd(stream: TorclVal) -> Option<i32> {
-    let guard = lock_stream(stream).ok()?;
+    torcl_rt::rooted!(stream = stream);
+    let guard = lock_stream(*stream).ok()?;
     guard.check_open().ok()?;
     match &guard.inner {
         StreamInner::FileIo { file, .. } => Some(file.as_raw_fd()),
@@ -2750,8 +2787,9 @@ pub fn stream_wait_for_input(
     stream: TorclVal,
     timeout_ms: Option<i32>,
 ) -> Result<bool, TorclError> {
+    torcl_rt::rooted!(stream = stream);
     let handle = {
-        let guard = lock_stream(stream)?;
+        let guard = lock_stream(*stream)?;
         guard.check_input()?;
         match &guard.inner {
             StreamInner::FileIo {
@@ -2789,44 +2827,45 @@ pub fn stream_wait_for_input(
 // ── Composite-stream accessors (synonym / two-way) ─────────────────
 /// The symbol a SYNONYM-STREAM forwards to, or None if not a synonym stream.
 pub fn synonym_stream_symbol(stream: TorclVal) -> Option<TorclVal> {
-    let alloc = get_stream_alloc(stream).ok()?;
-    let is_syn = {
-        let guard = alloc.state.lock().ok()?;
-        matches!(guard.inner, StreamInner::Synonym)
-    };
-    if is_syn {
-        alloc.components.first().copied()
-    } else {
-        None
-    }
+    with_stream(stream, |guard| {
+        Ok(if matches!(guard.inner, StreamInner::Synonym) {
+            guard.components().first().copied()
+        } else {
+            None
+        })
+    })
+    .ok()
+    .flatten()
 }
 
 /// The input stream of a TWO-WAY / ECHO stream, or None.
 pub fn two_way_stream_input_stream(stream: TorclVal) -> Option<TorclVal> {
-    let alloc = get_stream_alloc(stream).ok()?;
-    let ok = {
-        let guard = alloc.state.lock().ok()?;
-        matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo)
-    };
-    if ok {
-        alloc.components.first().copied()
-    } else {
-        None
-    }
+    with_stream(stream, |guard| {
+        Ok(
+            if matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo) {
+                guard.components().first().copied()
+            } else {
+                None
+            },
+        )
+    })
+    .ok()
+    .flatten()
 }
 
 /// The output stream of a TWO-WAY / ECHO stream, or None.
 pub fn two_way_stream_output_stream(stream: TorclVal) -> Option<TorclVal> {
-    let alloc = get_stream_alloc(stream).ok()?;
-    let ok = {
-        let guard = alloc.state.lock().ok()?;
-        matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo)
-    };
-    if ok {
-        alloc.components.get(1).copied()
-    } else {
-        None
-    }
+    with_stream(stream, |guard| {
+        Ok(
+            if matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo) {
+                guard.components().get(1).copied()
+            } else {
+                None
+            },
+        )
+    })
+    .ok()
+    .flatten()
 }
 
 // A Windows SOCKET cannot be represented as a Unix file descriptor.

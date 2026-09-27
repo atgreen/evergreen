@@ -1903,6 +1903,10 @@ pub fn format(
     control_string: &str,
     args: &[TorclVal],
 ) -> Result<TorclVal, TorclError> {
+    let mut destination = destination;
+    torcl_rt::rooted_ref!(_destination_root = &mut destination);
+    let mut args = args.to_vec();
+    torcl_rt::rooted_ref!(_args_root = &mut args);
     // Validate destination
     let to_string = destination.is_nil();
     let to_stdout = destination == T;
@@ -1934,7 +1938,7 @@ pub fn format(
 
     let mut output = String::new();
     let mut arg_idx: usize = 0;
-    let result = format_impl(control_string, args, &mut arg_idx, &mut output);
+    let result = format_impl(control_string, &args, &mut arg_idx, &mut output);
     if let Err(e) = &result {
         if std::env::var_os("TORCL_FMT_DBG").is_some() {
             eprintln!(
@@ -3560,6 +3564,8 @@ pub fn pprint_logical_block(
     suffix: Option<&str>,
     body: TorclVal,
 ) -> Result<(), TorclError> {
+    let mut stream = stream;
+    torcl_rt::rooted_ref!(_stream_root = &mut stream);
     // Build the output: per_line_prefix (or prefix) + body content + suffix
     let mut output = String::new();
 
@@ -3672,6 +3678,8 @@ pub fn pprint_tab(
     colinc: u32,
     stream: TorclVal,
 ) -> Result<(), TorclError> {
+    let mut stream = stream;
+    torcl_rt::rooted_ref!(_stream_root = &mut stream);
     // Without full column tracking we approximate: emit `colnum` spaces
     // for absolute kinds and `colnum` spaces for relative kinds.
     let spaces = match kind {

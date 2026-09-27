@@ -3128,6 +3128,18 @@ pub trait TraceHostRoots {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal));
 }
 
+// Scalar operation results contain no Lisp pointers, but can be part of a
+// rooted Result/tuple that also carries a Lisp value or error datum.
+impl TraceHostRoots for () {
+    fn trace_host_roots(&mut self, _visit: &mut dyn FnMut(*mut TorclVal)) {}
+}
+impl TraceHostRoots for bool {
+    fn trace_host_roots(&mut self, _visit: &mut dyn FnMut(*mut TorclVal)) {}
+}
+impl TraceHostRoots for u64 {
+    fn trace_host_roots(&mut self, _visit: &mut dyn FnMut(*mut TorclVal)) {}
+}
+
 impl TraceHostRoots for TorclVal {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         visit(self as *mut TorclVal);
