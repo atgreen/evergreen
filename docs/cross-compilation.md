@@ -79,6 +79,12 @@ active condition handlers. The runtime and CLI unit suites contain s390x
 instruction-encoding, ABI execution, native frame and deoptimization tests.
 Validation currently uses QEMU; native IBM Z hardware performance is unmeasured.
 
+s390x perf jitdump files identify their code as `EM_S390` and encode fields in
+big-endian native byte order. `DISASSEMBLE` and the tier viewer show labeled raw
+bytes with native offsets; System Z mnemonic decoding is not yet available.
+The native smoke test checks the architecture identifier and compares the
+listing's complete byte stream with the perf code-load record.
+
 Stack guards, safepoints and JIT mappings use the runtime kernel page size.
 QEMU user-mode validation on a 4 KiB host does not replace testing on a native
 64 KiB-page POWER or AArch64 kernel.

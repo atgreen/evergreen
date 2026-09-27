@@ -1096,12 +1096,30 @@ fn native_insn_annotation(
     None
 }
 
-/// The **native x86-64** (T1/T2) listing for a specific installed `NativeCode`,
-/// with a header describing that tier's compilation strategy and its OSR loop
-/// entry points. Offsets are relative to the code entry (stable across runs,
-/// unlike absolute addresses). Reads the R+X-mapped code bytes, so it must be
-/// called while `nc` is installed (that is why the tier snapshots are captured
-/// at compile time — see [`capture_tier_disasm`]).
+/// A lossless fallback for targets without an in-process instruction decoder.
+/// Keep halfword offsets so System Z bytecode/OSR positions remain selectable
+/// in the tier viewer without pretending these are decoded instructions.
+fn format_native_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out =
+        String::from("; Raw bytes; mnemonic decoding is unavailable for this architecture.\n");
+    for (index, chunk) in bytes.chunks(2).enumerate() {
+        let _ = write!(out, "  +{:04x}:  .byte ", index * 2);
+        for (byte_index, byte) in chunk.iter().enumerate() {
+            if byte_index != 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "0x{byte:02x}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The native T1/T2 listing for a specific installed `NativeCode`, with its
+/// compilation strategy and OSR entries. Offsets are relative to the code
+/// entry. Reads the R+X mapping, so the owner must remain alive (tier snapshots
+/// are captured at compile time — see [`capture_tier_disasm`]).
 fn format_native_listing(nc: &NativeCode) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1117,10 +1135,19 @@ fn format_native_listing(nc: &NativeCode) -> String {
         es.sort_unstable();
         let _ = writeln!(out, "; OSR loop-header entry bcps: {es:?}");
     }
-    let _ = writeln!(out, "; {} bytes of x86-64:", nc.code_len);
+    let architecture = if cfg!(target_arch = "x86_64") {
+        "x86-64"
+    } else {
+        std::env::consts::ARCH
+    };
+    let _ = writeln!(out, "; {} bytes of {architecture}:", nc.code_len);
     let base = nc.entry as u64;
     let len = nc.code_len as u64;
     let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
+    if !cfg!(target_arch = "x86_64") {
+        out.push_str(&format_native_bytes(bytes));
+        return out;
+    }
 
     // Pass 1: decode everything, then locate the cold deopt-stub section. A
     // failed speculation guard — an overflow `jo`/`jno`, or a `jne`/`je` right
@@ -15710,7 +15737,15 @@ fn elf_machine() -> u32 {
     {
         183
     }
-    #[cfg(not(any(all(target_arch = "x86_64", unix), target_arch = "aarch64")))]
+    #[cfg(target_arch = "s390x")]
+    {
+        22
+    }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", unix),
+        target_arch = "aarch64",
+        target_arch = "s390x"
+    )))]
     {
         0
     }
@@ -17223,20 +17258,24 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
                 artifact.code.len(),
                 artifact.compiled_entry
             );
-            let mut dec = iced_x86::Decoder::with_ip(
-                64,
-                &artifact.code,
-                entry as u64,
-                iced_x86::DecoderOptions::NONE,
-            );
-            let mut fmt = iced_x86::NasmFormatter::new();
-            let mut insn = iced_x86::Instruction::default();
-            let mut line = String::new();
-            while dec.can_decode() {
-                dec.decode_out(&mut insn);
-                line.clear();
-                iced_x86::Formatter::format(&mut fmt, &insn, &mut line);
-                eprintln!("  {:#x}: {}", insn.ip(), line);
+            if cfg!(target_arch = "x86_64") {
+                let mut dec = iced_x86::Decoder::with_ip(
+                    64,
+                    &artifact.code,
+                    entry as u64,
+                    iced_x86::DecoderOptions::NONE,
+                );
+                let mut fmt = iced_x86::NasmFormatter::new();
+                let mut insn = iced_x86::Instruction::default();
+                let mut line = String::new();
+                while dec.can_decode() {
+                    dec.decode_out(&mut insn);
+                    line.clear();
+                    iced_x86::Formatter::format(&mut fmt, &insn, &mut line);
+                    eprintln!("  {:#x}: {}", insn.ip(), line);
+                }
+            } else {
+                eprint!("{}", format_native_bytes(&artifact.code));
             }
         }
     }

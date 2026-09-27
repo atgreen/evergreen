@@ -5,8 +5,11 @@ Run under scripts/torcl-limited.sh, passing the binary or QEMU command after --.
 The tier assertions are essential: correct bytecode fallback is not a JIT pass.
 """
 import os
+from pathlib import Path
+import struct
 import subprocess
 import sys
+import tempfile
 
 
 PROGRAM = r"""
@@ -143,6 +146,41 @@ def main():
     """
     assert run(auto, TORCL_T0_T1_THRESHOLD="2", TORCL_DISABLE_T2="1") == reference
     print("s390x: automatic invocation promotion reaches T1", flush=True)
+
+    with tempfile.TemporaryDirectory(prefix="torcl-s390x-jit-") as directory:
+        dump_path = Path(directory) / "jit.dump"
+        listing = run("""
+          (defun jit-diagnostics (x) (+ x 1))
+          (jit-diagnostics 2)
+          (if (= (torcl-ext:function-tier 'jit-diagnostics) 1) nil
+              (error "diagnostic fixture did not compile"))
+          (disassemble 'jit-diagnostics)
+        """, TORCL_FORCE_TIER="t1", TORCL_PERF_JITDUMP=str(dump_path))
+        assert "bytes of s390x" in listing and "bytes of x86" not in listing, listing
+        assert "+0000:" in listing and ".byte 0xeb, 0x6f" in listing, listing
+        # jitdump fields use the producer's native byte order, not the host
+        # Python process's byte order when this test drives QEMU.
+        dump = dump_path.read_bytes()
+        magic, version, header_size, machine = struct.unpack_from(">IIII", dump)
+        assert (magic, version, header_size, machine) == (0x4A695444, 1, 40, 22)
+        listed_bytes = bytearray()
+        for line in listing.splitlines():
+            offset, separator, byte_text = line.partition(":  .byte ")
+            if separator:
+                assert int(offset.strip().removeprefix("+"), 16) == len(listed_bytes)
+                listed_bytes.extend(int(value, 16) for value in byte_text.split(", "))
+        at = header_size
+        found = False
+        while at + 56 <= len(dump):
+            record, size = struct.unpack_from(">II", dump, at)
+            assert record == 0 and size > 56 and at + size <= len(dump)
+            name, _, code = dump[at + 56:at + size].partition(b"\x00")
+            if b"JIT-DIAGNOSTICS" in name:
+                assert listed_bytes == code, (listed_bytes, code)
+                found = True
+            at += size
+        assert found, "no code-load record for JIT-DIAGNOSTICS"
+    print("s390x: native listings and perf jitdump identify System Z", flush=True)
 
 
 if __name__ == "__main__":
