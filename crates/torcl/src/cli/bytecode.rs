@@ -14848,7 +14848,7 @@ extern "C" fn c2i_set_native_sigsegv_recovery(enabled: u64) {
 
 // T1's expression templates use rdi/rsi/rdx/rcx as temporary argument
 // registers on both platforms. Only this call boundary assigns the C ABI.
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn emit_c2i_helper_call(c: &mut Asm) {
     let toggle = c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
     // The fixed T1 frame has 32 bytes of shadow space plus five saved words.
@@ -14878,7 +14878,7 @@ fn emit_c2i_helper_call(c: &mut Asm) {
     emit_native_transfer_check(c);
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), target_arch = "x86_64"))]
 fn emit_c2i_helper_call(c: &mut Asm) {
     let set_recovery = c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
 
@@ -14926,7 +14926,7 @@ extern "C" fn c2i_transfer_pending() -> u64 {
     NATIVE_ERROR.with(|error| u64::from(error.borrow().is_some()))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn emit_native_transfer_check(c: &mut Asm) {
     let resume = c.label();
     // This leaf cannot GC; keep the tagged result outside its shadow space.
@@ -14942,6 +14942,7 @@ fn emit_native_transfer_check(c: &mut Asm) {
     c.bind(resume);
 }
 
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn emit_t1_prologue(c: &mut Asm) {
     #[cfg(windows)]
     {
@@ -14962,6 +14963,7 @@ fn emit_t1_prologue(c: &mut Asm) {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn emit_t1_epilogue(c: &mut Asm) {
     #[cfg(windows)]
     {
@@ -14973,6 +14975,7 @@ fn emit_t1_epilogue(c: &mut Asm) {
     c.extend_from_slice(&[0x41, 0x5c, 0x41, 0x5f, 0x41, 0x5e, 0xc3]);
 }
 
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn emit_t1_osr_jump(c: &mut Asm, target: Label) {
     #[cfg(windows)]
     {
@@ -15027,7 +15030,7 @@ fn install_t1_code(code: &[u8], osr_entries: &[(u32, usize)]) -> Option<torcl_rt
 /// later side effects (including ASDF dependency traversal) must never happen.
 /// T1 declines local unwind handlers, so run_native/OSR owns delivery of the
 /// pending transfer; leave through the ordinary three-register epilogue.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), target_arch = "x86_64"))]
 fn emit_native_transfer_check(c: &mut Asm) {
     let resume = c.label();
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
@@ -19322,7 +19325,29 @@ fn is_inlinable_eq(sym: u32) -> bool {
     torcl_rt::symbols::symbol_name(sym).as_deref() == Some("EQ")
 }
 
-#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+#[cfg(all(target_arch = "aarch64", unix))]
+mod a64;
+
+/// Emit T1 native code for the host. Each architecture's baseline emitter
+/// decides for itself what it can lower; a host with no emitter never promotes
+/// and every function stays in the counting interpreter.
+fn emit_native_t1(
+    bf: &BytecodeFunction,
+    allow_speculation: bool,
+    sym: u32,
+    backedge_counter: u64,
+    allow_traps: bool,
+) -> Option<NativeEmission> {
+    #[cfg(all(target_arch = "aarch64", unix))]
+    return a64::emit_native_a64(bf, allow_speculation, sym, backedge_counter, allow_traps);
+    #[cfg(not(all(target_arch = "aarch64", unix)))]
+    emit_native_x86(bf, allow_speculation, sym, backedge_counter, allow_traps)
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+)))]
 fn emit_native_x86(
     _bf: &BytecodeFunction,
     _allow_speculation: bool,
@@ -19381,7 +19406,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         bcp_offsets,
         has_deopt,
         direct_calls,
-    } = emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
+    } = emit_native_t1(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -19890,7 +19915,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     // emit an uncommon-trap deopt to T0 instead of declining the whole function
     // — the loop runs native, cold code deopts (bliss-zqit). Gated (default off)
     // while env-var-native OSR is pending; see osr_traps_enabled.
-    let emitted = emit_native_x86(bf, true, u32::MAX, backedge_counter, osr_traps_enabled());
+    let emitted = emit_native_t1(bf, true, u32::MAX, backedge_counter, osr_traps_enabled());
     if std::env::var_os("TORCL_OSR_DEBUG").is_some() && emitted.is_none() {
         eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
     }

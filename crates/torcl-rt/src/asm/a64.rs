@@ -315,6 +315,17 @@ pub fn sub_imm(d: Reg, n: Reg, value: u64) -> Option<u32> {
     addsub_imm(0xD100_0000, d, n, value)
 }
 
+/// `ADD Wd, Wn, #value` — 32-bit, for incrementing a `u32` counter. The 32-bit
+/// forms of the arithmetic instructions are the 64-bit encodings with `sf` clear.
+pub fn add_imm_w(d: Reg, n: Reg, value: u64) -> Option<u32> {
+    addsub_imm(0x1100_0000, d, n, value)
+}
+
+/// `CMP Wn, #value` — 32-bit, i.e. `SUBS WZR, Wn, #value`.
+pub fn cmp_imm_w(n: Reg, value: u64) -> Option<u32> {
+    addsub_imm(0x7100_0000, XZR, n, value)
+}
+
 /// `SUBS Xd, Xn, #value`.
 pub fn subs_imm(d: Reg, n: Reg, value: u64) -> Option<u32> {
     addsub_imm(0xF100_0000, d, n, value)
@@ -362,6 +373,25 @@ pub fn ldr_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
     load_store_scaled(0xF940_0000, t, n, offset)
 }
 
+/// `STR Wt, [Xn, #offset]` — a 32-bit store, scaled by four. Needed because the
+/// tier counters are `AtomicU32`: a 64-bit access would read and write the four
+/// bytes beyond them.
+pub fn str_w_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    load_store_word(0xB900_0000, t, n, offset)
+}
+
+/// `LDR Wt, [Xn, #offset]` — a 32-bit load, scaled by four.
+pub fn ldr_w_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    load_store_word(0xB940_0000, t, n, offset)
+}
+
+fn load_store_word(base: u32, t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    if offset % 4 != 0 || offset / 4 >= 0x1000 {
+        return None;
+    }
+    Some(base | (((offset / 4) as u32) << 10) | ((n as u32) << 5) | t as u32)
+}
+
 fn load_store_unscaled(base: u32, t: Reg, n: Reg, offset: i32) -> Option<u32> {
     if !(-256..256).contains(&offset) {
         return None;
@@ -390,6 +420,18 @@ pub fn str_pre(t: Reg, n: Reg, offset: i32) -> Option<u32> {
 /// `Xn = SP` this is x86's `pop`.
 pub fn ldr_post(t: Reg, n: Reg, offset: i32) -> Option<u32> {
     load_store_unscaled(0xF840_0400, t, n, offset)
+}
+
+/// `STR Xt, [Xn], #offset` — post-index: store, then adjust the base. Pushing
+/// onto an upward-growing stack is this.
+pub fn str_post(t: Reg, n: Reg, offset: i32) -> Option<u32> {
+    load_store_unscaled(0xF800_0400, t, n, offset)
+}
+
+/// `LDR Xt, [Xn, #offset]!` — pre-index: adjust the base, then load. Popping
+/// from an upward-growing stack is this, with a negative offset.
+pub fn ldr_pre(t: Reg, n: Reg, offset: i32) -> Option<u32> {
+    load_store_unscaled(0xF840_0C00, t, n, offset)
 }
 
 /// `LDR Xt, [Xn, Xm, LSL #3]` — indexed by a word-scaled register, the shape of
@@ -684,6 +726,12 @@ mod tests {
             ),
             ("cmp x1, #5", 0xF100143F, cmp_imm(1, 5).unwrap()),
             (
+                "add w17, w17, #1",
+                0x11000631,
+                add_imm_w(17, 17, 1).unwrap(),
+            ),
+            ("cmp w17, #100", 0x7101923F, cmp_imm_w(17, 100).unwrap()),
+            (
                 "and x10, x11, #0x7",
                 0x9240096A,
                 and_imm(10, 11, 0x7).unwrap(),
@@ -822,6 +870,10 @@ mod tests {
 
     #[test]
     fn out_of_range_displacements_are_refused() {
+        // The 32-bit form scales by four, not eight.
+        assert!(ldr_w_imm(1, 2, 4).is_some());
+        assert!(ldr_w_imm(1, 2, 2).is_none());
+        assert!(ldr_w_imm(1, 2, 0x4000).is_none());
         // The scaled form reaches only non-negative multiples of eight.
         assert!(str_imm(1, 2, 4).is_none());
         assert!(str_imm(1, 2, 0x8000).is_none());
