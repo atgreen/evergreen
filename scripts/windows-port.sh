@@ -37,9 +37,10 @@ export TORCL_FFI_AGGREGATES_DLL="Z:$WINEPREFIX/ffi-aggregates.dll"
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test windows_os --test test_jit
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib allocator_admission_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib registration_tests
+scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --lib join_completion_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test fiber_fault_state --test fiber_preemption_state --test test_scheduler --test test_fiber_sync
-scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_join_gc --test fiber_native_join --test fiber_finish_error
-TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_join_gc --test fiber_native_join --test fiber_finish_error
+scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_join_gc --test fiber_native_join --test fiber_finish_error --test fiber_join_managed
+TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_join_gc --test fiber_native_join --test fiber_finish_error --test fiber_join_managed
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test fiber_roots --test fiber_preemption_state
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test ffi_jit --test ffi_callback_jit --test ffi_callback_runtime
 TORCL_GC_STRESS=1 TORCL_GC_POISON=1 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test ffi_callback_runtime
