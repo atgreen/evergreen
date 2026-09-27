@@ -8587,19 +8587,27 @@ fn print_val_inner(val: TorclVal, out: &mut String) {
         // A user-defined `print-object` method wins when one applies (and a print
         // env is parked); otherwise CLOS instances are opaque handles printed as
         // #<CLASS-NAME>.
-        if let Some(rendered) = dispatch_print_object(val, PRINT_ESCAPE.with(|c| c.get())) {
+        //
+        // Root VAL across the dispatch: it creates a string output stream and
+        // searches for an applicable method, so a moving GC can relocate the
+        // instance, and when the dispatch declines (no user method — the common
+        // case) everything below was reading a stale pointer. The stdlib printer
+        // had the identical defect, where it printed `#<HEAP-OBJECT>` for a live
+        // instance under GC stress (bliss-phgt).
+        torcl_rt::rooted!(val = val);
+        if let Some(rendered) = dispatch_print_object(*val, PRINT_ESCAPE.with(|c| c.get())) {
             out.push_str(&rendered);
             return;
         }
         // A DEFSTRUCT instance prints in readable #S(NAME :slot val …) syntax,
         // matching the stdlib printer (bliss-i1i9).
-        let class = torcl_stdlib::class_of(val);
+        let class = torcl_stdlib::class_of(*val);
         if torcl_stdlib::is_structure_class(class) {
             out.push_str("#S(");
             out.push_str(&sym_bare_name_rc(torcl_stdlib::class_name(class)));
             let prev = PRINT_ESCAPE.with(|c| c.replace(true));
             for slot in torcl_stdlib::effective_slots(class) {
-                if let Ok(sv) = torcl_stdlib::slot_value(val, slot) {
+                if let Ok(sv) = torcl_stdlib::slot_value(*val, slot) {
                     out.push_str(" :");
                     out.push_str(&sym_bare_name_rc(slot));
                     out.push(' ');
@@ -8610,7 +8618,7 @@ fn print_val_inner(val: TorclVal, out: &mut String) {
             out.push(')');
             return;
         }
-        let name = instance_class_hierarchy_names(val)
+        let name = instance_class_hierarchy_names(*val)
             .as_ref()
             .and_then(|names| names.first())
             .cloned()
@@ -8626,7 +8634,7 @@ fn print_val_inner(val: TorclVal, out: &mut String) {
                 .into_iter()
                 .find(|slot| sym_bare_name_rc(*slot).as_ref() == "NAME");
             if let Some(name_slot) = name_slot {
-                if let Ok(restart_name) = torcl_stdlib::slot_value(val, name_slot) {
+                if let Ok(restart_name) = torcl_stdlib::slot_value(*val, name_slot) {
                     out.push(' ');
                     print_val_inner(restart_name, out);
                 }
@@ -10047,25 +10055,30 @@ fn dispatch_print_object(val: TorclVal, escape: bool) -> Option<String> {
 /// `print-object` methods too. Delegates to [`dispatch_print_object`], which
 /// requires a print env to be parked (the FORMAT builtin parks it).
 fn stdlib_print_object_hook(val: TorclVal, escape: bool) -> Option<String> {
-    if let Some(name) = package_object_name(val) {
+    // Root VAL for the whole hook. `dispatch_print_object` allocates (a string
+    // output stream, the applicable-method search) and usually declines, and the
+    // condition/restart reporting below then tested a stale pointer with
+    // `is_instance` — so a condition signalled under GC pressure printed as
+    // `#<HEAP-OBJECT>` with no report at all (bliss-phgt).
+    torcl_rt::rooted!(val = val);
+    if let Some(name) = package_object_name(*val) {
         return Some(format!("#<PACKAGE {name}>"));
     }
     // A user PRINT-OBJECT method wins if one applies.
-    if let Some(s) = dispatch_print_object(val, escape) {
+    if let Some(s) = dispatch_print_object(*val, escape) {
         return Some(s);
     }
     // `princ` / `~A` of a CONDITION prints its report string (CLHS 9.1); `~S`
     // keeps the default `#<TYPE …>`. Without this, an UNDEFINED-FUNCTION printed
     // as an opaque `#<UNDEFINED-FUNCTION>` with no name — making a failed load
     // (e.g. a missing builtin during an ASDF compile) undiagnosable.
-    if !escape && torcl_stdlib::is_instance(val) && !PRINTING_OBJECT.with(|c| c.get()) {
+    if !escape && torcl_stdlib::is_instance(*val) && !PRINTING_OBJECT.with(|c| c.get()) {
         let ptr = PRINT_ENV.with(|c| c.get());
         if !ptr.is_null() {
-            // Root VAL: the allocations below (class-hierarchy walk, stream
-            // creation, report funcall) can fire a moving GC, which would leave
-            // this local copy stale and make the object look like a bare
-            // `#<HEAP-OBJECT>` (GC-stress reproduced exactly this).
-            torcl_rt::rooted!(val = val);
+            // (VAL is rooted for the whole hook, above: the allocations below —
+            // class-hierarchy walk, stream creation, report funcall — can fire a
+            // moving GC, which would leave a local copy stale and make the object
+            // look like a bare `#<HEAP-OBJECT>`.)
             // Safety: mirrors dispatch_print_object — the parked pointer is the
             // live print-entry Env; printing is single-threaded.
             let env = unsafe { &*ptr };

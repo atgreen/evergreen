@@ -1109,10 +1109,22 @@ fn torclval_to_print_inner(v: TorclVal, escapep: bool) -> String {
     // message (~A/princ semantics); any other instance prints as #<CLASS-NAME>.
     if crate::clos::is_instance(v) {
         // A user `print-object` method wins when one applies; else fall back.
-        if let Some(s) = dispatch_print_object(v, escapep) {
+        //
+        // Root V across the dispatch: the hook creates a string output stream
+        // and searches for an applicable PRINT-OBJECT method, both of which
+        // allocate, so a minor GC can relocate the instance while this local
+        // copy is looking away. When the dispatch then declines (the common
+        // case — no user method), the fallback below received a stale pointer,
+        // `class_of` did not recognize it, and a perfectly good instance printed
+        // as `#<HEAP-OBJECT>`: `(princ-to-string (make-instance 'foo))` answered
+        // "#<FOO>" normally and "#<HEAP-OBJECT>" under TORCL_GC_STRESS=1, which
+        // silently swallowed every condition report printed through FORMAT
+        // (bliss-phgt).
+        torcl_rt::rooted!(v = v);
+        if let Some(s) = dispatch_print_object(*v, escapep) {
             return s;
         }
-        return format_instance(v, escapep);
+        return format_instance(*v, escapep);
     }
     if v.is_fixnum() {
         let base = print_base();
