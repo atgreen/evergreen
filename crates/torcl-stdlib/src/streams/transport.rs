@@ -23,6 +23,11 @@ pub(super) struct PipeHandle {
 }
 
 impl StreamHandle {
+    pub(super) fn socket(socket: TcpStream) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self::Socket(socket))
+    }
+
     pub(super) fn pipe(file: File) -> Self {
         Self::Pipe(PipeHandle {
             file,
@@ -62,6 +67,13 @@ impl StreamHandle {
 
     /// True when a read can complete, including EOF and connection errors.
     pub(super) fn wait_readable(&self, timeout_ms: Option<i32>) -> io::Result<bool> {
+        if let Self::Socket(socket) = self {
+            let timeout = timeout_ms
+                .filter(|n| *n >= 0)
+                .map(|n| std::time::Duration::from_millis(n as u64));
+            return torcl_rt::sync::wait_socket(socket, torcl_rt::sync::IoInterest::Read, timeout)
+                .map_err(|e| io::Error::other(e.to_string()));
+        }
         if matches!(self, Self::Pipe(_)) && timeout_ms != Some(0) {
             let handle = self.try_clone()?;
             return pipe_io("pipe readiness", move || {
@@ -174,8 +186,42 @@ impl Read for StreamHandle {
                 buffer[..count].copy_from_slice(&owned[..count]);
                 Ok(count)
             }
-            Self::Socket(socket) => socket.read(buffer),
+            Self::Socket(socket) => socket_io(
+                socket,
+                torcl_rt::sync::IoInterest::Read,
+                socket.read_timeout()?,
+                |mut socket| socket.read(buffer),
+            ),
             Self::Closed => Err(io::Error::other("closed stream")),
+        }
+    }
+}
+
+/// Retry non-blocking I/O against one timeout budget. Readiness is only a hint;
+/// a competing reader or a spurious notification may require another wait.
+fn socket_io<T>(
+    socket: &TcpStream,
+    interest: torcl_rt::sync::IoInterest,
+    timeout: Option<std::time::Duration>,
+    mut action: impl FnMut(&TcpStream) -> io::Result<T>,
+) -> io::Result<T> {
+    let started = std::time::Instant::now();
+    loop {
+        match action(socket) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = timeout.map(|t| t.saturating_sub(started.elapsed()));
+                if remaining == Some(std::time::Duration::ZERO)
+                    || !torcl_rt::sync::wait_socket(socket, interest, remaining)
+                        .map_err(|e| io::Error::other(e.to_string()))?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "socket I/O timed out",
+                    ));
+                }
+            }
+            result => return result,
         }
     }
 }
@@ -191,7 +237,12 @@ impl Write for StreamHandle {
                 let owned = buffer.to_vec();
                 pipe_io("pipe write", move || file.write(&owned))
             }
-            Self::Socket(socket) => socket.write(buffer),
+            Self::Socket(socket) => socket_io(
+                socket,
+                torcl_rt::sync::IoInterest::Write,
+                socket.write_timeout()?,
+                |mut socket| socket.write(buffer),
+            ),
             Self::Closed => Err(io::Error::other("closed stream")),
         }
     }
@@ -351,5 +402,88 @@ fn pipe_wait_readable(pipe: &PipeHandle, timeout_ms: Option<i32>) -> io::Result<
         }
         #[cfg(windows)]
         std::thread::sleep(slice.min(Duration::from_millis(1)));
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::time::Duration;
+    use torcl_rt::value::{T, TorclVal};
+    use torcl_rt::{SchedulerConfig, SchedulerGroup};
+
+    static SOCKET: Mutex<Option<StreamHandle>> = Mutex::new(None);
+    static WRITING: AtomicBool = AtomicBool::new(false);
+    static RELEASE: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+    const SIZE: usize = 16 * 1024 * 1024;
+
+    fn writer() -> TorclVal {
+        let mut socket = SOCKET.lock().unwrap().take().unwrap();
+        let bytes = vec![0x5a; SIZE];
+        WRITING.store(true, Ordering::Release);
+        socket.write_all(&bytes).unwrap();
+        T
+    }
+
+    fn release_reader() -> TorclVal {
+        while !WRITING.load(Ordering::Acquire) {
+            torcl_rt::sync::fiber_sleep(Duration::from_millis(1)).unwrap();
+        }
+        RELEASE.get().unwrap().send(()).unwrap();
+        T
+    }
+
+    #[test]
+    fn socket_backpressure_parks_writer_and_preserves_every_byte() {
+        const CHILD: &str = "TORCL_SOCKET_BACKPRESSURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "streams::transport::socket_tests::socket_backpressure_parks_writer_and_preserves_every_byte", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(124);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        RELEASE.set(sender).unwrap();
+        let reader = std::thread::spawn(move || {
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut received = 0;
+            let mut buffer = [0; 65536];
+            loop {
+                let n = peer.read(&mut buffer).unwrap();
+                if n == 0 {
+                    break;
+                }
+                assert!(buffer[..n].iter().all(|b| *b == 0x5a));
+                received += n;
+            }
+            assert_eq!(received, SIZE);
+        });
+        *SOCKET.lock().unwrap() = Some(StreamHandle::socket(socket).unwrap());
+        let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
+        for entry in [writer as fn() -> TorclVal, release_reader] {
+            let function = unsafe { TorclVal::from_function_ptr(entry as *const () as *mut u8) };
+            group
+                .submit(torcl_rt::thread::make_fiber(function).unwrap())
+                .unwrap();
+        }
+        assert_eq!(group.finish().unwrap(), vec![T, T]);
+        reader.join().unwrap();
     }
 }

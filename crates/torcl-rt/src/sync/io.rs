@@ -32,20 +32,25 @@ fn native_poll(
     timeout: Option<Duration>,
 ) -> Result<bool, TorclError> {
     const EINTR: i32 = 4;
-    let timeout_ms = timeout
-        .map(|duration| duration.as_millis().min(i32::MAX as u128) as i32)
-        .unwrap_or(-1);
+    let started = Instant::now();
     let mut descriptor = crate::syscall::PollFd {
         fd,
         events: poll_events(interest),
         revents: 0,
     };
     loop {
+        let remaining = timeout.map(|t| t.saturating_sub(started.elapsed()));
+        let timeout_ms = remaining
+            .map(|t| t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
+            .unwrap_or(-1);
         // SAFETY: `descriptor` is a valid single-element PollFd for the call.
         match unsafe { crate::syscall::poll(&mut descriptor, 1, timeout_ms) } {
             Ok(n) if n > 0 => return Ok(true),
-            Ok(_) => return Ok(false),
-            Err(EINTR) => continue,
+            Ok(_) | Err(EINTR) => {
+                if timeout.is_some_and(|t| started.elapsed() >= t) {
+                    return Ok(false);
+                }
+            }
             Err(e) => {
                 return Err(TorclError::StreamError(format!(
                     "fd readiness wait failed: errno {e}"
@@ -72,8 +77,30 @@ pub fn wait_fd(
         return native_poll(fd, interest, timeout);
     }
     match blocking_mode("FD-WAIT")? {
-        BlockingMode::Native => native_poll(fd, interest, timeout),
+        BlockingMode::Native => {
+            // SAFETY: poll touches only the descriptor and native stack data.
+            let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+            native_poll(fd, interest, timeout)
+        }
         BlockingMode::Fiber => fiber_wait_fd(fd, interest, timeout),
+    }
+}
+
+/// Wait on an owned TCP socket without occupying an unpinned fiber's carrier.
+/// The caller must keep the socket alive until this call returns.
+pub fn wait_socket(
+    socket: &std::net::TcpStream,
+    interest: IoInterest,
+    timeout: Option<Duration>,
+) -> Result<bool, TorclError> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        wait_fd(socket.as_raw_fd(), interest, timeout)
+    }
+    #[cfg(windows)]
+    {
+        super::socket_windows::wait(socket, interest, timeout)
     }
 }
 
@@ -103,8 +130,9 @@ fn fiber_wait_fd(
             return Err(error);
         }
     }
-    crate::thread::park_prepared_current_fiber()?;
+    let parked = crate::thread::park_prepared_current_fiber();
     epoll::cancel(registration);
+    parked?;
     Ok(ready.load(Ordering::Acquire))
 }
 
@@ -137,8 +165,9 @@ fn fiber_wait_fd(
             return Err(error);
         }
     }
-    crate::thread::park_prepared_current_fiber()?;
+    let parked = crate::thread::park_prepared_current_fiber();
     kqueue::cancel(registration);
+    parked?;
     Ok(ready.load(Ordering::Acquire))
 }
 
@@ -257,6 +286,36 @@ mod epoll {
         events | EPOLLONESHOT
     }
 
+    #[test]
+    fn repeatedly_register_already_ready_descriptor() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _peer = listener.accept().unwrap();
+        for iteration in 0..5000 {
+            let ready = Arc::new(AtomicBool::new(false));
+            let id = register(
+                socket.as_raw_fd(),
+                IoInterest::Write,
+                FiberId(u64::MAX),
+                1,
+                Arc::clone(&ready),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            cancel(id);
+            assert!(
+                ready.load(Ordering::Acquire),
+                "lost readiness at iteration {iteration}"
+            );
+        }
+    }
+
     pub(super) fn register(
         fd: RawFd,
         interest: IoInterest,
@@ -309,9 +368,12 @@ mod epoll {
 
     pub(super) fn cancel(id: u64) {
         let poller = poller();
+        // Serialize publication, event dispatch and deletion under the same
+        // descriptor lock. A consumed one-shot event must see its registration;
+        // an old DEL must finish before a new ADD can reuse this descriptor.
+        let mut fds = poller.fds.lock().unwrap();
         let registration = poller.registrations.lock().unwrap().remove(&id);
         if let Some(registration) = registration {
-            poller.fds.lock().unwrap().remove(&registration.fd);
             // SAFETY: DEL takes no event pointer.
             unsafe {
                 let _ = crate::syscall::epoll_ctl(
@@ -321,6 +383,7 @@ mod epoll {
                     std::ptr::null_mut(),
                 );
             }
+            fds.remove(&registration.fd);
         }
     }
 
@@ -345,11 +408,11 @@ mod epoll {
             };
             for event in events.iter().take(count) {
                 let id = unsafe { std::ptr::addr_of!(event.data).read_unaligned() };
+                let mut descriptors = fds.lock().unwrap();
                 let registration = registrations.lock().unwrap().remove(&id);
                 let Some(registration) = registration else {
                     continue;
                 };
-                fds.lock().unwrap().remove(&registration.fd);
                 // SAFETY: DEL takes no event pointer.
                 unsafe {
                     let _ = crate::syscall::epoll_ctl(
@@ -359,6 +422,8 @@ mod epoll {
                         std::ptr::null_mut(),
                     );
                 }
+                descriptors.remove(&registration.fd);
+                drop(descriptors);
                 registration.ready.store(true, Ordering::Release);
                 crate::thread::wake_fiber_wait(registration.fiber, registration.token);
             }
@@ -490,9 +555,14 @@ mod kqueue {
                 )
             } != 0
             {
+                let error = std::io::Error::last_os_error();
+                for &filter in filters(interest) {
+                    unsafe {
+                        change(poller.queue_fd, fd, filter, libc::EV_DELETE as u16, id);
+                    }
+                }
                 return Err(TorclError::StreamError(format!(
-                    "kqueue registration failed: {}",
-                    std::io::Error::last_os_error()
+                    "kqueue registration failed: {error}"
                 )));
             }
         }
@@ -511,9 +581,9 @@ mod kqueue {
 
     pub(super) fn cancel(id: u64) {
         let poller = poller();
+        let mut fds = poller.fds.lock().unwrap();
         let registration = poller.registrations.lock().unwrap().remove(&id);
         if let Some(registration) = registration {
-            poller.fds.lock().unwrap().remove(&registration.fd);
             for &filter in &[libc::EVFILT_READ, libc::EVFILT_WRITE] {
                 unsafe {
                     change(
@@ -525,6 +595,7 @@ mod kqueue {
                     );
                 }
             }
+            fds.remove(&registration.fd);
         }
     }
 
@@ -554,11 +625,26 @@ mod kqueue {
             }
             for event in events.iter().take(count as usize) {
                 let id = event.udata as usize as u64;
+                let mut descriptors = fds.lock().unwrap();
                 let registration = registrations.lock().unwrap().remove(&id);
                 let Some(registration) = registration else {
                     continue;
                 };
-                fds.lock().unwrap().remove(&registration.fd);
+                // A ReadWrite registration may still have its other filter
+                // installed after this one-shot event consumed the first.
+                for &filter in &[libc::EVFILT_READ, libc::EVFILT_WRITE] {
+                    unsafe {
+                        change(
+                            queue_fd,
+                            registration.fd,
+                            filter,
+                            libc::EV_DELETE as u16,
+                            id,
+                        );
+                    }
+                }
+                descriptors.remove(&registration.fd);
+                drop(descriptors);
                 registration.ready.store(true, Ordering::Release);
                 crate::thread::wake_fiber_wait(registration.fiber, registration.token);
             }
