@@ -34,9 +34,9 @@ use super::{
     BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_alloc_cons, c2i_call_builtin,
     c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
     c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
-    c2i_store_env, c2i_store_global, c2i_t1_backedge, c2i_take_values, c2i_transfer_pending,
-    c2i_typep_class, c2i_values_to_list, call_site_profile_token, registry_get, resolve_sym,
-    t2_backedge_threshold,
+    c2i_set_native_sigsegv_recovery, c2i_store_env, c2i_store_global, c2i_t1_backedge,
+    c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
+    call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
 };
 use torcl_rt::asm::Cc;
 use torcl_rt::asm_ppc64le::{Asm, frame};
@@ -149,6 +149,8 @@ pub(super) fn emit_native_ppc64le(
     let builtin_addr =
         c2i_call_builtin as extern "C" fn(u64, u64, *const TorclVal, u64) -> u64 as usize as u64;
     let transfer_addr = c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64;
+    let recovery_toggle_addr =
+        c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
@@ -239,7 +241,7 @@ pub(super) fn emit_native_ppc64le(
                 emit_push(&mut c)?;
             }
             Instr::ClearMv => {
-                emit_c2i_call(&mut c, clear_mv_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, clear_mv_addr, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::CallNamed { sym: callee, nargs } => {
                 let direct_builtin = super::super::direct_builtin_slot(*callee, *nargs as usize);
@@ -263,7 +265,7 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     c2i_addr
                 };
-                emit_c2i_call(&mut c, target, transfer_addr)?;
+                emit_c2i_call(&mut c, target, transfer_addr, recovery_toggle_addr)?;
                 emit_add_disp(&mut c, OPSP, OPSP, -8 * i32::from(*nargs))?;
                 emit_push(&mut c)?;
             }
@@ -272,14 +274,14 @@ pub(super) fn emit_native_ppc64le(
                 c.imm64(4, u64::from(*n));
                 emit_add_disp(&mut c, 5, OPSP, -8 * i32::from(*n))?;
                 c.imm64(6, 0);
-                emit_c2i_call(&mut c, c2i_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, c2i_addr, transfer_addr, recovery_toggle_addr)?;
                 emit_add_disp(&mut c, OPSP, OPSP, -8 * i32::from(*n))?;
                 emit_push(&mut c)?;
             }
             Instr::LoadEnvVar(name_idx) => {
                 c.imm64(3, std::ptr::from_ref(bf) as u64);
                 c.imm64(4, u64::from(u32::from(*name_idx)));
-                emit_c2i_call(&mut c, load_env_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, load_env_addr, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
@@ -291,7 +293,7 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     define_env_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::PushEnvChild | Instr::PopEnvChild => {
                 let helper = if matches!(instr, Instr::PushEnvChild) {
@@ -299,13 +301,13 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     pop_env_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::AllocCons => {
                 // The cdr is on top, so it pops first.
                 emit_pop(&mut c, 4)?;
                 emit_pop(&mut c, 3)?;
-                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr)?;
+                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
@@ -319,39 +321,69 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     make_closure_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::TakeValuesToLocals { nvars, slot_base } => {
                 emit_pop(&mut c, 3)?;
                 emit_add_disp(&mut c, 4, SLOTS, 8 * i32::from(*slot_base))?;
                 c.imm64(5, u64::from(*nvars));
-                emit_c2i_call(&mut c, take_values_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    take_values_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
             }
             Instr::LoadGlobal(global) => {
                 c.imm64(3, u64::from(*global));
-                emit_c2i_call(&mut c, load_global_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    load_global_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c)?;
             }
             Instr::LoadFunction(global) => {
                 c.imm64(3, u64::from(*global));
-                emit_c2i_call(&mut c, load_function_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    load_function_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c)?;
             }
             Instr::StoreGlobal(global) => {
                 emit_pop(&mut c, 4)?;
                 c.imm64(3, u64::from(*global));
-                emit_c2i_call(&mut c, store_global_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    store_global_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
             }
             Instr::ValuesToList => {
                 emit_pop(&mut c, 3)?;
-                emit_c2i_call(&mut c, values_to_list_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    values_to_list_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c)?;
             }
             Instr::TypeP(class) => {
                 emit_pop(&mut c, 3)?;
                 c.imm64(4, u64::from(*class as u32));
-                emit_c2i_call(&mut c, typep_class_addr, transfer_addr)?;
+                emit_c2i_call(
+                    &mut c,
+                    typep_class_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
                 emit_push(&mut c)?;
             }
             Instr::Br(target) => {
@@ -430,7 +462,7 @@ pub(super) fn emit_native_ppc64le(
                         c.imm64(6, std::ptr::from_ref(bf) as u64);
                         t2_backedge_addr
                     };
-                    emit_c2i_call(&mut c, helper, transfer_addr)?;
+                    emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
                     c.compare_imm(0, ACC, 0);
                     c.branch(Cc::E, 0, keep);
                     // Leaving the loop: T2 finished, or a signal is pending. The
@@ -531,7 +563,12 @@ fn emit_add_disp(c: &mut Asm, destination: u8, source: u8, displacement: i32) ->
 /// An indirect call goes through the count register, and the ABI expects the
 /// target's address in r12 so that a callee entered at its global entry point can
 /// compute its own TOC. r2 is saved and restored around the call because of that.
-fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64) -> Option<()> {
+fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64, recovery_toggle: u64) -> Option<()> {
+    // Disable native-frame SIGSEGV recovery while a Rust helper frame is active.
+    // Recovery redirects a fault to a stub that unwinds a JIT frame through the back
+    // chain; with a helper frame on top that would restore the wrong registers and
+    // return to the wrong place.
+    emit_toggle(c, recovery_toggle, 0)?;
     c.store(TOC, 1, frame::TOC_SLOT)?;
     c.imm64(TARGET, target);
     c.move_to_count(TARGET);
@@ -553,6 +590,28 @@ fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64) -> Option<()> {
     c.load(ACC, 1, frame::SCRATCH_SLOT)?;
     emit_epilogue(c)?;
     c.bind(resume);
+    emit_toggle(c, recovery_toggle, 1)?;
     c.load(ACC, 1, frame::SCRATCH_SLOT)?;
+    Some(())
+}
+
+/// Call the recovery toggle, preserving the argument registers across it.
+///
+/// The toggle is an ordinary call and clobbers every volatile register, so all four
+/// argument registers are saved — not just the accumulator. Saving only r3 leaves
+/// the helper reading whatever the toggle happened to leave in r4, r5 and r6.
+fn emit_toggle(c: &mut Asm, toggle: u64, enable: i16) -> Option<()> {
+    for (index, register) in [3u8, 4, 5, 6].into_iter().enumerate() {
+        c.store(register, 1, frame::ARGUMENT_SPILL + 8 * index as i32)?;
+    }
+    c.store(TOC, 1, frame::TOC_SLOT)?;
+    c.li(3, enable);
+    c.imm64(TARGET, toggle);
+    c.move_to_count(TARGET);
+    c.call_count();
+    c.load(TOC, 1, frame::TOC_SLOT)?;
+    for (index, register) in [3u8, 4, 5, 6].into_iter().enumerate() {
+        c.load(register, 1, frame::ARGUMENT_SPILL + 8 * index as i32)?;
+    }
     Some(())
 }

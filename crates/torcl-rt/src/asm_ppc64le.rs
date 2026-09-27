@@ -40,8 +40,14 @@ pub mod frame {
     pub const SCRATCH_SLOT: i32 = 32;
     /// The back-edge poll counter.
     pub const POLL_SLOT: i32 = 40;
+    /// Four doublewords for holding the argument registers across a call that must
+    /// happen between setting them up and using them — the SIGSEGV recovery toggle.
+    /// A call clobbers every volatile register, so saving only the accumulator
+    /// destroys the other three arguments, which reach the callee as whatever the
+    /// toggle left behind.
+    pub const ARGUMENT_SPILL: i32 = 48;
     /// First byte available for a tier's own slots.
-    pub const LOCALS_BASE: i32 = 48;
+    pub const LOCALS_BASE: i32 = ARGUMENT_SPILL + 32;
 
     /// Every nonvolatile register a JIT tier may use: the three activation
     /// registers, then the optimizing tier's allocation pool.

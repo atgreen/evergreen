@@ -13452,7 +13452,52 @@ fn native_sigsegv_recovery_ip() -> usize {
     native_sigsegv_recovery_epilogue as *const () as usize
 }
 
-#[cfg(not(any(all(target_arch = "x86_64", unix), all(target_arch = "aarch64", unix))))]
+/// The ppc64le counterpart (bliss-yssbz), which is GENERATED rather than written as
+/// a naked function: Rust's inline assembly is not stable for powerpc64, so there is
+/// no way to spell this by hand on the pinned toolchain. It is emitted once, through
+/// the same assembler the JIT tiers use.
+///
+/// It needs no knowledge of which tier faulted, and that is the whole point of the
+/// frame convention both tiers follow (`asm_ppc64le::frame`). ELFv2 saves
+/// nonvolatile registers at the TOP of the frame, so their addresses are fixed
+/// relative to the CALLER's stack pointer: follow the back chain, restore from
+/// there, and return — whatever size frame the fault landed in. AArch64 instead had
+/// to make both tiers agree on a frame SIZE, retrofitted late (bliss-7t9a4).
+///
+/// Returns the sentinel 7 that the other epilogues return, which `run_native` reads
+/// as "this activation faulted".
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+fn native_sigsegv_recovery_ip() -> usize {
+    use std::sync::OnceLock;
+    static STUB: OnceLock<Option<usize>> = OnceLock::new();
+    (*STUB.get_or_init(|| {
+        use torcl_rt::asm_ppc64le::{Asm, frame};
+        let mut asm = Asm::new();
+        asm.li(3, 7);
+        // r11 = the caller's stack pointer, through the back chain.
+        asm.load(11, 1, 0)?;
+        for index in 0..frame::SAVED.len() {
+            let register = frame::SAVED[index];
+            // The same offsets a prologue used, measured from the caller's pointer.
+            asm.load(register, 11, frame::saved_offset(0, index))?;
+        }
+        asm.mov(1, 11);
+        asm.load(0, 1, frame::LINK_SLOT)?;
+        asm.move_to_link(0);
+        asm.ret();
+        let code = asm.finish()?;
+        // Leaked deliberately: a signal handler reaches this by address forever.
+        let buffer = torcl_rt::jit::JitBuffer::new(&code)?;
+        Some(buffer.leak() as usize)
+    }))
+    .unwrap_or(0)
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", unix),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
+)))]
 fn native_sigsegv_recovery_ip() -> usize {
     0
 }
