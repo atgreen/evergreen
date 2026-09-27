@@ -443,9 +443,9 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         let placements = classify(&scalars, None).unwrap();
-        for position in 0..8 {
-            assert_eq!(placements[position].integer, Some(position));
-            assert_eq!(placements[position].stack, None);
+        for (position, placement) in placements.iter().enumerate().take(8) {
+            assert_eq!(placement.integer, Some(position));
+            assert_eq!(placement.stack, None);
         }
         assert_eq!(placements[8].integer, None);
         assert_eq!(placements[8].stack, Some(0));

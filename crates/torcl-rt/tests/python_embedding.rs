@@ -84,6 +84,75 @@ fn the_interpreter_lifecycle() {
         );
     }
 
+    // ── owning a Python reference ────────────────────────────
+    // The whole reason releases are queued: Py_DECREF can run `__del__`, i.e.
+    // arbitrary Python, so it must not fire from wherever a Lisp proxy happened to
+    // become unreachable. This checks the deferral is real rather than decorative —
+    // the object stays alive with its last Python name deleted and its Rust owner
+    // dropped, and dies only at the drain.
+    {
+        let scope = PythonScope::enter().expect("an interpreter");
+        scope
+            .run(
+                "died = False\n\
+                 class Probe:\n\
+                 \x20   def __del__(self):\n\
+                 \x20       global died\n\
+                 \x20       died = True\n\
+                 probe = Probe()\n",
+            )
+            .expect("a probe whose death is observable");
+
+        let owned = scope.lookup("probe").expect("the probe object");
+        assert!(scope.lookup("no_such_name").is_none(), "an unbound name");
+
+        // Python's own reference goes away; ours is what keeps it alive.
+        scope.run("del probe").expect("dropping Python's name");
+        scope
+            .run("assert not died, 'the Rust-side reference kept it alive'")
+            .expect("still alive");
+
+        let before = python::pending_releases();
+        drop(owned);
+        assert_eq!(
+            python::pending_releases(),
+            before + 1,
+            "dropping a PyRef must queue a release, not perform one"
+        );
+        scope
+            .run("assert not died, '__del__ must not run at drop time'")
+            .expect("still alive after the drop");
+
+        // The drain is the safe point where arbitrary Python may run.
+        assert_eq!(
+            python::drain_releases(&scope).expect("a drain"),
+            before + 1,
+            "the drain releases everything queued"
+        );
+        assert_eq!(python::pending_releases(), 0, "the queue is empty after");
+        scope
+            .run("assert died, 'the drained release destroyed the object'")
+            .expect("__del__ ran at the drain");
+
+        // A second reference to a live object, and a drain with nothing to do.
+        scope.run("kept = Probe()").expect("a second probe");
+        let first = scope.lookup("kept").expect("the object");
+        let second = first.duplicate(&scope).expect("a second owned reference");
+        assert_eq!(first.as_ptr(), second.as_ptr(), "the same object");
+        scope.run("died = False; del kept").expect("Python lets go");
+        drop(first);
+        python::drain_releases(&scope).expect("a drain");
+        scope
+            .run("assert not died, 'one of two references was released'")
+            .expect("the duplicate still holds it");
+        drop(second);
+        python::drain_releases(&scope).expect("a drain");
+        scope
+            .run("assert died, 'the last reference was released'")
+            .expect("both references were accounted for");
+        assert_eq!(python::drain_releases(&scope).expect("a drain"), 0);
+    }
+
     // ── the transition does not leak ─────────────────────────
     // Each crossing acquires and releases both the foreign state and the GIL. If
     // either leaked, this would deadlock or strand the thread in Native state.
@@ -106,7 +175,7 @@ fn the_interpreter_lifecycle() {
     // that may belong to an exited thread. A spawned thread initialising and then
     // exiting was enough to segfault a later shutdown from main, which is what
     // made startup explicit in the first place.
-    let refused = std::thread::spawn(|| python::finalize())
+    let refused = std::thread::spawn(python::finalize)
         .join()
         .expect("the thread itself must survive");
     assert!(

@@ -39,7 +39,14 @@ struct Api {
     /// Releases the GIL and returns the saved thread state. Needed exactly once,
     /// after startup — see [`initialize`].
     eval_save_thread: unsafe extern "C" fn() -> *mut (),
+    inc_ref: unsafe extern "C" fn(*mut PyObject),
+    dec_ref: unsafe extern "C" fn(*mut PyObject),
     run_simple_string: unsafe extern "C" fn(*const i8) -> i32,
+    /// `__main__`'s module object, and its dictionary. Both borrowed, both needed
+    /// to reach a name Python has bound — see [`PythonScope::lookup`].
+    import_add_module: unsafe extern "C" fn(*const i8) -> *mut PyObject,
+    module_get_dict: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    dict_get_item_string: unsafe extern "C" fn(*mut PyObject, *const i8) -> *mut PyObject,
 }
 
 // SAFETY: every field is a code pointer into a library that stays loaded for the
@@ -91,8 +98,18 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
             let found = unsafe { crate::ffi::foreign_symbol(library, $name) }
                 .map_err(|error| format!("{name} has no {}: {error}", $name))?;
             // SAFETY: transmuting a resolved code address to its declared
-            // signature, which is the whole purpose of resolving it.
-            unsafe { std::mem::transmute(found) }
+            // signature, which is the whole purpose of resolving it. The
+            // destination is left to inference on purpose: the `Api` field being
+            // initialised is the single authority for each signature, and spelling
+            // it again here would be a second copy that could drift from CPython's
+            // documented prototype independently.
+            #[allow(
+                clippy::missing_transmute_annotations,
+                reason = "the destination is the Api field's declared signature"
+            )]
+            unsafe {
+                std::mem::transmute(found)
+            }
         }};
     }
     Ok(Api {
@@ -102,7 +119,12 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
         gil_ensure: symbol!("PyGILState_Ensure"),
         gil_release: symbol!("PyGILState_Release"),
         eval_save_thread: symbol!("PyEval_SaveThread"),
+        inc_ref: symbol!("Py_IncRef"),
+        dec_ref: symbol!("Py_DecRef"),
         run_simple_string: symbol!("PyRun_SimpleString"),
+        import_add_module: symbol!("PyImport_AddModule"),
+        module_get_dict: symbol!("PyModule_GetDict"),
+        dict_get_item_string: symbol!("PyDict_GetItemString"),
     })
 }
 
@@ -286,6 +308,31 @@ impl PythonScope {
         }
         Ok(())
     }
+
+    /// An owned reference to whatever `__main__` has bound to `name`, or `None` if
+    /// it is unbound.
+    ///
+    /// A deliberately narrow way to reach a Python object from Rust: enough to own
+    /// and release references, which is what this layer is about, without yet
+    /// committing to a calling convention (bliss-dk3nr).
+    pub fn lookup(&self, name: &str) -> Option<PyRef> {
+        let name = CString::new(name).ok()?;
+        let main = CString::new("__main__").ok()?;
+        // SAFETY: resolved entry points, and `self` proves the GIL is held. Every
+        // pointer here is borrowed, so nothing is released on the way out and the
+        // final value is adopted by adding a reference rather than stealing one.
+        unsafe {
+            let module = (self.api.import_add_module)(main.as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            let dict = (self.api.module_get_dict)(module);
+            if dict.is_null() {
+                return None;
+            }
+            PyRef::from_borrowed((self.api.dict_get_item_string)(dict, name.as_ptr()), self)
+        }
+    }
 }
 
 impl Drop for PythonScope {
@@ -293,4 +340,287 @@ impl Drop for PythonScope {
         // SAFETY: releasing the state this scope acquired, exactly once.
         unsafe { (self.api.gil_release)(self.gil) };
     }
+}
+
+// ── Ownership across two collectors ────────────────────────────────
+//
+// This is the part where TorCL's collector and CPython's differ most, and where
+// the design note's instincts are load-bearing rather than stylistic.
+//
+// Lisp holding Python is reference counting: a proxy owns a reference, and the
+// matching release must NOT run from a Lisp GC or finalizer context, because
+// `Py_DECREF` can run arbitrary Python — `__del__` — and re-enter CPython at a
+// point where no safe state has been published. So releases are QUEUED and drained
+// at a crossing (see [`PyRef`], [`drain_releases`]).
+//
+// Python holding Lisp is the mirror problem, and worse: TorCL's collector MOVES
+// objects, so a raw address handed to Python goes stale at the next collection
+// with no warning. A [`LispHandle`] is an indirection through a table the collector
+// visits, so Python holds a number that stays valid while the value beneath it is
+// relocated.
+
+/// An opaque CPython object. Never dereferenced on this side.
+#[repr(C)]
+pub struct PyObject {
+    _opaque: [u8; 0],
+}
+
+/// The pending `Py_DECREF` queue.
+///
+/// `GcWorld` level because it is taken from a `Drop` that may run anywhere,
+/// including while the collector is working; nothing here allocates on the Lisp
+/// heap, so it cannot itself provoke a collection.
+fn releases() -> &'static crate::lock_order::OrderedMutex<Vec<usize>> {
+    static QUEUE: OnceLock<crate::lock_order::OrderedMutex<Vec<usize>>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        crate::lock_order::OrderedMutex::new(
+            crate::lock_order::LockLevel::GcWorld,
+            20,
+            "CPython release queue",
+            Vec::new(),
+        )
+    })
+}
+
+/// An owned reference to a Python object.
+///
+/// Dropping one does not call CPython. It appends to the release queue, which is
+/// drained the next time a thread crosses into Python — so a proxy becoming
+/// unreachable during a collection cannot run `__del__` inside the collector.
+pub struct PyRef {
+    pointer: *mut PyObject,
+}
+
+// SAFETY: the pointer is only dereferenced by CPython, under the GIL, through a
+// `PythonScope`; this type itself only stores and enqueues it.
+unsafe impl Send for PyRef {}
+unsafe impl Sync for PyRef {}
+
+impl PyRef {
+    /// Take ownership of a NEW reference, which is what most C-API functions
+    /// return. `None` for a null pointer, which is how CPython reports failure.
+    ///
+    /// # Safety
+    /// `pointer` must be a new reference that this `PyRef` may own, or null.
+    pub unsafe fn from_owned(pointer: *mut PyObject) -> Option<Self> {
+        if pointer.is_null() {
+            None
+        } else {
+            Some(Self { pointer })
+        }
+    }
+
+    /// Add a reference to a BORROWED pointer, which is what container accessors
+    /// such as `PyList_GetItem` return. Requires a crossing, because this calls
+    /// `Py_IncRef`.
+    ///
+    /// # Safety
+    /// `pointer` must be a valid borrowed reference, or null.
+    pub unsafe fn from_borrowed(pointer: *mut PyObject, _scope: &PythonScope) -> Option<Self> {
+        if pointer.is_null() {
+            return None;
+        }
+        let api = api().ok()?;
+        // SAFETY: a resolved entry point, a valid pointer, and the scope proves the
+        // caller holds the GIL.
+        unsafe { (api.inc_ref)(pointer) };
+        Some(Self { pointer })
+    }
+
+    /// The borrowed pointer, for handing to the C API. Valid while `self` lives.
+    pub fn as_ptr(&self) -> *mut PyObject {
+        self.pointer
+    }
+
+    /// A second owned reference to the same object. Not `Clone`, because adding a
+    /// reference calls into CPython and therefore needs a crossing — a trait
+    /// implementation would have to hide that or lie about it.
+    pub fn duplicate(&self, scope: &PythonScope) -> Option<Self> {
+        // SAFETY: `self.pointer` is a live reference this value owns.
+        unsafe { Self::from_borrowed(self.pointer, scope) }
+    }
+}
+
+impl Drop for PyRef {
+    fn drop(&mut self) {
+        // Deliberately does NOT call Py_DecRef. See the module note: this may run
+        // from a collection, and a decref can run arbitrary Python.
+        if let Ok(mut queue) = releases().lock() {
+            queue.push(self.pointer as usize);
+        }
+    }
+}
+
+/// Release every reference queued by a dropped [`PyRef`], returning how many.
+///
+/// Called at a crossing, where the GIL is held and no collection is in progress.
+/// Taking the queue before releasing anything matters: a `__del__` can drop further
+/// proxies, and those must land in the next batch rather than mutate the vector
+/// being iterated.
+pub fn drain_releases(_scope: &PythonScope) -> Result<usize, TorclError> {
+    let api = api()?;
+    let pending: Vec<usize> = {
+        let mut queue = releases()
+            .lock()
+            .map_err(|_| TorclError::FfiError("the CPython release queue is poisoned".into()))?;
+        std::mem::take(&mut *queue)
+    };
+    for pointer in &pending {
+        // SAFETY: each was an owned reference held by a PyRef that has been
+        // dropped, so this consumes exactly the count that PyRef held, and the
+        // scope proves the GIL is held.
+        unsafe { (api.dec_ref)(*pointer as *mut PyObject) };
+    }
+    Ok(pending.len())
+}
+
+/// How many releases are waiting. For tests and diagnostics.
+pub fn pending_releases() -> usize {
+    releases().lock().map(|queue| queue.len()).unwrap_or(0)
+}
+
+// ── Stable handles to Lisp values ──────────────────────────────────
+
+/// A stable name for a Lisp value that Python may hold.
+///
+/// Not a pointer. TorCL's collector relocates objects, so an address handed across
+/// the boundary is valid only until the next collection — and nothing on the Python
+/// side would notice it had gone stale. A handle is an index plus a generation, and
+/// the value beneath it is visited by the collector, so it is rewritten rather than
+/// invalidated when the object moves.
+///
+/// The generation is what makes a stale handle *detectable*: releasing a handle and
+/// allocating another reuses the slot, and without a generation the old handle would
+/// silently resolve to the new value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LispHandle {
+    slot: u32,
+    generation: u32,
+}
+
+impl LispHandle {
+    /// The handle as one opaque word, which is what actually crosses into Python.
+    pub fn to_bits(self) -> u64 {
+        (u64::from(self.generation) << 32) | u64::from(self.slot)
+    }
+
+    /// Recover a handle from its word form.
+    pub fn from_bits(bits: u64) -> Self {
+        Self {
+            slot: bits as u32,
+            generation: (bits >> 32) as u32,
+        }
+    }
+}
+
+enum Slot {
+    /// Free, holding the generation the next occupant will use.
+    Free { generation: u32 },
+    /// Occupied by a value the collector keeps alive and rewrites in place.
+    Strong {
+        generation: u32,
+        value: crate::value::TorclVal,
+    },
+}
+
+/// The handle table. `GcWorld` level because the collector's root scanner takes it;
+/// nothing under this lock allocates on the Lisp heap, so holding it cannot provoke
+/// the collection that would deadlock against the scanner.
+fn handles() -> &'static crate::lock_order::OrderedMutex<Vec<Slot>> {
+    static TABLE: OnceLock<crate::lock_order::OrderedMutex<Vec<Slot>>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        crate::lock_order::OrderedMutex::new(
+            crate::lock_order::LockLevel::GcWorld,
+            21,
+            "CPython Lisp-handle table",
+            Vec::new(),
+        )
+    })
+}
+
+/// Visit every strongly-held value so the collector keeps it alive and rewrites it
+/// when the object moves. Registered once, on the first `retain`.
+fn scan_lisp_handles(visit: &mut dyn FnMut(*mut crate::value::TorclVal)) {
+    let mut table = match handles().lock() {
+        Ok(table) => table,
+        // A poisoned table must not silently drop roots: without the values the
+        // collector would free objects Python still refers to.
+        Err(error) => error.into_inner(),
+    };
+    for slot in table.iter_mut() {
+        if let Slot::Strong { value, .. } = slot {
+            visit(value as *mut crate::value::TorclVal);
+        }
+    }
+}
+
+/// Hold `value` alive and hand back a stable name for it.
+///
+/// Strong: the collector will keep the value reachable until [`release_lisp`], which
+/// is the correct default for something Python is about to own. Ownership is the
+/// caller's to document on the Python side — a handle that is never released is a
+/// leak the collector cannot see through.
+pub fn retain_lisp(value: crate::value::TorclVal) -> LispHandle {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| crate::gc::register_root_scanner(scan_lisp_handles));
+    let mut table = handles().lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((index, generation)) = table.iter().enumerate().find_map(|(index, slot)| match slot
+    {
+        Slot::Free { generation } => Some((index, *generation)),
+        _ => None,
+    }) {
+        table[index] = Slot::Strong { generation, value };
+        return LispHandle {
+            slot: index as u32,
+            generation,
+        };
+    }
+    table.push(Slot::Strong {
+        generation: 0,
+        value,
+    });
+    LispHandle {
+        slot: (table.len() - 1) as u32,
+        generation: 0,
+    }
+}
+
+/// The value a handle names, or `None` if the handle has been released — including
+/// the case where its slot has since been reused, which the generation catches.
+pub fn resolve_lisp(handle: LispHandle) -> Option<crate::value::TorclVal> {
+    let table = handles().lock().unwrap_or_else(|error| error.into_inner());
+    match table.get(handle.slot as usize) {
+        Some(Slot::Strong { generation, value }) if *generation == handle.generation => {
+            Some(*value)
+        }
+        _ => None,
+    }
+}
+
+/// Drop a handle. Idempotent, and a stale handle is ignored rather than releasing
+/// whatever now occupies its slot.
+pub fn release_lisp(handle: LispHandle) {
+    let mut table = handles().lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(Slot::Strong { generation, .. }) = table.get(handle.slot as usize) {
+        if *generation == handle.generation {
+            // Bump on free, so a handle to the old occupant can never resolve to
+            // the next one.
+            table[handle.slot as usize] = Slot::Free {
+                generation: generation.wrapping_add(1),
+            };
+        }
+    }
+}
+
+/// How many handles are held. For tests and diagnostics.
+pub fn held_lisp_handles() -> usize {
+    handles()
+        .lock()
+        .map(|table| {
+            table
+                .iter()
+                .filter(|slot| matches!(slot, Slot::Strong { .. }))
+                .count()
+        })
+        .unwrap_or(0)
 }
