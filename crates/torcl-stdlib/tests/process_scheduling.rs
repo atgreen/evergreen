@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use torcl_rt::{SchedulerConfig, SchedulerGroup, TorclVal};
-use torcl_stdlib::process::{ProcessCommand, run_program};
+use torcl_stdlib::process::{ProcessCommand, launch_program, run_program};
 
 fn marker(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("TORCL_PROCESS_TEST_DIR").unwrap()).join(name)
@@ -167,5 +167,93 @@ fn pinned_native_capture_allows_peer_collection() {
 fn pinned_error_capture_rejects_before_starting_child() {
     isolated("pinned_error_capture_rejects_before_starting_child", || {
         run_fibers(&[pinned_error_caller], 1);
+    });
+}
+
+fn waiting_caller() -> TorclVal {
+    torcl_rt::rooted!(kept = torcl_rt::gc::alloc_double_float(42.0));
+    let original = kept.to_raw();
+    let process = launch_program(child_command()).unwrap();
+    assert!(process.wait(None).unwrap().unwrap().success());
+    assert_ne!(kept.to_raw(), original, "wait must permit a relocating GC");
+    assert_eq!(unsafe { kept.as_ptr().add(8).cast::<f64>().read() }, 42.0);
+    torcl_rt::value::T
+}
+
+#[test]
+fn native_process_wait_allows_peer_collection() {
+    isolated("native_process_wait_allows_peer_collection", || {
+        let peer = std::thread::spawn(collecting_peer);
+        waiting_caller();
+        peer.join().unwrap();
+    });
+}
+
+#[test]
+fn managed_process_wait_releases_its_only_carrier() {
+    isolated("managed_process_wait_releases_its_only_carrier", || {
+        run_fibers(&[waiting_caller, collecting_peer], 1);
+    });
+}
+
+fn pinned_launch_error() -> TorclVal {
+    use torcl_rt::sync::{PinnedBlockingAction, set_pinned_blocking_action};
+    set_pinned_blocking_action(PinnedBlockingAction::Error);
+    let fiber = torcl_rt::thread::current_fiber().unwrap();
+    fiber.pin();
+    let result = launch_program(child_command());
+    fiber.unpin().unwrap();
+    assert!(matches!(result, Err(torcl_rt::TorclError::ProgramError(_))));
+    assert!(!marker("ready").exists(), "rejected launch spawned a child");
+    torcl_rt::value::T
+}
+
+#[test]
+fn pinned_launch_rejects_before_starting_child() {
+    isolated("pinned_launch_rejects_before_starting_child", || {
+        run_fibers(&[pinned_launch_error], 1);
+    });
+}
+
+fn pinned_wait_error() -> TorclVal {
+    use torcl_rt::sync::{PinnedBlockingAction, set_pinned_blocking_action};
+    let process = launch_program(child_command()).unwrap();
+    set_pinned_blocking_action(PinnedBlockingAction::Error);
+    let fiber = torcl_rt::thread::current_fiber().unwrap();
+    fiber.pin();
+    let result = process.wait(None);
+    fiber.unpin().unwrap();
+    assert!(matches!(result, Err(torcl_rt::TorclError::ProgramError(_))));
+    assert!(process.try_wait().unwrap().is_none());
+    std::fs::write(marker("release"), b"release after rejected wait").unwrap();
+    assert!(process.wait(None).unwrap().unwrap().success());
+    torcl_rt::value::T
+}
+
+#[test]
+fn pinned_wait_rejects_without_killing_child() {
+    isolated("pinned_wait_rejects_without_killing_child", || {
+        run_fibers(&[pinned_wait_error], 1);
+    });
+}
+
+static SHARED_PROCESS: std::sync::OnceLock<torcl_stdlib::process::Process> =
+    std::sync::OnceLock::new();
+
+fn shared_waiter() -> TorclVal {
+    let process = SHARED_PROCESS.get().unwrap();
+    assert!(process.wait(None).unwrap().unwrap().success());
+    torcl_rt::value::T
+}
+
+#[test]
+fn multiple_fibers_can_wait_for_the_same_process() {
+    isolated("multiple_fibers_can_wait_for_the_same_process", || {
+        assert!(
+            SHARED_PROCESS
+                .set(launch_program(child_command()).unwrap())
+                .is_ok()
+        );
+        run_fibers(&[shared_waiter, shared_waiter, collecting_peer], 1);
     });
 }

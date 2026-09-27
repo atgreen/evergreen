@@ -49,7 +49,9 @@ use super::{
     sym_name, symbol_bare_name, tag_key, take_control_value, torcl_error_to_condition, val_as_str,
     vec_to_list,
 };
-// Label-based assembler backing the native (T1) code emitter (see cli::asm).
+// Label-based assembler backing the x86-64 T1 emitter. The AArch64 emitter is a
+// submodule with its own imports, so on other targets nothing here uses these.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 use torcl_rt::asm::{Asm, Cc, Label};
 
 #[cfg(all(target_arch = "s390x", unix))]
@@ -13413,7 +13415,89 @@ fn native_sigsegv_recovery_ip() -> usize {
     native_sigsegv_recovery_epilogue as *const () as usize
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+/// The AArch64 counterpart (bliss-7t9a4). A fault anywhere in native code is
+/// redirected here, so this must unwind whichever tier was running — which is why
+/// T1 and T2 share one save-area layout (`a64::JIT_SAVE_BYTES`). Restoring the
+/// stack pointer from the frame pointer rather than from where the fault happened
+/// makes it independent of how much of the frame the body had claimed.
+///
+/// Returns the sentinel 7 that the x86 epilogue returns, which `run_native` reads
+/// as "this activation faulted".
+#[cfg(all(target_arch = "aarch64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn native_sigsegv_recovery_epilogue() {
+    core::arch::naked_asm!(
+        "mov x0, #7",
+        "mov sp, x29",
+        "ldp x19, x20, [sp, #16]",
+        "ldp x21, x22, [sp, #32]",
+        "ldp x23, x24, [sp, #48]",
+        "ldp x25, x26, [sp, #64]",
+        "ldp x27, x28, [sp, #80]",
+        "ldp x29, x30, [sp], #96",
+        "ret",
+    )
+}
+
+/// The epilogue above hard-codes the save-area offsets, so a change to the shared
+/// layout must break the build rather than the recovery path.
+#[cfg(all(target_arch = "aarch64", unix))]
+const _: () = assert!(
+    torcl_rt::asm::a64::JIT_SAVE_BYTES == 96,
+    "the AArch64 recovery epilogue's offsets assume a 96-byte save area"
+);
+
+#[cfg(all(target_arch = "aarch64", unix))]
+fn native_sigsegv_recovery_ip() -> usize {
+    native_sigsegv_recovery_epilogue as *const () as usize
+}
+
+/// The ppc64le counterpart (bliss-yssbz), which is GENERATED rather than written as
+/// a naked function: Rust's inline assembly is not stable for powerpc64, so there is
+/// no way to spell this by hand on the pinned toolchain. It is emitted once, through
+/// the same assembler the JIT tiers use.
+///
+/// It needs no knowledge of which tier faulted, and that is the whole point of the
+/// frame convention both tiers follow (`asm_ppc64le::frame`). ELFv2 saves
+/// nonvolatile registers at the TOP of the frame, so their addresses are fixed
+/// relative to the CALLER's stack pointer: follow the back chain, restore from
+/// there, and return — whatever size frame the fault landed in. AArch64 instead had
+/// to make both tiers agree on a frame SIZE, retrofitted late (bliss-7t9a4).
+///
+/// Returns the sentinel 7 that the other epilogues return, which `run_native` reads
+/// as "this activation faulted".
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+fn native_sigsegv_recovery_ip() -> usize {
+    use std::sync::OnceLock;
+    static STUB: OnceLock<Option<usize>> = OnceLock::new();
+    (*STUB.get_or_init(|| {
+        use torcl_rt::asm_ppc64le::{Asm, frame};
+        let mut asm = Asm::new();
+        asm.li(3, 7);
+        // r11 = the caller's stack pointer, through the back chain.
+        asm.load(11, 1, 0)?;
+        for index in 0..frame::SAVED.len() {
+            let register = frame::SAVED[index];
+            // The same offsets a prologue used, measured from the caller's pointer.
+            asm.load(register, 11, frame::saved_offset(0, index))?;
+        }
+        asm.mov(1, 11);
+        asm.load(0, 1, frame::LINK_SLOT)?;
+        asm.move_to_link(0);
+        asm.ret();
+        let code = asm.finish()?;
+        // Leaked deliberately: a signal handler reaches this by address forever.
+        let buffer = torcl_rt::jit::JitBuffer::new(&code)?;
+        Some(buffer.leak() as usize)
+    }))
+    .unwrap_or(0)
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", unix),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
+)))]
 fn native_sigsegv_recovery_ip() -> usize {
     0
 }
@@ -19398,6 +19482,9 @@ fn is_inlinable_eq(sym: u32) -> bool {
 #[cfg(all(target_arch = "aarch64", unix))]
 mod a64;
 
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+mod ppc64le;
+
 /// Emit T1 native code for the host. Each architecture's baseline emitter
 /// decides for itself what it can lower; a host with no emitter never promotes
 /// and every function stays in the counting interpreter.
@@ -19410,14 +19497,20 @@ fn emit_native_t1(
 ) -> Option<NativeEmission> {
     #[cfg(all(target_arch = "aarch64", unix))]
     return a64::emit_native_a64(bf, allow_speculation, sym, backedge_counter, allow_traps);
-    #[cfg(not(all(target_arch = "aarch64", unix)))]
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+    return ppc64le::emit_native_ppc64le(bf, allow_speculation, sym, backedge_counter, allow_traps);
+    #[cfg(not(any(
+        all(target_arch = "aarch64", unix),
+        all(target_arch = "powerpc64", target_endian = "little", unix)
+    )))]
     emit_native(bf, allow_speculation, sym, backedge_counter, allow_traps)
 }
 
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
-    all(target_arch = "s390x", unix)
+    all(target_arch = "s390x", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 fn emit_native(
     _bf: &BytecodeFunction,
@@ -19556,10 +19649,20 @@ macro_rules! t2_log {
 }
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
-    // Only targets with an optimizing native emitter may publish T2 code.
+    // Only targets with an optimizing native emitter may publish T2 code. This is
+    // a safety property, not an optimisation: without it the pipeline runs to
+    // completion on an architecture whose emitter encodes someone else's
+    // instructions, installs them as native code, and the first caller executes
+    // them. Measured on AArch64 before this guard existed, emission got as far as
+    // "emit_framed failed: BadBranch" — declining by accident, not by design, so
+    // a function whose shape the emitter DID encode would have gone through
+    // (bliss-z2qrz). Reachable only once a target has T1, since T2 is entered
+    // from an installed T1's back-edge poll.
     if !cfg!(any(
         all(target_arch = "x86_64", any(unix, windows)),
-        all(target_arch = "s390x", unix)
+        all(target_arch = "s390x", unix),
+        all(target_arch = "aarch64", unix),
+        all(target_arch = "powerpc64", target_endian = "little", unix)
     )) {
         return None;
     }

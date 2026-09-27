@@ -26,7 +26,8 @@ operator, use the [Symbol index](symbol-index.md); for a topic, use the
 7. [Java integration](java.md) — JVM lifecycle, Java calls and bindings,
    Lisp callbacks, reference scopes, and the descriptor API.
 8. [Threads and synchronization](concurrency.md) — native threads, joins,
-   mutexes, condition variables, and the distinction from managed fibers.
+   mutexes and condition variables. [Fibers and scheduler groups](fibers.md)
+   covers the fiber API and its current availability.
 9. [Operating-system interface](user/reference/extensions.md) — environment,
    current directory, subprocesses, and process arguments.
 10. [Profiling and efficiency](profiling.md) — engine reports, exact counts,
@@ -49,6 +50,7 @@ operator, use the [Symbol index](symbol-index.md); for a topic, use the
 ## Appendices
 
 - [Runtime contributor notes](contributing/index.md)
+- [Runtime fiber API](contributing/reference/fibers.md)
 - [Symbol index](symbol-index.md)
 - [Concept index](concept-index.md)
 - [Writing and building the manual](meta/documentation-guidelines.md)

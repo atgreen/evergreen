@@ -30,9 +30,22 @@ pub mod callback;
 // hardcoded shapes (spec §4.7.5.2). Everything else non-x86 still falls back.
 #[cfg(all(target_arch = "aarch64", unix))]
 mod aapcs64;
+/// ELFv2 foreign calls. Compiled on every host — the placement rules are pure
+/// logic, and their tests are what pin the difference from AAPCS64 that would
+/// otherwise be found only by running on POWER. Only the trampolines and the
+/// re-export below are architecture-gated.
+#[cfg_attr(
+    not(all(target_arch = "powerpc64", target_endian = "little")),
+    allow(
+        dead_code,
+        reason = "placement is exercised by this module's own tests"
+    )
+)]
+mod elfv2;
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix)
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 mod legacy;
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
@@ -41,9 +54,12 @@ pub mod managed_callback;
 mod win64;
 #[cfg(all(target_arch = "aarch64", unix))]
 pub use aapcs64::{ffi_call, ffi_call_variadic};
+#[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
+pub use elfv2::{ffi_call, ffi_call_variadic};
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix)
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 

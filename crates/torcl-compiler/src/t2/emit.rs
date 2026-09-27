@@ -2523,6 +2523,38 @@ pub fn emit_framed_with_activation_slots(
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
+    if cfg!(target_arch = "aarch64") {
+        return super::emit_a64::emit_framed_with_runtime(
+            f,
+            c2i_deopt_t2_addr,
+            activation_slots,
+            super::emit_a64::RuntimeCalls {
+                call_slice: c2i_call_slice_addr,
+                load_global: c2i_load_global_addr,
+                load_function: c2i_load_function_addr,
+                store_global: c2i_store_global_addr,
+                multiple_values: c2i_mv_addr,
+                transfer_pending: c2i_transfer_pending_addr,
+                poll: c2i_poll_addr,
+            },
+        );
+    }
+    if cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
+        return super::emit_ppc64le::emit_framed_with_runtime(
+            f,
+            c2i_deopt_t2_addr,
+            activation_slots,
+            super::emit_ppc64le::RuntimeCalls {
+                call_slice: c2i_call_slice_addr,
+                load_global: c2i_load_global_addr,
+                load_function: c2i_load_function_addr,
+                store_global: c2i_store_global_addr,
+                multiple_values: c2i_mv_addr,
+                transfer_pending: c2i_transfer_pending_addr,
+                poll: c2i_poll_addr,
+            },
+        );
+    }
     if cfg!(target_arch = "s390x") {
         return super::emit_s390x::emit_framed_with_runtime(
             f,

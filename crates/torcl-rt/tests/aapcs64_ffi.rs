@@ -167,14 +167,28 @@ fn pointers_pass_as_integers() {
 }
 
 #[test]
-fn bionic_is_reachable_with_a_mixed_signature() {
-    // The shape the Android raymarcher actually needs, against the real system
-    // library rather than a local function.
-    let libm = torcl_rt::ffi::load_foreign_library("libm.so").expect("libm");
-    // SAFETY: ldexp(double, int) -> double is its declared signature.
-    let ldexp = unsafe { torcl_rt::ffi::foreign_symbol(libm, "ldexp") }.expect("ldexp");
+fn a_mixed_signature_reaches_the_system_math_library() {
+    // The shape the Android raymarcher actually needs: a double and an int through
+    // one call, against a function this crate did not compile.
+    //
+    // Reached by name where that works, and otherwise through the linked symbol.
+    // The name is not portable — bionic ships `libm.so`, glibc merged libm into libc
+    // and keeps a versioned `libm.so.6`, and a cross sysroot's `libm.so` is a linker
+    // script rather than a loadable object — so insisting on `dlopen` would make this
+    // test about the environment instead of about the ABI.
+    unsafe extern "C" {
+        fn ldexp(x: f64, n: i32) -> f64;
+    }
+    let target = ["libm.so", "libm.so.6", "libc.so.6"]
+        .into_iter()
+        .find_map(|name| {
+            let library = torcl_rt::ffi::load_foreign_library(name).ok()?;
+            // SAFETY: ldexp(double, int) -> double is its declared signature.
+            unsafe { torcl_rt::ffi::foreign_symbol(library, "ldexp") }.ok()
+        })
+        .map_or(ldexp as usize, |symbol| symbol as usize);
     let result = call(
-        ldexp as usize,
+        target,
         AlienType::Double,
         &[AlienType::Double, int(32)],
         &[3.0f64.to_bits(), 4u64],

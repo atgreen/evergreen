@@ -69,16 +69,20 @@ to build for an emulator. App builds use the installed runtime and Android SDK;
 they do not require rebuilding TorCL.
 
 For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
-[cross-compilation and QEMU validation](docs/cross-compilation.md). All three
-ports run the interpreter and T0 bytecode engine. Linux s390x (IBM Z) also
-supports the native T1 baseline and T2 optimizing JITs, on-stack replacement
-(OSR) for running loops, and precise deoptimization. Its native runtime calls
-and loops support the moving garbage collector; validation under QEMU includes
-GC stress and poisoning, compiled-file loading, and saved-image round trips.
-AArch64 now has a partial T1 baseline backend; unsupported shapes stay at T0.
-It does not yet have a T2 backend. ppc64le currently uses T0 for native-tier
-requests. AArch64 supports scalar foreign calls through AAPCS64. Foreign callbacks and
-fiber context switching remain unported there; ppc64le also lacks foreign calls.
+[cross-compilation and QEMU validation](docs/cross-compilation.md). All four
+Fedora primary architectures — x86-64, AArch64, ppc64le and s390x — run the
+native T1 baseline and T2 optimizing JITs, with on-stack replacement (OSR) for
+running loops and precise deoptimization. Native runtime calls and loops support
+the moving garbage collector; validation under QEMU includes GC stress and
+poisoning, compiled-file loading, and saved-image round trips, and on AArch64
+also a differential run on a physical device.
+
+What the non-x86-64 ports do not yet have. Foreign callbacks and fiber context
+switching are x86-64 only. s390x reaches foreign code through the bootstrap
+dispatcher's fixed set of call shapes, while AArch64 and ppc64le support scalar
+foreign calls through AAPCS64 and ELFv2 respectively; aggregate arguments are
+unported everywhere but x86-64. The AArch64 and ppc64le T2 emitters cover a
+smaller opcode set than the x86-64 one and leave the rest at T1.
 
 For in-process Java calls and Java interfaces implemented by Lisp functions,
 see [Java integration in the manual](docs/manual/java.md). The current

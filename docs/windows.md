@@ -79,6 +79,12 @@ images. Ctrl+C and Ctrl+Break request cooperative Lisp interruption.
 
 ## Networking and subprocesses
 
+Stream operations retain exclusive ownership when a fiber parks or migrates.
+Fibers waiting for that ownership park without blocking their carrier, and
+stream handles, composite components, and returned Lisp values remain rooted
+through waits and unlocks. Native runtime mutex guards pin their owning fiber
+until the guard is released.
+
 TCP client and accepted connections are owned bidirectional octet streams.
 The existing `torcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
 `%socket-read-timeout`, and `%socket-wait-for-input` primitives work on Windows.
@@ -98,6 +104,33 @@ other fibers to run. Pinned callers follow the configured blocking policy;
 the error policy rejects the operation before starting a child.
 Interactive subprocess streams, asynchronous process management, and alternate
 console code-page decoding are not provided by this API.
+
+The standard-library backend can now own child stdin/stdout/stderr pipes as
+buffered character or octet streams. Blocking pipe I/O runs on a helper for
+managed fibers and admits GC for native callers. Pipe position and length
+queries return `NIL`; closing stdin sends EOF, and closing an input pipe cancels
+outstanding readiness waits. Windows pipe readiness uses
+[PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe).
+The Rust `torcl_stdlib::process::launch_program` API returns an owned `Process`
+with separately transferable stdin/stdout/stderr pipes. `try_wait` observes exit
+without blocking; `wait` supports an optional timeout and retains exit status
+for repeated or concurrent waiters. A timeout leaves the child running.
+`terminate` requests immediate termination of the child, not its descendants;
+call `wait` separately to observe completion. Callers must drain stdout and
+stderr concurrently when either may fill, and close stdin when the child needs
+EOF. Waiting never drains or closes a pipe implicitly.
+
+Dropping the owner closes pipes still held by it without killing or waiting for
+the child. A native reaper retains ownership until exit (or a permanent OS wait
+error). This initial backend uses one reaper thread per live child and polls
+status every two milliseconds; managed waiters suspend through the scheduler.
+The Lisp process object and launch/wait/terminate interface remain to be wired
+to this backend.
+
+`CLOSE` reports output-flush failures and leaves the stream open. After correcting
+the cause, retry `FINISH-OUTPUT` or `CLOSE`; successfully written bytes are not
+sent again. Use `(close stream :abort t)` to discard pending output and release
+the handle when retry is inappropriate.
 
 ## Validate under Wine
 

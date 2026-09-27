@@ -568,6 +568,98 @@ pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), RegAllocError> {
     allocate_with_call_operands(mf, env, clobbers, true)
 }
 
+/// AAPCS64 allocation for the AArch64 framed emitter. Like the System Z pool,
+/// `PhysReg.encoding` is the architectural register number, not an abstract index.
+///
+/// The allocatable set is x19–x27: callee-saved, so a value stays put across a
+/// runtime call without the emitter spilling it, and the prologue saves them once.
+/// x28 is reserved to hold the frame-slots pointer for the whole body (System Z
+/// uses r13 for this), and x29/x30/x31 are the frame pointer, link register and
+/// stack pointer. x16/x17 are IP0/IP1, which the architecture already reserves as
+/// call-clobbered scratch, and x0–x5 are the emitter's working registers.
+///
+/// Floats: v16–v31 are call-clobbered in full. v8–v15 are deliberately NOT offered
+/// even though they are nominally callee-saved, because AAPCS64 preserves only
+/// their low 64 bits — a caller that stored a wider value there would find the
+/// top half gone, and this pool is not the place to encode that subtlety.
+pub fn allocate_framed_a64(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+    let mut integers = PRegSet::empty();
+    for reg in 19..=27 {
+        integers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    let mut floats = PRegSet::empty();
+    for reg in 16..=30 {
+        floats.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    let env = MachineEnv {
+        preferred_regs_by_class: [integers, floats, PRegSet::empty()],
+        non_preferred_regs_by_class: [PRegSet::empty(); 3],
+        scratch_by_class: [
+            Some(PReg::new(17, Ra2RegClass::Int)),
+            Some(PReg::new(31, Ra2RegClass::Float)),
+            None,
+        ],
+        fixed_stack_slots: Vec::new(),
+    };
+    // AAPCS64 volatile registers: x0–x18 (x18 is the platform register, which is
+    // reserved rather than ours to keep) and v0–v7 plus v16–v31.
+    let mut clobbers = PRegSet::empty();
+    for reg in 0..=18 {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    for reg in (0..=7).chain(16..=31) {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    allocate_with_call_operands(mf, env, clobbers, true)
+}
+
+/// ELFv2 allocation for the ppc64le framed emitter. As on System Z,
+/// `PhysReg.encoding` is the architectural register number rather than an abstract
+/// index.
+///
+/// The allocatable set is r20–r29: nonvolatile, so a value survives a runtime call
+/// without the emitter spilling it, and the prologue saves them once as part of the
+/// frame convention both tiers share. r14–r16 are reserved for the activation
+/// registers, r1 is the stack pointer and r2 the TOC, r11/r12 are the emitter's
+/// scratch (r12 additionally because the ABI expects a call target there), and
+/// r3–r6 are the working registers, which double as the first argument registers.
+///
+/// r0 is excluded for a reason peculiar to POWER: several instruction forms read it
+/// as a literal zero rather than as r0's contents, so a value allocated there would
+/// silently read as 0 in exactly those forms.
+///
+/// Floats: f14–f29 are nonvolatile, with f30 as the class scratch; f0–f13 are
+/// call-clobbered and used as working registers.
+pub fn allocate_framed_ppc64le(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+    let mut integers = PRegSet::empty();
+    for reg in 20..=29 {
+        integers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    let mut floats = PRegSet::empty();
+    for reg in 14..=29 {
+        floats.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    let env = MachineEnv {
+        preferred_regs_by_class: [integers, floats, PRegSet::empty()],
+        non_preferred_regs_by_class: [PRegSet::empty(); 3],
+        scratch_by_class: [
+            Some(PReg::new(17, Ra2RegClass::Int)),
+            Some(PReg::new(30, Ra2RegClass::Float)),
+            None,
+        ],
+        fixed_stack_slots: Vec::new(),
+    };
+    // Volatile under ELFv2: r0 and r3–r12, and f0–f13.
+    let mut clobbers = PRegSet::empty();
+    for reg in std::iter::once(0).chain(3..=12) {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    for reg in 0..=13 {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    allocate_with_call_operands(mf, env, clobbers, true)
+}
+
 fn allocate_with_env(
     mf: &mut MachFunc,
     env: MachineEnv,

@@ -9,20 +9,31 @@ TorCL's CLI can be built on x86-64 for these Linux targets:
 | IBM Z big-endian | `s390x-unknown-linux-gnu` | `target/s390x-unknown-linux-gnu/release/torcl` |
 | Android AArch64 | `aarch64-linux-android` | `target-android/aarch64-linux-android/debug/torcl` |
 
-These are dynamically linked glibc executables, suitable for Fedora. They run
-the interpreter and T0 bytecode engine. s390x also supports native T1 compilation
-and T0-to-T1 OSR, including guarded fixnum arithmetic and precise deoptimization.
-The s390x T2 backend emits optimized guarded fixnum and single-float arithmetic,
-branches, loops, runtime calls and multiple-value transfers. Native register and spill
-roots are synchronized through GC-scanned activation slots at runtime calls
-and sampled loop safepoints. Live T1-to-T2 OSR grows the activation in place
-and imports its live locals. Deoptimization reconstructs shared tagged-value
-recipes from their live inputs. Unsupported functions stay at T1. AArch64 and
-POWER still use T0 for native-tier requests. Foreign calls/callbacks and fiber context
-switching are not yet ported; this is not a claim of full architecture parity.
-Library loading uses the system dynamic
-loader. Saved images have distinct architecture tags; do not move heap images
-between architectures.
+These are dynamically linked glibc executables, suitable for Fedora. All three
+support native T1 compilation and T0-to-T1 OSR, and a T2 backend emitting
+optimized guarded fixnum and single-float arithmetic, branches, loops, runtime
+calls and multiple-value transfers. Native register and spill roots are
+synchronized through GC-scanned activation slots at runtime calls and sampled
+loop safepoints. Live T1-to-T2 OSR grows the activation in place and imports its
+live locals. Deoptimization reconstructs shared tagged-value recipes from their
+live inputs. Functions the emitter does not cover stay at the tier below.
+
+The AArch64 and POWER T2 emitters cover a smaller opcode set than the x86-64
+one, so more functions remain at T1 there. Foreign calls: AArch64 uses AAPCS64
+and POWER uses ELFv2, both for scalars only; s390x still reaches foreign code
+through the bootstrap dispatcher's fixed set of call shapes. Aggregate
+arguments, foreign callbacks and fiber context switching are not yet ported to
+any of the three, so this is not a claim of full architecture parity.
+
+Two per-architecture notes worth knowing before working on these. Rust's inline
+assembly is not stable for powerpc64, so anything needing a hand-written stub
+there — the foreign-call trampoline and the SIGSEGV recovery epilogue — is
+generated at runtime through the POWER assembler instead. And POWER's sticky
+`XER[SO]` cannot carry a per-operation overflow guard, so fixnum arithmetic
+computes overflow explicitly rather than branching on a flag.
+
+Library loading uses the system dynamic loader. Saved images have distinct
+architecture tags; do not move heap images between architectures.
 
 ## Setup and build
 

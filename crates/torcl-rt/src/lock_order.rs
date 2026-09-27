@@ -8,8 +8,6 @@
 // The lock-order checker itself is compiled only under debug_assertions, so
 // its imports are gated the same way or release builds warn on them.
 #[cfg(debug_assertions)]
-use std::cell::RefCell;
-#[cfg(debug_assertions)]
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
@@ -39,15 +37,27 @@ struct LockMeta {
 }
 
 #[cfg(debug_assertions)]
-thread_local! {
-    static LOCK_STACK: RefCell<Vec<LockMeta>> = const { RefCell::new(Vec::new()) };
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LockOwner {
+    Native(std::thread::ThreadId),
+    Fiber(crate::thread::FiberId),
+}
+
+#[cfg(debug_assertions)]
+fn current_owner() -> LockOwner {
+    crate::thread::current_fiber_id()
+        .map(LockOwner::Fiber)
+        .unwrap_or_else(|| LockOwner::Native(std::thread::current().id()))
 }
 
 #[cfg(debug_assertions)]
 #[derive(Default)]
 struct WaitGraph {
-    owners: HashMap<usize, HashSet<std::thread::ThreadId>>,
-    waiters: HashMap<std::thread::ThreadId, LockMeta>,
+    owners: HashMap<usize, HashSet<LockOwner>>,
+    // Acquiring an execution mutex can itself acquire scheduler locks while
+    // parking. Preserve the outer wait while those temporary waits come/go.
+    waiters: HashMap<LockOwner, Vec<LockMeta>>,
+    held: HashMap<LockOwner, Vec<LockMeta>>,
 }
 
 #[cfg(debug_assertions)]
@@ -64,25 +74,33 @@ fn valid_after(held: LockMeta, requested: LockMeta) -> bool {
 
 #[cfg(debug_assertions)]
 fn before_acquire(meta: LockMeta) {
-    LOCK_STACK.with(|stack| {
-        if let Some(&held) = stack.borrow().last() {
-            assert!(
-                valid_after(held, meta),
-                "lock order violation: holding '{}' at level {} order {}, requesting '{}' at level {} order {}",
-                held.name,
-                held.level as u8,
-                held.order,
-                meta.name,
-                meta.level as u8,
-                meta.order
-            );
-        }
-    });
+    let owner = current_owner();
+    let held = wait_graph()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .held
+        .get(&owner)
+        .and_then(|stack| stack.last())
+        .copied();
+    if let Some(held) = held {
+        assert!(
+            valid_after(held, meta),
+            "lock order violation: holding '{}' at level {} order {}, requesting '{}' at level {} order {}",
+            held.name,
+            held.level as u8,
+            held.order,
+            meta.name,
+            meta.level as u8,
+            meta.order
+        );
+    }
     wait_graph()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .waiters
-        .insert(std::thread::current().id(), meta);
+        .entry(owner)
+        .or_default()
+        .push(meta);
     start_watchdog();
 }
 
@@ -90,15 +108,24 @@ fn before_acquire(meta: LockMeta) {
 fn before_acquire(_meta: LockMeta) {}
 
 #[cfg(debug_assertions)]
+fn pop_wait(graph: &mut WaitGraph, owner: LockOwner, meta: LockMeta) {
+    if let Some(stack) = graph.waiters.get_mut(&owner) {
+        assert_eq!(stack.pop(), Some(meta), "ordered wait nesting changed");
+        if stack.is_empty() {
+            graph.waiters.remove(&owner);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
 fn acquired(meta: LockMeta) {
-    let thread = std::thread::current().id();
+    let owner = current_owner();
     let mut graph = wait_graph()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    graph.waiters.remove(&thread);
-    graph.owners.entry(meta.id).or_default().insert(thread);
-    drop(graph);
-    LOCK_STACK.with(|stack| stack.borrow_mut().push(meta));
+    pop_wait(&mut graph, owner, meta);
+    graph.owners.entry(meta.id).or_default().insert(owner);
+    graph.held.entry(owner).or_default().push(meta);
 }
 
 #[cfg(not(debug_assertions))]
@@ -106,13 +133,11 @@ fn acquired(_meta: LockMeta) {}
 
 #[cfg(debug_assertions)]
 fn cancelled(meta: LockMeta) {
-    let thread = std::thread::current().id();
+    let owner = current_owner();
     let mut graph = wait_graph()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if graph.waiters.get(&thread) == Some(&meta) {
-        graph.waiters.remove(&thread);
-    }
+    pop_wait(&mut graph, owner, meta);
 }
 
 #[cfg(not(debug_assertions))]
@@ -120,20 +145,24 @@ fn cancelled(_meta: LockMeta) {}
 
 #[cfg(debug_assertions)]
 fn released(meta: LockMeta) {
-    LOCK_STACK.with(|stack| {
-        let released = stack.borrow_mut().pop();
-        assert_eq!(
-            released,
-            Some(meta),
-            "ordered locks must be released in reverse acquisition order"
-        );
-    });
-    let thread = std::thread::current().id();
+    let owner = current_owner();
     let mut graph = wait_graph()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let stack = graph
+        .held
+        .get_mut(&owner)
+        .expect("ordered lock owner disappeared");
+    assert_eq!(
+        stack.pop(),
+        Some(meta),
+        "ordered locks must be released in reverse acquisition order"
+    );
+    if stack.is_empty() {
+        graph.held.remove(&owner);
+    }
     if let Some(owners) = graph.owners.get_mut(&meta.id) {
-        owners.remove(&thread);
+        owners.remove(&owner);
         if owners.is_empty() {
             graph.owners.remove(&meta.id);
         }
@@ -144,19 +173,19 @@ fn released(meta: LockMeta) {
 fn released(_meta: LockMeta) {}
 
 #[cfg(debug_assertions)]
-fn find_cycle(graph: &WaitGraph) -> Option<Vec<std::thread::ThreadId>> {
+fn find_cycle(graph: &WaitGraph) -> Option<Vec<LockOwner>> {
     fn visit(
-        thread: std::thread::ThreadId,
+        thread: LockOwner,
         graph: &WaitGraph,
-        path: &mut Vec<std::thread::ThreadId>,
-        visiting: &mut HashSet<std::thread::ThreadId>,
-    ) -> Option<Vec<std::thread::ThreadId>> {
+        path: &mut Vec<LockOwner>,
+        visiting: &mut HashSet<LockOwner>,
+    ) -> Option<Vec<LockOwner>> {
         if !visiting.insert(thread) {
             let start = path.iter().position(|candidate| *candidate == thread)?;
             return Some(path[start..].to_vec());
         }
         path.push(thread);
-        if let Some(waited) = graph.waiters.get(&thread) {
+        if let Some(waited) = graph.waiters.get(&thread).and_then(|stack| stack.last()) {
             if let Some(owners) = graph.owners.get(&waited.id) {
                 for &owner in owners {
                     if let Some(cycle) = visit(owner, graph, path, visiting) {
@@ -179,16 +208,20 @@ fn find_cycle(graph: &WaitGraph) -> Option<Vec<std::thread::ThreadId>> {
 }
 
 #[cfg(debug_assertions)]
-fn cycle_diagnostic(graph: &WaitGraph, cycle: &[std::thread::ThreadId]) -> String {
+fn cycle_diagnostic(graph: &WaitGraph, cycle: &[LockOwner]) -> String {
     let edges = cycle
         .iter()
         .filter_map(|thread| {
-            graph.waiters.get(thread).map(|lock| {
-                format!(
-                    "{thread:?} waits for '{}' (level {} order {})",
-                    lock.name, lock.level as u8, lock.order
-                )
-            })
+            graph
+                .waiters
+                .get(thread)
+                .and_then(|stack| stack.last())
+                .map(|lock| {
+                    format!(
+                        "{thread:?} waits for '{}' (level {} order {})",
+                        lock.name, lock.level as u8, lock.order
+                    )
+                })
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -219,6 +252,115 @@ fn start_watchdog() {
                 });
         }
     });
+}
+
+/// An ordered, nonrecursive mutex owned by the current fiber or native thread.
+/// Contending unpinned fibers park without retaining their carrier. Unlike a
+/// native mutex, its guard can survive cooperative suspension and migration.
+///
+/// Lock and unlock can admit GC. Callers must root Lisp handles and operation
+/// results through both boundaries; the protected data is not a GC root.
+/// Its level must precede `GcWorld`: parking and waking use GC admission and
+/// execution registry/object locks internally.
+pub struct OrderedExecutionMutex<T> {
+    level: LockLevel,
+    order: u64,
+    name: &'static str,
+    gate: crate::sync::TorclMutex,
+    value: std::cell::UnsafeCell<T>,
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: the nonrecursive execution gate permits exactly one guard, and
+// migration transfers that guard with its owning fiber rather than sharing it.
+unsafe impl<T: Send> Send for OrderedExecutionMutex<T> {}
+unsafe impl<T: Send> Sync for OrderedExecutionMutex<T> {}
+
+impl<T> OrderedExecutionMutex<T> {
+    pub fn new(level: LockLevel, order: u64, name: &'static str, value: T) -> Self {
+        assert!(
+            level < LockLevel::GcWorld,
+            "execution mutex must precede GC and execution coordination locks"
+        );
+        Self {
+            level,
+            order,
+            name,
+            gate: crate::sync::TorclMutex::new(None, false),
+            value: std::cell::UnsafeCell::new(value),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn lock(&self) -> Result<OrderedExecutionMutexGuard<'_, T>, crate::TorclError> {
+        let meta = LockMeta {
+            id: self as *const Self as usize,
+            level: self.level,
+            order: self.order,
+            name: self.name,
+        };
+        before_acquire(meta);
+        if let Err(error) = self.gate.grab(true, None) {
+            cancelled(meta);
+            return Err(error);
+        }
+        acquired(meta);
+        let guard = OrderedExecutionMutexGuard {
+            lock: self,
+            meta,
+            _execution_bound: std::marker::PhantomData,
+        };
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            drop(guard);
+            return Err(crate::TorclError::ProgramError(format!(
+                "poisoned {} mutex",
+                self.name
+            )));
+        }
+        Ok(guard)
+    }
+
+    /// Exclusive access, including finalizer teardown, needs no gate or wait.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+}
+
+pub struct OrderedExecutionMutexGuard<'a, T> {
+    lock: &'a OrderedExecutionMutex<T>,
+    meta: LockMeta,
+    // Prevent handing a live guard to an unrelated execution with Rust Send.
+    _execution_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl<T> Deref for OrderedExecutionMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: this guard exclusively owns the execution gate.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for OrderedExecutionMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: this guard exclusively owns the execution gate.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for OrderedExecutionMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.lock
+                .poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.lock
+            .gate
+            .release()
+            .expect("execution mutex owner changed");
+        released(self.meta);
+    }
 }
 
 pub struct OrderedMutex<T> {
@@ -255,6 +397,7 @@ impl<T> OrderedMutex<T> {
                 acquired(meta);
                 Ok(OrderedMutexGuard {
                     guard: Some(guard),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 })
             }
@@ -262,6 +405,7 @@ impl<T> OrderedMutex<T> {
                 acquired(meta);
                 Err(PoisonError::new(OrderedMutexGuard {
                     guard: Some(error.into_inner()),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 }))
             }
@@ -276,6 +420,7 @@ impl<T> OrderedMutex<T> {
                 acquired(meta);
                 Ok(OrderedMutexGuard {
                     guard: Some(guard),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 })
             }
@@ -288,6 +433,7 @@ impl<T> OrderedMutex<T> {
                 Err(TryLockError::Poisoned(PoisonError::new(
                     OrderedMutexGuard {
                         guard: Some(error.into_inner()),
+                        _pin: crate::thread::FiberPin::current(),
                         meta,
                     },
                 )))
@@ -302,6 +448,8 @@ impl<T> OrderedMutex<T> {
 
 pub struct OrderedMutexGuard<'a, T> {
     guard: Option<std::sync::MutexGuard<'a, T>>,
+    // Native lock guards cannot move to another carrier while held.
+    _pin: crate::thread::FiberPin,
     meta: LockMeta,
 }
 
@@ -361,6 +509,7 @@ impl<T> OrderedRwLock<T> {
                 acquired(meta);
                 Ok(OrderedRwLockReadGuard {
                     guard: Some(guard),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 })
             }
@@ -368,6 +517,7 @@ impl<T> OrderedRwLock<T> {
                 acquired(meta);
                 Err(PoisonError::new(OrderedRwLockReadGuard {
                     guard: Some(error.into_inner()),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 }))
             }
@@ -382,6 +532,7 @@ impl<T> OrderedRwLock<T> {
                 acquired(meta);
                 Ok(OrderedRwLockWriteGuard {
                     guard: Some(guard),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 })
             }
@@ -389,6 +540,7 @@ impl<T> OrderedRwLock<T> {
                 acquired(meta);
                 Err(PoisonError::new(OrderedRwLockWriteGuard {
                     guard: Some(error.into_inner()),
+                    _pin: crate::thread::FiberPin::current(),
                     meta,
                 }))
             }
@@ -398,6 +550,8 @@ impl<T> OrderedRwLock<T> {
 
 pub struct OrderedRwLockReadGuard<'a, T> {
     guard: Option<std::sync::RwLockReadGuard<'a, T>>,
+    // Native lock guards cannot move to another carrier while held.
+    _pin: crate::thread::FiberPin,
     meta: LockMeta,
 }
 
@@ -419,6 +573,8 @@ impl<T> Drop for OrderedRwLockReadGuard<'_, T> {
 
 pub struct OrderedRwLockWriteGuard<'a, T> {
     guard: Option<std::sync::RwLockWriteGuard<'a, T>>,
+    // Native lock guards cannot move to another carrier while held.
+    _pin: crate::thread::FiberPin,
     meta: LockMeta,
 }
 
@@ -449,6 +605,32 @@ impl<T> Drop for OrderedRwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_mutex_poison_releases_ownership_and_ordering() {
+        let lock = OrderedExecutionMutex::new(LockLevel::Stream, 1, "poison probe", 0);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = lock.lock().unwrap();
+            *guard = 7;
+            panic!("poison execution mutex");
+        }));
+        assert!(unwind.is_err());
+        for _ in 0..2 {
+            assert!(matches!(
+                lock.lock(),
+                Err(crate::TorclError::ProgramError(_))
+            ));
+        }
+        // Both panic cleanup and poison rejection must remove held metadata.
+        let next = OrderedExecutionMutex::new(LockLevel::Stream, 1, "after poison", 11);
+        assert_eq!(*next.lock().unwrap(), 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "execution mutex must precede")]
+    fn execution_mutex_rejects_coordination_lock_levels() {
+        let _ = OrderedExecutionMutex::new(LockLevel::GcWorld, 1, "invalid", ());
+    }
 
     #[test]
     #[cfg(debug_assertions)]
@@ -493,10 +675,12 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn watchdog_cycle_diagnostic_names_waited_locks() {
-        let thread_a = std::thread::current().id();
-        let thread_b = std::thread::spawn(|| std::thread::current().id())
-            .join()
-            .unwrap();
+        let thread_a = LockOwner::Native(std::thread::current().id());
+        let thread_b = LockOwner::Native(
+            std::thread::spawn(|| std::thread::current().id())
+                .join()
+                .unwrap(),
+        );
         let lock_a = LockMeta {
             id: 1,
             level: LockLevel::CodeCache,
@@ -512,8 +696,8 @@ mod tests {
         let mut graph = WaitGraph::default();
         graph.owners.entry(lock_a.id).or_default().insert(thread_a);
         graph.owners.entry(lock_b.id).or_default().insert(thread_b);
-        graph.waiters.insert(thread_a, lock_b);
-        graph.waiters.insert(thread_b, lock_a);
+        graph.waiters.insert(thread_a, vec![lock_b]);
+        graph.waiters.insert(thread_b, vec![lock_a]);
 
         let cycle = find_cycle(&graph).expect("two-thread wait cycle should be detected");
         let diagnostic = cycle_diagnostic(&graph, &cycle);
