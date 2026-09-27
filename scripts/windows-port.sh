@@ -28,4 +28,5 @@ export WINEDEBUG=-all
 scripts/torcl-limited.sh wineboot -u
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine
 scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test windows_os
+scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
 scripts/torcl-limited.sh python3 scripts/portability-smoke.py win64 -- wine "$binary"
