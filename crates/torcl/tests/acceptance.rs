@@ -18640,3 +18640,90 @@ fn numeric_type_bounds_compare_exactly() {
     ];
     run_expression_cases(&cases);
 }
+
+/// TorCL must be able to SET an environment variable, not just read one
+/// (bliss-po88). `TORCL-EXT:GETENV` existed from the start, but nothing could
+/// write, so ASDF's `(defsetf getenv …)` table fell through to
+/// `(not-implemented-error '(setf getenv))` on TorCL — and with it every
+/// UIOP/ASDF path that configures a child process or a library through the
+/// environment. Found through pure-tls, whose trust-store tests pin
+/// SSL_CERT_FILE around each case.
+///
+/// `TORCL-EXT:SETENV` takes POSIX setenv's shape (name, value, optional
+/// overwrite, as `sb-posix:setenv` has) so the `#+torcl` arm of that table is a
+/// one-liner, and returns the value so `(setf (uiop:getenv …) v)` yields `v` the
+/// way SETF requires. It mutates the real process environment via std rather
+/// than a TorCL-private table, so a child process and FFI code see the change;
+/// std's unix shim holds an RwLock across getenv/setenv/unsetenv, so TorCL's own
+/// concurrent GETENV can never read a freed value.
+///
+/// The name checks matter because `std::env::set_var` *panics* on an empty name,
+/// a name containing `=`, or an embedded NUL — a Lisp-level mistake must not
+/// take the process down.
+#[test]
+fn environment_variables_can_be_set_and_unset() {
+    let cases = [
+        // Round trip: set, then read it back.
+        (
+            "(progn (torcl-ext:setenv \"TORCL_PO88\" \"hello\")
+               (torcl-ext:getenv \"TORCL_PO88\"))",
+            "\"hello\"",
+        ),
+        // SETENV returns the value it stored (what SETF must yield).
+        ("(torcl-ext:setenv \"TORCL_PO88\" \"v\")", "\"v\""),
+        // UNSETENV removes it; GETENV then answers NIL, not "".
+        (
+            "(progn (torcl-ext:setenv \"TORCL_PO88\" \"v\")
+               (torcl-ext:unsetenv \"TORCL_PO88\")
+               (torcl-ext:getenv \"TORCL_PO88\"))",
+            "NIL",
+        ),
+        // Unsetting a variable that was never set is not an error (POSIX).
+        ("(torcl-ext:unsetenv \"TORCL_PO88_NEVER_SET\")", "NIL"),
+        // A false OVERWRITE keeps an existing value ...
+        (
+            "(progn (torcl-ext:setenv \"TORCL_PO88\" \"first\")
+               (torcl-ext:setenv \"TORCL_PO88\" \"second\" nil)
+               (torcl-ext:getenv \"TORCL_PO88\"))",
+            "\"first\"",
+        ),
+        // ... but still creates an absent one.
+        (
+            "(progn (torcl-ext:setenv \"TORCL_PO88\" \"only\" nil)
+               (torcl-ext:getenv \"TORCL_PO88\"))",
+            "\"only\"",
+        ),
+        // Overwriting is the default, and a later set wins.
+        (
+            "(progn (torcl-ext:setenv \"TORCL_PO88\" \"first\")
+               (torcl-ext:setenv \"TORCL_PO88\" \"second\")
+               (torcl-ext:getenv \"TORCL_PO88\"))",
+            "\"second\"",
+        ),
+        // The three names std would panic on are program errors instead.
+        (
+            "(handler-case (torcl-ext:setenv \"\" \"v\")
+               (program-error () :program-error))",
+            ":PROGRAM-ERROR",
+        ),
+        (
+            "(handler-case (torcl-ext:setenv \"TORCL=PO88\" \"v\")
+               (program-error () :program-error))",
+            ":PROGRAM-ERROR",
+        ),
+        (
+            "(handler-case (torcl-ext:unsetenv \"\")
+               (program-error () :program-error))",
+            ":PROGRAM-ERROR",
+        ),
+        // The error carries a message, not just a class name (bliss-kk0i).
+        (
+            "(handler-case (torcl-ext:setenv \"\" \"v\")
+               (program-error (e) (and (search \"may not be empty\"
+                                               (princ-to-string e))
+                                       t)))",
+            "T",
+        ),
+    ];
+    run_expression_cases(&cases);
+}

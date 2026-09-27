@@ -15432,6 +15432,28 @@ fn env_has_setf_generic(env: &Env, place: &str) -> bool {
     env.methods.contains_key(&key) || env.generics.contains_key(&key)
 }
 
+/// Reject the environment-variable names `std::env::set_var` / `remove_var`
+/// PANIC on (empty, containing `=`, or containing NUL) so TORCL-EXT:SETENV and
+/// TORCL-EXT:UNSETENV report them as ordinary program errors instead of
+/// aborting the process (bliss-po88).
+fn check_env_var_name(operator: &str, name: &str) -> Result<(), TorclError> {
+    let bad = if name.is_empty() {
+        Some("may not be empty")
+    } else if name.contains('=') {
+        Some("may not contain an equals sign")
+    } else if name.contains('\0') {
+        Some("may not contain a NUL character")
+    } else {
+        None
+    };
+    match bad {
+        Some(why) => Err(TorclError::ProgramError(format!(
+            "{operator}: environment variable name {name:?} {why}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -24057,6 +24079,60 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     .ok()
                     .map(|value| arena_str(&value))
                     .unwrap_or(NIL));
+            }
+            "TORCL-EXT:SETENV" => {
+                // (torcl-ext:setenv name value &optional (overwrite t)) — POSIX
+                // setenv's shape, which is also sb-posix:setenv's, so ASDF's
+                // (defsetf getenv) table needs only a one-line #+torcl arm
+                // (bliss-po88). Returns the value, so (setf (uiop:getenv …) v)
+                // yields v the way SETF is required to.
+                //
+                // This mutates the REAL process environment through std (libc
+                // setenv), not a TorCL-private table: a private table would
+                // diverge from what a child process inherits and what FFI code
+                // reads, which is the whole point of being able to set a
+                // variable. std's unix env shim holds an RwLock across getenv /
+                // setenv / unsetenv, so TorCL's own GETENV (std::env::var) can
+                // never observe a torn or freed value however many threads
+                // race. The residual hazard the edition-2024 `unsafe` marks is
+                // non-Rust code calling libc getenv concurrently, which does
+                // not take that lock.
+                let (name_form, rest) = cp(cdr);
+                let (value_form, rest) = cp(rest);
+                let name = val_as_str(eval_form(name_form, env)?);
+                let value = val_as_str(eval_form(value_form, env)?);
+                let overwrite = if rest == NIL {
+                    true
+                } else {
+                    let (overwrite_form, _) = cp(rest);
+                    eval_form(overwrite_form, env)? != NIL
+                };
+                // std::env::set_var PANICS on these rather than reporting them,
+                // so they have to be rejected here as ordinary program errors.
+                check_env_var_name("TORCL-EXT:SETENV", &name)?;
+                if value.contains('\0') {
+                    return Err(TorclError::ProgramError(format!(
+                        "TORCL-EXT:SETENV: value of {name} may not contain a NUL character"
+                    )));
+                }
+                if overwrite || std::env::var_os(&name).is_none() {
+                    // SAFETY: as documented above — every TorCL-side read and
+                    // write of the environment goes through std, which
+                    // serializes them against each other with its own RwLock.
+                    unsafe { std::env::set_var(&name, &value) };
+                }
+                return Ok(arena_str(&value));
+            }
+            "TORCL-EXT:UNSETENV" => {
+                // (torcl-ext:unsetenv name) — the unset arm of the same
+                // (defsetf getenv) table (bliss-po88). Removing a variable that
+                // is not set is not an error, as POSIX unsetenv specifies.
+                let (name_form, _) = cp(cdr);
+                let name = val_as_str(eval_form(name_form, env)?);
+                check_env_var_name("TORCL-EXT:UNSETENV", &name)?;
+                // SAFETY: as TORCL-EXT:SETENV above.
+                unsafe { std::env::remove_var(&name) };
+                return Ok(NIL);
             }
             "TORCL-EXT:%BUILD-FINGERPRINT" => {
                 // A short hex tag that changes iff the running torcl binary

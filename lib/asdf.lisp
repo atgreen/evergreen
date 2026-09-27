@@ -2157,7 +2157,8 @@ use getenvp to return NIL in such a case."
          #+lispworks `(setf (lispworks:environment-variable ,x) ,val)
          #+mkcl `(mkcl:setenv ,x ,val)
          #+sbcl `(progn (require :sb-posix) (symbol-call :sb-posix :setenv ,x ,val 1))
-         #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl)
+         #+torcl `(torcl-ext:setenv ,x ,val)
+         #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
          '(not-implemented-error '(setf getenv))
          ;; VAL is NIL, unset the variable
          #+allegro `(symbol-call :excl.osi :unsetenv ,x)
@@ -2169,7 +2170,8 @@ use getenvp to return NIL in such a case."
          #+lispworks `(setf (lispworks:environment-variable ,x) ,val) ; according to their docs, this should unset the variable
          #+mkcl `(mkcl:setenv ,x ,val) ; like other ECL-family implementations, don't see UNSETENV
          #+sbcl `(progn (require :sb-posix) (symbol-call :sb-posix :unsetenv ,x))
-         #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl)
+         #+torcl `(torcl-ext:unsetenv ,x)
+         #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
          '(not-implemented-error 'unsetenv))
         `(if ,val
              #+allegro (setf (sys:getenv ,x) ,val)
@@ -2181,7 +2183,8 @@ use getenvp to return NIL in such a case."
              #+lispworks (setf (lispworks:environment-variable ,x) ,val)
              #+mkcl (mkcl:setenv ,x ,val)
              #+sbcl (progn (require :sb-posix) (symbol-call :sb-posix :setenv ,x ,val 1))
-             #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl)
+             #+torcl (torcl-ext:setenv ,x ,val)
+             #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
              '(not-implemented-error '(setf getenv))
              ;; VAL is NIL, unset the variable
              #+allegro (symbol-call :excl.osi :unsetenv ,x)
@@ -2193,7 +2196,8 @@ use getenvp to return NIL in such a case."
              #+lispworks (setf (lispworks:environment-variable ,x) ,val) ; according to their docs, this should unset the variable
              #+mkcl (mkcl:setenv ,x ,val) ; like other ECL-family implementations, don't see UNSETENV
              #+sbcl (progn (require :sb-posix) (symbol-call :sb-posix :unsetenv ,x))
-             #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl)
+             #+torcl (torcl-ext:unsetenv ,x)
+             #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
              '(not-implemented-error 'unsetenv))))
 
   (defun getenvp (x)
