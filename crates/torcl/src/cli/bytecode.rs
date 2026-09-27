@@ -14846,6 +14846,39 @@ extern "C" fn c2i_set_native_sigsegv_recovery(enabled: u64) {
     torcl_rt::runtime::set_sigsegv_recovery_ips(recovery, recovery);
 }
 
+// T1's expression templates use rdi/rsi/rdx/rcx as temporary argument
+// registers on both platforms. Only this call boundary assigns the C ABI.
+#[cfg(windows)]
+fn emit_c2i_helper_call(c: &mut Asm) {
+    let toggle = c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
+    // The fixed T1 frame has 32 bytes of shadow space plus five saved words.
+    // None of these copies is used across an allocating call: the recovery
+    // toggle is a leaf; the real helper owns/root-traces its arguments.
+    c.extend_from_slice(&[0x48, 0x89, 0x7c, 0x24, 32]); // save rdi
+    c.extend_from_slice(&[0x48, 0x89, 0x74, 0x24, 40]); // save rsi
+    c.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 48]); // save rdx
+    c.extend_from_slice(&[0x48, 0x89, 0x4c, 0x24, 56]); // save rcx
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 64]); // save target
+    c.extend_from_slice(&[0x31, 0xc9]); // xor ecx,ecx
+    c.extend_from_slice(&[0x48, 0xb8]);
+    c.extend_from_slice(&toggle.to_le_bytes());
+    c.extend_from_slice(&[0xff, 0xd0]);
+    c.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 32]); // rcx = arg0
+    c.extend_from_slice(&[0x48, 0x8b, 0x54, 0x24, 40]); // rdx = arg1
+    c.extend_from_slice(&[0x4c, 0x8b, 0x44, 0x24, 48]); // r8 = arg2
+    c.extend_from_slice(&[0x4c, 0x8b, 0x4c, 0x24, 56]); // r9 = arg3
+    c.extend_from_slice(&[0x48, 0x8b, 0x44, 0x24, 64]); // rax = target
+    c.extend_from_slice(&[0xff, 0xd0]);
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 32]); // save result
+    c.extend_from_slice(&[0xb9, 1, 0, 0, 0]); // ecx = enabled
+    c.extend_from_slice(&[0x48, 0xb8]);
+    c.extend_from_slice(&toggle.to_le_bytes());
+    c.extend_from_slice(&[0xff, 0xd0]);
+    c.extend_from_slice(&[0x48, 0x8b, 0x44, 0x24, 32]);
+    emit_native_transfer_check(c);
+}
+
+#[cfg(not(windows))]
 fn emit_c2i_helper_call(c: &mut Asm) {
     let set_recovery = c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
 
@@ -14893,11 +14926,108 @@ extern "C" fn c2i_transfer_pending() -> u64 {
     NATIVE_ERROR.with(|error| u64::from(error.borrow().is_some()))
 }
 
+#[cfg(windows)]
+fn emit_native_transfer_check(c: &mut Asm) {
+    let resume = c.label();
+    // This leaf cannot GC; keep the tagged result outside its shadow space.
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 32]);
+    c.extend_from_slice(&[0x48, 0xb8]);
+    c.extend_from_slice(
+        &(c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64).to_le_bytes(),
+    );
+    c.extend_from_slice(&[0xff, 0xd0, 0x48, 0x85, 0xc0]); // call; test rax,rax
+    c.extend_from_slice(&[0x48, 0x8b, 0x44, 0x24, 32]); // restore without changing flags
+    c.jcc(Cc::E, resume);
+    emit_t1_epilogue(c);
+    c.bind(resume);
+}
+
+fn emit_t1_prologue(c: &mut Asm) {
+    #[cfg(windows)]
+    {
+        // Preserve every nonvolatile register used by the T1 templates.
+        // Six pushes plus 88 bytes align RSP and leave a 32-byte home area,
+        // five argument/target saves, and spare padding. RBP stays fixed even
+        // while a direct native call pushes frame-restoration words.
+        c.extend_from_slice(&[0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x41, 0x54]);
+        c.extend_from_slice(&[0x48, 0x83, 0xec, 88, 0x48, 0x89, 0xe5]);
+        c.extend_from_slice(&[0x49, 0x89, 0xce]); // r14 = rcx (slots)
+        c.extend_from_slice(&[0x49, 0x89, 0xd4]); // r12 = rdx (TorclStack)
+    }
+    #[cfg(not(windows))]
+    {
+        c.extend_from_slice(&[0x41, 0x56, 0x41, 0x57, 0x41, 0x54]);
+        c.extend_from_slice(&[0x49, 0x89, 0xfe]); // r14 = rdi
+        c.extend_from_slice(&[0x49, 0x89, 0xf4]); // r12 = rsi
+    }
+}
+
+fn emit_t1_epilogue(c: &mut Asm) {
+    #[cfg(windows)]
+    {
+        // A recognized Win64 epilogue; restore RSP from the fixed frame base.
+        c.extend_from_slice(&[0x48, 0x8d, 0x65, 88]); // lea rsp,[rbp+88]
+        c.extend_from_slice(&[0x41, 0x5c, 0x41, 0x5f, 0x41, 0x5e, 0x5f, 0x5e, 0x5d, 0xc3]);
+    }
+    #[cfg(not(windows))]
+    c.extend_from_slice(&[0x41, 0x5c, 0x41, 0x5f, 0x41, 0x5e, 0xc3]);
+}
+
+fn emit_t1_osr_jump(c: &mut Asm, target: Label) {
+    #[cfg(windows)]
+    {
+        // A plain JMP out of this runtime-function range is recognized as a
+        // tail-return epilogue by the Windows unwinder, although our frame is
+        // still live. An always-taken conditional branch is an interior
+        // transfer, so unwind metadata remains authoritative at this boundary.
+        // RAX and flags are scratch when importing an OSR activation.
+        c.extend_from_slice(&[0x31, 0xc0]); // xor eax,eax
+        c.jcc(Cc::E, target);
+    }
+    #[cfg(not(windows))]
+    c.jmp(target);
+}
+
+fn install_t1_code(code: &[u8], osr_entries: &[(u32, usize)]) -> Option<torcl_rt::jit::JitBuffer> {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        use torcl_rt::jit::{JitBuffer, WindowsUnwindInfo};
+        // emit_t1_prologue: RBP frame, 88-byte allocation, six saved GPRs.
+        let unwind = [
+            1, 16, 8, 5, 16, 3, 13, 0xa2, 9, 0xc0, 7, 0xf0, 5, 0xe0, 3, 0x70, 2, 0x60, 1, 0x50,
+        ];
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(osr_entries.iter().map(|&(_, offset)| offset))
+            .chain(std::iter::once(code.len()))
+            .collect();
+        let ranges: Option<Vec<_>> = starts
+            .windows(2)
+            .map(|pair| {
+                Some(WindowsUnwindInfo {
+                    begin: u32::try_from(pair[0]).ok()?,
+                    end: u32::try_from(pair[1]).ok()?,
+                    unwind_info: &unwind,
+                })
+            })
+            .collect();
+        // SAFETY: every entry runs the same fixed prologue; the common body
+        // preserves RBP and exits through emit_t1_epilogue. Dynamic direct-call
+        // stack saves remain below RBP and do not affect unwind restoration.
+        unsafe { JitBuffer::new_with_windows_unwind_ranges(code, &ranges?) }
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        let _ = osr_entries;
+        torcl_rt::jit::JitBuffer::new(code)
+    }
+}
+
 /// Stop T1 at the call that initiated an error/THROW/RETURN-FROM. Returning a
 /// placeholder NIL and running the rest of the body first is not equivalent:
 /// later side effects (including ASDF dependency traversal) must never happen.
 /// T1 declines local unwind handlers, so run_native/OSR owns delivery of the
 /// pending transfer; leave through the ordinary three-register epilogue.
+#[cfg(not(windows))]
 fn emit_native_transfer_check(c: &mut Asm) {
     let resume = c.label();
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
@@ -14911,7 +15041,7 @@ fn emit_native_transfer_check(c: &mut Asm) {
     c.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp] (preserve flags)
     c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp+16]
     c.jcc(Cc::E, resume);
-    c.extend_from_slice(&[0x41, 0x5C, 0x41, 0x5F, 0x41, 0x5E, 0xC3]);
+    emit_t1_epilogue(c);
     c.bind(resume);
 }
 
@@ -17840,7 +17970,7 @@ fn resume_inlined_in_t0(
 /// TorclStack bounds guard caps direct recursion before the C stack fills.
 /// Errors propagate through the enclosing `run_native`'s `NATIVE_ERROR`; the
 /// emit-time `has_deopt` gate excludes callees that could resume T0 mid-call.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn emit_direct_native_call(
     c: &mut Asm,
     entry: u64,
@@ -17866,6 +17996,7 @@ fn emit_direct_native_call(
     const RAX: u8 = 0;
     const RCX: u8 = 1;
     const RDX: u8 = 2;
+    #[cfg(not(windows))]
     const RDI: u8 = 7;
     const R10: u8 = 10;
     const R11: u8 = 11;
@@ -17973,10 +18104,22 @@ fn emit_direct_native_call(
     c.extend_from_slice(&[0x41, 0x52]); // push r10 (old_fp)
     c.push(0x52); // push rdx (old_sp)
     // rdi = callee slots, rsi = r12 (stack); CALL entry directly
-    mem(c, 0x8D, RDI, RAX, hdr); // lea rdi, [rax + hdr]
-    c.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    #[cfg(not(windows))]
+    {
+        mem(c, 0x8D, RDI, RAX, hdr); // lea rdi, [rax + hdr]
+        c.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    }
+    #[cfg(windows)]
+    {
+        mem(c, 0x8D, RCX, RAX, hdr); // rcx = slots
+        c.extend_from_slice(&[0x4C, 0x89, 0xE2]); // rdx = stack
+        // The two saved frame pointers must stay above the callee's home area.
+        c.extend_from_slice(&[0x48, 0x83, 0xEC, 32]);
+    }
     mov_imm64(c, RAX, entry);
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax   (result in rax)
+    #[cfg(windows)]
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 32]);
     // pop the callee frame: restore fp/sp_offset
     c.push(0x59); // pop rcx (old_sp)
     c.extend_from_slice(&[0x41, 0x5A]); // pop r10 (old_fp)
@@ -18000,7 +18143,7 @@ fn emit_direct_native_call(
 /// to the interpreter through the c2i adapter — so a T1 function's arithmetic,
 /// calls, and conditionals produce results identical to pure interpretation,
 /// while the dispatch/operand-stack plumbing runs as native code (nmq.2).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 /// Emit native x86-64 for `bf`. `allow_speculation` enables the speculative
 /// fixnum fast paths, whose guards deoptimize via state-transfer: they
 /// PEEK-guard-commit and record `(bcp, depth)` so a failure resumes T0 at the
@@ -18174,11 +18317,7 @@ fn emit_native_x86(
     // receive the frame-slots pointer in rdi (SysV) and must set up r14/r15 and
     // 16-align rsp identically, so the one Return epilogue balances either.
     let emit_prologue = |c: &mut Asm| {
-        c.extend_from_slice(&[0x41, 0x56]); // push r14
-        c.extend_from_slice(&[0x41, 0x57]); // push r15
-        c.extend_from_slice(&[0x41, 0x54]); // push r12 (reserved: *mut TorclStack; 3 pushes keep rsp 16-aligned)
-        c.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi (frame slots)
-        c.extend_from_slice(&[0x49, 0x89, 0xF4]); // mov r12, rsi (TorclStack ptr; bliss-zhvn)
+        emit_t1_prologue(c);
         c.extend_from_slice(&[0x4D, 0x8D, 0xBE]); // lea r15, [r14 + 8*n_locals]
         c.extend_from_slice(&(8 * n_locals).to_le_bytes());
     };
@@ -18815,8 +18954,7 @@ fn emit_native_x86(
                     // used.
                     c.extend_from_slice(&[0x49, 0x8B, 0x86]);
                     c.extend_from_slice(&(8 * n_locals).to_le_bytes());
-                    c.extend_from_slice(&[0x41, 0x5C]); // pop r12 (bliss-zhvn)
-                    c.extend_from_slice(&[0x41, 0x5F, 0x41, 0x5E, 0xC3]);
+                    emit_t1_epilogue(&mut c);
                     c.bind(keep);
                 }
                 c.jmp(*bcp_labels.get(*target_bcp as usize)?);
@@ -18842,10 +18980,7 @@ fn emit_native_x86(
             }
             Instr::Return => {
                 pop_into(&mut c, 0, false); // rax = result
-                c.extend_from_slice(&[0x41, 0x5C]); // pop r12 (bliss-zhvn)
-                c.extend_from_slice(&[0x41, 0x5F]); // pop r15
-                c.extend_from_slice(&[0x41, 0x5E]); // pop r14
-                c.extend_from_slice(&[0xC3]); // ret
+                emit_t1_epilogue(&mut c);
             }
             // NamedTag only publishes a tag on the shared control-token stack
             // so a *non-local* GO (from a nested closure) can reach it. Local
@@ -18929,10 +19064,7 @@ fn emit_native_x86(
         c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_deopt_state)
         c.extend_from_slice(&deopt_state_addr.to_le_bytes());
         emit_c2i_helper_call(&mut c);
-        c.extend_from_slice(&[0x41, 0x5C]); // pop r12 (bliss-zhvn)
-        c.extend_from_slice(&[0x41, 0x5F]); // pop r15
-        c.extend_from_slice(&[0x41, 0x5E]); // pop r14
-        c.extend_from_slice(&[0xC3]); // ret
+        emit_t1_epilogue(&mut c);
 
         // One stub per distinct bcp: bind its label (the guards' `jcc`s already
         // point here) then `mov edi, bcp ; jmp tail`. finish() resolves the jmp.
@@ -18956,7 +19088,7 @@ fn emit_native_x86(
         let target = *bcp_labels.get(header as usize)?;
         let stub_off = c.here();
         emit_prologue(&mut c);
-        c.jmp(target);
+        emit_t1_osr_jump(&mut c, target);
         osr_entries.push((header, stub_off));
     }
     // Bytecode→native position map for the viewer (bliss-zmmb): each bcp's label
@@ -19170,7 +19302,7 @@ fn is_inlinable_eq(sym: u32) -> bool {
     torcl_rt::symbols::symbol_name(sym).as_deref() == Some("EQ")
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 fn emit_native_x86(
     _bf: &BytecodeFunction,
     _allow_speculation: bool,
@@ -19225,16 +19357,16 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // top-level calls (the OSR path below still traps to compile their loops).
     let NativeEmission {
         code,
+        osr_entries,
         bcp_offsets,
         has_deopt,
         direct_calls,
-        ..
     } = emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
     let code_info = install_stack_map(num_slots)?;
-    let buf = torcl_rt::jit::JitBuffer::new(&code)?;
+    let buf = install_t1_code(&code, &osr_entries)?;
     let entry = buf.leak();
     // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
     // (bliss-jtc.10) — the same mechanism HotSpot uses for its JIT code.
@@ -19308,6 +19440,11 @@ macro_rules! t2_log {
 }
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
+    // The framed T2 emitter still uses SysV calls and lacks Win64 unwind data.
+    // T1 becoming available must not publish that code on Windows.
+    if cfg!(windows) {
+        return None;
+    }
     let sym = input.sym;
     let bf = input.body.as_ref();
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
@@ -19754,7 +19891,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     }
     let num_slots = bf.num_slots();
     let code_info = install_stack_map(num_slots)?;
-    let buf = torcl_rt::jit::JitBuffer::new(&code)?;
+    let buf = install_t1_code(&code, &osr)?;
     let entry = buf.leak();
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
@@ -20297,6 +20434,125 @@ fn symbol_index_of(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod direct_call_invalidation_tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", windows))]
+    #[test]
+    fn windows_t1_frame_restores_nonvolatile_state_at_all_boundaries() {
+        use windows_sys::Win32::System::Diagnostics::Debug::*;
+        let mut asm = Asm::new();
+        let body = asm.label();
+        emit_t1_prologue(&mut asm);
+        asm.bind(body);
+        asm.extend_from_slice(&[0x48, 0xb8]);
+        asm.extend_from_slice(&42u64.to_le_bytes());
+        // Same temporary stack layout as the direct-call path: two saved
+        // frame words followed by the callee's 32-byte home area.
+        asm.extend_from_slice(&[0x41, 0x52, 0x52, 0x48, 0x83, 0xec, 32, 0x90]);
+        asm.extend_from_slice(&[0x48, 0x83, 0xc4, 32, 0x5a, 0x41, 0x5a]);
+        emit_t1_epilogue(&mut asm);
+        let osr = asm.here();
+        emit_t1_prologue(&mut asm);
+        emit_t1_osr_jump(&mut asm, body);
+        let bytes = asm.finish().unwrap();
+        let code = install_t1_code(&bytes, &[(0, osr)]).unwrap();
+        let address = code.as_ptr() as u64;
+        unsafe {
+            let f: extern "C" fn(*mut u64, *const u8) -> u64 = std::mem::transmute(code.as_ptr());
+            assert_eq!(f(std::ptr::null_mut(), std::ptr::null()), 42);
+            let f: extern "C" fn(*mut u64, *const u8) -> u64 =
+                std::mem::transmute(code.as_ptr().add(osr));
+            assert_eq!(f(std::ptr::null_mut(), std::ptr::null()), 42);
+            // Shadow/scratch words, then r12/r15/r14/rdi/rsi/rbp and return IP.
+            let mut stack = [0u64; 25];
+            stack[17..24].copy_from_slice(&[12, 15, 14, 7, 6, 5, 0x1234_5678]);
+            let bottom = stack.as_ptr().add(6) as u64;
+            let normal = [
+                (0, 17),
+                (1, 16),
+                (2, 15),
+                (3, 14),
+                (5, 13),
+                (7, 12),
+                (9, 11),
+                (13, 0),
+                (16, 0),
+                (19, 0),
+                (22, 0),
+                (32, 0),
+                (34, -1),
+                (35, -2),
+                (39, -6),
+                (40, -6),
+                (44, -2),
+                (45, -1),
+                (47, 0),
+                (51, 11),
+                (53, 12),
+                (55, 13),
+                (57, 14),
+                (58, 15),
+                (59, 16),
+                (60, 17),
+            ];
+            let alternate = normal[..11]
+                .iter()
+                .map(|&(offset, rsp)| (offset + osr as u64, rsp))
+                .chain(std::iter::once((osr as u64 + 24, 0)));
+            for (offset, rsp_slot) in normal.into_iter().chain(alternate) {
+                let local = if offset >= osr as u64 {
+                    offset - osr as u64
+                } else {
+                    offset
+                };
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = address + offset;
+                context.Rsp = bottom.wrapping_add_signed(rsp_slot * 8);
+                context.Rbp = if (16..60).contains(&local) { bottom } else { 5 };
+                context.R12 = 12;
+                context.R14 = 14;
+                context.R15 = 15;
+                context.Rdi = 7;
+                context.Rsi = 6;
+                // Model body register clobbers before the corresponding pop.
+                if (22..53).contains(&local) {
+                    context.R12 = 0xdead;
+                }
+                if (19..57).contains(&local) {
+                    context.R14 = 0xbeef;
+                }
+                let mut base = 0;
+                let entry = RtlLookupFunctionEntry(context.Rip, &mut base, std::ptr::null_mut());
+                assert!(!entry.is_null());
+                let mut data = std::ptr::null_mut();
+                let mut establisher = 0;
+                RtlVirtualUnwind(
+                    0,
+                    base,
+                    context.Rip,
+                    entry,
+                    &mut context,
+                    &mut data,
+                    &mut establisher,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(
+                    (context.Rip, context.Rsp),
+                    (stack[23], bottom + 18 * 8),
+                    "offset {offset}"
+                );
+                assert_eq!(
+                    (context.Rbp, context.Rsi, context.Rdi),
+                    (5, 6, 7),
+                    "offset {offset}"
+                );
+                assert_eq!(
+                    (context.R12, context.R14, context.R15),
+                    (12, 14, 15),
+                    "offset {offset}"
+                );
+            }
+        }
+    }
 
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
@@ -20921,6 +21177,7 @@ mod jtc4_stack_map_tests {
         );
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_sigsegv_recovery_epilogue_returns_to_run_native_boundary() {
         let _lock = super::super::heap_test_lock()
