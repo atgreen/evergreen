@@ -27,7 +27,8 @@ trap cleanup EXIT
 export WINEDEBUG=-all
 scripts/torcl-limited.sh wineboot -u
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine
-scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test windows_os
+scripts/torcl-limited.sh cargo test --locked -p torcl-rt --target "$target" --test windows_os --test test_jit
+scripts/torcl-limited.sh cargo test --locked -p torcl-compiler --target "$target" --lib declines_sysv_code_on_windows
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --lib windows_image_tests
 scripts/torcl-limited.sh cargo test --locked -p torcl-stdlib --target "$target" --test test_tcp_streams --test test_process -- --test-threads=1
 child="${CARGO_TARGET_DIR:-target}/$target/release/windows-process-child.exe"

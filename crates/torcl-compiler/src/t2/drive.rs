@@ -61,6 +61,11 @@ impl CompiledT2 {
 /// Compile `bf` to executable T2 native code. With `opt`, runs a small mid-end
 /// pass pipeline (fold → GVN → DCE) before lowering; the result is re-verified.
 pub fn compile(bf: &BytecodeFunction, opt: bool) -> Result<CompiledT2, CompileError> {
+    // Executable memory is available on Windows, but this standalone emitter
+    // still uses SysV registers and frames. Decline until its Win64 ABI port.
+    if cfg!(windows) {
+        return Err(CompileError::Jit);
+    }
     // Front: bytecode → SSA, verified.
     let mut f = build_from_bytecode(bf).map_err(CompileError::Build)?;
     verify(&f).map_err(CompileError::Verify)?;
@@ -121,6 +126,22 @@ mod tests {
             min_args: arity,
             max_args: Some(arity),
             variadic: false,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn declines_sysv_code_on_windows() {
+        let bf = bytecode_fn(
+            "answer",
+            vec![Instr::Const(0), Instr::Return],
+            vec![TorclVal::from_fixnum(42)],
+            0,
+            1,
+            0,
+        );
+        for opt in [false, true] {
+            assert!(matches!(compile(&bf, opt), Err(CompileError::Jit)));
         }
     }
 

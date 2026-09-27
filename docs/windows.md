@@ -9,6 +9,10 @@ recovery are not supported yet. Forcing T2 safely
 falls back to bytecode. DLL loading and symbol lookup are available; global
 Unix-style symbol lookup requires choosing a DLL explicitly on Windows.
 
+The runtime can allocate generated code with write-then-execute protection and
+register Win64 unwind metadata for its lifetime. This is groundwork for the
+native ABI port; it does not enable Lisp native compilation yet.
+
 ## Build on Linux
 
 Install Rust via rustup and the x86-64 MinGW GCC toolchain, then run:
@@ -86,7 +90,9 @@ scripts/windows-port.sh test
 This builds the release executable and creates a temporary, isolated Wine
 prefix. It runs Windows memory/protection, timing/thread, DLL-lifetime and stack
 budget tests, then the CLI functional tests in interpreter, bytecode, default,
-and forced-T2 fallback modes. Additional checks cover `USERPROFILE` without
+and forced-T2 fallback modes. Runtime tests also execute small Win64 functions,
+check read/execute protection and release, and exercise the OS unwinder at
+generated prologue/epilogue boundaries. Additional checks cover `USERPROFILE` without
 `HOME`, catchable recursive stack exhaustion, moving-GC stress with poison,
 TCP connect/accept, buffering, timeouts, EOF, immediate close, split UTF-8
 nonblocking reads, subprocess quoting and concurrent output pipes,
