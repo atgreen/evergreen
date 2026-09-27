@@ -270,6 +270,12 @@ pub fn uxth(d: Reg, n: Reg) -> u32 {
 // ---------------------------------------------------------------------------
 // Add and subtract
 
+/// Register 31 is **XZR** in the shifted-register forms below, not the stack
+/// pointer — `add(d, SP, m)` silently computes `0 + m`. Only the add/sub
+/// *immediate* forms read 31 as SP, which is why [`add_imm`]/[`sub_imm`] are the
+/// way to do stack arithmetic and [`mov_from_sp`]/[`mov_to_sp`] exist at all. The
+/// load/store forms also read 31 as SP, so `[sp, #off]` and `[sp, xm, lsl #3]`
+/// both work.
 fn addsub_reg(base: u32, d: Reg, n: Reg, m: Reg, shift: Shift) -> u32 {
     base | shift.bits() | ((m as u32) << 16) | ((n as u32) << 5) | d as u32
 }
@@ -309,6 +315,17 @@ pub fn subs_w(d: Reg, n: Reg, m: Reg) -> u32 {
 /// exceed, which matters for counters whose threshold is an arbitrary `u32`.
 pub fn cmp_w(n: Reg, m: Reg) -> u32 {
     subs_w(XZR, n, m)
+}
+
+/// `SUBS Xd, Xn, Xm, <shift>` — flag-setting subtract of a shifted operand.
+pub fn subs_shifted(d: Reg, n: Reg, m: Reg, shift: Shift) -> u32 {
+    addsub_reg(0xEB00_0000, d, n, m, shift)
+}
+
+/// `CMP Xn, Xm, <shift>` — compare against a shifted operand, which is what an
+/// "is the high half just the low half's sign?" overflow test needs.
+pub fn cmp_shifted(n: Reg, m: Reg, shift: Shift) -> u32 {
+    subs_shifted(XZR, n, m, shift)
 }
 
 /// `CMP Xn, Xm` — `SUBS` discarding the result.
@@ -367,6 +384,16 @@ pub fn cmp_imm(n: Reg, value: u64) -> Option<u32> {
 
 // ---------------------------------------------------------------------------
 // Multiply
+
+/// `SMULH Xd, Xn, Xm` — the high 64 bits of the signed 128-bit product.
+///
+/// This is how a fixnum multiply detects overflow: compare the high half against
+/// the low half's sign extension (`cmp_shifted(hi, lo, Shift::Asr(63))`) and
+/// deopt when they disagree. AArch64 has no flag-setting multiply, so unlike
+/// `ADDS`/`SUBS` there is nothing for a `Cc::O` branch to read.
+pub fn smulh(d: Reg, n: Reg, m: Reg) -> u32 {
+    0x9B40_7C00 | ((m as u32) << 16) | ((n as u32) << 5) | d as u32
+}
 
 /// `MADD Xd, Xn, Xm, Xa` — `Xd = Xa + Xn * Xm`.
 pub fn madd(d: Reg, n: Reg, m: Reg, a: Reg) -> u32 {
@@ -467,6 +494,11 @@ pub fn ldr_pre(t: Reg, n: Reg, offset: i32) -> Option<u32> {
 /// a stack-slot or vector element access.
 pub fn ldr_indexed(t: Reg, n: Reg, m: Reg) -> u32 {
     0xF860_7800 | ((m as u32) << 16) | ((n as u32) << 5) | t as u32
+}
+
+/// `STR Xt, [Xn, Xm, LSL #3]` — the store counterpart of [`ldr_indexed`].
+pub fn str_indexed(t: Reg, n: Reg, m: Reg) -> u32 {
+    0xF820_7800 | ((m as u32) << 16) | ((n as u32) << 5) | t as u32
 }
 
 fn pair(base: u32, t1: Reg, t2: Reg, n: Reg, offset: i32) -> Option<u32> {
@@ -663,6 +695,44 @@ pub fn fsqrt(d: Fpr, n: Fpr) -> u32 {
     0x1E61_C000 | ((n as u32) << 5) | d as u32
 }
 
+/// `FMOV Sd, Wn` — move a 32-bit pattern into a float register. A tagged TorCL
+/// single-float carries its f32 bits in the high half of the word, so unboxing is
+/// a shift and then this, not a load.
+pub fn fmov_from_gpr_single(d: Fpr, n: Reg) -> u32 {
+    0x1E27_0000 | ((n as u32) << 5) | d as u32
+}
+
+/// `FMOV Wd, Sn` — move the 32-bit pattern back out.
+pub fn fmov_to_gpr_single(d: Reg, n: Fpr) -> u32 {
+    0x1E26_0000 | ((n as u32) << 5) | d as u32
+}
+
+/// `FADD Sd, Sn, Sm`. The single-precision forms are the double-precision
+/// encodings with the type field cleared.
+pub fn fadd_single(d: Fpr, n: Fpr, m: Fpr) -> u32 {
+    float_arith(0x1E20_2800, d, n, m)
+}
+
+/// `FSUB Sd, Sn, Sm`.
+pub fn fsub_single(d: Fpr, n: Fpr, m: Fpr) -> u32 {
+    float_arith(0x1E20_3800, d, n, m)
+}
+
+/// `FMUL Sd, Sn, Sm`.
+pub fn fmul_single(d: Fpr, n: Fpr, m: Fpr) -> u32 {
+    float_arith(0x1E20_0800, d, n, m)
+}
+
+/// `FDIV Sd, Sn, Sm`.
+pub fn fdiv_single(d: Fpr, n: Fpr, m: Fpr) -> u32 {
+    float_arith(0x1E20_1800, d, n, m)
+}
+
+/// `FCMP Sn, Sm`.
+pub fn fcmp_single(n: Fpr, m: Fpr) -> u32 {
+    0x1E21_2000 | ((m as u32) << 16) | ((n as u32) << 5)
+}
+
 /// `FCMP Dn, Dm` — sets the flags, so `Cc` branches follow. Note that an
 /// unordered compare sets C and V, so the signed conditions do not mean what
 /// they mean after an integer compare.
@@ -746,6 +816,12 @@ mod tests {
             ),
             ("mul x1, x2, x3", 0x9B037C41, mul(1, 2, 3)),
             ("madd x1, x2, x3, x4", 0x9B031041, madd(1, 2, 3, 4)),
+            ("smulh x5, x4, x3", 0x9B437C85, smulh(5, 4, 3)),
+            (
+                "cmp x5, x2, asr #63",
+                0xEB82FCBF,
+                cmp_shifted(5, 2, Shift::Asr(63)),
+            ),
         ]);
     }
 
@@ -880,6 +956,21 @@ mod tests {
                 ldr_post(1, SP, 16).unwrap(),
             ),
             ("ldr x1, [x2, x3, lsl #3]", 0xF8637841, ldr_indexed(1, 2, 3)),
+            ("str x1, [x2, x3, lsl #3]", 0xF8237841, str_indexed(1, 2, 3)),
+            // Register 31 reads as SP in the load/store and add/sub-immediate
+            // forms, and as XZR in the shifted-register ones.
+            (
+                "ldr x1, [sp, x3, lsl #3]",
+                0xF8637BE1,
+                ldr_indexed(1, SP, 3),
+            ),
+            ("str x1, [sp, #8]", 0xF90007E1, str_imm(1, SP, 8).unwrap()),
+            ("add x2, sp, #16", 0x910043E2, add_imm(2, SP, 16).unwrap()),
+            (
+                "sub sp, sp, #128",
+                0xD10203FF,
+                sub_imm(SP, SP, 128).unwrap(),
+            ),
             (
                 "stp x29, x30, [sp, #-16]!",
                 0xA9BF7BFD,
@@ -968,6 +1059,13 @@ mod tests {
             ("fcmp d2, d3", 0x1E632040, fcmp(2, 3)),
             ("scvtf d1, x2", 0x9E620041, scvtf(1, 2)),
             ("fcvtzs x1, d2", 0x9E780041, fcvtzs(1, 2)),
+            ("fmov s0, w2", 0x1E270040, fmov_from_gpr_single(0, 2)),
+            ("fmov w2, s0", 0x1E260002, fmov_to_gpr_single(2, 0)),
+            ("fadd s0, s0, s1", 0x1E212800, fadd_single(0, 0, 1)),
+            ("fsub s0, s0, s1", 0x1E213800, fsub_single(0, 0, 1)),
+            ("fmul s0, s0, s1", 0x1E210800, fmul_single(0, 0, 1)),
+            ("fdiv s0, s0, s1", 0x1E211800, fdiv_single(0, 0, 1)),
+            ("fcmp s0, s1", 0x1E212000, fcmp_single(0, 1)),
         ]);
     }
 

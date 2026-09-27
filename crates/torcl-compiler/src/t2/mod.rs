@@ -50,6 +50,7 @@ pub mod speculate; // profile-guided single-type speculative lowering // P6 — 
 // ── Machine-code emission + pipeline driver ───────────────────────
 pub mod drive; // bytecode → executable T2 code (the tiering primitive)
 pub mod emit; // MachFunc → executable x86-64 bytes (spec §4.7)
+pub mod emit_a64;
 pub mod emit_s390x;
 
 // ── Wave 3 parcels ────────────────────────────────────────────────
