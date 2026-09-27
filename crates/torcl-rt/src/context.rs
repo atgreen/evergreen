@@ -90,8 +90,9 @@ pub fn make(stack: &mut [u8], entry: extern "C" fn()) -> Context {
 }
 
 // ── Non-x86_64 / non-unix stub ───────────────────────────────────────────────
-// Other targets keep the previous behaviour (fibers fall back to running inline
-// on the caller; see thread.rs). These stubs exist only so the module compiles.
+// Windows x86-64 uses owned OS fibers in thread/windows.rs instead of this
+// stack-pointer API. Other targets retain the inline fallback in thread.rs.
+// These stubs exist only so this module compiles on those targets.
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 pub unsafe fn swap(_from: *mut Context, _to: Context) {}
 

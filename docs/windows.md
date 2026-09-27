@@ -7,8 +7,8 @@ The port supports the interpreter, T0 bytecode, native T1 and optimizing T2
 compilation, and on-stack replacement (OSR) from T0 to T1 and T1 to T2.
 Native code preserves moving-GC roots, resumes bytecode at failed speculation
 guards, and supports direct native calls. Unsupported compilation shapes retain
-their lower tier. Fiber switching and structured-exception recovery are not
-supported yet. DLL loading and symbol lookup are available; global
+their lower tier. Structured-exception recovery is not supported yet.
+DLL loading and symbol lookup are available; global
 Unix-style symbol lookup requires choosing a DLL explicitly on Windows.
 
 Foreign calls and callbacks use generated Win64 adapters. They support
@@ -24,6 +24,12 @@ Generated adapters use write-then-execute protection, probe large stack frames,
 and retain registered Win64 unwind metadata for their lifetime. Native T1 and
 T2 functions register unwind ranges for their normal, compiled-register (T2),
 and OSR entries. T2 probes large spill frames and temporary deoptimization buffers.
+
+The runtime scheduler uses Windows-owned fiber stacks for suspension, carrier
+migration, and cooperative preemption. Mutex, condition-variable, semaphore,
+and timer waits release their carrier. Each fiber retains its registered GC
+root list while suspended and after migration. Windows descriptor-readiness
+integration and catchable native stack exhaustion remain unfinished.
 
 ## Build on Linux
 

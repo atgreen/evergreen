@@ -1,9 +1,13 @@
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+#[cfg(unix)]
+use torcl_rt::sync::{IoInterest, wait_fd};
 use torcl_rt::sync::{
-    IoInterest, PinnedBlockingAction, TorclCondVar, TorclMutex, TorclSemaphore, fiber_sleep,
-    set_pinned_blocking_action, wait_fd,
+    PinnedBlockingAction, TorclCondVar, TorclMutex, TorclSemaphore, fiber_sleep,
+    set_pinned_blocking_action,
 };
 use torcl_rt::thread::{FiberState, current_fiber, fiber_state, make_fiber};
 use torcl_rt::value::{T, TorclVal};
@@ -174,9 +178,12 @@ fn fiber_sleep_uses_deadline_service_and_releases_carrier() {
     assert_eq!(SLEEP_ORDER.load(Ordering::Acquire), 2);
 }
 
+#[cfg(unix)]
 static PIPE_READ: AtomicI32 = AtomicI32::new(-1);
+#[cfg(unix)]
 static PIPE_READY: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(unix)]
 fn fd_waiter() -> TorclVal {
     let ready = wait_fd(
         PIPE_READ.load(Ordering::Acquire),
@@ -188,6 +195,7 @@ fn fd_waiter() -> TorclVal {
     T
 }
 
+#[cfg(unix)]
 #[test]
 fn epoll_readiness_and_timeout_resume_waiting_fibers() {
     let _guard = serial_lock().lock().unwrap();
