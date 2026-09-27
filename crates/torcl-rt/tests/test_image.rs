@@ -11,6 +11,26 @@ fn lock() -> &'static Mutex<()> {
     L.get_or_init(|| Mutex::new(()))
 }
 
+/// A temp image path nobody else can be using. The paths here used to be fixed
+/// strings, which is fine for ONE cargo process and wrong for a machine running
+/// two checkouts: the roundtrip tests SAVE the heap to the path and LOAD it back,
+/// so a second session saving its own heap to the same name made the first load
+/// the wrong image and fail its contents assertions. The lock() above cannot help
+/// — it serializes tests inside one process, and this is a race BETWEEN processes
+/// (bliss-kqp7). crates/torcl-stdlib/tests/test_pathnames.rs already keys its
+/// temp paths this way.
+///
+/// Used for the must-NOT-exist paths too: another session's leftover at a fixed
+/// name would break those assertions just as surely.
+fn image_path(label: &str) -> String {
+    format!(
+        "{}/torcl-test-{}-{}.bimg",
+        std::env::temp_dir().display(),
+        label,
+        std::process::id()
+    )
+}
+
 #[test]
 fn arch_and_os_repr_values() {
     assert_eq!(Arch::X86_64 as u32, 1);
@@ -130,18 +150,19 @@ fn save_image_options_fields() {
 
 #[test]
 fn load_image_nonexistent_fails() {
-    assert!(load_image("/tmp/nonexistent_torcl_image.bimg").is_err());
+    assert!(load_image(&image_path("nonexistent")).is_err());
 }
 
 #[test]
 fn validate_image_header_nonexistent_fails() {
-    assert!(validate_image_header("/tmp/no_such_image.bimg").is_err());
+    assert!(validate_image_header(&image_path("no-such")).is_err());
 }
 
 #[test]
 fn validate_image_header_bad_magic_fails() {
     use std::io::Write;
-    let path = "/tmp/torcl_bad_magic_test.bimg";
+    let path = image_path("bad-magic");
+    let path = path.as_str();
     let mut f = std::fs::File::create(path).unwrap();
     f.write_all(&[0u8; 128]).unwrap();
     drop(f);
@@ -152,7 +173,8 @@ fn validate_image_header_bad_magic_fails() {
 #[test]
 fn save_image_returns_result() {
     let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
-    let path = "/tmp/torcl_test_save_image.bimg";
+    let path = image_path("save-image");
+    let path = path.as_str();
     let opts = SaveImageOptions {
         executable: false,
         compression: ImageCompression::None,
@@ -171,7 +193,8 @@ fn save_image_returns_result() {
 #[test]
 fn save_image_with_compression() {
     let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
-    let path = "/tmp/torcl_test_save_image_zstd.bimg";
+    let path = image_path("save-image-zstd");
+    let path = path.as_str();
     let opts = SaveImageOptions {
         executable: true,
         compression: ImageCompression::Zstd,
@@ -229,7 +252,8 @@ fn save_load_roundtrip_preserves_heap_objects() {
     gc::set_entry_continuation(entry_val);
 
     // Save the image.
-    let path = "/tmp/torcl_roundtrip_test.bimg";
+    let path = image_path("roundtrip");
+    let path = path.as_str();
     let opts = SaveImageOptions {
         executable: false,
         compression: ImageCompression::None,
@@ -312,7 +336,8 @@ fn save_load_roundtrip_with_compression() {
     let entry_val = torcl_rt::value::TorclVal::from_fixnum(99);
     gc::set_entry_continuation(entry_val);
 
-    let path = "/tmp/torcl_roundtrip_compressed_test.bimg";
+    let path = image_path("roundtrip-compressed");
+    let path = path.as_str();
     let opts = SaveImageOptions {
         executable: false,
         compression: ImageCompression::Zstd,
