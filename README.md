@@ -81,7 +81,7 @@ requests. AArch64 supports scalar foreign calls through AAPCS64. Foreign callbac
 fiber context switching remain unported there; ppc64le also lacks foreign calls.
 
 For in-process Java calls and Java interfaces implemented by Lisp functions,
-see the experimental [torcl-jvm package](lib/torcl-jvm/README.md). The initial
+see [Java integration in the manual](docs/manual/java.md). The current
 implementation uses a native x86-64 glibc build and a local JDK, with explicit
 reference ownership and checks for JVM startup, signals, callbacks, and shutdown.
 The primary `JAVA` API provides inferred calls, named bindings, Lisp callbacks

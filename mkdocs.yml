@@ -78,12 +78,13 @@ nav:
   - 4. Conditions and debugging: debugger.md
   - 5. Memory and garbage collection: memory.md
   - 6. Foreign function interface: foreign.md
-  - 7. Threads and synchronization: concurrency.md
-  - 8. Operating-system interface: user/reference/extensions.md
-  - 9. Profiling and efficiency:
+  - 7. Java integration: java.md
+  - 8. Threads and synchronization: concurrency.md
+  - 9. Operating-system interface: user/reference/extensions.md
+  - 10. Profiling and efficiency:
       - profiling.md
       - Measurement procedure: contributing/how-to/performance.md
-  - 10. Application delivery:
+  - 11. Application delivery:
       - user/explanation/images.md
       - Image dictionary: user/reference/images.md
       - Save an executable: user/how-to/save-executable.md

@@ -211,33 +211,7 @@ Implementation reference: [Public FFI wrappers](https://cave.moxielogic.com/atgr
 
 ## Java integration
 
-The experimental [torcl-jvm package](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/torcl-jvm/README.md)
-embeds HotSpot on native x86-64 glibc Linux. Loading the `torcl-jvm` ASDF system
-provides the primary `JAVA` package (`TORCL-JAVA`), plus the explicit descriptor
-API in `TORCL-JVM`.
-
-```lisp
-(java:with-scope ()
-  (let ((items (java:new "java.util.ArrayList")))
-    (java:call items "add" "hello")
-    (java:call items "add" 42)
-    (java:to-list items)))
-;; => ("hello" 42)
-```
-
-Start a JVM with `java:start-jvm` before making calls. `new`, `call`, and `static`
-resolve public overloads from argument types; an exact selector such as
-`'("remove" :int)` or an explicit `(java:as :long 42)` resolves ambiguities.
-`define-class` provides lazy aliases, and `define-call` creates ordinary Lisp
-functions. `java:lambda` implements a functional interface; `java:implement`
-defines named methods, including overloads. Java exceptions become Lisp conditions.
-
-`with-scope` releases newly created references on every exit, including
-intermediate results. Use `java:retain` to keep an independent reference beyond
-its scope, then `java:release` it. Retaining a callback also retains its Lisp
-closure. Each callback invocation has a separate scope. References created by
-the low-level `TORCL-JVM` API require explicit release or `with-java-objects`.
-
-The package guide covers JDK setup, conversions, callbacks, arrays and fields,
-resource ownership, signal chaining, and lifecycle constraints. Save images
-before loading the package; live JVM state cannot be included in an image.
+The [Java integration chapter](java.md) covers the in-process HotSpot JVM,
+the primary `JAVA` API, descriptor-based `TORCL-JVM` calls, Java interfaces
+implemented by Lisp callbacks, and reference ownership. Java calls use the
+checked JVM bridge rather than application-supplied JNI prototypes.
