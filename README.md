@@ -39,6 +39,10 @@ Build the CLI binary:
 cargo build -p torcl
 ```
 
+For native x86-64 Fedora RPMs with optional s390x Linux, AArch64 Linux,
+Windows, and Android image-dumping tools, see
+[container-free Fedora packaging](docs/fedora-rpm.md).
+
 For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
 [cross-compilation and QEMU validation](docs/cross-compilation.md). All three
 ports run the interpreter and T0 bytecode engine. Linux s390x (IBM Z) also
