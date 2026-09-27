@@ -56,7 +56,11 @@
   "Compile SOURCE, reporting the driver's own error text on failure."
   (let ((shader (gl "glCreateShader" kind))
         (strings (torcl-ffi:foreign-alloc 8)))
-    (torcl-ffi:mem-set (torcl-ffi:pointer-address (%c-string source)) strings :long 0)
+    ;; Store the pointer AS a pointer. Writing its address as :long asks for a
+    ;; signed 64-bit store, and Android's scudo allocator returns addresses with
+    ;; bit 63 set (0xB400_...), so a real device rejects it as out of range while
+    ;; an emulator — whose addresses are low — accepts it happily.
+    (torcl-ffi:mem-set (%c-string source) strings :pointer 0)
     (gl "glShaderSource" shader 1 strings (torcl-ffi:null-pointer))
     (gl "glCompileShader" shader)
     (let ((status (torcl-ffi:foreign-alloc 4)))
@@ -124,6 +128,8 @@ void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }
                       ("glUseProgram" :void (:int))
                       ("glGenBuffers" :void (:int :pointer))
                       ("glBindBuffer" :void (:int :int))
+                      ;; GLsizeiptr is signed, but every size we pass is small;
+                      ;; :long is correct here, unlike for an address.
                       ("glBufferData" :void (:int :long :pointer :int))
                       ("glGetAttribLocation" :int (:int :pointer))
                       ("glGetUniformLocation" :int (:int :pointer))

@@ -205,7 +205,12 @@ fn global_safepoint_page() -> &'static SafepointPage {
 
 /// A foreign call/callback transition serialized with GC participant snapshots.
 /// Fibers remain pinned while foreign frames are live, including nested entries.
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+// AArch64 needs this too now that it has a real FFI backend (spec §4.7.5.2):
+// the body is thread-state bookkeeping with nothing architecture-specific in it.
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 pub(crate) struct ForeignStateScope {
     thread: &'static crate::thread::NativeThread,
     previous: crate::thread::NativeThreadState,
@@ -213,7 +218,10 @@ pub(crate) struct ForeignStateScope {
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 impl ForeignStateScope {
     pub(crate) fn native() -> Self {
         Self::enter(
@@ -255,7 +263,10 @@ impl ForeignStateScope {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 fn transition_foreign_state(
     thread: &crate::thread::NativeThread,
     next: crate::thread::NativeThreadState,
@@ -287,7 +298,10 @@ fn transition_foreign_state(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 impl Drop for ForeignStateScope {
     fn drop(&mut self) {
         transition_foreign_state(self.thread, self.previous);
