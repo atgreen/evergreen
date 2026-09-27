@@ -47,6 +47,33 @@ impl Asm {
         self.rre(0x04, dst, src);
     }
 
+    pub fn compare(&mut self, lhs: u8, rhs: u8) {
+        self.rre(0x20, lhs, rhs);
+    }
+
+    pub fn add(&mut self, dst: u8, src: u8) {
+        self.rre(0x08, dst, src);
+    }
+
+    pub fn sub(&mut self, dst: u8, src: u8) {
+        self.rre(0x09, dst, src);
+    }
+
+    pub fn and(&mut self, dst: u8, src: u8) {
+        self.rre(0x80, dst, src);
+    }
+
+    pub fn shift_right_signed(&mut self, dst: u8, src: u8, bits: u8) {
+        assert!(dst < 16 && src < 16 && bits < 64);
+        self.code
+            .extend_from_slice(&[0xeb, dst << 4 | src, 0, bits, 0, 0x0a]);
+    }
+
+    pub fn address(&mut self, dst: u8, base: u8, disp: i32) {
+        assert!(dst < 16);
+        self.memory(0xe3, 0x71, dst << 4, base, disp);
+    }
+
     fn memory(&mut self, prefix: u8, opcode: u8, regs: u8, base: u8, disp: i32) {
         assert!(
             base > 0 && base < 16,
@@ -72,6 +99,16 @@ impl Asm {
     pub fn store(&mut self, src: u8, base: u8, disp: i32) {
         assert!(src < 16);
         self.memory(0xe3, 0x24, src << 4, base, disp);
+    }
+
+    pub fn load_u32(&mut self, dst: u8, base: u8, disp: i32) {
+        assert!(dst < 16);
+        self.memory(0xe3, 0x16, dst << 4, base, disp);
+    }
+
+    pub fn store_u32(&mut self, src: u8, base: u8, disp: i32) {
+        assert!(src < 16);
+        self.memory(0xe3, 0x50, src << 4, base, disp);
     }
 
     pub fn add_imm(&mut self, reg: u8, value: i16) {
@@ -178,6 +215,27 @@ mod tests {
                 0xb9, 0x04, 0x00, 0x82, 0xe3, 0x20, 0x9f, 0xf8, 0xff, 0x04, 0xe3, 0x20, 0x8f, 0xff,
                 0x7f, 0x24, 0xa7, 0x9b, 0xff, 0xf8, 0xc0, 0x28, 0x12, 0x34, 0x56, 0x78, 0xc0, 0x29,
                 0x9a, 0xbc, 0xde, 0xf0, 0x0d, 0xe1, 0x07, 0xfe,
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_and_addresses_match_llvm_systemz() {
+        let mut a = Asm::new();
+        a.compare(2, 3);
+        a.add(2, 3);
+        a.sub(2, 3);
+        a.and(4, 0);
+        a.shift_right_signed(3, 3, 3);
+        a.address(9, 8, 524280);
+        a.load_u32(2, 1, 0);
+        a.store_u32(2, 1, 0);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xb9, 0x20, 0, 0x23, 0xb9, 0x08, 0, 0x23, 0xb9, 0x09, 0, 0x23, 0xb9, 0x80, 0, 0x40,
+                0xeb, 0x33, 0, 3, 0, 0x0a, 0xe3, 0x90, 0x8f, 0xf8, 0x7f, 0x71, 0xe3, 0x20, 0x10, 0,
+                0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
             ]
         );
     }

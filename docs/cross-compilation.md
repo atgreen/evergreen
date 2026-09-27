@@ -10,9 +10,12 @@ TorCL's CLI can be built on x86-64 for these Linux targets:
 | Android AArch64 | `aarch64-linux-android` | `target-android/aarch64-linux-android/debug/torcl` |
 
 These are dynamically linked glibc executables, suitable for Fedora. They run
-the interpreter and T0 bytecode engine. Native T1/T2/OSR compilation, foreign
-calls/callbacks and fiber context switching are not yet ported; this is not a
-claim of full architecture parity. Library loading uses the system dynamic
+the interpreter and T0 bytecode engine. s390x also supports native T1 compilation
+and T0-to-T1 OSR, including guarded fixnum arithmetic and precise deoptimization.
+The s390x optimizing T2 backend remains in progress. AArch64 and POWER still
+use T0 for native-tier requests. Foreign calls/callbacks and fiber context
+switching are not yet ported; this is not a claim of full architecture parity.
+Library loading uses the system dynamic
 loader. Saved images have distinct architecture tags; do not move heap images
 between architectures.
 
@@ -57,7 +60,8 @@ containers also receive a memory cap. `TORCL_MEM_MAX` and `TORCL_TIMEOUT` retain
 their usual meanings.
 
 The CLI regression compares interpreter, bytecode, default tiering, and forced
-T2 (which falls back to bytecode on these targets) output. A focused raw-runtime
+T2 (which currently falls back to T1 on s390x and bytecode on the other targets)
+output. A focused raw-runtime
 program runs with and without GC stress/poison, comparing output byte-for-byte.
 It uses `--no-bootstrap` to avoid stressing prelude loading under emulation;
 every allocation in that run is stressed, with no allocation-skipping knob.
@@ -65,6 +69,15 @@ The tests cover arithmetic (including big integers and
 floats), specialized arrays, loops, collections, CLOS, conditions, streams, and
 a compiled-file and a heap-image round trip in fresh processes. These tests establish the initial
 CLI port, not native performance or full ANSI conformance.
+
+For s390x, `scripts/s390x-jit-smoke.py` additionally requires observable native
+T1 promotion and live OSR entry. It compares native and bytecode results for
+loops, calls with more than five arguments, allocations, multiple values,
+errors, and overflow deoptimization. Every-allocation GC stress with poisoning
+must produce identical output. The OSR cases also cover uncommon traps with
+active condition handlers. The runtime and CLI unit suites contain s390x
+instruction-encoding, ABI execution, native frame and deoptimization tests.
+Validation currently uses QEMU; native IBM Z hardware performance is unmeasured.
 
 Stack guards, safepoints and JIT mappings use the runtime kernel page size.
 QEMU user-mode validation on a 4 KiB host does not replace testing on a native

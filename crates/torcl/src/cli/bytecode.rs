@@ -52,6 +52,12 @@ use super::{
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use torcl_rt::asm::{Asm, Cc, Label};
 
+#[cfg(all(target_arch = "s390x", unix))]
+#[path = "bytecode_s390x.rs"]
+mod s390x;
+#[cfg(all(target_arch = "s390x", unix))]
+use s390x::emit_native;
+
 // ── Backend selection ──────────────────────────────────────────────
 
 /// Process-wide tier pin for differential testing (bliss-19tm).
@@ -14732,10 +14738,10 @@ fn unmatched_error(pending: Pending) -> TorclError {
 
 // ── T1 native code (codegen → execution, nmq.2) ────────────────────
 //
-// A hot bytecode function is compiled to native x86-64 by `emit_native_x86`,
+// A hot bytecode function is compiled for the host ISA by `emit_native`,
 // installed into executable memory (`torcl_rt::jit::JitBuffer`), and called via
 // an *i2c adapter* (`run_native`) that marshals the operand-stack arguments into
-// the SysV calling convention. Native code that calls a non-arithmetic function
+// the host C calling convention. Native code that calls a non-arithmetic function
 // crosses back through a *c2i adapter* (`c2i_call*`) into the interpreter. Both
 // frames stay on the one TorclStack (the interpreter still pushes D2.03 frames);
 // results are identical to pure interpretation (differential-verified).
@@ -17509,10 +17515,10 @@ fn run_native(
     let saved_stack_recovery = torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
     let native_recovery = native_sigsegv_recovery_ip();
     torcl_rt::runtime::set_sigsegv_recovery_ips(native_recovery, native_recovery);
-    // SAFETY: `entry` is installed executable code from emit_native_x86 with the
-    // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
-    // rsi = *mut TorclStack, stashed into the reserved r12 by the prologue
-    // (bliss-zhvn Stage 1). Unused by the body yet; foundation for direct calls.
+    // SAFETY: `entry` is installed executable code from emit_native with the
+    // host C signature fn(slots, stack) -> u64. On x86-64 the second argument
+    // arrives in rsi and is retained in r12 for direct native calls. On s390x
+    // slots arrives in r2; its emitter retains the address in r8.
     let f: extern "C" fn(*mut u64, *const u8) -> u64 = unsafe { std::mem::transmute(nc.entry) };
     let ret = {
         let _active = ActiveNativeCode::enter(nc);
@@ -18010,7 +18016,7 @@ fn emit_direct_native_call(
 /// target whose operand stack is empty), the byte offset of an alternate entry
 /// stub that sets up the
 /// activation registers and jumps straight to that header.
-fn emit_native_x86(
+fn emit_native(
     bf: &BytecodeFunction,
     allow_speculation: bool,
     sym: u32,
@@ -19170,8 +19176,8 @@ fn is_inlinable_eq(sym: u32) -> bool {
     torcl_rt::symbols::symbol_name(sym).as_deref() == Some("EQ")
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
-fn emit_native_x86(
+#[cfg(not(all(any(target_arch = "x86_64", target_arch = "s390x"), unix)))]
+fn emit_native(
     _bf: &BytecodeFunction,
     _allow_speculation: bool,
     _sym: u32,
@@ -19229,7 +19235,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         has_deopt,
         direct_calls,
         ..
-    } = emit_native_x86(&bf, allow_speculation, sym, backedge_counter, false)?;
+    } = emit_native(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -19308,6 +19314,11 @@ macro_rules! t2_log {
 }
 
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
+    // The current optimized emitter emits x86 instructions. A newly enabled
+    // baseline backend must never install those bytes on another ISA.
+    if !cfg!(all(target_arch = "x86_64", unix)) {
+        return None;
+    }
     let sym = input.sym;
     let bf = input.body.as_ref();
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
@@ -19736,9 +19747,9 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     // emit an uncommon-trap deopt to T0 instead of declining the whole function
     // — the loop runs native, cold code deopts (bliss-zqit). Gated (default off)
     // while env-var-native OSR is pending; see osr_traps_enabled.
-    let emitted = emit_native_x86(bf, true, u32::MAX, backedge_counter, osr_traps_enabled());
+    let emitted = emit_native(bf, true, u32::MAX, backedge_counter, osr_traps_enabled());
     if std::env::var_os("TORCL_OSR_DEBUG").is_some() && emitted.is_none() {
-        eprintln!("[osr] emit_native_x86 returned None (unsupported) for sym {sym}");
+        eprintln!("[osr] emit_native returned None (unsupported) for sym {sym}");
     }
     let NativeEmission {
         code,
@@ -19871,6 +19882,19 @@ fn maybe_osr(
             );
         }
         return None;
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        // GO has not unwound intervening handlers yet. Enter native code only
+        // when the destination tagbody is already the innermost live scope;
+        // otherwise T0 must first run cleanups and remove expired handlers.
+        let Instr::Go { tagbody_id, .. } = act.func.code.get(act.bcp.checked_sub(1)?)? else {
+            return None;
+        };
+        if !matches!(act.handlers.last(), Some(Handler::Tag { tagbody_id: active, .. }) if active == tagbody_id)
+        {
+            return None;
+        }
     }
     // Two hotness paths. A NAMED function counts its back-edges on its FnMeta and
     // OSRs at `osr_threshold`. An ANONYMOUS activation (a top-level form or gensym
@@ -20446,7 +20470,7 @@ mod direct_call_invalidation_tests {
         registry_remove(symbol);
     }
 
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "s390x"), unix))]
     #[test]
     fn selected_native_code_uses_its_original_environment_names() {
         let _lock = super::super::heap_test_lock()
@@ -20536,7 +20560,7 @@ mod direct_call_invalidation_tests {
         registry_remove(symbol);
     }
 
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "s390x"), unix))]
     #[test]
     fn selected_native_code_retains_its_original_bytecode_body() {
         let _lock = super::super::heap_test_lock()
@@ -20921,6 +20945,7 @@ mod jtc4_stack_map_tests {
         );
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_sigsegv_recovery_epilogue_returns_to_run_native_boundary() {
         let _lock = super::super::heap_test_lock()
@@ -20949,6 +20974,7 @@ mod jtc4_stack_map_tests {
         assert!(torcl_rt::runtime::check_sigsegv_null_guard());
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn run_native_rewrites_null_guard_sigsegv_to_type_error() {
         let _lock = super::super::heap_test_lock()
@@ -20994,6 +21020,7 @@ mod jtc4_stack_map_tests {
         ));
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn run_native_rewrites_stack_guard_sigsegv_to_stack_overflow() {
         let _lock = super::super::heap_test_lock()
