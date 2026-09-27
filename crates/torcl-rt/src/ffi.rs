@@ -603,10 +603,37 @@ mod elf_backend {
                 vec![ $( (stringify!($name), $name as *const ()) ),* ]
             }};
         }
-        host_syms![
-            malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp, strlen, strcmp,
-            strncmp, strcpy, strncpy, strncat, strcat, abort, abs, sqrt, qsort,
-        ]
+        // The handful of symbols the standard library itself relies on cannot be
+        // declared opaquely: since rustc 1.98 a declaration whose signature
+        // disagrees with the one std expects is a hard error ("invalid definition
+        // of the runtime `memcpy` symbol used by the standard library"), so the
+        // opaque `fn memcpy();` above broke the build outright (bliss-cice).
+        // Their real signatures go here; everything else stays opaque, because
+        // only the ADDRESS is ever used.
+        //
+        // The break hid from `cargo test --workspace`, which unifies features and
+        // so turns `c-ffi` on and cfg's this whole module out. Only a build that
+        // resolves features for this crate alone compiles it.
+        use core::ffi::c_void;
+        unsafe extern "C" {
+            fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+            fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+            fn memset(dest: *mut c_void, c: i32, n: usize) -> *mut c_void;
+            fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32;
+            fn strlen(s: *const i8) -> usize;
+        }
+        let mut syms = host_syms![
+            malloc, calloc, realloc, free, strcmp, strncmp, strcpy, strncpy, strncat, strcat,
+            abort, abs, sqrt, qsort,
+        ];
+        syms.extend_from_slice(&[
+            ("memcpy", memcpy as *const ()),
+            ("memmove", memmove as *const ()),
+            ("memset", memset as *const ()),
+            ("memcmp", memcmp as *const ()),
+            ("strlen", strlen as *const ()),
+        ]);
+        syms
     }
 
     /// Load a shared library by path with `elf_loader`, resolving its undefined
