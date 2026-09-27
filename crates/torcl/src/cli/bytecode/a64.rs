@@ -1,6 +1,6 @@
 //! T1 baseline code generation for AArch64.
 //!
-//! This is the sibling of `emit_native_x86`, not a rewrite of it. The two share
+//! This is the sibling of `emit_native`, not a rewrite of it. The two share
 //! everything that is not instruction selection: the entry ABI
 //! (`extern "C" fn(*mut u64, *const u8) -> u64`, the frame-slots pointer and the
 //! `TorclStack`), the `NativeEmission` output, `install_stack_map`,

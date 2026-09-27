@@ -289,14 +289,32 @@ impl<'f> Lowering<'f> {
         let mut deopt_uses: Vec<VReg> = Vec::new();
         if let Some(fsid) = frame_state {
             let fs = self.f.frame_states.get(fsid);
-            for scope in &fs.scopes {
-                for src in scope.locals.iter().chain(scope.stack.iter()) {
-                    if let crate::t2::frame_state::ValueSource::Value { value, .. } = src {
+            use crate::t2::frame_state::ValueSource;
+            let mut sources: Vec<_> = fs
+                .scopes
+                .iter()
+                .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+                .collect();
+            let mut visited = vec![false; fs.remat.len()];
+            while let Some(source) = sources.pop() {
+                match source {
+                    ValueSource::Value { value, .. } => {
                         let v = self.vreg(*value);
                         if !defs.contains(&v) && !deopt_uses.contains(&v) {
                             deopt_uses.push(v);
                         }
                     }
+                    ValueSource::Remat(id) => {
+                        // Recipe-only inputs must survive the guard too. Walk
+                        // shared recipes once, without recursive host calls.
+                        if let Some(seen) = visited.get_mut(id.0 as usize) {
+                            if !*seen {
+                                *seen = true;
+                                sources.extend(&fs.remat[id.0 as usize].inputs);
+                            }
+                        }
+                    }
+                    ValueSource::Const(_) | ValueSource::Unbound => {}
                 }
             }
         }
@@ -707,6 +725,65 @@ mod tests {
             IRType::of(TypeBits::DOUBLE_FLOAT),
             ValueRepresentation::UnboxedF64,
         )
+    }
+
+    #[test]
+    fn rematerialized_inputs_remain_deopt_live_at_the_guard() {
+        use crate::t2::frame_state::{
+            FrameScope, RematOp, RematRecipe, RematRecipeId, ValueSource,
+        };
+        let mut f = Function::new("recipe-liveness");
+        let block = f.entry();
+        let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let checked = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let source = |value| ValueSource::Value {
+            value,
+            repr: ValueRepresentation::Tagged,
+        };
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 1,
+                bcp: 9,
+                locals: vec![ValueSource::Remat(RematRecipeId(0))],
+                stack: vec![source(checked)],
+            }],
+            remat: vec![
+                RematRecipe {
+                    op: RematOp::FixnumAdd,
+                    inputs: vec![
+                        ValueSource::Remat(RematRecipeId(1)),
+                        ValueSource::Remat(RematRecipeId(1)),
+                    ],
+                    result_repr: ValueRepresentation::Tagged,
+                },
+                RematRecipe {
+                    op: RematOp::Const,
+                    inputs: vec![source(x)],
+                    result_repr: ValueRepresentation::Tagged,
+                },
+            ],
+        });
+        let mut guard = inst(
+            Opcode::Guard,
+            vec![checked],
+            AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+        );
+        guard.frame_state = Some(state);
+        let (guard, result) =
+            f.push_inst(block, guard, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+        f.set_terminator(block, inst(Opcode::Return, vec![result[0]], AuxData::None));
+        let machine = lower(&f);
+        let guard = machine
+            .insts
+            .iter()
+            .find(|i| i.source_inst == Some(guard))
+            .unwrap();
+        assert_eq!(
+            guard.deopt_uses.iter().filter(|v| v.num == x.0).count(),
+            1,
+            "shared nested recipe input must have one late use"
+        );
+        assert!(guard.deopt_uses.iter().any(|v| v.num == checked.0));
     }
 
     #[test]

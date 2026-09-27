@@ -2503,6 +2503,8 @@ pub fn emit_framed(
 /// A nonzero `c2i_transfer_pending_addr` is an `extern "C" fn() -> u64` that
 /// returns nonzero for a pending error/nonlocal exit. It must not allocate,
 /// safepoint, or call Lisp; results are saved on the native stack during it.
+/// `c2i_poll_addr` is the s390x back-edge safepoint callback (`fn() -> u64`):
+/// it may park for GC and returns nonzero when native execution must exit.
 // Public ABI hooks and activation layout are independent emission inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_with_activation_slots(
@@ -2517,9 +2519,26 @@ pub fn emit_framed_with_activation_slots(
     c2i_mv_addr: u64,
     c2i_recovery_toggle_addr: u64,
     c2i_transfer_pending_addr: u64,
+    c2i_poll_addr: u64,
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
+    if cfg!(target_arch = "s390x") {
+        return super::emit_s390x::emit_framed_with_runtime(
+            f,
+            c2i_deopt_t2_addr,
+            activation_slots,
+            super::emit_s390x::RuntimeCalls {
+                call_slice: c2i_call_slice_addr,
+                load_global: c2i_load_global_addr,
+                load_function: c2i_load_function_addr,
+                store_global: c2i_store_global_addr,
+                multiple_values: c2i_mv_addr,
+                transfer_pending: c2i_transfer_pending_addr,
+                poll: c2i_poll_addr,
+            },
+        );
+    }
     emit_framed_inner(
         f,
         c2i_deopt_addr,

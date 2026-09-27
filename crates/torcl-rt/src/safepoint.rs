@@ -246,7 +246,7 @@ impl ForeignStateScope {
             fiber.pin();
             (fiber, fiber.state())
         });
-        transition_foreign_state(thread, next);
+        transition_native_state(thread, next);
         if let Some((fiber, _)) = fiber {
             fiber.set_state(if next == crate::thread::NativeThreadState::Native {
                 crate::thread::FiberState::Native
@@ -263,11 +263,8 @@ impl ForeignStateScope {
     }
 }
 
-#[cfg(any(
-    all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix)
-))]
-fn transition_foreign_state(
+/// Serialize native mutator state changes with the GC participant snapshot.
+pub(crate) fn transition_native_state(
     thread: &crate::thread::NativeThread,
     next: crate::thread::NativeThreadState,
 ) {
@@ -281,6 +278,8 @@ fn transition_foreign_state(
     if next == NativeThreadState::Running {
         if thread.state() != NativeThreadState::Running {
             while coord.parked.load(Ordering::SeqCst) {
+                #[cfg(test)]
+                crate::thread::registration_tests::waiting_for_admission();
                 transition = coord.park_condvar.wait(transition).unwrap();
             }
             thread.set_state(next);
@@ -304,7 +303,7 @@ fn transition_foreign_state(
 ))]
 impl Drop for ForeignStateScope {
     fn drop(&mut self) {
-        transition_foreign_state(self.thread, self.previous);
+        transition_native_state(self.thread, self.previous);
         if let Some((fiber, previous)) = self.fiber {
             fiber.set_state(previous);
             // The matching entry added exactly one pin. Do not introduce a

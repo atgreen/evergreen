@@ -10,14 +10,17 @@
 use crate::t2::frame_state::FrameStateId;
 
 /// Register class. Tagged values, unboxed integers, and pointers live in GPRs;
-/// unboxed floats live in XMM registers (spec §4.7 R4.45).
+/// unboxed floats live in the target's floating-point registers (spec §4.7
+/// R4.45). `Xmm` is the historical name of the floating-point class; on System Z
+/// it refers to scalar FPRs.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum RegClass {
     Gpr,
     Xmm,
 }
 
-/// A physical register (backend-specific encoding in `.0`).
+/// A physical register. `encoding` is backend-specific: an abstract index for
+/// x86, or the architectural register number for System Z.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct PhysReg {
     pub class: RegClass,

@@ -288,65 +288,314 @@ fn fiber_object_order(id: FiberId, field: u64) -> u64 {
     (1_u64 << 62) | id.0.saturating_mul(32).saturating_add(field)
 }
 
-/// Holds the result of a thread's execution and a signal for completion.
+/// Completion remains observable after one joiner consumes the result.
+struct ThreadCompletion {
+    completed: bool,
+    value: Option<Result<TorclVal, TorclError>>,
+    fiber_waiters: Vec<(FiberId, u64)>,
+}
+
+/// Holds a thread's GC-visible result and native/managed completion waiters.
 pub(crate) struct ThreadResult {
-    /// The result value, set when the thread finishes.
-    value: Mutex<Option<Result<TorclVal, TorclError>>>,
-    /// Condvar signaled when the thread transitions to Dead.
+    completion: Mutex<ThreadCompletion>,
     done: Condvar,
 }
 
 impl ThreadResult {
     fn new() -> Self {
         ThreadResult {
-            value: Mutex::new(None),
+            completion: Mutex::new(ThreadCompletion {
+                completed: false,
+                value: None,
+                fiber_waiters: Vec::new(),
+            }),
             done: Condvar::new(),
         }
     }
 
-    /// Store the result and notify all waiters.
+    /// Publish completion before waking either kind of waiter. Wake fibers
+    /// without retaining the result mutex: their scheduler uses registry locks.
     fn complete(&self, val: Result<TorclVal, TorclError>) {
-        let mut guard = self.value.lock().unwrap();
-        *guard = Some(val);
-        self.done.notify_all();
-    }
-
-    /// Block until the result is available, then return it.
-    fn wait(&self) -> Result<TorclVal, TorclError> {
-        let mut guard = self.value.lock().unwrap();
-        while guard.is_none() {
-            guard = self.done.wait(guard).unwrap();
+        let waiters = {
+            let mut completion = self.completion.lock().unwrap();
+            completion.value = Some(val);
+            completion.completed = true;
+            self.done.notify_all();
+            std::mem::take(&mut completion.fiber_waiters)
+        };
+        for (fiber, token) in waiters {
+            wake_fiber_wait(fiber, token);
         }
-        guard.take().unwrap()
     }
 
     /// Wait without removing the GC-visible result. A blocked native caller
     /// must resume through the safepoint protocol before moving root slots.
     fn wait_until_ready(&self) {
-        let mut guard = self.value.lock().unwrap();
-        while guard.is_none() {
-            guard = self.done.wait(guard).unwrap();
+        let mut completion = self.completion.lock().unwrap();
+        while !completion.completed {
+            completion = self.done.wait(completion).unwrap();
         }
     }
 
-    /// Wait at most `timeout` for a result without removing it. Returns true
-    /// when the result is ready. Spurious condition-variable wakeups do not
-    /// turn into false completion reports.
+    /// A consumed result is still completed, so a concurrent join reports
+    /// "already joined" rather than mistaking consumption for a timeout.
     fn wait_until_ready_for(&self, timeout: std::time::Duration) -> bool {
-        let guard = self.value.lock().unwrap();
-        if guard.is_some() {
-            return true;
-        }
-        let (guard, _) = self
+        let completion = self.completion.lock().unwrap();
+        let (completion, _) = self
             .done
-            .wait_timeout_while(guard, timeout, |value| value.is_none())
+            .wait_timeout_while(completion, timeout, |state| !state.completed)
             .unwrap();
-        guard.is_some()
+        completion.completed
     }
 
-    /// Check if the thread has finished without blocking.
+    fn wait_for_fiber_join(&self) -> Result<(), TorclError> {
+        let mut completion = self.completion.lock().unwrap();
+        if completion.completed {
+            return Ok(());
+        }
+        match crate::sync::blocking_mode("JOIN-FIBER")? {
+            crate::sync::BlockingMode::Native => {
+                while !completion.completed {
+                    completion = self.done.wait(completion).unwrap();
+                }
+                Ok(())
+            }
+            crate::sync::BlockingMode::Fiber => loop {
+                // Register and publish Blocked under the completion lock so a
+                // concurrent completion cannot pass between the two actions.
+                let waiter = prepare_current_fiber_park(FiberState::Blocked)?;
+                completion.fiber_waiters.push(waiter);
+                drop(completion);
+                #[cfg(test)]
+                join_completion_tests::before_park();
+                let parked = park_prepared_current_fiber();
+                completion = self.completion.lock().unwrap();
+                completion.fiber_waiters.retain(|entry| *entry != waiter);
+                if parked.is_err() {
+                    cancel_prepared_current_fiber_park();
+                }
+                parked?;
+                if completion.completed {
+                    return Ok(());
+                }
+                // An explicit unpark can resume us before completion. Recheck
+                // and register a fresh generation rather than claiming success.
+            },
+        }
+    }
+
     fn is_done(&self) -> bool {
-        self.value.lock().unwrap().is_some()
+        self.completion.lock().unwrap().completed
+    }
+}
+
+#[cfg(test)]
+mod join_completion_tests {
+    use super::*;
+    use crate::value::T;
+
+    thread_local! {
+        static RETAINED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static BEFORE_PARK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn retained_result() {
+        let hook = RETAINED.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+            hook();
+        }
+    }
+
+    pub(super) fn before_park() {
+        let hook = BEFORE_PARK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn isolated(name: &str, body: impl FnOnce()) {
+        const CHILD: &str = "TORCL_TEST_CONCURRENT_JOIN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("thread::join_completion_tests::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            eprintln!("a concurrent joiner treated a consumed result as unfinished");
+            std::process::exit(124);
+        });
+        current_thread_id();
+        body();
+    }
+
+    fn concurrent_join(fiber: bool) {
+        let name = if fiber {
+            "consumed_fiber_result_remains_completed"
+        } else {
+            "consumed_native_result_remains_completed"
+        };
+        isolated(name, || {
+            let pool = fiber.then(|| CarrierPool::new(1));
+            let fiber_id = pool.as_ref().map(|pool| {
+                let id = make_fiber(T).unwrap();
+                pool.submit(id).unwrap();
+                id
+            });
+            let native_id = (!fiber).then(|| make_thread(T).unwrap());
+            let (ready, retained) = std::sync::mpsc::channel();
+            let (release, proceed) = std::sync::mpsc::channel();
+            let second = std::thread::spawn(move || {
+                RETAINED.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        ready.send(()).unwrap();
+                        proceed.recv().unwrap();
+                    }))
+                });
+                if let Some(id) = native_id {
+                    join_thread_timeout(id, Some(std::time::Duration::from_millis(100)))
+                } else {
+                    join_fiber(fiber_id.unwrap()).map(Some)
+                }
+            });
+            {
+                let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+                retained
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            let first = if let Some(id) = native_id {
+                join_thread(id)
+            } else {
+                join_fiber(fiber_id.unwrap())
+            };
+            assert_eq!(first.unwrap(), T);
+            release.send(()).unwrap();
+            let second = {
+                let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+                second.join().unwrap()
+            };
+            if let Some(pool) = pool {
+                pool.shutdown_and_join().unwrap();
+            }
+            assert!(
+                matches!(second, Err(TorclError::ProgramError(_))),
+                "consumption must be reported as already joined, not pending: {second:?}"
+            );
+        });
+    }
+
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    mod managed_races {
+        use super::*;
+        static RACE_POOL: OnceLock<CarrierPool> = OnceLock::new();
+        static CHILD_GATE: OnceLock<crate::sync::TorclSemaphore> = OnceLock::new();
+        static EARLY_WAKE: AtomicBool = AtomicBool::new(false);
+
+        fn race_child() -> TorclVal {
+            CHILD_GATE.get().unwrap().wait(None).unwrap();
+            T
+        }
+
+        fn race_parent() -> TorclVal {
+            if EARLY_WAKE.load(Ordering::Acquire) {
+                BEFORE_PARK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(|| {
+                        CHILD_GATE.get().unwrap().signal(1).unwrap();
+                        // Force completion's wake to finish while this parent is still
+                        // mounted, before the actual context switch.
+                        while !current_fiber()
+                            .unwrap()
+                            .wake_pending
+                            .load(Ordering::Acquire)
+                        {
+                            std::thread::yield_now();
+                        }
+                    }))
+                });
+            }
+            let entry = unsafe { TorclVal::from_function_ptr(race_child as *const () as *mut u8) };
+            let child = make_fiber(entry).unwrap();
+            RACE_POOL.get().unwrap().submit(child).unwrap();
+            join_fiber(child).unwrap()
+        }
+
+        fn completion_race(early: bool) {
+            let name = if early {
+                "managed_races::completion_before_unmount_does_not_lose_join_wake"
+            } else {
+                "managed_races::spurious_unpark_rechecks_completion_and_replaces_waiter"
+            };
+            isolated(name, || {
+                EARLY_WAKE.store(early, Ordering::Release);
+                assert!(
+                    CHILD_GATE
+                        .set(crate::sync::TorclSemaphore::new(None, 0).unwrap())
+                        .is_ok()
+                );
+                assert!(RACE_POOL.set(CarrierPool::new(2)).is_ok());
+                let entry =
+                    unsafe { TorclVal::from_function_ptr(race_parent as *const () as *mut u8) };
+                let parent = make_fiber(entry).unwrap();
+                let descriptor = fiber_registry()
+                    .lock()
+                    .unwrap()
+                    .get(&parent)
+                    .unwrap()
+                    .clone();
+                RACE_POOL.get().unwrap().submit(parent).unwrap();
+                if !early {
+                    while descriptor.state() != FiberState::Blocked {
+                        crate::poll_safepoint();
+                        std::thread::yield_now();
+                    }
+                    let generation = descriptor.wait_generation.load(Ordering::Acquire);
+                    assert!(wake_fiber_wait(parent, generation));
+                    while descriptor.wait_generation.load(Ordering::Acquire) == generation {
+                        crate::poll_safepoint();
+                        std::thread::yield_now();
+                    }
+                    assert!(!descriptor.result.is_done(), "spurious wake completed JOIN");
+                    CHILD_GATE.get().unwrap().signal(1).unwrap();
+                }
+                assert_eq!(join_fiber(parent).unwrap(), T);
+                RACE_POOL.get().unwrap().shutdown_and_join().unwrap();
+            });
+        }
+
+        #[test]
+        fn completion_before_unmount_does_not_lose_join_wake() {
+            completion_race(true);
+        }
+
+        #[test]
+        fn spurious_unpark_rechecks_completion_and_replaces_waiter() {
+            completion_race(false);
+        }
+    }
+
+    #[test]
+    fn consumed_native_result_remains_completed() {
+        concurrent_join(false);
+    }
+
+    #[test]
+    fn consumed_fiber_result_remains_completed() {
+        concurrent_join(true);
     }
 }
 
@@ -595,7 +844,12 @@ impl NativeThread {
         self.tls.lock().unwrap().trace_host_roots(visit);
         self.condition_state.lock().unwrap().trace_host_roots(visit);
         self.interrupt_value.lock().unwrap().trace_host_roots(visit);
-        self.result.value.lock().unwrap().trace_host_roots(visit);
+        self.result
+            .completion
+            .lock()
+            .unwrap()
+            .value
+            .trace_host_roots(visit);
     }
 }
 
@@ -707,6 +961,8 @@ fn install_current_native_thread(thread: Arc<NativeThread>) {
     CURRENT_NATIVE_THREAD.with(|slot| {
         *slot.borrow_mut() = Some(CurrentNativeThread::new(thread));
     });
+    #[cfg(test)]
+    registration_tests::installed();
 }
 
 fn ensure_current_native_thread() -> Arc<NativeThread> {
@@ -715,32 +971,196 @@ fn ensure_current_native_thread() -> Arc<NativeThread> {
 
 fn ensure_current_native_thread_in_state(initial_state: NativeThreadState) -> Arc<NativeThread> {
     install_execution_root_scanner();
-    CURRENT_NATIVE_THREAD.with(|slot| {
-        if let Some(current) = slot.borrow().as_ref() {
-            return Arc::clone(&current.thread);
+    if let Some(thread) = CURRENT_NATIVE_THREAD.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|current| Arc::clone(&current.thread))
+    }) {
+        return thread;
+    }
+    let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+    let result = Arc::new(ThreadResult::new());
+    let thread = Arc::new(NativeThread::new(
+        id,
+        std::thread::current().name().map(str::to_owned),
+        false,
+        true,
+        NIL,
+        result,
+    ));
+    // Publish a fully initialized, quiescent participant. A collector may have
+    // already taken its Running-thread snapshot, and registry enumeration must
+    // not mistake this entrant for an inactive auto registration and prune it.
+    thread.set_state(NativeThreadState::Native);
+    let current = CurrentNativeThread::new(Arc::clone(&thread));
+    #[cfg(unix)]
+    thread
+        .os_thread_id
+        .store(crate::syscall::gettid() as usize, Ordering::Release);
+    native_thread_registry()
+        .lock()
+        .unwrap()
+        .insert(id, Arc::clone(&thread));
+    #[cfg(test)]
+    registration_tests::published(&thread);
+    CURRENT_NATIVE_THREAD.with(|slot| *slot.borrow_mut() = Some(current));
+    if initial_state == NativeThreadState::Running {
+        // Wait out an active pause without retaining a registry lock or TLS
+        // borrow. Foreign callbacks instead remain Native until Lisp entry.
+        crate::safepoint::transition_native_state(&thread, initial_state);
+    }
+    thread
+}
+
+#[cfg(test)]
+pub(crate) mod registration_tests {
+    use super::*;
+
+    type PublicationHook = Box<dyn FnOnce(&NativeThread)>;
+    static STARTUP_WAIT: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+        std::sync::Mutex::new(None);
+    thread_local! {
+        static PUBLICATION_HOOK: RefCell<Option<PublicationHook>> = const { RefCell::new(None) };
+        static ADMISSION_WAIT: RefCell<Option<std::sync::mpsc::Sender<()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn installed() {
+        let sender = STARTUP_WAIT.lock().unwrap().take();
+        if let Some(sender) = sender {
+            ADMISSION_WAIT.with(|slot| *slot.borrow_mut() = Some(sender));
         }
-        let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
-        let result = Arc::new(ThreadResult::new());
-        let thread = Arc::new(NativeThread::new(
-            id,
-            std::thread::current().name().map(str::to_owned),
-            false,
-            true,
-            NIL,
-            result,
-        ));
-        thread.set_state(initial_state);
-        native_thread_registry()
-            .lock()
-            .unwrap()
-            .insert(id, Arc::clone(&thread));
-        #[cfg(unix)]
-        thread
-            .os_thread_id
-            .store(crate::syscall::gettid() as usize, Ordering::Release);
-        *slot.borrow_mut() = Some(CurrentNativeThread::new(Arc::clone(&thread)));
-        thread
-    })
+    }
+
+    pub(crate) fn waiting_for_admission() {
+        ADMISSION_WAIT.with(|slot| {
+            if let Some(sender) = slot.borrow_mut().take() {
+                sender.send(()).unwrap();
+            }
+        });
+    }
+
+    pub(super) fn published(thread: &NativeThread) {
+        let hook = PUBLICATION_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(thread);
+        }
+    }
+
+    #[test]
+    fn registration_during_gc_publishes_a_quiescent_participant() {
+        const CHILD: &str = "TORCL_TEST_REGISTRATION_DURING_GC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "thread::registration_tests::registration_during_gc_publishes_a_quiescent_participant",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        current_thread_id();
+        crate::safepoint::wait_for_all_threads().unwrap();
+        let (published, observed) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let (waiting, admission) = std::sync::mpsc::channel();
+        let newcomer = std::thread::spawn(move || {
+            ADMISSION_WAIT.with(|slot| *slot.borrow_mut() = Some(waiting));
+            PUBLICATION_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |thread| {
+                    published
+                        .send((thread.id, thread.state(), thread.gc_participates()))
+                        .unwrap();
+                    proceed.recv().unwrap();
+                }));
+            });
+            current_thread_id()
+        });
+        let observation = observed.recv_timeout(std::time::Duration::from_secs(10));
+        // Enumeration prunes inactive auto registrations. A published entrant
+        // must already participate even while it cannot yet run Lisp.
+        let ids = all_thread_ids();
+        release.send(()).unwrap();
+        // Prove that registration reaches the active-pause wait. Removing the
+        // admission transition must fail even if publication remains Native.
+        let waited = admission.recv_timeout(std::time::Duration::from_secs(10));
+        crate::safepoint::resume_all_threads().unwrap();
+        let joined = newcomer.join().unwrap();
+        let (id, state, participates) = observation.unwrap();
+        assert_eq!(joined, id);
+        assert_eq!(state, NativeThreadState::Native);
+        assert!(participates);
+        assert!(waited.is_ok(), "entrant did not wait for GC admission");
+        assert!(
+            ids.contains(&id),
+            "entrant was pruned before completing registration"
+        );
+    }
+
+    fn startup_waits_for_gc(carrier: bool) {
+        const CHILD: &str = "TORCL_TEST_STARTUP_DURING_GC_CHILD";
+        let name = if carrier {
+            "carrier_startup_waits_for_active_gc"
+        } else {
+            "dedicated_startup_waits_for_active_gc"
+        };
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("thread::registration_tests::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        current_thread_id();
+        crate::safepoint::wait_for_all_threads().unwrap();
+        let (waiting, admission) = std::sync::mpsc::channel();
+        *STARTUP_WAIT.lock().unwrap() = Some(waiting);
+        let group = carrier.then(|| {
+            crate::SchedulerGroup::init(&crate::SchedulerConfig { num_workers: 1 }).unwrap()
+        });
+        let dedicated = (!carrier).then(|| make_thread(NIL).unwrap());
+        // No new mutator was included in the collector's snapshot. Its first
+        // transition to Running must wait rather than contribute an arrival.
+        let waited = admission.recv_timeout(std::time::Duration::from_secs(10));
+        crate::safepoint::resume_all_threads().unwrap();
+        if let Some(group) = group {
+            group.finish().unwrap();
+        }
+        if let Some(id) = dedicated {
+            assert_eq!(join_thread(id).unwrap(), NIL);
+        }
+        assert!(waited.is_ok(), "{name} bypassed GC admission");
+    }
+
+    #[test]
+    fn carrier_startup_waits_for_active_gc() {
+        startup_waits_for_gc(true);
+    }
+
+    #[test]
+    fn dedicated_startup_waits_for_active_gc() {
+        startup_waits_for_gc(false);
+    }
 }
 
 /// Global thread registry mapping IDs to thread descriptors.
@@ -1085,7 +1505,12 @@ impl Fiber {
         self.restart_stack.lock().unwrap().trace_host_roots(visit);
         self.condition_state.lock().unwrap().trace_host_roots(visit);
         self.interrupt_value.lock().unwrap().trace_host_roots(visit);
-        self.result.value.lock().unwrap().trace_host_roots(visit);
+        self.result
+            .completion
+            .lock()
+            .unwrap()
+            .value
+            .trace_host_roots(visit);
     }
 }
 
@@ -1318,7 +1743,10 @@ impl WorkerPool {
                     .name(name)
                     .spawn(move || {
                         install_current_native_thread(Arc::clone(&running_carrier));
-                        running_carrier.set_state(NativeThreadState::Running);
+                        crate::safepoint::transition_native_state(
+                            &running_carrier,
+                            NativeThreadState::Running,
+                        );
                         worker_loop(running_pool, i);
                         result.complete(Ok(NIL));
                         crate::safepoint::retire_native_thread(&running_carrier);
@@ -1443,7 +1871,9 @@ impl WorkerPool {
                 .collect()
         };
         for carrier in carriers {
-            if let Some(handle) = carrier.join_handle.lock().unwrap().take() {
+            let handle = carrier.join_handle.lock().unwrap().take();
+            if let Some(handle) = handle {
+                let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
                 handle.join().map_err(|_| {
                     TorclError::Internal(format!("carrier thread {} panicked", carrier.id.0))
                 })?;
@@ -1793,7 +2223,7 @@ pub fn make_thread_named(
     let running = Arc::clone(&thread);
     let handle = match std::thread::Builder::new().name(name).spawn(move || {
         install_current_native_thread(Arc::clone(&running));
-        running.set_state(NativeThreadState::Running);
+        crate::safepoint::transition_native_state(&running, NativeThreadState::Running);
         // An unwinding entry must still publish completion: JOIN waits on
         // this result before it can inspect the OS join handle. Catch at
         // the worker boundary; after a panic this worker retires without
@@ -1857,6 +2287,8 @@ pub fn join_thread_timeout(
             .cloned()
             .ok_or_else(|| TorclError::Internal(format!("no native thread with id {}", id.0)))?
     };
+    #[cfg(test)]
+    join_completion_tests::retained_result();
     // Leave the result in its scanned cell throughout the native wait. The
     // scope's Drop waits out any active collection before we move the value.
     let ready = {
@@ -1872,9 +2304,16 @@ pub fn join_thread_timeout(
     if !ready {
         return Ok(None);
     }
-    let mut value = thread.result.value.lock().unwrap().take().ok_or_else(|| {
-        TorclError::ProgramError(format!("native thread {} was already joined", id.0))
-    })?;
+    let mut value = thread
+        .result
+        .completion
+        .lock()
+        .unwrap()
+        .value
+        .take()
+        .ok_or_else(|| {
+            TorclError::ProgramError(format!("native thread {} was already joined", id.0))
+        })?;
     crate::rooted_ref!(_value_root = &mut value);
     // OS teardown can outlast result publication. Keep the result rooted and
     // participate in GC while waiting, with no join-handle lock held.
@@ -2237,12 +2676,28 @@ pub fn join_fiber(id: FiberId) -> Result<TorclVal, TorclError> {
         .get(&id)
         .map(|fiber| Arc::clone(&fiber.result))
         .ok_or_else(|| TorclError::Internal(format!("no fiber with id {}", id.0)))?;
-    let value = result.wait()?;
+    #[cfg(test)]
+    join_completion_tests::retained_result();
+    // Keep the result in its registry-scanned cell until any active GC has
+    // finished. Waiting must not leave the native caller marked Running.
+    {
+        let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
+        result.wait_for_fiber_join()?;
+    }
+    let mut value = result
+        .completion
+        .lock()
+        .unwrap()
+        .value
+        .take()
+        .ok_or_else(|| TorclError::ProgramError(format!("fiber {} was already joined", id.0)))?;
+    crate::rooted_ref!(_value_root = &mut value);
     // Dropping the final owner unregisters host roots (GcWorld). Release the
     // higher-level execution registry lock before running that destructor.
     let removed = fiber_registry().lock().unwrap().remove(&id);
     drop(removed);
-    Ok(value)
+    drop(_value_root);
+    value
 }
 
 pub fn current_fiber() -> Option<&'static Fiber> {
@@ -2553,7 +3008,7 @@ mod native_join_gc_tests {
         let (observed, collection) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             install_current_native_thread(Arc::clone(&running));
-            running.set_state(NativeThreadState::Running);
+            crate::safepoint::transition_native_state(&running, NativeThreadState::Running);
             let body = crate::gc::alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT).unwrap();
             unsafe { *(body as *mut f64) = 42.0 };
             let original = unsafe { TorclVal::from_heap_ptr(body.sub(8)) }.to_raw();
@@ -2561,7 +3016,7 @@ mod native_join_gc_tests {
             // The Lisp result can be available before the OS thread exits.
             // Collect only after JOIN has taken it from the result cell: its
             // caller must keep that value rooted throughout the remaining wait.
-            while result.value.lock().unwrap().is_some() {
+            while result.completion.lock().unwrap().value.is_some() {
                 std::thread::yield_now();
             }
             let collected = crate::gc::collect_t0_minor();

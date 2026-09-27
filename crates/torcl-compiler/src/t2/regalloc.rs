@@ -9,6 +9,12 @@
 //!
 //! ## Mapping MachFunc → regalloc2
 //!
+//! The allocation environment and call-clobber set are selected together by
+//! the backend entry point. [`allocate`] and [`allocate_framed`] use x86's
+//! abstract register numbering; [`allocate_framed_s390x`] uses System Z hardware
+//! numbers. The CFG, operand liveness, spill edits, and stack-map pipeline are
+//! shared across both targets.
+//!
 //! * **Register classes.** Our [`RegClass::Gpr`] maps to `regalloc2::RegClass::Int`
 //!   (tagged values / unboxed integers / pointers) and [`RegClass::Xmm`] to
 //!   `Float` (unboxed floats). The `Vector` class is unused.
@@ -241,7 +247,7 @@ struct Adapter {
 }
 
 impl Adapter {
-    fn build(mf: &MachFunc) -> Adapter {
+    fn build(mf: &MachFunc, call_clobbers: PRegSet, stack_call_operands: bool) -> Adapter {
         let mut map: HashMap<VReg, usize> = HashMap::new();
         let mut reverse: Vec<VReg> = Vec::new();
         let mut intern = |v: VReg| -> Ra2VReg {
@@ -259,10 +265,37 @@ impl Adapter {
             let mut ops =
                 Vec::with_capacity(inst.defs.len() + inst.uses.len() + inst.deopt_uses.len());
             for &d in &inst.defs {
-                ops.push(Operand::reg_def(intern(d)));
+                if stack_call_operands
+                    && inst.op == crate::t2::lower::op::CALL_RUNTIME
+                    && inst.defs.len() > 1
+                {
+                    // Multiple values are copied from the activation to their
+                    // homes one at a time; they need not all fit in registers.
+                    ops.push(Operand::new(
+                        intern(d),
+                        OperandConstraint::Any,
+                        OperandKind::Def,
+                        OperandPos::Late,
+                    ));
+                } else {
+                    ops.push(Operand::reg_def(intern(d)));
+                }
             }
             for &u in &inst.uses {
-                ops.push(Operand::reg_use(intern(u)));
+                if stack_call_operands && inst.op == crate::t2::lower::op::CALL {
+                    // The System Z framed emitter copies arbitrary-arity call
+                    // arguments from their homes to a scanned slice. Requiring
+                    // every argument in a GPR simultaneously would make calls
+                    // wider than the register bank impossible to allocate.
+                    ops.push(Operand::new(
+                        intern(u),
+                        OperandConstraint::Any,
+                        OperandKind::Use,
+                        OperandPos::Early,
+                    ));
+                } else {
+                    ops.push(Operand::reg_use(intern(u)));
+                }
             }
             // Frame-state liveness extension (bliss-ad1e): a value a deopt may
             // reconstruct must stay locatable AT AND AFTER this instruction —
@@ -290,14 +323,7 @@ impl Adapter {
                     | crate::t2::lower::op::THROW
                     | crate::t2::lower::op::NLX_TRANSFER
             ) {
-                // Abstract GPR encodings 0..=8 map to SysV caller-saved
-                // rax,rcx,rdx,rsi,rdi,r8-r11 in emit.rs.
-                for i in 0..=8 {
-                    set.add(PReg::new(i, Ra2RegClass::Int));
-                }
-                for i in 0..N_XMM {
-                    set.add(PReg::new(i, Ra2RegClass::Float));
-                }
+                set = call_clobbers;
             }
             clobbers.push(set);
         }
@@ -464,7 +490,19 @@ impl Ra2Function for Adapter {
 /// R4.46, §4.10 R4.65). See the module docs for the single-block and
 /// stack-map limitations.
 pub fn allocate(mf: &mut MachFunc) -> Result<(), RegAllocError> {
-    allocate_with_env(mf, machine_env())
+    allocate_with_env(mf, machine_env(), x86_call_clobbers())
+}
+
+fn x86_call_clobbers() -> PRegSet {
+    let mut set = PRegSet::empty();
+    // Abstract encodings, mapped to rax,rcx,rdx,rsi,rdi,r8-r11 in emit.rs.
+    for i in 0..=8 {
+        set.add(PReg::new(i, Ra2RegClass::Int));
+    }
+    for i in 0..N_XMM {
+        set.add(PReg::new(i, Ra2RegClass::Float));
+    }
+    set
 }
 
 /// Allocate for the live framed x86 emitter, reserving its ABI and scratch
@@ -476,17 +514,74 @@ pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), RegAllocError> {
     // background-thread allocation pass, declining to T1 costs the tier.
     // TORCL_T2_FRAME_ENV=full|reduced pins one environment for debugging.
     match std::env::var("TORCL_T2_FRAME_ENV").as_deref() {
-        Ok("full") => return allocate_with_env(mf, framed_machine_env(false)),
-        Ok("reduced") => return allocate_with_env(mf, framed_machine_env(true)),
+        Ok("full") => return allocate_with_env(mf, framed_machine_env(false), x86_call_clobbers()),
+        Ok("reduced") => {
+            return allocate_with_env(mf, framed_machine_env(true), x86_call_clobbers());
+        }
         _ => {}
     }
-    match allocate_with_env(mf, framed_machine_env(true)) {
-        Err(RegAllocError::TooManyLiveRegs) => allocate_with_env(mf, framed_machine_env(false)),
+    match allocate_with_env(mf, framed_machine_env(true), x86_call_clobbers()) {
+        Err(RegAllocError::TooManyLiveRegs) => {
+            allocate_with_env(mf, framed_machine_env(false), x86_call_clobbers())
+        }
         done => done,
     }
 }
 
-fn allocate_with_env(mf: &mut MachFunc, env: MachineEnv) -> Result<(), RegAllocError> {
+/// Allocate for the System Z framed emitter. Unlike the x86 backend's abstract
+/// register indices, every returned PhysReg encoding is a hardware number.
+///
+/// r13 holds the TorclStack activation pointer; r14/r15 are link/stack. Reserve
+/// r0-r5 for instruction and ABI temporaries, with r1 as the allocator's edit
+/// scratch. Allocate r6-r12, all preserved across C calls. f0-f3 are instruction
+/// temporaries and f15 is the floating edit scratch; f4-f14 are allocatable.
+/// The emitter must save every callee-saved register it writes, including f15
+/// when an allocation edit uses it, and synchronize tagged roots at safepoints.
+pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+    let mut integers = PRegSet::empty();
+    for reg in 6..=12 {
+        integers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    let mut floats = PRegSet::empty();
+    for reg in 4..=14 {
+        floats.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    let env = MachineEnv {
+        preferred_regs_by_class: [integers, floats, PRegSet::empty()],
+        non_preferred_regs_by_class: [PRegSet::empty(); 3],
+        scratch_by_class: [
+            Some(PReg::new(1, Ra2RegClass::Int)),
+            Some(PReg::new(15, Ra2RegClass::Float)),
+            None,
+        ],
+        fixed_stack_slots: Vec::new(),
+    };
+    // Linux s390x ELF ABI: r0-r5/r14 and f0-f7 are volatile. This is the
+    // 64-bit ABI, not the older 31-bit s390 floating-point convention.
+    let mut clobbers = PRegSet::empty();
+    for reg in (0..=5).chain(std::iter::once(14)) {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    for reg in 0..=7 {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    allocate_with_call_operands(mf, env, clobbers, true)
+}
+
+fn allocate_with_env(
+    mf: &mut MachFunc,
+    env: MachineEnv,
+    call_clobbers: PRegSet,
+) -> Result<(), RegAllocError> {
+    allocate_with_call_operands(mf, env, call_clobbers, false)
+}
+
+fn allocate_with_call_operands(
+    mf: &mut MachFunc,
+    env: MachineEnv,
+    call_clobbers: PRegSet,
+    stack_call_operands: bool,
+) -> Result<(), RegAllocError> {
     mf.allocation.clear();
     mf.inst_allocations.clear();
     mf.allocation_edits.clear();
@@ -498,7 +593,7 @@ fn allocate_with_env(mf: &mut MachFunc, env: MachineEnv) -> Result<(), RegAllocE
         return Ok(());
     }
 
-    let adapter = Adapter::build(mf);
+    let adapter = Adapter::build(mf, call_clobbers, stack_call_operands);
 
     let options = RegallocOptions {
         verbose_log: false,
@@ -776,6 +871,88 @@ mod tests {
         allocate(&mut mf).expect("regalloc2");
         assert!(mf.allocation.is_empty());
         assert!(mf.stack_maps.is_empty());
+    }
+
+    /// Exercise the exact edit stream, including values live through a call
+    /// and a value whose only use is a late deopt operand on that call.
+    #[test]
+    fn s390x_allocations_preserve_values_across_calls_and_spills() {
+        use crate::t2::lower::op;
+
+        let mut mf = MachFunc::default();
+        for class in [RegClass::Gpr, RegClass::Xmm] {
+            for num in 0..24 {
+                mf.insts
+                    .push(inst(op::MOV_IMM, vec![vreg(class, num)], vec![]));
+            }
+        }
+        let deopt_only = vreg(RegClass::Gpr, 100);
+        mf.insts.push(inst(op::MOV_IMM, vec![deopt_only], vec![]));
+        let mut call = inst(op::CALL_RUNTIME, vec![vreg(RegClass::Gpr, 101)], vec![]);
+        call.deopt_uses.push(deopt_only);
+        mf.insts.push(call);
+        for class in [RegClass::Gpr, RegClass::Xmm] {
+            for num in 0..24 {
+                mf.insts.push(inst(op::MOV, vec![], vec![vreg(class, num)]));
+            }
+        }
+        mf.insts
+            .push(inst(op::RET, vec![], vec![vreg(RegClass::Gpr, 101)]));
+        allocate_framed_s390x(&mut mf).expect("s390x register allocation");
+        assert!(mf.num_spill_slots > 0, "fixture must force spills");
+        assert!(!mf.allocation_edits.is_empty());
+
+        // Keep identity tokens in physical locations. Poison precisely the
+        // ABI's volatile registers at a call, independently of the allocator.
+        let key = |loc: Location| match loc {
+            Location::Register(p) => (Some(p.class), u32::from(p.encoding)),
+            Location::Stack(slot) => (None, slot.0),
+        };
+        let mut contents = HashMap::new();
+        for (index, instruction) in mf.insts.iter().enumerate() {
+            for position in [EditPosition::Before, EditPosition::After] {
+                if position == EditPosition::After {
+                    let locations = &mf.inst_allocations[index];
+                    let defs = instruction.defs.len();
+                    for (operand, value) in instruction.uses.iter().enumerate() {
+                        assert_eq!(contents.get(&key(locations[defs + operand])), Some(value));
+                    }
+                    if instruction.op == op::CALL_RUNTIME {
+                        contents.retain(|&(class, reg), _| match class {
+                            Some(RegClass::Gpr) => (6..=13).contains(&reg) || reg == 15,
+                            Some(RegClass::Xmm) => (8..=15).contains(&reg),
+                            None => true,
+                        });
+                    }
+                    for (operand, value) in instruction.defs.iter().enumerate() {
+                        contents.insert(key(locations[operand]), *value);
+                    }
+                    for (operand, value) in instruction.deopt_uses.iter().enumerate() {
+                        let location = locations[defs + instruction.uses.len() + operand];
+                        assert_eq!(contents.get(&key(location)), Some(value));
+                    }
+                }
+                for edit in mf
+                    .allocation_edits
+                    .iter()
+                    .filter(|edit| edit.inst == index && edit.position == position)
+                {
+                    let value = *contents
+                        .get(&key(edit.from))
+                        .expect("initialized move source");
+                    contents.insert(key(edit.to), value);
+                }
+            }
+        }
+        for location in mf.inst_allocations.iter().flatten() {
+            if let Location::Register(p) = location {
+                let allowed = match p.class {
+                    RegClass::Gpr => 6..=12,
+                    RegClass::Xmm => 4..=14,
+                };
+                assert!(allowed.contains(&p.encoding), "reserved register {p:?}");
+            }
+        }
     }
 
     /// A diamond CFG with a merge block that has a parameter VReg:

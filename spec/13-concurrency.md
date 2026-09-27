@@ -401,6 +401,13 @@ that pause to end before disabling participation. JOIN leaves a pending result
 in its scanned result cell while blocked, then roots the transferred result
 across the remaining OS-thread exit wait.
 
+Completion remains recorded after a joiner consumes the result. A concurrent
+joiner that already retained the execution descriptor reports an already-joined
+error rather than waiting again or reporting a timeout. `JOIN-FIBER` parks an
+unpinned managed caller through the generation-tagged wait protocol below.
+Native callers block, while pinned callers follow the configured policy. The
+result remains GC-visible until the resumed caller transfers it to a root.
+
 ### 13.6.4 Safepoint and Scheduler Interaction
 
 Safepoint checks and scheduling decisions are co-located. At every

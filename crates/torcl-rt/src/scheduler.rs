@@ -94,10 +94,24 @@ impl SchedulerGroup {
     }
 
     pub fn finish(&self) -> Result<Vec<TorclVal>, TorclError> {
+        // The accumulator is scanned while this caller waits for later fibers.
+        // Register the caller before publishing or mutating its host roots.
+        crate::thread::current_thread_id();
         self.closed.store(true, Ordering::Release);
         let ids = self.submitted.lock().unwrap().clone();
-        let results = ids.into_iter().map(join_fiber).collect();
+        let mut results: Result<Vec<TorclVal>, TorclError> = Ok(Vec::with_capacity(ids.len()));
+        crate::rooted_ref!(_results_root = &mut results);
+        for id in ids {
+            match join_fiber(id) {
+                Ok(value) => results.as_mut().unwrap().push(value),
+                Err(error) => {
+                    results = Err(error);
+                    break;
+                }
+            }
+        }
         self.pool.shutdown_and_join()?;
+        drop(_results_root);
         results
     }
 
