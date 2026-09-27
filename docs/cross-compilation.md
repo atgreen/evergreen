@@ -113,9 +113,14 @@ CROSS_CONTAINER_OPTS="-e TORCL_IMAGE_OUT=/target/torcl-android-image" \
       --no-init --load scripts/build-image.lisp
 ```
 
-Verify it is self-contained by running it with the source tree ABSENT — the
-plain `cargo build` binary reads `lib/boot.lisp` from disk, so mounting the repo
-would hide the difference:
+Verify it is self-contained by running it with the source tree ABSENT. The
+prelude is not the reason to check: `lib/boot.lisp` is embedded at compile time
+(`EMBEDDED_BOOT_LISP`), so the plain binary never needs it on disk. ASDF is the
+reason — `bundled_asdf_path()` resolves `lib/asdf.lisp` through
+`env!("CARGO_MANIFEST_DIR")`, a *build-time absolute path*, so a plain
+cross-compiled binary can only `(require :asdf)` on a machine where that build
+directory still exists (bliss-bp4q). The dumped image has ASDF inside it and does
+not care:
 
 ```sh
 podman run --rm -v "$PWD/target-android:/img:ro" -w /img \
