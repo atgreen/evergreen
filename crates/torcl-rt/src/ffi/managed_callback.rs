@@ -92,6 +92,8 @@ unsafe extern "C" fn dispatch(context: *mut (), slots: *const u64) -> u64 {
     context.active.fetch_add(1, Ordering::SeqCst);
     let _active = ActiveEntry(&context.active);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(unix)]
+        crate::runtime::ensure_signal_stack().map_err(|error| error.to_string())?;
         let _state = crate::safepoint::ForeignStateScope::lisp();
         let slots = unsafe { std::slice::from_raw_parts(slots, context.arguments.len()) };
         context.invoke(slots).map_err(|error| error.to_string())

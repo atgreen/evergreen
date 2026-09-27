@@ -25,7 +25,7 @@ for order in ${TORCL_JVM_PROBE_ORDERS:-lisp-first jvm-first}; do
   set +e
   TORCL_TIMEOUT="${TORCL_TIMEOUT:-90}" scripts/torcl-limited.sh env \
     TORCL_JVM_PROBE_ORDER="$order" \
-    LD_PRELOAD="$TORCL_JVM_PROBE_DIR/libprobe.so" \
+    LD_PRELOAD="${TORCL_JVM_PROBE_JSIG:+$TORCL_JVM_PROBE_JSIG:}$TORCL_JVM_PROBE_DIR/libprobe.so" \
     "$TORCL_PROBE_BIN" --no-init --load tools/jvm-probe/probe.lisp \
     >"$TORCL_JVM_PROBE_DIR/$order.log" 2>&1
   status=$?

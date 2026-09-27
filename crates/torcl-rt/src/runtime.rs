@@ -692,7 +692,60 @@ static SIGSEGV_STACK_GUARD_ADDRS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK
 static SIGSEGV_STACK_GUARD_LENS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
 #[cfg(unix)]
-static SIGNAL_ALT_STACK: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+thread_local! {
+    static SIGNAL_ALT_STACK: RefCell<Option<SignalStack>> = const { RefCell::new(None) };
+}
+
+#[cfg(unix)]
+struct SignalStack {
+    storage: Option<Box<[u8]>>,
+    previous: crate::syscall::StackT,
+}
+
+#[cfg(unix)]
+impl Drop for SignalStack {
+    fn drop(&mut self) {
+        let Some(storage) = self.storage.take() else {
+            return;
+        };
+        let still_installed = crate::syscall::current_sigaltstack()
+            .map(|current| current.ss_sp == storage.as_ptr().cast_mut())
+            .unwrap_or(true);
+        // Never free storage still registered with the kernel. A failed restore
+        // is exceptional; retaining this thread's buffer is safer than a UAF.
+        if still_installed
+            && unsafe { crate::syscall::sigaltstack(&self.previous, std::ptr::null_mut()) }.is_err()
+        {
+            std::mem::forget(storage);
+        }
+    }
+}
+
+/// Ensure this OS thread has its own alternate stack, preserving a host's stack.
+#[cfg(unix)]
+pub fn ensure_signal_stack() -> Result<(), TorclError> {
+    let previous = crate::syscall::current_sigaltstack()
+        .map_err(|_| TorclError::SignalError(crate::syscall::SIGSEGV))?;
+    if previous.ss_flags & crate::syscall::SS_DISABLE == 0 {
+        return Ok(());
+    }
+    SIGNAL_ALT_STACK.with(|slot| {
+        let storage = vec![0u8; 64 * 1024].into_boxed_slice();
+        let stack = crate::syscall::StackT {
+            ss_sp: storage.as_ptr().cast_mut(),
+            ss_flags: 0,
+            ss_size: storage.len(),
+        };
+        // The owning TLS value restores/disables the stack before freeing it.
+        unsafe { crate::syscall::sigaltstack(&stack, std::ptr::null_mut()) }
+            .map_err(|_| TorclError::SignalError(crate::syscall::SIGSEGV))?;
+        *slot.borrow_mut() = Some(SignalStack {
+            storage: Some(storage),
+            previous,
+        });
+        Ok(())
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigsegvFaultKind {
@@ -1026,63 +1079,123 @@ pub fn unregister_sigsegv_stack_guard_range(addr: usize) {
     }
 }
 
+/// Capability checked by optional JVM bindings before loading native state.
+pub fn supports_jvm_coexistence() -> bool {
+    cfg!(all(
+        feature = "c-ffi",
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    ))
+}
+
 /// Install signal handlers (SIGSEGV, SIGINT, SIGTERM, etc.). §2.6.
 /// Issue #11: actually install at least SIGINT and SIGTERM using libc.
 #[cfg(unix)]
 pub fn install_signal_handlers() -> Result<(), TorclError> {
-    use crate::syscall;
-    let alt_stack = SIGNAL_ALT_STACK.get_or_init(|| vec![0_u8; 64 * 1024].into_boxed_slice());
-    let stack = syscall::StackT {
-        ss_sp: alt_stack.as_ptr() as *mut u8,
-        ss_flags: 0,
-        ss_size: alt_stack.len(),
-    };
-    // SAFETY: `stack` points at process-lifetime storage retained by OnceLock.
-    unsafe { syscall::sigaltstack(&stack as *const syscall::StackT, core::ptr::null_mut()) }
-        .map_err(|_| TorclError::SignalError(syscall::SIGSEGV))?;
+    ensure_signal_stack()?;
+    // Handler installation is process-wide; stack ownership is per-thread.
+    // In particular, a safepoint fallback must not replace a VM installed later.
+    static INSTALLED: Mutex<bool> = Mutex::new(false);
+    let mut installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+    if !*installed {
+        install_process_signal_handlers()?;
+        *installed = true;
+    }
+    Ok(())
+}
 
-    // Direct rt_sigaction (no libc). SIGINT/TERM/SEGV use SA_RESTART; SIGUSR1
+#[cfg(unix)]
+fn install_process_signal_handlers() -> Result<(), TorclError> {
+    use crate::syscall;
+    // Dynamic GNU builds can participate in HotSpot's documented libjsig
+    // interposition. Refuse JVM-first startup without it before changing any
+    // process disposition: silently taking over HotSpot's faults is unsafe.
+    #[cfg(all(feature = "c-ffi", target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let query = libc::dlsym(libc::RTLD_DEFAULT, c"JNI_GetCreatedJavaVMs".as_ptr());
+        if !query.is_null() {
+            let query: unsafe extern "system" fn(*mut *mut std::ffi::c_void, i32, *mut i32) -> i32 =
+                std::mem::transmute(query);
+            let mut count = 0;
+            if query(std::ptr::null_mut(), 0, &mut count) != 0 {
+                return Err(TorclError::FfiError("cannot query the existing JVM".into()));
+            }
+            let chaining = libc::dlsym(libc::RTLD_DEFAULT, c"JVM_get_signal_action".as_ptr());
+            let mut installed: libc::Dl_info = std::mem::zeroed();
+            let mut provider: libc::Dl_info = std::mem::zeroed();
+            let interposed = !chaining.is_null()
+                && libc::dladdr(libc::sigaction as *const () as *const _, &mut installed) != 0
+                && libc::dladdr(chaining, &mut provider) != 0
+                && installed.dli_fbase == provider.dli_fbase;
+            if count > 0 && !interposed {
+                return Err(TorclError::FfiError(
+                    "JVM already running: preload the JDK libjsig.so before starting TorCL".into(),
+                ));
+            }
+        }
+    }
+
+    unsafe fn install(sig: i32, handler: usize, flags: u64) -> Result<(), i32> {
+        #[cfg(all(feature = "c-ffi", target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler;
+            action.sa_flags = flags as i32;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(sig, &action, std::ptr::null_mut()) == 0 {
+                Ok(())
+            } else {
+                Err(*libc::__errno_location())
+            }
+        }
+        #[cfg(not(all(feature = "c-ffi", target_os = "linux", target_env = "gnu")))]
+        {
+            unsafe { syscall::rt_sigaction(sig, handler, flags) }
+        }
+    }
+    // SIGINT/TERM/SEGV use SA_RESTART; SIGUSR1
     // (the safepoint interrupt) deliberately omits SA_RESTART so a blocking
     // syscall returns EINTR and reaches the next safepoint.
     // SAFETY: each handler is a valid extern "C" fn(i32).
     unsafe {
-        syscall::rt_sigaction_siginfo(
+        install(
             syscall::SIGSEGV,
             sigsegv_handler as *const () as usize,
-            syscall::SA_RESTART | syscall::SA_ONSTACK,
+            syscall::SA_RESTART | syscall::SA_ONSTACK | syscall::SA_SIGINFO,
         )
         .map_err(|_| TorclError::SignalError(syscall::SIGSEGV))?;
-        syscall::rt_sigaction(
+        install(
             syscall::SIGINT,
             sigint_handler as *const () as usize,
             syscall::SA_RESTART,
         )
         .map_err(|_| TorclError::SignalError(syscall::SIGINT))?;
-        syscall::rt_sigaction(
+        install(
             syscall::SIGTERM,
             sigterm_handler as *const () as usize,
             syscall::SA_RESTART,
         )
         .map_err(|_| TorclError::SignalError(syscall::SIGTERM))?;
-        syscall::rt_sigaction(
+        install(
             syscall::SIGALRM,
             sigalrm_handler as *const () as usize,
             syscall::SA_RESTART,
         )
         .map_err(|_| TorclError::SignalError(syscall::SIGALRM))?;
-        syscall::rt_sigaction(
+        install(
             syscall::SIGFPE,
             sigfpe_handler as *const () as usize,
             syscall::SA_RESTART,
         )
         .map_err(|_| TorclError::SignalError(syscall::SIGFPE))?;
-        syscall::rt_sigaction(
+        install(
             syscall::SIGPIPE,
             sigpipe_handler as *const () as usize,
             syscall::SA_RESTART,
         )
         .map_err(|_| TorclError::SignalError(syscall::SIGPIPE))?;
-        syscall::rt_sigaction(
+        install(
             syscall::SIGUSR1,
             crate::safepoint::sigusr1_handler as *const () as usize,
             0,
