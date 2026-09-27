@@ -737,7 +737,7 @@ fn cc_swapped(cc: Cc) -> Cc {
         Cc::G => Cc::L,
         Cc::Le => Cc::Ge,
         Cc::Ge => Cc::Le,
-        Cc::E | Cc::Ne | Cc::O => cc,
+        Cc::E | Cc::Ne | Cc::O | Cc::No => cc,
     }
 }
 

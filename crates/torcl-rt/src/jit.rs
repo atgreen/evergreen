@@ -78,11 +78,10 @@ impl JitBuffer {
                 let _ = crate::syscall::munmap(ptr, len);
                 return None;
             }
-            // Flush the instruction cache (a no-op on x86, required on aarch64).
+            // Make the instructions visible to the fetch path (nothing to do on
+            // x86-64, which has coherent caches).
             #[cfg(target_arch = "aarch64")]
-            {
-                std::arch::asm!("isb", options(nostack, preserves_flags),);
-            }
+            flush_instruction_cache(ptr, code.len());
             Some(JitBuffer {
                 ptr,
                 len,
@@ -193,6 +192,69 @@ impl JitBuffer {
         let ptr = self.ptr;
         std::mem::forget(self);
         ptr
+    }
+}
+
+/// Make newly written instructions visible to instruction fetch.
+///
+/// AArch64's instruction and data caches are **not** coherent with each other
+/// (Arm ARM B2.4.4, "Concurrent modification and execution of instructions"):
+/// code written with ordinary stores sits in the data cache, while instruction
+/// fetch reads the instruction cache. The lines must be cleaned to the point of
+/// unification and then invalidated in the I-cache, exactly as a compiler's
+/// `__clear_cache` does. An `ISB` alone — which is what this used to be — only
+/// discards the prefetch pipeline and does nothing about either cache; it
+/// appeared to work solely because Linux happens to flush when `mprotect` makes
+/// a page executable, which is an implementation detail and is no help at all
+/// when patching code that is *already* executable (tier promotion).
+///
+/// # Safety
+/// `ptr..ptr + len` must be a mapped range in this process.
+#[cfg(target_arch = "aarch64")]
+unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // CTR_EL0 gives each cache's minimum line size as a log2 count of 4-byte
+    // words: D-cache in bits 19:16 (DminLine), I-cache in bits 3:0 (IminLine).
+    let ctr: u64;
+    // SAFETY: CTR_EL0 is readable from EL0 on Linux (trapped and emulated if the
+    // hardware does not permit it directly).
+    unsafe {
+        std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+    let data_line = 4usize << ((ctr >> 16) & 0xf);
+    let inst_line = 4usize << (ctr & 0xf);
+    let end = ptr as usize + len;
+
+    // Clean the data cache by VA to the point of unification, one line at a
+    // time from the containing line's start, then order those cleans before the
+    // invalidations below.
+    let mut addr = (ptr as usize) & !(data_line - 1);
+    while addr < end {
+        // SAFETY: `addr` is within the mapped range, rounded down to a line.
+        unsafe {
+            std::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += data_line;
+    }
+    // SAFETY: a barrier; touches no memory operand.
+    unsafe {
+        std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    let mut addr = (ptr as usize) & !(inst_line - 1);
+    while addr < end {
+        // SAFETY: as above; `ic ivau` is permitted from EL0 on Linux.
+        unsafe {
+            std::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += inst_line;
+    }
+    // Order the invalidations, then discard anything already prefetched.
+    // SAFETY: barriers only.
+    unsafe {
+        std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 }
 
