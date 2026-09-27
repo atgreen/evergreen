@@ -15517,7 +15517,7 @@ fn native_loop_should_exit() -> u64 {
     0
 }
 
-/// Signal-only loop back-edge poll for OSR-compiled loops (bliss-7rdu). OSR code
+/// GC/signal loop back-edge poll for OSR and s390x T2 code. Baseline OSR code
 /// is emitted with `sym == u32::MAX` (no T2 escalation from an OSR loop), so it
 /// cannot use `c2i_t1_backedge`; without any back-edge poll a hot OSR loop
 /// ignores SIGTERM and GC stop-the-world forever (the observed `timeout` hang).
@@ -15525,7 +15525,8 @@ extern "C" fn c2i_osr_backedge() -> u64 {
     // GC stop-the-world (bliss-eeyj): park here if a safepoint is requested.
     // The OSR frame is on the rt thread stack under a conservative all-slots
     // stack map (install_stack_map's single pc-0 entry matches every pc), and
-    // native code holds no heap refs in registers across this crossing — the
+    // native code synchronizes its live references into those slots before
+    // crossing (including s390x T2 register and spill homes) — the
     // same discipline that already makes moving GC safe at any T1/OSR runtime
     // call — so parking and being scanned here is sound.
     torcl_rt::safepoint::poll_safepoint();
@@ -15615,17 +15616,39 @@ extern "C" fn c2i_t1_backedge(
     // parameter: a hot `(dotimes (i n r) (setq r (f o)))` returned the next
     // frame's raw pointer instead of `o` (bliss-kqdr).
     //
-    // Decline the OSR entry when the live frame is too small, exactly as
-    // validate_t2_root_sync already refuses to install shadow-root code with a
+    // Other backends decline the OSR entry when the live frame is too small;
+    // s390x grows it in place below. The decline matches the way
+    // validate_t2_root_sync refuses to install shadow-root code with a
     // compiled entry, and as the emitter declines an OSR entry it cannot
     // transfer soundly. The loop keeps running at T1 and still promotes on its
     // next full call, so this costs a fast path, never a correct result.
+    #[cfg(not(target_arch = "s390x"))]
     if t2.num_slots > body.num_slots() {
         return 0;
     }
+    #[cfg(target_arch = "s390x")]
+    {
+        let thread = torcl_rt::current_thread();
+        let stack = thread.stack();
+        let frame = stack.fp();
+        // Grow only the still-current T1 activation. The mmap-backed stack
+        // keeps its frame and slot addresses stable; new shadow slots start
+        // as NIL and the T2 map covers them before a safepoint can scan them.
+        if frame.is_null()
+            || unsafe { frame.add(1) as *mut u64 } != slots
+            || stack.grow_top_frame(t2.num_slots, t2.code_info).is_none()
+        {
+            return 0;
+        }
+        OSR_ENTRY_COUNTS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            let count = counts.entry(sym).or_insert(0);
+            *count = count.saturating_add(1);
+        });
+    }
     let entry = t2.entry as usize + offset;
     // SAFETY: the T2 emitter records only alternate entries having the same
-    // `fn(*mut u64)->u64` ABI. `slots` is r14 from the still-live T1 frame.
+    // `fn(*mut u64)->u64` ABI. `slots` belongs to the still-live T1 frame.
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry) };
     let result = {
         let _active = ActiveNativeCode::enter(&t2);
@@ -19514,6 +19537,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         mv_addr,
         recovery_toggle_addr,
         c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64,
+        c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64,
         bf.num_slots(),
         Some(sym),
     ) {

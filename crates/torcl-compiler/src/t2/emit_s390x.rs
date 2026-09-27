@@ -7,7 +7,7 @@ use super::ir::{
     ValueRepresentation,
 };
 use super::mach::{Location, RegClass};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use torcl_rt::asm_s390x::{Asm, Label};
 use torcl_rt::value::{NIL, T, TorclVal, UNBOUND};
 
@@ -21,6 +21,8 @@ pub struct RuntimeCalls {
     pub store_global: u64,
     pub multiple_values: u64,
     pub transfer_pending: u64,
+    /// Safepoint callback: nonzero requests immediate native exit.
+    pub poll: u64,
 }
 
 fn calls_runtime(opcode: Opcode) -> bool {
@@ -59,6 +61,8 @@ struct Emitter<'a> {
     roots: HashMap<Inst, Vec<Value>>,
     root_sites: Vec<RootSyncSite>,
     result_offset: i32,
+    poll_offset: i32,
+    polls: HashSet<Inst>,
     transfer_exit: Option<Label>,
 }
 
@@ -67,7 +71,11 @@ fn unsupported() -> EmitError {
 }
 
 impl Emitter<'_> {
-    fn runtime_call(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
+    fn runtime_call(
+        &mut self,
+        instruction: Inst,
+        data: Option<&InstData>,
+    ) -> Result<(), EmitError> {
         let roots = self
             .roots
             .get(&instruction)
@@ -85,58 +93,62 @@ impl Emitter<'_> {
             self.load(value, 2)?;
             self.asm.store(2, 13, root_base + index as i32 * 8);
         }
-        let helper = match data.opcode {
-            Opcode::Call => {
-                let AuxData::CallTarget(symbol) = data.aux else {
-                    return Err(unsupported());
-                };
-                for (index, &arg) in data.args.iter().enumerate() {
-                    self.load(arg, 2)?;
-                    self.asm.store(2, 13, argument_base + index as i32 * 8);
+        let helper = if let Some(data) = data {
+            match data.opcode {
+                Opcode::Call => {
+                    let AuxData::CallTarget(symbol) = data.aux else {
+                        return Err(unsupported());
+                    };
+                    for (index, &arg) in data.args.iter().enumerate() {
+                        self.load(arg, 2)?;
+                        self.asm.store(2, 13, argument_base + index as i32 * 8);
+                    }
+                    self.asm.imm64(2, u64::from(symbol));
+                    self.asm.imm64(3, data.args.len() as u64);
+                    self.asm.address(4, 13, argument_base);
+                    self.asm.imm64(5, 0);
+                    self.runtime.call_slice
                 }
-                self.asm.imm64(2, u64::from(symbol));
-                self.asm.imm64(3, data.args.len() as u64);
-                self.asm.address(4, 13, argument_base);
-                self.asm.imm64(5, 0);
-                self.runtime.call_slice
-            }
-            Opcode::SymbolValue | Opcode::SymbolFunction | Opcode::SetSymbolValue => {
-                let AuxData::SymbolRef(symbol) = data.aux else {
-                    return Err(unsupported());
-                };
-                if data.opcode == Opcode::SetSymbolValue {
-                    self.load(*data.args.first().ok_or_else(unsupported)?, 3)?;
+                Opcode::SymbolValue | Opcode::SymbolFunction | Opcode::SetSymbolValue => {
+                    let AuxData::SymbolRef(symbol) = data.aux else {
+                        return Err(unsupported());
+                    };
+                    if data.opcode == Opcode::SetSymbolValue {
+                        self.load(*data.args.first().ok_or_else(unsupported)?, 3)?;
+                    }
+                    self.asm.imm64(2, u64::from(symbol));
+                    match data.opcode {
+                        Opcode::SymbolValue => self.runtime.load_global,
+                        Opcode::SymbolFunction => self.runtime.load_function,
+                        _ => self.runtime.store_global,
+                    }
                 }
-                self.asm.imm64(2, u64::from(symbol));
-                match data.opcode {
-                    Opcode::SymbolValue => self.runtime.load_global,
-                    Opcode::SymbolFunction => self.runtime.load_function,
-                    _ => self.runtime.store_global,
+                Opcode::ClearMv => {
+                    self.asm.imm64(2, NIL.0);
+                    self.asm.imm64(3, 0);
+                    self.asm.imm64(4, 0);
+                    self.runtime.multiple_values
                 }
-            }
-            Opcode::ClearMv => {
-                self.asm.imm64(2, NIL.0);
-                self.asm.imm64(3, 0);
-                self.asm.imm64(4, 0);
-                self.runtime.multiple_values
-            }
-            Opcode::TakeValuesToLocals => {
-                let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
-                    return Err(unsupported());
-                };
-                if usize::from(nvars) != data.results.len()
-                    || slot_base
-                        .checked_add(nvars)
-                        .is_none_or(|end| end > self.activation_slots)
-                {
-                    return Err(unsupported());
+                Opcode::TakeValuesToLocals => {
+                    let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
+                        return Err(unsupported());
+                    };
+                    if usize::from(nvars) != data.results.len()
+                        || slot_base
+                            .checked_add(nvars)
+                            .is_none_or(|end| end > self.activation_slots)
+                    {
+                        return Err(unsupported());
+                    }
+                    self.load(*data.args.first().ok_or_else(unsupported)?, 2)?;
+                    self.asm.address(3, 13, i32::from(slot_base) * 8);
+                    self.asm.imm64(4, u64::from(nvars));
+                    self.runtime.multiple_values
                 }
-                self.load(*data.args.first().ok_or_else(unsupported)?, 2)?;
-                self.asm.address(3, 13, i32::from(slot_base) * 8);
-                self.asm.imm64(4, u64::from(nvars));
-                self.runtime.multiple_values
+                _ => return Err(unsupported()),
             }
-            _ => return Err(unsupported()),
+        } else {
+            self.runtime.poll
         };
         if helper == 0 {
             return Err(unsupported());
@@ -145,9 +157,11 @@ impl Emitter<'_> {
         self.asm.imm64(1, helper);
         self.asm.call_reg(1);
         self.asm.store(2, 15, self.result_offset);
-        if self.runtime.transfer_pending != 0 {
-            self.asm.imm64(1, self.runtime.transfer_pending);
-            self.asm.call_reg(1);
+        if data.is_none() || self.runtime.transfer_pending != 0 {
+            if data.is_some() {
+                self.asm.imm64(1, self.runtime.transfer_pending);
+                self.asm.call_reg(1);
+            }
             self.asm.imm64(3, 0);
             self.asm.compare(2, 3);
             let exit = *self.transfer_exit.get_or_insert_with(|| self.asm.label());
@@ -159,15 +173,17 @@ impl Emitter<'_> {
             self.asm.load(2, 13, root_base + index as i32 * 8);
             self.store(value, 2)?;
         }
-        if let AuxData::ValuesLocals { slot_base, .. } = data.aux {
-            for (index, &value) in data.results.iter().enumerate() {
-                self.asm
-                    .load(2, 13, (i32::from(slot_base) + index as i32) * 8);
-                self.store(value, 2)?;
+        if let Some(data) = data {
+            if let AuxData::ValuesLocals { slot_base, .. } = data.aux {
+                for (index, &value) in data.results.iter().enumerate() {
+                    self.asm
+                        .load(2, 13, (i32::from(slot_base) + index as i32) * 8);
+                    self.store(value, 2)?;
+                }
+            } else if let Some(&result) = data.results.first() {
+                self.asm.load(2, 15, self.result_offset);
+                self.store(result, 2)?;
             }
-        } else if let Some(&result) = data.results.first() {
-            self.asm.load(2, 15, self.result_offset);
-            self.store(result, 2)?;
         }
         let register_roots = roots
             .iter()
@@ -209,6 +225,8 @@ impl Emitter<'_> {
         self.asm.prologue();
         self.asm.address(15, 15, -self.frame_bytes);
         self.asm.mov(13, 2);
+        self.asm.imm64(2, 256);
+        self.asm.store(2, 15, self.poll_offset);
     }
 
     fn epilogue(&mut self) {
@@ -254,8 +272,19 @@ impl Emitter<'_> {
 
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
+        if self.polls.contains(&instruction) {
+            let skip = self.asm.label();
+            self.asm.load(2, 15, self.poll_offset);
+            self.asm.add_imm(2, -1);
+            self.asm.store(2, 15, self.poll_offset);
+            self.asm.branch(6, skip);
+            self.asm.imm64(2, 256);
+            self.asm.store(2, 15, self.poll_offset);
+            self.runtime_call(instruction, None)?;
+            self.asm.bind(skip);
+        }
         if calls_runtime(data.opcode) {
-            return self.runtime_call(instruction, data);
+            return self.runtime_call(instruction, Some(data));
         }
         if data
             .results
@@ -410,7 +439,7 @@ pub fn emit_framed(
 /// Emit optimized System Z code with native roots synchronized through extra
 /// activation slots at runtime calls. Precise guard exits serialize virtual
 /// scopes for the T0 adapter, which must root the stream before allocating.
-/// Backward edges still decline until loop polling is implemented.
+/// Every cycle crosses a sampled GC/signal poll before its edge transfers.
 pub fn emit_framed_with_runtime(
     function: &Function,
     deopt_t2: u64,
@@ -418,22 +447,24 @@ pub fn emit_framed_with_runtime(
     runtime: RuntimeCalls,
 ) -> Result<FramedCode, EmitError> {
     // Backward edges need a signal/GC poll with synchronized native roots.
-    // Until that call path exists, keep these functions in the polling T1
-    // backend. This also catches irreducible cycles without relying on the
-    // optional OSR metadata to describe every loop.
+    // This also catches irreducible cycles without relying on OSR metadata.
     let positions: HashMap<_, _> = function
         .block_order()
         .iter()
         .enumerate()
         .map(|(index, &block)| (block, index))
         .collect();
+    let mut polls = HashSet::new();
     for (index, &block) in function.block_order().iter().enumerate() {
         if function
             .succs(block)
             .iter()
             .any(|target| positions.get(target).is_none_or(|&target| target <= index))
         {
-            return Err(unsupported());
+            if runtime.poll == 0 {
+                return Err(unsupported());
+            }
+            polls.insert(*function.block(block).insts.last().ok_or_else(unsupported)?);
         }
     }
     let mut machine = super::lower::lower(function);
@@ -457,6 +488,8 @@ pub fn emit_framed_with_runtime(
         roots: HashMap::new(),
         root_sites: Vec::new(),
         result_offset: 0,
+        poll_offset: 0,
+        polls,
         transfer_exit: None,
     };
     for &block in function.block_order() {
@@ -542,6 +575,46 @@ pub fn emit_framed_with_runtime(
         roots.dedup();
         emitter.roots.insert(source, roots);
     }
+    // Poll before the edge's parallel transfers. Lowering represents these
+    // transfers as anonymous moves before the machine terminator; their
+    // destination phi values do not exist yet in our emitted code.
+    for (block_index, &block) in function.block_order().iter().enumerate() {
+        let Some(&source) = function.block(block).insts.last() else {
+            continue;
+        };
+        if !emitter.polls.contains(&source) {
+            continue;
+        }
+        let mb = &machine.blocks[block_index];
+        let mut boundary = mb.end;
+        while boundary > mb.start
+            && machine.insts[boundary - 1]
+                .source_inst
+                .is_none_or(|inst| inst == source)
+        {
+            boundary -= 1;
+        }
+        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let data = function.inst(source);
+        let mut roots: Vec<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= point && point < range.end
+            })
+            .map(|range| Value(range.vreg.num))
+            .chain(data.args.iter().copied())
+            .chain(
+                data.targets
+                    .iter()
+                    .flat_map(|target| target.args.iter().copied()),
+            )
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        roots.sort_by_key(|value| value.0);
+        roots.dedup();
+        emitter.roots.insert(source, roots);
+    }
     emitter.root_slots = u16::try_from(emitter.roots.values().map(Vec::len).max().unwrap_or(0))
         .map_err(|_| unsupported())?;
     emitter.argument_slots = u16::try_from(
@@ -581,7 +654,7 @@ pub fn emit_framed_with_runtime(
         })
         .max()
         .unwrap_or(0);
-    let frame_words = spill_slots as usize + edge_words + deopt_words + 1;
+    let frame_words = spill_slots as usize + edge_words + deopt_words + 2;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported());
@@ -589,7 +662,8 @@ pub fn emit_framed_with_runtime(
     emitter.frame_bytes = (frame_words * 8) as i32;
     emitter.edge_base = 160 + spill_slots as i32 * 8;
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
-    emitter.result_offset = 160 + (frame_words as i32 - 1) * 8;
+    emitter.result_offset = 160 + (frame_words as i32 - 2) * 8;
+    emitter.poll_offset = emitter.result_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported());
     }
@@ -614,6 +688,63 @@ pub fn emit_framed_with_runtime(
             emitter.instruction(instruction, data)?;
         }
     }
+    let mut osr_entries = Vec::new();
+    for osr in &function.osr_entries {
+        let state = function.frame_states.get(osr.frame_state);
+        let Some(scope) = state.scopes.first() else {
+            continue;
+        };
+        if state.scopes.len() != 1
+            || !scope.stack.is_empty()
+            || scope.locals.len() > activation_slots as usize
+        {
+            continue;
+        }
+        let specs = super::slot_map::slot_specs(scope, state);
+        if specs.iter().any(|spec| {
+            spec.repr != ValueRepresentation::Tagged || matches!(spec.source, ValueSource::Remat(_))
+        }) {
+            continue;
+        }
+        let Some(&block_index) = positions.get(&osr.block) else {
+            continue;
+        };
+        let point = machine.blocks[block_index].start as u32 * 2;
+        let live: HashSet<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= point && point < range.end
+            })
+            .map(|range| Value(range.vreg.num))
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        let imports: Vec<_> = specs
+            .iter()
+            .filter_map(|spec| match spec.source {
+                ValueSource::Value { value, .. } if live.contains(&value) => {
+                    Some((spec.index, value))
+                }
+                _ => None,
+            })
+            .collect();
+        // An entry must reconstruct every live native home, including values
+        // defined above the loop. Constants are rematerialized by load().
+        if live
+            .iter()
+            .any(|value| !imports.iter().any(|(_, imported)| imported == value))
+        {
+            continue;
+        }
+        let offset = emitter.asm.here();
+        emitter.prologue();
+        for (slot, value) in imports {
+            emitter.asm.load(2, 13, slot as i32 * 8);
+            emitter.store(value, 2)?;
+        }
+        emitter.asm.branch(15, emitter.blocks[&osr.block]);
+        osr_entries.push((osr.bcp, offset));
+    }
     let has_deopt = !emitter.deopts.is_empty();
     if let Some(exit) = emitter.transfer_exit {
         emitter.asm.bind(exit);
@@ -627,7 +758,7 @@ pub fn emit_framed_with_runtime(
     Ok(FramedCode {
         code: emitter.asm.finish().ok_or(EmitError::BadBranch)?,
         compiled_entry: 0,
-        osr_entries: Vec::new(),
+        osr_entries,
         bcp_offsets,
         native_spill_slots: frame_words as u32,
         regalloc_spill_slots: machine.num_spill_slots,
@@ -796,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn declines_loops_until_native_safepoint_polling_is_available() {
+    fn declines_loops_without_a_bound_safepoint_poll() {
         let mut f = Function::new("z-needs-poll");
         let header = f.make_block();
         for block in [f.entry(), header] {
@@ -821,6 +952,107 @@ mod tests {
             emit_framed(&f, 0, 0).is_err(),
             "must not install a loop that cannot reach a GC/signal poll"
         );
+    }
+
+    #[test]
+    fn loops_poll_and_reload_moved_roots_before_the_next_backedge() {
+        let mut f = Function::new("z-loop-roots");
+        let entry = f.entry();
+        let header = f.make_block();
+        let inputs: Vec<_> = (0..20)
+            .map(|_| f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged))
+            .collect();
+        let carried: Vec<_> = (0..20)
+            .map(|_| f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged))
+            .collect();
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 73,
+                bcp: 12,
+                locals: carried
+                    .iter()
+                    .map(|&value| ValueSource::Value {
+                        value,
+                        repr: ValueRepresentation::Tagged,
+                    })
+                    .collect(),
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(crate::t2::ir::OsrEntry {
+            block: header,
+            bcp: 12,
+            frame_state: state,
+        });
+        for (block, args) in [(entry, inputs), (header, carried)] {
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Jump,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![BlockCall {
+                        block: header,
+                        args,
+                    }],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+        }
+        thread_local! {
+            static POLL_FRAME: std::cell::Cell<(*mut u64, usize)> = const { std::cell::Cell::new((std::ptr::null_mut(), 0)) };
+        }
+        extern "C" fn poll() -> u64 {
+            POLL_FRAME.with(|state| {
+                let (frame, count) = state.get();
+                for index in 0..20 {
+                    unsafe {
+                        assert_eq!(
+                            *frame.add(20 + index),
+                            0x1001 + index as u64 * 16 + count as u64 * 0x10000
+                        );
+                        *frame.add(20 + index) += 0x10000;
+                    }
+                }
+                state.set((frame, count + 1));
+                u64::from(count == 1)
+            })
+        }
+        let compiled = emit_framed_with_runtime(
+            &f,
+            0,
+            20,
+            RuntimeCalls {
+                poll: poll as *const () as usize as u64,
+                ..RuntimeCalls::default()
+            },
+        )
+        .expect("loop with a bound poll must compile");
+        assert_eq!(compiled.osr_entries.len(), 1);
+        assert_eq!(compiled.root_sync_sites.len(), 1);
+        assert_eq!(compiled.root_sync_sites[0].live_roots, 20);
+        #[cfg(target_arch = "s390x")]
+        {
+            let buffer = torcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            for offset in [0, compiled.osr_entries[0].1] {
+                let entry: extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(buffer.as_ptr().add(offset)) };
+                let mut slots = vec![NIL.0; 20 + compiled.shadow_root_slots as usize];
+                for (index, slot) in slots[..20].iter_mut().enumerate() {
+                    *slot = 0x1001 + index as u64 * 16;
+                }
+                POLL_FRAME.with(|state| state.set((slots.as_mut_ptr(), 0)));
+                assert_eq!(entry(slots.as_mut_ptr()), NIL.0);
+                POLL_FRAME.with(|state| {
+                    assert_eq!(state.get().1, 2);
+                    state.set((std::ptr::null_mut(), 0));
+                });
+            }
+        }
     }
 
     #[test]
