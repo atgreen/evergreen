@@ -131,10 +131,19 @@ bd update <id> --claim
 3. Run the relevant suites (`cargo test -p torcl --test <suite>`, plus
    `-p torcl-stdlib` / `-p torcl-compiler` when touched). Run the lib tests
    single-threaded (`--lib -- --test-threads=1`) — the deliberate-SIGSEGV
-   recovery tests (`jtc4_stack_map_tests`) and some `torcl-rt`
-   `spec_threading_concurrency` tests flake under parallel signal/safepoint
-   contention (pre-existing race, `bliss-lb6.20`); they pass in isolation. Don't
-   attribute a flake to your change without re-running the suite single-threaded.
+   recovery tests (`jtc4_stack_map_tests`) flake under parallel signal contention
+   and pass in isolation. Don't attribute a flake to your change without
+   re-running single-threaded.
+
+   **`cargo test --workspace` should now complete unattended.** The `torcl-rt`
+   parallel-interference flakes — `spec_threading_concurrency`, `test_safepoint`,
+   `test_scheduler`, `test_thread`, `test_runtime` — were fixed in `bliss-z11t`
+   (2026-09-26/27) by serializing the tests that drive process-global state (the
+   thread registry, the one safepoint handshake, the single mprotected page). So a
+   failure in those targets is now **evidence, not noise**: investigate it rather
+   than re-running until it passes. If you add a test that creates threads/fibers,
+   drives a stop-the-world, or asserts over `all_thread_ids()`, take that target's
+   serialization lock — otherwise you reintroduce the flake.
 4. GC fuzz + lint any allocating path you touched (§3).
 5. **Warning-clean build (non-negotiable, per the hackinator `finishing`
    skill).** Read the build output, not just the exit code: `cargo build

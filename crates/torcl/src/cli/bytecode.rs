@@ -14826,8 +14826,9 @@ extern "C" fn c2i_set_native_sigsegv_recovery(enabled: u64) {
     } else {
         0
     };
-    torcl_rt::runtime::set_sigsegv_null_guard_recovery_ip(recovery);
-    torcl_rt::runtime::set_sigsegv_stack_guard_recovery_ip(recovery);
+    // ONE slot resolution, not two: this runs on every native entry, and the
+    // two single-guard setters each did their own tid + slot lookup (bliss-dsr8).
+    torcl_rt::runtime::set_sigsegv_recovery_ips(recovery, recovery);
 }
 
 fn emit_c2i_helper_call(c: &mut Asm) {
@@ -17492,8 +17493,7 @@ fn run_native(
     let saved_null_recovery = torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip();
     let saved_stack_recovery = torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
     let native_recovery = native_sigsegv_recovery_ip();
-    torcl_rt::runtime::set_sigsegv_null_guard_recovery_ip(native_recovery);
-    torcl_rt::runtime::set_sigsegv_stack_guard_recovery_ip(native_recovery);
+    torcl_rt::runtime::set_sigsegv_recovery_ips(native_recovery, native_recovery);
     // SAFETY: `entry` is installed executable code from emit_native_x86 with the
     // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
     // rsi = *mut TorclStack, stashed into the reserved r12 by the prologue
@@ -17503,8 +17503,7 @@ fn run_native(
         let _active = ActiveNativeCode::enter(nc);
         f(slots, std::ptr::from_ref(stack) as *const u8)
     };
-    torcl_rt::runtime::set_sigsegv_null_guard_recovery_ip(saved_null_recovery);
-    torcl_rt::runtime::set_sigsegv_stack_guard_recovery_ip(saved_stack_recovery);
+    torcl_rt::runtime::set_sigsegv_recovery_ips(saved_null_recovery, saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
 

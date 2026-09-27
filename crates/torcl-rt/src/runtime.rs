@@ -813,6 +813,22 @@ pub fn post_sigsegv_null_guard() {
     mark_process_signal_activity();
 }
 
+/// Publish BOTH recovery IPs through a SINGLE slot resolution.
+///
+/// The two single-guard setters below each do their own `cached_tid()` plus slot
+/// resolution, and the native-entry adapter called them back to back — two full
+/// resolutions on every native call, measured at 23.96% + 16.89% of a 200M-call
+/// loop (bliss-dsr8). Callers that set both (the c2i adapters) MUST use this.
+pub fn set_sigsegv_recovery_ips(null_guard_ip: usize, stack_guard_ip: usize) {
+    let tid = crate::syscall::cached_tid() as usize;
+    if let Some(slot) = sigsegv_recovery_slot_for_tid(tid) {
+        SIGSEGV_NULL_GUARD_RECOVERY_IPS[slot]
+            .store(null_guard_ip, std::sync::atomic::Ordering::Release);
+        SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot]
+            .store(stack_guard_ip, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub fn set_sigsegv_null_guard_recovery_ip(ip: usize) {
     let tid = crate::syscall::cached_tid() as usize;
     if let Some(slot) = sigsegv_recovery_slot_for_tid(tid) {
@@ -1165,6 +1181,10 @@ impl Drop for SigsegvSlotGuard {
     fn drop(&mut self) {
         if let Some(i) = self.slot.get() {
             clear_sigsegv_recovery_slot(i);
+            // The fast-path cache must not outlive the slot it names. Writing it
+            // here may fail if that thread-local is already destroyed, which is
+            // harmless: the thread is going away and the cache dies with it.
+            let _ = SIGSEGV_SLOT_CACHE.try_with(|c| c.set(0));
         }
     }
 }
@@ -1173,6 +1193,23 @@ thread_local! {
     static SIGSEGV_SLOT: SigsegvSlotGuard = const {
         SigsegvSlotGuard { slot: std::cell::Cell::new(None) }
     };
+
+    /// Fast-path copy of this thread's slot, stored as `index + 1` so that `0`
+    /// means "not claimed yet" and the whole thing needs no `Option` and no
+    /// initialisation.
+    ///
+    /// This exists ONLY because `SIGSEGV_SLOT` above has a `Drop` impl. A
+    /// `thread_local!` whose type implements `Drop` cannot use the const-init
+    /// fast path: every access has to carry lazy-initialisation state and
+    /// register a destructor, so even `try_with` on it compiles to a state-byte
+    /// load, two branches, and a possible indirect call. That measured as 19.02%
+    /// of a 200M-call native loop, with its two callers a further 24% and 17%
+    /// (bliss-dsr8). A const-init `Cell<usize>` with no `Drop` compiles instead
+    /// to a single `mov %fs:disp`.
+    ///
+    /// `SIGSEGV_SLOT` keeps the release-at-thread-exit behaviour; this is only a
+    /// cache of the index it holds, so the two must be written together.
+    static SIGSEGV_SLOT_CACHE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Blank a slot and only then release its tid, so a concurrent reader can never
@@ -1194,8 +1231,12 @@ fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
 
     // Fast path: this thread already owns a slot. Keyed on thread-local state,
     // not on the tid, so a recycled tid cannot masquerade as the same thread.
-    if let Ok(Some(i)) = SIGSEGV_SLOT.try_with(|g| g.slot.get()) {
-        return Some(i);
+    // Read the non-Drop CACHE rather than the guard: one `mov %fs:disp` instead
+    // of a lazy-init `try_with` (see SIGSEGV_SLOT_CACHE; bliss-dsr8).
+    if let Ok(cached) = SIGSEGV_SLOT_CACHE.try_with(|c| c.get())
+        && cached != 0
+    {
+        return Some(cached - 1);
     }
 
     // First touch from this thread. Any slot still carrying our tid belongs to a
@@ -1224,7 +1265,10 @@ fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
             // reclaimed by the stale-slot sweep above when the tid is reused.
             SIGSEGV_STACK_GUARD_RECOVERY_IPS[i].store(0, std::sync::atomic::Ordering::Release);
             SIGSEGV_NULL_GUARD_RECOVERY_IPS[i].store(0, std::sync::atomic::Ordering::Release);
+            // Guard first (it owns release at thread exit), then the cache, so a
+            // visible cache entry always names a slot the guard will release.
             let _ = SIGSEGV_SLOT.try_with(|g| g.slot.set(Some(i)));
+            let _ = SIGSEGV_SLOT_CACHE.try_with(|c| c.set(i + 1));
             return Some(i);
         }
     }
