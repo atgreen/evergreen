@@ -4,17 +4,19 @@ TorCL can be cross-built on Linux as a Windows console executable:
 `target/x86_64-pc-windows-gnu/release/torcl.exe`.
 
 This is an interpreter/T0 bytecode port. Native T1/T2/OSR compilation,
-aggregate foreign calls, fiber switching, and structured-exception
+fiber switching, and structured-exception
 recovery are not supported yet. Forcing T2 safely
 falls back to bytecode. DLL loading and symbol lookup are available; global
 Unix-style symbol lookup requires choosing a DLL explicitly on Windows.
 
-Scalar foreign calls and callbacks use generated Win64 adapters. They support
+Foreign calls and callbacks use generated Win64 adapters. They support
 integers, pointers, single/double floats, mixed register and stack arguments,
 and variadic calls with C argument promotions. Callbacks retain Lisp closures,
 participate in moving GC, admit foreign threads, and contain Lisp errors and
-nonlocal exits before returning through C. Struct/union buffer calls remain
-unsupported.
+nonlocal exits before returning through C. Callback signatures are scalar.
+Buffered foreign calls support structs, packed structs, and unions passed and
+returned by value, including variadic calls. Indirect aggregate arguments use
+private aligned copies so C cannot overwrite the caller's original object.
 
 Generated adapters use write-then-execute protection, probe large stack frames,
 and retain registered Win64 unwind metadata for their lifetime. This does not
@@ -106,10 +108,13 @@ nonblocking reads, subprocess quoting and concurrent output pipes,
 pathname components, construction, merging, wildcard searches, equality/hashing,
 and compiled-file and heap-image pathname round trips in fresh processes.
 
-MinGW-built C DLL fixtures check scalar foreign calls, varargs, callbacks,
+MinGW-built C DLL fixtures check scalar and aggregate foreign calls, varargs, callbacks,
 large frames and all three stack-allocation unwind encodings. Managed callback
 tests cover moving GC, foreign-thread admission, nested entry and error
-containment; CLI tests exercise allocating Lisp closures through C DLL calls.
+containment; CLI tests exercise allocating Lisp closures and checked aggregate
+buffers through C DLL calls. Aggregate tests also check packed objects ending
+at guard pages, hidden return pointers, small aggregate register returns, and
+alignment and isolation of indirect copies.
 
 The GC stress probe uses `--no-bootstrap` and stresses every allocation in the
 probe; the broader functional tests load the normal prelude. Tests use

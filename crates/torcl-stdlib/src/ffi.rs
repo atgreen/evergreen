@@ -90,11 +90,11 @@ fn native_type(value: TorclVal, depth: usize) -> Result<AlienType, TorclError> {
 }
 
 fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     {
         torcl_rt::ffi::native_layout(ty)
     }
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
     {
         if matches!(ty, AlienType::Struct { .. } | AlienType::Union { .. }) {
             return Err(TorclError::FfiError(
@@ -108,7 +108,7 @@ fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
 /// All arguments are addresses of native C objects, not Lisp values to marshal.
 /// The caller supplies matching signatures and valid borrowed storage. Tracked
 /// storage is copied under short registry locks; no locks survive a C callback.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub fn buffered_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     if !(5..=6).contains(&args.len()) {
         return Err(TorclError::ProgramError("FOREIGN-CALL-BUFFERED requires pointer, result type, argument types, argument buffers, result buffer and optional fixed count".into()));
@@ -178,7 +178,7 @@ pub fn buffered_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     })
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 pub fn buffered_call(_args: &[TorclVal]) -> Result<TorclVal, TorclError> {
     Err(TorclError::FfiError(
         "buffered calls are not implemented for this target ABI".into(),

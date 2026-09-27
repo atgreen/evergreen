@@ -8,15 +8,15 @@ use crate::value::TorclVal;
 
 pub mod memory;
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 mod abi;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 mod buffered;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub use buffered::ffi_call_buffered;
 
 /// Checked native layout, identical to the generated call adapter's layout.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub fn native_layout(ty: &AlienType) -> Result<(usize, usize), TorclError> {
     let layout = abi::Layout::new(ty)?;
     Ok((layout.size as usize, layout.alignment as usize))

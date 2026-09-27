@@ -12,6 +12,35 @@ typedef struct { struct { float a, b; } pair; uint64_t c; } Nested;
 typedef union { uint64_t u; double d; } U;
 typedef struct { U u; float a, b; } UnionPair;
 typedef struct { uint8_t prefix[7]; Packed value; } Realigned;
+typedef struct { uint8_t a; } Small1;
+typedef struct { uint16_t a; } Small2;
+typedef struct { float a; } Float1;
+typedef struct { float a, b; } Float2;
+
+Small1 aggregate_small1(Small1 x) { return (Small1){x.a + 3}; }
+Small2 aggregate_small2(Small2 x) { return (Small2){x.a + 1000}; }
+Float1 aggregate_float1(Float1 x) { return (Float1){x.a * 2}; }
+Float2 aggregate_float2(Float2 x) { return (Float2){x.b + 1, x.a + 2}; }
+U aggregate_union8(U x) { x.u ^= UINT64_C(0x123456789abcdef0); return x; }
+uint64_t aggregate_copy_alignment(Big x) {
+    uintptr_t location = (uintptr_t)&x;
+    volatile Big *copy = &x;
+    copy->a = 0; copy->b = 0; copy->c = 0;
+    return location & 15;
+}
+Big aggregate_sret_mixed(double a, uint64_t b, float c, Big d, double e) {
+    return (Big){d.a + (uint64_t)a, d.b + b + (uint64_t)c, d.c + (uint64_t)e};
+}
+Big aggregate_variadic_sret(float fixed, int count, ...) {
+    va_list ap; va_start(ap, count);
+    Big result = {(uint64_t)fixed, 0, 0};
+    for (int i = 0; i < count; i++) {
+        result.b += (uint64_t)va_arg(ap, double);
+        II pair = va_arg(ap, II);
+        result.c += pair.a + pair.b;
+    }
+    va_end(ap); return result;
+}
 
 II aggregate_ii(II x, II y) { return (II){x.a + y.b, x.b ^ y.a}; }
 SS aggregate_ss(SS x) { return (SS){x.b + 1.25, x.a - 2.5}; }

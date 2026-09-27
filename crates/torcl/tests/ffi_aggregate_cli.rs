@@ -1,5 +1,5 @@
 //! R2.14: Lisp calls use native aggregate ABI adapters; R8.01: sandbox denial.
-#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 use std::process::Command;
 
 #[test]
@@ -23,22 +23,28 @@ fn aggregate_calls_are_denied_in_both_sandbox_dispatch_paths() {
 
 #[test]
 fn lisp_native_buffers_support_aggregates_and_checked_lifetimes() {
-    let dir = std::env::temp_dir().join(format!("torcl-aggregate-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let library = dir.join("aggregates.so");
-    assert!(
-        Command::new("cc")
-            .args(["-shared", "-fPIC", "-O2"])
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../torcl-rt/tests/fixtures/ffi_aggregates.c"
-            ))
-            .arg("-o")
-            .arg(&library)
-            .status()
-            .unwrap()
-            .success()
-    );
+    #[cfg(unix)]
+    let library = {
+        let dir = std::env::temp_dir().join(format!("torcl-aggregate-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let library = dir.join("aggregates.so");
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-O2"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../torcl-rt/tests/fixtures/ffi_aggregates.c"
+                ))
+                .arg("-o")
+                .arg(&library)
+                .status()
+                .unwrap()
+                .success()
+        );
+        library
+    };
+    #[cfg(windows)]
+    let library = std::path::PathBuf::from(std::env::var("TORCL_FFI_AGGREGATES_DLL").unwrap());
     let program = format!(
         r#"
       (defun ffi-fails (thunk)
