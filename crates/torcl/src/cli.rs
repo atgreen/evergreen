@@ -7481,7 +7481,7 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: 
                 visit(callable);
             }
         }
-        {
+        if root_definitions {
             for definition in GLOBAL_MACROS.lock().unwrap().values_mut() {
                 visit_macro_def_roots(definition, state, visit);
             }
@@ -7686,8 +7686,10 @@ impl Env {
         visit_env_frame_roots(&self.frame, state, visit);
 
         visit_fun_map_roots(&self.funs, state, visit);
-        for def in self.macros.borrow_mut().values_mut() {
-            visit_macro_def_roots(def, state, visit);
+        if root_closures {
+            for def in self.macros.borrow_mut().values_mut() {
+                visit_macro_def_roots(def, state, visit);
+            }
         }
         for expander in self.setf_expanders.borrow_mut().values_mut() {
             visit_setf_expander_roots(expander, state, visit);

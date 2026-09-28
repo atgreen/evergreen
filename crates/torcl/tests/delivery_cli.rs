@@ -303,6 +303,184 @@ fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
 }
 
 #[test]
+fn delivery_keeps_saved_macro_expanders_and_removes_unused_definitions() {
+    let f = Fixture::new();
+    let core = f.path("macro-handles.core");
+    let spec = f.path("macro-handles.delivery");
+    let exe = f.path("macro-handles");
+    let program = format!(
+        r#"
+        (defpackage :macro-handles (:use :cl))
+        (in-package :macro-handles)
+        (defun dead-helper () 99)
+        (defmacro unused () (dead-helper))
+        (defun live-helper (x) (list 'quote x))
+        (defmacro live (x) (live-helper x))
+        (set '*expander* (macro-function 'live))
+        (set '*alias* *expander*)
+        (defmacro kept () 43)
+        (defun main ()
+          (write-line
+            (if (and (equal '(quote 42) (funcall *expander* '(live 42) nil))
+                     (eq *expander* *alias*)
+                     (= 43 (macroexpand-1 (list (intern "KEPT" :macro-handles))))
+                     (null (macro-function (intern "UNUSED" :macro-handles))))
+                "MACRO-HANDLES-OK" "WRONG")))
+        (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    fs::write(&spec, "version = 1\nentry = MACRO-HANDLES::MAIN\nprune-package = MACRO-HANDLES\ndynamic = explicit\nkeep = MACRO-HANDLES::KEPT\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    for name in ["UNUSED", "DEAD-HELPER"] {
+        assert!(
+            report.contains(&format!("remove MACRO-HANDLES::{name}:")),
+            "{report}"
+        );
+    }
+    for name in ["LIVE", "LIVE-HELPER", "KEPT"] {
+        assert!(
+            report.contains(&format!("keep MACRO-HANDLES::{name}:")),
+            "{report}"
+        );
+    }
+    assert!(ok(run(&exe, &[])).contains("MACRO-HANDLES-OK"));
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let reduced = f.path("reduced.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(!again.contains("MACRO-HANDLES::UNUSED:"), "{again}");
+    assert!(!again.contains("MACRO-HANDLES::DEAD-HELPER:"), "{again}");
+}
+
+#[test]
+fn native_delivery_ignores_eval_in_an_unreachable_macro() {
+    let f = Fixture::new();
+    let source = f.path("main.lisp");
+    let fasl = f.path("main.bfasl");
+    let core = f.path("macros.core");
+    let spec = f.path("macros.delivery");
+    let exe = f.path("macros");
+    fs::write(&source, "(defpackage :macro-shake (:use :cl)) (in-package :macro-shake) (defun main () (write-line \"MACRO-SHAKE-OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (defmacro macro-shake::unused (form) (eval form)) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    let specification = "version = 1\nentry = MACRO-SHAKE::MAIN\nprune-package = MACRO-SHAKE\ndynamic = explicit\nruntime = specialized\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("remove MACRO-SHAKE::UNUSED:"), "{report}");
+    fs::write(
+        &spec,
+        format!("{specification}keep = MACRO-SHAKE::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(report.contains("keep MACRO-SHAKE::UNUSED:"), "{report}");
+}
+
+#[test]
+fn native_delivery_prunes_unused_bytecode_macro() {
+    let f = Fixture::new();
+    let source = f.path("compiled-macros.lisp");
+    let fasl = f.path("compiled-macros.bfasl");
+    let core = f.path("compiled-macros.core");
+    let spec = f.path("compiled-macros.delivery");
+    let exe = f.path("compiled-macros");
+    fs::write(&source, "(defpackage :compiled-macros (:use :cl)) (in-package :compiled-macros) (defmacro unused (form) (eval form)) (defun main () (write-line \"OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+        ],
+    ));
+    fs::write(&spec, "version = 1\nentry = COMPILED-MACROS::MAIN\nprune-package = COMPILED-MACROS\ndynamic = explicit\nruntime = specialized\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(
+        report.contains("remove COMPILED-MACROS::UNUSED:"),
+        "{report}"
+    );
+}
+
+#[test]
 fn native_delivery_ignores_eval_in_an_unreachable_method() {
     let f = Fixture::new();
     let source = f.path("main.lisp");
@@ -1050,7 +1228,7 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
             "--no-bootstrap",
             "--eval",
             &format!(
-                "(load {fasl:?}) (defgeneric walker-free::unused (x)) (defmethod walker-free::unused ((x t)) (eval x)) (save-lisp-and-die {core:?})"
+                "(load {fasl:?}) (defgeneric walker-free::unused (x)) (defmethod walker-free::unused ((x t)) (eval x)) (defmacro walker-free::unused-macro (x) (eval x)) (save-lisp-and-die {core:?})"
             ),
         ],
     ));
@@ -1070,6 +1248,10 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         .unwrap());
     assert!(report.contains("capabilities=\n"), "{report}");
     assert!(report.contains("remove WALKER-FREE::UNUSED:"), "{report}");
+    assert!(
+        report.contains("remove WALKER-FREE::UNUSED-MACRO:"),
+        "{report}"
+    );
     let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
     assert!(symbols.contains("torcl::cli::"), "missing symbol table");
     assert!(

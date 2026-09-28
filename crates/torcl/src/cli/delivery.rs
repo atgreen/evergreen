@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use torcl_rt::bytecode::{BytecodeFunction, Instr};
 use torcl_rt::symbols;
 mod generics;
+mod macros;
 
 fn error(message: impl Into<String>) -> TorclError {
     TorclError::ProgramError(format!("delivery: {}", message.into()))
@@ -91,6 +92,10 @@ impl Spec {
 }
 
 fn function_index(name: &str) -> Result<u32, TorclError> {
+    definition_index(name, false)
+}
+
+fn definition_index(name: &str, allow_macro: bool) -> Result<u32, TorclError> {
     let (package, bare) = name
         .split_once("::")
         .ok_or_else(|| error(format!("use PACKAGE::FUNCTION for {name}")))?;
@@ -104,6 +109,7 @@ fn function_index(name: &str) -> Result<u32, TorclError> {
     let generic_name = sym_name(symbol);
     if symbols::symbol_function(index).is_none_or(|v| v == torcl_rt::value::UNBOUND)
         && !GENERIC_DEFINITIONS.borrow().contains_key(&generic_name)
+        && !(allow_macro && GLOBAL_MACROS.lock().unwrap().contains_key(&generic_name))
     {
         return Err(error(format!("undefined function {name}")));
     }
@@ -167,6 +173,7 @@ fn bytecode_references_with_params(
 }
 
 struct Plan {
+    unreachable_macros: Vec<(u32, String)>,
     generic_candidates: BTreeMap<String, u64>,
     retained_generics: BTreeMap<String, String>,
     live_clos_definitions: HashSet<u64>,
@@ -214,6 +221,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             }
         });
         let generic_definitions = generics::GenericDefinitions::discover(env, &package_names);
+        let macro_definitions = macros::MacroDefinitions::discover(env, &package_names);
+        candidates.extend(macro_definitions.candidates.clone());
         let dynamic_roots: Vec<_> = candidates
             .keys()
             .map(|&index| TorclVal::from_symbol_index(index))
@@ -256,15 +265,18 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 .iter()
                 .map(|&value| (value, "retained generic or class accessor")),
         );
+        roots.extend(
+            macro_definitions
+                .roots
+                .iter()
+                .map(|&value| (value, "retained macro registry")),
+        );
         let edges = bytecode::delivery_dependencies();
         let compiled = if spec.specialized {
             bytecode::delivery_walker_dependencies()
         } else {
             HashMap::new()
         };
-        for (_, function) in global_bytecode_macros() {
-            exposed_roots.extend(bytecode_references(&function.lock().unwrap()));
-        }
         for function in LOADED_COMPILER_MACRO_FUNCTIONS
             .lock()
             .unwrap()
@@ -476,6 +488,14 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 } else {
                     reason.clone()
                 };
+                if let Some(refs) = macro_definitions.edges.get(&index) {
+                    if spec.specialized && macro_definitions.source.contains(&index) {
+                        walker_roots.insert(format!("{}: source macro", qualified_name(index)));
+                    }
+                    for &value in refs {
+                        queue.push_back((value, next_reason.clone(), true));
+                    }
+                }
                 if let Some(function) = functions.get(&index) {
                     queue.push_back((*function, next_reason.clone(), true));
                 }
@@ -535,6 +555,14 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             .collect();
         unreachable_source_closures.sort_unstable();
         Plan {
+            unreachable_macros: macro_definitions
+                .names
+                .into_iter()
+                .filter(|(index, _)| {
+                    macro_definitions.candidates.contains_key(index)
+                        && !retained.contains_key(index)
+                })
+                .collect(),
             live_clos_definitions: generic_definitions
                 .handles
                 .iter()
@@ -627,7 +655,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     let keeps = spec
         .keep
         .iter()
-        .map(|name| function_index(name))
+        .map(|name| definition_index(name, true))
         .collect::<Result<Vec<_>, _>>()?;
     // This process is disposable. Override the input entry without invoking it;
     // the original on-disk image is never written.
@@ -754,6 +782,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         closure_registry().borrow_mut().remove(id);
     }
     generics::retain(env, &plan.live_clos_definitions);
+    macros::retain(env, &plan.unreachable_macros);
     native_runtime::with_save_contract(&selected, || {
         save_core(
             executable_stage

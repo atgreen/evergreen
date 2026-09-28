@@ -119,7 +119,7 @@ Plugins, foreign callbacks, and method redefinition also need explicit roots
 when their targets cannot be inferred. This is a delivery policy, not a security
 boundary.
 
-The current pass retains all global data, symbol identities, packages, macros,
+The current pass retains all global data, symbol identities, packages,
 classes, and functions outside the selected packages. It follows
 references through saved data and source/bytecode, including nested functions
 and captured environments. Conservatively retained registries can keep extra
@@ -131,6 +131,13 @@ generic and method set. Class accessor names also retain their functions.
 Unreachable generic functions and their owned method records are removed from
 both evaluator and CLOS registries before saving. A generic can be an `entry`
 or an explicit `keep` root.
+
+Source and bytecode macros in selected packages also follow reachable names.
+Saved macro expanders retain the definitions they invoke, and `keep` may name
+a macro needed through a dynamically constructed name. An unreachable macro's
+body does not retain its callees or native capabilities. Macros cannot serve
+as the executable's `entry`. SETF expanders and compiler registration caches
+remain conservative roots.
 
 Private compiled closures and source closure handles are traced from reachable
 objects and code, including their captured environments. An unreachable
