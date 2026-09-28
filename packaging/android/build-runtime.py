@@ -52,7 +52,7 @@ def main():
     env.setdefault('CARGO_BUILD_JOBS', '3')
     metadata = {# Must match torcl_android_api_version in crates/torcl-android: this is
                   # what torcl-android-new writes into app.json and checks against.
-                  'api': 2, 'version': tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version'],
+                  'api': 3, 'version': tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version'],
                 'min_sdk': 28, 'ndk': (ndk / 'source.properties').read_text(), 'hosts': {}}
     for host, (abi, machine) in HOSTS.items():
         compiler = tools / f'{host}28-clang'

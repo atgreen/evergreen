@@ -2,6 +2,7 @@
 #![cfg(target_os = "android")]
 
 mod lifecycle;
+mod main_thread;
 use lifecycle::ActivityState;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Component, Path, PathBuf};
@@ -171,6 +172,9 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
         return;
     }
     ACTIVITY.store(activity, Ordering::SeqCst);
+    // On the main thread, which is the only place the gate can be opened, and
+    // before the worker starts so that its very first frame may use it.
+    main_thread::install();
     let result = (|| -> Result<(), String> {
         let root = unpack_assets(unsafe { &*activity })?;
         let state = Arc::new(ActivityState::default());
@@ -208,9 +212,9 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     })();
     if let Err(error) = result {
         log(&format!("Activity startup failed: {error}"));
+        main_thread::shutdown();
         ACTIVITY.store(std::ptr::null_mut(), Ordering::SeqCst);
-        ACTIVITY.store(std::ptr::null_mut(), Ordering::SeqCst);
-    ACTIVE.store(false, Ordering::SeqCst);
+        ACTIVE.store(false, Ordering::SeqCst);
         unsafe { ANativeActivity_finish(activity) };
     }
 }
@@ -242,6 +246,9 @@ extern "C" fn resumed(activity: *mut ANativeActivity) {
 extern "C" fn destroyed(activity: *mut ANativeActivity) {
     let mut context = unsafe { Box::from_raw((*activity).instance as *mut Activity) };
     context.state.shutdown();
+    // Before the join below, not after: a worker parked on a main-thread call
+    // would otherwise be waiting for this very thread, which is waiting for it.
+    main_thread::shutdown();
     if let Some(worker) = context.worker.take() {
         let _ = worker.join();
     }
@@ -249,6 +256,7 @@ extern "C" fn destroyed(activity: *mut ANativeActivity) {
         unsafe { ANativeWindow_release(context.window) };
     }
     unsafe { (*activity).instance = std::ptr::null_mut() };
+    ACTIVITY.store(std::ptr::null_mut(), Ordering::SeqCst);
     ACTIVE.store(false, Ordering::SeqCst);
 }
 
@@ -317,10 +325,68 @@ extern "C" fn input_destroyed(_activity: *mut ANativeActivity, queue: *mut c_voi
 // only while the interpreter worker is running and the Activity owns its Arc.
 #[unsafe(no_mangle)]
 pub extern "C" fn torcl_android_api_version() -> i32 {
-    // 2 adds torcl_android_key. Callers should test for AT LEAST the version
-    // they need rather than for equality, so that a later addition does not
-    // break an application that never uses it.
-    2
+    // 2 adds torcl_android_key; 3 adds torcl_android_call_on_main. Callers
+    // should test for AT LEAST the version they need rather than for equality,
+    // so that a later addition does not break an application that never uses it.
+    3
+}
+
+/// Call `function` with `count` word-sized arguments on the Android main thread
+/// and wait for it, writing its result to `out`.
+///
+/// 0 on success; -1 when there is no gate (before the Activity exists, or after
+/// it is gone); -2 when the main thread did not answer within five seconds; -3
+/// for more than six arguments.
+///
+/// The arguments and the result are words. That is exactly enough for the JNI
+/// calls a view hierarchy needs -- `CallObjectMethodA(env, object, method,
+/// args)` and `NewObjectA` -- and the caller supplies the function pointer out
+/// of the JNI table it is already walking, so this stays out of the business of
+/// knowing which Java call an application wants to make. A Java method
+/// returning `float` or `double` is the one shape it cannot carry.
+///
+/// `promote` and `release`, when given, run before the visit ends:
+/// `promote(args[0], result)` replaces the result and `release(args[0], result)`
+/// disposes of what it replaced. They exist because a handle the main thread
+/// returns may be valid only while the call that made it is still on the stack
+/// -- a JNI local reference is exactly that -- and a later visit is too late.
+/// Both are skipped for a zero result.
+///
+/// # Safety
+/// `function` must be a C function of `count` word-sized parameters, `args`
+/// must point to `count` readable words, and `out` to one writable word.
+/// `promote` and `release`, if not null, must take two words.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_call_on_main(
+    function: *mut c_void,
+    args: *const i64,
+    count: i32,
+    promote: *mut c_void,
+    release: *mut c_void,
+    out: *mut i64,
+) -> i32 {
+    if !(0..=6).contains(&count) || (count > 0 && args.is_null()) {
+        return -3;
+    }
+    // from_raw_parts refuses a null base even for an empty slice.
+    let args = match count {
+        0 => &[][..],
+        count => unsafe { std::slice::from_raw_parts(args, count as usize) },
+    };
+    match main_thread::call_on_main(
+        function as usize,
+        args,
+        promote as usize,
+        release as usize,
+    ) {
+        Ok(result) => {
+            if !out.is_null() {
+                unsafe { *out = result };
+            }
+            0
+        }
+        Err(code) => code,
+    }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn torcl_android_wait_window(state: *const ActivityState) -> usize {

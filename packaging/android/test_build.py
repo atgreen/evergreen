@@ -37,7 +37,7 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'reserved'): apk.assets(self.root)
 
     def test_runtime_api_mismatch_fails_before_packaging(self):
-        (self.root / 'runtime.json').write_text(json.dumps({'api': 2, 'version': '1'}))
+        (self.root / 'runtime.json').write_text(json.dumps({'api': 3, 'version': '1'}))
         with self.assertRaisesRegex(ValueError, 'Incompatible runtime API'):
             apk.runtime_libraries(self.root, ['x86_64-linux-android'], {'runtime_api': 1})
 
