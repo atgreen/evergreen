@@ -1,6 +1,33 @@
 //! Ownership of generic functions and methods in a saved world.
 use super::*;
 
+// Called under the delivery heap snapshot in the disposable driver process.
+// Reified method callables also hold a copy of the source body. Only discard
+// it when the saved bytecode is independently executable after restoration.
+pub(super) fn discard_compiled_method_sources() {
+    let bytecode = bytecode::delivery_walker_dependencies();
+    for &callable in METHOD_COMPILED.borrow().values() {
+        if !torcl_rt::function::is_interpreted_function(callable) {
+            continue;
+        }
+        let name = torcl_rt::function::name(callable);
+        if name.symbol_index().and_then(|index| bytecode.get(&index)) != Some(&None) {
+            continue;
+        }
+        // SAFETY: callable is a live interpreted function, the heap is stopped,
+        // and changing its source fields allocates no Lisp objects. Dispatch
+        // and image restoration preserve its registered bytecode by name.
+        unsafe {
+            torcl_rt::function::redefine(
+                callable,
+                torcl_rt::function::lambda_list(callable),
+                NIL,
+                torcl_rt::function::env(callable),
+            );
+        }
+    }
+}
+
 pub(super) struct GenericDefinitions {
     pub names: HashMap<String, TorclVal>,
     pub candidates: BTreeMap<String, u64>,
@@ -40,9 +67,7 @@ impl GenericDefinitions {
             result.names.insert(name.clone(), handle);
             if symbol
                 .symbol_index()
-                .and_then(symbols::symbol_package)
-                .and_then(torcl_stdlib::packages::package_name)
-                .is_some_and(|package| packages.contains(&package))
+                .is_some_and(|index| definition_selected(index, packages))
             {
                 result.candidates.insert(name, handle.0);
             } else {
@@ -90,6 +115,12 @@ impl GenericDefinitions {
                     result.roots.push(id);
                 }
                 let mut method = method.clone();
+                // invoke_method always uses the saved callable when present.
+                // Its original source is no longer executable, and following
+                // it would retain macros used only while compiling the method.
+                if compiled.contains_key(&id.0) {
+                    method.body = NIL;
+                }
                 let mut state = EnvRootVisitState::default();
                 visit_method_def_roots(&mut method, &mut state, &mut |slot| {
                     // SAFETY: the registry owns these values throughout this
@@ -156,8 +187,14 @@ pub(super) fn retain(env: &mut Env, live: &HashSet<u64>) {
     env.generics
         .borrow_mut()
         .retain(|_, def| live.contains(&def.generic_function.0));
+    let compiled: HashSet<u64> = METHOD_COMPILED.borrow().keys().copied().collect();
     env.methods.borrow_mut().retain(|_, methods| {
         methods.retain(|method| live.contains(&method.method_id.0));
+        for method in methods.iter_mut() {
+            if compiled.contains(&method.method_id.0) {
+                method.body = NIL;
+            }
+        }
         !methods.is_empty()
     });
     METHOD_COMPILED

@@ -41,10 +41,7 @@ impl MacroDefinitions {
             }
             result.names.insert(index, name);
             result.edges.insert(index, references);
-            if symbols::symbol_package(index)
-                .and_then(torcl_stdlib::packages::package_name)
-                .is_some_and(|package| packages.contains(&package))
-            {
+            if definition_selected(index, packages) {
                 result.candidates.insert(index, qualified_name(index));
             } else {
                 result.roots.push(TorclVal::from_symbol_index(index));

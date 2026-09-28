@@ -102,6 +102,7 @@ singleton keys, missing functions, and unknown packages are errors.
 | `version = 1` | Required specification version |
 | `entry = PACKAGE::FUNCTION` | Required existing entry function, called with no arguments |
 | `prune-package = PACKAGE` | Package whose named functions may be removed; repeat for multiple packages |
+| `prune-package = *` | Make all named definitions eligible, including bootstrap helpers without a package |
 | `keep = PACKAGE::FUNCTION` | Additional root, such as a dynamically selected callback; repeat as needed |
 | `dynamic = preserve` | Default: retain all candidate functions to preserve unknown dynamic targets |
 | `dynamic = explicit` | Opt in to pruning; declare every additional dynamic entry with `keep` |
@@ -128,12 +129,24 @@ can be selected explicitly; `KEYWORD` cannot. Installed printing, instance
 initialization, and Gray stream protocols remain reachable through the
 runtime's implicit calls, even when application code does not name them.
 
+For the broadest candidate set, use `prune-package = *`. The default
+`dynamic = preserve` still retains possible dynamic targets; combine the wildcard
+with `dynamic = explicit` after declaring any additional entry points with
+`keep`. A bootstrap helper that has no home package can be retained by its exact
+reported registry name, such as `keep = %GCD2`. Definitions with a home package
+still require `PACKAGE::NAME` in `keep`.
+
 Generic functions in selected packages are candidates too. Retaining a generic
 retains its methods, and a reachable saved method handle retains its owning
 generic and method set. Class accessor names also retain their functions.
 Unreachable generic functions and their owned method records are removed from
 both evaluator and CLOS registries before saving. A generic can be an `entry`
 or an explicit `keep` root.
+
+For methods with saved bytecode, delivery discards the redundant source body
+and follows the compiled callable. Macros used only to compile such a method
+do not stay alive through its old source. Uncompiled methods retain their
+source and its dependencies.
 
 Source and bytecode macros in selected packages also follow reachable names.
 Saved macro expanders retain the definitions they invoke, and `keep` may name

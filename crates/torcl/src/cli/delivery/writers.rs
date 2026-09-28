@@ -52,9 +52,7 @@ impl WriterDefinitions {
             if writers.is_empty() {
                 continue;
             }
-            let selected = symbols::symbol_package(*place)
-                .and_then(torcl_stdlib::packages::package_name)
-                .is_some_and(|package| packages.contains(&package));
+            let selected = definition_selected(*place, packages);
             for &writer in &writers {
                 if selected {
                     result
@@ -77,6 +75,7 @@ impl WriterDefinitions {
         let mut protected_prefixes = Vec::new();
         for package in torcl_stdlib::packages::list_all_packages() {
             if let Some(name) = torcl_stdlib::packages::package_name(package)
+                && !packages.contains("*")
                 && !packages.contains(&name)
             {
                 for spelling in

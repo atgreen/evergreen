@@ -46,16 +46,27 @@ const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
 #[test]
 fn delivery_prunes_unused_bootstrap_definitions() {
-    check_bootstrap_delivery(false);
+    check_bootstrap_delivery(false, false);
+}
+
+#[test]
+fn delivery_prunes_package_less_bootstrap_definitions_with_whole_world_scope() {
+    check_bootstrap_delivery(false, true);
 }
 
 #[test]
 #[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
 fn native_delivery_prunes_bootstrap_without_dynamic_code() {
-    check_bootstrap_delivery(true);
+    check_bootstrap_delivery(true, false);
 }
 
-fn check_bootstrap_delivery(specialized: bool) {
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_prunes_package_less_bootstrap_definitions() {
+    check_bootstrap_delivery(true, true);
+}
+
+fn check_bootstrap_delivery(specialized: bool, whole_world: bool) {
     let f = Fixture::new();
     let source = f.path("bootstrap-app.lisp");
     let fasl = f.path("bootstrap-app.bfasl");
@@ -93,6 +104,10 @@ fn check_bootstrap_delivery(specialized: bool) {
          prune-package = COMMON-LISP-USER\nprune-package = TORCL-INTERNAL\n",
     )
     .unwrap();
+    if whole_world {
+        let text = fs::read_to_string(&spec).unwrap();
+        fs::write(&spec, format!("{text}prune-package = *\n")).unwrap();
+    }
     if specialized {
         let text = fs::read_to_string(&spec).unwrap();
         fs::write(&spec, format!("{text}runtime = specialized\n")).unwrap();
@@ -103,6 +118,10 @@ fn check_bootstrap_delivery(specialized: bool) {
     ));
     assert!(report.contains("remove COMMON-LISP::GCD:"), "{report}");
     assert!(report.contains("remove COMMON-LISP::LCM:"), "{report}");
+    if whole_world {
+        assert!(report.contains("remove %GCD2:"), "{report}");
+        assert!(report.contains("remove %DEFSTRINGCMP:"), "{report}");
+    }
     if specialized {
         assert!(report.contains("capabilities=tree-walker\n"), "{report}");
         let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
@@ -116,6 +135,25 @@ fn check_bootstrap_delivery(specialized: bool) {
             .output()
             .unwrap());
         assert_eq!(output, "BOOTSTRAP-SHAKE-OK\n", "{tier}");
+    }
+    if whole_world {
+        let original = fs::read_to_string(&spec).unwrap();
+        for name in ["%GCD2", "%DEFSTRINGCMP"] {
+            fs::write(&spec, format!("{original}keep = {name}\n")).unwrap();
+            let report = ok(run(
+                BIN,
+                &[
+                    "--image",
+                    &core,
+                    "--deliver",
+                    &spec,
+                    "--output",
+                    &exe,
+                    "--dry-run",
+                ],
+            ));
+            assert!(report.contains(&format!("keep {name}:")), "{report}");
+        }
     }
 }
 
@@ -159,7 +197,7 @@ fn delivery_preserves_implicit_bootstrap_protocol_calls() {
         "version = 1\nentry = PROTOCOL-APP::MAIN\ndynamic = explicit\n\
          prune-package = PROTOCOL-APP\nprune-package = COMMON-LISP\n\
          prune-package = COMMON-LISP-USER\nprune-package = TORCL-INTERNAL\n\
-         prune-package = TORCL-GRAY-STREAMS\nprune-package = TORCL\n",
+         prune-package = TORCL-GRAY-STREAMS\nprune-package = TORCL\nprune-package = *\n",
     )
     .unwrap();
     ok(run(
@@ -167,6 +205,48 @@ fn delivery_preserves_implicit_bootstrap_protocol_calls() {
         &["--image", &core, "--deliver", &spec, "--output", &exe],
     ));
     assert_eq!(ok(run(&exe, &[])), "PRINT-OK 17\nQ\n3 4\n");
+}
+
+#[test]
+fn delivery_prunes_compile_time_dependencies_of_compiled_methods() {
+    let f = Fixture::new();
+    let core = f.path("compiled-method.core");
+    let spec = f.path("compiled-method.delivery");
+    let exe = f.path("compiled-method");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (defpackage :method-shake (:use :cl))
+        (in-package :method-shake)
+        (defmacro compile-only (x) (list '+ x 1))
+        (defmethod answer ((x t)) (compile-only x))
+        (defun main () (write-line (if (= 42 (answer 41)) "METHOD-OK" "WRONG")))
+        (save-lisp-and-die {core:?})
+    "#
+            ),
+        ],
+    ));
+    fs::write(&spec, "version = 1\nentry = METHOD-SHAKE::MAIN\nprune-package = METHOD-SHAKE\ndynamic = explicit\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(
+        report.contains("remove METHOD-SHAKE::COMPILE-ONLY:"),
+        "{report}"
+    );
+    for tier in ["t0", "t1", "t2"] {
+        let output = ok(Command::new(&exe)
+            .arg("--no-init")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .unwrap());
+        assert_eq!(output, "METHOD-OK\n", "{tier}");
+    }
 }
 
 #[test]
@@ -1276,23 +1356,26 @@ fn delivery_defaults_to_preserving_dynamic_targets_and_rejects_bad_specs() {
             ),
         ],
     ));
-    fs::write(
-        &spec,
-        "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = DELIVERY-POLICY\n",
-    )
-    .unwrap();
-    let report = ok(run(
-        BIN,
-        &["--image", &image, "--deliver", &spec, "--output", &exe],
-    ));
-    assert!(report.contains("dynamic = preserve"));
-    assert!(!report.contains("remove DELIVERY-POLICY::TARGET"));
-    assert!(ok(run(&exe, &[])).contains("DYNAMIC-OK"));
+    for package in ["DELIVERY-POLICY", "*"] {
+        fs::write(
+            &spec,
+            format!("version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = {package}\n"),
+        )
+        .unwrap();
+        let report = ok(run(
+            BIN,
+            &["--image", &image, "--deliver", &spec, "--output", &exe],
+        ));
+        assert!(report.contains("dynamic = preserve"));
+        assert!(!report.contains("remove DELIVERY-POLICY::TARGET"));
+        assert!(ok(run(&exe, &[])).contains("DYNAMIC-OK"));
+    }
     let previous = fs::read(&exe).unwrap();
     for bad in [
         "version = 2\nentry = DELIVERY-POLICY::MAIN\n",
         "version = 1\nentry = DELIVERY-POLICY::MISSING\n",
         "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = KEYWORD\n",
+        "version = 1\nentry = DELIVERY-POLICY::MAIN\nkeep = GCD\n",
         "version = 1\nentry = DELIVERY-POLICY::MAIN\ndynamci = explicit\n",
     ] {
         fs::write(&spec, bad).unwrap();

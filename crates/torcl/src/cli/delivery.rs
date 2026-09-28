@@ -97,13 +97,25 @@ fn function_index(name: &str) -> Result<u32, TorclError> {
 }
 
 fn definition_index(name: &str, allow_auxiliary: bool) -> Result<u32, TorclError> {
-    let (package, bare) = name
-        .split_once("::")
-        .ok_or_else(|| error(format!("use PACKAGE::FUNCTION for {name}")))?;
-    let package = torcl_stdlib::packages::find_package(package)
-        .ok_or_else(|| error(format!("unknown package in {name}")))?;
-    let (symbol, _) = torcl_stdlib::packages::find_symbol(bare, package)?
-        .ok_or_else(|| error(format!("unknown function {name}")))?;
+    let symbol = if let Some((package, bare)) = name.split_once("::") {
+        let package = torcl_stdlib::packages::find_package(package)
+            .ok_or_else(|| error(format!("unknown package in {name}")))?;
+        torcl_stdlib::packages::find_symbol(bare, package)?
+            .ok_or_else(|| error(format!("unknown function {name}")))?
+            .0
+    } else {
+        // Legacy bootstrap helpers have an exact registry key but no package.
+        // KEEP must be able to retain them when whole-world pruning is used.
+        let index = symbols::find_index(name)
+            .filter(|&index| {
+                allow_auxiliary
+                    && symbols::symbol_package(index)
+                        .and_then(torcl_stdlib::packages::package_name)
+                        .is_none()
+            })
+            .ok_or_else(|| error(format!("use PACKAGE::FUNCTION for {name}")))?;
+        TorclVal::from_symbol_index(index)
+    };
     let index = symbol
         .symbol_index()
         .ok_or_else(|| error(format!("unknown function {name}")))?;
@@ -126,6 +138,13 @@ fn qualified_name(index: u32) -> String {
         Some(package) => format!("{package}::{bare}"),
         None => name,
     }
+}
+
+fn definition_selected(index: u32, packages: &HashSet<String>) -> bool {
+    packages.contains("*")
+        || symbols::symbol_package(index)
+            .and_then(torcl_stdlib::packages::package_name)
+            .is_some_and(|package| packages.contains(&package))
 }
 
 /// Include instruction operands as well as GC-visible constants: CallNamed and
@@ -203,6 +222,10 @@ impl torcl_rt::gc::TraceHostRoots for DeliveryEnvironment<'_> {
 fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan, TorclError> {
     let mut package_names = HashSet::new();
     for name in &spec.packages {
+        if name == "*" {
+            package_names.insert(name.clone());
+            continue;
+        }
         let package = torcl_stdlib::packages::find_package(name)
             .ok_or_else(|| error(format!("unknown prune-package {name}")))?;
         let canonical = torcl_stdlib::packages::package_name(package).unwrap();
@@ -212,14 +235,12 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         package_names.insert(canonical);
     }
     torcl_rt::gc::with_heap_snapshot(|| {
+        generics::discard_compiled_method_sources();
         let mut candidates = BTreeMap::new();
         let mut functions = HashMap::new();
         symbols::for_each_bound_function(|index, _, function| {
             functions.insert(index, function);
-            if symbols::symbol_package(index)
-                .and_then(torcl_stdlib::packages::package_name)
-                .is_some_and(|name| package_names.contains(&name))
-            {
+            if definition_selected(index, &package_names) {
                 candidates.insert(index, qualified_name(index));
             }
         });
@@ -417,6 +438,12 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             if let Some(refs) = generic_definitions.edges.get(&value.0) {
                 for &(child, callable) in refs {
                     queue.push_back((child, reason.clone(), callable));
+                }
+            }
+            if torcl_rt::function::is_interpreted_function(value) {
+                let body = torcl_rt::function::body(value);
+                if !body.is_nil() {
+                    queue.push_back((body, reason.clone(), true));
                 }
             }
             if spec.specialized {
