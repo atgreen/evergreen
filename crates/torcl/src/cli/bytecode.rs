@@ -20608,6 +20608,15 @@ fn run_native_osr(
         NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
     let saved_err = NATIVE_ERROR.with(|c| c.take());
     NATIVE_DEOPT.with(|d| d.set(false));
+    // OSR executes inside the interpreter activation, so its fault-recovery
+    // window must be established just like a normal native entry. In
+    // particular, a Rust/c2i helper called from the OSR loop temporarily turns
+    // this off and restores it around the helper; leaving the enclosing value
+    // stale would route a helper fault through the wrong frame.
+    let saved_null_recovery = torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip();
+    let saved_stack_recovery = torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
+    let native_recovery = native_sigsegv_recovery_ip();
+    torcl_rt::runtime::set_sigsegv_recovery_ips(native_recovery, native_recovery);
     let entry_addr = osr.entry as usize + stub_off;
     // SAFETY: `entry_addr` is inside the installed OSR buffer at a stub whose
     // contract is `fn(*mut u64) -> u64` (prologue + jump to the loop header).
@@ -20618,6 +20627,7 @@ fn run_native_osr(
         slots,
         std::ptr::from_ref(torcl_rt::current_stack()) as *const u8,
     );
+    torcl_rt::runtime::set_sigsegv_recovery_ips(saved_null_recovery, saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
@@ -20626,6 +20636,9 @@ fn run_native_osr(
     NATIVE_ERROR.with(|c| c.replace(saved_err));
     let _ = osr.num_slots;
     let _ = osr.code_info;
+    if let Some(error) = pending_signal_error_for_current_execution() {
+        return Err(error);
+    }
     if let Some(err) = my_err {
         return Err(err);
     }
