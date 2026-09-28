@@ -11,6 +11,39 @@ mod handlers;
 mod live_signaling;
 mod payloads;
 
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_rollout_switch_enters_cached_segment_path() {
+    use super::native_transfer_entry::{take_segment_run_count, try_run};
+    assert!(torcl_rt::native_transfer::is_supported());
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    torcl_rt::rooted!(forms = reader::read_from_string("((+ x 1))").unwrap().0);
+    let body = Arc::new(
+        compile_function("NATIVE-ROLLOUT-PROBE", *params, *forms, &env, false, false)
+            .expect("compile rollout probe"),
+    );
+    torcl_rt::rooted!(args = vec![TorclVal::from_fixnum(41)]);
+    // Rust 2024 makes process-environment mutation explicitly unsafe. This
+    // ignored test is single-purpose and restores the switch before returning.
+    unsafe { std::env::set_var("TORCL_NATIVE_TRANSFER", "1") };
+    take_segment_run_count();
+    let first = try_run(Arc::clone(&body), &args, &mut env)
+        .expect("supported rollout must select the segment path")
+        .expect("segment probe returns normally");
+    let second = try_run(body, &args, &mut env)
+        .expect("cached rollout must select the segment path")
+        .expect("cached segment probe returns normally");
+    unsafe { std::env::remove_var("TORCL_NATIVE_TRANSFER") };
+    assert_eq!(first, TorclVal::from_fixnum(42));
+    assert_eq!(second, TorclVal::from_fixnum(42));
+    assert_eq!(take_segment_run_count(), 2);
+}
+
 struct NativeEnvGuard(*mut Env);
 impl NativeEnvGuard {
     fn enter(env: &mut Env) -> Self {

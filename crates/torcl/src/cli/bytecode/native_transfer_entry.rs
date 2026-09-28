@@ -24,6 +24,10 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
+#[cfg(test)]
+static SEGMENT_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn try_clone_string(value: &str) -> Result<String, TorclError> {
     let mut copy = String::new();
     copy.try_reserve(value.len()).map_err(|_| TorclError::Oom)?;
@@ -106,7 +110,16 @@ pub(super) fn try_run(
             .or_insert_with(|| TransferCode::compile(Arc::clone(&body)).map(Rc::new))
             .clone()
     });
-    code.map(|code| code.run(args, env))
+    code.map(|code| {
+        #[cfg(test)]
+        SEGMENT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        code.run(args, env)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn take_segment_run_count() -> u64 {
+    SEGMENT_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl TransferCode {
