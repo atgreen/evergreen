@@ -28,6 +28,9 @@ python3 benchmarks/run.py --cpu 0
 Add `--instructions` to collect process-wide retired-instruction counts with
 Linux `perf`; the HTML labels these separately because startup and compilation
 are included, while the Lisp timer measures only the warmed workload.
+Add `--native-transfer` to set `TORCL_NATIVE_TRANSFER=1` for TorCL children and
+exercise the opt-in native segment ABI. Unsupported bodies or platforms fall
+back to the checked entry; this switch records the mode in `results.json`.
 
 Open `benchmarks/results/index.html`. No server, JavaScript, external fonts, or
 network access is needed to view the report. `results.json` contains all samples,
