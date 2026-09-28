@@ -3635,10 +3635,62 @@ fn emit_framed_inner(
 
     let mut a = Asm::new();
     let deopt = a.label();
-    let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
-        pending_addr: c2i_transfer_pending_addr,
-        exit: a.label(),
+    // A closed, pure self-recursive function has no operation that can create
+    // a pending transfer: its only calls return to the same native entry and
+    // every other instruction is local arithmetic/control flow.  Those calls
+    // use the direct native ABI, so a post-return status branch would be dead
+    // work. Mixed calls retain the check until the versioned transfer ABI gate
+    // proves their bridge contract.
+    let transfer_free_self = self_sym.is_some_and(|sym| {
+        f.block_order().iter().all(|&block| {
+            f.block(block).insts.iter().all(|&inst| {
+                let data = f.inst(inst);
+                match data.opcode {
+                    Opcode::Call => {
+                        matches!(data.aux, AuxData::CallTarget(target) if target == sym)
+                    }
+                    Opcode::ConstFixnum
+                    | Opcode::ConstFloat
+                    | Opcode::ConstChar
+                    | Opcode::ConstSymbol
+                    | Opcode::ConstNil
+                    | Opcode::ConstT
+                    | Opcode::ConstHeapObj
+                    | Opcode::FixnumAdd
+                    | Opcode::FixnumSub
+                    | Opcode::FixnumMul
+                    | Opcode::FixnumDiv
+                    | Opcode::FixnumRem
+                    | Opcode::FixnumMod
+                    | Opcode::FixnumNeg
+                    | Opcode::FixnumShl
+                    | Opcode::FixnumShr
+                    | Opcode::FloatAdd
+                    | Opcode::FloatSub
+                    | Opcode::FloatMul
+                    | Opcode::FloatDiv
+                    | Opcode::FixnumCmpEq
+                    | Opcode::FixnumCmpLt
+                    | Opcode::FixnumCmpLe
+                    | Opcode::FixnumCmpGt
+                    | Opcode::FixnumCmpGe
+                    | Opcode::FloatCmpEq
+                    | Opcode::FloatCmpLt
+                    | Opcode::Guard
+                    | Opcode::Jump
+                    | Opcode::Brif
+                    | Opcode::Return
+                    | Opcode::Trap => true,
+                    _ => false,
+                }
+            })
+        })
     });
+    let transfer_check =
+        (c2i_transfer_pending_addr != 0 && !transfer_free_self).then(|| NativeTransferCheck {
+            pending_addr: c2i_transfer_pending_addr,
+            exit: a.label(),
+        });
     // Precise deopt (bliss-mba): each guarding instruction gets its own deopt stub
     // that reconstructs the interpreter frame at that guard's bytecode position.
     // Every instruction that reaches `emit_arith_inst` (the only guard emitter)
