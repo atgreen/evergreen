@@ -11,13 +11,21 @@
 
 Name: torcl
 Version: %{torcl_version}
-Release: 3%{?dist}
+Release: 5%{?dist}
 Summary: Common Lisp with a tiered JIT and saved executable images
 License: MIT OR Apache-2.0
 URL: https://github.com/atgreen/torcl
 Source0: torcl-payload.tar.gz
-Source1: torcl-android-source.tar.gz
+Source1: torcl-source.tar.gz
 BuildRequires: python3
+BuildRequires: gcc
+BuildRequires: make
+BuildRequires: java-devel >= 17
+BuildRequires: python3-mkdocs
+BuildRequires: python3-mkdocs-material
+Requires: java-headless >= 17
+Requires: which
+Requires: coreutils
 %if !0%{?torcl_rustup}
 BuildRequires: cargo
 %endif
@@ -25,6 +33,8 @@ ExclusiveArch: x86_64
 
 %description
 TorCL for Fedora x86-64, dynamically linked against glibc, with ASDF preloaded.
+Includes the JAVA and TORCL-JVM APIs, their native JNI bridge, and the HTML
+manual under %{_docdir}/torcl/manual/index.html.
 Optional target packages dump applications for other platforms through QEMU
 or Wine, without containers or a compiler on the user's machine.
 
@@ -45,6 +55,15 @@ Requires: /usr/bin/qemu-aarch64
 
 %description target-aarch64-linux
 An AArch64 TorCL runtime, private Fedora runtime libraries, and a QEMU launcher.
+
+%package target-ppc64le-linux
+Summary: TorCL image-dumping tools for little-endian POWER Linux
+License: (MIT OR Apache-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
+Requires: %{name} = %{version}-%{release}
+Requires: /usr/bin/qemu-ppc64le
+
+%description target-ppc64le-linux
+A ppc64le TorCL runtime, private Fedora runtime libraries, and a QEMU launcher.
 
 %package target-windows
 Summary: TorCL image-dumping tools for Windows x86-64
@@ -73,6 +92,10 @@ command-line runtime and QEMU launcher.
 %setup -q -n payload -a 1
 
 %build
+# The Java helper classes are embedded in the native bridge; no JDK or build
+# tools are needed by installed users. Keep this ELF outside the cross excludes.
+python3 torcl-source/packaging/fedora/native-content.py --stage "$PWD" \
+    --libdir "%{_libdir}" --datadir "%{_datadir}" --docdir "%{_docdir}"
 # Existing command-line payloads were image-dumped before rpmbuild. Compile
 # both reusable application libraries here from Source1, using vendored crates
 # and an explicitly supplied local NDK. No network or containers in this step.
@@ -81,6 +104,8 @@ python3 torcl-source/packaging/android/build-runtime.py \
     --ndk "%{android_ndk}" --stage "$PWD" --offline
 
 %check
+python3 torcl-source/packaging/fedora/test-native-content.py
+python3 torcl-source/packaging/fedora/test-cross-launcher.py
 python3 torcl-source/packaging/android/test_generator.py
 python3 torcl-source/packaging/android/test_build.py
 python3 torcl-source/packaging/android/test_install_tools.py
@@ -91,6 +116,10 @@ cp -a usr %{buildroot}/
 
 %files
 %{_bindir}/torcl
+%{_libdir}/torcl
+%dir %{_datadir}/common-lisp
+%dir %{_datadir}/common-lisp/source
+%{_datadir}/common-lisp/source/torcl-jvm
 %dir %{_libexecdir}/torcl
 %doc %{_docdir}/torcl
 
@@ -103,6 +132,11 @@ cp -a usr %{buildroot}/
 %{_bindir}/torcl-aarch64-linux
 %{_libexecdir}/torcl/aarch64-linux
 %license %{_datadir}/licenses/torcl-target-aarch64-linux
+
+%files target-ppc64le-linux
+%{_bindir}/torcl-ppc64le-linux
+%{_libexecdir}/torcl/ppc64le-linux
+%license %{_datadir}/licenses/torcl-target-ppc64le-linux
 
 %files target-windows
 %{_bindir}/torcl-windows

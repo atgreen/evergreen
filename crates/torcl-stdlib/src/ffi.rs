@@ -400,6 +400,22 @@ pub fn library_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
         operation.rsplit(':').next().unwrap_or_default(),
         &args[args.len().min(1)..],
     ) {
+        ("JVM-RUNTIME-VERSION", []) => Ok(TorclVal::from_fixnum(
+            if cfg!(all(
+                target_arch = "x86_64",
+                target_os = "linux",
+                target_env = "gnu"
+            )) && torcl_rt::runtime::supports_jvm_coexistence()
+            {
+                1
+            } else {
+                0
+            },
+        )),
+        ("INHIBIT-IMAGE", []) => {
+            torcl_rt::image::inhibit_saving()?;
+            Ok(NIL)
+        }
         ("P", [value]) => Ok(if library_p(*value) { T } else { NIL }),
         ("LOAD", [path]) => {
             let handle = torcl_rt::ffi::load_foreign_library(&foreign_name(*path)?)?;

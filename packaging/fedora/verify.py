@@ -10,6 +10,7 @@ TARGETS = {
     'native': (':x86-64', ':linux'),
     's390x-linux': (':s390x', ':big-endian'),
     'aarch64-linux': (':arm64', ':linux'),
+    'ppc64le-linux': (':ppc64le', ':little-endian', ':linux'),
     'windows': (':x86-64', ':windows'),
     'android': (':arm64', ':android'),
 }

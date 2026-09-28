@@ -20,6 +20,7 @@ pub mod exec_context;
 pub mod execution_local;
 pub mod function;
 pub mod fxhash;
+pub mod native_transfer;
 pub mod object;
 pub mod packages;
 pub mod symbols;

@@ -7,8 +7,20 @@ alphabetized by unqualified name and display their package explicitly.
 | Symbol | Reference |
 | --- | --- |
 | `*command-line-args*` | [Dictionary entry](user/reference/extensions.md#command-line-args) |
+| `java:+null+` | [Dictionary entry](java.md#java-conditions) |
+| `torcl-jvm:+null+` | [Dictionary entry](java.md#java-conditions) |
 | `torcl-thread:all-threads` | [Dictionary entry](concurrency.md#thread-observations) |
+| `java:ambiguous-call` | [Dictionary entry](java.md#java-conditions) |
+| `java:array-length` | [Dictionary entry](java.md#accessors) |
+| `torcl-jvm:array-length` | [Dictionary entry](java.md#descriptor-arrays) |
+| `java:array-ref` | [Dictionary entry](java.md#accessors) |
+| `torcl-jvm:array-ref` | [Dictionary entry](java.md#descriptor-arrays) |
+| `torcl-jvm:array-set` | [Dictionary entry](java.md#descriptor-arrays) |
+| `java:as` | [Dictionary entry](java.md#as) |
 | `torcl-ext:bail-report` | [Dictionary entry](compiler.md#bail-report) |
+| `java:call` | [Dictionary entry](java.md#new-call-static) |
+| `torcl-jvm:call` | [Dictionary entry](java.md#descriptor-calls) |
+| `torcl-jvm:call-static` | [Dictionary entry](java.md#descriptor-calls) |
 | `torcl-ffi:callback-error` | [Dictionary entry](foreign.md#callbacks) |
 | `torcl-ffi:callback-pointer` | [Dictionary entry](foreign.md#callbacks) |
 | `torcl-ext:cancel-finalization` | [Dictionary entry](memory.md#cancel-finalization) |
@@ -21,7 +33,12 @@ alphabetized by unqualified name and display their package explicitly.
 | `torcl-thread:condition-variable-p` | [Dictionary entry](concurrency.md#condition-wait) |
 | `torcl-thread:condition-wait` | [Dictionary entry](concurrency.md#condition-wait) |
 | `torcl-thread:current-thread` | [Dictionary entry](concurrency.md#thread-observations) |
+| `java:define-call` | [Dictionary entry](java.md#bindings) |
+| `java:define-class` | [Dictionary entry](java.md#classes) |
 | `torcl-ext:deopt-count` | [Dictionary entry](compiler.md#counters) |
+| `java:describe-class` | [Dictionary entry](java.md#bindings) |
+| `java:error-message` | [Dictionary entry](java.md#java-conditions) |
+| `torcl-jvm:error-message` | [Dictionary entry](java.md#java-conditions) |
 | `torcl-ext:events-count` | [Dictionary entry](profiling.md#events) |
 | `torcl-ext:events-json` | [Dictionary entry](profiling.md#events) |
 | `torcl-ext:events-report` | [Dictionary entry](profiling.md#events) |
@@ -30,7 +47,10 @@ alphabetized by unqualified name and display their package explicitly.
 | `torcl-ext:events-stop` | [Dictionary entry](profiling.md#events) |
 | `torcl-ext:events-summary` | [Dictionary entry](profiling.md#events) |
 | `torcl-ffi:ffi-error` | [Dictionary entry](foreign.md#conditions-and-sandboxing) |
+| `java:field` | [Dictionary entry](java.md#accessors) |
 | `torcl-ext:finalize` | [Dictionary entry](memory.md#finalize) |
+| `java:find-class` | [Dictionary entry](java.md#classes) |
+| `torcl-jvm:find-java-class` | [Dictionary entry](java.md#descriptor-calls) |
 | `torcl-ffi:foreign-alloc` | [Dictionary entry](foreign.md#foreign-alloc) |
 | `torcl-ffi:foreign-call` | [Dictionary entry](foreign.md#foreign-call) |
 | `torcl-ffi:foreign-callback-p` | [Dictionary entry](foreign.md#callbacks) |
@@ -48,8 +68,19 @@ alphabetized by unqualified name and display their package explicitly.
 | `torcl-ext:getcwd` | [Dictionary entry](user/reference/extensions.md#getcwd) |
 | `torcl-ext:getenv` | [Dictionary entry](user/reference/extensions.md#getenv) |
 | `torcl-thread:grab-mutex` | [Dictionary entry](concurrency.md#grab-mutex) |
+| `java:implement` | [Dictionary entry](java.md#interface-adapters) |
+| `torcl-jvm:implement` | [Dictionary entry](java.md#descriptor-callbacks) |
 | `torcl-ffi:inc-pointer` | [Dictionary entry](foreign.md#pointers) |
+| `java:java-error` | [Dictionary entry](java.md#java-conditions) |
+| `torcl-jvm:java-error` | [Dictionary entry](java.md#java-conditions) |
+| `java:java-object-p` | [Dictionary entry](java.md#with-scope) |
+| `torcl-jvm:java-object-p` | [Dictionary entry](java.md#with-scope) |
 | `torcl-thread:join-thread` | [Dictionary entry](concurrency.md#join-thread) |
+| `java:jvm-error` | [Dictionary entry](java.md#java-conditions) |
+| `torcl-jvm:jvm-error` | [Dictionary entry](java.md#java-conditions) |
+| `java:jvm-running-p` | [Dictionary entry](java.md#start-jvm) |
+| `torcl-jvm:jvm-running-p` | [Dictionary entry](java.md#start-jvm) |
+| `java:lambda` | [Dictionary entry](java.md#interface-adapters) |
 | `torcl-ffi:load-foreign-library` | [Dictionary entry](foreign.md#libraries) |
 | `android:log` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
 | `torcl-ffi:make-callback` | [Dictionary entry](foreign.md#callbacks) |
@@ -61,6 +92,9 @@ alphabetized by unqualified name and display their package explicitly.
 | `torcl-ffi:mem-set` | [Dictionary entry](foreign.md#mem-ref) |
 | `torcl-thread:mutex` | [Dictionary entry](concurrency.md#make-mutex) |
 | `torcl-thread:mutex-p` | [Dictionary entry](concurrency.md#make-mutex) |
+| `java:new` | [Dictionary entry](java.md#new-call-static) |
+| `torcl-jvm:new` | [Dictionary entry](java.md#descriptor-calls) |
+| `java:new-array` | [Dictionary entry](java.md#accessors) |
 | `torcl-ffi:null-pointer` | [Dictionary entry](foreign.md#pointers) |
 | `torcl-ffi:null-pointer-p` | [Dictionary entry](foreign.md#pointers) |
 | `android:paused-p` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
@@ -72,21 +106,40 @@ alphabetized by unqualified name and display their package explicitly.
 | `torcl-ext:profile-report` | [Dictionary entry](profiling.md#profile-report) |
 | `torcl-ext:profile-report-calls` | [Dictionary entry](profiling.md#profile) |
 | `torcl-ext:profile-reset` | [Dictionary entry](profiling.md#profile) |
+| `torcl-jvm:promote` | [Dictionary entry](java.md#with-java-objects) |
 | `torcl-ext:raw-command-line-arguments` | [Dictionary entry](user/reference/extensions.md#raw-command-line-arguments) |
+| `java:release` | [Dictionary entry](java.md#with-scope) |
+| `torcl-jvm:release` | [Dictionary entry](java.md#with-scope) |
 | `torcl-thread:release-mutex` | [Dictionary entry](concurrency.md#grab-mutex) |
+| `java:retain` | [Dictionary entry](java.md#with-scope) |
+| `torcl-jvm:retain` | [Dictionary entry](java.md#with-scope) |
 | `torcl-ext:run-program` | [Dictionary entry](user/reference/extensions.md#run-program) |
 | `android:running-p` | [Dictionary entry](user/reference/android.md#lisp-lifecycle-api) |
+| `java:same-object-p` | [Dictionary entry](java.md#with-scope) |
+| `torcl-jvm:same-object-p` | [Dictionary entry](java.md#with-scope) |
 | `save-image-and-die` | [Dictionary entry](user/reference/images.md#save-lisp-and-die) |
 | `save-lisp-and-die` | [Dictionary entry](user/reference/images.md#save-lisp-and-die) |
 | `torcl-ext:sprof-fold` | [Dictionary entry](profiling.md#sprof) |
 | `torcl-ext:sprof-start` | [Dictionary entry](profiling.md#sprof) |
 | `torcl-ext:sprof-stop` | [Dictionary entry](profiling.md#sprof) |
+| `java:start-jvm` | [Dictionary entry](java.md#start-jvm) |
+| `torcl-jvm:start-jvm` | [Dictionary entry](java.md#start-jvm) |
+| `java:static` | [Dictionary entry](java.md#new-call-static) |
+| `java:static-field` | [Dictionary entry](java.md#accessors) |
+| `java:stop-jvm` | [Dictionary entry](java.md#start-jvm) |
+| `torcl-jvm:stop-jvm` | [Dictionary entry](java.md#start-jvm) |
 | `torcl-thread:thread-alive-p` | [Dictionary entry](concurrency.md#thread-observations) |
 | `torcl-thread:thread-name` | [Dictionary entry](concurrency.md#thread-observations) |
 | `torcl-thread:thread-yield` | [Dictionary entry](concurrency.md#thread-observations) |
+| `java:to-list` | [Dictionary entry](java.md#accessors) |
 | `torcl-ext:unprofile` | [Dictionary entry](profiling.md#profile) |
+| `java:verify` | [Dictionary entry](java.md#bindings) |
+| `torcl-jvm:weak-reference` | [Dictionary entry](java.md#with-java-objects) |
+| `torcl-jvm:with-java-objects` | [Dictionary entry](java.md#with-java-objects) |
 | `torcl-thread:with-mutex` | [Dictionary entry](concurrency.md#with-mutex) |
 | `torcl-ffi:with-pointer-to-vector-data` | [Dictionary entry](foreign.md#vector-data) |
+| `java:with-resource` | [Dictionary entry](java.md#with-resource) |
+| `java:with-scope` | [Dictionary entry](java.md#with-scope) |
 
 ## Lisp fiber symbols
 

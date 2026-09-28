@@ -208,3 +208,10 @@ this interface. Sandbox mode denies foreign access; using `funcall` instead of
 a direct call does not bypass that policy.
 
 Implementation reference: [Public FFI wrappers](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/boot.lisp).
+
+## Java integration
+
+The [Java integration chapter](java.md) covers the in-process HotSpot JVM,
+the primary `JAVA` API, descriptor-based `TORCL-JVM` calls, Java interfaces
+implemented by Lisp callbacks, and reference ownership. Java calls use the
+checked JVM bridge rather than application-supplied JNI prototypes.

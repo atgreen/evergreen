@@ -30,6 +30,8 @@ signature, especially for subprocesses and foreign calls.
 interface, and `TORCL-THREAD` native threads and synchronization.
 `TORCL-THREADS` is a compatibility nickname for `TORCL-THREAD`.
 `TORCL-CLTL2` supplies lexical-environment extensions.
+Loading the `torcl-jvm` ASDF system provides `TORCL-JAVA` (nickname `JAVA`) for
+[Java integration](java.md), and `TORCL-JVM` for descriptor-based Java calls.
 
 The bootstrap also uses `TORCL::%...` entry points and `TORCL-INTERNAL` state.
 Do not build an application API around those internal names. They connect Lisp

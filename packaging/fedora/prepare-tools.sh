@@ -6,14 +6,14 @@ root=$PWD/target/fedora-rpm/tools
 mkdir -p "$root/rpms"
 # Limit repository selection to Fedora; unrelated third-party repos are irrelevant.
 dnf --repo=fedora --repo=updates download --destdir="$root/rpms" \
-    gcc-s390x-linux-gnu gcc-aarch64-linux-gnu \
-    binutils-s390x-linux-gnu binutils-aarch64-linux-gnu \
-    sysroot-s390x-fc44-glibc sysroot-aarch64-fc44-glibc
+    gcc-s390x-linux-gnu gcc-aarch64-linux-gnu gcc-powerpc64le-linux-gnu \
+    binutils-s390x-linux-gnu binutils-aarch64-linux-gnu binutils-powerpc64le-linux-gnu \
+    sysroot-s390x-fc44-glibc sysroot-aarch64-fc44-glibc sysroot-ppc64le-fc44-glibc
 for package in "$root"/rpms/gcc-*.rpm "$root"/rpms/binutils-*.rpm "$root"/rpms/sysroot-*.rpm; do
     rpmkeys --checksig "$package"
     rpm2cpio "$package" | (cd "$root" && cpio -idmu --quiet)
 done
-for arch in s390x aarch64; do
+for arch in s390x aarch64 ppc64le; do
     dnf --repo=fedora --repo=updates --forcearch="$arch" download \
         --destdir="$root/rpms" libgcc
     mkdir -p "$root/targets/$arch"
