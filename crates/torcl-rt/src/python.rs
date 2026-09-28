@@ -81,6 +81,8 @@ struct Api {
     err_get_raised_exception: Option<unsafe extern "C" fn() -> *mut PyObject>,
     err_fetch:
         unsafe extern "C" fn(*mut *mut PyObject, *mut *mut PyObject, *mut *mut PyObject),
+    sequence_size: unsafe extern "C" fn(*mut PyObject) -> isize,
+    sequence_get_item: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
 
     // ── singletons and types, which are DATA symbols ──
     //
@@ -214,6 +216,8 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
         err_clear: symbol!("PyErr_Clear"),
         err_get_raised_exception: optional!("PyErr_GetRaisedException"),
         err_fetch: symbol!("PyErr_Fetch"),
+        sequence_size: symbol!("PySequence_Size"),
+        sequence_get_item: symbol!("PySequence_GetItem"),
         none: data!("_Py_NoneStruct"),
         long_type: data!("PyLong_Type"),
         float_type: data!("PyFloat_Type"),
@@ -772,14 +776,16 @@ fn describe(value: crate::value::TorclVal) -> &'static str {
 /// returning null *and* setting an exception, and an exception left set leaks into
 /// whatever the next call happens to be.
 ///
-/// The message is best-effort on purpose. Turning an exception into a real
-/// condition with its traceback and Python frames is a separate concern
-/// (bliss-wq5tw); the requirement here is only that a failure never looks like
-/// success and never reports the wrong operation's error.
-fn check(api: &'static Api, fallback: &str) -> Result<(), TorclError> {
+/// The result is a [`Raise`] rather than a formatted string, so the condition built
+/// from it keeps the exception's type, its frames and the object itself. `fallback`
+/// names the operation, for the rare case where CPython reports failure with no
+/// exception set at all — a contract violation on its side, which should read as
+/// ours rather than as a Python error that never happened.
+fn check(scope: &PythonScope, fallback: &str) -> Result<(), TorclError> {
+    let api = scope.api;
     // SAFETY: resolved entry points, called on a thread holding the GIL (every
     // caller has a live PythonScope).
-    unsafe {
+    let raised = unsafe {
         if (api.err_occurred)().is_null() {
             return Ok(());
         }
@@ -800,22 +806,44 @@ fn check(api: &'static Api, fallback: &str) -> Result<(), TorclError> {
             }
         };
         (api.err_clear)();
-        let described = raised.and_then(|raised| {
-            let kind = PyRef::from_owned((api.object_type)(raised.pointer))
-                .and_then(|kind| utf8_of(api, &PyRef::from_owned((api.object_str)(kind.pointer))?))
-                .unwrap_or_else(|| "Python exception".to_string());
-            let text = utf8_of(api, &PyRef::from_owned((api.object_str)(raised.pointer))?)?;
-            // `<class 'ValueError'>` is what str() of a type gives; the bare name
-            // is what a reader wants to see.
-            let kind = kind
-                .rsplit_once('\'')
-                .and_then(|(head, _)| head.rsplit_once('\'').map(|(_, name)| name.to_string()))
-                .unwrap_or(kind);
-            Some(format!("{kind}: {text}"))
+        raised
+    };
+    let Some(raised) = raised else {
+        return Err(TorclError::FfiError(format!(
+            "{fallback} failed, and CPython reported no exception"
+        )));
+    };
+    // Describing this one would recurse if we are already describing another.
+    let Some(_describing) = Describing::begin() else {
+        return Err(TorclError::FfiError(format!(
+            "{fallback} failed while Python was already reporting a failure"
+        )));
+    };
+    Err(TorclError::PythonRaised(Box::new(Raise {
+        kind: scope.exception_kind(&raised),
+        message: scope
+            .display(&raised)
+            .unwrap_or_else(|_| fallback.to_string()),
+        frames: scope.traceback_frames(&raised),
+        object: Some(raised),
+    })))
+}
+
+impl PythonScope {
+    /// The bare name of an exception's class: `ValueError`, not
+    /// `<class 'ValueError'>`.
+    fn exception_kind(&self, exception: &PyRef) -> String {
+        // SAFETY: resolved entry points and a live exception, GIL held.
+        let kind = unsafe { PyRef::from_owned((self.api.object_type)(exception.pointer)) };
+        let named = kind.and_then(|kind| {
+            self.getattr(&kind, "__qualname__")
+                .ok()
+                .and_then(|name| utf8_of(self.api, &name))
         });
-        Err(TorclError::FfiError(
-            described.unwrap_or_else(|| fallback.to_string()),
-        ))
+        // A failed lookup would have set an exception of its own; it is not the
+        // caller's, so it must not outlive this function.
+        self.clear_error();
+        named.unwrap_or_else(|| "PythonError".to_string())
     }
 }
 
@@ -841,17 +869,13 @@ fn utf8_of(api: &'static Api, text: &PyRef) -> Option<String> {
 
 /// Adopt a call's result: an owned reference, or the exception that explains why
 /// there isn't one.
-fn adopt(
-    api: &'static Api,
-    pointer: *mut PyObject,
-    what: &str,
-) -> Result<PyRef, TorclError> {
+fn adopt(scope: &PythonScope, pointer: *mut PyObject, what: &str) -> Result<PyRef, TorclError> {
     // SAFETY: the caller has just produced `pointer` from a C-API call and is
     // handing over ownership of it.
     match unsafe { PyRef::from_owned(pointer) } {
         Some(reference) => Ok(reference),
         None => {
-            check(api, what)?;
+            check(scope, what)?;
             // Null with no exception set is a CPython contract violation rather
             // than a Python-level failure; report it as ours, not theirs.
             Err(TorclError::FfiError(format!(
@@ -868,7 +892,7 @@ impl PythonScope {
             .map_err(|_| TorclError::FfiError("a module name contains a null byte".into()))?;
         // SAFETY: a resolved entry point, a valid string, GIL held by `self`.
         let module = unsafe { (self.api.import_module)(cname.as_ptr()) };
-        adopt(self.api, module, &format!("importing {name}"))
+        adopt(self, module, &format!("importing {name}"))
     }
 
     /// Resolve a dotted name such as `numpy.mean` or `scipy.optimize.minimize`.
@@ -920,7 +944,7 @@ impl PythonScope {
         // SAFETY: resolved entry point, live reference, valid string, GIL held.
         let attribute =
             unsafe { (self.api.object_get_attr_string)(object.pointer, cname.as_ptr()) };
-        adopt(self.api, attribute, &format!("reading attribute {name}"))
+        adopt(self, attribute, &format!("reading attribute {name}"))
     }
 
     /// `(setf (py:getattr x "name") v)`.
@@ -932,7 +956,7 @@ impl PythonScope {
             (self.api.object_set_attr_string)(object.pointer, cname.as_ptr(), value.pointer)
         };
         if status != 0 {
-            check(self.api, &format!("setting attribute {name}"))?;
+            check(self, &format!("setting attribute {name}"))?;
             return Err(TorclError::FfiError(format!(
                 "setting attribute {name} failed without an exception"
             )));
@@ -951,18 +975,18 @@ impl PythonScope {
         // reference it is given, which is why `into_raw` rather than `as_ptr`; the
         // tuple owns them from that point and releases them when it dies.
         let result = unsafe {
-            let tuple = adopt(self.api, (self.api.tuple_new)(count as isize), "building arguments")?;
+            let tuple = adopt(self, (self.api.tuple_new)(count as isize), "building arguments")?;
             for (index, argument) in arguments.into_iter().enumerate() {
                 let status =
                     (self.api.tuple_set_item)(tuple.pointer, index as isize, argument.into_raw());
                 if status != 0 {
-                    check(self.api, "building arguments")?;
+                    check(self, "building arguments")?;
                     return Err(TorclError::FfiError("building arguments failed".into()));
                 }
             }
             (self.api.object_call)(callable.pointer, tuple.pointer, std::ptr::null_mut())
         };
-        adopt(self.api, result, "calling a Python object")
+        adopt(self, result, "calling a Python object")
     }
 
     /// `py:call-method`: the attribute, then the call.
@@ -980,7 +1004,7 @@ impl PythonScope {
     pub fn display(&self, object: &PyRef) -> Result<String, TorclError> {
         // SAFETY: resolved entry point, live reference, GIL held.
         let text = adopt(
-            self.api,
+            self,
             unsafe { (self.api.object_str)(object.pointer) },
             "stringifying a Python object",
         )?;
@@ -992,7 +1016,7 @@ impl PythonScope {
     pub fn represent(&self, object: &PyRef) -> Result<String, TorclError> {
         // SAFETY: as `display`.
         let text = adopt(
-            self.api,
+            self,
             unsafe { (self.api.object_repr)(object.pointer) },
             "representing a Python object",
         )?;
@@ -1006,7 +1030,7 @@ impl PythonScope {
     pub fn type_of(&self, object: &PyRef) -> Result<PyRef, TorclError> {
         // SAFETY: resolved entry point, live reference, GIL held.
         adopt(
-            self.api,
+            self,
             unsafe { (self.api.object_type)(object.pointer) },
             "taking the type of a Python object",
         )
@@ -1019,7 +1043,7 @@ impl PythonScope {
         // SAFETY: resolved entry point, two live references, GIL held.
         let status = unsafe { (self.api.object_is_instance)(object.pointer, class.pointer) };
         if status < 0 {
-            check(self.api, "testing a Python type")?;
+            check(self, "testing a Python type")?;
             return Err(TorclError::FfiError("testing a Python type failed".into()));
         }
         Ok(status == 1)
@@ -1060,7 +1084,7 @@ impl PythonScope {
         }
         if value == crate::value::T {
             return adopt(
-                self.api,
+                self,
                 unsafe { (self.api.bool_from_long)(1) },
                 "making a Python bool",
             );
@@ -1072,7 +1096,7 @@ impl PythonScope {
         if value.is_fixnum() {
             // SAFETY: a resolved entry point under the GIL.
             return adopt(
-                self.api,
+                self,
                 unsafe { (self.api.long_from_longlong)(value.as_fixnum()) },
                 "making a Python int",
             );
@@ -1088,7 +1112,7 @@ impl PythonScope {
             };
             // SAFETY: as above.
             return adopt(
-                self.api,
+                self,
                 unsafe { (self.api.float_from_double)(double) },
                 "making a Python float",
             );
@@ -1098,7 +1122,7 @@ impl PythonScope {
             // SAFETY: a resolved entry point under the GIL; the pointer and length
             // describe `text`, which outlives the call.
             return adopt(
-                self.api,
+                self,
                 unsafe {
                     (self.api.unicode_from_string_and_size)(
                         text.as_ptr() as *const i8,
@@ -1113,7 +1137,7 @@ impl PythonScope {
             // type, and `str` of length one is what its own APIs expect.
             let text = value.as_char().to_string();
             return adopt(
-                self.api,
+                self,
                 unsafe {
                     (self.api.unicode_from_string_and_size)(
                         text.as_ptr() as *const i8,
@@ -1178,7 +1202,7 @@ impl PythonScope {
         if self.is_instance_of_type(object.pointer, self.api.float_type) {
             // SAFETY: a resolved entry point, a live float, GIL held.
             let value = unsafe { (self.api.float_as_double)(object.pointer) };
-            check(self.api, "converting a Python float")?;
+            check(self, "converting a Python float")?;
             return Ok(crate::gc::alloc_double_float(value));
         }
         if self.is_instance_of_type(object.pointer, self.api.unicode_type) {
@@ -1316,5 +1340,144 @@ pub unsafe fn finalize_proxy(body: *mut u8) {
         // Constructing a PyRef and dropping it is exactly the queueing path, so
         // the release rule lives in one place rather than two.
         drop(PyRef::from_owned(pointer));
+    }
+}
+
+// ── Exceptions ─────────────────────────────────────────────────────
+//
+// A Python failure is carried out of the crossing with its structure intact —
+// type, message, frames, and the exception object — rather than flattened into a
+// string. The frames are the reason: a mixed-language backtrace is the thing that
+// makes this feel deeper than a foreign-function call, and a formatted message has
+// already thrown them away.
+
+/// One Python stack frame, as `traceback.extract_tb` reports it.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub file: String,
+    pub line: i64,
+    pub function: String,
+}
+
+/// A Python exception, owned by the Rust side.
+#[derive(Debug)]
+pub struct Raise {
+    /// The exception class's name: `ValueError`, `KeyError`.
+    pub kind: String,
+    /// `str(exception)` — what Python would print after the colon.
+    pub message: String,
+    /// Outermost first, matching Python's own traceback order.
+    pub frames: Vec<Frame>,
+    /// The exception itself, so a caller can reach its attributes. `None` when it
+    /// could not be recovered — which is rare but must not be fatal.
+    pub object: Option<PyRef>,
+}
+
+thread_local! {
+    /// True while an exception is being described on this thread.
+    static DESCRIBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the thread as describing an exception for as long as it lives.
+///
+/// Describing one means calling back into Python — `str(exception)`, the type's
+/// `__qualname__`, `traceback.extract_tb` — and any of those can itself raise, on a
+/// stack too deep to walk or a `__str__` that throws. Without this, the failure of
+/// the description would be described, whose failure would be described, without
+/// bound; the first version of this guarded only the traceback walk, which left the
+/// other two able to do it.
+///
+/// A guard rather than a pair of set calls so that no early return or panic can
+/// leave the thread permanently unable to report an exception.
+struct Describing;
+
+impl Describing {
+    /// `None` if a description is already in progress, in which case the caller
+    /// must not start another.
+    fn begin() -> Option<Self> {
+        if DESCRIBING.with(|flag| flag.replace(true)) {
+            None
+        } else {
+            Some(Describing)
+        }
+    }
+}
+
+impl Drop for Describing {
+    fn drop(&mut self) {
+        DESCRIBING.with(|flag| flag.set(false));
+    }
+}
+
+impl PythonScope {
+    /// The frames of `exception`'s traceback, outermost first.
+    ///
+    /// Asks Python's own `traceback` module rather than walking the traceback
+    /// object's fields: those are struct members with no stable C accessors, and
+    /// `extract_tb` already answers exactly this question.
+    ///
+    /// Best effort throughout. A missing or unwalkable traceback yields no frames;
+    /// it must never turn a Python error into a TorCL one.
+    fn traceback_frames(&self, exception: &PyRef) -> Vec<Frame> {
+        let extracted = (|| -> Option<Vec<Frame>> {
+            let traceback = self.getattr(exception, "__traceback__").ok()?;
+            if self.is_none(traceback.pointer) {
+                return None;
+            }
+            let extract = self.resolve("traceback.extract_tb").ok()?;
+            let summaries = self.call(&extract, vec![traceback]).ok()?;
+            // SAFETY: a resolved entry point and a live sequence, GIL held.
+            let count = unsafe { (self.api.sequence_size)(summaries.pointer) };
+            if count < 0 {
+                self.clear_error();
+                return None;
+            }
+            let mut extracted = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                // SAFETY: as above, and `index` is within the reported size.
+                let item = unsafe { (self.api.sequence_get_item)(summaries.pointer, index) };
+                let Some(summary) = (unsafe { PyRef::from_owned(item) }) else {
+                    self.clear_error();
+                    break;
+                };
+                let text = |name: &str| {
+                    self.getattr(&summary, name)
+                        .ok()
+                        // SAFETY: a resolved entry point and a live attribute
+                        // value, GIL held; `object_str` hands back a new reference.
+                        .and_then(|value| unsafe {
+                            PyRef::from_owned((self.api.object_str)(value.pointer))
+                        })
+                        .and_then(|value| utf8_of(self.api, &value))
+                        .unwrap_or_default()
+                };
+                extracted.push(Frame {
+                    file: text("filename"),
+                    line: text("lineno").parse().unwrap_or(0),
+                    function: text("name"),
+                });
+            }
+            Some(extracted)
+        })();
+        // Anything the extraction left set belongs to the extraction, not to the
+        // exception being described.
+        self.clear_error();
+        extracted.unwrap_or_default()
+    }
+}
+
+impl Raise {
+    /// The mixed-backtrace line for one frame, in the shape the debugger uses.
+    pub fn render_frames(&self) -> String {
+        self.frames
+            .iter()
+            .rev()
+            .map(|frame| {
+                format!(
+                    "  Python  {} at {}:{}\n",
+                    frame.function, frame.file, frame.line
+                )
+            })
+            .collect()
     }
 }

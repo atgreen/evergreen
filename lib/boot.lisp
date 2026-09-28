@@ -3997,6 +3997,63 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 (defun py:objectp (object) (torcl::%py-objectp object))
 (deftype py:object () '(satisfies py:objectp))
 
+;;; ---------------------------------------------------------------------------
+;;; A Python exception is a Lisp condition (bliss-wq5tw)
+;;; ---------------------------------------------------------------------------
+;;;
+;;; Signalled for every Python raise, so HANDLER-CASE works on it the way it works
+;;; on anything else, and so the failure carries its structure rather than a
+;;; formatted string: the exception's class, its message, the Python frames, and the
+;;; exception object itself, whose attributes are often the useful part (an
+;;; HTTPError's status, a KeyError's key).
+;;;
+;;; FRAMES are (FILE LINE FUNCTION) lists, outermost first -- Python's own order.
+;;;
+;;; NAMED PY:EXCEPTION, NOT PY:ERROR, and that is not a style choice. TorCL's class
+;;; registry is keyed by a class's BARE name, so a class named PY:ERROR registers
+;;; under "ERROR" and REPLACES CL:ERROR for the whole image -- after which every
+;;; user condition's superclass "ERROR" resolves to that class, which is its own
+;;; superclass, and MAKE-CONDITION of anything recurses until the stack is gone.
+;;; It took a SIGSEGV in (make-condition 'c1) -- a definition with nothing to do
+;;; with Python -- to find that. Filed as bliss-kliz4; until it is fixed, no package
+;;; here may define a class whose bare name a standard class already uses.
+;;; EXCEPTION is also simply the better word: this is a Python exception.
+(define-condition py:exception (error)
+  ((kind :initarg :kind :initform "PythonError" :reader py:exception-kind)
+   (text :initarg :text :initform "" :reader py:exception-text)
+   (frames :initarg :frames :initform nil :reader py:exception-frames)
+   (object :initarg :object :initform nil :reader py:exception-object)
+   ;; FORMAT-CONTROL carries the already-rendered report, which is what TorCL's
+   ;; printer actually reads: a DEFINE-CONDITION :report is not honoured by ~A yet
+   ;; (even a constant string prints as the bare class name -- bliss-e5eh6), so the
+   ;; :report below is the portable declaration and this slot is what makes ~A and
+   ;; an uncaught error show the message and the frames today. The signaller fills
+   ;; it; the two agree by construction.
+   (format-control :initarg :format-control :initform nil)
+   (format-arguments :initarg :format-arguments :initform nil))
+  (:report (lambda (condition stream)
+             (format stream "~a: ~a"
+                     (py:exception-kind condition) (py:exception-text condition))
+             ;; The frames go beneath the message, innermost first, which is the
+             ;; direction a reader looks first and the order a Lisp backtrace uses.
+             (dolist (frame (reverse (py:exception-frames condition)))
+               (format stream "~%  Python  ~a at ~a:~a"
+                       (third frame) (first frame) (second frame))))))
+
+;;; The Python half of a mixed-language backtrace, innermost first:
+;;;
+;;;   0: Lisp    PROCESS-DATA
+;;;   1: Lisp    PY:CALL
+;;;   2: Python  fit at sklearn/base.py:1389
+;;;   3: Python  asarray at numpy/_core/numeric.py:330
+;;;
+;;; Returned as data rather than printed, so a debugger or a log formatter can
+;;; interleave it with the Lisp frames however it presents them.
+(defun py:backtrace (condition)
+  (mapcar (lambda (frame)
+            (list :python (third frame) (first frame) (second frame)))
+          (reverse (py:exception-frames condition))))
+
 ;;; External, so TYPE-OF and error messages read PY:OBJECT rather than
 ;;; TORCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
 ;;; INTERN by name rather than writing '(py:import ...): a quoted list is read
@@ -4005,7 +4062,9 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; other package here exports the same way for the same reason.
 (export (mapcar (lambda (name) (intern name "TORCL-PYTHON"))
                 '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
-                  "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"))
+                  "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
+                  "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
+                  "EXCEPTION-OBJECT" "BACKTRACE"))
         "TORCL-PYTHON")
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.

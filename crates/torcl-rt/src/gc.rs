@@ -3200,6 +3200,11 @@ impl TraceHostRoots for TorclError {
             // The already-signalled condition is a live TorclVal and must be
             // relocated with the moving GC (bliss-9kc).
             TorclError::Signalled { condition, .. } => condition.trace_host_roots(visit),
+            // A Python raise carries strings and a PyObject pointer. The pointer
+            // names an object in CPython's heap, which this collector neither
+            // moves nor traces, so there is nothing here to visit.
+            #[cfg(feature = "python")]
+            TorclError::PythonRaised(_) => {}
             TorclError::Oom
             | TorclError::StackOverflow(_)
             | TorclError::InvalidImage(_)

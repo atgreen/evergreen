@@ -302,3 +302,86 @@ pub fn is_proxy(value: TorclVal) -> bool {
         false
     }
 }
+
+/// Build a `PY:EXCEPTION` condition instance from a Python raise (bliss-wq5tw).
+///
+/// Lives here rather than in `cli.rs`'s conversion table because assembling it
+/// needs to know what a Python frame is, and because the exception object has to
+/// become a proxy — which is a crossing, and the one place a *condition* is allowed
+/// to perform one.
+#[cfg(feature = "python")]
+pub fn build_error_condition(
+    env: &mut super::Env,
+    raise: &torcl_rt::python::Raise,
+) -> Result<TorclVal, torcl_rt::error::TorclError> {
+    use torcl_rt::gc::alloc_character_string;
+
+    // The frames first, before the condition exists: this allocates a list of
+    // lists, and building it while holding a partially-initialised instance would
+    // be the classic way to lose it under a moving collector.
+    //
+    // Each frame is (FILE LINE FUNCTION), outermost first — Python's own order, so
+    // a reader who has seen a Python traceback recognises it.
+    torcl_rt::rooted!(frames = torcl_rt::value::NIL);
+    for frame in raise.frames.iter().rev() {
+        torcl_rt::rooted!(file = alloc_character_string(&frame.file));
+        torcl_rt::rooted!(function = alloc_character_string(&frame.function));
+        torcl_rt::rooted!(
+            entry = super::vec_to_list(&[
+                *file,
+                TorclVal::from_fixnum(frame.line),
+                *function,
+            ])
+        );
+        // Built back to front, so the list comes out in the order above.
+        *frames = super::arena_cons(*entry, *frames);
+    }
+
+    torcl_rt::rooted!(kind = alloc_character_string(&raise.kind));
+    torcl_rt::rooted!(text = alloc_character_string(&raise.message));
+
+    // The exception object, as a proxy, so `(py:error-object e)` can be asked for
+    // its attributes. A crossing is needed to add the reference the proxy owns; if
+    // one cannot be had — the interpreter is going down, say — the condition is
+    // still worth having without it.
+    torcl_rt::rooted!(object = torcl_rt::value::NIL);
+    if let Some(exception) = raise.object.as_ref() {
+        if let Ok(scope) = torcl_rt::python::PythonScope::enter() {
+            if let Some(owned) = exception.duplicate(&scope) {
+                if let Ok(proxy) = scope.proxy(owned) {
+                    *object = proxy;
+                }
+            }
+        }
+    }
+
+    // The rendered report, which is what TorCL's printer reads (see the slot's
+    // comment in boot.lisp). Built here so an uncaught Python error shows its
+    // message AND its frames without anything else having to know how.
+    torcl_rt::rooted!(
+        report = alloc_character_string(&format!(
+            "{}: {}{}{}",
+            raise.kind,
+            raise.message,
+            if raise.frames.is_empty() { "" } else { "\n" },
+            raise.render_frames().trim_end()
+        ))
+    );
+
+    super::build_condition_instance(
+        env,
+        "TORCL-PYTHON::EXCEPTION",
+        &[
+            super::resolve_sym("FORMAT-CONTROL").unwrap_or(torcl_rt::value::NIL),
+            *report,
+            super::resolve_sym("KIND").unwrap_or(torcl_rt::value::NIL),
+            *kind,
+            super::resolve_sym("TEXT").unwrap_or(torcl_rt::value::NIL),
+            *text,
+            super::resolve_sym("FRAMES").unwrap_or(torcl_rt::value::NIL),
+            *frames,
+            super::resolve_sym("OBJECT").unwrap_or(torcl_rt::value::NIL),
+            *object,
+        ],
+    )
+}

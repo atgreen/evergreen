@@ -184,6 +184,170 @@ fn errors_report_pythons_own_message() {
     );
 }
 
+/// A Python raise is a first-class Lisp condition: catchable as `PY:EXCEPTION`,
+/// carrying the exception's class, its message, the Python frames, and the exception
+/// object itself so a handler can reach its attributes.
+#[test]
+fn a_python_raise_is_a_lisp_condition() {
+    let program = r#"
+      (py:exec "def inner(x):
+    return int(x)
+def outer(x):
+    return inner(x)")
+      (handler-case (py:call "__main__.outer" "bad")
+        (py:exception (e)
+          (format t "CONDITION ~S~%"
+                  (list (py:exception-kind e)
+                        ;; The message, and that it is Python's own.
+                        (not (null (search "invalid literal" (py:exception-text e))))
+                        ;; Frames are (FILE LINE FUNCTION), outermost first.
+                        (py:exception-frames e)
+                        ;; py:backtrace reverses them and tags them, for a mixed
+                        ;; backtrace a debugger can interleave with Lisp frames.
+                        (py:backtrace e)
+                        ;; The exception object is reachable, and is a proxy.
+                        (py:objectp (py:exception-object e))
+                        ;; And its attributes can be read, which is the reason for
+                        ;; carrying it rather than only its message.
+                        (not (null (search "invalid literal"
+                                           (py:str (py:getattr (py:exception-object e) "args")))))
+                        ;; It is an ERROR, so an ordinary handler catches it too.
+                        (typep e 'error)))))
+    "#;
+    let stdout = run(program, "t0", false);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("CONDITION "))
+        .unwrap_or("");
+    assert_eq!(
+        line.trim(),
+        r#"CONDITION ("ValueError" T (("<string>" 4 "outer") ("<string>" 2 "inner")) ((:PYTHON "inner" "<string>" 2) (:PYTHON "outer" "<string>" 4)) T T T)"#
+    );
+}
+
+/// The report shows the message and the Python frames, both when caught and when
+/// it reaches the top level uncaught — the latter being where a reader most needs
+/// to know where in Python it happened.
+#[test]
+fn the_report_renders_a_mixed_backtrace() {
+    let program = r#"
+      (py:exec "def inner(x):
+    return int(x)
+def outer(x):
+    return inner(x)")
+      (handler-case (py:call "__main__.outer" "bad")
+        (py:exception (e) (format t "~&CAUGHT~%~a~%END~%" e)))
+    "#;
+    let stdout = run(program, "t0", false);
+    let caught: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("CAUGHT"))
+        .take_while(|line| !line.starts_with("END"))
+        .collect();
+    assert_eq!(
+        caught,
+        vec![
+            "CAUGHT",
+            "ValueError: invalid literal for int() with base 10: 'bad'",
+            "  Python  inner at <string>:2",
+            "  Python  outer at <string>:4",
+        ],
+        "got: {stdout}"
+    );
+
+    // Uncaught: the same shape must reach the top level.
+    let mut command = Command::new(BIN);
+    command.args([
+        "--no-init",
+        "--eval",
+        r#"(progn (py:exec "def inner(x):
+    return int(x)
+def outer(x):
+    return inner(x)") (py:call "__main__.outer" "unhandled"))"#,
+    ]);
+    let output = command.output().expect("the CLI runs");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "an uncaught raise must fail");
+    assert!(
+        combined.contains("ValueError: invalid literal")
+            && combined.contains("Python  inner at <string>:2"),
+        "an uncaught raise should show its Python frames, got: {combined}"
+    );
+}
+
+/// Describing an exception calls back into Python — `str(exception)`, the type's
+/// `__qualname__`, `traceback.extract_tb` — and any of those can itself raise. The
+/// description must not then describe its own failure, without bound.
+///
+/// An exception whose `__str__` raises is the smallest way to provoke it. The first
+/// version of the guard covered only the traceback walk, which left this open.
+#[test]
+fn describing_a_hostile_exception_does_not_recurse() {
+    let program = r#"
+      (py:exec "class Hostile(Exception):
+    def __str__(self): raise RuntimeError('str failed too')
+def raiser(): raise Hostile()")
+      (format t "HOSTILE ~S~%"
+              (list (handler-case (py:call "__main__.raiser") (error () :caught))
+                    ;; And the guard resets, so the next exception still reports in
+                    ;; full — a guard that leaked would silently degrade every
+                    ;; later error on this thread.
+                    (handler-case (py:call "__main__.deep")
+                      (py:exception (e) (py:exception-kind e)))))
+      (py:exec "def bottom(x): return int(x)
+def deep(): return bottom('bad')")
+      (format t "AFTER ~S~%"
+              (handler-case (py:call "__main__.deep")
+                (py:exception (e) (list (py:exception-kind e)
+                                        (length (py:exception-frames e))))))
+    "#;
+    let stdout = run(program, "t0", false);
+    let hostile = stdout
+        .lines()
+        .find(|line| line.starts_with("HOSTILE "))
+        .unwrap_or("");
+    assert_eq!(hostile.trim(), r#"HOSTILE (:CAUGHT "AttributeError")"#);
+    let after = stdout
+        .lines()
+        .find(|line| line.starts_with("AFTER "))
+        .unwrap_or("");
+    assert_eq!(
+        after.trim(),
+        r#"AFTER ("ValueError" 2)"#,
+        "a later exception must still get its kind and its frames"
+    );
+}
+
+/// A regression guard with nothing to do with Python.
+///
+/// PY:EXCEPTION was first named PY:ERROR, and because TorCL's class registry is
+/// keyed by a class's BARE name that replaced CL:ERROR for the whole image: every
+/// user condition's superclass then resolved to it, it was its own superclass, and
+/// MAKE-CONDITION of anything recursed until the stack was gone. This asserts the
+/// ordinary case still works, so a future rename cannot quietly do it again
+/// (bliss-kliz4).
+#[test]
+fn defining_the_python_condition_does_not_disturb_cl_error() {
+    let program = r#"
+      (define-condition probe-condition (error) ((k :initarg :k :reader probe-k)))
+      (format t "PROBE ~S~%"
+              (list (probe-k (make-condition 'probe-condition :k 5))
+                    (handler-case (error "plain") (error () :caught))
+                    (eq (find-class 'error) (find-class 'cl:error))
+                    (not (eq (find-class 'py:exception) (find-class 'error)))))
+    "#;
+    let stdout = run(program, "t0", false);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("PROBE "))
+        .unwrap_or("");
+    assert_eq!(line.trim(), "PROBE (5 :CAUGHT T T)");
+}
+
 /// A proxy prints as the object, not as an address: `#<PYTHON-OBJECT <module …>>`.
 /// That is what makes one legible in a backtrace.
 #[test]

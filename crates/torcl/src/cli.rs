@@ -4334,6 +4334,11 @@ fn torcl_error_to_condition(
             torcl_rt::rooted!(message = arena_str(msg));
             make_simple_condition("TORCL-FFI::FFI-ERROR", *message, &[], env)?
         }
+        // A Python raise keeps its structure: the exception's class, its message,
+        // the Python frames for a mixed backtrace, and the exception object so a
+        // handler can reach its attributes (bliss-wq5tw).
+        #[cfg(feature = "python")]
+        TorclError::PythonRaised(raise) => python::build_error_condition(env, raise)?,
         TorclError::ProgramError(msg) => {
             let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
             torcl_rt::rooted!(control = arena_str(msg));

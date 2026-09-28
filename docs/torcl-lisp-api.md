@@ -955,9 +955,51 @@ This means a released Python object is destroyed slightly later than a `del` in
 Python would destroy it — after a collection and the next crossing. Code that
 depends on a `__del__` running at a particular moment should call it explicitly.
 
-Python errors are signalled as errors carrying the exception's type and message
-(`ValueError: invalid literal for int() ...`). Conditions carrying the traceback
-and a mixed-language backtrace are separate work.
+### Errors
+
+A Python raise is a first-class Lisp condition, `PY:EXCEPTION`, a subtype of
+`ERROR`:
+
+```lisp
+(handler-case (py:call "numpy.mean" x)
+  (py:exception (e)
+    (py:exception-kind e)     ; "ValueError"  -- the exception class's name
+    (py:exception-text e)     ; str(exception) -- Python's own message
+    (py:exception-frames e)   ; ((file line function) ...), outermost first
+    (py:exception-object e)   ; the exception itself, as a PY:OBJECT
+    (py:backtrace e)))        ; ((:python function file line) ...), innermost first
+```
+
+The exception object is carried, not just its message, because its attributes are
+usually the useful part -- an `HTTPError`'s status, a `KeyError`'s key. The message
+and the frames are rendered when the condition is printed, caught or not:
+
+```text
+ValueError: invalid literal for int() with base 10: 'bad'
+  Python  inner at <string>:2
+  Python  outer at <string>:4
+```
+
+`PY:BACKTRACE` returns the Python half of a mixed-language backtrace as data rather
+than printing it, so a debugger or log formatter can interleave it with the Lisp
+frames however it presents them:
+
+```text
+0: Lisp    PROCESS-DATA
+1: Lisp    PY:CALL
+2: Python  fit at sklearn/base.py:1389
+3: Python  asarray at numpy/_core/numeric.py:330
+```
+
+It is named `PY:EXCEPTION` rather than `PY:ERROR` for a reason worth knowing if you
+define conditions of your own: TorCL's class registry is currently keyed by a
+class's *bare* name, so a class named `PY:ERROR` replaces `CL:ERROR` image-wide
+(bliss-kliz4). Until that is fixed, do not give a class a bare name that a standard
+class already uses.
+
+The inverse direction -- a Lisp condition escaping into Python becoming a Python
+exception rather than unwinding through CPython frames -- needs Python-to-Lisp
+calls, which do not exist yet.
 
 Embedded Python requires the same sandbox permission as the FFI, and a sandboxed
 image refuses to start an interpreter: `exec` is arbitrary code execution and

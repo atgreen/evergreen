@@ -815,12 +815,18 @@ requires a glibc target rather than the default static musl):
 - The value policy: numbers by value, strings by copy, `NIL`↔`None`, `T`↔`True`,
   everything else a proxy. An integer beyond a fixnum stays a proxy rather than
   being truncated.
+- A Python raise as a first-class condition, `PY:EXCEPTION`, carrying the
+  exception's class, its message, the Python frames, and the exception object.
+  Its report renders the Python half of a mixed-language backtrace, and
+  `PY:BACKTRACE` returns those frames as data for a debugger to interleave.
 
-Still unbuilt, and tracked separately: Python exceptions as Lisp conditions with a
-mixed-language backtrace (`bliss-wq5tw`), Python→Lisp callables (`bliss-89axw`,
+Still unbuilt, and tracked separately: Python→Lisp callables (`bliss-89axw`,
 x86-64 only until callbacks are ported), the zero-copy buffer protocol
 (`bliss-s8wrr`), stream binding (`bliss-c4g9u`), and signal arbitration
-(`bliss-ztkuw`). Requirement numbers are deliberately not assigned yet; this
+(`bliss-ztkuw`). The inverse of the exception mapping — a Lisp condition escaping
+into Python becoming a Python exception rather than unwinding through CPython
+frames, which would leave its reference counts wrong — depends on Python→Lisp calls
+and is staged with them. Requirement numbers are deliberately not assigned yet; this
 section records a direction and its progress, and gains normative IDs when the
 surface stops moving.
 
