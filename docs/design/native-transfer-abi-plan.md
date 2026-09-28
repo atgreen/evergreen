@@ -362,6 +362,36 @@ fault-recovery/unwind gates, fiber migration and native-Windows execution gates 
 required before rollout. The
 adapter records TorclStack watermarks but does not restore them itself.
 
+### Generated helper outcome adapter
+
+`t2::native_transfer::emit_helper_veneer` emits an x86-64 Linux SysV adapter for
+a typed helper-v2 function `(request, outcome_out)`. The Rust helper writes an
+explicit NativeOutcome and returns normally. The adapter tests only the exit
+field: successful values, including zero and NIL, return in RAX. Transfer and
+Deopt tail-jump to a generated cold entry with `(request, value, exit)`, after
+removing only the adapter's temporary frame. The generated caller needs no
+post-call transfer check. Caller frames remain available for capture.
+
+An executable fixture runs generated caller → generated adapter → Rust helper
+→ generated cold route → segment landing, checking primary values, exit kinds,
+Rust destructor execution, and whether the caller's success continuation ran.
+Run the capability-dependent execution gate explicitly:
+
+```text
+cargo test -p torcl-compiler --test native_helper_veneer -- --include-ignored --nocapture
+```
+
+This is an adapter primitive, not production installation or a Lisp unwind
+implementation. Its test uses immediate values and has no Lisp cleanup/root
+retirement obligations. Production installation still needs typed request
+layouts, retained targets, precise call-site capture maps, rooted payloads,
+native dispatch/fallback, generated-frame unwind metadata, and converted helper
+classes. The temporary outcome slot is not a GC root; the helper must root its
+inputs across allocation, and the cold route must publish roots before its first
+allocation. There are no calls or safepoints between reading the outcome and
+entering the cold route. Win64 and other architecture veneers remain separate
+work; the ordinary pipeline continues to reject Invoke emission.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

@@ -53,6 +53,8 @@ pub mod emit; // MachFunc → executable x86-64 bytes (spec §4.7)
 pub mod emit_a64;
 pub mod emit_ppc64le;
 pub mod emit_s390x;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub mod native_transfer;
 
 // ── Wave 3 parcels ────────────────────────────────────────────────
 pub mod opt_escape; // P4e — escape analysis + scalar replacement
