@@ -134,5 +134,50 @@
     (java:with-scope ()
       (java:static "ErgonomicFixture" "throughWide"
         (java:lambda "ErgonomicFixture$Covariant" () "hello"))))
+  ;; Java's streams reach the Lisp streams, capturably and in program order. Before
+  ;; this, System.out.println wrote fd 1 directly: a WITH-OUTPUT-TO-STRING saw
+  ;; nothing and the ordering against Lisp's own output was flush timing (bliss-zsuw0).
+  (check-java "stdout-captured" "lisp-before java-line lisp-after"
+    (java:with-scope ()
+      (let ((text (with-output-to-string (stream)
+                    (let ((*standard-output* stream))
+                      (write-string "lisp-before ")
+                      (java:call (java:static-field "java.lang.System" "out") "println" "java-line")
+                      (write-string "lisp-after")))))
+        ;; The newline PRINTLN wrote is real output, not framing; collapse it so the
+        ;; assertion is about content and order rather than line endings.
+        (substitute #\Space #\Newline text))))
+  ;; stderr must land on *ERROR-OUTPUT*, not be merged into *STANDARD-OUTPUT*.
+  (check-java "stderr-separate" (list "out-line" "err-line")
+    (java:with-scope ()
+      (let (errors)
+        (let ((output (with-output-to-string (out)
+                        (setf errors (with-output-to-string (err)
+                                       (let ((*standard-output* out) (*error-output* err))
+                                         (java:call (java:static-field "java.lang.System" "out") "println" "out-line")
+                                         (java:call (java:static-field "java.lang.System" "err") "println" "err-line")
+                                         (java:flush)))))))
+          (list (string-trim (list #\Newline) output) (string-trim (list #\Newline) errors))))))
+  ;; Non-ASCII must survive the byte buffer -> UTF-8 -> UTF-16 -> Lisp path, including
+  ;; a character outside the BMP, which crosses as a surrogate pair.
+  (check-java "stdout-utf8" "café 🎉"
+    (java:with-scope ()
+      (string-trim (list #\Newline)
+        (with-output-to-string (stream)
+          (let ((*standard-output* stream))
+            (java:call (java:static-field "java.lang.System" "out") "println" "café 🎉")
+            (java:flush))))))
+  ;; Output printed before a Java throw is still delivered: the drain runs in
+  ;; UNWIND-PROTECT cleanup, so a failure does not swallow the very output that
+  ;; explains it.
+  (check-java "stdout-survives-throw" "printed-then-threw"
+    (java:with-scope ()
+      (string-trim (list #\Newline)
+        (with-output-to-string (stream)
+          (let ((*standard-output* stream))
+            (handler-case
+                (progn (java:call (java:static-field "java.lang.System" "out") "println" "printed-then-threw")
+                       (java:static "ErgonomicFixture" "fail"))
+              (java:java-error () nil)))))))
   (check-java "stop-no-leaks" t (java:stop-jvm vm)))
 (format t "JAVA-ERGONOMIC-PASS~%")

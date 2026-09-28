@@ -1,5 +1,7 @@
 package org.torcl.jvm;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
@@ -159,4 +161,76 @@ public final class Bridge implements InvocationHandler {
         return ((Number)value).longValue();
     }
     public static double real(Object value) { return ((Number)value).doubleValue(); }
+
+    // ── Java's standard streams ────────────────────────────────────────
+    //
+    // System.out writes to file descriptor 1 directly, so Java output bypassed
+    // *STANDARD-OUTPUT* entirely: a WITH-OUTPUT-TO-STRING around a Java call saw
+    // nothing, and output interleaved with Lisp's by flush timing rather than by
+    // program order. (Unlike the Python case it was never LOST -- System.out is
+    // autoflush-on-println -- so this is about capture and ordering only.)
+    //
+    // So both streams are redirected into byte buffers that Lisp drains at each
+    // crossing and writes to *STANDARD-OUTPUT* / *ERROR-OUTPUT*. The write happens
+    // in Lisp, not here, because only there does *STANDARD-OUTPUT* mean what the
+    // caller intends -- including a capture in force.
+    //
+    // Redirection is deliberately at the Java level rather than dup2 on fd 1, so
+    // native writes inside the JVM -- JNI libraries, -Xlog, crash reports -- keep
+    // reaching the real fd 1 where a reader expects them.
+    //
+    // The cost, as for Python: output appears when the crossing ends, so a long
+    // computation's progress prints arrive together. A pipe would not fix that
+    // (nothing drains it while Lisp is blocked in the call, so Java would block
+    // once the 64K kernel buffer filled) -- see the bead for that analysis.
+    private static ByteArrayOutputStream outBuffer, errBuffer;
+    private static PrintStream outStream, errStream;
+
+    /** Redirect the standard streams into buffers Lisp can drain. Idempotent. */
+    public static synchronized void captureStreams() {
+        if (outBuffer == null) { outBuffer = new ByteArrayOutputStream(); errBuffer = new ByteArrayOutputStream(); }
+        // Reinstall when user code has replaced a stream, rather than silently
+        // losing everything it writes from then on. The buffers are REUSED so a
+        // caller that kept a reference to ours keeps working.
+        if (System.out != outStream) {
+            outStream = new PrintStream(outBuffer, true, java.nio.charset.StandardCharsets.UTF_8);
+            System.setOut(outStream);
+        }
+        if (System.err != errStream) {
+            errStream = new PrintStream(errBuffer, true, java.nio.charset.StandardCharsets.UTF_8);
+            System.setErr(errStream);
+        }
+    }
+
+    /**
+     * Everything written to stream {@code which} (0 = out, 1 = err) since the last
+     * call, or null when there is nothing -- the common case, kept cheap because
+     * this runs at every crossing.
+     */
+    public static synchronized String takeOutput(int which) {
+        captureStreams();
+        ByteArrayOutputStream buffer = which == 0 ? outBuffer : errBuffer;
+        if (buffer.size() == 0) return null;
+        byte[] bytes = buffer.toByteArray();
+        // A JVM thread can write while we drain, so the tail may hold a partial
+        // UTF-8 sequence. Decoding it now would corrupt that character, so the
+        // incomplete tail goes back in the buffer and joins the next drain.
+        int complete = completeUtf8Length(bytes);
+        buffer.reset();
+        if (complete < bytes.length) buffer.write(bytes, complete, bytes.length - complete);
+        return complete == 0 ? null : new String(bytes, 0, complete, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Length of the longest prefix of {@code bytes} ending on a UTF-8 boundary. */
+    private static int completeUtf8Length(byte[] bytes) {
+        // At most three bytes can be pending: a 4-byte sequence missing three.
+        for (int back = 1; back <= 3 && back <= bytes.length; ++back) {
+            int b = bytes[bytes.length - back] & 0xFF;
+            if ((b & 0xC0) == 0x80) continue;          // a continuation byte, keep scanning
+            int needed = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+            // Complete when the lead byte and its continuations are all present.
+            return needed <= back ? bytes.length : bytes.length - back;
+        }
+        return bytes.length;
+    }
 }

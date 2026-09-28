@@ -27,7 +27,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static JavaVM *vm;
 static void *jvm_library;
 static jclass helper, ambiguity_type;
-static jmethodID dispatch_id, box_id, kind_id, integer_id, real_id;
+static jmethodID dispatch_id, box_id, kind_id, integer_id, real_id, take_output_id;
 static Reference *references;
 static Callback *callbacks;
 static Handle next_id = 1;
@@ -409,6 +409,13 @@ static void *start_worker(void *argument) {
             exception(env);
             if (!error_kind) real_id = (*env)->GetStaticMethodID(env, helper, "real", "(Ljava/lang/Object;)D");
             exception(env);
+            if (!error_kind) take_output_id = (*env)->GetStaticMethodID(env, helper, "takeOutput", "(I)Ljava/lang/String;");
+            exception(env);
+            /* Redirect the standard streams before any user code can print. */
+            if (!error_kind) {
+                jmethodID capture = (*env)->GetStaticMethodID(env, helper, "captureStreams", "()V");
+                if (!exception(env) && capture) { (*env)->CallStaticVoidMethod(env, helper, capture); exception(env); }
+            }
         }
     }
     (*env)->PopLocalFrame(env, NULL);
@@ -440,6 +447,21 @@ int tj_start(const char *library, const char *classpath, const char *options, in
     memcpy(error_text, start.message, sizeof(error_text));
     return !error_kind;
 }
+/* Everything Java wrote to stream WHICH (0=out, 1=err) since the last call, as a
+ * String handle, or 0 when there was nothing -- the common case, so this stays cheap
+ * enough to call at every crossing. Returning a handle rather than copying bytes out
+ * lets Lisp read it through the existing tj_text path instead of new plumbing. */
+Handle tj_drain_output(int which) {
+    Entry entry; if (!enter(&entry)) return 0;
+    JNIEnv *env = entry.env;
+    Handle id = 0;
+    if (take_output_id) {
+        jobject text = (*env)->CallStaticObjectMethod(env, helper, take_output_id, (jint)which);
+        if (!exception(env) && text) id = retain(env, text, 0);
+    }
+    leave(&entry); return id;
+}
+
 int tj_state(void) { pthread_mutex_lock(&lock); int result = state; pthread_mutex_unlock(&lock); return result; }
 
 static pthread_cond_t stopped = PTHREAD_COND_INITIALIZER;

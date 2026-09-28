@@ -9,12 +9,12 @@
   (:shadow :lambda :find-class)
   (:import-from :torcl-jvm
     :start-jvm :stop-jvm :jvm-running-p :jvm-error :java-error :error-message :ambiguous-call
-    :+null+ :java-object-p :release :retain :same-object-p)
+    :+null+ :java-object-p :release :retain :same-object-p :drain-output :draining)
   (:export :start-jvm :stop-jvm :jvm-running-p :jvm-error :java-error :error-message
     :+null+ :java-object-p :release :retain :same-object-p :ambiguous-call
     :with-scope :as :define-class :new :call :static :define-call
     :lambda :implement :to-list :find-class :new-array :array-ref :array-length
-    :field :static-field :with-resource :verify :describe-class))
+    :field :static-field :with-resource :verify :describe-class :flush :draining))
 (in-package :torcl-java)
 (defvar *classes* (make-hash-table :test 'eq))
 (defvar *bindings* (make-hash-table :test 'eq))
@@ -104,6 +104,12 @@ RETAIN returns an independent reference that escapes this scope."
        (setf (gethash ',name *bindings*)
              (list ,class ,method ,static ',parameters ',returns ,parameters-p))
        ',name)))
+;; Java's output is drained into *STANDARD-OUTPUT* / *ERROR-OUTPUT* at every
+;; crossing back into Lisp, so it is normally already there. FLUSH is for pulling
+;; it mid-computation -- from inside a callback, or from another thread watching a
+;; long-running Java call that has not returned yet.
+(defun flush () (torcl-jvm:drain-output))
+
 (defun verify (binding)
   "Resolve a DEFINE-CALL binding with explicit parameters without invoking it."
   (let ((definition (gethash binding *bindings*)))

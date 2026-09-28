@@ -255,11 +255,51 @@ so a user can see which layouts were considered rather than guessing."
           (5 (or (code-char (%native "tj_integer" :int64 '(:int64) id)) (%fail "Java char is not a Lisp character")))
           (otherwise (%fail "Unknown Java value kind ~D" kind)))
       (%native "tj_release" :int '(:int64) id))))
+;;; Java's standard streams are redirected into buffers at startup (Bridge.java),
+;;; and drained here at each crossing back into Lisp. The write happens in Lisp
+;;; rather than in the bridge because only here does *STANDARD-OUTPUT* mean what the
+;;; caller intends -- including a WITH-OUTPUT-TO-STRING in force. Without this,
+;;; System.out.println went straight to fd 1: uncapturable, and ordered against
+;;; Lisp's own output by flush timing rather than by program order.
+;;;
+;;; Never signals. It runs in UNWIND-PROTECT cleanup on the way out of every entry
+;;; point, so an error here would MASK the Java error being unwound -- replacing a
+;;; useful report with a confusing one from the machinery that was trying to print it.
+(defun %drain-stream (which stream)
+  (let ((id (%native "tj_drain_output" :int64 '(:int) which)))
+    (unless (zerop id)
+      (unwind-protect
+          (let ((length (%native "tj_text" :int '(:int64 :pointer :int) id (torcl-ffi:null-pointer) 0)))
+            (when (plusp length)
+              (let ((buffer (torcl-ffi:foreign-alloc (* 2 length))))
+                (unwind-protect
+                    (progn (%native "tj_text" :int '(:int64 :pointer :int) id buffer length)
+                           (write-string (%read-utf16 buffer length) stream))
+                  (torcl-ffi:foreign-free buffer)))))
+        (%native "tj_release" :int '(:int64) id)))))
+
+(defun drain-output ()
+  "Write everything Java has printed since the last drain to the Lisp streams."
+  (ignore-errors
+    (when (jvm-running-p)
+      (%drain-stream 0 *standard-output*)
+      (%drain-stream 1 *error-output*)))
+  (values))
+
+;;; Every entry point drains on the way out, INCLUDING when it signals: whatever Java
+;;; printed before throwing is exactly what a reader needs and would otherwise be lost.
+(defmacro draining (&body body)
+  `(unwind-protect (progn ,@body) (drain-output)))
+
 (defun %invoke (op target name signature arguments)
   (%running)
   (when (and name (not (stringp name))) (%fail "Java method names must be strings"))
   (when (and signature (not (stringp signature))) (%fail "Java signatures must be strings"))
-  (let ((owned nil))
+  ;; Every Java entry point funnels through here -- NEW, CALL, CALL-STATIC,
+  ;; FIND-JAVA-CLASS, the array operations, and the whole scoped JAVA API on top of
+  ;; them -- so draining here covers all of them with one wrapper.
+  (draining
+   (let ((owned nil))
     (unwind-protect
         (flet ((handle (value)
                  (if (java-object-p value) (%id value)
@@ -275,7 +315,7 @@ so a user can see which layouts were considered rather than guessing."
                                                 op receiver method descriptor buffer (length args)) (member op '(0 8 23)))))
                     (if (and (member op '(1 2)) signature (char= #\V (char signature (1- (length signature))))) nil value)))
               (torcl-ffi:foreign-free buffer))))
-      (dolist (id owned) (%native "tj_release" :int '(:int64) id)))))
+      (dolist (id owned) (%native "tj_release" :int '(:int64) id))))))
 (defun new (class signature &rest arguments) (%invoke 0 class nil signature arguments))
 (defun call (object method signature &rest arguments) (%invoke 1 object method signature arguments))
 (defun call-static (class method signature &rest arguments) (%invoke 2 class method signature arguments))
@@ -284,6 +324,10 @@ so a user can see which layouts were considered rather than guessing."
 (defun array-ref (array index) (%invoke 6 array nil nil (list index)))
 (defun array-set (array index value) (%invoke 7 array nil nil (list index value)))
 (defun %dispatch-callback (function method-id args-id context)
+  ;; Lisp re-entered FROM Java. Draining on the way in is what lets a long-running
+  ;; Java computation's output reach the user before it returns: this is the only
+  ;; point at which Lisp runs while the outer call is still in progress.
+  (drain-output)
   (handler-case
       (funcall context
         (lambda ()

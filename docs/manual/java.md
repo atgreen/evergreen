@@ -230,6 +230,47 @@ UTF-16 units). Throwable identity and stack traces are not retained.
     (format t "Java failed: ~A~%" (java:error-message condition))))
 ```
 
+## Streams { #streams }
+
+Java's `System.out` reaches `*standard-output*` and `System.err` reaches
+`*error-output*`, so the two runtimes' output interleaves in program order and a
+`WITH-OUTPUT-TO-STRING` or a rebinding captures both:
+
+```lisp
+(with-output-to-string (s)
+  (let ((*standard-output* s))
+    (write-string "lisp ")
+    (java:call (java:static-field "java.lang.System" "out") "print" "java")))
+;; => "lisp java"
+```
+
+Before this, `System.out` wrote file descriptor 1 directly: the capture above saw
+only `"lisp "`, and Java's line reached the terminal ordered against Lisp's own
+output by flush timing rather than by program order. Unlike the Python case nothing
+was ever *lost* — `System.out` is autoflush-on-`println` — so this is about capture
+and ordering.
+
+How it works, and what follows from it: `System.out` and `System.err` are redirected
+into in-memory buffers whose contents are written to the Lisp streams at the end of
+each crossing. So **output appears when the call returns**, not as it is produced — a
+long computation's progress prints arrive together at the end. `JAVA:FLUSH` writes out
+what has accumulated so far, and a callback into Lisp drains on entry, so a Java
+computation that calls back can report as it goes. Output printed before a Java
+exception still arrives, which is usually exactly what a reader needs.
+
+Three consequences worth knowing:
+
+* The redirection is at the Java level, not `dup2` on the file descriptor, so native
+  writes from inside the JVM — a JNI library, `-Xlog` GC logging, a crash report —
+  still go to the real file descriptor 1 where a reader expects them.
+* `System.out` no longer wraps a real file descriptor, so Java code that reaches for
+  one (`System.console()`, `ProcessBuilder.INHERIT_IO`, tty detection) will notice.
+* If your own code calls `System.setOut`, the next drain reinstalls the capture
+  rather than silently losing everything written from then on.
+
+`System.in` still reads file descriptor 0 directly rather than `*standard-input*`,
+for the same reason Python's `input()` does: input is pulled rather than pushed.
+
 ## Process lifecycle { #lifecycle }
 
 Only one JVM session is supported per process. Repeated start, restart after
@@ -447,6 +488,25 @@ Object-valued reads and new arrays belong to the scope or caller. Field names
 are case-sensitive strings; static access accepts class designators. SETF
 returns the supplied Lisp value. Invalid bounds, incompatible values, missing
 fields, and Java access violations signal `java-error`.
+
+### Output { #java-output }
+
+**Functions**
+
+```lisp
+(java:flush)          ; => (values)
+```
+
+Writes everything Java has printed since the last drain to `*standard-output*` and
+`*error-output*`. Every call into Java already drains on the way out, including when
+it signals, so `java:flush` is only needed to pull output *during* a call — from a
+callback, or from another thread watching a long computation. It never signals: it
+runs in cleanup positions where an error would mask the Java failure being unwound.
+
+Also exported from `TORCL-JVM` as `torcl-jvm:drain-output`, with
+`torcl-jvm:draining` wrapping a body so it drains on both normal and non-local exit.
+
+See [Streams](#streams) for what is captured and what is not.
 
 ### Null and conditions { #java-conditions }
 
