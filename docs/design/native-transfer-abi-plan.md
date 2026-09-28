@@ -792,6 +792,23 @@ This remains opt-in infrastructure. HANDLER-BIND/restart registration, inherited
 OSR scope admission, emergency allocation and production ABI installation still
 have separate gates; ordinary installed native functions retain their checks.
 
+### Direct local exits
+
+When a `RETURN-FROM` or `GO` crosses only locally established lexical block or
+tagbody metadata, the native builder lowers it to the ordinary SSA branch. The
+branch restores the destination operand-stack depth and carries the returned
+value through the same merge as normal control flow; it does not enter the
+generic transfer helper. A test with direct block and tagbody exits exercises
+the installed native path under moving-GC stress. A companion test keeps the
+older rejection rule: an exit crossing `UNWIND-PROTECT`, a catch, or another
+dynamic registration is not converted to a branch, because it must run cleanup
+or preserve the live registration for fallback.
+
+OSR scope maps mark interpreter-established records as `Inherited`. The native
+unwind selector refuses to retire or branch across inherited records, even when
+the lexical target itself is a block or tagbody. Such an exit remains a bytecode
+fallback until the activation can prove ownership of every crossed record.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

@@ -30,6 +30,39 @@ fn native_v2_protected_builder_refuses_cleanup_bypassing_direct_exits() {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_eligible_local_exits_use_direct_native_branches() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    for source in [
+        "((block exit (return-from exit (values x (list x)))))",
+        "((let ((y nil)) (tagbody (go done) (setq y :unreachable) done (setq y x)) (values y (list y))))",
+    ] {
+        torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        torcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
+        let body = Arc::new(
+            compile_function("DIRECT-LOCAL-EXIT", *params, *forms, &env, false, false)
+                .expect("compile direct local exit"),
+        );
+        assert!(
+            torcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).is_ok(),
+            "native builder must admit an exit with no crossed dynamic scope: {source}"
+        );
+        let code = TransferCode::compile(body).expect("native direct local exit");
+        torcl_rt::rooted!(args = vec![super::super::super::arena_cons(T, NIL)]);
+        torcl_rt::rooted!(result = code.run(&args, &mut env));
+        assert_eq!(*result.as_ref().unwrap(), args[0], "{source}");
+        assert!(env.mv_active);
+        assert_eq!(env.mv.len(), 2);
+        assert_eq!(env.mv[0], args[0]);
+        assert_eq!(super::super::super::cp(env.mv[1]).0, args[0]);
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
