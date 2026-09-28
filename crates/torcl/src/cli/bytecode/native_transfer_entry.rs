@@ -17,6 +17,13 @@ use torcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, Tr
 use torcl_rt::jit::JitBuffer;
 use torcl_rt::native_transfer::{self, NativeExit};
 
+thread_local! {
+    /// Opt-in production cache for the segment ABI. Keep the negative result
+    /// too: an unsupported body must not be recompiled on every invocation.
+    static SEGMENT_CACHE: RefCell<std::collections::HashMap<usize, Option<Rc<TransferCode>>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
 fn try_clone_string(value: &str) -> Result<String, TorclError> {
     let mut copy = String::new();
     copy.try_reserve(value.len()).map_err(|_| TorclError::Oom)?;
@@ -75,6 +82,31 @@ pub(super) struct TransferCode {
     unavailable_catch: Option<u32>,
     #[cfg(test)]
     unavailable_handler: Option<(u32, u32)>,
+}
+
+/// Try the new segment ABI for an ordinary native invocation. This remains an
+/// explicit rollout switch until the platform gates are complete; callers fall
+/// back to the legacy checked ABI when the machine transition or body shape is
+/// unavailable. The cache owns each compiled body through `TransferCode::body`.
+pub(super) fn try_run(
+    body: Arc<BytecodeFunction>,
+    args: &[TorclVal],
+    env: &mut Env,
+) -> Option<Result<TorclVal, TorclError>> {
+    if std::env::var_os("TORCL_NATIVE_TRANSFER") != Some(std::ffi::OsString::from("1"))
+        || !native_transfer::is_supported()
+    {
+        return None;
+    }
+    let key = Arc::as_ptr(&body) as usize;
+    let code = SEGMENT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| TransferCode::compile(Arc::clone(&body)).map(Rc::new))
+            .clone()
+    });
+    code.map(|code| code.run(args, env))
 }
 
 impl TransferCode {

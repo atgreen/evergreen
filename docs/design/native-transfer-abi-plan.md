@@ -238,6 +238,13 @@ compatibility fence, not a completed old-to-new bridge: artifacts with an older
 version or another architecture are conservatively kept on the checked/fallback
 path until an explicit bridge is implemented.
 
+The segment ABI can now be exercised for ordinary native invocations with
+`TORCL_NATIVE_TRANSFER=1`. Eligible bytecode bodies are compiled into a
+thread-local transfer-code cache and entered through `invoke_native_segment`;
+unsupported bodies, platforms, or hardening states fall back to the legacy
+checked entry. This rollout switch remains opt-in while native Windows gates and
+the full saved-image bridge are unfinished.
+
 ## Polling independently of exceptions
 
 Remove the signal/GC responsibility from ordinary return checks only after new

@@ -18119,6 +18119,15 @@ fn run_native(
     args: &[TorclVal],
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
+    // The segment ABI carries exceptional exits out-of-band through its cold
+    // landing path, so it does not need the legacy post-call transfer poll.
+    // Keep rollout explicit while native Windows and hardening gates are still
+    // being completed; unsupported shapes remain on the checked ABI below.
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry::try_run(body, args, env) {
+            return result;
+        }
+    }
     let bf = nc.body.clone();
     if let Some(body) = bf.as_ref() {
         validate_declared_args(body, args)?;
