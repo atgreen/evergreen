@@ -33147,9 +33147,9 @@ fn apply_function(
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
-            if cfg!(torcl_no_dynamic_code) {
+            if cfg!(torcl_no_tree_walker) {
                 return Err(TorclError::ProgramError(
-                    "raw lambda invocation requires retained dynamic-code support".into(),
+                    "raw lambda invocation requires retained tree-walker support".into(),
                 ));
             }
             let (params_form, body) = cp(lr);
@@ -36237,6 +36237,9 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // name through apply_function on every call (bliss-x5y.27). The table lives
     // in this crate, so the T2 emitter cannot reach it without being told.
     bytecode::install_direct_builtin_hooks();
+    // A restored entry point can run without reading any source. Its formatter
+    // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
+    torcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     let ca = CliArgs::parse(args)?;
     if ca.help {
         print_help();

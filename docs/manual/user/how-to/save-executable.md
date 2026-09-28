@@ -123,7 +123,10 @@ The current pass retains all global data, symbol identities, packages,
 classes, and functions outside the selected packages. It follows
 references through saved data and source/bytecode, including nested functions
 and captured environments. Conservatively retained registries can keep extra
-functions alive. Runtime packages cannot be selected for pruning.
+functions alive. Runtime packages such as `COMMON-LISP` and `TORCL-INTERNAL`
+can be selected explicitly; `KEYWORD` cannot. Installed printing, instance
+initialization, and Gray stream protocols remain reachable through the
+runtime's implicit calls, even when application code does not name them.
 
 Generic functions in selected packages are candidates too. Retaining a generic
 retains its methods, and a reachable saved method handle retains its owning
@@ -190,10 +193,11 @@ ones.
 When `dynamic-code` is unreachable, the specialized runtime omits those public
 source-evaluation entry points and rejects `--eval`, `--load`, scripts, the
 REPL, and legacy source images. It also skips init files. Validated saved cores
-remain supported. Raw source-lambda invocation is an evaluation entry too:
-saved raw lambda lists (including constant-pool and global data) are retained
-conservatively, and applications that
-construct them dynamically must retain `dynamic-code`.
+remain supported. Saved raw lambda lists, including constant-pool and global
+data, retain `tree-walker` and the definitions referenced by their bodies.
+A fixed lambda does not by itself retain every function or native capability;
+an `EVAL` inside its body does. Applications that construct arbitrary lambda
+bodies dynamically must retain `dynamic-code`.
 
 The GC, T0 bytecode interpreter, and tiered compilers remain available.
 Deoptimization resumes T0 bytecode; it does not require public `EVAL`.
@@ -215,15 +219,17 @@ retain the walker. Compiling Lisp files to BFASL before loading and saving the
 delivery input provides source-free function bodies. Simply omitting `EVAL`
 from a source-loaded application is not sufficient.
 
-Bootstrap definitions are currently retained too. A normal bootstrapped image
-can therefore retain all native capabilities even when its application entry
-point comes from BFASL. The source-free native-removal tests use images built
-with `--no-bootstrap`; pruning unused bootstrap definitions remains unfinished.
+Bootstrap definitions outside the selected packages are retained. Selecting
+their packages allows unreachable library functions and macros to be removed
+from an ordinary bootstrapped image. Conservative registry dependencies can
+still retain all native capabilities even when its application
+entry point comes from BFASL. The source-free native-removal tests use images
+built with `--no-bootstrap`.
 
 This is not yet general removal of every unused Rust builtin.
-Retained bootstrap functions and macros can contain
-source lambdas and keep all native capabilities even when the application entry
-does not call `EVAL`; the report identifies this conservative dependency.
+Retained bootstrap functions and macros can call open-code operations and keep
+all native capabilities even when the application entry does not call `EVAL`;
+the report identifies these dependencies.
 
 Delivery generates a versioned native contract, builds through Cargo in
 `target/delivery/` under the source checkout, checks the resulting executable,

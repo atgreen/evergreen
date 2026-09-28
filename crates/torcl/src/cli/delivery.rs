@@ -206,7 +206,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         let package = torcl_stdlib::packages::find_package(name)
             .ok_or_else(|| error(format!("unknown prune-package {name}")))?;
         let canonical = torcl_stdlib::packages::package_name(package).unwrap();
-        if canonical == "COMMON-LISP" || canonical == "KEYWORD" || canonical.starts_with("TORCL") {
+        if canonical == "KEYWORD" {
             return Err(error(format!("cannot prune runtime package {canonical}")));
         }
         package_names.insert(canonical);
@@ -282,6 +282,36 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 .iter()
                 .map(|&value| (value, "unresolved SETF writer registry")),
         );
+        // The runtime invokes these protocols by Rust-side names. All class
+        // metadata remains retained, so preserve their installed methods even
+        // when application bytecode never names the generic explicitly.
+        for name in [
+            "PRINT-OBJECT",
+            "INITIALIZE-INSTANCE",
+            "SHARED-INITIALIZE",
+            "STREAM-READ-CHAR",
+            "STREAM-UNREAD-CHAR",
+            "STREAM-READ-BYTE",
+            "STREAM-WRITE-CHAR",
+            "STREAM-WRITE-BYTE",
+            "STREAM-READ-LINE",
+            "STREAM-WRITE-STRING",
+            "STREAM-TERPRI",
+            "STREAM-FRESH-LINE",
+            "STREAM-FINISH-OUTPUT",
+            "STREAM-FORCE-OUTPUT",
+            "STREAM-CLEAR-OUTPUT",
+        ] {
+            if let Some(&handle) = generic_definitions.names.get(name) {
+                roots.push((handle, "implicit runtime protocol"));
+            }
+            if let Some(index) = reader::find_symbol_index(name) {
+                roots.push((
+                    TorclVal::from_symbol_index(index),
+                    "implicit runtime protocol",
+                ));
+            }
+        }
         let edges = bytecode::delivery_dependencies();
         let compiled = if spec.specialized {
             bytecode::delivery_walker_dependencies()
@@ -441,18 +471,30 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             }
             if spec.specialized && value.is_cons() {
                 let head = cp(value).0;
-                // Saved data and BFASL constants contain raw lambda lists, not
-                // QUOTE syntax. Conservatively keep their evaluator surface.
+                // A saved lambda has a known body, traced below like other
+                // source forms. It needs the evaluator, but only actual open-
+                // code operations within that body retain the whole world.
                 if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "LAMBDA" {
-                    if capabilities.insert("dynamic-code".into()) {
-                        for &candidate in &dynamic_roots {
-                            queue.push_back((candidate, "reachable source lambda".into(), true));
-                        }
-                    }
-                    capability_roots.insert("source lambda".into());
+                    walker_roots.insert("saved source lambda".into());
                 }
             }
             if let Some(index) = value.symbol_index() {
+                if callable_data {
+                    // These evaluator paths synthesize helper calls; their
+                    // source forms don't contain the helpers' names.
+                    let helper = match sym_bare_name_rc(value).as_ref() {
+                        "SETF" => Some("TORCL::%SETF-VALUES"),
+                        "DEFINE-CONDITION" => Some("%DEFINE-CONDITION-READER-DEFS"),
+                        _ => None,
+                    };
+                    if let Some(helper) = helper.and_then(reader::find_symbol_index) {
+                        queue.push_back((
+                            TorclVal::from_symbol_index(helper),
+                            format!("{} -> implicit source helper", qualified_name(index)),
+                            true,
+                        ));
+                    }
+                }
                 if spec.specialized && !is_keyword_arg(value) && value != NIL && value != T {
                     if let Some(Some(reason)) = compiled.get(&index) {
                         walker_roots.insert(format!("{}: {reason}", qualified_name(index)));

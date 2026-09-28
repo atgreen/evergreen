@@ -45,6 +45,131 @@ fn ok(output: Output) -> String {
 const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
 #[test]
+fn delivery_prunes_unused_bootstrap_definitions() {
+    check_bootstrap_delivery(false);
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_prunes_bootstrap_without_dynamic_code() {
+    check_bootstrap_delivery(true);
+}
+
+fn check_bootstrap_delivery(specialized: bool) {
+    let f = Fixture::new();
+    let source = f.path("bootstrap-app.lisp");
+    let fasl = f.path("bootstrap-app.bfasl");
+    let core = f.path("bootstrap-app.core");
+    let spec = f.path("bootstrap-app.delivery");
+    let exe = f.path("bootstrap-app");
+    fs::write(
+        &source,
+        "(defpackage :bootstrap-app (:use :cl))\n\
+         (defun bootstrap-app::main () (write-line \"BOOTSTRAP-SHAKE-OK\"))\n",
+    )
+    .unwrap();
+    // Use ordinary bootstrap in both processes: a bare runtime would miss the
+    // library definitions whose unconditional retention this test exercises.
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+        ],
+    ));
+    fs::remove_file(&source).unwrap();
+    fs::remove_file(&fasl).unwrap();
+    fs::write(
+        &spec,
+        "version = 1\nentry = BOOTSTRAP-APP::MAIN\ndynamic = explicit\n\
+         prune-package = BOOTSTRAP-APP\nprune-package = COMMON-LISP\n\
+         prune-package = COMMON-LISP-USER\nprune-package = TORCL-INTERNAL\n",
+    )
+    .unwrap();
+    if specialized {
+        let text = fs::read_to_string(&spec).unwrap();
+        fs::write(&spec, format!("{text}runtime = specialized\n")).unwrap();
+    }
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(report.contains("remove COMMON-LISP::GCD:"), "{report}");
+    assert!(report.contains("remove COMMON-LISP::LCM:"), "{report}");
+    if specialized {
+        assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+        let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+        assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+        assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+    }
+    for tier in ["t0", "t1", "t2"] {
+        let output = ok(Command::new(&exe)
+            .arg("--no-init")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .unwrap());
+        assert_eq!(output, "BOOTSTRAP-SHAKE-OK\n", "{tier}");
+    }
+}
+
+#[test]
+fn delivery_preserves_implicit_bootstrap_protocol_calls() {
+    let f = Fixture::new();
+    let core = f.path("protocol.core");
+    let spec = f.path("protocol.delivery");
+    let exe = f.path("protocol");
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!(
+                r#"
+                (defpackage :protocol-app (:use :cl))
+                (in-package :protocol-app)
+                (defclass box () ((value :initform 0)))
+                (defmethod initialize-instance :after ((object box) &key)
+                  (setf (slot-value object 'value) 17))
+                (defmethod print-object ((object box) stream)
+                  (write-string "PRINT-OK" stream))
+                (defclass input (torcl-gray-streams:fundamental-character-input-stream) ())
+                (defmethod torcl-gray-streams:stream-read-char ((stream input)) #\Q)
+                (defun main ()
+                  (let ((object (make-instance 'box)))
+                    (format t "~A ~D~%" object (slot-value object 'value)))
+                  (write-char (read-char (make-instance 'input)))
+                  (terpri)
+                  (let ((x (list 0)) (y (list 0)))
+                    (setf (values (car x) (car y)) (values 3 4))
+                    (format t "~D ~D~%" (car x) (car y))))
+                (save-lisp-and-die {core:?} :toplevel 'main)
+                "#
+            ),
+        ],
+    ));
+    assert_eq!(ok(run(BIN, &["--image", &core])), "PRINT-OK 17\nQ\n3 4\n");
+    fs::write(
+        &spec,
+        "version = 1\nentry = PROTOCOL-APP::MAIN\ndynamic = explicit\n\
+         prune-package = PROTOCOL-APP\nprune-package = COMMON-LISP\n\
+         prune-package = COMMON-LISP-USER\nprune-package = TORCL-INTERNAL\n\
+         prune-package = TORCL-GRAY-STREAMS\nprune-package = TORCL\n",
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert_eq!(ok(run(&exe, &[])), "PRINT-OK 17\nQ\n3 4\n");
+}
+
+#[test]
 fn saved_entry_preserves_class_instances_under_gc_stress() {
     let f = Fixture::new();
     let core = f.path("entry.core");
@@ -1167,7 +1292,7 @@ fn delivery_defaults_to_preserving_dynamic_targets_and_rejects_bad_specs() {
     for bad in [
         "version = 2\nentry = DELIVERY-POLICY::MAIN\n",
         "version = 1\nentry = DELIVERY-POLICY::MISSING\n",
-        "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = COMMON-LISP\n",
+        "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = KEYWORD\n",
         "version = 1\nentry = DELIVERY-POLICY::MAIN\ndynamci = explicit\n",
     ] {
         fs::write(&spec, bad).unwrap();
@@ -1604,9 +1729,26 @@ fn explicit_image_overrides_a_saved_executables_embedded_core() {
 
 #[test]
 fn native_delivery_retains_evaluation_for_saved_raw_lambda_data() {
+    check_raw_lambda_delivery(false, false);
+    check_raw_lambda_delivery(true, false);
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_executes_saved_raw_lambdas_without_dynamic_code() {
+    check_raw_lambda_delivery(false, true);
+}
+
+fn check_raw_lambda_delivery(dynamic: bool, build_runtime: bool) {
     let f = Fixture::new();
     let core = f.path("raw.core");
     let spec = f.path("raw.delivery");
+    let exe = f.path("app");
+    let lambda = if dynamic {
+        "(lambda () (eval '(helper)))"
+    } else {
+        "(lambda () (funcall '(lambda () (helper))))"
+    };
     ok(run(
         BIN,
         &[
@@ -1616,28 +1758,52 @@ fn native_delivery_retains_evaluation_for_saved_raw_lambda_data() {
                 r#"
       (defpackage :raw-app (:use :cl))
       (in-package :raw-app)
-      (set '*fn* '(lambda () 42))
-      (defun main () (funcall *fn*))
+      (set '*fn* '{lambda})
+      (defun helper () 42)
+      (defun unused () (disassemble 'unused))
+      (defun main () (write-line (if (= 42 (funcall *fn*)) "RAW-LAMBDA-OK" "WRONG")))
       (save-lisp-and-die {core:?})"#
             ),
         ],
     ));
     fs::write(&spec, "version = 1\nentry = RAW-APP::MAIN\nprune-package = RAW-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
-    let report = ok(run(
-        BIN,
-        &[
-            "--image",
-            &core,
-            "--deliver",
-            &spec,
-            "--output",
-            &f.path("app"),
-            "--dry-run",
-        ],
-    ));
+    let mut command = Command::new(BIN);
+    command.args([
+        "--no-init",
+        "--image",
+        &core,
+        "--deliver",
+        &spec,
+        "--output",
+        &exe,
+    ]);
+    if !build_runtime {
+        command.arg("--dry-run");
+    }
+    let report = ok(command.output().unwrap());
+    let capabilities = if dynamic {
+        "capabilities=disassembly,dynamic-code,tree-walker\n"
+    } else {
+        "capabilities=tree-walker\n"
+    };
+    assert!(report.contains(capabilities), "{report}");
+    assert!(report.contains("keep RAW-APP::HELPER:"), "{report}");
+    let unused = if dynamic { "keep" } else { "remove" };
     assert!(
-        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        report.contains(&format!("{unused} RAW-APP::UNUSED:")),
         "{report}"
     );
-    assert!(report.contains("native-root = source lambda"), "{report}");
+    if build_runtime {
+        let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+        assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+        assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+        for tier in ["t0", "t1", "t2"] {
+            let output = ok(Command::new(&exe)
+                .arg("--no-init")
+                .env("TORCL_FORCE_TIER", tier)
+                .output()
+                .unwrap());
+            assert_eq!(output, "RAW-LAMBDA-OK\n", "{tier}");
+        }
+    }
 }
