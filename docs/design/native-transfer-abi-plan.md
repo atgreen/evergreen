@@ -441,7 +441,26 @@ state and result availability. DCE keeps exceptional-only operands; inlining
 maps result definitions before successor arguments.
 
 This is compiler infrastructure, not activation of the native transfer ABI.
-The ordinary builder still emits Call. Scope ownership analysis, automatic
+The ordinary builder still emits Call. Complete scope coverage, automatic
 exception-edge construction, pass-wide integration, machine landing pads and
 unwind maps remain required. Lowering marks Invoke as unsupported until those
 machine contracts are implemented, preventing accidental ordinary-call emission.
+
+
+### Ordered control-scope analysis
+
+`control_scope::ScopeMap` tracks active BLOCK, TAGBODY and CATCH records at
+bytecode positions. Joins require the same ordered records; lexical exits must
+select an active target. GO retains its TAGBODY and reports intervening records
+in unwind order; RETURN-FROM also removes its target BLOCK. T2 validates this
+state before erasing handler instructions and uses it to resolve RETURN-FROM.
+
+OSR analysis marks records already live at entry as inherited, and subsequent
+pushes as local. Inherited BLOCK/CATCH exceptional resumes remain reachable even
+though their establishing PUSH is outside the segment. Ownership disagreements
+at joins conservatively refuse compilation. This metadata does not authorize
+eliding inherited runtime records or change the existing OSR fallback policy.
+
+Cleanup, condition and restart clusters still require continuation modelling;
+the analysis explicitly rejects them. Automatic Invoke construction and attaching
+scope maps to installed native code remain required before native dispatch.

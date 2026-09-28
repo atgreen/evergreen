@@ -50,26 +50,24 @@ fn bf(name: &str, code: Vec<Instr>, constants: Vec<TorclVal>, n_locals: u16) -> 
 /// the *target* has an empty operand stack, not which instruction jumps to it
 /// (bliss-izt.4).
 ///
-///   0: Const 0        ; i = 0
-///   1: StoreLocal 0
-///   2: LoadLocal 0    ; <- loop header, the Go target
-///   3: BrIfFalse 7
-///   4: Const 1
-///   5: StoreLocal 0
-///   6: Go -> 2
-///   7: LoadLocal 0
-///   8: Return
+/// Establish a TAGBODY before the loop and retire it on normal exit. Even the
+/// synthetic GO fixture must have an active lexical target.
 fn counted_loop(back: Instr) -> BytecodeFunction {
     bf(
         "osr_loop",
         vec![
             Instr::Const(0),
             Instr::StoreLocal(0),
+            Instr::PushTag {
+                tagbody_id: 0,
+                sp_restore: 0,
+            },
             Instr::LoadLocal(0),
-            Instr::BrIfFalse(7),
+            Instr::BrIfFalse(8),
             Instr::Const(1),
             Instr::StoreLocal(0),
             back,
+            Instr::PopHandler,
             Instr::LoadLocal(0),
             Instr::Return,
         ],
@@ -86,10 +84,10 @@ fn back_edges() -> Vec<(&'static str, Instr)> {
             "Go",
             Instr::Go {
                 tagbody_id: 0,
-                target_bcp: 2,
+                target_bcp: 3,
             },
         ),
-        ("Br", Instr::Br(2)),
+        ("Br", Instr::Br(3)),
     ]
 }
 
@@ -107,8 +105,8 @@ fn every_backward_branch_shape_yields_an_osr_safepoint() {
             "a counted loop with a backward {label} must produce exactly one              OSR safepoint at the loop header"
         );
         assert_eq!(
-            f.osr_entries[0].bcp, 2,
-            "the OSR safepoint belongs at the loop header (bcp 2), not at the              back-edge, for a backward {label}"
+            f.osr_entries[0].bcp, 3,
+            "the OSR safepoint belongs at the loop header (bcp 3), not at the              back-edge, for a backward {label}"
         );
     }
 }
@@ -221,4 +219,21 @@ fn osr_safepoint_slots_are_all_tagged_so_the_word_move_stub_is_valid() {
             }
         }
     }
+}
+
+#[test]
+fn builder_rejects_go_without_an_active_tagbody() {
+    use torcl_compiler::control_scope::ScopeError;
+    use torcl_compiler::t2::build::BuildError;
+    let mut body = counted_loop(Instr::Go {
+        tagbody_id: 0,
+        target_bcp: 3,
+    });
+    body.code[2] = Instr::Br(3);
+    assert!(matches!(
+        build_from_bytecode(&body),
+        Err(BuildError::InvalidScopes(
+            ScopeError::InactiveTarget { .. } | ScopeError::EmptyPop { .. }
+        ))
+    ));
 }

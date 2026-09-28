@@ -21077,6 +21077,73 @@ mod direct_call_invalidation_tests {
         }
     }
 
+    #[test]
+    fn native_control_scopes_follow_lowered_lisp_and_osr_ownership() {
+        use torcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun scope-probe () nil)", &mut env).unwrap();
+        torcl_rt::rooted!(
+            form = reader::read_from_string(
+                "((catch 'escape (block done (tagbody top
+                (block inner (scope-probe)) (go top)))))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = compile_function("SCOPE-PROBE-BODY", NIL, *form, &env, false, false)
+            .expect("lower nested control scopes");
+        let (go_pc, header) = body
+            .code
+            .iter()
+            .enumerate()
+            .find_map(|(pc, instr)| {
+                if let Instr::Go { target_bcp, .. } = instr {
+                    Some((pc as u32, *target_bcp))
+                } else {
+                    None
+                }
+            })
+            .expect("source loop has GO");
+        let normal = ScopeMap::analyze(&body.code).expect("lowered scopes agree");
+        let inherited = normal.before(header).unwrap();
+        assert!(
+            inherited
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::Catch { .. }))
+        );
+        assert!(
+            inherited
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::Tagbody { .. }))
+        );
+        let osr = ScopeMap::analyze_osr(&body.code, header).expect("OSR scopes agree");
+        assert!(
+            osr.before(header)
+                .unwrap()
+                .iter()
+                .all(|s| s.ownership == Ownership::Inherited)
+        );
+        let probe_pc = body
+            .code
+            .iter()
+            .position(|instr| {
+                matches!(instr,
+                    Instr::CallNamed { sym, .. } if reader::symbol_name(*sym)
+                        .is_some_and(|n| n.ends_with("SCOPE-PROBE"))
+                )
+            })
+            .expect("source calls probe") as u32;
+        let at_probe = osr.before(probe_pc).unwrap();
+        assert_eq!(at_probe.len(), inherited.len() + 1);
+        assert_eq!(at_probe.last().unwrap().ownership, Ownership::Local);
+        assert_eq!(osr.before(go_pc).unwrap(), osr.before(header).unwrap());
+        assert!(osr.exit_at(go_pc).unwrap().removed.is_empty());
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_caller_handles_callee_osr_deoptimization() {
