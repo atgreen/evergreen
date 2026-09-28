@@ -1,15 +1,45 @@
 # TorCL
 
-TorCL is a from-scratch Common Lisp implementation written in Rust. The
-current repository contains the bootstrap runtime, compiler pipeline,
-standard-library support, command-line driver, tests, and a detailed technical
-specification for the longer-term self-hosting system.
+**TorCL is Common Lisp with a HotSpot-inspired native runtime**, built from
+scratch in Rust. It starts executing in bytecode, compiles hot code to native
+instructions, and specializes dynamically typed programs as they run.
 
-The project targets ANSI Common Lisp with selected SBCL-compatible extensions
-where they are widely used and do not conflict with ANSI semantics. The
-long-term design is documented in `spec/`, including the object model, runtime,
-garbage collector, compiler tiers, standard library, developer tools, security
-model, and self-hosting roadmap.
+- **Tiered compilation with on-stack replacement.** Execution progresses from
+  bytecode through a baseline native compiler to an optimizing compiler. Hot
+  loops can enter compiled code during the current invocation, without waiting
+  for the function to return. See [how Lisp runs](docs/manual/user/explanation/execution.md).
+- **Speculative optimization without required type declarations.** The compiler
+  specializes supported operations under guarded assumptions about runtime
+  values. When an assumption fails, precise deoptimization resumes less
+  specialized execution while preserving program semantics. Live function
+  redefinition remains part of the programming model.
+- **Lightweight fibers with synchronous socket I/O.** On x86-64, many fibers
+  share native carrier threads. Reads, writes, and readiness waits on established
+  TCP streams park an unpinned fiber so other work can run, while Lisp code stays
+  sequential. Connect, accept, and DNS are not yet cooperative. See
+  [fibers and socket I/O](docs/manual/fibers.md#socket-io).
+- **Multiple architectures and operating systems.** Targets include x86-64
+  Linux, Windows, and Android; AArch64 Linux and Android; and Power (`ppc64le`)
+  and IBM Z (`s390x`) Linux. Compiler and FFI coverage varies by target; see
+  [cross-compilation and platform details](docs/cross-compilation.md) and
+  [Windows support](docs/windows.md).
+- **Native interoperability.** Call C libraries through the
+  [foreign function interface](docs/manual/foreign.md), and access the JVM through
+  `torcl-jvm`. CPython embedding is implemented; the Lisp-facing Python object
+  and calling APIs are still in development.
+- **Standalone applications and saved images.** Save a running Lisp environment
+  with its libraries preloaded, restore it later, or package it as a native
+  executable. The default x86-64 Linux build is fully static. See
+  [saved images and executables](docs/manual/user/reference/images.md).
+- **Native Android applications.** Generate and package APKs with Lisp lifecycle,
+  touch-input, and EGL/OpenGL ES code using `torcl-android-new`. See
+  [building Android applications](docs/manual/user/how-to/android.md).
+
+TorCL combines a precise generational garbage collector with Common Lisp's
+macros, CLOS, conditions, and restarts. It targets ANSI Common Lisp, supports
+ASDF systems, and provides selected SBCL-compatible extensions. The project is
+under active development; the manual describes current interfaces and
+limitations, while `spec/` records the design and self-hosting roadmap.
 
 ## Manual
 
