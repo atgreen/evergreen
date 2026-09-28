@@ -12942,8 +12942,16 @@ struct RuntimeClause {
     var_slot: Option<u16>,
 }
 
+/// A running cleanup's saved continuation and its dynamic extent. Handlers
+/// established inside that cleanup have indices at or above `handler_depth`.
+/// An unwind reaching a lower handler abandons this continuation (bliss-8m8ac).
+struct CleanupCont {
+    handler_depth: usize,
+    action: CleanupAction,
+}
+
 /// What to do when a cleanup body finishes (`CleanupReturn`).
-enum CleanupCont {
+enum CleanupAction {
     /// Normal completion of `unwind-protect`: restore the protected form's
     /// values and resume at `resume_bcp`.
     ///
@@ -12980,7 +12988,7 @@ fn visit_pending_roots(pending: &mut Pending, visit: &mut dyn FnMut(*mut TorclVa
         Pending::Return { value, .. } => visit(value),
         // A propagating error can carry movable TorclVals — TypeError.datum,
         // UNBOUND-VARIABLE/UNDEFINED-FUNCTION names, or a Signalled condition
-        // (bliss-9kc). While it is parked in a CleanupCont::Resume during an
+        // (bliss-9kc). While it is parked in a CleanupAction::Resume during an
         // UNWIND-PROTECT cleanup, that cleanup can allocate and move the nursery,
         // so those roots must be traced or they go stale (bliss-3scj).
         Pending::Propagate(error) => {
@@ -12999,8 +13007,8 @@ impl torcl_rt::gc::TraceHostRoots for Pending {
 
 impl torcl_rt::gc::TraceHostRoots for CleanupCont {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
-        match self {
-            CleanupCont::Normal { value, values, .. } => {
+        match &mut self.action {
+            CleanupAction::Normal { value, values, .. } => {
                 visit(value);
                 // The saved value list survives the cleanup body, which
                 // allocates freely, so every element is a root (bliss-pfgq).
@@ -13010,7 +13018,7 @@ impl torcl_rt::gc::TraceHostRoots for CleanupCont {
                     }
                 }
             }
-            CleanupCont::Resume(pending) => visit_pending_roots(pending, visit),
+            CleanupAction::Resume(pending) => visit_pending_roots(pending, visit),
         }
     }
 }
@@ -14495,10 +14503,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 };
                 let act = &mut acts[top_idx];
                 let value = act.pop_op();
-                act.cleanup_conts.push(CleanupCont::Normal {
-                    resume_bcp,
-                    value,
-                    values,
+                act.cleanup_conts.push(CleanupCont {
+                    handler_depth: act.handlers.len(),
+                    action: CleanupAction::Normal {
+                        resume_bcp,
+                        value,
+                        values,
+                    },
                 });
                 act.bcp = cleanup_bcp as usize;
             }
@@ -14507,8 +14518,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     .cleanup_conts
                     .pop()
                     .expect("CleanupReturn without a pending cleanup continuation");
-                match cont {
-                    CleanupCont::Normal {
+                match cont.action {
+                    CleanupAction::Normal {
                         resume_bcp,
                         value,
                         values,
@@ -14523,7 +14534,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         act.push_op(value);
                         act.bcp = resume_bcp as usize;
                     }
-                    CleanupCont::Resume(pending) => {
+                    CleanupAction::Resume(pending) => {
                         initiate_unwind(acts, stack, env, pending)?;
                     }
                 }
@@ -14749,7 +14760,19 @@ fn initiate_unwind(
     }
     loop {
         let top = acts.len() - 1;
-        let handler = acts[top].handlers.last().cloned();
+        let act = &mut acts[top];
+        // A transfer can exit an inner cleanup while retaining an outer one.
+        // Discard only continuations whose enclosing handler boundary is being
+        // crossed. Otherwise a later CleanupReturn resumes an abandoned inner
+        // protected form and replays the outer cleanup suffix (bliss-8m8ac).
+        while act
+            .cleanup_conts
+            .last()
+            .is_some_and(|cont| cont.handler_depth >= act.handlers.len())
+        {
+            act.cleanup_conts.pop();
+        }
+        let handler = act.handlers.last().cloned();
         match handler {
             Some(Handler::Unwind {
                 cleanup_bcp,
@@ -14758,7 +14781,10 @@ fn initiate_unwind(
                 let act = &mut acts[top];
                 act.handlers.pop();
                 act.sp_top = sp_restore;
-                act.cleanup_conts.push(CleanupCont::Resume(pending));
+                act.cleanup_conts.push(CleanupCont {
+                    handler_depth: act.handlers.len(),
+                    action: CleanupAction::Resume(pending),
+                });
                 act.bcp = cleanup_bcp as usize;
                 return Ok(());
             }

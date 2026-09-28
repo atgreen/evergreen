@@ -199,7 +199,11 @@ If native continuation is unavailable or invalidated:
    elide their scope transitions based on ordinary function-entry assumptions.
    Cleanup may allocate, yield, call native code, or supersede the original
    transfer. Restore bindings at their defined unwind points, not in one bulk
-   reset before cleanup.
+   reset before cleanup. A running cleanup's saved continuation also has a
+   dynamic extent: retire it when an exit crosses its enclosing handler boundary,
+   while preserving outer continuations and exits contained inside the cleanup.
+   The bytecode fallback records this handler depth (`bliss-8m8ac`); omitting it
+   replayed an outer cleanup suffix even when final return values were correct.
 4. **GC sees all live state throughout the transition.** Capture current
    register roots and publish call-site maps before any preparation allocation
    or safepoint. Keep old maps valid until the reconstructed frames/packet are
