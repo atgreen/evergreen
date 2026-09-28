@@ -120,10 +120,17 @@ when their targets cannot be inferred. This is a delivery policy, not a security
 boundary.
 
 The current pass retains all global data, symbol identities, packages, macros,
-classes, methods, and functions outside the selected packages. It follows
+classes, and functions outside the selected packages. It follows
 references through saved data and source/bytecode, including nested functions
 and captured environments. Conservatively retained registries can keep extra
 functions alive. Runtime packages cannot be selected for pruning.
+
+Generic functions in selected packages are candidates too. Retaining a generic
+retains its methods, and a reachable saved method handle retains its owning
+generic and method set. Class accessor names also retain their functions.
+Unreachable generic functions and their owned method records are removed from
+both evaluator and CLOS registries before saving. A generic can be an `entry`
+or an explicit `keep` root.
 
 Private compiled closures and source closure handles are traced from reachable
 objects and code, including their captured environments. An unreachable

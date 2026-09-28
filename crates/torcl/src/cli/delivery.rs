@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use torcl_rt::bytecode::{BytecodeFunction, Instr};
 use torcl_rt::symbols;
+mod generics;
 
 fn error(message: impl Into<String>) -> TorclError {
     TorclError::ProgramError(format!("delivery: {}", message.into()))
@@ -100,7 +101,10 @@ fn function_index(name: &str) -> Result<u32, TorclError> {
     let index = symbol
         .symbol_index()
         .ok_or_else(|| error(format!("unknown function {name}")))?;
-    if symbols::symbol_function(index).is_none_or(|v| v == torcl_rt::value::UNBOUND) {
+    let generic_name = sym_name(symbol);
+    if symbols::symbol_function(index).is_none_or(|v| v == torcl_rt::value::UNBOUND)
+        && !GENERIC_DEFINITIONS.borrow().contains_key(&generic_name)
+    {
         return Err(error(format!("undefined function {name}")));
     }
     Ok(index)
@@ -163,6 +167,9 @@ fn bytecode_references_with_params(
 }
 
 struct Plan {
+    generic_candidates: BTreeMap<String, u64>,
+    retained_generics: BTreeMap<String, String>,
+    live_clos_definitions: HashSet<u64>,
     unreachable_source_closures: Vec<u64>,
     unreachable_closures: Vec<u32>,
     capability_roots: std::collections::BTreeSet<String>,
@@ -206,6 +213,17 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 candidates.insert(index, qualified_name(index));
             }
         });
+        let generic_definitions = generics::GenericDefinitions::discover(env, &package_names);
+        let dynamic_roots: Vec<_> = candidates
+            .keys()
+            .map(|&index| TorclVal::from_symbol_index(index))
+            .chain(
+                generic_definitions
+                    .candidates
+                    .values()
+                    .map(|&id| TorclVal::from_raw(id)),
+            )
+            .collect();
         let indices = candidates.keys().copied().collect();
         let mut exposed_roots = symbols::delivery_roots(&indices);
         let mut roots = Vec::new();
@@ -216,6 +234,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 &[
                     bytecode::delivery_root_scanner(),
                     torcl_stdlib::hashtable::delivery_root_scanner(),
+                    torcl_stdlib::clos::delivery_root_scanner(),
                     scan_evaluator_global_roots,
                 ],
                 &mut |slot| roots.push((*slot, "runtime host registry")),
@@ -228,6 +247,15 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         env.visit_delivery_roots(&mut |slot| {
             roots.push((unsafe { *slot }, "delivery environment"))
         });
+        torcl_stdlib::clos::visit_delivery_roots(&mut |slot| {
+            roots.push((unsafe { *slot }, "retained CLOS class state"))
+        });
+        roots.extend(
+            generic_definitions
+                .roots
+                .iter()
+                .map(|&value| (value, "retained generic or class accessor")),
+        );
         let edges = bytecode::delivery_dependencies();
         let compiled = if spec.specialized {
             bytecode::delivery_walker_dependencies()
@@ -259,9 +287,9 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             ));
         }
         if !spec.explicit_dynamic_roots || spec.runtime_keep.contains("dynamic-code") {
-            for &index in candidates.keys() {
+            for &value in &dynamic_roots {
                 queue.push_back((
-                    TorclVal::from_symbol_index(index),
+                    value,
                     if spec.explicit_dynamic_roots {
                         "runtime-keep = dynamic-code"
                     } else {
@@ -284,17 +312,6 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         }
         let mut capability_roots = std::collections::BTreeSet::new();
         let mut walker_roots = std::collections::BTreeSet::new();
-        if spec.specialized {
-            let compiled_methods: HashSet<_> = METHOD_COMPILED.borrow().keys().copied().collect();
-            for (name, methods) in env.methods.borrow().iter() {
-                if methods
-                    .iter()
-                    .any(|method| !compiled_methods.contains(&method.method_id.0))
-                {
-                    walker_roots.insert(format!("{name}: source generic method"));
-                }
-            }
-        }
         let mut capabilities = spec.runtime_keep.clone();
         if !spec.explicit_dynamic_roots {
             capabilities.extend(
@@ -304,6 +321,12 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             );
         }
         let mut retained = BTreeMap::new();
+        let mut retained_generics = BTreeMap::new();
+        let candidate_generic_names: HashMap<_, _> = generic_definitions
+            .candidates
+            .iter()
+            .map(|(name, &id)| (id, name))
+            .collect();
         let mut visited = HashSet::new();
         let mut reached_source_closures = HashSet::new();
         // Runtime metadata (e.g. a class named VECTOR) is not itself a call
@@ -321,6 +344,24 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 continue;
             }
             visited.insert(value.0);
+            if let Some(name) = candidate_generic_names.get(&value.0) {
+                retained_generics.insert((*name).clone(), reason.clone());
+            }
+            if let Some((name, _)) = generics::function_name(value) {
+                if let Some(&handle) = generic_definitions.names.get(&name) {
+                    queue.push_back((handle, reason.clone(), false));
+                }
+            }
+            if let Some(refs) = generic_definitions.edges.get(&value.0) {
+                for &(child, callable) in refs {
+                    queue.push_back((child, reason.clone(), callable));
+                }
+            }
+            if spec.specialized {
+                if let Some(reason) = generic_definitions.source_methods.get(&value.0) {
+                    walker_roots.insert(reason.clone());
+                }
+            }
             if is_closure_cons(value) {
                 let id = cp(value).1.as_fixnum() as u64;
                 if reached_source_closures.insert(id) {
@@ -372,12 +413,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 // QUOTE syntax. Conservatively keep their evaluator surface.
                 if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "LAMBDA" {
                     if capabilities.insert("dynamic-code".into()) {
-                        for &candidate in candidates.keys() {
-                            queue.push_back((
-                                TorclVal::from_symbol_index(candidate),
-                                "reachable source lambda".into(),
-                                true,
-                            ));
+                        for &candidate in &dynamic_roots {
+                            queue.push_back((candidate, "reachable source lambda".into(), true));
                         }
                     }
                     capability_roots.insert("source lambda".into());
@@ -414,9 +451,9 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                     })
                 {
                     if capabilities.insert("dynamic-code".into()) {
-                        for &candidate in candidates.keys() {
+                        for &candidate in &dynamic_roots {
                             queue.push_back((
-                                TorclVal::from_symbol_index(candidate),
+                                candidate,
                                 format!(
                                     "reachable {} can invoke arbitrary code",
                                     qualified_name(index)
@@ -498,6 +535,14 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             .collect();
         unreachable_source_closures.sort_unstable();
         Plan {
+            live_clos_definitions: generic_definitions
+                .handles
+                .iter()
+                .filter(|key| visited.contains(key))
+                .copied()
+                .collect(),
+            generic_candidates: generic_definitions.candidates,
+            retained_generics,
             unreachable_source_closures,
             unreachable_closures,
             capability_roots,
@@ -670,6 +715,13 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
             ));
         }
     }
+    for name in plan.generic_candidates.keys() {
+        if let Some(reason) = plan.retained_generics.get(name) {
+            report.push_str(&format!("keep {name}: {reason}\n"));
+        } else {
+            report.push_str(&format!("remove {name}: unreachable generic function\n"));
+        }
+    }
     if args.dry_run {
         print!("{report}");
         return Ok(0);
@@ -701,6 +753,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     for id in &plan.unreachable_source_closures {
         closure_registry().borrow_mut().remove(id);
     }
+    generics::retain(env, &plan.live_clos_definitions);
     native_runtime::with_save_contract(&selected, || {
         save_core(
             executable_stage

@@ -303,6 +303,197 @@ fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
 }
 
 #[test]
+fn native_delivery_ignores_eval_in_an_unreachable_method() {
+    let f = Fixture::new();
+    let source = f.path("main.lisp");
+    let fasl = f.path("main.bfasl");
+    let core = f.path("methods.core");
+    let spec = f.path("methods.delivery");
+    let exe = f.path("methods");
+    fs::write(&source, "(defpackage :generic-eval (:use :cl)) (in-package :generic-eval) (defun main () (write-line \"OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (load {fasl:?})
+        (in-package :generic-eval)
+        (defgeneric unused (form))
+        (defmethod unused ((form t)) (eval form))
+        (defgeneric start ())
+        (defmethod start () (write-line "GENERIC-ENTRY-OK"))
+        (save-lisp-and-die {core:?})
+    "#
+            ),
+        ],
+    ));
+    let specification = "version = 1\nentry = GENERIC-EVAL::MAIN\nprune-package = GENERIC-EVAL\ndynamic = explicit\nruntime = specialized\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("remove GENERIC-EVAL::UNUSED:"), "{report}");
+    fs::write(
+        &spec,
+        format!("{specification}keep = GENERIC-EVAL::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(report.contains("keep GENERIC-EVAL::UNUSED:"), "{report}");
+    fs::write(&spec, "version = 1\nentry = GENERIC-EVAL::START\nprune-package = GENERIC-EVAL\ndynamic = explicit\n").unwrap();
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(ok(run(&exe, &[])).contains("GENERIC-ENTRY-OK"));
+}
+
+#[test]
+fn delivery_prunes_generic_owners_but_keeps_methods_and_class_accessors() {
+    let f = Fixture::new();
+    let core = f.path("generics.core");
+    let spec = f.path("generics.delivery");
+    let exe = f.path("generics");
+    let program = format!(
+        r#"
+      (defpackage :generic-shake (:use :cl))
+      (in-package :generic-shake)
+      (defun dead-target () :dead)
+      (defgeneric unused (x))
+      (defmethod unused ((x t)) (dead-target))
+      (defun live-target () 42)
+      (defgeneric live (x))
+      (defmethod live ((x t)) (live-target))
+      (defun method-target () 43)
+      (defgeneric method-rooted (x))
+      (defmethod method-rooted ((x t)) (method-target))
+      (set '*method* (find-method 'method-rooted nil (list (find-class 't))))
+      (defclass box () ((value :initarg :value :accessor value
+                              :reader read-value :writer write-value)))
+      (defun main ()
+        (let ((box (make-instance 'box :value 7)))
+          (funcall (intern "WRITE-VALUE" :generic-shake) 9 box)
+          (write-line
+            (if (and (= 42 (live nil))
+                     (= 43 (funcall (intern "METHOD-ROOTED" :generic-shake) nil))
+                     (eq *method* (find-method (intern "METHOD-ROOTED" :generic-shake)
+                                               nil (list (find-class 't))))
+                     (= 9 (funcall (intern "VALUE" :generic-shake) box))
+                     (= 9 (funcall (intern "READ-VALUE" :generic-shake) box))
+                     (not (fboundp (intern "UNUSED" :generic-shake))))
+                "GENERIC-SHAKE-OK" "WRONG"))))
+      (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    let specification = "version = 1\nentry = GENERIC-SHAKE::MAIN\nprune-package = GENERIC-SHAKE\ndynamic = explicit\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    for name in ["UNUSED", "DEAD-TARGET"] {
+        assert!(
+            report.contains(&format!("remove GENERIC-SHAKE::{name}:")),
+            "{report}"
+        );
+    }
+    for name in [
+        "LIVE",
+        "LIVE-TARGET",
+        "METHOD-ROOTED",
+        "METHOD-TARGET",
+        "VALUE",
+        "READ-VALUE",
+        "WRITE-VALUE",
+    ] {
+        assert!(
+            report.contains(&format!("keep GENERIC-SHAKE::{name}:")),
+            "{report}"
+        );
+    }
+    assert!(ok(run(&exe, &[])).contains("GENERIC-SHAKE-OK"));
+    // Re-delivery reads the serialized registries, so a removed generic or
+    // method cannot survive unnoticed in a host-side metadata table.
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let reduced = f.path("reduced-generics.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let second_exe = f.path("generics-again");
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &second_exe,
+        ],
+    ));
+    assert!(!again.contains("GENERIC-SHAKE::UNUSED:"), "{again}");
+    assert!(!again.contains("GENERIC-SHAKE::DEAD-TARGET:"), "{again}");
+    assert!(ok(run(&second_exe, &[])).contains("GENERIC-SHAKE-OK"));
+    fs::write(
+        &spec,
+        format!("{specification}keep = GENERIC-SHAKE::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("keep GENERIC-SHAKE::UNUSED:"), "{report}");
+    assert!(
+        report.contains("keep GENERIC-SHAKE::DEAD-TARGET:"),
+        "{report}"
+    );
+}
+
+#[test]
 fn delivery_traces_source_closures_only_from_reachable_handles() {
     let f = Fixture::new();
     let core = f.path("source-closures.core");
@@ -858,7 +1049,9 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         &[
             "--no-bootstrap",
             "--eval",
-            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+            &format!(
+                "(load {fasl:?}) (defgeneric walker-free::unused (x)) (defmethod walker-free::unused ((x t)) (eval x)) (save-lisp-and-die {core:?})"
+            ),
         ],
     ));
     fs::remove_file(&fasl).unwrap();
@@ -876,6 +1069,7 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         .output()
         .unwrap());
     assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("remove WALKER-FREE::UNUSED:"), "{report}");
     let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
     assert!(symbols.contains("torcl::cli::"), "missing symbol table");
     assert!(

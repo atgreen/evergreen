@@ -7429,9 +7429,9 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
     scan_evaluator_roots(visit, true);
 }
 
-// Delivery follows source closure ownership from reachable handles. Ordinary
+// Delivery follows closure and generic ownership from reachable handles. Ordinary
 // GC must continue scanning every registry entry until delivery removes it.
-fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_closures: bool) {
+fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: bool) {
     // SAFETY: registered root scanners run with all mutators stopped.
     unsafe {
         CONTROL_VALUES.scan(|values| {
@@ -7459,15 +7459,15 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_closures: boo
         for class in CLASS_DEFINITIONS.borrow_mut().values_mut() {
             visit_class_def_roots(class, state, visit);
         }
-        for generic in GENERIC_DEFINITIONS.borrow_mut().values_mut() {
-            visit(&mut generic.generic_function);
-        }
-        for methods in METHOD_DEFINITIONS.borrow_mut().values_mut() {
-            for method in methods {
-                visit_method_def_roots(method, state, visit);
+        if root_definitions {
+            for generic in GENERIC_DEFINITIONS.borrow_mut().values_mut() {
+                visit(&mut generic.generic_function);
             }
-        }
-        if root_closures {
+            for methods in METHOD_DEFINITIONS.borrow_mut().values_mut() {
+                for method in methods {
+                    visit_method_def_roots(method, state, visit);
+                }
+            }
             for closure in closure_registry().borrow_mut().values_mut() {
                 visit(&mut closure.params_form);
                 visit(&mut closure.body);
@@ -7476,10 +7476,10 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_closures: boo
                     visit_fun_map_roots(funs, state, visit);
                 }
             }
-        }
-        // Keep each method's compiled body object live (bliss-x5y.20).
-        for callable in METHOD_COMPILED.borrow_mut().values_mut() {
-            visit(callable);
+            // Keep each method's compiled body object live (bliss-x5y.20).
+            for callable in METHOD_COMPILED.borrow_mut().values_mut() {
+                visit(callable);
+            }
         }
         {
             for definition in GLOBAL_MACROS.lock().unwrap().values_mut() {
