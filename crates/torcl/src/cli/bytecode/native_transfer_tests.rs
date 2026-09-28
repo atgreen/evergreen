@@ -44,6 +44,42 @@ fn native_v2_rollout_switch_enters_cached_segment_path() {
     assert_eq!(take_segment_run_count(), 2);
 }
 
+#[test]
+fn native_v2_recursive_body_uses_direct_self_call_fallback() {
+    let self_symbol = torcl_rt::symbols::intern("NATIVE-RECURSION-PROBE");
+    let body = torcl_rt::bytecode::BytecodeFunction {
+        code: vec![
+            torcl_rt::bytecode::Instr::CallNamed {
+                sym: self_symbol,
+                nargs: 0,
+            },
+            torcl_rt::bytecode::Instr::Return,
+        ],
+        constants: vec![],
+        load_time_values: vec![],
+        handler_cases: vec![],
+        handler_binds: vec![],
+        names: vec![],
+        restart_cases: vec![],
+        nested_functions: vec![],
+        param_layout: vec![],
+        param_types: vec![],
+        has_env: false,
+        n_locals: 0,
+        max_stack: 1,
+        arity: 0,
+        name: "NATIVE-RECURSION-PROBE".into(),
+        params_form: torcl_rt::value::NIL,
+        min_args: 0,
+        max_args: Some(0),
+        variadic: false,
+    };
+    assert!(
+        native_transfer_entry::TransferCode::compile(Arc::new(body)).is_none(),
+        "recursive bodies must use the established direct-self-call entry until the segment ABI has one"
+    );
+}
+
 struct NativeEnvGuard(*mut Env);
 impl NativeEnvGuard {
     fn enter(env: &mut Env) -> Self {

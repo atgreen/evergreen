@@ -147,6 +147,33 @@ impl TransferCode {
         if body.variadic || body.has_env {
             return None;
         }
+        // Native-cleanup Invoke currently enters every call through the helper
+        // veneer. A recursive function would therefore create a fresh segment
+        // for each recursive edge instead of using the established direct
+        // register-entry self-call path. Keep that shape on the legacy entry
+        // until the segment ABI has a frame-safe recursive entry; otherwise an
+        // opt-in run can turn ordinary recursion into an effectively unbounded
+        // slow path. This is a capability refusal, so `run_native` retains the
+        // checked/direct-self fallback and Lisp semantics are unchanged.
+        let self_symbol = torcl_rt::symbols::intern(&body.name);
+        if body.code.iter().any(|instruction| {
+            matches!(instruction, Instr::CallNamed { sym, .. } if *sym == self_symbol)
+        }) && body.handler_cases.is_empty()
+            && body.handler_binds.is_empty()
+            && body.restart_cases.is_empty()
+            && !body.code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instr::PushUnwind { .. }
+                        | Instr::PushCatch { .. }
+                        | Instr::PushHandlerCase { .. }
+                        | Instr::PushHandlerBind { .. }
+                        | Instr::PushRestartCase { .. }
+                )
+            })
+        {
+            return None;
+        }
         // These scopes need executing identity, dynamic values or inherited
         // state. Do not invent fresh tokens during recovery for live closures.
         if body.code.iter().any(|instruction| {
