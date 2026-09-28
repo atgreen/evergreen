@@ -1468,6 +1468,63 @@ fn emit_call(
     Ok(())
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn emit_invoke_call(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    constants: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+    frame_base: FramedHome,
+    activation_slots: u16,
+    argument_base: u16,
+    veneer: u64,
+) -> Result<u32, EmitError> {
+    let crate::t2::ir::AuxData::CallTarget(symbol) = data.aux else {
+        return Err(EmitError::UnsupportedOp(0xF8));
+    };
+    load_home(a, SCRATCH, frame_base, 0);
+    let args_slot = i32::from(activation_slots) + i32::from(argument_base);
+    for (index, value) in data.args.iter().enumerate() {
+        if let Some(&bits) = constants.get(value) {
+            mov_imm64(a, RAX, bits as i64);
+        } else {
+            load_home(
+                a,
+                RAX,
+                *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                0,
+            );
+        }
+        store_mem64_disp(a, SCRATCH, (args_slot + index as i32) * 8, RAX);
+    }
+    // Fixed, aligned request; rooted arguments remain in the activation. The
+    // cold capture table records this exact temporary RSP adjustment.
+    const _: () = assert!(std::mem::size_of::<TransferCallRequest>() == 32);
+    alu_r_imm(a, 5, 4, 32); // sub rsp, 32
+    store_to_rsp(a, SCRATCH, 24); // activation
+    mov_imm64(a, RAX, i64::from(symbol));
+    store_to_rsp(a, RAX, 0);
+    mov_imm64(a, RAX, data.args.len() as i64);
+    store_to_rsp(a, RAX, 8);
+    alu_r_imm(a, 0, SCRATCH, args_slot * 8);
+    store_to_rsp(a, SCRATCH, 16); // args
+    mov_rr(a, 7, 4); // rdi = request
+    mov_imm64(a, RAX, veneer as i64);
+    a.extend_from_slice(&[0xff, 0xd0]);
+    let offset = u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?;
+    alu_r_imm(a, 0, 4, 32); // normal return only
+    if let Some(value) = data.results.first() {
+        store_home(
+            a,
+            *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+            RAX,
+            0,
+        );
+    }
+    Ok(offset)
+}
+
 /// `(symbol-value sym)` — a global read. Lowers to `c2i_load_global(sym) -> rax`,
 /// then moves the result into its value register (bliss-mzp). The call clobbers
 /// caller-saved registers, but a function containing this op is `has_calls`, so
@@ -2467,6 +2524,8 @@ pub fn emit_framed(
         0,
         None,
         self_sym,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        None,
     )
 }
 
@@ -2557,7 +2616,96 @@ pub fn emit_framed_with_activation_slots(
         c2i_transfer_pending_addr,
         Some(activation_slots),
         self_sym,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        None,
     )
+}
+
+/// Helper-v2 call request, live in the generated caller's temporary frame until
+/// normal return or completion of cold preparation. Arguments and shadow roots
+/// reside in the rooted owning activation, not in this unscanned request.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct TransferCallRequest {
+    pub symbol: u64,
+    pub nargs: usize,
+    pub args: *mut torcl_rt::value::TorclVal,
+    pub activation: *mut torcl_rt::value::TorclVal,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct TransferEmission {
+    veneer: u64,
+    sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
+}
+
+/// Opt-in SysV emission through a helper-v2 veneer. The owner must root all
+/// activation slots (including `shadow_root_slots`), retain code/definitions and
+/// adapters, and enter through a supported native segment. This is not yet a
+/// production installation API: unboxed values, guards, OSR and other helper
+/// classes are refused until their contracts are wired. Legacy entries reject Invoke.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub fn emit_framed_transfers(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    use crate::t2::ir::Opcode;
+    if call_veneer == 0
+        || !f.osr_entries.is_empty()
+        || (0..f.num_values()).any(|i| {
+            f.value(crate::t2::ir::Value(i as u32)).repr
+                != crate::t2::ir::ValueRepresentation::Tagged
+        })
+        || usize::from(activation_slots) < f.block(f.entry()).params.len()
+        || crate::t2::verify::verify(f).is_err()
+    {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            if !matches!(
+                f.inst(inst).opcode,
+                Opcode::Invoke
+                    | Opcode::NlxTransfer
+                    | Opcode::Return
+                    | Opcode::Jump
+                    | Opcode::Brif
+                    | Opcode::ConstFixnum
+                    | Opcode::ConstNil
+                    | Opcode::ConstT
+                    | Opcode::ConstSymbol
+                    | Opcode::ConstChar
+                    | Opcode::GenericEq
+                    | Opcode::TypeCheck
+            ) {
+                return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
+            }
+        }
+    }
+    let mut transfers = TransferEmission {
+        veneer: call_veneer,
+        sites: vec![],
+    };
+    let code = emit_framed_inner(
+        f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Some(activation_slots),
+        None,
+        Some(&mut transfers),
+    )?;
+    let table = crate::t2::transfer_sites::SysvTransferTable::new(code.code.len(), transfers.sites)
+        .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    Ok((code, table))
 }
 
 // Shared implementation mirrors both public emitter entry points above.
@@ -2576,12 +2724,30 @@ fn emit_framed_inner(
     c2i_transfer_pending_addr: u64,
     activation_slots: Option<u16>,
     self_sym: Option<u32>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] mut transfers: Option<
+        &mut TransferEmission,
+    >,
 ) -> Result<FramedCode, EmitError> {
     use crate::t2::frame_state::ValueSource;
     use crate::t2::ir::{
         AuxData, Block, Inst, Opcode, TypeBits, Value, ValueDef, ValueRepresentation,
     };
     use std::collections::{HashMap, HashSet};
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let transfer_mode = transfers.is_some();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let transfer_mode = false;
+    if !transfer_mode
+        && f.block_order().iter().any(|&b| {
+            f.block(b)
+                .insts
+                .iter()
+                .any(|&i| matches!(f.inst(i).opcode, Opcode::Invoke | Opcode::NlxTransfer))
+        })
+    {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
 
     let entry = f.entry();
     if std::env::var_os("TORCL_IR_FULL").is_some() {
@@ -2630,6 +2796,7 @@ fn emit_framed_inner(
         matches!(
             op,
             Opcode::Call
+                | Opcode::Invoke
                 | Opcode::SymbolValue
                 | Opcode::SymbolFunction
                 | Opcode::SetSymbolValue
@@ -2895,6 +3062,13 @@ fn emit_framed_inner(
             || fused.iter().any(|&i| f.inst(i).results.contains(&value))
     })
     .map_err(|_| EmitError::UnsupportedOp(0xFA))?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut transfer_maps = if transfer_mode {
+        crate::t2::transfer_map::lower_framed_transfer_maps(f, &machine, &layout, &const_tagged)
+            .map_err(|_| EmitError::UnsupportedOp(0xFD))?
+    } else {
+        vec![]
+    };
     let homes = layout.values;
     let mut next_stack = layout.stack_slots;
     // `TORCL_RA_DBG` dump of the three facts a deopt-clobber bug is diagnosed
@@ -3080,7 +3254,9 @@ fn emit_framed_inner(
         .iter()
         .flat_map(|&block| f.block(block).insts.iter().copied())
         .map(|inst| f.inst(inst))
-        .filter(|data| data.opcode == Opcode::Call && data.args.len() > 3)
+        .filter(|data| {
+            (data.opcode == Opcode::Call && data.args.len() > 3) || data.opcode == Opcode::Invoke
+        })
         .map(|data| data.args.len())
         .max()
         .unwrap_or(0);
@@ -3089,12 +3265,13 @@ fn emit_framed_inner(
     let shadow_root_slots = root_shadow_slots
         .checked_add(call_arg_slots)
         .ok_or(EmitError::UnsupportedOp(0xFD))?;
-    let needs_activation_frame = f.block_order().iter().any(|&block| {
-        f.block(block)
-            .insts
-            .iter()
-            .any(|&inst| f.inst(inst).opcode == Opcode::TakeValuesToLocals)
-    });
+    let needs_activation_frame = transfer_mode
+        || f.block_order().iter().any(|&block| {
+            f.block(block)
+                .insts
+                .iter()
+                .any(|&inst| f.inst(inst).opcode == Opcode::TakeValuesToLocals)
+        });
     if needs_activation_frame && activation_slots.is_none() {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)));
     }
@@ -3314,7 +3491,7 @@ fn emit_framed_inner(
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
-                || d.opcode.is_terminator()
+                || (d.opcode.is_terminator() && d.opcode != Opcode::Invoke)
                 || fused.contains(&inst)
             {
                 continue;
@@ -3374,12 +3551,14 @@ fn emit_framed_inner(
                 }
             }
             let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
-            let (mut inst_reg, result_stores) =
-                if d.opcode == Opcode::TakeValuesToLocals || wide_call {
-                    (HashMap::new(), Vec::new())
-                } else {
-                    prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?
-                };
+            let (mut inst_reg, result_stores) = if d.opcode == Opcode::TakeValuesToLocals
+                || d.opcode == Opcode::Invoke
+                || wide_call
+            {
+                (HashMap::new(), Vec::new())
+            } else {
+                prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?
+            };
             let mut inst_pool = Vec::new();
             if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
@@ -3391,6 +3570,76 @@ fn emit_framed_inner(
                     .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::ConstHeapObj)))?;
                 mov_imm64(&mut a, RAX, slot as i64);
                 load_mem64_disp(&mut a, dst, RAX, 0);
+            } else if d.opcode == Opcode::Invoke {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                {
+                    let transfer = transfers
+                        .as_deref_mut()
+                        .ok_or(EmitError::UnsupportedOp(0xFA))?;
+                    let return_offset = emit_invoke_call(
+                        &mut a,
+                        &d,
+                        &homes,
+                        &const_tagged,
+                        frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                        activation_slots.unwrap(),
+                        root_shadow_slots,
+                        transfer.veneer,
+                    )?;
+                    let index = transfer_maps
+                        .iter()
+                        .position(|map| map.call == inst)
+                        .ok_or(EmitError::UnsupportedOp(0xFD))?;
+                    let map = transfer_maps.remove(index);
+                    let mut shadow_roots = Vec::new();
+                    for (index, value) in roots
+                        .ok_or(EmitError::UnsupportedOp(0xFD))?
+                        .iter()
+                        .enumerate()
+                    {
+                        let location = homes[value]
+                            .location()
+                            .ok_or(EmitError::UnsupportedOp(0xFD))?;
+                        if map.roots.contains(&location) {
+                            let slot = activation_slots
+                                .unwrap()
+                                .checked_add(index as u16)
+                                .ok_or(EmitError::UnsupportedOp(0xFD))?;
+                            shadow_roots.push((location, slot));
+                        }
+                    }
+                    // A mapped tagged value may lack a shadow only if every
+                    // value assigned this home is provably non-moving. Never
+                    // let a liveness gap silently select a stale native root.
+                    for root in &map.roots {
+                        if shadow_roots.iter().any(|(location, _)| location == root) {
+                            continue;
+                        }
+                        let values: Vec<_> = homes
+                            .iter()
+                            .filter(|(_, home)| home.location() == Some(*root))
+                            .map(|(&value, _)| value)
+                            .collect();
+                        if values.is_empty() || !values.into_iter().all(proven_immediate) {
+                            return Err(EmitError::UnsupportedOp(0xFD));
+                        }
+                    }
+                    transfer
+                        .sites
+                        .push(crate::t2::transfer_sites::SysvTransferSite {
+                            return_offset,
+                            stack_slots: native_spill_slots,
+                            call_stack_adjust: 32,
+                            activation_slots: activation_slots
+                                .unwrap()
+                                .checked_add(shadow_root_slots)
+                                .ok_or(EmitError::UnsupportedOp(0xFD))?,
+                            shadow_roots,
+                            map,
+                        });
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+                return Err(EmitError::UnsupportedOp(0xFA));
             } else if d.opcode == Opcode::Call {
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
                 emit_call(
@@ -3597,6 +3846,18 @@ fn emit_framed_inner(
         let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
         let td = f.inst(t).clone();
         match td.opcode {
+            Opcode::Invoke if transfer_mode => {
+                let target = &td.targets[0];
+                parallel_home_move(&mut a, &edge_home_moves(f, target, &homes, &const_tagged)?);
+                if next != Some(target.block) {
+                    a.jmp(block_label[&target.block]);
+                }
+            }
+            Opcode::NlxTransfer if transfer_mode => {
+                // Metadata-only cold successor: the veneer enters the external
+                // capture stub. A normal path must never reach this block.
+                a.extend_from_slice(&[0x0f, 0x0b]);
+            }
             // A Trap ends a path that must not continue (bliss-wukf): today,
             // the code after a call that never returns normally.
             //
@@ -3993,6 +4254,10 @@ fn emit_framed_inner(
         || inst_deopt
             .values()
             .any(|&label| a.label_is_referenced(label));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if !transfer_maps.is_empty() {
+        return Err(EmitError::UnsupportedOp(0xFD));
+    }
     let code = a.finish().ok_or(EmitError::BadBranch)?;
     #[cfg(all(target_arch = "x86_64", windows))]
     let windows_unwind = {

@@ -450,6 +450,34 @@ assume that an object already moved/tenured by the helper must move a second tim
 Production emission must derive shadow mappings from the same ordered root list
 used by its pre-call synchronization; omitted mappings must never be guessed.
 
+The opt-in x86 Linux `emit_framed_transfers` entry now emits Invoke through the
+rich emitter, using its actual allocation, final frame homes, root synchronization,
+result storage and normal-edge moves. A 32-byte `TransferCallRequest` passes the
+symbol, arity, rooted argument slice and owning activation to a helper-v2 veneer.
+The emitter records the exact post-CALL offset and stack adjustment, derives
+canonical shadow mappings from its synchronization list, and rejects an unmapped
+potentially moving root or an unconsumed capture map. Invoke arguments may spill;
+requiring all arguments in registers reproduced a regalloc2 panic at eight args.
+Legacy emitter entry points still reject Invoke.
+
+`native_invoke_emit` executes bytecode-built functions through the generated code,
+not a hand-written caller. Its explicit capability gate covers zero, one, four and
+eight arguments, normal return/Transfer/Deopt, collection inside both helpers,
+rooted argument slices, preserved logical locals/stack, exact second-call recovery,
+normal results distinct from the original argument, and Rust destructor counts:
+
+```text
+cargo test -p torcl-compiler --test native_invoke_emit -- --include-ignored
+```
+
+Actual Lisp-source lowering also reaches this emitter in the CLI unit gate.
+This entry remains an integration path rather than production activation: it
+refuses unboxed values, OSR, guards and other helper classes until their contracts
+are connected; helper argument slices currently contain tagged values only.
+The fixture supplies rooted activation storage, per-execution snapshot reservation
+and cold dispatch. Runtime Lisp helper adapters, code/definition retention,
+installation ABI checks, native cleanup/handlers and polling remain required.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does
@@ -593,7 +621,7 @@ required emergency preparation-failure/OOM path.
 This path covers bytecodes already modelled by the SSA builder and ordinary
 function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide
 integration, machine landing pads and unwind maps remain required. Existing
-emitters still refuse Invoke; the machine emitter explicitly rejects the new
+legacy emission entry points still refuse Invoke; the compact machine emitter explicitly rejects the new
 call/route opcodes before applying ordinary-call allocation assumptions. This
 prevents accidental emission using the old ABI.
 

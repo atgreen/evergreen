@@ -21419,6 +21419,26 @@ mod direct_call_invalidation_tests {
             .expect("resolve actual source transfer captures");
         assert_eq!(captures.len(), calls);
         assert!(!captures[0].control_scopes.is_empty());
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let (code, sites) = torcl_compiler::t2::emit::emit_framed_transfers(
+                &ir,
+                0x12345678,
+                body.n_locals + body.max_stack,
+            )
+            .expect("emit actual source call with exact recovery metadata");
+            assert_eq!(sites.sites().count(), calls);
+            assert_eq!(code.emitted_safepoints, calls);
+            assert!(
+                !sites
+                    .sites()
+                    .next()
+                    .unwrap()
+                    .map()
+                    .control_scopes
+                    .is_empty()
+            );
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]

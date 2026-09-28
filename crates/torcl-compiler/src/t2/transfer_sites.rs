@@ -58,6 +58,9 @@ pub struct SysvTransferTable {
 }
 
 impl SysvTransferTable {
+    pub fn sites(&self) -> impl Iterator<Item = &CheckedSysvSite> {
+        self.sites.iter()
+    }
     /// Validate all descriptor inputs, including raw words and nested remat
     /// inputs, before the first native entry. Construction may allocate.
     pub fn new(code_len: usize, sites: Vec<SysvTransferSite>) -> Result<Self, TransferSiteError> {
@@ -161,6 +164,9 @@ impl SysvTransferTable {
 }
 
 impl CheckedSysvSite {
+    pub fn return_offset(&self) -> u32 {
+        self.return_offset
+    }
     pub fn map(&self) -> &TransferCaptureMap {
         &self.map
     }
