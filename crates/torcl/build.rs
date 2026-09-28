@@ -68,6 +68,8 @@ fn fingerprint(root: &Path) -> String {
 
 fn configure_runtime() {
     println!("cargo:rerun-if-env-changed=TORCL_RUNTIME_MANIFEST");
+    println!("cargo:rustc-check-cfg=cfg(torcl_no_t1)");
+    println!("cargo:rustc-check-cfg=cfg(torcl_no_t2)");
     println!("cargo:rustc-check-cfg=cfg(torcl_specialized_builtins)");
     println!("cargo:rustc-check-cfg=cfg(torcl_builtin, values(any()))");
     println!("cargo:rustc-check-cfg=cfg(torcl_no_disassembly)");
@@ -104,6 +106,7 @@ fn configure_runtime() {
             .map(|b| format!("{b:02x}"))
             .collect(),
         builtins: None,
+        max_tier: runtime_contract::NativeTier::T2,
         capabilities: runtime_contract::CAPABILITIES
             .iter()
             .map(|s| (*s).to_owned())
@@ -140,6 +143,12 @@ fn configure_runtime() {
     }
     if !selected.capabilities.contains("tree-walker") {
         println!("cargo:rustc-cfg=torcl_no_tree_walker");
+    }
+    if selected.max_tier < runtime_contract::NativeTier::T1 {
+        println!("cargo:rustc-cfg=torcl_no_t1");
+    }
+    if selected.max_tier < runtime_contract::NativeTier::T2 {
+        println!("cargo:rustc-cfg=torcl_no_t2");
     }
     if let Some(builtins) = &selected.builtins {
         println!("cargo:rustc-cfg=torcl_specialized_builtins");

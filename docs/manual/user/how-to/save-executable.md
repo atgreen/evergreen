@@ -212,7 +212,14 @@ A fixed lambda does not by itself retain every function or native capability;
 an `EVAL` inside its body does. Applications that construct arbitrary lambda
 bodies dynamically must retain `dynamic-code`.
 
-The GC, T0 bytecode interpreter, and tiered compilers remain available.
+The GC and T0 bytecode interpreter remain available. Delivery includes both
+native compilers by default. With `runtime = specialized`, choose the highest
+included tier using `max-tier = t2` (default), `max-tier = t1` (omit the T2
+optimizing compiler), or `max-tier = t0` (omit both native compilers).
+The omitted compiler entry points are removed at build time so native linking
+can remove their implementation. T0-only applications continue executing saved
+bytecode. Native promotion and OSR cannot exceed the selected tier;
+`TORCL_FORCE_TIER` requests above it are clamped to the available tier.
 Deoptimization resumes T0 bytecode; it does not require public `EVAL`.
 `EvalHost` follows the references in its saved constant form rather than rooting
 all capabilities. Many library builtins share an evaluated-argument dispatcher
@@ -261,7 +268,7 @@ and does not invoke Cargo.
 same compatibility information and is checked before heap restoration. Source
 content identity, target, Rust toolchain, Cargo features, and compiler flags
 must match; the runtime's native capabilities must include the image's required
-capabilities and builtin set. Contract schema 2 records builtin names as UTF-8
+capabilities, builtin set, and compiler tiers. Contract schema 3 records builtin names as UTF-8
 hex strings; `builtins=*` denotes the complete set. The source fingerprint is a
 compatibility identifier, not a
 cryptographic signature. Full runtimes can still read older images; specialized

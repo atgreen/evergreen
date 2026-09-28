@@ -27,6 +27,32 @@ pub fn close_capabilities(capabilities: &mut BTreeSet<String>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NativeTier {
+    T0,
+    T1,
+    T2,
+}
+
+impl NativeTier {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "t0" => Ok(Self::T0),
+            "t1" => Ok(Self::T1),
+            "t2" => Ok(Self::T2),
+            _ => Err("max-tier must be t0, t1, or t2".into()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::T0 => "t0",
+            Self::T1 => "t1",
+            Self::T2 => "t2",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contract {
     pub source: String,
@@ -37,6 +63,7 @@ pub struct Contract {
     pub capabilities: BTreeSet<String>,
     /// None means the complete builtin set; Some(empty) means no dispatch arms.
     pub builtins: Option<BTreeSet<String>>,
+    pub max_tier: NativeTier,
 }
 impl Contract {
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -54,6 +81,7 @@ impl Contract {
                 "rustflags",
                 "capabilities",
                 "builtins",
+                "max-tier",
             ]
             .contains(&key)
                 || fields.insert(key, value).is_some()
@@ -63,7 +91,7 @@ impl Contract {
                 ));
             }
         }
-        if fields.remove("schema") != Some("2") {
+        if fields.remove("schema") != Some("3") {
             return Err("unsupported runtime contract schema".into());
         }
         let mut required = |key| {
@@ -154,6 +182,11 @@ impl Contract {
         if capabilities.contains("dynamic-code") && builtins.is_some() {
             return Err("dynamic-code requires every native builtin".into());
         }
+        let max_tier = NativeTier::parse(
+            fields
+                .remove("max-tier")
+                .ok_or("missing runtime max-tier")?,
+        )?;
         Ok(Self {
             source,
             target,
@@ -162,11 +195,12 @@ impl Contract {
             rustflags,
             capabilities,
             builtins,
+            max_tier,
         })
     }
     pub fn encode(&self) -> String {
         format!(
-            "schema=2\nsource={}\ntarget={}\ntoolchain={}\nfeatures={}\nrustflags={}\ncapabilities={}\nbuiltins={}\n",
+            "schema=3\nsource={}\ntarget={}\ntoolchain={}\nfeatures={}\nrustflags={}\ncapabilities={}\nbuiltins={}\nmax-tier={}\n",
             self.source,
             self.target,
             self.toolchain,
@@ -186,7 +220,8 @@ impl Contract {
                         .collect::<Vec<_>>()
                         .join(",")
                 }
-            )
+            ),
+            self.max_tier.name()
         )
     }
     pub fn accepts(&self, required: &Self) -> Result<(), String> {
@@ -204,6 +239,9 @@ impl Contract {
         }
         if !required.capabilities.is_subset(&self.capabilities) {
             return Err("image requires unavailable native runtime capabilities".into());
+        }
+        if self.max_tier < required.max_tier {
+            return Err("image requires unavailable native compilation tiers".into());
         }
         if let Some(available) = &self.builtins {
             if required
@@ -224,7 +262,7 @@ mod builtin_contract_tests {
 
     fn contract(builtins: &str, capabilities: &str) -> Result<Contract, String> {
         Contract::parse(&format!(
-            "schema=2\nsource=test\ntarget=test\ntoolchain=test\nfeatures=\nrustflags=\ncapabilities={capabilities}\nbuiltins={builtins}\n"
+            "schema=3\nsource=test\ntarget=test\ntoolchain=test\nfeatures=\nrustflags=\ncapabilities={capabilities}\nbuiltins={builtins}\nmax-tier=t2\n"
         ))
     }
 
@@ -264,6 +302,42 @@ mod builtin_contract_tests {
             "434152,",
         ] {
             assert!(contract(names, "").is_err(), "accepted {names}");
+        }
+    }
+
+    #[test]
+    fn native_tier_requirements_follow_available_compilers() {
+        let full = contract("*", "").unwrap();
+        for (available_index, available) in ["t0", "t1", "t2"].iter().enumerate() {
+            let runtime = Contract::parse(
+                &full
+                    .encode()
+                    .replace("max-tier=t2", &format!("max-tier={available}")),
+            )
+            .unwrap();
+            assert_eq!(Contract::parse(&runtime.encode()).unwrap(), runtime);
+            for (required_index, required) in ["t0", "t1", "t2"].iter().enumerate() {
+                let image = Contract::parse(
+                    &full
+                        .encode()
+                        .replace("max-tier=t2", &format!("max-tier={required}")),
+                )
+                .unwrap();
+                assert_eq!(
+                    runtime.accepts(&image).is_ok(),
+                    available_index >= required_index
+                );
+            }
+        }
+        for invalid in ["", "t3", "native", "T0"] {
+            assert!(
+                Contract::parse(
+                    &full
+                        .encode()
+                        .replace("max-tier=t2", &format!("max-tier={invalid}"))
+                )
+                .is_err()
+            );
         }
     }
 }

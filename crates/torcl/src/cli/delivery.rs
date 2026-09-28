@@ -20,12 +20,14 @@ struct Spec {
     keep: Vec<String>,
     explicit_dynamic_roots: bool,
     specialized: bool,
+    max_tier: crate::runtime_contract::NativeTier,
     runtime_keep: std::collections::BTreeSet<String>,
 }
 
 impl Spec {
     fn parse(text: &str) -> Result<Self, TorclError> {
         let mut runtime = None;
+        let mut max_tier = None;
         let mut runtime_keep = std::collections::BTreeSet::new();
         let mut entry = None;
         let mut version = None;
@@ -51,6 +53,7 @@ impl Spec {
                 "prune-package" => packages.push(value.to_owned()),
                 "keep" => keep.push(value.to_owned()),
                 "runtime" if runtime.is_none() => runtime = Some(value),
+                "max-tier" if max_tier.is_none() => max_tier = Some(value),
                 "runtime-keep" => {
                     if !crate::runtime_contract::CAPABILITIES.contains(&value) {
                         return Err(error(format!("unknown runtime capability {value}")));
@@ -81,7 +84,15 @@ impl Spec {
         if !specialized && !runtime_keep.is_empty() {
             return Err(error("runtime-keep requires runtime = specialized"));
         }
+        let max_tier =
+            crate::runtime_contract::NativeTier::parse(max_tier.unwrap_or("t2")).map_err(error)?;
+        if !specialized && max_tier != crate::runtime_contract::NativeTier::T2 {
+            return Err(error(
+                "omitting native tiers requires runtime = specialized",
+            ));
+        }
         Ok(Self {
+            max_tier,
             specialized,
             runtime_keep,
             entry: entry.ok_or_else(|| error("spec requires entry"))?,
@@ -781,7 +792,10 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     torcl_stdlib::pathnames::clear_delivery_string_caches()?;
     let plan = analyze(&spec, entry, &keeps, env)?;
     let mut selected = native_runtime::contract();
-    if !spec.specialized && selected.builtins.is_some() {
+    if !spec.specialized
+        && (selected.builtins.is_some()
+            || selected.max_tier != crate::runtime_contract::NativeTier::T2)
+    {
         return Err(error("runtime = full requires a full delivery driver"));
     }
     if !spec.specialized
@@ -792,6 +806,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         return Err(error("runtime = full requires a full delivery driver"));
     }
     if spec.specialized {
+        selected.max_tier = spec.max_tier;
         selected.capabilities = plan.capabilities.clone();
         // Source evaluation still has implicit builtin calls. Keep its complete
         // dispatch until those dependencies are expressed as graph edges.

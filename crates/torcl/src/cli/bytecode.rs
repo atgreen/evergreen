@@ -88,22 +88,31 @@ pub(super) enum ForcedTier {
 pub(super) fn forced_tier() -> Option<ForcedTier> {
     use std::sync::OnceLock;
     static T: OnceLock<Option<ForcedTier>> = OnceLock::new();
-    *T.get_or_init(|| match std::env::var("TORCL_FORCE_TIER") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "interp" | "tree-walker" | "treewalker" | "treewalk" | "tw" => Some(ForcedTier::Interp),
-            "t0" | "bytecode" => Some(ForcedTier::T0),
-            "t1" => Some(ForcedTier::T1),
-            "t2" => Some(ForcedTier::T2),
-            "" => None,
-            other => {
-                eprintln!(
-                    "torcl: unrecognized TORCL_FORCE_TIER={other:?} \
+    *T.get_or_init(|| {
+        match std::env::var("TORCL_FORCE_TIER") {
+            Ok(v) => match v.to_ascii_lowercase().as_str() {
+                "interp" | "tree-walker" | "treewalker" | "treewalk" | "tw" => {
+                    Some(ForcedTier::Interp)
+                }
+                "t0" | "bytecode" => Some(ForcedTier::T0),
+                "t1" => Some(ForcedTier::T1),
+                "t2" => Some(ForcedTier::T2),
+                "" => None,
+                other => {
+                    eprintln!(
+                        "torcl: unrecognized TORCL_FORCE_TIER={other:?} \
                      (use interp|t0|t1|t2); ignoring"
-                );
-                None
-            }
-        },
-        Err(_) => None,
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+        .map(|tier| match tier {
+            ForcedTier::T1 | ForcedTier::T2 if cfg!(torcl_no_t1) => ForcedTier::T0,
+            ForcedTier::T2 if cfg!(torcl_no_t2) => ForcedTier::T1,
+            _ => tier,
+        })
     })
 }
 
@@ -15631,6 +15640,7 @@ extern "C" fn c2i_call_builtin_regs(
 /// lives in this crate, which depends on torcl-compiler, so the compiler cannot
 /// reach it directly (bliss-x5y.27).
 pub(super) fn install_direct_builtin_hooks() {
+    #[cfg(not(torcl_no_t2))]
     torcl_compiler::t2::emit::install_direct_builtin_hooks(
         torcl_compiler::t2::emit::DirectBuiltinHooks {
             addr: c2i_call_builtin_regs as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64
@@ -17250,6 +17260,9 @@ fn positive_env(names: &[&str], default: u32) -> u32 {
 /// T0→T1 promotion threshold (invocations).  The stage-5 spec name is
 /// preferred; `TORCL_T1_THRESHOLD` remains as a compatibility alias.
 fn t1_threshold() -> u32 {
+    if cfg!(torcl_no_t1) {
+        return u32::MAX;
+    }
     match forced_tier() {
         Some(ForcedTier::T0) => return u32::MAX, // never promote
         Some(ForcedTier::T1 | ForcedTier::T2) => return 1, // promote on first call
@@ -17263,6 +17276,9 @@ fn t1_threshold() -> u32 {
 /// `TORCL_T2=1`, cached. Read on the per-call tiering decision path, where an
 /// uncached `getenv` is a linear scan of `environ` under musl (bliss-jtc.9).
 fn torcl_t2_forced() -> bool {
+    if cfg!(torcl_no_t2) {
+        return false;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("TORCL_T2") == Some(true))
@@ -17295,6 +17311,9 @@ fn nn_direct_enabled() -> bool {
 /// T2 is part of normal tiering.  `TORCL_DISABLE_T2=1` is the explicit debug
 /// off-switch; `TORCL_T2=0` is accepted for compatibility with the old gate.
 fn t2_enabled() -> bool {
+    if cfg!(torcl_no_t2) {
+        return false;
+    }
     if profiling_disabled() {
         return false;
     }
@@ -19705,6 +19724,18 @@ mod ppc64le;
 /// Emit T1 native code for the host. Each architecture's baseline emitter
 /// decides for itself what it can lower; a host with no emitter never promotes
 /// and every function stays in the counting interpreter.
+#[cfg(torcl_no_t1)]
+fn emit_native_t1(
+    _bf: &BytecodeFunction,
+    _allow_speculation: bool,
+    _sym: u32,
+    _backedge_counter: u64,
+    _allow_traps: bool,
+) -> Option<NativeEmission> {
+    None
+}
+
+#[cfg(not(torcl_no_t1))]
 fn emit_native_t1(
     bf: &BytecodeFunction,
     allow_speculation: bool,
@@ -19750,6 +19781,9 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
 /// non-speculating form is the stable native fallback while a replacement T2
 /// version is compiled for a newly observed numeric phase.
 fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Option<Rc<NativeCode>> {
+    if cfg!(torcl_no_t1) {
+        return None;
+    }
     // Blacklisted (bliss-jtc.27): a function whose speculation repeatedly failed
     // is not recompiled — it stays in T0 to avoid churning through deopts.
     if DEOPT_BLACKLIST.with(|s| s.borrow().contains(&sym)) {
@@ -19865,6 +19899,12 @@ macro_rules! t2_log {
     ($($a:tt)*) => { t2_log_write(format_args!($($a)*)) };
 }
 
+#[cfg(torcl_no_t2)]
+fn compile_t2_artifact(_input: &T2CompileInput) -> Option<T2Artifact> {
+    None
+}
+
+#[cfg(not(torcl_no_t2))]
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // Only targets with an optimizing native emitter may publish T2 code. This is
     // a safety property, not an optimisation: without it the pipeline runs to
@@ -20287,6 +20327,9 @@ fn compile_osr_from_func(func: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
 /// Emit OSR-entry native code for one bytecode function (shared by the sym-keyed
 /// and anonymous paths). `sym` is used only for perf-map / jitdump labelling.
 fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> {
+    if cfg!(torcl_no_t1) {
+        return None;
+    }
     // Same safety gate as the T1-invoke path (see try_promote_to_t1): if a
     // closure created here captures one of this function's blocks/tags, the
     // native no-ops for PushBlock/PushTag/NamedTag would never publish the

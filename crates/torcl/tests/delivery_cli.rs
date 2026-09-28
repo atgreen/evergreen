@@ -1527,7 +1527,7 @@ fn saved_images_validate_native_requirements_before_restore() {
         &["--eval", &format!("(save-lisp-and-die {core:?})")],
     ));
     let mut bytes = fs::read(&core).unwrap();
-    let marker = b"schema=2\nsource=";
+    let marker = b"schema=3\nsource=";
     let offset = bytes
         .windows(marker.len())
         .position(|w| w == marker)
@@ -1621,6 +1621,22 @@ fn native_delivery_capabilities_follow_reachable_symbols_and_dynamic_policy() {
 #[test]
 #[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
 fn native_delivery_removes_the_walker_for_source_free_code() {
+    check_native_delivery_tier("t2");
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_omits_t2() {
+    check_native_delivery_tier("t1");
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_omits_both_native_tiers() {
+    check_native_delivery_tier("t0");
+}
+
+fn check_native_delivery_tier(max_tier: &str) {
     let f = Fixture::new();
     let source = f.path("walker-free.lisp");
     let fasl = f.path("walker-free.bfasl");
@@ -1664,7 +1680,7 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         ],
     ));
     fs::remove_file(&fasl).unwrap();
-    fs::write(&spec, "version = 1\nentry = WALKER-FREE::MAIN\nprune-package = WALKER-FREE\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    fs::write(&spec, format!("version = 1\nentry = WALKER-FREE::MAIN\nprune-package = WALKER-FREE\nruntime = specialized\ndynamic = explicit\nmax-tier = {max_tier}\n")).unwrap();
     let report = ok(Command::new(BIN)
         .args([
             "--no-init",
@@ -1687,6 +1703,10 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         report.contains("remove (SETF WALKER-FREE::UNUSED-WRITER):"),
         "{report}"
     );
+    assert!(
+        report.contains(&format!("max-tier={max_tier}\n")),
+        "{report}"
+    );
     let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
     assert!(symbols.contains("torcl::cli::"), "missing symbol table");
     for omitted in [
@@ -1697,6 +1717,19 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         assert!(
             !symbols.contains(omitted),
             "unreachable builtin remains linked: {omitted}"
+        );
+    }
+    if max_tier != "t2" {
+        assert!(!symbols.contains("torcl::cli::bytecode::compile_t2_artifact"));
+        assert!(
+            !symbols.contains("torcl_compiler::t2::"),
+            "T2 compiler remains linked"
+        );
+    }
+    if max_tier == "t0" {
+        assert!(
+            !symbols.contains("torcl::cli::bytecode::emit_native"),
+            "T1 emitter remains linked"
         );
     }
     println!("{report}");
@@ -1713,10 +1746,13 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         !symbols.contains("iced_x86::"),
         "disassembler remains linked"
     );
-    for tier in ["t0", "t1", "t2"] {
+    for tier in ["", "t0", "t1", "t2"] {
         let output = ok(Command::new(&exe)
             .arg("--no-init")
             .env("TORCL_FORCE_TIER", tier)
+            .env("TORCL_T2", "1")
+            .env("TORCL_T1_THRESHOLD", "1")
+            .env("TORCL_OSR_THRESHOLD", "1")
             .output()
             .unwrap());
         assert_eq!(output, "WALKER-FREE-OK\nARITY-OK\nUNDEFINED-OK\n", "{tier}");

@@ -3,16 +3,16 @@ mod runtime_contract;
 use runtime_contract::Contract;
 #[test]
 fn strict_contract_and_subset_validation() {
-    let full = Contract::parse("schema=2\nsource=abc\ntarget=x86_64-test\ntoolchain=rustc-test\nfeatures=thread-cache-alloc\nrustflags=\ncapabilities=disassembly\nbuiltins=*\n").unwrap();
+    let full = Contract::parse("schema=3\nsource=abc\ntarget=x86_64-test\ntoolchain=rustc-test\nfeatures=thread-cache-alloc\nrustflags=\ncapabilities=disassembly\nbuiltins=*\nmax-tier=t2\n").unwrap();
     let small = Contract::parse(
-        "schema=2\nsource=abc\ntarget=x86_64-test\ntoolchain=rustc-test\nfeatures=thread-cache-alloc\nrustflags=\ncapabilities=\nbuiltins=*\n",
+        "schema=3\nsource=abc\ntarget=x86_64-test\ntoolchain=rustc-test\nfeatures=thread-cache-alloc\nrustflags=\ncapabilities=\nbuiltins=*\nmax-tier=t2\n",
     )
     .unwrap();
     assert!(full.accepts(&small).is_ok());
     assert!(small.accepts(&full).is_err());
     assert_eq!(Contract::parse(&full.encode()).unwrap(), full);
     for bad in [
-        full.encode().replace("schema=2", "schema=99"),
+        full.encode().replace("schema=3", "schema=99"),
         full.encode() + "source=abc\n",
         full.encode().replace("disassembly", "unknown"),
     ] {
@@ -53,7 +53,7 @@ fn arbitrary_evaluation_closes_over_every_capability() {
         assert!(opens_code_world(name));
     }
     assert!(!opens_code_world("DISASSEMBLE"));
-    let bad = "schema=2\nsource=abc\ntarget=test\ntoolchain=test\nfeatures=\nrustflags=\ncapabilities=dynamic-code\nbuiltins=*\n";
+    let bad = "schema=3\nsource=abc\ntarget=test\ntoolchain=test\nfeatures=\nrustflags=\ncapabilities=dynamic-code\nbuiltins=*\nmax-tier=t2\n";
     assert!(Contract::parse(bad).is_err());
 }
 
