@@ -219,6 +219,12 @@ pub enum Opcode {
     Call,
     Guard,
     // Cat 5b — terminators
+    /// A transfer-capable call. Target 0 is normal completion; target 1 is
+    /// exceptional propagation. Result values may only be passed to target 0
+    /// as block arguments, never used on the exceptional edge or directly in
+    /// another instruction. Both edges participate in CFG/liveness analysis.
+    /// The frame state describes the pre-call state, not a replay permission.
+    Invoke,
     Jump,
     Brif,
     BrTable,
@@ -235,7 +241,7 @@ impl Opcode {
         use Opcode::*;
         matches!(
             self,
-            Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap
+            Invoke | Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap
         )
     }
 }
@@ -538,13 +544,22 @@ impl Function {
     pub fn push_inst(
         &mut self,
         block: Block,
-        mut data: InstData,
+        data: InstData,
         result_tys: &[(IRType, ValueRepresentation)],
     ) -> (Inst, Vec<Value>) {
         debug_assert!(
             !data.opcode.is_terminator(),
             "use set_terminator for terminators"
         );
+        self.append_inst(block, data, result_tys)
+    }
+
+    fn append_inst(
+        &mut self,
+        block: Block,
+        mut data: InstData,
+        result_tys: &[(IRType, ValueRepresentation)],
+    ) -> (Inst, Vec<Value>) {
         let inst = Inst(self.insts.len() as u32);
         let mut results = Vec::with_capacity(result_tys.len());
         for (num, &(ty, repr)) in result_tys.iter().enumerate() {
@@ -581,6 +596,27 @@ impl Function {
         self.insts.push(data);
         self.blocks[block.index()].insts.push(inst);
         inst
+    }
+
+    /// Finish a block with a result-producing terminator. Invoke results
+    /// are edge-local definitions; project them through normal block parameters.
+    pub fn set_terminator_with_results(
+        &mut self,
+        block: Block,
+        mut data: InstData,
+        result_tys: &[(IRType, ValueRepresentation)],
+    ) -> (Inst, Vec<Value>) {
+        assert_eq!(
+            data.opcode,
+            Opcode::Invoke,
+            "only Invoke defines edge results"
+        );
+        assert!(
+            !self.block_has_terminator(block),
+            "block already terminated"
+        );
+        data.flags.terminator = true;
+        self.append_inst(block, data, result_tys)
     }
 
     pub fn block_has_terminator(&self, block: Block) -> bool {
@@ -652,6 +688,65 @@ impl Function {
     /// Compute the dominator tree (spec §4.3.4; Cooper–Harvey–Kennedy).
     pub fn dominators(&self) -> DominatorTree {
         DominatorTree::compute(self)
+    }
+
+    /// Split an ordinary call into normal and exceptional continuations.
+    /// The exceptional arguments name values live before the call. Results are
+    /// projected into the new normal block, including in downstream frame states.
+    /// The caller supplies the selected cleanup/propagation block; this does not
+    /// infer Lisp handler ownership or permit native emission without unwind maps.
+    pub fn make_call_exceptional(
+        &mut self,
+        call: Inst,
+        exceptional: BlockCall,
+    ) -> Result<Block, &'static str> {
+        if !self.is_valid_inst(call) || !self.is_valid_block(exceptional.block) {
+            return Err("exceptional call or target is outside the function");
+        }
+        let (block, position) = self
+            .block_order
+            .iter()
+            .find_map(|&block| {
+                self.block(block)
+                    .insts
+                    .iter()
+                    .position(|&i| i == call)
+                    .map(|position| (block, position))
+            })
+            .ok_or("exceptional call is not in block layout")?;
+        let data = self.inst(call).clone();
+        if data.opcode != Opcode::Call
+            || data.frame_state.is_none()
+            || !matches!(data.aux, AuxData::CallTarget(_))
+            || !self.block_has_terminator(block)
+        {
+            return Err("exceptional conversion requires a mapped call in a finished block");
+        }
+        if exceptional.args.iter().any(|v| data.results.contains(v)) {
+            return Err("exceptional edge cannot use the call result");
+        }
+        let normal = self.make_block();
+        let suffix = self.block_mut(block).insts.split_off(position + 1);
+        self.block_mut(normal).insts = suffix;
+        for &result in &data.results {
+            let value = self.value(result).clone();
+            let parameter = self.add_block_param(normal, value.ty, value.repr);
+            self.replace_value_everywhere(result, parameter);
+        }
+        let invoke = self.inst_mut(call);
+        invoke.opcode = Opcode::Invoke;
+        invoke.flags.terminator = true;
+        invoke.flags.effectful = true;
+        invoke.flags.call = true;
+        invoke.flags.safepoint = true;
+        invoke.targets = vec![
+            BlockCall {
+                block: normal,
+                args: data.results,
+            },
+            exceptional,
+        ];
+        Ok(normal)
     }
 
     /// Replace one ordinary call with a cloned callee CFG. The caller block is
@@ -833,7 +928,37 @@ impl Function {
                     self.frame_states.add(FrameState { scopes, remat })
                 });
                 let args = old.args.iter().map(|v| value_map[v]).collect();
-                let targets = old
+                let data = InstData {
+                    opcode: old.opcode,
+                    args,
+                    results: vec![],
+                    aux: old.aux.clone(),
+                    flags: old.flags,
+                    targets: vec![],
+                    frame_state,
+                    source_pos: source_map[old.source_pos as usize].unwrap(),
+                };
+                let result_tys: Vec<_> = old
+                    .results
+                    .iter()
+                    .map(|&v| {
+                        let vd = callee.value(v);
+                        (vd.ty, vd.repr)
+                    })
+                    .collect();
+                let (new_inst, results) = if old.opcode == Opcode::Invoke {
+                    self.set_terminator_with_results(new_block, data, &result_tys)
+                } else if old.opcode.is_terminator() {
+                    (self.set_terminator(new_block, data), vec![])
+                } else {
+                    self.push_inst(new_block, data, &result_tys)
+                };
+                for (&old_value, &new_value) in old.results.iter().zip(&results) {
+                    value_map.insert(old_value, new_value);
+                }
+                // Invoke's own results can occur on its normal edge. Allocate
+                // and map them before translating successor arguments.
+                self.inst_mut(new_inst).targets = old
                     .targets
                     .iter()
                     .map(|target| BlockCall {
@@ -841,32 +966,6 @@ impl Function {
                         args: target.args.iter().map(|v| value_map[v]).collect(),
                     })
                     .collect();
-                let data = InstData {
-                    opcode: old.opcode,
-                    args,
-                    results: vec![],
-                    aux: old.aux.clone(),
-                    flags: old.flags,
-                    targets,
-                    frame_state,
-                    source_pos: source_map[old.source_pos as usize].unwrap(),
-                };
-                if old.opcode.is_terminator() {
-                    self.set_terminator(new_block, data);
-                } else {
-                    let result_tys: Vec<_> = old
-                        .results
-                        .iter()
-                        .map(|&v| {
-                            let vd = callee.value(v);
-                            (vd.ty, vd.repr)
-                        })
-                        .collect();
-                    let (_, results) = self.push_inst(new_block, data, &result_tys);
-                    for (&old_value, &new_value) in old.results.iter().zip(&results) {
-                        value_map.insert(old_value, new_value);
-                    }
-                }
             }
         }
 

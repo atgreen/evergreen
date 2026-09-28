@@ -620,7 +620,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         Guard => lo.emit_annotated(inst, op::GUARD, defs, uses),
 
         // Terminators are handled elsewhere; reaching here is a bug.
-        Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap => {
+        Invoke | Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap => {
             lo.emit_for(inst, op::PSEUDO_UNSUPPORTED, defs, uses);
         }
     }

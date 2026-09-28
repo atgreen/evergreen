@@ -352,3 +352,19 @@ Compiler work decomposition under `bliss-shih7.11`:
 
 The CFG contract follows the baseline contract. T2 pass integration and T1
 emission follow the CFG contract; the parent completes only after all three gates.
+
+### Exceptional call IR foundation
+
+`Opcode::Invoke` now describes distinct normal and exceptional CFG edges. Its
+results are available only as arguments to its own normal edge; all downstream
+uses name normal block parameters. `Function::make_call_exceptional` converts a
+bytecode-built Call by splitting its block and rewriting downstream value/frame
+state references. The verifier checks call effects, edge shape, pre-call frame
+state and result availability. DCE keeps exceptional-only operands; inlining
+maps result definitions before successor arguments.
+
+This is compiler infrastructure, not activation of the native transfer ABI.
+The ordinary builder still emits Call. Scope ownership analysis, automatic
+exception-edge construction, pass-wide integration, machine landing pads and
+unwind maps remain required. Lowering marks Invoke as unsupported until those
+machine contracts are implemented, preventing accidental ordinary-call emission.
