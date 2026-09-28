@@ -784,6 +784,35 @@ unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: Torc
     // Capacity was reserved before native entry; no continuation-stack growth
     // occurs inside the helper. Nested function entries own separate stacks.
     assert!(cleanups.len() < cleanups.capacity());
+    // Do not use `Vec::clone` after native entry. Its infallible allocation
+    // could abort before the storage-condition route gets a chance to run.
+    // Reserve first, then copy into the exact capacity; a failed reserve is
+    // reported through the execution-local error slot and the generated
+    // helper chain will leave native code on its next transfer boundary.
+    let values = if env.mv_active {
+        let mut values = Vec::new();
+        if values.try_reserve(env.mv.len()).is_err() {
+            // Install a resumable propagation continuation instead of leaving
+            // `complete_cleanup` with no saved record. The completion helper
+            // will return through the normal transfer machinery, which turns
+            // this pending OOM into the preallocated storage-condition path.
+            cleanups.push(SavedCleanup {
+                cleanup_bcp,
+                continuation: CleanupCont {
+                    handler_depth: depths[&cleanup_bcp],
+                    action: CleanupAction::Resume {
+                        pending: Pending::Propagate(TorclError::Oom),
+                        payload: ControlPayload::default(),
+                    },
+                },
+            });
+            return NIL;
+        }
+        values.extend_from_slice(&env.mv);
+        Some(values)
+    } else {
+        None
+    };
     cleanups.push(SavedCleanup {
         cleanup_bcp,
         continuation: CleanupCont {
@@ -791,7 +820,7 @@ unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: Torc
             action: CleanupAction::Normal {
                 resume_bcp,
                 value,
-                values: env.mv_active.then(|| env.mv.clone()),
+                values,
             },
         },
     });

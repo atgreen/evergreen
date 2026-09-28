@@ -565,8 +565,10 @@ shapes, forced moving GC during cleanup, and a replacement THROW crossing two
 running cleanup continuations before executing the outer cleanup once. The
 helper calls use the normal call-frame, clobber and shadow-root conventions;
 they add no generated caller status test. These helpers do not execute Lisp,
-yield, signal or collect. Copying multiple values still uses Rust allocation;
-the emergency allocation-failure contract remains an ABI installation gate.
+yield, signal or collect. Multiple-value snapshots use a fallible reserve-and-
+copy and turn reservation failure into a resumable propagation continuation;
+the remaining dynamic handler/restart record allocations are still an ABI
+installation gate.
 Before native entry, the transfer path now reserves the execution-local
 control-value map for the statically possible primary, multiple-value and
 restart-argument records. Payload extraction finds existing secondary and
