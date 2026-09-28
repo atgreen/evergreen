@@ -179,43 +179,46 @@ allocates — makes the program compute a quietly wrong answer with no
 segfault at all. Diff the program's *output* against a non-stress run;
 don't wait for a crash.
 
-**A SMALL PROBE UNDER STRESS PROVES LESS THAN IT LOOKS — measured, bliss-c0diw.**
-The rooting was deliberately REMOVED from the LAMBDA-application site whose bug
-was once deterministic (bliss-98mu), and probes then gave identical CORRECT
-answers with and without it, under `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`, both
-for a small inline lambda and for eight levels of nested quasiquoted lambda
-applications. Collections definitely fired — `TORCL_GC_STRESS_AT=100` and `=5000`
-both reported forcing one. So the detector missed a known-real violation.
+**A CLEAN STRESS RUN CAN MEAN "NOTHING MOVED", NOT "NOTHING IS WRONG" — measured,
+bliss-c0diw / bliss-ahnzt.** Stress plus poison catches a stale pointer to an object
+the collector MOVED. If the object never moves, there is nothing to catch, and a
+probe over it cannot fail however many collections fire.
 
-The miss is confirmed, not inferred: an `eprintln!` in the un-rooted arm showed it
-running 9 times during the probe, so the code really was exercised.
+That is not hypothetical. The rooting was deliberately REMOVED from the
+LAMBDA-application site whose bug was once deterministic (bliss-98mu), and probes
+still gave identical correct answers — at strides 1, 5, 25, 100 and 500, with poison
+on, across ~50,000 forced collections, with the un-rooted arm confirmed to run. The
+reason, measured last: **those objects were never relocated at all.**
 
-**The cause is still unknown, and two plausible explanations have been MEASURED AND
-RULED OUT** — recorded so nobody re-derives them:
+**So before concluding anything from a clean stress run, check that the value you care
+about actually moves.** Six lines, and it answers the only question that matters:
 
-- *Not* in-place region retention. `minor_gc` does retain a nursery region whole,
-  promoting it without relocating or poisoning it, when anything in it is pinned
-  (bliss-jtc.18) — which would make an unrooted pointer into it stay valid. But
-  `TORCL_GC_REGION_LOG=1` reports `retained 0 evacuated 1` on essentially all 50,150
-  collections of that probe. Regions are being evacuated.
-- *Not* stride sensitivity. `TORCL_GC_STRESS` at 1, 5, 25, 100 and 500 all give the
-  same correct answer, so it is not that stride-1 promotes everything out of the
-  nursery before it can be seen moving.
+```rust
+let unrooted = value;                 // a plain copy the collector cannot see
+torcl_rt::rooted_ref!(_r = &mut value);
+… the allocating call under test …
+assert_eq!(value, unrooted, "it moved");   // or eprintln! the two addresses
+```
 
-The leading remaining candidate is that these particular objects are already in
-old-gen by the time they are used, so nothing relocates *them* even though a region
-is reclaimed each collection. Unverified.
+If the rooted copy differs afterwards, the object moved and the probe is live — an
+unrooted copy would now be stale. If it does not differ, the probe proves nothing yet
+and needs a shape where relocation really happens (bliss-98mu needed a real library
+compile, not a hand-written form).
 
-One further trap, independent of all that: **a loaded `defun`'s body is the wrong
-place to probe.** It has survived several collections and been promoted out of the
-nursery, so those conses no longer move at all. Build the form at runtime
-(`read-from-string` + `eval`) if you need it in the nursery — though as above, that
-still is not sufficient.
+Two supporting facts, both measured, so they need not be re-derived:
 
-So treat a clean stress run as *failing to find* a bug, not as evidence there is
-none. Where it matters, add the A/B: remove the root, confirm the probe FAILS,
-put it back. A probe that cannot fail is not testing anything — and no "proved it
-under GC stress" claim is worth more than a probe that was checked this way.
+- `TORCL_GC_REGION_LOG=1` reports each minor collection's retained/evacuated nursery
+  split. A region containing anything pinned is retained IN PLACE — promoted without
+  being relocated or poisoned (bliss-jtc.18) — so nothing in it moves. Worth checking,
+  though it was NOT the explanation above: that probe logged `retained 0 evacuated 1`
+  throughout.
+- **A loaded `defun`'s body is the wrong place to probe.** It has survived several
+  collections and been promoted out of the nursery, so those conses no longer move.
+  Building the form at runtime (`read-from-string` + `eval`) puts it in the nursery,
+  but as above that alone is still not sufficient.
+
+`TORCL_GC_STRESS` also parses its value as an integer and silently DISABLES itself on
+anything unparseable, so `TORCL_GC_STRESS=true` is a no-op. Use `=1`.
 
 ## The debug torcl used to be ~9x slower after `cargo build` (FIXED)
 
