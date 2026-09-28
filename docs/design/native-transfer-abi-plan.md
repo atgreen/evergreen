@@ -566,9 +566,18 @@ helper calls use the normal call-frame, clobber and shadow-root conventions;
 they add no generated caller status test. These helpers do not execute Lisp,
 yield, signal or collect. Copying multiple values still uses Rust allocation;
 the emergency allocation-failure contract remains an ABI installation gate.
-Native **exceptional** cleanup destinations, fiber suspension validation and
-ordinary tier installation remain outstanding: exceptional entry into an outer
-cleanup in these tests still uses the bytecode fallback.
+A real-fiber gate also runs native cleanup on one and four carrier threads,
+observes at least two cleanup continuations suspended together, and collects
+from outside their stacks. On resumption, distinct per-fiber answers, multiple
+values, replacement THROW tokens, stack watermarks and native nesting depth must
+remain correct. It additionally forces collection within each resumed cleanup
+and verifies actual address relocation. This gate passes repeated stress/poison
+runs; it does not assert carrier migration and does not replace the wider
+fiber/foreign-boundary gates.
+
+Native **exceptional** cleanup destinations and ordinary tier installation
+remain outstanding: exceptional entry into an outer cleanup in these tests still
+uses the bytecode fallback.
 
 ### Windows validation and Wine limits
 

@@ -5,6 +5,7 @@ use torcl_rt::{Collector, HeapCollector};
 mod compiled;
 mod cleanup_ir;
 mod fallback;
+mod fibers;
 
 struct NativeEnvGuard(*mut Env);
 impl NativeEnvGuard {
