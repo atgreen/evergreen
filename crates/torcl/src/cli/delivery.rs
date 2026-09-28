@@ -163,12 +163,24 @@ fn bytecode_references_with_params(
 }
 
 struct Plan {
+    unreachable_source_closures: Vec<u64>,
     unreachable_closures: Vec<u32>,
     capability_roots: std::collections::BTreeSet<String>,
     walker_roots: std::collections::BTreeSet<String>,
     capabilities: std::collections::BTreeSet<String>,
     candidates: BTreeMap<u32, String>,
     retained: BTreeMap<u32, String>,
+}
+
+// The ordinary evaluator scanner roots the source closure registry during GC.
+// Delivery replaces that scanner with ownership edges, so its temporary Env
+// root must not independently root the whole registry again.
+struct DeliveryEnvironment<'a>(&'a mut Env);
+
+impl torcl_rt::gc::TraceHostRoots for DeliveryEnvironment<'_> {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        self.0.visit_delivery_roots(visit);
+    }
 }
 
 fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan, TorclError> {
@@ -204,11 +216,18 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 &[
                     bytecode::delivery_root_scanner(),
                     torcl_stdlib::hashtable::delivery_root_scanner(),
+                    scan_evaluator_global_roots,
                 ],
-                &mut |slot| roots.push(*slot),
+                &mut |slot| roots.push((*slot, "runtime host registry")),
             );
         }
-        env.visit_gc_roots(&mut |slot| roots.push(unsafe { *slot }));
+        scan_evaluator_roots(
+            &mut |slot| roots.push((unsafe { *slot }, "evaluator registry")),
+            false,
+        );
+        env.visit_delivery_roots(&mut |slot| {
+            roots.push((unsafe { *slot }, "delivery environment"))
+        });
         let edges = bytecode::delivery_dependencies();
         let compiled = if spec.specialized {
             bytecode::delivery_walker_dependencies()
@@ -253,12 +272,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 ));
             }
         }
-        for value in roots {
-            queue.push_back((
-                value,
-                "persistent data or runtime registry".to_owned(),
-                false,
-            ));
+        for (value, reason) in roots {
+            queue.push_back((value, reason.to_owned(), false));
         }
         for value in exposed_roots {
             queue.push_back((
@@ -290,6 +305,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         }
         let mut retained = BTreeMap::new();
         let mut visited = HashSet::new();
+        let mut reached_source_closures = HashSet::new();
         // Runtime metadata (e.g. a class named VECTOR) is not itself a call
         // to that builtin. Values also exposed through code, Lisp globals or
         // captures must be revisited in that role, regardless of visit order.
@@ -305,6 +321,25 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 continue;
             }
             visited.insert(value.0);
+            if is_closure_cons(value) {
+                let id = cp(value).1.as_fixnum() as u64;
+                if reached_source_closures.insert(id) {
+                    if let Some(closure) = closure_registry().borrow().get(&id) {
+                        queue.push_back((closure.params_form, reason.clone(), false));
+                        queue.push_back((closure.body, reason.clone(), true));
+                        let mut state = EnvRootVisitState::default();
+                        let mut visit = |slot: *mut TorclVal| {
+                            // SAFETY: registry-owned slots stay live throughout
+                            // this stopped-world, nonallocating analysis.
+                            queue.push_back((unsafe { *slot }, reason.clone(), true));
+                        };
+                        visit_env_frame_roots(&closure.captured_frame, &mut state, &mut visit);
+                        if let Some(funs) = &closure.captured_funs {
+                            visit_fun_map_roots(funs, &mut state, &mut visit);
+                        }
+                    }
+                }
+            }
             if spec.specialized {
                 if torcl_rt::function::is_interpreted_function(value) {
                     let name = torcl_rt::function::name(value);
@@ -455,7 +490,15 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             })
             .collect();
         unreachable_closures.sort_unstable();
+        let mut unreachable_source_closures: Vec<_> = closure_registry()
+            .borrow()
+            .keys()
+            .filter(|id| !reached_source_closures.contains(id))
+            .copied()
+            .collect();
+        unreachable_source_closures.sort_unstable();
         Plan {
+            unreachable_source_closures,
             unreachable_closures,
             capability_roots,
             walker_roots,
@@ -507,7 +550,9 @@ fn builtin_without_source_evaluation(name: &str) -> bool {
 }
 
 pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
-    torcl_rt::rooted_ref!(_env_root = env);
+    let mut delivery_env = DeliveryEnvironment(env);
+    torcl_rt::rooted_ref!(_env_root = &mut delivery_env);
+    let env = &mut *delivery_env.0;
     let input = Path::new(args.image.as_ref().unwrap());
     let spec_path = Path::new(args.deliver.as_ref().unwrap());
     let output = Path::new(args.output.as_ref().unwrap());
@@ -601,6 +646,10 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         "private-code-removed = {}\n",
         plan.unreachable_closures.len()
     ));
+    report.push_str(&format!(
+        "source-closures-removed = {}\n",
+        plan.unreachable_source_closures.len()
+    ));
     for package in &spec.packages {
         report.push_str(&format!("prune-package = {package}\n"));
     }
@@ -648,6 +697,9 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     }
     for &symbol in &plan.unreachable_closures {
         bytecode::remove_delivery_closure(symbol);
+    }
+    for id in &plan.unreachable_source_closures {
+        closure_registry().borrow_mut().remove(id);
     }
     native_runtime::with_save_contract(&selected, || {
         save_core(

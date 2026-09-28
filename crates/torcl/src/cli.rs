@@ -7426,6 +7426,12 @@ fn register_frozen_macro_capture(
 }
 
 fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    scan_evaluator_roots(visit, true);
+}
+
+// Delivery follows source closure ownership from reachable handles. Ordinary
+// GC must continue scanning every registry entry until delivery removes it.
+fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_closures: bool) {
     // SAFETY: registered root scanners run with all mutators stopped.
     unsafe {
         CONTROL_VALUES.scan(|values| {
@@ -7461,12 +7467,14 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
                 visit_method_def_roots(method, state, visit);
             }
         }
-        for closure in closure_registry().borrow_mut().values_mut() {
-            visit(&mut closure.params_form);
-            visit(&mut closure.body);
-            visit_env_frame_roots(&closure.captured_frame, state, visit);
-            if let Some(funs) = &closure.captured_funs {
-                visit_fun_map_roots(funs, state, visit);
+        if root_closures {
+            for closure in closure_registry().borrow_mut().values_mut() {
+                visit(&mut closure.params_form);
+                visit(&mut closure.body);
+                visit_env_frame_roots(&closure.captured_frame, state, visit);
+                if let Some(funs) = &closure.captured_funs {
+                    visit_fun_map_roots(funs, state, visit);
+                }
             }
         }
         // Keep each method's compiled body object live (bliss-x5y.20).
@@ -7662,6 +7670,19 @@ impl Env {
         state: &mut EnvRootVisitState,
         visit: &mut dyn FnMut(*mut TorclVal),
     ) {
+        self.visit_roots_with(state, visit, true);
+    }
+
+    fn visit_delivery_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        with_env_visit_state(|state| self.visit_roots_with(state, visit, false));
+    }
+
+    fn visit_roots_with(
+        &mut self,
+        state: &mut EnvRootVisitState,
+        visit: &mut dyn FnMut(*mut TorclVal),
+        root_closures: bool,
+    ) {
         visit_env_frame_roots(&self.frame, state, visit);
 
         visit_fun_map_roots(&self.funs, state, visit);
@@ -7702,15 +7723,17 @@ impl Env {
         for specifier in &mut self.active_declarations {
             visit(specifier);
         }
-        for closure in self.closures.borrow_mut().values_mut() {
-            visit(&mut closure.params_form);
-            visit(&mut closure.body);
-            visit_env_frame_roots(&closure.captured_frame, state, visit);
-            // The captured namespace holds FunDefs whose lambda lists and bodies
-            // are heap cons trees; unvisited they would go stale under the moving
-            // collector (bliss-5q20).
-            if let Some(funs) = &closure.captured_funs {
-                visit_fun_map_roots(funs, state, visit);
+        if root_closures {
+            for closure in self.closures.borrow_mut().values_mut() {
+                visit(&mut closure.params_form);
+                visit(&mut closure.body);
+                visit_env_frame_roots(&closure.captured_frame, state, visit);
+                // The captured namespace holds FunDefs whose lambda lists and bodies
+                // are heap cons trees; unvisited they would go stale under the moving
+                // collector (bliss-5q20).
+                if let Some(funs) = &closure.captured_funs {
+                    visit_fun_map_roots(funs, state, visit);
+                }
             }
         }
         for context in &mut self.method_context {

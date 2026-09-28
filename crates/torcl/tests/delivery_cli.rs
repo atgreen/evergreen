@@ -258,6 +258,90 @@ fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
 }
 
 #[test]
+fn delivery_traces_source_closures_only_from_reachable_handles() {
+    let f = Fixture::new();
+    let core = f.path("source-closures.core");
+    let spec = f.path("source-closures.delivery");
+    let exe = f.path("source-closures");
+    let program = format!(
+        r#"
+        (defpackage :source-closure-shake (:use :cl))
+        (in-package :source-closure-shake)
+        (defun live-target () 42)
+        (defun dead-target () :dead)
+        (eval (list 'defun 'unused nil
+                    (list 'quote
+                          (let ((target 'dead-target)
+                                (payload (make-string 200000 :initial-element #\x)))
+                            (lambda () (list payload (funcall target)))))))
+        (let ((target 'live-target) (count 0))
+          (set '*saved* (lambda () (setq count (1+ count)) (funcall target)))
+          (set '*sibling* (lambda () count)))
+        (set '*alias* *saved*)
+        (defun main ()
+          (write-line (if (and (= 42 (funcall *saved*))
+                               (= 1 (funcall *sibling*))
+                               (eq *saved* *alias*))
+                          "SOURCE-CLOSURE-OK" "WRONG")))
+        (save-lisp-and-die {core:?})
+        "#
+    );
+    ok(Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--eval", &program])
+        .env("TORCL_BACKEND", "tree-walker")
+        .env("TORCL_LAZY_COMPILE", "0")
+        .output()
+        .unwrap());
+    fs::write(&spec, "version = 1\nentry = SOURCE-CLOSURE-SHAKE::MAIN\nprune-package = SOURCE-CLOSURE-SHAKE\ndynamic = explicit\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(
+        report.contains("remove SOURCE-CLOSURE-SHAKE::UNUSED"),
+        "{report}"
+    );
+    assert!(
+        report.contains("remove SOURCE-CLOSURE-SHAKE::DEAD-TARGET"),
+        "{report}"
+    );
+    assert!(
+        report.contains("keep SOURCE-CLOSURE-SHAKE::LIVE-TARGET"),
+        "{report}"
+    );
+    assert!(ok(run(&exe, &[])).contains("SOURCE-CLOSURE-OK"));
+    let removed: usize = report
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("source-closures-removed = ")
+                .map(|n| n.parse().unwrap())
+        })
+        .unwrap();
+    assert!(removed > 0, "{report}");
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    assert!(
+        fs::metadata(&core).unwrap().len() > size as u64 + 100000,
+        "unreachable captured payload must leave the compacted image"
+    );
+    let reduced = f.path("reduced.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(again.contains("source-closures-removed = 0\n"), "{again}");
+}
+
+#[test]
 fn delivery_prunes_unreachable_functions_and_keeps_data_and_explicit_roots() {
     let f = Fixture::new();
     let image = f.path("input.core");
