@@ -275,4 +275,60 @@ mod tests {
         assert_eq!(*recovered, *datum);
         assert_eq!(val_as_str(*recovered), "wrong datum");
     }
+    #[test]
+    fn raw_handler_error_reaches_only_older_clusters() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env = &mut env);
+        read_eval_all_env(
+            "(setq *raw-inner* 0 *raw-outer* 0)
+             (defun raw-inner (c)
+               (setq *raw-inner* (+ *raw-inner* 1))
+               (%force-minor-gc-for-test)
+               (symbol-value 27))
+             (defun raw-outer (c)
+               (setq *raw-outer* (+ *raw-outer* 1))
+               (setq *raw-datum* (slot-value c 'datum))
+               (%force-minor-gc-for-test))",
+            &mut env,
+        )
+        .unwrap();
+        for name in ["RAW-OUTER", "RAW-INNER"] {
+            env.handlers.push(HandlerCluster {
+                entries: vec![HandlerEntry {
+                    type_name: "TYPE-ERROR".into(),
+                    handler: HandlerImpl::Function(resolve_sym(name).unwrap()),
+                }],
+            });
+        }
+        torcl_rt::rooted!(
+            error = signal_raw_error_in_context(
+                &mut env,
+                TorclError::TypeError {
+                    datum: TorclVal::from_fixnum(19),
+                    expected: "SYMBOL".into(),
+                }
+            )
+        );
+        assert!(
+            matches!(&*error, TorclError::Signalled { .. }),
+            "{:?}",
+            &*error
+        );
+        assert_eq!(env.handlers.len(), 2);
+        assert_eq!(
+            env.lookup_var("*RAW-INNER*"),
+            Some(TorclVal::from_fixnum(1))
+        );
+        assert_eq!(
+            env.lookup_var("*RAW-OUTER*"),
+            Some(TorclVal::from_fixnum(1))
+        );
+        assert_eq!(
+            env.lookup_var("*RAW-DATUM*"),
+            Some(TorclVal::from_fixnum(27))
+        );
+    }
 }

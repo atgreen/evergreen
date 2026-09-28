@@ -4650,12 +4650,23 @@ fn run_handler_cluster(env: &mut Env, condition: TorclVal, ci: usize) -> Result<
     if ci >= env.handlers.len() {
         return Ok(());
     }
-    let cluster = env.handlers[ci].clone();
-    for entry in &cluster.entries {
-        if condition_matches_handler(env, condition, &entry.type_name) {
-            let tail = env.handlers.split_off(ci);
-            let result = eval_handler_impl(&entry.handler, condition, env);
-            env.handlers.extend(tail);
+    torcl_rt::rooted!(condition = condition);
+    torcl_rt::rooted!(entries = env.handlers[ci].entries.clone());
+    for entry in entries.iter() {
+        if condition_matches_handler(env, *condition, &entry.type_name) {
+            let mut tail = env.handlers.split_off(ci);
+            torcl_rt::rooted_ref!(_tail = &mut tail);
+            // A raw evaluator error from the callback is a fresh signal in
+            // that callback's dynamic context. Keep this cluster hidden until
+            // older handlers have had their turn; restoring it first can call
+            // the same handler again while skipping the older ones.
+            let result = match eval_handler_impl(&entry.handler, *condition, env) {
+                Err(error) if !matches!(error, TorclError::Internal(_) | TorclError::Signalled { .. }) => {
+                    Err(signal_raw_error_in_context(env, error))
+                }
+                other => other,
+            };
+            env.handlers.append(&mut tail);
             result?;
         }
     }
@@ -7328,6 +7339,12 @@ fn visit_handler_roots(
 /// Let `rooted!`/`rooted_ref!` cover evaluator temporaries that hold heap forms
 /// in Rust-side containers across allocating evaluation (moving GC; bliss-8qf):
 /// handler clauses (HANDLER-CASE/HANDLER-BIND) and method specializers.
+impl torcl_rt::gc::TraceHostRoots for HandlerCluster {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        torcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.entries, visit);
+    }
+}
+
 impl torcl_rt::gc::TraceHostRoots for HandlerEntry {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         with_env_visit_state(|state| visit_handler_roots(&mut self.handler, state, visit));

@@ -781,6 +781,12 @@ The live-signaling regression requires a returning handler to run exactly once,
 before cleanup, and preserves the condition or restart arguments through moving
 GC. The outer handler/restart registration remains installed for its owner to
 consume; this does not provide native local restart registration or landing.
+The consumer test invokes the retained restart body after removing its bindings,
+checks that cleanup has finished, and preserves multiple values through another
+collection. A replacement-error regression also verifies that raw errors raised
+by a handler are signaled while its cluster is hidden: only older clusters see
+the new error. Shared signaling roots the condition, copied entries and hidden
+cluster tail throughout callbacks and nested signaling.
 
 This remains opt-in infrastructure. HANDLER-BIND/restart registration, inherited
 OSR scope admission, emergency allocation and production ABI installation still
