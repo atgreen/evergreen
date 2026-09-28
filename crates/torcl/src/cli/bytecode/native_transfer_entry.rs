@@ -182,6 +182,32 @@ impl TransferCode {
             .saturating_mul(4)
             .saturating_add(4);
         reserve_control_values(reserve).map_err(|_| TorclError::Oom)?;
+        // Registration helpers push into the live Env as well as the private
+        // activation records. Reserve those tails while ordinary Rust error
+        // reporting is still available; no helper entered from generated code
+        // may discover a Vec growth allocation halfway through a transfer.
+        env.handlers
+            .try_reserve(
+                self.body
+                    .handler_cases
+                    .len()
+                    .saturating_add(self.body.handler_binds.len()),
+            )
+            .map_err(|_| TorclError::Oom)?;
+        env.restarts
+            .try_reserve(self.body.restart_cases.iter().fold(0usize, |total, info| {
+                total.saturating_add(info.restarts.len())
+            }))
+            .map_err(|_| TorclError::Oom)?;
+        env.catch_stack
+            .try_reserve(
+                self.body
+                    .code
+                    .iter()
+                    .filter(|instruction| matches!(instruction, Instr::PushCatch { .. }))
+                    .count(),
+            )
+            .map_err(|_| TorclError::Oom)?;
         NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
         let _depth = NativeDepthGuard;
         // Every snapshot is reserved and rooted before machine entry. Cold
