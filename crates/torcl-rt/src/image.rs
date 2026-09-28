@@ -431,6 +431,20 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, TorclError> {
 ///
 /// Per R7.20 the write is atomic: we write to a temp file then rename.
 pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclError> {
+    save_image_impl(path, options, false)
+}
+
+/// Save an application-delivery image, omitting unreachable objects even when
+/// restored-world pinning prevents the collector from reclaiming their regions.
+pub fn save_reachable_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclError> {
+    crate::gc::with_heap_snapshot(|| save_image_impl(path, options, true))?
+}
+
+fn save_image_impl(
+    path: &str,
+    options: &SaveImageOptions,
+    reachable_only: bool,
+) -> Result<(), TorclError> {
     use std::io::Write;
 
     let use_compression = options.compression == ImageCompression::Zstd;
@@ -452,7 +466,13 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
 
     // Build the heap section: first 8 bytes are the entry continuation,
     // followed by serialised heap objects from gc::serialize_heap_objects().
-    let serialized_objects = crate::gc::serialize_heap_objects();
+    let serialized_objects = if reachable_only {
+        // SAFETY: save_reachable_image holds the stopped-world snapshot for
+        // this entire save; serialization performs no Lisp allocations.
+        unsafe { crate::gc::serialize_reachable_heap_objects()? }
+    } else {
+        crate::gc::serialize_heap_objects()
+    };
     let mut heap_data_raw: Vec<u8> = Vec::new();
     heap_data_raw.extend_from_slice(&entry_val.to_raw().to_ne_bytes());
     heap_data_raw.extend_from_slice(&serialized_objects);

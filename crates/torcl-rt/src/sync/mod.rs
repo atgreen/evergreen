@@ -8,10 +8,12 @@ mod condvar;
 mod io;
 mod mutex;
 mod semaphore;
+#[cfg(windows)]
+mod socket_windows;
 mod timer;
 
 pub use condvar::TorclCondVar;
-pub use io::{IoInterest, wait_fd};
+pub use io::{IoInterest, wait_fd, wait_socket};
 pub use mutex::TorclMutex;
 pub use semaphore::TorclSemaphore;
 

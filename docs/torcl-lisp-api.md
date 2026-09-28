@@ -535,6 +535,12 @@ one. Carriers are ordinary visible `TORCL-THREAD` objects.
 These operations park an unpinned fiber without blocking its carrier. Timer
 and wake generations prevent an expired earlier wait from waking a later one.
 
+Established TCP stream reads, writes/flushes, and `%SOCKET-WAIT-FOR-INPUT`
+also park on socket readiness. They use shared epoll/kqueue services on Unix
+and one shared Winsock poller on Windows, preserving synchronous Lisp stream
+calls and receive timeouts. Connect, accept, DNS, regular file I/O, and terminal
+I/O are not yet cooperative. See [socket I/O limitations](manual/fibers.md#socket-io).
+
 ### Pinning
 
 ```lisp

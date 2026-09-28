@@ -91,6 +91,26 @@ returns two values, `nil nil`; use the state/result accessors when the entry's
 own values could be ambiguous. `fiber-park` reevaluates its predicate between
 cooperative waits and returns true when it succeeds, or false at the timeout.
 
+## Socket I/O { #socket-io }
+
+Established TCP streams keep the usual synchronous Lisp interface: `read-byte`,
+`read-char`, writes, and output flushing park an unpinned fiber when the socket
+would block. Another fiber can run on that carrier until the socket is ready.
+`torcl::%socket-wait-for-input` also parks; a zero timeout only checks readiness.
+Receive timeouts still apply, and EOF retains the normal stream behavior.
+
+Linux/Android use the shared epoll service, BSD/macOS use kqueue, and Windows
+uses one shared Winsock polling thread. Waiting on a socket does not create a
+thread per fiber. Windows polls active socket sets in slices of up to 10 ms.
+Pinned waits follow `*pinned-blocking-action*` and may occupy the carrier.
+
+Connection setup is not yet cooperative: hostname lookup, connect, and accept
+can block a carrier. Regular file and terminal I/O are also outside this socket
+support. Stream operations retain exclusive ownership while waiting, so reads
+and writes on the same stream are serialized; closing that stream from another
+fiber does not interrupt an in-progress read. An explicit readiness wait releases
+stream ownership and can be woken by close.
+
 ## Lisp pinning { #pinning }
 
 **Functions, macro, and variable**

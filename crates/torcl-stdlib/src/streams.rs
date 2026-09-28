@@ -2751,7 +2751,7 @@ pub fn socket_connect(
         TcpStream::connect((host, port))
     }
     .map_err(|e| TorclError::FileError(format!("socket-connect {host}:{port}: {e}")))?;
-    Ok(socket_stream(connected))
+    socket_stream(connected)
 }
 
 /// Accept a connection on listener `id`, returning a bidirectional octet
@@ -2767,14 +2767,15 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
             .map(|(s, _)| s)
             .map_err(|e| TorclError::FileError(format!("socket-accept: {e}")))
     })?;
-    Ok(socket_stream(stream))
+    socket_stream(stream)
 }
 
 /// Transfer the owned socket to the common stream/finalizer machinery.
-fn socket_stream(stream: TcpStream) -> TorclVal {
+fn socket_stream(stream: TcpStream) -> Result<TorclVal, TorclError> {
     let _ = stream.set_nodelay(true);
-    let file = StreamHandle::Socket(stream);
-    alloc_stream(
+    let file = StreamHandle::socket(stream)
+        .map_err(|e| TorclError::StreamError(format!("socket setup: {e}")))?;
+    Ok(alloc_stream(
         StreamElementType::UnsignedByte8,
         StreamInner::FileIo {
             file,
@@ -2788,7 +2789,7 @@ fn socket_stream(stream: TcpStream) -> TorclVal {
             external_format: ExternalFormat::Utf8,
         },
         vec![],
-    )
+    ))
 }
 
 // Transfer ownership through the platform's safe owned-handle conversion.

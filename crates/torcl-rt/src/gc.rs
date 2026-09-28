@@ -3113,6 +3113,62 @@ fn scan_external_roots(mut visit: impl FnMut(*mut TorclVal)) {
     }
 }
 
+/// Inspect host roots for application delivery, replacing registry scanners
+/// with the caller's semantic dependency graph.
+///
+/// # Safety
+/// Call only inside `with_heap_snapshot`, without allocating Lisp objects.
+/// `excluded` must be covered by the delivery analyzer (including captures).
+/// The callback must not mutate slots or let unrooted values escape the snapshot.
+pub unsafe fn visit_delivery_host_roots(
+    excluded: &[RootScanner],
+    visit: &mut dyn FnMut(*mut TorclVal),
+) {
+    advance_root_scan_pass();
+    let scanners = root_scanners().lock().unwrap().clone();
+    for scanner in scanners {
+        if !excluded
+            .iter()
+            .any(|&skip| scanner as usize == skip as usize)
+        {
+            scanner(visit);
+        }
+    }
+}
+
+/// Inspect a live object's reference fields using the same layouts as the GC.
+/// Symbol/package identity does not imply retention of all their definitions;
+/// delivery handles symbol cells separately.
+///
+/// # Safety
+/// `value` must be live, and the call must be inside `with_heap_snapshot`.
+/// The callback must neither allocate Lisp objects nor mutate reference slots.
+pub unsafe fn visit_delivery_references(value: TorclVal, visit: &mut dyn FnMut(TorclVal)) {
+    if !is_heap_ref(value) {
+        return;
+    }
+    let value = resolve_forwarded(value);
+    let address = ref_body_addr(value);
+    let base = HEAP_RANGE_BASE.load(Ordering::Relaxed);
+    let end = HEAP_RANGE_END.load(Ordering::Relaxed);
+    // Native entry points and pinned objects outside the managed heap also
+    // carry pointer tags. The GC does not interpret their bytes as headers.
+    if base == 0 || address < base + OBJECT_HEADER_SIZE || address >= end {
+        return;
+    }
+    let header = (address - OBJECT_HEADER_SIZE) as *const u8;
+    // SAFETY: the caller provides a live object under a stopped-world snapshot.
+    let (kind, size) = unsafe { read_object_header(header) };
+    if matches!(
+        kind,
+        crate::object::type_id::SYMBOL | crate::object::type_id::PACKAGE
+    ) {
+        return;
+    }
+    let body = unsafe { header.add(body_offset(header)) };
+    unsafe { trace_object(body as *mut u8, kind, size as usize, |slot| visit(*slot)) };
+}
+
 // ── Host-container / in-place stack roots (bliss-6b2 #2) ───────────────────
 //
 // `StackRoot` registers the *address of an existing Rust local* `TorclVal` slot
@@ -5702,6 +5758,14 @@ pub fn walk_heap<F>(mut callback: F) -> Result<(), TorclError>
 where
     F: FnMut(*const u8, u8, usize) -> bool,
 {
+    walk_heap_records(|ptr, kind, size, _| callback(ptr, kind, size))
+}
+
+// Also expose header+8 identity internally: large objects have a 16-byte
+// payload offset, while tagged references still identify them by header+8.
+fn walk_heap_records(
+    mut callback: impl FnMut(*const u8, u8, usize, usize) -> bool,
+) -> Result<(), TorclError> {
     let guard = heap_state().lock().unwrap();
     let state = match &*guard {
         Some(s) => s,
@@ -5748,7 +5812,7 @@ where
             let _ = body_size;
             let exact = unsafe { header_exact_body_len(header_ptr) };
             let obj_ptr = unsafe { header_ptr.add(body_offset(header_ptr)) };
-            let should_continue = callback(obj_ptr, type_id, exact);
+            let should_continue = callback(obj_ptr, type_id, exact, cursor + OBJECT_HEADER_SIZE);
             if !should_continue {
                 return Ok(());
             }
@@ -5930,8 +5994,80 @@ pub fn full_gc() -> Result<(), TorclError> {
 /// per-object (not by a single uniform delta, which only worked when the restored
 /// heap reproduced the saved layout exactly — bliss-x0f2 M2.0).
 pub fn serialize_heap_objects() -> Vec<u8> {
+    serialize_heap_objects_matching(|_| true)
+}
+
+/// Serialize the reachable heap without retaining garbage merely because its
+/// region is pinned. Used only by application delivery; pins in the running
+/// process are unchanged. All symbol/package identity records remain roots.
+///
+/// # Safety
+/// Call inside `with_heap_snapshot`, with no concurrent Lisp allocation.
+pub(crate) unsafe fn serialize_reachable_heap_objects() -> Result<Vec<u8>, TorclError> {
+    let mut objects = HashMap::new();
+    let mut pending = Vec::new();
+    walk_heap_records(|ptr, kind, size, identity| {
+        objects.insert(identity, (ptr, kind, size));
+        if matches!(
+            kind,
+            crate::object::type_id::SYMBOL | crate::object::type_id::PACKAGE
+        ) {
+            pending.push(identity);
+        }
+        true
+    })?;
+    let mut root = |value| {
+        if is_heap_ref(value) {
+            pending.push(ref_body_addr(resolve_forwarded(value)));
+        }
+    };
+    root(get_entry_continuation());
+    HeapCollector::scan_cl_stack_roots(&mut root);
+    crate::symbols::for_each_root_slot(|slot| root(unsafe { *slot }));
+    // Includes all off-heap hash table entries, even weak entries below: their
+    // independent image section must never refer to an omitted heap object.
+    scan_external_roots(|slot| root(unsafe { *slot }));
+    let weak_roots = RefCell::new(Vec::new());
+    process_weak_containers(&|slot| {
+        // Weak referents are not ordinary roots, but preserving them in the
+        // delivered snapshot is conservative and keeps serialized slots valid.
+        let value = unsafe { *slot };
+        if is_heap_ref(value) {
+            weak_roots
+                .borrow_mut()
+                .push(ref_body_addr(resolve_forwarded(value)));
+        }
+        true
+    });
+    pending.extend(weak_roots.into_inner());
+    let mut retained = std::collections::HashSet::new();
+    while let Some(identity) = pending.pop() {
+        let Some(&(ptr, kind, size)) = objects.get(&identity) else {
+            continue;
+        };
+        if !retained.insert(ptr as usize) {
+            continue;
+        }
+        unsafe {
+            trace_object(ptr as *mut u8, kind, size, |slot| {
+                let value = *slot;
+                if is_heap_ref(value) {
+                    pending.push(ref_body_addr(resolve_forwarded(value)));
+                }
+            });
+        }
+    }
+    Ok(serialize_heap_objects_matching(|ptr| {
+        retained.contains(&(ptr as usize))
+    }))
+}
+
+fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) -> Vec<u8> {
     let mut out = Vec::new();
     let _ = walk_heap(|ptr, type_id, size| {
+        if !retain(ptr) {
+            return true;
+        }
         out.extend_from_slice(&(ptr as u64).to_le_bytes());
         out.push(type_id);
         out.extend_from_slice(&(size as u32).to_le_bytes());

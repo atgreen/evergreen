@@ -807,6 +807,30 @@ pub fn for_each_bound_function(mut f: impl FnMut(u32, String, TorclVal)) {
     }
 }
 
+/// Snapshot persistent data cells and function cells outside the delivery
+/// candidate set. No Lisp allocations; callers must consume/root the returned
+/// values before allocating. Symbol identities and package membership stay intact.
+pub fn delivery_roots(candidates: &std::collections::HashSet<u32>) -> Vec<TorclVal> {
+    with_registry(|reg| {
+        let mut roots = Vec::new();
+        if let Some(reg) = reg {
+            for (index, &obj) in reg.interned.iter().enumerate() {
+                // SAFETY: registry entries are pinned live SymbolData objects.
+                let data = unsafe { &*symbol_data(obj) };
+                roots.extend([data.value, data.plist]);
+                if !candidates.contains(&(index as u32)) {
+                    roots.push(data.function);
+                }
+            }
+            for &obj in reg.uninterned.values() {
+                let data = unsafe { &*symbol_data(obj) };
+                roots.extend([data.value, data.plist, data.function]);
+            }
+        }
+        roots
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! bliss-jtc.6 Stage A: symbols are heap-resident with their own cells and

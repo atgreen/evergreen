@@ -12,6 +12,25 @@ that runtime and the core together, allowing the operating system to start the
 application directly. Its `:toplevel` function supplies the application's entry
 point; without one, the saved executable opens a REPL.
 
+For an application with a known set of entry points, the separate
+[delivery command](../how-to/save-executable.md#deliver-an-application-from-a-saved-image)
+can consume a saved core and a retention specification. Its first pass removes
+unreachable named functions in opted-in packages while preserving the full
+runtime and global data. Ordinary image saving still preserves the loaded world.
+
+Delivery builds a new image rather than leaving holes in the input. It removes
+unreachable function bindings and bytecode registry entries, then traces the
+remaining image roots and writes only reachable heap objects. This separate
+serialization pass matters because restored objects are pinned: ordinary GC
+cannot reclaim all dead objects in those regions. Their pinning in the delivery
+process does not require retaining them in the output file.
+
+Heap objects are stored as individual records carrying their previous addresses.
+On restore, the loader allocates the objects again and fixes references through
+an old-to-new address map. Symbol identity records and section-alignment padding
+remain, but omitted function bodies and unreachable constants occupy no reserved
+holes. The native runtime is still copied in full.
+
 Embedding the runtime does not make an executable independent of its operating
 system. A dynamically linked Linux runtime still needs its loader and compatible
 libraries. A saved executable built for IBM Z is still an IBM Z executable.

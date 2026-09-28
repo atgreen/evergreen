@@ -143,12 +143,22 @@ applies to a pinned caller.
 | `semaphore.signal(permits: i64) -> Result<(), TorclError>` | Add a positive number of permits and wake eligible waiters; reject overflow |
 | `semaphore.count() -> i64` | Snapshot of available permits |
 | `sync::wait_fd(fd, IoInterest, Option<Duration>) -> Result<bool, TorclError>` | Unix descriptor readiness; true for a ready event, false for timeout |
+| `sync::wait_socket(&TcpStream, IoInterest, Option<Duration>) -> Result<bool, TorclError>` | TCP readiness on Unix and Windows; retains the caller's synchronous interface while parking an unpinned fiber |
 
 `IoInterest` is `Read`, `Write`, or `ReadWrite`. Readiness is a hint to retry I/O,
 not a transfer or ownership change. Keep the descriptor alive until the wait
 ends. Linux/Android managed waits use epoll; supported BSD/macOS targets have
 kqueue paths. Windows `wait_fd` is not a supported handle-readiness API: a Windows socket
 or pipe HANDLE cannot be passed as a Unix descriptor.
+
+Use `wait_socket` for TCP sockets on either platform. Windows uses a shared
+WSAPoll service whose snapshots own duplicate sockets until polling completes;
+admitting new registrations can take up to one 10 ms poll slice. Unix uses the
+descriptor service above. A caller performing I/O must use non-blocking sockets
+and retry after readiness. The stdlib's established TCP streams do this for
+reads, writes, flushing, and input readiness. Connect, accept, and DNS resolution
+remain blocking. Stream operation ownership is retained across a parked read
+or write; explicit input readiness waits release it and keep a duplicate handle.
 
 The stdlib's owned child-pipe streams have their own cooperative I/O and
 readiness path, including Windows. This does not make arbitrary Win32 handle
