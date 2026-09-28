@@ -29,6 +29,8 @@
 //! (closures / multiple values / special vars), nmq.6 (parity + default flip),
 //! nmq.2 (codegen via i2c/c2i), nmq.3 (precise GC of frames).
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_transfer_tests;
 mod pending_error;
 use pending_error::PendingError;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -15795,10 +15797,10 @@ extern "C" fn c2i_call_builtin(
     }
 }
 
-fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
+fn c2i_call_result(sym: u64, args: &[TorclVal], profile_site: u64) -> Result<TorclVal, TorclError> {
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
-        return NIL.0;
+        return Ok(NIL);
     }
     // SAFETY: `run_native` sets NATIVE_ENV to a live &mut Env for the duration
     // of the native call, and native code only calls this synchronously within
@@ -15810,7 +15812,7 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
     // Guard the interpreter reentry so a panic deep in the callee (e.g. a GC
     // root-scan RefCell reentrancy, bliss-011) is caught and re-raised as a
     // catchable condition rather than aborting across this `extern "C"` frame.
-    let result = guard_c2i(|| {
+    guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
         // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
         // run_loop dispatches ITS calls flatly on the TorclStack (bliss-x5y.4). This
@@ -15856,8 +15858,11 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
             }
             _ => apply_function(fn_val, args, env),
         }
-    });
-    match result {
+    })
+}
+
+fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
+    match c2i_call_result(sym, args, profile_site) {
         Ok(v) => v.0,
         // Rust cannot unwind through native code: stash the transfer and return
         // a placeholder. T1 checks immediately after the crossing and returns
@@ -15869,6 +15874,66 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
             });
             NIL.0
         }
+    }
+}
+
+/// Explicit compatibility bridge from helper-v2 to the existing Lisp dispatch
+/// and execution-owned transfer storage. Callee Rust frames finish normally
+/// before an outcome is published; only the generated veneer transfers control.
+/// Errors/control tokens stay rooted in NATIVE_ERROR/CONTROL_VALUES until cold
+/// preparation takes ownership. Nested legacy native deopts are handled by
+/// run_native and return their final value here, not a caller deopt request.
+///
+/// # Safety
+/// `request` is a live TransferCallRequest with a valid symbol and rooted,
+/// contiguous tagged arguments for its arity. `out` is writable. The owning
+/// native entry has published/rooted NATIVE_ENV for this execution. No GC may
+/// intervene between outcome publication and the veneer's cold preparation.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(dead_code)] // Installed only by the opt-in transfer integration until activation gates pass.
+unsafe extern "C" fn c2i_call_legacy_v2(
+    request: *mut u8,
+    out: *mut torcl_rt::native_transfer::NativeOutcome,
+) {
+    use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
+    let outcome = if native_error_pending() {
+        // Never execute another Lisp side effect over an existing transfer.
+        NativeOutcome {
+            value: NIL,
+            exit: NativeExit::Transfer,
+        }
+    } else {
+        let request = unsafe { &*request.cast::<torcl_compiler::t2::emit::TransferCallRequest>() };
+        let args = if request.nargs == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(request.args, request.nargs) }
+        };
+        let result = if NATIVE_ENV.with(|env| env.get().is_null()) {
+            Err(TorclError::Internal(
+                "helper-v2 called without a native environment".into(),
+            ))
+        } else {
+            c2i_call_result(request.symbol, args, 0)
+        };
+        match result {
+            Ok(value) => NativeOutcome {
+                value,
+                exit: NativeExit::Returned,
+            },
+            Err(error) => {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+                NativeOutcome {
+                    value: NIL,
+                    exit: NativeExit::Transfer,
+                }
+            }
+        }
+    };
+    // Neither Result handling nor publishing the execution-local error can
+    // allocate Lisp objects or yield. The returned value needs no unrooted gap.
+    unsafe {
+        out.write(outcome);
     }
 }
 

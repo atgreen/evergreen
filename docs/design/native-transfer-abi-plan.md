@@ -475,8 +475,35 @@ This entry remains an integration path rather than production activation: it
 refuses unboxed values, OSR, guards and other helper classes until their contracts
 are connected; helper argument slices currently contain tagged values only.
 The fixture supplies rooted activation storage, per-execution snapshot reservation
-and cold dispatch. Runtime Lisp helper adapters, code/definition retention,
+and cold dispatch. Full runtime helper coverage, code/definition retention,
 installation ABI checks, native cleanup/handlers and polling remain required.
+
+The CLI now supplies `c2i_call_legacy_v2`, an explicit compatibility bridge to
+the existing Lisp dispatcher. Both ABIs share Result-based dispatch; the bridge
+publishes Returned or Transfer only after callee Rust frames finish. Pending
+errors and THROW multiple values remain rooted in the execution-owned legacy
+storage until cold preparation takes ownership. An already-pending error prevents
+another call from executing side effects. Nested legacy deoptimization completes
+inside the callee and returns its final value, rather than requesting a deopt of
+the new caller.
+
+The CLI `native_transfer_tests` exercise real Lisp callees with zero and multiple
+values, eight arguments, errors, THROW and first-error preservation. The explicit
+capability gate compiles a caller from Lisp source, emits both Invoke sites,
+executes those sites through the real bridge, and captures the second call on
+error. It checks relocated locals/operands, multiple values, normal Rust drops,
+and side effects/UNWIND-PROTECT cleanup occurring exactly once. All three tests
+also run with `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`:
+
+```text
+cargo test -p torcl --lib native_v2_bridge -- --include-ignored
+```
+
+This is still an opt-in integration test. The callee cleanup runs through the
+existing runtime; it does not prove native cleanup landing pads. The test cold
+dispatcher leaves the segment and inspects the pending transfer, rather than
+resuming a reconstructed caller in bytecode. Ordinary native installation and
+its successful-return checks remain unchanged.
 
 ### Windows validation and Wine limits
 
