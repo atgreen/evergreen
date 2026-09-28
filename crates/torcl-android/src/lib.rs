@@ -80,6 +80,9 @@ unsafe extern "C" {
     fn AMotionEvent_getAction(event: *const c_void) -> i32;
     fn AMotionEvent_getX(event: *const c_void, index: usize) -> f32;
     fn AMotionEvent_getY(event: *const c_void, index: usize) -> f32;
+    fn AKeyEvent_getAction(event: *const c_void) -> i32;
+    fn AKeyEvent_getKeyCode(event: *const c_void) -> i32;
+    fn AKeyEvent_getMetaState(event: *const c_void) -> i32;
 }
 
 fn read_asset(manager: *mut c_void, name: &str) -> Result<Vec<u8>, String> {
@@ -253,15 +256,32 @@ extern "C" fn drain_input(_fd: c_int, _events: c_int, data: *mut c_void) -> c_in
         if unsafe { AInputQueue_preDispatchEvent(queue, event) } != 0 {
             continue;
         }
-        let handled = if unsafe { AInputEvent_getType(event) } == 2 {
-            context(activity).state.touch(
-                unsafe { AMotionEvent_getAction(event) } & 255,
-                unsafe { AMotionEvent_getX(event, 0) },
-                unsafe { AMotionEvent_getY(event, 0) },
-            );
-            1
-        } else {
-            0
+        // AINPUT_EVENT_TYPE_KEY is 1 and AINPUT_EVENT_TYPE_MOTION is 2. Both
+        // arrive on this one queue; keys used to fall into the `else` and be
+        // discarded, which made the runtime look as though it had no key path
+        // at all when it simply had no branch.
+        let handled = match unsafe { AInputEvent_getType(event) } {
+            2 => {
+                context(activity).state.touch(
+                    unsafe { AMotionEvent_getAction(event) } & 255,
+                    unsafe { AMotionEvent_getX(event, 0) },
+                    unsafe { AMotionEvent_getY(event, 0) },
+                );
+                1
+            }
+            1 => {
+                let code = unsafe { AKeyEvent_getKeyCode(event) };
+                context(activity).state.key(
+                    unsafe { AKeyEvent_getAction(event) },
+                    code,
+                    unsafe { AKeyEvent_getMetaState(event) },
+                );
+                // BACK stays the system's. Reporting it handled would trap the
+                // user in the application with no way out, which is a far worse
+                // failure than an application not seeing the key.
+                i32::from(code != 4)
+            }
+            _ => 0,
         };
         unsafe { AInputQueue_finishEvent(queue, event, handled) };
     }
@@ -289,7 +309,10 @@ extern "C" fn input_destroyed(_activity: *mut ANativeActivity, queue: *mut c_voi
 // only while the interpreter worker is running and the Activity owns its Arc.
 #[unsafe(no_mangle)]
 pub extern "C" fn torcl_android_api_version() -> i32 {
-    1
+    // 2 adds torcl_android_key. Callers should test for AT LEAST the version
+    // they need rather than for equality, so that a later addition does not
+    // break an application that never uses it.
+    2
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn torcl_android_wait_window(state: *const ActivityState) -> usize {
@@ -307,6 +330,25 @@ unsafe extern "C" fn torcl_android_running(state: *const ActivityState) -> i32 {
 unsafe extern "C" fn torcl_android_paused(state: *const ActivityState) -> i32 {
     unsafe { &*state }.paused() as i32
 }
+/// The next queued key event, or -1 when there is none.
+///
+/// Returns the action and writes the key code and meta state to `output`, which
+/// mirrors `torcl_android_touch` so the two poll the same way. A key CODE, not a
+/// character: turning one into text needs the keyboard layout and the meta
+/// state, which is a decision for the caller and not for this queue.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_key(state: *const ActivityState, output: *mut i32) -> i32 {
+    if let Some((action, code, meta)) = unsafe { &*state }.poll_key() {
+        unsafe {
+            *output = code;
+            *output.add(1) = meta;
+        }
+        action
+    } else {
+        -1
+    }
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn torcl_android_touch(state: *const ActivityState, output: *mut f32) -> i32 {
     if let Some((action, x, y)) = unsafe { &*state }.poll_touch() {

@@ -52,7 +52,9 @@ def main():
         (args.directory / name).write_text(text)
     (args.directory / 'app.json').write_text(json.dumps({
         'host': args.host, 'package': args.package, 'name': args.name or args.directory.name,
-        'runtime_api': 1, 'runtime_version': version,
+        # Matches build-runtime.py's metadata and torcl_android_api_version.
+        # build-apk.py refuses to package a project whose runtime_api differs.
+        'runtime_api': 2, 'runtime_version': version,
     }, indent=2) + '\n')
     if args.runtime != Path('/usr/libexec/torcl/android'):
         # Keep machine-specific runtime locations out of the generated source.

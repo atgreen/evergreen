@@ -50,7 +50,9 @@ def main():
     env.pop('CARGO_ENCODED_RUSTFLAGS', None)
     env['RUSTFLAGS'] = '-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384'
     env.setdefault('CARGO_BUILD_JOBS', '3')
-    metadata = {'api': 1, 'version': tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version'],
+    metadata = {# Must match torcl_android_api_version in crates/torcl-android: this is
+                  # what torcl-android-new writes into app.json and checks against.
+                  'api': 2, 'version': tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version'],
                 'min_sdk': 28, 'ndk': (ndk / 'source.properties').read_text(), 'hosts': {}}
     for host, (abi, machine) in HOSTS.items():
         compiler = tools / f'{host}28-clang'

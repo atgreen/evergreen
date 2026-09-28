@@ -10,6 +10,7 @@ struct State {
     shutdown: bool,
     paused: bool,
     touches: VecDeque<(i32, f32, f32)>,
+    keys: VecDeque<(i32, i32, i32)>,
 }
 
 #[derive(Default)]
@@ -84,5 +85,24 @@ impl ActivityState {
 
     pub fn poll_touch(&self) -> Option<(i32, f32, f32)> {
         self.state.lock().unwrap().touches.pop_front()
+    }
+
+    /// Queue a key event: action, key code, meta state.
+    ///
+    /// Bounded exactly like `touch`, and for the same reason: a Lisp worker that
+    /// stops polling must not grow this without limit. Dropping the OLDEST is
+    /// the right end to drop from for keys as well as touches -- a backlog that
+    /// has outrun the application is stale, and the recent keystrokes are the
+    /// ones still worth delivering.
+    pub fn key(&self, action: i32, code: i32, meta: i32) {
+        let mut state = self.state.lock().unwrap();
+        if state.keys.len() == 64 {
+            state.keys.pop_front();
+        }
+        state.keys.push_back((action, code, meta));
+    }
+
+    pub fn poll_key(&self) -> Option<(i32, i32, i32)> {
+        self.state.lock().unwrap().keys.pop_front()
     }
 }
