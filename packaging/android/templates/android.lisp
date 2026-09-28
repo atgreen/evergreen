@@ -2,7 +2,8 @@
 (defpackage :torcl-android
   (:use :cl) (:nicknames :android)
   (:shadow :log)
-  (:export :running-p :paused-p :poll-touch :poll-key :log :with-c-string :foreign-call))
+  (:export :running-p :paused-p :poll-touch :poll-key :activity
+           :log :with-c-string :foreign-call))
 (in-package :torcl-android)
 (defvar *state*)
 (defparameter *runtime* (torcl-ffi:load-foreign-library "libtorcl_android.so"))
@@ -58,6 +59,23 @@ loop; they were simply discarded before runtime API 2."
           (when (>= action 0)
             (values action (torcl-ffi:mem-ref out :int) (torcl-ffi:mem-ref out :int 4))))
       (torcl-ffi:foreign-free out))))
+
+(defun activity ()
+  "This process's ANativeActivity, or a null pointer before one exists.
+
+Its FOURTH pointer field is `clazz`: a global reference to the Java
+NativeActivity object itself, and therefore the way in to every platform API
+that is only offered in Java -- the Context, the Window, the View hierarchy,
+getSystemService. Handing the pointer out rather than wrapping each call keeps
+this runtime out of the business of deciding which of those an application may
+reach.
+
+Not wrapped here, and deliberately: ANativeActivity_showSoftInput. On Android 16
+it leaves mInputShown false and no keyboard appears, whereas calling
+InputMethodManager.showSoftInput on the decor view through JNI raises it. A
+wrapper that reliably does nothing is worse than no wrapper, because its void
+return looks like success."
+  (runtime-call "torcl_android_activity" :pointer nil nil))
 
 (defun run (address)
   ;; AT LEAST, not exactly: a runtime that has grown a capability this

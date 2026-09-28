@@ -12,6 +12,11 @@ use std::sync::{
 use std::thread::JoinHandle;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The live activity, for the few platform calls that need it rather than the
+/// worker's ActivityState. Only one may exist at a time -- ACTIVE enforces that
+/// above -- so a single slot is the whole story rather than a simplification.
+static ACTIVITY: std::sync::atomic::AtomicPtr<ANativeActivity> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 struct Activity {
     state: Arc<ActivityState>,
     worker: Option<JoinHandle<()>>,
@@ -165,6 +170,7 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
         unsafe { ANativeActivity_finish(activity) };
         return;
     }
+    ACTIVITY.store(activity, Ordering::SeqCst);
     let result = (|| -> Result<(), String> {
         let root = unpack_assets(unsafe { &*activity })?;
         let state = Arc::new(ActivityState::default());
@@ -202,7 +208,9 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     })();
     if let Err(error) = result {
         log(&format!("Activity startup failed: {error}"));
-        ACTIVE.store(false, Ordering::SeqCst);
+        ACTIVITY.store(std::ptr::null_mut(), Ordering::SeqCst);
+        ACTIVITY.store(std::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE.store(false, Ordering::SeqCst);
         unsafe { ANativeActivity_finish(activity) };
     }
 }
@@ -330,6 +338,25 @@ unsafe extern "C" fn torcl_android_running(state: *const ActivityState) -> i32 {
 unsafe extern "C" fn torcl_android_paused(state: *const ActivityState) -> i32 {
     unsafe { &*state }.paused() as i32
 }
+/// The live ANativeActivity, or null when there is none.
+///
+/// Its `clazz` field -- the fourth pointer -- is a global reference to the Java
+/// NativeActivity itself, so handing this pointer out gives Lisp the Context,
+/// the Window, the View hierarchy and getSystemService through JNI, and keeps
+/// this runtime out of the business of deciding which of those an application
+/// may reach.
+///
+/// That generality is not a preference. Measured on Android 16, the NDK's own
+/// ANativeActivity_showSoftInput leaves mInputShown false and raises no
+/// keyboard, while InputMethodManager.showSoftInput on the decor view -- the
+/// same request, made through JNI -- returns true and raises it. Wrapping the
+/// NDK call here would have shipped a function that reliably does nothing and
+/// whose void return looks like success.
+#[unsafe(no_mangle)]
+extern "C" fn torcl_android_activity() -> *mut c_void {
+    ACTIVITY.load(Ordering::SeqCst).cast()
+}
+
 /// The next queued key event, or -1 when there is none.
 ///
 /// Returns the action and writes the key code and meta state to `output`, which
