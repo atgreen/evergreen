@@ -1480,8 +1480,16 @@ fn emit_invoke_call(
     argument_base: u16,
     veneer: u64,
 ) -> Result<u32, EmitError> {
-    let crate::t2::ir::AuxData::CallTarget(symbol) = data.aux else {
-        return Err(EmitError::UnsupportedOp(0xF8));
+    let (request_word0, request_word1, cleanup) = match data.aux {
+        crate::t2::ir::AuxData::CallTarget(symbol) => {
+            (u64::from(symbol), data.args.len() as u64, false)
+        }
+        crate::t2::ir::AuxData::TransferThrow => (TRANSFER_THROW_REQUEST, 2, false),
+        crate::t2::ir::AuxData::CleanupContinuation {
+            cleanup_bcp,
+            resume_bcp,
+        } => (u64::from(cleanup_bcp), u64::from(resume_bcp), true),
+        _ => return Err(EmitError::UnsupportedOp(0xF8)),
     };
     load_home(a, SCRATCH, frame_base, 0);
     let args_slot = i32::from(activation_slots) + i32::from(argument_base);
@@ -1500,15 +1508,23 @@ fn emit_invoke_call(
     }
     // Fixed, aligned request; rooted arguments remain in the activation. The
     // cold capture table records this exact temporary RSP adjustment.
-    const _: () = assert!(std::mem::size_of::<TransferCallRequest>() == 32);
+    const _: () = {
+        assert!(std::mem::size_of::<TransferCallRequest>() == 32);
+        assert!(std::mem::size_of::<TransferCleanupRequest>() == 32);
+        assert!(std::mem::offset_of!(TransferCleanupRequest, activation) == 24);
+    };
     alu_r_imm(a, 5, 4, 32); // sub rsp, 32
     store_to_rsp(a, SCRATCH, 24); // activation
-    mov_imm64(a, RAX, i64::from(symbol));
+    mov_imm64(a, RAX, request_word0 as i64);
     store_to_rsp(a, RAX, 0);
-    mov_imm64(a, RAX, data.args.len() as i64);
+    mov_imm64(a, RAX, request_word1 as i64);
     store_to_rsp(a, RAX, 8);
-    alu_r_imm(a, 0, SCRATCH, args_slot * 8);
-    store_to_rsp(a, SCRATCH, 16); // args
+    if cleanup {
+        mov_imm64(a, SCRATCH, 0); // reserved, not an argument pointer
+    } else {
+        alu_r_imm(a, 0, SCRATCH, args_slot * 8);
+    }
+    store_to_rsp(a, SCRATCH, 16);
     mov_rr(a, 7, 4); // rdi = request
     mov_imm64(a, RAX, veneer as i64);
     a.extend_from_slice(&[0xff, 0xd0]);
@@ -2621,6 +2637,12 @@ pub fn emit_framed_with_activation_slots(
     )
 }
 
+/// Reserved request discriminator, outside the u32 symbol-index domain.
+/// Native-cleanup call veneers must implement this as THROW(tag, primary),
+/// preserving the execution's existing multiple values.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const TRANSFER_THROW_REQUEST: u64 = u64::MAX;
+
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. Arguments and shadow roots
 /// reside in the rooted owning activation, not in this unscanned request.
@@ -2633,11 +2655,37 @@ pub struct TransferCallRequest {
     pub activation: *mut torcl_rt::value::TorclVal,
 }
 
+/// Cleanup completion uses the same temporary area size as a call request.
+/// It returns a restored normal answer or a pending transfer through helper-v2.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct TransferCleanupRequest {
+    pub cleanup_bcp: u64,
+    pub resume_bcp: u64,
+    pub reserved: u64,
+    pub activation: *mut torcl_rt::value::TorclVal,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum CleanupEmission {
+    Normal {
+        save: u64,
+        restore: u64,
+    },
+    Native {
+        save: u64,
+        complete: u64,
+        clear_mv: u64,
+    },
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct TransferEmission {
     veneer: u64,
-    cleanup: Option<(u64, u64)>,
+    cleanup: Option<CleanupEmission>,
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
+    landings: std::collections::HashMap<crate::t2::ir::Block, (u32, u32)>,
 }
 
 /// Opt-in SysV emission through a helper-v2 veneer. The owner must root all
@@ -2664,9 +2712,57 @@ pub fn emit_framed_transfers_with_cleanup(
     activation_slots: u16,
     cleanup: Option<(u64, u64)>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
-    use crate::t2::ir::Opcode;
-    if cleanup.is_some_and(|(save, restore)| save == 0 || restore == 0)
-        || call_veneer == 0
+    emit_transfer_function(
+        f,
+        call_veneer,
+        activation_slots,
+        cleanup.map(|(save, restore)| CleanupEmission::Normal { save, restore }),
+    )
+}
+
+/// Emit verified exceptional cleanup edges and helper-v2 cleanup completion.
+/// `clear_mv` clears secondary values without allocating, yielding or signaling.
+/// `save` has the normal save-helper contract above; `complete` is a veneer for
+/// a helper consuming `TransferCleanupRequest`. The owner must root the pending
+/// continuation and repair source homes before entering a checked cold landing.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub fn emit_framed_native_cleanups(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    clear_mv: u64,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_transfer_function(
+        f,
+        call_veneer,
+        activation_slots,
+        Some(CleanupEmission::Native {
+            save,
+            complete,
+            clear_mv,
+        }),
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_transfer_function(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    cleanup: Option<CleanupEmission>,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode};
+    let native_cleanups = matches!(cleanup, Some(CleanupEmission::Native { .. }));
+    if cleanup.is_some_and(|helper| match helper {
+        CleanupEmission::Normal { save, restore } => save == 0 || restore == 0,
+        CleanupEmission::Native {
+            save,
+            complete,
+            clear_mv,
+        } => save == 0 || complete == 0 || clear_mv == 0,
+    }) || call_veneer == 0
         || !f.osr_entries.is_empty()
         || (0..f.num_values()).any(|i| {
             f.value(crate::t2::ir::Value(i as u32)).repr
@@ -2679,13 +2775,33 @@ pub fn emit_framed_transfers_with_cleanup(
     }
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
-            if cleanup.is_some()
-                && matches!(
-                    f.inst(inst).opcode,
-                    Opcode::CleanupSave | Opcode::CleanupRestore
-                )
+            let data = f.inst(inst);
+            if native_cleanups && data.opcode == Opcode::Invoke {
+                let edge = &data.targets[1];
+                let cold = f.block(edge.block);
+                // The published entry starts at NlxTransfer. Until incoming
+                // edge moves and earlier cold instructions have landing maps,
+                // accept only the builder's parameter-free transfer block.
+                if cold.insts.len() != 1 || !cold.params.is_empty() || !edge.args.is_empty() {
+                    return Err(EmitError::UnsupportedOp(0xFD));
+                }
+            }
+            if (cleanup.is_some() && data.opcode == Opcode::CleanupSave)
+                || (!native_cleanups && cleanup.is_some() && data.opcode == Opcode::CleanupRestore)
+                || (native_cleanups
+                    && matches!(data.opcode, Opcode::CleanupLanding | Opcode::ClearMv))
             {
                 continue;
+            }
+            if !native_cleanups
+                && (data.opcode == Opcode::Invoke
+                    && matches!(
+                        data.aux,
+                        AuxData::CleanupContinuation { .. } | AuxData::TransferThrow
+                    )
+                    || data.opcode == Opcode::NlxTransfer && !data.targets.is_empty())
+            {
+                return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
             }
             if !matches!(
                 f.inst(inst).opcode,
@@ -2711,6 +2827,7 @@ pub fn emit_framed_transfers_with_cleanup(
         veneer: call_veneer,
         cleanup,
         sites: vec![],
+        landings: std::collections::HashMap::new(),
     };
     let code = emit_framed_inner(
         f,
@@ -2721,14 +2838,29 @@ pub fn emit_framed_transfers_with_cleanup(
         0,
         0,
         0,
-        0,
+        match cleanup {
+            Some(CleanupEmission::Native { clear_mv, .. }) => clear_mv,
+            _ => 0,
+        },
         0,
         0,
         Some(activation_slots),
         None,
         Some(&mut transfers),
     )?;
+    let mut landings = Vec::new();
+    for site in &transfers.sites {
+        let cold = f.inst(site.map.call).targets[1].block;
+        if let Some(&(entry_offset, cleanup_bcp)) = transfers.landings.get(&cold) {
+            landings.push(crate::t2::transfer_sites::SysvCleanupLanding {
+                return_offset: site.return_offset,
+                entry_offset,
+                cleanup_bcp,
+            });
+        }
+    }
     let table = crate::t2::transfer_sites::SysvTransferTable::new(code.code.len(), transfers.sites)
+        .and_then(|table| table.with_cleanup_landings(&code.code, &landings))
         .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
     Ok((code, table))
 }
@@ -2769,6 +2901,7 @@ fn emit_framed_inner(
                 && matches!(
                     f.inst(i).opcode,
                     Opcode::CleanupSave
+                        | Opcode::CleanupLanding
                         | Opcode::CleanupRestore
                         | Opcode::Invoke
                         | Opcode::NlxTransfer
@@ -3522,6 +3655,7 @@ fn emit_framed_inner(
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
+                || d.opcode == Opcode::CleanupLanding
                 || (d.opcode.is_terminator() && d.opcode != Opcode::Invoke)
                 || fused.contains(&inst)
             {
@@ -3608,6 +3742,14 @@ fn emit_framed_inner(
                     let transfer = transfers
                         .as_deref_mut()
                         .ok_or(EmitError::UnsupportedOp(0xFA))?;
+                    let veneer = match d.aux {
+                        AuxData::CallTarget(_) | AuxData::TransferThrow => transfer.veneer,
+                        AuxData::CleanupContinuation { .. } => match transfer.cleanup {
+                            Some(CleanupEmission::Native { complete, .. }) => complete,
+                            _ => return Err(EmitError::UnsupportedOp(0xFA)),
+                        },
+                        _ => return Err(EmitError::UnsupportedOp(0xFA)),
+                    };
                     let return_offset = emit_invoke_call(
                         &mut a,
                         &d,
@@ -3616,7 +3758,7 @@ fn emit_framed_inner(
                         frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
                         activation_slots.unwrap(),
                         root_shadow_slots,
-                        transfer.veneer,
+                        veneer,
                     )?;
                     let index = transfer_maps
                         .iter()
@@ -3675,10 +3817,21 @@ fn emit_framed_inner(
             } else if matches!(d.opcode, Opcode::CleanupSave | Opcode::CleanupRestore) {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {
-                    let (save, restore) = transfers
-                        .as_ref()
-                        .and_then(|t| t.cleanup)
-                        .ok_or(EmitError::UnsupportedOp(0xFA))?;
+                    let helper = match transfers.as_ref().and_then(|t| t.cleanup) {
+                        Some(CleanupEmission::Normal { save, restore }) => {
+                            if d.opcode == Opcode::CleanupSave {
+                                save
+                            } else {
+                                restore
+                            }
+                        }
+                        Some(CleanupEmission::Native { save, .. })
+                            if d.opcode == Opcode::CleanupSave =>
+                        {
+                            save
+                        }
+                        _ => return Err(EmitError::UnsupportedOp(0xFA)),
+                    };
                     let AuxData::CleanupContinuation {
                         cleanup_bcp,
                         resume_bcp,
@@ -3697,15 +3850,7 @@ fn emit_framed_inner(
                     }
                     mov_imm64(&mut a, 7, i64::from(cleanup_bcp));
                     mov_imm64(&mut a, 6, i64::from(resume_bcp));
-                    mov_imm64(
-                        &mut a,
-                        RAX,
-                        if d.opcode == Opcode::CleanupSave {
-                            save
-                        } else {
-                            restore
-                        } as i64,
-                    );
+                    mov_imm64(&mut a, RAX, helper as i64);
                     a.extend_from_slice(&[0xff, 0xd0]);
                     if let Some(value) = d.results.first() {
                         store_home(&mut a, homes[value], RAX, 0);
@@ -3927,8 +4072,26 @@ fn emit_framed_inner(
                 }
             }
             Opcode::NlxTransfer if transfer_mode => {
-                // Metadata-only cold successor: the veneer enters the external
-                // capture stub. A normal path must never reach this block.
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                if let Some(target) = td.targets.first() {
+                    let transfer = transfers
+                        .as_deref_mut()
+                        .ok_or(EmitError::UnsupportedOp(0xFA))?;
+                    if !matches!(transfer.cleanup, Some(CleanupEmission::Native { .. })) {
+                        return Err(EmitError::UnsupportedOp(0xFA));
+                    }
+                    let landing = f.inst(f.block(target.block).insts[0]);
+                    let AuxData::CleanupContinuation { cleanup_bcp, .. } = landing.aux else {
+                        return Err(EmitError::UnsupportedOp(0xFA));
+                    };
+                    let offset = u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?;
+                    transfer.landings.insert(b, (offset, cleanup_bcp));
+                    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+                    parallel_home_move(&mut a, &edge_home_moves(f, target, &homes, &const_tagged)?);
+                    a.jmp(block_label[&target.block]);
+                    continue;
+                }
+                // No native destination: the runtime must leave the segment.
                 a.extend_from_slice(&[0x0f, 0x0b]);
             }
             // A Trap ends a path that must not continue (bliss-wukf): today,

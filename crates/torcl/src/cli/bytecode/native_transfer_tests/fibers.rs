@@ -1,16 +1,19 @@
-use super::super::native_transfer_entry::TransferCode;
+use super::super::native_transfer_entry::{TransferCode, take_native_cleanup_count};
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
 
 fn cleanup_fiber() -> TorclVal {
-    let case = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let case = NEXT_CASE.fetch_add(2, Ordering::Relaxed);
     // Match thread_entry_runner: workers share initialized classes/packages.
     let mut env = Env::new_impl(false, false, false);
     torcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun fiber-protected-answer (x) (values x (list :original)))
+        "(defun fiber-protected-answer (x)
+           (if (oddp (car x))
+             (throw :fiber-cleanup-exit (values x (list :original)))
+             (values x (list :original))))
          (defun fiber-sleeping-cleanup (x)
            (torcl::%native-fiber :sleep 0.1d0)
            (%force-minor-gc-for-test)
@@ -46,7 +49,13 @@ fn cleanup_fiber() -> TorclVal {
     let frame = torcl_rt::current_stack().fp();
     let fiber = torcl_rt::current_fiber_id();
     let depth = NATIVE_DEPTH.with(|slot| slot.get());
+    take_native_cleanup_count();
     torcl_rt::rooted!(result = code.run(&args, &mut env));
+    assert_eq!(
+        take_native_cleanup_count(),
+        case % 2,
+        "odd fibers suspend inside exceptionally entered native cleanup"
+    );
     assert_ne!(
         args[0].to_raw(),
         address,
@@ -97,41 +106,46 @@ fn native_v2_cleanup_values_and_transfers_survive_fiber_suspension() {
     let mut startup = Env::new(false);
     torcl_rt::rooted_ref!(_startup = &mut startup);
     for num_workers in [1, 4] {
-        let group =
-            torcl_rt::SchedulerGroup::init(&torcl_rt::SchedulerConfig { num_workers }).unwrap();
-        let mut fibers = Vec::new();
-        for _ in 0..8 {
-            let entry =
-                unsafe { TorclVal::from_function_ptr(cleanup_fiber as *const () as *mut u8) };
-            let fiber = torcl_rt::thread::make_fiber(entry).unwrap();
-            fibers.push(fiber);
-            group.submit(fiber).unwrap();
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while fibers
-            .iter()
-            .filter(|&&id| {
-                matches!(
-                    torcl_rt::thread::fiber_state(id),
-                    Some(
-                        torcl_rt::thread::FiberState::Waiting
-                            | torcl_rt::thread::FiberState::Blocked
+        for throwing in [false, true] {
+            // Homogeneous groups prove the external collection sees at least two
+            // pending native transfers, rather than merely two normal cleanups.
+            NEXT_CASE.store(usize::from(throwing), Ordering::Relaxed);
+            let group =
+                torcl_rt::SchedulerGroup::init(&torcl_rt::SchedulerConfig { num_workers }).unwrap();
+            let mut fibers = Vec::new();
+            for _ in 0..8 {
+                let entry =
+                    unsafe { TorclVal::from_function_ptr(cleanup_fiber as *const () as *mut u8) };
+                let fiber = torcl_rt::thread::make_fiber(entry).unwrap();
+                fibers.push(fiber);
+                group.submit(fiber).unwrap();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while fibers
+                .iter()
+                .filter(|&&id| {
+                    matches!(
+                        torcl_rt::thread::fiber_state(id),
+                        Some(
+                            torcl_rt::thread::FiberState::Waiting
+                                | torcl_rt::thread::FiberState::Blocked
+                        )
                     )
-                )
-            })
-            .count()
-            < 2
-        {
-            torcl_rt::poll_safepoint();
-            assert!(
-                std::time::Instant::now() < deadline,
-                "two cleanup continuations must suspend together"
-            );
-            std::thread::yield_now();
+                })
+                .count()
+                < 2
+            {
+                torcl_rt::poll_safepoint();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "two cleanup continuations must suspend together"
+                );
+                std::thread::yield_now();
+            }
+            // Collect from outside the fibers while their native frames and saved
+            // multiple values are suspended on distinct stacks.
+            HeapCollector::new().minor_gc().unwrap();
+            assert_eq!(group.finish().unwrap(), vec![TorclVal::from_fixnum(1); 8]);
         }
-        // Collect from outside the fibers while their native frames and saved
-        // multiple values are suspended on distinct stacks.
-        HeapCollector::new().minor_gc().unwrap();
-        assert_eq!(group.finish().unwrap(), vec![TorclVal::from_fixnum(1); 8]);
     }
 }

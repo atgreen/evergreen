@@ -620,7 +620,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         ClearMv | TakeValuesToLocals => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
         // Execution-owned cleanup helpers clobber caller-saved registers.
         // Only the opt-in transfer emitter supplies these helper addresses.
-        CleanupLanding => lo.emit_annotated(inst, op::PSEUDO_UNSUPPORTED, defs, uses),
+        CleanupLanding => lo.emit_annotated(inst, op::LIVENESS, defs, uses),
         CleanupSave | CleanupRestore => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
 
         // ── allocation (safepoint-bearing) ──
@@ -703,6 +703,11 @@ fn lower_terminator(lo: &mut Lowering, inst: Inst) {
         NlxTransfer => {
             let uses = lo.vregs(&data.args);
             lo.emit_annotated(inst, op::NLX_TRANSFER, vec![], uses);
+            if !data.targets.is_empty() {
+                // Keep the captured state live separately from the operand-free
+                // branch; a native cleanup entry can have multiple predecessors.
+                lo.emit_for(inst, op::JMP, vec![], vec![]);
+            }
         }
         Trap => {
             // A trap is an unconditional deopt point: carry its frame state.

@@ -125,11 +125,21 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     || !data.flags.safepoint
                     || !matches!(
                         data.aux,
-                        AuxData::CallTarget(_) | AuxData::CleanupContinuation { .. }
+                        AuxData::CallTarget(_)
+                            | AuxData::TransferThrow
+                            | AuxData::CleanupContinuation { .. }
                     ))
             {
                 errors.push(VerifyError::new("V11 invoke-shape",
                     format!("block{bi} Invoke requires distinct normal/exceptional edges and call effects")));
+            }
+            if matches!(data.aux, AuxData::TransferThrow)
+                && (data.opcode != Opcode::Invoke || data.args.len() != 2)
+            {
+                errors.push(VerifyError::new(
+                    "V11 invoke-shape",
+                    "THROW requires an Invoke with tag and primary",
+                ));
             }
             if data.opcode == Opcode::NlxTransfer {
                 let origin_matches = match (&data.aux, data.frame_state) {

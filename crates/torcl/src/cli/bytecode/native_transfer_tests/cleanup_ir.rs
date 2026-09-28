@@ -168,7 +168,7 @@ fn native_v2_normal_cleanup_executes_and_preserves_all_values() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_transfer_from_running_cleanup_discards_saved_answers_once() {
-    use super::super::native_transfer_entry::TransferCode;
+    use super::super::native_transfer_entry::{TransferCode, take_native_cleanup_count};
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -219,7 +219,13 @@ fn native_v2_transfer_from_running_cleanup_discards_saved_answers_once() {
     torcl_rt::rooted!(args = vec![super::super::super::arena_str("replacement answer")]);
     let before = args[0].to_raw();
     let frame = torcl_rt::current_stack().fp();
+    take_native_cleanup_count();
     torcl_rt::rooted!(result = code.run(&args, &mut env));
+    assert_eq!(
+        take_native_cleanup_count(),
+        1,
+        "outer cleanup must enter natively"
+    );
     assert!(
         matches!(&*result, Err(TorclError::Internal(t)) if t == &token),
         "{:?}",
@@ -349,4 +355,153 @@ fn native_v2_normal_cleanup_has_explicit_saved_values_and_checked_continuations(
         );
         assert!(torcl_compiler::t2::emit::emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).is_err());
     }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_throw_enters_nested_native_cleanups_without_bytecode() {
+    use super::super::native_transfer_entry::{TransferCode, take_native_cleanup_count};
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(setq *native-throw-cleanups* nil *replace-native-throw* nil)
+         (defun native-protected-throw (x) (throw :native-cleanup (values x (list x))))
+         (defun native-throw-cleanup (label x)
+           (if (stringp x) nil (error x))
+           (%force-minor-gc-for-test)
+           (setq *native-throw-cleanups* (cons label *native-throw-cleanups*))
+           (if (and *replace-native-throw* (eq label :inner))
+             (throw :new-native-cleanup (values x (list :replacement)))
+             (list x)))",
+        &mut env,
+    )
+    .unwrap();
+    torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    torcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((let ((saved x))
+            (unwind-protect
+              (unwind-protect (progn (native-protected-throw x) (setq saved 99))
+                (native-throw-cleanup :inner saved))
+              (native-throw-cleanup :outer saved))))"
+        )
+        .unwrap()
+        .0
+    );
+    let body = Arc::new(
+        compile_function("NATIVE-THROW-CLEANUPS", *params, *forms, &env, false, false).unwrap(),
+    );
+    let ir = build::build_from_bytecode_for_native_cleanups(&body).expect("native cleanup IR");
+    torcl_compiler::t2::emit::emit_framed_native_cleanups(&ir, 1, body.num_slots(), 2, 3, 4)
+        .unwrap_or_else(|error| panic!("cleanup emission: {error:?}; {:?}", body.code));
+    let code = TransferCode::compile(body).expect("native exceptional cleanup entry");
+    let token = super::super::super::next_control_token("NATIVE-CLEANUP");
+    let tag = reader::read_from_string(":native-cleanup").unwrap().0;
+    env.catch_stack
+        .push((super::super::super::val_as_str(tag), token.clone()));
+    torcl_rt::rooted!(args = vec![super::super::super::arena_str("saved before throw")]);
+    let original = args[0].to_raw();
+    take_native_cleanup_count();
+    torcl_rt::rooted!(result = code.run(&args, &mut env));
+    assert!(
+        matches!(&*result, Err(TorclError::Internal(t)) if t == &token),
+        "{:?}",
+        &*result
+    );
+    assert_eq!(
+        take_native_cleanup_count(),
+        2,
+        "both exceptional cleanups must run natively"
+    );
+    assert_ne!(args[0].to_raw(), original);
+    assert_eq!(
+        super::super::super::take_control_mv(&token, &mut env),
+        args[0]
+    );
+    assert_eq!(env.mv.len(), 2);
+    assert_eq!(super::super::super::cp(env.mv[1]).0, args[0]);
+    assert_eq!(
+        super::super::super::read_eval_all_env(
+            "(equal *native-throw-cleanups* '(:outer :inner))",
+            &mut env
+        )
+        .unwrap(),
+        T
+    );
+
+    super::super::super::read_eval_all_env(
+        "(setq *replace-native-throw* t *native-throw-cleanups* nil)",
+        &mut env,
+    )
+    .unwrap();
+    let replacement = super::super::super::next_control_token("NATIVE-REPLACEMENT");
+    let tag = reader::read_from_string(":new-native-cleanup").unwrap().0;
+    env.catch_stack
+        .push((super::super::super::val_as_str(tag), replacement.clone()));
+    torcl_rt::rooted!(result = code.run(&args, &mut env));
+    assert!(
+        matches!(&*result, Err(TorclError::Internal(t)) if t == &replacement),
+        "{:?}",
+        &*result
+    );
+    assert_eq!(take_native_cleanup_count(), 2);
+    assert!(
+        super::super::super::CONTROL_VALUES.with(|values| values
+            .borrow()
+            .keys()
+            .all(|key| key != &token && key.strip_suffix("\0MV") != Some(token.as_str()))),
+        "a superseded throw must release its payload roots"
+    );
+    assert_eq!(
+        super::super::super::take_control_mv(&replacement, &mut env),
+        args[0]
+    );
+    assert_eq!(env.mv.len(), 2);
+    assert_eq!(
+        super::super::super::cp(env.mv[1]).0,
+        reader::read_from_string(":replacement").unwrap().0
+    );
+    assert_eq!(
+        super::super::super::read_eval_all_env(
+            "(equal *native-throw-cleanups* '(:outer :inner))",
+            &mut env
+        )
+        .unwrap(),
+        T
+    );
+
+    // Exercise THROW emitted in this frame, not only a throw from a Lisp callee.
+    torcl_rt::rooted!(
+        direct = reader::read_from_string(
+            "((unwind-protect
+            (unwind-protect (throw :native-cleanup (values x (list x)))
+              (native-throw-cleanup :inner x))
+            (native-throw-cleanup :outer x)))"
+        )
+        .unwrap()
+        .0
+    );
+    let body = Arc::new(
+        compile_function("DIRECT-NATIVE-THROW", *params, *direct, &env, false, false).unwrap(),
+    );
+    let code = TransferCode::compile(body).expect("direct THROW uses helper-v2");
+    torcl_rt::rooted!(result = code.run(&args, &mut env));
+    assert!(
+        matches!(&*result, Err(TorclError::Internal(t)) if t == &replacement),
+        "{:?}",
+        &*result
+    );
+    assert_eq!(take_native_cleanup_count(), 2);
+    assert_eq!(
+        super::super::super::take_control_mv(&replacement, &mut env),
+        args[0]
+    );
+    assert_eq!(env.mv.len(), 2);
+    assert_eq!(
+        super::super::super::cp(env.mv[1]).0,
+        reader::read_from_string(":replacement").unwrap().0
+    );
 }

@@ -1,13 +1,15 @@
 //! Opt-in runtime entry for the tagged Invoke emitter. Normal installation is
 //! still gated on complete helper/poll/scope coverage. Own code and definitions,
-//! capture before leaving generated frames, then enter bytecode *unwinding*.
+//! capture into rooted snapshots, enter native cleanup for selected throws, and
+//! retain bytecode *unwinding* as the fallback.
 #![allow(dead_code)]
 
 use super::*;
 use std::cell::Cell;
 use torcl_compiler::control_scope::{Ownership, ScopeKind};
 use torcl_compiler::t2::native_transfer::{
-    SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
+    SysvNativeLanding, SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
+    emit_native_landing_stub,
 };
 use torcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use torcl_rt::jit::JitBuffer;
@@ -21,6 +23,8 @@ pub(super) struct TransferCode {
     code: JitBuffer,
     _veneer: JitBuffer,
     _capture: JitBuffer,
+    _completion: JitBuffer,
+    landing: JitBuffer,
     sites: SysvTransferTable,
     slots: u16,
     cleanup_depths: std::collections::HashMap<u32, usize>,
@@ -42,18 +46,19 @@ impl TransferCode {
             return None;
         }
         let roots = ActiveBytecodeRoot::new(&body);
-        let ir = torcl_compiler::t2::build::build_from_bytecode_for_transfers(&body).ok()?;
+        let ir = torcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
-        let veneer = JitBuffer::new(&emit_helper_veneer(c2i_call_legacy_v2, capture.as_ptr()))?;
+        let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
-        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_transfers_with_cleanup(
+        let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
+        let landing = JitBuffer::new(&emit_native_landing_stub())?;
+        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_cleanups(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
-            Some((
-                save_cleanup as *const () as u64,
-                restore_cleanup as *const () as u64,
-            )),
+            save_cleanup as *const () as u64,
+            completion.as_ptr() as u64,
+            c2i_clear_mv as *const () as u64,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -78,7 +83,7 @@ impl TransferCode {
         let scopes = torcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
         let mut cleanup_depths = std::collections::HashMap::new();
         for instruction in &body.code {
-            if let Instr::EnterCleanupNormal { cleanup_bcp, .. } = instruction {
+            if let Instr::PushUnwind { cleanup_bcp, .. } = instruction {
                 let depth = scopes
                     .before(*cleanup_bcp)?
                     .iter()
@@ -102,6 +107,8 @@ impl TransferCode {
             code,
             _veneer: veneer,
             _capture: capture,
+            _completion: completion,
+            landing,
             sites,
             slots,
             cleanup_depths,
@@ -142,6 +149,17 @@ impl TransferCode {
         let mut cleanups = Vec::<SavedCleanup>::with_capacity(self.cleanup_depths.len());
         torcl_rt::rooted_ref!(_cleanups = &mut cleanups);
         let mut context = CaptureContext {
+            frame,
+            completed_cleanup: None,
+            landing_stub: self.landing.as_ptr(),
+            landing: SysvNativeLanding {
+                stack_pointer: std::ptr::null_mut(),
+                entry: std::ptr::null(),
+            },
+            dispatch: DispatchPacket {
+                entry: std::ptr::null(),
+                request: std::ptr::null_mut(),
+            },
             cleanups: &mut cleanups,
             cleanup_depths: &self.cleanup_depths,
             code_base: self.code.as_ptr() as usize,
@@ -216,7 +234,12 @@ impl TransferCode {
                             && saved.stack.len() <= usize::from(self.body.max_stack)
                             && matches!(
                                 self.body.code.get(saved.resume_pc as usize),
-                                Some(Instr::CallNamed { .. })
+                                Some(
+                                    Instr::CallNamed { .. }
+                                        | Instr::CleanupReturn
+                                        | Instr::SetValues(_)
+                                        | Instr::Throw
+                                )
                             )
                     })
                     .ok_or_else(invalid_capture)?;
@@ -225,7 +248,7 @@ impl TransferCode {
                 }
                 let running = site.map().control_scopes.iter().filter_map(|scope| {
                     if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
-                        Some(cleanup_bcp)
+                        (Some(cleanup_bcp) != context.completed_cleanup).then_some(cleanup_bcp)
                     } else {
                         None
                     }
@@ -353,34 +376,127 @@ unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: Torc
     NIL
 }
 
-unsafe extern "C" fn restore_cleanup(
-    cleanup_bcp: u32,
-    resume_bcp: u32,
-    _unused: TorclVal,
-) -> TorclVal {
+unsafe extern "C" fn call_or_throw(
+    request: *mut u8,
+    out: *mut torcl_rt::native_transfer::NativeOutcome,
+) {
+    use torcl_compiler::t2::emit::{TRANSFER_THROW_REQUEST, TransferCallRequest};
+    use torcl_rt::native_transfer::NativeOutcome;
+    let call = unsafe { &*request.cast::<TransferCallRequest>() };
+    if call.symbol != TRANSFER_THROW_REQUEST {
+        unsafe {
+            c2i_call_legacy_v2(request, out);
+        }
+        return;
+    }
+    if !native_error_pending() {
+        let result = guard_c2i(|| {
+            assert_eq!(call.nargs, 2);
+            torcl_rt::rooted!(tag = unsafe { call.args.read() });
+            torcl_rt::rooted!(value = unsafe { call.args.add(1).read() });
+            let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+            let tag_name = val_as_str(*tag);
+            let token = env
+                .catch_stack
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == tag_name)
+                .map(|(_, token)| token.clone());
+            match token {
+                Some(token) => {
+                    super::super::store_control_mv(&token, *value, env);
+                    Err(TorclError::Internal(token))
+                }
+                None => Err(TorclError::ControlError(format!(
+                    "attempt to THROW to a tag that is not active: {tag_name}"
+                ))),
+            }
+        });
+        if let Err(error) = result {
+            NATIVE_ERROR.with(|slot| slot.set_first(error));
+        }
+    }
+    unsafe {
+        out.write(NativeOutcome {
+            value: NIL,
+            exit: NativeExit::Transfer,
+        });
+    }
+}
+
+unsafe extern "C" fn complete_cleanup(
+    request: *mut u8,
+    out: *mut torcl_rt::native_transfer::NativeOutcome,
+) {
+    use torcl_compiler::t2::emit::TransferCleanupRequest;
+    use torcl_rt::native_transfer::NativeOutcome;
+    let request = unsafe { &*request.cast::<TransferCleanupRequest>() };
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
-    let saved = unsafe { &mut *context.cleanups }
-        .pop()
-        .expect("verified cleanup stack");
-    assert_eq!(saved.cleanup_bcp, cleanup_bcp);
+    assert_eq!(request.activation, context.activation);
+    let cleanups = unsafe { &mut *context.cleanups };
+    let saved = cleanups.last().expect("verified cleanup stack");
+    assert_eq!(u64::from(saved.cleanup_bcp), request.cleanup_bcp);
+    if matches!(saved.continuation.action, CleanupAction::Resume(_)) {
+        // Keep the continuation rooted and the pre-op stack intact until cold
+        // capture has consumed its exact source map. Rust returns first.
+        context.completed_cleanup = Some(saved.cleanup_bcp);
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Transfer,
+            });
+        }
+        return;
+    }
+    let saved = cleanups.pop().expect("verified cleanup stack");
     let CleanupAction::Normal {
-        resume_bcp: expected,
+        resume_bcp,
         value,
         values,
     } = saved.continuation.action
     else {
-        unreachable!("normal native cleanup continuation");
+        unreachable!("checked normal continuation")
     };
-    assert_eq!(expected, resume_bcp);
+    assert_eq!(u64::from(resume_bcp), request.resume_bcp);
     match values {
         Some(values) => env.set_mv(values),
         None => env.clear_mv(),
     }
-    value
+    unsafe {
+        out.write(NativeOutcome {
+            value,
+            exit: NativeExit::Returned,
+        });
+    }
+}
+
+#[repr(C)]
+struct DispatchPacket {
+    entry: *const u8,
+    request: *mut u8,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<DispatchPacket>() == 16);
+    assert!(std::mem::offset_of!(DispatchPacket, entry) == 0);
+    assert!(std::mem::offset_of!(DispatchPacket, request) == 8);
+};
+
+#[cfg(test)]
+static NATIVE_CLEANUP_COUNT: torcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+pub(super) fn take_native_cleanup_count() -> usize {
+    NATIVE_CLEANUP_COUNT.with(|count| count.replace(0))
 }
 
 struct CaptureContext {
+    frame: *mut Frame,
+    completed_cleanup: Option<u32>,
+    landing_stub: *const u8,
+    landing: SysvNativeLanding,
+    dispatch: DispatchPacket,
     cleanups: *mut Vec<SavedCleanup>,
     cleanup_depths: *const std::collections::HashMap<u32, usize>,
     code_base: usize,
@@ -417,32 +533,134 @@ impl Drop for EntryGuard {
 unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let capture = unsafe { &mut *capture };
-    let sites = unsafe { &*context.sites };
-    let site = sites.lookup(context.code_base, capture.return_pc as usize);
-    if let Some((index, _)) = site.and_then(|site| {
-        sites
-            .sites()
-            .enumerate()
-            .find(|(_, candidate)| std::ptr::eq(*candidate, site))
-    }) {
-        let snapshot = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index) };
-        match unsafe {
-            snapshot.capture_from_activation(
-                context.code_base,
-                capture,
-                std::slice::from_raw_parts(context.activation, context.slots),
-            )
-        } {
-            Ok(()) => context.selected = Some(index),
-            Err(error) => context.failure = Some(error),
-        }
-    } else {
-        context.failure = Some(TransferSiteError::WrongReturnPc);
+    context.dispatch = DispatchPacket {
+        entry: native_transfer::leave_native_segment as *const u8,
+        request: native_transfer::current_segment().cast(),
+    };
+    if context.dispatch.request.is_null() || torcl_rt::current_stack().fp() != context.frame {
+        context.failure = Some(TransferSiteError::InvalidLandingCapture);
+    } else if let Err(error) = unsafe { prepare_transfer(context, capture) } {
+        context.failure = Some(error);
     }
-    capture.request = native_transfer::current_segment().cast();
+    capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
+}
+
+unsafe fn prepare_transfer(
+    context: &mut CaptureContext,
+    capture: &mut SysvTransferCapture,
+) -> Result<(), TransferSiteError> {
+    let sites = unsafe { &*context.sites };
+    let site = sites
+        .lookup(context.code_base, capture.return_pc as usize)
+        .ok_or(TransferSiteError::WrongReturnPc)?;
+    let index = sites
+        .sites()
+        .position(|candidate| std::ptr::eq(candidate, site))
+        .ok_or(TransferSiteError::WrongReturnPc)?;
+    let snapshot = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index) };
+    unsafe {
+        snapshot.capture_from_activation(
+            context.code_base,
+            capture,
+            std::slice::from_raw_parts(context.activation, context.slots),
+        )?;
+    }
+    context.selected = Some(index);
+    let cleanups = unsafe { &mut *context.cleanups };
+    if let Some(completed) = context.completed_cleanup {
+        let saved = cleanups.pop().expect("completing rooted native cleanup");
+        assert_eq!(saved.cleanup_bcp, completed);
+        let CleanupAction::Resume(pending) = saved.continuation.action else {
+            unreachable!("completion helper checked pending continuation")
+        };
+        NATIVE_ERROR.with(|slot| {
+            assert!(!slot.is_some());
+            slot.replace(Some(unmatched_error(pending)));
+        });
+    }
+    let Some(landing) = site.native_cleanup_landing(context.code_base, capture)? else {
+        return Ok(());
+    };
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    // Raw errors must first signal with live handlers/restarts. Until native
+    // signaling is wired, only a selected transfer to a live outer CATCH takes
+    // this route. Other outcomes retain explicit bytecode unwinding fallback.
+    let mut selected_throw = false;
+    NATIVE_ERROR.with(|slot| {
+        slot.visit(|error| {
+            selected_throw = matches!(error, TorclError::Internal(token)
+            if env.catch_stack.iter().any(|(_, live)| live == token));
+        })
+    });
+    if !selected_throw {
+        return Ok(());
+    }
+    let (scope_index, cleanup_bcp) = site
+        .map()
+        .control_scopes
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, scope)| match scope.kind {
+            ScopeKind::Unwind { cleanup_bcp } => Some((index, cleanup_bcp)),
+            _ => None,
+        })
+        .ok_or(TransferSiteError::InvalidLandingCapture)?;
+    let handler_depth = site.map().control_scopes[..scope_index]
+        .iter()
+        .filter(|scope| {
+            matches!(
+                scope.kind,
+                ScopeKind::Block { .. } | ScopeKind::Tagbody { .. } | ScopeKind::Unwind { .. }
+            )
+        })
+        .count();
+    // Restore native homes while canonical snapshots still own every root.
+    unsafe {
+        snapshot.write_back(context.code_base, capture)?;
+    }
+    let Some(TorclError::Internal(token)) = NATIVE_ERROR.with(|slot| slot.take()) else {
+        unreachable!("selected a rooted throw token")
+    };
+    while cleanups
+        .last()
+        .is_some_and(|saved| saved.continuation.handler_depth > handler_depth)
+    {
+        let saved = cleanups.pop().unwrap();
+        if let CleanupAction::Resume(Pending::Token(abandoned)) = saved.continuation.action {
+            if abandoned != token {
+                super::super::CONTROL_VALUES.with(|values| {
+                    values.borrow_mut().retain(|key, _| {
+                        key != &abandoned && key.strip_suffix("\0MV") != Some(abandoned.as_str())
+                    })
+                });
+            }
+        }
+    }
+    assert!(cleanups.len() < cleanups.capacity());
+    cleanups.push(SavedCleanup {
+        cleanup_bcp,
+        continuation: CleanupCont {
+            handler_depth,
+            action: CleanupAction::Resume(Pending::Token(token)),
+        },
+    });
+    // The rooted continuation owns the pending transfer before generated
+    // cleanup code can allocate or suspend. Clear any helper's secondary values.
+    env.clear_mv();
+    context.completed_cleanup = None;
+    context.selected = None;
+    context.landing = landing;
+    context.dispatch = DispatchPacket {
+        entry: context.landing_stub,
+        request: std::ptr::from_mut(&mut context.landing).cast(),
+    };
+    #[cfg(test)]
+    NATIVE_CLEANUP_COUNT.with(|count| count.set(count.get() + 1));
+    Ok(())
 }
 
 #[unsafe(naked)]
-unsafe extern "C" fn dispatch(_anchor: *mut u8, _value: u64, _exit: NativeExit) -> ! {
-    core::arch::naked_asm!("endbr64", "jmp {leave}", leave = sym native_transfer::leave_native_segment);
+unsafe extern "C" fn dispatch(_packet: *mut u8, _value: u64, _exit: NativeExit) -> ! {
+    core::arch::naked_asm!("endbr64", "mov rax, [rdi]", "mov rdi, [rdi + 8]", "jmp rax");
 }

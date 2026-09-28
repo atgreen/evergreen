@@ -554,7 +554,8 @@ helpers. The owning invocation reserves and roots its continuation stack before
 machine entry. Save retains the primary, zero/one/many-value state, and exact
 handler depth; restore republishes the saved values after native cleanup code.
 Calls made during cleanup retain their running-cleanup identities in the transfer
-maps. If they transfer, fallback adopts the already-rooted continuations and
+maps. Selected throws now enter native exceptional cleanup as described below;
+fallback adopts the already-rooted continuations for unsupported outcomes and
 unwinds them at their recorded handler depths, without replaying the failed call.
 Legacy emission and transfer emission without explicit cleanup helpers still
 refuse these operations.
@@ -575,9 +576,10 @@ and verifies actual address relocation. This gate passes repeated stress/poison
 runs; it does not assert carrier migration and does not replace the wider
 fiber/foreign-boundary gates.
 
-Native **exceptional** cleanup destinations and ordinary tier installation
-remain outstanding: exceptional entry into an outer cleanup in these tests still
-uses the bytecode fallback.
+The fiber gate now also suspends exceptionally entered native cleanup, with a
+pending THROW rooted across suspension, collection and a replacement THROW.
+Ordinary tier installation and broader handler/foreign/migration gates remain
+outstanding.
 
 ### Native-frame landing adapter
 
@@ -586,7 +588,7 @@ packet after the capture stub has returned from Rust preparation and restored
 its updated nonvolatile registers. It selects the destination frame's normal
 body SP, places the primary in RAX, and tail-jumps to the native landing pad.
 The original native frame remains live. The packet is a machine interface,
-not a target-admission check: the future dispatcher must validate retained code,
+not a target-admission check: dispatch must validate retained code,
 frame recipes, live-value homes, roots and segment ownership before selecting it.
 
 An executable fixture proves normal Rust destructor completion before landing,
@@ -597,8 +599,8 @@ and preparation, and dereferences relocated register/stack pointers after landin
 Run this capability gate explicitly with `cargo test -p torcl-compiler --test
 native_landing_sysv -- --include-ignored`.
 
-This adapter is not yet selected by Lisp transfer dispatch. The separate
-`SysvTransferTable::with_cleanup_landings` installer now binds a compiler-selected
+The opt-in Lisp transfer entry now selects this adapter for supported throws.
+`SysvTransferTable::with_cleanup_landings` binds a compiler-selected
 cold edge to an exact call site, checks the innermost local UNWIND-PROTECT identity,
 and requires an in-bounds ENDBR64 entry in the supplied code bytes. Duplicate or
 unknown call sites, inherited cleanup ownership and unaligned body-SP recipes
@@ -609,8 +611,7 @@ This is metadata validation, not proof of runtime ownership: the dispatcher stil
 must retain that exact code, establish current-segment/frame ownership, root the
 pending continuation and repair native homes before selecting the packet.
 
-The separate
-`build_from_bytecode_for_native_cleanups` entry now constructs exceptional cleanup
+`build_from_bytecode_for_native_cleanups` constructs exceptional cleanup
 predecessors **before** SSA sealing and phi simplification. Calls split into normal
 and cold blocks; the cold edge truncates the operand stack to the selected
 UNWIND-PROTECT's saved depth. Locals merge with the normal cleanup entry, so an
@@ -627,10 +628,45 @@ zero/multiple values, enclosing operand-stack prefixes and loop back edges,
 including DCE. Phi replacement also visits synthetic call-edge blocks; otherwise
 removing a trivial phi left dangling arguments on those new edges. Intrinsic
 expansion is conservatively deferred in this builder so structural throwing
-predecessors cannot disappear while SSA is being built. Ordinary tiering and the
-existing transfer runtime still use their existing builders. Machine emission
-deliberately refuses CleanupLanding until native destination maps, helper
-completion outcomes and the rooted pending-transfer cursor consume this IR.
+predecessors cannot disappear while SSA is being built. Ordinary tiering keeps
+its existing builder; the opt-in transfer runtime consumes this new CFG.
+
+`emit_framed_native_cleanups` emits ENDBR64 cold entries followed by parallel
+phi-home moves into the selected cleanup. The machine layer separates the cold
+FrameState use from its operand-free branch, as required by regalloc2 when the
+cleanup has multiple predecessors. CleanupLanding itself is a liveness marker.
+Admission currently requires each source Invoke's cold block to contain only
+NlxTransfer, with no incoming block arguments. A transform that adds work before
+that terminator is rejected until landing maps describe execution of the full
+edge; otherwise a native jump could silently skip that work.
+Cleanup completion uses a typed 32-byte helper-v2 request: normal completion
+restores the saved primary and multiple values, while exceptional completion
+retains its rooted continuation until cold capture consumes the pre-op map.
+Direct THROW is also an Invoke, with rooted tag/primary arguments and a reserved
+request discriminator outside the u32 symbol-index domain. Its helper preserves
+multiple values and returns through Rust before dispatch. SETQ's ClearMv uses
+the existing nonallocating reset helper; no successful-return check is added.
+
+The runtime retains code, maps and adapters for the invocation, captures exact
+source homes, and checks the current Lisp frame and active segment. For a selected
+throw to a live outer CATCH, it repairs native homes from canonical rooted shadows,
+parks the pending continuation before dispatch, and enters the cold edge. Running
+cleanup continuations are retired only at crossed handler depths. Completion
+continues through outer native cleanups or reconstructs bytecode for the remaining
+unwind; it never repeats the failed call or the completed cleanup. Raw errors
+retain fallback so signaling and restart search still happen in the live context.
+Native CATCH/handler/restart destinations and inherited OSR scope state are not
+admitted by this entry yet.
+
+The compiler execution fixture verifies normal/exceptional phi values after
+actual moving GC, and both completion outcomes without any bytecode evaluator.
+Lisp gates count native cleanup entries for nested throws, direct THROW,
+replacement transfers and fiber suspension. A replacement to a different catch
+also checks retirement of the superseded token's payload roots. More general
+reentrant transfers to the same catch binding still require private per-transfer
+payload ownership (`bliss-shih7.12.4`); token-keyed storage alone does not prove
+those semantics. Emergency allocation guarantees (`bliss-shih7.12.3`) and the
+remaining ABI activation gates still apply.
 
 ### Windows validation and Wine limits
 

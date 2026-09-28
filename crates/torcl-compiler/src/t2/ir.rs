@@ -295,6 +295,8 @@ pub enum AuxData {
     },
     FieldOffset(u32),
     CallTarget(u32),
+    /// Invoke a THROW with rooted tag and primary arguments; no normal result.
+    TransferThrow,
     /// Save/restore or landing identity. On Invoke this selects cleanup
     /// completion: normal edge pops/restores the saved value, exceptional edge
     /// resumes its pending transfer with the continuation still described by

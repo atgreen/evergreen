@@ -70,6 +70,27 @@ fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
             torcl_compiler::t2::build::build_from_bytecode(&original).is_err(),
             "legacy builder must still refuse protected code"
         );
+        let ir = torcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&original)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cleanup build replace={replace}: {error:?}; {:?}",
+                    original.code
+                )
+            });
+        torcl_compiler::t2::emit::emit_framed_native_cleanups(
+            &ir,
+            1,
+            original.num_slots(),
+            2,
+            3,
+            4,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "cleanup emission replace={replace}: {error:?}; {:?}",
+                original.code
+            )
+        });
         let code = TransferCode::compile(original)
             .expect("exceptional protected region has a mapped fallback");
         let token = super::super::super::next_control_token("REPLACEMENT");

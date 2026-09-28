@@ -517,7 +517,9 @@ impl<'a> Builder<'a> {
                 Instr::PushUnwind { cleanup_bcp, .. } if self.native_cleanups => {
                     set.insert(*cleanup_bcp as usize);
                 }
-                Instr::CallNamed { .. } | Instr::SetValues(_) if self.native_cleanups => {
+                Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::Throw
+                    if self.native_cleanups =>
+                {
                     if i + 1 < code.len() {
                         set.insert(i + 1);
                     }
@@ -597,7 +599,10 @@ impl<'a> Builder<'a> {
             if self.native_cleanups
                 && matches!(
                     code[i],
-                    Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::CleanupReturn
+                    Instr::CallNamed { .. }
+                        | Instr::SetValues(_)
+                        | Instr::CleanupReturn
+                        | Instr::Throw
                 )
             {
                 if let Some((cleanup, depth)) = self.exceptional_cleanup(i as u32) {
@@ -628,6 +633,7 @@ impl<'a> Builder<'a> {
                 Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
+                Instr::Throw if self.native_cleanups => {}
                 Instr::CallNamed { sym, .. }
                     if self.transfer_mode && is_never_returning_call(*sym) => {}
                 Instr::CallNamed { nargs, .. } => {
@@ -801,9 +807,12 @@ impl<'a> Builder<'a> {
         };
         for (offset, instr) in code[start..end].iter().enumerate() {
             match instr {
-                Instr::CallNamed { .. } | Instr::SetValues(_) if self.native_cleanups => {
+                Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::Throw
+                    if self.native_cleanups =>
+                {
                     let mut successors = Vec::new();
-                    if !matches!(instr, Instr::CallNamed { sym, .. } if is_never_returning_call(*sym))
+                    if !matches!(instr, Instr::Throw)
+                        && !matches!(instr, Instr::CallNamed { sym, .. } if is_never_returning_call(*sym))
                     {
                         successors.push(blk(end)?);
                     }
@@ -1103,6 +1112,34 @@ impl<'a> Builder<'a> {
                     for (offset, result) in results.into_iter().enumerate() {
                         self.write_var(Var::Local(*slot_base + offset as u16), block, result);
                     }
+                }
+                Instr::Throw if self.native_cleanups => {
+                    if stack.len() < 2 {
+                        return Err(BuildError::Unsupported("stack underflow (Throw)"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let args = stack.split_off(stack.len() - 2);
+                    let (inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::TransferThrow,
+                            flags: InstFlags {
+                                effectful: true,
+                                call: true,
+                                safepoint: true,
+                                ..InstFlags::default()
+                            },
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    self.finish_native_invoke(block, inst, stack, results[0], i as u32, None)?;
+                    return Ok(());
                 }
                 Instr::SetValues(n) => {
                     let n = *n as usize;
