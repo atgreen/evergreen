@@ -967,6 +967,7 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
 /// native `mov reg, <addr>` / `call <addr>` to one is otherwise an opaque
 /// pointer. The map is built once from the same function items the emitter
 /// embeds, so it can never drift from reality.
+#[cfg(not(torcl_no_disassembly))]
 fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
     use std::sync::OnceLock;
     static MAP: OnceLock<Vec<(u64, &'static str)>> = OnceLock::new();
@@ -1049,6 +1050,7 @@ fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
 }
 
 /// The first immediate operand of a decoded instruction, if any.
+#[cfg(not(torcl_no_disassembly))]
 fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
     use iced_x86::OpKind::*;
     (0..insn.op_count()).find_map(|i| match insn.op_kind(i) {
@@ -1062,6 +1064,7 @@ fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
 /// one. TorCL tags values in the low 3 bits: fixnum = `n<<3` (tag 000), NIL =
 /// `0x7`. Only unambiguous cases are named (large immediates are code/heap
 /// addresses, not values, so they are left alone).
+#[cfg(not(torcl_no_disassembly))]
 fn decode_tagged_immediate(imm: u64) -> Option<String> {
     use torcl_rt::value::{NIL_BITS, TAG_FIXNUM, TAG_MASK};
     if imm == NIL_BITS {
@@ -1080,6 +1083,7 @@ fn decode_tagged_immediate(imm: u64) -> Option<String> {
 
 /// True if `insn` is a fixnum tag guard: `test r/m8, 7` (masking the low 3 tag
 /// bits before a conditional deopt jump).
+#[cfg(not(torcl_no_disassembly))]
 fn is_tag_guard(insn: &iced_x86::Instruction) -> bool {
     insn.mnemonic() == iced_x86::Mnemonic::Test
         && native_immediate(insn) == Some(torcl_rt::value::TAG_MASK)
@@ -1090,6 +1094,7 @@ fn is_tag_guard(insn: &iced_x86::Instruction) -> bool {
 /// function's code; `osr` maps native offsets that are OSR loop entries;
 /// `deopt_start` is the offset where the cold deopt-stub section begins. Only
 /// unambiguous patterns are annotated (no false positives).
+#[cfg(not(torcl_no_disassembly))]
 fn native_insn_annotation(
     insn: &iced_x86::Instruction,
     prev: Option<&iced_x86::Instruction>,
@@ -1151,6 +1156,7 @@ fn native_insn_annotation(
 /// A lossless fallback for targets without an in-process instruction decoder.
 /// Keep halfword offsets so System Z bytecode/OSR positions remain selectable
 /// in the tier viewer without pretending these are decoded instructions.
+#[cfg(not(torcl_no_disassembly))]
 fn format_native_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out =
@@ -1172,6 +1178,7 @@ fn format_native_bytes(bytes: &[u8]) -> String {
 /// compilation strategy and OSR entries. Offsets are relative to the code
 /// entry. Reads the R+X mapping, so the owner must remain alive (tier snapshots
 /// are captured at compile time — see [`capture_tier_disasm`]).
+#[cfg(not(torcl_no_disassembly))]
 fn format_native_listing(nc: &NativeCode) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1391,6 +1398,7 @@ pub fn tier_disasm(sym: u32) -> Option<TierDisasm> {
 /// registry holds only compiled functions, so this is a short scan, and
 /// DISASSEMBLE is a debug path. Allocation-free: no TorCL object is created, so
 /// there is nothing for a GC to relocate mid-scan.
+#[cfg(not(torcl_no_disassembly))]
 pub fn disassemble_by_function(f: TorclVal) -> Option<String> {
     install_bytecode_root_scanner();
     // Collect the keys before probing so the registry borrow is not held across
@@ -1401,6 +1409,7 @@ pub fn disassemble_by_function(f: TorclVal) -> Option<String> {
         .and_then(disassemble_by_symbol)
 }
 
+#[cfg(not(torcl_no_disassembly))]
 pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
     let bf = registry_get(sym)?;
     let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
@@ -17608,6 +17617,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     // TORCL_T2_DISASM=<substring>: print the installed code of matching
     // functions to stderr at install time — the only way to inspect code that
     // crashes on its first execution (bliss-x5y.29 forensics).
+    #[cfg(not(torcl_no_disassembly))]
     if let Ok(pat) = std::env::var("TORCL_T2_DISASM") {
         if !pat.is_empty() && bf.name.contains(&pat) {
             eprintln!(
@@ -21754,4 +21764,9 @@ mod jtc4_stack_map_tests {
         assert!(parse_bbu_constant(&mut BbuCursor::new(&double), 0x0109).is_err());
         assert!(parse_bbu_constant(&mut BbuCursor::new(&double), 0x010a).is_ok());
     }
+}
+
+#[cfg(torcl_no_disassembly)]
+fn format_native_listing(_: &NativeCode) -> String {
+    "; Native disassembly was omitted at delivery.\n".into()
 }

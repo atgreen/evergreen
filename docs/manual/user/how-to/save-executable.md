@@ -105,13 +105,19 @@ singleton keys, missing functions, and unknown packages are errors.
 | `keep = PACKAGE::FUNCTION` | Additional root, such as a dynamically selected callback; repeat as needed |
 | `dynamic = preserve` | Default: retain all candidate functions to preserve unknown dynamic targets |
 | `dynamic = explicit` | Opt in to pruning; declare every additional dynamic entry with `keep` |
+| `runtime = full` | Default: reuse the full delivery driver, without invoking Cargo |
+| `runtime = specialized` | Build a matching release runtime with only the required optional native capabilities |
+| `runtime-keep = disassembly` | Additional native capability root; supported names are `disassembly` and `dynamic-code` |
 
 Use `dynamic = explicit` only when the root list describes your application.
 For example, `(funcall (intern command "MY-APP"))` can name functions the analyzer
 cannot infer from the saved data. Add a `keep` line for each permitted target,
-or leave `dynamic = preserve`. The same applies to code later introduced through
-`load`, `eval`, plugins, foreign callbacks, or method redefinition. This policy
-does not disable those operations or provide a security boundary.
+or leave `dynamic = preserve`. Reachable arbitrary-code entry points such as
+`EVAL` and `LOAD` retain all candidate functions and native capabilities even
+with `dynamic = explicit`: the retention policy cannot override that dependency.
+Plugins, foreign callbacks, and method redefinition also need explicit roots
+when their targets cannot be inferred. This is a delivery policy, not a security
+boundary.
 
 The current pass retains all global data, symbol identities, packages, macros,
 classes, methods, and functions outside the selected packages. It follows
@@ -119,9 +125,75 @@ references through saved data and source/bytecode, including nested functions
 and captured environments. Conservatively retained registries can keep extra
 functions alive. Runtime packages cannot be selected for pruning.
 
-This is **image-only delivery**: it keeps the full runtime, including the
-interpreter and tiered compilers. It does not rebuild Rust, remove native
-builtins, or claim to minimize the whole heap. Use the same compatible target
-runtime that loads the input core; delivery does not translate images between
-architectures. Re-saving an executable replaces its embedded image instead of
-stacking another copy of the previous core into the runtime prefix.
+With the default `runtime = full`, delivery reduces the saved image and keeps
+the full Rust runtime. Re-saving an executable replaces its embedded image
+instead of stacking another copy of the previous core into the runtime prefix.
+
+## Specialize the native runtime
+
+Add this to the same delivery specification:
+
+```text
+runtime = specialized
+```
+
+Then run delivery with a matching source checkout:
+
+```sh
+torcl --image app.core --deliver app.delivery --output hello \
+  --runtime-source /path/to/torcl
+```
+
+The source checkout defaults to the location recorded when the driver was built.
+You need Cargo, the matching Rust toolchain, its target libraries, and the target
+linker. The new runtime must execute on the delivery machine so its compatibility
+contract can be checked; this command does not cross-deliver images.
+
+Native capabilities are selected by the reachability graph. A retained
+`DISASSEMBLE` reference keeps disassembly. A retained `EVAL`, `COMPILE`, `LOAD`,
+`COMPILE-FILE`, `REQUIRE`, or reader operation supporting `#.` keeps
+`dynamic-code`, which in turn keeps **every** native capability and candidate
+Lisp function. The report names these roots. `dynamic = preserve` retains all
+capabilities; explicit `runtime-keep` entries add roots, never remove required
+ones.
+
+When `dynamic-code` is unreachable, the specialized runtime omits those public
+source-evaluation entry points and rejects `--eval`, `--load`, scripts, the
+REPL, and legacy source images. It also skips init files. Validated saved cores
+remain supported. Raw source-lambda invocation is an evaluation entry too:
+saved raw lambda lists (including constant-pool and global data) are retained
+conservatively, and applications that
+construct them dynamically must retain `dynamic-code`.
+
+The GC, T0 bytecode interpreter, and tiered compilers remain available.
+Deoptimization resumes T0 bytecode; it does not require public `EVAL`.
+`EvalHost` follows the references in its saved constant form rather than rooting
+all capabilities. The **tree-walker itself is not removed by this initial
+pass**: source closures, internal fallback paths, and shared builtin dispatch
+still need a separate dependency split. This is not yet general removal of
+every unused Rust builtin. Retained bootstrap functions and macros can contain
+source lambdas and keep all native capabilities even when the application entry
+does not call `EVAL`; the report identifies this conservative dependency.
+
+Delivery generates a versioned native contract, builds through Cargo in
+`target/delivery/` under the source checkout, checks the resulting executable,
+and appends the reduced image. Compile-time selection removes references to the
+instruction decoder; release LTO and linker garbage collection can then remove
+its implementation. The cache separates source versions, targets, capabilities,
+Cargo features, compiler flags, and toolchain identities. Existing output files
+survive a failed build or compatibility check. A dry run only reports selection
+and does not invoke Cargo.
+
+`--runtime-info` prints a runtime's contract. Saved image format 5 includes the
+same compatibility information and is checked before heap restoration. Source
+content identity, target, Rust toolchain, Cargo features, and compiler flags
+must match; the runtime's native capabilities must include the image's required
+capabilities. The source fingerprint is a compatibility identifier, not a
+cryptographic signature. Full runtimes can still read older images; specialized
+runtimes require the new metadata. A reduced driver cannot be used for
+`runtime = full` delivery.
+
+The delivery report separates `native-bytes` and `image-bytes`. Compare native
+sizes from the same release profile and stripping settings; a debug driver is
+not a useful size baseline for a specialized release build. Strip an executable
+**before** appending an image: stripping the delivered file may discard its core.

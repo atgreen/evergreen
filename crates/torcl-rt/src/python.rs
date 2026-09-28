@@ -54,8 +54,7 @@ struct Api {
     import_module: unsafe extern "C" fn(*const i8) -> *mut PyObject,
     object_get_attr_string: unsafe extern "C" fn(*mut PyObject, *const i8) -> *mut PyObject,
     object_set_attr_string: unsafe extern "C" fn(*mut PyObject, *const i8, *mut PyObject) -> i32,
-    object_call:
-        unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+    object_call: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
     object_str: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     object_repr: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     object_type: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
@@ -81,8 +80,7 @@ struct Api {
     /// 3.12 and later: the raised exception, normalized, as one owned reference.
     /// `None` on 3.11, which has only the three-part form below.
     err_get_raised_exception: Option<unsafe extern "C" fn() -> *mut PyObject>,
-    err_fetch:
-        unsafe extern "C" fn(*mut *mut PyObject, *mut *mut PyObject, *mut *mut PyObject),
+    err_fetch: unsafe extern "C" fn(*mut *mut PyObject, *mut *mut PyObject, *mut *mut PyObject),
     sequence_size: unsafe extern "C" fn(*mut PyObject) -> isize,
     sequence_get_item: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
 
@@ -466,9 +464,8 @@ impl PythonScope {
         const PY_FILE_INPUT: i32 = 257;
         // SAFETY: a resolved entry point, a valid null-terminated string, a borrowed
         // module dictionary, and this scope proves the caller may use the C API.
-        let result = unsafe {
-            (self.api.run_string)(source.as_ptr(), PY_FILE_INPUT, globals, globals)
-        };
+        let result =
+            unsafe { (self.api.run_string)(source.as_ptr(), PY_FILE_INPUT, globals, globals) };
         // The result of a statement sequence is None, which is of no use to a
         // caller. Released here rather than left to Drop so that running statements
         // does not fill the deferred-release queue with Nones.
@@ -1088,7 +1085,11 @@ impl PythonScope {
         // reference it is given, which is why `into_raw` rather than `as_ptr`; the
         // tuple owns them from that point and releases them when it dies.
         let result = unsafe {
-            let tuple = adopt(self, (self.api.tuple_new)(count as isize), "building arguments")?;
+            let tuple = adopt(
+                self,
+                (self.api.tuple_new)(count as isize),
+                "building arguments",
+            )?;
             for (index, argument) in arguments.into_iter().enumerate() {
                 let status =
                     (self.api.tuple_set_item)(tuple.pointer, index as isize, argument.into_raw());
@@ -1393,10 +1394,7 @@ impl PythonScope {
 
     /// The object a proxy names, as a fresh owned reference, or `None` if `value`
     /// is not a proxy (or is one whose reference has already been given back).
-    fn proxy_reference(
-        &self,
-        value: crate::value::TorclVal,
-    ) -> Option<Result<PyRef, TorclError>> {
+    fn proxy_reference(&self, value: crate::value::TorclVal) -> Option<Result<PyRef, TorclError>> {
         if !is_proxy(value) {
             return None;
         }

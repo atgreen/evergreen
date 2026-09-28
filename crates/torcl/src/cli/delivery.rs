@@ -16,10 +16,14 @@ struct Spec {
     packages: Vec<String>,
     keep: Vec<String>,
     explicit_dynamic_roots: bool,
+    specialized: bool,
+    runtime_keep: std::collections::BTreeSet<String>,
 }
 
 impl Spec {
     fn parse(text: &str) -> Result<Self, TorclError> {
+        let mut runtime = None;
+        let mut runtime_keep = std::collections::BTreeSet::new();
         let mut entry = None;
         let mut version = None;
         let mut dynamic = None;
@@ -43,6 +47,13 @@ impl Spec {
                 "dynamic" if dynamic.is_none() => dynamic = Some(value),
                 "prune-package" => packages.push(value.to_owned()),
                 "keep" => keep.push(value.to_owned()),
+                "runtime" if runtime.is_none() => runtime = Some(value),
+                "runtime-keep" => {
+                    if !crate::runtime_contract::CAPABILITIES.contains(&value) {
+                        return Err(error(format!("unknown runtime capability {value}")));
+                    }
+                    runtime_keep.insert(value.to_owned());
+                }
                 _ => {
                     return Err(error(format!(
                         "spec line {}: unknown or duplicate key {key}",
@@ -59,7 +70,17 @@ impl Spec {
             "explicit" => true,
             _ => return Err(error("dynamic must be preserve or explicit")),
         };
+        let specialized = match runtime.unwrap_or("full") {
+            "full" => false,
+            "specialized" => true,
+            _ => return Err(error("runtime must be full or specialized")),
+        };
+        if !specialized && !runtime_keep.is_empty() {
+            return Err(error("runtime-keep requires runtime = specialized"));
+        }
         Ok(Self {
+            specialized,
+            runtime_keep,
             entry: entry.ok_or_else(|| error("spec requires entry"))?,
             packages,
             keep,
@@ -126,6 +147,8 @@ pub(super) fn bytecode_references(function: &BytecodeFunction) -> Vec<TorclVal> 
 }
 
 struct Plan {
+    capability_roots: std::collections::BTreeSet<String>,
+    capabilities: std::collections::BTreeSet<String>,
     candidates: BTreeMap<u32, String>,
     retained: BTreeMap<u32, String>,
 }
@@ -188,16 +211,30 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 "explicit keep".to_owned(),
             ));
         }
-        if !spec.explicit_dynamic_roots {
+        if !spec.explicit_dynamic_roots || spec.runtime_keep.contains("dynamic-code") {
             for &index in candidates.keys() {
                 queue.push_back((
                     TorclVal::from_symbol_index(index),
-                    "dynamic = preserve".to_owned(),
+                    if spec.explicit_dynamic_roots {
+                        "runtime-keep = dynamic-code"
+                    } else {
+                        "dynamic = preserve"
+                    }
+                    .to_owned(),
                 ));
             }
         }
         for value in roots {
             queue.push_back((value, "persistent data or runtime registry".to_owned()));
+        }
+        let mut capability_roots = std::collections::BTreeSet::new();
+        let mut capabilities = spec.runtime_keep.clone();
+        if !spec.explicit_dynamic_roots {
+            capabilities.extend(
+                crate::runtime_contract::CAPABILITIES
+                    .iter()
+                    .map(|s| (*s).to_owned()),
+            );
         }
         let mut retained = BTreeMap::new();
         let mut visited = HashSet::new();
@@ -211,7 +248,49 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             if !visited.insert(value.0) {
                 continue;
             }
+            if spec.specialized && value.is_cons() {
+                let head = cp(value).0;
+                // Saved data and BFASL constants contain raw lambda lists, not
+                // QUOTE syntax. Conservatively keep their evaluator surface.
+                if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "LAMBDA" {
+                    if capabilities.insert("dynamic-code".into()) {
+                        for &candidate in candidates.keys() {
+                            queue.push_back((
+                                TorclVal::from_symbol_index(candidate),
+                                "reachable source lambda".into(),
+                            ));
+                        }
+                    }
+                    capability_roots.insert("source lambda".into());
+                }
+            }
             if let Some(index) = value.symbol_index() {
+                if !is_keyword_arg(value)
+                    && symbols::symbol_name(index).is_some_and(|name| {
+                        crate::runtime_contract::opens_code_world(
+                            name.rsplit(':').next().unwrap_or(&name),
+                        )
+                    })
+                {
+                    if capabilities.insert("dynamic-code".into()) {
+                        for &candidate in candidates.keys() {
+                            queue.push_back((
+                                TorclVal::from_symbol_index(candidate),
+                                format!(
+                                    "reachable {} can invoke arbitrary code",
+                                    qualified_name(index)
+                                ),
+                            ));
+                        }
+                    }
+                    capability_roots.insert(qualified_name(index));
+                }
+                if !is_keyword_arg(value)
+                    && symbols::symbol_name(index)
+                        .is_some_and(|name| name.rsplit(':').next() == Some("DISASSEMBLE"))
+                {
+                    capabilities.insert("disassembly".to_owned());
+                }
                 let next_reason = if let Some(name) = candidates.get(&index) {
                     retained.insert(index, reason.clone());
                     format!("{reason} -> {name}")
@@ -251,7 +330,10 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 });
             }
         }
+        crate::runtime_contract::close_capabilities(&mut capabilities);
         Plan {
+            capability_roots,
+            capabilities,
             candidates,
             retained,
         }
@@ -297,6 +379,20 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     symbols::set_symbol_value(top, TorclVal::from_symbol_index(entry));
     torcl_stdlib::pathnames::clear_delivery_string_caches()?;
     let plan = analyze(&spec, entry, &keeps, env)?;
+    let mut selected = native_runtime::contract();
+    if !spec.specialized
+        && crate::runtime_contract::CAPABILITIES
+            .iter()
+            .any(|name| !selected.capabilities.contains(*name))
+    {
+        return Err(error("runtime = full requires a full delivery driver"));
+    }
+    if spec.specialized {
+        selected.capabilities = plan.capabilities.clone();
+    }
+    native_runtime::contract()
+        .accepts(&selected)
+        .map_err(error)?;
     let input_size = std::fs::metadata(input)
         .map_err(|e| error(e.to_string()))?
         .len();
@@ -307,7 +403,12 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     // The core was validated by load_core_image_bytes before delivery started.
     let image_version = u32::from_ne_bytes(header[8..12].try_into().unwrap());
     let mut report = format!(
-        "torcl-delivery-manifest = 1\nruntime = full\ntorcl-version = {}\nplatform-tag = {}\ninput-bytes = {input_size}\nentry = {}\ndynamic = {}\n",
+        "torcl-delivery-manifest = 1\nruntime = {}\ntorcl-version = {}\nplatform-tag = {}\ninput-bytes = {input_size}\nentry = {}\ndynamic = {}\n",
+        if spec.specialized {
+            "specialized"
+        } else {
+            "full"
+        },
         env!("CARGO_PKG_VERSION"),
         torcl_rt::image::current_platform_tag(),
         spec.entry,
@@ -317,9 +418,21 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
             "preserve"
         }
     );
+    report.push_str(&format!(
+        "native-contract-begin\n{}native-contract-end\n",
+        selected.encode()
+    ));
+    for root in &plan.capability_roots {
+        report.push_str(&format!(
+            "native-root = {root} -> dynamic-code -> all native capabilities\n"
+        ));
+    }
     report.push_str(&format!("input-image-format = {image_version}\n"));
     for package in &spec.packages {
         report.push_str(&format!("prune-package = {package}\n"));
+    }
+    for capability in &spec.runtime_keep {
+        report.push_str(&format!("explicit-native-root = {capability}\n"));
     }
     for name in &spec.keep {
         report.push_str(&format!("explicit-keep = {name}\n"));
@@ -343,6 +456,14 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     // leaves any previous executable untouched.
     let executable_stage = TemporaryFile::new(output).map_err(|e| error(e.to_string()))?;
     let manifest_stage = TemporaryFile::new(&manifest_path).map_err(|e| error(e.to_string()))?;
+    let mut runtime = if spec.specialized {
+        eprintln!(";; building matching native runtime (cached Cargo release build)");
+        native_runtime::build(args.runtime_source.as_deref(), &selected)?
+    } else {
+        current_runtime_bytes().map_err(|e| error(e.to_string()))?
+    };
+    remove_embedded_images(&mut runtime).map_err(|e| error(e.to_string()))?;
+    let runtime_bytes = runtime.len();
     for &index in plan
         .candidates
         .keys()
@@ -352,15 +473,26 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         bytecode::clear_lazy_state(index);
         bytecode::clear_closure_env(index);
     }
-    save_core(
-        executable_stage
-            .path
-            .to_str()
-            .ok_or_else(|| error("output path is not UTF-8"))?,
-        true,
-        true,
-        env,
-    )?;
+    native_runtime::with_save_contract(&selected, || {
+        save_core(
+            executable_stage
+                .path
+                .to_str()
+                .ok_or_else(|| error("output path is not UTF-8"))?,
+            false,
+            true,
+            env,
+        )
+    })?;
+    let core = std::fs::read(&executable_stage.path).map_err(|e| error(e.to_string()))?;
+    report.push_str(&format!(
+        "native-bytes = {runtime_bytes}\nimage-bytes = {}\n",
+        core.len()
+    ));
+    runtime.extend_from_slice(&core);
+    runtime.extend_from_slice(EXE_IMAGE_MAGIC);
+    runtime.extend_from_slice(&(core.len() as u64).to_le_bytes());
+    write_atomic(&executable_stage.path, &runtime, true).map_err(|e| error(e.to_string()))?;
     report.push_str(&format!(
         "output-bytes = {}\n",
         std::fs::metadata(&executable_stage.path)

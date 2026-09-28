@@ -22,6 +22,7 @@ use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 mod bytecode;
 mod delivery;
 pub mod events;
+mod native_runtime;
 mod python;
 pub mod sprof;
 use torcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
@@ -43,6 +44,8 @@ pub struct CliArgs {
     pub deliver: Option<String>,
     pub output: Option<String>,
     pub dry_run: bool,
+    pub runtime_info: bool,
+    pub runtime_source: Option<String>,
     /// All `--eval`/`-e` forms in command-line order, evaluated in sequence in
     /// one shared env so later forms see earlier state (bliss-7zl).
     pub eval_forms: Vec<String>,
@@ -80,6 +83,8 @@ impl CliArgs {
         let mut deliver = None;
         let mut output = None;
         let mut dry_run = false;
+        let mut runtime_info = false;
+        let mut runtime_source = None;
         let mut eval_forms: Vec<String> = Vec::new();
         let mut saw_double_dash = false;
 
@@ -93,12 +98,14 @@ impl CliArgs {
             }
 
             match arg.as_str() {
-                "--deliver" | "--output" => {
+                "--deliver" | "--output" | "--runtime-source" => {
                     let value = args
                         .get(i + 1)
                         .ok_or_else(|| TorclError::Internal(format!("{arg} requires a value")))?;
                     let slot = if arg == "--deliver" {
                         &mut deliver
+                    } else if arg == "--runtime-source" {
+                        &mut runtime_source
                     } else {
                         &mut output
                     };
@@ -106,6 +113,10 @@ impl CliArgs {
                         return Err(TorclError::Internal(format!("duplicate {arg}")));
                     }
                     i += 2;
+                }
+                "--runtime-info" => {
+                    runtime_info = true;
+                    i += 1;
                 }
                 "--dry-run" => {
                     dry_run = true;
@@ -209,6 +220,8 @@ impl CliArgs {
             deliver,
             output,
             dry_run,
+            runtime_info,
+            runtime_source,
             eval_forms,
             load: config.load_file.clone(),
             no_image: shared_args.iter().any(|arg| arg == "--no-image"),
@@ -244,7 +257,7 @@ impl CliArgs {
             {
                 return Err(TorclError::Internal("--deliver cannot be combined with other execution modes or application arguments".into()));
             }
-        } else if r.output.is_some() || r.dry_run {
+        } else if r.output.is_some() || r.dry_run || r.runtime_source.is_some() {
             return Err(TorclError::Internal(
                 "--output and --dry-run require --deliver".into(),
             ));
@@ -3710,6 +3723,7 @@ fn drain_pending_host_generics(env: &Env) {
 /// Register the host-registry image hooks with torcl-rt. Idempotent (torcl-rt
 /// stores the last registration); call once at CLI startup.
 pub(crate) fn register_host_registry_hooks() {
+    native_runtime::register_image_hooks();
     torcl_rt::image::set_host_registry_hooks(host_serialize_registries, host_restore_registries);
     // Off-heap-body VALUE objects (hash-tables, pathnames) are carried in their
     // own image section and re-materialized mid-restore (bliss-x0f2 M3).
@@ -17275,6 +17289,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     // Otherwise the character is consumed; keep scanning.
                 }
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "READ" | "READ-PRESERVING-WHITESPACE" => {
                 // (read &optional stream eof-error-p eof-value recursive-p)
                 let args = eval_args(cdr, env)?;
@@ -17298,6 +17313,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     }
                 }
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "READ-FROM-STRING" => {
                 // (read-from-string string &optional eof-error-p eof-value
                 //  &key (start 0) end preserve-whitespace) => object, position
@@ -19974,6 +19990,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 };
                 return Ok(register_tree_closure(closure));
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "EVAL" => {
                 // (eval form): evaluate the argument to obtain the form, then
                 // evaluate that form in the NULL LEXICAL ENVIRONMENT (CLHS EVAL,
@@ -20011,6 +20028,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(result);
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "COMPILE" => {
                 // (compile name &optional definition) — CLHS 3.2. torcl functions
                 // are already compiled/callable, so COMPILE produces a callable
@@ -23850,6 +23868,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return invoke_restart_function(&entry.function, &interactive_args, env);
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
+            #[cfg(not(torcl_no_dynamic_code))]
             "LOAD" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
@@ -23928,6 +23947,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 load_path_into_env(&path, env)?;
                 return Ok(T);
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "COMPILE-FILE" => {
                 // (compile-file source &key output-file &allow-other-keys) — compile
                 // SOURCE to a .bfasl (bliss-lb6.6). Returns three values per ANSI:
@@ -24106,6 +24126,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     torcl_stdlib::parse_namestring(arena_str(&format!("{stem}.fasl")), None, None)?;
                 return Ok(pn);
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "REQUIRE" => {
                 let (module_form, _) = cp(cdr);
                 let module_val = eval_form(module_form, env)?;
@@ -26693,6 +26714,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
 
     // CL:DISASSEMBLE (spec §6) — render the callee's current tier: annotated
     // bytecode while interpreted (T0), decoded x86-64 once native (T1).
+    #[cfg(not(torcl_no_disassembly))]
     if car.is_symbol() && sym_bare_name_rc(car).as_ref() == "DISASSEMBLE" {
         let arg = if cdr.is_cons() {
             eval_form(cp(cdr).0, env)?
@@ -36456,6 +36478,11 @@ fn apply_function(
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
+            if cfg!(torcl_no_dynamic_code) {
+                return Err(TorclError::ProgramError(
+                    "raw lambda invocation requires retained dynamic-code support".into(),
+                ));
+            }
             let (params_form, body) = cp(lr);
             return eval_lambda_call(env, params_form, body, args, Arc::clone(&env.frame));
         }
@@ -36530,6 +36557,12 @@ fn apply_function(
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
 fn is_builtin_function(name: &str) -> bool {
+    if cfg!(torcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
+        return false;
+    }
+    if name == "DISASSEMBLE" {
+        return !cfg!(torcl_no_disassembly);
+    }
     if name == "TORCL::%STANDARD-CHARACTER-READER" {
         return true;
     }
@@ -36593,8 +36626,7 @@ fn is_builtin_function(name: &str) -> bool {
     matches!(
         name,
         // Introspection / devtools
-        "DISASSEMBLE"
-            | "TORCL::%NATIVE-MUTEX"
+        "TORCL::%NATIVE-MUTEX"
             | "TORCL::%NATIVE-FIBER"
             | "TORCL::%FOREIGN-MEMORY"
             | "TORCL::%FOREIGN-LIBRARY"
@@ -37459,6 +37491,11 @@ fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, Torcl
 }
 
 fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclVal, TorclError> {
+    if cfg!(torcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
+        return Err(TorclError::ProgramError(format!(
+            "native delivery omitted dynamic code entry {name}"
+        )));
+    }
     match name {
         "TORCL-EXT:DECLARATION-SPECIFIER" | "TORCL-EXT::DECLARATION-SPECIFIER" => {
             if args.len() != 2 {
@@ -37548,6 +37585,7 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
         }
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
+        #[cfg(not(torcl_no_disassembly))]
         "DISASSEMBLE" => {
             let listing = args.first().and_then(|a| {
                 if a.is_symbol() {
@@ -39535,9 +39573,25 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
         print_help();
         return Ok(0);
     }
+    if ca.runtime_info {
+        print!("{}", native_runtime::contract().encode());
+        return Ok(0);
+    }
     if ca.version {
         print_version();
         return Ok(0);
+    }
+
+    if cfg!(torcl_no_dynamic_code)
+        && (!ca.eval_forms.is_empty()
+            || ca.load.is_some()
+            || ca.script.is_some()
+            || ca.load_report.is_some()
+            || ca.no_image)
+    {
+        return Err(TorclError::ProgramError(
+            "dynamic code entry points are absent from this delivered runtime".into(),
+        ));
     }
 
     torcl_rt::install_signal_handlers()?;
@@ -39567,7 +39621,7 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // stranded).
     let image_magic = torcl_rt::image::IMAGE_MAGIC.to_ne_bytes();
     let mut core_loaded = false;
-    let embedded_core = if ca.deliver.is_some() {
+    let embedded_core = if ca.deliver.is_some() || ca.image.is_some() {
         None
     } else {
         embedded_image().filter(|b| b.starts_with(&image_magic))
@@ -39592,6 +39646,12 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
         }
         BOOT_COMPLETE.with(|c| c.set(true));
         return delivery::run(&ca, &mut env);
+    }
+
+    if cfg!(torcl_no_dynamic_code) && !core_loaded {
+        return Err(TorclError::ProgramError(
+            "this delivered runtime requires a compatible core image".into(),
+        ));
     }
 
     // Set *command-line-args* (issue #4)
@@ -39624,7 +39684,11 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // A saved `:executable` binary carries its image appended to itself. Detect
     // and load it like `--image`, but treat the process as that saved program:
     // skip the user init file and run its recorded top-level entry point.
-    let embedded = embedded_image();
+    let embedded = if ca.image.is_some() {
+        None
+    } else {
+        embedded_image()
+    };
     if let Some(ref bytes) = embedded {
         if bytes.starts_with(&torcl_rt::bfasl::BFASL_MAGIC) {
             load_bfasl_into_env(bytes, &mut env)?;
@@ -39643,7 +39707,8 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // image`) is a general REPL: skipping ~/.torclrc there silently dropped
     // the user's ocicl system-search hook, so (asdf:load-system :babel) died
     // with MISSING-COMPONENT (SBCL's saved REPL images read ~/.sbclrc too).
-    if !ca.no_init
+    if !cfg!(torcl_no_dynamic_code)
+        && !ca.no_init
         && (embedded.is_none() || image_toplevel().is_none())
         && ca.eval_forms.is_empty()
         && ca.load.is_none()
@@ -39702,6 +39767,11 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
                 }
             };
         }
+    }
+    if cfg!(torcl_no_dynamic_code) {
+        return Err(TorclError::ProgramError(
+            "the REPL is absent from this delivered runtime".into(),
+        ));
     }
     run_repl_env(&mut env)
 }
@@ -39971,6 +40041,8 @@ pub fn help_text() -> &'static str {
         "  --deliver SPEC       Deliver the saved --image using SPEC\n",
         "  --output FILE        Delivered executable (with FILE.manifest report)\n",
         "  --dry-run            Report delivery retention without writing files\n",
+        "  --runtime-source DIR Matching TorCL sources for specialized delivery\n",
+        "  --runtime-info       Print native runtime compatibility contract\n",
         "  --no-image           Start without loading an image\n",
         "  --bootstrap          Deprecated; the prelude now loads by default\n",
         "  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)\n",

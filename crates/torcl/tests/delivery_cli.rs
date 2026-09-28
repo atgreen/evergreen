@@ -376,3 +376,251 @@ fn delivery_reduces_the_embedded_core_when_unused_code_has_large_constants() {
     );
     assert!(ok(run(&exe, &[])).contains("SMALL-OK"));
 }
+
+#[test]
+fn saved_images_validate_native_requirements_before_restore() {
+    let f = Fixture::new();
+    let core = f.path("contract.core");
+    ok(run(
+        BIN,
+        &["--eval", &format!("(save-lisp-and-die {core:?})")],
+    ));
+    let mut bytes = fs::read(&core).unwrap();
+    let marker = b"schema=1\nsource=";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("saved core contains native runtime requirements")
+        + marker.len();
+    bytes[offset] = if bytes[offset] == b'0' { b'1' } else { b'0' };
+    fs::write(&core, bytes).unwrap();
+    let result = run(BIN, &["--image", &core]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("runtime source mismatch"));
+}
+
+#[test]
+fn native_delivery_capabilities_follow_reachable_symbols_and_dynamic_policy() {
+    let f = Fixture::new();
+    let core = f.path("caps.core");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (defpackage :native-delivery (:use :cl))
+        (in-package :native-delivery)
+        (defun main () (format t "NATIVE-OK~%"))
+        (defun inspect-main () (disassemble 'main))
+        (defun eval-main (form) (eval form))
+        (defun load-main () (load "later.lisp"))
+        (save-lisp-and-die {core:?})"#
+            ),
+        ],
+    ));
+    let spec = f.path("caps.delivery");
+    for (entry, policy, keep, expected) in [
+        ("MAIN", "explicit", "", "capabilities=\n"),
+        (
+            "EVAL-MAIN",
+            "explicit",
+            "",
+            "capabilities=disassembly,dynamic-code\n",
+        ),
+        (
+            "LOAD-MAIN",
+            "explicit",
+            "",
+            "capabilities=disassembly,dynamic-code\n",
+        ),
+        ("INSPECT-MAIN", "explicit", "", "capabilities=disassembly\n"),
+        (
+            "MAIN",
+            "preserve",
+            "",
+            "capabilities=disassembly,dynamic-code\n",
+        ),
+        (
+            "MAIN",
+            "explicit",
+            "runtime-keep = disassembly\n",
+            "capabilities=disassembly\n",
+        ),
+    ] {
+        fs::write(&spec, format!("version = 1\nentry = NATIVE-DELIVERY::{entry}\nprune-package = NATIVE-DELIVERY\nruntime = specialized\ndynamic = {policy}\n{keep}")).unwrap();
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--deliver",
+                &spec,
+                "--output",
+                &f.path("out"),
+                "--dry-run",
+            ],
+        ));
+        assert!(report.contains(expected), "{report}");
+        if entry == "EVAL-MAIN" || entry == "LOAD-MAIN" {
+            assert!(
+                report.contains("keep NATIVE-DELIVERY::INSPECT-MAIN"),
+                "{report}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_builds_and_runs_without_decoder() {
+    let f = Fixture::new();
+    let core = f.path("native.core");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (defpackage :native-app (:use :cl))
+        (in-package :native-app)
+        (defun add-one (x) (+ x 1))
+        (defun main ()
+          (dotimes (i 1000) (add-one i))
+          (write-line (if (= (add-one 1.5) 2.5) "NATIVE-OK" "WRONG")))
+        (save-lisp-and-die {core:?})"#
+            ),
+        ],
+    ));
+    let spec = f.path("native.delivery");
+    let exe = f.path("app");
+    fs::write(&spec, "version = 1\nentry = NATIVE-APP::MAIN\nprune-package = NATIVE-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    let output = Command::new(BIN)
+        .args([
+            "--no-init",
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+        ])
+        .output()
+        .unwrap();
+    let report = ok(output);
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("native-bytes = "));
+    assert!(ok(run(&exe, &[])).contains("NATIVE-OK"));
+    for (key, value) in [("TORCL_BACKEND", "treewalker"), ("TORCL_FORCE_TIER", "t2")] {
+        let output = Command::new(&exe)
+            .arg("--no-init")
+            .env(key, value)
+            .output()
+            .unwrap();
+        assert!(ok(output).contains("NATIVE-OK"));
+    }
+    let symbols = Command::new("nm").arg("-C").arg(&exe).output().unwrap();
+    let symbols = ok(symbols);
+    assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+    assert!(
+        symbols.contains("torcl::"),
+        "symbol table must be present to prove removal"
+    );
+    let eval = run(&exe, &["--eval", "(disassemble 'native-app::main)"]);
+    assert!(!eval.status.success());
+    assert!(String::from_utf8_lossy(&eval.stderr).contains("dynamic code entry points are absent"));
+    let rejected = run(&exe, &["--image", &core]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("unavailable native runtime capabilities")
+    );
+    let original = fs::read(&exe).unwrap();
+    let manifest = fs::read(format!("{exe}.manifest")).unwrap();
+    let failed = run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--runtime-source",
+            &f.path("missing-source"),
+        ],
+    );
+    assert!(!failed.status.success());
+    assert_eq!(fs::read(&exe).unwrap(), original);
+    assert_eq!(fs::read(format!("{exe}.manifest")).unwrap(), manifest);
+}
+
+#[test]
+fn explicit_image_overrides_a_saved_executables_embedded_core() {
+    let f = Fixture::new();
+    let exe = f.path("embedded");
+    let core = f.path("explicit.core");
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!(
+                r#"(defun embedded-main () (format t "EMBEDDED~%")) (save-lisp-and-die {exe:?} :executable t :toplevel 'embedded-main)"#
+            ),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!(
+                r#"(defun explicit-main () (format t "EXPLICIT~%")) (save-lisp-and-die {core:?} :toplevel 'explicit-main)"#
+            ),
+        ],
+    ));
+    let output = ok(run(&exe, &["--image", &core]));
+    assert!(output.contains("EXPLICIT"), "{output}");
+    assert!(!output.contains("EMBEDDED"), "{output}");
+}
+
+#[test]
+fn native_delivery_retains_evaluation_for_saved_raw_lambda_data() {
+    let f = Fixture::new();
+    let core = f.path("raw.core");
+    let spec = f.path("raw.delivery");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+      (defpackage :raw-app (:use :cl))
+      (in-package :raw-app)
+      (set '*fn* '(lambda () 42))
+      (defun main () (funcall *fn*))
+      (save-lisp-and-die {core:?})"#
+            ),
+        ],
+    ));
+    fs::write(&spec, "version = 1\nentry = RAW-APP::MAIN\nprune-package = RAW-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &f.path("app"),
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code\n"),
+        "{report}"
+    );
+    assert!(report.contains("native-root = source lambda"), "{report}");
+}
