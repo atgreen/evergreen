@@ -709,6 +709,21 @@ strings or uninterned symbols may print alike without naming the same catch.
 This representation is also required for upcoming native catch registration;
 moving GC must repair the saved tag before dynamic destination search.
 
+The opt-in entry executes CATCH registration and normal retirement through
+helper-v2 (`bliss-shih7.12.6.1`). Catch requests carry an establishing BCP in a
+reserved request class outside the symbol-index domain; both preserve multiple
+values. The activation retains the generated control token, while Env roots the
+dynamic tag. A scope guard retires this invocation's registrations on exit without
+discarding enclosing catches. Bytecode fallback reconstructs handlers with the
+same tokens, so it delivers the already-selected throw without replaying its call.
+The native selector runs only cleanups inside the selected catch boundary.
+
+This is registration and exact fallback identity, not native catch delivery.
+Exceptional catch CFG edges, phi moves and checked catch landing maps remain
+required in `bliss-shih7.12.6`. The compiler declines direct exits requiring catch
+unregistration, and inherited OSR scope admission remains disabled. Host allocation
+failure during token construction remains part of `bliss-shih7.12.3`.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

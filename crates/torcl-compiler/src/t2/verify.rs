@@ -127,6 +127,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         data.aux,
                         AuxData::CallTarget(_)
                             | AuxData::TransferThrow
+                            | AuxData::CatchScope { .. }
                             | AuxData::CleanupContinuation { .. }
                     ))
             {
@@ -140,6 +141,30 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "V11 invoke-shape",
                     "THROW requires an Invoke with tag and primary",
                 ));
+            }
+            if let AuxData::CatchScope { push_bcp, enter } = data.aux {
+                let identity_matches = if enter {
+                    data.frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                        .is_some_and(|scope| scope.bcp == push_bcp)
+                } else {
+                    data.targets.get(1).and_then(|edge| {
+                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
+                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
+                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                            if scopes.last().is_some_and(|scope|
+                                scope.push_bcp == push_bcp
+                                && scope.ownership == crate::control_scope::Ownership::Local
+                                && matches!(scope.kind, crate::control_scope::ScopeKind::Catch { .. })))
+                    })
+                };
+                if data.opcode != Opcode::Invoke
+                    || data.args.len() != usize::from(enter)
+                    || !identity_matches
+                {
+                    errors.push(VerifyError::new("V11 invoke-shape", "CATCH registration requires Invoke with one tag on entry and no arguments on exit"));
+                }
             }
             if data.opcode == Opcode::NlxTransfer {
                 let origin_matches = match (&data.aux, data.frame_state) {

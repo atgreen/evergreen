@@ -76,6 +76,7 @@ impl TransferCode {
                         } | ScopeKind::Tagbody { .. }
                             | ScopeKind::Unwind { .. }
                             | ScopeKind::Cleanup { .. }
+                            | ScopeKind::Catch { .. }
                     )
             }) {
                 return None;
@@ -94,6 +95,7 @@ impl TransferCode {
                             ScopeKind::Block { .. }
                                 | ScopeKind::Tagbody { .. }
                                 | ScopeKind::Unwind { .. }
+                                | ScopeKind::Catch { .. }
                         )
                     })
                     .count();
@@ -149,8 +151,21 @@ impl TransferCode {
         bind_params(&self.body, frame, &args, None);
         let mut cleanups = Vec::<SavedCleanup>::with_capacity(self.cleanup_depths.len());
         torcl_rt::rooted_ref!(_cleanups = &mut cleanups);
+        let mut catches = Vec::<SavedCatch>::with_capacity(
+            self.body
+                .code
+                .iter()
+                .filter(|i| matches!(i, Instr::PushCatch { .. }))
+                .count(),
+        );
+        let _catch_guard = CatchScopeGuard {
+            env,
+            base: env.catch_stack.len(),
+        };
         let mut context = CaptureContext {
             frame,
+            body: self.body.as_ref(),
+            catches: &mut catches,
             completed_cleanup: None,
             landing_stub: self.landing.as_ptr(),
             landing: SysvNativeLanding {
@@ -209,7 +224,10 @@ impl TransferCode {
         }
         match outcome.exit {
             NativeExit::Returned
-                if error.is_none() && context.selected.is_none() && cleanups.is_empty() =>
+                if error.is_none()
+                    && context.selected.is_none()
+                    && cleanups.is_empty()
+                    && catches.is_empty() =>
             {
                 Ok(*primary)
             }
@@ -240,6 +258,8 @@ impl TransferCode {
                                         | Instr::CleanupReturn
                                         | Instr::SetValues(_)
                                         | Instr::Throw
+                                        | Instr::PushCatch { .. }
+                                        | Instr::PopHandler
                                 )
                             )
                     })
@@ -255,6 +275,12 @@ impl TransferCode {
                     }
                 });
                 if !running.eq(cleanups.iter().map(|saved| saved.cleanup_bcp)) {
+                    return Err(invalid_capture());
+                }
+                let live_catches = site.map().control_scopes.iter().filter_map(|scope| {
+                    matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
+                });
+                if !live_catches.eq(catches.iter().map(|saved| saved.push_bcp)) {
                     return Err(invalid_capture());
                 }
                 let handlers = site
@@ -281,6 +307,16 @@ impl TransferCode {
                         },
                         ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
                             cleanup_bcp,
+                            sp_restore: scope.sp_restore,
+                        },
+                        ScopeKind::Catch { resume_bcp } => Handler::Catch {
+                            token: catches
+                                .iter()
+                                .find(|saved| saved.push_bcp == scope.push_bcp)
+                                .expect("checked catch identity")
+                                .token
+                                .clone(),
+                            resume_bcp,
                             sp_restore: scope.sp_restore,
                         },
                         _ => unreachable!("admission checked all scope records"),
@@ -346,6 +382,23 @@ struct SavedCleanup {
     cleanup_bcp: u32,
     continuation: CleanupCont,
 }
+
+struct SavedCatch {
+    push_bcp: u32,
+    token: String,
+}
+
+struct CatchScopeGuard {
+    env: *mut Env,
+    base: usize,
+}
+impl Drop for CatchScopeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.env).catch_stack.truncate(self.base);
+        }
+    }
+}
 impl torcl_rt::gc::TraceHostRoots for SavedCleanup {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         self.continuation.trace_host_roots(visit);
@@ -381,9 +434,65 @@ unsafe extern "C" fn call_or_throw(
     request: *mut u8,
     out: *mut torcl_rt::native_transfer::NativeOutcome,
 ) {
-    use torcl_compiler::t2::emit::{TRANSFER_THROW_REQUEST, TransferCallRequest};
+    use torcl_compiler::t2::emit::{
+        TRANSFER_CATCH_ENTER_REQUEST, TRANSFER_CATCH_LEAVE_REQUEST, TRANSFER_THROW_REQUEST,
+        TransferCallRequest,
+    };
     use torcl_rt::native_transfer::NativeOutcome;
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
+    let request_kind = call.symbol & !u64::from(u32::MAX);
+    if matches!(
+        request_kind,
+        TRANSFER_CATCH_ENTER_REQUEST | TRANSFER_CATCH_LEAVE_REQUEST
+    ) {
+        if !native_error_pending() {
+            let result = guard_c2i(|| {
+                let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+                let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+                let catches = unsafe { &mut *context.catches };
+                let push_bcp = call.symbol as u32;
+                let body = unsafe { &*context.body };
+                assert!(matches!(
+                    body.code.get(push_bcp as usize),
+                    Some(Instr::PushCatch { .. })
+                ));
+                if request_kind == TRANSFER_CATCH_ENTER_REQUEST {
+                    assert_eq!(call.nargs, 1);
+                    assert!(catches.len() < catches.capacity());
+                    let tag = unsafe { call.args.read() };
+                    let token = super::super::next_control_token("__THROW__");
+                    env.catch_stack.push((tag, token.clone()));
+                    catches.push(SavedCatch { push_bcp, token });
+                } else {
+                    assert_eq!(call.nargs, 0);
+                    let saved = catches.last().expect("live native catch");
+                    assert_eq!(saved.push_bcp, push_bcp);
+                    assert!(
+                        env.catch_stack
+                            .last()
+                            .is_some_and(|(_, token)| token == &saved.token)
+                    );
+                    env.catch_stack.pop();
+                    catches.pop();
+                }
+                Ok(NIL)
+            });
+            if let Err(error) = result {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
     if call.symbol != TRANSFER_THROW_REQUEST {
         unsafe {
             c2i_call_legacy_v2(request, out);
@@ -494,6 +603,8 @@ pub(super) fn take_native_cleanup_count() -> usize {
 
 struct CaptureContext {
     frame: *mut Frame,
+    body: *const BytecodeFunction,
+    catches: *mut Vec<SavedCatch>,
     completed_cleanup: Option<u32>,
     landing_stub: *const u8,
     landing: SysvNativeLanding,
@@ -588,21 +699,32 @@ unsafe fn prepare_transfer(
     // signaling is wired, only a selected transfer to a live outer CATCH takes
     // this route. Other outcomes retain explicit bytecode unwinding fallback.
     let mut selected_throw = false;
+    let mut selected_target = SelectedTarget::OutsideFrame;
     NATIVE_ERROR.with(|slot| {
         slot.visit(|error| {
             selected_throw = matches!(error, TorclError::Internal(token)
             if env.catch_stack.iter().any(|(_, live)| live == token));
+            if let TorclError::Internal(token) = error {
+                if let Some(saved) = unsafe { &*context.catches }
+                    .iter()
+                    .find(|saved| &saved.token == token)
+                {
+                    selected_target = SelectedTarget::Scope {
+                        push_bcp: saved.push_bcp,
+                    };
+                }
+            }
         })
     });
     if !selected_throw {
         return Ok(());
     }
-    // Admission currently permits only outer catch destinations. Once local
-    // native registrations exist, resolve their exact establishing scope here.
+    // Local catch identity survives fallback; only intervening cleanups may run
+    // natively until the selected catch has its own verified landing.
     let NativeUnwindStep::RunCleanup {
         scope_index,
         handler_depth,
-    } = next_unwind_step(&site.map().control_scopes, SelectedTarget::OutsideFrame)
+    } = next_unwind_step(&site.map().control_scopes, selected_target)
     else {
         return Ok(());
     };

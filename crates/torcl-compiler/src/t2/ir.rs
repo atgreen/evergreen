@@ -297,6 +297,12 @@ pub enum AuxData {
     CallTarget(u32),
     /// Invoke a THROW with rooted tag and primary arguments; no normal result.
     TransferThrow,
+    /// Establish/retire a dynamic CATCH binding in the owning activation.
+    /// The helper-v2 request preserves the existing multiple-value state.
+    CatchScope {
+        push_bcp: u32,
+        enter: bool,
+    },
     /// Save/restore or landing identity. On Invoke this selects cleanup
     /// completion: normal edge pops/restores the saved value, exceptional edge
     /// resumes its pending transfer with the continuation still described by

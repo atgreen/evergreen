@@ -326,6 +326,19 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
+    fn catch_transition(&self, bcp: usize) -> Option<(u32, bool)> {
+        if !self.native_cleanups {
+            return None;
+        }
+        match self.bf.code.get(bcp)? {
+            Instr::PushCatch { .. } => Some((bcp as u32, true)),
+            Instr::PopHandler => {
+                let scope = self.control_scopes.as_ref()?.before(bcp as u32)?.last()?;
+                matches!(scope.kind, ScopeKind::Catch { .. }).then_some((scope.push_bcp, false))
+            }
+            _ => None,
+        }
+    }
     fn normal_cleanup_return(&self, bcp: u32) -> Result<(u32, u32), BuildError> {
         let scopes = self
             .control_scopes
@@ -513,6 +526,9 @@ impl<'a> Builder<'a> {
         let mut set: BTreeSet<usize> = BTreeSet::new();
         set.insert(0);
         for (i, instr) in code.iter().enumerate() {
+            if self.catch_transition(i).is_some() && i + 1 < code.len() {
+                set.insert(i + 1);
+            }
             match instr {
                 Instr::PushUnwind { cleanup_bcp, .. } if self.native_cleanups => {
                     set.insert(*cleanup_bcp as usize);
@@ -597,19 +613,23 @@ impl<'a> Builder<'a> {
                     }
                 };
             if self.native_cleanups
-                && matches!(
-                    code[i],
-                    Instr::CallNamed { .. }
-                        | Instr::SetValues(_)
-                        | Instr::CleanupReturn
-                        | Instr::Throw
-                )
+                && (self.catch_transition(i).is_some()
+                    || matches!(
+                        code[i],
+                        Instr::CallNamed { .. }
+                            | Instr::SetValues(_)
+                            | Instr::CleanupReturn
+                            | Instr::Throw
+                    ))
             {
                 if let Some((cleanup, depth)) = self.exceptional_cleanup(i as u32) {
                     push(cleanup as usize, i32::from(depth), &mut depth_at, &mut work);
                 }
             }
             match &code[i] {
+                Instr::PushCatch { .. } if self.native_cleanups => {
+                    push(i + 1, d - 1, &mut depth_at, &mut work);
+                }
                 Instr::EnterCleanupNormal { cleanup_bcp, .. } if self.transfer_mode => {
                     if d < 1 {
                         return Err(BuildError::Unsupported("cleanup entry without primary"));
@@ -806,6 +826,13 @@ impl<'a> Builder<'a> {
                 ))
         };
         for (offset, instr) in code[start..end].iter().enumerate() {
+            if self.catch_transition(start + offset).is_some() {
+                let mut successors = vec![blk(end)?];
+                if let Some((cleanup, _)) = self.exceptional_cleanup((start + offset) as u32) {
+                    successors.push(blk(cleanup as usize)?);
+                }
+                return Ok(successors);
+            }
             match instr {
                 Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::Throw
                     if self.native_cleanups =>
@@ -1011,6 +1038,34 @@ impl<'a> Builder<'a> {
         let code = &self.bf.code;
         for (offset, instruction) in code[start..end].iter().enumerate() {
             let i = start + offset;
+            if let Some((push_bcp, enter)) = self.catch_transition(i) {
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let args = if enter {
+                    vec![
+                        stack
+                            .pop()
+                            .ok_or(BuildError::Unsupported("CATCH without tag"))?,
+                    ]
+                } else {
+                    vec![]
+                };
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args,
+                        results: vec![],
+                        aux: AuxData::CatchScope { push_bcp, enter },
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                return Ok(());
+            }
             match instruction {
                 Instr::Const(idx) => {
                     let v = self.emit_const(block, *idx)?;
@@ -1518,7 +1573,9 @@ impl<'a> Builder<'a> {
         } else {
             vec![]
         };
-        stack.push(projected);
+        if !matches!(self.f.inst(call).aux, AuxData::CatchScope { .. }) {
+            stack.push(projected);
+        }
         let normal_term = resume
             .map(|bcp| Term::Jump(self.block_of[&bcp]))
             .unwrap_or(Term::Trap);

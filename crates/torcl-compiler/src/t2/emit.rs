@@ -1485,6 +1485,15 @@ fn emit_invoke_call(
             (u64::from(symbol), data.args.len() as u64, false)
         }
         crate::t2::ir::AuxData::TransferThrow => (TRANSFER_THROW_REQUEST, 2, false),
+        crate::t2::ir::AuxData::CatchScope { push_bcp, enter } => (
+            (if enter {
+                TRANSFER_CATCH_ENTER_REQUEST
+            } else {
+                TRANSFER_CATCH_LEAVE_REQUEST
+            }) | u64::from(push_bcp),
+            u64::from(enter),
+            false,
+        ),
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -2643,6 +2652,14 @@ pub fn emit_framed_with_activation_slots(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub const TRANSFER_THROW_REQUEST: u64 = u64::MAX;
 
+/// Catch registration requests encode the establishing BCP in the low 32 bits.
+/// Entry supplies one rooted tag argument; exit supplies none. Both preserve
+/// multiple values and return through helper-v2 before any native transfer.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const TRANSFER_CATCH_ENTER_REQUEST: u64 = 1_u64 << 32;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const TRANSFER_CATCH_LEAVE_REQUEST: u64 = 2_u64 << 32;
+
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. Arguments and shadow roots
 /// reside in the rooted owning activation, not in this unscanned request.
@@ -2725,6 +2742,8 @@ pub fn emit_framed_transfers_with_cleanup(
 /// `save` has the normal save-helper contract above; `complete` is a veneer for
 /// a helper consuming `TransferCleanupRequest`. The owner must root the pending
 /// continuation and repair source homes before entering a checked cold landing.
+/// The call veneer must implement THROW and CATCH registration requests as well
+/// as ordinary symbol calls; older helper protocols must not use this emitter.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub fn emit_framed_native_cleanups(
     f: &Function,
@@ -2797,7 +2816,9 @@ fn emit_transfer_function(
                 && (data.opcode == Opcode::Invoke
                     && matches!(
                         data.aux,
-                        AuxData::CleanupContinuation { .. } | AuxData::TransferThrow
+                        AuxData::CleanupContinuation { .. }
+                            | AuxData::TransferThrow
+                            | AuxData::CatchScope { .. }
                     )
                     || data.opcode == Opcode::NlxTransfer && !data.targets.is_empty())
             {
@@ -3743,7 +3764,9 @@ fn emit_framed_inner(
                         .as_deref_mut()
                         .ok_or(EmitError::UnsupportedOp(0xFA))?;
                     let veneer = match d.aux {
-                        AuxData::CallTarget(_) | AuxData::TransferThrow => transfer.veneer,
+                        AuxData::CallTarget(_)
+                        | AuxData::TransferThrow
+                        | AuxData::CatchScope { .. } => transfer.veneer,
                         AuxData::CleanupContinuation { .. } => match transfer.cleanup {
                             Some(CleanupEmission::Native { complete, .. }) => complete,
                             _ => return Err(EmitError::UnsupportedOp(0xFA)),

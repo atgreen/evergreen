@@ -2,6 +2,7 @@ use super::*;
 use torcl_compiler::t2::emit::TransferCallRequest;
 use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
 use torcl_rt::{Collector, HeapCollector};
+mod catches;
 mod cleanup_ir;
 mod compiled;
 mod fallback;
