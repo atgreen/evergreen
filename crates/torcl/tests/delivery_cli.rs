@@ -45,6 +45,107 @@ fn ok(output: Output) -> String {
 const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
 #[test]
+fn delivery_distinguishes_source_functions_from_bytecode_only_functions() {
+    let f = Fixture::new();
+    let source = f.path("walker.lisp");
+    let fasl = f.path("walker.bfasl");
+    let spec = f.path("walker.delivery");
+    fs::write(&source, "(defpackage :walker-app (:use :cl)) (in-package :walker-app) (defun main () (write-line \"WALKER-FREE\"))").unwrap();
+    fs::write(&spec, "version = 1\nentry = WALKER-APP::MAIN\nprune-package = WALKER-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    for (kind, input, setup, expected) in [
+        ("source", &source, "", "capabilities=tree-walker\n"),
+        ("bytecode", &fasl, "", "capabilities=\n"),
+        (
+            "saved-builtin",
+            &fasl,
+            "(set 'walker-app::*saved* 'vector)",
+            "capabilities=tree-walker\n",
+        ),
+    ] {
+        let core = f.path(&format!("{kind}.core"));
+        ok(run(
+            BIN,
+            &[
+                "--no-bootstrap",
+                "--eval",
+                &format!("(load {input:?}) {setup} (save-lisp-and-die {core:?})"),
+            ],
+        ));
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--deliver",
+                &spec,
+                "--output",
+                &f.path(kind),
+                "--dry-run",
+            ],
+        ));
+        assert!(report.contains(expected), "{kind}: {report}");
+    }
+}
+
+#[test]
+fn delivery_retains_hidden_source_binders_and_methods() {
+    let f = Fixture::new();
+    let source = f.path("hidden.lisp");
+    let fasl = f.path("hidden.bfasl");
+    let spec = f.path("hidden.delivery");
+    fs::write(&source, "(defpackage :hidden-walker (:use :cl)) (in-package :hidden-walker) (defun optional-main (&optional (x 7)) x) (defun method-main () (method-result))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    for (entry, setup, dependency) in [
+        ("OPTIONAL-MAIN", "", "variadic lambda-list binder"),
+        (
+            "METHOD-MAIN",
+            "(let ((x 7)) (defmethod hidden-walker::method-result () x))",
+            "source generic method",
+        ),
+    ] {
+        let core = f.path(&format!("{entry}.core"));
+        ok(run(
+            BIN,
+            &[
+                "--no-bootstrap",
+                "--eval",
+                &format!("(load {fasl:?}) {setup} (save-lisp-and-die {core:?})"),
+            ],
+        ));
+        fs::write(&spec, format!("version = 1\nentry = HIDDEN-WALKER::{entry}\nprune-package = HIDDEN-WALKER\nruntime = specialized\ndynamic = explicit\n")).unwrap();
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--deliver",
+                &spec,
+                "--output",
+                &f.path(entry),
+                "--dry-run",
+            ],
+        ));
+        assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+        assert!(report.contains(dependency), "{report}");
+    }
+}
+
+#[test]
 fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
     let f = Fixture::new();
     let source = f.path("closures.lisp");
@@ -118,7 +219,7 @@ fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
         report.contains("keep CLOSURE-SHAKE::LIVE-TARGET"),
         "{report}"
     );
-    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("capabilities=tree-walker\n"), "{report}");
     let removed: usize = report
         .lines()
         .find_map(|line| {
@@ -534,31 +635,36 @@ fn native_delivery_capabilities_follow_reachable_symbols_and_dynamic_policy() {
     ));
     let spec = f.path("caps.delivery");
     for (entry, policy, keep, expected) in [
-        ("MAIN", "explicit", "", "capabilities=\n"),
+        ("MAIN", "explicit", "", "capabilities=tree-walker\n"),
         (
             "EVAL-MAIN",
             "explicit",
             "",
-            "capabilities=disassembly,dynamic-code\n",
+            "capabilities=disassembly,dynamic-code,tree-walker\n",
         ),
         (
             "LOAD-MAIN",
             "explicit",
             "",
-            "capabilities=disassembly,dynamic-code\n",
+            "capabilities=disassembly,dynamic-code,tree-walker\n",
         ),
-        ("INSPECT-MAIN", "explicit", "", "capabilities=disassembly\n"),
+        (
+            "INSPECT-MAIN",
+            "explicit",
+            "",
+            "capabilities=disassembly,tree-walker\n",
+        ),
         (
             "MAIN",
             "preserve",
             "",
-            "capabilities=disassembly,dynamic-code\n",
+            "capabilities=disassembly,dynamic-code,tree-walker\n",
         ),
         (
             "MAIN",
             "explicit",
             "runtime-keep = disassembly\n",
-            "capabilities=disassembly\n",
+            "capabilities=disassembly,tree-walker\n",
         ),
     ] {
         fs::write(&spec, format!("version = 1\nentry = NATIVE-DELIVERY::{entry}\nprune-package = NATIVE-DELIVERY\nruntime = specialized\ndynamic = {policy}\n{keep}")).unwrap();
@@ -581,6 +687,87 @@ fn native_delivery_capabilities_follow_reachable_symbols_and_dynamic_policy() {
                 "{report}"
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_removes_the_walker_for_source_free_code() {
+    let f = Fixture::new();
+    let source = f.path("walker-free.lisp");
+    let fasl = f.path("walker-free.bfasl");
+    let core = f.path("walker-free.core");
+    let spec = f.path("walker-free.delivery");
+    let exe = f.path("walker-free");
+    fs::write(
+        &source,
+        r#"
+        (defpackage :walker-free (:use :cl))
+        (in-package :walker-free)
+        (defun add-one (x) (+ x 1))
+        (defun main ()
+          (dotimes (i 1000) (add-one i))
+          (write-line (if (= 2.5 (add-one 1.5)) "WALKER-FREE-OK" "WRONG"))
+          (handler-case (funcall 'add-one)
+            (program-error () (write-line "ARITY-OK")))
+          (handler-case (funcall 'missing)
+            (undefined-function () (write-line "UNDEFINED-OK"))))
+    "#,
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    fs::remove_file(&source).unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+        ],
+    ));
+    fs::remove_file(&fasl).unwrap();
+    fs::write(&spec, "version = 1\nentry = WALKER-FREE::MAIN\nprune-package = WALKER-FREE\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    let report = ok(Command::new(BIN)
+        .args([
+            "--no-init",
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+        ])
+        .output()
+        .unwrap());
+    assert!(report.contains("capabilities=\n"), "{report}");
+    let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+    assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+    assert!(
+        !symbols.contains("torcl::cli::eval_list"),
+        "tree walker remains linked"
+    );
+    assert!(
+        !symbols.contains("torcl::cli::bytecode::Lowerer::"),
+        "source-to-bytecode compiler remains linked"
+    );
+    assert!(
+        !symbols.contains("iced_x86::"),
+        "disassembler remains linked"
+    );
+    for tier in ["t0", "t1", "t2"] {
+        let output = ok(Command::new(&exe)
+            .arg("--no-init")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .unwrap());
+        assert_eq!(output, "WALKER-FREE-OK\nARITY-OK\nUNDEFINED-OK\n", "{tier}");
     }
 }
 
@@ -622,7 +809,7 @@ fn native_delivery_builds_and_runs_without_decoder() {
         .output()
         .unwrap();
     let report = ok(output);
-    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("capabilities=tree-walker\n"), "{report}");
     assert!(report.contains("native-bytes = "));
     assert!(ok(run(&exe, &[])).contains("NATIVE-OK"));
     for (key, value) in [("TORCL_BACKEND", "treewalker"), ("TORCL_FORCE_TIER", "t2")] {
@@ -731,7 +918,7 @@ fn native_delivery_retains_evaluation_for_saved_raw_lambda_data() {
         ],
     ));
     assert!(
-        report.contains("capabilities=disassembly,dynamic-code\n"),
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
         "{report}"
     );
     assert!(report.contains("native-root = source lambda"), "{report}");

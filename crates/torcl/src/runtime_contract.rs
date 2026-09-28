@@ -1,7 +1,7 @@
 //! Native delivery compatibility contract, shared by build.rs and the CLI.
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CAPABILITIES: &[&str] = &["disassembly", "dynamic-code"];
+pub const CAPABILITIES: &[&str] = &["disassembly", "dynamic-code", "tree-walker"];
 
 /// These public operations can introduce arbitrary code (including reader #.).
 /// Their graph edge reaches every native capability. Internal EvalHost executes

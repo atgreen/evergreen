@@ -35,7 +35,9 @@ instructions, and specializes dynamically typed programs as they run.
   removing unreachable named Lisp functions from selected packages and pruning
   unused heap objects. Declare entry points and dynamic callbacks to retain;
   `--dry-run` previews what stays and what goes. Optional Cargo-based native
-  specialization can also remove unused disassembly support. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
+  specialization can also remove unused disassembly support and the tree walker
+  when retained code no longer needs source evaluation, while preserving bytecode
+  execution and native tiering. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
 - **Native Android applications.** Generate and package APKs with Lisp lifecycle,
   touch-input, and EGL/OpenGL ES code using `torcl-android-new`. See
   [building Android applications](docs/manual/user/how-to/android.md).

@@ -323,7 +323,7 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
 /// because a registry owns them. Heap function objects trace their name symbol,
 /// and direct bytecode calls explicitly trace their symbol operands.
 /// Only called in a heap snapshot, without Lisp allocation.
-pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<TorclVal>> {
+fn delivery_bodies() -> HashMap<u32, Arc<BytecodeFunction>> {
     let mut bodies = closure_bodies().borrow().clone();
     REGISTRY.with(|r| bodies.extend(r.borrow().iter().map(|(&s, b)| (s, Arc::clone(b)))));
     for (&symbol, definition) in named_definitions().borrow().iter() {
@@ -333,9 +333,21 @@ pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<TorclVal>> {
             bodies.remove(&symbol);
         }
     }
+    bodies
+}
+
+pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<(TorclVal, bool)>> {
     let mut edges = HashMap::new();
-    for (symbol, body) in bodies {
-        let refs = super::delivery::bytecode_references(&body);
+    for (symbol, body) in delivery_bodies() {
+        let mut refs: Vec<_> = super::delivery::bytecode_references(&body)
+            .into_iter()
+            .map(|value| (value, false))
+            .collect();
+        refs.extend(
+            super::delivery::bytecode_callable_references(&body)
+                .into_iter()
+                .map(|value| (value, true)),
+        );
         edges.insert(symbol, refs);
     }
     for (&symbol, frame) in closure_envs().borrow().iter() {
@@ -345,10 +357,62 @@ pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<TorclVal>> {
         let refs = edges.entry(symbol).or_default();
         super::visit_env_frame_roots(frame, &mut state, &mut |slot| {
             // SAFETY: the frame visitor supplies live slots under the snapshot.
-            refs.push(unsafe { *slot });
+            refs.push((unsafe { *slot }, true));
         });
     }
     edges
+}
+
+/// A saved callable is independent of source evaluation only if its entire
+/// bytecode tree can be restored and contains no source-executing operation.
+pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str>> {
+    fn source_dependency(body: &BytecodeFunction) -> Option<&'static str> {
+        if body.variadic {
+            return Some("variadic lambda-list binder");
+        }
+        if body
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)))
+        {
+            return Some("bytecode source-evaluation instruction");
+        }
+        if body
+            .handler_binds
+            .iter()
+            .any(|table| !table.bindings.is_empty())
+        {
+            return Some("source handler-binding form");
+        }
+        body.nested_functions
+            .iter()
+            .find_map(|nested| source_dependency(nested))
+            .or_else(|| {
+                body.restart_cases
+                    .iter()
+                    .flat_map(|table| &table.restarts)
+                    .find_map(|restart| source_dependency(&restart.function))
+            })
+    }
+    delivery_bodies()
+        .into_iter()
+        .map(|(symbol, body)| {
+            let reason = source_dependency(&body).or_else(|| {
+                let mut pool = BbuConstPool::default();
+                let mut functions = Vec::new();
+                serialize_bbu_function_tree(
+                    &body,
+                    BBU_NO_INDEX,
+                    BBU_FUNC_NESTED,
+                    &mut pool,
+                    &mut functions,
+                )
+                .is_none()
+                .then_some("bytecode cannot be saved")
+            });
+            (symbol, reason)
+        })
+        .collect()
 }
 
 /// Delivery owns a disposable restored world. Release registry ownership of
@@ -816,6 +880,13 @@ pub fn call_registered(
     }
     let callee = registry_get(sym)?;
     if !arity_accepts(&callee, args.len()) {
+        if cfg!(torcl_no_tree_walker) {
+            return Some(Err(TorclError::ProgramError(format!(
+                "{} called with {} argument(s), outside its lambda list's range",
+                sym_label(sym),
+                args.len()
+            ))));
+        }
         return None; // arg count outside the lambda list's range: tree-walker binds it
     }
     let fn_obj = torcl_rt::symbols::symbol_function(sym)
@@ -7716,6 +7787,11 @@ fn compile_function_in(
     enclosing_slots: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     // A failed allocating attempt can relocate both inputs before a retry.
+    // Source-free delivery restores bytecode; native tiering compiles that
+    // bytecode independently and does not need the source lowerer.
+    if cfg!(torcl_no_tree_walker) {
+        return None;
+    }
     torcl_rt::rooted!(params_form = params_form);
     torcl_rt::rooted!(body = body);
     let mut forced: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -8107,6 +8183,9 @@ fn lower_body(lo: &mut Lowerer, body: TorclVal) -> LowerResult<()> {
 
 /// Compile a top-level form as a zero-argument thunk. Returns `None` on bail.
 fn compile_thunk(form: TorclVal, env: &Env, portable: bool) -> Option<BytecodeFunction> {
+    if cfg!(torcl_no_tree_walker) {
+        return None;
+    }
     torcl_rt::rooted!(form = form);
     let mut lo = Lowerer::new(env);
     torcl_rt::rooted_ref!(_const_guard = &mut lo);

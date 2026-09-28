@@ -14634,6 +14634,14 @@ fn poison_trap(v: TorclVal, what: &str) {
 }
 
 fn eval_form(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
+    // The delivery proof excludes every reachable source-evaluation path.
+    // Keep a checked boundary for incompatible internal calls; constant folding
+    // removes the source dispatcher and its helpers from this native runtime.
+    if cfg!(torcl_no_tree_walker) {
+        return Err(TorclError::ProgramError(
+            "source evaluation is absent from this delivered runtime".into(),
+        ));
+    }
     poison_trap(form, "eval_form entry");
     torcl_rt::rooted!(form = form);
     let form = *form;
@@ -32830,7 +32838,9 @@ fn apply_function(
                 // Lazy compile when hot (bliss-x5y) — this path handles a global
                 // function reached through funcall/apply or the c2i fallback from
                 // compiled code (e.g. a call inside a compiled top-level thunk).
-                maybe_lazy_compile(&name, params_form, body, env);
+                if !cfg!(torcl_no_tree_walker) {
+                    maybe_lazy_compile(&name, params_form, body, env);
+                }
                 let (dispatch_idx, fn_val) = dispatch_target_of_symbol(fn_val, &name);
                 if let Some(idx) = dispatch_idx {
                     if let Some(res) = bytecode::call_registered(idx, args, fn_val, env) {
@@ -33010,6 +33020,16 @@ fn apply_function(
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
+        if cfg!(torcl_no_tree_walker) {
+            return if is_builtin_function(&name) {
+                Err(TorclError::ProgramError(format!(
+                    "{name} has no evaluated builtin entry for {} argument(s)",
+                    args.len()
+                )))
+            } else {
+                Err(TorclError::UndefinedFunction(fn_val))
+            };
+        }
         torcl_rt::rooted!(fn_val = fn_val);
         torcl_rt::rooted!(args = args.to_vec());
         let quote_sym = quote_sym();

@@ -107,7 +107,7 @@ singleton keys, missing functions, and unknown packages are errors.
 | `dynamic = explicit` | Opt in to pruning; declare every additional dynamic entry with `keep` |
 | `runtime = full` | Default: reuse the full delivery driver, without invoking Cargo |
 | `runtime = specialized` | Build a matching release runtime with only the required optional native capabilities |
-| `runtime-keep = disassembly` | Additional native capability root; supported names are `disassembly` and `dynamic-code` |
+| `runtime-keep = disassembly` | Additional native capability root; supported names are `disassembly`, `dynamic-code`, and `tree-walker` |
 
 Use `dynamic = explicit` only when the root list describes your application.
 For example, `(funcall (intern command "MY-APP"))` can name functions the analyzer
@@ -177,10 +177,28 @@ Deoptimization resumes T0 bytecode; it does not require public `EVAL`.
 `EvalHost` follows the references in its saved constant form rather than rooting
 all capabilities. Many library builtins share an evaluated-argument dispatcher
 between source and compiled calls, avoiding the construction and evaluation of
-temporary Lisp call forms. The **tree-walker itself is not removed yet**:
-source closures and the remaining internal evaluator fallbacks still retain it.
-This is not yet general removal of
-every unused Rust builtin. Retained bootstrap functions and macros can contain
+temporary Lisp call forms. The separate `tree-walker` capability is omitted
+when retained functions have restorable bytecode and their reachable operations
+do not require source evaluation. Native linking then removes the tree-walking
+operator dispatcher and source-to-bytecode compiler while retaining T0 bytecode
+and bytecode-to-native tiering.
+
+Source functions and closures, source handler forms, variadic argument binders,
+uncompiled generic methods, and builtin paths that still require the evaluator
+retain `tree-walker`. The report identifies these dependencies. The initial
+audited builtin set covers arithmetic, basic list operations, multiple values,
+function application, and `WRITE-LINE`; other builtin paths conservatively
+retain the walker. Compiling Lisp files to BFASL before loading and saving the
+delivery input provides source-free function bodies. Simply omitting `EVAL`
+from a source-loaded application is not sufficient.
+
+Bootstrap definitions are currently retained too. A normal bootstrapped image
+can therefore retain all native capabilities even when its application entry
+point comes from BFASL. The source-free native-removal tests use images built
+with `--no-bootstrap`; pruning unused bootstrap definitions remains unfinished.
+
+This is not yet general removal of every unused Rust builtin.
+Retained bootstrap functions and macros can contain
 source lambdas and keep all native capabilities even when the application entry
 does not call `EVAL`; the report identifies this conservative dependency.
 

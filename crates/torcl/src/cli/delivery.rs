@@ -119,8 +119,21 @@ fn qualified_name(index: u32) -> String {
 /// Include instruction operands as well as GC-visible constants: CallNamed and
 /// LoadFunction store symbol indices as raw integers, not tagged GC references.
 pub(super) fn bytecode_references(function: &BytecodeFunction) -> Vec<TorclVal> {
+    bytecode_references_with_params(function, true)
+}
+
+pub(super) fn bytecode_callable_references(function: &BytecodeFunction) -> Vec<TorclVal> {
+    bytecode_references_with_params(function, false)
+}
+
+fn bytecode_references_with_params(
+    function: &BytecodeFunction,
+    include_params: bool,
+) -> Vec<TorclVal> {
     let mut refs = function.constants.clone();
-    refs.push(function.params_form);
+    if include_params {
+        refs.push(function.params_form);
+    }
     refs.extend(function.load_time_values.iter().map(|(_, value)| *value));
     for instruction in &function.code {
         if let Instr::CallNamed { sym, .. }
@@ -137,11 +150,14 @@ pub(super) fn bytecode_references(function: &BytecodeFunction) -> Vec<TorclVal> 
     }
     for restart in &function.restart_cases {
         for entry in &restart.restarts {
-            refs.extend(bytecode_references(&entry.function));
+            refs.extend(bytecode_references_with_params(
+                &entry.function,
+                include_params,
+            ));
         }
     }
     for nested in &function.nested_functions {
-        refs.extend(bytecode_references(nested));
+        refs.extend(bytecode_references_with_params(nested, include_params));
     }
     refs
 }
@@ -149,6 +165,7 @@ pub(super) fn bytecode_references(function: &BytecodeFunction) -> Vec<TorclVal> 
 struct Plan {
     unreachable_closures: Vec<u32>,
     capability_roots: std::collections::BTreeSet<String>,
+    walker_roots: std::collections::BTreeSet<String>,
     capabilities: std::collections::BTreeSet<String>,
     candidates: BTreeMap<u32, String>,
     retained: BTreeMap<u32, String>,
@@ -178,7 +195,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             }
         });
         let indices = candidates.keys().copied().collect();
-        let mut roots = symbols::delivery_roots(&indices);
+        let mut exposed_roots = symbols::delivery_roots(&indices);
+        let mut roots = Vec::new();
         // SAFETY: this entire analysis runs under with_heap_snapshot and makes
         // no Lisp allocations. The omitted scanner is replaced below.
         unsafe {
@@ -192,8 +210,13 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         }
         env.visit_gc_roots(&mut |slot| roots.push(unsafe { *slot }));
         let edges = bytecode::delivery_dependencies();
+        let compiled = if spec.specialized {
+            bytecode::delivery_walker_dependencies()
+        } else {
+            HashMap::new()
+        };
         for (_, function) in global_bytecode_macros() {
-            roots.extend(bytecode_references(&function.lock().unwrap()));
+            exposed_roots.extend(bytecode_references(&function.lock().unwrap()));
         }
         for function in LOADED_COMPILER_MACRO_FUNCTIONS
             .lock()
@@ -201,14 +224,19 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             .iter()
             .filter_map(Weak::upgrade)
         {
-            roots.extend(bytecode_references(&function.lock().unwrap()));
+            exposed_roots.extend(bytecode_references(&function.lock().unwrap()));
         }
         let mut queue = VecDeque::new();
-        queue.push_back((TorclVal::from_symbol_index(entry), "entry point".to_owned()));
+        queue.push_back((
+            TorclVal::from_symbol_index(entry),
+            "entry point".to_owned(),
+            true,
+        ));
         for &index in keeps {
             queue.push_back((
                 TorclVal::from_symbol_index(index),
                 "explicit keep".to_owned(),
+                true,
             ));
         }
         if !spec.explicit_dynamic_roots || spec.runtime_keep.contains("dynamic-code") {
@@ -221,13 +249,37 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                         "dynamic = preserve"
                     }
                     .to_owned(),
+                    true,
                 ));
             }
         }
         for value in roots {
-            queue.push_back((value, "persistent data or runtime registry".to_owned()));
+            queue.push_back((
+                value,
+                "persistent data or runtime registry".to_owned(),
+                false,
+            ));
+        }
+        for value in exposed_roots {
+            queue.push_back((
+                value,
+                "persistent data or runtime registry".to_owned(),
+                true,
+            ));
         }
         let mut capability_roots = std::collections::BTreeSet::new();
+        let mut walker_roots = std::collections::BTreeSet::new();
+        if spec.specialized {
+            let compiled_methods: HashSet<_> = METHOD_COMPILED.borrow().keys().copied().collect();
+            for (name, methods) in env.methods.borrow().iter() {
+                if methods
+                    .iter()
+                    .any(|method| !compiled_methods.contains(&method.method_id.0))
+                {
+                    walker_roots.insert(format!("{name}: source generic method"));
+                }
+            }
+        }
         let mut capabilities = spec.runtime_keep.clone();
         if !spec.explicit_dynamic_roots {
             capabilities.extend(
@@ -238,15 +290,46 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         }
         let mut retained = BTreeMap::new();
         let mut visited = HashSet::new();
+        // Runtime metadata (e.g. a class named VECTOR) is not itself a call
+        // to that builtin. Values also exposed through code, Lisp globals or
+        // captures must be revisited in that role, regardless of visit order.
+        let mut visited_roles = HashSet::new();
         // A function stored under an alias must retain the named definition and
         // its bytecode even if its heap representation has no useful name.
         let mut owners: HashMap<u64, Vec<u32>> = HashMap::new();
         for (&index, function) in &functions {
             owners.entry(function.0).or_default().push(index);
         }
-        while let Some((value, reason)) = queue.pop_front() {
-            if !visited.insert(value.0) {
+        while let Some((value, reason, callable_data)) = queue.pop_front() {
+            if !visited_roles.insert((value.0, callable_data)) {
                 continue;
+            }
+            visited.insert(value.0);
+            if spec.specialized {
+                if torcl_rt::function::is_interpreted_function(value) {
+                    let name = torcl_rt::function::name(value);
+                    let reason = if !torcl_rt::function::body(value).is_nil() {
+                        Some("source function body")
+                    } else {
+                        match name.symbol_index().and_then(|index| compiled.get(&index)) {
+                            Some(reason) => *reason,
+                            None => Some("function without saved bytecode"),
+                        }
+                    };
+                    if let Some(reason) = reason {
+                        let name = name
+                            .symbol_index()
+                            .map(qualified_name)
+                            .unwrap_or_else(|| "anonymous function".to_owned());
+                        walker_roots.insert(format!("{name}: {reason}"));
+                    }
+                }
+                if value.is_cons() {
+                    let head = cp(value).0;
+                    if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "CLOSURE" {
+                        walker_roots.insert("source closure".to_owned());
+                    }
+                }
             }
             if spec.specialized && value.is_cons() {
                 let head = cp(value).0;
@@ -258,6 +341,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                             queue.push_back((
                                 TorclVal::from_symbol_index(candidate),
                                 "reachable source lambda".into(),
+                                true,
                             ));
                         }
                     }
@@ -265,6 +349,28 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 }
             }
             if let Some(index) = value.symbol_index() {
+                if spec.specialized && !is_keyword_arg(value) && value != NIL && value != T {
+                    if let Some(Some(reason)) = compiled.get(&index) {
+                        walker_roots.insert(format!("{}: {reason}", qualified_name(index)));
+                    }
+                    // Bound functions are checked through their actual object
+                    // and code, including aliases. Unbound runtime names can
+                    // designate native builtins through FUNCALL or saved data.
+                    if callable_data && !functions.contains_key(&index) {
+                        let name = symbols::symbol_name(index).unwrap_or_default();
+                        let runtime_symbol = is_builtin_function(&name)
+                            || name.starts_with("TORCL")
+                            || symbols::symbol_package(index)
+                                .and_then(torcl_stdlib::packages::package_name)
+                                .is_some_and(|package| package == "COMMON-LISP");
+                        if runtime_symbol && !builtin_without_source_evaluation(&name) {
+                            walker_roots.insert(format!(
+                                "{}: builtin evaluator dependency",
+                                qualified_name(index)
+                            ));
+                        }
+                    }
+                }
                 if !is_keyword_arg(value)
                     && symbols::symbol_name(index).is_some_and(|name| {
                         crate::runtime_contract::opens_code_world(
@@ -280,6 +386,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                                     "reachable {} can invoke arbitrary code",
                                     qualified_name(index)
                                 ),
+                                true,
                             ));
                         }
                     }
@@ -298,17 +405,17 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                     reason.clone()
                 };
                 if let Some(function) = functions.get(&index) {
-                    queue.push_back((*function, next_reason.clone()));
+                    queue.push_back((*function, next_reason.clone(), true));
                 }
                 if let Some(refs) = edges.get(&index) {
-                    for &value in refs {
-                        queue.push_back((value, next_reason.clone()));
+                    for &(value, callable_data) in refs {
+                        queue.push_back((value, next_reason.clone(), callable_data));
                     }
                 }
             }
             if let Some(indices) = owners.get(&value.0) {
                 for &index in indices {
-                    queue.push_back((TorclVal::from_symbol_index(index), reason.clone()));
+                    queue.push_back((TorclVal::from_symbol_index(index), reason.clone(), true));
                 }
             }
             if torcl_stdlib::hashtable::hash_table_p(value) {
@@ -318,17 +425,25 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 for (key, child) in torcl_stdlib::hashtable::hash_table_entries(value)
                     .expect("hash_table_p recognized a live table")
                 {
-                    queue.push_back((key, reason.clone()));
-                    queue.push_back((child, reason.clone()));
+                    queue.push_back((key, reason.clone(), callable_data));
+                    queue.push_back((child, reason.clone(), callable_data));
                 }
             }
             // SAFETY: values came from live roots, registered bodies, or the
             // GC's precise field visitor, all under the same stopped world.
             unsafe {
+                // A callable's name and lambda list are metadata. Executable
+                // operands/defaults are classified by its registered bytecode;
+                // source bodies have already retained the walker above.
+                let child_callable_data =
+                    callable_data && !torcl_rt::function::is_interpreted_function(value);
                 torcl_rt::gc::visit_delivery_references(value, &mut |child| {
-                    queue.push_back((child, reason.clone()))
+                    queue.push_back((child, reason.clone(), child_callable_data))
                 });
             }
+        }
+        if !walker_roots.is_empty() {
+            capabilities.insert("tree-walker".into());
         }
         crate::runtime_contract::close_capabilities(&mut capabilities);
         let mut unreachable_closures: Vec<_> = edges
@@ -343,11 +458,52 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         Plan {
             unreachable_closures,
             capability_roots,
+            walker_roots,
             capabilities,
             candidates,
             retained,
         }
     })
+}
+
+/// Audited native entry points with complete evaluated-argument dispatch.
+/// This is an implementation dependency catalog, not a delivery allowlist:
+/// unknown handlers retain the walker until their source dependencies are
+/// removed. Lisp callbacks remain edges through the saved object/code graph.
+fn builtin_without_source_evaluation(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "1+"
+            | "1-"
+            | "="
+            | "/="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "CAR"
+            | "FIRST"
+            | "CDR"
+            | "REST"
+            | "CONS"
+            | "CONSP"
+            | "ATOM"
+            | "LISTP"
+            | "NULL"
+            | "NOT"
+            | "APPEND"
+            | "REVERSE"
+            | "ENDP"
+            | "EQ"
+            | "VALUES"
+            | "VALUES-LIST"
+            | "FUNCALL"
+            | "APPLY"
+            | "WRITE-LINE"
+    )
 }
 
 pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
@@ -436,6 +592,9 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         report.push_str(&format!(
             "native-root = {root} -> dynamic-code -> all native capabilities\n"
         ));
+    }
+    for root in &plan.walker_roots {
+        report.push_str(&format!("native-root = {root} -> tree-walker\n"));
     }
     report.push_str(&format!("input-image-format = {image_version}\n"));
     report.push_str(&format!(
