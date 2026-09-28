@@ -317,6 +317,31 @@ The rollout gate requires:
 This plan does not remove the interpreter, replace Rust's unwinder, promise
 zero overhead for signal polling, or change the Fibonacci algorithm.
 
+## Segment boundary implementation checkpoint
+
+The runtime now provides an x86-64 Linux SysV segment adapter in
+`crates/torcl-rt/src/native_transfer.rs`. Its Rust wrapper pins the anchor,
+records execution ownership and TorclStack watermarks, and restores the previous
+anchor with a Rust guard. The private assembly entry uses the explicit outcome
+out parameter above; the Rust wrapper returns `Result<NativeOutcome,
+SegmentUnavailable>`. Normal return, transfer and deopt exits restore the six
+nonvolatile integer registers, MXCSR and x87 control word. Cold exits reset the
+host stack only after Rust helpers have returned. Nested entries keep their
+enclosing Rust frames alive.
+
+Activation currently requires a successful Linux shadow-stack status query
+reporting no enabled features. Unknown status and enabled shadow stacks refuse
+entry; no mitigation is disabled. Indirect assembly entries and the landing
+continuation have `ENDBR64`. Other targets refuse this adapter.
+
+Assembly probes cover register/control-word restoration, stack alignment,
+anchor invalidation, ownership/watermarks, nested entries and Rust destructor
+counts. This is boundary infrastructure, not activation: generated Lisp calls
+still use the existing ABI and successful-return checks. Transfer payload
+rooting, cleanup/root retirement, native dispatch, fault-recovery/unwind gates,
+fiber migration and the Win64 adapter remain required before rollout. The
+adapter records TorclStack watermarks but does not restore them itself.
+
 ## Baseline contract oracles and boundary inventory
 
 `crates/torcl/tests/native_transfer_cli.rs` verifies real T1/T2 entries, direct
