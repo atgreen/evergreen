@@ -505,6 +505,28 @@ dispatcher leaves the segment and inspects the pending transfer, rather than
 resuming a reconstructed caller in bytecode. Ordinary native installation and
 its successful-return checks remain unchanged.
 
+`native_transfer_entry::TransferCode` adds an opt-in runtime-owned entry for this
+emitter. It retains the original bytecode and all linked executable buffers,
+reserves and roots snapshots before invocation, and uses an execution-local
+capture context with nested save/restore. Cold preparation copies the failed
+site's values without allocation before assembly leaves the generated frame.
+The entry then reconstructs the logical activation and calls `initiate_unwind`
+before any bytecode execution. The failed call's PC is an origin, never a resume
+instruction. Exact scope maps rebuild only admitted local, non-escaping BLOCK
+and TAGBODY records; missing dynamic identity or inherited state is refused at
+compilation. Enclosing pending errors are rooted while saved, and lexical scopes,
+native depth, environment pointer and fault-recovery settings are restored.
+
+The `native_v2_fallback` execution gates run real Lisp success/error/THROW cases,
+including redefining the caller inside its callee. They check retained-definition
+recovery, multiple values, moving-GC relocation, unchanged enclosing stack and
+pending error, and exactly-once calls and callee cleanup. They are explicitly
+enabled with `--include-ignored` and also run under GC stress plus poison.
+This entry is not installed by ordinary tiering. Protected caller scopes, OSR,
+closures, other helper classes, native cleanup/handler destinations, and emergency
+reconstruction failure handling remain required. Output reconstruction still
+allocates; allocation-free cold capture alone does not satisfy the OOM gate.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

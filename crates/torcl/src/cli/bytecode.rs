@@ -31,6 +31,8 @@
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod native_transfer_entry;
 mod pending_error;
 use pending_error::PendingError;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
