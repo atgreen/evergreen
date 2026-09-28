@@ -1408,9 +1408,18 @@ fn resolve(name: &str) -> Option<Handler> {
                 None => make_simple_condition("SIMPLE-ERROR", *control, format_args, env)?,
             };
             // The terminal message is the condition's REPORT (e.g. "The value X
-            // is not of type Y"), not the bare designator/type name.
-            let report = condition_report_string(env, condition).unwrap_or(message);
-            match signal_condition_object(condition, env) {
+            // is not of type Y"), not the bare designator/type name. Via
+            // condition_report_text so a DEFINE-CONDITION :report is honoured here
+            // too: this is the message an UNCAUGHT error prints, and it showed the
+            // bare type name for every condition that declared one (bliss-e5eh6).
+            // CONDITION must be rooted across condition_report_text: it allocates a
+            // string stream and may FUNCALL a :report lambda, either of which can fire
+            // a moving GC. Unrooted, the copy handed to signal_condition_object below
+            // is stale and a re-synthesized condition reaches the handler instead --
+            // visible only as a wrong answer under TORCL_GC_STRESS, never a crash.
+            torcl_rt::rooted!(condition = condition);
+            let report = condition_report_text(env, *condition).unwrap_or(message);
+            match signal_condition_object(*condition, env) {
                 Ok(_) => Err(TorclError::Internal(format!("ERROR: {}", report))),
                 Err(error) => Err(error),
             }

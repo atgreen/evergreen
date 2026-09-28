@@ -4072,12 +4072,12 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
    (text :initarg :text :initform "" :reader py:exception-text)
    (frames :initarg :frames :initform nil :reader py:exception-frames)
    (object :initarg :object :initform nil :reader py:exception-object)
-   ;; FORMAT-CONTROL carries the already-rendered report, which is what TorCL's
-   ;; printer actually reads: a DEFINE-CONDITION :report is not honoured by ~A yet
-   ;; (even a constant string prints as the bare class name -- bliss-e5eh6), so the
-   ;; :report below is the portable declaration and this slot is what makes ~A and
-   ;; an uncaught error show the message and the frames today. The signaller fills
-   ;; it; the two agree by construction.
+   ;; FORMAT-CONTROL carries the already-rendered report. It was once the ONLY thing
+   ;; TorCL's printer read, because a DEFINE-CONDITION :report was not honoured at all
+   ;; (bliss-e5eh6); the :report below is now consulted first and supplies the message,
+   ;; so this slot no longer decides what ~A or an uncaught error shows. It is kept
+   ;; because the signaller fills it and SIMPLE-CONDITION-FORMAT-CONTROL can read it;
+   ;; the two agree by construction.
    (format-control :initarg :format-control :initform nil)
    (format-arguments :initarg :format-arguments :initform nil))
   (:report (lambda (condition stream)

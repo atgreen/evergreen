@@ -10283,8 +10283,12 @@ fn stdlib_print_object_hook(val: TorclVal, escape: bool) -> Option<String> {
                 .map(|ns| ns.iter().any(|n| n == "CONDITION"))
                 .unwrap_or(false);
             if is_condition {
+                // Safety: the parked pointer is the live print-entry &mut Env, the same
+                // one the RESTART report below re-borrows; printing is single-threaded.
+                // A &mut is needed because a :report designator may be a lambda to call.
+                let env_mut = unsafe { &mut *ptr };
                 PRINTING_OBJECT.with(|c| c.set(true));
-                let report = condition_report_string(env, *val);
+                let report = condition_report_text(env_mut, *val);
                 PRINTING_OBJECT.with(|c| c.set(false));
                 if let Some(report) = report {
                     return Some(report);
@@ -12324,7 +12328,10 @@ fn print_condition_defined_report(
     if !torcl_stdlib::is_instance(obj) {
         return Ok(false);
     }
-    let Some(names) = instance_class_hierarchy_names(obj) else {
+    // QUALIFIED names, because the registry is keyed by condition_type_key: a type
+    // defined in package P is stored as `P:NAME`, so the bare-name walk found nothing
+    // and every :report outside COMMON-LISP/CL-USER stayed unreachable (bliss-e5eh6).
+    let Some(names) = condition_type_hierarchy_names(obj) else {
         return Ok(false);
     };
     // Root OBJ / STREAM across the report designator eval + funcall below.
@@ -12355,6 +12362,31 @@ fn print_condition_defined_report(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// A condition's report text: its DEFINE-CONDITION `:report` when it declares one,
+/// otherwise the slot-derived shapes of [`condition_report_string`].
+///
+/// A `:report` outranks those shapes because it is the type's OWN declared report —
+/// notably for a subclass of TYPE-ERROR, which would otherwise always print the
+/// built-in "The value X is not of type Y." (bliss-l9tt).
+///
+/// Separate from `condition_report_string` because a designator may be a lambda, so
+/// rendering one needs `&mut Env` to funcall it and a stream to write into. That is
+/// why `print_condition_defined_report` sat unused and every `:report` -- string,
+/// function name or lambda alike -- printed as the bare class name (bliss-e5eh6).
+fn condition_report_text(env: &mut Env, cond: TorclVal) -> Option<String> {
+    // Root COND across the stream allocation, the designator eval and the funcall.
+    torcl_rt::rooted!(cond = cond);
+    if let Ok(stream) = torcl_stdlib::make_string_output_stream(NIL) {
+        torcl_rt::rooted!(stream = stream);
+        if matches!(print_condition_defined_report(*cond, *stream, env), Ok(true)) {
+            if let Ok(text) = torcl_stdlib::get_output_stream_string(*stream) {
+                return Some(val_as_str(text));
+            }
+        }
+    }
+    condition_report_string(env, *cond)
 }
 
 fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclVal)> {

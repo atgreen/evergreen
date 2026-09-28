@@ -412,6 +412,11 @@ pub fn library_call(args: &[TorclVal]) -> Result<TorclVal, TorclError> {
                 0
             },
         )),
+        // Companion to JVM-RUNTIME-VERSION: a 0 there has four possible causes and
+        // Lisp can see none of them, so the reason is reported from Rust (bliss-hllzi).
+        ("JVM-RUNTIME-DIAGNOSTIC", []) => Ok(torcl_rt::gc::alloc_character_string(
+            &torcl_rt::runtime::jvm_coexistence_diagnostic(),
+        )),
         ("INHIBIT-IMAGE", []) => {
             torcl_rt::image::inhibit_saving()?;
             Ok(NIL)

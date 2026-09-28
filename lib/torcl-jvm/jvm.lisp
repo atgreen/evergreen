@@ -88,10 +88,25 @@
 
 (defun %ensure-backend (java-home)
   (unless *backend*
-    (handler-case
-        (unless (= 1 (torcl::%foreign-library :jvm-runtime-version))
-          (%fail "This TorCL build does not support safe JVM entry"))
-      (error () (%fail "Use a current native Linux TorCL build with torcl-rt/c-ffi and JVM coexistence support")))
+    ;; The probe and the verdict must stay apart. %FAIL signals JVM-ERROR, a subtype
+    ;; of ERROR, so a single HANDLER-CASE spanning both caught the verdict's own
+    ;; %FAIL and relabelled it -- which made the specific diagnosis unreachable and
+    ;; reported every cause as one generic sentence (bliss-hllzi).
+    (let ((version
+            (handler-case (torcl::%foreign-library :jvm-runtime-version)
+              (error (condition)
+                (%fail "This TorCL cannot be asked whether it supports JVM entry: ~
+                        reading :JVM-RUNTIME-VERSION signalled ~S. A native Linux ~
+                        x86-64 build with the torcl-rt/c-ffi feature is required."
+                       (type-of condition))))))
+      (unless (eql version 1)
+        ;; The reason lives in Rust: *FEATURES* carries neither target_env nor a
+        ;; Cargo feature, so Lisp cannot tell musl from a missing c-ffi.
+        (%fail "This TorCL cannot host a JVM in process: ~A. (:JVM-RUNTIME-VERSION ~
+                reported ~S; 1 is required.)"
+               (handler-case (torcl::%foreign-library :jvm-runtime-diagnostic)
+                 (error () "this build predates the JVM coexistence diagnostic"))
+               version)))
     ;; Native VM state cannot be serialized, including state left after shutdown.
     (torcl::%foreign-library :inhibit-image)
     (let* ((root (asdf:system-source-directory :torcl-jvm))
@@ -106,6 +121,25 @@
                     (merge-pathnames "build/libtorcl_jvm.so" root))
                    (t (%fail "Missing installed JVM bridge in ~A; reinstall torcl" root)))))
       (setf *backend* (torcl-ffi:load-foreign-library (namestring library))))))
+
+;; JDK 17+ keeps libjvm.so at lib/server/. The rest are layouts a user really
+;; arrives with: Homebrew's openjdk on Linux installs the JDK under libexec/, so a
+;; JAVA_HOME set to the documented "JDK root" (its opt/ prefix) needs libexec/
+;; prepended, and some redistributed images retain a jre/ subtree (bliss-hllzi).
+(defparameter *libjvm-layouts*
+  '("lib/server/libjvm.so" "libexec/lib/server/libjvm.so" "jre/lib/server/libjvm.so"))
+
+(defun %find-libjvm (home)
+  "Return the first libjvm.so under HOME as a truename, and the paths searched.
+Both values matter to the caller: on failure the second is what the error lists,
+so a user can see which layouts were considered rather than guessing."
+  (let ((tried '()))
+    (dolist (layout *libjvm-layouts* (values nil (nreverse tried)))
+      (let ((candidate (merge-pathnames layout home)))
+        (push (namestring candidate) tried)
+        (when (probe-file candidate)
+          (return (values (namestring (truename candidate)) (nreverse tried))))))))
+
 (defun %java-home (home)
   (or home (torcl-ext:getenv "JAVA_HOME")
       (let* ((binary (string-trim '(#\Space #\Newline #\Return #\Tab)
@@ -117,9 +151,13 @@
   "Start one in-process JVM, or explicitly attach to an existing VM. JVM restart is unsupported."
   (torcl-thread:with-mutex (*lifecycle-lock*)
     (let* ((home (uiop:ensure-directory-pathname (%java-home java-home)))
-           (library (namestring (merge-pathnames "lib/server/libjvm.so" home)))
-           (path (format nil "~{~A~^:~}" classpath)))
-      (unless (probe-file library) (%fail "No libjvm.so at ~A; set :java-home or JAVA_HOME to the JDK root" library))
+           (path (format nil "~{~A~^:~}" classpath))
+           (library
+             (multiple-value-bind (found tried) (%find-libjvm home)
+               (or found
+                   (%fail "No libjvm.so under ~A. Tried:~{~%  ~A~}~%Set :java-home or ~
+                           JAVA_HOME to the directory holding lib/server/libjvm.so."
+                          (namestring home) tried)))))
       (%ensure-backend home)
       (dolist (option options)
         (unless (and (stringp option) (not (find #\Newline option))) (%fail "JVM options must be individual strings without newlines")))

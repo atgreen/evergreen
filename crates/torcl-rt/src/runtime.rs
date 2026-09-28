@@ -1122,6 +1122,49 @@ pub fn supports_jvm_coexistence() -> bool {
     ))
 }
 
+/// Why [`supports_jvm_coexistence`] said no, as a sentence a user can act on.
+///
+/// Every input is a `cfg!` this crate can see and a caller cannot: `*FEATURES*`
+/// carries the architecture and the OS but never `target_env` or a Cargo feature,
+/// so from Lisp a static musl build, a build without `torcl-rt/c-ffi`, and a
+/// non-x86-64 host are one indistinguishable "unsupported" (bliss-hllzi). Listing
+/// only the *unmet* conditions keeps the message short when a single one is wrong,
+/// which is the usual case.
+pub fn jvm_coexistence_diagnostic() -> String {
+    let mut unmet: Vec<String> = Vec::new();
+    if !cfg!(feature = "c-ffi") {
+        unmet.push("it was built without the torcl-rt/c-ffi feature".into());
+    }
+    if !cfg!(target_arch = "x86_64") {
+        unmet.push(format!(
+            "its architecture is {}, and only x86-64 has a JVM bridge so far",
+            std::env::consts::ARCH
+        ));
+    }
+    if !cfg!(target_os = "linux") {
+        unmet.push(format!("its OS is {}, not linux", std::env::consts::OS));
+    }
+    if !cfg!(target_env = "gnu") {
+        // Naming musl explicitly is worth a branch: it is the default target here,
+        // so "you are running the musl binary" is the single most likely answer.
+        unmet.push(if cfg!(target_env = "musl") {
+            "it is a musl build, which links statically and cannot dlopen libjvm.so; \
+             a glibc (gnu) build is required"
+                .into()
+        } else {
+            "it is not a glibc (gnu) build".into()
+        });
+    }
+    match unmet.len() {
+        0 => "JVM coexistence is supported by this build".into(),
+        1 => unmet.pop().expect("length checked"),
+        _ => {
+            let last = unmet.pop().expect("length checked");
+            format!("{}, and {last}", unmet.join(", "))
+        }
+    }
+}
+
 /// Install signal handlers (SIGSEGV, SIGINT, SIGTERM, etc.). §2.6.
 /// Issue #11: actually install at least SIGINT and SIGTERM using libc.
 #[cfg(unix)]
