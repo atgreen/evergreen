@@ -175,9 +175,11 @@ construct them dynamically must retain `dynamic-code`.
 The GC, T0 bytecode interpreter, and tiered compilers remain available.
 Deoptimization resumes T0 bytecode; it does not require public `EVAL`.
 `EvalHost` follows the references in its saved constant form rather than rooting
-all capabilities. The **tree-walker itself is not removed by this initial
-pass**: source closures, internal fallback paths, and shared builtin dispatch
-still need a separate dependency split. This is not yet general removal of
+all capabilities. Many library builtins share an evaluated-argument dispatcher
+between source and compiled calls, avoiding the construction and evaluation of
+temporary Lisp call forms. The **tree-walker itself is not removed yet**:
+source closures and the remaining internal evaluator fallbacks still retain it.
+This is not yet general removal of
 every unused Rust builtin. Retained bootstrap functions and macros can contain
 source lambdas and keep all native capabilities even when the application entry
 does not call `EVAL`; the report identifies this conservative dependency.
