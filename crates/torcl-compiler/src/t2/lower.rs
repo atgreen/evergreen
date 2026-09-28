@@ -150,6 +150,9 @@ pub mod op {
     pub const GUARD: u32 = 0x0072;
     /// A type/tag test (`test`/`cmp` on the tag bits) producing a GPR boolean.
     pub const TAG_TEST: u32 = 0x0073;
+    /// Call with an exceptional continuation. Paired with INVOKE_ROUTES in the
+    /// same block. This must not be emitted as an ordinary checked CALL.
+    pub const INVOKE: u32 = 0x0074;
 
     // ── 0x80 terminators ─────────────────────────────────────────────
     /// Unconditional branch (`jmp`).
@@ -168,6 +171,10 @@ pub mod op {
     pub const NLX_TRANSFER: u32 = 0x0086;
     /// Deopt trap (unconditional deoptimisation point).
     pub const TRAP: u32 = 0x0087;
+    /// Operand-free CFG marker after INVOKE: successor 0 receives a normal
+    /// result; successor 1 captures an escaping transfer. This describes an
+    /// exceptional edge, not a status test on the successful return path.
+    pub const INVOKE_ROUTES: u32 = 0x0088;
 }
 
 /// The register class a value with representation `repr` lives in (spec §4.7
@@ -640,6 +647,17 @@ fn lower_terminator(lo: &mut Lowering, inst: Inst) {
     let data = lo.f.inst(inst);
 
     match data.opcode {
+        Invoke => {
+            let defs = lo.vregs(&data.results);
+            let uses = lo.vregs(&data.args);
+            lo.emit_annotated(inst, op::INVOKE, defs, uses);
+            // regalloc2 requires an operand-free branch instruction. Keep the
+            // call's definitions/uses separate from its two CFG successors.
+            // Unlike ordinary branch lowering, do not eagerly copy edge args:
+            // the result exists only on the normal route. Regalloc owns edge
+            // moves through MachSucc::args and the destination block params.
+            lo.emit_for(inst, op::INVOKE_ROUTES, vec![], vec![]);
+        }
         Jump => {
             // Single successor: safe sequential edge moves, then jmp.
             let t = &data.targets[0];

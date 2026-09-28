@@ -787,14 +787,14 @@ mod tests {
 
     #[test]
     fn invoke_machine_emission_is_explicitly_unsupported_until_landing_pads_exist() {
+        use crate::t2::emit::{EmitError, emit};
+        use crate::t2::lower::op;
         let (f, _, _) = invoke_graph();
         let machine = crate::t2::lower::lower(&f);
-        assert!(
-            machine
-                .insts
-                .iter()
-                .any(|i| i.op == crate::t2::lower::op::PSEUDO_UNSUPPORTED)
-        );
+        assert!(matches!(
+            emit(&machine),
+            Err(EmitError::UnsupportedOp(op::INVOKE))
+        ));
     }
 
     #[test]

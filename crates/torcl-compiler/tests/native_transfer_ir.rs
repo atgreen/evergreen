@@ -152,10 +152,110 @@ fn cold_capture_survives_dce_and_reaches_machine_root_liveness() {
             .iter()
             .all(|i| i.safepoint && i.deopt_uses.iter().any(|v| v.num == exception_only.0))
     );
+    assert!(machine.insts.iter().all(|i| i.op != op::PSEUDO_UNSUPPORTED));
+}
+
+#[test]
+fn machine_call_routes_preserve_operands_and_exception_only_roots() {
+    use torcl_compiler::t2::lower::lower;
+    use torcl_compiler::t2::mach::Location;
+    use torcl_compiler::t2::regalloc::allocate;
+    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut machine = lower(&f);
+    let exception_only = f.block(f.entry()).params[1];
+    for call in instructions(&f, Opcode::Invoke) {
+        let invoke = f.inst(call);
+        let (index, selected) = machine
+            .insts
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.source_inst == Some(call) && i.safepoint)
+            .expect("the throwing call must preserve its safepoint and operands");
+        assert_eq!(
+            selected.defs.iter().map(|v| v.num).collect::<Vec<_>>(),
+            invoke.results.iter().map(|v| v.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            selected.uses.iter().map(|v| v.num).collect::<Vec<_>>(),
+            invoke.args.iter().map(|v| v.0).collect::<Vec<_>>()
+        );
+        assert_eq!(selected.frame_state, invoke.frame_state);
+        assert!(
+            selected
+                .deopt_uses
+                .iter()
+                .any(|v| v.num == exception_only.0)
+        );
+        let block = machine
+            .blocks
+            .iter()
+            .find(|b| b.start <= index && index < b.end)
+            .unwrap();
+        assert_eq!(block.succs.len(), 2);
+        assert_eq!(
+            block.end,
+            index + 2,
+            "operand-free route marker follows call"
+        );
+        assert!(machine.insts[index + 1].defs.is_empty());
+        assert!(machine.insts[index + 1].uses.is_empty());
+        assert_eq!(block.succs[0].args, selected.defs);
+        assert!(
+            block.succs[1].args.is_empty(),
+            "no result on the exceptional route"
+        );
+    }
+    allocate(&mut machine).expect("allocate both call routes");
+    for call in instructions(&f, Opcode::Invoke) {
+        let (index, selected) = machine
+            .insts
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.source_inst == Some(call) && i.safepoint)
+            .unwrap();
+        let root_index = selected.defs.len()
+            + selected.uses.len()
+            + selected
+                .deopt_uses
+                .iter()
+                .position(|v| v.num == exception_only.0)
+                .unwrap();
+        let root = machine.inst_allocations[index][root_index];
+        if let Location::Register(reg) = root {
+            assert!(
+                reg.encoding > 8,
+                "recovery state must survive caller-saved clobbers"
+            );
+        }
+        let map = machine
+            .stack_maps
+            .iter()
+            .find(|m| m.code_offset == index as u32)
+            .unwrap();
+        assert!(
+            map.live_refs.contains(&root),
+            "exception-only local has a root location"
+        );
+    }
+}
+
+#[test]
+fn ordinary_emitter_cannot_install_transfer_calls_with_the_old_abi() {
+    use torcl_compiler::t2::emit::{EmitError, emit, emit_framed};
+    use torcl_compiler::t2::lower::{lower, op};
+    use torcl_compiler::t2::regalloc::allocate;
+    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut machine = lower(&f);
+    allocate(&mut machine).unwrap();
+    let emission = emit(&machine);
     assert!(
-        machine.insts.iter().any(|i| i.op == op::PSEUDO_UNSUPPORTED),
-        "Invoke must remain un-emittable until its machine contract exists"
+        matches!(emission, Err(EmitError::UnsupportedOp(op::INVOKE))),
+        "{emission:?}"
     );
+    assert!(matches!(
+        emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None),
+        Err(EmitError::UnsupportedOp(_))
+    ));
 }
 
 #[test]

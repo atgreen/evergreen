@@ -452,14 +452,22 @@ distinct NlxTransfer continuation with the pre-call FrameState and a TransferSit
 snapshot of the source control scopes. That continuation starts propagation;
 it does not authorize replay of the throwing bytecode. Verification requires
 matching origin/capture metadata, transfer effects, and no normal successor.
-Exception-only state remains live through DCE and reaches the cold machine
-instruction's root liveness.
+Exception-only state remains live through DCE and reaches both the call and cold
+machine instruction's root liveness. Machine lowering pairs an annotated INVOKE
+with an operand-free INVOKE_ROUTES CFG marker. The call retains its arguments,
+result definitions, pre-call FrameState and call clobbers; the marker records
+normal/exceptional successors without introducing a successful-return status
+test. Result arguments belong only to the normal edge. Register allocation owns
+edge moves; lowering does not eagerly copy a normal result onto both paths.
+Tests check allocation and stack-map locations for exception-only locals, their
+survival across caller-saved clobbers, and a call lowered from actual Lisp source.
 
 This path covers bytecodes already modelled by the SSA builder and ordinary
 function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide
-integration, machine landing pads and unwind maps remain required. Lowering
-marks Invoke as unsupported until those machine contracts are implemented,
-preventing accidental ordinary-call emission.
+integration, machine landing pads and unwind maps remain required. Existing
+emitters still refuse Invoke; the machine emitter explicitly rejects the new
+call/route opcodes before applying ordinary-call allocation assumptions. This
+prevents accidental emission using the old ABI.
 
 
 ### Ordered control-scope analysis
