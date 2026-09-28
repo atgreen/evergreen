@@ -6,6 +6,65 @@ use torcl_compiler::t2::{
 };
 
 #[test]
+fn native_v2_exceptional_cleanup_cfg_preserves_source_scope_and_values() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun cfg-maybe-throw (x) (if x (error x) nil)) (defun cfg-observe (x) x)",
+        &mut env,
+    )
+    .unwrap();
+    for source in [
+        "((let ((saved x)) (unwind-protect (progn (cfg-maybe-throw x) (setq saved 99)) (cfg-observe saved))))",
+        "((unwind-protect (error x) (list x)))",
+        "((unwind-protect (unwind-protect (error x) (list x)) (list x)))",
+        "((unwind-protect x (unwind-protect (error x) (list x))))",
+        "((unwind-protect (values) (unwind-protect (values x (list x)) (list x))))",
+        "((list x (unwind-protect (cfg-maybe-throw x) (cfg-observe x))))",
+        "((dotimes (i 3) (unwind-protect (cfg-maybe-throw i) (cfg-observe i))))",
+    ] {
+        torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        torcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
+        let body = Arc::new(
+            compile_function(
+                "EXCEPTIONAL-CLEANUP-CFG",
+                *params,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .expect(source),
+        );
+        let _body = ActiveBytecodeRoot::new(&body);
+        let mut f = build::build_from_bytecode_for_native_cleanups(&body).expect(source);
+        verify::verify(&f).unwrap_or_else(|errors| panic!("{source}: {errors:?}"));
+        use torcl_compiler::t2::pass::{Analyses, Pass};
+        torcl_compiler::t2::opt_dce::Dce.run(&mut f, &mut Analyses::new());
+        verify::verify(&f).unwrap_or_else(|errors| panic!("after DCE {source}: {errors:?}"));
+        assert!(
+            f.block_order()
+                .iter()
+                .flat_map(|&b| &f.block(b).insts)
+                .any(|&i| f.inst(i).opcode == Opcode::CleanupLanding)
+        );
+        assert!(
+            torcl_compiler::t2::emit::emit_framed_transfers_with_cleanup(
+                &f,
+                1,
+                body.num_slots(),
+                Some((1, 1))
+            )
+            .is_err(),
+            "exceptional landing IR requires the new cursor and machine maps"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_normal_cleanup_executes_and_preserves_all_values() {
     use super::super::native_transfer_entry::TransferCode;

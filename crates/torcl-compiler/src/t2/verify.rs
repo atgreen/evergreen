@@ -123,7 +123,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     || !data.flags.call
                     || !data.flags.effectful
                     || !data.flags.safepoint
-                    || !matches!(data.aux, AuxData::CallTarget(_)))
+                    || !matches!(
+                        data.aux,
+                        AuxData::CallTarget(_) | AuxData::CleanupContinuation { .. }
+                    ))
             {
                 errors.push(VerifyError::new("V11 invoke-shape",
                     format!("block{bi} Invoke requires distinct normal/exceptional edges and call effects")));
@@ -142,7 +145,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     _ => false,
                 };
                 if !origin_matches
-                    || !data.targets.is_empty()
+                    || data.targets.len() > 1
                     || !data.results.is_empty()
                     || !data.flags.effectful
                     || !data.flags.call
@@ -477,9 +480,10 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
     if !f.block_order().iter().any(|&b| {
         f.block(b).insts.iter().any(|&i| {
             matches!(&f.inst(i).aux, AuxData::CleanupContinuation { .. })
+                || (f.inst(i).opcode == Opcode::NlxTransfer && !f.inst(i).targets.is_empty())
                 || matches!(
                     f.inst(i).opcode,
-                    Opcode::CleanupSave | Opcode::CleanupRestore
+                    Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CleanupLanding
                 )
         })
     }) {
@@ -492,7 +496,13 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
             if matches!(&data.aux, AuxData::CleanupContinuation { .. })
-                && !matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore)
+                && !matches!(
+                    data.opcode,
+                    Opcode::CleanupSave
+                        | Opcode::CleanupRestore
+                        | Opcode::CleanupLanding
+                        | Opcode::Invoke
+                )
             {
                 errors.push(VerifyError::new(
                     "V13 cleanup",
@@ -539,6 +549,56 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
                     ));
                 }
             }
+            if matches!(data.opcode, Opcode::CleanupLanding | Opcode::Invoke)
+                && matches!(data.aux, AuxData::CleanupContinuation { .. })
+            {
+                let AuxData::CleanupContinuation {
+                    cleanup_bcp,
+                    resume_bcp,
+                } = data.aux
+                else {
+                    unreachable!()
+                };
+                let landing = data.opcode == Opcode::CleanupLanding;
+                let valid = data.args.is_empty()
+                    && data.results.len() == usize::from(!landing)
+                    && data
+                        .results
+                        .iter()
+                        .all(|&v| f.value(v).repr == ValueRepresentation::Tagged)
+                    && data.flags.effectful
+                    && data.frame_state.is_some()
+                    && (!landing
+                        || data.frame_state.is_some_and(|id| {
+                            f.frame_states
+                                .get(id)
+                                .scopes
+                                .last()
+                                .is_some_and(|frame| frame.bcp == cleanup_bcp)
+                        }))
+                    && if landing {
+                        !data.flags.call && !data.flags.terminator && data.targets.is_empty()
+                    } else {
+                        data.flags.call && data.flags.safepoint && data.flags.terminator
+                    };
+                if !valid || stack.last() != Some(&(cleanup_bcp, resume_bcp)) {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "invalid landing or cleanup dispatch state",
+                    ));
+                }
+                if landing && f.block(block).insts.first() != Some(&inst) {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "cleanup landing must start its block",
+                    ));
+                }
+            }
+            if data.opcode == Opcode::CleanupLanding
+                && !matches!(data.aux, AuxData::CleanupContinuation { .. })
+            {
+                errors.push(VerifyError::new("V13 cleanup", "missing landing identity"));
+            }
             if matches!(data.opcode, Opcode::Return | Opcode::TailCall) && !stack.is_empty() {
                 errors.push(VerifyError::new(
                     "V13 cleanup",
@@ -564,16 +624,79 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
                     ));
                 }
             }
-            for target in &data.targets {
+            for (edge_index, target) in data.targets.iter().enumerate() {
+                let mut outgoing = stack.clone();
+                if data.opcode == Opcode::Invoke
+                    && edge_index == 0
+                    && matches!(data.aux, AuxData::CleanupContinuation { .. })
+                {
+                    outgoing.pop();
+                }
+                if data.opcode == Opcode::NlxTransfer {
+                    let AuxData::TransferSite { scopes, .. } = &data.aux else {
+                        unreachable!()
+                    };
+                    let selected = scopes
+                        .iter()
+                        .rposition(|scope| matches!(scope.kind, ScopeKind::Unwind { .. }));
+                    let landing = f.block(target.block).insts.first().map(|&i| f.inst(i));
+                    let valid = selected
+                        .zip(landing)
+                        .and_then(|(index, landing)| {
+                            let ScopeKind::Unwind { cleanup_bcp } = scopes[index].kind else {
+                                return None;
+                            };
+                            let AuxData::CleanupContinuation {
+                                cleanup_bcp: destination,
+                                resume_bcp,
+                            } = landing.aux
+                            else {
+                                return None;
+                            };
+                            let fs = landing
+                                .frame_state
+                                .and_then(|id| f.frame_states.get(id).scopes.last());
+                            if landing.opcode != Opcode::CleanupLanding
+                                || destination != cleanup_bcp
+                                || !fs.is_some_and(|frame| {
+                                    frame.bcp == cleanup_bcp
+                                        && frame.stack.len()
+                                            == usize::from(scopes[index].sp_restore)
+                                })
+                            {
+                                return None;
+                            }
+                            let retained: Vec<_> = scopes[..index]
+                                .iter()
+                                .filter_map(|scope| {
+                                    if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+                                        Some(cleanup_bcp)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            outgoing.retain(|(cleanup, _)| retained.contains(cleanup));
+                            outgoing.push((cleanup_bcp, resume_bcp));
+                            Some(())
+                        })
+                        .is_some();
+                    if !valid {
+                        errors.push(VerifyError::new(
+                            "V13 cleanup",
+                            "transfer target is not the selected cleanup landing",
+                        ));
+                    }
+                }
                 if let Some(prior) = incoming.get(&target.block) {
-                    if prior != &stack {
+                    if prior != &outgoing {
                         errors.push(VerifyError::new(
                             "V13 cleanup",
                             "join disagrees on active continuations",
                         ));
                     }
                 } else {
-                    incoming.insert(target.block, stack.clone());
+                    incoming.insert(target.block, outgoing);
                     work.push(target.block);
                 }
             }

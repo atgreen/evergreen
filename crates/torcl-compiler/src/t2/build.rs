@@ -84,9 +84,25 @@ pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError
 /// cleanup continuations. Emission requires matching runtime support; direct
 /// exits crossing cleanup remain refused until native unwind lowering exists.
 pub fn build_from_bytecode_for_transfers(bf: &BytecodeFunction) -> Result<Function, BuildError> {
+    build_transfer_cfg(bf, false)
+}
+
+/// Include cleanup predecessors before SSA sealing. Installation requires native
+/// landing/cursor support; the existing emitter deliberately declines this IR.
+pub fn build_from_bytecode_for_native_cleanups(
+    bf: &BytecodeFunction,
+) -> Result<Function, BuildError> {
+    build_transfer_cfg(bf, true)
+}
+
+fn build_transfer_cfg(
+    bf: &BytecodeFunction,
+    native_cleanups: bool,
+) -> Result<Function, BuildError> {
     let scopes = ScopeMap::analyze_function(bf).map_err(BuildError::InvalidScopes)?;
     let mut builder = Builder::new(bf, InlineOptions::default());
     builder.transfer_mode = true;
+    builder.native_cleanups = native_cleanups;
     let mut f = builder.run()?;
     let calls: Vec<Inst> = f
         .block_order()
@@ -302,9 +318,11 @@ struct Builder<'a> {
     /// Intrinsic expansions are leaves, so the first implementation stays at 0.
     inline_depth: u8,
     root_symbol: u32,
-    /// Protected regions may leave through mapped exceptional continuations.
-    /// Their normal cleanup handoffs remain unsupported until explicitly lowered.
+    /// Admit protected scopes and explicit normal cleanup handoffs.
     transfer_mode: bool,
+    /// Build exceptional cleanup predecessors before SSA sealing. Kept behind
+    /// its own entry while native landing maps and cursor dispatch are wired.
+    native_cleanups: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -329,6 +347,7 @@ impl<'a> Builder<'a> {
             ))?;
         match scopes.cleanup_resumes(cleanup) {
             [resume] => Ok((cleanup, *resume)),
+            [] if self.native_cleanups => Ok((cleanup, u32::MAX)),
             _ => Err(BuildError::Unsupported(
                 "cleanup requires dynamic continuation selection",
             )),
@@ -381,6 +400,7 @@ impl<'a> Builder<'a> {
             inline_depth: 0,
             root_symbol,
             transfer_mode: false,
+            native_cleanups: false,
         }
     }
 
@@ -494,6 +514,14 @@ impl<'a> Builder<'a> {
         set.insert(0);
         for (i, instr) in code.iter().enumerate() {
             match instr {
+                Instr::PushUnwind { cleanup_bcp, .. } if self.native_cleanups => {
+                    set.insert(*cleanup_bcp as usize);
+                }
+                Instr::CallNamed { .. } | Instr::SetValues(_) if self.native_cleanups => {
+                    if i + 1 < code.len() {
+                        set.insert(i + 1);
+                    }
+                }
                 Instr::EnterCleanupNormal {
                     cleanup_bcp,
                     resume_bcp,
@@ -566,6 +594,16 @@ impl<'a> Builder<'a> {
                         work.push(idx);
                     }
                 };
+            if self.native_cleanups
+                && matches!(
+                    code[i],
+                    Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::CleanupReturn
+                )
+            {
+                if let Some((cleanup, depth)) = self.exceptional_cleanup(i as u32) {
+                    push(cleanup as usize, i32::from(depth), &mut depth_at, &mut work);
+                }
+            }
             match &code[i] {
                 Instr::EnterCleanupNormal { cleanup_bcp, .. } if self.transfer_mode => {
                     if d < 1 {
@@ -763,12 +801,34 @@ impl<'a> Builder<'a> {
         };
         for (offset, instr) in code[start..end].iter().enumerate() {
             match instr {
+                Instr::CallNamed { .. } | Instr::SetValues(_) if self.native_cleanups => {
+                    let mut successors = Vec::new();
+                    if !matches!(instr, Instr::CallNamed { sym, .. } if is_never_returning_call(*sym))
+                    {
+                        successors.push(blk(end)?);
+                    }
+                    if let Some((cleanup, _)) = self.exceptional_cleanup((start + offset) as u32) {
+                        successors.push(blk(cleanup as usize)?);
+                    }
+                    return Ok(successors);
+                }
                 Instr::EnterCleanupNormal { cleanup_bcp, .. } if self.transfer_mode => {
                     return Ok(vec![blk(*cleanup_bcp as usize)?]);
                 }
                 Instr::CleanupReturn if self.transfer_mode => {
                     let (_, resume) = self.normal_cleanup_return((start + offset) as u32)?;
-                    return Ok(vec![blk(resume as usize)?]);
+                    let mut successors = Vec::new();
+                    if resume != u32::MAX {
+                        successors.push(blk(resume as usize)?);
+                    }
+                    if self.native_cleanups {
+                        if let Some((cleanup, _)) =
+                            self.exceptional_cleanup((start + offset) as u32)
+                        {
+                            successors.push(blk(cleanup as usize)?);
+                        }
+                    }
+                    return Ok(successors);
                 }
                 Instr::Br(t) => return Ok(vec![blk(*t as usize)?]),
                 Instr::Go { target_bcp, .. } => return Ok(vec![blk(*target_bcp as usize)?]),
@@ -897,6 +957,45 @@ impl<'a> Builder<'a> {
             stack.push(self.read_var(Var::Stack(k as u16), block));
         }
 
+        if self.native_cleanups
+            && self.bf.code.iter().any(|i| {
+                matches!(i,
+            Instr::PushUnwind { cleanup_bcp, .. } if *cleanup_bcp as usize == start)
+            })
+        {
+            let resumes = self
+                .control_scopes
+                .as_ref()
+                .unwrap()
+                .cleanup_resumes(start as u32);
+            let resume_bcp = match resumes {
+                [resume] => *resume,
+                [] => u32::MAX,
+                _ => return Err(BuildError::Unsupported("ambiguous cleanup resume")),
+            };
+            let fs = self.build_frame_state(block, &stack, start as u32);
+            self.f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::CleanupLanding,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::CleanupContinuation {
+                        cleanup_bcp: start as u32,
+                        resume_bcp,
+                    },
+                    flags: InstFlags {
+                        effectful: true,
+                        ..InstFlags::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(fs),
+                    source_pos: 0,
+                },
+                &[],
+            );
+        }
+
         // Interpret straight-line instructions until a terminator (or the range
         // ends and we fall through).
         let mut term: Option<Term> = None;
@@ -1014,7 +1113,7 @@ impl<'a> Builder<'a> {
                     let split = stack.len() - n;
                     let args: Vec<Value> = stack.split_off(split);
                     let values_sym = torcl_rt::symbols::intern("VALUES");
-                    let (_inst, results) = self.f.push_inst(
+                    let (inst, results) = self.f.push_inst(
                         block,
                         InstData {
                             opcode: Opcode::Call,
@@ -1033,6 +1132,17 @@ impl<'a> Builder<'a> {
                         },
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
+                    if self.native_cleanups {
+                        self.finish_native_invoke(
+                            block,
+                            inst,
+                            stack,
+                            results[0],
+                            i as u32,
+                            Some(end),
+                        )?;
+                        return Ok(());
+                    }
                     stack.push(results[0]);
                 }
                 Instr::PushBlock { sp_restore, .. } | Instr::PushTag { sp_restore, .. } => {
@@ -1073,7 +1183,7 @@ impl<'a> Builder<'a> {
                 Instr::CleanupReturn if self.transfer_mode => {
                     let (cleanup_bcp, resume_bcp) = self.normal_cleanup_return(i as u32)?;
                     let fs = self.build_frame_state(block, &stack, i as u32);
-                    let (_, values) = self.f.push_inst(
+                    let (inst, values) = self.f.push_inst(
                         block,
                         InstData {
                             opcode: Opcode::CleanupRestore,
@@ -1090,6 +1200,17 @@ impl<'a> Builder<'a> {
                         },
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
+                    if self.native_cleanups {
+                        self.finish_native_invoke(
+                            block,
+                            inst,
+                            stack,
+                            values[0],
+                            i as u32,
+                            (resume_bcp != u32::MAX).then_some(resume_bcp as usize),
+                        )?;
+                        return Ok(());
+                    }
                     stack.push(values[0]);
                     term = Some(Term::Jump(self.block_of[&(resume_bcp as usize)]));
                     break;
@@ -1109,7 +1230,9 @@ impl<'a> Builder<'a> {
                     // and call-site policy. An expansion hook can still decline
                     // for operand-shape reasons (for example dynamic TYPEP),
                     // leaving the normal Call and its FrameState intact.
-                    if let Some(metadata) = metadata_for_symbol(*sym) {
+                    if let Some(metadata) =
+                        metadata_for_symbol(*sym).filter(|_| !self.native_cleanups)
+                    {
                         let policy = self.inline_options.policy_at(i as u32);
                         let decision = decide(
                             metadata,
@@ -1152,7 +1275,17 @@ impl<'a> Builder<'a> {
                         },
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
-                    let _ = inst;
+                    if self.native_cleanups {
+                        self.finish_native_invoke(
+                            block,
+                            inst,
+                            stack,
+                            results[0],
+                            i as u32,
+                            (!is_never_returning_call(*sym)).then_some(end),
+                        )?;
+                        return Ok(());
+                    }
                     // A call that NEVER RETURNS NORMALLY ends this path
                     // (bliss-wukf). Without it T2 carried on executing code
                     // that must not run: a store after the error landed, and a
@@ -1276,6 +1409,117 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    fn exceptional_cleanup(&self, bcp: u32) -> Option<(u32, u16)> {
+        self.control_scopes
+            .as_ref()?
+            .before(bcp)?
+            .iter()
+            .rev()
+            .find_map(|scope| {
+                if let ScopeKind::Unwind { cleanup_bcp } = scope.kind {
+                    Some((cleanup_bcp, scope.sp_restore))
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn synthetic_block(&mut self) -> Block {
+        let block = self.f.make_block();
+        self.total_preds.push(1);
+        self.seen_preds.push(0);
+        self.interpreted.push(false);
+        self.sealed.push(false);
+        block
+    }
+
+    fn finish_native_invoke(
+        &mut self,
+        block: Block,
+        call: Inst,
+        mut stack: Vec<Value>,
+        result: Value,
+        bcp: u32,
+        resume: Option<usize>,
+    ) -> Result<(), BuildError> {
+        use crate::t2::ir::BlockCall;
+        let normal = self.synthetic_block();
+        let cold = self.synthetic_block();
+        let projected = self
+            .f
+            .add_block_param(normal, IRType::TOP, ValueRepresentation::Tagged);
+        let fs = self.f.inst(call).frame_state;
+        let invoke = self.f.inst_mut(call);
+        invoke.opcode = Opcode::Invoke;
+        invoke.flags.terminator = true;
+        invoke.targets = vec![
+            BlockCall {
+                block: normal,
+                args: vec![result],
+            },
+            BlockCall {
+                block: cold,
+                args: vec![],
+            },
+        ];
+        for (slot, &value) in stack.iter().enumerate() {
+            self.write_var(Var::Stack(slot as u16), block, value);
+        }
+        self.record_edges(block, call, vec![normal, cold]);
+        self.seal(normal);
+        self.seal(cold);
+        let mut cold_stack = stack.clone();
+        let targets = if let Some((cleanup, depth)) = self.exceptional_cleanup(bcp) {
+            if usize::from(depth) > cold_stack.len() {
+                return Err(BuildError::Unsupported("cleanup consumes enclosing stack"));
+            }
+            cold_stack.truncate(usize::from(depth));
+            vec![BlockCall {
+                block: self.block_of[&(cleanup as usize)],
+                args: vec![],
+            }]
+        } else {
+            vec![]
+        };
+        stack.push(projected);
+        let normal_term = resume
+            .map(|bcp| Term::Jump(self.block_of[&bcp]))
+            .unwrap_or(Term::Trap);
+        self.finish_block(normal, Some(normal_term), stack, self.bf.code.len());
+        let scopes = self
+            .control_scopes
+            .as_ref()
+            .unwrap()
+            .before(bcp)
+            .unwrap()
+            .to_vec();
+        self.finish_block(
+            cold,
+            Some(Term::Transfer(InstData {
+                opcode: Opcode::NlxTransfer,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::TransferSite {
+                    origin_bcp: bcp,
+                    scopes,
+                },
+                flags: InstFlags {
+                    effectful: true,
+                    safepoint: true,
+                    call: true,
+                    terminator: true,
+                    ..InstFlags::default()
+                },
+                targets,
+                frame_state: fs,
+                source_pos: 0,
+            })),
+            cold_stack,
+            self.bf.code.len(),
+        );
+        Ok(())
+    }
+
     /// Write exit stack defs, set the terminator, and do predecessor bookkeeping
     /// (marking edges and sealing any already-interpreted successor whose last
     /// predecessor this block is).
@@ -1292,6 +1536,10 @@ impl<'a> Builder<'a> {
         // Build the terminator and record its outgoing edges as (successor, idx).
         let (data, edges): (InstData, Vec<Block>) = match term {
             Some(Term::Jump(s)) => (jump(s), vec![s]),
+            Some(Term::Transfer(data)) => {
+                let edges = data.targets.iter().map(|edge| edge.block).collect();
+                (data, edges)
+            }
             Some(Term::Brif(cond, t, f)) => (brif(cond, t, f), vec![t, f]),
             Some(Term::Ret(v)) => (ret(v), vec![]),
             Some(Term::Trap) => (trap(), vec![]),
@@ -1308,6 +1556,10 @@ impl<'a> Builder<'a> {
         };
 
         let inst = self.f.set_terminator(block, data);
+        self.record_edges(block, inst, edges);
+    }
+
+    fn record_edges(&mut self, block: Block, inst: Inst, edges: Vec<Block>) {
         self.terminator_inst.insert(block, inst);
         self.interpreted[block.index()] = true;
 
@@ -1449,7 +1701,9 @@ impl<'a> Builder<'a> {
     /// (block-call) arguments, and in deopt frame states — so a removed trivial
     /// phi leaves no dangling reference.
     fn replace_value(&mut self, p: Value, u: Value) {
-        let blocks: Vec<Block> = self.block_of.values().copied().collect();
+        // Synthetic normal/cold call bridges also carry phi uses. Rewriting
+        // only bytecode leaders leaves their edge arguments dangling.
+        let blocks = self.f.block_order().to_vec();
         for b in blocks {
             let insts = self.f.block(b).insts.clone();
             for inst in insts {
@@ -1909,6 +2163,7 @@ impl<'a> Builder<'a> {
 /// A block's control-flow conclusion, captured during interpretation.
 enum Term {
     Jump(Block),
+    Transfer(InstData),
     /// `Brif(cond, taken_when_true, taken_when_false)`.
     Brif(Value, Block, Block),
     Ret(Value),

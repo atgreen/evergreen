@@ -221,6 +221,8 @@ pub enum Opcode {
     /// Pop the matching normal cleanup continuation, restore its multiple-value
     /// state and produce its primary. Exceptional entry uses the unwind cursor.
     CleanupRestore,
+    /// Verified exceptional/normal cleanup entry with an entry FrameState.
+    CleanupLanding,
     // Cat 5a — non-terminator control: calls & guards
     Call,
     Guard,
@@ -293,6 +295,10 @@ pub enum AuxData {
     },
     FieldOffset(u32),
     CallTarget(u32),
+    /// Save/restore or landing identity. On Invoke this selects cleanup
+    /// completion: normal edge pops/restores the saved value, exceptional edge
+    /// resumes its pending transfer with the continuation still described by
+    /// the cold site's pre-operation scope map. `u32::MAX` means no normal resume.
     CleanupContinuation {
         cleanup_bcp: u32,
         resume_bcp: u32,
@@ -301,6 +307,9 @@ pub enum AuxData {
     /// FrameState captures the pre-operation values, but propagation must begin
     /// unwinding rather than executing that bytecode operation again. These
     /// static scopes describe required runtime state, not permission to elide it.
+    /// NlxTransfer may name one verified CleanupLanding successor; no successor
+    /// means fallback/propagation outside this native CFG. A named native target
+    /// remains conditional on runtime destination availability and signaling.
     TransferSite {
         origin_bcp: u32,
         scopes: Vec<crate::control_scope::ControlScope>,

@@ -597,13 +597,28 @@ and preparation, and dereferences relocated register/stack pointers after landin
 Run this capability gate explicitly with `cargo test -p torcl-compiler --test
 native_landing_sysv -- --include-ignored`.
 
-This adapter is not yet selected by Lisp transfer dispatch. Exceptional cleanup
-edges must first participate in SSA construction **before** phi simplification
-and optimization. Attaching a landing PC afterward is insufficient: if a local
-is assigned after a potentially throwing call, normal-only SSA may propagate
-that later assignment into cleanup, although the exceptional edge needs the
-pre-call value. Native destination maps and rooted pending-transfer cursors must
-consume the resulting verified exceptional data flow.
+This adapter is not yet selected by Lisp transfer dispatch. The separate
+`build_from_bytecode_for_native_cleanups` entry now constructs exceptional cleanup
+predecessors **before** SSA sealing and phi simplification. Calls split into normal
+and cold blocks; the cold edge truncates the operand stack to the selected
+UNWIND-PROTECT's saved depth. Locals merge with the normal cleanup entry, so an
+assignment after a throwing call cannot replace the exceptional pre-call value.
+`CleanupLanding` retains the entry FrameState and continuation identity.
+Cleanup completion is an Invoke with `CleanupContinuation` metadata: only its
+normal edge pops/restores the saved answer, while its cold edge resumes the
+pending transfer. NlxTransfer may name a verified cleanup successor or leave the
+native CFG for fallback. V13 verifies landing identity, stack depth, retained
+running continuations and the distinct completion routes.
+
+Source tests cover nested normal/exceptional cleanup, ERROR-only protected paths,
+zero/multiple values, enclosing operand-stack prefixes and loop back edges,
+including DCE. Phi replacement also visits synthetic call-edge blocks; otherwise
+removing a trivial phi left dangling arguments on those new edges. Intrinsic
+expansion is conservatively deferred in this builder so structural throwing
+predecessors cannot disappear while SSA is being built. Ordinary tiering and the
+existing transfer runtime still use their existing builders. Machine emission
+deliberately refuses CleanupLanding until native destination maps, helper
+completion outcomes and the rooted pending-transfer cursor consume this IR.
 
 ### Windows validation and Wine limits
 
