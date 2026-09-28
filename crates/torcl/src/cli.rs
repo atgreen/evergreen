@@ -4060,7 +4060,7 @@ fn take_control_value(token: &str) -> TorclVal {
 }
 
 /// Store a control-token value together with the full multiple-value list live
-/// on `env`, so a RETURN / RETURN-FROM out of a BLOCK carries ALL values (not
+/// on `env`, so THROW and RETURN / RETURN-FROM carry ALL values (not
 /// just the primary) to the block's exit — `(return-from foo (values a b))`
 /// must yield two values, and `(return (values))` zero. The values are wrapped
 /// in a leading cons so their presence (even zero values) is unambiguous.
@@ -16104,7 +16104,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 env.catch_stack.pop();
                 match result {
                     Err(TorclError::Internal(msg)) if msg == token => {
-                        return Ok(take_control_value(&token));
+                        return Ok(take_control_mv(&token, env));
                     }
                     other => return other,
                 }
@@ -16150,8 +16150,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     .rev()
                     .find(|(catch_tag, _)| catch_tag == &tag)
                 {
-                    store_control_value(token, value);
-                    return Err(TorclError::Internal(token.clone()));
+                    let token = token.clone();
+                    store_control_mv(&token, value, env);
+                    return Err(TorclError::Internal(token));
                 }
                 // A THROW with no matching CATCH is a catchable CONTROL-ERROR
                 // (CLHS 5.2), not an uncatchable internal error.

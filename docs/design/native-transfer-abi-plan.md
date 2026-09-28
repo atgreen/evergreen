@@ -2,7 +2,9 @@
 
 Status: proposed implementation plan, not implemented.
 Tracking: **bliss-shih7**, with executable steps in its child Beads.
-Baseline: `2c84d2e1` (the counted pending-error fast path).
+Baseline: `2c84d2e1` (the counted pending-error fast path, `bliss-5fzra`).
+That completed mitigation retained return checks; this work replaces the protocol
+on top of it. Do not remove checks until the new boundary contract is verified.
 
 ## Objective and decision
 
@@ -135,7 +137,9 @@ preparation returns a `NativeUnwindAction` (`RunCleanup`, `EnterTarget`,
 before assembly adjusts generated frames. A cleanup landing pad resumes the
 cursor after normal completion; a new escaping transfer replaces it according
 to Lisp semantics. Frames needed by cleanup remain live until that cleanup has
-finished. Reentry and suspended cleanup cursors are rooted and nestable.
+finished. The cursor is rooted before the first action is returned: even the
+first `RunCleanup` may allocate. Reentry and suspended cleanup cursors are rooted
+and nestable.
 
 The compiler represents normal and exceptional successors explicitly through
 lowering, T2 IR, optimization, liveness and emission, with equivalent T1 metadata.
@@ -190,6 +194,9 @@ If native continuation is unavailable or invalidated:
    `TorclError` as an unconditional throw.
 3. **Cleanup executes exactly once and in order.** Preserve active handlers,
    catch/block/tag targets, special-binding depths and `UNWIND-PROTECT` actions.
+   Handlers live at segment entry may have been established by the interpreter
+   before OSR. Record that ownership and preserve their state; a segment cannot
+   elide their scope transitions based on ordinary function-entry assumptions.
    Cleanup may allocate, yield, call native code, or supersede the original
    transfer. Restore bindings at their defined unwind points, not in one bulk
    reset before cleanup.
@@ -205,10 +212,16 @@ If native continuation is unavailable or invalidated:
    again.
 6. **Handle resource exhaustion.** Stack guards need enough reserved space to
    publish the failure and reach the landing continuation. OOM must not require
-   another successful allocation to begin unwinding. Test failed preparation,
+   another successful allocation to begin unwinding. Reuse
+   `torcl_stdlib::acquire_preallocated_storage_condition()` for the condition;
+   reserve cursor/capture storage separately, since a preallocated condition
+   alone does not supply unwind metadata storage. Test failed preparation,
    not only successful reconstruction.
-7. **Cross-version calls are explicit.** Tag native code with its transfer ABI.
-   Direct-call installation, OSR and cache invalidation verify compatibility.
+7. **Cross-version calls are explicit.** Tag native code with its transfer ABI
+   and target architecture/calling convention.
+   Direct-call installation, OSR and cache invalidation verify both. Reject
+   incompatible artifacts before executable installation; no backend may install
+   another architecture's bytes even if an unrelated compilation guard passes.
    Legacy code stays behind a bridge segment until converted. No old helper can
    silently return a placeholder into unchecked new code.
 
@@ -220,12 +233,15 @@ poll sites are proven. Return safepoint polls are not inherently forbidden:
 The prohibited cost is a mandatory transfer helper/status test after every
 successful native call. Start with a cheap inline poll-word test and a cold slow
 path at root-safe function entries, loop back-edges and bounded straight-line
-intervals. Entry coverage must include every recursive cycle. A slow poll may
+intervals. Entry coverage must include every recursive cycle, including
+Lisp-to-Python-to-Lisp recursion through `PY:EXPORT` callback segment entries. A slow poll may
 collect/yield only after live references are published; a delivered interrupt
 uses the new transfer path.
 
 Keep the existing process signal epoch, per-execution ownership and deadline
-semantics. Preserve blocked-foreign-call protocols. Verify signal response and
+semantics. Preserve blocked-foreign-call protocols. Lisp poll sites cannot
+interrupt Python while no Lisp code runs: `bliss-ziuwp` requires a foreign-runtime
+interruption protocol, not merely additional Lisp polls. Verify signal response and
 GC rendezvous deadlines from the existing tests on recursive, looping and
 straight-line workloads. The known SIGINT regression (`bliss-mhuai`) is a gate
 prerequisite, not an excuse to waive signal tests.
@@ -263,8 +279,11 @@ Required additions to the sequence (Beads dependencies are authoritative):
 
 Steps 2 and 3 follow the contract; step 4 needs both. The fallback milestone
 unblocks independent polling work, but native dispatch and local-exit/scope work
-are required before activation. Step 7 requires both native dispatch and polling;
-step 8 requires step 7 and local-exit/scope work. Steps 9 and 10 follow activation.
+remain required for the final endpoint. A limited activation milestone may
+remove successful-return checks using verified bytecode fallback after steps
+1–6 plus boundary/fiber coverage from step 7. It must be labeled intermediate
+and report fallback costs. Step 8 final activation still requires native dispatch,
+step 7 and local-exit/scope work. Steps 9 and 10 follow final activation.
 Keep unsupported platforms on the old ABI until their own gates pass.
 QEMU proves functional behavior only; native hardware is required for platform
 performance claims. x86-64 Linux and Windows are the first delivery milestone.
@@ -288,8 +307,48 @@ The rollout gate requires:
   an assumption or acceptance shortcut.
 * Forced moving GC/poison, nested cleanup transfers, multiple values, migration,
   OSR, invalidation, legacy bridges and Windows ABI tests pass. Verify actual
-  relocation, not just a process exit under a stress environment variable.
+  relocation: retain a raw copy of a rooted heap value before the allocation
+  under test, require the rooted value to change address, then check its content
+  and aliases. Never dereference the stale copy. Run with GC poison and use
+  `TORCL_GC_REGION_LOG=1` as supporting evidence; a clean stress run alone does
+  not prove movement. Test zero, one and several values across cleanup.
 * Run workspace gates and record unrelated baseline failures explicitly.
 
 This plan does not remove the interpreter, replace Rust's unwinder, promise
 zero overhead for signal polling, or change the Fibonacci algorithm.
+
+## Baseline contract oracles and boundary inventory
+
+`crates/torcl/tests/native_transfer_cli.rs` verifies real T1/T2 entries, direct
+calls, OSR, escaping side effects, multiple values, fiber yields and native
+reentry through resumable restarts and replacing cleanup transfers. The shared
+`crates/torcl/tests/fixtures/native-transfer-osr.lisp` is also consumed by
+`scripts/s390x-jit-smoke.py`: expired catch, unwinding GO, and outer GO run with
+OSR traps and GC stress. Extend these oracles rather than duplicating them.
+
+The following existing sites must be covered when installing the segment ABI:
+
+| Boundary/state | Current implementation and required treatment |
+|---|---|
+| Full native invocation | `run_native`: parameter/root frame, lexical scope guard, depth guard, native environment, pending error save/restore, fault recovery IPs, active code and MV context. Anchor before machine entry; restore each exactly once. |
+| T0 OSR | `run_native_osr`: reuses the interpreter frame and its live handlers. Anchor records inherited scope ownership and frame watermark. |
+| T1-to-T2 OSR | `c2i_t1_backedge`: Rust helper directly enters a T2 alternate entry; this is a nested segment, not a native-only jump across the helper. Preserve deopt operand slots. |
+| Calls into Lisp/runtime | `c2i_call`, `c2i_call_slice`, `c2i_call_builtin`, `c2i_call_builtin_regs`, `c2i_call_args`; reentrant calls may establish inner segments. Helpers return normally before their veneer transfers. |
+| Environment/allocation helpers | `c2i_load_global`, `c2i_load_function`, environment load/store/define, host evaluation/closure/cons creation and MV helpers. Inventory their allocation, signaling and transfer effects before classifying a helper as nonthrowing. |
+| Existing transfer state | `NATIVE_ERROR`, `native_error_pending`, `c2i_transfer_pending`, `native_loop_should_exit`; replace checked legacy calls only behind versioned bridges. Preserve first-error behavior and nested save/restore during migration. |
+| Deopt | `c2i_deopt`, `c2i_deopt_state`, `c2i_deopt_t2`, `NATIVE_DEOPT_RESUME`; keep transfer propagation distinct from ordinary resumption and preserve original code identity. |
+| Fault recovery | `c2i_set_native_sigsegv_recovery`, architecture recovery stubs and recovery guards; only generated-frame faults may use generated-frame recovery. No generic unwind through Rust helpers. |
+| Installation/lifetime | `NativeCode`, `OsrCode`, `ActiveNativeCode`, `publish_native`, `install_t2_completion`, `compile_t2_artifact` and retained direct callees; verify architecture plus ABI at every entry/cache/installation boundary. |
+
+PPC deferral is scheduling per user direction, not a claim that its existing
+backend lacks native compilation. Foreign callbacks and all architecture-specific
+entry stubs remain in the final portability audit.
+
+Compiler work decomposition under `bliss-shih7.11`:
+
+* `bliss-shih7.11.1`: Specify exceptional CFG and liveness invariants.
+* `bliss-shih7.11.2`: Preserve exceptional state through T2 optimization and allocation.
+* `bliss-shih7.11.3`: Implement the exceptional scope contract in T1 emission.
+
+The CFG contract follows the baseline contract. T2 pass integration and T1
+emission follow the CFG contract; the parent completes only after all three gates.
