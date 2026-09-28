@@ -16556,6 +16556,9 @@ struct NativeCode {
     /// The exact metadata and constant slots this machine code was built from.
     /// Only synthetic signal-recovery test adapters have no bytecode body.
     body: Option<Arc<BytecodeFunction>>,
+    /// Transfer contract used by direct native calls. Versioned explicitly so
+    /// a future unchecked-return ABI cannot be mixed with legacy checked code.
+    transfer_abi_version: u16,
     /// A baked direct call can already be active when its name is redefined.
     /// Keep that exact callee (and its transitive dependencies) alive.
     _direct_calls: Vec<Rc<NativeCode>>,
@@ -16592,6 +16595,13 @@ struct NativeCode {
     /// Owns original T2 constant slots and every deoptimization scope's body.
     /// T1 uses the original `body` retained above.
     t2_metadata: Option<Arc<T2InstalledMetadata>>,
+}
+
+const NATIVE_TRANSFER_ABI_VERSION: u16 = 1;
+
+#[inline]
+fn native_transfer_abi_compatible(code: &NativeCode) -> bool {
+    code.transfer_abi_version == NATIVE_TRANSFER_ABI_VERSION
 }
 
 struct NativeEmission {
@@ -17909,6 +17919,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     }
     let nc = Rc::new(NativeCode {
         body: Some(Arc::clone(&bf)),
+        transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         _direct_calls: Vec::new(),
         entry,
         code_len: artifact.code.len(),
@@ -19203,7 +19214,12 @@ fn emit_native(
                         // same rdi=slots run_native frame ABI. Only the real
                         // has_deopt gates them (a deopting callee would mid-flight
                         // resume to T0, which the direct path can't handle).
-                        if !cnc.has_deopt && fixed && no_types && not_closure {
+                        if native_transfer_abi_compatible(&cnc)
+                            && !cnc.has_deopt
+                            && fixed
+                            && no_types
+                            && not_closure
+                        {
                             torcl_rt::blog!(
                                 "compile",
                                 torcl_rt::log::TRACE,
@@ -19993,6 +20009,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
         body: Some(bf),
+        transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         _direct_calls: direct_calls,
         entry,
         code_len: code.len(),
@@ -22226,6 +22243,7 @@ mod jtc4_stack_map_tests {
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
             body: None,
+            transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),
@@ -22238,9 +22256,13 @@ mod jtc4_stack_map_tests {
             has_deopt: false,
             t2_metadata: None,
         };
+        assert!(native_transfer_abi_compatible(&nc));
         let mut env = Env::new(false);
 
         let error = run_native(&nc, u32::MAX, &[], &mut env).unwrap_err();
+        let mut legacy = nc;
+        legacy.transfer_abi_version = 0;
+        assert!(!native_transfer_abi_compatible(&legacy));
 
         assert!(matches!(
             error,
@@ -22278,6 +22300,7 @@ mod jtc4_stack_map_tests {
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
             body: None,
+            transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),

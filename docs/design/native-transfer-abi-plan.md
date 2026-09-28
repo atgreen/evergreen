@@ -1,6 +1,8 @@
 # Native transfers without checks after successful native returns
 
-Status: proposed implementation plan, not implemented.
+Status: in progress. The native transfer path and emergency cleanup slices are
+implemented; final activation still depends on inherited OSR state, native
+Windows mitigation gates, and the remaining cross-version bridge work.
 Tracking: **bliss-shih7**, with executable steps in its child Beads.
 Baseline: `2c84d2e1` (the counted pending-error fast path, `bliss-5fzra`).
 That completed mitigation retained return checks; this work replaces the protocol
@@ -228,6 +230,12 @@ If native continuation is unavailable or invalidated:
    another architecture's bytes even if an unrelated compilation guard passes.
    Legacy code stays behind a bridge segment until converted. No old helper can
    silently return a placeholder into unchecked new code.
+
+The current implementation carries `transfer_abi_version` on every installed
+`NativeCode` object and admits direct native calls only when it matches the
+runtime's `NATIVE_TRANSFER_ABI_VERSION`. This is a compatibility fence, not a
+completed old-to-new bridge: artifacts with an older version are conservatively
+kept on the checked/fallback path until an explicit bridge is implemented.
 
 ## Polling independently of exceptions
 
