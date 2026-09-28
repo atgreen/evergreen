@@ -7,6 +7,7 @@ mod cleanup_ir;
 mod compiled;
 mod fallback;
 mod fibers;
+mod handlers;
 mod payloads;
 
 struct NativeEnvGuard(*mut Env);

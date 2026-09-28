@@ -238,3 +238,33 @@ fn selected_handler_or_restart_is_entered_before_outer_cleanup() {
         );
     }
 }
+
+#[test]
+fn crossed_handler_clusters_retire_before_cleanup_and_selected_clause() {
+    let mut scopes = [
+        scope(1, ScopeKind::HandlerCase { table_index: 0 }),
+        scope(2, ScopeKind::Unwind { cleanup_bcp: 70 }),
+        scope(3, ScopeKind::HandlerCase { table_index: 1 }),
+    ];
+    let target = SelectedTarget::Scope { push_bcp: 1 };
+    assert_eq!(
+        next_unwind_step(&scopes, target),
+        NativeUnwindStep::RetireHandler { scope_index: 2 }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes[..2], target),
+        NativeUnwindStep::RunCleanup {
+            scope_index: 1,
+            handler_depth: 1
+        }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes[..1], target),
+        NativeUnwindStep::EnterTarget { scope_index: 0 }
+    );
+    scopes[2].ownership = Ownership::Inherited;
+    assert_eq!(
+        next_unwind_step(&scopes, target),
+        NativeUnwindStep::Fallback
+    );
+}

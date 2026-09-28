@@ -1494,6 +1494,15 @@ fn emit_invoke_call(
             u64::from(enter),
             false,
         ),
+        crate::t2::ir::AuxData::HandlerScope { push_bcp, enter } => (
+            (if enter {
+                TRANSFER_HANDLER_ENTER_REQUEST
+            } else {
+                TRANSFER_HANDLER_LEAVE_REQUEST
+            }) | u64::from(push_bcp),
+            0,
+            false,
+        ),
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -2659,6 +2668,10 @@ pub const TRANSFER_THROW_REQUEST: u64 = u64::MAX;
 pub const TRANSFER_CATCH_ENTER_REQUEST: u64 = 1_u64 << 32;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub const TRANSFER_CATCH_LEAVE_REQUEST: u64 = 2_u64 << 32;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const TRANSFER_HANDLER_ENTER_REQUEST: u64 = 3_u64 << 32;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub const TRANSFER_HANDLER_LEAVE_REQUEST: u64 = 4_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. Arguments and shadow roots
@@ -2695,6 +2708,7 @@ enum CleanupEmission {
         complete: u64,
         clear_mv: u64,
         catch_landing: u64,
+        handler_landing: u64,
     },
 }
 
@@ -2705,6 +2719,7 @@ struct TransferEmission {
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
     landings: std::collections::HashMap<crate::t2::ir::Block, (u32, u32)>,
     catch_landings: std::collections::HashMap<crate::t2::ir::Block, Vec<(u32, u32, u32)>>,
+    handler_landings: std::collections::HashMap<crate::t2::ir::Block, Vec<(u32, u32, u32, u32)>>,
 }
 
 /// Opt-in SysV emission through a helper-v2 veneer. The owner must root all
@@ -2764,6 +2779,7 @@ pub fn emit_framed_native_cleanups(
             complete,
             clear_mv,
             catch_landing: 0,
+            handler_landing: 0,
         }),
     )
 }
@@ -2792,6 +2808,37 @@ pub fn emit_framed_native_catches(
             complete,
             clear_mv,
             catch_landing,
+            handler_landing: 0,
+        }),
+    )
+}
+
+/// Extend catch/cleanup emission with a noncollecting clause-delivery helper.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    clear_mv: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    if catch_landing == 0 || handler_landing == 0 {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    emit_transfer_function(
+        f,
+        call_veneer,
+        activation_slots,
+        Some(CleanupEmission::Native {
+            save,
+            complete,
+            clear_mv,
+            catch_landing,
+            handler_landing,
         }),
     )
 }
@@ -2827,6 +2874,13 @@ fn emit_transfer_function(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
+            if data.opcode == Opcode::HandlerLanding {
+                if !matches!(cleanup, Some(CleanupEmission::Native { handler_landing, .. }) if handler_landing != 0)
+                {
+                    return Err(EmitError::UnsupportedOp(0xFA));
+                }
+                continue;
+            }
             if data.opcode == Opcode::CatchLanding {
                 if !matches!(cleanup, Some(CleanupEmission::Native { catch_landing, .. }) if catch_landing != 0)
                 {
@@ -2858,6 +2912,7 @@ fn emit_transfer_function(
                         AuxData::CleanupContinuation { .. }
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
+                            | AuxData::HandlerScope { .. }
                     )
                     || data.opcode == Opcode::NlxTransfer && !data.targets.is_empty())
             {
@@ -2889,6 +2944,7 @@ fn emit_transfer_function(
         sites: vec![],
         landings: std::collections::HashMap::new(),
         catch_landings: std::collections::HashMap::new(),
+        handler_landings: std::collections::HashMap::new(),
     };
     let code = emit_framed_inner(
         f,
@@ -2911,8 +2967,20 @@ fn emit_transfer_function(
     )?;
     let mut landings = Vec::new();
     let mut catch_landings = Vec::new();
+    let mut handler_landings = Vec::new();
     for site in &transfers.sites {
         let cold = f.inst(site.map.call).targets[1].block;
+        if let Some(entries) = transfers.handler_landings.get(&cold) {
+            for &(entry_offset, push_bcp, table_index, clause_index) in entries {
+                handler_landings.push(crate::t2::transfer_sites::SysvHandlerLanding {
+                    return_offset: site.return_offset,
+                    entry_offset,
+                    push_bcp,
+                    table_index,
+                    clause_index,
+                });
+            }
+        }
         if let Some(entries) = transfers.catch_landings.get(&cold) {
             for &(entry_offset, push_bcp, resume_bcp) in entries {
                 catch_landings.push(crate::t2::transfer_sites::SysvCatchLanding {
@@ -2934,6 +3002,9 @@ fn emit_transfer_function(
     let table = crate::t2::transfer_sites::SysvTransferTable::new(code.code.len(), transfers.sites)
         .and_then(|table| table.with_cleanup_landings(&code.code, &landings))
         .and_then(|table| table.with_catch_landings(&code.code, &catch_landings))
+        .and_then(|table| {
+            table.with_handler_landings(&code.code, &f.handler_cases, &handler_landings)
+        })
         .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
     Ok((code, table))
 }
@@ -2977,6 +3048,7 @@ fn emit_framed_inner(
                         | Opcode::CleanupLanding
                         | Opcode::CleanupRestore
                         | Opcode::CatchLanding
+                        | Opcode::HandlerLanding
                         | Opcode::Invoke
                         | Opcode::NlxTransfer
                 )
@@ -3041,6 +3113,7 @@ fn emit_framed_inner(
                 | Opcode::CleanupSave
                 | Opcode::CleanupRestore
                 | Opcode::CatchLanding
+                | Opcode::HandlerLanding
         )
     };
     let has_ir_calls = f.block_order().iter().any(|&b| {
@@ -3741,7 +3814,7 @@ fn emit_framed_inner(
             // does not have (or need) a safepoint synchronization map.
             let roots = if activation_slots.is_some()
                 && is_call_like(d.opcode)
-                && d.opcode != Opcode::CatchLanding
+                && !matches!(d.opcode, Opcode::CatchLanding | Opcode::HandlerLanding)
             {
                 emitted_safepoints += 1;
                 Some(
@@ -3801,7 +3874,10 @@ fn emit_framed_inner(
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
-                    Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CatchLanding
+                    Opcode::CleanupSave
+                        | Opcode::CleanupRestore
+                        | Opcode::CatchLanding
+                        | Opcode::HandlerLanding
                 )
                 || wide_call
             {
@@ -3829,7 +3905,8 @@ fn emit_framed_inner(
                     let veneer = match d.aux {
                         AuxData::CallTarget(_)
                         | AuxData::TransferThrow
-                        | AuxData::CatchScope { .. } => transfer.veneer,
+                        | AuxData::CatchScope { .. }
+                        | AuxData::HandlerScope { .. } => transfer.veneer,
                         AuxData::CleanupContinuation { .. } => match transfer.cleanup {
                             Some(CleanupEmission::Native { complete, .. }) => complete,
                             _ => return Err(EmitError::UnsupportedOp(0xFA)),
@@ -3902,11 +3979,20 @@ fn emit_framed_inner(
                 return Err(EmitError::UnsupportedOp(0xFA));
             } else if matches!(
                 d.opcode,
-                Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CatchLanding
+                Opcode::CleanupSave
+                    | Opcode::CleanupRestore
+                    | Opcode::CatchLanding
+                    | Opcode::HandlerLanding
             ) {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {
                     let helper = match transfers.as_ref().and_then(|t| t.cleanup) {
+                        Some(CleanupEmission::Native {
+                            handler_landing, ..
+                        }) if d.opcode == Opcode::HandlerLanding && handler_landing != 0 => {
+                            handler_landing
+                        }
+
                         Some(CleanupEmission::Native { catch_landing, .. })
                             if d.opcode == Opcode::CatchLanding && catch_landing != 0 =>
                         {
@@ -3935,6 +4021,11 @@ fn emit_framed_inner(
                             push_bcp,
                             resume_bcp,
                         } => (push_bcp, resume_bcp),
+                        AuxData::HandlerDestination {
+                            push_bcp,
+                            clause_index,
+                            ..
+                        } => (push_bcp, clause_index),
                         _ => return Err(EmitError::UnsupportedOp(0xFA)),
                     };
                     if let Some(value) = d.args.first() {
@@ -4184,6 +4275,18 @@ fn emit_framed_inner(
                         match landing.aux {
                             AuxData::CleanupContinuation { cleanup_bcp, .. } => {
                                 transfer.landings.insert(b, (offset, cleanup_bcp));
+                            }
+                            AuxData::HandlerDestination {
+                                push_bcp,
+                                table_index,
+                                clause_index,
+                            } => {
+                                transfer.handler_landings.entry(b).or_default().push((
+                                    offset,
+                                    push_bcp,
+                                    table_index,
+                                    clause_index,
+                                ));
                             }
                             AuxData::CatchDestination {
                                 push_bcp,

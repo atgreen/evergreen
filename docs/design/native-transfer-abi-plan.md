@@ -750,6 +750,35 @@ unregistration, and inherited OSR scope admission remains disabled. Host allocat
 failure during token construction and payload restoration remains part of
 `bliss-shih7.12.3`.
 
+### Opt-in native HANDLER-CASE delivery
+
+The SysV transfer entry also registers live HANDLER-CASE clusters with original
+activation-owned clause tokens and rooted condition-cluster frames. Raw errors
+are signaled while that dynamic context is still installed; selecting a clause
+then begins unwinding. The builder creates per-source, per-clause exceptional
+edges before sealing SSA. A checked HandlerLanding defines the condition local
+at the clause's bytecode destination, with the enclosing operand stack restored.
+The transfer table binds that destination to the exact source scope, clause,
+return PC and native stack recipe.
+
+Native preparation validates the owned cluster-frame chain and all registrations
+before retirement. It roots the selected condition across intervening native
+cleanup, retires crossed handler clusters in order, and delivers the condition
+only after Rust returns to the assembly dispatcher. A missing native destination
+retains the original cluster frames and tokens for bytecode transfer propagation;
+the failed call is not replayed. Normal completion unregisters the same records.
+
+The handler regressions distinguish native clause entry from fallback, check
+nested and declined clauses, replacement errors, collecting cleanup, multiple
+values and actual condition-datum relocation. Fiber tests suspend several pending
+conditions together, collect while suspended, and check each fiber's result and
+restored stack/segment state. A test-only missing-destination path exercises both
+immediate fallback and fallback after native cleanup.
+
+This remains opt-in infrastructure. HANDLER-BIND/restart registration, inherited
+OSR scope admission, emergency allocation and production ABI installation still
+have separate gates; ordinary installed native functions retain their checks.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

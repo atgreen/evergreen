@@ -26,6 +26,10 @@ pub enum NativeUnwindStep {
     RetireCatch {
         scope_index: usize,
     },
+    /// Retire a crossed local HANDLER-CASE cluster after validating the landing.
+    RetireHandler {
+        scope_index: usize,
+    },
     RunCleanup {
         scope_index: usize,
         /// Number of installed handlers outside this cleanup. Running cleanup
@@ -80,6 +84,9 @@ pub fn next_unwind_step(scopes: &[ControlScope], target: SelectedTarget) -> Nati
             return NativeUnwindStep::EnterTarget { scope_index: index };
         }
         match scope.kind {
+            ScopeKind::HandlerCase { .. } => {
+                return NativeUnwindStep::RetireHandler { scope_index: index };
+            }
             ScopeKind::Catch { .. } => {
                 return NativeUnwindStep::RetireCatch { scope_index: index };
             }

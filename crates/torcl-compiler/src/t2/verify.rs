@@ -128,6 +128,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         AuxData::CallTarget(_)
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
+                            | AuxData::HandlerScope { .. }
                             | AuxData::CleanupContinuation { .. }
                     ))
             {
@@ -141,6 +142,30 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "V11 invoke-shape",
                     "THROW requires an Invoke with tag and primary",
                 ));
+            }
+            if let AuxData::HandlerScope { push_bcp, enter } = data.aux {
+                let identity_matches = if enter {
+                    data.frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                        .is_some_and(|scope| scope.bcp == push_bcp)
+                } else {
+                    data.targets.get(1).and_then(|edge| {
+                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
+                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
+                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                            if scopes.last().is_some_and(|scope|
+                                scope.push_bcp == push_bcp
+                                && scope.ownership == crate::control_scope::Ownership::Local
+                                && matches!(scope.kind, crate::control_scope::ScopeKind::HandlerCase { .. })))
+                    })
+                };
+                if data.opcode != Opcode::Invoke || !data.args.is_empty() || !identity_matches {
+                    errors.push(VerifyError::new(
+                        "V15 handler",
+                        "invalid handler registration identity or shape",
+                    ));
+                }
             }
             if let AuxData::CatchScope { push_bcp, enter } = data.aux {
                 let identity_matches = if enter {
@@ -529,6 +554,22 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
         let mut stack = incoming[&block].clone();
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
+            if data.opcode == Opcode::HandlerLanding
+                && (!matches!(data.aux, AuxData::HandlerDestination { .. })
+                    || !data.args.is_empty()
+                    || data.results.len() != 1
+                    || !data.flags.effectful
+                    || !data.flags.call
+                    || data.flags.safepoint
+                    || data.flags.terminator
+                    || !data.targets.is_empty()
+                    || f.block(block).insts.first() != Some(&inst))
+            {
+                errors.push(VerifyError::new(
+                    "V15 handler",
+                    "invalid handler landing shape",
+                ));
+            }
             if data.opcode == Opcode::CatchLanding
                 && (!matches!(data.aux, AuxData::CatchDestination { .. })
                     || !data.args.is_empty()
@@ -673,6 +714,18 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
             }
             for (edge_index, target) in data.targets.iter().enumerate() {
                 let mut outgoing = stack.clone();
+                let handler_landing = f
+                    .block(target.block)
+                    .insts
+                    .first()
+                    .map(|&i| f.inst(i))
+                    .filter(|landing| landing.opcode == Opcode::HandlerLanding);
+                if handler_landing.is_some() && data.opcode != Opcode::NlxTransfer {
+                    errors.push(VerifyError::new(
+                        "V15 handler",
+                        "handler landing requires an exceptional edge",
+                    ));
+                }
                 let catch_landing = f
                     .block(target.block)
                     .insts
@@ -695,7 +748,69 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
                     let AuxData::TransferSite { scopes, .. } = &data.aux else {
                         unreachable!()
                     };
-                    if let Some(landing) = catch_landing {
+                    if let Some(landing) = handler_landing {
+                        let valid = match landing.aux {
+                            AuxData::HandlerDestination {
+                                push_bcp,
+                                table_index,
+                                clause_index,
+                            } => {
+                                let selected = scopes
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, scope)| scope.push_bcp == push_bcp);
+                                let clause = f
+                                    .handler_cases
+                                    .get(table_index as usize)
+                                    .and_then(|info| info.clauses.get(clause_index as usize));
+                                selected
+                                    .zip(clause)
+                                    .filter(|((index, scope), clause)| {
+                                        scope.ownership == crate::control_scope::Ownership::Local
+                                            && scope.kind == ScopeKind::HandlerCase { table_index }
+                                            && !scopes[index + 1..].iter().any(|s| {
+                                                s.ownership
+                                                    != crate::control_scope::Ownership::Local
+                                                    || matches!(s.kind, ScopeKind::Unwind { .. })
+                                            })
+                                            && landing
+                                                .frame_state
+                                                .and_then(|id| f.frame_states.get(id).scopes.last())
+                                                .is_some_and(|frame| {
+                                                    frame.bcp == clause.body_bcp
+                                                        && frame.stack.len()
+                                                            == usize::from(scope.sp_restore)
+                                                        && clause.var_slot.is_none_or(|slot| {
+                                                            usize::from(slot) < frame.locals.len()
+                                                        })
+                                                })
+                                    })
+                                    .map(|((index, _), _)| {
+                                        let retained: Vec<_> = scopes[..index]
+                                            .iter()
+                                            .filter_map(|scope| {
+                                                if let ScopeKind::Cleanup { cleanup_bcp } =
+                                                    scope.kind
+                                                {
+                                                    Some(cleanup_bcp)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect();
+                                        outgoing.retain(|(cleanup, _)| retained.contains(cleanup));
+                                    })
+                                    .is_some()
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            errors.push(VerifyError::new(
+                                "V15 handler",
+                                "handler landing does not match its live clause",
+                            ));
+                        }
+                    } else if let Some(landing) = catch_landing {
                         let valid = match landing.aux {
                             AuxData::CatchDestination {
                                 push_bcp,

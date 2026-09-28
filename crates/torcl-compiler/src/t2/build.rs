@@ -325,7 +325,65 @@ struct Builder<'a> {
     native_cleanups: bool,
 }
 
+#[derive(Clone, Copy)]
+struct HandlerDestination {
+    push_bcp: u32,
+    table_index: u32,
+    clause_index: u32,
+    body_bcp: u32,
+    var_slot: Option<u16>,
+    sp_restore: u16,
+}
+
 impl<'a> Builder<'a> {
+    fn handler_transition(&self, bcp: usize) -> Option<(u32, bool)> {
+        if !self.native_cleanups {
+            return None;
+        }
+        match self.bf.code.get(bcp)? {
+            Instr::PushHandlerCase { .. } => Some((bcp as u32, true)),
+            Instr::PopHandlerCase => {
+                let scope = self.control_scopes.as_ref()?.before(bcp as u32)?.last()?;
+                matches!(scope.kind, ScopeKind::HandlerCase { .. })
+                    .then_some((scope.push_bcp, false))
+            }
+            _ => None,
+        }
+    }
+    fn exceptional_handlers(&self, bcp: u32) -> Vec<HandlerDestination> {
+        self.control_scopes
+            .as_ref()
+            .and_then(|s| s.before(bcp))
+            .into_iter()
+            .flatten()
+            .rev()
+            .take_while(|s| !matches!(s.kind, ScopeKind::Unwind { .. }))
+            .flat_map(|scope| {
+                let clauses = match scope.kind {
+                    ScopeKind::HandlerCase { table_index } => self
+                        .bf
+                        .handler_cases
+                        .get(table_index as usize)
+                        .map(|info| (table_index, &info.clauses)),
+                    _ => None,
+                };
+                clauses.into_iter().flat_map(move |(table_index, clauses)| {
+                    clauses
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, clause)| HandlerDestination {
+                            push_bcp: scope.push_bcp,
+                            table_index,
+                            clause_index: index as u32,
+                            body_bcp: clause.body_bcp,
+                            var_slot: clause.var_slot,
+                            sp_restore: scope.sp_restore,
+                        })
+                })
+            })
+            .collect()
+    }
+
     fn catch_transition(&self, bcp: usize) -> Option<(u32, bool)> {
         if !self.native_cleanups {
             return None;
@@ -432,6 +490,9 @@ impl<'a> Builder<'a> {
 
         self.control_scopes =
             Some(ScopeMap::analyze_function(self.bf).map_err(BuildError::InvalidScopes)?);
+        if self.native_cleanups {
+            self.f.handler_cases = self.bf.handler_cases.clone();
+        }
         self.find_leaders()?;
         self.compute_depths()?;
         self.create_blocks();
@@ -526,10 +587,17 @@ impl<'a> Builder<'a> {
         let mut set: BTreeSet<usize> = BTreeSet::new();
         set.insert(0);
         for (i, instr) in code.iter().enumerate() {
-            if self.catch_transition(i).is_some() && i + 1 < code.len() {
+            if (self.catch_transition(i).is_some() || self.handler_transition(i).is_some())
+                && i + 1 < code.len()
+            {
                 set.insert(i + 1);
             }
             match instr {
+                Instr::PushHandlerCase { hc, .. } if self.native_cleanups => {
+                    for clause in &self.bf.handler_cases[*hc as usize].clauses {
+                        set.insert(clause.body_bcp as usize);
+                    }
+                }
                 Instr::PushCatch { resume_bcp, .. } if self.native_cleanups => {
                     set.insert(*resume_bcp as usize);
                 }
@@ -617,6 +685,7 @@ impl<'a> Builder<'a> {
                 };
             if self.native_cleanups
                 && (self.catch_transition(i).is_some()
+                    || self.handler_transition(i).is_some()
                     || matches!(
                         code[i],
                         Instr::CallNamed { .. }
@@ -628,6 +697,14 @@ impl<'a> Builder<'a> {
                 if let Some((cleanup, depth)) = self.exceptional_cleanup(i as u32) {
                     push(cleanup as usize, i32::from(depth), &mut depth_at, &mut work);
                 }
+                for target in self.exceptional_handlers(i as u32) {
+                    push(
+                        target.body_bcp as usize,
+                        i32::from(target.sp_restore),
+                        &mut depth_at,
+                        &mut work,
+                    );
+                }
                 for (_, resume, depth) in self.exceptional_catches(i as u32) {
                     push(
                         resume as usize,
@@ -638,6 +715,9 @@ impl<'a> Builder<'a> {
                 }
             }
             match &code[i] {
+                Instr::PushHandlerCase { .. } | Instr::PopHandlerCase if self.native_cleanups => {
+                    push(i + 1, d, &mut depth_at, &mut work);
+                }
                 Instr::PushCatch { .. } if self.native_cleanups => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
@@ -837,8 +917,13 @@ impl<'a> Builder<'a> {
                 ))
         };
         for (offset, instr) in code[start..end].iter().enumerate() {
-            if self.catch_transition(start + offset).is_some() {
+            if self.catch_transition(start + offset).is_some()
+                || self.handler_transition(start + offset).is_some()
+            {
                 let mut successors = vec![blk(end)?];
+                for target in self.exceptional_handlers((start + offset) as u32) {
+                    successors.push(blk(target.body_bcp as usize)?);
+                }
                 for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
                     successors.push(blk(resume as usize)?);
                 }
@@ -852,6 +937,9 @@ impl<'a> Builder<'a> {
                     if self.native_cleanups =>
                 {
                     let mut successors = Vec::new();
+                    for target in self.exceptional_handlers((start + offset) as u32) {
+                        successors.push(blk(target.body_bcp as usize)?);
+                    }
                     for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
                         successors.push(blk(resume as usize)?);
                     }
@@ -875,6 +963,9 @@ impl<'a> Builder<'a> {
                         successors.push(blk(resume as usize)?);
                     }
                     if self.native_cleanups {
+                        for target in self.exceptional_handlers((start + offset) as u32) {
+                            successors.push(blk(target.body_bcp as usize)?);
+                        }
                         for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
                             successors.push(blk(resume as usize)?);
                         }
@@ -1058,6 +1149,25 @@ impl<'a> Builder<'a> {
         let code = &self.bf.code;
         for (offset, instruction) in code[start..end].iter().enumerate() {
             let i = start + offset;
+            if let Some((push_bcp, enter)) = self.handler_transition(i) {
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args: vec![],
+                        results: vec![],
+                        aux: AuxData::HandlerScope { push_bcp, enter },
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                return Ok(());
+            }
             if let Some((push_bcp, enter)) = self.catch_transition(i) {
                 let fs = self.build_frame_state(block, &stack, i as u32);
                 let args = if enter {
@@ -1623,7 +1733,22 @@ impl<'a> Builder<'a> {
             });
             catch_edges.push((landing, push_bcp, resume_bcp, depth));
         }
-        if !matches!(self.f.inst(call).aux, AuxData::CatchScope { .. }) {
+        let mut handler_edges = Vec::new();
+        for target in self.exceptional_handlers(bcp) {
+            if usize::from(target.sp_restore) > cold_stack.len() {
+                return Err(BuildError::Unsupported("handler consumes enclosing stack"));
+            }
+            let landing = self.synthetic_block();
+            targets.push(BlockCall {
+                block: landing,
+                args: vec![],
+            });
+            handler_edges.push((landing, target));
+        }
+        if !matches!(
+            self.f.inst(call).aux,
+            AuxData::CatchScope { .. } | AuxData::HandlerScope { .. }
+        ) {
             stack.push(projected);
         }
         let normal_term = resume
@@ -1661,6 +1786,42 @@ impl<'a> Builder<'a> {
             cold_stack.clone(),
             self.bf.code.len(),
         );
+        for (landing, target) in handler_edges {
+            self.seal(landing);
+            let prefix = cold_stack[..usize::from(target.sp_restore)].to_vec();
+            let state = self.build_frame_state(landing, &prefix, target.body_bcp);
+            let (_, results) = self.f.push_inst(
+                landing,
+                InstData {
+                    opcode: Opcode::HandlerLanding,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::HandlerDestination {
+                        push_bcp: target.push_bcp,
+                        table_index: target.table_index,
+                        clause_index: target.clause_index,
+                    },
+                    flags: InstFlags {
+                        effectful: true,
+                        call: true,
+                        ..InstFlags::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            if let Some(slot) = target.var_slot {
+                self.write_var(Var::Local(slot), landing, results[0]);
+            }
+            self.finish_block(
+                landing,
+                Some(Term::Jump(self.block_of[&(target.body_bcp as usize)])),
+                prefix,
+                self.bf.code.len(),
+            );
+        }
         for (landing, push_bcp, resume_bcp, depth) in catch_edges {
             self.seal(landing);
             let mut prefix = cold_stack[..usize::from(depth)].to_vec();

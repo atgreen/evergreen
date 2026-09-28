@@ -31,6 +31,8 @@ pub(super) struct TransferCode {
     cleanup_depths: std::collections::HashMap<u32, usize>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
+    #[cfg(test)]
+    unavailable_handler: Option<(u32, u32)>,
 }
 
 impl TransferCode {
@@ -41,6 +43,16 @@ impl TransferCode {
             Some(Instr::PushCatch { .. })
         ));
         self.unavailable_catch = Some(push_bcp);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn without_handler_destination(mut self, push_bcp: u32, clause_index: u32) -> Self {
+        let Some(Instr::PushHandlerCase { hc, .. }) = self.body.code.get(push_bcp as usize) else {
+            panic!("handler scope");
+        };
+        assert!((clause_index as usize) < self.body.handler_cases[*hc as usize].clauses.len());
+        self.unavailable_handler = Some((push_bcp, clause_index));
         self
     }
 
@@ -65,7 +77,7 @@ impl TransferCode {
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
         let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
         let landing = JitBuffer::new(&emit_native_landing_stub())?;
-        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_catches(
+        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_handlers(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -73,6 +85,7 @@ impl TransferCode {
             completion.as_ptr() as u64,
             c2i_clear_mv as *const () as u64,
             deliver_catch as *const () as u64,
+            deliver_handler as *const () as u64,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -90,6 +103,7 @@ impl TransferCode {
                             | ScopeKind::Unwind { .. }
                             | ScopeKind::Cleanup { .. }
                             | ScopeKind::Catch { .. }
+                            | ScopeKind::HandlerCase { .. }
                     )
             }) {
                 return None;
@@ -109,6 +123,7 @@ impl TransferCode {
                                 | ScopeKind::Tagbody { .. }
                                 | ScopeKind::Unwind { .. }
                                 | ScopeKind::Catch { .. }
+                                | ScopeKind::HandlerCase { .. }
                         )
                     })
                     .count();
@@ -120,6 +135,8 @@ impl TransferCode {
         Some(Self {
             #[cfg(test)]
             unavailable_catch: None,
+            #[cfg(test)]
+            unavailable_handler: None,
             body,
             _body_roots: roots,
             code,
@@ -177,12 +194,23 @@ impl TransferCode {
             env,
             base: env.catch_stack.len(),
         };
+        let mut handlers = Vec::<SavedHandler>::with_capacity(self.body.handler_cases.len());
+        let _handler_guard = HandlerScopeGuard {
+            env,
+            handlers: &mut handlers,
+        };
+        let mut prepared_handler = None::<PreparedHandler>;
+        torcl_rt::rooted_ref!(_prepared_handler = &mut prepared_handler);
         let mut prepared_catch = None::<PreparedCatch>;
         torcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
         let mut context = CaptureContext {
             #[cfg(test)]
             unavailable_catch: self.unavailable_catch,
+            #[cfg(test)]
+            unavailable_handler: self.unavailable_handler,
             prepared_catch: &mut prepared_catch,
+            handlers: &mut handlers,
+            prepared_handler: &mut prepared_handler,
             frame,
             body: self.body.as_ref(),
             catches: &mut catches,
@@ -248,7 +276,9 @@ impl TransferCode {
                     && context.selected.is_none()
                     && cleanups.is_empty()
                     && catches.is_empty()
-                    && prepared_catch.is_none() =>
+                    && prepared_catch.is_none()
+                    && handlers.is_empty()
+                    && prepared_handler.is_none() =>
             {
                 Ok(*primary)
             }
@@ -283,6 +313,8 @@ impl TransferCode {
                                         | Instr::Throw
                                         | Instr::PushCatch { .. }
                                         | Instr::PopHandler
+                                        | Instr::PushHandlerCase { .. }
+                                        | Instr::PopHandlerCase
                                 )
                             )
                     })
@@ -306,7 +338,13 @@ impl TransferCode {
                 if !live_catches.eq(catches.iter().map(|saved| saved.push_bcp)) {
                     return Err(invalid_capture());
                 }
-                let handlers = site
+                let live_handlers = site.map().control_scopes.iter().filter_map(|scope| {
+                    matches!(scope.kind, ScopeKind::HandlerCase { .. }).then_some(scope.push_bcp)
+                });
+                if !live_handlers.eq(handlers.iter().map(|saved| saved.push_bcp)) {
+                    return Err(invalid_capture());
+                }
+                let restored_handlers = site
                     .map()
                     .control_scopes
                     .iter()
@@ -332,6 +370,18 @@ impl TransferCode {
                             cleanup_bcp,
                             sp_restore: scope.sp_restore,
                         },
+                        ScopeKind::HandlerCase { .. } => {
+                            let saved = handlers
+                                .iter_mut()
+                                .find(|saved| saved.push_bcp == scope.push_bcp)
+                                .expect("checked handler identity");
+                            Handler::HandlerCase {
+                                clauses: std::mem::take(&mut saved.clauses),
+                                sp_restore: scope.sp_restore,
+                                cluster_base: saved.cluster_base,
+                                cluster_frame: saved.cluster_frame,
+                            }
+                        }
                         ScopeKind::Catch { resume_bcp } => Handler::Catch {
                             token: catches
                                 .iter()
@@ -345,13 +395,15 @@ impl TransferCode {
                         _ => unreachable!("admission checked all scope records"),
                     })
                     .collect();
+                // Bytecode now owns the live cluster frames and registrations.
+                handlers.clear();
                 let mut acts = vec![Activation {
                     frame,
                     func: self.body.clone(),
                     bcp: saved.resume_pc as usize,
                     sp_top: saved.stack.len() as u16,
                     n_locals: self.body.n_locals,
-                    handlers,
+                    handlers: restored_handlers,
                     cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
                     dyn_binds: Vec::new(),
                     env_frame: None,
@@ -404,6 +456,60 @@ impl Drop for FrameGuard {
 struct SavedCleanup {
     cleanup_bcp: u32,
     continuation: CleanupCont,
+}
+
+struct SavedHandler {
+    push_bcp: u32,
+    clauses: Vec<RuntimeClause>,
+    cluster_base: usize,
+    cluster_frame: *mut Frame,
+}
+
+struct HandlerScopeGuard {
+    env: *mut Env,
+    handlers: *mut Vec<SavedHandler>,
+}
+impl Drop for HandlerScopeGuard {
+    fn drop(&mut self) {
+        let stack = torcl_rt::current_stack();
+        let env = unsafe { &mut *self.env };
+        let handlers = unsafe { &mut *self.handlers };
+        while let Some(saved) = handlers.pop() {
+            env.handlers.truncate(saved.cluster_base);
+            pop_condition_cluster_frame(stack, saved.cluster_frame);
+        }
+    }
+}
+
+struct PreparedHandler {
+    push_bcp: u32,
+    clause_index: u32,
+    token: String,
+    payload: ControlPayload,
+}
+impl torcl_rt::gc::TraceHostRoots for PreparedHandler {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        self.payload.trace_host_roots(visit);
+    }
+}
+
+unsafe extern "C" fn deliver_handler(
+    push_bcp: u32,
+    clause_index: u32,
+    _unused: TorclVal,
+) -> TorclVal {
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    let prepared = unsafe { &mut *context.prepared_handler }
+        .take()
+        .expect("prepared native handler payload");
+    assert_eq!(prepared.push_bcp, push_bcp);
+    assert_eq!(prepared.clause_index, clause_index);
+    prepared.payload.restore();
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    env.clear_mv();
+    #[cfg(test)]
+    NATIVE_HANDLER_COUNT.with(|count| count.set(count.get() + 1));
+    super::super::take_control_value(&prepared.token)
 }
 
 struct SavedCatch {
@@ -494,6 +600,87 @@ unsafe extern "C" fn call_or_throw(
     use torcl_rt::native_transfer::NativeOutcome;
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
     let request_kind = call.symbol & !u64::from(u32::MAX);
+    use torcl_compiler::t2::emit::{
+        TRANSFER_HANDLER_ENTER_REQUEST, TRANSFER_HANDLER_LEAVE_REQUEST,
+    };
+    if matches!(
+        request_kind,
+        TRANSFER_HANDLER_ENTER_REQUEST | TRANSFER_HANDLER_LEAVE_REQUEST
+    ) {
+        if !native_error_pending() {
+            let result = guard_c2i(|| {
+                assert_eq!(call.nargs, 0);
+                let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+                let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+                let handlers = unsafe { &mut *context.handlers };
+                let push_bcp = call.symbol as u32;
+                let body = unsafe { &*context.body };
+                let Some(Instr::PushHandlerCase { hc, .. }) = body.code.get(push_bcp as usize)
+                else {
+                    return Err(invalid_capture());
+                };
+                if request_kind == TRANSFER_HANDLER_ENTER_REQUEST {
+                    assert!(handlers.len() < handlers.capacity());
+                    let info = &body.handler_cases[*hc as usize];
+                    let cluster_base = env.handlers.len();
+                    let mut clauses = Vec::with_capacity(info.clauses.len());
+                    let mut entries = Vec::with_capacity(info.clauses.len());
+                    let mut values = Vec::with_capacity(info.clauses.len().saturating_mul(2));
+                    torcl_rt::rooted_ref!(_values = &mut values);
+                    for clause in &info.clauses {
+                        let token = next_control_token("__HANDLER_CASE__");
+                        entries.push(HandlerEntry {
+                            type_name: clause.type_name.clone(),
+                            handler: HandlerImpl::HandlerCase {
+                                token: token.clone(),
+                                var_name: None,
+                                body: NIL,
+                                captured_frame: Arc::clone(&env.frame),
+                            },
+                        });
+                        clauses.push(RuntimeClause {
+                            token,
+                            type_name: clause.type_name.clone(),
+                            body_bcp: clause.body_bcp,
+                            var_slot: clause.var_slot,
+                        });
+                        values.push(resolve_sym(&clause.type_name).ok_or_else(invalid_capture)?);
+                        values.push(NIL);
+                    }
+                    let cluster_frame =
+                        push_condition_cluster_frame(torcl_rt::current_stack(), &values)?;
+                    env.handlers.push(HandlerCluster { entries });
+                    handlers.push(SavedHandler {
+                        push_bcp,
+                        clauses,
+                        cluster_base,
+                        cluster_frame,
+                    });
+                } else {
+                    let saved = handlers.pop().expect("live native handler cluster");
+                    assert_eq!(saved.push_bcp, push_bcp);
+                    env.handlers.truncate(saved.cluster_base);
+                    pop_condition_cluster_frame(torcl_rt::current_stack(), saved.cluster_frame);
+                }
+                Ok(NIL)
+            });
+            if let Err(error) = result {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
+
     if matches!(
         request_kind,
         TRANSFER_CATCH_ENTER_REQUEST | TRANSFER_CATCH_LEAVE_REQUEST
@@ -669,9 +856,21 @@ pub(super) fn take_native_fallback_count() -> usize {
     NATIVE_FALLBACK_COUNT.with(|count| count.replace(0))
 }
 
+#[cfg(test)]
+static NATIVE_HANDLER_COUNT: torcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+pub(super) fn take_native_handler_count() -> usize {
+    NATIVE_HANDLER_COUNT.with(|count| count.replace(0))
+}
+
 struct CaptureContext {
+    handlers: *mut Vec<SavedHandler>,
+    prepared_handler: *mut Option<PreparedHandler>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
+    #[cfg(test)]
+    unavailable_handler: Option<(u32, u32)>,
     prepared_catch: *mut Option<PreparedCatch>,
     frame: *mut Frame,
     body: *const BytecodeFunction,
@@ -710,9 +909,9 @@ impl Drop for EntryGuard {
     }
 }
 
-// No Lisp allocation, GC, yield or Lisp execution here. The owning invocation has
-// already rooted/reserved snapshots and activation slots. Rust returns before
-// the capture stub dispatches; assembly only discards generated frames.
+// Capture into reserved, rooted snapshots before live signaling can allocate
+// or reenter Lisp. Rust returns before the capture stub dispatches; assembly
+// only discards generated frames, never a Rust signaling or handler frame.
 unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let capture = unsafe { &mut *capture };
@@ -720,10 +919,31 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         entry: native_transfer::leave_native_segment as *const u8,
         request: native_transfer::current_segment().cast(),
     };
-    if context.dispatch.request.is_null() || torcl_rt::current_stack().fp() != context.frame {
+    let mut expected_frame = context.frame;
+    let mut frames_valid = true;
+    for handler in unsafe { &*context.handlers } {
+        frames_valid &= unsafe { (*handler.cluster_frame).prev_fp == expected_frame };
+        expected_frame = handler.cluster_frame;
+    }
+    if context.dispatch.request.is_null()
+        || !frames_valid
+        || torcl_rt::current_stack().fp() != expected_frame
+    {
         context.failure = Some(TransferSiteError::InvalidLandingCapture);
-    } else if let Err(error) = unsafe { prepare_transfer(context, capture) } {
-        context.failure = Some(error);
+    } else {
+        let result = guard_c2i(|| {
+            if let Err(error) = unsafe { prepare_transfer(context, capture) } {
+                context.failure = Some(error);
+                return Err(invalid_capture());
+            }
+            Ok(NIL)
+        });
+        if let Err(error) = result {
+            context
+                .failure
+                .get_or_insert(TransferSiteError::InvalidLandingCapture);
+            NATIVE_ERROR.with(|slot| slot.set_first(error));
+        }
     }
     capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
 }
@@ -740,17 +960,19 @@ unsafe fn prepare_transfer(
         .sites()
         .position(|candidate| std::ptr::eq(candidate, site))
         .ok_or(TransferSiteError::WrongReturnPc)?;
-    let snapshot = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index) };
+    // End the mutable snapshot borrow before live signaling can allocate or
+    // reenter Lisp. The execution-owned snapshot vector remains rooted.
     unsafe {
-        snapshot.capture_from_activation(
-            context.code_base,
-            capture,
-            std::slice::from_raw_parts(context.activation, context.slots),
-        )?;
+        (&mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index))
+            .capture_from_activation(
+                context.code_base,
+                capture,
+                std::slice::from_raw_parts(context.activation, context.slots),
+            )?;
     }
     context.selected = Some(index);
-    let cleanups = unsafe { &mut *context.cleanups };
     if let Some(completed) = context.completed_cleanup {
+        let cleanups = unsafe { &mut *context.cleanups };
         let saved = cleanups.pop().expect("completing rooted native cleanup");
         assert_eq!(saved.cleanup_bcp, completed);
         let CleanupAction::Resume { pending, payload } = saved.continuation.action else {
@@ -763,28 +985,47 @@ unsafe fn prepare_transfer(
         });
     }
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
-    // Raw errors must first signal with live handlers/restarts. Until native
-    // signaling is wired, only a selected transfer to a live outer CATCH takes
-    // this route. Other outcomes retain explicit bytecode unwinding fallback.
-    let mut selected_throw = false;
+    // Signal before retiring dynamic state. Returning handlers and restart
+    // searches see the original context; only selected transfers start unwind.
+    if let Some(error) = NATIVE_ERROR.with(|slot| slot.take()) {
+        let selected = if matches!(
+            error,
+            TorclError::Internal(_) | TorclError::Signalled { .. }
+        ) {
+            error
+        } else {
+            signal_raw_error_in_context(env, error)
+        };
+        NATIVE_ERROR.with(|slot| {
+            slot.replace(Some(selected));
+        });
+    }
+    let mut selected_transfer = false;
     let mut selected_target = SelectedTarget::OutsideFrame;
+    let mut selected_clause = None;
+    let mut handler_token = None;
     NATIVE_ERROR.with(|slot| {
         slot.visit(|error| {
-            selected_throw = matches!(error, TorclError::Internal(token)
-            if env.catch_stack.iter().any(|(_, live)| live == token));
-            if let TorclError::Internal(token) = error {
-                if let Some(saved) = unsafe { &*context.catches }
-                    .iter()
-                    .find(|saved| &saved.token == token)
-                {
-                    selected_target = SelectedTarget::Scope {
-                        push_bcp: saved.push_bcp,
-                    };
+            if let Some(token) = handler_case_token(error) {
+                selected_transfer = env.handlers.iter().any(|cluster| cluster.entries.iter().any(|entry|
+                    matches!(&entry.handler, HandlerImpl::HandlerCase { token: live, .. } if live == &token)));
+                for saved in unsafe { &*context.handlers } {
+                    if let Some(index) = saved.clauses.iter().position(|clause| clause.token == token) {
+                        selected_target = SelectedTarget::Scope { push_bcp: saved.push_bcp };
+                        selected_clause = Some(index as u32);
+                        break;
+                    }
+                }
+                handler_token = Some(token);
+            } else if let TorclError::Internal(token) = error {
+                selected_transfer = env.catch_stack.iter().any(|(_, live)| live == token);
+                if let Some(saved) = unsafe { &*context.catches }.iter().find(|saved| &saved.token == token) {
+                    selected_target = SelectedTarget::Scope { push_bcp: saved.push_bcp };
                 }
             }
         })
     });
-    if !selected_throw {
+    if !selected_transfer {
         return Ok(());
     }
     // Plan against scope prefixes without mutating live catch registrations.
@@ -794,7 +1035,8 @@ unsafe fn prepare_transfer(
     let mut remaining = scopes.as_slice();
     let action = loop {
         match next_unwind_step(remaining, selected_target) {
-            NativeUnwindStep::RetireCatch { scope_index } => {
+            NativeUnwindStep::RetireCatch { scope_index }
+            | NativeUnwindStep::RetireHandler { scope_index } => {
                 remaining = &remaining[..scope_index];
             }
             action => break action,
@@ -811,22 +1053,36 @@ unsafe fn prepare_transfer(
             (scope_index, handler_depth, landing)
         }
         NativeUnwindStep::EnterTarget { scope_index } => {
-            if !matches!(scopes[scope_index].kind, ScopeKind::Catch { .. }) {
-                return Ok(());
-            }
-            // Fault injection models a missing selected continuation while
-            // retaining the source capture map and all dynamic registrations.
-            // Production code always consults the verified landing table below.
-            #[cfg(test)]
-            if context.unavailable_catch == Some(scopes[scope_index].push_bcp) {
-                return Ok(());
-            }
-            let Some(landing) = site.native_catch_landing(
-                context.code_base,
-                capture,
-                scopes[scope_index].push_bcp,
-            )?
-            else {
+            let landing = match scopes[scope_index].kind {
+                ScopeKind::Catch { .. } => {
+                    #[cfg(test)]
+                    if context.unavailable_catch == Some(scopes[scope_index].push_bcp) {
+                        return Ok(());
+                    }
+                    site.native_catch_landing(
+                        context.code_base,
+                        capture,
+                        scopes[scope_index].push_bcp,
+                    )?
+                }
+                ScopeKind::HandlerCase { .. } => {
+                    let Some(clause) = selected_clause else {
+                        return Ok(());
+                    };
+                    #[cfg(test)]
+                    if context.unavailable_handler == Some((scopes[scope_index].push_bcp, clause)) {
+                        return Ok(());
+                    }
+                    site.native_handler_landing(
+                        context.code_base,
+                        capture,
+                        scopes[scope_index].push_bcp,
+                        clause,
+                    )?
+                }
+                _ => return Ok(()),
+            };
+            let Some(landing) = landing else {
                 return Ok(());
             };
             let handler_depth = scopes[..scope_index]
@@ -870,13 +1126,40 @@ unsafe fn prepare_transfer(
         }
         retire_count += 1;
     }
+    let handlers = unsafe { &mut *context.handlers };
+    let mut saved_handlers = handlers.iter().rev();
+    let mut handler_count = 0;
+    let mut cluster_end = env.handlers.len();
+    for scope in scopes[scope_index..]
+        .iter()
+        .rev()
+        .filter(|s| matches!(s.kind, ScopeKind::HandlerCase { .. }))
+    {
+        let Some(saved) = saved_handlers.next() else {
+            return Ok(());
+        };
+        if saved.push_bcp != scope.push_bcp || saved.cluster_base + 1 != cluster_end {
+            return Ok(());
+        }
+        let Some(cluster) = env.handlers.get(saved.cluster_base) else {
+            return Ok(());
+        };
+        if cluster.entries.len() != saved.clauses.len() || !cluster.entries.iter().zip(&saved.clauses).all(|(entry, clause)|
+            matches!(&entry.handler, HandlerImpl::HandlerCase { token, .. } if token == &clause.token)) {
+            return Ok(());
+        }
+        handler_count += 1;
+        cluster_end = saved.cluster_base;
+    }
     // Restore native homes while canonical snapshots still own every root.
     unsafe {
-        snapshot.write_back(context.code_base, capture)?;
+        (&*context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index))
+            .write_back(context.code_base, capture)?;
     }
-    let Some(TorclError::Internal(token)) = NATIVE_ERROR.with(|slot| slot.take()) else {
-        unreachable!("selected a rooted throw token")
-    };
+    let error = NATIVE_ERROR
+        .with(|slot| slot.take())
+        .expect("selected rooted transfer");
+    let cleanups = unsafe { &mut *context.cleanups };
     while cleanups
         .last()
         .is_some_and(|saved| saved.continuation.handler_depth > handler_depth)
@@ -893,8 +1176,8 @@ unsafe fn prepare_transfer(
                 continuation: CleanupCont {
                     handler_depth,
                     action: CleanupAction::Resume {
-                        payload: ControlPayload::take(&token),
-                        pending: Pending::Token(token),
+                        payload: ControlPayload::for_error(&error),
+                        pending: error_to_pending(error, env),
                     },
                 },
             });
@@ -902,6 +1185,9 @@ unsafe fn prepare_transfer(
             NATIVE_CLEANUP_COUNT.with(|count| count.set(count.get() + 1));
         }
         ScopeKind::Catch { resume_bcp } => {
+            let TorclError::Internal(token) = error else {
+                unreachable!("selected catch token");
+            };
             let prepared = unsafe { &mut *context.prepared_catch };
             assert!(prepared.is_none());
             *prepared = Some(PreparedCatch {
@@ -911,7 +1197,22 @@ unsafe fn prepare_transfer(
                 token,
             });
         }
+        ScopeKind::HandlerCase { .. } => {
+            let prepared = unsafe { &mut *context.prepared_handler };
+            assert!(prepared.is_none());
+            *prepared = Some(PreparedHandler {
+                push_bcp: scopes[scope_index].push_bcp,
+                clause_index: selected_clause.expect("selected native clause"),
+                token: handler_token.expect("selected handler binding"),
+                payload: ControlPayload::for_error(&error),
+            });
+        }
         _ => unreachable!("validated native destination"),
+    }
+    for _ in 0..handler_count {
+        let saved = handlers.pop().expect("validated crossed handler");
+        env.handlers.truncate(saved.cluster_base);
+        pop_condition_cluster_frame(torcl_rt::current_stack(), saved.cluster_frame);
     }
     catches.truncate(catches.len() - retire_count);
     env.catch_stack

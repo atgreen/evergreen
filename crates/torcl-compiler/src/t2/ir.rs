@@ -226,6 +226,8 @@ pub enum Opcode {
     /// Consume the prepared catch payload and produce its primary value.
     /// Native-only, noncollecting helper; secondary values remain in runtime state.
     CatchLanding,
+    /// Define the condition delivered to a selected HANDLER-CASE clause.
+    HandlerLanding,
     // Cat 5a — non-terminator control: calls & guards
     Call,
     Guard,
@@ -305,6 +307,15 @@ pub enum AuxData {
     CatchScope {
         push_bcp: u32,
         enter: bool,
+    },
+    HandlerScope {
+        push_bcp: u32,
+        enter: bool,
+    },
+    HandlerDestination {
+        push_bcp: u32,
+        table_index: u32,
+        clause_index: u32,
     },
     CatchDestination {
         push_bcp: u32,
@@ -416,6 +427,9 @@ pub struct Function {
     pub source_positions: Vec<SourcePosition>,
     /// Root-function loop headers eligible for on-stack replacement.
     pub osr_entries: Vec<OsrEntry>,
+    /// Root-definition clause metadata used by opt-in native transfer edges.
+    /// Inlining must remap this domain before admitting inlined handler scopes.
+    pub handler_cases: Vec<torcl_rt::bytecode::HandlerCaseInfo>,
     /// The interpreter state at function ENTRY (bcp 0, empty stack), recorded
     /// by the builder so speculation can place parameter pre-guards whose
     /// deopt harmlessly re-runs the whole function in T0 (bliss-x5y.25).
@@ -454,6 +468,7 @@ impl Function {
             frame_states: crate::t2::frame_state::FrameStateTable::default(),
             source_positions: vec![SourcePosition::default()],
             osr_entries: Vec::new(),
+            handler_cases: Vec::new(),
             entry_frame_state: None,
             checked_entry_params: Vec::new(),
             variadic: false,

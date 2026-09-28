@@ -48,6 +48,15 @@ pub struct SysvCatchLanding {
     pub resume_bcp: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SysvHandlerLanding {
+    pub return_offset: u32,
+    pub entry_offset: u32,
+    pub push_bcp: u32,
+    pub table_index: u32,
+    pub clause_index: u32,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum TransferSiteError {
     InvalidReturnOffset(u32),
@@ -61,6 +70,7 @@ pub enum TransferSiteError {
     MissingActivation,
     InvalidCleanupLanding(u32),
     InvalidCatchLanding(u32),
+    InvalidHandlerLanding(u32),
     InvalidLandingCapture,
 }
 
@@ -77,6 +87,7 @@ pub struct CheckedSysvSite {
     call_stack_adjust: u32,
     cleanup_landing: Option<u32>,
     catch_landings: Vec<(u32, u32)>,
+    handler_landings: Vec<(u32, u32, u32)>,
 }
 
 pub struct SysvTransferTable {
@@ -161,6 +172,7 @@ impl SysvTransferTable {
                 call_stack_adjust: site.call_stack_adjust,
                 cleanup_landing: None,
                 catch_landings: Vec::new(),
+                handler_landings: Vec::new(),
             });
         }
         checked.sort_unstable_by_key(|site| site.return_offset);
@@ -275,6 +287,66 @@ impl SysvTransferTable {
         Ok(self)
     }
 
+    /// Bind each selected clause to its source site and retained definition.
+    pub fn with_handler_landings(
+        mut self,
+        code: &[u8],
+        definitions: &[torcl_rt::bytecode::HandlerCaseInfo],
+        landings: &[SysvHandlerLanding],
+    ) -> Result<Self, TransferSiteError> {
+        use crate::control_scope::{Ownership, ScopeKind};
+        if code.len() != self.code_len {
+            return Err(TransferSiteError::InvalidHandlerLanding(u32::MAX));
+        }
+        for landing in landings {
+            let invalid = || TransferSiteError::InvalidHandlerLanding(landing.return_offset);
+            let index = self
+                .sites
+                .binary_search_by_key(&landing.return_offset, |site| site.return_offset)
+                .map_err(|_| invalid())?;
+            let site = &mut self.sites[index];
+            let mut candidates = site
+                .map
+                .control_scopes
+                .iter()
+                .enumerate()
+                .filter(|(_, scope)| scope.push_bcp == landing.push_bcp);
+            let (scope_index, scope) = candidates.next().ok_or_else(invalid)?;
+            let start = landing.entry_offset as usize;
+            let end = start.checked_add(4).ok_or_else(invalid)?;
+            if candidates.next().is_some()
+                || scope.ownership != Ownership::Local
+                || scope.kind
+                    != (ScopeKind::HandlerCase {
+                        table_index: landing.table_index,
+                    })
+                || definitions
+                    .get(landing.table_index as usize)
+                    .and_then(|info| info.clauses.get(landing.clause_index as usize))
+                    .is_none()
+                || site.map.control_scopes[scope_index + 1..]
+                    .iter()
+                    .any(|scope| {
+                        scope.ownership != Ownership::Local
+                            || matches!(scope.kind, ScopeKind::Unwind { .. })
+                    })
+                || site.call_stack_adjust % 16 != 0
+                || site.handler_landings.iter().any(|(push, clause, _)| {
+                    *push == landing.push_bcp && *clause == landing.clause_index
+                })
+                || code.get(start..end) != Some(&[0xf3, 0x0f, 0x1e, 0xfa])
+            {
+                return Err(invalid());
+            }
+            site.handler_landings.push((
+                landing.push_bcp,
+                landing.clause_index,
+                landing.entry_offset,
+            ));
+        }
+        Ok(self)
+    }
+
     /// Integer address checks only; this does not dereference code or allocate.
     /// The caller must supply the base of the code owning this table.
     pub fn lookup(&self, code_base: usize, return_pc: usize) -> Option<&CheckedSysvSite> {
@@ -327,6 +399,23 @@ impl CheckedSysvSite {
                 .iter()
                 .find(|(push, _)| *push == push_bcp)
                 .map(|(_, offset)| *offset),
+        )
+    }
+
+    pub fn native_handler_landing(
+        &self,
+        code_base: usize,
+        capture: &SysvTransferCapture,
+        push_bcp: u32,
+        clause_index: u32,
+    ) -> Result<Option<SysvNativeLanding>, TransferSiteError> {
+        self.native_landing(
+            code_base,
+            capture,
+            self.handler_landings
+                .iter()
+                .find(|(push, clause, _)| *push == push_bcp && *clause == clause_index)
+                .map(|(_, _, offset)| *offset),
         )
     }
 

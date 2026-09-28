@@ -475,3 +475,151 @@ fn catch_landings_bind_each_identity_to_its_exact_source_site() {
             .is_err()
     );
 }
+
+#[test]
+fn handler_landing_requires_exact_source_cluster_and_clause() {
+    use torcl_compiler::control_scope::{ControlScope, Ownership, ScopeKind};
+    use torcl_compiler::t2::transfer_sites::SysvHandlerLanding;
+    use torcl_rt::bytecode::{ClauseInfo, HandlerCaseInfo};
+    let definitions = [HandlerCaseInfo {
+        clauses: vec![
+            ClauseInfo {
+                type_name: "TYPE-ERROR".into(),
+                body_bcp: 70,
+                var_slot: Some(0),
+            },
+            ClauseInfo {
+                type_name: "ERROR".into(),
+                body_bcp: 80,
+                var_slot: None,
+            },
+        ],
+    }];
+    let handler_site = || {
+        let mut emitted = site(12, 0);
+        emitted.map.control_scopes.push(ControlScope {
+            push_bcp: 1,
+            ownership: Ownership::Local,
+            sp_restore: 0,
+            kind: ScopeKind::HandlerCase { table_index: 0 },
+        });
+        emitted
+    };
+    let mut code = [0x90; 64];
+    code[40..44].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+    code[48..52].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+    let first = SysvHandlerLanding {
+        return_offset: 12,
+        entry_offset: 40,
+        push_bcp: 1,
+        table_index: 0,
+        clause_index: 0,
+    };
+    let second = SysvHandlerLanding {
+        entry_offset: 48,
+        clause_index: 1,
+        ..first
+    };
+    let table = SysvTransferTable::new(64, vec![handler_site()])
+        .unwrap()
+        .with_handler_landings(&code, &definitions, &[first, second])
+        .unwrap();
+    let selected = table.lookup(0x1000, 0x100c).unwrap();
+    let mut capture = SysvTransferCapture {
+        request: std::ptr::null_mut(),
+        value: NIL,
+        exit: NativeExit::Transfer,
+        preserved: [0; 6],
+        caller_sp: 0x2000 as *const u64,
+        return_pc: 0x100c as *const u8,
+    };
+    for (clause, address) in [(0, 0x1028), (1, 0x1030)] {
+        let landing = selected
+            .native_handler_landing(0x1000, &capture, 1, clause)
+            .unwrap()
+            .unwrap();
+        assert_eq!(landing.entry as usize, address);
+        assert_eq!(landing.stack_pointer as usize, 0x2010);
+    }
+    assert!(
+        selected
+            .native_handler_landing(0x1000, &capture, 2, 0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        selected
+            .native_handler_landing(0x1000, &capture, 1, 2)
+            .unwrap()
+            .is_none()
+    );
+    capture.return_pc = 0x100d as *const u8;
+    assert!(
+        selected
+            .native_handler_landing(0x1000, &capture, 1, 0)
+            .is_err()
+    );
+    capture.return_pc = 0x100c as *const u8;
+    capture.exit = NativeExit::Returned;
+    assert!(
+        selected
+            .native_handler_landing(0x1000, &capture, 1, 0)
+            .is_err()
+    );
+    for bad in [
+        SysvHandlerLanding {
+            return_offset: 13,
+            ..first
+        },
+        SysvHandlerLanding {
+            push_bcp: 2,
+            ..first
+        },
+        SysvHandlerLanding {
+            table_index: 1,
+            ..first
+        },
+        SysvHandlerLanding {
+            clause_index: 2,
+            ..first
+        },
+        SysvHandlerLanding {
+            entry_offset: 41,
+            ..first
+        },
+    ] {
+        assert!(
+            SysvTransferTable::new(64, vec![handler_site()])
+                .unwrap()
+                .with_handler_landings(&code, &definitions, &[bad])
+                .is_err()
+        );
+    }
+    assert!(
+        SysvTransferTable::new(64, vec![handler_site()])
+            .unwrap()
+            .with_handler_landings(&code, &definitions, &[first, first])
+            .is_err()
+    );
+    let mut inherited = handler_site();
+    inherited.map.control_scopes[0].ownership = Ownership::Inherited;
+    assert!(
+        SysvTransferTable::new(64, vec![inherited])
+            .unwrap()
+            .with_handler_landings(&code, &definitions, &[first])
+            .is_err()
+    );
+    let mut cleanup = handler_site();
+    cleanup.map.control_scopes.push(ControlScope {
+        push_bcp: 2,
+        ownership: Ownership::Local,
+        sp_restore: 0,
+        kind: ScopeKind::Unwind { cleanup_bcp: 60 },
+    });
+    assert!(
+        SysvTransferTable::new(64, vec![cleanup])
+            .unwrap()
+            .with_handler_landings(&code, &definitions, &[first])
+            .is_err()
+    );
+}
