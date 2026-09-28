@@ -20,6 +20,7 @@ pub(super) use torcl_rt::bignum::{
 use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+mod control_payload;
 mod delivery;
 mod evaluated_builtins;
 pub mod events;
@@ -16251,10 +16252,18 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         env.mv_active = saved_mv_active;
                         return Ok(v);
                     }
-                    Err(e) => match eval_progn(cleanup, env) {
-                        Ok(_) => return Err(e),
-                        Err(cleanup_exit) => return Err(cleanup_exit),
-                    },
+                    Err(mut error) => {
+                        torcl_rt::rooted_ref!(_error_root = &mut error);
+                        let mut payload = control_payload::ControlPayload::for_error(&error);
+                        torcl_rt::rooted_ref!(_payload_root = &mut payload);
+                        match eval_progn(cleanup, env) {
+                            Ok(_) => {
+                                payload.restore();
+                                return Err(error);
+                            }
+                            Err(cleanup_exit) => return Err(cleanup_exit),
+                        }
+                    }
                 }
             }
             "PRINT" => return eval_builtin_arguments(&name, cdr, env),

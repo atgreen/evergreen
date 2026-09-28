@@ -2,10 +2,11 @@ use super::*;
 use torcl_compiler::t2::emit::TransferCallRequest;
 use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
 use torcl_rt::{Collector, HeapCollector};
-mod compiled;
 mod cleanup_ir;
+mod compiled;
 mod fallback;
 mod fibers;
+mod payloads;
 
 struct NativeEnvGuard(*mut Env);
 impl NativeEnvGuard {

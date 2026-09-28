@@ -662,11 +662,26 @@ The compiler execution fixture verifies normal/exceptional phi values after
 actual moving GC, and both completion outcomes without any bytecode evaluator.
 Lisp gates count native cleanup entries for nested throws, direct THROW,
 replacement transfers and fiber suspension. A replacement to a different catch
-also checks retirement of the superseded token's payload roots. More general
-reentrant transfers to the same catch binding still require private per-transfer
-payload ownership (`bliss-shih7.12.4`); token-keyed storage alone does not prove
-those semantics. Emergency allocation guarantees (`bliss-shih7.12.3`) and the
-remaining ABI activation gates still apply.
+also checks retirement of the superseded token's payload roots.
+
+Paused cleanup continuations now privately own their control payloads
+(`bliss-shih7.12.4`). Catch/block tokens name destinations, so they cannot also
+identify individual pending transfers: a second throw to the same catch may be
+redirected inside cleanup while the original throw must still complete. Native,
+bytecode and tree-walker cleanup move primary/secondary values out of the shared
+token map, root them while paused, and restore them only when resuming that
+transfer. Dropping a superseded continuation cannot erase a newer transfer's
+values. Selected HANDLER-CASE conditions and restart arguments receive the same
+ownership; local bytecode RETURN-FROM
+retains its full multiple-value state. Tree-walker cleanup also roots the original
+error datum while running allocating cleanup.
+
+Regression gates cover reentrant throws with zero/one/many values, conditions, restart
+arguments, local-return multiple values, and actual relocation during native
+cleanup and error propagation. These changes do not activate the ABI for ordinary
+tiers. Emergency allocation guarantees (`bliss-shih7.12.3`) still apply to Rust
+key construction, map restoration and multiple-value vector snapshots, alongside
+the remaining ABI activation gates.
 
 ### Windows validation and Wine limits
 

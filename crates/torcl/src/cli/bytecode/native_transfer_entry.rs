@@ -437,7 +437,7 @@ unsafe extern "C" fn complete_cleanup(
     let cleanups = unsafe { &mut *context.cleanups };
     let saved = cleanups.last().expect("verified cleanup stack");
     assert_eq!(u64::from(saved.cleanup_bcp), request.cleanup_bcp);
-    if matches!(saved.continuation.action, CleanupAction::Resume(_)) {
+    if matches!(saved.continuation.action, CleanupAction::Resume { .. }) {
         // Keep the continuation rooted and the pre-op stack intact until cold
         // capture has consumed its exact source map. Rust returns first.
         context.completed_cleanup = Some(saved.cleanup_bcp);
@@ -527,7 +527,7 @@ impl Drop for EntryGuard {
     }
 }
 
-// No allocation, GC, yield or Lisp execution here. The owning invocation has
+// No Lisp allocation, GC, yield or Lisp execution here. The owning invocation has
 // already rooted/reserved snapshots and activation slots. Rust returns before
 // the capture stub dispatches; assembly only discards generated frames.
 unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
@@ -570,9 +570,10 @@ unsafe fn prepare_transfer(
     if let Some(completed) = context.completed_cleanup {
         let saved = cleanups.pop().expect("completing rooted native cleanup");
         assert_eq!(saved.cleanup_bcp, completed);
-        let CleanupAction::Resume(pending) = saved.continuation.action else {
+        let CleanupAction::Resume { pending, payload } = saved.continuation.action else {
             unreachable!("completion helper checked pending continuation")
         };
+        payload.restore();
         NATIVE_ERROR.with(|slot| {
             assert!(!slot.is_some());
             slot.replace(Some(unmatched_error(pending)));
@@ -626,23 +627,19 @@ unsafe fn prepare_transfer(
         .last()
         .is_some_and(|saved| saved.continuation.handler_depth > handler_depth)
     {
-        let saved = cleanups.pop().unwrap();
-        if let CleanupAction::Resume(Pending::Token(abandoned)) = saved.continuation.action {
-            if abandoned != token {
-                super::super::CONTROL_VALUES.with(|values| {
-                    values.borrow_mut().retain(|key, _| {
-                        key != &abandoned && key.strip_suffix("\0MV") != Some(abandoned.as_str())
-                    })
-                });
-            }
-        }
+        // Dropping the private payload cannot erase a newer throw's values,
+        // even when both transfers name the same catch binding.
+        cleanups.pop();
     }
     assert!(cleanups.len() < cleanups.capacity());
     cleanups.push(SavedCleanup {
         cleanup_bcp,
         continuation: CleanupCont {
             handler_depth,
-            action: CleanupAction::Resume(Pending::Token(token)),
+            action: CleanupAction::Resume {
+                payload: ControlPayload::take(&token),
+                pending: Pending::Token(token),
+            },
         },
     });
     // The rooted continuation owns the pending transfer before generated

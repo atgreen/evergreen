@@ -29,11 +29,12 @@
 //! (closures / multiple values / special vars), nmq.6 (parity + default flip),
 //! nmq.2 (codegen via i2c/c2i), nmq.3 (precise GC of frames).
 
-#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-mod native_transfer_tests;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_entry;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_transfer_tests;
 mod pending_error;
+use super::control_payload::ControlPayload;
 use pending_error::PendingError;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -12970,16 +12971,24 @@ enum CleanupAction {
         values: Option<Vec<TorclVal>>,
     },
     /// The cleanup ran during an unwind: resume that unwind afterwards.
-    Resume(Pending),
+    Resume {
+        pending: Pending,
+        payload: ControlPayload,
+    },
 }
 
 /// An in-progress non-local transfer looking for its matching handler.
 enum Pending {
     /// A `THROW` (or a tree-walker control transfer propagated as
-    /// `Err(Internal(token))`): value is held by `store_control_value(token)`.
+    /// `Err(Internal(token))`): values are in CONTROL_VALUES while in flight,
+    /// or privately owned by the cleanup continuation while it is paused.
     Token(String),
     /// A `RETURN-FROM` to the lexical block `block_id`.
-    Return { block_id: u32, value: TorclVal },
+    Return {
+        block_id: u32,
+        value: TorclVal,
+        values: Option<Vec<TorclVal>>,
+    },
     /// A `GO` to `target_bcp` within tagbody `tagbody_id`.
     Go { tagbody_id: u32, target_bcp: u32 },
     /// A genuine error (or uncaught throw): unwind all handlers running
@@ -12989,7 +12998,14 @@ enum Pending {
 
 fn visit_pending_roots(pending: &mut Pending, visit: &mut dyn FnMut(*mut TorclVal)) {
     match pending {
-        Pending::Return { value, .. } => visit(value),
+        Pending::Return { value, values, .. } => {
+            visit(value);
+            if let Some(values) = values {
+                for value in values {
+                    visit(value);
+                }
+            }
+        }
         // A propagating error can carry movable TorclVals — TypeError.datum,
         // UNBOUND-VARIABLE/UNDEFINED-FUNCTION names, or a Signalled condition
         // (bliss-9kc). While it is parked in a CleanupAction::Resume during an
@@ -13022,7 +13038,10 @@ impl torcl_rt::gc::TraceHostRoots for CleanupCont {
                     }
                 }
             }
-            CleanupAction::Resume(pending) => visit_pending_roots(pending, visit),
+            CleanupAction::Resume { pending, payload } => {
+                visit_pending_roots(pending, visit);
+                torcl_rt::gc::TraceHostRoots::trace_host_roots(payload, visit);
+            }
         }
     }
 }
@@ -14371,7 +14390,17 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
             }
             Instr::ReturnFrom { block_id } => {
                 let value = acts[top_idx].pop_op();
-                initiate_unwind(acts, stack, env, Pending::Return { block_id, value })?;
+                let values = env.mv_active.then(|| env.mv.clone());
+                initiate_unwind(
+                    acts,
+                    stack,
+                    env,
+                    Pending::Return {
+                        block_id,
+                        value,
+                        values,
+                    },
+                )?;
             }
             Instr::ReturnFromNamed { name_idx } => {
                 // Non-local return from an enclosing block: resolve the block's
@@ -14538,7 +14567,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         act.push_op(value);
                         act.bcp = resume_bcp as usize;
                     }
-                    CleanupAction::Resume(pending) => {
+                    CleanupAction::Resume { pending, payload } => {
+                        payload.restore();
                         initiate_unwind(acts, stack, env, pending)?;
                     }
                 }
@@ -14787,7 +14817,14 @@ fn initiate_unwind(
                 act.sp_top = sp_restore;
                 act.cleanup_conts.push(CleanupCont {
                     handler_depth: act.handlers.len(),
-                    action: CleanupAction::Resume(pending),
+                    action: CleanupAction::Resume {
+                        payload: match &pending {
+                            Pending::Token(token) => ControlPayload::take(token),
+                            Pending::Propagate(error) => ControlPayload::for_error(error),
+                            _ => ControlPayload::default(),
+                        },
+                        pending,
+                    },
                 });
                 act.bcp = cleanup_bcp as usize;
                 return Ok(());
@@ -14821,12 +14858,19 @@ fn initiate_unwind(
                 // A compiled `return-from` matches by lexical id; a tree-walker
                 // `return-from` (e.g. from a handler function) arrives as this
                 // block's control token.
-                let matched = match &pending {
+                let matched = match &mut pending {
                     Pending::Return {
                         block_id: bid,
                         value,
-                    } if *bid == block_id => Some(*value),
-                    Pending::Token(t) if *t == token => Some(take_control_value(&token)),
+                        values,
+                    } if *bid == block_id => {
+                        match values.take() {
+                            Some(values) => env.set_mv(values),
+                            None => env.clear_mv(),
+                        }
+                        Some(*value)
+                    }
+                    Pending::Token(t) if *t == token => Some(super::take_control_mv(&token, env)),
                     _ => None,
                 };
                 if let Some(v) = matched {
