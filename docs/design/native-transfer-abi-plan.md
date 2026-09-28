@@ -18,11 +18,16 @@ may contain many native calls, but an exceptional jump cannot cross its Rust
 caller. This obtains the useful property of SBCL-style native transfer without
 attempting to jump through arbitrary Rust or foreign frames.
 
-The initial complete design dispatches exceptional continuations through the
-existing bytecode machinery. Native frames are materialized only on the cold
-path. It does not restart the failed function or replay the failed call.
-Native handler landing pads can later optimize exception-heavy workloads; they
-are not required to remove successful-return checks.
+The required endpoint dispatches transfers through **native handler and cleanup
+landing pads**. Selected transfers within a fully supported native segment stay
+native. Bytecode reconstruction is an intermediate milestone and a fallback for
+unavailable or invalidated native continuations, not the normal unwind strategy.
+It must never restart the failed function or replay the failed call.
+
+Known local `RETURN-FROM` and `GO` become direct branches with required cleanup
+and binding restoration when legal. General nonlocal transfers use the native
+unwinder. Condition signaling and restart search retain the live dynamic context;
+only a selected escaping transfer begins unwinding.
 
 ## Evidence and existing integration points
 
@@ -106,7 +111,8 @@ fn resume_native_transfer(
 ) -> Result<TorclVal, TorclError>;
 ```
 
-Preparation roots the payload and reconstructs the exact logical continuation.
+The interfaces above describe the bytecode fallback. Preparation roots the
+payload and reconstructs the exact logical continuation.
 It must finish while the physical frame information is still available. A
 preparation failure must itself produce a valid transfer, including on OOM or
 stack exhaustion; reserve an emergency path before enabling the ABI. The
@@ -120,6 +126,27 @@ frame/save recipe, root locations, logical/inlined scopes, continuation BCP,
 dynamic actions, and retained definition identity. The compiler must preserve
 exception-live values as well as deopt-live values. Code installation rejects
 incomplete metadata rather than guessing a reconstruction.
+
+The native dispatcher uses a rooted, execution-owned `NativeUnwindCursor`:
+segment identity, retained code version, current frame/site, selected destination,
+next cleanup action, binding watermark and pending transfer payload. Runtime
+preparation returns a `NativeUnwindAction` (`RunCleanup`, `EnterTarget`,
+`LeaveSegment`, or `MaterializeFallback`) to assembly. Rust returns normally
+before assembly adjusts generated frames. A cleanup landing pad resumes the
+cursor after normal completion; a new escaping transfer replaces it according
+to Lisp semantics. Frames needed by cleanup remain live until that cleanup has
+finished. Reentry and suspended cleanup cursors are rooted and nestable.
+
+The compiler represents normal and exceptional successors explicitly through
+lowering, T2 IR, optimization, liveness and emission, with equivalent T1 metadata.
+Exception-live values and dynamic scope boundaries constrain motion, elimination,
+inlining and register allocation. Native landing pads consume verified maps;
+missing native destinations select the explicit fallback, never a guessed PC.
+
+Static scope descriptions belong in code metadata. Runtime handler/restart/catch
+records carry only information that is dynamic or needed for dynamic visibility.
+Do not erase records merely because a scope did not throw during profiling.
+Measure normal scope entry/exit instructions and allocations as well as throws.
 
 Architecture emitters implement entry, helper veneers, capture and landing
 stubs. Helper v2 adapters publish `NativeOutcome` only after their ordinary Rust
@@ -139,10 +166,17 @@ Escaping transfer from a runtime helper:
 
 ```
 native B -> Rust helper -> ordinary Rust return to assembly veneer
-         -> capture/root/materialize exceptional continuation
-         -> retire this segment's generated frames
-         -> segment landing -> ordinary return to Rust
-         -> resume bytecode transfer/cleanup dispatch
+         -> capture/root selected transfer and consult native scope maps
+         -> run required native cleanup, restoring bindings at each boundary
+         -> enter native target with preserved values
+
+If the destination lies outside the segment:
+         -> finish required cleanup in this segment
+         -> segment landing -> ordinary return to Rust -> propagate outward
+
+If native continuation is unavailable or invalidated:
+         -> materialize precise bytecode transfer state before retiring frames
+         -> segment landing -> ordinary return to Rust -> bytecode propagation
 ```
 
 1. **Never skip a live Rust or foreign frame.** No `longjmp` through Rust,
@@ -181,7 +215,10 @@ native B -> Rust helper -> ordinary Rust return to assembly veneer
 ## Polling independently of exceptions
 
 Remove the signal/GC responsibility from ordinary return checks only after new
-poll sites are proven. Start with a cheap inline poll-word test and a cold slow
+poll sites are proven. Return safepoint polls are not inherently forbidden:
+[HotSpot also supports return polling](https://github.com/openjdk/jdk/blob/master/src/hotspot/share/runtime/sharedRuntime.cpp#L621).
+The prohibited cost is a mandatory transfer helper/status test after every
+successful native call. Start with a cheap inline poll-word test and a cold slow
 path at root-safe function entries, loop back-edges and bounded straight-line
 intervals. Entry coverage must include every recursive cycle. A slow poll may
 collect/yield only after live references are published; a delivered interrupt
@@ -209,15 +246,26 @@ The Beads contain task descriptions and acceptance criteria; the order is:
 | 2 | bliss-shih7.2 | Verified root and exceptional-continuation metadata; real relocation tests. |
 | 3 | bliss-shih7.3 | SysV/Win64 segment trampolines; register, destructor and fault-recovery probes. |
 | 4 | bliss-shih7.4 | Versioned runtime helper outcomes; complete helper inventory checks. |
-| 5 | bliss-shih7.5 | Exception-only bytecode reification; cleanup, handlers, restarts and no-replay tests. |
+| 5 | bliss-shih7.5 | Bytecode fallback milestone; cleanup, handlers, restarts and no-replay tests. |
 | 6 | bliss-shih7.6 | Root-safe independent polling; signal, deadline, preemption and GC liveness gates. |
 | 7 | bliss-shih7.7 | Fiber migration and nested Rust/foreign callback ownership tests. |
 | 8 | bliss-shih7.8 | Enable mapped new-ABI T1/T2 code and remove checks after successful native calls. |
 | 9 | bliss-shih7.9 | Controlled release comparisons, instruction counts, regression gates and documentation. |
 | 10 | bliss-shih7.10 | AArch64/s390x adapters after host stabilization; PPC work remains deferred. |
 
-Steps 2 and 3 both follow step 1. Step 4 needs both; subsequent host steps follow
-in order. Keep unsupported platforms on the old ABI until their own gates pass.
+Required additions to the sequence (Beads dependencies are authoritative):
+
+| Bead | Deliverable and dependencies |
+|---|---|
+| bliss-shih7.11 | Explicit exceptional compiler edges; follows step 1 and precedes step 2. |
+| bliss-shih7.12 | Native handler/cleanup dispatch; follows fallback step 5 and gates fiber integration step 7. |
+| bliss-shih7.13 | Direct local exits and cheap protected-scope setup; follows native dispatch and compiler edges, gates activation step 8. |
+
+Steps 2 and 3 follow the contract; step 4 needs both. The fallback milestone
+unblocks independent polling work, but native dispatch and local-exit/scope work
+are required before activation. Step 7 requires both native dispatch and polling;
+step 8 requires step 7 and local-exit/scope work. Steps 9 and 10 follow activation.
+Keep unsupported platforms on the old ABI until their own gates pass.
 QEMU proves functional behavior only; native hardware is required for platform
 performance claims. x86-64 Linux and Windows are the first delivery milestone.
 
@@ -228,6 +276,12 @@ The rollout gate requires:
 * Same source and inputs, verified T2 before/after every sample, correct
   checksums and recorded deopts. Archive paired timings, retired instructions,
   code size and binary/source hashes in the existing HTML report.
+* Supported compiled transfer workloads remain native: zero transfer-triggered
+  deopts, checked separately from deliberate fallback tests. Disassembly proves
+  direct branches for eligible local exits. Forced fallback preserves semantics.
+* Compare protected-scope entry/exit without throwing, instructions, allocations
+  and code/metadata size as well as transfer cost. Publish SBCL comparisons for
+  normal and exceptional paths; Fibonacci alone cannot establish ABI parity.
 * Measure nonthrowing, throwing, handler-heavy, cleanup-heavy, fiber and callback
   workloads. There must be lower instruction cost on the normal path and no
   unexplained regression in the other paths. An SBCL win is a measurement, not
