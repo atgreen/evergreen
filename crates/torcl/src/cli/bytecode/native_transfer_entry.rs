@@ -461,6 +461,14 @@ impl TransferCode {
             stack: torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
         };
         torcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+        // The segment owns a rooted TorclStack frame and all host-side
+        // execution state at this point, so this is a safe entry poll: a
+        // moving GC may park and scan before generated code starts. Native
+        // loop/back-edge polling remains a separate emitter gate.
+        torcl_rt::safepoint::poll_safepoint();
+        if let Some(error) = pending_signal_error_for_current_execution() {
+            return Err(error);
+        }
         let outcome = unsafe {
             native_transfer::invoke_native_segment(
                 self.code.as_ptr(),
