@@ -51,8 +51,8 @@ impl TransferCode {
             base_slots,
         )
         .ok()?;
-        // The current entry can reconstruct local, non-escaping BLOCK/TAGBODY
-        // records from exact scope maps. Other dynamic records require the
+        // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
+        // UNWIND-PROTECT cleanups from exact scope maps. Other records require the
         // forthcoming native scope state; rejecting them is part of admission.
         for site in sites.sites() {
             if site.map().control_scopes.iter().any(|scope| {
@@ -63,6 +63,7 @@ impl TransferCode {
                             register: false,
                             ..
                         } | ScopeKind::Tagbody { .. }
+                            | ScopeKind::Unwind { .. }
                     )
             }) {
                 return None;
@@ -208,6 +209,10 @@ impl TransferCode {
                             sp_restore: scope.sp_restore,
                             token: None,
                             tag_bcps: Vec::new(),
+                        },
+                        ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
+                            cleanup_bcp,
+                            sp_restore: scope.sp_restore,
                         },
                         _ => unreachable!("admission checked all scope records"),
                     })

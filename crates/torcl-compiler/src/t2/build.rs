@@ -24,7 +24,7 @@
 //! exits) return `Err(BuildError::Unsupported(..))`; the caller keeps such a
 //! function at T1 (spec R4.28). Correctness over coverage.
 
-use crate::control_scope::{ScopeError, ScopeMap, is_never_returning_call};
+use crate::control_scope::{ScopeError, ScopeKind, ScopeMap, is_never_returning_call};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
@@ -77,12 +77,16 @@ pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError
 
 /// Construct the native-transfer call contract with an explicit cold fallback
 /// for every remaining call. This entry point stays separate from installation
-/// until Invoke emission and runtime capture/landing maps are implemented.
+/// until complete helper, scope, polling and native landing coverage is ready.
 /// Body inlining must preserve logical control scopes before it can use this
 /// path; intrinsic expansion still happens in the ordinary SSA builder.
+/// Protected regions whose normal path cannot return can use bytecode cleanup
+/// fallback. Normal cleanup handoff and direct exits crossing cleanup are refused.
 pub fn build_from_bytecode_for_transfers(bf: &BytecodeFunction) -> Result<Function, BuildError> {
     let scopes = ScopeMap::analyze_function(bf).map_err(BuildError::InvalidScopes)?;
-    let mut f = Builder::new(bf, InlineOptions::default()).run()?;
+    let mut builder = Builder::new(bf, InlineOptions::default());
+    builder.transfer_mode = true;
+    let mut f = builder.run()?;
     let calls: Vec<Inst> = f
         .block_order()
         .iter()
@@ -297,9 +301,31 @@ struct Builder<'a> {
     /// Intrinsic expansions are leaves, so the first implementation stays at 0.
     inline_depth: u8,
     root_symbol: u32,
+    /// Protected regions may leave through mapped exceptional continuations.
+    /// Their normal cleanup handoffs remain unsupported until explicitly lowered.
+    transfer_mode: bool,
 }
 
 impl<'a> Builder<'a> {
+    fn check_direct_exit(&self, bcp: u32) -> Result<(), BuildError> {
+        let exit = self
+            .control_scopes
+            .as_ref()
+            .and_then(|scopes| scopes.exit_at(bcp))
+            .ok_or(BuildError::Unsupported("direct exit without active scope"))?;
+        if exit.removed.iter().any(|scope| {
+            !matches!(
+                scope.kind,
+                ScopeKind::Block { .. } | ScopeKind::Tagbody { .. }
+            )
+        }) {
+            return Err(BuildError::Unsupported(
+                "direct exit requires dynamic unwinding",
+            ));
+        }
+        Ok(())
+    }
+
     fn new(bf: &'a BytecodeFunction, inline_options: InlineOptions) -> Builder<'a> {
         let remaining_inline_budget = inline_options.config.node_budget;
         let root_symbol = inline_options
@@ -326,6 +352,7 @@ impl<'a> Builder<'a> {
             remaining_inline_budget,
             inline_depth: 0,
             root_symbol,
+            transfer_mode: false,
         }
     }
 
@@ -518,6 +545,8 @@ impl<'a> Builder<'a> {
                 Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
+                Instr::CallNamed { sym, .. }
+                    if self.transfer_mode && is_never_returning_call(*sym) => {}
                 Instr::CallNamed { nargs, .. } => {
                     push(i + 1, d - (*nargs as i32) + 1, &mut depth_at, &mut work);
                 }
@@ -532,6 +561,11 @@ impl<'a> Builder<'a> {
                 }
                 Instr::PushBlock { .. } | Instr::PushTag { .. } | Instr::PopHandler => {
                     push(i + 1, d, &mut depth_at, &mut work); // handler markers: no stack effect
+                }
+                Instr::PushUnwind { .. } if self.transfer_mode => {
+                    // The exact handler is in every protected Invoke map. Its
+                    // cold body is bytecode fallback, not a normal SSA successor.
+                    push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::Br(t) => {
                     push(*t as usize, d, &mut depth_at, &mut work);
@@ -955,6 +989,7 @@ impl<'a> Builder<'a> {
                     }
                 }
                 Instr::PopHandler => {}
+                Instr::PushUnwind { .. } if self.transfer_mode => {}
                 Instr::Dup => {
                     let v = *stack
                         .last()
@@ -1066,21 +1101,21 @@ impl<'a> Builder<'a> {
                     break;
                 }
                 Instr::Go { target_bcp, .. } => {
+                    self.check_direct_exit(i as u32)?;
                     let s = self.block_of[&(*target_bcp as usize)];
                     term = Some(Term::Jump(s));
                     break;
                 }
                 Instr::ReturnFrom { .. } => {
+                    self.check_direct_exit(i as u32)?;
                     // The runtime pops the value, unwinds to the block, resets
                     // the operand stack to `sp_restore` and pushes the value
                     // back. Mirror that here so the exit stack matches what
                     // normal completion leaves, and the Braun merge at the
                     // resume block sees one consistent slot from every edge.
                     //
-                    // A direct jump is sound because the builder declines every
-                    // construct that would need real unwinding on the way out:
-                    // `PushUnwind` is not modelled at all, and `PushBlock` /
-                    // `PushTag` are accepted only with `sp_restore == 0`.
+                    // The exit check refuses intervening cleanup/dynamic scopes.
+                    // The legacy builder also declines PushUnwind entirely.
                     let v = stack
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (ReturnFrom)"))?;

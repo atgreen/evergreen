@@ -2668,6 +2668,7 @@ pub fn emit_framed_transfers(
                 f.inst(inst).opcode,
                 Opcode::Invoke
                     | Opcode::NlxTransfer
+                    | Opcode::Trap
                     | Opcode::Return
                     | Opcode::Jump
                     | Opcode::Brif

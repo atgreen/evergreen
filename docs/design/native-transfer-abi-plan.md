@@ -512,8 +512,8 @@ capture context with nested save/restore. Cold preparation copies the failed
 site's values without allocation before assembly leaves the generated frame.
 The entry then reconstructs the logical activation and calls `initiate_unwind`
 before any bytecode execution. The failed call's PC is an origin, never a resume
-instruction. Exact scope maps rebuild only admitted local, non-escaping BLOCK
-and TAGBODY records; missing dynamic identity or inherited state is refused at
+instruction. Exact scope maps rebuild admitted local, non-escaping BLOCK and
+TAGBODY records and pending UNWIND-PROTECT cleanups; missing dynamic identity or inherited state is refused at
 compilation. Enclosing pending errors are rooted while saved, and lexical scopes,
 native depth, environment pointer and fault-recovery settings are restored.
 
@@ -522,10 +522,22 @@ including redefining the caller inside its callee. They check retained-definitio
 recovery, multiple values, moving-GC relocation, unchanged enclosing stack and
 pending error, and exactly-once calls and callee cleanup. They are explicitly
 enabled with `--include-ignored` and also run under GC stress plus poison.
-This entry is not installed by ordinary tiering. Protected caller scopes, OSR,
+This entry is not installed by ordinary tiering. General protected caller scopes, OSR,
 closures, other helper classes, native cleanup/handler destinations, and emergency
 reconstruction failure handling remain required. Output reconstruction still
 allocates; allocation-free cold capture alone does not satisfy the OOM gate.
+
+The transfer builder now admits UNWIND-PROTECT regions whose normal path ends
+in a known non-returning call. Calls within that region retain their exact
+pending cleanup scopes and cleanup-only locals. Cold cleanup bodies remain in
+the retained bytecode; the runtime reconstructs their handlers and enters them
+through the unwind driver. A real Lisp native caller with nested protected
+regions verifies inner-before-outer cleanup exactly once, replacement THROW
+with multiple values, and moving-GC preservation of a local used only by cleanup.
+This proves exceptional bytecode cleanup fallback, not native cleanup execution.
+The ordinary builder still refuses protected code. Normal cleanup handoffs remain
+unsupported, and GO/RETURN-FROM crossing a cleanup are explicitly refused rather
+than silently branching past it; source-level tests cover both refusal cases.
 
 ### Windows validation and Wine limits
 

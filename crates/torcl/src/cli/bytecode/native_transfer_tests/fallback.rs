@@ -3,6 +3,129 @@ use super::*;
 use std::cell::Cell;
 
 #[test]
+fn native_v2_protected_builder_refuses_cleanup_bypassing_direct_exits() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    for source in [
+        "((block exit (unwind-protect (return-from exit x) (identity x))))",
+        "((tagbody (unwind-protect (go done) (identity x)) done))",
+    ] {
+        torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        torcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
+        let body = compile_function("PROTECTED-EXIT", *params, *forms, &env, false, false).unwrap();
+        assert!(
+            matches!(
+                torcl_compiler::t2::build::build_from_bytecode_for_transfers(&body),
+                Err(torcl_compiler::t2::build::BuildError::Unsupported(
+                    "direct exit requires dynamic unwinding"
+                ))
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(torcl_rt::native_transfer::is_supported());
+    for replace in [false, true] {
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env = &mut env);
+        super::super::super::read_eval_all_env(
+            "(setq *caller-cleanups* nil *caller-ticks* 0)
+             (defun caller-tick (x) (setq *caller-ticks* (+ *caller-ticks* 1)) x)
+             (defun caller-cleanup (name x)
+               (setq *caller-cleanups* (cons (cons name x) *caller-cleanups*)))",
+            &mut env,
+        )
+        .unwrap();
+        torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        let cleanup_exit = if replace {
+            "(throw :replacement (values x (list :second)))"
+        } else {
+            "nil"
+        };
+        torcl_rt::rooted!(
+            forms = reader::read_from_string(&format!(
+                "((let ((saved (list x)))
+                (unwind-protect
+                  (unwind-protect (progn (caller-tick x) (error x))
+                    (caller-cleanup :inner saved) {cleanup_exit})
+                  (caller-cleanup :outer saved))))"
+            ))
+            .unwrap()
+            .0
+        );
+        let original = Arc::new(
+            compile_function("PROTECTED-CALLER", *params, *forms, &env, false, false).unwrap(),
+        );
+        assert!(
+            torcl_compiler::t2::build::build_from_bytecode(&original).is_err(),
+            "legacy builder must still refuse protected code"
+        );
+        let code = TransferCode::compile(original)
+            .expect("exceptional protected region has a mapped fallback");
+        let token = super::super::super::next_control_token("REPLACEMENT");
+        let tag = reader::read_from_string(":replacement").unwrap().0;
+        env.catch_stack
+            .push((super::super::super::val_as_str(tag), token.clone()));
+        torcl_rt::rooted!(args = vec![super::super::super::arena_str("original error")]);
+        let old_address = args[0].to_raw();
+        let before = torcl_rt::current_stack().fp();
+        torcl_rt::rooted!(result = code.run(&args, &mut env));
+        HeapCollector::new().minor_gc().unwrap();
+        assert_ne!(args[0].to_raw(), old_address);
+        assert_eq!(torcl_rt::current_stack().fp(), before);
+        if replace {
+            assert!(
+                matches!(&*result, Err(TorclError::Internal(t)) if t == &token),
+                "{:?}",
+                &*result
+            );
+            assert_eq!(
+                super::super::super::take_control_mv(&token, &mut env),
+                args[0]
+            );
+            assert!(env.mv_active && env.mv.len() == 2);
+            assert!(env.mv[1].is_cons());
+        } else {
+            assert!(
+                matches!(&*result, Err(TorclError::Internal(message)) if message == "ERROR: original error"),
+                "{:?}",
+                &*result
+            );
+        }
+        assert_eq!(
+            super::super::super::read_eval_all_env("*caller-ticks*", &mut env).unwrap(),
+            TorclVal::from_fixnum(1)
+        );
+        torcl_rt::rooted!(
+            log = super::super::super::read_eval_all_env("*caller-cleanups*", &mut env).unwrap()
+        );
+        torcl_rt::rooted!(entries = super::super::super::list_to_vec(*log));
+        assert_eq!(entries.len(), 2);
+        for (index, name) in [":OUTER", ":INNER"].into_iter().enumerate() {
+            let expected = reader::read_from_string(name).unwrap().0;
+            let (key, saved) = super::super::super::cp(entries[index]);
+            assert_eq!(key, expected);
+            assert_eq!(
+                super::super::super::cp(saved).0,
+                args[0],
+                "cleanup-only local survived capture and GC"
+            );
+        }
+        env.catch_stack.pop();
+    }
+}
+
+#[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_fallback_propagates_without_replaying_the_original_definition() {
     let _lock = super::super::super::heap_test_lock()
