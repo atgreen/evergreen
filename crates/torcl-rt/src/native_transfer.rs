@@ -4,10 +4,19 @@
 
 use crate::execution_local::ExecutionLocal;
 use crate::stack::{Frame, TorclStack};
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 use crate::value::NIL;
 use crate::value::TorclVal;
 use std::cell::Cell;
+
+#[cfg(all(target_arch = "x86_64", any(windows, all(test, target_os = "linux"))))]
+mod win64;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use self::enter_sysv as enter_platform;
+#[cfg(all(target_arch = "x86_64", windows))]
+use win64::enter as enter_platform;
+#[cfg(all(target_arch = "x86_64", windows))]
+pub use win64::leave_native_segment;
 
 #[repr(u64)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,15 +95,19 @@ pub fn is_supported() -> bool {
             unsafe { crate::syscall::syscall2(158, 0x5005, &mut features as *mut u64 as usize) };
         result == 0 && features == 0
     }
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    #[cfg(all(target_arch = "x86_64", windows))]
+    {
+        win64::is_supported()
+    }
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
     {
         false
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 struct ActiveSegment(*mut NativeSegment);
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 impl Drop for ActiveSegment {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.set(self.0));
@@ -112,7 +125,7 @@ impl Drop for ActiveSegment {
 /// leaving, generated frames' roots and Lisp cleanup must be handled by the
 /// transfer preparation protocol. Hardening cannot be enabled within a segment.
 /// The returned primary must be rooted before the caller next allocates.
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 pub unsafe fn invoke_native_segment(
     entry: *const u8,
     slots: *mut u64,
@@ -143,7 +156,7 @@ pub unsafe fn invoke_native_segment(
         value: NIL,
         exit: NativeExit::Returned,
     };
-    unsafe { enter_sysv(entry, slots, stack, anchor, &mut outcome) };
+    unsafe { enter_platform(entry, slots, stack, anchor, &mut outcome) };
     Ok(outcome)
 }
 
@@ -151,7 +164,7 @@ pub unsafe fn invoke_native_segment(
 ///
 /// # Safety
 /// Same entry/slot contract as the supported implementation; no code is entered.
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+#[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
 pub unsafe fn invoke_native_segment(
     _entry: *const u8,
     _slots: *mut u64,

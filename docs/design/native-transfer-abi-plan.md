@@ -319,8 +319,8 @@ zero overhead for signal polling, or change the Fibonacci algorithm.
 
 ## Segment boundary implementation checkpoint
 
-The runtime now provides an x86-64 Linux SysV segment adapter in
-`crates/torcl-rt/src/native_transfer.rs`. Its Rust wrapper pins the anchor,
+The runtime provides x86-64 Linux SysV and Windows Win64 segment adapters in
+`crates/torcl-rt/src/native_transfer.rs` and its `win64` module. The Rust wrapper pins the anchor,
 records execution ownership and TorclStack watermarks, and restores the previous
 anchor with a Rust guard. The private assembly entry uses the explicit outcome
 out parameter above; the Rust wrapper returns `Result<NativeOutcome,
@@ -332,7 +332,12 @@ enclosing Rust frames alive.
 Activation currently requires a successful Linux shadow-stack status query
 reporting no enabled features. Unknown status and enabled shadow stacks refuse
 entry; no mitigation is disabled. Indirect assembly entries and the landing
-continuation have `ENDBR64`. Other targets refuse this adapter.
+continuation have `ENDBR64`. Win64 entry additionally preserves RDI, RSI and
+XMM6–XMM15, supplies the callee's 32-byte home area, and carries assembler-generated
+SEH unwind metadata. It requires successful CFG and user-shadow-stack policy
+queries with no enabled flags. Query output starts with an invalid sentinel;
+success without a written output does not grant permission. Other targets refuse
+this adapter.
 
 Assembly probes cover register/control-word restoration, stack alignment,
 anchor invalidation, ownership/watermarks, nested entries and Rust destructor
@@ -349,9 +354,45 @@ unchanged TorclStack watermarks and restoration of enclosing recovery targets.
 This is boundary infrastructure, not activation: generated Lisp calls
 still use the existing ABI and successful-return checks. Transfer payload
 rooting, cleanup/root retirement, native dispatch, actual JIT integration of the
-fault-recovery/unwind gates, fiber migration and the Win64 adapter remain
+fault-recovery/unwind gates, fiber migration and native-Windows execution gates remain
 required before rollout. The
 adapter records TorclStack watermarks but does not restore them itself.
+
+### Windows validation and Wine limits
+
+Wine remains a fast regression environment for Windows functionality. It does
+not establish Windows performance or hardware-mitigation behavior. Wine 11.0
+(Staging) here returns success from `GetProcessMitigationPolicy` for CFG and
+user shadow stacks without changing the output DWORD. The sentinel check
+therefore refuses segment execution. This does not invalidate independently
+exercised pathname, I/O or unwind-table tests.
+The behavior matches the [Wine 11.0 source stub](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/kernelbase/process.c#L828-L836),
+which returns success without writing the buffer. Repairing that query requires
+accurate policy reporting or an unsupported-query error; arbitrary zero output
+would conceal the missing information.
+
+The Win64 machine probe compiles the same instructions on Linux with Rust's
+`win64` calling convention and checks host shadow-stack compatibility before
+execution. It covers all eight integer nonvolatiles, all 128 bits of XMM6–XMM15,
+FP controls, home space, alignment, Rust helper destructors and all three exit
+kinds. Windows `RtlVirtualUnwind` separately checks the actual COFF metadata at
+the body and landing continuation under Wine using a synthetic saved frame.
+Neither substitutes for running the public entry on native Windows.
+
+Capability-dependent execution tests are explicitly ignored by default. Selecting
+them with `--include-ignored` makes unknown or incompatible mitigation state a
+failure, not a successful no-op. On native Windows, the release gate must run:
+
+```text
+cargo test -p torcl-rt --target x86_64-pc-windows-msvc --lib native_transfer -- --include-ignored --nocapture
+cargo test -p torcl-rt --target x86_64-pc-windows-msvc --test native_segment_windows -- --include-ignored --nocapture
+```
+
+Report machine execution, refusal behavior, ignored tests and metadata checks
+separately. Never disable mitigations to make a gate pass. Native Windows CI and
+the remaining SEH/mitigation gates are tracked in `bliss-shih7.14` and gate final
+activation. The boundary follows Microsoft's [x64 prologue/epilogue rules](https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog)
+and [process mitigation query contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessmitigationpolicy).
 
 ## Baseline contract oracles and boundary inventory
 

@@ -93,6 +93,11 @@ pub fn make(stack: &mut [u8], entry: extern "C" fn()) -> Context {
 // Windows x86-64 uses owned OS fibers in thread/windows.rs instead of this
 // stack-pointer API. Other targets retain the inline fallback in thread.rs.
 // These stubs exist only so this module compiles on those targets.
+/// Compatibility stub that performs no context switch.
+///
+/// # Safety
+/// Callers must use the platform's supported fiber backend and must not rely
+/// on this stub to save or resume an execution context.
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 pub unsafe fn swap(_from: *mut Context, _to: Context) {}
 
