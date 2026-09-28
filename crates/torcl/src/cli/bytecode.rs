@@ -16559,6 +16559,9 @@ struct NativeCode {
     /// Transfer contract used by direct native calls. Versioned explicitly so
     /// a future unchecked-return ABI cannot be mixed with legacy checked code.
     transfer_abi_version: u16,
+    /// Machine target encoded separately from the transfer version. Saved or
+    /// cached code must never become a direct target on another ISA.
+    transfer_abi_arch: u16,
     /// A baked direct call can already be active when its name is redefined.
     /// Keep that exact callee (and its transitive dependencies) alive.
     _direct_calls: Vec<Rc<NativeCode>>,
@@ -16599,9 +16602,26 @@ struct NativeCode {
 
 const NATIVE_TRANSFER_ABI_VERSION: u16 = 1;
 
+#[cfg(target_arch = "x86_64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0x8664;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0xaa64;
+#[cfg(target_arch = "powerpc64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0x9a64;
+#[cfg(target_arch = "s390x")]
+const NATIVE_TRANSFER_ARCH: u16 = 0xa390;
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "powerpc64",
+    target_arch = "s390x"
+)))]
+const NATIVE_TRANSFER_ARCH: u16 = 0;
+
 #[inline]
 fn native_transfer_abi_compatible(code: &NativeCode) -> bool {
     code.transfer_abi_version == NATIVE_TRANSFER_ABI_VERSION
+        && code.transfer_abi_arch == NATIVE_TRANSFER_ARCH
 }
 
 struct NativeEmission {
@@ -17920,6 +17940,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let nc = Rc::new(NativeCode {
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+        transfer_abi_arch: NATIVE_TRANSFER_ARCH,
         _direct_calls: Vec::new(),
         entry,
         code_len: artifact.code.len(),
@@ -20010,6 +20031,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     let nc = Rc::new(NativeCode {
         body: Some(bf),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+        transfer_abi_arch: NATIVE_TRANSFER_ARCH,
         _direct_calls: direct_calls,
         entry,
         code_len: code.len(),
@@ -22257,6 +22279,7 @@ mod jtc4_stack_map_tests {
         let nc = NativeCode {
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+            transfer_abi_arch: NATIVE_TRANSFER_ARCH,
             _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),
@@ -22275,6 +22298,9 @@ mod jtc4_stack_map_tests {
         let error = run_native(&nc, u32::MAX, &[], &mut env).unwrap_err();
         let mut legacy = nc;
         legacy.transfer_abi_version = 0;
+        assert!(!native_transfer_abi_compatible(&legacy));
+        legacy.transfer_abi_version = NATIVE_TRANSFER_ABI_VERSION;
+        legacy.transfer_abi_arch = 0;
         assert!(!native_transfer_abi_compatible(&legacy));
 
         assert!(matches!(
@@ -22314,6 +22340,7 @@ mod jtc4_stack_map_tests {
         let nc = NativeCode {
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+            transfer_abi_arch: NATIVE_TRANSFER_ARCH,
             _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),

@@ -231,11 +231,12 @@ If native continuation is unavailable or invalidated:
    Legacy code stays behind a bridge segment until converted. No old helper can
    silently return a placeholder into unchecked new code.
 
-The current implementation carries `transfer_abi_version` on every installed
-`NativeCode` object and admits direct native calls only when it matches the
-runtime's `NATIVE_TRANSFER_ABI_VERSION`. This is a compatibility fence, not a
-completed old-to-new bridge: artifacts with an older version are conservatively
-kept on the checked/fallback path until an explicit bridge is implemented.
+The current implementation carries both `transfer_abi_version` and a target
+architecture identifier on every installed `NativeCode` object. Direct native
+calls are admitted only when both match the running backend. This is a
+compatibility fence, not a completed old-to-new bridge: artifacts with an older
+version or another architecture are conservatively kept on the checked/fallback
+path until an explicit bridge is implemented.
 
 ## Polling independently of exceptions
 
