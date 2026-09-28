@@ -45,6 +45,118 @@ fn ok(output: Output) -> String {
 const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
 #[test]
+fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
+    let f = Fixture::new();
+    let source = f.path("closures.lisp");
+    let fasl = f.path("closures.bfasl");
+    let core = f.path("closures.core");
+    let spec = f.path("closures.delivery");
+    let exe = f.path("closures-app");
+    fs::write(
+        &source,
+        r#"
+      (defpackage :closure-shake (:use :cl))
+      (in-package :closure-shake)
+      (defun live-target () 42)
+      (defun dead-target () :dead)
+      (defun dead-captured-target () :dead-captured)
+      (defun make-live (f)
+        ;; Both closures share the captured frame. Only the second escapes.
+        (lambda () (funcall f) (dead-target))
+        (lambda () (funcall f)))
+      (defun make-dead (f) (lambda () (funcall f) (dead-target) (disassemble 'dead-target)))
+      (defun main ()
+        (write-line (if (and (= 42 (funcall *saved*))
+                             (not (fboundp (intern "DEAD-TARGET" :closure-shake)))
+                             (not (fboundp (intern "DEAD-CAPTURED-TARGET" :closure-shake))))
+                        "CLOSURE-SHAKE-OK" "WRONG")))
+    "#,
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    fs::remove_file(&source).unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (set 'closure-shake::*saved* (closure-shake::make-live #'closure-shake::live-target)) (closure-shake::make-dead #'closure-shake::dead-captured-target) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    fs::remove_file(&fasl).unwrap();
+    fs::write(&spec, "version = 1\nentry = CLOSURE-SHAKE::MAIN\nprune-package = CLOSURE-SHAKE\ndynamic = explicit\nruntime = specialized\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("remove CLOSURE-SHAKE::DEAD-TARGET"),
+        "{report}"
+    );
+    assert!(
+        report.contains("remove CLOSURE-SHAKE::DEAD-CAPTURED-TARGET"),
+        "{report}"
+    );
+    assert!(
+        report.contains("keep CLOSURE-SHAKE::LIVE-TARGET"),
+        "{report}"
+    );
+    assert!(report.contains("capabilities=\n"), "{report}");
+    let removed: usize = report
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("private-code-removed = ")
+                .map(|n| n.parse().unwrap())
+        })
+        .unwrap();
+    assert!(removed >= 2, "{report}");
+    // Exercise publication/restore without making an ordinary regression test
+    // rebuild a separate native release runtime.
+    fs::write(&spec, "version = 1\nentry = CLOSURE-SHAKE::MAIN\nprune-package = CLOSURE-SHAKE\ndynamic = explicit\n").unwrap();
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(ok(run(&exe, &[])).contains("CLOSURE-SHAKE-OK"));
+    // The code must actually disappear from the serialized registry, not just
+    // be ignored by analysis. A second delivery has no orphan code to remove.
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let reduced = f.path("reduced.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(again.contains("private-code-removed = 0\n"), "{again}");
+}
+
+#[test]
 fn delivery_prunes_unreachable_functions_and_keeps_data_and_explicit_roots() {
     let f = Fixture::new();
     let image = f.path("input.core");

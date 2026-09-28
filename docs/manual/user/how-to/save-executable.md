@@ -125,6 +125,13 @@ references through saved data and source/bytecode, including nested functions
 and captured environments. Conservatively retained registries can keep extra
 functions alive. Runtime packages cannot be selected for pruning.
 
+Private compiled closures are traced from reachable function objects and
+bytecode references, including their captured environments. An unreachable
+closure does not retain its callees or native capabilities just because it
+remains in a runtime registry. Delivery removes its private code and captures
+before saving; `private-code-removed` reports the number of removed entries.
+Escaped closures and shared captured environments remain live when reachable.
+
 With the default `runtime = full`, delivery reduces the saved image and keeps
 the full Rust runtime. Re-saving an executable replaces its embedded image
 instead of stacking another copy of the previous core into the runtime prefix.

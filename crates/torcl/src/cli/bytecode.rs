@@ -319,9 +319,11 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
     });
 }
 
-/// Named bodies are conditional edges during delivery; private closure bodies
-/// and captured frames remain conservative roots. Only called in a heap snapshot.
-pub(super) fn delivery_dependencies() -> (HashMap<u32, Vec<TorclVal>>, Vec<TorclVal>) {
+/// Code and captures are edges from a callable's identity, not roots merely
+/// because a registry owns them. Heap function objects trace their name symbol,
+/// and direct bytecode calls explicitly trace their symbol operands.
+/// Only called in a heap snapshot, without Lisp allocation.
+pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<TorclVal>> {
     let mut bodies = closure_bodies().borrow().clone();
     REGISTRY.with(|r| bodies.extend(r.borrow().iter().map(|(&s, b)| (s, Arc::clone(b)))));
     for (&symbol, definition) in named_definitions().borrow().iter() {
@@ -332,22 +334,30 @@ pub(super) fn delivery_dependencies() -> (HashMap<u32, Vec<TorclVal>>, Vec<Torcl
         }
     }
     let mut edges = HashMap::new();
-    let mut roots = Vec::new();
     for (symbol, body) in bodies {
         let refs = super::delivery::bytecode_references(&body);
-        if torcl_rt::symbols::is_uninterned(symbol) {
-            roots.extend(refs.iter().copied());
-        }
         edges.insert(symbol, refs);
     }
-    let mut state = super::EnvRootVisitState::default();
-    for frame in closure_envs().borrow().values() {
+    for (&symbol, frame) in closure_envs().borrow().iter() {
+        // A shared frame contributes an edge to EACH owner. Deduplicating
+        // across owners would lose the captures if the first owner is dead.
+        let mut state = super::EnvRootVisitState::default();
+        let refs = edges.entry(symbol).or_default();
         super::visit_env_frame_roots(frame, &mut state, &mut |slot| {
             // SAFETY: the frame visitor supplies live slots under the snapshot.
-            roots.push(unsafe { *slot });
+            refs.push(unsafe { *slot });
         });
     }
-    (edges, roots)
+    edges
+}
+
+/// Delivery owns a disposable restored world. Release registry ownership of
+/// unreachable private code and captures before the compacting image save.
+pub(super) fn remove_delivery_closure(symbol: u32) {
+    debug_assert!(torcl_rt::symbols::is_uninterned(symbol));
+    closure_bodies().borrow_mut().remove(&symbol);
+    clear_lazy_state(symbol);
+    clear_closure_env(symbol);
 }
 
 pub(super) fn delivery_root_scanner() -> torcl_rt::gc::RootScanner {

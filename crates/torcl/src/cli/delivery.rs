@@ -147,6 +147,7 @@ pub(super) fn bytecode_references(function: &BytecodeFunction) -> Vec<TorclVal> 
 }
 
 struct Plan {
+    unreachable_closures: Vec<u32>,
     capability_roots: std::collections::BTreeSet<String>,
     capabilities: std::collections::BTreeSet<String>,
     candidates: BTreeMap<u32, String>,
@@ -190,8 +191,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             );
         }
         env.visit_gc_roots(&mut |slot| roots.push(unsafe { *slot }));
-        let (edges, closure_roots) = bytecode::delivery_dependencies();
-        roots.extend(closure_roots);
+        let edges = bytecode::delivery_dependencies();
         for (_, function) in global_bytecode_macros() {
             roots.extend(bytecode_references(&function.lock().unwrap()));
         }
@@ -331,7 +331,17 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             }
         }
         crate::runtime_contract::close_capabilities(&mut capabilities);
+        let mut unreachable_closures: Vec<_> = edges
+            .keys()
+            .copied()
+            .filter(|&symbol| {
+                symbols::is_uninterned(symbol)
+                    && !visited.contains(&TorclVal::from_symbol_index(symbol).0)
+            })
+            .collect();
+        unreachable_closures.sort_unstable();
         Plan {
+            unreachable_closures,
             capability_roots,
             capabilities,
             candidates,
@@ -428,6 +438,10 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         ));
     }
     report.push_str(&format!("input-image-format = {image_version}\n"));
+    report.push_str(&format!(
+        "private-code-removed = {}\n",
+        plan.unreachable_closures.len()
+    ));
     for package in &spec.packages {
         report.push_str(&format!("prune-package = {package}\n"));
     }
@@ -472,6 +486,9 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
         symbols::set_symbol_function(index, torcl_rt::value::UNBOUND);
         bytecode::clear_lazy_state(index);
         bytecode::clear_closure_env(index);
+    }
+    for &symbol in &plan.unreachable_closures {
+        bytecode::remove_delivery_closure(symbol);
     }
     native_runtime::with_save_contract(&selected, || {
         save_core(
