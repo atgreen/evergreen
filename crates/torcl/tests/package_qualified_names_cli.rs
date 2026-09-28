@@ -96,6 +96,86 @@ fn each_packages_type_of_a_shared_bare_name_stays_its_own() {
     );
 }
 
+/// A handler must catch the condition type it named, and nothing else that merely
+/// shares its bare name (bliss-tnavc).
+///
+/// Handler matching compared class-hierarchy names as BARE strings, so a handler for
+/// one package's `ERROR` caught a plain `CL:ERROR`, and caught an unrelated package's
+/// `ERROR` too. Swallowing conditions it never asked for is the worst thing a handler
+/// can do, because nothing reports it — the error simply vanishes into the wrong
+/// clause.
+#[test]
+fn a_handler_catches_only_the_type_it_named() {
+    let stdout = run(
+        r#"
+        (defpackage "KLIZ4A" (:use "COMMON-LISP") (:shadow "ERROR"))
+        (defpackage "KLIZ4B" (:use "COMMON-LISP") (:shadow "ERROR"))
+        (eval (read-from-string "(progn
+          (define-condition kliz4a::error (cl:error) ((k :initarg :k :initform 1)))
+          (define-condition kliz4b::error (cl:error) ((k :initarg :k :initform 2))))"))
+        (format t "MATCH ~S~%"
+                (list
+                 ;; Must NOT catch a plain CL:ERROR.
+                 (handler-case (error "plain")
+                   (kliz4a::error () :wrong) (error () :right))
+                 ;; Must NOT catch the other package's type of the same bare name.
+                 (handler-case (error 'kliz4b::error)
+                   (kliz4a::error () :wrong) (error () :right))
+                 ;; MUST catch its own.
+                 (handler-case (error 'kliz4a::error)
+                   (kliz4a::error () :right) (error () :wrong))
+                 ;; And CL:ERROR must still catch both, which they inherit from.
+                 (handler-case (error 'kliz4a::error) (cl:error () :right))
+                 (handler-case (error 'kliz4b::error) (cl:error () :right))))
+        "#,
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("MATCH "))
+            .unwrap_or(""),
+        "MATCH (:RIGHT :RIGHT :RIGHT :RIGHT :RIGHT)"
+    );
+}
+
+/// The standard condition types, and TorCL's own qualified one, must keep matching —
+/// both by their own name and as the supertypes they inherit from.
+///
+/// This is the half a package-aware matcher can easily break, and the half that
+/// matters most: nearly every HANDLER-CASE in existence names one of these.
+#[test]
+fn standard_and_qualified_condition_types_still_match() {
+    let stdout = run(
+        r#"
+        (format t "STD ~S~%"
+                (list
+                 (handler-case (error "boom") (simple-error () :ok))
+                 (handler-case (error "boom") (error () :ok))
+                 (handler-case (error "boom") (serious-condition () :ok))
+                 (handler-case (error "boom") (condition () :ok))
+                 (handler-case (/ 1 0) (division-by-zero () :ok))
+                 (handler-case (/ 1 0) (arithmetic-error () :ok))
+                 (handler-case (symbol-value 'no-such-variable-kliz) (unbound-variable () :ok))
+                 (handler-case (car 5) (type-error () :ok))
+                 ;; A qualified condition TorCL itself signals, by its own name and
+                 ;; as the ERROR it inherits from.
+                 (handler-case (torcl-ffi:load-foreign-library "/nonexistent-kliz.so")
+                   (torcl-ffi:ffi-error () :ok))
+                 (handler-case (torcl-ffi:load-foreign-library "/nonexistent-kliz.so")
+                   (error () :ok))
+                 ;; And T catches anything.
+                 (handler-case (error "boom") (t () :ok))))
+        "#,
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("STD "))
+            .unwrap_or(""),
+        "STD (:OK :OK :OK :OK :OK :OK :OK :OK :OK :OK :OK)"
+    );
+}
+
 /// COMMON-LISP's own names must keep resolving whether written bare or qualified —
 /// the normalization that makes `ERROR` and `COMMON-LISP:ERROR` one key.
 #[test]

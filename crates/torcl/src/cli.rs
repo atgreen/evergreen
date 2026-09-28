@@ -12348,6 +12348,19 @@ fn instance_class_hierarchy_names(object: TorclVal) -> Option<Vec<String>> {
     if names.is_empty() { None } else { Some(names) }
 }
 
+/// A condition's class-precedence list as `condition_type_key`s, most-specific
+/// first — the names a handler clause is matched against.
+///
+/// PACKAGE-QUALIFIED, unlike the otherwise identical
+/// [`instance_class_hierarchy_names`]. These were bare names, so a handler matched
+/// any condition whose class had the same BARE name: a handler for one package's
+/// `ERROR` caught a plain `CL:ERROR`, and caught another package's `ERROR` too
+/// (bliss-tnavc). Swallowing conditions it never asked for is the worst failure mode
+/// a handler has, because nothing reports it.
+///
+/// `instance_class_hierarchy_names` stays bare deliberately: a dozen callers compare
+/// its strings to literals like `"TYPE-ERROR"`, and those names are COMMON-LISP's,
+/// where bare and qualified agree.
 fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
     let class = torcl_stdlib::class_of(cond);
     let cpl = torcl_stdlib::compute_class_precedence_list(class).ok()?;
@@ -12355,7 +12368,7 @@ fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
     for class in cpl {
         let name = torcl_stdlib::class_name(class);
         if name.is_symbol() {
-            names.push(sym_bare_name_rc(name).to_string());
+            names.push(condition_type_key(&sym_name(name)));
         }
     }
     if names.iter().any(|name| name == "CONDITION") {
@@ -12373,7 +12386,9 @@ fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
     );
     while let Some(list) = cur {
         for sup in list_to_vec(list) {
-            supers.push(symbol_bare_name(&val_as_str(sup)));
+            // Qualified, so the chain can be compared against a handler's own
+            // qualified name (see `condition_type_hierarchy_names`).
+            supers.push(condition_type_key(&val_as_str(sup)));
         }
         cur = None;
     }
@@ -12381,8 +12396,8 @@ fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
 }
 
 fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) -> bool {
-    let signaled = symbol_bare_name(signaled_type);
-    let handler = symbol_bare_name(handler_type);
+    let signaled = condition_type_key(signaled_type);
+    let handler = condition_type_key(handler_type);
     handler == "T"
         || signaled == handler
         || condition_supertypes(env, &signaled)
@@ -12391,7 +12406,7 @@ fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) ->
 }
 
 fn condition_matches_handler(env: &Env, condition: TorclVal, handler_type: &str) -> bool {
-    let handler = symbol_bare_name(handler_type);
+    let handler = condition_type_key(handler_type);
     if handler == "T" {
         return true;
     }
