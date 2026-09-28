@@ -773,10 +773,13 @@ call, correct cleanup order, preserved locals/multiple values and an unchanged
 enclosing catch, with actual tag relocation under GC stress. It covers both
 immediate fallback and fallback after an intervening native cleanup.
 This extension does not enable ordinary ABI installation. The compiler still
-declines direct exits requiring catch
-unregistration, and inherited OSR scope admission remains disabled. Host allocation
-failure during token construction and payload restoration remains part of
-`bliss-shih7.12.3`.
+declines direct exits requiring catch unregistration, and the opt-in transfer
+entry does not yet start from an OSR continuation. The existing T0-to-native OSR
+path does preserve interpreter-owned handlers: `run_native_osr` keeps the live
+activation stacks, establishes a frame-scoped fault-recovery window, and hands
+pending signals back to the interpreter before restoring the outer native state.
+Host allocation failure during token construction and payload restoration remains
+part of `bliss-shih7.12.3`.
 
 ### Opt-in native HANDLER-CASE delivery
 
