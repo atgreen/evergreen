@@ -88,22 +88,31 @@ pub(super) enum ForcedTier {
 pub(super) fn forced_tier() -> Option<ForcedTier> {
     use std::sync::OnceLock;
     static T: OnceLock<Option<ForcedTier>> = OnceLock::new();
-    *T.get_or_init(|| match std::env::var("TORCL_FORCE_TIER") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "interp" | "tree-walker" | "treewalker" | "treewalk" | "tw" => Some(ForcedTier::Interp),
-            "t0" | "bytecode" => Some(ForcedTier::T0),
-            "t1" => Some(ForcedTier::T1),
-            "t2" => Some(ForcedTier::T2),
-            "" => None,
-            other => {
-                eprintln!(
-                    "torcl: unrecognized TORCL_FORCE_TIER={other:?} \
+    *T.get_or_init(|| {
+        match std::env::var("TORCL_FORCE_TIER") {
+            Ok(v) => match v.to_ascii_lowercase().as_str() {
+                "interp" | "tree-walker" | "treewalker" | "treewalk" | "tw" => {
+                    Some(ForcedTier::Interp)
+                }
+                "t0" | "bytecode" => Some(ForcedTier::T0),
+                "t1" => Some(ForcedTier::T1),
+                "t2" => Some(ForcedTier::T2),
+                "" => None,
+                other => {
+                    eprintln!(
+                        "torcl: unrecognized TORCL_FORCE_TIER={other:?} \
                      (use interp|t0|t1|t2); ignoring"
-                );
-                None
-            }
-        },
-        Err(_) => None,
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+        .map(|tier| match tier {
+            ForcedTier::T1 | ForcedTier::T2 if cfg!(torcl_no_t1) => ForcedTier::T0,
+            ForcedTier::T2 if cfg!(torcl_no_t2) => ForcedTier::T1,
+            _ => tier,
+        })
     })
 }
 
@@ -319,9 +328,11 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
     });
 }
 
-/// Named bodies are conditional edges during delivery; private closure bodies
-/// and captured frames remain conservative roots. Only called in a heap snapshot.
-pub(super) fn delivery_dependencies() -> (HashMap<u32, Vec<TorclVal>>, Vec<TorclVal>) {
+/// Code and captures are edges from a callable's identity, not roots merely
+/// because a registry owns them. Heap function objects trace their name symbol,
+/// and direct bytecode calls explicitly trace their symbol operands.
+/// Only called in a heap snapshot, without Lisp allocation.
+fn delivery_bodies() -> HashMap<u32, Arc<BytecodeFunction>> {
     let mut bodies = closure_bodies().borrow().clone();
     REGISTRY.with(|r| bodies.extend(r.borrow().iter().map(|(&s, b)| (s, Arc::clone(b)))));
     for (&symbol, definition) in named_definitions().borrow().iter() {
@@ -331,23 +342,95 @@ pub(super) fn delivery_dependencies() -> (HashMap<u32, Vec<TorclVal>>, Vec<Torcl
             bodies.remove(&symbol);
         }
     }
+    bodies
+}
+
+pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<(TorclVal, bool)>> {
     let mut edges = HashMap::new();
-    let mut roots = Vec::new();
-    for (symbol, body) in bodies {
-        let refs = super::delivery::bytecode_references(&body);
-        if torcl_rt::symbols::is_uninterned(symbol) {
-            roots.extend(refs.iter().copied());
-        }
+    for (symbol, body) in delivery_bodies() {
+        let mut refs: Vec<_> = super::delivery::bytecode_references(&body)
+            .into_iter()
+            .map(|value| (value, false))
+            .collect();
+        refs.extend(
+            super::delivery::bytecode_callable_references(&body)
+                .into_iter()
+                .map(|value| (value, true)),
+        );
         edges.insert(symbol, refs);
     }
-    let mut state = super::EnvRootVisitState::default();
-    for frame in closure_envs().borrow().values() {
+    for (&symbol, frame) in closure_envs().borrow().iter() {
+        // A shared frame contributes an edge to EACH owner. Deduplicating
+        // across owners would lose the captures if the first owner is dead.
+        let mut state = super::EnvRootVisitState::default();
+        let refs = edges.entry(symbol).or_default();
         super::visit_env_frame_roots(frame, &mut state, &mut |slot| {
             // SAFETY: the frame visitor supplies live slots under the snapshot.
-            roots.push(unsafe { *slot });
+            refs.push((unsafe { *slot }, true));
         });
     }
-    (edges, roots)
+    edges
+}
+
+/// A saved callable is independent of source evaluation only if its entire
+/// bytecode tree can be restored and contains no source-executing operation.
+pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str>> {
+    fn source_dependency(body: &BytecodeFunction) -> Option<&'static str> {
+        if body.variadic {
+            return Some("variadic lambda-list binder");
+        }
+        if body
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)))
+        {
+            return Some("bytecode source-evaluation instruction");
+        }
+        if body
+            .handler_binds
+            .iter()
+            .any(|table| !table.bindings.is_empty())
+        {
+            return Some("source handler-binding form");
+        }
+        body.nested_functions
+            .iter()
+            .find_map(|nested| source_dependency(nested))
+            .or_else(|| {
+                body.restart_cases
+                    .iter()
+                    .flat_map(|table| &table.restarts)
+                    .find_map(|restart| source_dependency(&restart.function))
+            })
+    }
+    delivery_bodies()
+        .into_iter()
+        .map(|(symbol, body)| {
+            let reason = source_dependency(&body).or_else(|| {
+                let mut pool = BbuConstPool::default();
+                let mut functions = Vec::new();
+                serialize_bbu_function_tree(
+                    &body,
+                    BBU_NO_INDEX,
+                    BBU_FUNC_NESTED,
+                    &mut pool,
+                    &mut functions,
+                )
+                .is_none()
+                .then_some("bytecode cannot be saved")
+            });
+            (symbol, reason)
+        })
+        .collect()
+}
+
+/// Delivery owns a disposable restored world. Release registry ownership of
+/// unreachable private code and captures before the compacting image save.
+pub(super) fn remove_delivery_closure(symbol: u32) {
+    debug_assert!(torcl_rt::symbols::is_uninterned(symbol));
+    closure_bodies().borrow_mut().remove(&symbol);
+    clear_lazy_state(symbol);
+    clear_closure_env(symbol);
 }
 
 pub(super) fn delivery_root_scanner() -> torcl_rt::gc::RootScanner {
@@ -806,6 +889,13 @@ pub fn call_registered(
     }
     let callee = registry_get(sym)?;
     if !arity_accepts(&callee, args.len()) {
+        if cfg!(torcl_no_tree_walker) {
+            return Some(Err(TorclError::ProgramError(format!(
+                "{} called with {} argument(s), outside its lambda list's range",
+                sym_label(sym),
+                args.len()
+            ))));
+        }
         return None; // arg count outside the lambda list's range: tree-walker binds it
     }
     let fn_obj = torcl_rt::symbols::symbol_function(sym)
@@ -967,6 +1057,7 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
 /// native `mov reg, <addr>` / `call <addr>` to one is otherwise an opaque
 /// pointer. The map is built once from the same function items the emitter
 /// embeds, so it can never drift from reality.
+#[cfg(not(torcl_no_disassembly))]
 fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
     use std::sync::OnceLock;
     static MAP: OnceLock<Vec<(u64, &'static str)>> = OnceLock::new();
@@ -1049,6 +1140,7 @@ fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
 }
 
 /// The first immediate operand of a decoded instruction, if any.
+#[cfg(not(torcl_no_disassembly))]
 fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
     use iced_x86::OpKind::*;
     (0..insn.op_count()).find_map(|i| match insn.op_kind(i) {
@@ -1062,6 +1154,7 @@ fn native_immediate(insn: &iced_x86::Instruction) -> Option<u64> {
 /// one. TorCL tags values in the low 3 bits: fixnum = `n<<3` (tag 000), NIL =
 /// `0x7`. Only unambiguous cases are named (large immediates are code/heap
 /// addresses, not values, so they are left alone).
+#[cfg(not(torcl_no_disassembly))]
 fn decode_tagged_immediate(imm: u64) -> Option<String> {
     use torcl_rt::value::{NIL_BITS, TAG_FIXNUM, TAG_MASK};
     if imm == NIL_BITS {
@@ -1080,6 +1173,7 @@ fn decode_tagged_immediate(imm: u64) -> Option<String> {
 
 /// True if `insn` is a fixnum tag guard: `test r/m8, 7` (masking the low 3 tag
 /// bits before a conditional deopt jump).
+#[cfg(not(torcl_no_disassembly))]
 fn is_tag_guard(insn: &iced_x86::Instruction) -> bool {
     insn.mnemonic() == iced_x86::Mnemonic::Test
         && native_immediate(insn) == Some(torcl_rt::value::TAG_MASK)
@@ -1090,6 +1184,7 @@ fn is_tag_guard(insn: &iced_x86::Instruction) -> bool {
 /// function's code; `osr` maps native offsets that are OSR loop entries;
 /// `deopt_start` is the offset where the cold deopt-stub section begins. Only
 /// unambiguous patterns are annotated (no false positives).
+#[cfg(not(torcl_no_disassembly))]
 fn native_insn_annotation(
     insn: &iced_x86::Instruction,
     prev: Option<&iced_x86::Instruction>,
@@ -1151,6 +1246,7 @@ fn native_insn_annotation(
 /// A lossless fallback for targets without an in-process instruction decoder.
 /// Keep halfword offsets so System Z bytecode/OSR positions remain selectable
 /// in the tier viewer without pretending these are decoded instructions.
+#[cfg(not(torcl_no_disassembly))]
 fn format_native_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out =
@@ -1172,6 +1268,7 @@ fn format_native_bytes(bytes: &[u8]) -> String {
 /// compilation strategy and OSR entries. Offsets are relative to the code
 /// entry. Reads the R+X mapping, so the owner must remain alive (tier snapshots
 /// are captured at compile time — see [`capture_tier_disasm`]).
+#[cfg(not(torcl_no_disassembly))]
 fn format_native_listing(nc: &NativeCode) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1391,6 +1488,7 @@ pub fn tier_disasm(sym: u32) -> Option<TierDisasm> {
 /// registry holds only compiled functions, so this is a short scan, and
 /// DISASSEMBLE is a debug path. Allocation-free: no TorCL object is created, so
 /// there is nothing for a GC to relocate mid-scan.
+#[cfg(not(torcl_no_disassembly))]
 pub fn disassemble_by_function(f: TorclVal) -> Option<String> {
     install_bytecode_root_scanner();
     // Collect the keys before probing so the registry borrow is not held across
@@ -1401,6 +1499,7 @@ pub fn disassemble_by_function(f: TorclVal) -> Option<String> {
         .and_then(disassemble_by_symbol)
 }
 
+#[cfg(not(torcl_no_disassembly))]
 pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
     let bf = registry_get(sym)?;
     let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
@@ -7697,6 +7796,11 @@ fn compile_function_in(
     enclosing_slots: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     // A failed allocating attempt can relocate both inputs before a retry.
+    // Source-free delivery restores bytecode; native tiering compiles that
+    // bytecode independently and does not need the source lowerer.
+    if cfg!(torcl_no_tree_walker) {
+        return None;
+    }
     torcl_rt::rooted!(params_form = params_form);
     torcl_rt::rooted!(body = body);
     let mut forced: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -8088,6 +8192,9 @@ fn lower_body(lo: &mut Lowerer, body: TorclVal) -> LowerResult<()> {
 
 /// Compile a top-level form as a zero-argument thunk. Returns `None` on bail.
 fn compile_thunk(form: TorclVal, env: &Env, portable: bool) -> Option<BytecodeFunction> {
+    if cfg!(torcl_no_tree_walker) {
+        return None;
+    }
     torcl_rt::rooted!(form = form);
     let mut lo = Lowerer::new(env);
     torcl_rt::rooted_ref!(_const_guard = &mut lo);
@@ -9367,6 +9474,21 @@ pub fn build_bbu_from_forms(
         // (2) A DEFUN whose name and body serialise faithfully → install the
         // precompiled function directly at load (skips read/macroexpand/compile).
         if let Some((name, params, body)) = as_defun(form) {
+            let name_form = cp(cp(form).1).0;
+            if name_form.is_cons() {
+                // Keep the original accessor in the portable symbol pool too.
+                // Only emitting the mangled writer name loses its package
+                // ownership when no executable constant mentions the accessor.
+                // Materializing this symbol lets delivery associate the private
+                // writer cell with its owner without reversing lossy mangling.
+                let accessor = cp(cp(name_form).1).0;
+                let Some(index) = accessor.symbol_index() else {
+                    return Ok(None);
+                };
+                if pool.symbol_by_index(index).is_none() {
+                    return Ok(None);
+                }
+            }
             if let Some(sym) = symbol_index_of(&name) {
                 if let Some(name_ref) = pool.symbol_by_index(sym) {
                     if let Some(bf) = compile_function(&name, params, body, env, true, false) {
@@ -15518,6 +15640,7 @@ extern "C" fn c2i_call_builtin_regs(
 /// lives in this crate, which depends on torcl-compiler, so the compiler cannot
 /// reach it directly (bliss-x5y.27).
 pub(super) fn install_direct_builtin_hooks() {
+    #[cfg(not(torcl_no_t2))]
     torcl_compiler::t2::emit::install_direct_builtin_hooks(
         torcl_compiler::t2::emit::DirectBuiltinHooks {
             addr: c2i_call_builtin_regs as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64
@@ -17137,6 +17260,9 @@ fn positive_env(names: &[&str], default: u32) -> u32 {
 /// T0→T1 promotion threshold (invocations).  The stage-5 spec name is
 /// preferred; `TORCL_T1_THRESHOLD` remains as a compatibility alias.
 fn t1_threshold() -> u32 {
+    if cfg!(torcl_no_t1) {
+        return u32::MAX;
+    }
     match forced_tier() {
         Some(ForcedTier::T0) => return u32::MAX, // never promote
         Some(ForcedTier::T1 | ForcedTier::T2) => return 1, // promote on first call
@@ -17150,6 +17276,9 @@ fn t1_threshold() -> u32 {
 /// `TORCL_T2=1`, cached. Read on the per-call tiering decision path, where an
 /// uncached `getenv` is a linear scan of `environ` under musl (bliss-jtc.9).
 fn torcl_t2_forced() -> bool {
+    if cfg!(torcl_no_t2) {
+        return false;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_flag("TORCL_T2") == Some(true))
@@ -17182,6 +17311,9 @@ fn nn_direct_enabled() -> bool {
 /// T2 is part of normal tiering.  `TORCL_DISABLE_T2=1` is the explicit debug
 /// off-switch; `TORCL_T2=0` is accepted for compatibility with the old gate.
 fn t2_enabled() -> bool {
+    if cfg!(torcl_no_t2) {
+        return false;
+    }
     if profiling_disabled() {
         return false;
     }
@@ -17608,6 +17740,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     // TORCL_T2_DISASM=<substring>: print the installed code of matching
     // functions to stderr at install time — the only way to inspect code that
     // crashes on its first execution (bliss-x5y.29 forensics).
+    #[cfg(not(torcl_no_disassembly))]
     if let Ok(pat) = std::env::var("TORCL_T2_DISASM") {
         if !pat.is_empty() && bf.name.contains(&pat) {
             eprintln!(
@@ -19614,6 +19747,18 @@ mod ppc64le;
 /// Emit T1 native code for the host. Each architecture's baseline emitter
 /// decides for itself what it can lower; a host with no emitter never promotes
 /// and every function stays in the counting interpreter.
+#[cfg(torcl_no_t1)]
+fn emit_native_t1(
+    _bf: &BytecodeFunction,
+    _allow_speculation: bool,
+    _sym: u32,
+    _backedge_counter: u64,
+    _allow_traps: bool,
+) -> Option<NativeEmission> {
+    None
+}
+
+#[cfg(not(torcl_no_t1))]
 fn emit_native_t1(
     bf: &BytecodeFunction,
     allow_speculation: bool,
@@ -19659,6 +19804,9 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
 /// non-speculating form is the stable native fallback while a replacement T2
 /// version is compiled for a newly observed numeric phase.
 fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Option<Rc<NativeCode>> {
+    if cfg!(torcl_no_t1) {
+        return None;
+    }
     // Blacklisted (bliss-jtc.27): a function whose speculation repeatedly failed
     // is not recompiled — it stays in T0 to avoid churning through deopts.
     if DEOPT_BLACKLIST.with(|s| s.borrow().contains(&sym)) {
@@ -19774,6 +19922,12 @@ macro_rules! t2_log {
     ($($a:tt)*) => { t2_log_write(format_args!($($a)*)) };
 }
 
+#[cfg(torcl_no_t2)]
+fn compile_t2_artifact(_input: &T2CompileInput) -> Option<T2Artifact> {
+    None
+}
+
+#[cfg(not(torcl_no_t2))]
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // Only targets with an optimizing native emitter may publish T2 code. This is
     // a safety property, not an optimisation: without it the pipeline runs to
@@ -20196,6 +20350,9 @@ fn compile_osr_from_func(func: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
 /// Emit OSR-entry native code for one bytecode function (shared by the sym-keyed
 /// and anonymous paths). `sym` is used only for perf-map / jitdump labelling.
 fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> {
+    if cfg!(torcl_no_t1) {
+        return None;
+    }
     // Same safety gate as the T1-invoke path (see try_promote_to_t1): if a
     // closure created here captures one of this function's blocks/tags, the
     // native no-ops for PushBlock/PushTag/NamedTag would never publish the
@@ -21777,4 +21934,9 @@ mod jtc4_stack_map_tests {
         assert!(parse_bbu_constant(&mut BbuCursor::new(&double), 0x0109).is_err());
         assert!(parse_bbu_constant(&mut BbuCursor::new(&double), 0x010a).is_ok());
     }
+}
+
+#[cfg(torcl_no_disassembly)]
+fn format_native_listing(_: &NativeCode) -> String {
+    "; Native disassembly was omitted at delivery.\n".into()
 }

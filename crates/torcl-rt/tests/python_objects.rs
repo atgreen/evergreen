@@ -87,7 +87,10 @@ fn the_object_model() {
     let seven = scope
         .from_python(
             scope
-                .call(&identity, vec![scope.to_python(TorclVal::from_fixnum(7)).unwrap()])
+                .call(
+                    &identity,
+                    vec![scope.to_python(TorclVal::from_fixnum(7)).unwrap()],
+                )
                 .expect("int(7)"),
         )
         .expect("a Lisp value");
@@ -110,20 +113,26 @@ fn the_object_model() {
     // Lisp's one false value, and this is the only way it resolves.
     let repr = scope.resolve("builtins.repr").expect("repr");
     let of_nil = scope
-        .from_python(scope.call(&repr, vec![scope.to_python(NIL).unwrap()]).unwrap())
+        .from_python(
+            scope
+                .call(&repr, vec![scope.to_python(NIL).unwrap()])
+                .unwrap(),
+        )
         .unwrap();
     assert_eq!(of_nil.as_string(), "None", "NIL crosses as None");
     let of_t = scope
-        .from_python(scope.call(&repr, vec![scope.to_python(T).unwrap()]).unwrap())
+        .from_python(
+            scope
+                .call(&repr, vec![scope.to_python(T).unwrap()])
+                .unwrap(),
+        )
         .unwrap();
     assert_eq!(of_t.as_string(), "True", "T crosses as True");
 
-    scope.run("true_value = True; false_value = False; none_value = None").unwrap();
-    for (name, expected) in [
-        ("true_value", T),
-        ("false_value", NIL),
-        ("none_value", NIL),
-    ] {
+    scope
+        .run("true_value = True; false_value = False; none_value = None")
+        .unwrap();
+    for (name, expected) in [("true_value", T), ("false_value", NIL), ("none_value", NIL)] {
         let value = scope
             .from_python(scope.lookup(name).expect(name))
             .expect("a Lisp value");
@@ -160,14 +169,24 @@ fn the_object_model() {
         TorclVal::from_fixnum(3)
     );
     scope
-        .setattr(&point, "x", &scope.to_python(TorclVal::from_fixnum(10)).unwrap())
+        .setattr(
+            &point,
+            "x",
+            &scope.to_python(TorclVal::from_fixnum(10)).unwrap(),
+        )
         .expect("setting an attribute");
-    scope.run("assert p.x == 10, 'the attribute was set'").unwrap();
+    scope
+        .run("assert p.x == 10, 'the attribute was set'")
+        .unwrap();
     assert_eq!(
         scope
             .from_python(
                 scope
-                    .call_method(&point, "scale", vec![scope.to_python(TorclVal::from_fixnum(4)).unwrap()])
+                    .call_method(
+                        &point,
+                        "scale",
+                        vec![scope.to_python(TorclVal::from_fixnum(4)).unwrap()]
+                    )
                     .unwrap()
             )
             .unwrap(),
@@ -189,7 +208,11 @@ fn the_object_model() {
     let raiser = scope.resolve("builtins.int").expect("int");
     let bad = scope.call(
         &raiser,
-        vec![scope.to_python(torcl_rt::gc::alloc_character_string("not a number")).unwrap()],
+        vec![
+            scope
+                .to_python(torcl_rt::gc::alloc_character_string("not a number"))
+                .unwrap(),
+        ],
     );
     let message = format!("{}", bad.expect_err("int('not a number') raises"));
     assert!(
@@ -225,7 +248,9 @@ fn the_object_model() {
     // Sweep the proxies earlier parts of this test left unreachable (the 2**200
     // integer among them), so the count below is about THIS proxy and not about
     // whatever else was outstanding.
-    HeapCollector::new().full_gc().expect("sweeping earlier garbage");
+    HeapCollector::new()
+        .full_gc()
+        .expect("sweeping earlier garbage");
     python::drain_releases(&scope).expect("draining earlier garbage");
     let before = python::pending_releases();
     assert_eq!(before, 0, "the queue starts empty");
@@ -235,7 +260,9 @@ fn the_object_model() {
     scope
         .run("assert not released, 'the proxy holds the last reference'")
         .unwrap();
-    HeapCollector::new().full_gc().expect("full_gc while rooted");
+    HeapCollector::new()
+        .full_gc()
+        .expect("full_gc while rooted");
     assert_eq!(
         python::pending_releases(),
         before,
@@ -271,10 +298,16 @@ fn the_object_model() {
     let round = scope.proxy(scope.lookup("marker").unwrap()).unwrap();
     let same = scope.resolve("builtins.id").unwrap();
     let identity_out = scope
-        .from_python(scope.call(&same, vec![scope.to_python(round).unwrap()]).unwrap())
+        .from_python(
+            scope
+                .call(&same, vec![scope.to_python(round).unwrap()])
+                .unwrap(),
+        )
         .unwrap();
     scope.run("expected = id(marker)").unwrap();
-    let expected = scope.from_python(scope.lookup("expected").unwrap()).unwrap();
+    let expected = scope
+        .from_python(scope.lookup("expected").unwrap())
+        .unwrap();
     assert_eq!(
         identity_out, expected,
         "a proxy crosses back as the same object"

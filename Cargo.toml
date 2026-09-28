@@ -5,6 +5,7 @@ members = [
     "crates/torcl-compiler",
     "crates/torcl-stdlib",
     "crates/torcl",
+    "crates/torcl-delivery-macros",
     # The Android NativeActivity shim. Declared rlib so the default musl target
     # can build it; the .so is produced with `cargo rustc --crate-type cdylib`
     # for an Android target (bliss-w2vp).

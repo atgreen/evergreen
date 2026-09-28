@@ -430,6 +430,10 @@ static CLOS_STATE: LazyLock<OrderedMutex<ClosState>> = LazyLock::new(|| {
 });
 
 fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    visit_clos_roots(visit, true);
+}
+
+fn visit_clos_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: bool) {
     {
         let mut state = CLOS_STATE.lock().unwrap();
         // Discard derived values before relocation rather than retaining and
@@ -458,33 +462,35 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
             // Wrapper class ids and slot-layout names are the same immediate
             // meta-handles/symbols represented above, so they need no rewrite.
         }
-        for data in state.generic_functions.values_mut() {
-            visit(&mut data.name);
-            visit(&mut data.lambda_list);
-            for method in &mut data.methods {
-                visit(method);
-            }
-        }
-        for meta in state.method_meta.values_mut() {
-            for specializer in &mut meta.specializers {
-                visit(specializer);
-            }
-        }
-        for method in state.effective_methods.values_mut() {
-            for group in [
-                &mut method.around,
-                &mut method.before,
-                &mut method.primary,
-                &mut method.after,
-            ] {
-                for value in group {
-                    visit(value);
+        if root_definitions {
+            for data in state.generic_functions.values_mut() {
+                visit(&mut data.name);
+                visit(&mut data.lambda_list);
+                for method in &mut data.methods {
+                    visit(method);
                 }
             }
-        }
-        for method in state.short_form_methods.values_mut() {
-            for value in &mut method.methods {
-                visit(value);
+            for meta in state.method_meta.values_mut() {
+                for specializer in &mut meta.specializers {
+                    visit(specializer);
+                }
+            }
+            for method in state.effective_methods.values_mut() {
+                for group in [
+                    &mut method.around,
+                    &mut method.before,
+                    &mut method.primary,
+                    &mut method.after,
+                ] {
+                    for value in group {
+                        visit(value);
+                    }
+                }
+            }
+            for method in state.short_form_methods.values_mut() {
+                for value in &mut method.methods {
+                    visit(value);
+                }
             }
         }
         // Instance slot cells are NOT yielded here (bliss-334): instances are
@@ -506,6 +512,77 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
         visit(&mut state.function_class);
         visit(&mut state.heap_object_class);
     }
+}
+
+/// Registry ownership edges for stopped-world delivery analysis. Keys are
+/// stable meta-handles; payload values must not escape the heap snapshot.
+pub struct DeliveryDefinitions {
+    pub generics: Vec<(TorclVal, TorclVal)>,
+    pub edges: HashMap<TorclVal, Vec<TorclVal>>,
+}
+
+pub fn delivery_root_scanner() -> torcl_rt::gc::RootScanner {
+    scan_clos_state_roots
+}
+
+/// Keep class state rooted while generic and method ownership is traced by
+/// the delivery graph. Call only under a nonallocating heap snapshot.
+pub fn visit_delivery_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    visit_clos_roots(visit, false);
+}
+
+pub fn delivery_definitions() -> DeliveryDefinitions {
+    let state = CLOS_STATE.lock().unwrap();
+    let mut edges: HashMap<TorclVal, Vec<TorclVal>> = HashMap::new();
+    let mut generics = Vec::new();
+    for (&handle, data) in &state.generic_functions {
+        generics.push((handle, data.name));
+        let refs = edges.entry(handle).or_default();
+        refs.extend([data.name, data.lambda_list]);
+        refs.extend(&data.methods);
+        for &method in &data.methods {
+            edges.entry(method).or_default().push(handle);
+        }
+    }
+    for (&handle, method) in &state.method_meta {
+        edges
+            .entry(handle)
+            .or_default()
+            .extend(&method.specializers);
+    }
+    for (&handle, method) in &state.effective_methods {
+        let refs = edges.entry(handle).or_default();
+        for group in [
+            &method.around,
+            &method.before,
+            &method.primary,
+            &method.after,
+        ] {
+            refs.extend(group);
+        }
+    }
+    for (&handle, method) in &state.short_form_methods {
+        edges.entry(handle).or_default().extend(&method.methods);
+    }
+    DeliveryDefinitions { generics, edges }
+}
+
+/// Remove unreachable metadata before serializing the disposable delivery
+/// world. Surviving handles and their allocation counters retain their IDs.
+pub fn retain_delivery_definitions(live: &HashSet<u64>) {
+    let mut state = CLOS_STATE.lock().unwrap();
+    state
+        .generic_functions
+        .retain(|handle, _| live.contains(&handle.to_raw()));
+    state
+        .method_meta
+        .retain(|handle, _| live.contains(&handle.to_raw()));
+    state
+        .effective_methods
+        .retain(|handle, _| live.contains(&handle.to_raw()));
+    state
+        .short_form_methods
+        .retain(|handle, _| live.contains(&handle.to_raw()));
 }
 
 fn install_clos_state_root_scanner() {

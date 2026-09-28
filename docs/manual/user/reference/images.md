@@ -39,3 +39,8 @@ different architectures or arbitrary TorCL builds.
 
 The Android project generator currently packages Lisp source assets, not saved
 core images. See [Images and applications](../explanation/images.md).
+
+Format 5 records native runtime requirements in the Settings section. The CLI
+validates source content identity, target triple, toolchain, Cargo features,
+compiler flags, and available native capabilities before heap restoration.
+See [native runtime specialization](../how-to/save-executable.md#specialize-the-native-runtime).

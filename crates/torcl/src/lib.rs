@@ -4,6 +4,7 @@
 //! interactive REPL driver.
 
 pub mod cli;
+mod runtime_contract;
 
 pub use cli::{CliArgs, ReplConfig, help_text, print_help, print_version, run, run_repl};
 

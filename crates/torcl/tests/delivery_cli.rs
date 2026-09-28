@@ -45,6 +45,1144 @@ fn ok(output: Output) -> String {
 const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
 #[test]
+fn delivery_prunes_unused_bootstrap_definitions() {
+    check_bootstrap_delivery(false, false);
+}
+
+#[test]
+fn delivery_prunes_package_less_bootstrap_definitions_with_whole_world_scope() {
+    check_bootstrap_delivery(false, true);
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_prunes_bootstrap_without_dynamic_code() {
+    check_bootstrap_delivery(true, false);
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_prunes_package_less_bootstrap_definitions() {
+    check_bootstrap_delivery(true, true);
+}
+
+fn check_bootstrap_delivery(specialized: bool, whole_world: bool) {
+    let f = Fixture::new();
+    let source = f.path("bootstrap-app.lisp");
+    let fasl = f.path("bootstrap-app.bfasl");
+    let core = f.path("bootstrap-app.core");
+    let spec = f.path("bootstrap-app.delivery");
+    let exe = f.path("bootstrap-app");
+    fs::write(
+        &source,
+        "(defpackage :bootstrap-app (:use :cl))\n\
+         (defun bootstrap-app::main () (write-line \"BOOTSTRAP-SHAKE-OK\"))\n",
+    )
+    .unwrap();
+    // Use ordinary bootstrap in both processes: a bare runtime would miss the
+    // library definitions whose unconditional retention this test exercises.
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+        ],
+    ));
+    fs::remove_file(&source).unwrap();
+    fs::remove_file(&fasl).unwrap();
+    fs::write(
+        &spec,
+        "version = 1\nentry = BOOTSTRAP-APP::MAIN\ndynamic = explicit\n\
+         prune-package = BOOTSTRAP-APP\nprune-package = COMMON-LISP\n\
+         prune-package = COMMON-LISP-USER\nprune-package = TORCL-INTERNAL\n",
+    )
+    .unwrap();
+    if whole_world {
+        let text = fs::read_to_string(&spec).unwrap();
+        fs::write(&spec, format!("{text}prune-package = *\n")).unwrap();
+    }
+    if specialized {
+        let text = fs::read_to_string(&spec).unwrap();
+        fs::write(&spec, format!("{text}runtime = specialized\n")).unwrap();
+    }
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(report.contains("remove COMMON-LISP::GCD:"), "{report}");
+    assert!(report.contains("remove COMMON-LISP::LCM:"), "{report}");
+    if whole_world {
+        assert!(report.contains("remove %GCD2:"), "{report}");
+        assert!(report.contains("remove %DEFSTRINGCMP:"), "{report}");
+    }
+    if specialized {
+        assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+        let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+        assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+        assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+    }
+    for tier in ["t0", "t1", "t2"] {
+        let output = ok(Command::new(&exe)
+            .arg("--no-init")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .unwrap());
+        assert_eq!(output, "BOOTSTRAP-SHAKE-OK\n", "{tier}");
+    }
+    if whole_world {
+        let original = fs::read_to_string(&spec).unwrap();
+        for name in ["%GCD2", "%DEFSTRINGCMP"] {
+            fs::write(&spec, format!("{original}keep = {name}\n")).unwrap();
+            let report = ok(run(
+                BIN,
+                &[
+                    "--image",
+                    &core,
+                    "--deliver",
+                    &spec,
+                    "--output",
+                    &exe,
+                    "--dry-run",
+                ],
+            ));
+            assert!(report.contains(&format!("keep {name}:")), "{report}");
+        }
+    }
+}
+
+#[test]
+fn delivery_preserves_implicit_bootstrap_protocol_calls() {
+    let f = Fixture::new();
+    let core = f.path("protocol.core");
+    let spec = f.path("protocol.delivery");
+    let exe = f.path("protocol");
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!(
+                r#"
+                (defpackage :protocol-app (:use :cl))
+                (in-package :protocol-app)
+                (defclass box () ((value :initform 0)))
+                (defmethod initialize-instance :after ((object box) &key)
+                  (setf (slot-value object 'value) 17))
+                (defmethod print-object ((object box) stream)
+                  (write-string "PRINT-OK" stream))
+                (defclass input (torcl-gray-streams:fundamental-character-input-stream) ())
+                (defmethod torcl-gray-streams:stream-read-char ((stream input)) #\Q)
+                (defun main ()
+                  (let ((object (make-instance 'box)))
+                    (format t "~A ~D~%" object (slot-value object 'value)))
+                  (write-char (read-char (make-instance 'input)))
+                  (terpri)
+                  (let ((x (list 0)) (y (list 0)))
+                    (setf (values (car x) (car y)) (values 3 4))
+                    (format t "~D ~D~%" (car x) (car y))))
+                (save-lisp-and-die {core:?} :toplevel 'main)
+                "#
+            ),
+        ],
+    ));
+    assert_eq!(ok(run(BIN, &["--image", &core])), "PRINT-OK 17\nQ\n3 4\n");
+    fs::write(
+        &spec,
+        "version = 1\nentry = PROTOCOL-APP::MAIN\ndynamic = explicit\n\
+         prune-package = PROTOCOL-APP\nprune-package = COMMON-LISP\n\
+         prune-package = COMMON-LISP-USER\nprune-package = TORCL-INTERNAL\n\
+         prune-package = TORCL-GRAY-STREAMS\nprune-package = TORCL\nprune-package = *\n",
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert_eq!(ok(run(&exe, &[])), "PRINT-OK 17\nQ\n3 4\n");
+}
+
+#[test]
+fn delivery_prunes_compile_time_dependencies_of_compiled_methods() {
+    let f = Fixture::new();
+    let core = f.path("compiled-method.core");
+    let spec = f.path("compiled-method.delivery");
+    let exe = f.path("compiled-method");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (defpackage :method-shake (:use :cl))
+        (in-package :method-shake)
+        (defmacro compile-only (x) (list '+ x 1))
+        (defmethod answer ((x t)) (compile-only x))
+        (defun main () (write-line (if (= 42 (answer 41)) "METHOD-OK" "WRONG")))
+        (save-lisp-and-die {core:?})
+    "#
+            ),
+        ],
+    ));
+    fs::write(&spec, "version = 1\nentry = METHOD-SHAKE::MAIN\nprune-package = METHOD-SHAKE\ndynamic = explicit\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(
+        report.contains("remove METHOD-SHAKE::COMPILE-ONLY:"),
+        "{report}"
+    );
+    for tier in ["t0", "t1", "t2"] {
+        let output = ok(Command::new(&exe)
+            .arg("--no-init")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .unwrap());
+        assert_eq!(output, "METHOD-OK\n", "{tier}");
+    }
+}
+
+#[test]
+fn saved_entry_preserves_class_instances_under_gc_stress() {
+    let f = Fixture::new();
+    let core = f.path("entry.core");
+    let program = format!(
+        r#"
+      (defpackage :generic-shake (:use :cl))
+      (in-package :generic-shake)
+      (defun dead-target () :dead)
+      (defgeneric unused (x))
+      (defmethod unused ((x t)) (dead-target))
+      (defun live-target () 42)
+      (defgeneric live (x))
+      (defmethod live ((x t)) (live-target))
+      (defun method-target () 43)
+      (defgeneric method-rooted (x))
+      (defmethod method-rooted ((x t)) (method-target))
+      (set '*method* (find-method 'method-rooted nil (list (find-class 't))))
+      (defclass box () ((value :initarg :value :accessor value
+                              :reader read-value :writer write-value)))
+      (defun main ()
+        (let ((box (make-instance 'box :value 7)))
+          (funcall (intern "WRITE-VALUE" :generic-shake) 9 box)
+          (write-line
+            (if (and (= 42 (live nil))
+                     (= 43 (funcall (intern "METHOD-ROOTED" :generic-shake) nil))
+                     (eq *method* (find-method (intern "METHOD-ROOTED" :generic-shake)
+                                               nil (list (find-class 't))))
+                     (= 9 (funcall (intern "VALUE" :generic-shake) box))
+                     (= 9 (funcall (intern "READ-VALUE" :generic-shake) box))
+                     t)
+                "GENERIC-SHAKE-OK" "WRONG"))))
+      (save-lisp-and-die {core:?} :toplevel (quote generic-shake::main))
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    let output = Command::new(BIN)
+        .args(["--no-init", "--image", &core])
+        .env("TORCL_GC_STRESS", "1")
+        .env("TORCL_GC_POISON", "1")
+        .output()
+        .unwrap();
+    assert!(ok(output).contains("GENERIC-SHAKE-OK"));
+}
+
+#[test]
+fn delivery_distinguishes_source_functions_from_bytecode_only_functions() {
+    let f = Fixture::new();
+    let source = f.path("walker.lisp");
+    let fasl = f.path("walker.bfasl");
+    let spec = f.path("walker.delivery");
+    fs::write(&source, "(defpackage :walker-app (:use :cl)) (in-package :walker-app) (defun main () (write-line \"WALKER-FREE\"))").unwrap();
+    fs::write(&spec, "version = 1\nentry = WALKER-APP::MAIN\nprune-package = WALKER-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    for (kind, input, setup, expected) in [
+        ("source", &source, "", "capabilities=tree-walker\n"),
+        ("bytecode", &fasl, "", "capabilities=\n"),
+        (
+            "saved-builtin",
+            &fasl,
+            "(set 'walker-app::*saved* 'vector)",
+            "capabilities=tree-walker\n",
+        ),
+    ] {
+        let core = f.path(&format!("{kind}.core"));
+        ok(run(
+            BIN,
+            &[
+                "--no-bootstrap",
+                "--eval",
+                &format!("(load {input:?}) {setup} (save-lisp-and-die {core:?})"),
+            ],
+        ));
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--deliver",
+                &spec,
+                "--output",
+                &f.path(kind),
+                "--dry-run",
+            ],
+        ));
+        assert!(report.contains(expected), "{kind}: {report}");
+    }
+}
+
+#[test]
+fn delivery_retains_hidden_source_binders_and_methods() {
+    let f = Fixture::new();
+    let source = f.path("hidden.lisp");
+    let fasl = f.path("hidden.bfasl");
+    let spec = f.path("hidden.delivery");
+    fs::write(&source, "(defpackage :hidden-walker (:use :cl)) (in-package :hidden-walker) (defun optional-main (&optional (x 7)) x) (defun method-main () (method-result))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    for (entry, setup, dependency) in [
+        ("OPTIONAL-MAIN", "", "variadic lambda-list binder"),
+        (
+            "METHOD-MAIN",
+            "(let ((x 7)) (defmethod hidden-walker::method-result () x))",
+            "source generic method",
+        ),
+    ] {
+        let core = f.path(&format!("{entry}.core"));
+        ok(run(
+            BIN,
+            &[
+                "--no-bootstrap",
+                "--eval",
+                &format!("(load {fasl:?}) {setup} (save-lisp-and-die {core:?})"),
+            ],
+        ));
+        fs::write(&spec, format!("version = 1\nentry = HIDDEN-WALKER::{entry}\nprune-package = HIDDEN-WALKER\nruntime = specialized\ndynamic = explicit\n")).unwrap();
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--deliver",
+                &spec,
+                "--output",
+                &f.path(entry),
+                "--dry-run",
+            ],
+        ));
+        assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+        assert!(report.contains(dependency), "{report}");
+    }
+}
+
+#[test]
+fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
+    let f = Fixture::new();
+    let source = f.path("closures.lisp");
+    let fasl = f.path("closures.bfasl");
+    let core = f.path("closures.core");
+    let spec = f.path("closures.delivery");
+    let exe = f.path("closures-app");
+    fs::write(
+        &source,
+        r#"
+      (defpackage :closure-shake (:use :cl))
+      (in-package :closure-shake)
+      (defun live-target () 42)
+      (defun dead-target () :dead)
+      (defun dead-captured-target () :dead-captured)
+      (defun make-live (f)
+        ;; Both closures share the captured frame. Only the second escapes.
+        (lambda () (funcall f) (dead-target))
+        (lambda () (funcall f)))
+      (defun make-dead (f) (lambda () (funcall f) (dead-target) (disassemble 'dead-target)))
+      (defun main ()
+        (write-line (if (and (= 42 (funcall *saved*))
+                             (not (fboundp (intern "DEAD-TARGET" :closure-shake)))
+                             (not (fboundp (intern "DEAD-CAPTURED-TARGET" :closure-shake))))
+                        "CLOSURE-SHAKE-OK" "WRONG")))
+    "#,
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    fs::remove_file(&source).unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (set 'closure-shake::*saved* (closure-shake::make-live #'closure-shake::live-target)) (closure-shake::make-dead #'closure-shake::dead-captured-target) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    fs::remove_file(&fasl).unwrap();
+    fs::write(&spec, "version = 1\nentry = CLOSURE-SHAKE::MAIN\nprune-package = CLOSURE-SHAKE\ndynamic = explicit\nruntime = specialized\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("remove CLOSURE-SHAKE::DEAD-TARGET"),
+        "{report}"
+    );
+    assert!(
+        report.contains("remove CLOSURE-SHAKE::DEAD-CAPTURED-TARGET"),
+        "{report}"
+    );
+    assert!(
+        report.contains("keep CLOSURE-SHAKE::LIVE-TARGET"),
+        "{report}"
+    );
+    assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+    let removed: usize = report
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("private-code-removed = ")
+                .map(|n| n.parse().unwrap())
+        })
+        .unwrap();
+    assert!(removed >= 2, "{report}");
+    // Exercise publication/restore without making an ordinary regression test
+    // rebuild a separate native release runtime.
+    fs::write(&spec, "version = 1\nentry = CLOSURE-SHAKE::MAIN\nprune-package = CLOSURE-SHAKE\ndynamic = explicit\n").unwrap();
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(ok(run(&exe, &[])).contains("CLOSURE-SHAKE-OK"));
+    // The code must actually disappear from the serialized registry, not just
+    // be ignored by analysis. A second delivery has no orphan code to remove.
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let reduced = f.path("reduced.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(again.contains("private-code-removed = 0\n"), "{again}");
+}
+
+#[test]
+fn delivery_keeps_saved_macro_expanders_and_removes_unused_definitions() {
+    let f = Fixture::new();
+    let core = f.path("macro-handles.core");
+    let spec = f.path("macro-handles.delivery");
+    let exe = f.path("macro-handles");
+    let program = format!(
+        r#"
+        (defpackage :macro-handles (:use :cl))
+        (in-package :macro-handles)
+        (defun dead-helper () 99)
+        (defmacro unused () (dead-helper))
+        (defun live-helper (x) (list 'quote x))
+        (defmacro live (x) (live-helper x))
+        (set '*expander* (macro-function 'live))
+        (set '*alias* *expander*)
+        (defmacro kept () 43)
+        (defun main ()
+          (write-line
+            (if (and (equal '(quote 42) (funcall *expander* '(live 42) nil))
+                     (eq *expander* *alias*)
+                     (= 43 (macroexpand-1 (list (intern "KEPT" :macro-handles))))
+                     (null (macro-function (intern "UNUSED" :macro-handles))))
+                "MACRO-HANDLES-OK" "WRONG")))
+        (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    fs::write(&spec, "version = 1\nentry = MACRO-HANDLES::MAIN\nprune-package = MACRO-HANDLES\ndynamic = explicit\nkeep = MACRO-HANDLES::KEPT\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    for name in ["UNUSED", "DEAD-HELPER"] {
+        assert!(
+            report.contains(&format!("remove MACRO-HANDLES::{name}:")),
+            "{report}"
+        );
+    }
+    for name in ["LIVE", "LIVE-HELPER", "KEPT"] {
+        assert!(
+            report.contains(&format!("keep MACRO-HANDLES::{name}:")),
+            "{report}"
+        );
+    }
+    assert!(ok(run(&exe, &[])).contains("MACRO-HANDLES-OK"));
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let reduced = f.path("reduced.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(!again.contains("MACRO-HANDLES::UNUSED:"), "{again}");
+    assert!(!again.contains("MACRO-HANDLES::DEAD-HELPER:"), "{again}");
+}
+
+#[test]
+fn delivery_prunes_setf_writers_and_preserves_saved_writer_functions() {
+    for compiled in [false, true] {
+        let f = Fixture::new();
+        let source = f.path("writers.lisp");
+        let fasl = f.path("writers.bfasl");
+        let core = f.path("writers.core");
+        let spec = f.path("writers.delivery");
+        let exe = f.path("writers");
+        fs::write(
+            &source,
+            r#"
+          (defpackage :writer-live (:use :cl))
+          (in-package :writer-live)
+          (defun dead-helper () 99)
+          (defun (setf unused) (value cell) (dead-helper))
+          (defun (setf live) (value cell) (setf (car cell) value))
+          (defun (setf saved) (value cell) (setf (car cell) value))
+          (set '*writer* #'(setf saved))
+          (set '*alias* *writer*)
+          (defun main ()
+            (let ((cell (list 0)))
+              (setf (live cell) 7)
+              (write-line
+                (if (and (= 7 (car cell))
+                         (= 9 (funcall *writer* 9 cell))
+                         (= 9 (car cell))
+                         (eq *writer* *alias*)
+                         (not (fboundp (list 'setf (intern "UNUSED" :writer-live)))))
+                    "WRITER-LIVE-OK" "WRONG"))))
+        "#,
+        )
+        .unwrap();
+        if compiled {
+            ok(run(
+                BIN,
+                &[
+                    "--no-bootstrap",
+                    "--eval",
+                    &format!("(compile-file {source:?} :output-file {fasl:?})"),
+                ],
+            ));
+        }
+        let input = if compiled { &fasl } else { &source };
+        let mut save = Command::new(BIN);
+        save.args([
+            "--no-init",
+            "--no-bootstrap",
+            "--eval",
+            &format!("(load {input:?}) (save-lisp-and-die {core:?})"),
+        ]);
+        if !compiled {
+            save.env("TORCL_BACKEND", "tree-walker")
+                .env("TORCL_LAZY_COMPILE", "0");
+        }
+        ok(save.output().unwrap());
+        fs::write(&spec, "version = 1\nentry = WRITER-LIVE::MAIN\nprune-package = WRITER-LIVE\ndynamic = explicit\n").unwrap();
+        let report = ok(run(
+            BIN,
+            &["--image", &core, "--deliver", &spec, "--output", &exe],
+        ));
+        assert!(
+            report.contains("remove (SETF WRITER-LIVE::UNUSED):"),
+            "{report}"
+        );
+        assert!(
+            report.contains("remove WRITER-LIVE::DEAD-HELPER:"),
+            "{report}"
+        );
+        for name in ["LIVE", "SAVED"] {
+            assert!(
+                report.contains(&format!("keep (SETF WRITER-LIVE::{name}):")),
+                "{report}"
+            );
+        }
+        assert!(ok(run(&exe, &[])).contains("WRITER-LIVE-OK"));
+        let bytes = fs::read(&exe).unwrap();
+        let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+        let reduced = f.path("reduced.core");
+        fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+        let again = ok(run(
+            BIN,
+            &[
+                "--image",
+                &reduced,
+                "--deliver",
+                &spec,
+                "--output",
+                &exe,
+                "--dry-run",
+            ],
+        ));
+        assert!(!again.contains("(SETF WRITER-LIVE::UNUSED):"), "{again}");
+        assert!(!again.contains("WRITER-LIVE::DEAD-HELPER:"), "{again}");
+    }
+}
+
+#[test]
+fn delivery_preserves_legacy_writer_with_an_ambiguous_package_owner() {
+    let f = Fixture::new();
+    let core = f.path("legacy-writer.core");
+    let spec = f.path("legacy-writer.delivery");
+    let exe = f.path("legacy-writer");
+    // Model an older BFASL: only the private function cell is present, not
+    // OUT.::X. The unrelated selected accessor OUT::|.X| has the same mangling.
+    let program = format!(
+        r#"
+      (defpackage :out. (:use :cl))
+      (defpackage :out (:use :cl) (:intern ".X"))
+      (defun torcl-internal::%setf-writer-out...x (value target) (eval value))
+      (defun out::main () (write-line "OK"))
+      (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    fs::write(&spec, "version = 1\nentry = OUT::MAIN\nprune-package = OUT\ndynamic = explicit\nruntime = specialized\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(!report.contains("remove (SETF OUT::.X):"), "{report}");
+}
+
+#[test]
+fn native_delivery_ignores_eval_in_an_unreachable_setf_writer() {
+    let f = Fixture::new();
+    let source = f.path("writer-main.lisp");
+    let fasl = f.path("writer-main.bfasl");
+    let core = f.path("writers.core");
+    let spec = f.path("writers.delivery");
+    let exe = f.path("writers");
+    fs::write(&source, "(defpackage :writer-shake (:use :cl)) (in-package :writer-shake) (defun main () (write-line \"WRITER-SHAKE-OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (defun (setf writer-shake::unused) (value target) (eval value)) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    let specification = "version = 1\nentry = WRITER-SHAKE::MAIN\nprune-package = WRITER-SHAKE\ndynamic = explicit\nruntime = specialized\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(
+        report.contains("remove (SETF WRITER-SHAKE::UNUSED):"),
+        "{report}"
+    );
+    fs::write(
+        &spec,
+        format!("{specification}keep = WRITER-SHAKE::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(
+        report.contains("keep (SETF WRITER-SHAKE::UNUSED):"),
+        "{report}"
+    );
+}
+
+#[test]
+fn native_delivery_ignores_eval_in_an_unreachable_macro() {
+    let f = Fixture::new();
+    let source = f.path("main.lisp");
+    let fasl = f.path("main.bfasl");
+    let core = f.path("macros.core");
+    let spec = f.path("macros.delivery");
+    let exe = f.path("macros");
+    fs::write(&source, "(defpackage :macro-shake (:use :cl)) (in-package :macro-shake) (defun main () (write-line \"MACRO-SHAKE-OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (defmacro macro-shake::unused (form) (eval form)) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    let specification = "version = 1\nentry = MACRO-SHAKE::MAIN\nprune-package = MACRO-SHAKE\ndynamic = explicit\nruntime = specialized\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("remove MACRO-SHAKE::UNUSED:"), "{report}");
+    fs::write(
+        &spec,
+        format!("{specification}keep = MACRO-SHAKE::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(report.contains("keep MACRO-SHAKE::UNUSED:"), "{report}");
+}
+
+#[test]
+fn native_delivery_prunes_unused_bytecode_macro() {
+    let f = Fixture::new();
+    let source = f.path("compiled-macros.lisp");
+    let fasl = f.path("compiled-macros.bfasl");
+    let core = f.path("compiled-macros.core");
+    let spec = f.path("compiled-macros.delivery");
+    let exe = f.path("compiled-macros");
+    fs::write(&source, "(defpackage :compiled-macros (:use :cl)) (in-package :compiled-macros) (defmacro unused (form) (eval form)) (defun main () (write-line \"OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+        ],
+    ));
+    fs::write(&spec, "version = 1\nentry = COMPILED-MACROS::MAIN\nprune-package = COMPILED-MACROS\ndynamic = explicit\nruntime = specialized\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    let builtins = report
+        .lines()
+        .find_map(|line| line.strip_prefix("builtins="))
+        .expect("native builtin selection");
+    assert_ne!(builtins, "*");
+    let names: Vec<_> = builtins.split(',').collect();
+    assert!(
+        names.contains(&"57524954452d4c494e45"),
+        "WRITE-LINE missing: {report}"
+    );
+    assert!(
+        !names.contains(&"53494e"),
+        "unreachable SIN retained: {report}"
+    );
+    assert!(
+        report.contains("remove COMPILED-MACROS::UNUSED:"),
+        "{report}"
+    );
+}
+
+#[test]
+fn native_delivery_ignores_eval_in_an_unreachable_method() {
+    let f = Fixture::new();
+    let source = f.path("main.lisp");
+    let fasl = f.path("main.bfasl");
+    let core = f.path("methods.core");
+    let spec = f.path("methods.delivery");
+    let exe = f.path("methods");
+    fs::write(&source, "(defpackage :generic-eval (:use :cl)) (in-package :generic-eval) (defun main () (write-line \"OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (load {fasl:?})
+        (in-package :generic-eval)
+        (defgeneric unused (form))
+        (defmethod unused ((form t)) (eval form))
+        (defgeneric start ())
+        (defmethod start () (write-line "GENERIC-ENTRY-OK"))
+        (save-lisp-and-die {core:?})
+    "#
+            ),
+        ],
+    ));
+    let specification = "version = 1\nentry = GENERIC-EVAL::MAIN\nprune-package = GENERIC-EVAL\ndynamic = explicit\nruntime = specialized\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("remove GENERIC-EVAL::UNUSED:"), "{report}");
+    fs::write(
+        &spec,
+        format!("{specification}keep = GENERIC-EVAL::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(report.contains("keep GENERIC-EVAL::UNUSED:"), "{report}");
+    fs::write(&spec, "version = 1\nentry = GENERIC-EVAL::START\nprune-package = GENERIC-EVAL\ndynamic = explicit\n").unwrap();
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(ok(run(&exe, &[])).contains("GENERIC-ENTRY-OK"));
+}
+
+#[test]
+fn delivery_prunes_generic_owners_but_keeps_methods_and_class_accessors() {
+    let f = Fixture::new();
+    let core = f.path("generics.core");
+    let spec = f.path("generics.delivery");
+    let exe = f.path("generics");
+    let program = format!(
+        r#"
+      (defpackage :generic-shake (:use :cl))
+      (in-package :generic-shake)
+      (defun dead-target () :dead)
+      (defgeneric unused (x))
+      (defmethod unused ((x t)) (dead-target))
+      (defun live-target () 42)
+      (defgeneric live (x))
+      (defmethod live ((x t)) (live-target))
+      (defun method-target () 43)
+      (defgeneric method-rooted (x))
+      (defmethod method-rooted ((x t)) (method-target))
+      (set '*method* (find-method 'method-rooted nil (list (find-class 't))))
+      (defclass box () ((value :initarg :value :accessor value
+                              :reader read-value :writer write-value)))
+      (defun main ()
+        (let ((box (make-instance 'box :value 7)))
+          (funcall (intern "WRITE-VALUE" :generic-shake) 9 box)
+          (write-line
+            (if (and (= 42 (live nil))
+                     (= 43 (funcall (intern "METHOD-ROOTED" :generic-shake) nil))
+                     (eq *method* (find-method (intern "METHOD-ROOTED" :generic-shake)
+                                               nil (list (find-class 't))))
+                     (= 9 (funcall (intern "VALUE" :generic-shake) box))
+                     (= 9 (funcall (intern "READ-VALUE" :generic-shake) box))
+                     (not (fboundp (intern "UNUSED" :generic-shake))))
+                "GENERIC-SHAKE-OK" "WRONG"))))
+      (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    let specification = "version = 1\nentry = GENERIC-SHAKE::MAIN\nprune-package = GENERIC-SHAKE\ndynamic = explicit\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    for name in ["UNUSED", "DEAD-TARGET"] {
+        assert!(
+            report.contains(&format!("remove GENERIC-SHAKE::{name}:")),
+            "{report}"
+        );
+    }
+    for name in [
+        "LIVE",
+        "LIVE-TARGET",
+        "METHOD-ROOTED",
+        "METHOD-TARGET",
+        "VALUE",
+        "READ-VALUE",
+        "WRITE-VALUE",
+    ] {
+        assert!(
+            report.contains(&format!("keep GENERIC-SHAKE::{name}:")),
+            "{report}"
+        );
+    }
+    assert!(ok(run(&exe, &[])).contains("GENERIC-SHAKE-OK"));
+    // Re-delivery reads the serialized registries, so a removed generic or
+    // method cannot survive unnoticed in a host-side metadata table.
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let reduced = f.path("reduced-generics.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let second_exe = f.path("generics-again");
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &second_exe,
+        ],
+    ));
+    assert!(!again.contains("GENERIC-SHAKE::UNUSED:"), "{again}");
+    assert!(!again.contains("GENERIC-SHAKE::DEAD-TARGET:"), "{again}");
+    assert!(ok(run(&second_exe, &[])).contains("GENERIC-SHAKE-OK"));
+    fs::write(
+        &spec,
+        format!("{specification}keep = GENERIC-SHAKE::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("keep GENERIC-SHAKE::UNUSED:"), "{report}");
+    assert!(
+        report.contains("keep GENERIC-SHAKE::DEAD-TARGET:"),
+        "{report}"
+    );
+}
+
+#[test]
+fn delivery_traces_source_closures_only_from_reachable_handles() {
+    let f = Fixture::new();
+    let core = f.path("source-closures.core");
+    let spec = f.path("source-closures.delivery");
+    let exe = f.path("source-closures");
+    let program = format!(
+        r#"
+        (defpackage :source-closure-shake (:use :cl))
+        (in-package :source-closure-shake)
+        (defun live-target () 42)
+        (defun dead-target () :dead)
+        (eval (list 'defun 'unused nil
+                    (list 'quote
+                          (let ((target 'dead-target)
+                                (payload (make-string 200000 :initial-element #\x)))
+                            (lambda () (list payload (funcall target)))))))
+        (let ((target 'live-target) (count 0))
+          (set '*saved* (lambda () (setq count (1+ count)) (funcall target)))
+          (set '*sibling* (lambda () count)))
+        (set '*alias* *saved*)
+        (defun main ()
+          (write-line (if (and (= 42 (funcall *saved*))
+                               (= 1 (funcall *sibling*))
+                               (eq *saved* *alias*))
+                          "SOURCE-CLOSURE-OK" "WRONG")))
+        (save-lisp-and-die {core:?})
+        "#
+    );
+    ok(Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--eval", &program])
+        .env("TORCL_BACKEND", "tree-walker")
+        .env("TORCL_LAZY_COMPILE", "0")
+        .output()
+        .unwrap());
+    fs::write(&spec, "version = 1\nentry = SOURCE-CLOSURE-SHAKE::MAIN\nprune-package = SOURCE-CLOSURE-SHAKE\ndynamic = explicit\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    assert!(
+        report.contains("remove SOURCE-CLOSURE-SHAKE::UNUSED"),
+        "{report}"
+    );
+    assert!(
+        report.contains("remove SOURCE-CLOSURE-SHAKE::DEAD-TARGET"),
+        "{report}"
+    );
+    assert!(
+        report.contains("keep SOURCE-CLOSURE-SHAKE::LIVE-TARGET"),
+        "{report}"
+    );
+    assert!(ok(run(&exe, &[])).contains("SOURCE-CLOSURE-OK"));
+    let removed: usize = report
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("source-closures-removed = ")
+                .map(|n| n.parse().unwrap())
+        })
+        .unwrap();
+    assert!(removed > 0, "{report}");
+    let bytes = fs::read(&exe).unwrap();
+    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    assert!(
+        fs::metadata(&core).unwrap().len() > size as u64 + 100000,
+        "unreachable captured payload must leave the compacted image"
+    );
+    let reduced = f.path("reduced.core");
+    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    let again = ok(run(
+        BIN,
+        &[
+            "--image",
+            &reduced,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(again.contains("source-closures-removed = 0\n"), "{again}");
+}
+
+#[test]
 fn delivery_prunes_unreachable_functions_and_keeps_data_and_explicit_roots() {
     let f = Fixture::new();
     let image = f.path("input.core");
@@ -232,23 +1370,26 @@ fn delivery_defaults_to_preserving_dynamic_targets_and_rejects_bad_specs() {
             ),
         ],
     ));
-    fs::write(
-        &spec,
-        "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = DELIVERY-POLICY\n",
-    )
-    .unwrap();
-    let report = ok(run(
-        BIN,
-        &["--image", &image, "--deliver", &spec, "--output", &exe],
-    ));
-    assert!(report.contains("dynamic = preserve"));
-    assert!(!report.contains("remove DELIVERY-POLICY::TARGET"));
-    assert!(ok(run(&exe, &[])).contains("DYNAMIC-OK"));
+    for package in ["DELIVERY-POLICY", "*"] {
+        fs::write(
+            &spec,
+            format!("version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = {package}\n"),
+        )
+        .unwrap();
+        let report = ok(run(
+            BIN,
+            &["--image", &image, "--deliver", &spec, "--output", &exe],
+        ));
+        assert!(report.contains("dynamic = preserve"));
+        assert!(!report.contains("remove DELIVERY-POLICY::TARGET"));
+        assert!(ok(run(&exe, &[])).contains("DYNAMIC-OK"));
+    }
     let previous = fs::read(&exe).unwrap();
     for bad in [
         "version = 2\nentry = DELIVERY-POLICY::MAIN\n",
         "version = 1\nentry = DELIVERY-POLICY::MISSING\n",
-        "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = COMMON-LISP\n",
+        "version = 1\nentry = DELIVERY-POLICY::MAIN\nprune-package = KEYWORD\n",
+        "version = 1\nentry = DELIVERY-POLICY::MAIN\nkeep = GCD\n",
         "version = 1\nentry = DELIVERY-POLICY::MAIN\ndynamci = explicit\n",
     ] {
         fs::write(&spec, bad).unwrap();
@@ -375,4 +1516,439 @@ fn delivery_reduces_the_embedded_core_when_unused_code_has_large_constants() {
         "delivered core {core_size} must be smaller than input {input_size}"
     );
     assert!(ok(run(&exe, &[])).contains("SMALL-OK"));
+}
+
+#[test]
+fn saved_images_validate_native_requirements_before_restore() {
+    let f = Fixture::new();
+    let core = f.path("contract.core");
+    ok(run(
+        BIN,
+        &["--eval", &format!("(save-lisp-and-die {core:?})")],
+    ));
+    let mut bytes = fs::read(&core).unwrap();
+    let marker = b"schema=3\nsource=";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("saved core contains native runtime requirements")
+        + marker.len();
+    bytes[offset] = if bytes[offset] == b'0' { b'1' } else { b'0' };
+    fs::write(&core, bytes).unwrap();
+    let result = run(BIN, &["--image", &core]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("runtime source mismatch"));
+}
+
+#[test]
+fn native_delivery_capabilities_follow_reachable_symbols_and_dynamic_policy() {
+    let f = Fixture::new();
+    let core = f.path("caps.core");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (defpackage :native-delivery (:use :cl))
+        (in-package :native-delivery)
+        (defun main () (format t "NATIVE-OK~%"))
+        (defun inspect-main () (disassemble 'main))
+        (defun eval-main (form) (eval form))
+        (defun load-main () (load "later.lisp"))
+        (save-lisp-and-die {core:?})"#
+            ),
+        ],
+    ));
+    let spec = f.path("caps.delivery");
+    for (entry, policy, keep, expected) in [
+        ("MAIN", "explicit", "", "capabilities=tree-walker\n"),
+        (
+            "EVAL-MAIN",
+            "explicit",
+            "",
+            "capabilities=disassembly,dynamic-code,tree-walker\n",
+        ),
+        (
+            "LOAD-MAIN",
+            "explicit",
+            "",
+            "capabilities=disassembly,dynamic-code,tree-walker\n",
+        ),
+        (
+            "INSPECT-MAIN",
+            "explicit",
+            "",
+            "capabilities=disassembly,tree-walker\n",
+        ),
+        (
+            "MAIN",
+            "preserve",
+            "",
+            "capabilities=disassembly,dynamic-code,tree-walker\n",
+        ),
+        (
+            "MAIN",
+            "explicit",
+            "runtime-keep = disassembly\n",
+            "capabilities=disassembly,tree-walker\n",
+        ),
+    ] {
+        fs::write(&spec, format!("version = 1\nentry = NATIVE-DELIVERY::{entry}\nprune-package = NATIVE-DELIVERY\nruntime = specialized\ndynamic = {policy}\n{keep}")).unwrap();
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--deliver",
+                &spec,
+                "--output",
+                &f.path("out"),
+                "--dry-run",
+            ],
+        ));
+        assert!(report.contains(expected), "{report}");
+        if entry == "EVAL-MAIN" || entry == "LOAD-MAIN" {
+            assert!(
+                report.contains("keep NATIVE-DELIVERY::INSPECT-MAIN"),
+                "{report}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_removes_the_walker_for_source_free_code() {
+    check_native_delivery_tier("t2");
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_omits_t2() {
+    check_native_delivery_tier("t1");
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_omits_both_native_tiers() {
+    check_native_delivery_tier("t0");
+}
+
+fn check_native_delivery_tier(max_tier: &str) {
+    let f = Fixture::new();
+    let source = f.path("walker-free.lisp");
+    let fasl = f.path("walker-free.bfasl");
+    let core = f.path("walker-free.core");
+    let spec = f.path("walker-free.delivery");
+    let exe = f.path("walker-free");
+    fs::write(
+        &source,
+        r#"
+        (defpackage :walker-free (:use :cl))
+        (in-package :walker-free)
+        (defun add-one (x) (+ x 1))
+        (defun (setf unused-writer) (value target) (eval value))
+        (defun main ()
+          (dotimes (i 1000) (add-one i))
+          (write-line (if (= 2.5 (add-one 1.5)) "WALKER-FREE-OK" "WRONG"))
+          (handler-case (funcall 'add-one)
+            (program-error () (write-line "ARITY-OK")))
+          (handler-case (funcall 'missing)
+            (undefined-function () (write-line "UNDEFINED-OK"))))
+    "#,
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    fs::remove_file(&source).unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (defgeneric walker-free::unused (x)) (defmethod walker-free::unused ((x t)) (eval x)) (defmacro walker-free::unused-macro (x) (eval x)) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    fs::remove_file(&fasl).unwrap();
+    fs::write(&spec, format!("version = 1\nentry = WALKER-FREE::MAIN\nprune-package = WALKER-FREE\nruntime = specialized\ndynamic = explicit\nmax-tier = {max_tier}\n")).unwrap();
+    let report = ok(Command::new(BIN)
+        .args([
+            "--no-init",
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+        ])
+        .output()
+        .unwrap());
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(report.contains("remove WALKER-FREE::UNUSED:"), "{report}");
+    assert!(
+        report.contains("remove WALKER-FREE::UNUSED-MACRO:"),
+        "{report}"
+    );
+    assert!(
+        report.contains("remove (SETF WALKER-FREE::UNUSED-WRITER):"),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("max-tier={max_tier}\n")),
+        "{report}"
+    );
+    let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+    assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+    for omitted in [
+        "torcl_stdlib::ffi::memory_call",
+        "torcl_stdlib::pathnames::directory",
+        "torcl_stdlib::sequences::reverse",
+    ] {
+        assert!(
+            !symbols.contains(omitted),
+            "unreachable builtin remains linked: {omitted}"
+        );
+    }
+    if max_tier != "t2" {
+        assert!(!symbols.contains("torcl::cli::bytecode::compile_t2_artifact"));
+        assert!(
+            !symbols.contains("torcl_compiler::t2::"),
+            "T2 compiler remains linked"
+        );
+    }
+    if max_tier == "t0" {
+        assert!(
+            !symbols.contains("torcl::cli::bytecode::emit_native"),
+            "T1 emitter remains linked"
+        );
+    }
+    println!("{report}");
+
+    assert!(
+        !symbols.contains("torcl::cli::eval_list"),
+        "tree walker remains linked"
+    );
+    assert!(
+        !symbols.contains("torcl::cli::bytecode::Lowerer::"),
+        "source-to-bytecode compiler remains linked"
+    );
+    assert!(
+        !symbols.contains("iced_x86::"),
+        "disassembler remains linked"
+    );
+    for tier in ["", "t0", "t1", "t2"] {
+        let output = ok(Command::new(&exe)
+            .arg("--no-init")
+            .env("TORCL_FORCE_TIER", tier)
+            .env("TORCL_T2", "1")
+            .env("TORCL_T1_THRESHOLD", "1")
+            .env("TORCL_OSR_THRESHOLD", "1")
+            .output()
+            .unwrap());
+        assert_eq!(output, "WALKER-FREE-OK\nARITY-OK\nUNDEFINED-OK\n", "{tier}");
+    }
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_builds_and_runs_without_decoder() {
+    let f = Fixture::new();
+    let core = f.path("native.core");
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+        (defpackage :native-app (:use :cl))
+        (in-package :native-app)
+        (defun add-one (x) (+ x 1))
+        (defun main ()
+          (dotimes (i 1000) (add-one i))
+          (write-line (if (= (add-one 1.5) 2.5) "NATIVE-OK" "WRONG")))
+        (save-lisp-and-die {core:?})"#
+            ),
+        ],
+    ));
+    let spec = f.path("native.delivery");
+    let exe = f.path("app");
+    fs::write(&spec, "version = 1\nentry = NATIVE-APP::MAIN\nprune-package = NATIVE-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    let output = Command::new(BIN)
+        .args([
+            "--no-init",
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+        ])
+        .output()
+        .unwrap();
+    let report = ok(output);
+    assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+    assert!(report.contains("native-bytes = "));
+    assert!(ok(run(&exe, &[])).contains("NATIVE-OK"));
+    for (key, value) in [("TORCL_BACKEND", "treewalker"), ("TORCL_FORCE_TIER", "t2")] {
+        let output = Command::new(&exe)
+            .arg("--no-init")
+            .env(key, value)
+            .output()
+            .unwrap();
+        assert!(ok(output).contains("NATIVE-OK"));
+    }
+    let symbols = Command::new("nm").arg("-C").arg(&exe).output().unwrap();
+    let symbols = ok(symbols);
+    assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+    assert!(
+        symbols.contains("torcl::"),
+        "symbol table must be present to prove removal"
+    );
+    let eval = run(&exe, &["--eval", "(disassemble 'native-app::main)"]);
+    assert!(!eval.status.success());
+    assert!(String::from_utf8_lossy(&eval.stderr).contains("dynamic code entry points are absent"));
+    let rejected = run(&exe, &["--image", &core]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("unavailable native runtime capabilities")
+    );
+    let original = fs::read(&exe).unwrap();
+    let manifest = fs::read(format!("{exe}.manifest")).unwrap();
+    let failed = run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--runtime-source",
+            &f.path("missing-source"),
+        ],
+    );
+    assert!(!failed.status.success());
+    assert_eq!(fs::read(&exe).unwrap(), original);
+    assert_eq!(fs::read(format!("{exe}.manifest")).unwrap(), manifest);
+}
+
+#[test]
+fn explicit_image_overrides_a_saved_executables_embedded_core() {
+    let f = Fixture::new();
+    let exe = f.path("embedded");
+    let core = f.path("explicit.core");
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!(
+                r#"(defun embedded-main () (format t "EMBEDDED~%")) (save-lisp-and-die {exe:?} :executable t :toplevel 'embedded-main)"#
+            ),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!(
+                r#"(defun explicit-main () (format t "EXPLICIT~%")) (save-lisp-and-die {core:?} :toplevel 'explicit-main)"#
+            ),
+        ],
+    ));
+    let output = ok(run(&exe, &["--image", &core]));
+    assert!(output.contains("EXPLICIT"), "{output}");
+    assert!(!output.contains("EMBEDDED"), "{output}");
+}
+
+#[test]
+fn native_delivery_retains_evaluation_for_saved_raw_lambda_data() {
+    check_raw_lambda_delivery(false, false);
+    check_raw_lambda_delivery(true, false);
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_executes_saved_raw_lambdas_without_dynamic_code() {
+    check_raw_lambda_delivery(false, true);
+}
+
+fn check_raw_lambda_delivery(dynamic: bool, build_runtime: bool) {
+    let f = Fixture::new();
+    let core = f.path("raw.core");
+    let spec = f.path("raw.delivery");
+    let exe = f.path("app");
+    let lambda = if dynamic {
+        "(lambda () (eval '(helper)))"
+    } else {
+        "(lambda () (funcall '(lambda () (helper))))"
+    };
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                r#"
+      (defpackage :raw-app (:use :cl))
+      (in-package :raw-app)
+      (set '*fn* '{lambda})
+      (defun helper () 42)
+      (defun unused () (disassemble 'unused))
+      (defun main () (write-line (if (= 42 (funcall *fn*)) "RAW-LAMBDA-OK" "WRONG")))
+      (save-lisp-and-die {core:?})"#
+            ),
+        ],
+    ));
+    fs::write(&spec, "version = 1\nentry = RAW-APP::MAIN\nprune-package = RAW-APP\nruntime = specialized\ndynamic = explicit\n").unwrap();
+    let mut command = Command::new(BIN);
+    command.args([
+        "--no-init",
+        "--image",
+        &core,
+        "--deliver",
+        &spec,
+        "--output",
+        &exe,
+    ]);
+    if !build_runtime {
+        command.arg("--dry-run");
+    }
+    let report = ok(command.output().unwrap());
+    let capabilities = if dynamic {
+        "capabilities=disassembly,dynamic-code,tree-walker\n"
+    } else {
+        "capabilities=tree-walker\n"
+    };
+    assert!(report.contains(capabilities), "{report}");
+    assert!(report.contains("keep RAW-APP::HELPER:"), "{report}");
+    let unused = if dynamic { "keep" } else { "remove" };
+    assert!(
+        report.contains(&format!("{unused} RAW-APP::UNUSED:")),
+        "{report}"
+    );
+    if build_runtime {
+        let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+        assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+        assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+        for tier in ["t0", "t1", "t2"] {
+            let output = ok(Command::new(&exe)
+                .arg("--no-init")
+                .env("TORCL_FORCE_TIER", tier)
+                .output()
+                .unwrap());
+            assert_eq!(output, "RAW-LAMBDA-OK\n", "{tier}");
+        }
+    }
 }

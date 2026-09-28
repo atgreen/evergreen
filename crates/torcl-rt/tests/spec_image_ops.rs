@@ -365,8 +365,8 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-        4,
-        "condition-variable handles require image format version 4"
+        5,
+        "native runtime requirements require image format version 5"
     );
     bytes[0] ^= 0xFF;
     let bad_magic = temp_path("header-bad-magic.bimg");
