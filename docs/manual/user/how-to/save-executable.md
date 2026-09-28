@@ -108,6 +108,7 @@ singleton keys, missing functions, and unknown packages are errors.
 | `dynamic = explicit` | Opt in to pruning; declare every additional dynamic entry with `keep` |
 | `runtime = full` | Default: reuse the full delivery driver, without invoking Cargo |
 | `runtime = specialized` | Build a matching release runtime with only the required optional native capabilities |
+| `max-tier = t2` | Default: include both native compilers; `t1` omits T2 and `t0` omits both, requiring `runtime = specialized` |
 | `runtime-keep = disassembly` | Additional native capability root; supported names are `disassembly`, `dynamic-code`, and `tree-walker` |
 
 Use `dynamic = explicit` only when the root list describes your application.
@@ -173,6 +174,14 @@ before saving; `private-code-removed` reports removed compiled entries and
 `source-closures-removed` reports removed source closure entries.
 Escaped closures and shared captured environments remain live when reachable.
 
+Pruning removes function bindings and their owned registry records, then saves
+the remaining reachable objects into a new image. The serializer omits dead
+objects even from pinned regions, rather than leaving holes for their bytes.
+Saved object identities let the loader rebuild pointers with an old-to-new
+address map. Symbol identities and other retained data can therefore survive
+after a function's implementation is removed. The original input file is never
+modified.
+
 With the default `runtime = full`, delivery reduces the saved image and keeps
 the full Rust runtime. Re-saving an executable replaces its embedded image
 instead of stacking another copy of the previous core into the runtime prefix.
@@ -222,6 +231,23 @@ The omitted compiler entry points are removed at build time so native linking
 can remove their implementation. T0-only applications continue executing saved
 bytecode. Native promotion and OSR cannot exceed the selected tier;
 `TORCL_FORCE_TIER` requests above it are clamped to the available tier.
+
+For example, a specification that selects the whole saved world and omits both
+native compilers is:
+
+```text
+version = 1
+entry = MY-APP::MAIN
+prune-package = *
+dynamic = explicit
+runtime = specialized
+max-tier = t0
+```
+
+Add `keep` entries for dynamically selected callbacks. Tier selection is
+independent of source evaluation: reachable `EVAL` still retains its evaluator
+and builtin dependencies even with `max-tier = t0`.
+
 Deoptimization resumes T0 bytecode; it does not require public `EVAL`.
 `EvalHost` follows the references in its saved constant form rather than rooting
 all capabilities. Many library builtins share an evaluated-argument dispatcher
@@ -230,7 +256,7 @@ temporary Lisp call forms. The separate `tree-walker` capability is omitted
 when retained functions have restorable bytecode and their reachable operations
 do not require source evaluation. Native linking then removes the tree-walking
 operator dispatcher and source-to-bytecode compiler while retaining T0 bytecode
-and bytecode-to-native tiering.
+and any selected native compilation tiers.
 
 Specialized delivery attempts to compile reachable named source functions that
 have no captured lexical environment. It discards their source only after
@@ -239,10 +265,10 @@ recomputes reachability. This also runs during `--dry-run`: compilation may
 invoke macro expanders, but delivery does not call the application entry point.
 The input image is unchanged.
 
-Unsupported source functions and closures, source handler forms, variadic argument binders,
-uncompiled generic methods, and builtin paths that still require the evaluator
-retain `tree-walker`. The report identifies these dependencies. The initial
-audited builtin set covers arithmetic, basic list operations, multiple values,
+Unsupported source functions and closures, source handler forms, variadic
+argument binders, uncompiled generic methods, and builtin paths that still
+require the evaluator retain `tree-walker`. The report identifies these
+dependencies. The initial audited builtin set covers arithmetic, basic list operations, multiple values,
 function application, and `WRITE-LINE`; other builtin paths conservatively
 retain the walker. BFASL input already provides compiled function bodies;
 supported cold source definitions can now be compiled during delivery too.
@@ -270,22 +296,44 @@ Delivery generates a versioned native contract, builds through Cargo in
 and appends the reduced image. Compile-time selection removes references to the
 instruction decoder; release LTO and linker garbage collection can then remove
 its implementation. The cache separates source versions, targets, capabilities,
-builtin selections, Cargo features, compiler flags, and toolchain identities. Existing output files
-survive a failed build or compatibility check. A dry run only reports selection
-and does not invoke Cargo.
+builtin selections, maximum tiers, Cargo features, compiler flags, and toolchain
+identities. Existing output files survive a failed build or compatibility check.
+A dry run reports selection without invoking Cargo or writing an executable;
+source preparation and macro expansion can still run as described above.
 
 `--runtime-info` prints a runtime's contract. Saved image format 5 includes the
 same compatibility information and is checked before heap restoration. Source
 content identity, target, Rust toolchain, Cargo features, and compiler flags
 must match; the runtime's native capabilities must include the image's required
-capabilities, builtin set, and compiler tiers. Contract schema 3 records builtin names as UTF-8
-hex strings; `builtins=*` denotes the complete set. The source fingerprint is a
-compatibility identifier, not a
-cryptographic signature. Full runtimes can still read older images; specialized
-runtimes require the new metadata. A reduced driver cannot be used for
+capabilities, builtin set, and compiler tiers. Contract schema 3 records builtin
+names as UTF-8 hex strings; `builtins=*` denotes the complete set. The source
+fingerprint is a compatibility identifier, not a cryptographic signature.
+Full runtimes can still read older images; specialized runtimes require the new
+metadata. A reduced driver cannot be used for
 `runtime = full` delivery.
 
 The delivery report separates `native-bytes` and `image-bytes`. Compare native
 sizes from the same release profile and stripping settings; a debug driver is
 not a useful size baseline for a specialized release build. Strip an executable
 **before** appending an image: stripping the delivered file may discard its core.
+
+### Measured size example
+
+At commit `c25f245f`, the source-free native delivery regression on x86-64 Linux
+musl produced the following sizes. All three builds used Rust 1.94.1, the same
+release profile (Thin LTO), the same application, and no additional stripping.
+The application exercises arithmetic, loops, output, and condition handlers;
+only `+`, `<`, `=`, `FUNCALL`, and `WRITE-LINE` remained in its builtin selection.
+
+| Highest included tier | Native runtime bytes | Image bytes | Complete executable bytes |
+| --- | ---: | ---: | ---: |
+| T2 (default) | 6,302,160 | 246,167 | 6,548,343 |
+| T1 | 5,128,024 | 246,167 | 5,374,207 |
+| T0 | 4,947,864 | 246,167 | 5,194,047 |
+
+The executable totals include the 16-byte image trailer. These are a small
+fixture's measurements, not a promised size for other applications. The tests
+check omitted compiler and builtin symbols and execute with automatic tiering,
+forced-tier requests, and low promotion/OSR thresholds. Ordinary bootstrap
+images can retain more code through the conservative dependencies described
+above; all global data and symbol/package identities remain roots.
