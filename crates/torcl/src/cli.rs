@@ -15961,7 +15961,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 ));
             }
             "CATCH" => {
-                let (tag_form, body) = cp(cdr);
+                // The BODY is a source form held across evaluating the TAG, which
+                // allocates: a relocating minor GC there leaves `body` stale and
+                // `eval_progn` walks a moved list (bliss-ep38p). PROGV below roots
+                // its source forms for the same reason.
+                let (tag_form, mut body) = cp(cdr);
+                torcl_rt::rooted_ref!(_body_root = &mut body);
                 let tag = val_as_str(eval_form(tag_form, env)?);
                 let token = next_control_token("__THROW__");
                 env.catch_stack.push((tag, token.clone()));
@@ -26758,7 +26763,13 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             if parts.len() == 2 {
                 let _pkg_name = parts[0];
                 let fn_name = parts[1].trim_start_matches(':');
-                if let Some((params_form, body)) = callable_body(env, fn_name) {
+                if let Some((mut params_form, mut body)) = callable_body(env, fn_name) {
+                    // Both are source forms held across argument evaluation, which
+                    // allocates; without rooting, a minor GC there leaves the lambda
+                    // list and body pointing at moved conses (bliss-ep38p). The
+                    // LAMBDA fallback further down already does this (bliss-98mu).
+                    torcl_rt::rooted_ref!(_params_form_root = &mut params_form);
+                    torcl_rt::rooted_ref!(_body_root = &mut body);
                     let args = eval_args(cdr, env)?;
                     return eval_lambda_call(env, params_form, body, &args, Arc::clone(&env.frame));
                 }
@@ -37996,14 +38007,25 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
     // A `(:no-error (lambda-list) body)` clause (CLHS 9.1) is not a handler: when
     // the protected form returns normally, its body runs with the lambda-list
     // bound to the returned values, OUTSIDE this HANDLER-CASE's handlers.
-    let mut no_error: Option<(TorclVal, TorclVal, Arc<SharedCell<EnvFrame>>)> = None;
+    // A :no-error clause's lambda list and body are source forms that must survive
+    // the PROTECTED FORM's evaluation — arbitrary user code, so arbitrarily many
+    // allocations. Held in a plain tuple they went stale under a relocating GC
+    // (bliss-ep38p); the `installed` handler list a few lines below was already
+    // rooted for exactly this reason. Kept as two rooted values plus the frame,
+    // because the root macros take a place and not a tuple field; the frame's
+    // presence is what says a :no-error clause was seen.
+    torcl_rt::rooted!(no_error_params = NIL);
+    torcl_rt::rooted!(no_error_body = NIL);
+    let mut no_error_frame: Option<Arc<SharedCell<EnvFrame>>> = None;
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);
         let (type_form, clause_rest) = cp(clause);
         let (bind_list, handler_body) = cp(clause_rest);
         if sym_bare_name_rc(type_form).as_ref() == "NO-ERROR" {
-            no_error = Some((bind_list, handler_body, Arc::clone(&env.frame)));
+            *no_error_params = bind_list;
+            *no_error_body = handler_body;
+            no_error_frame = Some(Arc::clone(&env.frame));
             c = rest;
             continue;
         }
@@ -38041,7 +38063,8 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
         Ok(val) => {
             // Normal return: run a :no-error clause (if any) with its lambda list
             // bound to the values the protected form produced (HANDLER-CASE.20+).
-            if let Some((params, body, frame)) = no_error {
+            if let Some(frame) = no_error_frame {
+                let (params, body) = (*no_error_params, *no_error_body);
                 let mut values: Vec<TorclVal> = if env.mv_active {
                     env.mv.clone()
                 } else {
