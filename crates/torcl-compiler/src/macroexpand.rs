@@ -733,6 +733,11 @@ pub fn register_macro_function(key: TorclVal, func: Arc<MacroFn>) {
     registry.insert(key.0, func);
 }
 
+/// Release an expander registration proven unreachable by image delivery.
+pub fn unregister_macro_function(key: TorclVal) {
+    MACRO_FUNCTION_REGISTRY.write().unwrap().remove(&key.0);
+}
+
 /// Mint a fresh, process-unique key for `MACRO_FUNCTION_REGISTRY`.
 ///
 /// This is the SINGLE source of truth for registry keys. Both macrolet-local

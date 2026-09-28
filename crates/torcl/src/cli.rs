@@ -2123,6 +2123,7 @@ struct FrozenEnvFrame {
 }
 
 struct FrozenMacroCapture {
+    registration: Option<(String, TorclVal)>,
     params_form: TorclVal,
     body: TorclVal,
     captured_frame: Arc<FrozenEnvFrame>,
@@ -7493,7 +7494,7 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: 
                 }
             });
         }
-        {
+        if root_definitions {
             for entry in MACRO_FN_CACHE.lock().unwrap().values_mut() {
                 let mut params = TorclVal(entry.params_bits);
                 let mut body = TorclVal(entry.body_bits);
@@ -7517,6 +7518,9 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: 
             let mut capture = capture
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !root_definitions && capture.registration.is_some() {
+                continue;
+            }
             visit(&mut capture.params_form);
             visit(&mut capture.body);
             visit_frozen_env_frame_roots(&capture.captured_frame, &mut frozen_frames, visit);
@@ -30000,6 +30004,7 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
     // Arc<dyn Fn + Send + Sync>, so it must own a Send snapshot of the defining
     // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
     let capture = register_frozen_macro_capture(FrozenMacroCapture {
+        registration: None,
         params_form,
         body,
         captured_frame: freeze_env_frame(&env.frame),
@@ -30722,6 +30727,7 @@ fn augment_env_with_macros(
                 debug_validate_form("define", name, macro_defs[idx].params_form);
                 debug_validate_form("define", name, macro_defs[idx].body);
                 let capture = register_frozen_macro_capture(FrozenMacroCapture {
+                    registration: Some((name.clone(), handle)),
                     params_form: macro_defs[idx].params_form,
                     body: macro_defs[idx].body,
                     captured_frame,

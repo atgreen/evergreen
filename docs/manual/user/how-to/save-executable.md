@@ -152,8 +152,10 @@ Source and bytecode macros in selected packages also follow reachable names.
 Saved macro expanders retain the definitions they invoke, and `keep` may name
 a macro needed through a dynamically constructed name. An unreachable macro's
 body does not retain its callees or native capabilities. Macros cannot serve
-as the executable's `entry`. SETF expanders and compiler registration caches
-remain conservative roots.
+as the executable's `entry`. Compiler registrations and frozen captures with a
+known macro owner follow that macro's reachability. Unreachable registrations
+are released before saving. SETF expanders, compiler macros, and registrations
+without a known owner remain conservative roots.
 
 User-defined SETF writers in selected packages follow the reachability of their
 accessor names and saved writer functions. Delivery removes an unreachable
@@ -230,14 +232,22 @@ do not require source evaluation. Native linking then removes the tree-walking
 operator dispatcher and source-to-bytecode compiler while retaining T0 bytecode
 and bytecode-to-native tiering.
 
-Source functions and closures, source handler forms, variadic argument binders,
+Specialized delivery attempts to compile reachable named source functions that
+have no captured lexical environment. It discards their source only after
+confirming that the bytecode can be saved and restored independently, then
+recomputes reachability. This also runs during `--dry-run`: compilation may
+invoke macro expanders, but delivery does not call the application entry point.
+The input image is unchanged.
+
+Unsupported source functions and closures, source handler forms, variadic argument binders,
 uncompiled generic methods, and builtin paths that still require the evaluator
 retain `tree-walker`. The report identifies these dependencies. The initial
 audited builtin set covers arithmetic, basic list operations, multiple values,
 function application, and `WRITE-LINE`; other builtin paths conservatively
-retain the walker. Compiling Lisp files to BFASL before loading and saving the
-delivery input provides source-free function bodies. Simply omitting `EVAL`
-from a source-loaded application is not sufficient.
+retain the walker. BFASL input already provides compiled function bodies;
+supported cold source definitions can now be compiled during delivery too.
+Simply omitting `EVAL` is insufficient if other reachable operations still
+require source evaluation.
 
 Bootstrap definitions outside the selected packages are retained. Selecting
 their packages allows unreachable library functions and macros to be removed
