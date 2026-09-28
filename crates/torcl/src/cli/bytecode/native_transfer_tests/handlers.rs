@@ -2,10 +2,42 @@ use super::*;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_handler_bind_and_restart_case_preserve_fallback_context() {
+    use super::super::native_transfer_entry::{take_native_fallback_count, TransferCode};
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    torcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((handler-bind ((type-error (lambda (c) (declare (ignore c)) (invoke-restart 'k))))\
+          (restart-case (symbol-value x) (k () :ok))))"
+        )
+        .unwrap()
+        .0
+    );
+    let body = Arc::new(
+        compile_function("NATIVE-HANDLER-BIND", *params, *forms, &env, false, false).unwrap(),
+    );
+    let code = TransferCode::compile(body).expect("native handler-bind/restart-case caller");
+    torcl_rt::rooted!(args = vec![super::super::super::arena_cons(T, NIL)]);
+    take_native_fallback_count();
+    torcl_rt::rooted!(result = code.run(&args, &mut env));
+    torcl_rt::rooted!(ok = reader::read_from_string(":ok").unwrap().0);
+    assert_eq!(*result.as_ref().unwrap(), *ok);
+    assert_eq!(take_native_fallback_count(), 1);
+    assert!(env.handlers.is_empty());
+    assert!(env.restarts.is_empty());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_handler_case_enters_selected_clause_without_fallback() {
     use super::super::native_transfer_entry::{
-        TransferCode, take_native_cleanup_count, take_native_fallback_count,
-        take_native_handler_count,
+        take_native_cleanup_count, take_native_fallback_count, take_native_handler_count,
+        TransferCode,
     };
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -210,8 +242,8 @@ fn native_v2_handler_case_ir_tracks_clause_destinations() {
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_unavailable_handler_clause_preserves_fallback_and_cleanup() {
     use super::super::native_transfer_entry::{
-        TransferCode, take_native_cleanup_count, take_native_fallback_count,
-        take_native_handler_count,
+        take_native_cleanup_count, take_native_fallback_count, take_native_handler_count,
+        TransferCode,
     };
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -304,7 +336,7 @@ static NEXT_HANDLER_FIBER: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 
 fn handler_fiber() -> TorclVal {
     use super::super::native_transfer_entry::{
-        TransferCode, take_native_fallback_count, take_native_handler_count,
+        take_native_fallback_count, take_native_handler_count, TransferCode,
     };
     let case = NEXT_HANDLER_FIBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut env = Env::new_impl(false, false, false);

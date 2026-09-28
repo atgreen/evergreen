@@ -312,6 +312,16 @@ pub enum AuxData {
         push_bcp: u32,
         enter: bool,
     },
+    /// Establish/retire a dynamic HANDLER-BIND cluster.
+    HandlerBindScope {
+        push_bcp: u32,
+        enter: bool,
+    },
+    /// Establish/retire a dynamic RESTART-CASE cluster.
+    RestartCaseScope {
+        push_bcp: u32,
+        enter: bool,
+    },
     HandlerDestination {
         push_bcp: u32,
         table_index: u32,

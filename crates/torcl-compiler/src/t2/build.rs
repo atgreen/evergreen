@@ -24,19 +24,19 @@
 //! exits) return `Err(BuildError::Unsupported(..))`; the caller keeps such a
 //! function at T1 (spec R4.28). Correctness over coverage.
 
-use crate::control_scope::{ScopeError, ScopeKind, ScopeMap, is_never_returning_call};
+use crate::control_scope::{is_never_returning_call, ScopeError, ScopeKind, ScopeMap};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
 use crate::t2::inlining::{
-    InlineDecision, InlineOptions, InlinePolicy, IntrinsicId, body_cost, decide,
-    metadata_for_symbol,
+    body_cost, decide, metadata_for_symbol, InlineDecision, InlineOptions, InlinePolicy,
+    IntrinsicId,
 };
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
 };
-use torcl_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc, typep_class};
+use torcl_rt::bytecode::{typep_class, BytecodeFunction, DeclaredType, Instr, VarLoc};
 
 /// Why the builder could not produce IR for a function (e.g. an opcode not yet
 /// modelled). The caller keeps such a function at T1 (spec R4.28).
@@ -350,6 +350,36 @@ impl<'a> Builder<'a> {
             _ => None,
         }
     }
+
+    fn handler_bind_transition(&self, bcp: usize) -> Option<(u32, bool)> {
+        if !self.native_cleanups {
+            return None;
+        }
+        match self.bf.code.get(bcp)? {
+            Instr::PushHandlerBind { .. } => Some((bcp as u32, true)),
+            Instr::PopHandlerBind => {
+                let scope = self.control_scopes.as_ref()?.before(bcp as u32)?.last()?;
+                matches!(scope.kind, ScopeKind::HandlerBind { .. })
+                    .then_some((scope.push_bcp, false))
+            }
+            _ => None,
+        }
+    }
+
+    fn restart_case_transition(&self, bcp: usize) -> Option<(u32, bool)> {
+        if !self.native_cleanups {
+            return None;
+        }
+        match self.bf.code.get(bcp)? {
+            Instr::PushRestartCase { .. } => Some((bcp as u32, true)),
+            Instr::PopRestartCase => {
+                let scope = self.control_scopes.as_ref()?.before(bcp as u32)?.last()?;
+                matches!(scope.kind, ScopeKind::RestartCase { .. })
+                    .then_some((scope.push_bcp, false))
+            }
+            _ => None,
+        }
+    }
     fn exceptional_handlers(&self, bcp: u32) -> Vec<HandlerDestination> {
         self.control_scopes
             .as_ref()
@@ -587,7 +617,10 @@ impl<'a> Builder<'a> {
         let mut set: BTreeSet<usize> = BTreeSet::new();
         set.insert(0);
         for (i, instr) in code.iter().enumerate() {
-            if (self.catch_transition(i).is_some() || self.handler_transition(i).is_some())
+            if (self.catch_transition(i).is_some()
+                || self.handler_transition(i).is_some()
+                || self.handler_bind_transition(i).is_some()
+                || self.restart_case_transition(i).is_some())
                 && i + 1 < code.len()
             {
                 set.insert(i + 1);
@@ -686,6 +719,8 @@ impl<'a> Builder<'a> {
             if self.native_cleanups
                 && (self.catch_transition(i).is_some()
                     || self.handler_transition(i).is_some()
+                    || self.handler_bind_transition(i).is_some()
+                    || self.restart_case_transition(i).is_some()
                     || matches!(
                         code[i],
                         Instr::CallNamed { .. }
@@ -715,7 +750,14 @@ impl<'a> Builder<'a> {
                 }
             }
             match &code[i] {
-                Instr::PushHandlerCase { .. } | Instr::PopHandlerCase if self.native_cleanups => {
+                Instr::PushHandlerCase { .. }
+                | Instr::PopHandlerCase
+                | Instr::PushHandlerBind { .. }
+                | Instr::PopHandlerBind
+                | Instr::PushRestartCase { .. }
+                | Instr::PopRestartCase
+                    if self.native_cleanups =>
+                {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::PushCatch { .. } if self.native_cleanups => {
@@ -1168,14 +1210,50 @@ impl<'a> Builder<'a> {
                 self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
                 return Ok(());
             }
+            if let Some((push_bcp, enter)) = self.handler_bind_transition(i) {
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args: vec![],
+                        results: vec![],
+                        aux: AuxData::HandlerBindScope { push_bcp, enter },
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                return Ok(());
+            }
+            if let Some((push_bcp, enter)) = self.restart_case_transition(i) {
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args: vec![],
+                        results: vec![],
+                        aux: AuxData::RestartCaseScope { push_bcp, enter },
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                return Ok(());
+            }
             if let Some((push_bcp, enter)) = self.catch_transition(i) {
                 let fs = self.build_frame_state(block, &stack, i as u32);
                 let args = if enter {
-                    vec![
-                        stack
-                            .pop()
-                            .ok_or(BuildError::Unsupported("CATCH without tag"))?,
-                    ]
+                    vec![stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("CATCH without tag"))?]
                 } else {
                     vec![]
                 };
@@ -1747,7 +1825,10 @@ impl<'a> Builder<'a> {
         }
         if !matches!(
             self.f.inst(call).aux,
-            AuxData::CatchScope { .. } | AuxData::HandlerScope { .. }
+            AuxData::CatchScope { .. }
+                | AuxData::HandlerScope { .. }
+                | AuxData::HandlerBindScope { .. }
+                | AuxData::RestartCaseScope { .. }
         ) {
             stack.push(projected);
         }
@@ -3174,11 +3255,9 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].function, caller);
         assert_eq!(scopes[1].function, helper);
-        assert!(
-            f.source_positions[data.source_pos as usize]
-                .inlined_at
-                .is_some()
-        );
+        assert!(f.source_positions[data.source_pos as usize]
+            .inlined_at
+            .is_some());
         crate::t2::verify::verify(&f).expect("nested metadata verifies");
     }
 
@@ -3292,19 +3371,17 @@ mod tests {
         let mut budget = base.clone();
         budget.config.node_budget = 0;
         let f = build_from_bytecode_with_inline_options(&input, budget).unwrap();
-        assert!(
-            f.block_order()
-                .iter()
-                .any(|&b| has_opcode(&f, b, Opcode::Call))
-        );
+        assert!(f
+            .block_order()
+            .iter()
+            .any(|&b| has_opcode(&f, b, Opcode::Call)));
 
         let notinline = base.clone().with_policy(1, InlinePolicy::NotInline);
         let f = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
-        assert!(
-            f.block_order()
-                .iter()
-                .any(|&b| has_opcode(&f, b, Opcode::Call))
-        );
+        assert!(f
+            .block_order()
+            .iter()
+            .any(|&b| has_opcode(&f, b, Opcode::Call)));
 
         let recursive = Arc::new(bf(
             "BODY-INLINE-LIMITED",
@@ -3325,10 +3402,9 @@ mod tests {
             .with_root_symbol(caller)
             .with_body(helper, recursive);
         let f = build_from_bytecode_with_inline_options(&input, recursive_options).unwrap();
-        assert!(
-            f.block_order()
-                .iter()
-                .any(|&b| has_opcode(&f, b, Opcode::Call))
-        );
+        assert!(f
+            .block_order()
+            .iter()
+            .any(|&b| has_opcode(&f, b, Opcode::Call)));
     }
 }

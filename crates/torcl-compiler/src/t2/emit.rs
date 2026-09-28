@@ -18,7 +18,7 @@ use crate::osr::ConversionKind;
 use crate::t2::ir::Function;
 use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 use crate::t2::slot_map;
-use crate::t2::x64_frame::{GPR_X86, ValueHome as FramedHome, select_frame_homes};
+use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
@@ -1297,20 +1297,20 @@ fn emit_call(
     // registers, so our live values survive).
     if let (Some(ss), Some(entry)) = (self_sym, self_entry) {
         const ARG_REGS: [u8; 4] = [1, 8, 9, 10]; // rcx, r8, r9, r10
-        // TORCL_NO_DIRECT_SELF_CALL routes self-calls back through c2i.
-        //
-        // The direct self-call skips c2i_call_args, and with it the
-        // native_depth_cap() check that is the ONLY bound on recursion depth in
-        // compiled code — the T2 prologue has no stack guard. A deeply
-        // self-recursive function therefore runs off the C stack and returns a
-        // WRONG ANSWER rather than signalling: (deep 400000) answers 30, and
-        // (deep 200000) answers a raw stack address. T0 and T1 both raise the
-        // STORAGE-CONDITION they should (bliss-b4fd).
-        //
-        // This flag is the workaround and the bisection tool, not the fix. The
-        // fix is a stack guard in the prologue, because the optimization is
-        // worth far too much to simply drop: without it fib(30) goes from 3ms to
-        // 498ms, a 166x regression.
+                                                 // TORCL_NO_DIRECT_SELF_CALL routes self-calls back through c2i.
+                                                 //
+                                                 // The direct self-call skips c2i_call_args, and with it the
+                                                 // native_depth_cap() check that is the ONLY bound on recursion depth in
+                                                 // compiled code — the T2 prologue has no stack guard. A deeply
+                                                 // self-recursive function therefore runs off the C stack and returns a
+                                                 // WRONG ANSWER rather than signalling: (deep 400000) answers 30, and
+                                                 // (deep 200000) answers a raw stack address. T0 and T1 both raise the
+                                                 // STORAGE-CONDITION they should (bliss-b4fd).
+                                                 //
+                                                 // This flag is the workaround and the bisection tool, not the fix. The
+                                                 // fix is a stack guard in the prologue, because the optimization is
+                                                 // worth far too much to simply drop: without it fib(30) goes from 3ms to
+                                                 // 498ms, a 166x regression.
         let self_call_disabled = std::env::var_os("TORCL_NO_DIRECT_SELF_CALL").is_some();
         if !self_call_disabled && sym == ss && nargs <= ARG_REGS.len() {
             // Stack guard. The direct call below takes a REAL C frame and does
@@ -1499,6 +1499,24 @@ fn emit_invoke_call(
                 TRANSFER_HANDLER_ENTER_REQUEST
             } else {
                 TRANSFER_HANDLER_LEAVE_REQUEST
+            }) | u64::from(push_bcp),
+            0,
+            false,
+        ),
+        crate::t2::ir::AuxData::HandlerBindScope { push_bcp, enter } => (
+            (if enter {
+                TRANSFER_HANDLER_BIND_ENTER_REQUEST
+            } else {
+                TRANSFER_HANDLER_BIND_LEAVE_REQUEST
+            }) | u64::from(push_bcp),
+            0,
+            false,
+        ),
+        crate::t2::ir::AuxData::RestartCaseScope { push_bcp, enter } => (
+            (if enter {
+                TRANSFER_RESTART_CASE_ENTER_REQUEST
+            } else {
+                TRANSFER_RESTART_CASE_LEAVE_REQUEST
             }) | u64::from(push_bcp),
             0,
             false,
@@ -2159,8 +2177,8 @@ fn emit_type_check(
         a.jcc(Cc::Ne, not_found);
         mov_rr(a, SCRATCH, xr);
         alu_r_imm(a, AND, SCRATCH, -8); // clear the low tag bits
-        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
-        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
+                                        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
+                                        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, torcl_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
     } else if bits == TypeBits::STRING {
@@ -2672,6 +2690,10 @@ pub const TRANSFER_CATCH_LEAVE_REQUEST: u64 = 2_u64 << 32;
 pub const TRANSFER_HANDLER_ENTER_REQUEST: u64 = 3_u64 << 32;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub const TRANSFER_HANDLER_LEAVE_REQUEST: u64 = 4_u64 << 32;
+pub const TRANSFER_HANDLER_BIND_ENTER_REQUEST: u64 = 5_u64 << 32;
+pub const TRANSFER_HANDLER_BIND_LEAVE_REQUEST: u64 = 6_u64 << 32;
+pub const TRANSFER_RESTART_CASE_ENTER_REQUEST: u64 = 7_u64 << 32;
+pub const TRANSFER_RESTART_CASE_LEAVE_REQUEST: u64 = 8_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. Arguments and shadow roots
@@ -2913,6 +2935,8 @@ fn emit_transfer_function(
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
+                            | AuxData::HandlerBindScope { .. }
+                            | AuxData::RestartCaseScope { .. }
                     )
                     || data.opcode == Opcode::NlxTransfer && !data.targets.is_empty())
             {
@@ -3718,10 +3742,10 @@ fn emit_framed_inner(
     // enter directly (args in registers) instead of paying c2i dispatch.
     let reg_entry_label = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
-    // A variadic function's entry params are pre-collected frame slots (the
-    // &rest list etc.), not positional call args, so it must NOT get a register
-    // entry — a register self-call would pass raw args into those slots
-    // (bliss-32l). Its self-calls take the interpreter/c2i entry instead.
+                                    // A variadic function's entry params are pre-collected frame slots (the
+                                    // &rest list etc.), not positional call args, so it must NOT get a register
+                                    // entry — a register self-call would pass raw args into those slots
+                                    // (bliss-32l). Its self-calls take the interpreter/c2i entry instead.
     let has_reg_entry = !has_declared_params
         && !f.is_variadic()
         && frame_base_home.is_none()
@@ -3906,7 +3930,9 @@ fn emit_framed_inner(
                         AuxData::CallTarget(_)
                         | AuxData::TransferThrow
                         | AuxData::CatchScope { .. }
-                        | AuxData::HandlerScope { .. } => transfer.veneer,
+                        | AuxData::HandlerScope { .. }
+                        | AuxData::HandlerBindScope { .. }
+                        | AuxData::RestartCaseScope { .. } => transfer.veneer,
                         AuxData::CleanupContinuation { .. } => match transfer.cleanup {
                             Some(CleanupEmission::Native { complete, .. }) => complete,
                             _ => return Err(EmitError::UnsupportedOp(0xFA)),
@@ -4461,8 +4487,8 @@ fn emit_framed_inner(
         a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
     }
     mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
-    // Deopt stubs have their own temporary stack layout and return immediately;
-    // they must finish that cleanup instead of taking the normal transfer exit.
+                                                 // Deopt stubs have their own temporary stack layout and return immediately;
+                                                 // they must finish that cleanup instead of taking the normal transfer exit.
     emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
     if cfg!(windows) {
         emit_epilogue(&mut a);
@@ -5050,7 +5076,7 @@ mod tests {
     #[test]
     fn windows_t2_framed_entries_execute_and_deopt() {
         use torcl_rt::jit::{JitBuffer, WindowsUnwindInfo};
-        use torcl_rt::value::{NIL, TorclVal};
+        use torcl_rt::value::{TorclVal, NIL};
         extern "C" fn deopt() -> u64 {
             0x1234_5678_ABCD_EF00
         }
@@ -5319,7 +5345,7 @@ mod tests {
     // Build and speculate `(lambda (x) (* x 5))` into single-guarded-FixnumMul IR.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn speculated_mul5() -> crate::t2::ir::Function {
-        use crate::t2::speculate::{SpecType, speculate};
+        use crate::t2::speculate::{speculate, SpecType};
         use torcl_rt::bytecode::{BytecodeFunction, Instr};
         use torcl_rt::value::TorclVal;
         let star = torcl_rt::symbols::intern("*");
@@ -5470,7 +5496,7 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     fn test_string(bytes: &[u8]) -> torcl_rt::value::TorclVal {
-        use torcl_rt::object::{ObjectHeader, type_id};
+        use torcl_rt::object::{type_id, ObjectHeader};
         let total = (16 + bytes.len() + 7) & !7;
         let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
         unsafe {

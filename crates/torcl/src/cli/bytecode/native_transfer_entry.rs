@@ -7,10 +7,10 @@
 use super::*;
 use std::cell::Cell;
 use torcl_compiler::control_scope::{Ownership, ScopeKind};
-use torcl_compiler::native_unwind::{NativeUnwindStep, SelectedTarget, next_unwind_step};
+use torcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use torcl_compiler::t2::native_transfer::{
-    SysvNativeLanding, SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
-    emit_native_landing_stub,
+    emit_capture_stub, emit_helper_veneer, emit_native_landing_stub, SysvNativeLanding,
+    SysvTransferCapture,
 };
 use torcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use torcl_rt::jit::JitBuffer;
@@ -104,6 +104,8 @@ impl TransferCode {
                             | ScopeKind::Cleanup { .. }
                             | ScopeKind::Catch { .. }
                             | ScopeKind::HandlerCase { .. }
+                            | ScopeKind::HandlerBind { .. }
+                            | ScopeKind::RestartCase { .. }
                     )
             }) {
                 return None;
@@ -124,6 +126,8 @@ impl TransferCode {
                                 | ScopeKind::Unwind { .. }
                                 | ScopeKind::Catch { .. }
                                 | ScopeKind::HandlerCase { .. }
+                                | ScopeKind::HandlerBind { .. }
+                                | ScopeKind::RestartCase { .. }
                         )
                     })
                     .count();
@@ -214,9 +218,18 @@ impl TransferCode {
             base: env.catch_stack.len(),
         };
         let mut handlers = Vec::<SavedHandler>::with_capacity(self.body.handler_cases.len());
-        let _handler_guard = HandlerScopeGuard {
+        let mut handler_binds =
+            Vec::<SavedHandlerBind>::with_capacity(self.body.handler_binds.len());
+        let mut restart_cases =
+            Vec::<SavedRestartCase>::with_capacity(self.body.restart_cases.len());
+        let mut dynamic_scopes = Vec::<DynamicScope>::with_capacity(
+            self.body.handler_cases.len()
+                + self.body.handler_binds.len()
+                + self.body.restart_cases.len(),
+        );
+        let _dynamic_scope_guard = DynamicScopeGuard {
             env,
-            handlers: &mut handlers,
+            scopes: &mut dynamic_scopes,
         };
         let mut prepared_handler = None::<PreparedHandler>;
         torcl_rt::rooted_ref!(_prepared_handler = &mut prepared_handler);
@@ -229,6 +242,9 @@ impl TransferCode {
             unavailable_handler: self.unavailable_handler,
             prepared_catch: &mut prepared_catch,
             handlers: &mut handlers,
+            handler_binds: &mut handler_binds,
+            restart_cases: &mut restart_cases,
+            dynamic_scopes: &mut dynamic_scopes,
             prepared_handler: &mut prepared_handler,
             frame,
             body: self.body.as_ref(),
@@ -295,6 +311,8 @@ impl TransferCode {
                     && context.selected.is_none()
                     && cleanups.is_empty()
                     && catches.is_empty()
+                    && handler_binds.is_empty()
+                    && restart_cases.is_empty()
                     && prepared_catch.is_none()
                     && handlers.is_empty()
                     && prepared_handler.is_none() =>
@@ -334,6 +352,10 @@ impl TransferCode {
                                         | Instr::PopHandler
                                         | Instr::PushHandlerCase { .. }
                                         | Instr::PopHandlerCase
+                                        | Instr::PushHandlerBind { .. }
+                                        | Instr::PopHandlerBind
+                                        | Instr::PushRestartCase { .. }
+                                        | Instr::PopRestartCase
                                 )
                             )
                     })
@@ -361,6 +383,18 @@ impl TransferCode {
                     matches!(scope.kind, ScopeKind::HandlerCase { .. }).then_some(scope.push_bcp)
                 });
                 if !live_handlers.eq(handlers.iter().map(|saved| saved.push_bcp)) {
+                    return Err(invalid_capture());
+                }
+                let live_handler_binds = site.map().control_scopes.iter().filter_map(|scope| {
+                    matches!(scope.kind, ScopeKind::HandlerBind { .. }).then_some(scope.push_bcp)
+                });
+                if !live_handler_binds.eq(handler_binds.iter().map(|saved| saved.push_bcp)) {
+                    return Err(invalid_capture());
+                }
+                let live_restart_cases = site.map().control_scopes.iter().filter_map(|scope| {
+                    matches!(scope.kind, ScopeKind::RestartCase { .. }).then_some(scope.push_bcp)
+                });
+                if !live_restart_cases.eq(restart_cases.iter().map(|saved| saved.push_bcp)) {
                     return Err(invalid_capture());
                 }
                 let restored_handlers = site
@@ -401,6 +435,28 @@ impl TransferCode {
                                 cluster_frame: saved.cluster_frame,
                             }
                         }
+                        ScopeKind::HandlerBind { .. } => {
+                            let saved = handler_binds
+                                .iter()
+                                .find(|saved| saved.push_bcp == scope.push_bcp)
+                                .expect("checked handler-bind identity");
+                            Handler::HandlerBind {
+                                cluster_base: saved.cluster_base,
+                                cluster_frame: saved.cluster_frame,
+                            }
+                        }
+                        ScopeKind::RestartCase { resume_bcp, .. } => {
+                            let saved = restart_cases
+                                .iter()
+                                .find(|saved| saved.push_bcp == scope.push_bcp)
+                                .expect("checked restart-case identity");
+                            Handler::RestartCase {
+                                restart_base: saved.restart_base,
+                                resume_bcp,
+                                sp_restore: scope.sp_restore,
+                                cluster_frame: saved.cluster_frame,
+                            }
+                        }
                         ScopeKind::Catch { resume_bcp } => Handler::Catch {
                             token: catches
                                 .iter()
@@ -416,6 +472,9 @@ impl TransferCode {
                     .collect();
                 // Bytecode now owns the live cluster frames and registrations.
                 handlers.clear();
+                handler_binds.clear();
+                restart_cases.clear();
+                dynamic_scopes.clear();
                 let mut acts = vec![Activation {
                     frame,
                     func: self.body.clone(),
@@ -484,6 +543,69 @@ struct SavedHandler {
     cluster_frame: *mut Frame,
 }
 
+struct SavedHandlerBind {
+    push_bcp: u32,
+    cluster_base: usize,
+    cluster_frame: *mut Frame,
+}
+
+struct SavedRestartCase {
+    push_bcp: u32,
+    restart_base: usize,
+    resume_bcp: u32,
+    sp_restore: u16,
+    cluster_frame: *mut Frame,
+}
+
+enum DynamicScope {
+    HandlerCase {
+        cluster_base: usize,
+        cluster_frame: *mut Frame,
+    },
+    HandlerBind {
+        cluster_base: usize,
+        cluster_frame: *mut Frame,
+    },
+    RestartCase {
+        restart_base: usize,
+        cluster_frame: *mut Frame,
+    },
+}
+
+struct DynamicScopeGuard {
+    env: *mut Env,
+    scopes: *mut Vec<DynamicScope>,
+}
+impl Drop for DynamicScopeGuard {
+    fn drop(&mut self) {
+        let stack = torcl_rt::current_stack();
+        let env = unsafe { &mut *self.env };
+        let scopes = unsafe { &mut *self.scopes };
+        while let Some(scope) = scopes.pop() {
+            match scope {
+                DynamicScope::HandlerCase {
+                    cluster_base,
+                    cluster_frame,
+                }
+                | DynamicScope::HandlerBind {
+                    cluster_base,
+                    cluster_frame,
+                } => {
+                    env.handlers.truncate(cluster_base);
+                    pop_condition_cluster_frame(stack, cluster_frame);
+                }
+                DynamicScope::RestartCase {
+                    restart_base,
+                    cluster_frame,
+                } => {
+                    env.restarts.truncate(restart_base);
+                    pop_condition_cluster_frame(stack, cluster_frame);
+                }
+            }
+        }
+    }
+}
+
 struct HandlerScopeGuard {
     env: *mut Env,
     handlers: *mut Vec<SavedHandler>,
@@ -495,6 +617,38 @@ impl Drop for HandlerScopeGuard {
         let handlers = unsafe { &mut *self.handlers };
         while let Some(saved) = handlers.pop() {
             env.handlers.truncate(saved.cluster_base);
+            pop_condition_cluster_frame(stack, saved.cluster_frame);
+        }
+    }
+}
+
+struct HandlerBindScopeGuard {
+    env: *mut Env,
+    handler_binds: *mut Vec<SavedHandlerBind>,
+}
+impl Drop for HandlerBindScopeGuard {
+    fn drop(&mut self) {
+        let stack = torcl_rt::current_stack();
+        let env = unsafe { &mut *self.env };
+        let binds = unsafe { &mut *self.handler_binds };
+        while let Some(saved) = binds.pop() {
+            env.handlers.truncate(saved.cluster_base);
+            pop_condition_cluster_frame(stack, saved.cluster_frame);
+        }
+    }
+}
+
+struct RestartCaseScopeGuard {
+    env: *mut Env,
+    restart_cases: *mut Vec<SavedRestartCase>,
+}
+impl Drop for RestartCaseScopeGuard {
+    fn drop(&mut self) {
+        let stack = torcl_rt::current_stack();
+        let env = unsafe { &mut *self.env };
+        let cases = unsafe { &mut *self.restart_cases };
+        while let Some(saved) = cases.pop() {
+            env.restarts.truncate(saved.restart_base);
             pop_condition_cluster_frame(stack, saved.cluster_frame);
         }
     }
@@ -613,18 +767,191 @@ unsafe extern "C" fn call_or_throw(
     out: *mut torcl_rt::native_transfer::NativeOutcome,
 ) {
     use torcl_compiler::t2::emit::{
-        TRANSFER_CATCH_ENTER_REQUEST, TRANSFER_CATCH_LEAVE_REQUEST, TRANSFER_THROW_REQUEST,
-        TransferCallRequest,
+        TransferCallRequest, TRANSFER_CATCH_ENTER_REQUEST, TRANSFER_CATCH_LEAVE_REQUEST,
+        TRANSFER_THROW_REQUEST,
     };
     use torcl_rt::native_transfer::NativeOutcome;
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
     let request_kind = call.symbol & !u64::from(u32::MAX);
     use torcl_compiler::t2::emit::{
+        TRANSFER_HANDLER_BIND_ENTER_REQUEST, TRANSFER_HANDLER_BIND_LEAVE_REQUEST,
         TRANSFER_HANDLER_ENTER_REQUEST, TRANSFER_HANDLER_LEAVE_REQUEST,
+        TRANSFER_RESTART_CASE_ENTER_REQUEST, TRANSFER_RESTART_CASE_LEAVE_REQUEST,
     };
     if matches!(
         request_kind,
-        TRANSFER_HANDLER_ENTER_REQUEST | TRANSFER_HANDLER_LEAVE_REQUEST
+        TRANSFER_HANDLER_BIND_ENTER_REQUEST
+            | TRANSFER_HANDLER_BIND_LEAVE_REQUEST
+            | TRANSFER_RESTART_CASE_ENTER_REQUEST
+            | TRANSFER_RESTART_CASE_LEAVE_REQUEST
+    ) {
+        if !native_error_pending() {
+            let result = guard_c2i(|| {
+                assert_eq!(call.nargs, 0);
+                let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+                let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+                let push_bcp = call.symbol as u32;
+                let body = unsafe { &*context.body };
+                if matches!(
+                    request_kind,
+                    TRANSFER_HANDLER_BIND_ENTER_REQUEST | TRANSFER_HANDLER_BIND_LEAVE_REQUEST
+                ) {
+                    let binds = unsafe { &mut *context.handler_binds };
+                    let Some(instruction) = body.code.get(push_bcp as usize) else {
+                        return Err(invalid_capture());
+                    };
+                    let Instr::PushHandlerBind { hb } = instruction else {
+                        return Err(invalid_capture());
+                    };
+                    if request_kind == TRANSFER_HANDLER_BIND_ENTER_REQUEST {
+                        assert!(binds.len() < binds.capacity());
+                        let info = &body.handler_binds[*hb as usize];
+                        let cluster_base = env.handlers.len();
+                        let mut entries = Vec::with_capacity(info.bindings.len());
+                        let mut values = Vec::with_capacity(info.bindings.len().saturating_mul(2));
+                        torcl_rt::rooted_ref!(_entries = &mut entries);
+                        torcl_rt::rooted_ref!(_values = &mut values);
+                        for (type_name, form) in &info.bindings {
+                            let handler = eval_form(*form, env)
+                                .map(HandlerImpl::Function)
+                                .unwrap_or(HandlerImpl::Function(*form));
+                            let handler_value = match &handler {
+                                HandlerImpl::Function(value) => *value,
+                                HandlerImpl::HandlerCase { .. } => NIL,
+                            };
+                            entries.push(HandlerEntry {
+                                type_name: type_name.clone(),
+                                handler,
+                            });
+                            values.push(resolve_sym(type_name).ok_or_else(invalid_capture)?);
+                            values.push(handler_value);
+                        }
+                        let cluster_frame =
+                            push_condition_cluster_frame(torcl_rt::current_stack(), &values)?;
+                        env.handlers.push(HandlerCluster { entries });
+                        binds.push(SavedHandlerBind {
+                            push_bcp,
+                            cluster_base,
+                            cluster_frame,
+                        });
+                        unsafe { &mut *context.dynamic_scopes }.push(DynamicScope::HandlerBind {
+                            cluster_base,
+                            cluster_frame,
+                        });
+                    } else {
+                        let saved = binds.pop().expect("live native handler-bind");
+                        assert_eq!(saved.push_bcp, push_bcp);
+                        let Some(DynamicScope::HandlerBind {
+                            cluster_base: live_base,
+                            cluster_frame: live_frame,
+                        }) = unsafe { &mut *context.dynamic_scopes }.pop()
+                        else {
+                            return Err(invalid_capture());
+                        };
+                        assert_eq!(
+                            (live_base, live_frame),
+                            (saved.cluster_base, saved.cluster_frame)
+                        );
+                        env.handlers.truncate(saved.cluster_base);
+                        pop_condition_cluster_frame(torcl_rt::current_stack(), saved.cluster_frame);
+                    }
+                } else {
+                    let cases = unsafe { &mut *context.restart_cases };
+                    let Some(instruction) = body.code.get(push_bcp as usize) else {
+                        return Err(invalid_capture());
+                    };
+                    let Instr::PushRestartCase {
+                        rc,
+                        resume_bcp,
+                        sp_restore,
+                    } = instruction
+                    else {
+                        return Err(invalid_capture());
+                    };
+                    if request_kind == TRANSFER_RESTART_CASE_ENTER_REQUEST {
+                        assert!(cases.len() < cases.capacity());
+                        let info = &body.restart_cases[*rc as usize];
+                        let restart_base = env.restarts.len();
+                        let captured_frame = Arc::clone(&env.frame);
+                        let mut values = Vec::with_capacity(info.restarts.len().saturating_mul(5));
+                        torcl_rt::rooted_ref!(_values = &mut values);
+                        for restart in &info.restarts {
+                            env.restarts.push(RestartEntry {
+                                name: restart.name.clone(),
+                                captured_blocks: env.block_stack.clone(),
+                                captured_tags: env.tag_stack.clone(),
+                                function: RestartFunction::Bytecode {
+                                    function: Rc::new(RefCell::new((*restart.function).clone())),
+                                    captured_frame: Arc::clone(&captured_frame),
+                                },
+                                interactive_function: None,
+                                test_function: None,
+                                unwind_on_invoke: true,
+                                group_base: restart_base,
+                                id: super::super::next_restart_id(),
+                                restart_obj: NIL,
+                                report: NIL,
+                            });
+                            values.push(resolve_sym(&restart.name).ok_or_else(invalid_capture)?);
+                            values.extend([NIL, NIL, NIL, NIL]);
+                        }
+                        let cluster_frame =
+                            push_condition_cluster_frame(torcl_rt::current_stack(), &values)?;
+                        cases.push(SavedRestartCase {
+                            push_bcp,
+                            restart_base,
+                            resume_bcp: *resume_bcp,
+                            sp_restore: *sp_restore,
+                            cluster_frame,
+                        });
+                        unsafe { &mut *context.dynamic_scopes }.push(DynamicScope::RestartCase {
+                            restart_base,
+                            cluster_frame,
+                        });
+                    } else {
+                        let saved = cases.pop().expect("live native restart-case");
+                        assert_eq!(saved.push_bcp, push_bcp);
+                        let Some(DynamicScope::RestartCase {
+                            restart_base: live_base,
+                            cluster_frame: live_frame,
+                        }) = unsafe { &mut *context.dynamic_scopes }.pop()
+                        else {
+                            return Err(invalid_capture());
+                        };
+                        assert_eq!(
+                            (live_base, live_frame),
+                            (saved.restart_base, saved.cluster_frame)
+                        );
+                        env.restarts.truncate(saved.restart_base);
+                        pop_condition_cluster_frame(torcl_rt::current_stack(), saved.cluster_frame);
+                    }
+                }
+                Ok(NIL)
+            });
+            if let Err(error) = result {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
+    if matches!(
+        request_kind,
+        TRANSFER_HANDLER_ENTER_REQUEST
+            | TRANSFER_HANDLER_LEAVE_REQUEST
+            | TRANSFER_HANDLER_BIND_ENTER_REQUEST
+            | TRANSFER_HANDLER_BIND_LEAVE_REQUEST
+            | TRANSFER_RESTART_CASE_ENTER_REQUEST
+            | TRANSFER_RESTART_CASE_LEAVE_REQUEST
     ) {
         if !native_error_pending() {
             let result = guard_c2i(|| {
@@ -675,9 +1002,24 @@ unsafe extern "C" fn call_or_throw(
                         cluster_base,
                         cluster_frame,
                     });
+                    unsafe { &mut *context.dynamic_scopes }.push(DynamicScope::HandlerCase {
+                        cluster_base,
+                        cluster_frame,
+                    });
                 } else {
                     let saved = handlers.pop().expect("live native handler cluster");
                     assert_eq!(saved.push_bcp, push_bcp);
+                    let Some(DynamicScope::HandlerCase {
+                        cluster_base: live_base,
+                        cluster_frame: live_frame,
+                    }) = unsafe { &mut *context.dynamic_scopes }.pop()
+                    else {
+                        return Err(invalid_capture());
+                    };
+                    assert_eq!(
+                        (live_base, live_frame),
+                        (saved.cluster_base, saved.cluster_frame)
+                    );
                     env.handlers.truncate(saved.cluster_base);
                     pop_condition_cluster_frame(torcl_rt::current_stack(), saved.cluster_frame);
                 }
@@ -726,11 +1068,10 @@ unsafe extern "C" fn call_or_throw(
                     assert_eq!(call.nargs, 0);
                     let saved = catches.last().expect("live native catch");
                     assert_eq!(saved.push_bcp, push_bcp);
-                    assert!(
-                        env.catch_stack
-                            .last()
-                            .is_some_and(|(_, token)| token == &saved.token)
-                    );
+                    assert!(env
+                        .catch_stack
+                        .last()
+                        .is_some_and(|(_, token)| token == &saved.token));
                     env.catch_stack.pop();
                     catches.pop();
                 }
@@ -885,6 +1226,9 @@ pub(super) fn take_native_handler_count() -> usize {
 
 struct CaptureContext {
     handlers: *mut Vec<SavedHandler>,
+    handler_binds: *mut Vec<SavedHandlerBind>,
+    restart_cases: *mut Vec<SavedRestartCase>,
+    dynamic_scopes: *mut Vec<DynamicScope>,
     prepared_handler: *mut Option<PreparedHandler>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
@@ -940,9 +1284,26 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     };
     let mut expected_frame = context.frame;
     let mut frames_valid = true;
-    for handler in unsafe { &*context.handlers } {
-        frames_valid &= unsafe { (*handler.cluster_frame).prev_fp == expected_frame };
-        expected_frame = handler.cluster_frame;
+    let mut cluster_frames = Vec::new();
+    cluster_frames.extend(
+        unsafe { &*context.handlers }
+            .iter()
+            .map(|saved| (saved.push_bcp, saved.cluster_frame)),
+    );
+    cluster_frames.extend(
+        unsafe { &*context.handler_binds }
+            .iter()
+            .map(|saved| (saved.push_bcp, saved.cluster_frame)),
+    );
+    cluster_frames.extend(
+        unsafe { &*context.restart_cases }
+            .iter()
+            .map(|saved| (saved.push_bcp, saved.cluster_frame)),
+    );
+    cluster_frames.sort_unstable_by_key(|(push_bcp, _)| *push_bcp);
+    for (_, cluster_frame) in cluster_frames {
+        frames_valid &= unsafe { (*cluster_frame).prev_fp == expected_frame };
+        expected_frame = cluster_frame;
     }
     if context.dispatch.request.is_null()
         || !frames_valid
@@ -1238,6 +1599,16 @@ unsafe fn prepare_transfer(
     }
     for _ in 0..handler_count {
         let saved = handlers.pop().expect("validated crossed handler");
+        let Some(DynamicScope::HandlerCase {
+            cluster_base: live_base,
+            cluster_frame: live_frame,
+        }) = unsafe { &mut *context.dynamic_scopes }.pop()
+        else {
+            return Err(TransferSiteError::InvalidLandingCapture);
+        };
+        if (live_base, live_frame) != (saved.cluster_base, saved.cluster_frame) {
+            return Err(TransferSiteError::InvalidLandingCapture);
+        }
         env.handlers.truncate(saved.cluster_base);
         pop_condition_cluster_frame(torcl_rt::current_stack(), saved.cluster_frame);
     }

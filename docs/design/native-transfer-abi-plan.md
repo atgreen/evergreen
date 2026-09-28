@@ -663,8 +663,10 @@ cleanup continuations are retired only at crossed handler depths. Completion
 continues through outer native cleanups or reconstructs bytecode for the remaining
 unwind; it never repeats the failed call or the completed cleanup. Raw errors
 retain fallback so signaling and restart search still happen in the live context.
-Native CATCH/handler/restart destinations and inherited OSR scope state are not
-admitted by this entry yet.
+Native CATCH and HANDLER-CASE destinations are admitted by the opt-in entry;
+HANDLER-BIND and RESTART-CASE now have activation-owned registration records and
+exact bytecode fallback, but remain fallback barriers rather than native landing
+destinations. Inherited OSR scope state is still rejected at this entry.
 
 The compiler execution fixture verifies normal/exceptional phi values after
 actual moving GC, and both completion outcomes without any bytecode evaluator.
@@ -788,7 +790,10 @@ also run checked local native cleanup before materializing the outer boundary.
 The live-signaling regression requires a returning handler to run exactly once,
 before cleanup, and preserves the condition or restart arguments through moving
 GC. The outer handler/restart registration remains installed for its owner to
-consume; this does not provide native local restart registration or landing.
+consume. HANDLER-BIND and RESTART-CASE setup/retirement now uses helper-v2
+requests with a single ordered cluster-frame guard, and fallback reconstructs
+their interpreter records without replaying the failed call. They do not yet
+provide native local restart landing.
 The consumer test invokes the retained restart body after removing its bindings,
 checks that cleanup has finished, and preserves multiple values through another
 collection. A replacement-error regression also verifies that raw errors raised
@@ -796,9 +801,9 @@ by a handler are signaled while its cluster is hidden: only older clusters see
 the new error. Shared signaling roots the condition, copied entries and hidden
 cluster tail throughout callbacks and nested signaling.
 
-This remains opt-in infrastructure. HANDLER-BIND/restart registration, inherited
-OSR scope admission, emergency allocation and production ABI installation still
-have separate gates; ordinary installed native functions retain their checks.
+This remains opt-in infrastructure. Inherited OSR scope admission, complete
+emergency allocation and production ABI installation still have separate gates;
+ordinary installed native functions retain their checks.
 
 ### Direct local exits
 
