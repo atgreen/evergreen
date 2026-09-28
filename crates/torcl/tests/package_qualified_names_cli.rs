@@ -176,6 +176,102 @@ fn standard_and_qualified_condition_types_still_match() {
     );
 }
 
+/// A bare read in a user package must intern into THAT package, not pick up a
+/// homeless bootstrap identity from `boot.lisp` (bliss-nn6f).
+///
+/// `boot.lisp` is read with `*PACKAGE*` = COMMON-LISP and no IN-PACKAGE, so every name
+/// it mentions — including lambda-list variables like `A`, `N`, `SEQ`, `ACC` and
+/// `VALUE` — becomes a registry identity with no home package. The reader's
+/// homeless-identity arm, which exists to keep Rust builtins and boot-private helpers
+/// callable, then handed those to a bare read in ANY package.
+#[test]
+fn a_bare_read_interns_into_its_own_package() {
+    // IN-PACKAGE rather than read-from-string gymnastics: the point is what a BARE
+    // read does in each package, which means actually reading in that package.
+    let stdout = run(
+        r#"
+        (defpackage "NNA" (:use "COMMON-LISP"))
+        (defpackage "NNB" (:use "COMMON-LISP"))
+        (in-package "NNA")
+        (defvar *a-home* (list (package-name (symbol-package 'a))
+                               (eq 'a (intern "A"))
+                               (package-name (symbol-package 'value))
+                               ;; A builtin still resolves from a user package,
+                               ;; which is what the homeless arm exists for.
+                               (length '(1 2 3))))
+        (cl:in-package "NNB")
+        (defvar *b-home* (list (package-name (symbol-package 'a))
+                               (eq 'a (intern "A"))))
+        (defvar *distinct* (not (eq 'nna::value 'nnb::value)))
+        (cl:in-package "COMMON-LISP-USER")
+        (format t "BARE ~S ~S ~S~%" nna::*a-home* nnb::*b-home* nnb::*distinct*)
+        "#,
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("BARE "))
+            .unwrap_or(""),
+        r#"BARE ("NNA" T "NNA" 3) ("NNB" T) T"#
+    );
+}
+
+/// A macro that interns its parameter names must produce a body that can see them —
+/// the upstream failure this was found through (cl-completions' DEFUN-TOOL, whose
+/// INVOKE-TOOL-BASIC test failed with "The variable A is unbound").
+#[test]
+fn an_interned_parameter_name_matches_the_body() {
+    let stdout = run(
+        r#"
+        (defpackage "NNTOOL" (:use "COMMON-LISP"))
+        (in-package "NNTOOL")
+        (defmacro m (args &body body)
+          `(lambda ,(mapcar (lambda (a) (intern (string-upcase (symbol-name a)))) args)
+             ,@body))
+        (format t "TOOL ~S~%" (funcall (m (a b) (+ a b)) 3 4))
+        "#,
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("TOOL "))
+            .unwrap_or(""),
+        "TOOL 7"
+    );
+}
+
+/// TorCL's own extension condition types must be catchable by the name they are
+/// documented under, and by their bare name.
+///
+/// `TIMEOUT-CONDITION` is BUILT under a bare name
+/// (`build_condition_instance(env, "TIMEOUT-CONDITION", …)`) while it is documented and
+/// written as `TORCL-EXT:TIMEOUT-CONDITION`. That mismatch predates bliss-nn6f and was
+/// masked by the reader handing both spellings one homeless identity; without the mask
+/// a sandboxed timeout fired and escaped its own handler unhandled.
+#[test]
+fn a_torcl_extension_condition_is_catchable_by_either_spelling() {
+    for form in [
+        "(handler-case (loop) (torcl-ext:timeout-condition (e) (declare (ignore e)) :caught))",
+        "(handler-case (loop) (timeout-condition (e) (declare (ignore e)) :caught))",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+            .args(["--no-init", "--sandbox", "--eval", form])
+            .env("TORCL_SANDBOX_CPU_MS", "25")
+            .output()
+            .expect("the CLI runs");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success() && combined.contains("CAUGHT"),
+            "the sandbox timeout must be caught, not escape: {form}
+got: {combined}"
+        );
+    }
+}
+
 /// COMMON-LISP's own names must keep resolving whether written bare or qualified —
 /// the normalization that makes `ERROR` and `COMMON-LISP:ERROR` one key.
 #[test]
