@@ -7486,11 +7486,13 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: 
                 visit_macro_def_roots(definition, state, visit);
             }
         }
-        with_global_setf_fns(|functions| {
-            for definition in functions.borrow_mut().values_mut() {
-                visit_fun_def_roots(definition, visit);
-            }
-        });
+        if root_definitions {
+            with_global_setf_fns(|functions| {
+                for definition in functions.borrow_mut().values_mut() {
+                    visit_fun_def_roots(definition, visit);
+                }
+            });
+        }
         {
             for entry in MACRO_FN_CACHE.lock().unwrap().values_mut() {
                 let mut params = TorclVal(entry.params_bits);

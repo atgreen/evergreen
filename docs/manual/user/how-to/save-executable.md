@@ -139,6 +139,14 @@ body does not retain its callees or native capabilities. Macros cannot serve
 as the executable's `entry`. SETF expanders and compiler registration caches
 remain conservative roots.
 
+User-defined SETF writers in selected packages follow the reachability of their
+accessor names and saved writer functions. Delivery removes an unreachable
+writer's private function cell and source record. Use `keep = PACKAGE::ACCESSOR`
+to retain a dynamically invoked writer, even if the accessor has no getter.
+New BFASLs preserve the accessor symbol so delivery can identify its owning
+package. Older artifacts with missing or ambiguous ownership remain
+conservatively retained.
+
 Private compiled closures and source closure handles are traced from reachable
 objects and code, including their captured environments. An unreachable
 closure does not retain its callees or native capabilities just because it

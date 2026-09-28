@@ -8,6 +8,7 @@ use torcl_rt::bytecode::{BytecodeFunction, Instr};
 use torcl_rt::symbols;
 mod generics;
 mod macros;
+mod writers;
 
 fn error(message: impl Into<String>) -> TorclError {
     TorclError::ProgramError(format!("delivery: {}", message.into()))
@@ -95,7 +96,7 @@ fn function_index(name: &str) -> Result<u32, TorclError> {
     definition_index(name, false)
 }
 
-fn definition_index(name: &str, allow_macro: bool) -> Result<u32, TorclError> {
+fn definition_index(name: &str, allow_auxiliary: bool) -> Result<u32, TorclError> {
     let (package, bare) = name
         .split_once("::")
         .ok_or_else(|| error(format!("use PACKAGE::FUNCTION for {name}")))?;
@@ -107,10 +108,11 @@ fn definition_index(name: &str, allow_macro: bool) -> Result<u32, TorclError> {
         .symbol_index()
         .ok_or_else(|| error(format!("unknown function {name}")))?;
     let generic_name = sym_name(symbol);
-    if symbols::symbol_function(index).is_none_or(|v| v == torcl_rt::value::UNBOUND)
-        && !GENERIC_DEFINITIONS.borrow().contains_key(&generic_name)
-        && !(allow_macro && GLOBAL_MACROS.lock().unwrap().contains_key(&generic_name))
-    {
+    let callable = symbols::symbol_function(index).is_some_and(|v| v != torcl_rt::value::UNBOUND)
+        || GENERIC_DEFINITIONS.borrow().contains_key(&generic_name);
+    let macro_root = allow_auxiliary && GLOBAL_MACROS.lock().unwrap().contains_key(&generic_name);
+    let auxiliary = macro_root || (allow_auxiliary && writers::has_writer(&generic_name));
+    if !callable && !auxiliary {
         return Err(error(format!("undefined function {name}")));
     }
     Ok(index)
@@ -173,6 +175,7 @@ fn bytecode_references_with_params(
 }
 
 struct Plan {
+    unreachable_setf_writers: Vec<String>,
     unreachable_macros: Vec<(u32, String)>,
     generic_candidates: BTreeMap<String, u64>,
     retained_generics: BTreeMap<String, String>,
@@ -223,6 +226,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         let generic_definitions = generics::GenericDefinitions::discover(env, &package_names);
         let macro_definitions = macros::MacroDefinitions::discover(env, &package_names);
         candidates.extend(macro_definitions.candidates.clone());
+        let writer_definitions = writers::WriterDefinitions::discover(&package_names, &functions);
+        candidates.extend(writer_definitions.candidates.clone());
         let dynamic_roots: Vec<_> = candidates
             .keys()
             .map(|&index| TorclVal::from_symbol_index(index))
@@ -270,6 +275,12 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 .roots
                 .iter()
                 .map(|&value| (value, "retained macro registry")),
+        );
+        roots.extend(
+            writer_definitions
+                .roots
+                .iter()
+                .map(|&value| (value, "unresolved SETF writer registry")),
         );
         let edges = bytecode::delivery_dependencies();
         let compiled = if spec.specialized {
@@ -360,6 +371,15 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 retained_generics.insert((*name).clone(), reason.clone());
             }
             if let Some((name, _)) = generics::function_name(value) {
+                if let Some(writers) = writer_definitions.names.get(&name) {
+                    for &writer in writers {
+                        queue.push_back((
+                            TorclVal::from_symbol_index(writer),
+                            reason.clone(),
+                            true,
+                        ));
+                    }
+                }
                 if let Some(&handle) = generic_definitions.names.get(&name) {
                     queue.push_back((handle, reason.clone(), false));
                 }
@@ -499,6 +519,11 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 if let Some(function) = functions.get(&index) {
                     queue.push_back((*function, next_reason.clone(), true));
                 }
+                if let Some(refs) = writer_definitions.edges.get(&index) {
+                    for &value in refs {
+                        queue.push_back((value, next_reason.clone(), true));
+                    }
+                }
                 if let Some(refs) = edges.get(&index) {
                     for &(value, callable_data) in refs {
                         queue.push_back((value, next_reason.clone(), callable_data));
@@ -555,6 +580,17 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             .collect();
         unreachable_source_closures.sort_unstable();
         Plan {
+            unreachable_setf_writers: writer_definitions
+                .records
+                .into_iter()
+                .filter(|(_, writers)| {
+                    writers.iter().all(|index| {
+                        writer_definitions.candidates.contains_key(index)
+                            && !retained.contains_key(index)
+                    })
+                })
+                .map(|(name, _)| name)
+                .collect(),
             unreachable_macros: macro_definitions
                 .names
                 .into_iter()
@@ -783,6 +819,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     }
     generics::retain(env, &plan.live_clos_definitions);
     macros::retain(env, &plan.unreachable_macros);
+    writers::remove(&plan.unreachable_setf_writers);
     native_runtime::with_save_contract(&selected, || {
         save_core(
             executable_stage

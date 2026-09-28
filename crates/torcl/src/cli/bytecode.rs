@@ -9465,6 +9465,21 @@ pub fn build_bbu_from_forms(
         // (2) A DEFUN whose name and body serialise faithfully → install the
         // precompiled function directly at load (skips read/macroexpand/compile).
         if let Some((name, params, body)) = as_defun(form) {
+            let name_form = cp(cp(form).1).0;
+            if name_form.is_cons() {
+                // Keep the original accessor in the portable symbol pool too.
+                // Only emitting the mangled writer name loses its package
+                // ownership when no executable constant mentions the accessor.
+                // Materializing this symbol lets delivery associate the private
+                // writer cell with its owner without reversing lossy mangling.
+                let accessor = cp(cp(name_form).1).0;
+                let Some(index) = accessor.symbol_index() else {
+                    return Ok(None);
+                };
+                if pool.symbol_by_index(index).is_none() {
+                    return Ok(None);
+                }
+            }
             if let Some(sym) = symbol_index_of(&name) {
                 if let Some(name_ref) = pool.symbol_by_index(sym) {
                     if let Some(bf) = compile_function(&name, params, body, env, true, false) {

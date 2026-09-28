@@ -369,6 +369,214 @@ fn delivery_keeps_saved_macro_expanders_and_removes_unused_definitions() {
 }
 
 #[test]
+fn delivery_prunes_setf_writers_and_preserves_saved_writer_functions() {
+    for compiled in [false, true] {
+        let f = Fixture::new();
+        let source = f.path("writers.lisp");
+        let fasl = f.path("writers.bfasl");
+        let core = f.path("writers.core");
+        let spec = f.path("writers.delivery");
+        let exe = f.path("writers");
+        fs::write(
+            &source,
+            r#"
+          (defpackage :writer-live (:use :cl))
+          (in-package :writer-live)
+          (defun dead-helper () 99)
+          (defun (setf unused) (value cell) (dead-helper))
+          (defun (setf live) (value cell) (setf (car cell) value))
+          (defun (setf saved) (value cell) (setf (car cell) value))
+          (set '*writer* #'(setf saved))
+          (set '*alias* *writer*)
+          (defun main ()
+            (let ((cell (list 0)))
+              (setf (live cell) 7)
+              (write-line
+                (if (and (= 7 (car cell))
+                         (= 9 (funcall *writer* 9 cell))
+                         (= 9 (car cell))
+                         (eq *writer* *alias*)
+                         (not (fboundp (list 'setf (intern "UNUSED" :writer-live)))))
+                    "WRITER-LIVE-OK" "WRONG"))))
+        "#,
+        )
+        .unwrap();
+        if compiled {
+            ok(run(
+                BIN,
+                &[
+                    "--no-bootstrap",
+                    "--eval",
+                    &format!("(compile-file {source:?} :output-file {fasl:?})"),
+                ],
+            ));
+        }
+        let input = if compiled { &fasl } else { &source };
+        let mut save = Command::new(BIN);
+        save.args([
+            "--no-init",
+            "--no-bootstrap",
+            "--eval",
+            &format!("(load {input:?}) (save-lisp-and-die {core:?})"),
+        ]);
+        if !compiled {
+            save.env("TORCL_BACKEND", "tree-walker")
+                .env("TORCL_LAZY_COMPILE", "0");
+        }
+        ok(save.output().unwrap());
+        fs::write(&spec, "version = 1\nentry = WRITER-LIVE::MAIN\nprune-package = WRITER-LIVE\ndynamic = explicit\n").unwrap();
+        let report = ok(run(
+            BIN,
+            &["--image", &core, "--deliver", &spec, "--output", &exe],
+        ));
+        assert!(
+            report.contains("remove (SETF WRITER-LIVE::UNUSED):"),
+            "{report}"
+        );
+        assert!(
+            report.contains("remove WRITER-LIVE::DEAD-HELPER:"),
+            "{report}"
+        );
+        for name in ["LIVE", "SAVED"] {
+            assert!(
+                report.contains(&format!("keep (SETF WRITER-LIVE::{name}):")),
+                "{report}"
+            );
+        }
+        assert!(ok(run(&exe, &[])).contains("WRITER-LIVE-OK"));
+        let bytes = fs::read(&exe).unwrap();
+        let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+        let reduced = f.path("reduced.core");
+        fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+        let again = ok(run(
+            BIN,
+            &[
+                "--image",
+                &reduced,
+                "--deliver",
+                &spec,
+                "--output",
+                &exe,
+                "--dry-run",
+            ],
+        ));
+        assert!(!again.contains("(SETF WRITER-LIVE::UNUSED):"), "{again}");
+        assert!(!again.contains("WRITER-LIVE::DEAD-HELPER:"), "{again}");
+    }
+}
+
+#[test]
+fn delivery_preserves_legacy_writer_with_an_ambiguous_package_owner() {
+    let f = Fixture::new();
+    let core = f.path("legacy-writer.core");
+    let spec = f.path("legacy-writer.delivery");
+    let exe = f.path("legacy-writer");
+    // Model an older BFASL: only the private function cell is present, not
+    // OUT.::X. The unrelated selected accessor OUT::|.X| has the same mangling.
+    let program = format!(
+        r#"
+      (defpackage :out. (:use :cl))
+      (defpackage :out (:use :cl) (:intern ".X"))
+      (defun torcl-internal::%setf-writer-out...x (value target) (eval value))
+      (defun out::main () (write-line "OK"))
+      (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    fs::write(&spec, "version = 1\nentry = OUT::MAIN\nprune-package = OUT\ndynamic = explicit\nruntime = specialized\n").unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(!report.contains("remove (SETF OUT::.X):"), "{report}");
+}
+
+#[test]
+fn native_delivery_ignores_eval_in_an_unreachable_setf_writer() {
+    let f = Fixture::new();
+    let source = f.path("writer-main.lisp");
+    let fasl = f.path("writer-main.bfasl");
+    let core = f.path("writers.core");
+    let spec = f.path("writers.delivery");
+    let exe = f.path("writers");
+    fs::write(&source, "(defpackage :writer-shake (:use :cl)) (in-package :writer-shake) (defun main () (write-line \"WRITER-SHAKE-OK\"))").unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!(
+                "(load {fasl:?}) (defun (setf writer-shake::unused) (value target) (eval value)) (save-lisp-and-die {core:?})"
+            ),
+        ],
+    ));
+    let specification = "version = 1\nentry = WRITER-SHAKE::MAIN\nprune-package = WRITER-SHAKE\ndynamic = explicit\nruntime = specialized\n";
+    fs::write(&spec, specification).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(
+        report.contains("remove (SETF WRITER-SHAKE::UNUSED):"),
+        "{report}"
+    );
+    fs::write(
+        &spec,
+        format!("{specification}keep = WRITER-SHAKE::UNUSED\n"),
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=disassembly,dynamic-code,tree-walker\n"),
+        "{report}"
+    );
+    assert!(
+        report.contains("keep (SETF WRITER-SHAKE::UNUSED):"),
+        "{report}"
+    );
+}
+
+#[test]
 fn native_delivery_ignores_eval_in_an_unreachable_macro() {
     let f = Fixture::new();
     let source = f.path("main.lisp");
@@ -1203,6 +1411,7 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
         (defpackage :walker-free (:use :cl))
         (in-package :walker-free)
         (defun add-one (x) (+ x 1))
+        (defun (setf unused-writer) (value target) (eval value))
         (defun main ()
           (dotimes (i 1000) (add-one i))
           (write-line (if (= 2.5 (add-one 1.5)) "WALKER-FREE-OK" "WRONG"))
@@ -1250,6 +1459,10 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
     assert!(report.contains("remove WALKER-FREE::UNUSED:"), "{report}");
     assert!(
         report.contains("remove WALKER-FREE::UNUSED-MACRO:"),
+        "{report}"
+    );
+    assert!(
+        report.contains("remove (SETF WALKER-FREE::UNUSED-WRITER):"),
         "{report}"
     );
     let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
