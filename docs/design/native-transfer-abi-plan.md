@@ -775,6 +775,13 @@ conditions together, collect while suspended, and check each fiber's result and
 restored stack/segment state. A test-only missing-destination path exercises both
 immediate fallback and fallback after native cleanup.
 
+Already-signaled errors and transfers to a validated live enclosing restart can
+also run checked local native cleanup before materializing the outer boundary.
+The live-signaling regression requires a returning handler to run exactly once,
+before cleanup, and preserves the condition or restart arguments through moving
+GC. The outer handler/restart registration remains installed for its owner to
+consume; this does not provide native local restart registration or landing.
+
 This remains opt-in infrastructure. HANDLER-BIND/restart registration, inherited
 OSR scope admission, emergency allocation and production ABI installation still
 have separate gates; ordinary installed native functions retain their checks.

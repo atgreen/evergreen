@@ -8,6 +8,7 @@ mod compiled;
 mod fallback;
 mod fibers;
 mod handlers;
+mod live_signaling;
 mod payloads;
 
 struct NativeEnvGuard(*mut Env);

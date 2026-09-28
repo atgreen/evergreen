@@ -1006,7 +1006,15 @@ unsafe fn prepare_transfer(
     let mut handler_token = None;
     NATIVE_ERROR.with(|slot| {
         slot.visit(|error| {
-            if let Some(token) = handler_case_token(error) {
+            // A declined condition is already signaled and must leave this
+            // activation. A selected enclosing restart likewise unwinds here
+            // before its owner consumes the arguments. Both may run checked
+            // local cleanup without guessing an outer native destination.
+            if matches!(error, TorclError::Signalled { .. }) {
+                selected_transfer = true;
+            } else if let Some(id) = super::super::restart_invoked_id(error) {
+                selected_transfer = env.restarts.iter().any(|restart| restart.id == id);
+            } else if let Some(token) = handler_case_token(error) {
                 selected_transfer = env.handlers.iter().any(|cluster| cluster.entries.iter().any(|entry|
                     matches!(&entry.handler, HandlerImpl::HandlerCase { token: live, .. } if live == &token)));
                 for saved in unsafe { &*context.handlers } {
