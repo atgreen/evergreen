@@ -21210,6 +21210,154 @@ mod direct_call_invalidation_tests {
         }
     }
 
+    #[test]
+    fn native_control_scopes_follow_lowered_condition_and_restart_clusters() {
+        use torcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun cluster-scope-probe () nil)", &mut env).unwrap();
+        torcl_rt::rooted!(
+            form = reader::read_from_string(
+                "((handler-bind ((error (lambda (c) c)))
+                (restart-case
+                    (handler-case
+                        (unwind-protect (cluster-scope-probe) (cluster-scope-probe))
+                      (error (c) c))
+                  (retry () 22))))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = compile_function("CLUSTER-SCOPE-PROBE", NIL, *form, &env, false, false)
+            .expect("lower handler/restart source");
+        let normal = ScopeMap::analyze_function(&body).expect("full scope analysis");
+        let probe_pc = body
+            .code
+            .iter()
+            .position(|instr| {
+                matches!(instr,
+                    Instr::CallNamed { sym, .. } if reader::symbol_name(*sym)
+                        .is_some_and(|n| n.ends_with("CLUSTER-SCOPE-PROBE"))
+                )
+            })
+            .expect("protected source call") as u32;
+        let protected = normal.before(probe_pc).unwrap();
+        assert!(
+            protected
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::HandlerCase { .. }))
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::HandlerBind { .. }))
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::RestartCase { .. }))
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::Unwind { .. }))
+        );
+        let osr = ScopeMap::analyze_osr_function(&body, probe_pc).expect("inherited clusters");
+        let clause_pc = body.handler_cases[0].clauses[0].body_bcp;
+        let clause = osr.before(clause_pc).unwrap();
+        assert!(clause.iter().all(|s| s.ownership == Ownership::Inherited));
+        assert!(
+            clause
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::HandlerBind { .. }))
+        );
+        assert!(
+            clause
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::RestartCase { .. }))
+        );
+        assert!(!clause.iter().any(|s| matches!(
+            s.kind,
+            ScopeKind::HandlerCase { .. } | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }
+        )));
+        let resume = body
+            .code
+            .iter()
+            .find_map(|instr| match instr {
+                Instr::PushRestartCase { resume_bcp, .. } => Some(*resume_bcp),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !osr.before(resume)
+                .unwrap()
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::RestartCase { .. }))
+        );
+    }
+
+    #[test]
+    fn native_control_scopes_record_lowered_binding_restoration() {
+        use torcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        torcl_rt::rooted!(
+            form = reader::read_from_string(
+                "((block done
+                (let* ((*scope-binding* 1) (x 2) (thunk (lambda () x)))
+                  (declare (special *scope-binding*))
+                  (unwind-protect (return-from done thunk) (list *scope-binding* x)))))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = compile_function("BINDING-SCOPE-PROBE", NIL, *form, &env, false, false)
+            .expect("lower dynamic and captured bindings");
+        let pc = body
+            .code
+            .iter()
+            .position(|instr| matches!(instr, Instr::ReturnFrom { .. }))
+            .expect("source has lexical exit") as u32;
+        let map = ScopeMap::analyze_osr_function(&body, pc)
+            .unwrap_or_else(|e| panic!("{e:?}\n{:?}", body.code));
+        let removed = &map.exit_at(pc).unwrap().removed;
+        assert!(removed.iter().all(|s| s.ownership == Ownership::Inherited));
+        assert!(
+            removed
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::SpecialBinding { .. }))
+        );
+        assert!(
+            removed
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::LexicalEnvironment))
+        );
+        let cleanup = removed
+            .iter()
+            .find_map(|s| match s.kind {
+                ScopeKind::Unwind { cleanup_bcp } => Some(cleanup_bcp),
+                _ => None,
+            })
+            .expect("cleanup must precede the lexical exit");
+        let inside = map.before(cleanup).unwrap();
+        assert!(
+            inside
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::SpecialBinding { .. }))
+        );
+        assert!(
+            inside
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::LexicalEnvironment))
+        );
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_caller_handles_callee_osr_deoptimization() {

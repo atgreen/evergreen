@@ -277,7 +277,8 @@ impl<'a> Builder<'a> {
 
         self.find_leaders()?;
         self.compute_depths()?;
-        self.control_scopes = Some(ScopeMap::analyze(code).map_err(BuildError::InvalidScopes)?);
+        self.control_scopes =
+            Some(ScopeMap::analyze_function(self.bf).map_err(BuildError::InvalidScopes)?);
         self.create_blocks();
         self.compute_reachable()?;
         self.compute_total_preds()?;

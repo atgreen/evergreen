@@ -222,3 +222,181 @@ fn cleanup_protocol_rejects_orphan_returns_and_mismatched_normal_entries() {
         "popped cleanup cannot be silently discarded"
     );
 }
+
+fn function_with_scopes(code: Vec<Instr>) -> torcl_rt::bytecode::BytecodeFunction {
+    torcl_rt::bytecode::BytecodeFunction {
+        code,
+        constants: vec![],
+        load_time_values: vec![],
+        handler_cases: vec![],
+        handler_binds: vec![],
+        restart_cases: vec![],
+        nested_functions: vec![],
+        names: vec![],
+        param_layout: vec![],
+        param_types: vec![],
+        has_env: false,
+        n_locals: 1,
+        max_stack: 2,
+        arity: 0,
+        name: "scopes".into(),
+        params_form: torcl_rt::value::NIL,
+        min_args: 0,
+        max_args: Some(0),
+        variadic: false,
+    }
+}
+
+#[test]
+fn condition_clause_unwinds_cluster_but_handler_bind_stays_in_context() {
+    use torcl_compiler::control_scope::ScopeKind;
+    use torcl_rt::bytecode::{ClauseInfo, HandlerBindInfo, HandlerCaseInfo};
+    let mut body = function_with_scopes(vec![
+        Instr::PushHandlerBind { hb: 0 },
+        Instr::PushHandlerCase {
+            hc: 0,
+            sp_restore: 0,
+        },
+        Instr::Const(0),
+        Instr::PopHandlerCase,
+        Instr::Br(7),
+        Instr::LoadLocal(0),
+        Instr::Br(7),
+        Instr::PopHandlerBind,
+        Instr::Return,
+    ]);
+    body.handler_binds
+        .push(HandlerBindInfo { bindings: vec![] });
+    body.handler_cases.push(HandlerCaseInfo {
+        clauses: vec![ClauseInfo {
+            type_name: "ERROR".into(),
+            body_bcp: 5,
+            var_slot: Some(0),
+        }],
+    });
+    let map = ScopeMap::analyze_function(&body).unwrap();
+    assert_eq!(map.before(2).unwrap().len(), 2);
+    let clause = map.before(5).unwrap();
+    assert_eq!(clause.len(), 1);
+    assert!(matches!(clause[0].kind, ScopeKind::HandlerBind { .. }));
+    let osr = ScopeMap::analyze_osr_function(&body, 2).unwrap();
+    assert_eq!(osr.before(5).unwrap()[0].ownership, Ownership::Inherited);
+    assert!(osr.before(8).unwrap().is_empty());
+}
+
+#[test]
+fn restart_result_resumes_outside_its_cluster_including_at_osr_entry() {
+    use torcl_compiler::control_scope::ScopeKind;
+    use torcl_rt::bytecode::RestartCaseInfo;
+    let mut body = function_with_scopes(vec![
+        Instr::PushRestartCase {
+            rc: 0,
+            resume_bcp: 4,
+            sp_restore: 0,
+        },
+        Instr::Const(0),
+        Instr::PopRestartCase,
+        Instr::Br(4),
+        Instr::Return,
+    ]);
+    body.restart_cases
+        .push(RestartCaseInfo { restarts: vec![] });
+    let map = ScopeMap::analyze_osr_function(&body, 1).unwrap();
+    assert!(matches!(
+        map.before(1).unwrap()[0].kind,
+        ScopeKind::RestartCase { .. }
+    ));
+    assert_eq!(map.before(1).unwrap()[0].ownership, Ownership::Inherited);
+    assert!(map.before(4).unwrap().is_empty());
+    // A restart pop must never silently discard an unrelated handler cluster.
+    body.code[2] = Instr::PopHandlerCase;
+    assert!(ScopeMap::analyze_function(&body).is_err());
+}
+
+#[test]
+fn condition_scope_tables_and_clause_targets_are_validated() {
+    use torcl_rt::bytecode::{ClauseInfo, HandlerCaseInfo};
+    let mut body = function_with_scopes(vec![
+        Instr::PushHandlerCase {
+            hc: 0,
+            sp_restore: 0,
+        },
+        Instr::Return,
+    ]);
+    assert!(
+        ScopeMap::analyze(&body.code).is_err(),
+        "instruction-only analysis lacks clauses"
+    );
+    assert!(ScopeMap::analyze_function(&body).is_err(), "missing table");
+    body.handler_cases.push(HandlerCaseInfo {
+        clauses: vec![ClauseInfo {
+            type_name: "ERROR".into(),
+            body_bcp: 99,
+            var_slot: Some(0),
+        }],
+    });
+    assert!(
+        ScopeMap::analyze_function(&body).is_err(),
+        "invalid clause destination"
+    );
+    body.handler_cases[0].clauses[0].body_bcp = 1;
+    body.handler_cases[0].clauses[0].var_slot = Some(1);
+    assert!(
+        ScopeMap::analyze_function(&body).is_err(),
+        "invalid condition slot"
+    );
+}
+
+#[test]
+fn binding_and_environment_scopes_survive_osr_and_retire_independently() {
+    use torcl_compiler::control_scope::ScopeKind;
+    let code = [
+        Instr::BindSpecial(1),
+        Instr::PushEnvChild,
+        Instr::BindSpecial(2),
+        Instr::PushEnvChild,
+        Instr::UnbindSpecial(2),
+        Instr::PopEnvChild,
+        Instr::PopEnvChild,
+        Instr::Return,
+    ];
+    let map = ScopeMap::analyze_osr(&code, 3).unwrap();
+    let before = map.before(4).unwrap();
+    assert_eq!(before.len(), 4);
+    assert!(matches!(
+        before[0].kind,
+        ScopeKind::SpecialBinding { symbol: 1 }
+    ));
+    assert!(matches!(before[1].kind, ScopeKind::LexicalEnvironment));
+    assert!(
+        before[..3]
+            .iter()
+            .all(|s| s.ownership == Ownership::Inherited)
+    );
+    assert_eq!(before[3].ownership, Ownership::Local);
+    assert_eq!(map.before(5).unwrap().len(), 2);
+    assert!(map.before(7).unwrap().is_empty());
+}
+
+#[test]
+fn lexical_exit_records_binding_and_environment_restoration() {
+    use torcl_compiler::control_scope::ScopeKind;
+    let code = [
+        block(1, 5),
+        Instr::BindSpecial(1),
+        Instr::PushEnvChild,
+        Instr::Const(0),
+        Instr::ReturnFrom { block_id: 1 },
+        Instr::Return,
+    ];
+    let map = ScopeMap::analyze(&code).unwrap();
+    let removed = &map.exit_at(4).unwrap().removed;
+    assert_eq!(removed.len(), 3);
+    assert!(matches!(removed[0].kind, ScopeKind::LexicalEnvironment));
+    assert!(matches!(
+        removed[1].kind,
+        ScopeKind::SpecialBinding { symbol: 1 }
+    ));
+    assert!(ScopeMap::analyze(&[Instr::UnbindSpecial(1)]).is_err());
+    assert!(ScopeMap::analyze(&[Instr::PopEnvChild]).is_err());
+}

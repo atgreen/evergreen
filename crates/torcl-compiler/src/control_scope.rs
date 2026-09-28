@@ -4,11 +4,11 @@
 //! scope inherited at OSR entry still belongs to the interpreter activation;
 //! seeing its POP or a lexical exit does not authorize erasing runtime state.
 //! Logical scopes include running cleanup continuations, not only installed
-//! handlers. Condition and restart clusters are still rejected. Unknown scope
-//! state must never become an empty set.
+//! handlers. Full-function analysis reads handler/restart side tables; the
+//! instruction-only API refuses those scopes. Unknown state never becomes empty.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use torcl_rt::bytecode::Instr;
+use torcl_rt::bytecode::{BytecodeFunction, Instr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ownership {
@@ -18,6 +18,10 @@ pub enum Ownership {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScopeKind {
+    SpecialBinding {
+        symbol: u32,
+    },
+    LexicalEnvironment,
     Block {
         id: u32,
         resume_bcp: u32,
@@ -27,6 +31,18 @@ pub enum ScopeKind {
         id: u32,
     },
     Catch {
+        resume_bcp: u32,
+    },
+    HandlerCase {
+        table_index: u32,
+    },
+    /// Signaling calls handlers with this scope still active; only a selected
+    /// escaping transfer unwinds it.
+    HandlerBind {
+        table_index: u32,
+    },
+    RestartCase {
+        table_index: u32,
         resume_bcp: u32,
     },
     /// Installed UNWIND-PROTECT handler; an exit must execute its cleanup.
@@ -70,7 +86,9 @@ pub enum ScopeError {
     InactiveTarget { bcp: u32 },
     InconsistentJoin { bcp: u32 },
     DuplicateIdentity { bcp: u32 },
-    UnsupportedScope { bcp: u32 },
+    MissingScopeTables { bcp: u32 },
+    BadScopeTable { bcp: u32 },
+    WrongPop { bcp: u32 },
     InvalidCleanup { bcp: u32 },
 }
 
@@ -99,7 +117,25 @@ impl ScopeMap {
     }
 
     pub fn analyze(code: &[Instr]) -> Result<Self, ScopeError> {
-        Self::from_entry(code, 0, Vec::new(), HashMap::new())
+        Self::from_entry(code, None, 0, Vec::new(), HashMap::new())
+    }
+
+    pub fn analyze_function(function: &BytecodeFunction) -> Result<Self, ScopeError> {
+        Self::from_entry(
+            &function.code,
+            Some(function),
+            0,
+            Vec::new(),
+            HashMap::new(),
+        )
+    }
+
+    pub fn analyze_osr_function(
+        function: &BytecodeFunction,
+        entry: u32,
+    ) -> Result<Self, ScopeError> {
+        let normal = Self::analyze_function(function)?;
+        Self::from_osr(&function.code, Some(function), entry, normal)
     }
 
     /// Seed the alternate entry with the normal-entry scope state, marking those
@@ -107,6 +143,15 @@ impl ScopeMap {
     /// inside inherited scopes. Ownership disagreement at a join is a refusal.
     pub fn analyze_osr(code: &[Instr], entry: u32) -> Result<Self, ScopeError> {
         let normal = Self::analyze(code)?;
+        Self::from_osr(code, None, entry, normal)
+    }
+
+    fn from_osr(
+        code: &[Instr],
+        function: Option<&BytecodeFunction>,
+        entry: u32,
+        normal: Self,
+    ) -> Result<Self, ScopeError> {
         let inherited = normal
             .before(entry)
             .ok_or(ScopeError::BadTarget { bcp: entry })?
@@ -120,11 +165,12 @@ impl ScopeMap {
         // A cleanup already running at entry can return to a normal destination
         // registered before entry. Retain those static possibilities; runtime
         // continuation state still chooses normal return versus resumed unwind.
-        Self::from_entry(code, entry, inherited, normal.normal_resumes)
+        Self::from_entry(code, function, entry, inherited, normal.normal_resumes)
     }
 
     fn from_entry(
         code: &[Instr],
+        function: Option<&BytecodeFunction>,
         entry: u32,
         scopes: Vec<ControlScope>,
         normal_resumes: HashMap<u32, Vec<u32>>,
@@ -153,8 +199,9 @@ impl ScopeMap {
         // The establishing PUSH is outside an OSR segment. Preserve its cold
         // resume edge explicitly, with only scopes outside the selected target.
         for (index, scope) in scopes.iter().enumerate() {
-            if let ScopeKind::Block { resume_bcp, .. } | ScopeKind::Catch { resume_bcp } =
-                scope.kind
+            if let ScopeKind::Block { resume_bcp, .. }
+            | ScopeKind::Catch { resume_bcp }
+            | ScopeKind::RestartCase { resume_bcp, .. } = scope.kind
             {
                 map.merge(resume_bcp, scopes[..index].to_vec(), &mut queue)?;
             } else if let ScopeKind::Unwind { cleanup_bcp } = scope.kind {
@@ -163,6 +210,10 @@ impl ScopeMap {
                 cleanup.kind = ScopeKind::Cleanup { cleanup_bcp };
                 cleanup_scopes.push(cleanup);
                 map.merge(cleanup_bcp, cleanup_scopes, &mut queue)?;
+            } else if let ScopeKind::HandlerCase { table_index } = scope.kind {
+                for target in handler_clause_targets(function, table_index, scope.push_bcp)? {
+                    map.merge(target, scopes[..index].to_vec(), &mut queue)?;
+                }
             }
         }
         map.merge(entry, scopes, &mut queue)?;
@@ -177,6 +228,18 @@ impl ScopeMap {
                 return Err(ScopeError::InvalidCleanup { bcp: pc });
             }
             let push = match code[pc as usize] {
+                Instr::BindSpecial(symbol) => Some((0, ScopeKind::SpecialBinding { symbol })),
+                Instr::PushEnvChild => Some((0, ScopeKind::LexicalEnvironment)),
+                Instr::UnbindSpecial(count) => {
+                    for _ in 0..count {
+                        remove_auxiliary_scope(&mut scopes, pc, true)?;
+                    }
+                    None
+                }
+                Instr::PopEnvChild => {
+                    remove_auxiliary_scope(&mut scopes, pc, false)?;
+                    None
+                }
                 Instr::PushBlock {
                     block_id,
                     resume_bcp,
@@ -207,6 +270,54 @@ impl ScopeMap {
                     map.merge(resume_bcp, scopes.clone(), &mut queue)?;
                     Some((sp_restore, ScopeKind::Catch { resume_bcp }))
                 }
+                Instr::PushHandlerCase { hc, sp_restore } => {
+                    for target in handler_clause_targets(function, hc, pc)? {
+                        map.merge(target, scopes.clone(), &mut queue)?;
+                    }
+                    Some((sp_restore, ScopeKind::HandlerCase { table_index: hc }))
+                }
+                Instr::PushHandlerBind { hb } => {
+                    let function = function.ok_or(ScopeError::MissingScopeTables { bcp: pc })?;
+                    function
+                        .handler_binds
+                        .get(hb as usize)
+                        .ok_or(ScopeError::BadScopeTable { bcp: pc })?;
+                    // No unwind target: SIGNAL may return with handlers and
+                    // restarts still live. Callback invocation is modelled by
+                    // the eventual exceptional call edges, not as clause entry.
+                    Some((0, ScopeKind::HandlerBind { table_index: hb }))
+                }
+                Instr::PushRestartCase {
+                    rc,
+                    resume_bcp,
+                    sp_restore,
+                } => {
+                    let function = function.ok_or(ScopeError::MissingScopeTables { bcp: pc })?;
+                    function
+                        .restart_cases
+                        .get(rc as usize)
+                        .ok_or(ScopeError::BadScopeTable { bcp: pc })?;
+                    map.merge(resume_bcp, scopes.clone(), &mut queue)?;
+                    Some((
+                        sp_restore,
+                        ScopeKind::RestartCase {
+                            table_index: rc,
+                            resume_bcp,
+                        },
+                    ))
+                }
+                Instr::PopHandlerCase | Instr::PopHandlerBind | Instr::PopRestartCase => {
+                    let scope = scopes.pop().ok_or(ScopeError::EmptyPop { bcp: pc })?;
+                    if !matches!(
+                        (code[pc as usize], scope.kind),
+                        (Instr::PopHandlerCase, ScopeKind::HandlerCase { .. })
+                            | (Instr::PopHandlerBind, ScopeKind::HandlerBind { .. })
+                            | (Instr::PopRestartCase, ScopeKind::RestartCase { .. })
+                    ) {
+                        return Err(ScopeError::WrongPop { bcp: pc });
+                    }
+                    None
+                }
                 Instr::PushUnwind {
                     cleanup_bcp,
                     sp_restore,
@@ -232,6 +343,13 @@ impl ScopeMap {
                         }
                         ScopeKind::Cleanup { .. } | ScopeKind::PendingCleanup { .. } => {
                             return Err(ScopeError::InvalidCleanup { bcp: pc });
+                        }
+                        ScopeKind::SpecialBinding { .. }
+                        | ScopeKind::LexicalEnvironment
+                        | ScopeKind::HandlerCase { .. }
+                        | ScopeKind::HandlerBind { .. }
+                        | ScopeKind::RestartCase { .. } => {
+                            return Err(ScopeError::WrongPop { bcp: pc });
                         }
                         _ => {
                             scopes.pop();
@@ -350,12 +468,6 @@ impl ScopeMap {
                     fallthrough = false;
                     None
                 }
-                Instr::PushHandlerCase { .. }
-                | Instr::PopHandlerCase
-                | Instr::PushHandlerBind { .. }
-                | Instr::PopHandlerBind
-                | Instr::PushRestartCase { .. }
-                | Instr::PopRestartCase => return Err(ScopeError::UnsupportedScope { bcp: pc }),
                 _ => None,
             };
             if let Some((sp_restore, kind)) = push {
@@ -395,6 +507,67 @@ impl ScopeMap {
             }
         }
     }
+}
+
+/// Dynamic bindings and lexical environments are separate runtime stacks.
+/// LET* can interleave them and then unbind specials before leaving its child
+/// environments. Retire the matching record without erasing those other
+/// records, but never cross a still-active handler or cleanup boundary.
+fn remove_auxiliary_scope(
+    scopes: &mut Vec<ControlScope>,
+    pc: u32,
+    special: bool,
+) -> Result<(), ScopeError> {
+    let index = scopes
+        .iter()
+        .rposition(|scope| match scope.kind {
+            ScopeKind::SpecialBinding { .. } => special,
+            ScopeKind::LexicalEnvironment => !special,
+            _ => false,
+        })
+        .ok_or(ScopeError::EmptyPop { bcp: pc })?;
+    if scopes[index + 1..].iter().any(|scope| {
+        !matches!(
+            scope.kind,
+            ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment
+        )
+    }) {
+        return Err(ScopeError::WrongPop { bcp: pc });
+    }
+    scopes.remove(index);
+    Ok(())
+}
+
+/// Clause destinations are outside their selected cluster. Validate both the
+/// target and condition local before exposing the cold edge to later passes.
+fn handler_clause_targets(
+    function: Option<&BytecodeFunction>,
+    index: u32,
+    pc: u32,
+) -> Result<Vec<u32>, ScopeError> {
+    let function = function.ok_or(ScopeError::MissingScopeTables { bcp: pc })?;
+    let table = function
+        .handler_cases
+        .get(index as usize)
+        .ok_or(ScopeError::BadScopeTable { bcp: pc })?;
+    table
+        .clauses
+        .iter()
+        .map(|clause| {
+            if clause
+                .var_slot
+                .is_some_and(|slot| slot >= function.n_locals)
+            {
+                return Err(ScopeError::BadScopeTable { bcp: pc });
+            }
+            if clause.body_bcp as usize >= function.code.len() {
+                return Err(ScopeError::BadTarget {
+                    bcp: clause.body_bcp,
+                });
+            }
+            Ok(clause.body_bcp)
+        })
+        .collect()
 }
 
 /// ERROR has no normal successor; SIGNAL/CERROR/WARN may return normally.
