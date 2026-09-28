@@ -121,6 +121,13 @@ foreign calls through AAPCS64 and ELFv2 respectively; aggregate arguments are
 unported everywhere but x86-64. The AArch64 and ppc64le T2 emitters cover a
 smaller opcode set than the x86-64 one and leave the rest at T1.
 
+For in-process Java calls and Java interfaces implemented by Lisp functions,
+see [Java integration in the manual](docs/manual/java.md). The current
+implementation uses a native x86-64 glibc build and a local JDK, with explicit
+reference ownership and checks for JVM startup, signals, callbacks, and shutdown.
+The primary `JAVA` API provides inferred calls, named bindings, Lisp callbacks
+and `with-scope` cleanup; the explicit `TORCL-JVM` descriptor API remains available.
+
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
 The Android AArch64 CLI is built and validated the same way — same kernel, a
 different libc — and is

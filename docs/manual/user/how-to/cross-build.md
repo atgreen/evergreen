@@ -39,7 +39,14 @@ explicit QEMU command above. Do not put foreign libraries in your host `/lib`.
 
 ## Select a different target
 
-Use `torcl-aarch64-linux` or `torcl-windows` in place of the s390x launcher.
+Use `torcl-aarch64-linux`, `torcl-ppc64le-linux`, or `torcl-windows` in place
+of the s390x launcher. POWER uses little-endian ppc64le Linux. Test a dumped
+POWER executable with:
+
+```sh
+qemu-ppc64le -L /usr/libexec/torcl/ppc64le-linux/sysroot ./hello-ppc64le
+```
+
 Give Windows executable outputs an `.exe` suffix. Windows creation runs under
 Wine; the Linux target tools run under QEMU.
 

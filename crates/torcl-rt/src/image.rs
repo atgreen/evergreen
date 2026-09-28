@@ -5,6 +5,44 @@
 use crate::error::TorclError;
 use crate::value::TorclVal;
 
+// Native runtimes cannot be reconstructed from heap snapshots. This gate also
+// serializes inhibition against a save already in progress without waiting for
+// a mutator that the collector might be trying to stop.
+static SAVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Permanently inhibit images once a foreign runtime may own process state.
+pub fn inhibit_saving() -> Result<(), TorclError> {
+    use std::sync::atomic::Ordering;
+    match SAVE_STATE.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) | Err(2) => Ok(()),
+        Err(_) => Err(TorclError::InvalidImage(
+            "cannot start a foreign runtime while an image is being saved".into(),
+        )),
+    }
+}
+
+struct SavePermit;
+impl SavePermit {
+    fn acquire() -> Result<Self, TorclError> {
+        use std::sync::atomic::Ordering;
+        match SAVE_STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(Self),
+            Err(2) => Err(TorclError::InvalidImage(
+                "image saving inhibited by foreign runtime state; save before starting the JVM"
+                    .into(),
+            )),
+            Err(_) => Err(TorclError::InvalidImage(
+                "another image save is in progress".into(),
+            )),
+        }
+    }
+}
+impl Drop for SavePermit {
+    fn drop(&mut self) {
+        SAVE_STATE.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 // ── Platform tags ──────────────────────────────────────────────────
 
 /// CPU architecture.
@@ -465,6 +503,7 @@ fn save_image_impl(
     options: &SaveImageOptions,
     reachable_only: bool,
 ) -> Result<(), TorclError> {
+    let _permit = SavePermit::acquire()?;
     use std::io::Write;
 
     let use_compression = options.compression == ImageCompression::Zstd;

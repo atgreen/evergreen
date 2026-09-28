@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""The installed Java system must relocate with an extracted native RPM."""
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('native_content', HERE / 'native-content.py')
+content = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(content)
+
+
+class NativeContentTests(unittest.TestCase):
+    def test_installs_complete_system_and_relocatable_bridge_without_build_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'source'
+            system = source / 'lib/torcl-jvm'
+            (system / 'build').mkdir(parents=True)
+            for name in ('torcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp'):
+                (system / name).write_text(name)
+            (system / 'build/libtorcl_jvm.so').write_bytes(b'native bridge')
+            (system / 'Makefile').write_text('must not ship')
+            (system / 'native.c').write_text('must not ship')
+            manual = root / 'manual'
+            (manual / 'java').mkdir(parents=True)
+            (manual / 'assets').mkdir()
+            (manual / 'index.html').write_text('manual')
+            (manual / 'java/index.html').write_text('Java API')
+            (manual / 'assets/local.css').write_text('local assets')
+            stage = root / 'stage'
+            content.install(source, manual, stage, libdir='/usr/lib64', datadir='/usr/share', docdir='/usr/share/doc')
+            installed = stage / 'usr/share/common-lisp/source/torcl-jvm'
+            self.assertEqual({p.name for p in installed.iterdir()},
+                             {'torcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp', 'libtorcl_jvm.so'})
+            self.assertTrue((installed / 'libtorcl_jvm.so').is_symlink())
+            self.assertFalse((installed / 'libtorcl_jvm.so').readlink().is_absolute())
+            relocated = root / 'extracted'
+            stage.rename(relocated)
+            self.assertEqual((relocated / 'usr/share/common-lisp/source/torcl-jvm/libtorcl_jvm.so').read_bytes(), b'native bridge')
+            self.assertEqual((relocated / 'usr/share/doc/torcl/manual/java/index.html').read_text(), 'Java API')
+            self.assertTrue((relocated / 'usr/share/doc/torcl/manual/assets/local.css').is_file())
+
+
+if __name__ == '__main__':
+    unittest.main()

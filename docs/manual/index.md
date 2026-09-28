@@ -2,7 +2,7 @@
 
 This manual describes TorCL's implementation of Common Lisp and its extensions.
 It concentrates on behavior specific to TorCL: startup, compilation, debugging,
-memory, foreign calls, concurrency, and application delivery.
+memory, foreign calls, Java integration, concurrency, and application delivery.
 
 The manual follows the development checkout. For differences between targets,
 consult [Platform support](user/reference/platforms.md). For a particular
@@ -23,14 +23,16 @@ operator, use the [Symbol index](symbol-index.md); for a topic, use the
    explicit collection, finalization, and measurement.
 6. [Foreign function interface](foreign.md) — C types, pointers, allocation,
    shared libraries, calls, callbacks, and lifetime rules.
-7. [Threads and synchronization](concurrency.md) — native threads, joins,
+7. [Java integration](java.md) — JVM lifecycle, Java calls and bindings,
+   Lisp callbacks, reference scopes, and the descriptor API.
+8. [Threads and synchronization](concurrency.md) — native threads, joins,
    mutexes and condition variables. [Fibers and scheduler groups](fibers.md)
    covers the fiber API and its current availability.
-8. [Operating-system interface](user/reference/extensions.md) — environment,
+9. [Operating-system interface](user/reference/extensions.md) — environment,
    current directory, subprocesses, and process arguments.
-9. [Profiling and efficiency](profiling.md) — engine reports, exact counts,
+10. [Profiling and efficiency](profiling.md) — engine reports, exact counts,
    event recording, sampling, and measurement effects.
-10. [Application delivery](user/explanation/images.md) — core images,
+11. [Application delivery](user/explanation/images.md) — core images,
     executables, cross-target creation, and Android's application lifecycle.
 
 ## Recipes and supplementary reference
