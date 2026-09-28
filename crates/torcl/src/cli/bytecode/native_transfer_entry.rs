@@ -253,6 +253,15 @@ impl TransferCode {
                 + self.body.handler_binds.len()
                 + self.body.restart_cases.len(),
         );
+        // `prepare` runs after native code has already crossed the transfer
+        // boundary. Keep its frame-chain validation allocation-free: an
+        // ordinary Vec growth there would turn an otherwise reserved unwind
+        // into an allocator failure before the emergency error path can run.
+        let mut cluster_frames = Vec::<(u32, *mut Frame)>::with_capacity(
+            self.body.handler_cases.len()
+                + self.body.handler_binds.len()
+                + self.body.restart_cases.len(),
+        );
         let _dynamic_scope_guard = DynamicScopeGuard {
             env,
             scopes: &mut dynamic_scopes,
@@ -271,6 +280,7 @@ impl TransferCode {
             handler_binds: &mut handler_binds,
             restart_cases: &mut restart_cases,
             dynamic_scopes: &mut dynamic_scopes,
+            cluster_frames: &mut cluster_frames,
             prepared_handler: &mut prepared_handler,
             frame,
             body: self.body.as_ref(),
@@ -1255,6 +1265,7 @@ struct CaptureContext {
     handler_binds: *mut Vec<SavedHandlerBind>,
     restart_cases: *mut Vec<SavedRestartCase>,
     dynamic_scopes: *mut Vec<DynamicScope>,
+    cluster_frames: *mut Vec<(u32, *mut Frame)>,
     prepared_handler: *mut Option<PreparedHandler>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
@@ -1310,7 +1321,8 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     };
     let mut expected_frame = context.frame;
     let mut frames_valid = true;
-    let mut cluster_frames = Vec::new();
+    let cluster_frames = unsafe { &mut *context.cluster_frames };
+    cluster_frames.clear();
     cluster_frames.extend(
         unsafe { &*context.handlers }
             .iter()
@@ -1327,7 +1339,7 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
             .map(|saved| (saved.push_bcp, saved.cluster_frame)),
     );
     cluster_frames.sort_unstable_by_key(|(push_bcp, _)| *push_bcp);
-    for (_, cluster_frame) in cluster_frames {
+    for &(_, cluster_frame) in cluster_frames.iter() {
         frames_valid &= unsafe { (*cluster_frame).prev_fp == expected_frame };
         expected_frame = cluster_frame;
     }
