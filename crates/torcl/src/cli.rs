@@ -7561,7 +7561,15 @@ fn install_evaluator_global_root_scanner() {
     });
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+/// Run a Lisp function from FOREIGN code: a fresh control environment, rooted, with
+/// the caller's nonlocal-exit tokens preserved and this callback's discarded.
+///
+/// Registered with `managed_callback` on x86-64, where its JIT trampoline lives, but
+/// the function itself is architecture-independent and the embedded-Python export
+/// path (bliss-89axw) calls it directly on every target — that path needs no
+/// trampoline, because all its exports share one static C entry point and carry the
+/// Lisp function in a handle rather than in generated code. Hence no `cfg` here;
+/// only the registration below has one.
 fn foreign_callback_runner(
     entry: TorclVal,
     arguments: &[TorclVal],
@@ -11935,6 +11943,41 @@ fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
     reader::register_package(name);
 }
 
+/// The identity of a condition type name for registry lookups: its FULL,
+/// package-qualified name, uppercased, with one colon and no redundant
+/// `COMMON-LISP` qualifier.
+///
+/// These registries were keyed by the package-STRIPPED bare name, which made a
+/// condition in any other package alias COMMON-LISP's of the same name. Defining
+/// `MYPKG::ERROR` put its definition where `ERROR`'s belonged, and since that
+/// definition's parent is `CL:ERROR` — also reduced to `ERROR` — walking the parents
+/// found the entry again and recursed until the stack was gone (bliss-kliz4):
+///
+///     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+///     (define-condition later (error) ((k :initarg :k)))
+///     (make-condition 'later :k 5)        => SIGSEGV
+///
+/// `COMMON-LISP:` is normalized away because a CL symbol's name is ordinarily
+/// reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must be one key. The
+/// same bare-name-keying hazard is noted for the DEFTYPE registry at
+/// `resolve_type_spec` (bliss-66ny) — this is that hazard in the condition
+/// registries.
+fn condition_type_key(type_name: &str) -> String {
+    let single = type_name.to_uppercase().replace("::", ":");
+    for qualifier in ["COMMON-LISP:", "CL:"] {
+        if let Some(rest) = single.strip_prefix(qualifier) {
+            return rest.to_string();
+        }
+    }
+    single
+}
+
+/// True when this name is COMMON-LISP's own — i.e. carries no package qualifier
+/// once normalized. Only such a name may match a standard condition type.
+fn names_a_standard_condition(type_name: &str) -> bool {
+    !condition_type_key(type_name).contains(':')
+}
+
 fn plist_get(list: TorclVal, key: &str) -> Option<TorclVal> {
     let mut cur = list;
     while cur.is_cons() {
@@ -11950,13 +11993,36 @@ fn plist_get(list: TorclVal, key: &str) -> Option<TorclVal> {
     None
 }
 
+/// Like [`plist_get`] but matching the FULL, package-qualified name — for the
+/// condition registries, whose keys must distinguish `MYPKG:ERROR` from `CL:ERROR`.
+///
+/// Deliberately not a change to `plist_get` itself: its other caller is the DEFTYPE
+/// registry, which is keyed by bare name ON PURPOSE (`resolve_type_spec`, bliss-66ny)
+/// and guards the collision a different way, by checking for a class of that name
+/// first. Making `plist_get` package-aware broke `(typep cv
+/// 'torcl-thread:condition-variable)`, because the deftype lookup passes a bare name.
+fn plist_get_qualified(list: TorclVal, key: &str) -> Option<TorclVal> {
+    let mut cur = list;
+    while cur.is_cons() {
+        let (entry, rest) = cp(cur);
+        if entry.is_cons() {
+            let (entry_key, entry_vals) = cp(entry);
+            if condition_type_key(&val_as_str(entry_key)) == key {
+                return Some(cp(entry_vals).0);
+            }
+        }
+        cur = rest;
+    }
+    None
+}
+
 fn plist_entry(list: TorclVal, key: &str) -> Option<TorclVal> {
     let mut cur = list;
     while cur.is_cons() {
         let (entry, rest) = cp(cur);
         if entry.is_cons() {
             let (entry_key, _) = cp(entry);
-            if symbol_bare_name(&val_as_str(entry_key)) == key {
+            if condition_type_key(&val_as_str(entry_key)) == key {
                 return Some(entry);
             }
         }
@@ -11990,7 +12056,7 @@ fn resolve_type_spec(env: &Env, type_spec: TorclVal) -> TorclVal {
 fn condition_definition_entry(env: &Env, type_name: &str) -> Option<TorclVal> {
     plist_entry(
         env.lookup_var("*CONDITION-DEFINITIONS*").unwrap_or(NIL),
-        &symbol_bare_name(type_name),
+        &condition_type_key(type_name),
     )
 }
 
@@ -11998,7 +12064,13 @@ fn condition_definition_entry(env: &Env, type_name: &str) -> Option<TorclVal> {
 type ConditionDefinition = (Vec<String>, Vec<(String, String)>);
 
 fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> {
-    match symbol_bare_name(type_name).as_str() {
+    // A qualified name is some other package's type, even when its bare name
+    // matches one of these: `MYPKG:ERROR` is not `CL:ERROR` and must not inherit
+    // its definition.
+    if !names_a_standard_condition(type_name) {
+        return None;
+    }
+    match condition_type_key(type_name).as_str() {
         "CONDITION" => Some((vec![], vec![])),
         "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "ERROR" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
@@ -12103,7 +12175,7 @@ fn condition_slot_defaults_to_nil(slot_name: &str) -> bool {
 
 fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
     let mut specs = Vec::new();
-    let type_name = symbol_bare_name(type_name);
+    let type_name = condition_type_key(type_name);
     if let Some((parents, own_slots)) = builtin_condition_definition(&type_name) {
         for parent in parents {
             specs.extend(condition_slot_specs(env, &parent));
@@ -12221,7 +12293,7 @@ fn print_condition_defined_report(
 
 fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclVal)> {
     let mut defaults = Vec::new();
-    let type_name = symbol_bare_name(type_name);
+    let type_name = condition_type_key(type_name);
     if let Some(entry) = condition_definition_entry(env, &type_name) {
         let (_, rest) = cp(entry);
         let (parents_form, rest2) = cp(rest);
@@ -12250,7 +12322,22 @@ fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclV
 }
 
 fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<TorclVal, TorclError> {
-    let type_sym = resolve_sym(&symbol_bare_name(type_name)).unwrap_or(NIL);
+    // The FULL name, not the bare one. Reducing it to the bare name meant a class
+    // in any other package registered under COMMON-LISP's symbol of that name:
+    // `MYPKG::ERROR` was registered as `CL:ERROR`, replacing it. Its own parent
+    // `CL:ERROR` was then reduced the same way, resolved to the class just
+    // registered, and the class became its own superclass — after which
+    // MAKE-CONDITION of ANY condition recursed until the stack was gone
+    // (bliss-kliz4):
+    //
+    //     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+    //     (define-condition later (error) ((k :initarg :k)))
+    //     (make-condition 'later :k 5)        => SIGSEGV
+    //
+    // `resolve_sym` takes a package-qualified name (an exact registry probe first,
+    // then the reader), and every call site here passes either a bare COMMON-LISP
+    // name or an explicitly qualified one, so the full name is always resolvable.
+    let type_sym = resolve_sym(type_name).unwrap_or(NIL);
     if let Some(class) = torcl_stdlib::find_class(type_sym) {
         return Ok(class);
     }
@@ -12262,7 +12349,9 @@ fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<Torcl
         let (_, rest) = cp(entry);
         let (parents_form, _) = cp(rest);
         for parent in list_to_vec(parents_form) {
-            parent_names.push(sym_bare_name_rc(parent).to_string());
+            // Also the full name: a parent named in another package must resolve to
+            // ITS class, not to whatever COMMON-LISP calls by the same bare name.
+            parent_names.push(sym_name(parent));
         }
     } else {
         parent_names.push("CONDITION".into());
@@ -12313,6 +12402,19 @@ fn instance_class_hierarchy_names(object: TorclVal) -> Option<Vec<String>> {
     if names.is_empty() { None } else { Some(names) }
 }
 
+/// A condition's class-precedence list as `condition_type_key`s, most-specific
+/// first — the names a handler clause is matched against.
+///
+/// PACKAGE-QUALIFIED, unlike the otherwise identical
+/// [`instance_class_hierarchy_names`]. These were bare names, so a handler matched
+/// any condition whose class had the same BARE name: a handler for one package's
+/// `ERROR` caught a plain `CL:ERROR`, and caught another package's `ERROR` too
+/// (bliss-tnavc). Swallowing conditions it never asked for is the worst failure mode
+/// a handler has, because nothing reports it.
+///
+/// `instance_class_hierarchy_names` stays bare deliberately: a dozen callers compare
+/// its strings to literals like `"TYPE-ERROR"`, and those names are COMMON-LISP's,
+/// where bare and qualified agree.
 fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
     let class = torcl_stdlib::class_of(cond);
     let cpl = torcl_stdlib::compute_class_precedence_list(class).ok()?;
@@ -12320,7 +12422,7 @@ fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
     for class in cpl {
         let name = torcl_stdlib::class_name(class);
         if name.is_symbol() {
-            names.push(sym_bare_name_rc(name).to_string());
+            names.push(condition_type_key(&sym_name(name)));
         }
     }
     if names.iter().any(|name| name == "CONDITION") {
@@ -12332,13 +12434,15 @@ fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
 
 fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
     let mut supers = Vec::new();
-    let mut cur = plist_get(
+    let mut cur = plist_get_qualified(
         env.lookup_var("*CONDITION-TYPES*").unwrap_or(NIL),
-        &symbol_bare_name(type_name),
+        &condition_type_key(type_name),
     );
     while let Some(list) = cur {
         for sup in list_to_vec(list) {
-            supers.push(symbol_bare_name(&val_as_str(sup)));
+            // Qualified, so the chain can be compared against a handler's own
+            // qualified name (see `condition_type_hierarchy_names`).
+            supers.push(condition_type_key(&val_as_str(sup)));
         }
         cur = None;
     }
@@ -12346,8 +12450,8 @@ fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
 }
 
 fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) -> bool {
-    let signaled = symbol_bare_name(signaled_type);
-    let handler = symbol_bare_name(handler_type);
+    let signaled = condition_type_key(signaled_type);
+    let handler = condition_type_key(handler_type);
     handler == "T"
         || signaled == handler
         || condition_supertypes(env, &signaled)
@@ -12356,7 +12460,7 @@ fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) ->
 }
 
 fn condition_matches_handler(env: &Env, condition: TorclVal, handler_type: &str) -> bool {
-    let handler = symbol_bare_name(handler_type);
+    let handler = condition_type_key(handler_type);
     if handler == "T" {
         return true;
     }
@@ -15930,7 +16034,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 ));
             }
             "CATCH" => {
-                let (tag_form, body) = cp(cdr);
+                // The BODY is a source form held across evaluating the TAG, which
+                // allocates: a relocating minor GC there leaves `body` stale and
+                // `eval_progn` walks a moved list (bliss-ep38p). PROGV below roots
+                // its source forms for the same reason.
+                let (tag_form, mut body) = cp(cdr);
+                torcl_rt::rooted_ref!(_body_root = &mut body);
                 let tag = val_as_str(eval_form(tag_form, env)?);
                 let token = next_control_token("__THROW__");
                 env.catch_stack.push((tag, token.clone()));
@@ -16308,6 +16417,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             | "TORCL::%PY-REPR"
             | "TORCL::%PY-OBJECTP"
             | "TORCL::%PY-DRAIN-OUTPUT"
+            | "TORCL::%PY-EXPORT"
             | "TORCL::%PY-STOP") => {
                 if env.sandbox {
                     return Err(TorclError::SandboxViolation(
@@ -23344,7 +23454,13 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             if parts.len() == 2 {
                 let _pkg_name = parts[0];
                 let fn_name = parts[1].trim_start_matches(':');
-                if let Some((params_form, body)) = callable_body(env, fn_name) {
+                if let Some((mut params_form, mut body)) = callable_body(env, fn_name) {
+                    // Both are source forms held across argument evaluation, which
+                    // allocates; without rooting, a minor GC there leaves the lambda
+                    // list and body pointing at moved conses (bliss-ep38p). The
+                    // LAMBDA fallback further down already does this (bliss-98mu).
+                    torcl_rt::rooted_ref!(_params_form_root = &mut params_form);
+                    torcl_rt::rooted_ref!(_body_root = &mut body);
                     let args = eval_args(cdr, env)?;
                     return eval_lambda_call(env, params_form, body, &args, Arc::clone(&env.frame));
                 }
@@ -33232,6 +33348,26 @@ fn apply_function(
 /// builtin like FUNCALL is reported bound and `(fdefinition 'funcall)` returns a
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
+/// Is `name` one of the interpreter's own builtin functions?
+///
+/// A CONSTRAINT ON WHAT MAY BE ADDED HERE. The compiled tier and the FUNCALL fast
+/// path both reduce an operator to its BARE name to decide what it is
+/// (`apply_builtin_fast` / `DIRECT_FAST`, `builtin_fn_wrapper`). So registering a
+/// builtin as `SOMEPKG:TYPEP` does not give you a distinct function: the bare name
+/// wins and CL's `TYPEP` answers instead, silently and with no warning
+/// (bliss-kliz4 — it cost a debugging session, since `(py:typep x "builtins.float")`
+/// returned NIL for every input while never being called at all).
+///
+/// The convention that avoids it, and which `TORCL-FFI` and the `PY` package both
+/// follow: register the primitive under a `TORCL::%`-prefixed name, whose bare form
+/// collides with nothing, and define the package-qualified function over it in
+/// `lib/boot.lisp`. That also gives it a real function cell, so `FUNCALL`, `APPLY`
+/// and `MAPCAR` work on it.
+///
+/// A USER's `DEFUN` of such a name is fine and needs nothing: a global function is
+/// keyed by its full name and is consulted before this predicate, so
+/// `(defun somepkg:length (x) ...)` is called correctly in both tiers. The hazard is
+/// specific to registering a *builtin* here.
 fn is_builtin_function(name: &str) -> bool {
     if cfg!(torcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
         return false;
@@ -33295,6 +33431,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL::%PY-REPR"
             | "TORCL::%PY-OBJECTP"
             | "TORCL::%PY-DRAIN-OUTPUT"
+            | "TORCL::%PY-EXPORT"
             | "TORCL::%PY-STOP"
     ) {
         return true;
@@ -34153,6 +34290,10 @@ fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, Torcl
             exactly(name, args, 1)?;
             Ok(if python::is_proxy(args[0]) { T } else { NIL })
         }
+        "EXPORT" => {
+            exactly(name, args, 2)?;
+            python::export(text(name, args[0], "the Python name to bind")?, args[1])
+        }
         "DRAIN-OUTPUT" => {
             exactly(name, args, 0)?;
             python::drain_output()
@@ -34219,6 +34360,7 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
         | "TORCL::%PY-REPR"
         | "TORCL::%PY-OBJECTP"
         | "TORCL::%PY-DRAIN-OUTPUT"
+        | "TORCL::%PY-EXPORT"
         | "TORCL::%PY-STOP") => {
             if _env.sandbox {
                 return Err(TorclError::SandboxViolation(
@@ -34596,14 +34738,25 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
     // A `(:no-error (lambda-list) body)` clause (CLHS 9.1) is not a handler: when
     // the protected form returns normally, its body runs with the lambda-list
     // bound to the returned values, OUTSIDE this HANDLER-CASE's handlers.
-    let mut no_error: Option<(TorclVal, TorclVal, Arc<SharedCell<EnvFrame>>)> = None;
+    // A :no-error clause's lambda list and body are source forms that must survive
+    // the PROTECTED FORM's evaluation — arbitrary user code, so arbitrarily many
+    // allocations. Held in a plain tuple they went stale under a relocating GC
+    // (bliss-ep38p); the `installed` handler list a few lines below was already
+    // rooted for exactly this reason. Kept as two rooted values plus the frame,
+    // because the root macros take a place and not a tuple field; the frame's
+    // presence is what says a :no-error clause was seen.
+    torcl_rt::rooted!(no_error_params = NIL);
+    torcl_rt::rooted!(no_error_body = NIL);
+    let mut no_error_frame: Option<Arc<SharedCell<EnvFrame>>> = None;
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);
         let (type_form, clause_rest) = cp(clause);
         let (bind_list, handler_body) = cp(clause_rest);
         if sym_bare_name_rc(type_form).as_ref() == "NO-ERROR" {
-            no_error = Some((bind_list, handler_body, Arc::clone(&env.frame)));
+            *no_error_params = bind_list;
+            *no_error_body = handler_body;
+            no_error_frame = Some(Arc::clone(&env.frame));
             c = rest;
             continue;
         }
@@ -34641,7 +34794,8 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
         Ok(val) => {
             // Normal return: run a :no-error clause (if any) with its lambda list
             // bound to the values the protected form produced (HANDLER-CASE.20+).
-            if let Some((params, body, frame)) = no_error {
+            if let Some(frame) = no_error_frame {
+                let (params, body) = (*no_error_params, *no_error_body);
                 let mut values: Vec<TorclVal> = if env.mv_active {
                     env.mv.clone()
                 } else {

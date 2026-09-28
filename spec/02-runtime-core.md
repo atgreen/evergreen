@@ -831,14 +831,22 @@ requires a glibc target rather than the default static musl):
   alone — so without this a null dereference inside CPython would be rewritten to
   unwind a Lisp frame that is not on top. A fault inside CPython now kills the
   process, as it would in Python itself.
+- Python calling Lisp: `PY:EXPORT` binds a Python callable backed by a Lisp function,
+  reached through the stable handle table so the collector may move the function and
+  its captured environment. Notably this needs NO generated trampoline — every export
+  shares one static C entry point and carries its function in a handle rather than in
+  code — so it is not restricted to x86-64 the way `managed_callback` is; the only
+  architecture-specific dependency is the foreign→managed transition, which all three
+  supported targets have. Verified on x86-64.
 - A Python raise as a first-class condition, `PY:EXCEPTION`, carrying the
   exception's class, its message, the Python frames, and the exception object.
   Its report renders the Python half of a mixed-language backtrace, and
   `PY:BACKTRACE` returns those frames as data for a debugger to interleave.
 
-Still unbuilt, and tracked separately: Python→Lisp callables (`bliss-89axw`,
-x86-64 only until callbacks are ported), the zero-copy buffer protocol
-(`bliss-s8wrr`).
+Still unbuilt, and tracked separately: the zero-copy buffer protocol
+(`bliss-s8wrr`), which is blocked on unboxed specialized arrays (`bliss-iqyv`) —
+every `:element-type` currently upgrades to `T`, so there is no contiguous numeric
+storage to share.
 
 Two staged pieces are worth naming because each is a limitation a user meets rather
 than a feature that is merely absent. Forwarding an interrupt INTO a running Python

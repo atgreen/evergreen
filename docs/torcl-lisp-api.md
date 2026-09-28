@@ -961,6 +961,43 @@ This means a released Python object is destroyed slightly later than a `del` in
 Python would destroy it — after a collection and the next crossing. Code that
 depends on a `__del__` running at a particular moment should call it explicitly.
 
+### Calling Lisp from Python
+
+`PY:EXPORT` binds a Python callable, in `__main__`, that calls back into Lisp:
+
+```lisp
+(py:export "add" (lambda (a b) (+ a b)))
+(py:exec "print(add(2, 3))")            ; => 5
+```
+
+The callable is an ordinary Python value, so it can be passed around and called from
+inside Python code, not just by name:
+
+```lisp
+(py:exec "def twice(f, x): return f(f(x))")
+(py:export "inc" (lambda (n) (+ n 1)))
+(py:call "__main__.twice" (py:resolve "__main__.inc") 5)   ; => 7
+```
+
+Arguments and results cross by the same value policy as everything else. A Lisp error
+becomes a Python exception (a `RuntimeError` carrying the Lisp message) rather than
+unwinding through CPython frames, which would leave their reference counts wrong.
+
+**The Lisp function is reached through a stable handle, and is retained for the process
+lifetime.** A Python callable can be stored anywhere on the Python side, so there is no
+moment at which releasing it would be safe without reference-counting that side; the
+handle also means the collector can move the function (and anything its closure
+captures) without invalidating the callable.
+
+Unlike the FFI's callbacks, this needs no generated trampoline: every export shares one
+static C entry point and carries its Lisp function in the handle rather than in code.
+So the only architecture-specific dependency is the foreign-to-managed thread
+transition, which x86-64, AArch64 and ppc64le all have. **Verified on x86-64 only** —
+the other two are expected to work by construction but have not been run.
+
+Not yet available: exporting a whole Lisp package as a Python module
+(`import lisp.statistics`), and `input()` reading `*standard-input*`.
+
 ### Errors
 
 A Python raise is a first-class Lisp condition, `PY:EXCEPTION`, a subtype of
@@ -997,11 +1034,11 @@ frames however it presents them:
 3: Python  asarray at numpy/_core/numeric.py:330
 ```
 
-It is named `PY:EXCEPTION` rather than `PY:ERROR` for a reason worth knowing if you
-define conditions of your own: TorCL's class registry is currently keyed by a
-class's *bare* name, so a class named `PY:ERROR` replaces `CL:ERROR` image-wide
-(bliss-kliz4). Until that is fixed, do not give a class a bare name that a standard
-class already uses.
+It is named `PY:EXCEPTION` rather than `PY:ERROR` because that is the better word for
+what it is. Originally the name was forced: the condition and class registries were
+keyed by a class's *bare* name, so `PY:ERROR` replaced `CL:ERROR` image-wide
+(bliss-kliz4, since fixed — a class or condition in another package now keeps its own
+identity).
 
 The inverse direction -- a Lisp condition escaping into Python becoming a Python
 exception rather than unwinding through CPython frames -- needs Python-to-Lisp

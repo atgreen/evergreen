@@ -19162,6 +19162,29 @@ fn emit_native(
             // PopHandler are elided. Any catch/unwind-protect emits opcodes this
             // codegen does not handle and bails at the catch-all, so a
             // PopHandler reaching here can only partner a PushBlock/PushTag.
+            // ...BUT ONLY FOR AN ORDINARY T1 ENTRY. An OSR body is entered with
+            // the interpreter's handler stack already live — the enclosing CATCH
+            // of a hot loop is still on it — and OSR compiles only the LOOP, so
+            // the reasoning above (a catch in the function makes the whole
+            // function bail) does not apply. Eliding the scope transitions then
+            // leaves those T0 handlers live at a later deopt, which delivers a
+            // THROW to an already-expired CATCH and REPLAYS the side effects that
+            // follow it. The s390x emitter deopts these for the same reason; this
+            // is the same fix, and the reproducer is
+            // scripts/s390x-jit-smoke.py's jit-expired-catch (bliss-57da).
+            //
+            // Deopting is correct rather than merely safe: T0 then establishes,
+            // unwinds and pops the scopes itself, which is what the elision was
+            // assuming had already happened.
+            Instr::PushBlock { .. }
+            | Instr::PushTag { .. }
+            | Instr::PopHandler
+            | Instr::ReturnFrom { .. }
+                if sym == u32::MAX =>
+            {
+                let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                c.jmp(l);
+            }
             Instr::PushBlock { .. } => {}
             Instr::PushTag { .. } => {}
             Instr::PopHandler => {}

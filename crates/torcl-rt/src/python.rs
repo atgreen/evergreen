@@ -82,6 +82,12 @@ struct Api {
     err_get_raised_exception: Option<unsafe extern "C" fn() -> *mut PyObject>,
     err_fetch: unsafe extern "C" fn(*mut *mut PyObject, *mut *mut PyObject, *mut *mut PyObject),
     sequence_size: unsafe extern "C" fn(*mut PyObject) -> isize,
+    // ── exporting Lisp functions (see the export section) ──
+    cfunction_new_ex: unsafe extern "C" fn(*mut (), *mut PyObject, *mut PyObject) -> *mut PyObject,
+    dict_set_item_string: unsafe extern "C" fn(*mut PyObject, *const i8, *mut PyObject) -> i32,
+    err_set_string: unsafe extern "C" fn(*mut PyObject, *const i8),
+    /// `PyExc_RuntimeError`, a DATA symbol like the type objects.
+    runtime_error: *mut PyObject,
     sequence_get_item: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
 
     // ── singletons and types, which are DATA symbols ──
@@ -171,8 +177,25 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
                 .map(|found| unsafe { std::mem::transmute(found) })
         }};
     }
-    /// Resolve a DATA symbol, whose address is the value rather than something to
-    /// call. `Py_None` and the type objects are macros for exactly this.
+    /// Resolve a DATA symbol that is itself a POINTER VARIABLE, and read it.
+    ///
+    /// The distinction matters and is easy to get wrong: `_Py_NoneStruct` (16 bytes)
+    /// and `PyLong_Type` (416) ARE the objects, so their addresses are the values.
+    /// `PyExc_RuntimeError` is 8 bytes — a `PyObject *` variable — so its address is
+    /// where the pointer lives, and using it directly would hand CPython a pointer
+    /// to a pointer. `nm -D -S` on libpython tells them apart by size.
+    macro_rules! data_pointer {
+        ($name:literal) => {{
+            // SAFETY: the handle came from a successful load above, and the symbol
+            // is a pointer-sized data object holding a PyObject pointer.
+            let slot = unsafe { crate::ffi::foreign_symbol(library, $name) }
+                .map_err(|error| format!("{name} has no {}: {error}", $name))?;
+            unsafe { (slot as *const *mut PyObject).read() }
+        }};
+    }
+    /// Resolve a DATA symbol whose address IS the value — a struct, not a pointer
+    /// to one. `_Py_NoneStruct` and the type objects are exactly this; contrast
+    /// [`data_pointer!`].
     macro_rules! data {
         ($name:literal) => {{
             // SAFETY: the handle came from a successful load above.
@@ -217,6 +240,10 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
         err_get_raised_exception: optional!("PyErr_GetRaisedException"),
         err_fetch: symbol!("PyErr_Fetch"),
         sequence_size: symbol!("PySequence_Size"),
+        cfunction_new_ex: symbol!("PyCFunction_NewEx"),
+        dict_set_item_string: symbol!("PyDict_SetItemString"),
+        err_set_string: symbol!("PyErr_SetString"),
+        runtime_error: data_pointer!("PyExc_RuntimeError"),
         sequence_get_item: symbol!("PySequence_GetItem"),
         none: data!("_Py_NoneStruct"),
         long_type: data!("PyLong_Type"),
@@ -1681,5 +1708,179 @@ impl PythonScope {
         let error = text.pop().unwrap_or_default();
         let output = text.pop().unwrap_or_default();
         Ok((output, error))
+    }
+}
+
+// ── Exporting Lisp functions to Python ─────────────────────────────
+//
+// `(py:export "calculate_price" #'calculate-price)` binds a Python callable in
+// `__main__` that calls back into Lisp.
+//
+// NO JIT TRAMPOLINE, AND SO NOT x86-64 ONLY. The obvious way to do this is a
+// generated thunk per exported function, which is what `managed_callback` provides
+// and why it is gated to x86-64. It is not needed: every export shares ONE static
+// `extern "C"` entry point, and which Lisp function to call travels in CPython's
+// `self` argument as a stable handle. So the only architecture requirement is the
+// foreign→managed transition, which x86-64, AArch64 and ppc64le all have.
+//
+// THE HANDLE IS THE POINT. `self` carries a [`LispHandle`]'s bits, not a pointer:
+// TorCL's collector moves objects, and a Python callable outlives any particular
+// address. The handle table keeps the function alive and rewrites it when it moves.
+
+/// `PyMethodDef`, whose layout is part of CPython's stable ABI.
+#[repr(C)]
+struct PyMethodDef {
+    name: *const i8,
+    meth: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    flags: i32,
+    doc: *const i8,
+}
+
+/// `METH_VARARGS`: the callable receives `(self, args_tuple)`.
+const METH_VARARGS: i32 = 0x0001;
+
+/// How an exported Lisp function is actually invoked.
+///
+/// A registered function pointer rather than a direct call, because running Lisp
+/// means evaluating with the interpreter, which lives in a crate above this one —
+/// the same arrangement as the GC's finalizer dispatch.
+pub type ExportDispatch = fn(u64, &[crate::value::TorclVal]) -> Result<crate::value::TorclVal, TorclError>;
+
+static EXPORT_DISPATCH: OnceLock<ExportDispatch> = OnceLock::new();
+
+/// Install the interpreter's way of calling a Lisp function. Once, at startup.
+pub fn set_export_dispatch(dispatch: ExportDispatch) {
+    let _ = EXPORT_DISPATCH.set(dispatch);
+}
+
+/// The single C entry point shared by every exported Lisp function.
+///
+/// Called by CPython on a thread that already holds the GIL, which may be a thread
+/// TorCL has never seen. The phases are ordered deliberately:
+///
+/// 1. Read the arguments while still FOREIGN — this needs the C API, not Lisp.
+/// 2. Publish managed state and run the Lisp function. The arguments are rooted
+///    across it: evaluating allocates, and a `Vec<TorclVal>` is invisible to the
+///    collector otherwise.
+/// 3. Convert the result back, foreign again.
+///
+/// Returning null with an exception set is how a C function reports failure, so a
+/// Lisp error becomes a Python exception rather than unwinding through CPython
+/// frames — which would leave its reference counts wrong.
+unsafe extern "C" fn call_exported(
+    owner: *mut PyObject,
+    arguments: *mut PyObject,
+) -> *mut PyObject {
+    let Ok(api) = api() else {
+        return std::ptr::null_mut();
+    };
+    // Phase 1: the handle and the arguments, read through the C API.
+    let read = (|| -> Option<(u64, Vec<crate::value::TorclVal>)> {
+        let scope = PythonScope::enter().ok()?;
+        // SAFETY: `owner` is the `self` given to PyCFunction_NewEx below, which is
+        // always the integer handle this export was created with.
+        let handle = unsafe { (api.long_as_longlong_and_overflow)(owner, &mut 0) } as u64;
+        // SAFETY: METH_VARARGS guarantees a tuple.
+        let count = unsafe { (api.sequence_size)(arguments) };
+        if count < 0 {
+            scope.clear_error();
+            return None;
+        }
+        let mut values = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            // SAFETY: `index` is within the reported size.
+            let item = unsafe { (api.sequence_get_item)(arguments, index) };
+            let item = unsafe { PyRef::from_owned(item) }?;
+            values.push(scope.from_python(item).ok()?);
+        }
+        Some((handle, values))
+    })();
+    let Some((handle, mut values)) = read else {
+        return raise_from_lisp(api, "an exported Lisp function's arguments could not be read");
+    };
+
+    // Phase 2: into Lisp. The arguments must be rooted across it.
+    let Some(dispatch) = EXPORT_DISPATCH.get() else {
+        return raise_from_lisp(api, "no Lisp dispatcher is registered for exported functions");
+    };
+    let outcome = {
+        let _managed = crate::safepoint::ForeignStateScope::lisp();
+        crate::rooted_ref!(_values_root = &mut values);
+        dispatch(handle, &values)
+    };
+
+    // Phase 3: the result, back through the C API.
+    match outcome {
+        Ok(value) => {
+            let converted = (|| -> Option<*mut PyObject> {
+                let scope = PythonScope::enter().ok()?;
+                Some(scope.to_python(value).ok()?.into_raw())
+            })();
+            converted.unwrap_or_else(|| {
+                raise_from_lisp(api, "an exported Lisp function's result has no Python equivalent")
+            })
+        }
+        Err(error) => raise_from_lisp(api, &format!("{error}")),
+    }
+}
+
+/// Set a Python exception and return null, which is how a C function fails.
+fn raise_from_lisp(api: &'static Api, message: &str) -> *mut PyObject {
+    if let Ok(text) = CString::new(message) {
+        // SAFETY: a resolved entry point, a valid string, and the GIL is held by
+        // whoever called into us.
+        unsafe { (api.err_set_string)(api.runtime_error, text.as_ptr()) };
+    }
+    std::ptr::null_mut()
+}
+
+impl PythonScope {
+    /// Bind `function` in `__main__` under `name`, callable from Python.
+    ///
+    /// The Lisp function is retained by the handle table for the process lifetime:
+    /// a Python callable can be stored anywhere, so there is no moment at which
+    /// dropping it would be safe without reference counting the Python side, which
+    /// is not worth it for a surface whose whole point is long-lived exports.
+    pub fn export(&self, name: &str, function: crate::value::TorclVal) -> Result<(), TorclError> {
+        let handle = retain_lisp(function);
+        // The definition must outlive the callable, which can live as long as the
+        // interpreter. One leak per export, bounded by how many a program makes.
+        let name_c = CString::new(name)
+            .map_err(|_| TorclError::FfiError("an export name contains a null byte".into()))?;
+        let definition = Box::leak(Box::new(PyMethodDef {
+            name: Box::leak(name_c.into_boxed_c_str()).as_ptr(),
+            meth: call_exported,
+            flags: METH_VARARGS,
+            doc: std::ptr::null(),
+        }));
+
+        // SAFETY: resolved entry points under the GIL. `owner` is a new reference
+        // the callable takes over; the definition is leaked and so outlives it.
+        let callable = unsafe {
+            let owner = adopt(
+                self,
+                (self.api.long_from_longlong)(handle.to_bits() as i64),
+                "making an export handle",
+            )?;
+            adopt(
+                self,
+                (self.api.cfunction_new_ex)(
+                    definition as *mut PyMethodDef as *mut (),
+                    owner.into_raw(),
+                    std::ptr::null_mut(),
+                ),
+                "making a Python callable",
+            )?
+        };
+
+        let dict = self.main_dict()?;
+        let key = CString::new(name).expect("checked above");
+        // SAFETY: a borrowed dictionary and a live callable, GIL held.
+        let status = unsafe { (self.api.dict_set_item_string)(dict, key.as_ptr(), callable.as_ptr()) };
+        if status != 0 {
+            check(self, "binding an exported function")?;
+            return Err(TorclError::FfiError("binding an exported function failed".into()));
+        }
+        Ok(())
     }
 }

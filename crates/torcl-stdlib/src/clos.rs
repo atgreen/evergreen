@@ -1384,12 +1384,43 @@ fn class_name_key(name: TorclVal) -> Option<String> {
         return Some("T".into());
     }
     let full = torcl_rt::symbols::symbol_name(name.as_symbol_index())?;
-    let bare = full
-        .trim_start_matches("KEYWORD:")
-        .rsplit(':')
-        .next()
-        .unwrap_or(&full);
-    Some(bare.to_uppercase())
+    // KEEP THE PACKAGE. This key used to be the package-STRIPPED bare name, which
+    // made two classes of the same bare name in different packages collide — and
+    // because `set_find_class` writes this map as well as the symbol-keyed one,
+    // defining a class named e.g. `MYPKG::ERROR` REPLACED the entry for `CL:ERROR`.
+    // Every condition defined afterwards then resolved its `ERROR` superclass to
+    // that class, which is its own superclass, and `MAKE-CONDITION` of anything
+    // recursed until the stack was gone (bliss-kliz4):
+    //
+    //     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+    //     (define-condition later (error) ((k :initarg :k)))
+    //     (make-condition 'later :k 5)        => SIGSEGV
+    //
+    // The fallback itself is still wanted: it exists because a class-name symbol's
+    // IDENTITY can drift (re-interned after the class was defined) while its name
+    // does not, and a name that carries its package is just as stable against that
+    // as a bare one.
+    //
+    // `COMMON-LISP:` is normalized away because a CL symbol's name is ordinarily
+    // reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must land on one key.
+    Some(normalized_class_key(&full))
+}
+
+/// The comparison form of a class name: uppercase, one colon between package and
+/// name, and no redundant `COMMON-LISP` qualifier.
+///
+/// Only ever compared against other keys from this same function, so what matters
+/// is that it is consistent — and that two names differing only by package do not
+/// collapse onto each other.
+fn normalized_class_key(full: &str) -> String {
+    let upper = full.to_uppercase();
+    let single = upper.replace("::", ":");
+    for prefix in ["COMMON-LISP:", "CL:"] {
+        if let Some(rest) = single.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    single
 }
 
 pub fn find_class(name: TorclVal) -> Option<TorclVal> {

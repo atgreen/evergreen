@@ -449,6 +449,101 @@ f()")
     );
 }
 
+/// Python can call Lisp: `py:export` binds a Python callable backed by a Lisp
+/// function (bliss-89axw).
+#[test]
+fn python_can_call_an_exported_lisp_function() {
+    let program = r#"
+      (py:export "add" (lambda (a b) (+ a b)))
+      (py:export "greet" (lambda (who) (concatenate 'string "hello " who)))
+      (py:exec "def twice(f, x): return f(f(x))")
+      (py:export "inc" (lambda (n) (+ n 1)))
+      (format t "EXPORT ~S~%"
+              (list (py:call "__main__.add" 2 3)
+                    (py:call "__main__.greet" "world")
+                    ;; The exported function as a VALUE, passed into a Python
+                    ;; higher-order function and called from inside Python — the
+                    ;; case that a mere name binding would not cover.
+                    (py:call "__main__.twice" (py:resolve "__main__.inc") 5)))
+    "#;
+    let stdout = run(program, "t0", false);
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("EXPORT "))
+            .unwrap_or("")
+            .trim(),
+        r#"EXPORT (5 "hello world" 7)"#
+    );
+}
+
+/// The exported function is reached through a STABLE HANDLE, which is the whole
+/// reason the mechanism exists: TorCL's collector moves objects, and a Python
+/// callable outlives any address.
+///
+/// The closure captures heap data so the collector has something to relocate. A raw
+/// pointer would survive the first assertion and then read moved or reclaimed memory.
+#[test]
+fn an_exported_function_survives_collection() {
+    let program = r#"
+      (let ((table (list 1 2 3)))
+        (py:export "lookup" (lambda (i) (nth i table))))
+      (py:exec "before = lookup(1)")
+      (dotimes (i 3) (torcl-ext:gc))
+      ;; Churn the heap hard enough to reuse whatever the closure occupied.
+      (let ((junk nil)) (dotimes (i 20000) (push (list i i) junk)) (length junk))
+      (torcl-ext:gc)
+      (torcl-ext:gc)
+      (format t "HANDLE ~S~%"
+              (list (py:resolve "__main__.before")
+                    (py:call "__main__.lookup" 1)
+                    (py:call "__main__.lookup" 2)))
+    "#;
+    let stdout = run(program, "t0", false);
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("HANDLE "))
+            .unwrap_or("")
+            .trim(),
+        "HANDLE (2 2 3)",
+        "the closure must still answer correctly after being moved"
+    );
+}
+
+/// A Lisp error inside an exported function becomes a Python exception.
+///
+/// It must NOT unwind through CPython frames: that would leave their reference
+/// counts wrong and corrupt the interpreter. Returning null with an exception set is
+/// how a C function reports failure, which is what the entry point does.
+#[test]
+fn a_lisp_error_becomes_a_python_exception() {
+    let program = r#"
+      (py:export "boom" (lambda () (error "lisp exploded")))
+      (py:export "ok" (lambda () 99))
+      (py:exec "
+caught = None
+try:
+    boom()
+except Exception as e:
+    caught = type(e).__name__ + ':' + ('lisp exploded' in str(e) and 'msg' or 'nomsg')
+")
+      (format t "ERR ~S~%"
+              (list (py:resolve "__main__.caught")
+                    ;; And the interpreter is still healthy afterwards.
+                    (py:call "__main__.ok")))
+    "#;
+    let stdout = run(program, "t0", false);
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("ERR "))
+            .unwrap_or("")
+            .trim(),
+        r#"ERR ("RuntimeError:msg" 99)"#
+    );
+}
+
 /// A fault inside CPython must produce CPython's behaviour, not TorCL's
 /// (bliss-ztkuw).
 ///

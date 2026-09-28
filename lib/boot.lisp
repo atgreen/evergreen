@@ -4023,6 +4023,22 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 (defun py:str (object) (py::draining (torcl::%py-str object)))
 (defun py:repr (object) (py::draining (torcl::%py-repr object)))
 
+;;; (py:export "calculate_price" #'calculate-price) makes a Lisp function callable
+;;; from Python by that name:
+;;;
+;;;   (py:export "add" (lambda (a b) (+ a b)))
+;;;   (py:exec "print(add(2, 3))")        =>  5
+;;;
+;;; The Python callable reaches the Lisp function through a STABLE HANDLE, not a
+;;; pointer: the collector moves objects, and a Python callable can outlive any
+;;; address. The handle keeps the function alive for the process lifetime -- a
+;;; callable can be stored anywhere on the Python side, so there is no moment at
+;;; which releasing it would be safe.
+;;;
+;;; Arguments and the result cross by the same policy as everything else, so a Lisp
+;;; error becomes a Python exception rather than unwinding through CPython frames.
+(defun py:export (name function) (py::draining (torcl::%py-export name function)))
+
 ;;; Flush Python's buffered output without doing anything else -- for a long
 ;;; computation whose progress prints would otherwise arrive only when it returns.
 (defun py:flush () (py::drain-output) (values))
@@ -4044,15 +4060,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;;
 ;;; FRAMES are (FILE LINE FUNCTION) lists, outermost first -- Python's own order.
 ;;;
-;;; NAMED PY:EXCEPTION, NOT PY:ERROR, and that is not a style choice. TorCL's class
-;;; registry is keyed by a class's BARE name, so a class named PY:ERROR registers
-;;; under "ERROR" and REPLACES CL:ERROR for the whole image -- after which every
-;;; user condition's superclass "ERROR" resolves to that class, which is its own
-;;; superclass, and MAKE-CONDITION of anything recurses until the stack is gone.
-;;; It took a SIGSEGV in (make-condition 'c1) -- a definition with nothing to do
-;;; with Python -- to find that. Filed as bliss-kliz4; until it is fixed, no package
-;;; here may define a class whose bare name a standard class already uses.
-;;; EXCEPTION is also simply the better word: this is a Python exception.
+;;; NAMED PY:EXCEPTION, NOT PY:ERROR. Originally that was forced: the condition and
+;;; class registries were keyed by a class's BARE name, so a class named PY:ERROR
+;;; registered under "ERROR" and REPLACED CL:ERROR for the whole image -- after which
+;;; MAKE-CONDITION of any condition recursed until the stack was gone. It took a
+;;; SIGSEGV in (make-condition 'c1), a definition with nothing to do with Python, to
+;;; find it. That bug is FIXED (bliss-kliz4), so PY:ERROR would be safe now; the name
+;;; stays EXCEPTION because it is simply the better word for what this is.
 (define-condition py:exception (error)
   ((kind :initarg :kind :initform "PythonError" :reader py:exception-kind)
    (text :initarg :text :initform "" :reader py:exception-text)
@@ -4099,7 +4113,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                 '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
                   "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
                   "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
-                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH"))
+                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH" "EXPORT"))
         "TORCL-PYTHON")
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
