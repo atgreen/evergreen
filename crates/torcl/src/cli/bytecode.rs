@@ -21358,6 +21358,56 @@ mod direct_call_invalidation_tests {
         );
     }
 
+    #[test]
+    fn native_transfer_ir_routes_actual_lowered_calls() {
+        use torcl_compiler::control_scope::ScopeMap;
+        use torcl_compiler::t2::build::build_from_bytecode_for_transfers;
+        use torcl_compiler::t2::ir::{AuxData, Opcode};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun transfer-source-probe (x) x)", &mut env).unwrap();
+        torcl_rt::rooted!(
+            form = reader::read_from_string(
+                "((let ((saved 19)) (block done (transfer-source-probe saved))))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = Arc::new(
+            compile_function("TRANSFER-SOURCE-BODY", NIL, *form, &env, false, false)
+                .expect("lower transfer source"),
+        );
+        let _body_roots = ActiveBytecodeRoot::new(&body);
+        let scopes = ScopeMap::analyze_function(&body).unwrap();
+        let ir = build_from_bytecode_for_transfers(&body).expect("build actual exceptional calls");
+        assert!(torcl_compiler::t2::verify::verify(&ir).is_ok());
+        let mut calls = 0;
+        for &block in ir.block_order() {
+            for &inst in &ir.block(block).insts {
+                let data = ir.inst(inst);
+                assert_ne!(data.opcode, Opcode::Call);
+                if data.opcode == Opcode::Invoke {
+                    calls += 1;
+                    let cold = ir.inst(ir.terminator(data.targets[1].block).unwrap());
+                    assert_eq!(cold.opcode, Opcode::NlxTransfer);
+                    let AuxData::TransferSite {
+                        origin_bcp,
+                        scopes: actual,
+                    } = &cold.aux
+                    else {
+                        panic!("source call lost its scope map")
+                    };
+                    assert_eq!(actual.as_slice(), scopes.before(*origin_bcp).unwrap());
+                    assert!(!actual.is_empty(), "source block must be represented");
+                }
+            }
+        }
+        assert_eq!(calls, 1);
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_caller_handles_callee_osr_deoptimization() {

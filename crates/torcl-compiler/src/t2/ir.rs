@@ -287,6 +287,14 @@ pub enum AuxData {
     },
     FieldOffset(u32),
     CallTarget(u32),
+    /// Cold propagation after a transfer-capable operation. The attached
+    /// FrameState captures the pre-operation values, but propagation must begin
+    /// unwinding rather than executing that bytecode operation again. These
+    /// static scopes describe required runtime state, not permission to elide it.
+    TransferSite {
+        origin_bcp: u32,
+        scopes: Vec<crate::control_scope::ControlScope>,
+    },
     TypeTag(IRType),
     /// Exact class code for the pure bytecode `TypeP` predicate. Unlike a
     /// `TypeTag`, classes such as BOOLEAN and LIST are not equivalent to their

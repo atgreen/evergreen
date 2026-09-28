@@ -75,6 +75,73 @@ pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError
     build_from_bytecode_with_inline_options(bf, InlineOptions::default())
 }
 
+/// Construct the native-transfer call contract with an explicit cold fallback
+/// for every remaining call. This entry point stays separate from installation
+/// until Invoke emission and runtime capture/landing maps are implemented.
+/// Body inlining must preserve logical control scopes before it can use this
+/// path; intrinsic expansion still happens in the ordinary SSA builder.
+pub fn build_from_bytecode_for_transfers(bf: &BytecodeFunction) -> Result<Function, BuildError> {
+    let scopes = ScopeMap::analyze_function(bf).map_err(BuildError::InvalidScopes)?;
+    let mut f = Builder::new(bf, InlineOptions::default()).run()?;
+    let calls: Vec<Inst> = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| f.block(b).insts.iter().copied())
+        .filter(|&i| f.inst(i).opcode == Opcode::Call)
+        .collect();
+    for call in calls {
+        let data = f.inst(call).clone();
+        let state = data
+            .frame_state
+            .ok_or(BuildError::Unsupported("unmapped transfer call"))?;
+        let frame = f
+            .frame_states
+            .get(state)
+            .scopes
+            .last()
+            .ok_or(BuildError::Unsupported(
+                "transfer call without logical frame",
+            ))?;
+        let origin_bcp = frame.bcp;
+        let control_scopes = scopes
+            .before(origin_bcp)
+            .ok_or(BuildError::Unsupported("transfer call without scope state"))?
+            .to_vec();
+        let cold = f.make_block();
+        f.set_terminator(
+            cold,
+            InstData {
+                opcode: Opcode::NlxTransfer,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::TransferSite {
+                    origin_bcp,
+                    scopes: control_scopes,
+                },
+                flags: InstFlags {
+                    effectful: true,
+                    safepoint: true,
+                    call: true,
+                    terminator: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: data.source_pos,
+            },
+        );
+        f.make_call_exceptional(
+            call,
+            crate::t2::ir::BlockCall {
+                block: cold,
+                args: vec![],
+            },
+        )
+        .map_err(BuildError::Unsupported)?;
+    }
+    Ok(f)
+}
+
 /// Build T2 IR with explicit per-call-site inlining policy. The ordinary
 /// tiering path uses [`InlineOptions::default`]; this entry point is also the
 /// seam where lexical INLINE/NOTINLINE declarations are supplied.
