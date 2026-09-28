@@ -14343,7 +14343,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     .map(|(_, tok)| tok.clone());
                 match token {
                     Some(tok) => {
-                        store_control_value(&tok, value);
+                        super::store_control_mv(&tok, value, env);
                         initiate_unwind(acts, stack, env, Pending::Token(tok))?;
                     }
                     None => {
@@ -14771,7 +14771,7 @@ fn initiate_unwind(
                 acts[top].handlers.pop();
                 env.catch_stack.retain(|(_, t)| *t != token);
                 if matched {
-                    let v = take_control_value(&token);
+                    let v = super::take_control_mv(&token, env);
                     let act = &mut acts[top];
                     act.sp_top = sp_restore;
                     act.bcp = resume_bcp as usize;
