@@ -1717,7 +1717,7 @@ pub fn translate_logical_pathname(pathname: TorclVal) -> Result<TorclVal, TorclE
         with_logical_translations(|map| map.get(&host).copied()).ok_or_else(|| {
             TorclError::FileError(format!("no translations for logical host {:?}", host))
         })?;
-    let translations_src = lookup_string(translations_val).ok_or_else(|| {
+    let translations_src = component_string(translations_val).ok_or_else(|| {
         TorclError::FileError(format!(
             "logical host {:?} has unreadable translations",
             host
