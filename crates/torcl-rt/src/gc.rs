@@ -2085,10 +2085,14 @@ impl HeapCollector {
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
         // to old-gen in place and must NOT be zeroed (bliss-jtc.18).
+        let mut regions_retained = 0u64;
+        let mut regions_evacuated = 0u64;
         for &nursery_idx in &nursery_indices {
             if pinned_indices.contains(&nursery_idx) {
+                regions_retained += 1;
                 continue;
             }
+            regions_evacuated += 1;
             let region = &mut state.regions[nursery_idx];
             // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
             let region_used =
@@ -2113,6 +2117,15 @@ impl HeapCollector {
         }
 
         // Update stats.
+        state.stats.nursery_regions_retained += regions_retained;
+        state.stats.nursery_regions_evacuated += regions_evacuated;
+        if gc_region_log_enabled() {
+            crate::syscall::dbg_write(b"[gc-regions] minor: retained ");
+            write_decimal(regions_retained);
+            crate::syscall::dbg_write(b" evacuated ");
+            write_decimal(regions_evacuated);
+            crate::syscall::dbg_write(b"\n");
+        }
         state.stats.minor_gc_count += 1;
         state.stats.bytes_promoted += bytes_promoted;
         state.stats.nursery_used = 0; // nursery was just collected
@@ -4642,6 +4655,37 @@ unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
 /// that into a deterministic, near-immediate failure at the offending site.
 /// Counterpart to `TORCL_GC_DISABLE` (which does the opposite).
 /// Whether `TORCL_GC_POISON` is set (cached). See the fill site in `minor_gc`.
+/// `TORCL_GC_REGION_LOG=1`: report each minor collection's retained/evacuated
+/// nursery-region split on stderr.
+///
+/// Off by default and deliberately allocation-free: this prints from inside a
+/// collection, where allocating on the Lisp heap is not allowed. Pair it with
+/// `TORCL_GC_STRESS_AT=N` for a single line rather than one per allocation.
+fn gc_region_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TORCL_GC_REGION_LOG").is_some())
+}
+
+/// Write a decimal number to stderr without allocating.
+fn write_decimal(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    if value == 0 {
+        crate::syscall::dbg_write(b"0");
+        return;
+    }
+    while value > 0 {
+        digits[n] = b'0' + (value % 10) as u8;
+        value /= 10;
+        n += 1;
+    }
+    let mut out = [0u8; 20];
+    for i in 0..n {
+        out[i] = digits[n - 1 - i];
+    }
+    crate::syscall::dbg_write(&out[..n]);
+}
+
 fn gc_poison_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TORCL_GC_POISON").is_some())
@@ -5518,6 +5562,20 @@ pub struct GcStats {
     pub large_object_bytes: u64,
     pub regions_total: u32,
     pub regions_free: u32,
+    /// Nursery regions a minor collection RETAINED IN PLACE, cumulative. A region
+    /// is retained whole when anything in it is pinned: it is promoted to old-gen
+    /// without being relocated or poisoned, so nothing in it moves.
+    ///
+    /// Counted because it decides whether a GC-stress run can detect a rooting bug
+    /// at all — an unrooted pointer into a retained region stays valid, so the bug
+    /// is invisible no matter how many collections are forced. Without this the
+    /// split was unobservable from outside, and a clean stress run could not be
+    /// distinguished from a stress run that moved nothing (bliss-ahnzt, measured in
+    /// bliss-c0diw).
+    pub nursery_regions_retained: u64,
+    /// Nursery regions a minor collection evacuated and reclaimed, cumulative.
+    /// Objects in these DID move, so an unrooted reference to one is detectable.
+    pub nursery_regions_evacuated: u64,
 }
 
 // ── Heap initialization ────────────────────────────────────────────

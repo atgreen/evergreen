@@ -187,18 +187,30 @@ for a small inline lambda and for eight levels of nested quasiquoted lambda
 applications. Collections definitely fired — `TORCL_GC_STRESS_AT=100` and `=5000`
 both reported forcing one. So the detector missed a known-real violation.
 
-Two things to know from that:
+The miss is confirmed, not inferred: an `eprintln!` in the un-rooted arm showed it
+running 9 times during the probe, so the code really was exercised.
 
-- **A rooting bug is only visible if its object actually MOVED.** `minor_gc`
-  retains a nursery region *in place*, promoting it to old-gen without relocating
-  or poisoning it, when anything in it is pinned (gc.rs "Retained pinned regions
-  were promoted to old-gen in place and must NOT be zeroed", bliss-jtc.18). An
-  unrooted pointer into such a region stays valid, so whether a probe detects the
-  bug depends on which region its forms landed in — luck, not coverage.
-- **A loaded `defun`'s body is the wrong place to probe.** It has survived several
-  collections and been promoted out of the nursery, so those conses no longer
-  move at all. Build the form at runtime (`read-from-string` + `eval`) if you
-  need it in the nursery — though as above, that still is not sufficient.
+**The cause is still unknown, and two plausible explanations have been MEASURED AND
+RULED OUT** — recorded so nobody re-derives them:
+
+- *Not* in-place region retention. `minor_gc` does retain a nursery region whole,
+  promoting it without relocating or poisoning it, when anything in it is pinned
+  (bliss-jtc.18) — which would make an unrooted pointer into it stay valid. But
+  `TORCL_GC_REGION_LOG=1` reports `retained 0 evacuated 1` on essentially all 50,150
+  collections of that probe. Regions are being evacuated.
+- *Not* stride sensitivity. `TORCL_GC_STRESS` at 1, 5, 25, 100 and 500 all give the
+  same correct answer, so it is not that stride-1 promotes everything out of the
+  nursery before it can be seen moving.
+
+The leading remaining candidate is that these particular objects are already in
+old-gen by the time they are used, so nothing relocates *them* even though a region
+is reclaimed each collection. Unverified.
+
+One further trap, independent of all that: **a loaded `defun`'s body is the wrong
+place to probe.** It has survived several collections and been promoted out of the
+nursery, so those conses no longer move at all. Build the form at runtime
+(`read-from-string` + `eval`) if you need it in the nursery — though as above, that
+still is not sufficient.
 
 So treat a clean stress run as *failing to find* a bug, not as evidence there is
 none. Where it matters, add the A/B: remove the root, confirm the probe FAILS,
