@@ -567,6 +567,14 @@ helper calls use the normal call-frame, clobber and shadow-root conventions;
 they add no generated caller status test. These helpers do not execute Lisp,
 yield, signal or collect. Copying multiple values still uses Rust allocation;
 the emergency allocation-failure contract remains an ABI installation gate.
+Before native entry, the transfer path now reserves the execution-local
+control-value map for the statically possible primary, multiple-value and
+restart-argument records. Payload extraction finds existing secondary and
+restart keys by borrowed lookup, without formatting temporary Rust strings.
+The reserve failure is reported as `STORAGE-CONDITION`/`Oom` before generated
+code runs. This removes two avoidable cold-path allocations; arbitrary cleanup
+code can still allocate, and the full preallocated emergency storage path is
+still required before ordinary ABI activation.
 A real-fiber gate also runs native cleanup on one and four carrier threads,
 observes at least two cleanup continuations suspended together, and collects
 from outside their stacks. On resumption, distinct per-fiber answers, multiple

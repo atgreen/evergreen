@@ -159,6 +159,25 @@ impl TransferCode {
             ));
         }
         validate_declared_args(&self.body, &args)?;
+        // Reserve the control-value map while the caller can still report an
+        // ordinary storage condition. Once generated code is running, payload
+        // retirement and restoration must not discover a rehash allocation in
+        // the middle of an unwind. The estimate covers primary, multiple-value
+        // and restart-argument entries for every statically mapped scope.
+        let reserve = self
+            .cleanup_depths
+            .len()
+            .saturating_add(self.body.handler_cases.len())
+            .saturating_add(
+                self.body
+                    .code
+                    .iter()
+                    .filter(|instruction| matches!(instruction, Instr::PushCatch { .. }))
+                    .count(),
+            )
+            .saturating_mul(4)
+            .saturating_add(4);
+        reserve_control_values(reserve).map_err(|_| TorclError::Oom)?;
         NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
         let _depth = NativeDepthGuard;
         // Every snapshot is reserved and rooted before machine entry. Cold

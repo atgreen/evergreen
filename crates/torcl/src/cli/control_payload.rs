@@ -12,17 +12,48 @@ pub(super) struct ControlPayload {
     restart_arguments: Option<(String, TorclVal)>,
 }
 
+/// Reserve map entries before entering generated native code. A failure is
+/// reported to the caller while the ordinary Rust/Lisp emergency path is still
+/// available; transfer dispatch must never discover a rehash failure halfway
+/// through retiring a cleanup.
+pub(super) fn reserve_control_values(additional: usize) -> Result<(), ()> {
+    CONTROL_VALUES.with(|values| values.borrow_mut().try_reserve(additional).map_err(|_| ()))
+}
+
 impl ControlPayload {
-    /// Move the existing entries and their keys into private storage. No Lisp
-    /// allocation occurs; constructing the secondary-value key follows the
-    /// existing Rust host-allocation policy. Root the holder before cleanup.
+    fn remove_matching(
+        values: &mut std::collections::HashMap<String, TorclVal>,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<(String, TorclVal)> {
+        // HashMap's borrowed-key lookup lets us remove the owned String without
+        // constructing a temporary key. This path runs after a native transfer
+        // has already crossed into Rust, so a formatting allocation here would
+        // turn an otherwise reserved transfer into an allocator failure.
+        let key = values
+            .keys()
+            .find(|key| predicate(key.as_str()))
+            .map(|key| (key.as_ptr(), key.len()));
+        key.and_then(|(ptr, len)| {
+            // The map is not mutated between taking this pointer and the
+            // borrowed lookup. Rust's HashMap API cannot express this
+            // allocation-free remove directly on the declared MSRV, so keep
+            // the short raw-key window local and preserve the owned String.
+            let key =
+                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
+            values.remove_entry(key)
+        })
+    }
+
+    /// Move the existing entries and their keys into private storage without
+    /// allocating temporary lookup strings. Root the holder before cleanup.
     pub(super) fn take(token: &str) -> Self {
-        let multiple_key = format!("{token}\0MV");
         CONTROL_VALUES.with(|values| {
             let mut values = values.borrow_mut();
             Self {
                 primary: values.remove_entry(token),
-                multiple: values.remove_entry(&multiple_key),
+                multiple: Self::remove_matching(&mut values, |key| {
+                    key.strip_prefix(token) == Some("\0MV")
+                }),
                 restart_arguments: None,
             }
         })
@@ -38,9 +69,14 @@ impl ControlPayload {
             _ => Self::default(),
         };
         if let Some(id) = super::restart_invoked_id(error) {
-            let key = format!("RESTART-ARGS:{id}");
-            payload.restart_arguments =
-                CONTROL_VALUES.with(|values| values.borrow_mut().remove_entry(&key));
+            payload.restart_arguments = CONTROL_VALUES.with(|values| {
+                let mut values = values.borrow_mut();
+                Self::remove_matching(&mut values, |key| {
+                    key.strip_prefix("RESTART-ARGS:")
+                        .and_then(|suffix| suffix.parse::<u64>().ok())
+                        == Some(id)
+                })
+            });
         }
         payload
     }
@@ -79,6 +115,41 @@ impl TraceHostRoots for ControlPayload {
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use super::ControlPayload;
+
+    #[test]
+    fn payload_take_uses_existing_secondary_and_restart_keys() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let token = "payload-key";
+        let restart_id = 0xfeed_u64;
+        CONTROL_VALUES.with(|values| {
+            let mut values = values.borrow_mut();
+            values.clear();
+            values.insert(token.into(), TorclVal::from_fixnum(1));
+            values.insert(format!("{token}\0MV"), TorclVal::from_fixnum(2));
+            values.insert(
+                format!("RESTART-ARGS:{restart_id}"),
+                TorclVal::from_fixnum(3),
+            );
+        });
+        let payload = ControlPayload::take(token);
+        assert!(payload.primary.is_some());
+        assert!(payload.multiple.is_some());
+        let error = TorclError::Internal(restart_invoked_token(restart_id, "RECOVER"));
+        let restart_payload = ControlPayload::for_error(&error);
+        assert_eq!(
+            restart_payload
+                .restart_arguments
+                .as_ref()
+                .map(|(_, value)| *value),
+            Some(TorclVal::from_fixnum(3))
+        );
+        restart_payload.restore();
+        payload.restore();
+        CONTROL_VALUES.with(|values| values.borrow_mut().clear());
+    }
 
     #[test]
     fn type_error_condition_preserves_heap_datum_identity() {

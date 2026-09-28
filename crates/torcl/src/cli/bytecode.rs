@@ -34,7 +34,7 @@ mod native_transfer_entry;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
 mod pending_error;
-use super::control_payload::ControlPayload;
+use super::control_payload::{ControlPayload, reserve_control_values};
 use pending_error::PendingError;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
