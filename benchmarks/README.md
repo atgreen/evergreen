@@ -5,13 +5,11 @@ with a standalone HTML report, raw JSON, generated scripts, and process logs.
 This showcase complements the regression suite in `tests/benchmarks/`.
 
 [Open the checked-in sample HTML report](sample-report/index.html).
-The fast path keeps native error and signal delivery while skipping the
-execution-local mutex/hash lookup when no native error is pending. Five
-alternating pairs against untouched main measured 1.499 s versus 0.233 s
-(medians, 6.4× faster); see [build and measurement details](sample-report/BUILD.txt)
-and [raw before/after samples](sample-report/before-after.json).
-The updated seven-sample SBCL comparison still favors SBCL; this is progress,
-not a claimed win over SBCL.
+The current sample report is generated from native-transfer ABI milestone
+`67058a73`. Five alternating samples measure Fibonacci at 111 ms on TorCL versus
+57 ms on SBCL, and the Ironclad POWER-MOD kernel at 503 ms versus 10 ms. Every
+TorCL sample passed the T2 and checksum gates; these are local measurements,
+not a universal performance claim.
 
 The sample report verifies T2 before and after every measured TorCL kernel
 and batch driver. It reports whichever implementation is faster.

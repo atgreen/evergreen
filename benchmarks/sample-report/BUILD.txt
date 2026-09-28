@@ -1,38 +1,23 @@
-Fibonacci pending-native-error summary experiment
+Native-transfer ABI milestone benchmark report
 
-Base source: a7d2a90deeaae80a33de5710919fa01838f3a2c5
-Before: isolated git archive of that revision, no runtime modifications.
-After: same revision plus the pending-error patch committed with this report.
-The final rebuild includes all five slot unit tests and the fiber regression.
+Commit: 67058a73697c87de8507267f9be1454e62b00a86
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
+TorCL binary SHA256: 04bcd35d6a1b5f255ca997de9ba7a4b9f560c062c87c13ce5ec59c3189a35c8e
 
-Before binary SHA256: 1025bd95368396b402946d2427ab2f27825db92ff552a7a15b0945c139571c6d
-After binary SHA256: e5fd8c66c8ddf9d473b59c18167e1ba1863dcba08b932a3f9c37adc7ee04689a
+The report was generated with five alternating TorCL/SBCL samples on CPU 0,
+using a bounded 4 GiB / 300-second child runner. Every TorCL sample passed the
+checksum gate and reported T2 for both timed functions before and after timing.
 
-After runtime source SHA256:
-1b714cbb6c852eaf0cdc4df2a1fde7cc4ef425ed017207a064e784e1324a9a78  crates/torcl/src/cli/bytecode.rs
-487a6e51c6eb0b8adf86692a07292ef799b04fe83d8efde3bc49c169e1892210  crates/torcl/src/cli/bytecode/pending_error.rs
+Fibonacci F(30), ten evaluations per workload:
+  TorCL median 111 ms (samples 111, 111, 111, 111, 112)
+  SBCL  median  57 ms (samples  57,  57,  57,  56,  57)
 
-Before/after: five alternating pairs using the generated fibonacci.lisp,
-CPU 0, 4 GiB memory cap, 60-second deadline, cleared inherited TORCL_* tuning.
-All ten processes exited 0, checksum 8320400, kernel and driver T2 both before
-and after timing, zero timed deoptimizations. Raw samples: before-after.json;
-individual logs: fibonacci-head-summary-{before,after}-{0..4}.log.gz.
+Ironclad POWER-MOD, 100,000 modular exponentiations:
+  TorCL median 503 ms (samples 503, 503, 499, 504, 746)
+  SBCL  median  10 ms (samples  10,  10,   9,  10,  10)
 
-SBCL comparison: python3 benchmarks/run.py --samples 7 --cpu 0
---torcl target/native-baseline/x86_64-unknown-linux-musl/release/torcl
---output benchmarks/results/final-performance
-All 28 processes exited 0; every TorCL sample passed the tier gate.
-
-These are workstation measurements. Other work, including workspace validation,
-was running; CPU frequency and background load were not controlled. Interpret
-the large improvement, not small differences between absolute timings.
-Logs are losslessly gzip-compressed. This uses the real error/signal checks;
-it is NOT the earlier diagnostic binary that bypassed transfer handling.
-
-Hardware cross-check (whole process, including warmup/startup, not just timing):
-CPU 0, perf stat -e instructions:u. Untouched main: 45,564,712,620 instructions;
-final fixed binary: 13,242,140,956 instructions (70.9% fewer). Both exited 0,
-checksum correct, T2 verified, zero timed deoptimizations. The CSV and logs
-are retained as fibonacci-{head,fixed}-instructions.*.gz in sample-report.
+These are local workstation measurements, not universal performance claims.
+The HTML and JSON retain the machine, runtime, source, runner, and binary
+hashes. The report includes no native-transfer-specific workload yet; the
+26-case GC-stress suite remains the correctness evidence for this milestone.
