@@ -243,7 +243,17 @@ The segment ABI can now be exercised for ordinary native invocations with
 thread-local transfer-code cache and entered through `invoke_native_segment`;
 unsupported bodies, platforms, or hardening states fall back to the legacy
 checked entry. This rollout switch remains opt-in while native Windows gates and
-the full saved-image bridge are unfinished.
+the full saved-image bridge are unfinished. Recursive bodies are currently
+also rejected from the segment cache: their existing direct self-call register
+entry is frame-safe, while the segment emitter still routes recursive `Invoke`
+edges through a helper veneer. The explicit fallback prevents pathological
+segment nesting; `bliss-49gcf` tracks a frame-safe recursive segment entry.
+
+The segment emitter's exceptional edges and landing pads are exercised by the
+native POWER-MOD and caught-condition benchmarks. Independent asynchronous
+signal/GC polling at native loop back-edges remains a separate activation gate
+(`bliss-shih7.6`); a successful segment return must not be read as proof that
+the polling obligation is complete.
 
 ## Polling independently of exceptions
 
