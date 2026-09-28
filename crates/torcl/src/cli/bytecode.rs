@@ -21144,6 +21144,46 @@ mod direct_call_invalidation_tests {
         assert!(osr.exit_at(go_pc).unwrap().removed.is_empty());
     }
 
+    #[test]
+    fn native_control_scopes_follow_lowered_nested_cleanups() {
+        use torcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun cleanup-scope-probe () nil)", &mut env).unwrap();
+        for source in [
+            "((unwind-protect (cleanup-scope-probe) (cleanup-scope-probe)))",
+            "((unwind-protect
+                (unwind-protect (cleanup-scope-probe) (cleanup-scope-probe))
+                (unwind-protect (cleanup-scope-probe) (cleanup-scope-probe))))",
+            "((block done (unwind-protect (return-from done 1) (return-from done 2))))",
+            "((unwind-protect 1 (block done (return-from done 2))))",
+        ] {
+            torcl_rt::rooted!(form = reader::read_from_string(source).unwrap().0);
+            let body = compile_function("CLEANUP-SCOPE-PROBE", NIL, *form, &env, false, false)
+                .expect("lower cleanup source");
+            let map = ScopeMap::analyze(&body.code)
+                .unwrap_or_else(|e| panic!("{source}: {e:?}\n{:?}", body.code));
+            let mut cleanups = 0;
+            for instr in &body.code {
+                if let Instr::PushUnwind { cleanup_bcp, .. } = instr {
+                    cleanups += 1;
+                    let scope = map.before(*cleanup_bcp).unwrap().last().unwrap();
+                    assert!(matches!(scope.kind, ScopeKind::Cleanup { .. }));
+                    let osr = ScopeMap::analyze_osr(&body.code, *cleanup_bcp)
+                        .unwrap_or_else(|e| panic!("{source} OSR at {cleanup_bcp}: {e:?}"));
+                    assert_eq!(
+                        osr.before(*cleanup_bcp).unwrap().last().unwrap().ownership,
+                        Ownership::Inherited
+                    );
+                }
+            }
+            assert!(cleanups > 0, "source must actually lower a cleanup");
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_caller_handles_callee_osr_deoptimization() {

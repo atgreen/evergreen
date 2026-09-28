@@ -461,6 +461,18 @@ though their establishing PUSH is outside the segment. Ownership disagreements
 at joins conservatively refuse compilation. This metadata does not authorize
 eliding inherited runtime records or change the existing OSR fallback policy.
 
-Cleanup, condition and restart clusters still require continuation modelling;
-the analysis explicitly rejects them. Automatic Invoke construction and attaching
-scope maps to installed native code remain required before native dispatch.
+UNWIND-PROTECT analysis distinguishes its installed handler, the normal-path
+POP/EnterCleanupNormal handoff, and a running saved continuation. Cleanup entry
+removes the installed handler. CleanupReturn reaches registered normal resumes;
+resumed unwinds retain their dynamic target selection. A lexical exit's removed
+records distinguish cleanups still to execute from running continuations that
+must be superseded. Nested cleanups and OSR inside a running cleanup preserve
+outer scope ownership. Malformed cleanup handoffs and orphan returns are refused.
+
+The analysis is conservative: cold target edges establish possible scope state,
+not proof that a cleanup will complete normally. Actual native control flow must
+run required cleanups and respect a cleanup's replacement transfer before
+reaching an exit target. T2 still declines cleanup bytecodes until that lowering
+exists. Condition and restart clusters remain explicitly unsupported by this
+analysis. Automatic Invoke construction and attaching scope maps to installed
+native code remain required before native dispatch.

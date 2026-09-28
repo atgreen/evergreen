@@ -3,8 +3,9 @@
 //! This describes logical handler ownership, not native landing addresses. A
 //! scope inherited at OSR entry still belongs to the interpreter activation;
 //! seeing its POP or a lexical exit does not authorize erasing runtime state.
-//! Cleanup, condition and restart clusters are rejected until their continuation
-//! edges can be represented. Unknown scope state must never become an empty set.
+//! Logical scopes include running cleanup continuations, not only installed
+//! handlers. Condition and restart clusters are still rejected. Unknown scope
+//! state must never become an empty set.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use torcl_rt::bytecode::Instr;
@@ -28,6 +29,20 @@ pub enum ScopeKind {
     Catch {
         resume_bcp: u32,
     },
+    /// Installed UNWIND-PROTECT handler; an exit must execute its cleanup.
+    Unwind {
+        cleanup_bcp: u32,
+    },
+    /// Handler popped on the normal path, awaiting EnterCleanupNormal.
+    /// Retains ownership through this handoff; it is not a runtime handler.
+    PendingCleanup {
+        cleanup_bcp: u32,
+    },
+    /// Cleanup executing with a saved normal value or pending transfer.
+    /// An exit crossing this record supersedes that saved continuation.
+    Cleanup {
+        cleanup_bcp: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +55,8 @@ pub struct ControlScope {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeExit {
+    /// Ultimate lexical destination, not necessarily the next executed BCP.
+    /// Removed Unwind records must run first and can replace the transfer.
     pub target_bcp: u32,
     pub sp_restore: u16,
     /// Innermost first. GO retains its target TAGBODY; RETURN-FROM removes BLOCK.
@@ -54,12 +71,14 @@ pub enum ScopeError {
     InconsistentJoin { bcp: u32 },
     DuplicateIdentity { bcp: u32 },
     UnsupportedScope { bcp: u32 },
+    InvalidCleanup { bcp: u32 },
 }
 
 #[derive(Clone, Debug)]
 pub struct ScopeMap {
     before: Vec<Option<Vec<ControlScope>>>,
     exits: HashMap<u32, ScopeExit>,
+    normal_resumes: HashMap<u32, Vec<u32>>,
 }
 
 impl ScopeMap {
@@ -71,8 +90,16 @@ impl ScopeMap {
         self.exits.get(&bcp)
     }
 
+    /// Possible normal destinations of a cleanup. An unwind continuation is
+    /// selected dynamically and is not a normal successor from this list.
+    pub fn cleanup_resumes(&self, cleanup_bcp: u32) -> &[u32] {
+        self.normal_resumes
+            .get(&cleanup_bcp)
+            .map_or(&[], Vec::as_slice)
+    }
+
     pub fn analyze(code: &[Instr]) -> Result<Self, ScopeError> {
-        Self::from_entry(code, 0, Vec::new())
+        Self::from_entry(code, 0, Vec::new(), HashMap::new())
     }
 
     /// Seed the alternate entry with the normal-entry scope state, marking those
@@ -90,17 +117,22 @@ impl ScopeMap {
                 scope
             })
             .collect();
-        Self::from_entry(code, entry, inherited)
+        // A cleanup already running at entry can return to a normal destination
+        // registered before entry. Retain those static possibilities; runtime
+        // continuation state still chooses normal return versus resumed unwind.
+        Self::from_entry(code, entry, inherited, normal.normal_resumes)
     }
 
     fn from_entry(
         code: &[Instr],
         entry: u32,
         scopes: Vec<ControlScope>,
+        normal_resumes: HashMap<u32, Vec<u32>>,
     ) -> Result<Self, ScopeError> {
         let mut map = Self {
             before: vec![None; code.len()],
             exits: HashMap::new(),
+            normal_resumes,
         };
         if code.is_empty() {
             return Ok(map);
@@ -117,6 +149,7 @@ impl ScopeMap {
             }
         }
         let mut queue = VecDeque::new();
+        let mut cleanup_returns: HashMap<u32, Vec<u32>> = HashMap::new();
         // The establishing PUSH is outside an OSR segment. Preserve its cold
         // resume edge explicitly, with only scopes outside the selected target.
         for (index, scope) in scopes.iter().enumerate() {
@@ -124,12 +157,25 @@ impl ScopeMap {
                 scope.kind
             {
                 map.merge(resume_bcp, scopes[..index].to_vec(), &mut queue)?;
+            } else if let ScopeKind::Unwind { cleanup_bcp } = scope.kind {
+                let mut cleanup_scopes = scopes[..index].to_vec();
+                let mut cleanup = scope.clone();
+                cleanup.kind = ScopeKind::Cleanup { cleanup_bcp };
+                cleanup_scopes.push(cleanup);
+                map.merge(cleanup_bcp, cleanup_scopes, &mut queue)?;
             }
         }
         map.merge(entry, scopes, &mut queue)?;
         while let Some(pc) = queue.pop_front() {
             let mut scopes = map.before[pc as usize].clone().expect("queued scope state");
             let mut fallthrough = true;
+            if matches!(
+                scopes.last().map(|s| &s.kind),
+                Some(ScopeKind::PendingCleanup { .. })
+            ) && !matches!(code[pc as usize], Instr::EnterCleanupNormal { .. })
+            {
+                return Err(ScopeError::InvalidCleanup { bcp: pc });
+            }
             let push = match code[pc as usize] {
                 Instr::PushBlock {
                     block_id,
@@ -161,8 +207,85 @@ impl ScopeMap {
                     map.merge(resume_bcp, scopes.clone(), &mut queue)?;
                     Some((sp_restore, ScopeKind::Catch { resume_bcp }))
                 }
+                Instr::PushUnwind {
+                    cleanup_bcp,
+                    sp_restore,
+                } => {
+                    let mut cleanup_scopes = scopes.clone();
+                    cleanup_scopes.push(ControlScope {
+                        push_bcp: pc,
+                        ownership: Ownership::Local,
+                        sp_restore,
+                        kind: ScopeKind::Cleanup { cleanup_bcp },
+                    });
+                    // A call or transfer may start unwinding here. The handler
+                    // is removed before running its cleanup; the saved transfer
+                    // remains live as a distinct logical scope.
+                    map.merge(cleanup_bcp, cleanup_scopes, &mut queue)?;
+                    Some((sp_restore, ScopeKind::Unwind { cleanup_bcp }))
+                }
                 Instr::PopHandler => {
-                    scopes.pop().ok_or(ScopeError::EmptyPop { bcp: pc })?;
+                    let scope = scopes.last_mut().ok_or(ScopeError::EmptyPop { bcp: pc })?;
+                    match scope.kind {
+                        ScopeKind::Unwind { cleanup_bcp } => {
+                            scope.kind = ScopeKind::PendingCleanup { cleanup_bcp };
+                        }
+                        ScopeKind::Cleanup { .. } | ScopeKind::PendingCleanup { .. } => {
+                            return Err(ScopeError::InvalidCleanup { bcp: pc });
+                        }
+                        _ => {
+                            scopes.pop();
+                        }
+                    }
+                    None
+                }
+                Instr::EnterCleanupNormal {
+                    cleanup_bcp,
+                    resume_bcp,
+                } => {
+                    let scope = scopes
+                        .last_mut()
+                        .ok_or(ScopeError::InvalidCleanup { bcp: pc })?;
+                    if scope.kind != (ScopeKind::PendingCleanup { cleanup_bcp }) {
+                        return Err(ScopeError::InvalidCleanup { bcp: pc });
+                    }
+                    scope.kind = ScopeKind::Cleanup { cleanup_bcp };
+                    if resume_bcp as usize >= code.len() {
+                        return Err(ScopeError::BadTarget { bcp: resume_bcp });
+                    }
+                    let resumes = map.normal_resumes.entry(cleanup_bcp).or_default();
+                    if !resumes.contains(&resume_bcp) {
+                        resumes.push(resume_bcp);
+                        // CleanupReturn may have been visited first via the
+                        // exceptional edge. Revisit it when a new normal
+                        // continuation becomes reachable.
+                        queue.extend(
+                            cleanup_returns
+                                .get(&cleanup_bcp)
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        );
+                    }
+                    map.merge(cleanup_bcp, scopes.clone(), &mut queue)?;
+                    fallthrough = false;
+                    None
+                }
+                Instr::CleanupReturn => {
+                    let scope = scopes.pop().ok_or(ScopeError::InvalidCleanup { bcp: pc })?;
+                    let ScopeKind::Cleanup { cleanup_bcp } = scope.kind else {
+                        return Err(ScopeError::InvalidCleanup { bcp: pc });
+                    };
+                    let returns = cleanup_returns.entry(cleanup_bcp).or_default();
+                    if !returns.contains(&pc) {
+                        returns.push(pc);
+                    }
+                    for resume in map.cleanup_resumes(cleanup_bcp).to_vec() {
+                        map.merge(resume, scopes.clone(), &mut queue)?;
+                    }
+                    // An exceptional continuation resumes the dynamic unwind;
+                    // its outer targets were seeded when they were established.
+                    fallthrough = false;
                     None
                 }
                 Instr::ReturnFrom { block_id } => {
@@ -227,10 +350,7 @@ impl ScopeMap {
                     fallthrough = false;
                     None
                 }
-                Instr::PushUnwind { .. }
-                | Instr::EnterCleanupNormal { .. }
-                | Instr::CleanupReturn
-                | Instr::PushHandlerCase { .. }
+                Instr::PushHandlerCase { .. }
                 | Instr::PopHandlerCase
                 | Instr::PushHandlerBind { .. }
                 | Instr::PopHandlerBind
