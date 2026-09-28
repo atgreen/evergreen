@@ -266,3 +266,109 @@ fn t2_osr_does_not_clobber_the_callers_parameter() {
         );
     }
 }
+
+/// An OSR body must not skip the interpreter's scope transitions, or a later deopt
+/// delivers a THROW to an already-expired CATCH and REPLAYS the side effects that
+/// follow it (bliss-57da).
+///
+/// Native T1 elides PushBlock/PushTag/PopHandler/ReturnFrom because a T1-eligible
+/// function is a leaf whose transfers are all lexically local, so the handler state
+/// is dead. That reasoning does NOT hold for OSR: an OSR body is entered with the
+/// interpreter's handler stack already live — the CATCH enclosing a hot loop is still
+/// on it — and OSR compiles only the loop, so nothing made the function bail.
+///
+/// Measured on x86-64 before the fix: T0 ran the side effect once, OSR ran it TWICE.
+/// s390x hit this first and fixed it the same way; this is the x86 reproduction the
+/// bead asked for, kept as a regression test.
+#[test]
+fn osr_does_not_replay_effects_after_an_expired_catch() {
+    let program = r#"
+      (defvar *effects* 0)
+      (defun expired-catch ()
+        (catch 'expired
+          (let ((i 0))
+            (block done (tagbody top
+              (if (>= i 10) (return-from done i))
+              (setq i (1+ i)) (go top)))))
+        ;; The CATCH has returned, so its tag is expired: this THROW must be a
+        ;; CONTROL-ERROR, and the increment above it must happen exactly once.
+        (setq *effects* (1+ *effects*))
+        (throw 'expired 99))
+      ;; The same hazard reached through NESTED tagbodies, where the inner GO
+      ;; crosses to the outer one — the shape s390x guards separately at its GO.
+      ;; On x86 deopting the scope transitions covers this too, but it exercises a
+      ;; different path to the same replay and fails identically without the fix.
+      (defvar *nested-effects* 0)
+      (defun nested-expired-catch ()
+        (catch 'gone
+          (let ((i 0) (visits 0))
+            (block done (tagbody outer
+              (setq visits (1+ visits))
+              (if (>= visits 3) (return-from done (list i visits)))
+              (tagbody inner
+                (if (>= i 10) (go outer))
+                (setq i (1+ i)) (go inner))))))
+        (setq *nested-effects* (1+ *nested-effects*))
+        (throw 'gone 1))
+      (let ((outcome (handler-case (expired-catch)
+                       (control-error () :control-error)
+                       (error (e) (list :other (type-of e)))))
+            (nested (handler-case (nested-expired-catch)
+                      (control-error () :control-error)
+                      (error (e) (list :other (type-of e))))))
+        (format t "SCOPE ~s ~s ~s~%" *effects* outcome
+                (> (torcl-ext:function-osr-count 'expired-catch) 0))
+        (format t "NESTED ~s ~s~%" *nested-effects* nested))
+    "#;
+    // The interpreter's answer, with OSR effectively off.
+    let interpreted = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("TORCL_T0_T1_THRESHOLD", "1000000")
+        .env("TORCL_DISABLE_T2", "1")
+        .output()
+        .expect("the CLI runs");
+    // The same program with OSR firing almost immediately and uncommon traps on,
+    // which is the configuration that exposed it.
+    let osr = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("TORCL_T0_T1_THRESHOLD", "1000000")
+        .env("TORCL_OSR_THRESHOLD", "2")
+        .env("TORCL_DISABLE_T2", "1")
+        .env("TORCL_OSR_TRAPS", "1")
+        .output()
+        .expect("the CLI runs");
+    let line = |out: &std::process::Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|line| line.starts_with("SCOPE "))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        line(&interpreted),
+        "SCOPE 1 :CONTROL-ERROR NIL",
+        "the interpreter must run the effect once and signal"
+    );
+    assert_eq!(
+        line(&osr),
+        "SCOPE 1 :CONTROL-ERROR T",
+        "OSR must agree with the interpreter — and must actually have fired, or this \
+         test would pass by never exercising the path"
+    );
+
+    let nested = |out: &std::process::Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|line| line.starts_with("NESTED "))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    assert_eq!(nested(&interpreted), "NESTED 1 :CONTROL-ERROR");
+    assert_eq!(
+        nested(&osr),
+        "NESTED 1 :CONTROL-ERROR",
+        "the nested-tagbody route to the same replay must agree too"
+    );
+}
