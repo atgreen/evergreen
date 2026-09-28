@@ -683,6 +683,25 @@ tiers. Emergency allocation guarantees (`bliss-shih7.12.3`) still apply to Rust
 key construction, map restoration and multiple-value vector snapshots, alongside
 the remaining ABI activation gates.
 
+### Selecting the next native unwind action
+
+`torcl-compiler::native_unwind` selects the next logical action from one retained
+activation's ordered scope map (`bliss-shih7.12.5`). The runtime resolves a live
+destination first; the selector neither signals conditions nor searches Lisp
+names. A local target is identified by its establishing bytecode PC within that
+exact activation, not its resume address. It selects an intervening cleanup before
+the target, never an outer cleanup beyond the selected destination. Existing
+native cleanup dispatch uses the selector for transfers to an outer activation.
+
+Inherited OSR records and unsupported dynamic restoration select fallback.
+Running cleanup continuations do not count as installed handlers. A local tagbody
+alone is insufficient evidence that its dynamic registration can be discarded;
+the scope map does not encode whether NamedTag exposed it to a closure. EnterTarget
+is only a logical action: native registration, destination-specific CFG/phi edges,
+landing validation and state restoration must still exist before a jump is legal.
+Native CATCH execution is tracked in `bliss-shih7.12.6`; the selector does not claim
+that capability or enable ordinary ABI installation.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

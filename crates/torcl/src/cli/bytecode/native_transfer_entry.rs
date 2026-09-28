@@ -7,6 +7,7 @@
 use super::*;
 use std::cell::Cell;
 use torcl_compiler::control_scope::{Ownership, ScopeKind};
+use torcl_compiler::native_unwind::{NativeUnwindStep, SelectedTarget, next_unwind_step};
 use torcl_compiler::t2::native_transfer::{
     SysvNativeLanding, SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
     emit_native_landing_stub,
@@ -596,26 +597,18 @@ unsafe fn prepare_transfer(
     if !selected_throw {
         return Ok(());
     }
-    let (scope_index, cleanup_bcp) = site
-        .map()
-        .control_scopes
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, scope)| match scope.kind {
-            ScopeKind::Unwind { cleanup_bcp } => Some((index, cleanup_bcp)),
-            _ => None,
-        })
-        .ok_or(TransferSiteError::InvalidLandingCapture)?;
-    let handler_depth = site.map().control_scopes[..scope_index]
-        .iter()
-        .filter(|scope| {
-            matches!(
-                scope.kind,
-                ScopeKind::Block { .. } | ScopeKind::Tagbody { .. } | ScopeKind::Unwind { .. }
-            )
-        })
-        .count();
+    // Admission currently permits only outer catch destinations. Once local
+    // native registrations exist, resolve their exact establishing scope here.
+    let NativeUnwindStep::RunCleanup {
+        scope_index,
+        handler_depth,
+    } = next_unwind_step(&site.map().control_scopes, SelectedTarget::OutsideFrame)
+    else {
+        return Ok(());
+    };
+    let ScopeKind::Unwind { cleanup_bcp } = site.map().control_scopes[scope_index].kind else {
+        unreachable!("unwind selector returned a cleanup scope")
+    };
     // Restore native homes while canonical snapshots still own every root.
     unsafe {
         snapshot.write_back(context.code_base, capture)?;
