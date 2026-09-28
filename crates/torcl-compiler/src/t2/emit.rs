@@ -2739,14 +2739,15 @@ fn emit_framed_inner(
     let transfer_mode = transfers.is_some();
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
-    if !transfer_mode
-        && f.block_order().iter().any(|&b| {
-            f.block(b)
-                .insts
-                .iter()
-                .any(|&i| matches!(f.inst(i).opcode, Opcode::Invoke | Opcode::NlxTransfer))
+    if f.block_order().iter().any(|&b| {
+        f.block(b).insts.iter().any(|&i| {
+            matches!(
+                f.inst(i).opcode,
+                Opcode::CleanupSave | Opcode::CleanupRestore
+            ) || (!transfer_mode
+                && matches!(f.inst(i).opcode, Opcode::Invoke | Opcode::NlxTransfer))
         })
-    {
+    }) {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
 

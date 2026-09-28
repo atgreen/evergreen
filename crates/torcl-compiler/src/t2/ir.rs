@@ -215,6 +215,12 @@ pub enum Opcode {
     /// lexical locals. Results correspond positionally to `slot_base..` and
     /// are NIL-padded by the runtime helper.
     TakeValuesToLocals,
+    /// Save the protected primary and the complete runtime multiple-value state
+    /// in an execution-owned rooted cleanup continuation. No normal result.
+    CleanupSave,
+    /// Pop the matching normal cleanup continuation, restore its multiple-value
+    /// state and produce its primary. Exceptional entry uses the unwind cursor.
+    CleanupRestore,
     // Cat 5a — non-terminator control: calls & guards
     Call,
     Guard,
@@ -287,6 +293,10 @@ pub enum AuxData {
     },
     FieldOffset(u32),
     CallTarget(u32),
+    CleanupContinuation {
+        cleanup_bcp: u32,
+        resume_bcp: u32,
+    },
     /// Cold propagation after a transfer-capable operation. The attached
     /// FrameState captures the pre-operation values, but propagation must begin
     /// unwinding rather than executing that bytecode operation again. These

@@ -459,9 +459,125 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
     }
 
     if errors.is_empty() {
+        verify_cleanup_continuations(f, &mut errors);
+    }
+    if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// A normal cleanup owns an execution-local saved value tuple. Joins must agree
+/// on the complete ordered continuation stack, not merely its depth. Exceptional
+/// exits retain that stack in their scope metadata for the unwind cursor.
+fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
+    use crate::control_scope::ScopeKind;
+    use crate::t2::ir::ValueRepresentation;
+    if !f.block_order().iter().any(|&b| {
+        f.block(b).insts.iter().any(|&i| {
+            matches!(&f.inst(i).aux, AuxData::CleanupContinuation { .. })
+                || matches!(
+                    f.inst(i).opcode,
+                    Opcode::CleanupSave | Opcode::CleanupRestore
+                )
+        })
+    }) {
+        return;
+    }
+    let mut incoming = HashMap::from([(f.entry(), Vec::<(u32, u32)>::new())]);
+    let mut work = vec![f.entry()];
+    while let Some(block) = work.pop() {
+        let mut stack = incoming[&block].clone();
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            if matches!(&data.aux, AuxData::CleanupContinuation { .. })
+                && !matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore)
+            {
+                errors.push(VerifyError::new(
+                    "V13 cleanup",
+                    "continuation metadata on a non-cleanup operation",
+                ));
+            }
+            if matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore) {
+                let save = data.opcode == Opcode::CleanupSave;
+                let valid_shape = data.args.len() == usize::from(save)
+                    && data.results.len() == usize::from(!save)
+                    && data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .all(|&v| f.value(v).repr == ValueRepresentation::Tagged)
+                    && data.flags.effectful
+                    && data.flags.call
+                    && data.flags.safepoint
+                    && !data.flags.terminator
+                    && data.frame_state.is_some();
+                let AuxData::CleanupContinuation {
+                    cleanup_bcp,
+                    resume_bcp,
+                } = data.aux
+                else {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "missing continuation identity",
+                    ));
+                    continue;
+                };
+                if !valid_shape {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "invalid cleanup effects or value shape",
+                    ));
+                }
+                if save {
+                    stack.push((cleanup_bcp, resume_bcp));
+                } else if stack.pop() != Some((cleanup_bcp, resume_bcp)) {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "restore does not match active continuation",
+                    ));
+                }
+            }
+            if matches!(data.opcode, Opcode::Return | Opcode::TailCall) && !stack.is_empty() {
+                errors.push(VerifyError::new(
+                    "V13 cleanup",
+                    "normal return abandons saved cleanup values",
+                ));
+            }
+            if let AuxData::TransferSite { scopes, .. } = &data.aux {
+                let captured: Vec<_> = scopes
+                    .iter()
+                    .filter_map(|scope| match scope.kind {
+                        ScopeKind::Cleanup { cleanup_bcp } => Some(cleanup_bcp),
+                        _ => None,
+                    })
+                    .collect();
+                if !captured
+                    .iter()
+                    .copied()
+                    .eq(stack.iter().map(|&(cleanup, _)| cleanup))
+                {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "transfer lost active cleanup continuation",
+                    ));
+                }
+            }
+            for target in &data.targets {
+                if let Some(prior) = incoming.get(&target.block) {
+                    if prior != &stack {
+                        errors.push(VerifyError::new(
+                            "V13 cleanup",
+                            "join disagrees on active continuations",
+                        ));
+                    }
+                } else {
+                    incoming.insert(target.block, stack.clone());
+                    work.push(target.block);
+                }
+            }
+        }
     }
 }
 

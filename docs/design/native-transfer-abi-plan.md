@@ -535,9 +535,23 @@ through the unwind driver. A real Lisp native caller with nested protected
 regions verifies inner-before-outer cleanup exactly once, replacement THROW
 with multiple values, and moving-GC preservation of a local used only by cleanup.
 This proves exceptional bytecode cleanup fallback, not native cleanup execution.
-The ordinary builder still refuses protected code. Normal cleanup handoffs remain
-unsupported, and GO/RETURN-FROM crossing a cleanup are explicitly refused rather
+The ordinary builder still refuses protected code. Normal cleanup machine emission
+remains gated, and GO/RETURN-FROM crossing a cleanup are explicitly refused rather
 than silently branching past it; source-level tests cover both refusal cases.
+
+Normal cleanup now has explicit transfer-SSA operations: `CleanupSave` preserves
+the protected primary and complete runtime multiple-value state, while
+`CleanupRestore` restores that tuple and produces the primary on the normal
+resume edge. Both are effectful runtime boundaries with FrameState metadata;
+their continuation identity names the cleanup and normal resume bytecodes.
+The builder connects normal cleanup entry/return edges, including nested and
+branched forms. V13 verifies matching ordered continuation stacks, consistent
+joins, no abandoned values on normal return, and matching running-cleanup scopes
+on exceptional exits. Source tests cover cleanup inside cleanup, dead-code
+elimination preserving save/restore, and malformed identities and joins.
+These operations are deliberately rejected by machine emission until rooted
+runtime continuation storage and native cleanup dispatch are connected. This
+compiler milestone does not turn normal cleanup into executable native code.
 
 ### Windows validation and Wine limits
 

@@ -80,8 +80,9 @@ pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError
 /// until complete helper, scope, polling and native landing coverage is ready.
 /// Body inlining must preserve logical control scopes before it can use this
 /// path; intrinsic expansion still happens in the ordinary SSA builder.
-/// Protected regions whose normal path cannot return can use bytecode cleanup
-/// fallback. Normal cleanup handoff and direct exits crossing cleanup are refused.
+/// Protected regions retain exceptional cleanup metadata and explicit normal
+/// cleanup continuations. Emission requires matching runtime support; direct
+/// exits crossing cleanup remain refused until native unwind lowering exists.
 pub fn build_from_bytecode_for_transfers(bf: &BytecodeFunction) -> Result<Function, BuildError> {
     let scopes = ScopeMap::analyze_function(bf).map_err(BuildError::InvalidScopes)?;
     let mut builder = Builder::new(bf, InlineOptions::default());
@@ -307,6 +308,33 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
+    fn normal_cleanup_return(&self, bcp: u32) -> Result<(u32, u32), BuildError> {
+        let scopes = self
+            .control_scopes
+            .as_ref()
+            .expect("scope analysis before SSA");
+        let cleanup = scopes
+            .before(bcp)
+            .and_then(|active| {
+                active.iter().rev().find_map(|scope| {
+                    if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+                        Some(cleanup_bcp)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or(BuildError::Unsupported(
+                "cleanup return without active continuation",
+            ))?;
+        match scopes.cleanup_resumes(cleanup) {
+            [resume] => Ok((cleanup, *resume)),
+            _ => Err(BuildError::Unsupported(
+                "cleanup requires dynamic continuation selection",
+            )),
+        }
+    }
+
     fn check_direct_exit(&self, bcp: u32) -> Result<(), BuildError> {
         let exit = self
             .control_scopes
@@ -369,10 +397,10 @@ impl<'a> Builder<'a> {
             return Ok(self.f);
         }
 
-        self.find_leaders()?;
-        self.compute_depths()?;
         self.control_scopes =
             Some(ScopeMap::analyze_function(self.bf).map_err(BuildError::InvalidScopes)?);
+        self.find_leaders()?;
+        self.compute_depths()?;
         self.create_blocks();
         self.compute_reachable()?;
         self.compute_total_preds()?;
@@ -466,6 +494,13 @@ impl<'a> Builder<'a> {
         set.insert(0);
         for (i, instr) in code.iter().enumerate() {
             match instr {
+                Instr::EnterCleanupNormal {
+                    cleanup_bcp,
+                    resume_bcp,
+                } if self.transfer_mode => {
+                    set.insert(*cleanup_bcp as usize);
+                    set.insert(*resume_bcp as usize);
+                }
                 Instr::Br(t) => {
                     set.insert(*t as usize);
                 }
@@ -532,6 +567,16 @@ impl<'a> Builder<'a> {
                     }
                 };
             match &code[i] {
+                Instr::EnterCleanupNormal { cleanup_bcp, .. } if self.transfer_mode => {
+                    if d < 1 {
+                        return Err(BuildError::Unsupported("cleanup entry without primary"));
+                    }
+                    push(*cleanup_bcp as usize, d - 1, &mut depth_at, &mut work);
+                }
+                Instr::CleanupReturn if self.transfer_mode => {
+                    let (_, resume) = self.normal_cleanup_return(i as u32)?;
+                    push(resume as usize, d + 1, &mut depth_at, &mut work);
+                }
                 Instr::Const(_)
                 | Instr::LoadLocal(_)
                 | Instr::LoadGlobal(_)
@@ -716,8 +761,15 @@ impl<'a> Builder<'a> {
                     "branch target is not a block leader",
                 ))
         };
-        for instr in &code[start..end] {
+        for (offset, instr) in code[start..end].iter().enumerate() {
             match instr {
+                Instr::EnterCleanupNormal { cleanup_bcp, .. } if self.transfer_mode => {
+                    return Ok(vec![blk(*cleanup_bcp as usize)?]);
+                }
+                Instr::CleanupReturn if self.transfer_mode => {
+                    let (_, resume) = self.normal_cleanup_return((start + offset) as u32)?;
+                    return Ok(vec![blk(resume as usize)?]);
+                }
                 Instr::Br(t) => return Ok(vec![blk(*t as usize)?]),
                 Instr::Go { target_bcp, .. } => return Ok(vec![blk(*target_bcp as usize)?]),
                 Instr::ReturnFrom { block_id } => {
@@ -990,6 +1042,58 @@ impl<'a> Builder<'a> {
                 }
                 Instr::PopHandler => {}
                 Instr::PushUnwind { .. } if self.transfer_mode => {}
+                Instr::EnterCleanupNormal {
+                    cleanup_bcp,
+                    resume_bcp,
+                } if self.transfer_mode => {
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let primary = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("cleanup entry without primary"))?;
+                    self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::CleanupSave,
+                            args: vec![primary],
+                            results: vec![],
+                            aux: AuxData::CleanupContinuation {
+                                cleanup_bcp: *cleanup_bcp,
+                                resume_bcp: *resume_bcp,
+                            },
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[],
+                    );
+                    term = Some(Term::Jump(self.block_of[&(*cleanup_bcp as usize)]));
+                    break;
+                }
+                Instr::CleanupReturn if self.transfer_mode => {
+                    let (cleanup_bcp, resume_bcp) = self.normal_cleanup_return(i as u32)?;
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let (_, values) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::CleanupRestore,
+                            args: vec![],
+                            results: vec![],
+                            aux: AuxData::CleanupContinuation {
+                                cleanup_bcp,
+                                resume_bcp,
+                            },
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    stack.push(values[0]);
+                    term = Some(Term::Jump(self.block_of[&(resume_bcp as usize)]));
+                    break;
+                }
                 Instr::Dup => {
                     let v = *stack
                         .last()
