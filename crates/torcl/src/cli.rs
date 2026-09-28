@@ -12021,7 +12021,16 @@ fn condition_type_key(type_name: &str) -> String {
     //
     // A user package's own `MYPKG:TIMEOUT-CONDITION` still stays distinct — only the
     // two packages whose condition types TorCL itself defines are folded.
-    for qualifier in ["COMMON-LISP:", "CL:", "TORCL-EXT:"] {
+    // COMMON-LISP-USER is folded too, and that one is not cosmetic. A handler clause
+    // naming a condition type resolves to CL-USER's symbol when the read happens
+    // there, so its key was COMMON-LISP-USER:INTERRUPT-CONDITION — while the runtime
+    // builds that condition from Rust under the BARE name
+    // (`build_condition_instance(env, "INTERRUPT-CONDITION", …)`), keying as
+    // INTERRUPT-CONDITION. The two never matched, so a delivered SIGINT escaped
+    // `(handler-case … (interrupt-condition () …))` as an unhandled error while an
+    // explicit `(signal 'interrupt-condition)` was caught — both sides of THAT share
+    // one symbol (bliss-mhuai).
+    for qualifier in ["COMMON-LISP-USER:", "CL-USER:", "COMMON-LISP:", "CL:", "TORCL-EXT:"] {
         if let Some(rest) = single.strip_prefix(qualifier) {
             return rest.to_string();
         }
