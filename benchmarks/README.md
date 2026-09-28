@@ -6,8 +6,8 @@ This showcase complements the regression suite in `tests/benchmarks/`.
 
 [Open the checked-in sample HTML report](sample-report/index.html).
 The current sample report is generated from native-transfer ABI milestone
-`f2639868`. Five alternating samples measure Fibonacci at 32 ms on TorCL versus
-57 ms on SBCL, and the Ironclad POWER-MOD kernel at 505 ms versus 9 ms. Every
+`3dfac001`. Five alternating samples measure Fibonacci at 29 ms on TorCL versus
+57 ms on SBCL, and the Ironclad POWER-MOD kernel at 505 ms versus 10 ms. Every
 TorCL sample passed the T2 and checksum gates; these are local measurements,
 not a universal performance claim.
 

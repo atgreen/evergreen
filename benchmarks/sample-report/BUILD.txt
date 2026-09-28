@@ -1,17 +1,17 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: f2639868efc5d381239c93976c3dc2489371bdd6
+Commit: 3dfac00192ea2c601e40a6ff572acf714f4db439
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
-TorCL binary SHA256: cc53b69eec3edb1fd3a0e271f5a70be7d5031758201716e7a8a2cb1bd36331eb
+TorCL binary SHA256: 98341d8f782ca39cf871d9d4573d132cc9fdef06e410d2597abc3801029e8553
 
 The report was generated with five alternating TorCL/SBCL samples on CPU 0,
 using a bounded 4 GiB / 300-second child runner. Every TorCL sample passed the
 checksum gate and reported T2 for both timed functions before and after timing.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 32 ms (samples 34, 35, 29, 32, 32)
-  SBCL  median  57 ms (samples 57, 57, 56, 57, 56)
+  TorCL median 505 ms (samples 505, 505, 504, 506, 505)
+  SBCL  median 10 ms (samples 10, 9, 10, 10, 10)
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
   TorCL median 505 ms (samples 505, 505, 504, 1065, 509)

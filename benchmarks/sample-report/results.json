@@ -1,22 +1,22 @@
 {
-  "generated_at": "2026-09-28T21:52:12.074371+00:00",
+  "generated_at": "2026-09-28T22:17:23.266522+00:00",
   "samples": 5,
   "metadata": {
-    "commit": "f2639868efc5d381239c93976c3dc2489371bdd6",
+    "commit": "3dfac00192ea2c601e40a6ff572acf714f4db439",
     "working_tree": "M .beads/interactions.jsonl\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs",
     "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
     "cpu": 0,
     "cpu_model": "Intel(R) Core(TM) Ultra 7 255H",
     "load_average": [
-      2.3046875,
-      2.841796875,
-      2.83837890625
+      10.767578125,
+      10.66796875,
+      7.8203125
     ],
     "memory_cap": "4G",
     "binaries": {
       "TorCL": {
         "path": "/home/green/git/torcl/bliss/target/x86_64-unknown-linux-musl/release/torcl",
-        "sha256": "cc53b69eec3edb1fd3a0e271f5a70be7d5031758201716e7a8a2cb1bd36331eb"
+        "sha256": "98341d8f782ca39cf871d9d4573d132cc9fdef06e410d2597abc3801029e8553"
       },
       "SBCL": {
         "path": "/home/linuxbrew/.linuxbrew/Cellar/sbcl/2.6.8/bin/sbcl",
@@ -48,7 +48,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 14164,
+              "calls": 17870,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -62,7 +62,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 14174,
+              "calls": 17880,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -79,7 +79,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 14284,
+              "calls": 17066,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -93,7 +93,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 14294,
+              "calls": 17076,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -110,7 +110,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 18192,
+              "calls": 16972,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -124,7 +124,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 18202,
+              "calls": 16982,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -141,7 +141,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 16182,
+              "calls": 17840,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -155,7 +155,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 16192,
+              "calls": 17850,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -172,7 +172,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15102,
+              "calls": 16160,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -186,7 +186,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15112,
+              "calls": 16170,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -203,14 +203,14 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            0.034,
-            0.035,
+            0.033,
             0.029,
-            0.032,
-            0.032
+            0.029,
+            0.029,
+            0.035
           ],
-          "median_seconds": 0.032,
-          "iqr_seconds": 0.0020000000000000018,
+          "median_seconds": 0.029,
+          "iqr_seconds": 0.004,
           "min_seconds": 0.029,
           "max_seconds": 0.035
         },
@@ -218,13 +218,13 @@
           "samples_seconds": [
             0.057,
             0.057,
-            0.056,
             0.057,
-            0.056
+            0.057,
+            0.057
           ],
           "median_seconds": 0.057,
-          "iqr_seconds": 0.0010000000000000009,
-          "min_seconds": 0.056,
+          "iqr_seconds": 0.0,
+          "min_seconds": 0.057,
           "max_seconds": 0.057
         }
       }
@@ -339,7 +339,7 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 310004,
-              "back_edges": 80167,
+              "back_edges": 90167,
               "osr_entries": 0
             },
             "BENCH-WORKLOAD": {
@@ -353,7 +353,7 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 410004,
-              "back_edges": 80167,
+              "back_edges": 90167,
               "osr_entries": 0
             },
             "BENCH-WORKLOAD": {
@@ -370,7 +370,7 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 310004,
-              "back_edges": 90167,
+              "back_edges": 80167,
               "osr_entries": 0
             },
             "BENCH-WORKLOAD": {
@@ -384,7 +384,7 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 410004,
-              "back_edges": 90167,
+              "back_edges": 80167,
               "osr_entries": 0
             },
             "BENCH-WORKLOAD": {
@@ -403,23 +403,23 @@
             0.505,
             0.505,
             0.504,
-            1.065,
-            0.509
+            0.506,
+            0.505
           ],
           "median_seconds": 0.505,
-          "iqr_seconds": 0.0040000000000000036,
+          "iqr_seconds": 0.0,
           "min_seconds": 0.504,
-          "max_seconds": 1.065
+          "max_seconds": 0.506
         },
         "SBCL": {
           "samples_seconds": [
-            0.009,
             0.01,
             0.009,
-            0.009,
-            0.009
+            0.01,
+            0.01,
+            0.01
           ],
-          "median_seconds": 0.009,
+          "median_seconds": 0.01,
           "iqr_seconds": 0.0,
           "min_seconds": 0.009,
           "max_seconds": 0.01
