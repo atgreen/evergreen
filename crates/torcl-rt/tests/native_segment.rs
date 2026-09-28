@@ -153,3 +153,54 @@ fn native_segment_records_have_stable_machine_layout() {
         8
     );
 }
+
+extern "C" fn capture_segment_backtrace() -> u64 {
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let crossed_boundary = trace.contains("segment_backtrace_boundary");
+    if !crossed_boundary {
+        eprintln!("backtrace stopped before the Rust segment caller:\n{trace}");
+    }
+    u64::from(crossed_boundary)
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn backtrace_entry() -> u64 {
+    core::arch::naked_asm!(
+        ".cfi_startproc",
+        "endbr64",
+        "sub rsp, 8",
+        ".cfi_def_cfa_offset 16",
+        // Frame walking must use the adapter's save area, not accidentally
+        // succeed because generated code left the caller's registers intact.
+        "mov rbp, 1", "mov rbx, 2", "mov r12, 3",
+        "mov r13, 4", "mov r14, 5", "mov r15, 6",
+        "call {helper}",
+        "add rsp, 8",
+        ".cfi_def_cfa_offset 8",
+        "ret",
+        ".cfi_endproc",
+        helper = sym capture_segment_backtrace,
+    )
+}
+
+#[inline(never)]
+fn segment_backtrace_boundary() -> u64 {
+    let result = unsafe {
+        native_transfer::invoke_native_segment(
+            backtrace_entry as *const u8,
+            std::ptr::null_mut(),
+            torcl_rt::current_stack(),
+        )
+    }
+    .unwrap();
+    std::hint::black_box(result.value.0)
+}
+
+#[test]
+fn backtrace_crosses_the_segment_adapter() {
+    if !native_transfer::is_supported() {
+        eprintln!("native segment backtrace probe unavailable on this hardened host");
+        return;
+    }
+    assert_eq!(segment_backtrace_boundary(), 1);
+}

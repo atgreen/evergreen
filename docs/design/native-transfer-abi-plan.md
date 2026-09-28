@@ -336,10 +336,21 @@ continuation have `ENDBR64`. Other targets refuse this adapter.
 
 Assembly probes cover register/control-word restoration, stack alignment,
 anchor invalidation, ownership/watermarks, nested entries and Rust destructor
-counts. This is boundary infrastructure, not activation: generated Lisp calls
+counts. The SysV entry has DWARF frame descriptions for every prologue and
+epilogue stack adjustment. A backtrace probe crosses it from a Rust helper
+through an assembly fixture that clobbers all six nonvolatile integer registers.
+This proves stack walking through the adapter; emitted JIT frames still need
+their own metadata, and it does not authorize Rust panic unwinding across the
+native ABI. Separate probes cause real null-page and TorclStack guard faults,
+then use the existing signal recovery targets to return through a Rust helper
+and the segment landing. They verify fault classification, destructor execution,
+unchanged TorclStack watermarks and restoration of enclosing recovery targets.
+
+This is boundary infrastructure, not activation: generated Lisp calls
 still use the existing ABI and successful-return checks. Transfer payload
-rooting, cleanup/root retirement, native dispatch, fault-recovery/unwind gates,
-fiber migration and the Win64 adapter remain required before rollout. The
+rooting, cleanup/root retirement, native dispatch, actual JIT integration of the
+fault-recovery/unwind gates, fiber migration and the Win64 adapter remain
+required before rollout. The
 adapter records TorclStack watermarks but does not restore them itself.
 
 ## Baseline contract oracles and boundary inventory
