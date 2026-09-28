@@ -171,3 +171,156 @@ fn shadow_maps_reject_raw_words_out_of_bounds_and_ambiguous_sources() {
     emitted.map.frames[0].live_ref_bitmap[0] = false;
     assert!(SysvTransferTable::new(64, vec![emitted]).is_err());
 }
+
+fn cleanup_site() -> SysvTransferSite {
+    use torcl_compiler::control_scope::{ControlScope, Ownership, ScopeKind};
+    let mut emitted = site(12, 0);
+    for cleanup_bcp in [80, 60] {
+        emitted.map.control_scopes.push(ControlScope {
+            push_bcp: cleanup_bcp - 10,
+            ownership: Ownership::Local,
+            sp_restore: 0,
+            kind: ScopeKind::Unwind { cleanup_bcp },
+        });
+    }
+    emitted
+}
+
+#[test]
+fn cleanup_landing_is_bound_to_exact_site_scope_code_and_body_stack() {
+    use torcl_compiler::t2::transfer_sites::SysvCleanupLanding;
+    let mut code = [0x90; 64];
+    code[40..44].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+    let target = SysvCleanupLanding {
+        return_offset: 12,
+        entry_offset: 40,
+        cleanup_bcp: 60,
+    };
+    let table = SysvTransferTable::new(code.len(), vec![cleanup_site(), site(24, 0)])
+        .unwrap()
+        .with_cleanup_landings(&code, &[target])
+        .unwrap();
+    let mut capture = SysvTransferCapture {
+        request: std::ptr::null_mut(),
+        value: NIL,
+        exit: NativeExit::Transfer,
+        preserved: [0; 6],
+        caller_sp: 0x2000 as *const u64,
+        return_pc: 0x100c as *const u8,
+    };
+    let selected = table.lookup(0x1000, 0x100c).unwrap();
+    let packet = selected
+        .native_cleanup_landing(0x1000, &capture)
+        .unwrap()
+        .unwrap();
+    assert_eq!(packet.entry as usize, 0x1028);
+    assert_eq!(packet.stack_pointer as usize, 0x2010);
+    capture.return_pc = 0x1018 as *const u8;
+    assert!(selected.native_cleanup_landing(0x1000, &capture).is_err());
+    assert!(
+        table
+            .lookup(0x1000, 0x1018)
+            .unwrap()
+            .native_cleanup_landing(0x1000, &capture)
+            .unwrap()
+            .is_none()
+    );
+    capture.return_pc = 0x100c as *const u8;
+    for address in [0, 0x2008, usize::MAX - 15] {
+        capture.caller_sp = address as *const u64;
+        assert!(selected.native_cleanup_landing(0x1000, &capture).is_err());
+    }
+    capture.caller_sp = 0x2000 as *const u64;
+    for exit in [NativeExit::Returned, NativeExit::Deopt] {
+        capture.exit = exit;
+        assert!(selected.native_cleanup_landing(0x1000, &capture).is_err());
+    }
+    capture.exit = NativeExit::Transfer;
+    capture.return_pc = (usize::MAX - 16 + 12) as *const u8;
+    assert!(
+        selected
+            .native_cleanup_landing(usize::MAX - 16, &capture)
+            .is_err()
+    );
+}
+
+#[test]
+fn cleanup_landing_rejects_unverified_targets_and_inherited_scopes() {
+    use torcl_compiler::control_scope::Ownership;
+    use torcl_compiler::t2::transfer_sites::SysvCleanupLanding;
+    let mut code = [0x90; 64];
+    code[40..44].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+    let target = SysvCleanupLanding {
+        return_offset: 12,
+        entry_offset: 40,
+        cleanup_bcp: 60,
+    };
+    for bad in [
+        SysvCleanupLanding {
+            return_offset: 13,
+            ..target
+        },
+        SysvCleanupLanding {
+            entry_offset: 41,
+            ..target
+        },
+        SysvCleanupLanding {
+            entry_offset: 62,
+            ..target
+        },
+        SysvCleanupLanding {
+            entry_offset: u32::MAX,
+            ..target
+        },
+        SysvCleanupLanding {
+            cleanup_bcp: 80,
+            ..target
+        },
+    ] {
+        assert!(
+            SysvTransferTable::new(64, vec![cleanup_site()])
+                .unwrap()
+                .with_cleanup_landings(&code, &[bad])
+                .is_err()
+        );
+    }
+    assert!(
+        SysvTransferTable::new(64, vec![cleanup_site()])
+            .unwrap()
+            .with_cleanup_landings(&code, &[target, target])
+            .is_err()
+    );
+    assert!(
+        SysvTransferTable::new(64, vec![cleanup_site()])
+            .unwrap()
+            .with_cleanup_landings(&code[..63], &[target])
+            .is_err()
+    );
+    assert!(
+        SysvTransferTable::new(64, vec![site(12, 0)])
+            .unwrap()
+            .with_cleanup_landings(&code, &[target])
+            .is_err()
+    );
+    let mut inherited = cleanup_site();
+    inherited.map.control_scopes.last_mut().unwrap().ownership = Ownership::Inherited;
+    assert!(
+        SysvTransferTable::new(64, vec![inherited])
+            .unwrap()
+            .with_cleanup_landings(&code, &[target])
+            .is_err()
+    );
+    let mut unaligned = cleanup_site();
+    unaligned.call_stack_adjust = 8;
+    assert!(
+        SysvTransferTable::new(64, vec![unaligned])
+            .unwrap()
+            .with_cleanup_landings(&code, &[target])
+            .is_err()
+    );
+    let bound = SysvTransferTable::new(64, vec![cleanup_site()])
+        .unwrap()
+        .with_cleanup_landings(&code, &[target])
+        .unwrap();
+    assert!(bound.with_cleanup_landings(&code, &[target]).is_err());
+}

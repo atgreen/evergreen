@@ -5,7 +5,9 @@
 
 use crate::t2::deopt::ReconstructedFrame;
 use crate::t2::mach::{Location, RegClass};
-use crate::t2::native_transfer::{CaptureLocationError, SysvCaptureLocation, SysvTransferCapture};
+use crate::t2::native_transfer::{
+    CaptureLocationError, SysvCaptureLocation, SysvNativeLanding, SysvTransferCapture,
+};
 use crate::t2::transfer_capture::{CaptureError, TransferSnapshot};
 use crate::t2::transfer_map::TransferCaptureMap;
 use crate::t2::x64_frame::{GPR_X86, ValueHome};
@@ -27,6 +29,16 @@ pub struct SysvTransferSite {
     pub map: TransferCaptureMap,
 }
 
+/// Compiler-selected cold edge that performs the phi moves into a cleanup.
+/// The entry is not the cleanup body itself: different source calls can require
+/// different moves. Bind these descriptors only after final code emission.
+#[derive(Clone, Copy, Debug)]
+pub struct SysvCleanupLanding {
+    pub return_offset: u32,
+    pub entry_offset: u32,
+    pub cleanup_bcp: u32,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum TransferSiteError {
     InvalidReturnOffset(u32),
@@ -38,6 +50,8 @@ pub enum TransferSiteError {
     WrongReturnPc,
     InvalidShadowRoot(Location),
     MissingActivation,
+    InvalidCleanupLanding(u32),
+    InvalidLandingCapture,
 }
 
 struct CaptureRecipe {
@@ -50,6 +64,8 @@ pub struct CheckedSysvSite {
     map: TransferCaptureMap,
     recipes: Vec<(Location, CaptureRecipe)>,
     activation_slots: usize,
+    call_stack_adjust: u32,
+    cleanup_landing: Option<u32>,
 }
 
 pub struct SysvTransferTable {
@@ -131,6 +147,8 @@ impl SysvTransferTable {
                 map: site.map,
                 recipes,
                 activation_slots: usize::from(site.activation_slots),
+                call_stack_adjust: site.call_stack_adjust,
+                cleanup_landing: None,
             });
         }
         checked.sort_unstable_by_key(|site| site.return_offset);
@@ -145,6 +163,53 @@ impl SysvTransferTable {
             code_len,
             sites: checked,
         })
+    }
+
+    /// Bind compiler-verified cleanup edges to the exact bytes being installed.
+    /// Unknown sites, duplicate destinations for one site, inherited cleanups,
+    /// and entries without ENDBR64 are refused. Failure consumes the table, so
+    /// partially checked destinations cannot be published. Sites omitted here
+    /// retain explicit fallback. This does not infer CFG semantics from bytes;
+    /// the emitter must supply edges validated by the IR verifier.
+    pub fn with_cleanup_landings(
+        mut self,
+        code: &[u8],
+        landings: &[SysvCleanupLanding],
+    ) -> Result<Self, TransferSiteError> {
+        use crate::control_scope::{Ownership, ScopeKind};
+        if code.len() != self.code_len {
+            return Err(TransferSiteError::InvalidCleanupLanding(u32::MAX));
+        }
+        for landing in landings {
+            let invalid = || TransferSiteError::InvalidCleanupLanding(landing.return_offset);
+            let index = self
+                .sites
+                .binary_search_by_key(&landing.return_offset, |site| site.return_offset)
+                .map_err(|_| invalid())?;
+            let site = &mut self.sites[index];
+            let scope = site
+                .map
+                .control_scopes
+                .iter()
+                .rev()
+                .find(|scope| matches!(scope.kind, ScopeKind::Unwind { .. }))
+                .ok_or_else(invalid)?;
+            let start = landing.entry_offset as usize;
+            let end = start.checked_add(4).ok_or_else(invalid)?;
+            if site.cleanup_landing.is_some()
+                || site.call_stack_adjust % 16 != 0
+                || scope.ownership != Ownership::Local
+                || scope.kind
+                    != (ScopeKind::Unwind {
+                        cleanup_bcp: landing.cleanup_bcp,
+                    })
+                || code.get(start..end) != Some(&[0xf3, 0x0f, 0x1e, 0xfa])
+            {
+                return Err(invalid());
+            }
+            site.cleanup_landing = Some(landing.entry_offset);
+        }
+        Ok(self)
     }
 
     /// Integer address checks only; this does not dereference code or allocate.
@@ -169,6 +234,41 @@ impl CheckedSysvSite {
     }
     pub fn map(&self) -> &TransferCaptureMap {
         &self.map
+    }
+
+    /// Construct a same-frame landing packet without allocating or reading raw
+    /// memory. The caller must retain the installed code at `code_base`, prove
+    /// this is its live frame in the current segment, root the pending cursor,
+    /// and repair captured native homes before dispatch. Address arithmetic and
+    /// exact-PC checks cannot prove those ownership/lifetime obligations.
+    pub fn native_cleanup_landing(
+        &self,
+        code_base: usize,
+        capture: &SysvTransferCapture,
+    ) -> Result<Option<SysvNativeLanding>, TransferSiteError> {
+        if (capture.return_pc as usize).checked_sub(code_base) != Some(self.return_offset as usize)
+        {
+            return Err(TransferSiteError::WrongReturnPc);
+        }
+        let Some(offset) = self.cleanup_landing else {
+            return Ok(None);
+        };
+        let invalid = || TransferSiteError::InvalidLandingCapture;
+        let caller_sp = capture.caller_sp as usize;
+        if caller_sp == 0
+            || caller_sp % 16 != 0
+            || capture.exit != torcl_rt::native_transfer::NativeExit::Transfer
+        {
+            return Err(invalid());
+        }
+        let stack_pointer = caller_sp
+            .checked_add(self.call_stack_adjust as usize)
+            .ok_or_else(invalid)? as *mut u64;
+        let entry = code_base.checked_add(offset as usize).ok_or_else(invalid)? as *const u8;
+        Ok(Some(SysvNativeLanding {
+            stack_pointer,
+            entry,
+        }))
     }
 
     /// Reserve execution-owned storage before native entry. The borrow keeps

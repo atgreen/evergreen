@@ -598,6 +598,18 @@ Run this capability gate explicitly with `cargo test -p torcl-compiler --test
 native_landing_sysv -- --include-ignored`.
 
 This adapter is not yet selected by Lisp transfer dispatch. The separate
+`SysvTransferTable::with_cleanup_landings` installer now binds a compiler-selected
+cold edge to an exact call site, checks the innermost local UNWIND-PROTECT identity,
+and requires an in-bounds ENDBR64 entry in the supplied code bytes. Duplicate or
+unknown call sites, inherited cleanup ownership and unaligned body-SP recipes
+are rejected. Unlisted sites retain fallback. The checked site can construct a
+same-frame landing packet without allocation, using its temporary call-area size;
+it rejects the wrong captured PC, exit kind, stack alignment and address overflow.
+This is metadata validation, not proof of runtime ownership: the dispatcher still
+must retain that exact code, establish current-segment/frame ownership, root the
+pending continuation and repair native homes before selecting the packet.
+
+The separate
 `build_from_bytecode_for_native_cleanups` entry now constructs exceptional cleanup
 predecessors **before** SSA sealing and phi simplification. Calls split into normal
 and cold blocks; the cold edge truncates the operand stack to the selected
