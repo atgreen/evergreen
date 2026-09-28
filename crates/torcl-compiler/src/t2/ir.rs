@@ -223,6 +223,9 @@ pub enum Opcode {
     CleanupRestore,
     /// Verified exceptional/normal cleanup entry with an entry FrameState.
     CleanupLanding,
+    /// Consume the prepared catch payload and produce its primary value.
+    /// Native-only, noncollecting helper; secondary values remain in runtime state.
+    CatchLanding,
     // Cat 5a — non-terminator control: calls & guards
     Call,
     Guard,
@@ -303,6 +306,10 @@ pub enum AuxData {
         push_bcp: u32,
         enter: bool,
     },
+    CatchDestination {
+        push_bcp: u32,
+        resume_bcp: u32,
+    },
     /// Save/restore or landing identity. On Invoke this selects cleanup
     /// completion: normal edge pops/restores the saved value, exceptional edge
     /// resumes its pending transfer with the continuation still described by
@@ -315,8 +322,8 @@ pub enum AuxData {
     /// FrameState captures the pre-operation values, but propagation must begin
     /// unwinding rather than executing that bytecode operation again. These
     /// static scopes describe required runtime state, not permission to elide it.
-    /// NlxTransfer may name one verified CleanupLanding successor; no successor
-    /// means fallback/propagation outside this native CFG. A named native target
+    /// NlxTransfer may name verified cleanup and catch landing successors;
+    /// no successor means fallback/propagation outside this native CFG. A native target
     /// remains conditional on runtime destination availability and signaling.
     TransferSite {
         origin_bcp: u32,

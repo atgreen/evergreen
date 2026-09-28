@@ -621,7 +621,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         // Execution-owned cleanup helpers clobber caller-saved registers.
         // Only the opt-in transfer emitter supplies these helper addresses.
         CleanupLanding => lo.emit_annotated(inst, op::LIVENESS, defs, uses),
-        CleanupSave | CleanupRestore => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
+        CleanupSave | CleanupRestore | CatchLanding => {
+            lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses)
+        }
 
         // ── allocation (safepoint-bearing) ──
         Alloc | AllocCons => lo.emit_annotated(inst, op::ALLOC, defs, uses),

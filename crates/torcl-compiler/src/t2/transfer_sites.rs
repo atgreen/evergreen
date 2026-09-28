@@ -39,6 +39,15 @@ pub struct SysvCleanupLanding {
     pub cleanup_bcp: u32,
 }
 
+/// Source-specific cold edge into one exact catch in the retained activation.
+#[derive(Clone, Copy, Debug)]
+pub struct SysvCatchLanding {
+    pub return_offset: u32,
+    pub entry_offset: u32,
+    pub push_bcp: u32,
+    pub resume_bcp: u32,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum TransferSiteError {
     InvalidReturnOffset(u32),
@@ -51,6 +60,7 @@ pub enum TransferSiteError {
     InvalidShadowRoot(Location),
     MissingActivation,
     InvalidCleanupLanding(u32),
+    InvalidCatchLanding(u32),
     InvalidLandingCapture,
 }
 
@@ -66,6 +76,7 @@ pub struct CheckedSysvSite {
     activation_slots: usize,
     call_stack_adjust: u32,
     cleanup_landing: Option<u32>,
+    catch_landings: Vec<(u32, u32)>,
 }
 
 pub struct SysvTransferTable {
@@ -149,6 +160,7 @@ impl SysvTransferTable {
                 activation_slots: usize::from(site.activation_slots),
                 call_stack_adjust: site.call_stack_adjust,
                 cleanup_landing: None,
+                catch_landings: Vec::new(),
             });
         }
         checked.sort_unstable_by_key(|site| site.return_offset);
@@ -212,6 +224,57 @@ impl SysvTransferTable {
         Ok(self)
     }
 
+    /// Bind catch destinations to exact source sites and scope identities,
+    /// validating their machine-code entry markers before publishing the table.
+    pub fn with_catch_landings(
+        mut self,
+        code: &[u8],
+        landings: &[SysvCatchLanding],
+    ) -> Result<Self, TransferSiteError> {
+        use crate::control_scope::{Ownership, ScopeKind};
+        if code.len() != self.code_len {
+            return Err(TransferSiteError::InvalidCatchLanding(u32::MAX));
+        }
+        for landing in landings {
+            let invalid = || TransferSiteError::InvalidCatchLanding(landing.return_offset);
+            let index = self
+                .sites
+                .binary_search_by_key(&landing.return_offset, |site| site.return_offset)
+                .map_err(|_| invalid())?;
+            let site = &mut self.sites[index];
+            let mut candidates = site
+                .map
+                .control_scopes
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.push_bcp == landing.push_bcp);
+            let (scope_index, scope) = candidates.next().ok_or_else(invalid)?;
+            let start = landing.entry_offset as usize;
+            let end = start.checked_add(4).ok_or_else(invalid)?;
+            if candidates.next().is_some()
+                || scope.ownership != Ownership::Local
+                || scope.kind
+                    != (ScopeKind::Catch {
+                        resume_bcp: landing.resume_bcp,
+                    })
+                || site.map.control_scopes[scope_index + 1..].iter().any(|s| {
+                    s.ownership != Ownership::Local || matches!(s.kind, ScopeKind::Unwind { .. })
+                })
+                || site.call_stack_adjust % 16 != 0
+                || site
+                    .catch_landings
+                    .iter()
+                    .any(|(push, _)| *push == landing.push_bcp)
+                || code.get(start..end) != Some(&[0xf3, 0x0f, 0x1e, 0xfa])
+            {
+                return Err(invalid());
+            }
+            site.catch_landings
+                .push((landing.push_bcp, landing.entry_offset));
+        }
+        Ok(self)
+    }
+
     /// Integer address checks only; this does not dereference code or allocate.
     /// The caller must supply the base of the code owning this table.
     pub fn lookup(&self, code_base: usize, return_pc: usize) -> Option<&CheckedSysvSite> {
@@ -246,11 +309,38 @@ impl CheckedSysvSite {
         code_base: usize,
         capture: &SysvTransferCapture,
     ) -> Result<Option<SysvNativeLanding>, TransferSiteError> {
+        self.native_landing(code_base, capture, self.cleanup_landing)
+    }
+
+    /// Same lifetime/rooting obligations as native_cleanup_landing. A missing
+    /// exact scope identity means explicit fallback, never a nearest destination.
+    pub fn native_catch_landing(
+        &self,
+        code_base: usize,
+        capture: &SysvTransferCapture,
+        push_bcp: u32,
+    ) -> Result<Option<SysvNativeLanding>, TransferSiteError> {
+        self.native_landing(
+            code_base,
+            capture,
+            self.catch_landings
+                .iter()
+                .find(|(push, _)| *push == push_bcp)
+                .map(|(_, offset)| *offset),
+        )
+    }
+
+    fn native_landing(
+        &self,
+        code_base: usize,
+        capture: &SysvTransferCapture,
+        offset: Option<u32>,
+    ) -> Result<Option<SysvNativeLanding>, TransferSiteError> {
         if (capture.return_pc as usize).checked_sub(code_base) != Some(self.return_offset as usize)
         {
             return Err(TransferSiteError::WrongReturnPc);
         }
-        let Some(offset) = self.cleanup_landing else {
+        let Some(offset) = offset else {
             return Ok(None);
         };
         let invalid = || TransferSiteError::InvalidLandingCapture;

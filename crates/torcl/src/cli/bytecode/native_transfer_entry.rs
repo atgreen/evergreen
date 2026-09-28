@@ -53,13 +53,14 @@ impl TransferCode {
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
         let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
         let landing = JitBuffer::new(&emit_native_landing_stub())?;
-        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_cleanups(
+        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_catches(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
             save_cleanup as *const () as u64,
             completion.as_ptr() as u64,
             c2i_clear_mv as *const () as u64,
+            deliver_catch as *const () as u64,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -162,7 +163,10 @@ impl TransferCode {
             env,
             base: env.catch_stack.len(),
         };
+        let mut prepared_catch = None::<PreparedCatch>;
+        torcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
         let mut context = CaptureContext {
+            prepared_catch: &mut prepared_catch,
             frame,
             body: self.body.as_ref(),
             catches: &mut catches,
@@ -227,11 +231,14 @@ impl TransferCode {
                 if error.is_none()
                     && context.selected.is_none()
                     && cleanups.is_empty()
-                    && catches.is_empty() =>
+                    && catches.is_empty()
+                    && prepared_catch.is_none() =>
             {
                 Ok(*primary)
             }
             NativeExit::Transfer => {
+                #[cfg(test)]
+                NATIVE_FALLBACK_COUNT.with(|count| count.set(count.get() + 1));
                 let index = context.selected.ok_or_else(invalid_capture)?;
                 if error.is_none() {
                     return Err(invalid_capture());
@@ -386,6 +393,36 @@ struct SavedCleanup {
 struct SavedCatch {
     push_bcp: u32,
     token: String,
+}
+
+struct PreparedCatch {
+    push_bcp: u32,
+    resume_bcp: u32,
+    token: String,
+    payload: ControlPayload,
+}
+impl torcl_rt::gc::TraceHostRoots for PreparedCatch {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        self.payload.trace_host_roots(visit);
+    }
+}
+
+// Noncollecting: the prepared payload is rooted until this helper consumes it,
+// and no Lisp allocation or suspension occurs before the returned primary is
+// stored in its generated-code home.
+unsafe extern "C" fn deliver_catch(push_bcp: u32, resume_bcp: u32, _unused: TorclVal) -> TorclVal {
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    let prepared = unsafe { &mut *context.prepared_catch }
+        .take()
+        .expect("prepared native catch payload");
+    assert_eq!(prepared.push_bcp, push_bcp);
+    assert_eq!(prepared.resume_bcp, resume_bcp);
+    prepared.payload.restore();
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    let primary = super::super::take_control_mv(&prepared.token, env);
+    #[cfg(test)]
+    NATIVE_CATCH_COUNT.with(|count| count.set(count.get() + 1));
+    primary
 }
 
 struct CatchScopeGuard {
@@ -601,7 +638,23 @@ pub(super) fn take_native_cleanup_count() -> usize {
     NATIVE_CLEANUP_COUNT.with(|count| count.replace(0))
 }
 
+#[cfg(test)]
+static NATIVE_CATCH_COUNT: torcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+static NATIVE_FALLBACK_COUNT: torcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+pub(super) fn take_native_catch_count() -> usize {
+    NATIVE_CATCH_COUNT.with(|count| count.replace(0))
+}
+#[cfg(test)]
+pub(super) fn take_native_fallback_count() -> usize {
+    NATIVE_FALLBACK_COUNT.with(|count| count.replace(0))
+}
+
 struct CaptureContext {
+    prepared_catch: *mut Option<PreparedCatch>,
     frame: *mut Frame,
     body: *const BytecodeFunction,
     catches: *mut Vec<SavedCatch>,
@@ -691,9 +744,6 @@ unsafe fn prepare_transfer(
             slot.replace(Some(unmatched_error(pending)));
         });
     }
-    let Some(landing) = site.native_cleanup_landing(context.code_base, capture)? else {
-        return Ok(());
-    };
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
     // Raw errors must first signal with live handlers/restarts. Until native
     // signaling is wired, only a selected transfer to a live outer CATCH takes
@@ -719,18 +769,82 @@ unsafe fn prepare_transfer(
     if !selected_throw {
         return Ok(());
     }
-    // Local catch identity survives fallback; only intervening cleanups may run
-    // natively until the selected catch has its own verified landing.
-    let NativeUnwindStep::RunCleanup {
-        scope_index,
-        handler_depth,
-    } = next_unwind_step(&site.map().control_scopes, selected_target)
-    else {
-        return Ok(());
+    // Plan against scope prefixes without mutating live catch registrations.
+    // If any subsequent step lacks a native destination, fallback still sees
+    // the exact state described by this source site's reconstruction map.
+    let scopes = &site.map().control_scopes;
+    let mut remaining = scopes.as_slice();
+    let action = loop {
+        match next_unwind_step(remaining, selected_target) {
+            NativeUnwindStep::RetireCatch { scope_index } => {
+                remaining = &remaining[..scope_index];
+            }
+            action => break action,
+        }
     };
-    let ScopeKind::Unwind { cleanup_bcp } = site.map().control_scopes[scope_index].kind else {
-        unreachable!("unwind selector returned a cleanup scope")
+    let (scope_index, handler_depth, landing) = match action {
+        NativeUnwindStep::RunCleanup {
+            scope_index,
+            handler_depth,
+        } => {
+            let Some(landing) = site.native_cleanup_landing(context.code_base, capture)? else {
+                return Ok(());
+            };
+            (scope_index, handler_depth, landing)
+        }
+        NativeUnwindStep::EnterTarget { scope_index } => {
+            if !matches!(scopes[scope_index].kind, ScopeKind::Catch { .. }) {
+                return Ok(());
+            }
+            let Some(landing) = site.native_catch_landing(
+                context.code_base,
+                capture,
+                scopes[scope_index].push_bcp,
+            )?
+            else {
+                return Ok(());
+            };
+            let handler_depth = scopes[..scope_index]
+                .iter()
+                .filter(|scope| {
+                    matches!(
+                        scope.kind,
+                        ScopeKind::Block { .. }
+                            | ScopeKind::Tagbody { .. }
+                            | ScopeKind::Catch { .. }
+                            | ScopeKind::Unwind { .. }
+                            | ScopeKind::HandlerCase { .. }
+                            | ScopeKind::HandlerBind { .. }
+                            | ScopeKind::RestartCase { .. }
+                    )
+                })
+                .count();
+            (scope_index, handler_depth, landing)
+        }
+        _ => return Ok(()),
     };
+    // Validate every retiring record before changing either stack. This also
+    // checks selected-catch identity independently of its resume address.
+    let retiring = scopes[scope_index..]
+        .iter()
+        .rev()
+        .filter(|scope| matches!(scope.kind, ScopeKind::Catch { .. }));
+    let catches = unsafe { &mut *context.catches };
+    let mut saved = catches.iter().rev();
+    let mut live = env.catch_stack.iter().rev();
+    let mut retire_count = 0;
+    for scope in retiring {
+        let Some(record) = saved.next() else {
+            return Ok(());
+        };
+        let Some((_, token)) = live.next() else {
+            return Ok(());
+        };
+        if record.push_bcp != scope.push_bcp || &record.token != token {
+            return Ok(());
+        }
+        retire_count += 1;
+    }
     // Restore native homes while canonical snapshots still own every root.
     unsafe {
         snapshot.write_back(context.code_base, capture)?;
@@ -746,17 +860,37 @@ unsafe fn prepare_transfer(
         // even when both transfers name the same catch binding.
         cleanups.pop();
     }
-    assert!(cleanups.len() < cleanups.capacity());
-    cleanups.push(SavedCleanup {
-        cleanup_bcp,
-        continuation: CleanupCont {
-            handler_depth,
-            action: CleanupAction::Resume {
+    match scopes[scope_index].kind {
+        ScopeKind::Unwind { cleanup_bcp } => {
+            assert!(cleanups.len() < cleanups.capacity());
+            cleanups.push(SavedCleanup {
+                cleanup_bcp,
+                continuation: CleanupCont {
+                    handler_depth,
+                    action: CleanupAction::Resume {
+                        payload: ControlPayload::take(&token),
+                        pending: Pending::Token(token),
+                    },
+                },
+            });
+            #[cfg(test)]
+            NATIVE_CLEANUP_COUNT.with(|count| count.set(count.get() + 1));
+        }
+        ScopeKind::Catch { resume_bcp } => {
+            let prepared = unsafe { &mut *context.prepared_catch };
+            assert!(prepared.is_none());
+            *prepared = Some(PreparedCatch {
+                push_bcp: scopes[scope_index].push_bcp,
+                resume_bcp,
                 payload: ControlPayload::take(&token),
-                pending: Pending::Token(token),
-            },
-        },
-    });
+                token,
+            });
+        }
+        _ => unreachable!("validated native destination"),
+    }
+    catches.truncate(catches.len() - retire_count);
+    env.catch_stack
+        .truncate(env.catch_stack.len() - retire_count);
     // The rooted continuation owns the pending transfer before generated
     // cleanup code can allocate or suspend. Clear any helper's secondary values.
     env.clear_mv();
@@ -767,8 +901,6 @@ unsafe fn prepare_transfer(
         entry: context.landing_stub,
         request: std::ptr::from_mut(&mut context.landing).cast(),
     };
-    #[cfg(test)]
-    NATIVE_CLEANUP_COUNT.with(|count| count.set(count.get() + 1));
     Ok(())
 }
 

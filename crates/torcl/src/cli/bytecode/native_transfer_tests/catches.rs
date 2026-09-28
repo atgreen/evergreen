@@ -37,7 +37,10 @@ fn native_v2_catch_ir_rejects_wrong_scope_identity() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
-    use super::super::native_transfer_entry::{TransferCode, take_native_cleanup_count};
+    use super::super::native_transfer_entry::{
+        TransferCode, take_native_catch_count, take_native_cleanup_count,
+        take_native_fallback_count,
+    };
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -46,6 +49,8 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
     super::super::super::read_eval_all_env(
         "(setq *catch-calls* 0)
          (defun catch-answer (x) (%force-minor-gc-for-test) (values x (list x)))
+         (defun catch-first (first second)
+           (%force-minor-gc-for-test) (values first (list first)))
          (defun catch-exit (tag x)
            (setq *catch-calls* (+ *catch-calls* 1))
            (%force-minor-gc-for-test) (throw tag (values x (list x))))",
@@ -57,9 +62,31 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
         ("((catch tag (catch-exit tag x)))", 1, 0),
         ("((catch tag (throw tag (catch-answer x))))", 0, 0),
         ("((catch tag (catch tag (catch-exit tag x))))", 1, 0),
+        ("((catch tag (catch nil (catch-exit tag x))))", 1, 0),
+        ("((catch-first x (catch tag (catch-exit tag nil))))", 1, 0),
+        (
+            "((let ((saved nil)) (catch tag (if tag (setq saved x) (setq saved tag)) (catch-exit tag nil)) (catch-answer saved)))",
+            1,
+            0,
+        ),
+        (
+            "((let ((saved nil)) (catch tag (setq saved x) (catch-exit tag nil)) (catch-answer saved)))",
+            1,
+            0,
+        ),
+        (
+            "((catch tag (unwind-protect (catch nil (catch-exit tag x)) (catch-answer x))))",
+            1,
+            1,
+        ),
         (
             "((catch tag (unwind-protect (catch-exit tag x) (catch-answer x))))",
             1,
+            1,
+        ),
+        (
+            "((catch tag (unwind-protect (catch-exit tag nil) (catch-exit tag x))))",
+            2,
             1,
         ),
         (
@@ -73,7 +100,7 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
         let body = Arc::new(
             compile_function("NATIVE-CATCH", *params, *forms, &env, false, false).unwrap(),
         );
-        let code = TransferCode::compile(body).expect("native catch registration");
+        let code = TransferCode::compile(body).unwrap_or_else(|| panic!("native catch: {source}"));
         torcl_rt::rooted!(answer = super::super::super::arena_cons(TorclVal::from_fixnum(42), NIL));
         torcl_rt::rooted!(args = vec![NIL, *answer]);
         super::super::super::read_eval_all_env("(setq *catch-calls* 0)", &mut env).unwrap();
@@ -84,10 +111,22 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
         let enclosing = super::super::super::next_control_token("ENCLOSING-CATCH");
         env.catch_stack.push((args[0], enclosing.clone()));
         take_native_cleanup_count();
+        take_native_fallback_count();
+        take_native_catch_count();
         torcl_rt::rooted!(result = code.run(&args, &mut env));
         assert_eq!(result.as_ref().unwrap(), &*answer, "{source}");
         assert_ne!(args[0].to_raw(), before, "{source}");
         assert_eq!(take_native_cleanup_count(), native_cleanups, "{source}");
+        assert_eq!(
+            take_native_catch_count(),
+            usize::from(source.contains("catch-exit") || source.contains("(throw")),
+            "{source}"
+        );
+        assert_eq!(
+            take_native_fallback_count(),
+            0,
+            "catch must stay native: {source}"
+        );
         assert_eq!(env.catch_stack.len(), 1, "native catches retired");
         assert_eq!(
             env.catch_stack[0],
@@ -106,6 +145,12 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
     for (source, count, expected) in [
         ("((catch tag (values)))", 0, NIL),
         ("((catch tag (values 9)))", 1, TorclVal::from_fixnum(9)),
+        ("((catch tag (throw tag (values))))", 0, NIL),
+        (
+            "((catch tag (throw tag (values 9))))",
+            1,
+            TorclVal::from_fixnum(9),
+        ),
     ] {
         torcl_rt::rooted!(params = reader::read_from_string("(tag)").unwrap().0);
         torcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
@@ -113,7 +158,14 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
             compile_function("CATCH-VALUE-COUNT", *params, *forms, &env, false, false).unwrap(),
         );
         let code = TransferCode::compile(body).expect("native catch value count");
+        take_native_catch_count();
+        take_native_fallback_count();
         assert_eq!(code.run(&[NIL], &mut env).unwrap(), expected);
+        assert_eq!(
+            take_native_catch_count(),
+            usize::from(source.contains("throw"))
+        );
+        assert_eq!(take_native_fallback_count(), 0);
         assert!(env.mv_active);
         assert_eq!(env.mv.len(), count);
         assert!(env.catch_stack.is_empty());

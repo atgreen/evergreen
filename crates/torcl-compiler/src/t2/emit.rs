@@ -2694,6 +2694,7 @@ enum CleanupEmission {
         save: u64,
         complete: u64,
         clear_mv: u64,
+        catch_landing: u64,
     },
 }
 
@@ -2703,6 +2704,7 @@ struct TransferEmission {
     cleanup: Option<CleanupEmission>,
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
     landings: std::collections::HashMap<crate::t2::ir::Block, (u32, u32)>,
+    catch_landings: std::collections::HashMap<crate::t2::ir::Block, Vec<(u32, u32, u32)>>,
 }
 
 /// Opt-in SysV emission through a helper-v2 veneer. The owner must root all
@@ -2761,6 +2763,35 @@ pub fn emit_framed_native_cleanups(
             save,
             complete,
             clear_mv,
+            catch_landing: 0,
+        }),
+    )
+}
+
+/// Add a noncollecting `(push_bcp, resume_bcp, unused) -> primary` helper that
+/// consumes an already rooted, selected catch payload and restores all values.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub fn emit_framed_native_catches(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    clear_mv: u64,
+    catch_landing: u64,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    if catch_landing == 0 {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    emit_transfer_function(
+        f,
+        call_veneer,
+        activation_slots,
+        Some(CleanupEmission::Native {
+            save,
+            complete,
+            clear_mv,
+            catch_landing,
         }),
     )
 }
@@ -2780,6 +2811,7 @@ fn emit_transfer_function(
             save,
             complete,
             clear_mv,
+            ..
         } => save == 0 || complete == 0 || clear_mv == 0,
     }) || call_veneer == 0
         || !f.osr_entries.is_empty()
@@ -2795,6 +2827,13 @@ fn emit_transfer_function(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
+            if data.opcode == Opcode::CatchLanding {
+                if !matches!(cleanup, Some(CleanupEmission::Native { catch_landing, .. }) if catch_landing != 0)
+                {
+                    return Err(EmitError::UnsupportedOp(0xFA));
+                }
+                continue;
+            }
             if native_cleanups && data.opcode == Opcode::Invoke {
                 let edge = &data.targets[1];
                 let cold = f.block(edge.block);
@@ -2849,6 +2888,7 @@ fn emit_transfer_function(
         cleanup,
         sites: vec![],
         landings: std::collections::HashMap::new(),
+        catch_landings: std::collections::HashMap::new(),
     };
     let code = emit_framed_inner(
         f,
@@ -2870,8 +2910,19 @@ fn emit_transfer_function(
         Some(&mut transfers),
     )?;
     let mut landings = Vec::new();
+    let mut catch_landings = Vec::new();
     for site in &transfers.sites {
         let cold = f.inst(site.map.call).targets[1].block;
+        if let Some(entries) = transfers.catch_landings.get(&cold) {
+            for &(entry_offset, push_bcp, resume_bcp) in entries {
+                catch_landings.push(crate::t2::transfer_sites::SysvCatchLanding {
+                    return_offset: site.return_offset,
+                    entry_offset,
+                    push_bcp,
+                    resume_bcp,
+                });
+            }
+        }
         if let Some(&(entry_offset, cleanup_bcp)) = transfers.landings.get(&cold) {
             landings.push(crate::t2::transfer_sites::SysvCleanupLanding {
                 return_offset: site.return_offset,
@@ -2882,6 +2933,7 @@ fn emit_transfer_function(
     }
     let table = crate::t2::transfer_sites::SysvTransferTable::new(code.code.len(), transfers.sites)
         .and_then(|table| table.with_cleanup_landings(&code.code, &landings))
+        .and_then(|table| table.with_catch_landings(&code.code, &catch_landings))
         .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
     Ok((code, table))
 }
@@ -2924,6 +2976,7 @@ fn emit_framed_inner(
                     Opcode::CleanupSave
                         | Opcode::CleanupLanding
                         | Opcode::CleanupRestore
+                        | Opcode::CatchLanding
                         | Opcode::Invoke
                         | Opcode::NlxTransfer
                 )
@@ -2987,6 +3040,7 @@ fn emit_framed_inner(
                 | Opcode::TakeValuesToLocals
                 | Opcode::CleanupSave
                 | Opcode::CleanupRestore
+                | Opcode::CatchLanding
         )
     };
     let has_ir_calls = f.block_order().iter().any(|&b| {
@@ -3682,7 +3736,13 @@ fn emit_framed_inner(
             {
                 continue;
             }
-            let roots = if activation_slots.is_some() && is_call_like(d.opcode) {
+            // Catch delivery consumes a rooted payload without allocating,
+            // collecting or yielding. It is a register-clobbering call, but
+            // does not have (or need) a safepoint synchronization map.
+            let roots = if activation_slots.is_some()
+                && is_call_like(d.opcode)
+                && d.opcode != Opcode::CatchLanding
+            {
                 emitted_safepoints += 1;
                 Some(
                     safepoint_roots
@@ -3739,7 +3799,10 @@ fn emit_framed_inner(
             let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
             let (mut inst_reg, result_stores) = if d.opcode == Opcode::TakeValuesToLocals
                 || d.opcode == Opcode::Invoke
-                || matches!(d.opcode, Opcode::CleanupSave | Opcode::CleanupRestore)
+                || matches!(
+                    d.opcode,
+                    Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CatchLanding
+                )
                 || wide_call
             {
                 (HashMap::new(), Vec::new())
@@ -3837,10 +3900,18 @@ fn emit_framed_inner(
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
                 return Err(EmitError::UnsupportedOp(0xFA));
-            } else if matches!(d.opcode, Opcode::CleanupSave | Opcode::CleanupRestore) {
+            } else if matches!(
+                d.opcode,
+                Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CatchLanding
+            ) {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {
                     let helper = match transfers.as_ref().and_then(|t| t.cleanup) {
+                        Some(CleanupEmission::Native { catch_landing, .. })
+                            if d.opcode == Opcode::CatchLanding && catch_landing != 0 =>
+                        {
+                            catch_landing
+                        }
                         Some(CleanupEmission::Normal { save, restore }) => {
                             if d.opcode == Opcode::CleanupSave {
                                 save
@@ -3855,12 +3926,16 @@ fn emit_framed_inner(
                         }
                         _ => return Err(EmitError::UnsupportedOp(0xFA)),
                     };
-                    let AuxData::CleanupContinuation {
-                        cleanup_bcp,
-                        resume_bcp,
-                    } = d.aux
-                    else {
-                        return Err(EmitError::UnsupportedOp(0xFA));
+                    let (cleanup_bcp, resume_bcp) = match d.aux {
+                        AuxData::CleanupContinuation {
+                            cleanup_bcp,
+                            resume_bcp,
+                        } => (cleanup_bcp, resume_bcp),
+                        AuxData::CatchDestination {
+                            push_bcp,
+                            resume_bcp,
+                        } => (push_bcp, resume_bcp),
+                        _ => return Err(EmitError::UnsupportedOp(0xFA)),
                     };
                     if let Some(value) = d.args.first() {
                         if let Some(&bits) = const_tagged.get(value) {
@@ -4096,22 +4171,39 @@ fn emit_framed_inner(
             }
             Opcode::NlxTransfer if transfer_mode => {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                if let Some(target) = td.targets.first() {
+                if !td.targets.is_empty() {
                     let transfer = transfers
                         .as_deref_mut()
                         .ok_or(EmitError::UnsupportedOp(0xFA))?;
                     if !matches!(transfer.cleanup, Some(CleanupEmission::Native { .. })) {
                         return Err(EmitError::UnsupportedOp(0xFA));
                     }
-                    let landing = f.inst(f.block(target.block).insts[0]);
-                    let AuxData::CleanupContinuation { cleanup_bcp, .. } = landing.aux else {
-                        return Err(EmitError::UnsupportedOp(0xFA));
-                    };
-                    let offset = u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?;
-                    transfer.landings.insert(b, (offset, cleanup_bcp));
-                    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
-                    parallel_home_move(&mut a, &edge_home_moves(f, target, &homes, &const_tagged)?);
-                    a.jmp(block_label[&target.block]);
+                    for target in &td.targets {
+                        let landing = f.inst(f.block(target.block).insts[0]);
+                        let offset = u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?;
+                        match landing.aux {
+                            AuxData::CleanupContinuation { cleanup_bcp, .. } => {
+                                transfer.landings.insert(b, (offset, cleanup_bcp));
+                            }
+                            AuxData::CatchDestination {
+                                push_bcp,
+                                resume_bcp,
+                            } => {
+                                transfer
+                                    .catch_landings
+                                    .entry(b)
+                                    .or_default()
+                                    .push((offset, push_bcp, resume_bcp));
+                            }
+                            _ => return Err(EmitError::UnsupportedOp(0xFA)),
+                        }
+                        a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+                        parallel_home_move(
+                            &mut a,
+                            &edge_home_moves(f, target, &homes, &const_tagged)?,
+                        );
+                        a.jmp(block_label[&target.block]);
+                    }
                     continue;
                 }
                 // No native destination: the runtime must leave the segment.

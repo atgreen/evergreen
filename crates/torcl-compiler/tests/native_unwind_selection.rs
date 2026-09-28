@@ -94,7 +94,15 @@ fn catch_identity_is_the_establishing_scope_not_its_resume_address() {
     // Crossing the unselected inner catch requires retiring its live registration.
     assert_eq!(
         next_unwind_step(&scopes, SelectedTarget::Scope { push_bcp: 1 }),
-        NativeUnwindStep::Fallback
+        NativeUnwindStep::RetireCatch { scope_index: 1 }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes[..1], SelectedTarget::Scope { push_bcp: 1 }),
+        NativeUnwindStep::EnterTarget { scope_index: 0 }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes, SelectedTarget::OutsideFrame),
+        NativeUnwindStep::RetireCatch { scope_index: 1 }
     );
 }
 

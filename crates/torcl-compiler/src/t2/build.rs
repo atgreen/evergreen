@@ -530,6 +530,9 @@ impl<'a> Builder<'a> {
                 set.insert(i + 1);
             }
             match instr {
+                Instr::PushCatch { resume_bcp, .. } if self.native_cleanups => {
+                    set.insert(*resume_bcp as usize);
+                }
                 Instr::PushUnwind { cleanup_bcp, .. } if self.native_cleanups => {
                     set.insert(*cleanup_bcp as usize);
                 }
@@ -624,6 +627,14 @@ impl<'a> Builder<'a> {
             {
                 if let Some((cleanup, depth)) = self.exceptional_cleanup(i as u32) {
                     push(cleanup as usize, i32::from(depth), &mut depth_at, &mut work);
+                }
+                for (_, resume, depth) in self.exceptional_catches(i as u32) {
+                    push(
+                        resume as usize,
+                        i32::from(depth) + 1,
+                        &mut depth_at,
+                        &mut work,
+                    );
                 }
             }
             match &code[i] {
@@ -828,6 +839,9 @@ impl<'a> Builder<'a> {
         for (offset, instr) in code[start..end].iter().enumerate() {
             if self.catch_transition(start + offset).is_some() {
                 let mut successors = vec![blk(end)?];
+                for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
+                    successors.push(blk(resume as usize)?);
+                }
                 if let Some((cleanup, _)) = self.exceptional_cleanup((start + offset) as u32) {
                     successors.push(blk(cleanup as usize)?);
                 }
@@ -838,6 +852,9 @@ impl<'a> Builder<'a> {
                     if self.native_cleanups =>
                 {
                     let mut successors = Vec::new();
+                    for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
+                        successors.push(blk(resume as usize)?);
+                    }
                     if !matches!(instr, Instr::Throw)
                         && !matches!(instr, Instr::CallNamed { sym, .. } if is_never_returning_call(*sym))
                     {
@@ -858,6 +875,9 @@ impl<'a> Builder<'a> {
                         successors.push(blk(resume as usize)?);
                     }
                     if self.native_cleanups {
+                        for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
+                            successors.push(blk(resume as usize)?);
+                        }
                         if let Some((cleanup, _)) =
                             self.exceptional_cleanup((start + offset) as u32)
                         {
@@ -1516,6 +1536,25 @@ impl<'a> Builder<'a> {
             })
     }
 
+    /// Only catches before the next cleanup can be entered immediately. The
+    /// cleanup completion site exposes the next set after that cleanup runs.
+    fn exceptional_catches(&self, bcp: u32) -> Vec<(u32, u32, u16)> {
+        self.control_scopes
+            .as_ref()
+            .and_then(|s| s.before(bcp))
+            .into_iter()
+            .flatten()
+            .rev()
+            .take_while(|scope| !matches!(scope.kind, ScopeKind::Unwind { .. }))
+            .filter_map(|scope| match scope.kind {
+                ScopeKind::Catch { resume_bcp } => {
+                    Some((scope.push_bcp, resume_bcp, scope.sp_restore))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn synthetic_block(&mut self) -> Block {
         let block = self.f.make_block();
         self.total_preds.push(1);
@@ -1560,12 +1599,11 @@ impl<'a> Builder<'a> {
         self.record_edges(block, call, vec![normal, cold]);
         self.seal(normal);
         self.seal(cold);
-        let mut cold_stack = stack.clone();
-        let targets = if let Some((cleanup, depth)) = self.exceptional_cleanup(bcp) {
+        let cold_stack = stack.clone();
+        let mut targets = if let Some((cleanup, depth)) = self.exceptional_cleanup(bcp) {
             if usize::from(depth) > cold_stack.len() {
                 return Err(BuildError::Unsupported("cleanup consumes enclosing stack"));
             }
-            cold_stack.truncate(usize::from(depth));
             vec![BlockCall {
                 block: self.block_of[&(cleanup as usize)],
                 args: vec![],
@@ -1573,6 +1611,18 @@ impl<'a> Builder<'a> {
         } else {
             vec![]
         };
+        let mut catch_edges = Vec::new();
+        for (push_bcp, resume_bcp, depth) in self.exceptional_catches(bcp) {
+            if usize::from(depth) > cold_stack.len() {
+                return Err(BuildError::Unsupported("catch consumes enclosing stack"));
+            }
+            let landing = self.synthetic_block();
+            targets.push(BlockCall {
+                block: landing,
+                args: vec![],
+            });
+            catch_edges.push((landing, push_bcp, resume_bcp, depth));
+        }
         if !matches!(self.f.inst(call).aux, AuxData::CatchScope { .. }) {
             stack.push(projected);
         }
@@ -1608,9 +1658,42 @@ impl<'a> Builder<'a> {
                 frame_state: fs,
                 source_pos: 0,
             })),
-            cold_stack,
+            cold_stack.clone(),
             self.bf.code.len(),
         );
+        for (landing, push_bcp, resume_bcp, depth) in catch_edges {
+            self.seal(landing);
+            let mut prefix = cold_stack[..usize::from(depth)].to_vec();
+            let state = self.build_frame_state(landing, &prefix, resume_bcp);
+            let (_, results) = self.f.push_inst(
+                landing,
+                InstData {
+                    opcode: Opcode::CatchLanding,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::CatchDestination {
+                        push_bcp,
+                        resume_bcp,
+                    },
+                    flags: InstFlags {
+                        effectful: true,
+                        call: true,
+                        ..InstFlags::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            prefix.push(results[0]);
+            self.finish_block(
+                landing,
+                Some(Term::Jump(self.block_of[&(resume_bcp as usize)])),
+                prefix,
+                self.bf.code.len(),
+            );
+        }
         Ok(())
     }
 

@@ -20,6 +20,12 @@ pub enum SelectedTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeUnwindStep {
+    /// Crossing an unselected local catch requires retiring its live record.
+    /// Callers may plan further actions on the outer prefix, but must validate
+    /// the final landing before changing registrations needed by fallback.
+    RetireCatch {
+        scope_index: usize,
+    },
     RunCleanup {
         scope_index: usize,
         /// Number of installed handlers outside this cleanup. Running cleanup
@@ -74,6 +80,9 @@ pub fn next_unwind_step(scopes: &[ControlScope], target: SelectedTarget) -> Nati
             return NativeUnwindStep::EnterTarget { scope_index: index };
         }
         match scope.kind {
+            ScopeKind::Catch { .. } => {
+                return NativeUnwindStep::RetireCatch { scope_index: index };
+            }
             ScopeKind::Unwind { .. } => {
                 let handler_depth = scopes[..index]
                     .iter()

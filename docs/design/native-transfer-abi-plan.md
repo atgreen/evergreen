@@ -706,7 +706,7 @@ Catch bindings retain the actual tagged Lisp object as a GC root, and THROW
 compares tags by object identity across bytecode, tree-walking and native helper
 paths (`bliss-shih7.12.6.2`). Printed tag text is only diagnostic: distinct lists,
 strings or uninterned symbols may print alike without naming the same catch.
-This representation is also required for upcoming native catch registration;
+This representation is also used by native catch registration;
 moving GC must repair the saved tag before dynamic destination search.
 
 The opt-in entry executes CATCH registration and normal retirement through
@@ -718,11 +718,31 @@ discarding enclosing catches. Bytecode fallback reconstructs handlers with the
 same tokens, so it delivers the already-selected throw without replaying its call.
 The native selector runs only cleanups inside the selected catch boundary.
 
-This is registration and exact fallback identity, not native catch delivery.
-Exceptional catch CFG edges, phi moves and checked catch landing maps remain
-required in `bliss-shih7.12.6`. The compiler declines direct exits requiring catch
+The next opt-in extension adds native catch delivery (`bliss-shih7.12.6.3`).
+Catch destinations enter the exceptional CFG before SSA sealing, with a separate
+landing block for each source site and selected catch. Its noncollecting helper
+produces the catch's primary value, and the resulting edge joins ordinary
+completion with the correct locals and enclosing operand-stack prefix. Emission
+binds each landing to an exact return PC, establishing BCP, resume BCP and checked
+machine entry; it cannot jump past an intervening cleanup.
+
+Runtime preparation plans explicit retirement of crossed local catches, validates
+the destination and live registrations before changing them, repairs native homes,
+and moves the selected values into a rooted payload. Rust returns before assembly
+enters the landing, whose helper consumes that payload and restores multiple
+values. Missing destinations retain the original registrations for bytecode
+fallback. Test counters distinguish actual catch landings from fallback, so a
+correct result alone cannot disguise interpreter execution.
+
+The opt-in tests exercise same-tag shadowing, crossed catches, cleanup ordering
+and replacement throws, modified and branch-merged locals, enclosing operand-stack
+values, zero/one/many returned values, and actual moving-GC relocation. They require
+native catch execution and zero fallback for supported local destinations.
+This extension does not enable ordinary ABI installation. The compiler still
+declines direct exits requiring catch
 unregistration, and inherited OSR scope admission remains disabled. Host allocation
-failure during token construction remains part of `bliss-shih7.12.3`.
+failure during token construction and payload restoration remains part of
+`bliss-shih7.12.3`.
 
 ### Windows validation and Wine limits
 
