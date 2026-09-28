@@ -359,6 +359,58 @@ fn a_proxy_prints_as_the_object_it_names() {
     );
 }
 
+/// A fault inside CPython must produce CPython's behaviour, not TorCL's
+/// (bliss-ztkuw).
+///
+/// TorCL rewrites a faulting instruction to a native recovery epilogue that unwinds
+/// a JIT frame and returns a sentinel, and it decides to purely from the FAULT
+/// ADDRESS — anything below one page is "a null guard". Nothing looks at where the
+/// fault happened, so a null dereference inside CPython is indistinguishable from one
+/// in compiled Lisp. Were recovery armed, this would unwind a Lisp frame that is not
+/// on top, leaving CPython mid-operation with its reference counts wrong, and the
+/// program would carry on as though a Lisp type error had occurred.
+///
+/// So the required outcome is that the process DIES — which is what CPython itself
+/// does for a null dereference — and specifically that IGNORE-ERRORS does not catch
+/// it and execution does not continue. The crossing disarms recovery to guarantee
+/// this however the call was reached.
+#[test]
+fn a_fault_inside_cpython_is_not_swallowed_as_a_lisp_error() {
+    let program = r#"
+      (py:exec "import ctypes")
+      (defun hot (n) (let ((acc 0)) (dotimes (i n) (setq acc (+ acc i))) acc))
+      ;; Warm a function so native code is on the stack when the fault happens —
+      ;; that is the configuration in which recovery would be armed.
+      (hot 300000)
+      (format t "BEFORE~%")
+      (finish-output)
+      (ignore-errors (py:call "ctypes.string_at" 0))
+      ;; Must be unreachable: recovery must not have resumed us.
+      (format t "SWALLOWED~%")
+    "#;
+    let output = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .output()
+        .expect("the CLI runs");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("BEFORE"),
+        "the program should have got as far as the crossing: {combined}"
+    );
+    assert!(
+        !combined.contains("SWALLOWED"),
+        "a fault inside CPython must not be recovered into a catchable Lisp error: {combined}"
+    );
+    assert!(
+        !output.status.success(),
+        "the process must not exit successfully after faulting inside CPython: {combined}"
+    );
+}
+
 /// The sandbox must deny embedded Python. It grants strictly more than the FFI
 /// does — arbitrary code through `exec`, and the whole filesystem through Python's
 /// own library — so a sandbox that denies FFI and allows this would be no sandbox.

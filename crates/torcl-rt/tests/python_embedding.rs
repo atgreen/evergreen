@@ -169,6 +169,87 @@ fn the_interpreter_lifecycle() {
             .expect("all of them took effect");
     }
 
+    // ── native fault recovery is disarmed while Python runs ──
+    // TorCL rewrites a faulting instruction to a native recovery epilogue, and it
+    // decides to from the FAULT ADDRESS ALONE — anything below one page is "a null
+    // guard", with nothing looking at where the fault happened. So a null
+    // dereference inside CPython is indistinguishable from one in compiled Lisp,
+    // and with recovery armed it would unwind a Lisp frame that is not on top,
+    // leaving CPython mid-operation with its reference counts wrong.
+    //
+    // Asserted here rather than by provoking a real fault because this is the
+    // precise property: it must hold for the whole crossing, and be restored after.
+    {
+        torcl_rt::runtime::set_sigsegv_recovery_ips(0xAAAA_0000, 0xBBBB_0000);
+        {
+            let scope = PythonScope::enter().expect("a crossing");
+            assert_eq!(
+                torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+                0,
+                "null-guard recovery must be disarmed while Python runs"
+            );
+            assert_eq!(
+                torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+                0,
+                "stack-guard recovery must be disarmed while Python runs"
+            );
+            // A nested crossing must not restore it on the way out of the inner one.
+            {
+                let _inner = PythonScope::enter().expect("a nested crossing");
+                assert_eq!(
+                    torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+                    0
+                );
+            }
+            assert_eq!(
+                torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+                0,
+                "leaving a nested crossing must not rearm recovery"
+            );
+            scope.run("x = 1").expect("Python still runs");
+        }
+        assert_eq!(
+            torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+            0xAAAA_0000,
+            "recovery must be restored on the way out"
+        );
+        assert_eq!(
+            torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+            0xBBBB_0000
+        );
+        torcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+    }
+
+    // ── embedding claims no signals ──────────────────────────
+    // Two runtimes must not both believe they own SIGINT. `Py_InitializeEx(0)` is
+    // the whole of the arbitration: CPython installs no handlers, so TorCL's remain
+    // the process's — and this asserts it from INSIDE Python, which is where a claim
+    // would be visible.
+    //
+    // `getsignal` returning None is the interesting value: it means a handler IS
+    // installed that Python did not install. So None proves both halves at once —
+    // TorCL owns the signal, and CPython did not replace it. SIG_DFL would mean
+    // nobody owns it (true of SIGCHLD, which neither runtime claims), and a callable
+    // would mean CPython had taken it.
+    //
+    // The handlers have to be installed for the question to mean anything: a bare
+    // test process is not the CLI and has none, so without this every signal reads
+    // SIG_DFL and the test would pass while asserting nothing.
+    {
+        torcl_rt::install_signal_handlers().expect("TorCL's signal handlers");
+        let scope = PythonScope::enter().expect("a crossing");
+        scope
+            .run(
+                r#"
+import signal
+for _signal in (signal.SIGINT, signal.SIGTERM, signal.SIGSEGV):
+    assert signal.getsignal(_signal) is None, _signal.name
+assert signal.getsignal(signal.SIGCHLD) is signal.SIG_DFL
+"#,
+            )
+            .expect("TorCL still owns the signals it installed");
+    }
+
     // ── shutting down ────────────────────────────────────────
     // ── only the owner may shut it down ──────────────────────
     // Not a nicety: CPython does not check this, it dereferences a thread state

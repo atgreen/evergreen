@@ -815,6 +815,14 @@ requires a glibc target rather than the default static musl):
 - The value policy: numbers by value, strings by copy, `NIL`↔`None`, `T`↔`True`,
   everything else a proxy. An integer beyond a fixnum stays a proxy rather than
   being truncated.
+- Signal arbitration, in the direction that matters first: the interpreter is
+  started with `Py_InitializeEx(0)`, so CPython installs no handlers and TorCL's
+  remain the process's (observable from inside Python, where the signals TorCL owns
+  report as handlers Python did not install). And the crossing disarms native fault
+  recovery for its duration, because that recovery is chosen from the fault address
+  alone — so without this a null dereference inside CPython would be rewritten to
+  unwind a Lisp frame that is not on top. A fault inside CPython now kills the
+  process, as it would in Python itself.
 - A Python raise as a first-class condition, `PY:EXCEPTION`, carrying the
   exception's class, its message, the Python frames, and the exception object.
   Its report renders the Python half of a mixed-language backtrace, and
@@ -822,11 +830,16 @@ requires a glibc target rather than the default static musl):
 
 Still unbuilt, and tracked separately: Python→Lisp callables (`bliss-89axw`,
 x86-64 only until callbacks are ported), the zero-copy buffer protocol
-(`bliss-s8wrr`), stream binding (`bliss-c4g9u`), and signal arbitration
-(`bliss-ztkuw`). The inverse of the exception mapping — a Lisp condition escaping
-into Python becoming a Python exception rather than unwinding through CPython
-frames, which would leave its reference counts wrong — depends on Python→Lisp calls
-and is staged with them. Requirement numbers are deliberately not assigned yet; this
+(`bliss-s8wrr`), and stream binding (`bliss-c4g9u`).
+
+Two staged pieces are worth naming because each is a limitation a user meets rather
+than a feature that is merely absent. Forwarding an interrupt INTO a running Python
+call (`bliss-ziuwp`): a Ctrl-C cannot interrupt one today, because the flag TorCL's
+handler sets is only examined by Lisp code and none runs until Python returns.
+And the inverse of the exception mapping — a Lisp condition escaping into Python
+becoming a Python exception rather than unwinding through CPython frames, which
+would leave its reference counts wrong — which depends on Python→Lisp calls and is
+staged with them. Requirement numbers are deliberately not assigned yet; this
 section records a direction and its progress, and gains normative IDs when the
 surface stops moving.
 

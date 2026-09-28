@@ -353,8 +353,53 @@ pub struct PythonScope {
     gil: GilState,
     api: &'static Api,
     /// Declared last so it is dropped last: the thread stays in Native state until
-    /// after the GIL is released.
+    /// after the GIL is released, and native fault recovery stays disarmed until
+    /// after that.
     _foreign: crate::safepoint::ForeignStateScope,
+    _recovery: RecoveryDisarmed,
+}
+
+/// Disarms this thread's native SIGSEGV recovery for as long as it lives
+/// (bliss-ztkuw).
+///
+/// TorCL redirects a faulting instruction to a native recovery epilogue that
+/// unwinds a JIT frame and returns a sentinel, and it decides to do so from the
+/// FAULT ADDRESS ALONE — any address below one page is "a null guard". Nothing looks
+/// at where the fault happened. So a null dereference inside CPython, in a C
+/// extension, or in libffi is indistinguishable from one in compiled Lisp, and with
+/// recovery armed it would be rewritten to unwind a Lisp frame that is not on top:
+/// CPython would be left mid-operation with its reference counts wrong and the
+/// process would carry on as though a Lisp type error had occurred.
+///
+/// This is the same rule as the c2i boundary's recovery toggle — recovery must be
+/// off while a foreign frame is on top — applied at the transition instead of at
+/// each caller. Doing it here is what makes the property local: it holds however
+/// the crossing was reached, including from a future caller that does not know the
+/// rule exists.
+///
+/// A fault inside CPython therefore reaches the default path and kills the process,
+/// which is what CPython itself would do; it is not silently converted into a
+/// catchable Lisp condition.
+struct RecoveryDisarmed {
+    null_ip: usize,
+    stack_ip: usize,
+}
+
+impl RecoveryDisarmed {
+    fn enter() -> Self {
+        let saved = Self {
+            null_ip: crate::runtime::current_sigsegv_null_guard_recovery_ip(),
+            stack_ip: crate::runtime::current_sigsegv_stack_guard_recovery_ip(),
+        };
+        crate::runtime::set_sigsegv_recovery_ips(0, 0);
+        saved
+    }
+}
+
+impl Drop for RecoveryDisarmed {
+    fn drop(&mut self) {
+        crate::runtime::set_sigsegv_recovery_ips(self.null_ip, self.stack_ip);
+    }
 }
 
 impl PythonScope {
@@ -385,6 +430,9 @@ impl PythonScope {
             gil,
             api,
             _foreign: foreign,
+            // After the GIL, so a fault while WAITING for it is still ours: at that
+            // point this thread is not yet running Python code.
+            _recovery: RecoveryDisarmed::enter(),
         })
     }
 

@@ -1001,6 +1001,28 @@ The inverse direction -- a Lisp condition escaping into Python becoming a Python
 exception rather than unwinding through CPython frames -- needs Python-to-Lisp
 calls, which do not exist yet.
 
+### Signals and faults
+
+TorCL stays the process's signal authority. The interpreter is started with
+`Py_InitializeEx(0)`, so CPython installs no handlers at all and TorCL's remain in
+place; from inside Python, `signal.getsignal(signal.SIGINT)` reports `None` — a
+handler Python did not install — which is what proves both halves.
+
+One consequence to know: **Ctrl-C cannot interrupt a running Python call.** TorCL's
+handler sets a flag that only Lisp code examines, and no Lisp code runs until Python
+returns, so an endless Python loop has to be killed (bliss-ziuwp).
+
+A **fault inside CPython kills the process**, as it would in Python itself, rather
+than being reported as a Lisp error. That is deliberate and it is not automatic:
+TorCL redirects a faulting instruction to a recovery epilogue that unwinds a JIT
+frame, and it decides to from the fault address alone — any address below one page
+is "a null guard", with nothing looking at where the fault happened. A crossing
+therefore disarms that recovery for its duration, so a null dereference in CPython,
+a C extension or libffi cannot be rewritten into an unwind of a Lisp frame that is
+not on top, which would leave CPython mid-operation with its reference counts wrong.
+The crash message still says `null guard SIGSEGV` for any such fault, which is
+misleading rather than wrong (bliss-p4mey).
+
 Embedded Python requires the same sandbox permission as the FFI, and a sandboxed
 image refuses to start an interpreter: `exec` is arbitrary code execution and
 Python's own library reaches the whole filesystem, so a sandbox that allowed this
