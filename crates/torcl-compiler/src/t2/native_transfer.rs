@@ -13,6 +13,93 @@ use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
 /// until either the normal return or the cold route finishes consuming it.
 pub type NativeHelperV2 = unsafe extern "C" fn(*mut u8, *mut NativeOutcome);
 
+/// Stack-resident image captured after a SysV helper returns. Caller-saved
+/// GPRs and all XMM registers are already clobbered: exception-live values must
+/// have call-preserved homes. This image does not itself register GC roots.
+#[repr(C)]
+pub struct SysvTransferCapture {
+    pub request: *mut u8,
+    pub value: torcl_rt::value::TorclVal,
+    pub exit: NativeExit,
+    /// Hardware RBX, RBP, R12, R13, R14, R15, in that order. Preparation may
+    /// update these words after GC; the stub reloads them before dispatch.
+    pub preserved: [u64; 6],
+    /// Caller RSP immediately before CALL, above the saved return address.
+    pub caller_sp: *const u64,
+    pub return_pc: *const u8,
+}
+
+/// Preparation must publish the payload and mapped register/stack roots before
+/// allocating or yielding, and return normally. It must update all native homes
+/// needed by subsequent native cleanup/targets after relocation. The capture
+/// image is temporary and must not be retained by address after dispatch. The
+/// source frame remains live for the dispatcher, which owns its eventual
+/// retirement and any longer-lived cleanup cursor. Lisp errors use an outcome,
+/// not panic.
+pub type NativeTransferPrepare = unsafe extern "C" fn(*mut SysvTransferCapture);
+
+/// Emit the cold entry for a helper veneer. Capture the caller before invoking
+/// Rust preparation, then reload the updated image and tail-dispatch using the
+/// same `(request, value, exit)` convention. Only this stub's temporary frame is
+/// removed; the caller and its return address remain available to the unwinder.
+/// The installer must retain both targets, validate physical capture recipes,
+/// and provide platform capability/unwind metadata before publishing this code.
+pub fn emit_capture_stub(prepare: NativeTransferPrepare, dispatch: *const u8) -> Vec<u8> {
+    use std::mem::{offset_of, size_of};
+    const SIZE: u8 = size_of::<SysvTransferCapture>() as u8;
+    const {
+        assert!(size_of::<SysvTransferCapture>() == 88);
+    }
+    let mut a = Asm::new();
+    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // endbr64
+    a.extend_from_slice(&[0x48, 0x83, 0xec, SIZE]); // align RSP for Rust CALL
+    for (reg, offset) in [
+        (7, offset_of!(SysvTransferCapture, request)),
+        (6, offset_of!(SysvTransferCapture, value)),
+        (2, offset_of!(SysvTransferCapture, exit)),
+    ] {
+        capture_stack_word(&mut a, false, reg, offset);
+    }
+    let preserved = offset_of!(SysvTransferCapture, preserved);
+    for (i, reg) in [3, 5, 12, 13, 14, 15].into_iter().enumerate() {
+        capture_stack_word(&mut a, false, reg, preserved + i * 8);
+    }
+    a.extend_from_slice(&[0x48, 0x8d, 0x44, 0x24, SIZE + 8]); // caller SP
+    capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, caller_sp));
+    capture_stack_word(&mut a, true, 0, SIZE as usize); // return PC
+    capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, return_pc));
+    a.extend_from_slice(&[0x48, 0x89, 0xe7]); // rdi = capture image
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&(prepare as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xd0]); // all Rust frames return before dispatch
+    for (i, reg) in [3, 5, 12, 13, 14, 15].into_iter().enumerate() {
+        capture_stack_word(&mut a, true, reg, preserved + i * 8);
+    }
+    for (reg, offset) in [
+        (7, offset_of!(SysvTransferCapture, request)),
+        (6, offset_of!(SysvTransferCapture, value)),
+        (2, offset_of!(SysvTransferCapture, exit)),
+    ] {
+        capture_stack_word(&mut a, true, reg, offset);
+    }
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, SIZE]);
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&(dispatch as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xe0]);
+    a.finish().expect("capture stub has no unresolved labels")
+}
+
+fn capture_stack_word(a: &mut Asm, load: bool, reg: u8, offset: usize) {
+    let displacement = i8::try_from(offset).expect("capture image fits disp8") as u8;
+    a.extend_from_slice(&[
+        0x48 | ((reg >> 3) << 2), // REX.W and high register bit
+        if load { 0x8b } else { 0x89 },
+        0x44 | ((reg & 7) << 3),
+        0x24,
+        displacement,
+    ]);
+}
+
 /// Emit a callable adapter with SysV signature `(request) -> primary_value`.
 /// Only the Rust-helper return is tested. A generated caller calls this adapter
 /// normally and needs no successful-return transfer test of its own.

@@ -392,6 +392,31 @@ allocation. There are no calls or safepoints between reading the outcome and
 entering the cold route. Win64 and other architecture veneers remain separate
 work; the ordinary pipeline continues to reject Invoke emission.
 
+The SysV `emit_capture_stub` now supplies the helper veneer's cold entry. It
+saves RBX/RBP/R12–R15, the caller's pre-CALL stack pointer, return PC and helper
+outcome before calling Rust preparation. Preparation returns normally; the stub
+reloads any updated preserved registers and outcome, removes only its own
+temporary frame, and tail-dispatches. Caller-saved GPRs and XMM registers are
+already clobbered by the helper, so exception-live values require preserved
+registers or spill homes. The capture image itself does not register GC roots.
+
+`native_capture_sysv` executes a generated caller and both adapters, copies an
+actual register root and caller-stack root into TransferSnapshot, roots the
+transfer payload, forces relocation during reconstruction, writes the relocated
+homes back, and reaches the segment landing. It checks all six preserved
+registers, exact return PC, an unboxed double spill, updated native register/stack
+roots, payload identity and both Rust destructor counts. It covers Transfer and
+Deopt outcomes, including GC stress/poison, with the explicit gate:
+
+```text
+cargo test -p torcl-compiler --test native_capture_sysv -- --include-ignored
+```
+
+The fixture supplies its known physical frame recipe and preparation callback.
+Production emission still needs generated recipes, retained code/PC lookup,
+payload/cursor preparation, cleanup/target dispatch and unwind metadata. This
+gate does not activate ordinary Lisp Invoke emission or remove its return checks.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does
