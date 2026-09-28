@@ -579,6 +579,32 @@ Native **exceptional** cleanup destinations and ordinary tier installation
 remain outstanding: exceptional entry into an outer cleanup in these tests still
 uses the bytecode fallback.
 
+### Native-frame landing adapter
+
+`emit_native_landing_stub` consumes an execution-owned `SysvNativeLanding`
+packet after the capture stub has returned from Rust preparation and restored
+its updated nonvolatile registers. It selects the destination frame's normal
+body SP, places the primary in RAX, and tail-jumps to the native landing pad.
+The original native frame remains live. The packet is a machine interface,
+not a target-admission check: the future dispatcher must validate retained code,
+frame recipes, live-value homes, roots and segment ownership before selecting it.
+
+An executable fixture proves normal Rust destructor completion before landing,
+all six updated nonvolatile registers, stack-slot preservation, aligned calls
+from the landing pad, and return through the original native frame and segment.
+It exercises 0/16/32/64-byte temporary call areas, forces moving GC in the helper
+and preparation, and dereferences relocated register/stack pointers after landing.
+Run this capability gate explicitly with `cargo test -p torcl-compiler --test
+native_landing_sysv -- --include-ignored`.
+
+This adapter is not yet selected by Lisp transfer dispatch. Exceptional cleanup
+edges must first participate in SSA construction **before** phi simplification
+and optimization. Attaching a landing PC afterward is insufficient: if a local
+is assigned after a potentially throwing call, normal-only SSA may propagate
+that later assignment into cleanup, although the exceptional edge needs the
+pre-call value. Native destination maps and rooted pending-transfer cursors must
+consume the resulting verified exceptional data flow.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

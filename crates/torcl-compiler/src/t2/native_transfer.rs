@@ -29,6 +29,47 @@ pub struct SysvTransferCapture {
     pub return_pc: *const u8,
 }
 
+/// Execution-owned packet consumed by the native landing adapter after Rust
+/// preparation returns. This is a machine interface, not an admission check.
+/// The dispatcher must validate both fields against retained code/frame maps.
+#[repr(C)]
+pub struct SysvNativeLanding {
+    /// The landing frame's normal body RSP, after discarding the completed
+    /// helper's return address and temporary request area. The frame must still
+    /// be live in the current segment; no Rust/foreign frame may be crossed.
+    pub stack_pointer: *mut u64,
+    /// An ENDBR64 landing pad in retained native code. Its live-value homes must
+    /// already have been populated, including writes required by moving GC.
+    pub entry: *const u8,
+}
+
+/// Tail adapter from `(landing_packet, primary, exit)` to a native landing pad.
+/// Pair with `emit_capture_stub`: preparation returns normally and that stub
+/// restores the updated nonvolatile registers before entering this adapter.
+/// The source frame remains live. The landing pad owns its eventual retirement.
+///
+/// The packet must occupy stable storage until dispatch, independently of the
+/// temporary capture frame. Publish all pending transfer/cleanup roots before
+/// selecting this route. This adapter neither searches handlers nor establishes
+/// roots, validates targets, or supplies platform unwind metadata. The installer
+/// must enforce those contracts and the segment capability gate before use.
+/// Caller-saved registers are scratch; RAX receives the primary and RDI retains
+/// the packet pointer. A transfer cursor may ignore the primary on cleanup entry.
+pub fn emit_native_landing_stub() -> Vec<u8> {
+    const {
+        assert!(std::mem::size_of::<SysvNativeLanding>() == 16);
+        assert!(std::mem::offset_of!(SysvNativeLanding, stack_pointer) == 0);
+        assert!(std::mem::offset_of!(SysvNativeLanding, entry) == 8);
+    }
+    vec![
+        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+        0x48, 0x89, 0xf0, // mov rax, rsi
+        0x4c, 0x8b, 0x5f, 0x08, // mov r11, [rdi + 8]
+        0x48, 0x8b, 0x27, // mov rsp, [rdi]
+        0x41, 0xff, 0xe3, // jmp r11
+    ]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureHome {
     Preserved(u8),
