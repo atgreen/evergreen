@@ -7532,7 +7532,15 @@ fn install_evaluator_global_root_scanner() {
     });
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+/// Run a Lisp function from FOREIGN code: a fresh control environment, rooted, with
+/// the caller's nonlocal-exit tokens preserved and this callback's discarded.
+///
+/// Registered with `managed_callback` on x86-64, where its JIT trampoline lives, but
+/// the function itself is architecture-independent and the embedded-Python export
+/// path (bliss-89axw) calls it directly on every target — that path needs no
+/// trampoline, because all its exports share one static C entry point and carry the
+/// Lisp function in a handle rather than in generated code. Hence no `cfg` here;
+/// only the registration below has one.
 fn foreign_callback_runner(
     entry: TorclVal,
     arguments: &[TorclVal],
@@ -16972,6 +16980,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             | "TORCL::%PY-REPR"
             | "TORCL::%PY-OBJECTP"
             | "TORCL::%PY-DRAIN-OUTPUT"
+            | "TORCL::%PY-EXPORT"
             | "TORCL::%PY-STOP") => {
                 if env.sandbox {
                     return Err(TorclError::SandboxViolation(
@@ -36713,6 +36722,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL::%PY-REPR"
             | "TORCL::%PY-OBJECTP"
             | "TORCL::%PY-DRAIN-OUTPUT"
+            | "TORCL::%PY-EXPORT"
             | "TORCL::%PY-STOP"
     ) {
         return true;
@@ -37571,6 +37581,10 @@ fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, Torcl
             exactly(name, args, 1)?;
             Ok(if python::is_proxy(args[0]) { T } else { NIL })
         }
+        "EXPORT" => {
+            exactly(name, args, 2)?;
+            python::export(text(name, args[0], "the Python name to bind")?, args[1])
+        }
         "DRAIN-OUTPUT" => {
             exactly(name, args, 0)?;
             python::drain_output()
@@ -37631,6 +37645,7 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
         | "TORCL::%PY-REPR"
         | "TORCL::%PY-OBJECTP"
         | "TORCL::%PY-DRAIN-OUTPUT"
+        | "TORCL::%PY-EXPORT"
         | "TORCL::%PY-STOP") => {
             if _env.sandbox {
                 return Err(TorclError::SandboxViolation(

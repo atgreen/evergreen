@@ -225,6 +225,46 @@ mod enabled {
         Ok(crate::cli::arena_cons(*output, *error))
     }
 
+    /// Make a Lisp function callable from Python as `name` in `__main__`.
+    pub fn export(name: TorclVal, function: TorclVal) -> Result<TorclVal, TorclError> {
+        let name = name.as_string();
+        install_export_dispatch();
+        crossing(|scope| {
+            scope.export(&name, function)?;
+            Ok(torcl_rt::value::NIL)
+        })
+    }
+
+    /// Teach the runtime how to call a Lisp function, once.
+    ///
+    /// The runtime owns the C entry point and the handle table but cannot evaluate
+    /// Lisp, which lives up here — the same split the GC's finalizer dispatch uses.
+    fn install_export_dispatch() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| torcl_rt::python::set_export_dispatch(dispatch_to_lisp));
+    }
+
+    /// Call the Lisp function a handle names. Runs on a thread CPython owns, already
+    /// transitioned to managed state by the runtime's C entry point.
+    ///
+    /// Delegates to the interpreter's existing foreign-callback runner rather than
+    /// building an environment here: a call arriving from foreign code needs a fresh
+    /// control environment that adopts this thread's definitions, and needs the
+    /// caller's nonlocal-exit tokens kept while this callback's are discarded —
+    /// subtleties already worked out there for FFI callbacks, and not worth a second
+    /// implementation.
+    fn dispatch_to_lisp(handle: u64, args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+        let handle = torcl_rt::python::LispHandle::from_bits(handle);
+        let function = torcl_rt::python::resolve_lisp(handle).ok_or_else(|| {
+            TorclError::FfiError(
+                "this exported function's handle no longer names anything: the \
+                 interpreter it was exported from has gone away"
+                    .into(),
+            )
+        })?;
+        crate::cli::foreign_callback_runner(function, args)
+    }
+
     pub fn stop() -> Result<TorclVal, TorclError> {
         // The last drain before shutdown: a queued reference released after
         // Py_FinalizeEx would be a use-after-free.
@@ -301,6 +341,10 @@ mod disabled {
     }
 
     pub fn drain_output() -> Result<TorclVal, TorclError> {
+        Err(unavailable())
+    }
+
+    pub fn export(_: TorclVal, _: TorclVal) -> Result<TorclVal, TorclError> {
         Err(unavailable())
     }
 

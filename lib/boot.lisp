@@ -4023,6 +4023,22 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 (defun py:str (object) (py::draining (torcl::%py-str object)))
 (defun py:repr (object) (py::draining (torcl::%py-repr object)))
 
+;;; (py:export "calculate_price" #'calculate-price) makes a Lisp function callable
+;;; from Python by that name:
+;;;
+;;;   (py:export "add" (lambda (a b) (+ a b)))
+;;;   (py:exec "print(add(2, 3))")        =>  5
+;;;
+;;; The Python callable reaches the Lisp function through a STABLE HANDLE, not a
+;;; pointer: the collector moves objects, and a Python callable can outlive any
+;;; address. The handle keeps the function alive for the process lifetime -- a
+;;; callable can be stored anywhere on the Python side, so there is no moment at
+;;; which releasing it would be safe.
+;;;
+;;; Arguments and the result cross by the same policy as everything else, so a Lisp
+;;; error becomes a Python exception rather than unwinding through CPython frames.
+(defun py:export (name function) (py::draining (torcl::%py-export name function)))
+
 ;;; Flush Python's buffered output without doing anything else -- for a long
 ;;; computation whose progress prints would otherwise arrive only when it returns.
 (defun py:flush () (py::drain-output) (values))
@@ -4097,7 +4113,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                 '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
                   "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
                   "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
-                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH"))
+                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH" "EXPORT"))
         "TORCL-PYTHON")
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
