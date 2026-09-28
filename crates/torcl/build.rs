@@ -164,6 +164,11 @@ fn configure_runtime() {
     )
     .unwrap();
     println!("cargo:rustc-env=TORCL_RUNTIME_SOURCE={}", root.display());
+    // The exact target triple as a compile-time constant for the banner and
+    // --version. It is already computed above for the runtime contract; exposing it
+    // this way costs nothing at runtime, where reading it back out of the embedded
+    // contract would mean parsing the contract on every startup.
+    println!("cargo:rustc-env=TORCL_TARGET={}", selected.target);
 }
 
 fn main() {

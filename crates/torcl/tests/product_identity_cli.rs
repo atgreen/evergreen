@@ -17,6 +17,44 @@ fn executable_advertises_torcl() {
     }
 }
 
+/// The banner and --version identify the build and its terms: version, the exact
+/// target triple, copyright, and licence.
+///
+/// The triple is the load-bearing part. This project ships both a musl and a glibc
+/// x86-64 build and they are not interchangeable -- a static musl binary cannot
+/// dlopen, so the Python and JVM bindings need the glibc one -- and *FEATURES*
+/// carries the architecture and OS but never the environment, so without this a user
+/// cannot tell which binary they are running.
+#[test]
+fn version_and_banner_identify_the_build_and_its_licence() {
+    let expected_target = env!("TORCL_TARGET");
+    for text in [version_output(), repl_banner()] {
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains(expected_target), "{text}");
+        assert!(text.contains("Copyright (C)"), "{text}");
+        assert!(text.contains("Anthony Green"), "{text}");
+        // The licence the crate metadata and the RPM spec both declare.
+        assert!(text.contains("MIT"), "{text}");
+        assert!(text.contains("Apache-2.0"), "{text}");
+    }
+}
+
+fn version_output() -> String {
+    let output = Command::new(BIN).arg("--version").output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The banner as an interactive session sees it: stdin closes immediately, so the
+/// REPL prints its banner and reaches EOF.
+fn repl_banner() -> String {
+    let output = Command::new(BIN)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[test]
 fn lisp_exposes_the_torcl_implementation_and_extension_packages() {
     let output = Command::new(BIN)

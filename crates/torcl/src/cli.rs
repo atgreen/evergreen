@@ -37002,8 +37002,29 @@ pub fn print_help() {
     print!("{}", help_text());
 }
 
+/// Who owns the code and on what terms, shown in the REPL banner.
+///
+/// The license is the one declared in `Cargo.toml` and in the RPM spec; keep the
+/// three in step if it ever changes.
+const COPYRIGHT: &str = "Copyright (C) 2026 Anthony Green.";
+const LICENSE: &str = "Licensed under the MIT or Apache-2.0 license, at your option. No warranty.";
+
+/// The build's target triple, e.g. `x86_64-unknown-linux-musl`.
+///
+/// Taken from the build script's `TARGET` rather than composed from
+/// `std::env::consts`, so it is the real triple Cargo built for and matches what
+/// `--runtime-info` reports. The environment field is the part that earns its place
+/// in a banner: this project ships both a musl and a glibc x86-64 build and they are
+/// not interchangeable — a static musl binary cannot `dlopen`, so the Python and JVM
+/// bindings need the glibc one. `*FEATURES*` carries the architecture and the OS but
+/// never the environment, so from inside the REPL that is otherwise unanswerable.
+const TARGET: &str = env!("TORCL_TARGET");
+
 pub fn print_version() {
-    println!("torcl {}", env!("CARGO_PKG_VERSION"));
+    // Must keep starting with "torcl " (product_identity_cli).
+    println!("torcl {} ({TARGET})", env!("CARGO_PKG_VERSION"));
+    println!("{COPYRIGHT}");
+    println!("{LICENSE}");
 }
 
 // ── REPL driver ────────────────────────────────────────────────────
@@ -37031,7 +37052,10 @@ pub fn run_repl_with_reader<R: std::io::BufRead>(reader: &mut R) -> Result<i32, 
 /// `stdin().lock()`; tests inject an empty reader (immediate EOF).
 fn run_repl_reader<R: std::io::BufRead>(env: &mut Env, reader: &mut R) -> Result<i32, TorclError> {
     let _config = ReplConfig::default();
-    println!("TorCL Common Lisp {}", env!("CARGO_PKG_VERSION"));
+    println!("TorCL Common Lisp {} ({TARGET})", env!("CARGO_PKG_VERSION"));
+    println!("{COPYRIGHT}");
+    println!("{LICENSE}");
+    println!();
     println!("Type (quit) to exit.");
     println!();
     // Promote initial allocations (env setup, image load) to permanent
