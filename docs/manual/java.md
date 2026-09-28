@@ -244,32 +244,26 @@ Java's `System.out` reaches `*standard-output*` and `System.err` reaches
 ;; => "lisp java"
 ```
 
-Before this, `System.out` wrote file descriptor 1 directly: the capture above saw
-only `"lisp "`, and Java's line reached the terminal ordered against Lisp's own
-output by flush timing rather than by program order. Unlike the Python case nothing
-was ever *lost* — `System.out` is autoflush-on-`println` — so this is about capture
-and ordering.
-
-How it works, and what follows from it: `System.out` and `System.err` are redirected
-into in-memory buffers whose contents are written to the Lisp streams at the end of
-each crossing. So **output appears when the call returns**, not as it is produced — a
-long computation's progress prints arrive together at the end. `JAVA:FLUSH` writes out
-what has accumulated so far, and a callback into Lisp drains on entry, so a Java
-computation that calls back can report as it goes. Output printed before a Java
-exception still arrives, which is usually exactly what a reader needs.
+`System.out` and `System.err` are redirected into in-memory buffers whose contents
+are written to the Lisp streams at the end of each crossing. **Output therefore
+appears when the call returns**, not as it is produced, so a long computation's
+progress prints arrive together at the end. `JAVA:FLUSH` writes out what has
+accumulated so far, and a callback into Lisp drains on entry, so a Java computation
+that calls back can report as it goes. Output printed before a Java exception also
+arrives.
 
 Three consequences worth knowing:
 
 * The redirection is at the Java level, not `dup2` on the file descriptor, so native
   writes from inside the JVM — a JNI library, `-Xlog` GC logging, a crash report —
-  still go to the real file descriptor 1 where a reader expects them.
-* `System.out` no longer wraps a real file descriptor, so Java code that reaches for
+  go to the real file descriptor 1 where a reader expects them.
+* `System.out` does not wrap a real file descriptor, so Java code that reaches for
   one (`System.console()`, `ProcessBuilder.INHERIT_IO`, tty detection) will notice.
 * If your own code calls `System.setOut`, the next drain reinstalls the capture
-  rather than silently losing everything written from then on.
+  rather than losing everything written from then on.
 
-`System.in` still reads file descriptor 0 directly rather than `*standard-input*`,
-for the same reason Python's `input()` does: input is pulled rather than pushed.
+`System.in` reads file descriptor 0 directly rather than `*standard-input*`, for the
+same reason Python's `input()` does: input is pulled rather than pushed.
 
 ## Process lifecycle { #lifecycle }
 

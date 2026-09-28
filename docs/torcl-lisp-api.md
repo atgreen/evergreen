@@ -1058,23 +1058,17 @@ Python's `print` reaches `*standard-output*`, and `sys.stderr` reaches
 ;; => "lisp python"
 ```
 
-Before this, Python's output was not merely interleaved unpredictably — it was
-**silently lost**. CPython block-buffers a non-tty stdout, nothing flushed it, and
-the interpreter is usually never finalized, so `(py:exec "print('hi')")` printed
-nothing at all.
-
-How it works, and what follows from it: `sys.stdout` and `sys.stderr` are
-redirected into in-memory buffers, whose contents are written to the Lisp streams at
-the end of each crossing. So **output appears when the call returns**, not as it is
-produced — a long computation's progress prints arrive together at the end. `PY:FLUSH`
-writes out what has accumulated so far, for a loop that wants to report as it goes.
-Output printed before a Python error still arrives, which is usually exactly what a
-reader needs.
+`sys.stdout` and `sys.stderr` are redirected into in-memory buffers whose contents
+are written to the Lisp streams at the end of each crossing. **Output therefore
+appears when the call returns**, not as it is produced, so a long computation's
+progress prints arrive together at the end. `PY:FLUSH` writes out what has
+accumulated so far, for a loop that wants to report as it goes. Output printed
+before a Python error also arrives.
 
 Two consequences worth knowing. `sys.stdout` has no `fileno()`, so a library that
-reaches for one will notice. And `input()` still reads file descriptor 0 directly
-rather than `*standard-input*`, because input is pulled rather than pushed and
-answering it needs Python to call Lisp (bliss-m4h70's callbacks).
+reaches for one will notice. And `input()` reads file descriptor 0 directly rather
+than `*standard-input*`, because input is pulled rather than pushed and answering it
+needs Python to call Lisp (bliss-m4h70's callbacks).
 
 ### Signals and faults
 
