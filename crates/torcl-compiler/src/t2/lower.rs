@@ -618,9 +618,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
 
         // ── multiple-values reset → runtime helper (no defs/uses) ──
         ClearMv | TakeValuesToLocals => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
-        // No legacy helper implements rooted cleanup continuation ownership.
-        // Preserve operands/effects but force emission to decline until wired.
-        CleanupSave | CleanupRestore => lo.emit_annotated(inst, op::PSEUDO_UNSUPPORTED, defs, uses),
+        // Execution-owned cleanup helpers clobber caller-saved registers.
+        // Only the opt-in transfer emitter supplies these helper addresses.
+        CleanupSave | CleanupRestore => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
 
         // ── allocation (safepoint-bearing) ──
         Alloc | AllocCons => lo.emit_annotated(inst, op::ALLOC, defs, uses),

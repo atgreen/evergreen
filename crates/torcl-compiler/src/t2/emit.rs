@@ -2636,6 +2636,7 @@ pub struct TransferCallRequest {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct TransferEmission {
     veneer: u64,
+    cleanup: Option<(u64, u64)>,
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
 }
 
@@ -2650,8 +2651,22 @@ pub fn emit_framed_transfers(
     call_veneer: u64,
     activation_slots: u16,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_framed_transfers_with_cleanup(f, call_veneer, activation_slots, None)
+}
+
+/// Cleanup helpers take `(cleanup_bcp, resume_bcp, primary)` and return the
+/// restored primary (ignored for save). They must return normally without Lisp
+/// allocation, yielding or signaling. The owning entry roots saved values.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub fn emit_framed_transfers_with_cleanup(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    cleanup: Option<(u64, u64)>,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::Opcode;
-    if call_veneer == 0
+    if cleanup.is_some_and(|(save, restore)| save == 0 || restore == 0)
+        || call_veneer == 0
         || !f.osr_entries.is_empty()
         || (0..f.num_values()).any(|i| {
             f.value(crate::t2::ir::Value(i as u32)).repr
@@ -2664,6 +2679,14 @@ pub fn emit_framed_transfers(
     }
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
+            if cleanup.is_some()
+                && matches!(
+                    f.inst(inst).opcode,
+                    Opcode::CleanupSave | Opcode::CleanupRestore
+                )
+            {
+                continue;
+            }
             if !matches!(
                 f.inst(inst).opcode,
                 Opcode::Invoke
@@ -2686,6 +2709,7 @@ pub fn emit_framed_transfers(
     }
     let mut transfers = TransferEmission {
         veneer: call_veneer,
+        cleanup,
         sites: vec![],
     };
     let code = emit_framed_inner(
@@ -2741,11 +2765,14 @@ fn emit_framed_inner(
     let transfer_mode = false;
     if f.block_order().iter().any(|&b| {
         f.block(b).insts.iter().any(|&i| {
-            matches!(
-                f.inst(i).opcode,
-                Opcode::CleanupSave | Opcode::CleanupRestore
-            ) || (!transfer_mode
-                && matches!(f.inst(i).opcode, Opcode::Invoke | Opcode::NlxTransfer))
+            !transfer_mode
+                && matches!(
+                    f.inst(i).opcode,
+                    Opcode::CleanupSave
+                        | Opcode::CleanupRestore
+                        | Opcode::Invoke
+                        | Opcode::NlxTransfer
+                )
         })
     }) {
         return Err(EmitError::UnsupportedOp(0xFA));
@@ -2804,6 +2831,8 @@ fn emit_framed_inner(
                 | Opcode::SetSymbolValue
                 | Opcode::ClearMv
                 | Opcode::TakeValuesToLocals
+                | Opcode::CleanupSave
+                | Opcode::CleanupRestore
         )
     };
     let has_ir_calls = f.block_order().iter().any(|&b| {
@@ -3555,6 +3584,7 @@ fn emit_framed_inner(
             let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
             let (mut inst_reg, result_stores) = if d.opcode == Opcode::TakeValuesToLocals
                 || d.opcode == Opcode::Invoke
+                || matches!(d.opcode, Opcode::CleanupSave | Opcode::CleanupRestore)
                 || wide_call
             {
                 (HashMap::new(), Vec::new())
@@ -3639,6 +3669,47 @@ fn emit_framed_inner(
                             shadow_roots,
                             map,
                         });
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+                return Err(EmitError::UnsupportedOp(0xFA));
+            } else if matches!(d.opcode, Opcode::CleanupSave | Opcode::CleanupRestore) {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                {
+                    let (save, restore) = transfers
+                        .as_ref()
+                        .and_then(|t| t.cleanup)
+                        .ok_or(EmitError::UnsupportedOp(0xFA))?;
+                    let AuxData::CleanupContinuation {
+                        cleanup_bcp,
+                        resume_bcp,
+                    } = d.aux
+                    else {
+                        return Err(EmitError::UnsupportedOp(0xFA));
+                    };
+                    if let Some(value) = d.args.first() {
+                        if let Some(&bits) = const_tagged.get(value) {
+                            mov_imm64(&mut a, 2, bits as i64);
+                        } else {
+                            load_home(&mut a, 2, homes[value], 0);
+                        }
+                    } else {
+                        mov_imm64(&mut a, 2, 0);
+                    }
+                    mov_imm64(&mut a, 7, i64::from(cleanup_bcp));
+                    mov_imm64(&mut a, 6, i64::from(resume_bcp));
+                    mov_imm64(
+                        &mut a,
+                        RAX,
+                        if d.opcode == Opcode::CleanupSave {
+                            save
+                        } else {
+                            restore
+                        } as i64,
+                    );
+                    a.extend_from_slice(&[0xff, 0xd0]);
+                    if let Some(value) = d.results.first() {
+                        store_home(&mut a, homes[value], RAX, 0);
+                    }
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
                 return Err(EmitError::UnsupportedOp(0xFA));

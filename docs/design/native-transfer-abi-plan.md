@@ -535,8 +535,8 @@ through the unwind driver. A real Lisp native caller with nested protected
 regions verifies inner-before-outer cleanup exactly once, replacement THROW
 with multiple values, and moving-GC preservation of a local used only by cleanup.
 This proves exceptional bytecode cleanup fallback, not native cleanup execution.
-The ordinary builder still refuses protected code. Normal cleanup machine emission
-remains gated, and GO/RETURN-FROM crossing a cleanup are explicitly refused rather
+The ordinary builder still refuses protected code. GO/RETURN-FROM crossing a
+cleanup are explicitly refused rather
 than silently branching past it; source-level tests cover both refusal cases.
 
 Normal cleanup now has explicit transfer-SSA operations: `CleanupSave` preserves
@@ -549,9 +549,26 @@ branched forms. V13 verifies matching ordered continuation stacks, consistent
 joins, no abandoned values on normal return, and matching running-cleanup scopes
 on exceptional exits. Source tests cover cleanup inside cleanup, dead-code
 elimination preserving save/restore, and malformed identities and joins.
-These operations are deliberately rejected by machine emission until rooted
-runtime continuation storage and native cleanup dispatch are connected. This
-compiler milestone does not turn normal cleanup into executable native code.
+The opt-in SysV emitter now lowers these operations to normal-returning runtime
+helpers. The owning invocation reserves and roots its continuation stack before
+machine entry. Save retains the primary, zero/one/many-value state, and exact
+handler depth; restore republishes the saved values after native cleanup code.
+Calls made during cleanup retain their running-cleanup identities in the transfer
+maps. If they transfer, fallback adopts the already-rooted continuations and
+unwinds them at their recorded handler depths, without replaying the failed call.
+Legacy emission and transfer emission without explicit cleanup helpers still
+refuse these operations.
+
+Source-level execution tests cover nested normal cleanup, all multiple-value
+shapes, forced moving GC during cleanup, and a replacement THROW crossing two
+running cleanup continuations before executing the outer cleanup once. The
+helper calls use the normal call-frame, clobber and shadow-root conventions;
+they add no generated caller status test. These helpers do not execute Lisp,
+yield, signal or collect. Copying multiple values still uses Rust allocation;
+the emergency allocation-failure contract remains an ABI installation gate.
+Native **exceptional** cleanup destinations, fiber suspension validation and
+ordinary tier installation remain outstanding: exceptional entry into an outer
+cleanup in these tests still uses the bytecode fallback.
 
 ### Windows validation and Wine limits
 

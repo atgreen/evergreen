@@ -23,6 +23,7 @@ pub(super) struct TransferCode {
     _capture: JitBuffer,
     sites: SysvTransferTable,
     slots: u16,
+    cleanup_depths: std::collections::HashMap<u32, usize>,
 }
 
 impl TransferCode {
@@ -45,10 +46,14 @@ impl TransferCode {
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
         let veneer = JitBuffer::new(&emit_helper_veneer(c2i_call_legacy_v2, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
-        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_transfers(
+        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_transfers_with_cleanup(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
+            Some((
+                save_cleanup as *const () as u64,
+                restore_cleanup as *const () as u64,
+            )),
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -64,9 +69,29 @@ impl TransferCode {
                             ..
                         } | ScopeKind::Tagbody { .. }
                             | ScopeKind::Unwind { .. }
+                            | ScopeKind::Cleanup { .. }
                     )
             }) {
                 return None;
+            }
+        }
+        let scopes = torcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
+        let mut cleanup_depths = std::collections::HashMap::new();
+        for instruction in &body.code {
+            if let Instr::EnterCleanupNormal { cleanup_bcp, .. } = instruction {
+                let depth = scopes
+                    .before(*cleanup_bcp)?
+                    .iter()
+                    .filter(|scope| {
+                        matches!(
+                            scope.kind,
+                            ScopeKind::Block { .. }
+                                | ScopeKind::Tagbody { .. }
+                                | ScopeKind::Unwind { .. }
+                        )
+                    })
+                    .count();
+                cleanup_depths.insert(*cleanup_bcp, depth);
             }
         }
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
@@ -79,6 +104,7 @@ impl TransferCode {
             _capture: capture,
             sites,
             slots,
+            cleanup_depths,
         })
     }
 
@@ -113,7 +139,11 @@ impl TransferCode {
             })?;
         let mut frame_guard = FrameGuard(Some(frame));
         bind_params(&self.body, frame, &args, None);
+        let mut cleanups = Vec::<SavedCleanup>::with_capacity(self.cleanup_depths.len());
+        torcl_rt::rooted_ref!(_cleanups = &mut cleanups);
         let mut context = CaptureContext {
+            cleanups: &mut cleanups,
+            cleanup_depths: &self.cleanup_depths,
             code_base: self.code.as_ptr() as usize,
             sites: &self.sites,
             snapshots: snapshots.as_mut_ptr().cast(),
@@ -159,7 +189,11 @@ impl TransferCode {
             return Err(invalid_capture());
         }
         match outcome.exit {
-            NativeExit::Returned if error.is_none() && context.selected.is_none() => Ok(*primary),
+            NativeExit::Returned
+                if error.is_none() && context.selected.is_none() && cleanups.is_empty() =>
+            {
+                Ok(*primary)
+            }
             NativeExit::Transfer => {
                 let index = context.selected.ok_or_else(invalid_capture)?;
                 if error.is_none() {
@@ -189,10 +223,21 @@ impl TransferCode {
                 for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
                     unsafe { slot_set(frame, index as u16, *value) };
                 }
+                let running = site.map().control_scopes.iter().filter_map(|scope| {
+                    if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+                        Some(cleanup_bcp)
+                    } else {
+                        None
+                    }
+                });
+                if !running.eq(cleanups.iter().map(|saved| saved.cleanup_bcp)) {
+                    return Err(invalid_capture());
+                }
                 let handlers = site
                     .map()
                     .control_scopes
                     .iter()
+                    .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. }))
                     .map(|scope| match scope.kind {
                         ScopeKind::Block {
                             id,
@@ -224,7 +269,7 @@ impl TransferCode {
                     sp_top: saved.stack.len() as u16,
                     n_locals: self.body.n_locals,
                     handlers,
-                    cleanup_conts: Vec::new(),
+                    cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
                     dyn_binds: Vec::new(),
                     env_frame: None,
                     fn_obj: None,
@@ -273,7 +318,71 @@ impl Drop for FrameGuard {
     }
 }
 
+struct SavedCleanup {
+    cleanup_bcp: u32,
+    continuation: CleanupCont,
+}
+impl torcl_rt::gc::TraceHostRoots for SavedCleanup {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        self.continuation.trace_host_roots(visit);
+    }
+}
+
+// These helpers never execute Lisp, collect, yield or signal. Rust allocation
+// of the MV copy retains the current runtime's host-allocation policy; emergency
+// storage exhaustion is still an installation gate for the entire opt-in ABI.
+unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: TorclVal) -> TorclVal {
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
+    let cleanups = unsafe { &mut *context.cleanups };
+    let depths = unsafe { &*context.cleanup_depths };
+    // Capacity was reserved before native entry; no continuation-stack growth
+    // occurs inside the helper. Nested function entries own separate stacks.
+    assert!(cleanups.len() < cleanups.capacity());
+    cleanups.push(SavedCleanup {
+        cleanup_bcp,
+        continuation: CleanupCont {
+            handler_depth: depths[&cleanup_bcp],
+            action: CleanupAction::Normal {
+                resume_bcp,
+                value,
+                values: env.mv_active.then(|| env.mv.clone()),
+            },
+        },
+    });
+    NIL
+}
+
+unsafe extern "C" fn restore_cleanup(
+    cleanup_bcp: u32,
+    resume_bcp: u32,
+    _unused: TorclVal,
+) -> TorclVal {
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    let saved = unsafe { &mut *context.cleanups }
+        .pop()
+        .expect("verified cleanup stack");
+    assert_eq!(saved.cleanup_bcp, cleanup_bcp);
+    let CleanupAction::Normal {
+        resume_bcp: expected,
+        value,
+        values,
+    } = saved.continuation.action
+    else {
+        unreachable!("normal native cleanup continuation");
+    };
+    assert_eq!(expected, resume_bcp);
+    match values {
+        Some(values) => env.set_mv(values),
+        None => env.clear_mv(),
+    }
+    value
+}
+
 struct CaptureContext {
+    cleanups: *mut Vec<SavedCleanup>,
+    cleanup_depths: *const std::collections::HashMap<u32, usize>,
     code_base: usize,
     sites: *const SysvTransferTable,
     snapshots: *mut u8,
