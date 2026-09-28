@@ -65,7 +65,8 @@ p = Point(3)")
                   (py:exec "pass"))))
 "#;
 
-const EXPECTED: &str = r#"PY (3.0d0 5.0d0 "HELLO" 3 10 40 T NIL T T NIL T "5" "None" "True" "linux" NIL)"#;
+const EXPECTED: &str =
+    r#"PY (3.0d0 5.0d0 "HELLO" 3 10 40 T NIL T T NIL T "5" "None" "True" "linux" NIL)"#;
 
 #[test]
 fn the_calling_surface_answers_the_same_in_both_tiers() {
@@ -112,10 +113,7 @@ fraction = 0.5")
         .lines()
         .find(|line| line.starts_with("POLICY "))
         .unwrap_or("");
-    assert_eq!(
-        line.trim(),
-        r#"POLICY (7 T T NIL NIL "héllo ☃" 0.5d0 NIL)"#
-    );
+    assert_eq!(line.trim(), r#"POLICY (7 T T NIL NIL "héllo ☃" 0.5d0 NIL)"#);
 }
 
 /// A dead proxy owes CPython a reference, and the collector must see to it that it
@@ -356,6 +354,98 @@ fn a_proxy_prints_as_the_object_it_names() {
     assert!(
         stdout.contains("#<PYTHON-OBJECT <module 'math'"),
         "got: {stdout}"
+    );
+}
+
+/// Python's output reaches `*standard-output*` (bliss-c4g9u).
+///
+/// Before this it was not merely interleaved unpredictably — it was SILENTLY LOST.
+/// CPython block-buffers a non-tty stdout, nothing flushed it, and the interpreter is
+/// usually never finalized, so `(py:exec "print('hi')")` printed nothing at all.
+#[test]
+fn pythons_output_reaches_the_lisp_stream() {
+    let program = r#"
+      (py:exec "import sys")
+      (format t "ORDER ~a~%"
+              (with-output-to-string (s)
+                (let ((*standard-output* s))
+                  (princ "lisp-1 ")
+                  (py:exec "print('python-1', end=' ')")
+                  (princ "lisp-2 ")
+                  (py:exec "print('python-2', end='')"))))
+      ;; stderr is a separate stream, and goes to *ERROR-OUTPUT*.
+      (format t "STDERR ~s~%"
+              (with-output-to-string (s)
+                (let ((*error-output* s))
+                  (py:exec "print('to-stderr', end='', file=sys.stderr)"))))
+      ;; Output printed before a raise still arrives: it is exactly what a reader
+      ;; needs, and unwind-protect is what keeps it.
+      (format t "BEFORE-RAISE ~s~%"
+              (with-output-to-string (s)
+                (let ((*standard-output* s))
+                  (ignore-errors (py:exec "print('said', end=''); raise ValueError('x')")))))
+      ;; A value AND its side effects, from py:call rather than py:exec.
+      (py:exec "def noisy():
+    print('side', end='')
+    return 7")
+      (format t "CALL ~s~%"
+              (with-output-to-string (s)
+                (let ((*standard-output* s))
+                  (princ (py:call "__main__.noisy")))))
+    "#;
+    let stdout = run(program, "t0", false);
+    let line = |prefix: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        line("ORDER "),
+        "ORDER lisp-1 python-1 lisp-2 python-2",
+        "the two runtimes' output must interleave in program order: {stdout}"
+    );
+    assert_eq!(line("STDERR "), r#"STDERR "to-stderr""#);
+    assert_eq!(line("BEFORE-RAISE "), r#"BEFORE-RAISE "said""#);
+    assert_eq!(line("CALL "), r#"CALL "side7""#);
+}
+
+/// A statement that raises is reported ONCE, as a condition with its frames.
+///
+/// `PyRun_SimpleString` — the obvious call for this, and the one used first — prints
+/// a traceback itself and CONSUMES the exception. The failure was then reported twice,
+/// and the Lisp half was a bare FFI error with no type, message or frames, because
+/// there was no longer an exception left to describe.
+#[test]
+fn a_raising_statement_is_reported_once_with_its_frames() {
+    let program = r#"
+      (handler-case (py:exec "def f(): raise ValueError('deep')
+f()")
+        (py:exception (e)
+          (format t "EXEC ~S~%" (list (py:exception-kind e)
+                                      (py:exception-text e)
+                                      (py:exception-frames e)))))
+    "#;
+    let output = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("TORCL_FORCE_TIER", "t0")
+        .output()
+        .expect("the CLI runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout
+            .lines()
+            .find(|line| line.starts_with("EXEC "))
+            .unwrap_or("")
+            .trim(),
+        r#"EXEC ("ValueError" "deep" (("<string>" 2 "<module>") ("<string>" 1 "f")))"#
+    );
+    assert!(
+        !stderr.contains("Traceback"),
+        "CPython must not also print its own traceback: {stderr}"
     );
 }
 

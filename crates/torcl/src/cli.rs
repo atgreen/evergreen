@@ -16821,6 +16821,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             | "TORCL::%PY-STR"
             | "TORCL::%PY-REPR"
             | "TORCL::%PY-OBJECTP"
+            | "TORCL::%PY-DRAIN-OUTPUT"
             | "TORCL::%PY-STOP") => {
                 if env.sandbox {
                     return Err(TorclError::SandboxViolation(
@@ -26251,8 +26252,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 if python::is_proxy(v) {
-                    return Ok(resolve_sym("TORCL-PYTHON::OBJECT")
-                        .expect("Python object type symbol"));
+                    return Ok(
+                        resolve_sym("TORCL-PYTHON::OBJECT").expect("Python object type symbol")
+                    );
                 }
                 if torcl_stdlib::synchronization::mutex_p(v) {
                     return Ok(resolve_sym("TORCL-THREAD::MUTEX").expect("mutex type symbol"));
@@ -36534,6 +36536,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL::%PY-STR"
             | "TORCL::%PY-REPR"
             | "TORCL::%PY-OBJECTP"
+            | "TORCL::%PY-DRAIN-OUTPUT"
             | "TORCL::%PY-STOP"
     ) {
         return true;
@@ -37392,6 +37395,10 @@ fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, Torcl
             exactly(name, args, 1)?;
             Ok(if python::is_proxy(args[0]) { T } else { NIL })
         }
+        "DRAIN-OUTPUT" => {
+            exactly(name, args, 0)?;
+            python::drain_output()
+        }
         "STOP" => {
             exactly(name, args, 0)?;
             python::stop()
@@ -37447,6 +37454,7 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
         | "TORCL::%PY-STR"
         | "TORCL::%PY-REPR"
         | "TORCL::%PY-OBJECTP"
+        | "TORCL::%PY-DRAIN-OUTPUT"
         | "TORCL::%PY-STOP") => {
             if _env.sandbox {
                 return Err(TorclError::SandboxViolation(

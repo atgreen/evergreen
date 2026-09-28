@@ -37,31 +37,34 @@ mod enabled {
     use torcl_rt::python::{self, PyRef, PythonScope};
 
     /// Enter Python, do the work, then release whatever the collector has queued.
-///
-/// Everything coming back goes through `from_python`, with no exceptions — so
-/// `(py:resolve "math.pi")` is a DOUBLE-FLOAT and `(py:resolve "sys.maxsize")` an
-/// integer, exactly as the same values would be if they came back from `py:call`.
-/// One value policy, applied everywhere, is worth more than letting a couple of
-/// entry points hand back proxies for things that have Lisp equivalents.
-///
-/// Note that every operation below takes its receiver through `to_python` rather
-/// than demanding a proxy. A proxy passes through unchanged, and anything else
-/// converts — so `(py:str 5)` is "5", `(py:call-method "hello" "upper")` is
-/// "HELLO", and `(py:typep 5 "builtins.int")` is true. Requiring a proxy made the
-/// surface sharp in a way that is entirely avoidable: an operation on a value that
-/// had just crossed BACK as a Lisp string (which the policy says it must) would be
-/// a type error for no reason a caller could see.
     ///
     /// The drain is here rather than at each call site so that it cannot be
     /// forgotten: a proxy that died during a collection has a reference waiting,
     /// and a crossing is the only context in which paying it is safe.
+    ///
+    /// Everything coming back goes through `from_python`, with no exceptions — so
+    /// `(py:resolve "math.pi")` is a DOUBLE-FLOAT and `(py:resolve "sys.maxsize")`
+    /// an integer, exactly as the same values would be if they came back from
+    /// `py:call`. One value policy applied everywhere is worth more than letting a
+    /// couple of entry points hand back proxies for things that have Lisp
+    /// equivalents.
+    ///
+    /// Every operation also takes its receiver through `to_python` rather than
+    /// demanding a proxy. A proxy passes through unchanged and anything else
+    /// converts — so `(py:str 5)` is "5", `(py:call-method "hello" "upper")` is
+    /// "HELLO", and `(py:typep 5 "builtins.int")` is true. Requiring a proxy made
+    /// the surface sharp for no reason a caller could see: a value that had just
+    /// crossed BACK as a Lisp string, which the policy says it must, was then a
+    /// type error.
     ///
     /// GC-SAFETY. The Lisp values a caller passes in are read BEFORE `body`
     /// allocates anything on the Lisp heap — `to_python` copies out of them and
     /// never allocates — and nothing reads them afterwards. The one allocating step
     /// is converting the result, by which point no Lisp value from the argument
     /// list is live. So there is nothing here to root.
-    fn crossing<T>(body: impl FnOnce(&PythonScope) -> Result<T, TorclError>) -> Result<T, TorclError> {
+    fn crossing<T>(
+        body: impl FnOnce(&PythonScope) -> Result<T, TorclError>,
+    ) -> Result<T, TorclError> {
         // Starting the interpreter lazily is safe because `initialize` is
         // idempotent and records its owner: a later shutdown from any other thread
         // is refused rather than dereferencing a thread state that may be gone.
@@ -157,7 +160,11 @@ mod enabled {
         })
     }
 
-    pub fn setattr(object: TorclVal, name: TorclVal, value: TorclVal) -> Result<TorclVal, TorclError> {
+    pub fn setattr(
+        object: TorclVal,
+        name: TorclVal,
+        value: TorclVal,
+    ) -> Result<TorclVal, TorclError> {
         let name = name.as_string();
         crossing(|scope| {
             let receiver = scope.to_python(object)?;
@@ -198,6 +205,24 @@ mod enabled {
             };
             Ok(torcl_rt::gc::alloc_character_string(&rendered))
         })
+    }
+
+    /// Everything Python has written since the last drain, as `(stdout . stderr)`,
+    /// or NIL when both are empty.
+    ///
+    /// Returned rather than written here: only Lisp knows what `*standard-output*`
+    /// currently is — a `WITH-OUTPUT-TO-STRING` may be in force — so the write
+    /// belongs in `lib/boot.lisp`, and this is the part that needs a crossing.
+    pub fn drain_output() -> Result<TorclVal, TorclError> {
+        let (output, error) = crossing(|scope| scope.take_output())?;
+        if output.is_empty() && error.is_empty() {
+            return Ok(torcl_rt::value::NIL);
+        }
+        // Both strings rooted before the cons: building the pair allocates, and the
+        // first would otherwise be a bare local across it.
+        torcl_rt::rooted!(output = torcl_rt::gc::alloc_character_string(&output));
+        torcl_rt::rooted!(error = torcl_rt::gc::alloc_character_string(&error));
+        Ok(crate::cli::arena_cons(*output, *error))
     }
 
     pub fn stop() -> Result<TorclVal, TorclError> {
@@ -275,6 +300,10 @@ mod disabled {
         Err(unavailable())
     }
 
+    pub fn drain_output() -> Result<TorclVal, TorclError> {
+        Err(unavailable())
+    }
+
     pub fn stop() -> Result<TorclVal, TorclError> {
         Err(unavailable())
     }
@@ -327,11 +356,7 @@ pub fn build_error_condition(
         torcl_rt::rooted!(file = alloc_character_string(&frame.file));
         torcl_rt::rooted!(function = alloc_character_string(&frame.function));
         torcl_rt::rooted!(
-            entry = super::vec_to_list(&[
-                *file,
-                TorclVal::from_fixnum(frame.line),
-                *function,
-            ])
+            entry = super::vec_to_list(&[*file, TorclVal::from_fixnum(frame.line), *function,])
         );
         // Built back to front, so the list comes out in the order above.
         *frames = super::arena_cons(*entry, *frames);

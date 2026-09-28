@@ -815,6 +815,14 @@ requires a glibc target rather than the default static musl):
 - The value policy: numbers by value, strings by copy, `NIL`↔`None`, `T`↔`True`,
   everything else a proxy. An integer beyond a fixnum stays a proxy rather than
   being truncated.
+- Python's standard output and error bound to `*standard-output*` and
+  `*error-output*`, so the two runtimes' output interleaves in program order and a
+  Lisp rebinding captures both. Done by buffering on the Python side and draining at
+  the end of each crossing rather than by a Python extension type delegating to a
+  Lisp stream: the latter needs Python to call Lisp, which is x86-64 only, while
+  buffering needs nothing but the scalar calls that work everywhere. `input()` is
+  the half that cannot work this way, input being pulled rather than pushed, and is
+  staged with callbacks.
 - Signal arbitration, in the direction that matters first: the interpreter is
   started with `Py_InitializeEx(0)`, so CPython installs no handlers and TorCL's
   remain the process's (observable from inside Python, where the signals TorCL owns
@@ -830,7 +838,7 @@ requires a glibc target rather than the default static musl):
 
 Still unbuilt, and tracked separately: Python→Lisp callables (`bliss-89axw`,
 x86-64 only until callbacks are ported), the zero-copy buffer protocol
-(`bliss-s8wrr`), and stream binding (`bliss-c4g9u`).
+(`bliss-s8wrr`).
 
 Two staged pieces are worth naming because each is a limitation a user meets rather
 than a feature that is merely absent. Forwarding an interrupt INTO a running Python

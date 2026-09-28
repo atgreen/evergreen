@@ -41,7 +41,9 @@ struct Api {
     eval_save_thread: unsafe extern "C" fn() -> *mut (),
     inc_ref: unsafe extern "C" fn(*mut PyObject),
     dec_ref: unsafe extern "C" fn(*mut PyObject),
-    run_simple_string: unsafe extern "C" fn(*const i8) -> i32,
+    /// Runs source WITHOUT printing a traceback of its own, which is why this
+    /// rather than `PyRun_SimpleString` — see [`PythonScope::run`].
+    run_string: unsafe extern "C" fn(*const i8, i32, *mut PyObject, *mut PyObject) -> *mut PyObject,
     /// `__main__`'s module object, and its dictionary. Both borrowed, both needed
     /// to reach a name Python has bound — see [`PythonScope::lookup`].
     import_add_module: unsafe extern "C" fn(*const i8) -> *mut PyObject,
@@ -190,7 +192,7 @@ fn bind(library: *mut (), name: &str) -> Result<Api, String> {
         eval_save_thread: symbol!("PyEval_SaveThread"),
         inc_ref: symbol!("Py_IncRef"),
         dec_ref: symbol!("Py_DecRef"),
-        run_simple_string: symbol!("PyRun_SimpleString"),
+        run_string: symbol!("PyRun_String"),
         import_add_module: symbol!("PyImport_AddModule"),
         module_get_dict: symbol!("PyModule_GetDict"),
         dict_get_item_string: symbol!("PyDict_GetItemString"),
@@ -277,6 +279,7 @@ pub fn initialize() -> Result<(), TorclError> {
     let mut owner = OWNER
         .lock()
         .map_err(|_| TorclError::FfiError("the CPython owner lock is poisoned".into()))?;
+    let mut started = false;
     // SAFETY: resolved entry points, and the lock makes the check-and-start atomic.
     unsafe {
         if (api.is_initialized)() == 0 {
@@ -293,7 +296,16 @@ pub fn initialize() -> Result<(), TorclError> {
             // an embedder is expected to do once startup is complete.
             let _ = (api.eval_save_thread)();
             *owner = Some(std::thread::current().id());
+            started = true;
         }
+    }
+    // Redirect Python's standard streams, outside the lock and after the GIL has
+    // been handed back, since this needs an ordinary crossing. Only on a real start:
+    // a second `initialize` must not disturb the buffers of a live interpreter, which
+    // may have output in them.
+    if started {
+        let scope = PythonScope::enter()?;
+        scope.install_stream_capture()?;
     }
     Ok(())
 }
@@ -436,23 +448,52 @@ impl PythonScope {
         })
     }
 
-    /// Run a statement for its effect, as `python -c` would.
+    /// Run source in `__main__`, for its effect, as `python -c` would.
     ///
-    /// Present so this layer can be tested end to end before any object model
-    /// exists; it reports only success or failure, because turning a Python
-    /// exception into a Lisp condition is a separate concern (bliss-wq5tw).
+    /// `PyRun_String` rather than `PyRun_SimpleString`, which looks like the obvious
+    /// choice and is the wrong one: on an error it calls `PyErr_Print` itself, which
+    /// PRINTS a traceback and CONSUMES the exception. The failure was then reported
+    /// twice — once by CPython, once as a Lisp error — and the Lisp one was a bare
+    /// FFI error with no type, message or frames, because there was no longer an
+    /// exception to describe. This form returns null with the exception still set,
+    /// so it becomes an ordinary PY:EXCEPTION like every other failure.
     pub fn run(&self, source: &str) -> Result<(), TorclError> {
         let source = CString::new(source)
             .map_err(|_| TorclError::FfiError("Python source contains a null byte".into()))?;
-        // SAFETY: a resolved entry point, a valid null-terminated string, and this
-        // scope proves the caller may use the C API.
-        let status = unsafe { (self.api.run_simple_string)(source.as_ptr()) };
-        if status != 0 {
-            return Err(TorclError::FfiError(
-                "Python raised while executing a statement".into(),
-            ));
-        }
+        let globals = self.main_dict()?;
+        // `Py_file_input` (257): a sequence of statements, which is what a caller
+        // writing `(py:exec "...")` means. The value is part of the stable C API.
+        const PY_FILE_INPUT: i32 = 257;
+        // SAFETY: a resolved entry point, a valid null-terminated string, a borrowed
+        // module dictionary, and this scope proves the caller may use the C API.
+        let result = unsafe {
+            (self.api.run_string)(source.as_ptr(), PY_FILE_INPUT, globals, globals)
+        };
+        // The result of a statement sequence is None, which is of no use to a
+        // caller. Released here rather than left to Drop so that running statements
+        // does not fill the deferred-release queue with Nones.
+        adopt(self, result, "executing Python source")?.release(self);
         Ok(())
+    }
+
+    /// `__main__`'s dictionary, borrowed. Where `py:exec` evaluates, and where
+    /// `py:resolve` looks for a name a caller has bound.
+    fn main_dict(&self) -> Result<*mut PyObject, TorclError> {
+        let main = CString::new("__main__").expect("a literal with no null byte");
+        // SAFETY: resolved entry points under the GIL. Both results are borrowed.
+        unsafe {
+            let module = (self.api.import_add_module)(main.as_ptr());
+            if module.is_null() {
+                check(self, "reaching __main__")?;
+                return Err(TorclError::FfiError("Python has no __main__".into()));
+            }
+            let dict = (self.api.module_get_dict)(module);
+            if dict.is_null() {
+                check(self, "reaching __main__'s namespace")?;
+                return Err(TorclError::FfiError("__main__ has no namespace".into()));
+            }
+            Ok(dict)
+        }
     }
 
     /// An owned reference to whatever `__main__` has bound to `name`, or `None` if
@@ -463,21 +504,13 @@ impl PythonScope {
     /// committing to a calling convention (bliss-dk3nr).
     pub fn lookup(&self, name: &str) -> Option<PyRef> {
         let name = CString::new(name).ok()?;
-        let main = CString::new("__main__").ok()?;
         // SAFETY: resolved entry points, and `self` proves the GIL is held. Every
         // pointer here is borrowed, so nothing is released on the way out and the
         // final value is adopted by adding a reference rather than stealing one.
-        unsafe {
-            let module = (self.api.import_add_module)(main.as_ptr());
-            if module.is_null() {
-                return None;
-            }
-            let dict = (self.api.module_get_dict)(module);
-            if dict.is_null() {
-                return None;
-            }
-            PyRef::from_borrowed((self.api.dict_get_item_string)(dict, name.as_ptr()), self)
-        }
+        let dict = self.main_dict().ok()?;
+        // SAFETY: a resolved entry point, a borrowed dictionary, GIL held; the
+        // result is borrowed and `from_borrowed` adds the reference it returns.
+        unsafe { PyRef::from_borrowed((self.api.dict_get_item_string)(dict, name.as_ptr()), self) }
     }
 }
 
@@ -576,6 +609,38 @@ impl PyRef {
     /// The borrowed pointer, for handing to the C API. Valid while `self` lives.
     pub fn as_ptr(&self) -> *mut PyObject {
         self.pointer
+    }
+
+    /// Release this reference NOW rather than queueing it.
+    ///
+    /// Valid because the scope proves the GIL is held and that no collection is in
+    /// progress — the two conditions that make [`Drop`] defer instead. For a
+    /// reference the caller is finished with inside a crossing this is both cheaper
+    /// and more honest: the queue then holds only what died at a moment when
+    /// releasing was unsafe, which is what it is for.
+    pub fn release(self, _scope: &PythonScope) {
+        let api = self.api_or_queue();
+        let pointer = self.into_raw();
+        if let Some(api) = api {
+            // SAFETY: an owned reference, released exactly once; the scope proves
+            // the GIL is held.
+            unsafe { (api.dec_ref)(pointer) };
+        }
+    }
+
+    /// The resolved API, or `None` having queued this reference instead — for the
+    /// case that cannot arise in practice (the library is loaded, or there would be
+    /// no reference) but must not leak if it does.
+    fn api_or_queue(&self) -> Option<&'static Api> {
+        match api() {
+            Ok(api) => Some(api),
+            Err(_) => {
+                if let Ok(mut queue) = releases().lock() {
+                    queue.push(self.pointer as usize);
+                }
+                None
+            }
+        }
     }
 
     /// A second owned reference to the same object. Not `Clone`, because adding a
@@ -1527,5 +1592,96 @@ impl Raise {
                 )
             })
             .collect()
+    }
+}
+
+// ── Python's standard streams ──────────────────────────────────────
+//
+// Python's `print` wrote to file descriptor 1 directly, which had two
+// consequences, the second much worse than the first: output from the two runtimes
+// interleaved unpredictably, and — because CPython block-buffers a non-tty stdout
+// and nothing flushed it, the interpreter usually not being finalized at all —
+// Python's output was SILENTLY LOST. `(py:exec "print('hi')")` printed nothing.
+//
+// So `sys.stdout` and `sys.stderr` are redirected into in-memory buffers, and their
+// contents are handed to Lisp at the end of each crossing to be written to
+// `*standard-output*` and `*error-output*`. The write happens in Lisp
+// (`lib/boot.lisp`) rather than here, because only there does `*standard-output*`
+// mean what the caller intends — including a `WITH-OUTPUT-TO-STRING` in force.
+//
+// NOT a Python extension type delegating to a Lisp stream, which is what the design
+// note imagined. That would need Python to call Lisp, i.e. foreign callbacks, which
+// are x86-64 only. Buffering and draining at the crossing needs nothing but the
+// scalar calls that already work everywhere.
+//
+// The cost is that output appears when the crossing ends rather than as it is
+// produced, so a long computation's progress prints arrive together at the end. And
+// `sys.stdout` no longer has a `fileno()`, which a library that reaches for one will
+// notice.
+
+/// The Python source installed once per interpreter, holding the buffers and the
+/// function that empties them.
+///
+/// Defined in `__main__` because that is where `PyRun_SimpleString` evaluates, so
+/// there is no hiding from it anyway; the names are underscore-prefixed to stay out
+/// of a user's way. `seek`+`truncate` rather than a fresh `StringIO` so that code
+/// which captured `sys.stdout` keeps working.
+const STREAM_CAPTURE: &str = r#"
+import io as _torcl_io, sys as _torcl_sys
+if not isinstance(_torcl_sys.stdout, _torcl_io.StringIO):
+    _torcl_sys.stdout = _torcl_io.StringIO()
+if not isinstance(_torcl_sys.stderr, _torcl_io.StringIO):
+    _torcl_sys.stderr = _torcl_io.StringIO()
+def _torcl_take_output():
+    _out = _torcl_sys.stdout.getvalue()
+    _torcl_sys.stdout.seek(0)
+    _torcl_sys.stdout.truncate(0)
+    _err = _torcl_sys.stderr.getvalue()
+    _torcl_sys.stderr.seek(0)
+    _torcl_sys.stderr.truncate(0)
+    return (_out, _err)
+"#;
+
+impl PythonScope {
+    /// Redirect Python's standard streams into buffers this side can drain.
+    ///
+    /// Idempotent, and re-runnable: the helper lives in `__main__`, which user code
+    /// can clobber, so [`take_output`](Self::take_output) reinstalls it rather than
+    /// starting to lose output again.
+    fn install_stream_capture(&self) -> Result<(), TorclError> {
+        self.run(STREAM_CAPTURE)
+    }
+
+    /// Everything Python has written since the last call: `(stdout, stderr)`.
+    ///
+    /// Empty strings when there is nothing, which is the common case, so this stays
+    /// cheap enough to call at the end of every crossing.
+    pub fn take_output(&self) -> Result<(String, String), TorclError> {
+        let taker = match self.lookup("_torcl_take_output") {
+            Some(taker) => taker,
+            None => {
+                // Either the first crossing of this interpreter, or user code
+                // replaced the helper. Either way, reinstall and try once more.
+                self.install_stream_capture()?;
+                self.lookup("_torcl_take_output")
+                    .ok_or_else(|| TorclError::FfiError("Python output capture failed".into()))?
+            }
+        };
+        let pair = self.call(&taker, Vec::new())?;
+        let mut text = Vec::with_capacity(2);
+        for index in 0..2 {
+            // SAFETY: a resolved entry point, a live 2-tuple, GIL held.
+            let item = unsafe { (self.api.sequence_get_item)(pair.pointer, index) };
+            let Some(item) = (unsafe { PyRef::from_owned(item) }) else {
+                self.clear_error();
+                return Err(TorclError::FfiError(
+                    "Python output capture returned the wrong shape".into(),
+                ));
+            };
+            text.push(utf8_of(self.api, &item).unwrap_or_default());
+        }
+        let error = text.pop().unwrap_or_default();
+        let output = text.pop().unwrap_or_default();
+        Ok((output, error))
     }
 }

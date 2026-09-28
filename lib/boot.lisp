@@ -3950,47 +3950,82 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;;; The PY package does not use COMMON-LISP, which is what lets IMPORT, TYPE-OF,
 ;;;; TYPEP and CALL-METHOD keep the names Python gives them.
 
+;;; PYTHON'S OUTPUT REACHES *STANDARD-OUTPUT* (bliss-c4g9u).
+;;;
+;;; sys.stdout and sys.stderr are redirected into buffers on the Python side; this
+;;; is where their contents are written, and it has to be here rather than in Rust
+;;; because only here does *STANDARD-OUTPUT* mean what the caller intends -- a
+;;; WITH-OUTPUT-TO-STRING or a rebinding in force is respected for free.
+;;;
+;;; Before this, Python's output was not merely interleaved unpredictably: it was
+;;; SILENTLY LOST. CPython block-buffers a non-tty stdout, nothing flushed it, and
+;;; the interpreter is usually never finalized, so (py:exec "print('hi')") printed
+;;; nothing at all.
+;;; Never signals. It runs in UNWIND-PROTECT cleanup on the way out of every entry
+;;; point, so an error here would MASK the Python error being unwound -- replacing the
+;;; useful report with a confusing one from the machinery that was trying to print it.
+(defun py::drain-output ()
+  (ignore-errors
+    (let ((pair (torcl::%py-drain-output)))
+      (when pair
+        (let ((out (car pair)) (err (cdr pair)))
+          (when (plusp (length out)) (write-string out *standard-output*))
+          (when (plusp (length err)) (write-string err *error-output*))))))
+  (values))
+
+;;; Every entry point drains on the way out, including when it signals: a Python
+;;; traceback's own output, and anything printed before the raise, is exactly what a
+;;; reader needs and would otherwise be dropped.
+(defmacro py::draining (&body body)
+  `(unwind-protect (progn ,@body) (py::drain-output)))
+
 ;;; Bring an interpreter up and take it down. Starting is implicit in every other
 ;;; entry point, so START is only for choosing WHEN the cost is paid; STOP drains
 ;;; the pending releases first, since a reference released after shutdown would be
 ;;; a use-after-free.
 (defun py:start () (py:exec "pass"))
-(defun py:stop () (torcl::%py-stop))
+(defun py:stop () (py::draining (torcl::%py-stop)))
 
 ;;; (py:import "numpy") -> the module, as a PY:OBJECT.
-(defun py:import (name) (torcl::%py-import name))
+(defun py:import (name) (py::draining (torcl::%py-import name)))
 
 ;;; (py:exec "print('hello')") -> NIL. A statement, run for its effect.
-(defun py:exec (source) (torcl::%py-exec source))
+(defun py:exec (source) (py::draining (torcl::%py-exec source)))
 
 ;;; (py:resolve "numpy.mean") -> the object that dotted name names, whether the
 ;;; segments are modules, attributes, or a builtin.
-(defun py:resolve (name) (torcl::%py-resolve name))
+(defun py:resolve (name) (py::draining (torcl::%py-resolve name)))
 
 ;;; (py:call "numpy.mean" a) or (py:call f 1 2) -- the callable may be named or
 ;;; already in hand.
-(defun py:call (callable &rest arguments) (torcl::%py-call callable arguments))
+(defun py:call (callable &rest arguments)
+  (py::draining (torcl::%py-call callable arguments)))
 
 ;;; (py:call-method x "reshape" 10 20)
 (defun py:call-method (object name &rest arguments)
-  (torcl::%py-call-method object name arguments))
+  (py::draining (torcl::%py-call-method object name arguments)))
 
 ;;; (py:getattr x "shape"), and settable: (setf (py:getattr x "n") 5).
-(defun py:getattr (object name) (torcl::%py-getattr object name))
-(defun py:setattr (object name value) (torcl::%py-setattr object name value))
+(defun py:getattr (object name) (py::draining (torcl::%py-getattr object name)))
+(defun py:setattr (object name value)
+  (py::draining (torcl::%py-setattr object name value)))
 (defsetf py:getattr (object name) (value) `(py:setattr ,object ,name ,value))
 
 ;;; (py:type-of x) -> the Python TYPE, as an object rather than a name, so it can
 ;;; be called, compared and asked for its own attributes as Python code would.
-(defun py:type-of (object) (torcl::%py-type-of object))
+(defun py:type-of (object) (py::draining (torcl::%py-type-of object)))
 
 ;;; (py:typep x "numpy.ndarray")
-(defun py:typep (object class) (torcl::%py-typep object class))
+(defun py:typep (object class) (py::draining (torcl::%py-typep object class)))
 
 ;;; str() and repr(). PY:REPR is what the Lisp printer shows inside
 ;;; #<PYTHON-OBJECT ...>.
-(defun py:str (object) (torcl::%py-str object))
-(defun py:repr (object) (torcl::%py-repr object))
+(defun py:str (object) (py::draining (torcl::%py-str object)))
+(defun py:repr (object) (py::draining (torcl::%py-repr object)))
+
+;;; Flush Python's buffered output without doing anything else -- for a long
+;;; computation whose progress prints would otherwise arrive only when it returns.
+(defun py:flush () (py::drain-output) (values))
 
 ;;; Is this a Python object rather than a converted Lisp value? A number, string,
 ;;; NIL or T that crossed back is an ordinary Lisp object and answers NIL.
@@ -4064,7 +4099,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                 '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
                   "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
                   "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
-                  "EXCEPTION-OBJECT" "BACKTRACE"))
+                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH"))
         "TORCL-PYTHON")
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
