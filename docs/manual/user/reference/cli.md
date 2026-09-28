@@ -14,6 +14,13 @@ This option listing is generated at site-build time from `help_text()` in
 | `torcl --load FILE` | Load a Lisp file and exit |
 | `torcl FILE -- ARG…` | Run a script with application arguments |
 | `torcl --image FILE` | Restore a core image |
+| `torcl --image FILE --deliver SPEC --output APP` | Deliver an executable from a saved core and retention specification |
+
+Delivery is a separate execution mode: it cannot be combined with `--eval`,
+`--load`, a script, or application arguments. `--dry-run` prints its retention
+report without producing files. See the
+[delivery guide](../how-to/save-executable.md#deliver-an-application-from-a-saved-image)
+for the specification format and dynamic-entry retention contract.
 
 The prelude loads by default. `--no-bootstrap` selects the raw evaluator.
 For the REPL, `TORCL_INIT_FILE` selects an initialization file; its default is

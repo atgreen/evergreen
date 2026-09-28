@@ -20,6 +20,7 @@ pub(super) use torcl_rt::bignum::{
 use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+mod delivery;
 pub mod events;
 pub mod sprof;
 use torcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
@@ -38,6 +39,9 @@ use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 #[derive(Clone, Debug)]
 pub struct CliArgs {
     pub image: Option<String>,
+    pub deliver: Option<String>,
+    pub output: Option<String>,
+    pub dry_run: bool,
     /// All `--eval`/`-e` forms in command-line order, evaluated in sequence in
     /// one shared env so later forms see earlier state (bliss-7zl).
     pub eval_forms: Vec<String>,
@@ -72,6 +76,9 @@ impl CliArgs {
         let mut version = false;
         let mut script = None;
         let mut load_report = None;
+        let mut deliver = None;
+        let mut output = None;
+        let mut dry_run = false;
         let mut eval_forms: Vec<String> = Vec::new();
         let mut saw_double_dash = false;
 
@@ -85,6 +92,24 @@ impl CliArgs {
             }
 
             match arg.as_str() {
+                "--deliver" | "--output" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| TorclError::Internal(format!("{arg} requires a value")))?;
+                    let slot = if arg == "--deliver" {
+                        &mut deliver
+                    } else {
+                        &mut output
+                    };
+                    if slot.replace(value.clone()).is_some() {
+                        return Err(TorclError::Internal(format!("duplicate {arg}")));
+                    }
+                    i += 2;
+                }
+                "--dry-run" => {
+                    dry_run = true;
+                    i += 1;
+                }
                 "--" => {
                     saw_double_dash = true;
                     i += 1;
@@ -180,6 +205,9 @@ impl CliArgs {
 
         let r = CliArgs {
             image: extract_flag_value(&shared_args, "--image"),
+            deliver,
+            output,
+            dry_run,
             eval_forms,
             load: config.load_file.clone(),
             no_image: shared_args.iter().any(|arg| arg == "--no-image"),
@@ -199,6 +227,27 @@ impl CliArgs {
             script,
             load_report,
         };
+        if r.deliver.is_some() {
+            if r.image.is_none() || r.output.is_none() {
+                return Err(TorclError::Internal(
+                    "--deliver requires --image and --output".into(),
+                ));
+            }
+            if !r.eval_forms.is_empty()
+                || r.load.is_some()
+                || r.script.is_some()
+                || r.load_report.is_some()
+                || r.no_image
+                || r.sandbox
+                || !r.cl_args.is_empty()
+            {
+                return Err(TorclError::Internal("--deliver cannot be combined with other execution modes or application arguments".into()));
+            }
+        } else if r.output.is_some() || r.dry_run {
+            return Err(TorclError::Internal(
+                "--output and --dry-run require --deliver".into(),
+            ));
+        }
         if r.image.is_some() && r.no_image {
             return Err(TorclError::Internal(
                 "--image and --no-image are contradictory".into(),
@@ -39005,6 +39054,7 @@ fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
 /// runtime-plus-core scheme SBCL uses for `:executable t`).
 fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut bytes = current_runtime_bytes()?;
+    delivery::remove_embedded_images(&mut bytes)?;
     bytes.extend_from_slice(image);
     bytes.extend_from_slice(EXE_IMAGE_MAGIC);
     bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
@@ -39021,6 +39071,17 @@ fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
 /// scheme, recovered by `embedded_image` at startup). GC-safe: no TorCL
 /// allocation between the GC and the serialize walk.
 fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), TorclError> {
+    save_core(path, executable, false, env)?;
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprintln!(
+        ";; wrote core {} to {path}; exiting",
+        if executable { "executable" } else { "image" }
+    );
+    std::process::exit(0);
+}
+
+fn save_core(path: &str, executable: bool, delivery: bool, env: &Env) -> Result<(), TorclError> {
     // Expose this Env's generic-function registries to the serialize hook
     // (whose signature has no Env). Rc shares — the full_gc below relocates
     // objects and the Env root scan updates this same storage (torcl-x0f2.7a).
@@ -39030,7 +39091,8 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Torc
     SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(env.generics));
     SAVE_METHODS.with(|m| *m.borrow_mut() = Some(env.methods));
     SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(env.classes));
-    // Compact so the live set is a dense prefix and garbage is dropped.
+    // Collect reclaimable garbage. Restored pinned objects require the delivery
+    // serializer's separate reachability pass to omit dead objects from disk.
     torcl_rt::gc::full_gc()?;
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
     // cell (serialized with the symbol table), not the image entry continuation.
@@ -39041,38 +39103,34 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Torc
         compression: torcl_rt::image::ImageCompression::None,
         purify: true,
     };
+    let save_image = if delivery {
+        torcl_rt::image::save_reachable_image
+    } else {
+        torcl_rt::image::save_image
+    };
 
     if executable {
         // Serialize to a temp core file, then append its bytes to a runtime copy.
-        let tmp = format!("{path}.core.tmp");
-        torcl_rt::image::save_image(&tmp, &opts)
+        let tmp = delivery::TemporaryFile::new(std::path::Path::new(path))
             .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
-        let core_bytes = std::fs::read(&tmp)
+        save_image(
+            tmp.path
+                .to_str()
+                .expect("temporary path derives from UTF-8 input"),
+            &opts,
+        )
+        .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
+        let core_bytes = std::fs::read(&tmp.path)
             .map_err(|e| TorclError::FileError(format!("%save-core: reread core: {e}")))?;
-        let _ = std::fs::remove_file(&tmp);
         let exe_bytes = wrap_executable(&core_bytes)
             .map_err(|e| TorclError::FileError(format!("%save-core :executable: {e}")))?;
-        std::fs::write(path, &exe_bytes)
+        delivery::write_atomic(std::path::Path::new(path), &exe_bytes, true)
             .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
-        }
     } else {
-        torcl_rt::image::save_image(path, &opts)
-            .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
+        save_image(path, &opts).map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
     }
 
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let kind = if executable {
-        "core executable"
-    } else {
-        "core image"
-    };
-    eprintln!(";; wrote {kind} to {path}; exiting");
-    std::process::exit(0);
+    Ok(())
 }
 
 /// Load a heap-snapshot CORE image into the (freshly initialized) runtime and
@@ -39293,7 +39351,11 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // stranded).
     let image_magic = torcl_rt::image::IMAGE_MAGIC.to_ne_bytes();
     let mut core_loaded = false;
-    let embedded_core = embedded_image().filter(|b| b.starts_with(&image_magic));
+    let embedded_core = if ca.deliver.is_some() {
+        None
+    } else {
+        embedded_image().filter(|b| b.starts_with(&image_magic))
+    };
     if let Some(bytes) = embedded_core {
         load_core_image_bytes(&bytes, &mut env)?;
         core_loaded = true;
@@ -39304,6 +39366,16 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
             load_core_image_bytes(&bytes, &mut env)?;
             core_loaded = true;
         }
+    }
+
+    if ca.deliver.is_some() {
+        if !core_loaded {
+            return Err(TorclError::FileError(
+                "delivery requires a saved TORCLIMG core image".into(),
+            ));
+        }
+        BOOT_COMPLETE.with(|c| c.set(true));
+        return delivery::run(&ca, &mut env);
     }
 
     // Set *command-line-args* (issue #4)
@@ -39680,6 +39752,9 @@ pub fn help_text() -> &'static str {
         "  --eval, -e EXPR      Evaluate EXPR and exit\n",
         "  --load FILE          Load FILE and exit\n",
         "  --image FILE         Path to the boot image\n",
+        "  --deliver SPEC       Deliver the saved --image using SPEC\n",
+        "  --output FILE        Delivered executable (with FILE.manifest report)\n",
+        "  --dry-run            Report delivery retention without writing files\n",
         "  --no-image           Start without loading an image\n",
         "  --bootstrap          Deprecated; the prelude now loads by default\n",
         "  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)\n",

@@ -319,6 +319,41 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
     });
 }
 
+/// Named bodies are conditional edges during delivery; private closure bodies
+/// and captured frames remain conservative roots. Only called in a heap snapshot.
+pub(super) fn delivery_dependencies() -> (HashMap<u32, Vec<TorclVal>>, Vec<TorclVal>) {
+    let mut bodies = closure_bodies().borrow().clone();
+    REGISTRY.with(|r| bodies.extend(r.borrow().iter().map(|(&s, b)| (s, Arc::clone(b)))));
+    for (&symbol, definition) in named_definitions().borrow().iter() {
+        if let Some(body) = &definition.body {
+            bodies.insert(symbol, Arc::clone(body));
+        } else {
+            bodies.remove(&symbol);
+        }
+    }
+    let mut edges = HashMap::new();
+    let mut roots = Vec::new();
+    for (symbol, body) in bodies {
+        let refs = super::delivery::bytecode_references(&body);
+        if torcl_rt::symbols::is_uninterned(symbol) {
+            roots.extend(refs.iter().copied());
+        }
+        edges.insert(symbol, refs);
+    }
+    let mut state = super::EnvRootVisitState::default();
+    for frame in closure_envs().borrow().values() {
+        super::visit_env_frame_roots(frame, &mut state, &mut |slot| {
+            // SAFETY: the frame visitor supplies live slots under the snapshot.
+            roots.push(unsafe { *slot });
+        });
+    }
+    (edges, roots)
+}
+
+pub(super) fn delivery_root_scanner() -> torcl_rt::gc::RootScanner {
+    scan_bytecode_roots
+}
+
 fn install_bytecode_root_scanner() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| torcl_rt::gc::register_root_scanner(scan_bytecode_roots));

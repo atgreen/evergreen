@@ -31,6 +31,9 @@ instructions, and specializes dynamically typed programs as they run.
   with its libraries preloaded, restore it later, or package it as a native
   executable. The default x86-64 Linux build is fully static. See
   [saved images and executables](docs/manual/user/reference/images.md).
+  [Application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image)
+  can prune unreachable named Lisp functions from a saved image using explicit
+  entry points and a package retention policy, while keeping the full runtime.
 - **Native Android applications.** Generate and package APKs with Lisp lifecycle,
   touch-input, and EGL/OpenGL ES code using `torcl-android-new`. See
   [building Android applications](docs/manual/user/how-to/android.md).
