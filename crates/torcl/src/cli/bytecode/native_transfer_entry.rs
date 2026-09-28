@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use super::super::CONTROL_COUNTER;
 use std::cell::Cell;
 use torcl_compiler::control_scope::{Ownership, ScopeKind};
 use torcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
@@ -15,6 +16,35 @@ use torcl_compiler::t2::native_transfer::{
 use torcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use torcl_rt::jit::JitBuffer;
 use torcl_rt::native_transfer::{self, NativeExit};
+
+fn try_clone_string(value: &str) -> Result<String, TorclError> {
+    let mut copy = String::new();
+    copy.try_reserve(value.len()).map_err(|_| TorclError::Oom)?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn try_control_token(prefix: &str) -> Result<String, TorclError> {
+    use std::fmt::Write;
+    let id = CONTROL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut token = String::new();
+    token
+        .try_reserve(prefix.len().saturating_add(20))
+        .map_err(|_| TorclError::Oom)?;
+    write!(&mut token, "{prefix}:{id}").expect("writing to a String cannot fail");
+    Ok(token)
+}
+
+fn try_clone_control_stack(
+    stack: &[(String, String)],
+) -> Result<Vec<(String, String)>, TorclError> {
+    let mut copy = Vec::new();
+    copy.try_reserve(stack.len()).map_err(|_| TorclError::Oom)?;
+    for (name, token) in stack {
+        copy.push((try_clone_string(name)?, try_clone_string(token)?));
+    }
+    Ok(copy)
+}
 
 /// Only constructible through the host-specific emitter. Retaining this value
 /// retains every embedded code address and the original bytecode definition.
@@ -872,8 +902,14 @@ unsafe extern "C" fn call_or_throw(
                         assert!(binds.len() < binds.capacity());
                         let info = &body.handler_binds[*hb as usize];
                         let cluster_base = env.handlers.len();
-                        let mut entries = Vec::with_capacity(info.bindings.len());
-                        let mut values = Vec::with_capacity(info.bindings.len().saturating_mul(2));
+                        let mut entries = Vec::new();
+                        entries
+                            .try_reserve(info.bindings.len())
+                            .map_err(|_| TorclError::Oom)?;
+                        let mut values = Vec::new();
+                        values
+                            .try_reserve(info.bindings.len().saturating_mul(2))
+                            .map_err(|_| TorclError::Oom)?;
                         torcl_rt::rooted_ref!(_entries = &mut entries);
                         torcl_rt::rooted_ref!(_values = &mut values);
                         for (type_name, form) in &info.bindings {
@@ -885,7 +921,7 @@ unsafe extern "C" fn call_or_throw(
                                 HandlerImpl::HandlerCase { .. } => NIL,
                             };
                             entries.push(HandlerEntry {
-                                type_name: type_name.clone(),
+                                type_name: try_clone_string(type_name)?,
                                 handler,
                             });
                             values.push(resolve_sym(type_name).ok_or_else(invalid_capture)?);
@@ -938,13 +974,41 @@ unsafe extern "C" fn call_or_throw(
                         let info = &body.restart_cases[*rc as usize];
                         let restart_base = env.restarts.len();
                         let captured_frame = Arc::clone(&env.frame);
-                        let mut values = Vec::with_capacity(info.restarts.len().saturating_mul(5));
+                        let mut values = Vec::new();
+                        values
+                            .try_reserve(info.restarts.len().saturating_mul(5))
+                            .map_err(|_| TorclError::Oom)?;
                         torcl_rt::rooted_ref!(_values = &mut values);
+                        // Finish every fallible string/stack copy before
+                        // mutating the live restart stack. A later OOM then
+                        // cannot leave a partially registered restart-case.
+                        let mut prepared = Vec::new();
+                        prepared
+                            .try_reserve(info.restarts.len())
+                            .map_err(|_| TorclError::Oom)?;
                         for restart in &info.restarts {
+                            prepared.push((
+                                try_clone_string(&restart.name)?,
+                                try_clone_control_stack(&env.block_stack)?,
+                                try_clone_control_stack(&env.tag_stack)?,
+                            ));
+                        }
+                        let mut restart_symbols = Vec::new();
+                        restart_symbols
+                            .try_reserve(info.restarts.len())
+                            .map_err(|_| TorclError::Oom)?;
+                        for restart in &info.restarts {
+                            restart_symbols.push(
+                                resolve_sym(&restart.name).ok_or_else(invalid_capture)?,
+                            );
+                        }
+                        for ((restart, (name, captured_blocks, captured_tags)), symbol) in
+                            info.restarts.iter().zip(prepared).zip(restart_symbols)
+                        {
                             env.restarts.push(RestartEntry {
-                                name: restart.name.clone(),
-                                captured_blocks: env.block_stack.clone(),
-                                captured_tags: env.tag_stack.clone(),
+                                name,
+                                captured_blocks,
+                                captured_tags,
                                 function: RestartFunction::Bytecode {
                                     function: Rc::new(RefCell::new((*restart.function).clone())),
                                     captured_frame: Arc::clone(&captured_frame),
@@ -957,7 +1021,7 @@ unsafe extern "C" fn call_or_throw(
                                 restart_obj: NIL,
                                 report: NIL,
                             });
-                            values.push(resolve_sym(&restart.name).ok_or_else(invalid_capture)?);
+                            values.push(symbol);
                             values.extend([NIL, NIL, NIL, NIL]);
                         }
                         let cluster_frame =
@@ -1034,16 +1098,25 @@ unsafe extern "C" fn call_or_throw(
                     assert!(handlers.len() < handlers.capacity());
                     let info = &body.handler_cases[*hc as usize];
                     let cluster_base = env.handlers.len();
-                    let mut clauses = Vec::with_capacity(info.clauses.len());
-                    let mut entries = Vec::with_capacity(info.clauses.len());
-                    let mut values = Vec::with_capacity(info.clauses.len().saturating_mul(2));
+                    let mut clauses = Vec::new();
+                    clauses
+                        .try_reserve(info.clauses.len())
+                        .map_err(|_| TorclError::Oom)?;
+                    let mut entries = Vec::new();
+                    entries
+                        .try_reserve(info.clauses.len())
+                        .map_err(|_| TorclError::Oom)?;
+                    let mut values = Vec::new();
+                    values
+                        .try_reserve(info.clauses.len().saturating_mul(2))
+                        .map_err(|_| TorclError::Oom)?;
                     torcl_rt::rooted_ref!(_values = &mut values);
                     for clause in &info.clauses {
-                        let token = next_control_token("__HANDLER_CASE__");
+                        let token = try_control_token("__HANDLER_CASE__")?;
                         entries.push(HandlerEntry {
-                            type_name: clause.type_name.clone(),
+                            type_name: try_clone_string(&clause.type_name)?,
                             handler: HandlerImpl::HandlerCase {
-                                token: token.clone(),
+                                token: try_clone_string(&token)?,
                                 var_name: None,
                                 body: NIL,
                                 captured_frame: Arc::clone(&env.frame),
@@ -1051,7 +1124,7 @@ unsafe extern "C" fn call_or_throw(
                         });
                         clauses.push(RuntimeClause {
                             token,
-                            type_name: clause.type_name.clone(),
+                            type_name: try_clone_string(&clause.type_name)?,
                             body_bcp: clause.body_bcp,
                             var_slot: clause.var_slot,
                         });
@@ -1126,8 +1199,9 @@ unsafe extern "C" fn call_or_throw(
                     assert_eq!(call.nargs, 1);
                     assert!(catches.len() < catches.capacity());
                     let tag = unsafe { call.args.read() };
-                    let token = super::super::next_control_token("__THROW__");
-                    env.catch_stack.push((tag, token.clone()));
+                    let token = try_control_token("__THROW__")?;
+                    env.catch_stack
+                        .push((tag, try_clone_string(&token)?));
                     catches.push(SavedCatch { push_bcp, token });
                 } else {
                     assert_eq!(call.nargs, 0);

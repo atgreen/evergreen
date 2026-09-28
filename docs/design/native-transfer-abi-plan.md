@@ -575,7 +575,10 @@ restart-argument records. Payload extraction finds existing secondary and
 restart keys by borrowed lookup, without formatting temporary Rust strings. The
 cold capture path also reuses a pre-reserved frame-chain scratch vector, so
 validating the native cluster stack after a transfer does not grow a Rust
-container.
+container. Native catch and handler registration now uses fallible string,
+token, and vector construction; restart names and captured exit stacks are
+prepared before mutating the live restart stack, so a failed reservation cannot
+leave a partial dynamic scope.
 The reserve failure is reported as `STORAGE-CONDITION`/`Oom` before generated
 code runs. This removes two avoidable cold-path allocations; arbitrary cleanup
 code can still allocate, and the full preallocated emergency storage path is
