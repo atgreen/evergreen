@@ -282,7 +282,12 @@ impl Adapter {
                 }
             }
             for &u in &inst.uses {
-                if stack_call_operands && inst.op == crate::t2::lower::op::CALL {
+                if stack_call_operands
+                    && matches!(
+                        inst.op,
+                        crate::t2::lower::op::CALL | crate::t2::lower::op::INVOKE
+                    )
+                {
                     // The System Z framed emitter copies arbitrary-arity call
                     // arguments from their homes to a scanned slice. Requiring
                     // every argument in a GPR simultaneously would make calls
@@ -317,6 +322,7 @@ impl Adapter {
             if matches!(
                 inst.op,
                 crate::t2::lower::op::CALL
+                    | crate::t2::lower::op::INVOKE
                     | crate::t2::lower::op::CALL_RUNTIME
                     | crate::t2::lower::op::ALLOC
                     | crate::t2::lower::op::TAILCALL

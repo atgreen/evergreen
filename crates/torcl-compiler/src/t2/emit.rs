@@ -4112,6 +4112,16 @@ fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
 
 /// Emit `mf` to x86-64 machine code. `mf.allocation` must be populated (P6).
 pub fn emit(mf: &MachFunc) -> Result<Vec<u8>, EmitError> {
+    use crate::t2::lower::op;
+    // Exceptional call edges require the native-transfer ABI and landing-pad
+    // emission. Refuse before consulting ordinary-call allocation assumptions.
+    if let Some(inst) = mf
+        .insts
+        .iter()
+        .find(|i| matches!(i.op, op::INVOKE | op::INVOKE_ROUTES))
+    {
+        return Err(EmitError::UnsupportedOp(inst.op));
+    }
     // Which callee-saved registers the body actually uses → prologue/epilogue.
     let mut used_callee: Vec<u8> = Vec::new();
     for loc in mf

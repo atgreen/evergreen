@@ -21406,6 +21406,15 @@ mod direct_call_invalidation_tests {
             }
         }
         assert_eq!(calls, 1);
+        let mut machine = torcl_compiler::t2::lower::lower(&ir);
+        assert!(
+            machine
+                .insts
+                .iter()
+                .any(|inst| { inst.op == torcl_compiler::t2::lower::op::INVOKE && inst.safepoint })
+        );
+        torcl_compiler::t2::regalloc::allocate_framed(&mut machine)
+            .expect("allocate actual source call and recovery route");
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
