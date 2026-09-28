@@ -570,7 +570,10 @@ the emergency allocation-failure contract remains an ABI installation gate.
 Before native entry, the transfer path now reserves the execution-local
 control-value map for the statically possible primary, multiple-value and
 restart-argument records. Payload extraction finds existing secondary and
-restart keys by borrowed lookup, without formatting temporary Rust strings.
+restart keys by borrowed lookup, without formatting temporary Rust strings. The
+cold capture path also reuses a pre-reserved frame-chain scratch vector, so
+validating the native cluster stack after a transfer does not grow a Rust
+container.
 The reserve failure is reported as `STORAGE-CONDITION`/`Oom` before generated
 code runs. This removes two avoidable cold-path allocations; arbitrary cleanup
 code can still allocate, and the full preallocated emergency storage path is
