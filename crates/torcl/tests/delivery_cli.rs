@@ -45,6 +45,51 @@ fn ok(output: Output) -> String {
 const BIN: &str = env!("CARGO_BIN_EXE_torcl");
 
 #[test]
+fn saved_entry_preserves_class_instances_under_gc_stress() {
+    let f = Fixture::new();
+    let core = f.path("entry.core");
+    let program = format!(
+        r#"
+      (defpackage :generic-shake (:use :cl))
+      (in-package :generic-shake)
+      (defun dead-target () :dead)
+      (defgeneric unused (x))
+      (defmethod unused ((x t)) (dead-target))
+      (defun live-target () 42)
+      (defgeneric live (x))
+      (defmethod live ((x t)) (live-target))
+      (defun method-target () 43)
+      (defgeneric method-rooted (x))
+      (defmethod method-rooted ((x t)) (method-target))
+      (set '*method* (find-method 'method-rooted nil (list (find-class 't))))
+      (defclass box () ((value :initarg :value :accessor value
+                              :reader read-value :writer write-value)))
+      (defun main ()
+        (let ((box (make-instance 'box :value 7)))
+          (funcall (intern "WRITE-VALUE" :generic-shake) 9 box)
+          (write-line
+            (if (and (= 42 (live nil))
+                     (= 43 (funcall (intern "METHOD-ROOTED" :generic-shake) nil))
+                     (eq *method* (find-method (intern "METHOD-ROOTED" :generic-shake)
+                                               nil (list (find-class 't))))
+                     (= 9 (funcall (intern "VALUE" :generic-shake) box))
+                     (= 9 (funcall (intern "READ-VALUE" :generic-shake) box))
+                     t)
+                "GENERIC-SHAKE-OK" "WRONG"))))
+      (save-lisp-and-die {core:?} :toplevel (quote generic-shake::main))
+    "#
+    );
+    ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
+    let output = Command::new(BIN)
+        .args(["--no-init", "--image", &core])
+        .env("TORCL_GC_STRESS", "1")
+        .env("TORCL_GC_POISON", "1")
+        .output()
+        .unwrap();
+    assert!(ok(output).contains("GENERIC-SHAKE-OK"));
+}
+
+#[test]
 fn delivery_distinguishes_source_functions_from_bytecode_only_functions() {
     let f = Fixture::new();
     let source = f.path("walker.lisp");

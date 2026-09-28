@@ -36424,6 +36424,9 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // never hijacked by a stale entry symbol.
     if embedded.is_some() || ca.image.is_some() {
         if let Some(top) = image_toplevel() {
+            // Unlike run_eval_env, this path enters a callable directly. Its
+            // lexical frames and multiple values must remain visible to GC.
+            torcl_rt::rooted_ref!(_entry_env_root = &mut env);
             return match apply_function(top, &[], &mut env) {
                 Ok(_) => Ok(0),
                 Err(e) => {
