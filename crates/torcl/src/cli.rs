@@ -10345,6 +10345,40 @@ fn stdlib_print_object_hook(val: TorclVal, escape: bool) -> Option<String> {
 ///
 /// `None` is returned only when no load environment is active, resolution is
 /// already re-entered, the package is unknown, or package interning fails.
+/// May a bare/qualified read take the HOMELESS bootstrap identity `idx` for `name`?
+///
+/// Either the read is in a package where those identities legitimately live, or the
+/// identity carries an actual bootstrap DEFINITION. Neither test alone works, and
+/// both failures were measured (bliss-nn6f):
+///
+/// * By PACKAGE alone: ironclad's `whirlpool.lisp` reads `CALCULATE-C-EVEN` from a
+///   non-CL package inside a `#.` during compile-file, and losing it downgrades the
+///   file to a source-only fasl.
+/// * By DEFINITION alone: names read during boot BEFORE their `defun` runs — the MOP
+///   accessors `CLASS-SLOTS` and friends — have only an UNBOUND cell at read time, so
+///   the read minted a package-local lookalike and `(fboundp 'class-slots)` went NIL.
+///
+/// And A CELL IS NOT A DEFINITION: `symbol_function` and `global_value_cell` answer
+/// `Some` for a symbol whose cell merely EXISTS holding UNBOUND, which is true of
+/// every name `boot.lisp` reads — so testing `is_some()` would admit the very
+/// lambda-list names (`A`, `VALUE`) this exists to exclude.
+///
+/// A named function rather than an inline block: as a closure inside the resolver it
+/// pushed that codegen unit over a limit where rustc referenced an internal sort
+/// helper it had not emitted, and the musl static-pie link failed with an undefined
+/// `core::slice::sort::…::insert_tail`.
+fn homeless_identity_is_shareable(env: &Env, pkg_name: &str, name: &str, idx: u32) -> bool {
+    let defined = |cell: Option<TorclVal>| {
+        cell.is_some_and(|v| v != torcl_rt::value::UNBOUND && !v.is_nil())
+    };
+    pkg_name == "COMMON-LISP"
+        || pkg_name == "COMMON-LISP-USER"
+        || is_builtin_function(name)
+        || defined(torcl_rt::symbols::symbol_function(idx))
+        || defined(global_value_cell(idx))
+        || env.macros.borrow().contains_key(name)
+}
+
 fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
@@ -10392,21 +10426,30 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 // callable by their existing bare symbol rather than minting a
                 // package-local lookalike with no builtin/function cell.
                 //
-                // This arm is WRONG for a read in a user package and is kept
-                // deliberately: boot.lisp is read in COMMON-LISP with no
-                // IN-PACKAGE, so every name it mentions — including
-                // lambda-list variables like A, N, SEQ, ACC and VALUE — is a
-                // homeless bare identity that this arm then hands to a bare
-                // read in ANY package. Restricting it to COMMON-LISP /
-                // COMMON-LISP-USER fixes that (and `(intern "A")` vs the read
-                // `a`), but it also makes ironclad's whirlpool.lisp fail its
-                // upfront compile-file read and fall back to a source-only
-                // fasl that then calls a compile-time-only function at load.
-                // See bliss-nn6f for the diagnosis and the two candidate fixes.
+                // ONLY identities that carry an actual bootstrap DEFINITION.
+                // boot.lisp is read in COMMON-LISP with no IN-PACKAGE, so every
+                // name it mentions — including lambda-list variables like A, N,
+                // SEQ, ACC and VALUE — becomes a homeless bare identity. Handing
+                // those to a bare read in ANY package is wrong three ways, all
+                // measured: `(symbol-package 'a)` in package P reported
+                // COMMON-LISP, `(eq 'a (intern "A"))` was NIL because INTERN
+                // minted a proper P::A, and two packages could not each own a
+                // variable named VALUE (bliss-nn6f).
+                //
+                // Requiring a definition is what separates the two: a
+                // lambda-list name carries none, while a bootstrap helper the
+                // arm exists for — a Rust builtin, a boot-private function or
+                // macro, a global special — carries one by the time anything
+                // reads it. Restricting by PACKAGE instead was tried and
+                // reverted: it breaks ironclad's whirlpool.lisp, whose `#.`
+                // reads CALCULATE-C-EVEN from a non-CL package during
+                // compile-file. That name has a function cell, so it still
+                // resolves here.
                 reader::find_symbol_index(name)
                     .filter(|idx| {
                         torcl_rt::symbols::symbol_package(*idx)
                             .is_some_and(|package| package.is_nil())
+                            && homeless_identity_is_shareable(env, &pkg_name, name, *idx)
                     })
                     .map(TorclVal::from_symbol_index)
             })
@@ -11964,7 +12007,21 @@ fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
 /// registries.
 fn condition_type_key(type_name: &str) -> String {
     let single = type_name.to_uppercase().replace("::", ":");
-    for qualifier in ["COMMON-LISP:", "CL:"] {
+    // COMMON-LISP's qualifier is normalized away because a CL symbol's name is
+    // ordinarily reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must be one
+    // key. TORCL-EXT's is normalized for the same reason and one more: TorCL's own
+    // extension condition types — TIMEOUT-CONDITION, INTERRUPT-CONDITION — are BUILT
+    // under their bare names (`build_condition_instance(env, "TIMEOUT-CONDITION", …)`)
+    // while users name them `torcl-ext:timeout-condition`, which is how they are
+    // documented. Keeping those two spellings apart meant a sandboxed
+    // `(handler-case (loop) (torcl-ext:timeout-condition …))` no longer caught its own
+    // timeout: the CPU deadline fired and the condition escaped unhandled. That
+    // mismatch predates this change and was masked by the reader handing both
+    // spellings the same homeless identity (bliss-nn6f).
+    //
+    // A user package's own `MYPKG:TIMEOUT-CONDITION` still stays distinct — only the
+    // two packages whose condition types TorCL itself defines are folded.
+    for qualifier in ["COMMON-LISP:", "CL:", "TORCL-EXT:"] {
         if let Some(rest) = single.strip_prefix(qualifier) {
             return rest.to_string();
         }
