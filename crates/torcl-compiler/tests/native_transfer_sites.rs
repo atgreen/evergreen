@@ -15,6 +15,8 @@ fn site(offset: u32, slot: u32) -> SysvTransferSite {
         return_offset: offset,
         stack_slots: 2,
         call_stack_adjust: 16,
+        activation_slots: 0,
+        shadow_roots: vec![],
         map: TransferCaptureMap {
             call: Inst(offset),
             machine_inst: offset as usize,
@@ -99,4 +101,73 @@ fn snapshot_cannot_capture_another_sites_frame() {
     assert!(unsafe { snapshot.write_back(0x1000, &mut capture) }.is_err());
     assert!(unsafe { snapshot.capture(0x1000, &capture) }.is_err());
     assert!(snapshot.reconstruct(|_| panic!("no floats")).is_err());
+}
+
+#[test]
+fn canonical_shadow_wins_over_stale_native_home_and_requires_owning_activation() {
+    use torcl_rt::value::TorclVal;
+    let mut emitted = site(12, 0);
+    emitted.activation_slots = 2;
+    emitted.shadow_roots = vec![(Location::Stack(StackSlot(0)), 1)];
+    let table = SysvTransferTable::new(64, vec![emitted]).unwrap();
+    let mut snapshot = table
+        .lookup(0x1000, 0x100c)
+        .unwrap()
+        .reserve_snapshot()
+        .unwrap();
+    let mut words = [0, 0, TorclVal::from_fixnum(1).to_raw(), 0];
+    let mut capture = SysvTransferCapture {
+        request: std::ptr::null_mut(),
+        value: NIL,
+        exit: NativeExit::Transfer,
+        preserved: [0; 6],
+        caller_sp: words.as_mut_ptr(),
+        return_pc: 0x100c as *const u8,
+    };
+    let activation = [NIL, TorclVal::from_fixnum(2)];
+    assert!(unsafe { snapshot.capture(0x1000, &capture) }.is_err());
+    assert!(
+        unsafe { snapshot.capture_from_activation(0x1000, &capture, &activation[..1]) }.is_err()
+    );
+    unsafe {
+        snapshot
+            .capture_from_activation(0x1000, &capture, &activation)
+            .unwrap();
+    }
+    let frames = snapshot.reconstruct(|_| panic!("no floats")).unwrap();
+    assert_eq!(
+        frames[0].locals,
+        vec![activation[1]],
+        "native home is stale"
+    );
+    unsafe {
+        snapshot.write_back(0x1000, &mut capture).unwrap();
+    }
+    assert_eq!(
+        words[2],
+        activation[1].to_raw(),
+        "repair native home after capture"
+    );
+}
+
+#[test]
+fn shadow_maps_reject_raw_words_out_of_bounds_and_ambiguous_sources() {
+    let root = Location::Stack(StackSlot(0));
+    for shadows in [
+        vec![(root, 1)],
+        vec![(root, 0), (root, 0)],
+        vec![(Location::Stack(StackSlot(1)), 0)],
+    ] {
+        let mut emitted = site(12, 0);
+        emitted.activation_slots = 1;
+        emitted.shadow_roots = shadows;
+        assert!(SysvTransferTable::new(64, vec![emitted]).is_err());
+    }
+    let mut emitted = site(12, 0);
+    emitted.activation_slots = 1;
+    emitted.shadow_roots = vec![(root, 0)];
+    emitted.map.roots.clear();
+    emitted.map.frames[0].slots[0] = SlotDescriptor::InLocation(root, Rebox::ReboxFixnum);
+    emitted.map.frames[0].live_ref_bitmap[0] = false;
+    assert!(SysvTransferTable::new(64, vec![emitted]).is_err());
 }

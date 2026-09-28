@@ -436,6 +436,20 @@ spills with and without temporary stack adjustment. This verifies the lookup
 boundary; production code ownership, complete emitter site coverage, ABI checks,
 and dispatcher integration are still required before activation.
 
+Capture also distinguishes a native home from its canonical GC shadow. A helper
+can collect and then transfer without executing the caller's normal shadow-root
+restoration, leaving saved registers/spills with stale addresses. Checked sites
+therefore carry bounded activation shadow slots for synchronized tagged roots.
+`capture_from_activation` reads those updated slots, reads raw words from their
+native homes, and rejects missing activation storage. Writeback repairs the
+native homes. The activation must remain rooted until its frame is retired.
+The execution gate forces GC inside the helper, proves that the shadow moved
+while the native register stayed stale, then collects again during reconstruction
+and checks repaired registers, stack roots and payload identity. It does not
+assume that an object already moved/tenured by the helper must move a second time.
+Production emission must derive shadow mappings from the same ordered root list
+used by its pre-call synchronization; omitted mappings must never be guessed.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

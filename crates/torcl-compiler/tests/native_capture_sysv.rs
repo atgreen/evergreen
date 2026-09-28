@@ -23,7 +23,9 @@ struct Request {
     prepare_drops: usize,
     cold_registers: [u64; 6],
     rebuilt_float: f64,
-    payload: TorclVal,
+    shadows: *mut TorclVal,
+    helper_before_gc: u64,
+    helper_after_gc: u64,
     cold_spill: u64,
     exit: NativeExit,
     table: *const SysvTransferTable,
@@ -47,9 +49,14 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     };
     let _drop = Finished(&mut request.helper_drops);
     request.anchor = native_transfer::current_segment();
+    if exit != NativeExit::Returned {
+        request.helper_before_gc = unsafe { request.shadows.read().to_raw() };
+        HeapCollector::new().minor_gc().unwrap();
+        request.helper_after_gc = unsafe { request.shadows.read().to_raw() };
+    }
     unsafe {
         out.write(NativeOutcome {
-            value: request.payload,
+            value: request.shadows.read(),
             exit,
         });
     }
@@ -67,6 +74,11 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     let _drop = Finished(&mut request.prepare_drops);
     torcl_rt::rooted!(payload = capture.value);
     request.observed = capture.preserved;
+    assert_ne!(
+        capture.preserved[0],
+        unsafe { request.shadows.read().to_raw() },
+        "helper GC left the saved native register stale before shadow restoration"
+    );
     request.return_pc = capture.return_pc as usize;
     let table = unsafe { &*request.table };
     request.origin_bcp = table
@@ -76,7 +88,10 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         .origin_bcp;
     let snapshot = unsafe { &mut *request.snapshot.cast::<SysvSiteSnapshot<'_>>() };
     unsafe {
-        snapshot.capture(request.code_base, capture).unwrap();
+        let activation = std::slice::from_raw_parts(request.shadows, 2);
+        snapshot
+            .capture_from_activation(request.code_base, capture, activation)
+            .unwrap();
     }
     torcl_rt::rooted!(
         frames = snapshot
@@ -157,6 +172,9 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
     let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)).unwrap();
     let veneer = JitBuffer::new(&emit_helper_veneer(helper, capture.as_ptr())).unwrap();
     torcl_rt::rooted!(expected = double(101.0));
+    // Model the emitter's activation shadow roots: GC updates these while the
+    // Rust helper runs, before cold capture can read the stale native homes.
+    torcl_rt::rooted!(shadows = vec![*expected, *expected]);
     let original = expected.to_raw();
     let values = [original, 102, 103, 104, 105, 106];
     let mut code = vec![0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x83, 0xec, 24];
@@ -194,12 +212,16 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
                 return_offset: first_return_offset as u32,
                 stack_slots: 2,
                 call_stack_adjust: call_adjust,
+                activation_slots: 2,
+                shadow_roots: vec![(reg, 0), (heap_spill, 1)],
                 map: first_map,
             },
             SysvTransferSite {
                 return_offset: return_offset as u32,
                 stack_slots: 2,
                 call_stack_adjust: call_adjust,
+                activation_slots: 2,
+                shadow_roots: vec![(reg, 0), (heap_spill, 1)],
                 map,
             },
         ],
@@ -222,7 +244,9 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
         prepare_drops: 0,
         cold_registers: [0; 6],
         rebuilt_float: 0.0,
-        payload: *expected,
+        shadows: shadows.as_mut_ptr(),
+        helper_before_gc: 0,
+        helper_after_gc: 0,
         cold_spill: 0,
         exit,
         table: &table,
@@ -244,6 +268,10 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
     assert_eq!(request.observed, values);
     assert_eq!(request.return_pc, caller.as_ptr() as usize + return_offset);
     assert_eq!(request.origin_bcp, 17);
+    assert_ne!(
+        request.helper_before_gc, request.helper_after_gc,
+        "helper relocated the root before capture"
+    );
     assert_eq!(request.stack_bits, 3.25f64.to_bits());
     assert_eq!(request.rebuilt_float, 3.25);
     assert_ne!(

@@ -18,6 +18,12 @@ pub struct SysvTransferSite {
     pub return_offset: u32,
     pub stack_slots: u32,
     pub call_stack_adjust: u32,
+    /// Total tagged slots in the still-rooted owning activation.
+    pub activation_slots: u16,
+    /// Native location -> canonical activation slot. A collecting helper may
+    /// have updated these shadows without restoring the native homes yet.
+    /// Emission must include every moving root synchronized before this call.
+    pub shadow_roots: Vec<(Location, u16)>,
     pub map: TransferCaptureMap,
 }
 
@@ -30,12 +36,20 @@ pub enum TransferSiteError {
     Capture(CaptureError),
     Physical(CaptureLocationError),
     WrongReturnPc,
+    InvalidShadowRoot(Location),
+    MissingActivation,
+}
+
+struct CaptureRecipe {
+    native: SysvCaptureLocation,
+    shadow_slot: Option<usize>,
 }
 
 pub struct CheckedSysvSite {
     return_offset: u32,
     map: TransferCaptureMap,
-    recipes: Vec<(Location, SysvCaptureLocation)>,
+    recipes: Vec<(Location, CaptureRecipe)>,
+    activation_slots: usize,
 }
 
 pub struct SysvTransferTable {
@@ -68,6 +82,18 @@ impl SysvTransferTable {
                 ));
             }
             let snapshot = TransferSnapshot::new(&site.map).map_err(TransferSiteError::Capture)?;
+            for (index, &(location, slot)) in site.shadow_roots.iter().enumerate() {
+                if !site.map.roots.contains(&location)
+                    || slot >= site.activation_slots
+                    || site.shadow_roots[..index]
+                        .iter()
+                        .any(|&(prior_location, prior_slot)| {
+                            prior_location == location || prior_slot == slot
+                        })
+                {
+                    return Err(TransferSiteError::InvalidShadowRoot(location));
+                }
+            }
             let mut recipes = Vec::new();
             for location in snapshot.locations() {
                 let home = match location {
@@ -84,12 +110,24 @@ impl SysvTransferTable {
                 let recipe =
                     SysvCaptureLocation::for_home(home, site.stack_slots, site.call_stack_adjust)
                         .map_err(TransferSiteError::Physical)?;
-                recipes.push((location, recipe));
+                let shadow_slot = site
+                    .shadow_roots
+                    .iter()
+                    .find(|(native, _)| *native == location)
+                    .map(|(_, slot)| usize::from(*slot));
+                recipes.push((
+                    location,
+                    CaptureRecipe {
+                        native: recipe,
+                        shadow_slot,
+                    },
+                ));
             }
             checked.push(CheckedSysvSite {
                 return_offset: site.return_offset,
                 map: site.map,
                 recipes,
+                activation_slots: usize::from(site.activation_slots),
             });
         }
         checked.sort_unstable_by_key(|site| site.return_offset);
@@ -168,17 +206,42 @@ impl SysvSiteSnapshot<'_> {
         code_base: usize,
         capture: &SysvTransferCapture,
     ) -> Result<(), TransferSiteError> {
+        unsafe { self.capture_from_activation(code_base, capture, &[]) }
+    }
+
+    /// Capture updated activation shadows for roots and native homes for raw
+    /// words. Normal-path shadow restoration has not run when a helper exits
+    /// through the veneer, so reading native root homes here can resurrect stale
+    /// pointers. Bounds and mapping checks finish before any native read.
+    ///
+    /// # Safety
+    /// Same live-frame contract as `capture`. `activation` must be the owning
+    /// activation, kept rooted across the helper and subsequent reconstruction;
+    /// its mapped shadows must contain the current values for this exact call.
+    pub unsafe fn capture_from_activation(
+        &mut self,
+        code_base: usize,
+        capture: &SysvTransferCapture,
+        activation: &[TorclVal],
+    ) -> Result<(), TransferSiteError> {
         self.snapshot.invalidate();
         self.check_pc(code_base, capture)?;
+        if activation.len() < self.site.activation_slots {
+            return Err(TransferSiteError::MissingActivation);
+        }
         unsafe {
             self.snapshot.capture(|location| {
-                self.site
+                let recipe = &self
+                    .site
                     .recipes
                     .iter()
                     .find(|(key, _)| *key == location)
                     .expect("validated descriptor location")
-                    .1
-                    .read(capture)
+                    .1;
+                match recipe.shadow_slot {
+                    Some(slot) => activation[slot].to_raw(),
+                    None => recipe.native.read(capture),
+                }
             });
         }
         Ok(())
@@ -209,6 +272,7 @@ impl SysvSiteSnapshot<'_> {
                         .find(|(key, _)| *key == location)
                         .expect("validated descriptor location")
                         .1
+                        .native
                         .write(capture, word)
                 })
                 .map_err(TransferSiteError::Capture)
