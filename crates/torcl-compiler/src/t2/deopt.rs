@@ -316,6 +316,13 @@ pub struct ReconstructedFrame {
     pub stack: Vec<TorclVal>,
 }
 
+impl torcl_rt::gc::TraceHostRoots for ReconstructedFrame {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        self.locals.trace_host_roots(visit);
+        self.stack.trace_host_roots(visit);
+    }
+}
+
 /// Reconstruct the interpreter frame from lowered deopt metadata and a machine
 /// state (spec §4.6 A4.04 steps 3 & 6). This is the round-trip inverse of
 /// [`lower_one`]: every descriptor `lower_source` produced is resolved back to a
@@ -326,25 +333,37 @@ pub struct ReconstructedFrame {
 /// * `MaterializeConst` → write the immediate directly;
 /// * `Unbound` → UNBOUND-MARKER (step 6);
 /// * `Remat` → replay the cold recipe (A4.13).
+///
+/// The machine's tagged inputs must remain rooted and its `read` operation must
+/// observe relocated values. Completed frames and the frame being constructed
+/// are rooted here because `box_double` may collect. The caller must root the
+/// returned frames before its next allocation.
 pub fn reconstruct(lowered: &LoweredDeopt, mach: &impl MachineState) -> Vec<ReconstructedFrame> {
-    lowered
-        .scopes
-        .iter()
-        .map(|scope| {
-            let mut values: Vec<TorclVal> = scope
-                .slots
-                .iter()
-                .map(|slot| eval_slot(slot, mach))
-                .collect();
-            let stack = values.split_off(scope.num_locals);
-            ReconstructedFrame {
-                function: scope.function,
-                resume_pc: scope.resume_pc,
-                locals: values,
-                stack,
+    let mut frames = Vec::with_capacity(lowered.scopes.len());
+    torcl_rt::rooted_ref!(_completed_frames = &mut frames);
+    for scope in &lowered.scopes {
+        let mut frame = ReconstructedFrame {
+            function: scope.function,
+            resume_pc: scope.resume_pc,
+            locals: Vec::with_capacity(scope.num_locals),
+            stack: Vec::with_capacity(scope.slots.len().saturating_sub(scope.num_locals)),
+        };
+        {
+            torcl_rt::rooted_ref!(_current_frame = &mut frame);
+            for (index, slot) in scope.slots.iter().enumerate() {
+                let value = eval_slot(slot, mach);
+                if index < scope.num_locals {
+                    frame.locals.push(value);
+                } else {
+                    frame.stack.push(value);
+                }
             }
-        })
-        .collect()
+        }
+        // No Lisp allocation between removing the local root and publishing
+        // this frame in the already-rooted completed-frame vector.
+        frames.push(frame);
+    }
+    frames
 }
 
 /// Resolve one lowered slot descriptor to its tagged interpreter value.

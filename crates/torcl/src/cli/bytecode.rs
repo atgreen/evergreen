@@ -21415,6 +21415,10 @@ mod direct_call_invalidation_tests {
         );
         torcl_compiler::t2::regalloc::allocate_framed(&mut machine)
             .expect("allocate actual source call and recovery route");
+        let captures = torcl_compiler::t2::transfer_map::lower_transfer_maps(&ir, &machine)
+            .expect("resolve actual source transfer captures");
+        assert_eq!(captures.len(), calls);
+        assert!(!captures[0].control_scopes.is_empty());
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]

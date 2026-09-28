@@ -362,6 +362,36 @@ fault-recovery/unwind gates, fiber migration and native-Windows execution gates 
 required before rollout. The
 adapter records TorclStack watermarks but does not restore them itself.
 
+### Generated helper outcome adapter
+
+`t2::native_transfer::emit_helper_veneer` emits an x86-64 Linux SysV adapter for
+a typed helper-v2 function `(request, outcome_out)`. The Rust helper writes an
+explicit NativeOutcome and returns normally. The adapter tests only the exit
+field: successful values, including zero and NIL, return in RAX. Transfer and
+Deopt tail-jump to a generated cold entry with `(request, value, exit)`, after
+removing only the adapter's temporary frame. The generated caller needs no
+post-call transfer check. Caller frames remain available for capture.
+
+An executable fixture runs generated caller → generated adapter → Rust helper
+→ generated cold route → segment landing, checking primary values, exit kinds,
+Rust destructor execution, and whether the caller's success continuation ran.
+Run the capability-dependent execution gate explicitly:
+
+```text
+cargo test -p torcl-compiler --test native_helper_veneer -- --include-ignored --nocapture
+```
+
+This is an adapter primitive, not production installation or a Lisp unwind
+implementation. Its test uses immediate values and has no Lisp cleanup/root
+retirement obligations. Production installation still needs typed request
+layouts, retained targets, precise call-site capture maps, rooted payloads,
+native dispatch/fallback, generated-frame unwind metadata, and converted helper
+classes. The temporary outcome slot is not a GC root; the helper must root its
+inputs across allocation, and the cold route must publish roots before its first
+allocation. There are no calls or safepoints between reading the outcome and
+entering the cold route. Win64 and other architecture veneers remain separate
+work; the ordinary pipeline continues to reject Invoke emission.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does
@@ -461,6 +491,37 @@ test. Result arguments belong only to the normal edge. Register allocation owns
 edge moves; lowering does not eagerly copy a normal result onto both paths.
 Tests check allocation and stack-map locations for exception-only locals, their
 survival across caller-saved clobbers, and a call lowered from actual Lisp source.
+
+`transfer_map::lower_transfer_maps` connects each Invoke to its TransferSite,
+ordered control scopes, and resolved FrameState slot descriptors. It reads the
+call's own operand allocations rather than a function-wide register summary or
+the later cold continuation's locations. Required tagged roots include inputs
+inside reconstruction recipes; raw unboxed words are excluded. Missing call
+allocations, missing/mismatched root maps, duplicate calls and uncomposed inlined
+scope stacks are compilation errors. This reuses deopt descriptor lowering but
+the recorded BCP is an unwind origin, never permission to replay the failed call.
+These are pre-emission maps: machine instruction indices still need native PCs,
+allocator locations still need physical save recipes, and logical function names
+still need retained executing definitions before they form installable unwind
+sites. Tests cover actual Lisp lowering as well as malformed-map rejection.
+
+`transfer_capture::TransferSnapshot` reserves storage before native entry and
+copies located words without Lisp allocation while the source frame is still
+available. It scans only tagged saved words; raw integers/floats are preserved
+as raw bits. Reconstruction roots the saved inputs and uses the shared deopt
+slot evaluator, whose in-progress and completed output frames are now also
+rooted. An explicit moving-GC regression failed before this fix with an earlier
+local retaining its old heap address. It now checks changed input/result
+addresses, completed frames surviving later boxing, and a raw word equal to an
+old heap address remaining unchanged. This proves relocation across this capture
+and reconstruction boundary, not yet across the complete emitted unwind path.
+
+The caller must root returned frames and any pending transfer payload before
+another allocation. The snapshot neither runs cleanup nor retires native root
+links; those responsibilities remain with the dispatcher. Physical register/save
+recipes still supply its capture reader. Snapshot reservation occurs before
+entry, but output reconstruction still allocates and does not yet implement the
+required emergency preparation-failure/OOM path.
 
 This path covers bytecodes already modelled by the SSA builder and ordinary
 function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide

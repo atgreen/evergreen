@@ -30,6 +30,8 @@ pub mod pass;
 /// The shared per-safepoint liveness+representation producer that the deopt
 /// export and the OSR import both read (bliss-ht4).
 pub mod slot_map;
+pub mod transfer_capture;
+pub mod transfer_map;
 
 // ── Wave 1 parcels (one module per sub-agent; disjoint files) ─────
 pub mod build; // P1 — bytecode → SSA
@@ -53,6 +55,8 @@ pub mod emit; // MachFunc → executable x86-64 bytes (spec §4.7)
 pub mod emit_a64;
 pub mod emit_ppc64le;
 pub mod emit_s390x;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub mod native_transfer;
 
 // ── Wave 3 parcels ────────────────────────────────────────────────
 pub mod opt_escape; // P4e — escape analysis + scalar replacement
