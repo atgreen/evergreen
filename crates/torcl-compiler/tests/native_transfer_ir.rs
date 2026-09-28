@@ -259,6 +259,173 @@ fn ordinary_emitter_cannot_install_transfer_calls_with_the_old_abi() {
 }
 
 #[test]
+fn capture_maps_use_each_calls_allocations_and_preserve_control_scopes() {
+    use torcl_compiler::t2::deopt::{Rebox, SlotDescriptor};
+    use torcl_compiler::t2::lower::{lower, op};
+    use torcl_compiler::t2::regalloc::allocate;
+    use torcl_compiler::t2::transfer_map::lower_transfer_maps;
+    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut machine = lower(&f);
+    allocate(&mut machine).unwrap();
+    // A function-wide location summary cannot describe split live ranges.
+    machine.allocation.clear();
+    let maps = lower_transfer_maps(&f, &machine).unwrap();
+    assert_eq!(maps.len(), 2);
+    for map in maps {
+        let call = &machine.insts[map.machine_inst];
+        assert_eq!(call.op, op::INVOKE);
+        assert_eq!(call.source_inst, Some(map.call));
+        assert_eq!(map.frames.len(), 1);
+        assert_eq!(map.frames[0].resume_pc, map.origin_bcp);
+        let source = f.frame_states.get(call.frame_state.unwrap());
+        for (slot, value) in source.scopes[0].locals.iter().enumerate() {
+            let torcl_compiler::t2::frame_state::ValueSource::Value { value, .. } = value else {
+                continue;
+            };
+            let index = call
+                .deopt_uses
+                .iter()
+                .position(|v| v.num == value.0)
+                .unwrap();
+            let location = machine.inst_allocations[map.machine_inst]
+                [call.defs.len() + call.uses.len() + index];
+            assert_eq!(
+                map.frames[0].slots[slot],
+                SlotDescriptor::InLocation(location, Rebox::None)
+            );
+            assert!(map.roots.contains(&location));
+        }
+        if map.origin_bcp == 2 {
+            assert!(
+                matches!(map.control_scopes.as_slice(), [scope] if matches!(scope.kind, ScopeKind::Block { id: 7, .. }))
+            );
+        } else {
+            assert_eq!(map.origin_bcp, 4);
+            assert!(map.control_scopes.is_empty());
+        }
+    }
+}
+
+#[test]
+fn capture_maps_reject_missing_call_roots_or_allocations() {
+    use torcl_compiler::t2::lower::{lower, op};
+    use torcl_compiler::t2::regalloc::allocate;
+    use torcl_compiler::t2::transfer_map::lower_transfer_maps;
+    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut machine = lower(&f);
+    allocate(&mut machine).unwrap();
+    let index = machine
+        .insts
+        .iter()
+        .position(|i| i.op == op::INVOKE)
+        .unwrap();
+    let allocations = std::mem::take(&mut machine.inst_allocations[index]);
+    assert!(lower_transfer_maps(&f, &machine).is_err());
+    machine.inst_allocations[index] = allocations;
+    let map = machine
+        .stack_maps
+        .iter_mut()
+        .find(|m| m.code_offset == index as u32)
+        .unwrap();
+    map.live_refs.clear();
+    assert!(
+        lower_transfer_maps(&f, &machine).is_err(),
+        "cold-route maps cannot substitute for a missing call root"
+    );
+}
+
+#[test]
+fn capture_maps_find_tagged_inputs_inside_nested_rematerialization() {
+    use torcl_compiler::t2::frame_state::{RematOp, RematRecipe, RematRecipeId, ValueSource};
+    use torcl_compiler::t2::ir::ValueRepresentation;
+    use torcl_compiler::t2::lower::lower;
+    use torcl_compiler::t2::regalloc::allocate;
+    use torcl_compiler::t2::transfer_map::lower_transfer_maps;
+    let mut f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let call = instructions(&f, Opcode::Invoke)[0];
+    let fsid = f.inst(call).frame_state.unwrap();
+    let state = f.frame_states.get_mut(fsid);
+    let input = state.scopes[0].locals[1].clone();
+    state.remat = vec![
+        RematRecipe {
+            op: RematOp::UnboxFloat,
+            inputs: vec![input],
+            result_repr: ValueRepresentation::UnboxedF64,
+        },
+        RematRecipe {
+            op: RematOp::BoxFloat,
+            inputs: vec![ValueSource::Remat(RematRecipeId(0))],
+            result_repr: ValueRepresentation::Tagged,
+        },
+    ];
+    state.scopes[0].locals[1] = ValueSource::Remat(RematRecipeId(1));
+    let mut machine = lower(&f);
+    allocate(&mut machine).unwrap();
+    let captures = lower_transfer_maps(&f, &machine).unwrap();
+    let capture = captures.iter().find(|m| m.call == call).unwrap();
+    let mi = &machine.insts[capture.machine_inst];
+    let value = f.block(f.entry()).params[1];
+    let index = mi.deopt_uses.iter().position(|v| v.num == value.0).unwrap();
+    let root =
+        machine.inst_allocations[capture.machine_inst][mi.defs.len() + mi.uses.len() + index];
+    assert!(
+        !capture.frames[0].live_ref_bitmap[1],
+        "computed slot is not itself a root"
+    );
+    assert!(
+        capture.roots.contains(&root),
+        "its nested tagged input still is"
+    );
+}
+
+#[test]
+fn capture_maps_exclude_unboxed_words_and_refuse_uncomposed_inline_scopes() {
+    use torcl_compiler::t2::frame_state::ValueSource;
+    use torcl_compiler::t2::ir::ValueRepresentation;
+    use torcl_compiler::t2::lower::lower;
+    use torcl_compiler::t2::regalloc::allocate;
+    use torcl_compiler::t2::transfer_map::{TransferMapError, lower_transfer_maps};
+    let mut f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let unboxed = f.block(f.entry()).params[1];
+    f.set_repr(unboxed, ValueRepresentation::UnboxedFixnum);
+    let states: Vec<_> = f.frame_states.iter().map(|(id, _)| id).collect();
+    for id in states {
+        for scope in &mut f.frame_states.get_mut(id).scopes {
+            for source in scope.locals.iter_mut().chain(&mut scope.stack) {
+                if let ValueSource::Value { value, repr } = source {
+                    if *value == unboxed {
+                        *repr = ValueRepresentation::UnboxedFixnum;
+                    }
+                }
+            }
+        }
+    }
+    let mut machine = lower(&f);
+    allocate(&mut machine).unwrap();
+    let captures = lower_transfer_maps(&f, &machine).unwrap();
+    for capture in &captures {
+        let mi = &machine.insts[capture.machine_inst];
+        let index = mi
+            .deopt_uses
+            .iter()
+            .position(|v| v.num == unboxed.0)
+            .unwrap();
+        let location =
+            machine.inst_allocations[capture.machine_inst][mi.defs.len() + mi.uses.len() + index];
+        assert!(
+            !capture.roots.contains(&location),
+            "raw fixnum bits must not be relocated"
+        );
+    }
+    let call = captures[0].call;
+    let fsid = f.inst(call).frame_state.unwrap();
+    let state = f.frame_states.get_mut(fsid);
+    state.scopes.insert(0, state.scopes[0].clone());
+    assert!(matches!(lower_transfer_maps(&f, &machine),
+        Err(TransferMapError::UnsupportedLogicalScopes(i)) if i == call));
+}
+
+#[test]
 fn automatic_call_routes_preserve_loop_and_osr_header_state() {
     let mut source = body();
     source.code = vec![

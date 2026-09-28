@@ -492,6 +492,19 @@ edge moves; lowering does not eagerly copy a normal result onto both paths.
 Tests check allocation and stack-map locations for exception-only locals, their
 survival across caller-saved clobbers, and a call lowered from actual Lisp source.
 
+`transfer_map::lower_transfer_maps` connects each Invoke to its TransferSite,
+ordered control scopes, and resolved FrameState slot descriptors. It reads the
+call's own operand allocations rather than a function-wide register summary or
+the later cold continuation's locations. Required tagged roots include inputs
+inside reconstruction recipes; raw unboxed words are excluded. Missing call
+allocations, missing/mismatched root maps, duplicate calls and uncomposed inlined
+scope stacks are compilation errors. This reuses deopt descriptor lowering but
+the recorded BCP is an unwind origin, never permission to replay the failed call.
+These are pre-emission maps: machine instruction indices still need native PCs,
+allocator locations still need physical save recipes, and logical function names
+still need retained executing definitions before they form installable unwind
+sites. Tests cover actual Lisp lowering as well as malformed-map rejection.
+
 This path covers bytecodes already modelled by the SSA builder and ordinary
 function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide
 integration, machine landing pads and unwind maps remain required. Existing
