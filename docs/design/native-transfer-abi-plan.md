@@ -505,6 +505,24 @@ allocator locations still need physical save recipes, and logical function names
 still need retained executing definitions before they form installable unwind
 sites. Tests cover actual Lisp lowering as well as malformed-map rejection.
 
+`transfer_capture::TransferSnapshot` reserves storage before native entry and
+copies located words without Lisp allocation while the source frame is still
+available. It scans only tagged saved words; raw integers/floats are preserved
+as raw bits. Reconstruction roots the saved inputs and uses the shared deopt
+slot evaluator, whose in-progress and completed output frames are now also
+rooted. An explicit moving-GC regression failed before this fix with an earlier
+local retaining its old heap address. It now checks changed input/result
+addresses, completed frames surviving later boxing, and a raw word equal to an
+old heap address remaining unchanged. This proves relocation across this capture
+and reconstruction boundary, not yet across the complete emitted unwind path.
+
+The caller must root returned frames and any pending transfer payload before
+another allocation. The snapshot neither runs cleanup nor retires native root
+links; those responsibilities remain with the dispatcher. Physical register/save
+recipes still supply its capture reader. Snapshot reservation occurs before
+entry, but output reconstruction still allocates and does not yet implement the
+required emergency preparation-failure/OOM path.
+
 This path covers bytecodes already modelled by the SSA builder and ordinary
 function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide
 integration, machine landing pads and unwind maps remain required. Existing

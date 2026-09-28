@@ -30,6 +30,7 @@ pub mod pass;
 /// The shared per-safepoint liveness+representation producer that the deopt
 /// export and the OSR import both read (bliss-ht4).
 pub mod slot_map;
+pub mod transfer_capture;
 pub mod transfer_map;
 
 // ── Wave 1 parcels (one module per sub-agent; disjoint files) ─────
