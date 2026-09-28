@@ -208,6 +208,93 @@ fn delivery_preserves_implicit_bootstrap_protocol_calls() {
 }
 
 #[test]
+fn delivery_restores_warmed_named_functions_without_source_dependencies() {
+    check_named_function_delivery(true, false);
+}
+
+#[test]
+fn delivery_compiles_cold_source_entry_before_specialization() {
+    check_named_function_delivery(false, false);
+}
+
+#[test]
+#[ignore = "builds a matching release runtime; requires Cargo, target toolchain and nm"]
+fn native_delivery_compiles_cold_source_without_the_walker() {
+    check_named_function_delivery(false, true);
+}
+
+fn check_named_function_delivery(warm: bool, specialized: bool) {
+    let f = Fixture::new();
+    let core = f.path("compiled-source.core");
+    let spec = f.path("compiled-source.delivery");
+    let exe = f.path("compiled-source");
+    let warmup = if warm { "(main)" } else { "" };
+    let form = format!(
+        r#"
+        (defpackage :compiled-source (:use :cl))
+        (in-package :compiled-source)
+        (defmacro compile-only () '(write-line "COMPILED-SOURCE-OK"))
+        (defun main () (compile-only))
+        (set '*saved* #'main)
+        {warmup}
+        (save-lisp-and-die {core:?})
+    "#
+    );
+    ok(Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--eval", &form])
+        .env("TORCL_LAZY_COMPILE", "1")
+        .env("TORCL_LAZY_THRESHOLD", "1")
+        .output()
+        .unwrap());
+    let policy = "version = 1\nentry = COMPILED-SOURCE::MAIN\nprune-package = COMPILED-SOURCE\ndynamic = explicit\n";
+    fs::write(&spec, format!("{policy}runtime = specialized\n")).unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--deliver",
+            &spec,
+            "--output",
+            &exe,
+            "--dry-run",
+        ],
+    ));
+    assert!(report.contains("capabilities=\n"), "{report}");
+    assert!(
+        report.contains("remove COMPILED-SOURCE::COMPILE-ONLY:"),
+        "{report}"
+    );
+    if !specialized {
+        fs::write(&spec, policy).unwrap();
+    }
+    ok(run(
+        BIN,
+        &["--image", &core, "--deliver", &spec, "--output", &exe],
+    ));
+    if specialized {
+        let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
+        assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+        assert!(
+            !symbols.contains("torcl::cli::eval_list"),
+            "tree walker remains linked"
+        );
+        assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+    }
+    for tier in ["t0", "t1", "t2"] {
+        assert_eq!(
+            ok(Command::new(&exe)
+                .arg("--no-init")
+                .env("TORCL_FORCE_TIER", tier)
+                .output()
+                .unwrap()),
+            "COMPILED-SOURCE-OK\n",
+            "{tier}"
+        );
+    }
+}
+
+#[test]
 fn delivery_prunes_compile_time_dependencies_of_compiled_methods() {
     let f = Fixture::new();
     let core = f.path("compiled-method.core");
@@ -295,7 +382,7 @@ fn saved_entry_preserves_class_instances_under_gc_stress() {
 }
 
 #[test]
-fn delivery_distinguishes_source_functions_from_bytecode_only_functions() {
+fn delivery_prepares_source_functions_and_preserves_builtin_dependencies() {
     let f = Fixture::new();
     let source = f.path("walker.lisp");
     let fasl = f.path("walker.bfasl");
@@ -311,7 +398,7 @@ fn delivery_distinguishes_source_functions_from_bytecode_only_functions() {
         ],
     ));
     for (kind, input, setup, expected) in [
-        ("source", &source, "", "capabilities=tree-walker\n"),
+        ("source", &source, "", "capabilities=\n"),
         ("bytecode", &fasl, "", "capabilities=\n"),
         (
             "saved-builtin",
@@ -1797,7 +1884,7 @@ fn native_delivery_builds_and_runs_without_decoder() {
         .output()
         .unwrap();
     let report = ok(output);
-    assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+    assert!(report.contains("capabilities=\n"), "{report}");
     assert!(report.contains("native-bytes = "));
     assert!(ok(run(&exe, &[])).contains("NATIVE-OK"));
     for (key, value) in [("TORCL_BACKEND", "treewalker"), ("TORCL_FORCE_TIER", "t2")] {
@@ -1811,6 +1898,10 @@ fn native_delivery_builds_and_runs_without_decoder() {
     let symbols = Command::new("nm").arg("-C").arg(&exe).output().unwrap();
     let symbols = ok(symbols);
     assert!(!symbols.contains("iced_x86::"), "decoder remains linked");
+    assert!(
+        !symbols.contains("torcl::cli::eval_list"),
+        "tree walker remains linked"
+    );
     assert!(
         symbols.contains("torcl::"),
         "symbol table must be present to prove removal"

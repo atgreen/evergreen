@@ -42,5 +42,6 @@ core images. See [Images and applications](../explanation/images.md).
 
 Format 5 records native runtime requirements in the Settings section. The CLI
 validates source content identity, target triple, toolchain, Cargo features,
-compiler flags, and available native capabilities before heap restoration.
+compiler flags, native capabilities, selected builtins, and available compiler
+tiers before heap restoration.
 See [native runtime specialization](../how-to/save-executable.md#specialize-the-native-runtime).

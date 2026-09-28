@@ -206,6 +206,8 @@ fn bytecode_references_with_params(
 
 struct Plan {
     builtins: std::collections::BTreeSet<String>,
+    unreachable_macro_callbacks: Vec<u64>,
+    reachable_functions: Vec<u32>,
     unreachable_setf_writers: Vec<String>,
     unreachable_macros: Vec<(u32, String)>,
     generic_candidates: BTreeMap<String, u64>,
@@ -431,6 +433,9 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 continue;
             }
             visited.insert(value.0);
+            if let Some(&owner) = macro_definitions.callback_owners.get(&value.0) {
+                queue.push_back((TorclVal::from_symbol_index(owner), reason.clone(), true));
+            }
             if let Some(name) = candidate_generic_names.get(&value.0) {
                 retained_generics.insert((*name).clone(), reason.clone());
             }
@@ -672,6 +677,20 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         unreachable_source_closures.sort_unstable();
         Plan {
             builtins,
+            unreachable_macro_callbacks: macro_definitions
+                .callback_owners
+                .iter()
+                .filter(|(_, index)| {
+                    macro_definitions.candidates.contains_key(index)
+                        && !retained.contains_key(index)
+                })
+                .map(|(&handle, _)| handle)
+                .collect(),
+            reachable_functions: functions
+                .iter()
+                .filter(|(_, function)| visited.contains(&function.0))
+                .map(|(&index, _)| index)
+                .collect(),
             unreachable_setf_writers: writer_definitions
                 .records
                 .into_iter()
@@ -708,6 +727,67 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             retained,
         }
     })
+}
+
+fn prepare_source_functions(
+    spec: &Spec,
+    entry: u32,
+    keeps: &[u32],
+    env: &mut Env,
+) -> Result<Plan, TorclError> {
+    let mut plan = analyze(spec, entry, keeps, env)?;
+    if !spec.specialized {
+        return Ok(plan);
+    }
+    let mut attempted = HashSet::new();
+    loop {
+        let mut changed = false;
+        // Stable symbol indices survive compilation and any moving collection.
+        let mut functions = plan.reachable_functions.clone();
+        functions.sort_unstable();
+        for index in functions {
+            if !attempted.insert(index) {
+                continue;
+            }
+            let Some(function) = symbols::symbol_function(index)
+                .filter(|&value| torcl_rt::function::is_interpreted_function(value))
+            else {
+                continue;
+            };
+            torcl_rt::rooted!(function = function);
+            if torcl_rt::function::name(*function).symbol_index() != Some(index)
+                || torcl_rt::function::body(*function).is_nil()
+                || bytecode::closure_captured_env(*function).is_some()
+            {
+                continue;
+            }
+            torcl_rt::rooted!(params = torcl_rt::function::lambda_list(*function));
+            torcl_rt::rooted!(body = torcl_rt::function::body(*function));
+            let name = symbols::symbol_name(index).unwrap_or_default();
+            // Even a declined compilation can expand macros and mutate the
+            // restored world. Recompute liveness after every compilation pass.
+            changed = true;
+            if !bytecode::lazy_compile_defun(index, &name, *params, *body, env)
+                || symbols::symbol_function(index) != Some(*function)
+                || bytecode::delivery_walker_dependencies().get(&index) != Some(&None)
+            {
+                continue;
+            }
+            torcl_rt::gc::with_heap_snapshot(|| {
+                // SAFETY: this is the same live function compiled above, with
+                // independently restorable bytecode and no captured frame.
+                // The stopped heap protects its source fields from readers.
+                unsafe {
+                    torcl_rt::function::redefine(*function, *params, NIL, NIL);
+                }
+            })?;
+        }
+        if !changed {
+            return Ok(plan);
+        }
+        // Macro expansion and newly compiled call edges can change liveness.
+        plan = analyze(spec, entry, keeps, env)?;
+    }
 }
 
 /// Audited native entry points with complete evaluated-argument dispatch.
@@ -790,7 +870,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     let top = symbols::intern(IMAGE_TOPLEVEL_VAR);
     symbols::set_symbol_value(top, TorclVal::from_symbol_index(entry));
     torcl_stdlib::pathnames::clear_delivery_string_caches()?;
-    let plan = analyze(&spec, entry, &keeps, env)?;
+    let plan = prepare_source_functions(&spec, entry, &keeps, env)?;
     let mut selected = native_runtime::contract();
     if !spec.specialized
         && (selected.builtins.is_some()
@@ -925,6 +1005,9 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     }
     generics::retain(env, &plan.live_clos_definitions);
     macros::retain(env, &plan.unreachable_macros);
+    for &handle in &plan.unreachable_macro_callbacks {
+        compiler_macroexpand::unregister_macro_function(TorclVal(handle));
+    }
     writers::remove(&plan.unreachable_setf_writers);
     native_runtime::with_save_contract(&selected, || {
         save_core(

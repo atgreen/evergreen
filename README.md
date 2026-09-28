@@ -31,13 +31,13 @@ instructions, and specializes dynamically typed programs as they run.
   with its libraries preloaded, restore it later, or package it as a native
   executable. The default x86-64 Linux build is fully static. See
   [saved images and executables](docs/manual/user/reference/images.md).
-- **Tree shaking from saved images.** Build smaller standalone applications by
-  removing unreachable named Lisp functions from selected packages and pruning
-  unused heap objects. Declare entry points and dynamic callbacks to retain;
-  `--dry-run` previews what stays and what goes. Optional Cargo-based native
-  specialization can also remove unused disassembly support and the tree walker
-  when retained code no longer needs source evaluation, while preserving bytecode
-  execution and native tiering. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
+- **Tree shaking of Lisp and Rust.** Deliver a saved image with unreachable
+  functions, macros, methods, closures, and heap objects removed. Supported
+  source functions can be compiled during delivery. Native specialization can
+  omit unused builtin implementations, disassembly, and the tree walker when
+  reachable code permits. Choose `max-tier = t1` to omit T2, or `max-tier = t0`
+  to omit both native compilers. Explicit retention roots and `--dry-run` explain
+  what stays and why. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
 - **Native Android applications.** Generate and package APKs with Lisp lifecycle,
   touch-input, and EGL/OpenGL ES code using `torcl-android-new`. See
   [building Android applications](docs/manual/user/how-to/android.md).
