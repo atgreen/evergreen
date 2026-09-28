@@ -179,6 +179,32 @@ allocates — makes the program compute a quietly wrong answer with no
 segfault at all. Diff the program's *output* against a non-stress run;
 don't wait for a crash.
 
+**A SMALL PROBE UNDER STRESS PROVES LESS THAN IT LOOKS — measured, bliss-c0diw.**
+The rooting was deliberately REMOVED from the LAMBDA-application site whose bug
+was once deterministic (bliss-98mu), and probes then gave identical CORRECT
+answers with and without it, under `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`, both
+for a small inline lambda and for eight levels of nested quasiquoted lambda
+applications. Collections definitely fired — `TORCL_GC_STRESS_AT=100` and `=5000`
+both reported forcing one. So the detector missed a known-real violation.
+
+Two things to know from that:
+
+- **A rooting bug is only visible if its object actually MOVED.** `minor_gc`
+  retains a nursery region *in place*, promoting it to old-gen without relocating
+  or poisoning it, when anything in it is pinned (gc.rs "Retained pinned regions
+  were promoted to old-gen in place and must NOT be zeroed", bliss-jtc.18). An
+  unrooted pointer into such a region stays valid, so whether a probe detects the
+  bug depends on which region its forms landed in — luck, not coverage.
+- **A loaded `defun`'s body is the wrong place to probe.** It has survived several
+  collections and been promoted out of the nursery, so those conses no longer
+  move at all. Build the form at runtime (`read-from-string` + `eval`) if you
+  need it in the nursery — though as above, that still is not sufficient.
+
+So treat a clean stress run as *failing to find* a bug, not as evidence there is
+none. Where it matters, add the A/B: remove the root, confirm the probe FAILS,
+put it back. A probe that cannot fail is not testing anything — and no "proved it
+under GC stress" claim is worth more than a probe that was checked this way.
+
 ## The debug torcl used to be ~9x slower after `cargo build` (FIXED)
 
 **Fixed in bliss-em8x — kept here because the symptom is memorable and you may
