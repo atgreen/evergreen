@@ -4278,16 +4278,19 @@ fn torcl_error_to_condition(
 ) -> Result<Option<TorclVal>, TorclError> {
     let name_sym = resolve_sym("NAME").unwrap_or(NIL);
     let mut condition = match error {
-        TorclError::TypeError { datum, expected } => build_condition_instance(
-            env,
-            "TYPE-ERROR",
-            &[
-                resolve_sym("DATUM").unwrap_or(NIL),
-                *datum,
-                resolve_sym("EXPECTED-TYPE").unwrap_or(NIL),
-                arena_str(expected),
-            ],
-        )?,
+        TorclError::TypeError { datum, expected } => {
+            // Build allocating siblings before copying either value into the
+            // initarg array: rooting the error does not repair an earlier copy.
+            torcl_rt::rooted!(datum = *datum);
+            torcl_rt::rooted!(expected = arena_str(expected));
+            let datum_key = resolve_sym("DATUM").unwrap_or(NIL);
+            let expected_key = resolve_sym("EXPECTED-TYPE").unwrap_or(NIL);
+            build_condition_instance(
+                env,
+                "TYPE-ERROR",
+                &[datum_key, *datum, expected_key, *expected],
+            )?
+        }
         TorclError::UnboundVariable(sym) => {
             build_condition_instance(env, "UNBOUND-VARIABLE", &[name_sym, *sym])?
         }

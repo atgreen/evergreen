@@ -81,6 +81,38 @@ mod tests {
     use super::super::*;
 
     #[test]
+    fn type_error_condition_preserves_heap_datum_identity() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env = &mut env);
+        let datum_slot = resolve_sym("DATUM").unwrap();
+        resolve_sym("NAME").unwrap();
+        resolve_sym("EXPECTED-TYPE").unwrap();
+        torcl_rt::rooted!(datum = arena_cons(T, NIL));
+        let before = datum.to_raw();
+        torcl_rt::rooted!(
+            error = TorclError::TypeError {
+                datum: *datum,
+                expected: "SYMBOL".into()
+            }
+        );
+        torcl_rt::rooted!(condition = torcl_error_to_condition(&mut env, &error).unwrap().unwrap());
+        if std::env::var("TORCL_GC_STRESS").as_deref() == Ok("1") {
+            assert_ne!(
+                datum.to_raw(),
+                before,
+                "the condition build must relocate the datum"
+            );
+        }
+        assert_eq!(
+            read_slot_value(*condition, datum_slot, &env).unwrap(),
+            *datum
+        );
+    }
+
+    #[test]
     fn catch_tags_use_object_identity_across_cleanup_and_gc() {
         let _lock = super::super::heap_test_lock()
             .lock()
