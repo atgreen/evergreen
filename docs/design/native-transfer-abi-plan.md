@@ -477,6 +477,18 @@ The analysis is conservative: cold target edges establish possible scope state,
 not proof that a cleanup will complete normally. Actual native control flow must
 run required cleanups and respect a cleanup's replacement transfer before
 reaching an exit target. T2 still declines cleanup bytecodes until that lowering
-exists. Condition and restart clusters remain explicitly unsupported by this
-analysis. Automatic Invoke construction and attaching scope maps to installed
-native code remain required before native dispatch.
+exists. Full-function analysis reads condition/restart tables: HANDLER-CASE
+clause entry removes the selected cluster, HANDLER-BIND remains active while
+signaling can return, and a delivered restart result resumes outside its
+cluster. Inherited OSR entry preserves those exceptional destinations and outer
+owners. The instruction-only API refuses table-dependent scopes instead of
+guessing their destinations. Table indices, clause targets, condition slots,
+and matching cluster pops are checked.
+
+Special bindings and captured lexical environments are also ordered logical
+records. Normal LET* teardown may remove bindings and child environments from
+their separate runtime stacks; lexical exits report both in restoration order.
+Cleanups retain any surrounding bindings until unwinding crosses them.
+Automatic Invoke construction and attaching scope maps to installed native code
+remain required before native dispatch; this analysis does not enable emission
+of currently unsupported protected forms.
