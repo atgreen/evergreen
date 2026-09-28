@@ -25,6 +25,11 @@ class ResultTests(unittest.TestCase):
     def test_no_winner_for_a_tie(self):
         self.assertEqual(run.comparison(1, 1), ('Tie', 1))
 
+    def test_parse_perf_instruction_counts_and_ignores_uncounted_rows(self):
+        stderr = ('100,,cpu_core/instructions/u,1,2.0,,\n'
+                   '<not counted>,,cpu_atom/instructions/u,0,0.0,,\n')
+        self.assertEqual(run.parse_instructions(stderr), 100)
+
 class ReportTests(unittest.TestCase):
     def test_report_escapes_metadata_and_shows_the_actual_winner(self):
         import json

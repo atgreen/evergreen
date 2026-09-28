@@ -80,6 +80,26 @@ def summarize(samples):
                 iqr_seconds=q3-q1, min_seconds=min(samples), max_seconds=max(samples))
 
 
+def parse_instructions(stderr):
+    """Read counted retired-instruction rows from `perf stat -x,` output."""
+    counts = []
+    for line in stderr.splitlines():
+        match = re.match(r'\s*([0-9][0-9,]*),,([^,]*instructions[^,]*),', line)
+        if match:
+            counts.append(int(match.group(1).replace(',', '')))
+    if not counts:
+        raise ValueError('perf did not report a counted instruction event')
+    return sum(counts)
+
+
+def summarize_instructions(samples):
+    if not samples:
+        return None
+    q1, _, q3 = statistics.quantiles(samples, method='inclusive')
+    return dict(samples=samples, median=statistics.median(samples),
+                iqr=q3-q1, min=min(samples), max=max(samples))
+
+
 def comparison(torcl, sbcl):
     if torcl == sbcl:
         return 'Tie', 1
@@ -107,12 +127,21 @@ def render(data):
         maximum = max(a['median_seconds'], b['median_seconds'])
         bars = ''.join(f'<div class="bar-row"><b>{name}</b><div class="track"><div class="bar {name.lower()}" style="width:{100*s["median_seconds"]/maximum:.2f}%"></div></div><span>{1000*s["median_seconds"]:.3f} ms</span></div>' for name, s in [('TorCL', a), ('SBCL', b)])
         rows = ''.join(f'<tr><th>{name}</th><td>{1000*s["median_seconds"]:.3f}</td><td>{1000*s["iqr_seconds"]:.3f}</td><td>{esc(", ".join(f"{x*1000:.3f}" for x in s["samples_seconds"]))}</td></tr>' for name, s in [('TorCL', a), ('SBCL', b)])
+        instruction_html = ''
+        if a.get('instructions') and b.get('instructions'):
+            instruction_html = (
+                '<p class="muted">Retired instructions are process-wide '
+                '(including startup and compilation): '
+                f'TorCL median {a["instructions"]["median"]:,}, '
+                f'SBCL median {b["instructions"]["median"]:,}. '
+                'They are supplemental to the in-Lisp throughput timer.</p>'
+            )
         tier_html = ''
         if case.get('tier_evidence'):
             deopts = [record['deoptimizations'] for record in case['tier_evidence']]
             tier_html = f'<p class="muted">T2 verified before and after every TorCL sample: {esc(", ".join(case["hot_functions"]))}. Timed deoptimizations per sample: {esc(str(deopts))}.</p>'
         verdict = 'Equal medians' if winner == 'Tie' else f'{winner} {ratio:.2f}× faster'
-        cards.append(f'<article><div class="eyebrow">{esc(case["category"])}</div><h2>{esc(case["title"])}</h2><p>{esc(case["description"])}</p><strong class="verdict">{verdict}</strong>{bars}{tier_html}<p class="muted">Lower is better · identical workload · checksum {case["expected"]:,} verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody>{rows}</tbody></table></div></details></article>')
+        cards.append(f'<article><div class="eyebrow">{esc(case["category"])}</div><h2>{esc(case["title"])}</h2><p>{esc(case["description"])}</p><strong class="verdict">{verdict}</strong>{bars}{tier_html}{instruction_html}<p class="muted">Lower is better · identical workload · checksum {case["expected"]:,} verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody>{rows}</tbody></table></div></details></article>')
     meta = data['metadata']
     return '''<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -131,6 +160,10 @@ def main():
     parser.add_argument('--cpu', type=int, default=min(os.sched_getaffinity(0)))
     parser.add_argument('--output', type=Path, default=HERE/'results')
     parser.add_argument('--case', action='append', help='Select case IDs (repeatable)')
+    parser.add_argument('--instructions', action='store_true',
+                        help='Collect process-wide retired instructions with perf')
+    parser.add_argument('--perf-event', default='cpu_atom/instructions/',
+                        help='perf event used by --instructions')
     args = parser.parse_args()
     if args.samples < 5:
         parser.error('At least five samples are required')
@@ -161,10 +194,12 @@ def main():
                          'binaries':{name:{'path':str(path),'sha256':sha256(path)} for name,path in binaries.items()},
                          'sbcl_version':command_output([str(binaries['SBCL']), '--version']),
                          'sources': {p.name:sha256(p) for p in sorted(HERE.glob('*.lisp'))},
-                         'runner_sha256':sha256(__file__), 'cases_sha256':sha256(HERE/'cases.json')},
+                         'runner_sha256':sha256(__file__), 'cases_sha256':sha256(HERE/'cases.json'),
+                         **({'instruction_event': args.perf_event} if args.instructions else {})},
             'benchmarks':[]}
     for case in cases:
         measurements = {'TorCL':[], 'SBCL':[]}
+        instruction_measurements = {'TorCL':[], 'SBCL':[]}
         tier_evidence = []
         source = '(declaim (optimize (speed 3) (safety 1) (debug 0)))\n' + (HERE/case['source']).read_text()
         source += f'''\n(bench-validate)
@@ -191,21 +226,33 @@ def main():
                         form = f'(multiple-value-bind (file warnings failure) (compile-file {lisp_string(script)} :output-file {lisp_string(fasl)}) (declare (ignore warnings)) (when failure (error "Compilation failed")) (load file))'
                         invocation = [str(binaries[name]), '--noinform','--no-sysinit','--no-userinit','--non-interactive','--eval',form]
                     command = [str(ROOT/'scripts/torcl-limited.sh'), 'taskset','-c',str(args.cpu),*invocation]
-                    result = subprocess.run(command, env=env, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    (out/f'{case["id"]}-{name.lower()}-{sample+1}.log').write_text(result.stdout)
+                    measured_command = command
+                    if args.instructions:
+                        measured_command = ['perf', 'stat', '-x,', '-e', args.perf_event,
+                                            '--', *command]
+                    result = subprocess.run(measured_command, env=env, cwd=ROOT, text=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    combined_output = result.stdout + result.stderr
+                    (out/f'{case["id"]}-{name.lower()}-{sample+1}.log').write_text(combined_output)
                     if result.returncode:
                         raise RuntimeError(f'{case["id"]} {name} exited {result.returncode}; see {out}')
-                    seconds = parse_result(result.stdout, case['expected'])
+                    seconds = parse_result(combined_output, case['expected'])
+                    if args.instructions:
+                        instruction_measurements[name].append(parse_instructions(result.stderr))
                     if name == 'TorCL':
-                        evidence = parse_tiers(result.stdout, case['hot_functions'])
-                        deopts = re.findall(r'^BENCH-DEOPTS (\d+)$', result.stdout, re.MULTILINE)
+                        evidence = parse_tiers(combined_output, case['hot_functions'])
+                        deopts = re.findall(r'^BENCH-DEOPTS (\d+)$', combined_output, re.MULTILINE)
                         if len(deopts) != 1:
                             raise ValueError('Missing deoptimization evidence')
                         evidence['deoptimizations'] = int(deopts[0])
                         tier_evidence.append(evidence)
                     measurements[name].append(seconds)
                     print(f'{case["id"]} {name} {sample+1}/{args.samples}: {seconds:.6f}s', flush=True)
-        data['benchmarks'].append({**case, 'tier_evidence':tier_evidence, 'results':{name:summarize(values) for name,values in measurements.items()}})
+        results = {name:summarize(values) for name,values in measurements.items()}
+        if args.instructions:
+            for name, values in instruction_measurements.items():
+                results[name]['instructions'] = summarize_instructions(values)
+        data['benchmarks'].append({**case, 'tier_evidence':tier_evidence, 'results':results})
     (out/'results.json').write_text(json.dumps(data, indent=2)+'\n')
     (out/'index.html').write_text(render(data))
     print(f'Report: {out / "index.html"}')

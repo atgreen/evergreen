@@ -6,9 +6,10 @@ This showcase complements the regression suite in `tests/benchmarks/`.
 
 [Open the checked-in sample HTML report](sample-report/index.html).
 The current sample report is generated from native-transfer ABI milestone
-`3dfac001`. Five alternating samples measure Fibonacci at 29 ms on TorCL versus
-57 ms on SBCL, and the Ironclad POWER-MOD kernel at 505 ms versus 10 ms. Every
-TorCL sample passed the T2 and checksum gates; these are local measurements,
+`a46395a2`. Five alternating samples measure Fibonacci at 33 ms on TorCL versus
+56 ms on SBCL, and the Ironclad POWER-MOD kernel at 527 ms versus 10 ms. The
+report also records process-wide retired-instruction counts from `perf`; every
+TorCL sample passed the T2 and checksum gates. These are local measurements,
 not a universal performance claim.
 
 The sample report verifies T2 before and after every measured TorCL kernel
@@ -23,6 +24,10 @@ TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh \
   cargo build --release -p torcl --bin torcl
 python3 benchmarks/run.py --cpu 0
 ```
+
+Add `--instructions` to collect process-wide retired-instruction counts with
+Linux `perf`; the HTML labels these separately because startup and compilation
+are included, while the Lisp timer measures only the warmed workload.
 
 Open `benchmarks/results/index.html`. No server, JavaScript, external fonts, or
 network access is needed to view the report. `results.json` contains all samples,
