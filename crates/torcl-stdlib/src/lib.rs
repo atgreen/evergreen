@@ -4,6 +4,12 @@
 //! generic sequences, hash tables, FORMAT / pretty-printer,
 //! pathnames, and developer tools (REPL, debugger, profiler, SWANK).
 
+/// Cargo features that must survive a specialized CLI rebuild.
+pub const RUNTIME_BUILD_FEATURES: &[&str] = &[
+    #[cfg(feature = "python")]
+    "torcl-stdlib/python",
+];
+
 mod ansi_symbols;
 
 /// Unit fixtures that reset the shared heap or CLOS definitions must not
@@ -27,6 +33,7 @@ pub mod conditions;
 
 // ── Streams ───────────────────────────────────────────────────────
 pub mod ffi;
+pub mod fibers;
 pub mod process;
 pub mod streams;
 pub mod synchronization;

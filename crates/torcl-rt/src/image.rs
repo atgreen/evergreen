@@ -128,7 +128,8 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"TORCLIMG");
 // Version 3 preserves compiled-method associations in the host registry. Version
 // 2 added opaque MUTEX handles with nulled native pointers. Both older layouts
 // remain readable; absent method associations use interpreted dispatch.
-const FORMAT_VERSION: u32 = 4;
+// Version 5 carries native runtime requirements, validated before restoration.
+const FORMAT_VERSION: u32 = 5;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
@@ -185,6 +186,25 @@ pub enum SectionType {
 /// outside `torcl-rt` (macros, setf, CLOS). The serializer returns an opaque
 /// blob; the deserializer restores it AFTER the heap/symbols/packages are back,
 /// so it may use `gc::remap_saved_pointer`.
+/// Cargo features that must survive a specialized CLI rebuild.
+pub const RUNTIME_BUILD_FEATURES: &[&str] = &[
+    #[cfg(feature = "c-ffi")]
+    "torcl-rt/c-ffi",
+    #[cfg(feature = "python")]
+    "torcl-rt/python",
+];
+
+type RuntimeSerializeHook = fn() -> Vec<u8>;
+type RuntimeValidateHook = fn(Option<&[u8]>) -> Result<(), TorclError>;
+static RUNTIME_HOOKS: std::sync::Mutex<Option<(RuntimeSerializeHook, RuntimeValidateHook)>> =
+    std::sync::Mutex::new(None);
+
+/// Install runtime compatibility metadata and pre-restoration validation.
+/// The validator runs before heap or host-registry mutation.
+pub fn set_runtime_contract_hooks(save: RuntimeSerializeHook, validate: RuntimeValidateHook) {
+    *RUNTIME_HOOKS.lock().unwrap() = Some((save, validate));
+}
+
 type HostSerializeHook = fn() -> Vec<u8>;
 type HostRestoreHook = fn(&[u8]) -> Result<(), TorclError>;
 static HOST_SERIALIZE: std::sync::Mutex<Option<HostSerializeHook>> = std::sync::Mutex::new(None);
@@ -469,6 +489,20 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, TorclError> {
 ///
 /// Per R7.20 the write is atomic: we write to a temp file then rename.
 pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclError> {
+    save_image_impl(path, options, false)
+}
+
+/// Save an application-delivery image, omitting unreachable objects even when
+/// restored-world pinning prevents the collector from reclaiming their regions.
+pub fn save_reachable_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclError> {
+    crate::gc::with_heap_snapshot(|| save_image_impl(path, options, true))?
+}
+
+fn save_image_impl(
+    path: &str,
+    options: &SaveImageOptions,
+    reachable_only: bool,
+) -> Result<(), TorclError> {
     let _permit = SavePermit::acquire()?;
     use std::io::Write;
 
@@ -491,7 +525,13 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
 
     // Build the heap section: first 8 bytes are the entry continuation,
     // followed by serialised heap objects from gc::serialize_heap_objects().
-    let serialized_objects = crate::gc::serialize_heap_objects();
+    let serialized_objects = if reachable_only {
+        // SAFETY: save_reachable_image holds the stopped-world snapshot for
+        // this entire save; serialization performs no Lisp allocations.
+        unsafe { crate::gc::serialize_reachable_heap_objects()? }
+    } else {
+        crate::gc::serialize_heap_objects()
+    };
     let mut heap_data_raw: Vec<u8> = Vec::new();
     heap_data_raw.extend_from_slice(&entry_val.to_raw().to_ne_bytes());
     heap_data_raw.extend_from_slice(&serialized_objects);
@@ -576,7 +616,15 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
     };
 
     // Sections: Heap, Symbols, Packages, Code, Reloc, GcMeta, HostRegistries, OffHeap
-    let section_count: u32 = 8;
+    let runtime_hooks = *RUNTIME_HOOKS.lock().unwrap();
+    let settings_raw = runtime_hooks.map(|(save, _)| save()).unwrap_or_default();
+    let settings_size = settings_raw.len();
+    let settings_data = if use_compression {
+        compress_data(&settings_raw)
+    } else {
+        settings_raw
+    };
+    let section_count: u32 = 9;
 
     // Page alignment constant (4 KiB) — §7.2.2 requires sections after
     // the directory to be page-aligned to allow mmap with MAP_FIXED (R7.02).
@@ -669,6 +717,15 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
         uncompressed_size: offheap_uncompressed_size as u64,
     };
 
+    current_offset = align_to_page(current_offset + offheap_data.len());
+    let settings_section = SectionEntry {
+        section_type: SectionType::Settings as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: settings_data.len() as u64,
+        uncompressed_size: settings_size as u64,
+    };
+
     // Get the actual heap base address for relocation tracking (R7.03).
     let original_base = crate::gc::heap_base_address();
     let gc_generation = crate::gc::gc_generation();
@@ -716,6 +773,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
             gc_meta_section,
             host_section,
             offheap_section,
+            settings_section,
         ];
         for section in &sections {
             let section_bytes = struct_to_bytes(section);
@@ -727,7 +785,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
         // Write section data with page-alignment padding between sections.
         // Each section's file_offset was computed with page alignment, so
         // we pad to match those offsets.
-        let section_data_slices: [&[u8]; 8] = [
+        let section_data_slices: [&[u8]; 9] = [
             &heap_data,
             &symbol_data,
             &package_data,
@@ -736,6 +794,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), TorclErr
             &gc_meta_data,
             &host_data,
             &offheap_data,
+            &settings_data,
         ];
         let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
         for (idx, data) in section_data_slices.iter().enumerate() {
@@ -882,6 +941,7 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<TorclVal, TorclError> {
 
     // Collect all sections first so we can process them in the right order.
     // We need the relocation table before restoring the heap if bases differ.
+    let mut settings_entry: Option<SectionEntry> = None;
     let mut heap_entry: Option<SectionEntry> = None;
     let mut symbol_entry: Option<SectionEntry> = None;
     let mut package_entry: Option<SectionEntry> = None;
@@ -897,6 +957,13 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<TorclVal, TorclError> {
             .ok_or_else(|| TorclError::InvalidImage(format!("cannot parse section entry {}", i)))?;
 
         match entry.section_type {
+            t if t == SectionType::Settings as u32 => {
+                if settings_entry.replace(entry).is_some() {
+                    return Err(TorclError::InvalidImage(
+                        "duplicate runtime settings section".into(),
+                    ));
+                }
+            }
             t if t == SectionType::Heap as u32 => heap_entry = Some(entry),
             t if t == SectionType::Symbols as u32 => symbol_entry = Some(entry),
             t if t == SectionType::Packages as u32 => package_entry = Some(entry),
@@ -909,6 +976,19 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<TorclVal, TorclError> {
                 // Unknown section type — skip for forward compatibility.
             }
         }
+    }
+
+    let settings = settings_entry
+        .as_ref()
+        .map(&read_section_data)
+        .transpose()?;
+    let runtime_hooks = *RUNTIME_HOOKS.lock().unwrap();
+    if let Some((_, validate)) = runtime_hooks {
+        validate(settings.as_deref().filter(|bytes| !bytes.is_empty()))?;
+    } else if settings.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+        return Err(TorclError::InvalidImage(
+            "image requires a runtime contract validator".into(),
+        ));
     }
 
     // Read the relocation table first — needed before heap restore if bases differ.

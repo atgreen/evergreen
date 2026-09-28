@@ -378,3 +378,27 @@ fn runtime_init_zero_workers_is_error() {
         "Runtime::init with num_workers=0 should return Err"
     );
 }
+
+#[test]
+fn stack_guard_registry_grows_beyond_one_chunk() {
+    serialize_runtime!();
+    let ranges: Vec<_> = (0..300).map(|i| 0x4000_0000usize + i * 8192).collect();
+    for &base in &ranges {
+        register_sigsegv_stack_guard_range(base, 4096);
+    }
+    let recognized = ranges
+        .iter()
+        .all(|&base| classify_sigsegv_address(base + 2048) == SigsegvFaultKind::StackGuard);
+    for &base in &ranges {
+        unregister_sigsegv_stack_guard_range(base);
+    }
+    assert!(
+        recognized,
+        "every registered guard must remain recognizable"
+    );
+    assert!(
+        ranges
+            .iter()
+            .all(|&base| classify_sigsegv_address(base + 2048) == SigsegvFaultKind::Ordinary)
+    );
+}

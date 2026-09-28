@@ -590,9 +590,9 @@ bind its own debugger hook independently.
   will use that thread's handlers.
 - `*DEBUGGER-HOOK*` is a thread-local special variable; binding it in one
   thread does not affect other threads.
-- The pre-allocated `STORAGE-CONDITION` pool (D5.13) is thread-local; each
-  thread claims an instance from its own pool with an atomic compare-and-swap
-  (bliss-wzw), so OOM signalling is thread-safe with no cross-thread contention.
+- The pre-allocated `STORAGE-CONDITION` pool (D5.13) is process-wide;
+  native threads and fibers claim an instance with an atomic compare-and-swap,
+  so OOM signalling stays allocation-free and claims survive fiber migration.
   A `release` returns the slot; total exhaustion falls back deterministically to
   a shared slot rather than failing.
 

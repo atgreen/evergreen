@@ -687,10 +687,29 @@ static SIGSEGV_STACK_GUARD_RECEIVED_SLOTS: [std::sync::atomic::AtomicBool; SIGSE
 static SIGSEGV_NULL_GUARD_RECEIVED_SLOTS: [std::sync::atomic::AtomicBool; SIGSEGV_RECOVERY_SLOTS] =
     [const { std::sync::atomic::AtomicBool::new(false) }; SIGSEGV_RECOVERY_SLOTS];
 const SIGSEGV_STACK_GUARD_SLOTS: usize = 128;
-static SIGSEGV_STACK_GUARD_ADDRS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
-static SIGSEGV_STACK_GUARD_LENS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
+struct StackGuardChunk {
+    addresses: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS],
+    lengths: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS],
+    next: std::sync::atomic::AtomicPtr<StackGuardChunk>,
+}
+impl StackGuardChunk {
+    const fn new() -> Self {
+        Self {
+            addresses: [const { std::sync::atomic::AtomicUsize::new(0) };
+                SIGSEGV_STACK_GUARD_SLOTS],
+            lengths: [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS],
+            next: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+    fn next(&self) -> Option<&'static Self> {
+        let next = self.next.load(std::sync::atomic::Ordering::Acquire);
+        // Chunks are published once and never freed: signal handlers can walk
+        // them without a lock, allocator, or reclamation handshake.
+        unsafe { next.as_ref() }
+    }
+}
+static STACK_GUARDS: StackGuardChunk = StackGuardChunk::new();
+static STACK_GUARD_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(unix)]
 thread_local! {
     static SIGNAL_ALT_STACK: RefCell<Option<SignalStack>> = const { RefCell::new(None) };
@@ -1042,38 +1061,52 @@ pub fn register_sigsegv_stack_guard_range(addr: usize, len: usize) {
     if addr == 0 || len == 0 {
         return;
     }
-
-    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
-        if SIGSEGV_STACK_GUARD_ADDRS[i].load(std::sync::atomic::Ordering::Relaxed) == addr {
-            SIGSEGV_STACK_GUARD_LENS[i].store(len, std::sync::atomic::Ordering::Release);
-            return;
+    let _writer = STACK_GUARD_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut chunk = &STACK_GUARDS;
+    let mut vacant = None;
+    loop {
+        for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+            let old = chunk.addresses[i].load(std::sync::atomic::Ordering::Relaxed);
+            if old == addr {
+                chunk.lengths[i].store(len, std::sync::atomic::Ordering::Release);
+                return;
+            }
+            if old == 0 && vacant.is_none() {
+                vacant = Some((chunk, i));
+            }
+        }
+        if let Some(next) = chunk.next() {
+            chunk = next;
+        } else {
+            break;
         }
     }
-
-    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
-        if SIGSEGV_STACK_GUARD_ADDRS[i]
-            .compare_exchange(
-                0,
-                addr,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            SIGSEGV_STACK_GUARD_LENS[i].store(len, std::sync::atomic::Ordering::Release);
-            return;
-        }
-    }
+    let (target, i) = vacant.unwrap_or_else(|| {
+        let next = Box::leak(Box::new(StackGuardChunk::new()));
+        chunk.next.store(next, std::sync::atomic::Ordering::Release);
+        (&*next, 0)
+    });
+    target.addresses[i].store(addr, std::sync::atomic::Ordering::Relaxed);
+    target.lengths[i].store(len, std::sync::atomic::Ordering::Release);
 }
 
 pub fn unregister_sigsegv_stack_guard_range(addr: usize) {
     if addr == 0 {
         return;
     }
-    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
-        if SIGSEGV_STACK_GUARD_ADDRS[i].load(std::sync::atomic::Ordering::Relaxed) == addr {
-            SIGSEGV_STACK_GUARD_LENS[i].store(0, std::sync::atomic::Ordering::Release);
-            SIGSEGV_STACK_GUARD_ADDRS[i].store(0, std::sync::atomic::Ordering::Relaxed);
+    let _writer = STACK_GUARD_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut chunk = &STACK_GUARDS;
+    loop {
+        for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+            if chunk.addresses[i].load(std::sync::atomic::Ordering::Relaxed) == addr {
+                chunk.lengths[i].store(0, std::sync::atomic::Ordering::Release);
+                chunk.addresses[i].store(0, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        if let Some(next) = chunk.next() {
+            chunk = next;
+        } else {
             return;
         }
     }
@@ -1527,20 +1560,26 @@ fn sigsegv_stack_guard_recovery_ip_for_tid(tid: usize) -> usize {
 }
 
 fn sigsegv_stack_guard_contains(addr: usize) -> bool {
-    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
-        let len = SIGSEGV_STACK_GUARD_LENS[i].load(std::sync::atomic::Ordering::Acquire);
-        if len == 0 {
-            continue;
+    let mut chunk = &STACK_GUARDS;
+    loop {
+        for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+            let len = chunk.lengths[i].load(std::sync::atomic::Ordering::Acquire);
+            if len == 0 {
+                continue;
+            }
+            let base = chunk.addresses[i].load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(end) = base.checked_add(len) {
+                if addr >= base && addr < end {
+                    return true;
+                }
+            }
         }
-        let base = SIGSEGV_STACK_GUARD_ADDRS[i].load(std::sync::atomic::Ordering::Relaxed);
-        let Some(end) = base.checked_add(len) else {
-            continue;
-        };
-        if addr >= base && addr < end {
-            return true;
+        if let Some(next) = chunk.next() {
+            chunk = next;
+        } else {
+            return false;
         }
     }
-    false
 }
 
 #[cfg(unix)]
@@ -1553,7 +1592,7 @@ fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
     unsafe { core::ptr::read_unaligned((info as *const u8).add(16) as *const usize) }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(unix, target_arch = "x86_64"))]
 fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     if context.is_null() {
         return false;
@@ -1571,7 +1610,7 @@ fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     true
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(unix, not(target_arch = "x86_64")))]
 fn rewrite_ucontext_ip(_context: *mut core::ffi::c_void, _ip: usize) -> bool {
     false
 }

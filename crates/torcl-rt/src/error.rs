@@ -76,6 +76,18 @@ pub enum TorclError {
     /// carries the evaluator's live control-flow tokens and must keep propagating.
     ControlError(String),
 
+    /// Python raised. Maps to `PY:ERROR`, carrying the exception's type, message,
+    /// Python frames and the exception object itself.
+    ///
+    /// A variant rather than an `FfiError` string because a Python failure is a
+    /// first-class condition with structure a caller can inspect — `(py:error-kind
+    /// e)`, `(py:error-frames e)` — and because the mixed-language backtrace needs
+    /// the frames, which a formatted string has already thrown away. Gated on the
+    /// feature that provides the payload; the enum is `#[non_exhaustive]`, so a
+    /// build without it simply has one fewer variant.
+    #[cfg(feature = "python")]
+    PythonRaised(Box<crate::python::Raise>),
+
     /// A condition-denoting raw error that has ALREADY been signalled through the
     /// live handler stack (bliss-9kc) and declined by every handler. Carries the
     /// built condition (so it stays reachable/traced) plus a pre-rendered report
@@ -121,6 +133,18 @@ impl core::fmt::Display for TorclError {
             TorclError::FileError(msg) => write!(f, "file error: {}", msg),
             TorclError::SandboxViolation(msg) => write!(f, "sandbox violation: {}", msg),
             TorclError::ControlError(msg) => write!(f, "control error: {}", msg),
+            #[cfg(feature = "python")]
+            TorclError::PythonRaised(raise) => {
+                // The frames belong here too: this is the form an UNCAUGHT Python
+                // error takes on the way out, which is exactly where a reader wants
+                // to see where in Python it happened.
+                write!(f, "{}: {}", raise.kind, raise.message)?;
+                let frames = raise.render_frames();
+                if !frames.is_empty() {
+                    write!(f, "\n{}", frames.trim_end())?;
+                }
+                Ok(())
+            }
             TorclError::Signalled { report, .. } => write!(f, "{}", report),
         }
     }

@@ -2235,28 +2235,29 @@ fn fits_fixnum(n: i64) -> bool {
     (MIN..=MAX).contains(&n)
 }
 
-thread_local! {
-    /// CLHS `*READ-DEFAULT-FLOAT-FORMAT*` as seen by the reader: `true` means
-    /// DOUBLE-FLOAT (or LONG-FLOAT, which torcl identifies with double). The
-    /// host resolves the dynamic variable and sets this before each toplevel
-    /// read (bliss-un1x); marker-less and e/E-marked literals read in this
-    /// format (CLHS 2.3.2.2 — `e` selects the DEFAULT format, not single).
-    static READ_DEFAULT_FLOAT_DOUBLE: core::cell::Cell<bool> =
-        const { core::cell::Cell::new(false) };
-}
+/// CLHS `*READ-DEFAULT-FLOAT-FORMAT*` as seen by the reader: `true` means
+/// DOUBLE-FLOAT (or LONG-FLOAT, which torcl identifies with double). The
+/// host resolves the dynamic variable and sets this before each toplevel
+/// read (bliss-un1x); marker-less and e/E-marked literals read in this
+/// format (CLHS 2.3.2.2 — `e` selects the DEFAULT format, not single).
+static READ_DEFAULT_FLOAT_DOUBLE: torcl_rt::execution_local::ExecutionLocal<
+    core::cell::Cell<bool>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { core::cell::Cell::new(false) })
+};
 
 /// Set the reader's view of `*READ-DEFAULT-FLOAT-FORMAT*`: `true` = doubles.
 pub fn set_read_default_float_double(double: bool) {
     READ_DEFAULT_FLOAT_DOUBLE.with(|c| c.set(double));
 }
 
-thread_local! {
-    /// CLHS `*READ-SUPPRESS*`. When true, the reader parses a form's syntax and
-    /// discards it: no symbol interning, no `#.` read-eval, no object building —
-    /// the result is always NIL, but the full form's characters are consumed.
-    /// The host resolves the dynamic variable and sets this around each read.
-    static READ_SUPPRESS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-}
+/// CLHS `*READ-SUPPRESS*`. When true, the reader parses a form's syntax and
+/// discards it: no symbol interning, no `#.` read-eval, no object building —
+/// the result is always NIL, but the full form's characters are consumed.
+/// The host resolves the dynamic variable and sets this around each read.
+static READ_SUPPRESS: torcl_rt::execution_local::ExecutionLocal<core::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { core::cell::Cell::new(false) })
+};
 
 /// Set the reader's view of `*READ-SUPPRESS*`.
 pub fn set_read_suppress_flag(suppress: bool) {

@@ -117,6 +117,17 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
         for (pos, &inst) in bd.insts.iter().enumerate() {
             let data = f.inst(inst);
             let is_term = data.opcode.is_terminator();
+            if data.opcode == Opcode::Invoke
+                && (data.targets.len() != 2
+                    || data.targets[0].block == data.targets[1].block
+                    || !data.flags.call
+                    || !data.flags.effectful
+                    || !data.flags.safepoint
+                    || !matches!(data.aux, AuxData::CallTarget(_)))
+            {
+                errors.push(VerifyError::new("V11 invoke-shape",
+                    format!("block{bi} Invoke requires distinct normal/exceptional edges and call effects")));
+            }
             if is_term {
                 term_positions.push(pos);
             } else if !data.targets.is_empty() {
@@ -228,6 +239,9 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
         let def_loc = |v: Value| -> Option<DefLoc> {
             match f.value(v).def {
                 ValueDef::Param { block, .. } => Some(DefLoc { block, pos: None }),
+                // An Invoke result exists only on its successful edge. Users
+                // must name the normal successor's block parameter instead.
+                ValueDef::Result { inst, .. } if f.inst(inst).opcode == Opcode::Invoke => None,
                 ValueDef::Result { inst, .. } => {
                     inst_loc.get(&inst.0).map(|&(block, pos)| DefLoc {
                         block,
@@ -279,7 +293,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 }
 
                 // V3 — block-call arguments (their use site is the terminator).
-                for call in data.targets.iter() {
+                for (edge_index, call) in data.targets.iter().enumerate() {
                     if call.block.index() >= n_blocks {
                         continue; // already reported as V10 above
                     }
@@ -287,7 +301,20 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         if !valid_values.contains(&arg.0) {
                             continue; // already reported as V1 above
                         }
-                        if !dominates_use(arg, b, pos) {
+                        let own_invoke_result = data.opcode == Opcode::Invoke
+                            && matches!(f.value(arg).def, ValueDef::Result { inst: definition, .. } if definition == inst);
+                        if own_invoke_result && edge_index != 0 {
+                            errors.push(VerifyError::new(
+                                "V11 invoke-result",
+                                format!(
+                                    "block{bi} Invoke result v{} used on exceptional edge",
+                                    arg.0
+                                ),
+                            ));
+                        }
+                        let available =
+                            (own_invoke_result && edge_index == 0) || dominates_use(arg, b, pos);
+                        if !available {
                             errors.push(VerifyError::new(
                                 "V3 dominance",
                                 format!(
@@ -350,12 +377,18 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 }
 
                 // V8 — guard/FrameState well-formedness.
-                if data.flags.guard {
+                if data.flags.guard || data.opcode == Opcode::Invoke {
                     match data.frame_state {
                         None => errors.push(VerifyError::new(
                             "V8 guard-framestate",
                             format!("block{bi} guard {:?} has no frame_state", data.opcode),
                         )),
+                        Some(id) if id.0 as usize >= f.frame_states.len() => {
+                            errors.push(VerifyError::new(
+                                "V8 framestate-handle",
+                                format!("block{bi} has nonexistent frame_state {}", id.0),
+                            ));
+                        }
                         Some(id) => {
                             let fs = f.frame_states.get(id);
                             check_frame_state(
@@ -562,6 +595,212 @@ mod tests {
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         r[0]
+    }
+
+    fn invoke_graph() -> (Function, crate::t2::ir::Inst, Value) {
+        let mut f = Function::new("invoke");
+        let entry = f.entry();
+        let normal = f.make_block();
+        let exceptional = f.make_block();
+        let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let returned = f.add_block_param(normal, IRType::TOP, ValueRepresentation::Tagged);
+        let saved = f.add_block_param(exceptional, IRType::TOP, ValueRepresentation::Tagged);
+        let frame = f.frame_states.add(FrameState {
+            scopes: vec![],
+            remat: vec![],
+        });
+        let (invoke, values) = f.set_terminator_with_results(
+            entry,
+            InstData {
+                args: vec![input],
+                aux: AuxData::CallTarget(1),
+                flags: InstFlags {
+                    call: true,
+                    effectful: true,
+                    safepoint: true,
+                    ..Default::default()
+                },
+                targets: vec![
+                    BlockCall {
+                        block: normal,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: exceptional,
+                        args: vec![input],
+                    },
+                ],
+                frame_state: Some(frame),
+                ..inst(Opcode::Invoke)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.inst_mut(invoke).targets[0].args.push(values[0]);
+        f.set_terminator(normal, ret(vec![returned]));
+        f.set_terminator(exceptional, ret(vec![saved]));
+        (f, invoke, values[0])
+    }
+
+    #[test]
+    fn invoke_edges_expose_exception_only_live_values() {
+        let (f, _, _) = invoke_graph();
+        assert!(verify(&f).is_ok(), "{:?}", verify(&f));
+        assert_eq!(f.succs(f.entry()), vec![Block(1), Block(2)]);
+        assert_eq!(f.preds(Block(2)), vec![f.entry()]);
+    }
+
+    #[test]
+    fn invoke_result_cannot_flow_to_exceptional_successor() {
+        let (mut f, invoke, result) = invoke_graph();
+        f.inst_mut(invoke).targets[1].args[0] = result;
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V11 invoke-result")
+        );
+    }
+
+    #[test]
+    fn invoke_result_must_be_projected_through_normal_block_parameter() {
+        let (mut f, _, result) = invoke_graph();
+        let ret = f.terminator(Block(1)).unwrap();
+        f.inst_mut(ret).args[0] = result;
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V3 dominance")
+        );
+    }
+
+    #[test]
+    fn invoke_requires_two_distinct_successors_and_runtime_effects() {
+        for mutation in 0..5 {
+            let (mut f, invoke, _) = invoke_graph();
+            let d = f.inst_mut(invoke);
+            match mutation {
+                0 => {
+                    d.targets.pop();
+                }
+                1 => d.targets[1].block = d.targets[0].block,
+                2 => d.flags.call = false,
+                3 => d.flags.effectful = false,
+                _ => d.flags.safepoint = false,
+            }
+            assert!(
+                verify(&f)
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| e.check == "V11 invoke-shape")
+            );
+        }
+    }
+
+    #[test]
+    fn invoke_requires_frame_state_before_the_call() {
+        let (mut f, invoke, _) = invoke_graph();
+        f.inst_mut(invoke).frame_state = None;
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 guard-framestate")
+        );
+    }
+
+    #[test]
+    fn invoke_result_is_not_available_in_pre_call_frame_state() {
+        let (mut f, invoke, result) = invoke_graph();
+        let frame = f.inst(invoke).frame_state.unwrap();
+        f.frame_states.get_mut(frame).scopes.push(FrameScope {
+            function: 1,
+            bcp: 0,
+            locals: vec![ValueSource::Value {
+                value: result,
+                repr: ValueRepresentation::Tagged,
+            }],
+            stack: vec![],
+        });
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 framestate-dominance")
+        );
+    }
+
+    #[test]
+    fn invoke_invalid_frame_handle_is_reported_without_panicking() {
+        let (mut f, invoke, _) = invoke_graph();
+        f.inst_mut(invoke).frame_state = Some(FrameStateId(u32::MAX));
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 framestate-handle")
+        );
+    }
+
+    #[test]
+    fn invoke_exception_only_value_survives_dead_code_elimination() {
+        use crate::t2::pass::Pass;
+        let (mut f, invoke, _) = invoke_graph();
+        let entry = f.entry();
+        assert_eq!(f.block_mut(entry).insts.pop(), Some(invoke));
+        let (constant, values) = f.push_inst(
+            entry,
+            inst(Opcode::ConstNil),
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.block_mut(entry).insts.push(invoke);
+        f.inst_mut(invoke).targets[1].args = values;
+        crate::t2::opt_dce::Dce.run(&mut f, &mut crate::t2::pass::Analyses::new());
+        assert!(f.block(entry).insts.contains(&constant));
+        assert!(verify(&f).is_ok(), "{:?}", verify(&f));
+    }
+
+    #[test]
+    fn invoke_machine_emission_is_explicitly_unsupported_until_landing_pads_exist() {
+        let (f, _, _) = invoke_graph();
+        let machine = crate::t2::lower::lower(&f);
+        assert!(
+            machine
+                .insts
+                .iter()
+                .any(|i| i.op == crate::t2::lower::op::PSEUDO_UNSUPPORTED)
+        );
+    }
+
+    #[test]
+    fn invoke_inlining_preserves_edge_local_results() {
+        let (mut callee, _, _) = invoke_graph();
+        for index in 0..callee.num_insts() {
+            callee
+                .inst_mut(crate::t2::ir::Inst(index as u32))
+                .source_pos = 0;
+        }
+        let mut caller = Function::new("invoke-caller");
+        let entry = caller.entry();
+        let input = caller.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (call, result) = caller.push_inst(
+            entry,
+            InstData {
+                args: vec![input],
+                aux: AuxData::CallTarget(7),
+                source_pos: 0,
+                ..inst(Opcode::Call)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        caller.set_terminator(entry, ret(result));
+        caller.inline_call(call, &callee, &[]).unwrap();
+        assert!(verify(&caller).is_ok(), "{:?}", verify(&caller));
+        assert!(caller.block_order().iter().any(|&block| {
+            caller
+                .terminator(block)
+                .is_some_and(|i| caller.inst(i).opcode == Opcode::Invoke)
+        }));
     }
 
     // ── Positive: a valid single-block function verifies clean ──────────

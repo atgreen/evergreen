@@ -1939,6 +1939,69 @@ mod tests {
     }
 
     #[test]
+    fn invoke_conversion_preserves_bytecode_call_state_and_live_cleanup_input() {
+        let mut f = build_from_bytecode(&bf(
+            "invoke-conversion",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: 123456,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            2,
+        ))
+        .expect("build ordinary call");
+        let entry = f.entry();
+        let call = f
+            .block(entry)
+            .insts
+            .iter()
+            .copied()
+            .find(|&i| f.inst(i).opcode == Opcode::Call)
+            .unwrap();
+        let before = f.inst(call).frame_state;
+        let cleanup = f.make_block();
+        let saved = f.add_block_param(cleanup, IRType::TOP, ValueRepresentation::Tagged);
+        let live = f.inst(call).args[0];
+        f.set_terminator(
+            cleanup,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![saved],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        let normal = f
+            .make_call_exceptional(
+                call,
+                crate::t2::ir::BlockCall {
+                    block: cleanup,
+                    args: vec![live],
+                },
+            )
+            .expect("split call and project result");
+        assert_eq!(f.inst(call).opcode, Opcode::Invoke);
+        assert_eq!(f.inst(call).frame_state, before);
+        assert_eq!(f.succs(entry), vec![normal, cleanup]);
+        assert_eq!(f.inst(call).targets[1].args, vec![live]);
+        assert!(
+            crate::t2::verify::verify(&f).is_ok(),
+            "{:?}",
+            crate::t2::verify::verify(&f)
+        );
+    }
+
+    #[test]
     fn counted_loop_header_has_parameter() {
         // A loop whose header carries local 0 across the back edge:
         //  0: Const 0            ; A

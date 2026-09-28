@@ -796,8 +796,70 @@ Availability follows the FFI. Lisp→Python works wherever the per-ABI scalar pa
 does; Python→Lisp requires callbacks (§2.7.5) and is therefore x86-64 only until
 those are ported. Staging the two directions separately is deliberate.
 
-This is an approved design direction, **not an implemented ABI**. No JVM
-integration is implied or planned.
+**What exists as of 2026-09-27.** The direction above is now partly built, behind
+the `python` Cargo feature (CPython is resolved through the foreign-library loader
+rather than linked, so a build need not depend on `libpython`, and embedding
+requires a glibc target rather than the default static musl):
+
+- The interpreter lifecycle and the transition, with a crossing reentrant so
+  Lisp→Python→Lisp→Python works. Startup is explicit rather than lazy at the
+  runtime layer, because CPython binds the interpreter to its initialising thread
+  and shutdown from any other thread dereferences a thread state that may be gone.
+- Reference ownership in both directions: a queued release drained at a crossing,
+  and a stable handle table visited by a registered root scanner so a Lisp value
+  Python holds survives and is rewritten when the collector moves it.
+- The `TORCL-PYTHON` package, nicknamed `PY` — `import`, `resolve`, `call`,
+  `call-method`, `getattr`/`setattr`, `type-of`, `typep`, `str`, `repr`, `exec` —
+  with `PY:OBJECT` proxies whose references are released through the collector's
+  finalizer registry. Documented in `docs/torcl-lisp-api.md`.
+- The value policy: numbers by value, strings by copy, `NIL`↔`None`, `T`↔`True`,
+  everything else a proxy. An integer beyond a fixnum stays a proxy rather than
+  being truncated.
+- Python's standard output and error bound to `*standard-output*` and
+  `*error-output*`, so the two runtimes' output interleaves in program order and a
+  Lisp rebinding captures both. Done by buffering on the Python side and draining at
+  the end of each crossing rather than by a Python extension type delegating to a
+  Lisp stream: the latter needs Python to call Lisp, which is x86-64 only, while
+  buffering needs nothing but the scalar calls that work everywhere. `input()` is
+  the half that cannot work this way, input being pulled rather than pushed, and is
+  staged with callbacks.
+- Signal arbitration, in the direction that matters first: the interpreter is
+  started with `Py_InitializeEx(0)`, so CPython installs no handlers and TorCL's
+  remain the process's (observable from inside Python, where the signals TorCL owns
+  report as handlers Python did not install). And the crossing disarms native fault
+  recovery for its duration, because that recovery is chosen from the fault address
+  alone — so without this a null dereference inside CPython would be rewritten to
+  unwind a Lisp frame that is not on top. A fault inside CPython now kills the
+  process, as it would in Python itself.
+- Python calling Lisp: `PY:EXPORT` binds a Python callable backed by a Lisp function,
+  reached through the stable handle table so the collector may move the function and
+  its captured environment. Notably this needs NO generated trampoline — every export
+  shares one static C entry point and carries its function in a handle rather than in
+  code — so it is not restricted to x86-64 the way `managed_callback` is; the only
+  architecture-specific dependency is the foreign→managed transition, which all three
+  supported targets have. Verified on x86-64.
+- A Python raise as a first-class condition, `PY:EXCEPTION`, carrying the
+  exception's class, its message, the Python frames, and the exception object.
+  Its report renders the Python half of a mixed-language backtrace, and
+  `PY:BACKTRACE` returns those frames as data for a debugger to interleave.
+
+Still unbuilt, and tracked separately: the zero-copy buffer protocol
+(`bliss-s8wrr`), which is blocked on unboxed specialized arrays (`bliss-iqyv`) —
+every `:element-type` currently upgrades to `T`, so there is no contiguous numeric
+storage to share.
+
+Two staged pieces are worth naming because each is a limitation a user meets rather
+than a feature that is merely absent. Forwarding an interrupt INTO a running Python
+call (`bliss-ziuwp`): a Ctrl-C cannot interrupt one today, because the flag TorCL's
+handler sets is only examined by Lisp code and none runs until Python returns.
+And the inverse of the exception mapping — a Lisp condition escaping into Python
+becoming a Python exception rather than unwinding through CPython frames, which
+would leave its reference counts wrong — which depends on Python→Lisp calls and is
+staged with them. Requirement numbers are deliberately not assigned yet; this
+section records a direction and its progress, and gains normative IDs when the
+surface stops moving.
+
+No JVM integration is implied or planned.
 
 ---
 

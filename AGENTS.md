@@ -179,6 +179,47 @@ allocates — makes the program compute a quietly wrong answer with no
 segfault at all. Diff the program's *output* against a non-stress run;
 don't wait for a crash.
 
+**A CLEAN STRESS RUN CAN MEAN "NOTHING MOVED", NOT "NOTHING IS WRONG" — measured,
+bliss-c0diw / bliss-ahnzt.** Stress plus poison catches a stale pointer to an object
+the collector MOVED. If the object never moves, there is nothing to catch, and a
+probe over it cannot fail however many collections fire.
+
+That is not hypothetical. The rooting was deliberately REMOVED from the
+LAMBDA-application site whose bug was once deterministic (bliss-98mu), and probes
+still gave identical correct answers — at strides 1, 5, 25, 100 and 500, with poison
+on, across ~50,000 forced collections, with the un-rooted arm confirmed to run. The
+reason, measured last: **those objects were never relocated at all.**
+
+**So before concluding anything from a clean stress run, check that the value you care
+about actually moves.** Six lines, and it answers the only question that matters:
+
+```rust
+let unrooted = value;                 // a plain copy the collector cannot see
+torcl_rt::rooted_ref!(_r = &mut value);
+… the allocating call under test …
+assert_eq!(value, unrooted, "it moved");   // or eprintln! the two addresses
+```
+
+If the rooted copy differs afterwards, the object moved and the probe is live — an
+unrooted copy would now be stale. If it does not differ, the probe proves nothing yet
+and needs a shape where relocation really happens (bliss-98mu needed a real library
+compile, not a hand-written form).
+
+Two supporting facts, both measured, so they need not be re-derived:
+
+- `TORCL_GC_REGION_LOG=1` reports each minor collection's retained/evacuated nursery
+  split. A region containing anything pinned is retained IN PLACE — promoted without
+  being relocated or poisoned (bliss-jtc.18) — so nothing in it moves. Worth checking,
+  though it was NOT the explanation above: that probe logged `retained 0 evacuated 1`
+  throughout.
+- **A loaded `defun`'s body is the wrong place to probe.** It has survived several
+  collections and been promoted out of the nursery, so those conses no longer move.
+  Building the form at runtime (`read-from-string` + `eval`) puts it in the nursery,
+  but as above that alone is still not sufficient.
+
+`TORCL_GC_STRESS` also parses its value as an integer and silently DISABLES itself on
+anything unparseable, so `TORCL_GC_STRESS=true` is a no-op. Use `=1`.
+
 ## The debug torcl used to be ~9x slower after `cargo build` (FIXED)
 
 **Fixed in bliss-em8x — kept here because the symptom is memorable and you may

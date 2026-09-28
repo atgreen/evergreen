@@ -156,6 +156,26 @@ where
     f(map)
 }
 
+/// Drop redundant heap-string caches before application delivery. Real strings
+/// decode from their heap bodies; keeping a cache entry must not keep an unused
+/// function's literals in the saved image. Pathname components and logical
+/// translations remain roots, and non-heap sentinel entries remain available.
+pub fn clear_delivery_string_caches() -> Result<(), TorclError> {
+    torcl_rt::gc::with_heap_snapshot(|| {
+        // Collect addresses without holding a registry lock while consulting
+        // the heap. The snapshot keeps these identities stable throughout.
+        let keys = with_string_registry(|registry| registry.keys().copied().collect::<Vec<_>>());
+        let heap_keys: std::collections::HashSet<_> = keys
+            .into_iter()
+            .filter(|bits| torcl_rt::gc::is_in_heap((bits & !torcl_rt::value::TAG_MASK) as usize))
+            .collect();
+        with_string_registry(|registry| registry.retain(|bits, _| !heap_keys.contains(bits)));
+        with_string_reverse_registry(|registry| {
+            registry.retain(|_, value| !heap_keys.contains(&value.0))
+        });
+    })
+}
+
 fn with_logical_translations<F, R>(f: F) -> R
 where
     F: FnOnce(&mut HashMap<String, TorclVal>) -> R,
@@ -1697,7 +1717,7 @@ pub fn translate_logical_pathname(pathname: TorclVal) -> Result<TorclVal, TorclE
         with_logical_translations(|map| map.get(&host).copied()).ok_or_else(|| {
             TorclError::FileError(format!("no translations for logical host {:?}", host))
         })?;
-    let translations_src = lookup_string(translations_val).ok_or_else(|| {
+    let translations_src = component_string(translations_val).ok_or_else(|| {
         TorclError::FileError(format!(
             "logical host {:?} has unreadable translations",
             host

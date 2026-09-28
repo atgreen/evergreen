@@ -17,6 +17,7 @@ pub mod context;
 /// Lisp execution context reached from generated code (§2.3.1, R4.72).
 /// NOT `context` above, which is the machine/stack-pointer switch.
 pub mod exec_context;
+pub mod execution_local;
 pub mod function;
 pub mod fxhash;
 pub mod object;
@@ -42,6 +43,8 @@ pub mod thread;
 
 // ── FFI ───────────────────────────────────────────────────────────
 pub mod ffi;
+#[cfg(feature = "python")]
+pub mod python;
 
 // ── Image persistence ─────────────────────────────────────────────
 pub mod image;

@@ -430,6 +430,10 @@ static CLOS_STATE: LazyLock<OrderedMutex<ClosState>> = LazyLock::new(|| {
 });
 
 fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    visit_clos_roots(visit, true);
+}
+
+fn visit_clos_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: bool) {
     {
         let mut state = CLOS_STATE.lock().unwrap();
         // Discard derived values before relocation rather than retaining and
@@ -458,33 +462,35 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
             // Wrapper class ids and slot-layout names are the same immediate
             // meta-handles/symbols represented above, so they need no rewrite.
         }
-        for data in state.generic_functions.values_mut() {
-            visit(&mut data.name);
-            visit(&mut data.lambda_list);
-            for method in &mut data.methods {
-                visit(method);
-            }
-        }
-        for meta in state.method_meta.values_mut() {
-            for specializer in &mut meta.specializers {
-                visit(specializer);
-            }
-        }
-        for method in state.effective_methods.values_mut() {
-            for group in [
-                &mut method.around,
-                &mut method.before,
-                &mut method.primary,
-                &mut method.after,
-            ] {
-                for value in group {
-                    visit(value);
+        if root_definitions {
+            for data in state.generic_functions.values_mut() {
+                visit(&mut data.name);
+                visit(&mut data.lambda_list);
+                for method in &mut data.methods {
+                    visit(method);
                 }
             }
-        }
-        for method in state.short_form_methods.values_mut() {
-            for value in &mut method.methods {
-                visit(value);
+            for meta in state.method_meta.values_mut() {
+                for specializer in &mut meta.specializers {
+                    visit(specializer);
+                }
+            }
+            for method in state.effective_methods.values_mut() {
+                for group in [
+                    &mut method.around,
+                    &mut method.before,
+                    &mut method.primary,
+                    &mut method.after,
+                ] {
+                    for value in group {
+                        visit(value);
+                    }
+                }
+            }
+            for method in state.short_form_methods.values_mut() {
+                for value in &mut method.methods {
+                    visit(value);
+                }
             }
         }
         // Instance slot cells are NOT yielded here (bliss-334): instances are
@@ -506,6 +512,77 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
         visit(&mut state.function_class);
         visit(&mut state.heap_object_class);
     }
+}
+
+/// Registry ownership edges for stopped-world delivery analysis. Keys are
+/// stable meta-handles; payload values must not escape the heap snapshot.
+pub struct DeliveryDefinitions {
+    pub generics: Vec<(TorclVal, TorclVal)>,
+    pub edges: HashMap<TorclVal, Vec<TorclVal>>,
+}
+
+pub fn delivery_root_scanner() -> torcl_rt::gc::RootScanner {
+    scan_clos_state_roots
+}
+
+/// Keep class state rooted while generic and method ownership is traced by
+/// the delivery graph. Call only under a nonallocating heap snapshot.
+pub fn visit_delivery_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
+    visit_clos_roots(visit, false);
+}
+
+pub fn delivery_definitions() -> DeliveryDefinitions {
+    let state = CLOS_STATE.lock().unwrap();
+    let mut edges: HashMap<TorclVal, Vec<TorclVal>> = HashMap::new();
+    let mut generics = Vec::new();
+    for (&handle, data) in &state.generic_functions {
+        generics.push((handle, data.name));
+        let refs = edges.entry(handle).or_default();
+        refs.extend([data.name, data.lambda_list]);
+        refs.extend(&data.methods);
+        for &method in &data.methods {
+            edges.entry(method).or_default().push(handle);
+        }
+    }
+    for (&handle, method) in &state.method_meta {
+        edges
+            .entry(handle)
+            .or_default()
+            .extend(&method.specializers);
+    }
+    for (&handle, method) in &state.effective_methods {
+        let refs = edges.entry(handle).or_default();
+        for group in [
+            &method.around,
+            &method.before,
+            &method.primary,
+            &method.after,
+        ] {
+            refs.extend(group);
+        }
+    }
+    for (&handle, method) in &state.short_form_methods {
+        edges.entry(handle).or_default().extend(&method.methods);
+    }
+    DeliveryDefinitions { generics, edges }
+}
+
+/// Remove unreachable metadata before serializing the disposable delivery
+/// world. Surviving handles and their allocation counters retain their IDs.
+pub fn retain_delivery_definitions(live: &HashSet<u64>) {
+    let mut state = CLOS_STATE.lock().unwrap();
+    state
+        .generic_functions
+        .retain(|handle, _| live.contains(&handle.to_raw()));
+    state
+        .method_meta
+        .retain(|handle, _| live.contains(&handle.to_raw()));
+    state
+        .effective_methods
+        .retain(|handle, _| live.contains(&handle.to_raw()));
+    state
+        .short_form_methods
+        .retain(|handle, _| live.contains(&handle.to_raw()));
 }
 
 fn install_clos_state_root_scanner() {
@@ -808,6 +885,8 @@ pub fn serialize_clos_state() -> Vec<u8> {
 /// number of bytes consumed so the caller can parse blocks appended after this
 /// one in the same section.
 pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usize, TorclError> {
+    // The restore rewrites wrapper addresses, including preallocated reserves.
+    crate::conditions::reset_storage_condition_pool();
     let bad = || TorclError::InvalidImage("CLOS state section: truncated".into());
     if data.len() < 8 || &data[..4] != b"CLST" {
         return Err(TorclError::InvalidImage(
@@ -1105,6 +1184,7 @@ pub fn ensure_clos_bootstrapped() -> Result<(), TorclError> {
 /// Reset CLOS in a quiescent runtime (startup or an isolated test fixture).
 /// Worker entry must use `ensure_clos_bootstrapped` instead.
 pub fn bootstrap_clos() -> Result<(), TorclError> {
+    crate::conditions::reset_storage_condition_pool();
     initialize_clos(true)
 }
 
@@ -1304,12 +1384,43 @@ fn class_name_key(name: TorclVal) -> Option<String> {
         return Some("T".into());
     }
     let full = torcl_rt::symbols::symbol_name(name.as_symbol_index())?;
-    let bare = full
-        .trim_start_matches("KEYWORD:")
-        .rsplit(':')
-        .next()
-        .unwrap_or(&full);
-    Some(bare.to_uppercase())
+    // KEEP THE PACKAGE. This key used to be the package-STRIPPED bare name, which
+    // made two classes of the same bare name in different packages collide — and
+    // because `set_find_class` writes this map as well as the symbol-keyed one,
+    // defining a class named e.g. `MYPKG::ERROR` REPLACED the entry for `CL:ERROR`.
+    // Every condition defined afterwards then resolved its `ERROR` superclass to
+    // that class, which is its own superclass, and `MAKE-CONDITION` of anything
+    // recursed until the stack was gone (bliss-kliz4):
+    //
+    //     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+    //     (define-condition later (error) ((k :initarg :k)))
+    //     (make-condition 'later :k 5)        => SIGSEGV
+    //
+    // The fallback itself is still wanted: it exists because a class-name symbol's
+    // IDENTITY can drift (re-interned after the class was defined) while its name
+    // does not, and a name that carries its package is just as stable against that
+    // as a bare one.
+    //
+    // `COMMON-LISP:` is normalized away because a CL symbol's name is ordinarily
+    // reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must land on one key.
+    Some(normalized_class_key(&full))
+}
+
+/// The comparison form of a class name: uppercase, one colon between package and
+/// name, and no redundant `COMMON-LISP` qualifier.
+///
+/// Only ever compared against other keys from this same function, so what matters
+/// is that it is consistent — and that two names differing only by package do not
+/// collapse onto each other.
+fn normalized_class_key(full: &str) -> String {
+    let upper = full.to_uppercase();
+    let single = upper.replace("::", ":");
+    for prefix in ["COMMON-LISP:", "CL:"] {
+        if let Some(rest) = single.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    single
 }
 
 pub fn find_class(name: TorclVal) -> Option<TorclVal> {

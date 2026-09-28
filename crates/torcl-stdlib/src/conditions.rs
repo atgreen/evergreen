@@ -114,9 +114,8 @@ fn is_known_condition_type(val: TorclVal) -> bool {
 
 type FuncallFn = Box<dyn Fn(TorclVal, &[TorclVal]) -> Result<TorclVal, TorclError>>;
 
-thread_local! {
-    static FUNCALL_HOOK: RefCell<Option<FuncallFn>> = RefCell::new(None);
-}
+static FUNCALL_HOOK: torcl_rt::execution_local::ExecutionLocal<RefCell<Option<FuncallFn>>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(None)) };
 
 /// Install a funcall hook for the condition system.
 ///
@@ -345,22 +344,15 @@ fn active_restart_entries() -> Vec<RestartEntry> {
 // and a CAS — it never borrows a `RefCell` (whose reentrant borrow would panic
 // if the storage path were ever re-entered).
 //
-// The pool is **thread-local**, not a process-wide `static` as sketched in the
-// spec's D5.13. That is deliberate: CLOS instance identity here is thread-local
-// (`clos::live_instances`), so an instance created on one thread cannot be
-// safely inspected — `class_of` / condition-type matching — from another. Each
-// thread therefore owns a private pool of instances built against its own
-// condition classes. Cross-thread "concurrent claim" (spec 5.4.10) is satisfied
-// with zero contention: threads never share a slot. The atomic claim bitmask
-// still earns its keep *within* a thread, handing out distinct instances under
-// nested / reentrant storage signalling and recycling them on release, with a
-// deterministic fallback to slot 0 when all slots are in flight so the signal
-// path can never itself fail to produce a condition.
+// Condition classes and pinned instances are process-wide. Share one immutable
+// reserve across native threads and fibers; atomic claims remain valid when a
+// fiber migrates, and idle callbacks do not allocate permanent reserves.
 struct StoragePool {
     slots: [AtomicU64; STORAGE_CONDITION_POOL_SIZE],
     /// Bit `i` set ⇒ slot `i` is currently claimed (in flight).
     claimed: AtomicU32,
     initialized: AtomicBool,
+    heap_epoch: AtomicU64,
 }
 
 impl StoragePool {
@@ -380,6 +372,7 @@ impl StoragePool {
             ],
             claimed: AtomicU32::new(0),
             initialized: AtomicBool::new(false),
+            heap_epoch: AtomicU64::new(0),
         }
     }
 
@@ -387,14 +380,11 @@ impl StoragePool {
     const MASK: u32 = (1u32 << STORAGE_CONDITION_POOL_SIZE) - 1;
 }
 
-thread_local! {
-    static STORAGE_POOL: StoragePool = const { StoragePool::new() };
-}
+static STORAGE_POOL: StoragePool = StoragePool::new();
 
-thread_local! {
-    /// Flag set by the MUFFLE-WARNING restart to suppress warning output.
-    static WARNING_MUFFLED: RefCell<bool> = const { RefCell::new(false) };
-}
+/// Flag set by the MUFFLE-WARNING restart to suppress warning output.
+static WARNING_MUFFLED: torcl_rt::execution_local::ExecutionLocal<RefCell<bool>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(false) }) };
 
 // ── Condition construction ────────────────────────────────────────
 
@@ -475,21 +465,31 @@ pub fn storage_condition_pool_size() -> usize {
 /// pinned in the GC heap by the caller (D5.13). Requires exactly
 /// `storage_condition_pool_size()` instances.
 pub fn set_storage_condition_pool(instances: &[TorclVal]) -> Result<(), TorclError> {
+    set_storage_condition_pool_in(&STORAGE_POOL, instances)
+}
+
+fn set_storage_condition_pool_in(
+    pool: &StoragePool,
+    instances: &[TorclVal],
+) -> Result<(), TorclError> {
     if instances.len() != STORAGE_CONDITION_POOL_SIZE {
         return Err(TorclError::Internal(format!(
             "STORAGE-CONDITION pool needs {STORAGE_CONDITION_POOL_SIZE} instances, got {}",
             instances.len()
         )));
     }
-    STORAGE_POOL.with(|p| {
+    {
+        let p = pool;
         for (slot, inst) in p.slots.iter().zip(instances) {
             slot.store(inst.0, Ordering::Release);
         }
         // Fresh instances are all free; publish `initialized` last so the acquire
         // path never observes populated slots before the claim mask is cleared.
         p.claimed.store(0, Ordering::Release);
+        p.heap_epoch
+            .store(torcl_rt::gc::heap_identity_epoch(), Ordering::Release);
         p.initialized.store(true, Ordering::Release);
-    });
+    }
     Ok(())
 }
 
@@ -509,8 +509,12 @@ fn initialize_storage_condition_pool() -> Result<(), TorclError> {
 }
 
 fn storage_condition_pool_is_live() -> bool {
-    STORAGE_POOL.with(|p| {
+    {
+        let p = &STORAGE_POOL;
         if !p.initialized.load(Ordering::Acquire) {
+            return false;
+        }
+        if p.heap_epoch.load(Ordering::Acquire) != torcl_rt::gc::heap_identity_epoch() {
             return false;
         }
         let first = TorclVal(p.slots[0].load(Ordering::Acquire));
@@ -519,14 +523,14 @@ fn storage_condition_pool_is_live() -> bool {
                 class_of(first),
                 TorclVal::from_symbol_index(*SYMBOL_STORAGE_CONDITION),
             )
-    })
+    }
 }
 
 /// Acquire a preallocated `STORAGE-CONDITION` instance for the heap-exhaustion /
 /// stack-overflow signalling path (R5.110). This runs when allocation is already
 /// failing, so it MUST NOT allocate, intern, define classes, resolve symbols, or
 /// take a lock that could block or allocate: it only does atomic loads and a
-/// compare-and-swap on the thread-local pool (bliss-wzw). The pool is filled once
+/// compare-and-swap on the process-wide pool (bliss-wzw). The pool is filled once
 /// at startup by `initialize_condition_runtime_support` (called from the
 /// interpreter's `Env::new` after CLOS/condition-class bootstrap and before any
 /// user code). If it is somehow not initialized, we fail hard with a fixed
@@ -543,7 +547,12 @@ fn storage_condition_pool_is_live() -> bool {
 /// Deliberately does NOT call `storage_condition_pool_is_live`, whose
 /// `class_of` / class-graph walk could allocate or lock.
 pub fn acquire_preallocated_storage_condition() -> Result<TorclVal, TorclError> {
-    STORAGE_POOL.with(|p| {
+    acquire_preallocated_storage_condition_in(&STORAGE_POOL)
+}
+
+fn acquire_preallocated_storage_condition_in(pool: &StoragePool) -> Result<TorclVal, TorclError> {
+    {
+        let p = pool;
         if !p.initialized.load(Ordering::Acquire) {
             return Err(TorclError::Internal(
                 "STORAGE-CONDITION pool not initialized before the storage-failure path".into(),
@@ -583,7 +592,7 @@ pub fn acquire_preallocated_storage_condition() -> Result<TorclVal, TorclError> 
             }
             // CAS lost the race; retry with the fresh mask.
         }
-    })
+    }
 }
 
 /// Release a previously [`acquire_preallocated_storage_condition`]-claimed
@@ -592,30 +601,41 @@ pub fn acquire_preallocated_storage_condition() -> Result<TorclVal, TorclError> 
 /// that was the exhaustion fallback (slot 0, never claimed) is a harmless no-op
 /// on the bit level. Releasing an unknown value is ignored.
 pub fn release_preallocated_storage_condition(condition: TorclVal) {
-    STORAGE_POOL.with(|p| {
+    release_preallocated_storage_condition_in(&STORAGE_POOL, condition)
+}
+
+fn release_preallocated_storage_condition_in(pool: &StoragePool, condition: TorclVal) {
+    {
+        let p = pool;
         for (i, slot) in p.slots.iter().enumerate() {
             if slot.load(Ordering::Acquire) == condition.0 {
                 p.claimed.fetch_and(!(1u32 << i), Ordering::AcqRel);
                 return;
             }
         }
-    });
+    }
 }
 
-/// Forget the preallocated STORAGE-CONDITION pool. Called after a core-image
+/// Forget the preallocated STORAGE-CONDITION pool. Requires quiescent mutators.
+/// Called after a core-image
 /// load (torcl-x0f2.7a): the pool instances were allocated in the pre-load heap
 /// that `restore_heap` discarded, so `storage_condition_pool_is_live`'s
 /// `class_of(first)` would deref a dead instance's wrapper word and SIGSEGV.
 /// Clearing lets the next `initialize_condition_runtime_support` re-preallocate
 /// from the restored world's classes.
 pub fn reset_storage_condition_pool() {
-    STORAGE_POOL.with(|p| {
+    reset_storage_condition_pool_in(&STORAGE_POOL)
+}
+
+fn reset_storage_condition_pool_in(pool: &StoragePool) {
+    {
+        let p = pool;
         p.initialized.store(false, Ordering::Release);
         for slot in &p.slots {
             slot.store(NIL.0, Ordering::Release);
         }
         p.claimed.store(0, Ordering::Release);
-    });
+    }
 }
 
 fn runtime_init_storage_condition_support() -> Result<(), TorclError> {
@@ -631,6 +651,26 @@ pub fn install_runtime_init_hook() {
 
 pub fn initialize_condition_runtime_support() -> Result<(), TorclError> {
     install_runtime_init_hook();
+    // Cold initialization can allocate and collect. A waiting registered
+    // mutator must still acknowledge safepoints, rather than block on a mutex.
+    static INITIALIZING: AtomicBool = AtomicBool::new(false);
+    while INITIALIZING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        torcl_rt::safepoint::poll_safepoint();
+        std::thread::yield_now();
+    }
+    struct Initializing;
+    impl Drop for Initializing {
+        fn drop(&mut self) {
+            INITIALIZING.store(false, Ordering::Release);
+        }
+    }
+    let _initializing = Initializing;
+    // CLOS may have been reset since this reserve was installed. Re-establish
+    // the canonical shared condition classes before inspecting old instances.
+    ensure_builtin_condition_classes()?;
     if storage_condition_pool_is_live() {
         Ok(())
     } else {
@@ -1298,12 +1338,13 @@ mod storage_pool_cas_tests {
 
     #[test]
     fn claim_release_and_deterministic_exhaustion_fallback() {
+        let reserve = StoragePool::new();
         let pool = [sentinel(1), sentinel(2), sentinel(3), sentinel(4)];
-        set_storage_condition_pool(&pool).unwrap();
+        set_storage_condition_pool_in(&reserve, &pool).unwrap();
 
         // The four claims hand out four *distinct* slots.
         let claims: Vec<TorclVal> = (0..STORAGE_CONDITION_POOL_SIZE)
-            .map(|_| acquire_preallocated_storage_condition().unwrap())
+            .map(|_| acquire_preallocated_storage_condition_in(&reserve).unwrap())
             .collect();
         let mut got: Vec<u64> = claims.iter().map(|c| c.0).collect();
         got.sort_unstable();
@@ -1313,56 +1354,40 @@ mod storage_pool_cas_tests {
         );
 
         // Pool exhausted → deterministic fallback to slot 0, no error.
-        let fallback = acquire_preallocated_storage_condition().unwrap();
+        let fallback = acquire_preallocated_storage_condition_in(&reserve).unwrap();
         assert_eq!(fallback.0, sentinel(1).0);
 
         // Releasing a claimed slot lets the next claim reuse exactly it.
-        release_preallocated_storage_condition(claims[1]);
-        let reused = acquire_preallocated_storage_condition().unwrap();
+        release_preallocated_storage_condition_in(&reserve, claims[1]);
+        let reused = acquire_preallocated_storage_condition_in(&reserve).unwrap();
         assert_eq!(reused.0, claims[1].0);
     }
 
     #[test]
     fn uninitialized_pool_errors_rather_than_allocating() {
-        // A thread that never installed a pool must fail hard on the storage
-        // path rather than lazily allocate (bliss-uh4.2).
-        std::thread::spawn(|| {
-            assert!(acquire_preallocated_storage_condition().is_err());
-        })
-        .join()
-        .unwrap();
+        assert!(acquire_preallocated_storage_condition_in(&StoragePool::new()).is_err());
     }
 
     #[test]
-    fn concurrent_threads_claim_from_independent_pools() {
-        // Pools are thread-local: many OS threads claim/release concurrently with
-        // zero contention and each only ever sees its own instances — the
-        // architecture's answer to spec 5.4.10 "concurrent claim".
-        let handles: Vec<_> = (0..8u64)
-            .map(|t| {
+    fn concurrent_threads_claim_from_shared_pool() {
+        let reserve = std::sync::Arc::new(StoragePool::new());
+        let values = [sentinel(1), sentinel(2), sentinel(3), sentinel(4)];
+        set_storage_condition_pool_in(&reserve, &values).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let reserve = reserve.clone();
+                let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let base = (t + 1) * 100;
-                    let pool = [
-                        sentinel(base),
-                        sentinel(base + 1),
-                        sentinel(base + 2),
-                        sentinel(base + 3),
-                    ];
-                    set_storage_condition_pool(&pool).unwrap();
-                    for _ in 0..2000 {
-                        let c = acquire_preallocated_storage_condition().unwrap();
-                        let v = c.0 >> 3;
-                        assert!(
-                            (base..base + 4).contains(&v),
-                            "thread {t} saw a foreign slot {v}"
-                        );
-                        release_preallocated_storage_condition(c);
-                    }
+                    let value = acquire_preallocated_storage_condition_in(&reserve).unwrap();
+                    barrier.wait(); // All four claims must be simultaneously distinct.
+                    release_preallocated_storage_condition_in(&reserve, value);
+                    value
                 })
             })
             .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
+        let mut claims: Vec<_> = handles.into_iter().map(|h| h.join().unwrap().0).collect();
+        claims.sort_unstable();
+        assert_eq!(claims, values.map(|v| v.0));
     }
 }

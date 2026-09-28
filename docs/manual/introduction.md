@@ -59,9 +59,8 @@ runtime.
 
 This edition follows the development checkout, not a frozen release. Older
 installed packages may predate the behavior described here. Planned interfaces
-in `spec/` are not automatically part of the callable Lisp API. In particular,
-the native-thread interface described here is implemented; the proposed public
-`TORCL-FIBER` interface is not installed by the current bootstrap.
+in `spec/` are not automatically part of the callable Lisp API. Both the native-thread interface and the x86-64 `TORCL-FIBER` interface
+described here are installed by the standard bootstrap.
 
 ## Reporting a problem
 

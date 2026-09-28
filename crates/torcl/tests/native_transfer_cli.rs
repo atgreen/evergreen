@@ -179,3 +179,198 @@ fn native_calls_stop_at_errors_and_nonlocal_exits() {
         }
     }
 }
+
+#[test]
+fn t2_transfer_checks_preserve_errors_across_fiber_yields() {
+    let program = r#"
+        (defun fiber-transfer-leaf (fail)
+          (when (torcl-fiber:current-fiber) (torcl-fiber:fiber-yield))
+          (when fail (error "expected fiber error"))
+          7)
+        (defun fiber-transfer-recursive (n fail)
+          (if (= n 0) (fiber-transfer-leaf fail)
+              (+ 1 (fiber-transfer-recursive (- n 1) fail))))
+        (dotimes (i 40) (assert (= 11 (fiber-transfer-recursive 4 nil))))
+        (assert (= 2 (torcl-ext:function-tier 'fiber-transfer-recursive)))
+        (dolist (carriers '(1 4))
+          (let ((fibers
+                  (loop for n below 16 collect
+                    (let ((n n))
+                      (torcl-fiber:make-fiber
+                        (lambda ()
+                          (dotimes (i 10)
+                            (assert (eq :caught
+                              (handler-case (fiber-transfer-recursive 4 t)
+                                (error () :caught))))
+                            (assert (= 11 (fiber-transfer-recursive 4 nil))))
+                          n))))))
+            (assert (equal (loop for n below 16 collect n)
+                           (torcl-fiber:run-fibers fibers :carrier-count carriers)))))
+        (assert (= 11 (fiber-transfer-recursive 4 nil)))
+        (format t "FIBER-TRANSFERS-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", program])
+        .env("TORCL_LAZY_COMPILE", "0")
+        .env("TORCL_FORCE_TIER", "t2")
+        .output()
+        .expect("run TorCL");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FIBER-TRANSFERS-OK"));
+}
+
+#[test]
+fn osr_transfers_preserve_inherited_handlers_and_cleanup_order() {
+    // Shared with the s390x smoke suite: an expired CATCH must not catch,
+    // unwinding GO must run cleanup exactly once, and outer GO must keep
+    // the handler stack inherited from the interpreter consistent.
+    let program = include_str!("fixtures/native-transfer-osr.lisp");
+    let mut reference = None;
+    for stress in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_torcl"));
+        command
+            .args(["--no-init", "--no-bootstrap", "--eval", program])
+            .env_remove("TORCL_FORCE_TIER")
+            .env("TORCL_LAZY_COMPILE", "0")
+            .env("TORCL_T0_T1_THRESHOLD", "1000000")
+            .env("TORCL_OSR_THRESHOLD", "2")
+            .env("TORCL_DISABLE_T2", "1")
+            .env("TORCL_OSR_TRAPS", "1")
+            .env_remove("TORCL_GC_STRESS")
+            .env_remove("TORCL_GC_POISON");
+        if stress {
+            command
+                .env("TORCL_GC_STRESS", "1")
+                .env("TORCL_GC_POISON", "1");
+        }
+        let output = command.output().expect("run inherited-handler OSR oracle");
+        assert!(
+            output.status.success(),
+            "stress={stress} stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("OSR-TRAP-OK"));
+        if let Some(expected) = &reference {
+            assert_eq!(
+                &output.stdout, expected,
+                "stress changed transfer semantics"
+            );
+        } else {
+            reference = Some(output.stdout);
+        }
+    }
+}
+
+#[test]
+fn native_reentry_preserves_resumption_and_cleanup_replacement() {
+    let program = r#"
+        (defvar *transfer-effects* 0)
+        (defvar *transfer-binding* :outer)
+        (defvar *cleanup-log* nil)
+        (defun transfer-invoke (thunk)
+          (funcall thunk)
+          (incf *transfer-effects*))
+        (dotimes (i 40) (transfer-invoke (lambda () 7)))
+        (assert (= EXPECTED-TIER (torcl-ext:function-tier 'transfer-invoke)))
+        (setq *transfer-effects* 0)
+        ;; A selected restart returns normally through nested native reentry.
+        ;; Its dynamic context must remain live while the handler runs.
+        (let ((handled 0))
+          (handler-bind ((simple-condition
+                           (lambda (condition)
+                             (declare (ignore condition))
+                             (incf handled)
+                             (assert (eq *transfer-binding* :inner))
+                             (invoke-restart 'continue-transfer))))
+            (let ((*transfer-binding* :inner))
+              (transfer-invoke
+                (lambda ()
+                  (restart-case
+                    (transfer-invoke (lambda () (signal "resume me")))
+                    (continue-transfer () :resumed))))))
+          (assert (= handled 1)))
+        ;; The inner call escaped, the outer call resumed and ran its suffix.
+        (assert (= *transfer-effects* 1))
+        (assert (eq *transfer-binding* :outer))
+        (setq *transfer-effects* 0)
+        (assert (equal '(:replacement 43)
+          (multiple-value-list
+            (catch 'replacement
+              (catch 'original
+                (let ((*transfer-binding* :inner))
+                  (unwind-protect
+                    (unwind-protect
+                      (transfer-invoke (lambda () (throw 'original :discarded)))
+                      (push *transfer-binding* *cleanup-log*)
+                      (transfer-invoke
+                        (lambda () (throw 'replacement (values :replacement 43)))))
+                    (push :outer-cleanup *cleanup-log*))))))))
+        (assert (equal '(:outer-cleanup :inner) *cleanup-log*))
+        (assert (eq *transfer-binding* :outer))
+        (assert (= *transfer-effects* 0))
+        (assert (= 1 (transfer-invoke (lambda () :normal))))
+        (format t "NATIVE-REENTRY-OK~%")
+    "#;
+    for (tier, expected) in [("t0", "0"), ("t1", "1"), ("t2", "2")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+            .args([
+                "--no-init",
+                "--eval",
+                &program.replace("EXPECTED-TIER", expected),
+            ])
+            .env("TORCL_LAZY_COMPILE", "0")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .expect("run native reentry oracle");
+        assert!(
+            output.status.success(),
+            "tier={tier} stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("NATIVE-REENTRY-OK"));
+    }
+}
+
+#[test]
+fn throw_values_survive_cleanup_in_bytecode_and_eval() {
+    let cases = r#"
+        (assert (equal nil
+          (multiple-value-list
+            (catch 'done (unwind-protect (throw 'done (values)) (values 9 10))))))
+        (assert (equal '(7)
+          (multiple-value-list
+            (catch 'done (unwind-protect (throw 'done 7) (values 9 10))))))
+        (assert (equal '((:primary) (:secondary))
+          (multiple-value-list
+            (catch 'done
+              (unwind-protect
+                (throw 'done (values (list :primary) (list :secondary)))
+                (list :cleanup))))))
+        (assert (equal '(3 4)
+          (multiple-value-list
+            (catch 'done
+              (unwind-protect (throw 'done (values 1 2))
+                (throw 'done (values 3 4)))))))
+    "#;
+    let program =
+        format!("(progn {cases} (eval '(progn {cases})) (format t \"THROW-VALUES-OK~%\"))");
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", &program])
+        .env("TORCL_FORCE_TIER", "t0")
+        .output()
+        .expect("run THROW value oracles");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("THROW-VALUES-OK"));
+}

@@ -667,14 +667,67 @@ fn write_cell(idx: u32, set: impl FnOnce(&mut SymbolData)) {
     });
 }
 
-/// The global value cell (`UNBOUND` if unbound).
-pub fn symbol_value(idx: u32) -> Option<TorclVal> {
-    read_cell(idx, |s| s.value)
+// Dynamic bindings belong to the Lisp execution, not to a carrier or to the
+// process-wide symbol object. All callers, including stdlib printers, see the
+// same binding overlay through symbol_value/set_symbol_value.
+static DYNAMIC_VALUES: crate::execution_local::ExecutionLocal<
+    std::cell::RefCell<std::collections::HashMap<u32, TorclVal>>,
+> = unsafe {
+    crate::execution_local::ExecutionLocal::new(|| {
+        std::cell::RefCell::new(std::collections::HashMap::new())
+    })
+};
+
+/// Bind locally; the returned previous local value must be rooted until restored.
+pub fn bind_symbol_value(idx: u32, value: TorclVal) -> Option<TorclVal> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        crate::gc::register_root_scanner(|visit| {
+            // SAFETY: root scanners execute under the stop-the-world handshake.
+            unsafe {
+                DYNAMIC_VALUES.scan(|values| {
+                    for value in values.borrow_mut().values_mut() {
+                        visit(value);
+                    }
+                })
+            };
+        })
+    });
+    DYNAMIC_VALUES.with(|values| values.borrow_mut().insert(idx, value))
 }
 
-/// Set the global value cell.
+pub fn restore_symbol_binding(idx: u32, previous: Option<TorclVal>) {
+    DYNAMIC_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        if let Some(previous) = previous {
+            values.insert(idx, previous);
+        } else {
+            values.remove(&idx);
+        }
+    });
+}
+
+/// Read the current dynamic binding, or the global cell when not bound locally.
+pub fn symbol_value(idx: u32) -> Option<TorclVal> {
+    DYNAMIC_VALUES
+        .with(|values| values.borrow().get(&idx).copied())
+        .or_else(|| read_cell(idx, |s| s.value))
+}
+
+/// Assign the current binding, falling back to the global cell.
 pub fn set_symbol_value(idx: u32, value: TorclVal) {
-    write_cell(idx, |s| s.value = value);
+    let local = DYNAMIC_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        if let Some(slot) = values.get_mut(&idx) {
+            *slot = value;
+            true
+        } else {
+            false
+        }
+    });
+    if !local {
+        write_cell(idx, |s| s.value = value);
+    }
 }
 
 /// The printed name of `v` when it is a symbol whose name is known, for error
@@ -752,6 +805,30 @@ pub fn for_each_bound_function(mut f: impl FnMut(u32, String, TorclVal)) {
     for (idx, name, function) in bound {
         f(idx, name, function);
     }
+}
+
+/// Snapshot persistent data cells and function cells outside the delivery
+/// candidate set. No Lisp allocations; callers must consume/root the returned
+/// values before allocating. Symbol identities and package membership stay intact.
+pub fn delivery_roots(candidates: &std::collections::HashSet<u32>) -> Vec<TorclVal> {
+    with_registry(|reg| {
+        let mut roots = Vec::new();
+        if let Some(reg) = reg {
+            for (index, &obj) in reg.interned.iter().enumerate() {
+                // SAFETY: registry entries are pinned live SymbolData objects.
+                let data = unsafe { &*symbol_data(obj) };
+                roots.extend([data.value, data.plist]);
+                if !candidates.contains(&(index as u32)) {
+                    roots.push(data.function);
+                }
+            }
+            for &obj in reg.uninterned.values() {
+                let data = unsafe { &*symbol_data(obj) };
+                roots.extend([data.value, data.plist, data.function]);
+            }
+        }
+        roots
+    })
 }
 
 #[cfg(test)]

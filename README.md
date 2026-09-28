@@ -1,15 +1,52 @@
 # TorCL
 
-TorCL is a from-scratch Common Lisp implementation written in Rust. The
-current repository contains the bootstrap runtime, compiler pipeline,
-standard-library support, command-line driver, tests, and a detailed technical
-specification for the longer-term self-hosting system.
+**TorCL is Common Lisp with a HotSpot-inspired native runtime**, built from
+scratch in Rust. It starts executing in bytecode, compiles hot code to native
+instructions, and specializes dynamically typed programs as they run.
 
-The project targets ANSI Common Lisp with selected SBCL-compatible extensions
-where they are widely used and do not conflict with ANSI semantics. The
-long-term design is documented in `spec/`, including the object model, runtime,
-garbage collector, compiler tiers, standard library, developer tools, security
-model, and self-hosting roadmap.
+- **Tiered compilation with on-stack replacement.** Execution progresses from
+  bytecode through a baseline native compiler to an optimizing compiler. Hot
+  loops can enter compiled code during the current invocation, without waiting
+  for the function to return. See [how Lisp runs](docs/manual/user/explanation/execution.md).
+- **Speculative optimization without required type declarations.** The compiler
+  specializes supported operations under guarded assumptions about runtime
+  values. When an assumption fails, precise deoptimization resumes less
+  specialized execution while preserving program semantics. Live function
+  redefinition remains part of the programming model.
+- **Lightweight fibers with synchronous socket I/O.** On x86-64, many fibers
+  share native carrier threads. Reads, writes, and readiness waits on established
+  TCP streams park an unpinned fiber so other work can run, while Lisp code stays
+  sequential. Connect, accept, and DNS are not yet cooperative. See
+  [fibers and socket I/O](docs/manual/fibers.md#socket-io).
+- **Multiple architectures and operating systems.** Targets include x86-64
+  Linux, Windows, and Android; AArch64 Linux and Android; and Power (`ppc64le`)
+  and IBM Z (`s390x`) Linux. Compiler and FFI coverage varies by target; see
+  [cross-compilation and platform details](docs/cross-compilation.md) and
+  [Windows support](docs/windows.md).
+- **Native interoperability.** Call C libraries through the
+  [foreign function interface](docs/manual/foreign.md), and access the JVM through
+  `torcl-jvm`. The `PY` package provides Lisp-facing CPython object and calling
+  APIs in builds with Python support enabled.
+- **Standalone applications and saved images.** Save a running Lisp environment
+  with its libraries preloaded, restore it later, or package it as a native
+  executable. The default x86-64 Linux build is fully static. See
+  [saved images and executables](docs/manual/user/reference/images.md).
+- **Tree shaking of Lisp and Rust.** Deliver a saved image with unreachable
+  functions, macros, methods, closures, and heap objects removed. Supported
+  source functions can be compiled during delivery. Native specialization can
+  omit unused builtin implementations, disassembly, and the tree walker when
+  reachable code permits. Choose `max-tier = t1` to omit T2, or `max-tier = t0`
+  to omit both native compilers. Explicit retention roots and `--dry-run` explain
+  what stays and why. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
+- **Native Android applications.** Generate and package APKs with Lisp lifecycle,
+  touch-input, and EGL/OpenGL ES code using `torcl-android-new`. See
+  [building Android applications](docs/manual/user/how-to/android.md).
+
+TorCL combines a precise generational garbage collector with Common Lisp's
+macros, CLOS, conditions, and restarts. It targets ANSI Common Lisp, supports
+ASDF systems, and provides selected SBCL-compatible extensions. The project is
+under active development; the manual describes current interfaces and
+limitations, while `spec/` records the design and self-hosting roadmap.
 
 ## Manual
 
@@ -257,6 +294,13 @@ Use the gate mode when uncovered `MUST` requirements should fail the check:
 ```sh
 python3 scripts/spec-coverage.py --gate
 ```
+
+## Performance benchmarks
+
+The [performance lab](benchmarks/README.md) compares identical Fibonacci and
+Ironclad-derived workloads on TorCL and SBCL, with correctness checks, repeated
+measurements, and a standalone HTML report. Run `python3 benchmarks/run.py`
+after building the release binary. Results report whichever runtime is faster.
 
 ## Development Notes
 

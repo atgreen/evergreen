@@ -20,7 +20,11 @@ pub(super) use torcl_rt::bignum::{
 use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+mod delivery;
+mod evaluated_builtins;
 pub mod events;
+mod native_runtime;
+mod python;
 pub mod sprof;
 use torcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use torcl_rt::runtime::parse_cli as parse_runtime_cli;
@@ -38,6 +42,11 @@ use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 #[derive(Clone, Debug)]
 pub struct CliArgs {
     pub image: Option<String>,
+    pub deliver: Option<String>,
+    pub output: Option<String>,
+    pub dry_run: bool,
+    pub runtime_info: bool,
+    pub runtime_source: Option<String>,
     /// All `--eval`/`-e` forms in command-line order, evaluated in sequence in
     /// one shared env so later forms see earlier state (bliss-7zl).
     pub eval_forms: Vec<String>,
@@ -72,6 +81,11 @@ impl CliArgs {
         let mut version = false;
         let mut script = None;
         let mut load_report = None;
+        let mut deliver = None;
+        let mut output = None;
+        let mut dry_run = false;
+        let mut runtime_info = false;
+        let mut runtime_source = None;
         let mut eval_forms: Vec<String> = Vec::new();
         let mut saw_double_dash = false;
 
@@ -85,6 +99,30 @@ impl CliArgs {
             }
 
             match arg.as_str() {
+                "--deliver" | "--output" | "--runtime-source" => {
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| TorclError::Internal(format!("{arg} requires a value")))?;
+                    let slot = if arg == "--deliver" {
+                        &mut deliver
+                    } else if arg == "--runtime-source" {
+                        &mut runtime_source
+                    } else {
+                        &mut output
+                    };
+                    if slot.replace(value.clone()).is_some() {
+                        return Err(TorclError::Internal(format!("duplicate {arg}")));
+                    }
+                    i += 2;
+                }
+                "--runtime-info" => {
+                    runtime_info = true;
+                    i += 1;
+                }
+                "--dry-run" => {
+                    dry_run = true;
+                    i += 1;
+                }
                 "--" => {
                     saw_double_dash = true;
                     i += 1;
@@ -180,6 +218,11 @@ impl CliArgs {
 
         let r = CliArgs {
             image: extract_flag_value(&shared_args, "--image"),
+            deliver,
+            output,
+            dry_run,
+            runtime_info,
+            runtime_source,
             eval_forms,
             load: config.load_file.clone(),
             no_image: shared_args.iter().any(|arg| arg == "--no-image"),
@@ -199,6 +242,27 @@ impl CliArgs {
             script,
             load_report,
         };
+        if r.deliver.is_some() {
+            if r.image.is_none() || r.output.is_none() {
+                return Err(TorclError::Internal(
+                    "--deliver requires --image and --output".into(),
+                ));
+            }
+            if !r.eval_forms.is_empty()
+                || r.load.is_some()
+                || r.script.is_some()
+                || r.load_report.is_some()
+                || r.no_image
+                || r.sandbox
+                || !r.cl_args.is_empty()
+            {
+                return Err(TorclError::Internal("--deliver cannot be combined with other execution modes or application arguments".into()));
+            }
+        } else if r.output.is_some() || r.dry_run || r.runtime_source.is_some() {
+            return Err(TorclError::Internal(
+                "--output and --dry-run require --deliver".into(),
+            ));
+        }
         if r.image.is_some() && r.no_image {
             return Err(TorclError::Internal(
                 "--image and --no-image are contradictory".into(),
@@ -391,9 +455,9 @@ impl Drop for Arena {
 }
 
 // Thread-local arena so alloc functions can be called from anywhere in the evaluator.
-thread_local! {
-    static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
-}
+
+static ARENA: torcl_rt::execution_local::ExecutionLocal<RefCell<Arena>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(Arena::new())) };
 
 thread_local! {
     /// Deterministic call-count profiler (bliss-xgr5, the sb-profile analog):
@@ -605,7 +669,7 @@ fn reset_package_registry() {
 /// `ensure_clos_bootstrapped`: macro / compiler-macro expansion environments
 /// share the caller's live packages rather than wiping them.
 fn ensure_package_registry() {
-    let missing = PACKAGE_REGISTRY.with(|cell| cell.borrow().is_none());
+    let missing = !torcl_stdlib::packages::has_active_registry();
     if missing {
         reset_package_registry();
     }
@@ -626,9 +690,18 @@ fn seed_standard_packages_registry() {
     // compatibility nickname (spec §13.9.1). Fibers get a separate TORCL-FIBER
     // package (bliss-l3wy).
     let _ = torcl_stdlib::make_package("TORCL-THREAD", &["TORCL-THREADS"], &["COMMON-LISP"]);
+    let _ = torcl_stdlib::make_package("TORCL-FIBER", &[], &["COMMON-LISP"]);
     // CLtL2 lexical-environment access (§4.14), the package a portability layer
     // such as trivial-cltl2 USEs — TorCL's counterpart of SB-CLTL2.
     let _ = torcl_stdlib::make_package("TORCL-CLTL2", &[], &["COMMON-LISP"]);
+    // Embedded CPython (§2.7.8), nicknamed PY so the calling surface reads the way
+    // the design intends: (py:import "numpy"), (py:call "numpy.mean" a).
+    //
+    // It does NOT use COMMON-LISP, and that is not an oversight: IMPORT, TYPE-OF,
+    // TYPEP and CALL-METHOD are all names this package needs and CL already
+    // exports. Inheriting them would make every one of those a conflict, and
+    // renaming them would make the surface read worse than Python's own.
+    let _ = torcl_stdlib::make_package("TORCL-PYTHON", &["PY"], &[]);
     for name in [
         "COMMON-LISP",
         "COMMON-LISP-USER",
@@ -637,11 +710,14 @@ fn seed_standard_packages_registry() {
         "TORCL-EXT",
         "TORCL-FFI",
         "TORCL-THREAD",
+        "TORCL-FIBER",
         "TORCL-CLTL2",
+        "TORCL-PYTHON",
     ] {
         reader::register_package(name);
     }
     reader::register_package("CL-USER");
+    reader::register_package("PY");
     reader::register_package("TORCL-THREADS");
     // All 978 ANSI names live present+external in COMMON-LISP before boot.
     let _ = torcl_stdlib::seed_ansi_symbols();
@@ -1371,7 +1447,7 @@ pub(in crate::cli) fn accessor_slot_name(env: &Env, accessor: &str) -> Option<St
 
 pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
     let key = format!("(SETF {place_name})");
-    if GLOBAL_SETF_FNS.with(|m| m.borrow().contains_key(&key)) {
+    if with_global_setf_fns(|m| m.borrow().contains_key(&key)) {
         return true;
     }
     // A `(defun (setf place) …)` writer loaded from a `.bfasl` installs its
@@ -1465,7 +1541,7 @@ fn callable_body_inner_ex(
         return Some((fdef.params_form, fdef.body));
     }
     // Global `(setf place)` writers registered by a top-level defun (any file).
-    if let Some(pb) = GLOBAL_SETF_FNS.with(|m| {
+    if let Some(pb) = with_global_setf_fns(|m| {
         m.borrow()
             .get(name)
             .map(|fdef| (fdef.params_form, fdef.body))
@@ -1638,7 +1714,7 @@ fn reject_assignment_to_constant(target: TorclVal) -> Result<(), TorclError> {
         "a keyword"
     } else if !target.is_symbol() {
         "a non-symbol"
-    } else if CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(target))) {
+    } else if with_constant_vars(|c| c.borrow().contains(&sym_name(target))) {
         "a constant defined by DEFCONSTANT"
     } else {
         return Ok(());
@@ -2047,6 +2123,7 @@ struct FrozenEnvFrame {
 }
 
 struct FrozenMacroCapture {
+    registration: Option<(String, TorclVal)>,
     params_form: TorclVal,
     body: TorclVal,
     captured_frame: Arc<FrozenEnvFrame>,
@@ -2289,20 +2366,16 @@ struct RestartEntry {
     report: TorclVal,
 }
 
-thread_local! {
-    static NEXT_RESTART_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-    /// One-shot: the restart ids that the NEXT `signal_condition_object` call
-    /// should associate with the condition it signals — set by
-    /// `eval_restart_case` when the restart-case body is a signalling form.
-    static PENDING_SIGNAL_RESTART_IDS: RefCell<Option<Vec<u64>>> = const { RefCell::new(None) };
-}
+/// One-shot: the restart ids that the NEXT `signal_condition_object` call
+/// should associate with the condition it signals — set by
+/// `eval_restart_case` when the restart-case body is a signalling form.
+static PENDING_SIGNAL_RESTART_IDS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<Vec<u64>>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn next_restart_id() -> u64 {
-    NEXT_RESTART_ID.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    })
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 #[derive(Clone)]
@@ -2381,42 +2454,55 @@ static MACRO_FN_CACHE: LazyLock<OrderedMutex<HashMap<String, MacroFnCacheEntry>>
     });
 static MACRO_ENV_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    static CONTROL_VALUES: RefCell<HashMap<String, TorclVal>> = RefCell::new(HashMap::new());
-    /// Stack of the innermost-enclosing LOOP's own implicit-block return token.
-    /// The LOOP `return` clause and `loop-finish` unwind THIS block (nil for an
-    /// unnamed loop, else the named block) — distinct from the Lisp RETURN
-    /// special form, which always targets a lexical `block nil`. `loop named
-    /// foo` establishes only block foo (no implicit nil), so a bare
-    /// `(return x)` in its body escapes to an OUTER nil block (LOOP.13.*).
-    static LOOP_RETURN_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    /// Stack of the innermost-enclosing extended-LOOP's `loop-finish` token.
-    /// `(loop-finish)` stops iteration of that loop and proceeds to its
-    /// `finally` clause + accumulated result (CLHS: local macro established by
-    /// LOOP), distinct from `return` which skips `finally`.
-    static LOOP_FINISH_TOKENS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    static MACROEXPAND_ENVIRONMENTS: RefCell<HashMap<u64, MacroexpandEnv>> = RefCell::new(HashMap::new());
-    static NEXT_MACROEXPAND_ENVIRONMENT_ID: RefCell<u64> = const { RefCell::new(1) };
-    /// Identity (pointer address) of the lexical frame current at the start of
-    /// each top-level form under evaluation, one entry per active load/eval
-    /// nesting level. A DEFUN closes over its enclosing lexicals only when its
-    /// frame is NOT this base — i.e. it is genuinely nested inside a user binding
-    /// form (LET/FLET/lambda body/…), not merely at the top level of a (possibly
-    /// nested) LOAD, whose frame carries incidental lexical copies (bliss-sdd).
-    static TOPLEVEL_FRAME_BASE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+static CONTROL_VALUES: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<String, TorclVal>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+/// Stack of the innermost-enclosing LOOP's own implicit-block return token.
+/// The LOOP `return` clause and `loop-finish` unwind THIS block (nil for an
+/// unnamed loop, else the named block) — distinct from the Lisp RETURN
+/// special form, which always targets a lexical `block nil`. `loop named
+/// foo` establishes only block foo (no implicit nil), so a bare
+/// `(return x)` in its body escapes to an OUTER nil block (LOOP.13.*).
+static LOOP_RETURN_TOKENS: torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<String>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+/// Stack of the innermost-enclosing extended-LOOP's `loop-finish` token.
+/// `(loop-finish)` stops iteration of that loop and proceeds to its
+/// `finally` clause + accumulated result (CLHS: local macro established by
+/// LOOP), distinct from `return` which skips `finally`.
+static LOOP_FINISH_TOKENS: torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<String>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+static MACROEXPAND_ENVIRONMENTS: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u64, MacroexpandEnv>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+static NEXT_MACROEXPAND_ENVIRONMENT_ID: torcl_rt::execution_local::ExecutionLocal<RefCell<u64>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(1)) };
+/// Identity (pointer address) of the lexical frame current at the start of
+/// each top-level form under evaluation, one entry per active load/eval
+/// nesting level. A DEFUN closes over its enclosing lexicals only when its
+/// frame is NOT this base — i.e. it is genuinely nested inside a user binding
+/// form (LET/FLET/lambda body/…), not merely at the top level of a (possibly
+/// nested) LOAD, whose frame carries incidental lexical copies (bliss-sdd).
+static TOPLEVEL_FRAME_BASE: torcl_rt::execution_local::ExecutionLocal<RefCell<Vec<usize>>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
 
-    /// Effective-method dispatch cache (bliss-x5y.20). Standard method
-    /// combination with class-only specializers is a pure function of (generic
-    /// name, argument classes): the applicable-method set, its ordering, and the
-    /// around/before/primary/after split never change unless a method or class
-    /// is (re)defined. Recomputing it per call — cloning the whole method vector,
-    /// computing specificity, sorting, and building the effective method — is the
-    /// dominant cost of a method call and made compiling method bodies pointless.
-    /// Cache the four method-id lists (each id is a `from_meta_handle` immediate,
-    /// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
-    /// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
-    static GF_DISPATCH_CACHE: RefCell<HashMap<GfKey, GfDispatchEntry, torcl_rt::fxhash::FxBuildHasher>> =
-        RefCell::new(HashMap::default());
+/// Effective-method dispatch cache (bliss-x5y.20). Standard method
+/// combination with class-only specializers is a pure function of (generic
+/// name, argument classes): the applicable-method set, its ordering, and the
+/// around/before/primary/after split never change unless a method or class
+/// is (re)defined. Recomputing it per call — cloning the whole method vector,
+/// computing specificity, sorting, and building the effective method — is the
+/// dominant cost of a method call and made compiling method bodies pointless.
+/// Cache the four method-id lists (each id is a `from_meta_handle` immediate,
+/// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
+/// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
+static GF_DISPATCH_CACHE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<GfKey, GfDispatchEntry, torcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+thread_local! {
+
 
     /// Per-generic dispatch metadata memo (bliss-fy37 #3), keyed by the generic's
     /// interned symbol index and stamped with the same GF_DISPATCH_GENERATION as
@@ -2425,33 +2511,32 @@ thread_local! {
     /// iterates every method of the generic, on every dispatch.
     static GF_META_CACHE: RefCell<HashMap<u32, GfMeta, torcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
-
-    /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
-    /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
-    /// `(setf place)` defun is a *global* definition and must survive the
-    /// throwaway child Envs used during compile/load — storing it in a per-Env
-    /// `funs` map lost it across files, so `(setf (place …) v)` in a later file
-    /// failed with "SETF: unsupported place" even though the writer was defined
-    /// (bliss-d0b). FLET-local `(setf place)` writers stay lexical in `Env.funs`.
-    static GLOBAL_SETF_FNS: RefCell<HashMap<String, FunDef>> = RefCell::new(HashMap::new());
-
-    /// Names of variables established by DEFCONSTANT — torcl models a constant as
-    /// an ordinary global binding, so this set is how CONSTANTP (and library code
-    /// like alexandria's DEFINE-CONSTANT, used by babel) can tell a defconstant'd
-    /// symbol from a defparameter.
-    static CONSTANT_VARS: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
-
-    /// Cached `(generation, env)` where `env` holds every global macro in its
-    /// function map. `macroexpand_environment_from_cli` was rebuilding this for
-    /// EVERY compiled form — cloning all of GLOBAL_MACROS and re-augmenting once
-    /// per macro — which dominated load compile time and blocked any per-closure
-    /// macro-aware analysis (bliss-usb2 / bliss-9u6d). The function-map values are
-    /// immediate macro handles (`from_macro_handle`), so this env holds no movable
-    /// GC pointers and is safe to retain across collections without tracing.
-    static CLI_GLOBAL_MACRO_ENV: RefCell<Option<(u64, Arc<MacroexpandEnv>)>> =
-        const { RefCell::new(None) };
 }
+/// Global SETF writers are shared by every execution and scanned once per GC.
+static GLOBAL_SETF_FNS: LazyLock<SharedCell<HashMap<String, FunDef>>> =
+    LazyLock::new(|| SharedCell::new(HashMap::new()));
+/// DEFCONSTANT metadata is process-wide, like the symbol value cells.
+static CONSTANT_VARS: LazyLock<SharedCell<std::collections::HashSet<String>>> =
+    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
+
+fn with_global_setf_fns<R>(f: impl FnOnce(&SharedCell<HashMap<String, FunDef>>) -> R) -> R {
+    f(&GLOBAL_SETF_FNS)
+}
+fn with_constant_vars<R>(f: impl FnOnce(&SharedCell<std::collections::HashSet<String>>) -> R) -> R {
+    f(&CONSTANT_VARS)
+}
+
+/// Cached `(generation, env)` where `env` holds every global macro in its
+/// function map. `macroexpand_environment_from_cli` was rebuilding this for
+/// EVERY compiled form — cloning all of GLOBAL_MACROS and re-augmenting once
+/// per macro — which dominated load compile time and blocked any per-closure
+/// macro-aware analysis (bliss-usb2 / bliss-9u6d). The function-map values are
+/// immediate macro handles (`from_macro_handle`), so this env holds no movable
+/// GC pointers and is safe to retain across collections without tracing.
+type CachedMacroEnvironment = (u64, Arc<MacroexpandEnv>);
+static CLI_GLOBAL_MACRO_ENV: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<CachedMacroEnvironment>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn bump_macro_env_generation() {
     MACRO_ENV_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2593,7 +2678,7 @@ pub(crate) fn global_macro_source(name: &str) -> Option<(TorclVal, TorclVal)> {
 /// e.g. ASDF's `(setf (operate-level) …)`).
 #[allow(dead_code)] // image setf-writer retention API (bliss-cje1); build_image_from_runtime
 pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
-    GLOBAL_SETF_FNS.with(|m| {
+    with_global_setf_fns(|m| {
         m.borrow()
             .keys()
             .filter_map(|k| {
@@ -2610,7 +2695,7 @@ pub(crate) fn global_setf_fn_place_names() -> Vec<String> {
 #[allow(dead_code)] // image setf-writer retention API (bliss-cje1); build_image_from_runtime
 pub(crate) fn global_setf_fn_source(place: &str) -> Option<(TorclVal, TorclVal)> {
     let key = format!("(SETF {place})");
-    GLOBAL_SETF_FNS.with(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
+    with_global_setf_fns(|m| m.borrow().get(&key).map(|f| (f.params_form, f.body)))
 }
 
 // ── Host-registry image hook (bliss-x0f2 M2) ───────────────────────────
@@ -2727,7 +2812,7 @@ fn host_serialize_registries() -> Vec<u8> {
         out.extend_from_slice(&body_raw.to_le_bytes());
     }
     // Setf-functions.
-    let setfs: Vec<(String, Vec<String>, u64, u64)> = GLOBAL_SETF_FNS.with(|m| {
+    let setfs: Vec<(String, Vec<String>, u64, u64)> = with_global_setf_fns(|m| {
         m.borrow()
             .iter()
             .map(|(k, f)| {
@@ -3580,7 +3665,7 @@ fn drain_pending_host_registries(root_frame: &Arc<SharedCell<EnvFrame>>) {
     }
     let setfs = PENDING_HOST_SETF.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (key, params, params_raw, body_raw) in setfs {
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().insert(
                 key,
                 FunDef::plain(
@@ -3640,6 +3725,7 @@ fn drain_pending_host_generics(env: &Env) {
 /// Register the host-registry image hooks with torcl-rt. Idempotent (torcl-rt
 /// stores the last registration); call once at CLI startup.
 pub(crate) fn register_host_registry_hooks() {
+    native_runtime::register_image_hooks();
     torcl_rt::image::set_host_registry_hooks(host_serialize_registries, host_restore_registries);
     // Off-heap-body VALUE objects (hash-tables, pathnames) are carried in their
     // own image section and re-materialized mid-restore (bliss-x0f2 M3).
@@ -3974,7 +4060,7 @@ fn take_control_value(token: &str) -> TorclVal {
 }
 
 /// Store a control-token value together with the full multiple-value list live
-/// on `env`, so a RETURN / RETURN-FROM out of a BLOCK carries ALL values (not
+/// on `env`, so THROW and RETURN / RETURN-FROM carry ALL values (not
 /// just the primary) to the block's exit — `(return-from foo (values a b))`
 /// must yield two values, and `(return (values))` zero. The values are wrapped
 /// in a leading cons so their presence (even zero values) is unambiguous.
@@ -4304,7 +4390,7 @@ fn torcl_error_to_condition(
         TorclError::StackOverflow(_) => {
             // Control-stack overflow must use the same no-allocation
             // STORAGE-CONDITION payload as heap exhaustion (D5.13 / bliss-7z8).
-            // Env::new reseeds the thread-local pool with CLI-native instances,
+            // Env::new initializes the shared reserve with canonical condition classes,
             // so handler matching still sees the CLI-recognized class.
             torcl_stdlib::acquire_preallocated_storage_condition()?
         }
@@ -4313,6 +4399,11 @@ fn torcl_error_to_condition(
             torcl_rt::rooted!(message = arena_str(msg));
             make_simple_condition("TORCL-FFI::FFI-ERROR", *message, &[], env)?
         }
+        // A Python raise keeps its structure: the exception's class, its message,
+        // the Python frames for a mixed backtrace, and the exception object so a
+        // handler can reach its attributes (bliss-wq5tw).
+        #[cfg(feature = "python")]
+        TorclError::PythonRaised(raise) => python::build_error_condition(env, raise)?,
         TorclError::ProgramError(msg) => {
             let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
             torcl_rt::rooted!(control = arena_str(msg));
@@ -7336,24 +7427,32 @@ fn register_frozen_macro_capture(
 }
 
 fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
-    CONTROL_VALUES.with(|values| {
-        for value in values.borrow_mut().values_mut() {
+    scan_evaluator_roots(visit, true);
+}
+
+// Delivery follows closure and generic ownership from reachable handles. Ordinary
+// GC must continue scanning every registry entry until delivery removes it.
+fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut TorclVal), root_definitions: bool) {
+    // SAFETY: registered root scanners run with all mutators stopped.
+    unsafe {
+        CONTROL_VALUES.scan(|values| {
+            for value in values.borrow_mut().values_mut() {
+                visit(value);
+            }
+        });
+        // The cached `#'<builtin>` wrapper conses (bliss-hb0q). Visiting them is
+        // what lets the cache hold a TorclVal at all: the collector rewrites each
+        // entry in place, so a cached `#'car` stays valid across a relocation
+        // instead of becoming a stale pointer.
+        for value in builtin_wrapper_cache().borrow_mut().values.values_mut() {
             visit(value);
         }
-    });
-    // The cached `#'<builtin>` wrapper conses (bliss-hb0q). Visiting them is
-    // what lets the cache hold a TorclVal at all: the collector rewrites each
-    // entry in place, so a cached `#'car` stays valid across a relocation
-    // instead of becoming a stale pointer.
-    for value in builtin_wrapper_cache().borrow_mut().values.values_mut() {
-        visit(value);
+        MACROEXPAND_ENVIRONMENTS.scan(|environments| {
+            for environment in environments.borrow_mut().values_mut() {
+                environment.visit_gc_roots(visit);
+            }
+        });
     }
-    MACROEXPAND_ENVIRONMENTS.with(|environments| {
-        for environment in environments.borrow_mut().values_mut() {
-            environment.visit_gc_roots(visit);
-        }
-    });
-
     // Shared per-pass visit state (bliss-s56e).
     with_env_visit_state(|state| {
         // Definitions outlive every Env, including the execution that created
@@ -7361,37 +7460,41 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
         for class in CLASS_DEFINITIONS.borrow_mut().values_mut() {
             visit_class_def_roots(class, state, visit);
         }
-        for generic in GENERIC_DEFINITIONS.borrow_mut().values_mut() {
-            visit(&mut generic.generic_function);
-        }
-        for methods in METHOD_DEFINITIONS.borrow_mut().values_mut() {
-            for method in methods {
-                visit_method_def_roots(method, state, visit);
+        if root_definitions {
+            for generic in GENERIC_DEFINITIONS.borrow_mut().values_mut() {
+                visit(&mut generic.generic_function);
+            }
+            for methods in METHOD_DEFINITIONS.borrow_mut().values_mut() {
+                for method in methods {
+                    visit_method_def_roots(method, state, visit);
+                }
+            }
+            for closure in closure_registry().borrow_mut().values_mut() {
+                visit(&mut closure.params_form);
+                visit(&mut closure.body);
+                visit_env_frame_roots(&closure.captured_frame, state, visit);
+                if let Some(funs) = &closure.captured_funs {
+                    visit_fun_map_roots(funs, state, visit);
+                }
+            }
+            // Keep each method's compiled body object live (bliss-x5y.20).
+            for callable in METHOD_COMPILED.borrow_mut().values_mut() {
+                visit(callable);
             }
         }
-        for closure in closure_registry().borrow_mut().values_mut() {
-            visit(&mut closure.params_form);
-            visit(&mut closure.body);
-            visit_env_frame_roots(&closure.captured_frame, state, visit);
-            if let Some(funs) = &closure.captured_funs {
-                visit_fun_map_roots(funs, state, visit);
-            }
-        }
-        // Keep each method's compiled body object live (bliss-x5y.20).
-        for callable in METHOD_COMPILED.borrow_mut().values_mut() {
-            visit(callable);
-        }
-        {
+        if root_definitions {
             for definition in GLOBAL_MACROS.lock().unwrap().values_mut() {
                 visit_macro_def_roots(definition, state, visit);
             }
         }
-        GLOBAL_SETF_FNS.with(|functions| {
-            for definition in functions.borrow_mut().values_mut() {
-                visit_fun_def_roots(definition, visit);
-            }
-        });
-        {
+        if root_definitions {
+            with_global_setf_fns(|functions| {
+                for definition in functions.borrow_mut().values_mut() {
+                    visit_fun_def_roots(definition, visit);
+                }
+            });
+        }
+        if root_definitions {
             for entry in MACRO_FN_CACHE.lock().unwrap().values_mut() {
                 let mut params = TorclVal(entry.params_bits);
                 let mut body = TorclVal(entry.body_bits);
@@ -7415,6 +7518,9 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
             let mut capture = capture
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !root_definitions && capture.registration.is_some() {
+                continue;
+            }
             visit(&mut capture.params_form);
             visit(&mut capture.body);
             visit_frozen_env_frame_roots(&capture.captured_frame, &mut frozen_frames, visit);
@@ -7455,7 +7561,15 @@ fn install_evaluator_global_root_scanner() {
     });
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+/// Run a Lisp function from FOREIGN code: a fresh control environment, rooted, with
+/// the caller's nonlocal-exit tokens preserved and this callback's discarded.
+///
+/// Registered with `managed_callback` on x86-64, where its JIT trampoline lives, but
+/// the function itself is architecture-independent and the embedded-Python export
+/// path (bliss-89axw) calls it directly on every target — that path needs no
+/// trampoline, because all its exports share one static C entry point and carry the
+/// Lisp function in a handle rather than in generated code. Hence no `cfg` here;
+/// only the registration below has one.
 fn foreign_callback_runner(
     entry: TorclVal,
     arguments: &[TorclVal],
@@ -7502,6 +7616,8 @@ fn foreign_callback_runner(
 /// bliss-nubv. Crucially we use the *non-resetting* constructor:
 /// `reset_clos=true` would wipe the parent thread's classes and packages.
 fn thread_entry_runner(mut entry: TorclVal) -> Result<TorclVal, TorclError> {
+    let _packages = torcl_stdlib::fibers::activate_packages();
+    BOOT_COMPLETE.with(|ready| ready.set(true));
     torcl_rt::rooted_ref!(_entry_root = &mut entry);
     let mut env = Env::new_impl(false, false, false);
     // Root the worker's whole Env in place, exactly as the main thread does at
@@ -7568,11 +7684,26 @@ impl Env {
         state: &mut EnvRootVisitState,
         visit: &mut dyn FnMut(*mut TorclVal),
     ) {
+        self.visit_roots_with(state, visit, true);
+    }
+
+    fn visit_delivery_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        with_env_visit_state(|state| self.visit_roots_with(state, visit, false));
+    }
+
+    fn visit_roots_with(
+        &mut self,
+        state: &mut EnvRootVisitState,
+        visit: &mut dyn FnMut(*mut TorclVal),
+        root_closures: bool,
+    ) {
         visit_env_frame_roots(&self.frame, state, visit);
 
         visit_fun_map_roots(&self.funs, state, visit);
-        for def in self.macros.borrow_mut().values_mut() {
-            visit_macro_def_roots(def, state, visit);
+        if root_closures {
+            for def in self.macros.borrow_mut().values_mut() {
+                visit_macro_def_roots(def, state, visit);
+            }
         }
         for expander in self.setf_expanders.borrow_mut().values_mut() {
             visit_setf_expander_roots(expander, state, visit);
@@ -7608,15 +7739,17 @@ impl Env {
         for specifier in &mut self.active_declarations {
             visit(specifier);
         }
-        for closure in self.closures.borrow_mut().values_mut() {
-            visit(&mut closure.params_form);
-            visit(&mut closure.body);
-            visit_env_frame_roots(&closure.captured_frame, state, visit);
-            // The captured namespace holds FunDefs whose lambda lists and bodies
-            // are heap cons trees; unvisited they would go stale under the moving
-            // collector (bliss-5q20).
-            if let Some(funs) = &closure.captured_funs {
-                visit_fun_map_roots(funs, state, visit);
+        if root_closures {
+            for closure in self.closures.borrow_mut().values_mut() {
+                visit(&mut closure.params_form);
+                visit(&mut closure.body);
+                visit_env_frame_roots(&closure.captured_frame, state, visit);
+                // The captured namespace holds FunDefs whose lambda lists and bodies
+                // are heap cons trees; unvisited they would go stale under the moving
+                // collector (bliss-5q20).
+                if let Some(funs) = &closure.captured_funs {
+                    visit_fun_map_roots(funs, state, visit);
+                }
             }
         }
         for context in &mut self.method_context {
@@ -7957,33 +8090,6 @@ impl Env {
         ensure_global("*CONDITION-DEFINITIONS*", NIL);
         env.define_local("*BREAK-ON-SIGNALS*", NIL);
 
-        // bliss-5mf: reseed the STORAGE-CONDITION pool with CLI-native instances
-        // whose class the CLI's condition matcher and TYPE-OF recognize (the
-        // stdlib preallocated them under its own hardcoded condition-symbol class,
-        // which the CLI reads back as a different symbol). They stay pinned in the
-        // GC heap and immortal (D5.13). Runs after the env is functional and
-        // before any user code; best-effort — a failure leaves the stdlib pool.
-        {
-            let n = torcl_stdlib::conditions::storage_condition_pool_size();
-            let mut pool = Vec::with_capacity(n);
-            // Each build_condition_instance_impl allocates; the instances
-            // already accumulated in this Rust-local Vec must be rooted across
-            // those allocations or they relocate out from under it (bliss-wlf).
-            torcl_rt::rooted_ref!(_pool_root = &mut pool);
-            let mut ok = true;
-            for _ in 0..n {
-                match build_condition_instance_impl(&mut env, "STORAGE-CONDITION", &[], true) {
-                    Ok(inst) => pool.push(inst),
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                let _ = torcl_stdlib::conditions::set_storage_condition_pool(&pool);
-            }
-        }
         drop(env_guard);
         env
     }
@@ -8459,6 +8565,7 @@ fn eval_named_call_ex(
     // Lisp-aware statistical profiler (bliss-sc4t): this is the tree-walked call
     // path — record the Lisp frame so a sampled stack shows the function, not the
     // interpreter. The guard pops on every exit (return, `?`, non-local).
+    let _fiber_frame = torcl_rt::thread::FiberCallFrame::enter(name);
     let _sf = sprof::Frame::name(name, sprof::TREEWALK);
     sprof::maybe_sample();
     // Clone the FLET function's captured scope out (releasing the env.funs
@@ -8501,11 +8608,8 @@ fn eval_lambda_call_ex(
     parent: Arc<SharedCell<EnvFrame>>,
     control: LexicalControl,
 ) -> Result<TorclVal, TorclError> {
-    // The interim host-stack depth guard (commit ddba528) is retired (nmq.6):
-    // with the bytecode backend the default, deep recursion runs on the
-    // per-green-thread TorclStack and is bounded by TORCL_STACK_SIZE, raising a
-    // catchable STORAGE-CONDITION (R2.20). This tree-walker path is now the
-    // fallback for forms the compiler does not yet handle.
+    let _call_depth = CallDepthGuard::enter()?;
+    // Tree-walker frames consume the fiber's bounded native stack too.
     torcl_rt::rooted!(params_form = params_form);
     torcl_rt::rooted!(body = body);
     rooted_args!(args = args);
@@ -8620,12 +8724,11 @@ fn print_md_nested(base: *const u8, dims: &[usize], start: usize, out: &mut Stri
     consumed
 }
 
-thread_local! {
-    /// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
-    /// Incremented around each list body; balanced, so it returns to 0 after a
-    /// top-level print.
-    static PRINT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+/// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
+/// Incremented around each list body; balanced, so it returns to 0 after a
+/// top-level print.
+static PRINT_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 fn print_val(val: TorclVal, out: &mut String) {
     // Establish the *print-circle* label table at the outermost print so shared
@@ -8647,6 +8750,17 @@ fn print_val_inner(val: TorclVal, out: &mut String) {
         // A first-class package object (bliss-bhs) prints as #<PACKAGE name>.
         out.push_str("#<PACKAGE ");
         out.push_str(&name);
+        out.push('>');
+    } else if python::is_proxy(val) {
+        // Show Python's own repr, which is what makes a proxy legible in a
+        // backtrace. `describe_proxy` declines rather than failing when there is
+        // no interpreter or __repr__ itself raised: printing must not signal, and
+        // must not start an interpreter as a side effect.
+        out.push_str("#<PYTHON-OBJECT");
+        if let Some(rendered) = python::describe_proxy(val) {
+            out.push(' ');
+            out.push_str(&rendered);
+        }
         out.push('>');
     } else if torcl_stdlib::is_instance(val) {
         // A user-defined `print-object` method wins when one applies (and a print
@@ -9063,34 +9177,40 @@ fn princ_val_env(val: TorclVal, env: &mut Env, out: &mut String) {
 }
 
 // ── Symbol name lookup ────────────────────────────────────────────
-thread_local! {
-    /// Interned symbol index -> its name, so the hot call path can borrow a
-    /// name instead of allocating one.
-    ///
-    /// `sym_name` returns an owned `String`, so every interpreted call through a
-    /// symbol callee paid a malloc + copy + free just to obtain a `&str` it uses
-    /// for a few map lookups and drops. A symbol's name only changes when
-    /// RENAME-PACKAGE rewrites its qualifier (`rekey_renamed_symbols`
-    /// invalidates the affected entries on this thread), and the registry pins
-    /// its objects, so the mapping is otherwise stable for the process.
-    /// Indices are dense and small for interned symbols, so a Vec is the right
-    /// shape; uninterned indices (the high range) are not cached.
-    static SYM_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> = const { RefCell::new(Vec::new()) };
 
-    /// The BARE (package-qualifier-stripped, upcased) name, memoized the same
-    /// way and invalidated at the same two points as `SYM_NAME_CACHE`.
-    ///
-    /// `symbol_bare_name` allocates a fresh String on every call — it upcases
-    /// unconditionally, and `trim_start_matches` showed up as the single
-    /// hottest symbol in two unrelated profiles. Operator dispatch called it
-    /// TWICE per evaluated form (the lexical-shadowing test and the
-    /// fixed-arity-builtin guard), and `apply_function` once more per call, so
-    /// an interpreted loop minted several Strings per operator. Under musl,
-    /// whose allocator does not return freed spans to the OS, that churn shows
-    /// up as unbounded RSS growth (bliss-7x7o, bliss-edzd).
-    static SYM_BARE_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> =
-        const { RefCell::new(Vec::new()) };
-}
+/// Interned symbol index -> its name, so the hot call path can borrow a
+/// name instead of allocating one.
+///
+/// `sym_name` returns an owned `String`, so every interpreted call through a
+/// symbol callee paid a malloc + copy + free just to obtain a `&str` it uses
+/// for a few map lookups and drops. A symbol's name only changes when
+/// RENAME-PACKAGE rewrites its qualifier (`rekey_renamed_symbols`
+/// invalidates the affected entries on this thread), and the registry pins
+/// its objects, so the mapping is otherwise stable for the process.
+/// Indices are dense and small for interned symbols, so a Vec is the right
+/// shape; uninterned indices (the high range) are not cached.
+static SYM_NAME_CACHE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<std::rc::Rc<str>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
+
+/// The BARE (package-qualifier-stripped, upcased) name, memoized the same
+/// way and invalidated at the same two points as `SYM_NAME_CACHE`.
+///
+/// `symbol_bare_name` allocates a fresh String on every call — it upcases
+/// unconditionally, and `trim_start_matches` showed up as the single
+/// hottest symbol in two unrelated profiles. Operator dispatch called it
+/// TWICE per evaluated form (the lexical-shadowing test and the
+/// fixed-arity-builtin guard), and `apply_function` once more per call, so
+/// an interpreted loop minted several Strings per operator. Under musl,
+/// whose allocator does not return freed spans to the OS, that churn shows
+/// up as unbounded RSS growth (bliss-7x7o, bliss-edzd).
+static SYM_BARE_NAME_CACHE: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Vec<Option<std::rc::Rc<str>>>>,
+> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
+};
 
 /// The bare name of a SYMBOL value, memoized by symbol index.
 ///
@@ -9316,10 +9436,9 @@ struct DefinitionalRegistries {
     symbol_macros: std::rc::Weak<RefCell<HashMap<u32, TorclVal>>>,
 }
 
-thread_local! {
-    static LIVE_DEFINITIONAL_REGISTRIES: RefCell<Option<DefinitionalRegistries>> =
-        const { RefCell::new(None) };
-}
+static LIVE_DEFINITIONAL_REGISTRIES: torcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<DefinitionalRegistries>>,
+> = unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn resolve_sym(name: &str) -> Option<TorclVal> {
     // An exact registry key resolves to that symbol directly. `name` is often
@@ -10038,31 +10157,44 @@ fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
 // this thread-local. It is set to point at the loop's `&mut Env` only for the
 // duration of each top-level read (during which the outer `env` binding is not
 // otherwise touched) and cleared afterwards. Evaluation is single-threaded.
-thread_local! {
-    static READ_EVAL_ENV: std::cell::Cell<*mut Env> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
-    // Re-entrancy guard for the package-aware symbol resolver. Package lookup
-    // can reach name helpers that read symbols; nested reads must take the
-    // reader's default path rather than recurse into the resolver (bliss-lb6.12).
-    static RESOLVING_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // False while the bootstrap prelude (lib/boot.lisp) is loading, true once it
-    // finishes. The prelude defines the standard library with bare (nominally
-    // COMMON-LISP) symbols in the CL-USER context, so `home_defined_symbol` must
-    // NOT home those into CL-USER; only user-level DEFUN/DEFVAR after boot should
-    // be registered present there (bliss-v15i).
-    static BOOT_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // Printing an instance may dispatch a user `print-object` method, which needs
-    // the live env. Like READ_EVAL_ENV, the print entry points park their `&mut
-    // Env` here for the span of one print. PRINT_ESCAPE carries `*print-escape*`
-    // (prin1/write => true, princ => false) to the dispatched method; the
-    // PRINTING_OBJECT guard stops a method that itself prints another instance
-    // from re-entering dispatch (which would alias the parked `&mut`), so nested
-    // instances fall back to the `#<CLASS>` form.
-    static PRINT_ENV: std::cell::Cell<*mut Env> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
-    static PRINT_ESCAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static PRINTING_OBJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+
+static READ_EVAL_ENV: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<*mut Env>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| {
+        const { std::cell::Cell::new(std::ptr::null_mut()) }
+    })
+};
+// Re-entrancy guard for the package-aware symbol resolver. Package lookup
+// can reach name helpers that read symbols; nested reads must take the
+// reader's default path rather than recurse into the resolver (bliss-lb6.12).
+static RESOLVING_SYMBOL: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
+// False while the bootstrap prelude (lib/boot.lisp) is loading, true once it
+// finishes. The prelude defines the standard library with bare (nominally
+// COMMON-LISP) symbols in the CL-USER context, so `home_defined_symbol` must
+// NOT home those into CL-USER; only user-level DEFUN/DEFVAR after boot should
+// be registered present there (bliss-v15i).
+static BOOT_COMPLETE: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
+// Printing an instance may dispatch a user `print-object` method, which needs
+// the live env. Like READ_EVAL_ENV, the print entry points park their `&mut
+// Env` here for the span of one print. PRINT_ESCAPE carries `*print-escape*`
+// (prin1/write => true, princ => false) to the dispatched method; the
+// PRINTING_OBJECT guard stops a method that itself prints another instance
+// from re-entering dispatch (which would alias the parked `&mut`), so nested
+// instances fall back to the `#<CLASS>` form.
+static PRINT_ENV: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<*mut Env>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| {
+        const { std::cell::Cell::new(std::ptr::null_mut()) }
+    })
+};
+static PRINT_ESCAPE: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(true) })
+};
+static PRINTING_OBJECT: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(false) })
+};
 
 /// Print `val` with the given `*print-escape*` value, dispatching user
 /// `print-object` methods for instances by parking `env` for the printer. The
@@ -10213,6 +10345,40 @@ fn stdlib_print_object_hook(val: TorclVal, escape: bool) -> Option<String> {
 ///
 /// `None` is returned only when no load environment is active, resolution is
 /// already re-entered, the package is unknown, or package interning fails.
+/// May a bare/qualified read take the HOMELESS bootstrap identity `idx` for `name`?
+///
+/// Either the read is in a package where those identities legitimately live, or the
+/// identity carries an actual bootstrap DEFINITION. Neither test alone works, and
+/// both failures were measured (bliss-nn6f):
+///
+/// * By PACKAGE alone: ironclad's `whirlpool.lisp` reads `CALCULATE-C-EVEN` from a
+///   non-CL package inside a `#.` during compile-file, and losing it downgrades the
+///   file to a source-only fasl.
+/// * By DEFINITION alone: names read during boot BEFORE their `defun` runs — the MOP
+///   accessors `CLASS-SLOTS` and friends — have only an UNBOUND cell at read time, so
+///   the read minted a package-local lookalike and `(fboundp 'class-slots)` went NIL.
+///
+/// And A CELL IS NOT A DEFINITION: `symbol_function` and `global_value_cell` answer
+/// `Some` for a symbol whose cell merely EXISTS holding UNBOUND, which is true of
+/// every name `boot.lisp` reads — so testing `is_some()` would admit the very
+/// lambda-list names (`A`, `VALUE`) this exists to exclude.
+///
+/// A named function rather than an inline block: as a closure inside the resolver it
+/// pushed that codegen unit over a limit where rustc referenced an internal sort
+/// helper it had not emitted, and the musl static-pie link failed with an undefined
+/// `core::slice::sort::…::insert_tail`.
+fn homeless_identity_is_shareable(env: &Env, pkg_name: &str, name: &str, idx: u32) -> bool {
+    let defined = |cell: Option<TorclVal>| {
+        cell.is_some_and(|v| v != torcl_rt::value::UNBOUND && !v.is_nil())
+    };
+    pkg_name == "COMMON-LISP"
+        || pkg_name == "COMMON-LISP-USER"
+        || is_builtin_function(name)
+        || defined(torcl_rt::symbols::symbol_function(idx))
+        || defined(global_value_cell(idx))
+        || env.macros.borrow().contains_key(name)
+}
+
 fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
@@ -10260,21 +10426,30 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 // callable by their existing bare symbol rather than minting a
                 // package-local lookalike with no builtin/function cell.
                 //
-                // This arm is WRONG for a read in a user package and is kept
-                // deliberately: boot.lisp is read in COMMON-LISP with no
-                // IN-PACKAGE, so every name it mentions — including
-                // lambda-list variables like A, N, SEQ, ACC and VALUE — is a
-                // homeless bare identity that this arm then hands to a bare
-                // read in ANY package. Restricting it to COMMON-LISP /
-                // COMMON-LISP-USER fixes that (and `(intern "A")` vs the read
-                // `a`), but it also makes ironclad's whirlpool.lisp fail its
-                // upfront compile-file read and fall back to a source-only
-                // fasl that then calls a compile-time-only function at load.
-                // See bliss-nn6f for the diagnosis and the two candidate fixes.
+                // ONLY identities that carry an actual bootstrap DEFINITION.
+                // boot.lisp is read in COMMON-LISP with no IN-PACKAGE, so every
+                // name it mentions — including lambda-list variables like A, N,
+                // SEQ, ACC and VALUE — becomes a homeless bare identity. Handing
+                // those to a bare read in ANY package is wrong three ways, all
+                // measured: `(symbol-package 'a)` in package P reported
+                // COMMON-LISP, `(eq 'a (intern "A"))` was NIL because INTERN
+                // minted a proper P::A, and two packages could not each own a
+                // variable named VALUE (bliss-nn6f).
+                //
+                // Requiring a definition is what separates the two: a
+                // lambda-list name carries none, while a bootstrap helper the
+                // arm exists for — a Rust builtin, a boot-private function or
+                // macro, a global special — carries one by the time anything
+                // reads it. Restricting by PACKAGE instead was tried and
+                // reverted: it breaks ironclad's whirlpool.lisp, whose `#.`
+                // reads CALCULATE-C-EVEN from a non-CL package during
+                // compile-file. That name has a function cell, so it still
+                // resolves here.
                 reader::find_symbol_index(name)
                     .filter(|idx| {
                         torcl_rt::symbols::symbol_package(*idx)
                             .is_some_and(|package| package.is_nil())
+                            && homeless_identity_is_shareable(env, &pkg_name, name, *idx)
                     })
                     .map(TorclVal::from_symbol_index)
             })
@@ -11378,7 +11553,7 @@ fn rekey_renamed_symbols(env: &Env, renamed: &[(u32, String, String)]) {
         rekey(&mut macros, renamed);
         bump_macro_env_generation();
     }
-    GLOBAL_SETF_FNS.with(|m| rekey(&mut m.borrow_mut(), renamed));
+    with_global_setf_fns(|m| rekey(&mut m.borrow_mut(), renamed));
     // The macro-expander cache is keyed by macro name; entries under the old
     // name are unreachable now — drop them rather than serving stale expanders.
     {
@@ -11811,6 +11986,55 @@ fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
     reader::register_package(name);
 }
 
+/// The identity of a condition type name for registry lookups: its FULL,
+/// package-qualified name, uppercased, with one colon and no redundant
+/// `COMMON-LISP` qualifier.
+///
+/// These registries were keyed by the package-STRIPPED bare name, which made a
+/// condition in any other package alias COMMON-LISP's of the same name. Defining
+/// `MYPKG::ERROR` put its definition where `ERROR`'s belonged, and since that
+/// definition's parent is `CL:ERROR` — also reduced to `ERROR` — walking the parents
+/// found the entry again and recursed until the stack was gone (bliss-kliz4):
+///
+///     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+///     (define-condition later (error) ((k :initarg :k)))
+///     (make-condition 'later :k 5)        => SIGSEGV
+///
+/// `COMMON-LISP:` is normalized away because a CL symbol's name is ordinarily
+/// reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must be one key. The
+/// same bare-name-keying hazard is noted for the DEFTYPE registry at
+/// `resolve_type_spec` (bliss-66ny) — this is that hazard in the condition
+/// registries.
+fn condition_type_key(type_name: &str) -> String {
+    let single = type_name.to_uppercase().replace("::", ":");
+    // COMMON-LISP's qualifier is normalized away because a CL symbol's name is
+    // ordinarily reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must be one
+    // key. TORCL-EXT's is normalized for the same reason and one more: TorCL's own
+    // extension condition types — TIMEOUT-CONDITION, INTERRUPT-CONDITION — are BUILT
+    // under their bare names (`build_condition_instance(env, "TIMEOUT-CONDITION", …)`)
+    // while users name them `torcl-ext:timeout-condition`, which is how they are
+    // documented. Keeping those two spellings apart meant a sandboxed
+    // `(handler-case (loop) (torcl-ext:timeout-condition …))` no longer caught its own
+    // timeout: the CPU deadline fired and the condition escaped unhandled. That
+    // mismatch predates this change and was masked by the reader handing both
+    // spellings the same homeless identity (bliss-nn6f).
+    //
+    // A user package's own `MYPKG:TIMEOUT-CONDITION` still stays distinct — only the
+    // two packages whose condition types TorCL itself defines are folded.
+    for qualifier in ["COMMON-LISP:", "CL:", "TORCL-EXT:"] {
+        if let Some(rest) = single.strip_prefix(qualifier) {
+            return rest.to_string();
+        }
+    }
+    single
+}
+
+/// True when this name is COMMON-LISP's own — i.e. carries no package qualifier
+/// once normalized. Only such a name may match a standard condition type.
+fn names_a_standard_condition(type_name: &str) -> bool {
+    !condition_type_key(type_name).contains(':')
+}
+
 fn plist_get(list: TorclVal, key: &str) -> Option<TorclVal> {
     let mut cur = list;
     while cur.is_cons() {
@@ -11826,13 +12050,36 @@ fn plist_get(list: TorclVal, key: &str) -> Option<TorclVal> {
     None
 }
 
+/// Like [`plist_get`] but matching the FULL, package-qualified name — for the
+/// condition registries, whose keys must distinguish `MYPKG:ERROR` from `CL:ERROR`.
+///
+/// Deliberately not a change to `plist_get` itself: its other caller is the DEFTYPE
+/// registry, which is keyed by bare name ON PURPOSE (`resolve_type_spec`, bliss-66ny)
+/// and guards the collision a different way, by checking for a class of that name
+/// first. Making `plist_get` package-aware broke `(typep cv
+/// 'torcl-thread:condition-variable)`, because the deftype lookup passes a bare name.
+fn plist_get_qualified(list: TorclVal, key: &str) -> Option<TorclVal> {
+    let mut cur = list;
+    while cur.is_cons() {
+        let (entry, rest) = cp(cur);
+        if entry.is_cons() {
+            let (entry_key, entry_vals) = cp(entry);
+            if condition_type_key(&val_as_str(entry_key)) == key {
+                return Some(cp(entry_vals).0);
+            }
+        }
+        cur = rest;
+    }
+    None
+}
+
 fn plist_entry(list: TorclVal, key: &str) -> Option<TorclVal> {
     let mut cur = list;
     while cur.is_cons() {
         let (entry, rest) = cp(cur);
         if entry.is_cons() {
             let (entry_key, _) = cp(entry);
-            if symbol_bare_name(&val_as_str(entry_key)) == key {
+            if condition_type_key(&val_as_str(entry_key)) == key {
                 return Some(entry);
             }
         }
@@ -11866,7 +12113,7 @@ fn resolve_type_spec(env: &Env, type_spec: TorclVal) -> TorclVal {
 fn condition_definition_entry(env: &Env, type_name: &str) -> Option<TorclVal> {
     plist_entry(
         env.lookup_var("*CONDITION-DEFINITIONS*").unwrap_or(NIL),
-        &symbol_bare_name(type_name),
+        &condition_type_key(type_name),
     )
 }
 
@@ -11874,7 +12121,13 @@ fn condition_definition_entry(env: &Env, type_name: &str) -> Option<TorclVal> {
 type ConditionDefinition = (Vec<String>, Vec<(String, String)>);
 
 fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> {
-    match symbol_bare_name(type_name).as_str() {
+    // A qualified name is some other package's type, even when its bare name
+    // matches one of these: `MYPKG:ERROR` is not `CL:ERROR` and must not inherit
+    // its definition.
+    if !names_a_standard_condition(type_name) {
+        return None;
+    }
+    match condition_type_key(type_name).as_str() {
         "CONDITION" => Some((vec![], vec![])),
         "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "ERROR" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
@@ -11979,7 +12232,7 @@ fn condition_slot_defaults_to_nil(slot_name: &str) -> bool {
 
 fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
     let mut specs = Vec::new();
-    let type_name = symbol_bare_name(type_name);
+    let type_name = condition_type_key(type_name);
     if let Some((parents, own_slots)) = builtin_condition_definition(&type_name) {
         for parent in parents {
             specs.extend(condition_slot_specs(env, &parent));
@@ -12097,7 +12350,7 @@ fn print_condition_defined_report(
 
 fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclVal)> {
     let mut defaults = Vec::new();
-    let type_name = symbol_bare_name(type_name);
+    let type_name = condition_type_key(type_name);
     if let Some(entry) = condition_definition_entry(env, &type_name) {
         let (_, rest) = cp(entry);
         let (parents_form, rest2) = cp(rest);
@@ -12126,7 +12379,22 @@ fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclV
 }
 
 fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<TorclVal, TorclError> {
-    let type_sym = resolve_sym(&symbol_bare_name(type_name)).unwrap_or(NIL);
+    // The FULL name, not the bare one. Reducing it to the bare name meant a class
+    // in any other package registered under COMMON-LISP's symbol of that name:
+    // `MYPKG::ERROR` was registered as `CL:ERROR`, replacing it. Its own parent
+    // `CL:ERROR` was then reduced the same way, resolved to the class just
+    // registered, and the class became its own superclass — after which
+    // MAKE-CONDITION of ANY condition recursed until the stack was gone
+    // (bliss-kliz4):
+    //
+    //     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+    //     (define-condition later (error) ((k :initarg :k)))
+    //     (make-condition 'later :k 5)        => SIGSEGV
+    //
+    // `resolve_sym` takes a package-qualified name (an exact registry probe first,
+    // then the reader), and every call site here passes either a bare COMMON-LISP
+    // name or an explicitly qualified one, so the full name is always resolvable.
+    let type_sym = resolve_sym(type_name).unwrap_or(NIL);
     if let Some(class) = torcl_stdlib::find_class(type_sym) {
         return Ok(class);
     }
@@ -12138,7 +12406,9 @@ fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<Torcl
         let (_, rest) = cp(entry);
         let (parents_form, _) = cp(rest);
         for parent in list_to_vec(parents_form) {
-            parent_names.push(sym_bare_name_rc(parent).to_string());
+            // Also the full name: a parent named in another package must resolve to
+            // ITS class, not to whatever COMMON-LISP calls by the same bare name.
+            parent_names.push(sym_name(parent));
         }
     } else {
         parent_names.push("CONDITION".into());
@@ -12189,6 +12459,19 @@ fn instance_class_hierarchy_names(object: TorclVal) -> Option<Vec<String>> {
     if names.is_empty() { None } else { Some(names) }
 }
 
+/// A condition's class-precedence list as `condition_type_key`s, most-specific
+/// first — the names a handler clause is matched against.
+///
+/// PACKAGE-QUALIFIED, unlike the otherwise identical
+/// [`instance_class_hierarchy_names`]. These were bare names, so a handler matched
+/// any condition whose class had the same BARE name: a handler for one package's
+/// `ERROR` caught a plain `CL:ERROR`, and caught another package's `ERROR` too
+/// (bliss-tnavc). Swallowing conditions it never asked for is the worst failure mode
+/// a handler has, because nothing reports it.
+///
+/// `instance_class_hierarchy_names` stays bare deliberately: a dozen callers compare
+/// its strings to literals like `"TYPE-ERROR"`, and those names are COMMON-LISP's,
+/// where bare and qualified agree.
 fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
     let class = torcl_stdlib::class_of(cond);
     let cpl = torcl_stdlib::compute_class_precedence_list(class).ok()?;
@@ -12196,7 +12479,7 @@ fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
     for class in cpl {
         let name = torcl_stdlib::class_name(class);
         if name.is_symbol() {
-            names.push(sym_bare_name_rc(name).to_string());
+            names.push(condition_type_key(&sym_name(name)));
         }
     }
     if names.iter().any(|name| name == "CONDITION") {
@@ -12208,13 +12491,15 @@ fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
 
 fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
     let mut supers = Vec::new();
-    let mut cur = plist_get(
+    let mut cur = plist_get_qualified(
         env.lookup_var("*CONDITION-TYPES*").unwrap_or(NIL),
-        &symbol_bare_name(type_name),
+        &condition_type_key(type_name),
     );
     while let Some(list) = cur {
         for sup in list_to_vec(list) {
-            supers.push(symbol_bare_name(&val_as_str(sup)));
+            // Qualified, so the chain can be compared against a handler's own
+            // qualified name (see `condition_type_hierarchy_names`).
+            supers.push(condition_type_key(&val_as_str(sup)));
         }
         cur = None;
     }
@@ -12222,8 +12507,8 @@ fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
 }
 
 fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) -> bool {
-    let signaled = symbol_bare_name(signaled_type);
-    let handler = symbol_bare_name(handler_type);
+    let signaled = condition_type_key(signaled_type);
+    let handler = condition_type_key(handler_type);
     handler == "T"
         || signaled == handler
         || condition_supertypes(env, &signaled)
@@ -12232,7 +12517,7 @@ fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) ->
 }
 
 fn condition_matches_handler(env: &Env, condition: TorclVal, handler_type: &str) -> bool {
-    let handler = symbol_bare_name(handler_type);
+    let handler = condition_type_key(handler_type);
     if handler == "T" {
         return true;
     }
@@ -14541,6 +14826,14 @@ fn poison_trap(v: TorclVal, what: &str) {
 }
 
 fn eval_form(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
+    // The delivery proof excludes every reachable source-evaluation path.
+    // Keep a checked boundary for incompatible internal calls; constant folding
+    // removes the source dispatcher and its helpers from this native runtime.
+    if cfg!(torcl_no_tree_walker) {
+        return Err(TorclError::ProgramError(
+            "source evaluation is absent from this delivered runtime".into(),
+        ));
+    }
     poison_trap(form, "eval_form entry");
     torcl_rt::rooted!(form = form);
     let form = *form;
@@ -15506,6 +15799,17 @@ fn check_env_var_name(operator: &str, name: &str) -> Result<(), TorclError> {
     }
 }
 
+/// Source calls evaluate their arguments once before entering the same library
+/// dispatcher used by compiled calls. Keep form evaluation outside that module.
+fn eval_builtin_arguments(
+    name: &str,
+    forms: TorclVal,
+    env: &mut Env,
+) -> Result<TorclVal, TorclError> {
+    let args = eval_args(forms, env)?;
+    evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler")
+}
+
 fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -15787,7 +16091,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 ));
             }
             "CATCH" => {
-                let (tag_form, body) = cp(cdr);
+                // The BODY is a source form held across evaluating the TAG, which
+                // allocates: a relocating minor GC there leaves `body` stale and
+                // `eval_progn` walks a moved list (bliss-ep38p). PROGV below roots
+                // its source forms for the same reason.
+                let (tag_form, mut body) = cp(cdr);
+                torcl_rt::rooted_ref!(_body_root = &mut body);
                 let tag = val_as_str(eval_form(tag_form, env)?);
                 let token = next_control_token("__THROW__");
                 env.catch_stack.push((tag, token.clone()));
@@ -15795,47 +16104,41 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 env.catch_stack.pop();
                 match result {
                     Err(TorclError::Internal(msg)) if msg == token => {
-                        return Ok(take_control_value(&token));
+                        return Ok(take_control_mv(&token, env));
                     }
                     other => return other,
                 }
             }
             "PROGV" => {
-                // (progv symbols values body*) — evaluate SYMBOLS and VALUES (two
-                // lists), then dynamically bind each symbol to the corresponding
-                // value for the extent of BODY. Excess symbols become unbound;
-                // excess values are ignored (CLHS). Bindings are the symbols'
-                // global value cells, saved and restored (unwind-safe).
+                // PROGV bindings belong to this execution, like LET special
+                // bindings. Preserve the source across evaluating both lists.
                 let (syms_form, rest) = cp(cdr);
-                let (vals_form, body) = cp(rest);
-                let mut syms_v = eval_form(syms_form, env)?;
-                torcl_rt::rooted_ref!(_syms_root = &mut syms_v);
-                let mut vals_v = eval_form(vals_form, env)?;
-                torcl_rt::rooted_ref!(_vals_root = &mut vals_v);
-                let syms = list_to_vec(syms_v);
-                let vals = list_to_vec(vals_v);
-                // The saved old values leave their value cells (a GC root) once we
-                // overwrite them, so they must be rooted across BODY's evaluation.
-                let mut saved_idx: Vec<u32> = Vec::new();
-                torcl_rt::rooted!(saved_val = Vec::<TorclVal>::new());
-                for (i, s) in syms.iter().enumerate() {
-                    if !s.is_symbol() {
-                        continue;
+                let (mut vals_form, mut body) = cp(rest);
+                torcl_rt::rooted_ref!(_vals_form_root = &mut vals_form);
+                torcl_rt::rooted_ref!(_body_root = &mut body);
+                torcl_rt::rooted!(syms_v = eval_form(syms_form, env)?);
+                torcl_rt::rooted!(vals_v = eval_form(vals_form, env)?);
+                let syms = list_to_vec(*syms_v);
+                let vals = list_to_vec(*vals_v);
+                for sym in &syms {
+                    if !sym.is_symbol() || *sym == NIL || *sym == T {
+                        return Err(TorclError::TypeError {
+                            datum: *sym,
+                            expected: "SYMBOL".into(),
+                        });
                     }
-                    let idx = s.as_symbol_index();
-                    let old =
-                        torcl_rt::symbols::symbol_value(idx).unwrap_or(torcl_rt::value::UNBOUND);
-                    saved_idx.push(idx);
-                    saved_val.push(old);
-                    let newv = vals.get(i).copied().unwrap_or(torcl_rt::value::UNBOUND);
-                    torcl_rt::symbols::set_symbol_value(idx, newv);
+                }
+                torcl_rt::rooted!(bindings = Vec::<DynBind>::new());
+                for (i, sym) in syms.iter().enumerate() {
+                    let value = vals.get(i).copied().unwrap_or(torcl_rt::value::UNBOUND);
+                    bindings.push(DynBind::establish(*sym, value));
                 }
                 let result = eval_progn(body, env);
-                for k in (0..saved_idx.len()).rev() {
-                    torcl_rt::symbols::set_symbol_value(saved_idx[k], saved_val[k]);
-                }
+                // Duplicate symbols unwind in reverse binding order.
+                while bindings.pop().is_some() {}
                 return result;
             }
+
             "THROW" => {
                 let (tag_form, rest) = cp(cdr);
                 let (val_form, _) = cp(rest);
@@ -15847,8 +16150,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     .rev()
                     .find(|(catch_tag, _)| catch_tag == &tag)
                 {
-                    store_control_value(token, value);
-                    return Err(TorclError::Internal(token.clone()));
+                    let token = token.clone();
+                    store_control_mv(&token, value, env);
+                    return Err(TorclError::Internal(token));
                 }
                 // A THROW with no matching CATCH is a catchable CONTROL-ERROR
                 // (CLHS 5.2), not an uncatchable internal error.
@@ -15912,90 +16216,10 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     },
                 }
             }
-            "PRINT" => {
-                // (print object &optional stream): per CLHS, PRINT is PRIN1
-                // preceded by a newline and followed by a SPACE (not a newline)
-                // — "the printed representation of object is preceded by a
-                // newline and followed by a space" (bliss-g5dg).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError("PRINT requires an object".into()));
-                }
-                // Render first (dispatching print-object allocates), then resolve
-                // the stream from the rooted args so a GC in between cannot stale
-                // the object or the stream (bliss-6b2 #2).
-                let rendered = format_val_env(args[0], env, true);
-                let stream = if args.len() > 1 { args[1] } else { NIL };
-                let out = resolve_output_stream(stream, env);
-                write_str_to(out, "\n")?;
-                write_str_to(out, &rendered)?;
-                write_str_to(out, " ")?;
-                return Ok(args[0]);
-            }
-            "PRINC" => {
-                // (princ object &optional stream)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError("PRINC requires an object".into()));
-                }
-                let mut s = String::new();
-                princ_val_env(args[0], env, &mut s);
-                let stream = if args.len() > 1 { args[1] } else { NIL };
-                let out = resolve_output_stream(stream, env);
-                write_str_to(out, &s)?;
-                return Ok(args[0]);
-            }
-            "PRIN1" => {
-                // (prin1 object &optional stream): the escaped (readable)
-                // representation, no surrounding newlines. Returns the object.
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError("PRIN1 requires an object".into()));
-                }
-                let rendered = format_val_env(args[0], env, true);
-                let stream = if args.len() > 1 { args[1] } else { NIL };
-                let out = resolve_output_stream(stream, env);
-                write_str_to(out, &rendered)?;
-                return Ok(args[0]);
-            }
-            "WRITE" => {
-                // (write object &key stream escape ...): render OBJECT honouring
-                // :escape (default T → prin1-style; NIL → princ-style) to :stream
-                // (default *standard-output*). Other keywords are accepted and
-                // ignored. Returns the object.
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError("WRITE requires an object".into()));
-                }
-                let mut stream_idx: Option<usize> = None;
-                let mut escape = true;
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    let key = sym_bare_name_rc(args[i]);
-                    let val = args[i + 1];
-                    match key.as_ref() {
-                        "STREAM" => stream_idx = Some(i + 1),
-                        "ESCAPE" => escape = !val.is_nil(),
-                        _ => {}
-                    }
-                    i += 2;
-                }
-                // :escape NIL is princ semantics (unquoted strings/chars);
-                // otherwise prin1 (readable) semantics. Render before resolving the
-                // stream from the rooted args so an allocating render cannot stale
-                // it (bliss-6b2 #2).
-                let rendered = if escape {
-                    format_val_env(args[0], env, true)
-                } else {
-                    let mut s = String::new();
-                    princ_val_env(args[0], env, &mut s);
-                    s
-                };
-                let stream = stream_idx.map(|k| args[k]).unwrap_or(NIL);
-                let out = resolve_output_stream(stream, env);
-                write_str_to(out, &rendered)?;
-                return Ok(args[0]);
-            }
+            "PRINT" => return eval_builtin_arguments(&name, cdr, env),
+            "PRINC" => return eval_builtin_arguments(&name, cdr, env),
+            "PRIN1" => return eval_builtin_arguments(&name, cdr, env),
+            "WRITE" => return eval_builtin_arguments(&name, cdr, env),
             "TERPRI" => {
                 let args = list_to_vec(cdr);
                 let stream = if args.is_empty() {
@@ -16061,439 +16285,55 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(NIL);
             }
-            "WRITE-CHAR" => {
-                // (write-char character &optional stream)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "WRITE-CHAR requires a character".into(),
-                    ));
-                }
-                let ch = args[0];
-                let stream = if args.len() > 1 { args[1] } else { NIL };
-                let out = resolve_output_stream(stream, env);
-                check_pending_sigpipe_for_output()?;
-                if is_gray_stream(out) {
-                    invoke_generic_function("STREAM-WRITE-CHAR", &[out, ch], env)?;
-                } else {
-                    torcl_stdlib::stream_write_char(out, ch)?;
-                }
-                return Ok(ch);
-            }
-            "MAKE-STRING" => {
-                // (make-string size &key initial-element element-type) → a FRESH
-                // (non-interned) mutable string, so (setf (char s i) c) / REPLACE
-                // can mutate it without aliasing a shared literal.
-                //
-                // Argument validation is a catchable PROGRAM-ERROR (ansi
-                // MAKE-STRING.ERROR.1-6): no size, an odd number of keyword
-                // arguments, a non-symbol in keyword position, or an unknown
-                // keyword when :allow-other-keys is not (first-occurrence) true.
-                // For a repeated keyword the LEFTMOST value wins (KEYWORDS.7).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "MAKE-STRING requires a size argument".into(),
-                    ));
-                }
-                let size = args[0];
-                if !size.is_fixnum() || size.as_fixnum() < 0 {
-                    return Err(TorclError::TypeError {
-                        datum: size,
-                        expected: "non-negative fixnum size".into(),
-                    });
-                }
-                let kv = &args[1..];
-                if kv.len() % 2 != 0 {
-                    return Err(TorclError::ProgramError(
-                        "MAKE-STRING: keyword arguments must appear in key/value pairs".into(),
-                    ));
-                }
-                // Determine :allow-other-keys from its FIRST occurrence (ANSI).
-                let mut allow_other = false;
-                let mut j = 0;
-                while j < kv.len() {
-                    if kv[j].is_symbol() && sym_bare_name_rc(kv[j]).as_ref() == "ALLOW-OTHER-KEYS" {
-                        allow_other = !kv[j + 1].is_nil();
-                        break;
-                    }
-                    j += 2;
-                }
-                let mut fill = ' ';
-                let mut fill_set = false;
-                let mut i = 0;
-                while i < kv.len() {
-                    let key = kv[i];
-                    let val = kv[i + 1];
-                    if !key.is_symbol() {
-                        let mut kbuf = String::new();
-                        print_val(key, &mut kbuf);
-                        return Err(TorclError::ProgramError(format!(
-                            "MAKE-STRING: keyword argument name is not a symbol: {kbuf}"
-                        )));
-                    }
-                    match sym_bare_name_rc(key).as_ref() {
-                        "INITIAL-ELEMENT" => {
-                            if !fill_set {
-                                if !val.is_character() {
-                                    return Err(TorclError::TypeError {
-                                        datum: val,
-                                        expected: "character".into(),
-                                    });
-                                }
-                                fill = val.as_char();
-                                fill_set = true;
-                            }
-                        }
-                        "ELEMENT-TYPE" | "ALLOW-OTHER-KEYS" => {}
-                        other => {
-                            if !allow_other {
-                                return Err(TorclError::ProgramError(format!(
-                                    "MAKE-STRING: unknown keyword argument :{other}"
-                                )));
-                            }
-                        }
-                    }
-                    i += 2;
-                }
-                let content: String =
-                    std::iter::repeat_n(fill, size.as_fixnum() as usize).collect();
-                return Ok(torcl_stdlib::make_lisp_string_fresh(&content));
-            }
+            "WRITE-CHAR" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-STRING" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING-OUTPUT-STREAM" => {
                 // (make-string-output-stream &key element-type)
                 return torcl_stdlib::make_string_output_stream(NIL);
             }
-            "MAKE-BROADCAST-STREAM" => {
-                // (make-broadcast-stream &rest streams) → output stream that fans
-                // each write out to all component streams. eval_args keeps the
-                // component streams rooted across the allocating constructor.
-                let args = eval_args(cdr, env)?;
-                return torcl_stdlib::make_broadcast_stream(&args);
-            }
-            "MAKE-CONCATENATED-STREAM" => {
-                // (make-concatenated-stream &rest streams) → input stream that
-                // reads successively from each component.
-                let args = eval_args(cdr, env)?;
-                return torcl_stdlib::make_concatenated_stream(&args);
-            }
-            "MAKE-TWO-WAY-STREAM" => {
-                // (make-two-way-stream input output)
-                let args = eval_args(cdr, env)?;
-                let input = args.first().copied().unwrap_or(NIL);
-                let output = args.get(1).copied().unwrap_or(NIL);
-                return torcl_stdlib::make_two_way_stream(input, output);
-            }
-            "MAKE-ECHO-STREAM" => {
-                // (make-echo-stream input output) → reads echo to output.
-                let args = eval_args(cdr, env)?;
-                let input = args.first().copied().unwrap_or(NIL);
-                let output = args.get(1).copied().unwrap_or(NIL);
-                return torcl_stdlib::make_echo_stream(input, output);
-            }
-            "MAKE-SYNONYM-STREAM" => {
-                // (make-synonym-stream symbol) → stream that forwards to the stream
-                // that is the current value of SYMBOL.
-                let args = eval_args(cdr, env)?;
-                let symbol = args.first().copied().unwrap_or(NIL);
-                return torcl_stdlib::make_synonym_stream(symbol);
-            }
-            "STREAMP" => {
-                // (streamp object) → T if object is a stream.
-                let args = eval_args(cdr, env)?;
-                let obj = args.first().copied().unwrap_or(NIL);
-                return Ok(if is_stream(obj) { T } else { NIL });
-            }
+            "MAKE-BROADCAST-STREAM" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-CONCATENATED-STREAM" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-TWO-WAY-STREAM" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-ECHO-STREAM" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-SYNONYM-STREAM" => return eval_builtin_arguments(&name, cdr, env),
+            "STREAMP" => return eval_builtin_arguments(&name, cdr, env),
             "INPUT-STREAM-P" | "TORCL::%NATIVE-INPUT-STREAM-P"
                 if !env.generics.contains_key(&name) =>
             {
-                // (input-stream-p stream) → T if the stream can be read from.
-                let args = eval_args(cdr, env)?;
-                let obj = args.first().copied().unwrap_or(NIL);
-                return Ok(if torcl_stdlib::input_stream_p(obj) {
-                    T
-                } else {
-                    NIL
-                });
+                return eval_builtin_arguments(&name, cdr, env);
             }
-            "TORCL::%NATIVE-STREAM-ELEMENT-TYPE" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 {
-                    return Err(TorclError::ProgramError(
-                        "%native-stream-element-type requires one stream".into(),
-                    ));
-                }
-                return Ok(torcl_stdlib::stream_element_type(args[0]));
-            }
+            "TORCL::%NATIVE-STREAM-ELEMENT-TYPE" => return eval_builtin_arguments(&name, cdr, env),
             "OUTPUT-STREAM-P" | "TORCL::%NATIVE-OUTPUT-STREAM-P"
                 if !env.generics.contains_key(&name) =>
             {
-                // (output-stream-p stream) → T if the stream can be written to.
-                let args = eval_args(cdr, env)?;
-                let obj = args.first().copied().unwrap_or(NIL);
-                return Ok(if torcl_stdlib::output_stream_p(obj) {
-                    T
-                } else {
-                    NIL
-                });
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "OPEN-STREAM-P" | "TORCL::%NATIVE-OPEN-STREAM-P"
                 if !env.generics.contains_key(&name) =>
             {
-                // (open-stream-p stream) → T if the stream is not closed.
-                let args = eval_args(cdr, env)?;
-                let obj = args.first().copied().unwrap_or(NIL);
-                return Ok(if torcl_stdlib::open_stream_p(obj) {
-                    T
-                } else {
-                    NIL
-                });
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "CLOSE" | "TORCL::%NATIVE-CLOSE" if !env.generics.contains_key(&name) => {
-                // (close stream &key abort) → T. Closing a non-stream is a no-op.
-                let args = eval_args(cdr, env)?;
-                let stream = if args.is_empty() { NIL } else { args[0] };
-                let mut abort = false;
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    let key = args[i];
-                    if key.is_symbol() && sym_bare_name_rc(key).as_ref() == "ABORT" {
-                        abort = args[i + 1] != NIL;
-                    }
-                    i += 2;
-                }
-                if is_stream(stream) {
-                    torcl_stdlib::close(stream, abort)?;
-                }
-                return Ok(T);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             // Debug introspection (bliss-zz6w): raw body/lambda-list of an
             // interpreted-function object, for inspecting restored cores.
-            "TORCL::%FN-BODY" => {
-                let args = eval_args(cdr, env)?;
-                let f = args.first().copied().unwrap_or(NIL);
-                return Ok(if torcl_rt::function::is_interpreted_function(f) {
-                    torcl_rt::function::body(f)
-                } else {
-                    NIL
-                });
-            }
+            "TORCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
             // ── Custom reader macros (bliss-r4mk) ──────────────────────
             // Registrations key by the (pinned) readtable OBJECT in
             // *READTABLE*; handlers are coerced to pinned interpreted-function
             // objects (or kept as index-immune symbols), so the reader tables'
             // raw TorclVals never go stale under the moving GC.
-            "SET-DISPATCH-MACRO-CHARACTER" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() < 3 || !args[0].is_character() || !args[1].is_character() {
-                    return Err(TorclError::Internal(
-                        "SET-DISPATCH-MACRO-CHARACTER requires disp-char sub-char function".into(),
-                    ));
-                }
-                let handler = coerce_installed_function(env, args[2]);
-                let rt = args
-                    .get(3)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or_else(cli_current_readtable);
-                reader::set_dispatch_macro_character(
-                    rt,
-                    args[0].as_char(),
-                    args[1].as_char(),
-                    handler,
-                )?;
-                return Ok(T);
-            }
-            "GET-DISPATCH-MACRO-CHARACTER" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 || !args[0].is_character() || !args[1].is_character() {
-                    return Err(TorclError::ProgramError(
-                        "GET-DISPATCH-MACRO-CHARACTER requires disp-char sub-char".into(),
-                    ));
-                }
-                let rt = args
-                    .get(2)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or_else(cli_current_readtable);
-                // CLHS: disp-char must be a dispatch macro character, else error.
-                if !reader::is_dispatch_macro_character(rt, args[0].as_char()) {
-                    return Err(TorclError::StreamError(format!(
-                        "{} is not a dispatch macro character",
-                        args[0].as_char()
-                    )));
-                }
-                if let Some(handler) =
-                    reader::get_dispatch_macro_character(rt, args[0].as_char(), args[1].as_char())?
-                {
-                    return Ok(handler);
-                }
-                if args[0].as_char() == '#' && args[1].as_char() == '\\' {
-                    let name = resolve_sym("TORCL::%STANDARD-CHARACTER-READER").unwrap();
-                    return Ok(symbol_function_object(env, name).unwrap_or(NIL));
-                }
-                return Ok(NIL);
-            }
-            "TORCL::%STANDARD-CHARACTER-READER" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 3 {
-                    return Err(TorclError::ProgramError(
-                        "standard character reader requires stream, sub-character and argument"
-                            .into(),
-                    ));
-                }
-                let suppress = env
-                    .lookup_var("*READ-SUPPRESS*")
-                    .is_some_and(|v| !v.is_nil());
-                if !args[2].is_nil() && !suppress {
-                    return Err(TorclError::StreamError(
-                        "#\\ does not accept a numeric argument".into(),
-                    ));
-                }
-                return torcl_stdlib::streams::read_character_literal(args[0], suppress);
-            }
-            "MAKE-DISPATCH-MACRO-CHARACTER" => {
-                let args = eval_args(cdr, env)?;
-                // (make-dispatch-macro-character char &optional non-term-p rt):
-                // no char, a non-char, or more than 3 args is a PROGRAM-ERROR
-                // (make-dispatch-macro-character.error.1/.2).
-                if args.is_empty() || !args[0].is_character() || args.len() > 3 {
-                    return Err(TorclError::ProgramError(
-                        "MAKE-DISPATCH-MACRO-CHARACTER requires a character".into(),
-                    ));
-                }
-                let non_term = args.get(1).copied().unwrap_or(NIL) != NIL;
-                let rt = args
-                    .get(2)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or_else(cli_current_readtable);
-                reader::make_dispatch_macro_character(rt, args[0].as_char(), non_term)?;
-                return Ok(T);
-            }
-            "SET-SYNTAX-FROM-CHAR" => {
-                // (set-syntax-from-char to-char from-char &optional to-rt from-rt)
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 || !args[0].is_character() || !args[1].is_character() {
-                    return Err(TorclError::ProgramError(
-                        "SET-SYNTAX-FROM-CHAR requires two characters".into(),
-                    ));
-                }
-                let to_rt = args
-                    .get(2)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or_else(cli_current_readtable);
-                // from-readtable defaults to the STANDARD readtable (NIL here,
-                // which the reader treats as standard syntax).
-                let from_rt = args
-                    .get(3)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or(NIL);
-                reader::set_syntax_from_char(args[0].as_char(), args[1].as_char(), to_rt, from_rt);
-                return Ok(T);
-            }
-            "SET-MACRO-CHARACTER" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 || !args[0].is_character() {
-                    return Err(TorclError::Internal(
-                        "SET-MACRO-CHARACTER requires char function".into(),
-                    ));
-                }
-                let handler = coerce_installed_function(env, args[1]);
-                let non_term = args.get(2).copied().unwrap_or(NIL) != NIL;
-                let rt = args
-                    .get(3)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or_else(cli_current_readtable);
-                reader::set_macro_character(rt, args[0].as_char(), handler, non_term)?;
-                return Ok(T);
-            }
-            "GET-MACRO-CHARACTER" => {
-                let args = eval_args(cdr, env)?;
-                // (get-macro-character char &optional readtable): 0 or >2 args is
-                // a PROGRAM-ERROR (get-macro-character.error.1/.2).
-                if args.is_empty() || args.len() > 2 {
-                    return Err(TorclError::ProgramError(
-                        "GET-MACRO-CHARACTER takes one or two arguments".into(),
-                    ));
-                }
-                if !args[0].is_character() {
-                    return Err(TorclError::TypeError {
-                        datum: args[0],
-                        expected: "CHARACTER".into(),
-                    });
-                }
-                let rt = args
-                    .get(1)
-                    .copied()
-                    .filter(|v| v.is_heap_object())
-                    .unwrap_or_else(cli_current_readtable);
-                let ch = args[0].as_char();
-                let (func, non_term) = reader::get_macro_character(rt, ch)?;
-                let (f, nt) = match func {
-                    Some(f) if f != T => (f, non_term),
-                    // No custom handler: report the built-in macro function for a
-                    // standard macro character as an fbound placeholder symbol
-                    // (get-macro-character.1/.3 only check functionp/fboundp).
-                    _ => match reader::standard_macro_char(ch) {
-                        Some(standard_nt) => (
-                            resolve_sym("TORCL::%STANDARD-READER-MACRO").unwrap_or(NIL),
-                            standard_nt,
-                        ),
-                        None => (NIL, false),
-                    },
-                };
-                env.set_mv(vec![f, if nt { T } else { NIL }]);
-                return Ok(f);
-            }
-            "TORCL::%COPY-READTABLE" => {
-                let args = eval_args(cdr, env)?;
-                // CLHS: from omitted → copy the CURRENT readtable; from = NIL
-                // → a readtable with STANDARD syntax (no user registrations).
-                let to = args.get(1).copied().filter(|v| v.is_heap_object());
-                return match args.first().copied() {
-                    Some(v) if v.is_heap_object() => Ok(reader::copy_readtable(v, to)?),
-                    Some(v) if v == NIL => Ok(reader::make_readtable(None)?),
-                    _ => Ok(reader::copy_readtable(cli_current_readtable(), to)?),
-                };
-            }
-            "TORCL::%READTABLE-CASE" => {
-                // (torcl::%readtable-case rt) => :upcase|:downcase|:preserve|:invert
-                let args = eval_args(cdr, env)?;
-                let rt = args.first().copied().unwrap_or(NIL);
-                let mode = reader::readtable_case_mode(rt).unwrap_or(0);
-                let kw = match mode {
-                    1 => ":DOWNCASE",
-                    2 => ":PRESERVE",
-                    3 => ":INVERT",
-                    _ => ":UPCASE",
-                };
-                return Ok(resolve_sym(kw).unwrap_or(NIL));
-            }
-            "TORCL::%SET-READTABLE-CASE" => {
-                // (torcl::%set-readtable-case mode rt) => mode
-                let args = eval_args(cdr, env)?;
-                let mode_kw = args.first().copied().unwrap_or(NIL);
-                let rt = args.get(1).copied().unwrap_or(NIL);
-                let name = sym_bare_name_rc(mode_kw);
-                let code = match name.as_ref() {
-                    "UPCASE" => 0u8,
-                    "DOWNCASE" => 1,
-                    "PRESERVE" => 2,
-                    "INVERT" => 3,
-                    _ => {
-                        return Err(TorclError::TypeError {
-                            datum: mode_kw,
-                            expected: "one of :UPCASE :DOWNCASE :PRESERVE :INVERT".into(),
-                        });
-                    }
-                };
-                reader::set_readtable_case_mode(rt, code);
-                return Ok(mode_kw);
-            }
+            "SET-DISPATCH-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
+            "GET-DISPATCH-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%STANDARD-CHARACTER-READER" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-DISPATCH-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
+            "SET-SYNTAX-FROM-CHAR" => return eval_builtin_arguments(&name, cdr, env),
+            "SET-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
+            "GET-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%COPY-READTABLE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SET-READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%PRUNE-CLOSURES" => {
                 // (torcl::%prune-closures) → (before after): drop dead
                 // closure-registry entries (bliss-uamd). Also runs
@@ -16513,28 +16353,18 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 torcl_rt::rooted!(c = TorclVal::from_fixnum(generations as i64));
                 return Ok(vec_to_list(&[*a, *b, *c]));
             }
-            "TORCL::%SYM-BY-INDEX" => {
-                let args = eval_args(cdr, env)?;
-                let idx = args.first().map(|v| v.as_fixnum() as u32).unwrap_or(0);
-                return Ok(arena_str(&format!(
-                    "key={:?} name={:?}",
-                    torcl_rt::symbols::registry_key(idx),
-                    torcl_rt::symbols::symbol_name(idx)
-                )));
-            }
-            "TORCL::%FN-LAMBDA-LIST" => {
-                let args = eval_args(cdr, env)?;
-                let f = args.first().copied().unwrap_or(NIL);
-                return Ok(if torcl_rt::function::is_interpreted_function(f) {
-                    torcl_rt::function::lambda_list(f)
-                } else {
-                    NIL
-                });
-            }
-            "TORCL::%NATIVE-MUTEX" => {
+            "TORCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%FN-LAMBDA-LIST" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%NATIVE-MUTEX" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%NATIVE-FIBER" => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation(
+                        "fiber runtime access denied".into(),
+                    ));
+                }
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
-                return torcl_stdlib::synchronization::call(&args);
+                return torcl_stdlib::fibers::call(&args);
             }
             "TORCL::%FOREIGN-MEMORY" => {
                 if env.sandbox {
@@ -16568,11 +16398,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 env.clear_mv();
                 return torcl_stdlib::ffi::buffered_call(&args);
             }
-            "TORCL::%NATIVE-CONDITION" => {
-                let args = eval_args(cdr, env)?;
-                env.clear_mv();
-                return torcl_stdlib::synchronization::condition_call(&args);
-            }
+            "TORCL::%NATIVE-CONDITION" => return eval_builtin_arguments(&name, cdr, env),
             // ── TCP socket primitives (for the slynk backend) ──────────
             "TORCL::%SOCKET-CONNECT" => {
                 // (%socket-connect host port &optional timeout-ms) → UB8 stream.
@@ -16615,158 +16441,49 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     timeout,
                 );
             }
-            "TORCL::%SOCKET-READ-TIMEOUT" => {
-                // (%socket-read-timeout stream &optional timeout-ms) → ms | NIL.
-                let args = eval_args(cdr, env)?;
-                if !(1..=2).contains(&args.len()) {
-                    return Err(TorclError::ProgramError(
-                        "%socket-read-timeout requires stream and optional timeout-ms".into(),
-                    ));
-                }
-                if let Some(value) = args.get(1).copied() {
-                    let timeout = if value.is_nil() {
-                        None
-                    } else if value.is_fixnum() && value.as_fixnum() > 0 {
-                        Some(std::time::Duration::from_millis(value.as_fixnum() as u64))
-                    } else {
-                        return Err(TorclError::TypeError {
-                            datum: value,
-                            expected: "(OR NULL (INTEGER 1 *))".into(),
-                        });
-                    };
-                    torcl_stdlib::streams::socket_set_read_timeout(args[0], timeout)?;
-                }
-                return Ok(torcl_stdlib::streams::socket_read_timeout(args[0])?
-                    .map(|duration| TorclVal::from_fixnum(duration.as_millis() as i64))
-                    .unwrap_or(NIL));
-            }
-            "TORCL::%SOCKET-LISTEN" => {
-                // (%socket-listen host port &optional backlog) → listener-id
-                let args = eval_args(cdr, env)?;
-                let host = if args.is_empty() {
-                    "127.0.0.1".to_string()
-                } else {
-                    val_as_str(args[0])
-                };
-                let port = if args.len() > 1 && args[1].is_fixnum() {
-                    args[1].as_fixnum() as u16
-                } else {
-                    0
-                };
-                let backlog = if args.len() > 2 && args[2].is_fixnum() {
-                    args[2].as_fixnum() as i32
-                } else {
-                    5
-                };
-                let id = torcl_stdlib::socket_listen(&host, port, backlog)?;
-                return Ok(TorclVal::from_fixnum(id as i64));
-            }
-            "TORCL::%SOCKET-LOCAL-PORT" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() || !args[0].is_fixnum() {
-                    return Ok(NIL);
-                }
-                return Ok(torcl_stdlib::socket_local_port(args[0].as_fixnum() as u64)
-                    .map(|p| TorclVal::from_fixnum(p as i64))
-                    .unwrap_or(NIL));
-            }
-            "TORCL::%SOCKET-ACCEPT" => {
-                // (%socket-accept listener-id) → connection stream (blocks)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() || !args[0].is_fixnum() {
-                    return Err(TorclError::ProgramError(
-                        "%socket-accept: listener id must be an integer".into(),
-                    ));
-                }
-                return torcl_stdlib::socket_accept(args[0].as_fixnum() as u64);
-            }
-            "TORCL::%SOCKET-CLOSE" => {
-                // (%socket-close listener-id) → NIL. Connections are closed via CLOSE.
-                let args = eval_args(cdr, env)?;
-                if let Some(v) = args.first() {
-                    if v.is_fixnum() {
-                        torcl_stdlib::socket_close_listener(v.as_fixnum() as u64);
-                    }
-                }
-                return Ok(NIL);
-            }
-            "TORCL::%SOCKET-FD" => {
-                // (%socket-fd stream) → integer fd | NIL
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                return Ok(torcl_stdlib::stream_raw_fd(s)
-                    .map(|fd| TorclVal::from_fixnum(fd as i64))
-                    .unwrap_or(NIL));
-            }
-            "TORCL::%SOCKET-WAIT-FOR-INPUT" => {
-                // (%socket-wait-for-input stream &optional timeout-ms) → T | NIL
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                let timeout = if args.len() > 1 && args[1].is_fixnum() {
-                    Some(args[1].as_fixnum() as i32)
-                } else {
-                    None
-                };
-                return Ok(if torcl_stdlib::stream_wait_for_input(s, timeout)? {
-                    T
-                } else {
-                    NIL
-                });
-            }
-            "WRITE-BYTE" => {
-                // (write-byte integer stream) → integer
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal(
-                        "WRITE-BYTE requires a byte and a stream".into(),
-                    ));
-                }
-                let byte = args[0];
-                let out = resolve_output_stream(args[1], env);
-                check_pending_sigpipe_for_output()?;
-                if is_gray_stream(out) {
-                    invoke_generic_function("STREAM-WRITE-BYTE", &[out, byte], env)?;
-                } else {
-                    torcl_stdlib::stream_write_byte(out, byte)?;
-                }
-                return Ok(byte);
-            }
-            "READ-BYTE" => {
-                // (read-byte stream &optional eof-error-p eof-value)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal("READ-BYTE requires a stream".into()));
-                }
-                let inp = resolve_input_stream(args[0], env);
-                let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
-                let b = if is_gray_stream(inp) {
-                    invoke_generic_function("STREAM-READ-BYTE", &[inp], env)?
-                } else {
-                    torcl_stdlib::stream_read_byte(inp)?
-                };
-                if b == EOF {
-                    if eof_error {
-                        return Err(TorclError::StreamError("end of file on READ-BYTE".into()));
-                    }
-                    return Ok(args.get(2).copied().unwrap_or(NIL));
-                }
-                return Ok(b);
-            }
-            "SLEEP" => {
-                // (sleep seconds) → NIL. Blocks the (single) thread.
-                let args = eval_args(cdr, env)?;
-                let secs = if args.is_empty() {
-                    0.0
-                } else {
-                    num_val(args[0])?
-                };
-                if secs > 0.0 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-                }
-                return Ok(NIL);
-            }
+            "TORCL::%SOCKET-READ-TIMEOUT" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-LISTEN" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-LOCAL-PORT" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-ACCEPT" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-CLOSE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-FD" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-WAIT-FOR-INPUT" => return eval_builtin_arguments(&name, cdr, env),
+            "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),
+            "READ-BYTE" => return eval_builtin_arguments(&name, cdr, env),
+            "SLEEP" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%GETPID" => {
                 return Ok(TorclVal::from_fixnum(std::process::id() as i64));
+            }
+            // ── Embedded CPython: the PY package (§2.7.8, bliss-dk3nr) ──
+            //
+            // GC-SAFETY. `args` is an unrooted Vec, which is safe here for a
+            // specific reason rather than by luck: everything downstream reads
+            // those values BEFORE it allocates on the Lisp heap (`to_python` copies
+            // out and never allocates), and the single allocating step — converting
+            // the result — happens once no argument is live. See
+            // `cli/python.rs::crossing`.
+            name @ ("TORCL::%PY-IMPORT"
+            | "TORCL::%PY-EXEC"
+            | "TORCL::%PY-RESOLVE"
+            | "TORCL::%PY-CALL"
+            | "TORCL::%PY-CALL-METHOD"
+            | "TORCL::%PY-GETATTR"
+            | "TORCL::%PY-SETATTR"
+            | "TORCL::%PY-TYPE-OF"
+            | "TORCL::%PY-TYPEP"
+            | "TORCL::%PY-STR"
+            | "TORCL::%PY-REPR"
+            | "TORCL::%PY-OBJECTP"
+            | "TORCL::%PY-DRAIN-OUTPUT"
+            | "TORCL::%PY-EXPORT"
+            | "TORCL::%PY-STOP") => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation(
+                        "embedded Python access denied".into(),
+                    ));
+                }
+                let args = eval_args(cdr, env)?;
+                return apply_python_builtin(name, &args);
             }
             "TORCL::%LOAD-FOREIGN-LIBRARY" => {
                 if env.sandbox {
@@ -16898,18 +16615,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return torcl_rt::ffi::unmarshal_from_c(raw, &ret_type);
             }
-            "TORCL::%EXIT" => {
-                // (%exit &optional code) — flush and terminate the process.
-                let args = eval_args(cdr, env)?;
-                let code = if !args.is_empty() && args[0].is_fixnum() {
-                    args[0].as_fixnum() as i32
-                } else {
-                    0
-                };
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                std::process::exit(code);
-            }
+            "TORCL::%EXIT" => return eval_builtin_arguments(&name, cdr, env),
             "GET-OUTPUT-STREAM-STRING" => {
                 let (sf, _) = cp(cdr);
                 let stream = eval_form(sf, env)?;
@@ -16930,72 +16636,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let s = eval_form(sf, env)?;
                 return Ok(torcl_stdlib::two_way_stream_output_stream(s).unwrap_or(NIL));
             }
-            "MACRO-FUNCTION" => {
-                // (macro-function symbol &optional environment) → an expander or
-                // NIL. torcl macros are not first-class functions; return T for a
-                // macro (callers here use it as a boolean) and NIL otherwise.
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                if s.is_symbol() {
-                    let name = sym_name(s);
-                    let bare = symbol_bare_name(&name);
-                    let mdef = lookup_macro(env, &name).or_else(|| lookup_macro(env, &bare));
-                    if let Some(mdef) = &mdef {
-                        // A first-class expander installed via
-                        // (setf (macro-function name) fn) round-trips (bliss-fo0o).
-                        if let Some(f) = mdef.function {
-                            return Ok(f);
-                        }
-                    }
-                    // A registered source/bytecode macro, OR a standard CL macro
-                    // that torcl implements as a special-form arm (AND/OR/WHEN/COND/
-                    // MULTIPLE-VALUE-BIND/DEFUN/…). Either way MACRO-FUNCTION must
-                    // return a genuine two-argument (form environment) expander per
-                    // CLHS 3.1.2.1.2.2, so `(funcall (macro-function 'NAME) …)`
-                    // enforces the arity — a wrong count trips the lambda binder's
-                    // PROGRAM-ERROR (ansi AND/OR/WHEN/COND/RETURN/DEFUN/MULTIPLE-
-                    // VALUE-*/…-ERROR.1/2). Standard special OPERATORS that are not
-                    // macros (IF, PROGN, LET, QUOTE, …) are excluded and return NIL.
-                    if mdef.is_some() || is_ansi_standard_macro(&bare) {
-                        return synthesize_macro_expander(env, s);
-                    }
-                }
-                return Ok(NIL);
-            }
-            "SPECIAL-OPERATOR-P" => {
-                // (special-operator-p symbol) → generalized boolean. The 25 ANSI
-                // special operators (CLHS 3.1.2.1.2.1) that the evaluator handles
-                // as special forms. Lenient on a non-symbol argument (returns NIL),
-                // matching the sibling MACRO-FUNCTION arm above.
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                // A non-symbol argument is a TYPE-ERROR (special-operator-p.error.1).
-                if !s.is_symbol() {
-                    return Err(TorclError::TypeError {
-                        datum: s,
-                        expected: "SYMBOL".to_string(),
-                    });
-                }
-                if is_ansi_special_operator(&sym_bare_name_rc(s)) {
-                    return Ok(T);
-                }
-                return Ok(NIL);
-            }
-            "COMPILER-MACRO-FUNCTION" => {
-                // (compiler-macro-function name &optional environment) → the
-                // compiler macro or NIL. Compiler macros are always optional
-                // (CLHS 3.2.2.1). Like MACRO-FUNCTION above, torcl compiler macros
-                // are not first-class function objects, so return T when one is
-                // registered for NAME and NIL otherwise (callers use it as a
-                // boolean existence check). A `(setf f)` name never has one (the
-                // definer skips non-symbol names), so NIL is correct there.
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                if s.is_symbol() && compiler_macroexpand::has_compiler_macro(s) {
-                    return Ok(T);
-                }
-                return Ok(NIL);
-            }
+            "MACRO-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
+            "SPECIAL-OPERATOR-P" => return eval_builtin_arguments(&name, cdr, env),
+            "COMPILER-MACRO-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
             "SYMBOL-PLIST" => {
                 // (symbol-plist symbol) → its property list
                 let (sf, _) = cp(cdr);
@@ -17009,160 +16652,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(symbol_plist_of(s));
             }
-            "GET" => {
-                // (get symbol indicator &optional default)
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                // A non-symbol first argument is a TYPE-ERROR (get.error.4).
-                if !s.is_symbol() {
-                    return Err(TorclError::TypeError {
-                        datum: s,
-                        expected: "SYMBOL".to_string(),
-                    });
-                }
-                let key = args.get(1).copied().unwrap_or(NIL);
-                let default = args.get(2).copied().unwrap_or(NIL);
-                return Ok(plist_lookup(symbol_plist_of(s), key).unwrap_or(default));
-            }
-            "REMPROP" => {
-                // (remprop symbol indicator) → T if present. Rebuild without the
-                // first matching pair.
-                let args = eval_args(cdr, env)?;
-                let s = args.first().copied().unwrap_or(NIL);
-                let key = args.get(1).copied().unwrap_or(NIL);
-                // A non-symbol is a TYPE-ERROR (remprop.error.4).
-                if !s.is_symbol() {
-                    return Err(TorclError::TypeError {
-                        datum: s,
-                        expected: "SYMBOL".to_string(),
-                    });
-                }
-                // NIL and T report is_symbol()=true but carry the SPECIAL tag, not
-                // TAG_SYMBOL, so as_symbol_index() panics/aborts on them; they have
-                // no registry-backed plist, so nothing to remove (bliss-x7aa).
-                if s == NIL || s == T {
-                    return Ok(NIL);
-                }
-                let idx = s.as_symbol_index();
-                let plist = torcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
-                let mut kept: Vec<TorclVal> = Vec::new();
-                let mut removed = false;
-                let mut c = plist;
-                while c.is_cons() {
-                    let (k, r) = cp(c);
-                    if !r.is_cons() {
-                        break;
-                    }
-                    let (v, r2) = cp(r);
-                    if !removed && k == key {
-                        removed = true;
-                    } else {
-                        kept.push(k);
-                        kept.push(v);
-                    }
-                    c = r2;
-                }
-                if removed {
-                    torcl_rt::symbols::set_symbol_plist(idx, vec_to_list(&kept));
-                }
-                return Ok(if removed { T } else { NIL });
-            }
-            "MAKE-STRING-INPUT-STREAM" => {
-                // (make-string-input-stream string &optional start end)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "MAKE-STRING-INPUT-STREAM requires a string".into(),
-                    ));
-                }
-                let string = args[0];
-                let start = if args.len() > 1 && args[1].is_fixnum() {
-                    args[1].as_fixnum() as usize
-                } else {
-                    0
-                };
-                let end = if args.len() > 2 && args[2].is_fixnum() {
-                    Some(args[2].as_fixnum() as usize)
-                } else {
-                    None
-                };
-                return torcl_stdlib::make_string_input_stream(string, start, end);
-            }
-            "READ-CHAR" => {
-                // (read-char &optional stream eof-error-p eof-value)
-                let args = eval_args(cdr, env)?;
-                let stream = if !args.is_empty() { args[0] } else { NIL };
-                let eof_error_p = if args.len() > 1 { args[1] } else { T };
-                let in_stream = resolve_input_stream(stream, env);
-                let (result, at_eof) = if is_gray_stream(in_stream) {
-                    let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
-                    let eof = !r.is_character();
-                    (r, eof)
-                } else {
-                    let r = torcl_stdlib::stream_read_char(in_stream)?;
-                    let eof = r == EOF;
-                    (r, eof)
-                };
-                if at_eof {
-                    if eof_error_p.is_nil() {
-                        // Re-read eof-value from the rooted args after the
-                        // (allocating) read (bliss-6b2 #2).
-                        return Ok(if args.len() > 2 { args[2] } else { NIL });
-                    }
-                    return Err(TorclError::StreamError("end of file on READ-CHAR".into()));
-                }
-                return Ok(result);
-            }
-            "PEEK-CHAR" => {
-                // (peek-char &optional peek-type stream eof-error-p eof-value
-                //  recursive-p): return the next character WITHOUT consuming it.
-                // peek-type NIL = next char; T = skip whitespace; a character =
-                // skip until that character (all of which are consumed).
-                let args = eval_args(cdr, env)?;
-                let peek_type = args.first().copied().unwrap_or(NIL);
-                let stream = args.get(1).copied().unwrap_or(NIL);
-                let eof_error_p = args.get(2).copied().unwrap_or(T);
-                let mut in_stream = resolve_input_stream(stream, env);
-                torcl_rt::rooted_ref!(_stream_root = &mut in_stream);
-                let skip_ws = peek_type == T;
-                let until = if peek_type.is_character() {
-                    Some(peek_type.as_char())
-                } else {
-                    None
-                };
-                loop {
-                    // Read one character (gray-stream aware, like READ-CHAR).
-                    let (c, at_eof) = if is_gray_stream(in_stream) {
-                        let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
-                        (r, !r.is_character())
-                    } else {
-                        let r = torcl_stdlib::stream_read_char(in_stream)?;
-                        (r, r == EOF)
-                    };
-                    if at_eof {
-                        if eof_error_p.is_nil() {
-                            return Ok(args.get(3).copied().unwrap_or(NIL));
-                        }
-                        return Err(TorclError::StreamError("end of file on PEEK-CHAR".into()));
-                    }
-                    let ch = c.as_char();
-                    let stop = match (skip_ws, until) {
-                        (true, _) => !ch.is_whitespace(),
-                        (false, Some(u)) => ch == u,
-                        (false, None) => true,
-                    };
-                    if stop {
-                        // Put the peeked character back and return it.
-                        if is_gray_stream(in_stream) {
-                            invoke_generic_function("STREAM-UNREAD-CHAR", &[in_stream, c], env)?;
-                        } else {
-                            torcl_stdlib::stream_unread_char(in_stream, c)?;
-                        }
-                        return Ok(c);
-                    }
-                    // Otherwise the character is consumed; keep scanning.
-                }
-            }
+            "GET" => return eval_builtin_arguments(&name, cdr, env),
+            "REMPROP" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-STRING-INPUT-STREAM" => return eval_builtin_arguments(&name, cdr, env),
+            "READ-CHAR" => return eval_builtin_arguments(&name, cdr, env),
+            "PEEK-CHAR" => return eval_builtin_arguments(&name, cdr, env),
+            #[cfg(not(torcl_no_dynamic_code))]
             "READ" | "READ-PRESERVING-WHITESPACE" => {
                 // (read &optional stream eof-error-p eof-value recursive-p)
                 let args = eval_args(cdr, env)?;
@@ -17186,6 +16681,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     }
                 }
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "READ-FROM-STRING" => {
                 // (read-from-string string &optional eof-error-p eof-value
                 //  &key (start 0) end preserve-whitespace) => object, position
@@ -17278,24 +16774,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     Err(e) => return Err(e),
                 }
             }
-            "UNREAD-CHAR" => {
-                // (unread-char character &optional stream)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "UNREAD-CHAR requires a character".into(),
-                    ));
-                }
-                let ch = args[0];
-                let stream = if args.len() > 1 { args[1] } else { NIL };
-                let in_stream = resolve_input_stream(stream, env);
-                if is_gray_stream(in_stream) {
-                    invoke_generic_function("STREAM-UNREAD-CHAR", &[in_stream, ch], env)?;
-                } else {
-                    torcl_stdlib::stream_unread_char(in_stream, ch)?;
-                }
-                return Ok(NIL);
-            }
+            "UNREAD-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
             "-" => return eval_arith_sub(cdr, env),
             "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
@@ -17630,22 +17109,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     None => Err(TorclError::UnboundVariable(sym)),
                 };
             }
-            "SET" => {
-                // (set symbol value) — assign SYMBOL's dynamic (special) value,
-                // like SETQ on the symbol / (setf (symbol-value symbol) value).
-                // Returns VALUE. Arity (2,2) is enforced above (set.error.*).
-                let args = eval_args(cdr, env)?;
-                let sym = args[0];
-                torcl_rt::rooted!(val = args[1]);
-                if !sym.is_symbol() {
-                    return Err(TorclError::TypeError {
-                        datum: sym,
-                        expected: "SYMBOL".to_string(),
-                    });
-                }
-                env.set_var_symbol(sym, *val);
-                return Ok(*val);
-            }
+            "SET" => return eval_builtin_arguments(&name, cdr, env),
             "MAKUNBOUND" => {
                 // (makunbound symbol) — make SYMBOL's dynamic value unbound and
                 // return SYMBOL. Clearing the global value cell (to UNBOUND) makes
@@ -17669,48 +17133,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
             }
-            "COMPILED-FUNCTION-P" => {
-                // (compiled-function-p object) — the predicate for the
-                // COMPILED-FUNCTION type, which TYPEP already decides. Routing
-                // it through TYPEP rather than reimplementing the test keeps the
-                // two from disagreeing, which is exactly what ansi
-                // COMPILED-FUNCTION-P.1 checks over the whole test universe.
-                let args = eval_args(cdr, env)?;
-                let object = args.first().copied().unwrap_or(NIL);
-                let spec = resolve_sym("COMPILED-FUNCTION").unwrap_or(NIL);
-                return Ok(if typep_matches(env, object, spec)? {
-                    T
-                } else {
-                    NIL
-                });
-            }
-            "FUNCTION-LAMBDA-EXPRESSION" => {
-                // (function-lambda-expression fn) → three values: the defining
-                // lambda expression (an implementation MAY always return NIL —
-                // CLHS 3.1.2.1.2 — and torcl does not retain one), whether the
-                // function has a non-null lexical closure, and its name.
-                let args = eval_args(cdr, env)?;
-                let f = args.first().copied().unwrap_or(NIL);
-                // CLHS 3.1.2.1.2 constrains this value in ONE direction: it may
-                // be false only when the function is definitely known to have
-                // been defined in the null lexical environment, and an
-                // implementation is explicitly permitted to return true
-                // otherwise. torcl does not retain that fact reliably — the
-                // interpreted-function object's env cell is left NIL even for a
-                // genuine closure — so answering true for any function is both
-                // conforming and the safe direction. Claiming "not a closure"
-                // from missing information is the answer that would be wrong.
-                let closure_p = if is_function_value(f) { T } else { NIL };
-                let name = if torcl_rt::function::is_interpreted_function(f) {
-                    torcl_rt::function::name(f)
-                } else if f.is_symbol() {
-                    f
-                } else {
-                    NIL
-                };
-                env.set_mv(vec![NIL, closure_p, name]);
-                return Ok(NIL);
-            }
+            "COMPILED-FUNCTION-P" => return eval_builtin_arguments(&name, cdr, env),
+            "FUNCTION-LAMBDA-EXPRESSION" => return eval_builtin_arguments(&name, cdr, env),
             "KEYWORDP" => {
                 // A keyword is a symbol whose home package is KEYWORD. NIL is a
                 // symbol but not a keyword.
@@ -17731,7 +17155,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     let (h, _) = cp(v);
                     h.is_symbol() && sym_bare_name_rc(h).as_ref() == "QUOTE"
                 } else if v.is_symbol() {
-                    is_keyword_arg(v) || CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(v)))
+                    is_keyword_arg(v) || with_constant_vars(|c| c.borrow().contains(&sym_name(v)))
                 } else {
                     // Numbers, characters, strings, and other self-evaluating
                     // heap atoms are constant.
@@ -17740,187 +17164,25 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(if is_const { T } else { NIL });
             }
             "TORCL-THREAD::MAKE-THREAD" | "TORCL-THREAD:MAKE-THREAD" => {
-                // (torcl-thread:make-thread function &key name) — spawn a
-                // dedicated native OS thread that runs FUNCTION with no
-                // arguments and returns its value to a later JOIN-THREAD
-                // (bliss-q9i1, §13.5.3). NAME is retained by both the Lisp
-                // descriptor and the host OS thread (bliss-94kq).
-                // The handle is presently the raw native-thread id as a fixnum;
-                // a distinct first-class THREAD object is tracked as bliss-8z5i.
-                //
-                // The runtime roots the entry until the new thread adopts it.
-                // Preserve a closure cons as-is: reifying it as a fresh function
-                // would discard its local function namespace and EQ identity.
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:MAKE-THREAD requires a function".into(),
-                    ));
-                }
-                for pair in args[1..].chunks(2) {
-                    if !is_keyword_arg(pair[0]) {
-                        return Err(TorclError::ProgramError(
-                            "TORCL-THREAD:MAKE-THREAD argument names must be keywords".into(),
-                        ));
-                    }
-                }
-                validate_builtin_keywords(&args[1..], &["NAME"])?;
-                let fnv = args[0];
-                // Both closure representations resolve their captured state
-                // through process-wide, precisely scanned registries.
-                let shareable = fnv.is_symbol()
-                    || is_closure_cons(fnv)
-                    || torcl_rt::function::is_interpreted_function(fnv);
-                if !shareable {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:MAKE-THREAD entry must be a function or a symbol \
-                         naming a global function (bliss-nubv)."
-                            .to_string(),
-                    ));
-                }
-                let name = args[1..]
-                    .chunks(2)
-                    .find(|pair| key_bare(pair[0]) == "NAME")
-                    .map(|pair| pair[1])
-                    .filter(|value| !value.is_nil())
-                    .map(|value| {
-                        if !is_string_value(value) {
-                            return Err(TorclError::TypeError {
-                                datum: value,
-                                expected: "a string thread name or NIL".to_string(),
-                            });
-                        }
-                        Ok(val_as_str(value))
-                    })
-                    .transpose()?;
-                let id = torcl_rt::make_thread_named(fnv, name)?;
-                return Ok(TorclVal::from_fixnum(id.0 as i64));
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-THREAD::JOIN-THREAD" | "TORCL-THREAD:JOIN-THREAD" => {
-                // (torcl-thread:join-thread thread &key timeout) — block until
-                // THREAD's entry function returns, or return NIL/NIL when the
-                // timeout in seconds expires (§13.5.3 Death; bliss-94kq).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:JOIN-THREAD requires a thread".into(),
-                    ));
-                }
-                for pair in args[1..].chunks(2) {
-                    if !is_keyword_arg(pair[0]) {
-                        return Err(TorclError::ProgramError(
-                            "TORCL-THREAD:JOIN-THREAD argument names must be keywords".into(),
-                        ));
-                    }
-                }
-                validate_builtin_keywords(&args[1..], &["TIMEOUT"])?;
-                let tv = args[0];
-                if !tv.is_fixnum() {
-                    return Err(TorclError::TypeError {
-                        datum: tv,
-                        expected: "a torcl-thread thread handle".to_string(),
-                    });
-                }
-                let id = torcl_rt::NativeThreadId(tv.as_fixnum() as u64);
-                let timeout_value = args[1..]
-                    .chunks(2)
-                    .find(|pair| key_bare(pair[0]) == "TIMEOUT")
-                    .map(|pair| pair[1]);
-                let timeout = match timeout_value {
-                    None | Some(NIL) => None,
-                    Some(value) => {
-                        let seconds = num_val(value)?;
-                        if !seconds.is_finite() || seconds < 0.0 {
-                            return Err(TorclError::TypeError {
-                                datum: value,
-                                expected: "a non-negative real timeout in seconds".to_string(),
-                            });
-                        }
-                        Some(
-                            std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
-                                TorclError::TypeError {
-                                    datum: value,
-                                    expected:
-                                        "a representable non-negative real timeout in seconds"
-                                            .to_string(),
-                                }
-                            })?,
-                        )
-                    }
-                };
-                return match torcl_rt::join_thread_timeout(id, timeout)? {
-                    Some(value) => {
-                        env.set_mv(vec![value, T]);
-                        Ok(value)
-                    }
-                    None => {
-                        env.set_mv(vec![NIL, NIL]);
-                        Ok(NIL)
-                    }
-                };
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-THREAD::CURRENT-THREAD" | "TORCL-THREAD:CURRENT-THREAD" => {
-                // (torcl-thread:current-thread) — the running thread's handle.
-                let args = eval_args(cdr, env)?;
-                if !args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:CURRENT-THREAD takes no arguments".into(),
-                    ));
-                }
-                return Ok(TorclVal::from_fixnum(
-                    torcl_rt::current_thread_id().0 as i64,
-                ));
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-THREAD::THREAD-NAME" | "TORCL-THREAD:THREAD-NAME" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 || !args[0].is_fixnum() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:THREAD-NAME requires one thread handle".into(),
-                    ));
-                }
-                let id = torcl_rt::NativeThreadId(args[0].as_fixnum() as u64);
-                return Ok(torcl_rt::thread_name(id)
-                    .map(|name| arena_str(&name))
-                    .unwrap_or(NIL));
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-THREAD::THREAD-ALIVE-P" | "TORCL-THREAD:THREAD-ALIVE-P" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 || !args[0].is_fixnum() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:THREAD-ALIVE-P requires one thread handle".into(),
-                    ));
-                }
-                let id = torcl_rt::NativeThreadId(args[0].as_fixnum() as u64);
-                return Ok(if torcl_rt::thread_alive(id).unwrap_or(false) {
-                    T
-                } else {
-                    NIL
-                });
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-THREAD::ALL-THREADS" | "TORCL-THREAD:ALL-THREADS" => {
-                let args = eval_args(cdr, env)?;
-                if !args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:ALL-THREADS takes no arguments".into(),
-                    ));
-                }
-                let mut ids = torcl_rt::live_thread_ids();
-                ids.sort_by_key(|id| id.0);
-                torcl_rt::rooted!(threads = NIL);
-                for id in ids.into_iter().rev() {
-                    *threads = arena_cons(TorclVal::from_fixnum(id.0 as i64), *threads);
-                }
-                return Ok(*threads);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-THREAD::THREAD-YIELD" | "TORCL-THREAD:THREAD-YIELD" => {
-                let args = eval_args(cdr, env)?;
-                if !args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-THREAD:THREAD-YIELD takes no arguments".into(),
-                    ));
-                }
-                torcl_rt::thread_yield();
-                return Ok(NIL);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "TORCL-INTERNAL::%DEFCONSTANT" | "TORCL-INTERNAL:%DEFCONSTANT" | "%DEFCONSTANT" => {
                 // (%defconstant 'name value) — establish NAME's value and record
@@ -17949,7 +17211,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 if name.is_symbol() {
                     env.set_var_symbol(name, *val);
                     let n = sym_name(name);
-                    CONSTANT_VARS.with(|c| c.borrow_mut().insert(n));
+                    with_constant_vars(|c| c.borrow_mut().insert(n));
                     home_defined_symbol(env, name);
                 }
                 return Ok(*val);
@@ -17962,7 +17224,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 if v.is_symbol() {
-                    CONSTANT_VARS.with(|c| c.borrow_mut().insert(sym_name(v)));
+                    with_constant_vars(|c| c.borrow_mut().insert(sym_name(v)));
                     // DEFCONSTANT routes its name here; home it present INTERNAL
                     // in CL-USER so FIND-SYMBOL reports :INTERNAL (bliss-v15i).
                     home_defined_symbol(env, v);
@@ -18022,6 +17284,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                         "KEYWORD:{name}"
                     )))
                 };
+                // GC can rewrite this rooted vector during each allocation;
+                // re-read fields by index instead of retaining a slot reference.
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..slots.len() {
                     // Each of these allocates; build the sub-lists into rooted
                     // Vecs before assembling the plist so a collection mid-build
@@ -18252,7 +17517,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     if tail.is_cons() {
                         let place = cp(tail).0;
                         if place.is_symbol() {
-                            GLOBAL_SETF_FNS.with(|m| {
+                            with_global_setf_fns(|m| {
                                 m.borrow_mut().remove(&name);
                             });
                             if let Some(index) =
@@ -18521,30 +17786,34 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             "WHEN" => {
                 let (test, body) = cp(cdr);
+                torcl_rt::rooted!(body = body);
                 let tv = eval_form(test, env)?;
                 if !tv.is_nil() {
-                    return eval_progn(body, env);
+                    return eval_progn(*body, env);
                 }
                 return Ok(NIL);
             }
             "UNLESS" => {
                 let (test, body) = cp(cdr);
+                torcl_rt::rooted!(body = body);
                 let tv = eval_form(test, env)?;
                 if tv.is_nil() {
-                    return eval_progn(body, env);
+                    return eval_progn(*body, env);
                 }
                 return Ok(NIL);
             }
             "DESTRUCTURING-BIND" => {
                 let (pattern, rest) = cp(cdr);
                 let (value_form, body) = cp(rest);
+                torcl_rt::rooted!(pattern = pattern);
+                torcl_rt::rooted!(body = body);
                 let value = eval_form(value_form, env)?;
                 let parent = Arc::clone(&env.frame);
-                return with_child_frame(env, parent, move |env| {
+                return with_child_frame(env, parent, |env| {
                     // Use the full destructuring binder so &optional/&rest/&key
                     // work in the pattern (not just plain structural matching).
-                    bind_macro_param(pattern, value, env, None)?;
-                    eval_progn(body, env)
+                    bind_macro_param(*pattern, value, env, None)?;
+                    eval_progn(*body, env)
                 });
             }
             "COND" => {
@@ -18590,37 +17859,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(env.return_values(std::mem::take(&mut *vals)));
             }
             "FORMAT" => return eval_format(cdr, env),
-            "ERROR" => {
-                // Root the evaluated datum and format args across the condition
-                // construction, which allocates (bliss-6b2 #2). eval_args keeps
-                // the whole arg vector rooted; a slice into it stays rooted too.
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal("ERROR".into()));
-                }
-                torcl_rt::rooted!(control = args[0]);
-                let format_args = &args[1..];
-                let message = if is_string_value(*control) {
-                    format_control_message(&val_as_str(*control), format_args)?
-                } else {
-                    val_as_str(*control)
-                };
-                // (error datum &rest args): a condition instance is signalled as
-                // is; a condition-type symbol is built via MAKE-CONDITION with the
-                // remaining args as initargs; a format-control string becomes a
-                // SIMPLE-ERROR.
-                let condition = match coerce_condition_designator(env, *control, format_args)? {
-                    Some(condition) => condition,
-                    None => make_simple_condition("SIMPLE-ERROR", *control, format_args, env)?,
-                };
-                // The terminal message is the condition's REPORT (e.g. "The value X
-                // is not of type Y"), not the bare designator/type name.
-                let report = condition_report_string(env, condition).unwrap_or(message);
-                match signal_condition_object(condition, env) {
-                    Ok(_) => return Err(TorclError::Internal(format!("ERROR: {}", report))),
-                    Err(error) => return Err(error),
-                }
-            }
+            "ERROR" => return eval_builtin_arguments(&name, cdr, env),
             "LET" => return eval_let(cdr, env, false),
             "LET*" => return eval_let(cdr, env, true),
             "SETQ" => {
@@ -19855,6 +19094,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 };
                 return Ok(register_tree_closure(closure));
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "EVAL" => {
                 // (eval form): evaluate the argument to obtain the form, then
                 // evaluate that form in the NULL LEXICAL ENVIRONMENT (CLHS EVAL,
@@ -19892,6 +19132,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(result);
             }
+            #[cfg(not(torcl_no_dynamic_code))]
             "COMPILE" => {
                 // (compile name &optional definition) — CLHS 3.2. torcl functions
                 // are already compiled/callable, so COMPILE produces a callable
@@ -20038,66 +19279,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let v = eval_form(af, env)?;
                 return Ok(TorclVal::from_fixnum(torcl_stdlib::length(v)? as i64));
             }
-            "ELT" => {
-                // (elt sequence index) — works on lists, vectors, and strings.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal(
-                        "ELT requires a sequence and an index".into(),
-                    ));
-                }
-                let seq = args[0];
-                let idx = args[1];
-                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
-                    return Err(TorclError::TypeError {
-                        datum: idx,
-                        expected: "non-negative sequence index".into(),
-                    });
-                }
-                return torcl_stdlib::elt(seq, idx.as_fixnum() as usize);
-            }
+            "ELT" => return eval_builtin_arguments(&name, cdr, env),
             "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
-                // One-dimensional array/vector/string access — delegates to elt.
-                // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
-                let args = eval_args(cdr, env)?;
-                let arr0 = args.first().copied().unwrap_or(NIL);
-                // Multidimensional (rank ≥ 2) array: AREF takes one subscript per
-                // axis (row-major); ROW-MAJOR-AREF takes a single flat index.
-                if torcl_rt::types::md_array_p(arr0) {
-                    let storage = torcl_rt::types::md_array_storage(arr0).unwrap();
-                    let flat = if name == "ROW-MAJOR-AREF" {
-                        let idx = args.get(1).copied().unwrap_or(NIL);
-                        if !idx.is_fixnum() || idx.as_fixnum() < 0 {
-                            return Err(TorclError::TypeError {
-                                datum: idx,
-                                expected: "non-negative row-major index".into(),
-                            });
-                        }
-                        idx.as_fixnum() as usize
-                    } else {
-                        md_row_major_index(arr0, &args[1..])?
-                    };
-                    return torcl_stdlib::elt(storage, flat);
-                }
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(format!(
-                        "{}: only one-dimensional arrays are supported",
-                        name
-                    )));
-                }
-                let arr = args[0];
-                let idx = args[1];
-                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
-                    return Err(TorclError::TypeError {
-                        datum: idx,
-                        expected: "non-negative array index".into(),
-                    });
-                }
-                // AREF ignores fill pointers — it may read any element up to the
-                // total size, not just the active prefix ELT bounds against
-                // (CLHS AREF; bliss-30be). SVREF/BIT/SBIT hit non-complex arrays
-                // so `aref` delegates to `elt` for them.
-                return torcl_stdlib::aref(arr, idx.as_fixnum() as usize);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "VECTOR" => {
                 // (vector &rest elements) → a fresh simple-vector.
@@ -20119,53 +19303,17 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             // rejected as not naming a sequence at all.
             "TORCL-INTERNAL::%EXPAND-TYPE-SPEC"
             | "TORCL-INTERNAL:%EXPAND-TYPE-SPEC"
-            | "%EXPAND-TYPE-SPEC" => {
-                let args = eval_args(cdr, env)?;
-                let spec = args.first().copied().unwrap_or(NIL);
-                return Ok(resolve_type_spec(env, spec));
-            }
+            | "%EXPAND-TYPE-SPEC" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-INTERNAL::%MAKE-SIMPLE-VECTOR"
             | "TORCL-INTERNAL:%MAKE-SIMPLE-VECTOR"
-            | "%MAKE-SIMPLE-VECTOR" => {
-                let args = eval_args(cdr, env)?;
-                let size = args.first().copied().unwrap_or(NIL);
-                if !size.is_fixnum() || size.as_fixnum() < 0 {
-                    return Err(TorclError::TypeError {
-                        datum: size,
-                        expected: "non-negative array dimension".into(),
-                    });
-                }
-                let fill = args.get(1).copied().unwrap_or(NIL);
-                return Ok(torcl_stdlib::build_filled_simple_vector(
-                    size.as_fixnum() as usize,
-                    fill,
-                ));
-            }
+            | "%MAKE-SIMPLE-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
             // (%make-md-array dims-list initial-element) — build a rank ≥ 2
             // multidimensional array with row-major storage seeded with
             // initial-element. MAKE-ARRAY (boot.lisp) routes list dimensions of
             // length ≥ 2 here (bliss-rh0t).
             "TORCL-INTERNAL::%MAKE-MD-ARRAY"
             | "TORCL-INTERNAL:%MAKE-MD-ARRAY"
-            | "%MAKE-MD-ARRAY" => {
-                let args = eval_args(cdr, env)?;
-                torcl_rt::rooted!(fill = args.get(1).copied().unwrap_or(NIL));
-                let dims_list = args.first().copied().unwrap_or(NIL);
-                let mut dims = Vec::new();
-                let mut c = dims_list;
-                while c.is_cons() {
-                    let (d, rest) = cp(c);
-                    if !d.is_fixnum() || d.as_fixnum() < 0 {
-                        return Err(TorclError::TypeError {
-                            datum: d,
-                            expected: "non-negative array dimension".into(),
-                        });
-                    }
-                    dims.push(d.as_fixnum() as usize);
-                    c = rest;
-                }
-                return Ok(torcl_stdlib::build_md_array(&dims, *fill));
-            }
+            | "%MAKE-MD-ARRAY" => return eval_builtin_arguments(&name, cdr, env),
             // (%proclaim-special (a b c)) — register each symbol in the argument
             // list as globally special. The declaim macro and proclaim function in
             // boot.lisp call this for `(special …)` declarations (bliss-7na).
@@ -20222,161 +19370,15 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             "TORCL-INTERNAL::%MAKE-COMPLEX-VECTOR"
             | "TORCL-INTERNAL:%MAKE-COMPLEX-VECTOR"
-            | "%MAKE-COMPLEX-VECTOR" => {
-                // (%make-complex-vector size fill-pointer adjustable-p &optional
-                // initial-element) — build a rank-1 fill-pointer / adjustable
-                // vector. Called by MAKE-ARRAY (boot.lisp) for the
-                // :fill-pointer/:adjustable cases.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 3 {
-                    return Err(TorclError::Internal(
-                        "%MAKE-COMPLEX-VECTOR requires size, fill-pointer, adjustable".into(),
-                    ));
-                }
-                let size = if args[0].is_fixnum() {
-                    args[0].as_fixnum().max(0) as usize
-                } else {
-                    0
-                };
-                let fp = if args[1].is_fixnum() {
-                    args[1].as_fixnum().max(0) as usize
-                } else {
-                    // :fill-pointer T (or absent) ⇒ full length.
-                    size
-                };
-                let adjustable = !args[2].is_nil();
-                let iel = if args.len() > 3 { args[3] } else { NIL };
-                // 5th arg (optional): non-NIL ⇒ element-type CHARACTER (a string).
-                let element_is_char = args.len() > 4 && !args[4].is_nil();
-                // 6th arg (optional): non-NIL ⇒ the user asked for :fill-pointer,
-                // so ARRAY-HAS-FILL-POINTER-P answers T. A plain :adjustable
-                // array is a COMPLEX_ARRAY too but has no fill pointer
-                // (bliss-0x9y). Absent ⇒ NIL, matching the old callers.
-                let has_fill_pointer = args.len() > 5 && !args[5].is_nil();
-                // 7th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
-                let element_is_bit = args.len() > 6 && !args[6].is_nil();
-                let elems = vec![iel; size];
-                return Ok(torcl_stdlib::build_complex_vector(
-                    &elems,
-                    size,
-                    fp,
-                    adjustable,
-                    element_is_char,
-                    element_is_bit,
-                    has_fill_pointer,
-                ));
-            }
+            | "%MAKE-COMPLEX-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-INTERNAL::%MAKE-DISPLACED-ARRAY"
             | "TORCL-INTERNAL:%MAKE-DISPLACED-ARRAY"
-            | "%MAKE-DISPLACED-ARRAY" => {
-                // (%make-displaced-array base offset length fill-pointer
-                // adjustable-p element-is-char has-fill-pointer) — build a
-                // rank-1 array displaced to BASE (bliss-7o4y). Called by
-                // MAKE-ARRAY (boot.lisp) for :displaced-to.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 3 {
-                    return Err(TorclError::Internal(
-                        "%MAKE-DISPLACED-ARRAY requires base, offset, length".into(),
-                    ));
-                }
-                let base = args[0];
-                let fix = |v: TorclVal| {
-                    if v.is_fixnum() {
-                        v.as_fixnum().max(0) as usize
-                    } else {
-                        0
-                    }
-                };
-                let offset = fix(args[1]);
-                let length = fix(args[2]);
-                let Some(base_total) = torcl_stdlib::array_total_size(base) else {
-                    return Err(TorclError::TypeError {
-                        datum: base,
-                        expected: "array (:displaced-to)".to_string(),
-                    });
-                };
-                if offset + length > base_total {
-                    return Err(TorclError::TypeError {
-                        datum: base,
-                        expected: format!(
-                            "displacement {offset}+{length} within array-total-size {base_total}"
-                        ),
-                    });
-                }
-                let fp = if args.len() > 3 && args[3].is_fixnum() {
-                    args[3].as_fixnum().max(0) as usize
-                } else {
-                    length
-                };
-                let adjustable = args.len() > 4 && !args[4].is_nil();
-                let element_is_char = args.len() > 5 && !args[5].is_nil();
-                let has_fill_pointer = args.len() > 6 && !args[6].is_nil();
-                // 8th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
-                let element_is_bit = args.len() > 7 && !args[7].is_nil();
-                return Ok(torcl_stdlib::build_displaced_vector(
-                    base,
-                    offset,
-                    length,
-                    fp,
-                    adjustable,
-                    element_is_char,
-                    element_is_bit,
-                    has_fill_pointer,
-                ));
-            }
+            | "%MAKE-DISPLACED-ARRAY" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-INTERNAL::%ADJUST-ARRAY" | "TORCL-INTERNAL:%ADJUST-ARRAY" | "%ADJUST-ARRAY" => {
-                // (%adjust-array complex-vector new-size fill-pointer initial-elt)
-                // — grow a rank-1 fill-pointer/adjustable vector in place and set
-                // its fill pointer. Called by MAKE-ARRAY's ADJUST-ARRAY wrapper.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal(
-                        "%ADJUST-ARRAY requires an array and a new size".into(),
-                    ));
-                }
-                let arr = args[0];
-                let new_size = if args[1].is_fixnum() {
-                    args[1].as_fixnum().max(0) as usize
-                } else {
-                    0
-                };
-                let fill_pointer = args
-                    .get(2)
-                    .filter(|fp| fp.is_fixnum())
-                    .map(|fp| fp.as_fixnum().max(0) as usize);
-                let iel = args.get(3).copied().unwrap_or(NIL);
-                return torcl_stdlib::adjust_complex_vector(arr, new_size, fill_pointer, iel);
+                return eval_builtin_arguments(&name, cdr, env);
             }
-            "VECTOR-PUSH" => {
-                // (vector-push new-element vector) → index used, or NIL if full.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal(
-                        "VECTOR-PUSH requires an element and a vector".into(),
-                    ));
-                }
-                let val = args[0];
-                let vec = args[1];
-                return torcl_stdlib::vector_push(vec, val);
-            }
-            "VECTOR-PUSH-EXTEND" => {
-                // (vector-push-extend new-element vector &optional extension)
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal(
-                        "VECTOR-PUSH-EXTEND requires an element and a vector".into(),
-                    ));
-                }
-                let val = args[0];
-                let vec = args[1];
-                let ext = if args.len() > 2 {
-                    let e = args[2];
-                    e.is_fixnum().then(|| e.as_fixnum().max(0) as usize)
-                } else {
-                    None
-                };
-                return torcl_stdlib::vector_push_extend(vec, val, ext);
-            }
+            "VECTOR-PUSH" => return eval_builtin_arguments(&name, cdr, env),
+            "VECTOR-PUSH-EXTEND" => return eval_builtin_arguments(&name, cdr, env),
             "VECTOR-POP" => {
                 // (vector-pop vector) → the element at the (decremented) fill ptr.
                 let (vf, _) = cp(cdr);
@@ -20604,8 +19606,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return Ok(TorclVal::from_fixnum(torcl_stdlib::length(v)? as i64));
             }
             "APPEND" if global_fn(&name).is_none() => {
-                let args = eval_args(cdr, env)?;
-                return torcl_stdlib::sequences::append(&args);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "REVERSE" if global_fn(&name).is_none() => {
                 // Delegate to the stdlib so lists, vectors, and strings all
@@ -20615,34 +19616,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let v = eval_form(af, env)?;
                 return torcl_stdlib::reverse(v);
             }
-            "NTH" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    // Wrong arg count is a catchable PROGRAM-ERROR, not an
-                    // uncatchable internal abort (ansi-test nth.error.*; bliss-x7aa).
-                    return Err(TorclError::ProgramError(
-                        "NTH requires an index and a list".into(),
-                    ));
-                }
-                // ANSI: NTH's index is a non-negative integer. A negative
-                // index (or a non-integer) is a TYPE-ERROR, not a saturated 0 —
-                // `num_val(-1) as usize` used to silently return element 0.
-                let nidx = args[0];
-                if !torcl_rt::types::integerp(nidx) || num_val(nidx)? < 0.0 {
-                    return Err(TorclError::TypeError {
-                        datum: nidx,
-                        expected: "(integer 0)".into(),
-                    });
-                }
-                // A valid fixnum index; any (non-negative) bignum is far past
-                // the end of a real list, so it reads as NIL.
-                let idx = if nidx.is_fixnum() {
-                    nidx.as_fixnum() as usize
-                } else {
-                    usize::MAX
-                };
-                return nth_element(idx, args[1]);
-            }
+            "NTH" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-HASH-TABLE" => {
                 // (make-hash-table &key test size ...) — honor :test, evaluate
                 // and ignore the rest. Backed by the real stdlib hash table.
@@ -20712,36 +19686,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 };
                 return torcl_stdlib::make_hash_table(&opts);
             }
-            "GETHASH" => {
-                // (gethash key table &optional default) -> value; sets the
-                // second value to the present-p flag. Wrong argument count is a
-                // (catchable) PROGRAM-ERROR (ANSI; gethash.error.*).
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 || args.len() > 3 {
-                    return Err(TorclError::ProgramError(
-                        "GETHASH requires a key, a table, and an optional default".into(),
-                    ));
-                }
-                let key = args[0];
-                let tbl = args[1];
-                let default = if args.len() >= 3 { args[2] } else { NIL };
-                let (val, present) = torcl_stdlib::gethash(key, tbl, default)?;
-                env.set_mv(vec![val, if present { T } else { NIL }]);
-                return Ok(val);
-            }
-            "TORCL::PUT-GETHASH" => {
-                // Store primitive for bytecode-lowered `(setf (gethash key table)
-                // value)` (bliss-x5y.2). Arguments arrive already evaluated —
-                // value, key, table, in the SETF handler's value-first order —
-                // through apply_function's synthesize path. Returns the value.
-                let args = eval_args(cdr, env)?;
-                let val = args.first().copied().unwrap_or(NIL);
-                let key = args.get(1).copied().unwrap_or(NIL);
-                let tbl = args.get(2).copied().unwrap_or(NIL);
-                torcl_stdlib::set_gethash(key, tbl, val)?;
-                // Re-read from the rooted args: set_gethash may rehash/allocate.
-                return Ok(args.first().copied().unwrap_or(NIL));
-            }
+            "GETHASH" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::PUT-GETHASH" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::SET-AREF" | "TORCL::SET-ELT" => {
                 // Store primitive for bytecode-lowered `(setf (aref|svref|char|
                 // schar|row-major-aref|elt seq index) value)`. Arguments arrive
@@ -20803,81 +19749,10 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // Re-read from the rooted args: the store may have allocated.
                 return Ok(args.get(2).copied().unwrap_or(NIL));
             }
-            "TORCL::SET-FDEFINITION" => {
-                // Store primitive for bytecode-lowered
-                // `(setf (fdefinition name) fn)`. Unlike SYMBOL-FUNCTION,
-                // FDEFINITION names any FUNCTION NAME, so a `(setf place)` cons
-                // is legal and installs the writer on the mangled
-                // %SETF-WRITER-place symbol — where the compiled SETF path calls
-                // it and FBOUNDP / #'(setf f) / FMAKUNBOUND look (bliss-rg32).
-                let args = eval_args(cdr, env)?;
-                let name = args.first().copied().unwrap_or(NIL);
-                let val = args.get(1).copied().unwrap_or(NIL);
-                check_function_name(name)?;
-                let fnval = coerce_installed_function(env, val);
-                if name.is_symbol() {
-                    if let Some(index) = name.symbol_index() {
-                        torcl_rt::symbols::set_symbol_function(index, fnval);
-                    }
-                } else {
-                    let (_setf, tail) = cp(name);
-                    let place = cp(tail).0;
-                    if let Some(index) = resolve_sym(&setf_writer_symbol_name(&sym_name(place)))
-                        .and_then(|writer| writer.symbol_index())
-                    {
-                        torcl_rt::symbols::set_symbol_function(index, fnval);
-                    }
-                }
-                return Ok(val);
-            }
-            "TORCL::SET-SYMBOL-FUNCTION" => {
-                // Store primitive for bytecode-lowered `(setf (symbol-function|
-                // fdefinition sym) fn)`. Args arrive evaluated (sym, value);
-                // install fn as the symbol's global function and return it.
-                let args = eval_args(cdr, env)?;
-                let sym = args.first().copied().unwrap_or(NIL);
-                let val = args.get(1).copied().unwrap_or(NIL);
-                if !sym.is_symbol() {
-                    return Err(TorclError::Internal(format!(
-                        "SET-SYMBOL-FUNCTION: expected a symbol, got {}",
-                        format_val(sym)
-                    )));
-                }
-                let fnval = coerce_installed_function(env, val);
-                torcl_rt::symbols::set_symbol_function(sym.as_symbol_index(), fnval);
-                return Ok(val);
-            }
-            "TORCL::SET-SLOT-VALUE" => {
-                let args = eval_args(cdr, env)?;
-                let instance = args.first().copied().unwrap_or(NIL);
-                let slot = args.get(1).copied().unwrap_or(NIL);
-                let val = args.get(2).copied().unwrap_or(NIL);
-                return store_slot_value(instance, slot, val, env);
-            }
-            "TORCL::SET-ACCESSOR-SLOT" => {
-                // Store primitive for bytecode-lowered `(setf (accessor obj) v)`
-                // where ACCESSOR is a DEFCLASS :accessor/:reader/:writer or a
-                // DEFSTRUCT accessor (bliss-ljmj).
-                //
-                // The accessor -> slot mapping is resolved HERE, at run time,
-                // exactly as the tree-walker does. Baking the slot name in at
-                // lowering time would be wrong in both directions: a function can
-                // be compiled before the class it touches exists, and a class can
-                // be redefined afterwards. The lowerer only uses the mapping's
-                // existence as a gate.
-                let args = eval_args(cdr, env)?;
-                let instance = args.first().copied().unwrap_or(NIL);
-                let accessor = args.get(1).copied().unwrap_or(NIL);
-                let val = args.get(2).copied().unwrap_or(NIL);
-                let Some(slot_name) = accessor_slot_name(env, &sym_name(accessor)) else {
-                    return Err(TorclError::Internal(format!(
-                        "SETF: {} does not name a slot accessor",
-                        format_val(accessor)
-                    )));
-                };
-                write_slot_value(instance, resolve_sym(&slot_name).unwrap_or(NIL), val, env)?;
-                return Ok(val);
-            }
+            "TORCL::SET-FDEFINITION" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::SET-SYMBOL-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::SET-SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::SET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::SET-CAR" | "TORCL::SET-CDR" => {
                 // Store primitives for bytecode-lowered `(setf (car|cdr place)
                 // value)`. Arguments arrive already evaluated (cons, value)
@@ -20895,18 +19770,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 store_cons_field(target, val, set_car)?;
                 return Ok(val);
             }
-            "REMHASH" => {
-                // (remhash key table) — exactly two args; otherwise PROGRAM-ERROR
-                // (ANSI; remhash.error.*).
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(
-                        "REMHASH requires a key and a table".into(),
-                    ));
-                }
-                let removed = torcl_stdlib::remhash(args[0], args[1])?;
-                return Ok(if removed { T } else { NIL });
-            }
+            "REMHASH" => return eval_builtin_arguments(&name, cdr, env),
             "CLRHASH" => {
                 if list_to_vec(cdr).len() != 1 {
                     return Err(TorclError::ProgramError(
@@ -21002,28 +19866,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 };
                 return Ok(vec_to_list(&items));
             }
-            "MAPHASH" => {
-                // (maphash function hash-table): call FUNCTION on each key/value
-                // pair through the unified function protocol (bliss-jtc.8) — any
-                // callable (lambda, closure, heap function object, builtin), not
-                // only a native pointer. Iterates a snapshot so the table may be
-                // mutated (per-key) during the walk. Returns NIL.
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(
-                        "MAPHASH requires a function and a table".into(),
-                    ));
-                }
-                torcl_rt::rooted!(function = args[0]);
-                // Root the entry snapshot: each apply_function runs user code that
-                // can relocate the still-pending Vec-resident keys/values (#2).
-                torcl_rt::rooted!(entries = torcl_stdlib::hash_table_entries(args[1])?);
-                for i in 0..entries.len() {
-                    let (key, value) = entries[i];
-                    apply_function(*function, &[key, value], env)?;
-                }
-                return Ok(NIL);
-            }
+            "MAPHASH" => return eval_builtin_arguments(&name, cdr, env),
             "SXHASH" => {
                 // (sxhash object): a hash code such that equal objects hash equal
                 // (ANSI); routed to the stdlib hash (bliss-jtc.8). Exactly one
@@ -21329,44 +20172,10 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return torcl_stdlib::concatenate(*expanded, &sequences);
             }
             "SUBSEQ" if global_fn(&name).is_none() => {
-                let args = eval_args(cdr, env)?;
-                return subseq_values(&args);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "SOME" | "EVERY" | "NOTANY" | "NOTEVERY" => {
-                let args = eval_args(cdr, env)?;
-                // CLHS `predicate &rest sequences+`: a predicate plus at least one
-                // sequence are required — fewer is a PROGRAM-ERROR, not a silent
-                // result (ansi SOME.ERROR.8/9, EVERY/NOTANY/NOTEVERY.ERROR.8/9).
-                if args.len() < 2 {
-                    return Err(TorclError::ProgramError(format!(
-                        "{name} requires a predicate and at least one sequence"
-                    )));
-                }
-                // Root predicate + all sequence elements across the apply loop
-                // (bliss-6b2 #2): apply_function runs user code that can relocate
-                // these Vec-resident values.
-                torcl_rt::rooted!(pred = args[0]);
-                torcl_rt::rooted!(seqs = Vec::<Vec<TorclVal>>::with_capacity(args.len() - 1));
-                for s in &args[1..] {
-                    seqs.push(seq_elements(*s)?);
-                }
-                let minlen = seqs.iter().map(Vec::len).min().unwrap_or(0);
-                for i in 0..minlen {
-                    let call_args: Vec<TorclVal> = seqs.iter().map(|s| s[i]).collect();
-                    let r = apply_function(*pred, &call_args, env)?;
-                    match name.as_str() {
-                        "SOME" if !r.is_nil() => return Ok(r),
-                        "EVERY" if r.is_nil() => return Ok(NIL),
-                        "NOTANY" if !r.is_nil() => return Ok(NIL),
-                        "NOTEVERY" if r.is_nil() => return Ok(T),
-                        _ => {}
-                    }
-                }
-                return Ok(match name.as_str() {
-                    "SOME" => NIL,
-                    "EVERY" | "NOTANY" => T,
-                    _ => NIL, // NOTEVERY
-                });
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "COERCE" if global_fn(&name).is_none() => {
                 // (coerce object result-type): exactly two arguments, or a
@@ -21421,68 +20230,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     NIL
                 });
             }
-            "MAKE-PATHNAME" => {
-                // (make-pathname &key host device directory name type version defaults)
-                let args = eval_args(cdr, env)?;
-                // Track supplied-p per component so an explicit `:name nil`
-                // (override) is distinguished from an unsupplied component (which
-                // is taken from :defaults, per ANSI).
-                let (mut host, mut device, mut directory) = (None, None, None);
-                let (mut name_c, mut type_c, mut version) = (None, None, None);
-                let mut defaults: Option<TorclVal> = None;
-                let mut i = 0;
-                while i + 1 < args.len() {
-                    let key = sym_bare_name_rc(args[i]);
-                    let val = args[i + 1];
-                    match key.as_ref() {
-                        "HOST" => host = Some(val),
-                        "DEVICE" => device = Some(val),
-                        // A directory given as (:absolute|:relative comp…) uses
-                        // reader keywords the stdlib can't match by hash; render
-                        // it to a namestring the stdlib parser accepts.
-                        "DIRECTORY" => {
-                            // Reject syntactically impossible directory lists
-                            // (`:up`/`:back` right after `:absolute` or a
-                            // `:wild-inferiors`) with a FILE-ERROR before
-                            // building the pathname (ansi make-pathname-error-*).
-                            validate_make_pathname_directory(val)?;
-                            directory = Some(match directory_designator_to_namestring(val) {
-                                Some(s) => arena_str(&s),
-                                None => val,
-                            });
-                        }
-                        "NAME" => name_c = Some(val),
-                        "TYPE" => type_c = Some(val),
-                        "VERSION" => version = Some(val),
-                        "DEFAULTS" => defaults = Some(val),
-                        _ => {}
-                    }
-                    i += 2;
-                }
-                // Components not explicitly supplied are taken from :defaults
-                // (ANSI). :defaults is a pathname *designator*, so a namestring
-                // string must be coerced to a pathname first — otherwise its
-                // components are silently dropped and, e.g., UIOP's
-                // `pathname-directory-pathname` (make-pathname :defaults <string>)
-                // loses the directory (bliss-aid). A non-coercible value stays
-                // unused, as before.
-                let d = match defaults {
-                    Some(v) if torcl_stdlib::is_pathname(v) => Some(v),
-                    Some(v) => coerce_pathname_designator(v).ok(),
-                    None => None,
-                };
-                let resolve = |supplied: Option<TorclVal>, from: fn(TorclVal) -> TorclVal| {
-                    supplied.unwrap_or_else(|| d.map(from).unwrap_or(NIL))
-                };
-                return torcl_stdlib::make_pathname(
-                    resolve(host, torcl_stdlib::pathname_host),
-                    resolve(device, torcl_stdlib::pathname_device),
-                    resolve(directory, torcl_stdlib::pathname_directory),
-                    resolve(name_c, torcl_stdlib::pathname_name),
-                    resolve(type_c, torcl_stdlib::pathname_type),
-                    resolve(version, torcl_stdlib::pathname_version),
-                );
-            }
+            "MAKE-PATHNAME" => return eval_builtin_arguments(&name, cdr, env),
             "USER-HOMEDIR-PATHNAME" => {
                 let home = torcl_stdlib::pathnames::user_home_namestring()
                     .unwrap_or_else(|| "/".to_string());
@@ -21496,54 +20244,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let (pathname, _) = torcl_stdlib::parse_namestring(namestring, None, None)?;
                 return Ok(pathname);
             }
-            "PARSE-NAMESTRING" => {
-                // (parse-namestring thing &optional host default &key start end
-                // junk-allowed) — at least one argument; zero args, an unknown
-                // keyword, or a dangling keyword is a PROGRAM-ERROR (ansi
-                // parse-namestring.error.1 / parse-name-string.error.2/.3).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "PARSE-NAMESTRING requires at least 1 argument".into(),
-                    ));
-                }
-                // Validate the &key section (everything past thing/host/default).
-                if args.len() > 3 {
-                    let keys = &args[3..];
-                    if keys.len() % 2 != 0 {
-                        return Err(TorclError::ProgramError(
-                            "PARSE-NAMESTRING called with an odd number of keyword arguments"
-                                .into(),
-                        ));
-                    }
-                    let mut i = 0;
-                    while i < keys.len() {
-                        let ok = keys[i].is_symbol() && keys[i] != NIL && {
-                            let bare = sym_bare_name_rc(keys[i]);
-                            matches!(bare.as_ref(), "START" | "END" | "JUNK-ALLOWED")
-                        };
-                        if !ok {
-                            return Err(TorclError::ProgramError(
-                                "PARSE-NAMESTRING called with invalid keyword arguments".into(),
-                            ));
-                        }
-                        i += 2;
-                    }
-                }
-                let mut thing = args[0];
-                // A non-simple string designator (fill-pointer / adjustable /
-                // displaced char array) → a fresh simple string the parser reads
-                // (ansi parse-namestring.3). A pathname passes through unchanged.
-                if !torcl_stdlib::is_pathname(thing) {
-                    thing = normalize_pathname_string_designator(thing);
-                }
-                torcl_rt::rooted_ref!(_thing_root = &mut thing);
-                let mut host = args.get(1).copied();
-                torcl_rt::rooted_ref!(_host_root = &mut host);
-                let (pathname, position) = torcl_stdlib::parse_namestring(thing, host, None)?;
-                env.set_mv(vec![pathname, TorclVal::from_fixnum(position as i64)]);
-                return Ok(pathname);
-            }
+            "PARSE-NAMESTRING" => return eval_builtin_arguments(&name, cdr, env),
             "NAMESTRING" => {
                 // (namestring pathname) — exactly one pathname designator; a
                 // string coerces to a pathname first (ansi namestring.1/.2), and
@@ -21566,40 +20267,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let pathname = eval_form(pathname_form, env)?;
                 return Ok(torcl_stdlib::probe_file(pathname)?.unwrap_or(NIL));
             }
-            "OPEN" => {
-                // (open filespec &key direction element-type if-exists
-                // if-does-not-exist external-format) → a stream, or NIL when
-                // `:if-does-not-exist nil` and the file is missing (bliss-wne9.5).
-                // The caller owns the stream and must CLOSE it; WITH-OPEN-FILE is
-                // the same machinery with the close wired into an unwind.
-                // `eval_args` hands back a self-rooting RootedVals, so the
-                // filespec and option values stay traced without further work.
-                let args = eval_args(cdr, env)?;
-                let Some((path_val, opts)) = args.split_first() else {
-                    return Err(TorclError::ProgramError(
-                        "OPEN requires a filespec argument".into(),
-                    ));
-                };
-                let path_val = *path_val;
-                if env.sandbox {
-                    return Err(TorclError::SandboxViolation(format!(
-                        "File access denied in sandbox mode: {}",
-                        val_as_str(path_val)
-                    )));
-                }
-                let options = decode_open_options(opts);
-                // `options` copies out of the rooted `args`, and `torcl_stdlib::open`
-                // is the next thing that can allocate, so nothing needs re-rooting
-                // between here and the call.
-                return torcl_stdlib::open(
-                    path_val,
-                    options.direction,
-                    options.element_type,
-                    options.if_exists,
-                    options.if_does_not_exist,
-                    torcl_stdlib::ExternalFormat::Utf8,
-                );
-            }
+            "OPEN" => return eval_builtin_arguments(&name, cdr, env),
             "DELETE-FILE" => {
                 // (delete-file pathspec) — delete the file, returning T.
                 let (path_form, _) = cp(cdr);
@@ -21654,20 +20322,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             // Atomic wall-clock sample for libraries that need a fractional
             // absolute deadline: (values universal-seconds nanoseconds).
-            "TORCL-EXT:GET-PRECISE-TIME" => {
-                let args = eval_args(cdr, env)?;
-                if !args.is_empty() {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-EXT:GET-PRECISE-TIME requires no arguments, got {}",
-                        args.len()
-                    )));
-                }
-                let (seconds, nanoseconds) = torcl_stdlib::time::get_precise_time();
-                let seconds = TorclVal::from_fixnum(seconds);
-                let nanoseconds = TorclVal::from_fixnum(nanoseconds);
-                env.set_mv(vec![seconds, nanoseconds]);
-                return Ok(seconds);
-            }
+            "TORCL-EXT:GET-PRECISE-TIME" => return eval_builtin_arguments(&name, cdr, env),
             // High-resolution monotonic nanoseconds for the deterministic
             // profiler (bliss-xgr5); the CL ms clock is too coarse per call.
             "TORCL-EXT:REAL-TIME-NANOSECONDS" => {
@@ -21748,73 +20403,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 write_trace_output(env, &report)?;
                 return Ok(NIL);
             }
-            "ENCODE-UNIVERSAL-TIME" => {
-                // (encode-universal-time second minute hour date month year
-                //  &optional time-zone)
-                let args = eval_args(cdr, env)?;
-                if args.len() < 6 {
-                    return Err(TorclError::ProgramError(
-                        "ENCODE-UNIVERSAL-TIME requires at least 6 arguments".into(),
-                    ));
-                }
-                let n = |v: TorclVal| -> Result<i64, TorclError> { Ok(num_val(v)? as i64) };
-                let (second, minute, hour) = (n(args[0])?, n(args[1])?, n(args[2])?);
-                let (date, month, mut year) = (n(args[3])?, n(args[4])?, n(args[5])?);
-                // CLHS 25.1.4: a two-digit year is relative to a 50-year window
-                // around the current year.
-                if (0..=99).contains(&year) {
-                    let current = torcl_stdlib::time::decode_universal_time(
-                        torcl_stdlib::time::get_universal_time(),
-                        Some(0),
-                    )
-                    .5;
-                    let base = current - 50;
-                    year = base + (year - base).rem_euclid(100);
-                }
-                // Time zone is hours west of GMT; NIL / omitted means local,
-                // which we model as GMT (see time.rs).
-                let time_zone = match args.get(6) {
-                    Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
-                    _ => None,
-                };
-                return Ok(TorclVal::from_fixnum(
-                    torcl_stdlib::time::encode_universal_time(
-                        second, minute, hour, date, month, year, time_zone,
-                    ),
-                ));
-            }
-            "DECODE-UNIVERSAL-TIME" => {
-                // (decode-universal-time universal-time &optional time-zone)
-                //   => second, minute, hour, date, month, year,
-                //      day-of-week, daylight-p, zone
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "DECODE-UNIVERSAL-TIME requires a universal time".into(),
-                    ));
-                }
-                let universal = num_val(args[0])? as i64;
-                let time_zone = match args.get(1) {
-                    Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
-                    _ => None,
-                };
-                let (sec, min, hour, date, month, year, dow, dst, zone) =
-                    torcl_stdlib::time::decode_universal_time(universal, time_zone);
-                let values = vec![
-                    TorclVal::from_fixnum(sec),
-                    TorclVal::from_fixnum(min),
-                    TorclVal::from_fixnum(hour),
-                    TorclVal::from_fixnum(date),
-                    TorclVal::from_fixnum(month),
-                    TorclVal::from_fixnum(year),
-                    TorclVal::from_fixnum(dow),
-                    if dst { T } else { NIL },
-                    TorclVal::from_fixnum(zone),
-                ];
-                let first = values[0];
-                env.set_mv(values);
-                return Ok(first);
-            }
+            "ENCODE-UNIVERSAL-TIME" => return eval_builtin_arguments(&name, cdr, env),
+            "DECODE-UNIVERSAL-TIME" => return eval_builtin_arguments(&name, cdr, env),
             "DIRECTORY" => {
                 // (directory pathspec &key …) — list pathnames matching a
                 // (possibly wild) pathname. Extra keyword args (e.g. UIOP's
@@ -21900,24 +20490,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     expected: "logical pathname, string, or stream".to_string(),
                 });
             }
-            "TRANSLATE-LOGICAL-PATHNAME" => {
-                // (translate-logical-pathname pathname &key …) — a physical
-                // pathname translates to itself (EQ); a logical one is resolved
-                // through its host's translation rules. Extra keyword args
-                // (:allow-other-keys etc.) are accepted and ignored. Zero args is
-                // a PROGRAM-ERROR (ansi translate-logical-pathname.error.1).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "TRANSLATE-LOGICAL-PATHNAME requires at least 1 argument".into(),
-                    ));
-                }
-                torcl_rt::rooted!(pn = coerce_to_pathname(args[0])?);
-                if torcl_stdlib::is_logical_pathname(*pn) {
-                    return torcl_stdlib::translate_logical_pathname(*pn);
-                }
-                return Ok(*pn);
-            }
+            "TRANSLATE-LOGICAL-PATHNAME" => return eval_builtin_arguments(&name, cdr, env),
             "LOAD-LOGICAL-PATHNAME-TRANSLATIONS" => {
                 // (load-logical-pathname-translations host) → NIL when the host's
                 // translations are already defined (nothing to load); an ERROR
@@ -21941,177 +20514,15 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     ))),
                 };
             }
-            "MERGE-PATHNAMES" => {
-                // (merge-pathnames pathname &optional default-pathname default-version)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "MERGE-PATHNAMES requires a pathname".into(),
-                    ));
-                }
-                // Coerce a pathname designator (string / pathname) to a pathname.
-                let to_pathname = |v: TorclVal| -> Result<TorclVal, TorclError> {
-                    if torcl_stdlib::is_pathname(v) {
-                        Ok(v)
-                    } else {
-                        let mut v = v;
-                        torcl_rt::rooted_ref!(_v_root = &mut v);
-                        Ok(torcl_stdlib::parse_namestring(v, None, None)?.0)
-                    }
-                };
-                // Root the intermediate pathnames: to_pathname/lookup allocate and
-                // can relocate an earlier result (bliss-6b2 #2).
-                torcl_rt::rooted!(pathname = to_pathname(args[0])?);
-                torcl_rt::rooted!(
-                    default = if args.len() > 1 {
-                        to_pathname(args[1])?
-                    } else {
-                        // ANSI default is *default-pathname-defaults*.
-                        match env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*") {
-                            Some(v) if !v.is_nil() => to_pathname(v)?,
-                            _ => to_pathname(torcl_stdlib::make_lisp_string("./"))?,
-                        }
-                    }
-                );
-                // ANSI: default-version defaults to :NEWEST when not supplied, so
-                // a merged pathname whose name comes from a versionless source
-                // gets version :NEWEST (ansi merge-pathnames.2/.3/.4/.7). An
-                // explicit third argument (including NIL) is honoured as given
-                // (merge-pathnames.1 passes NIL and expects the version to stay
-                // NIL).
-                let default_version = if args.len() > 2 {
-                    args[2]
-                } else {
-                    resolve_sym(":NEWEST").unwrap_or(NIL)
-                };
-                return torcl_stdlib::merge_pathnames(*pathname, *default, default_version);
-            }
-            "PATHNAME-NAME" => {
-                let args = eval_args(cdr, env)?;
-                let pathname =
-                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-NAME", &args)?)?;
-                return Ok(torcl_stdlib::pathname_name(pathname));
-            }
-            "PATHNAME-TYPE" => {
-                let args = eval_args(cdr, env)?;
-                let pathname =
-                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-TYPE", &args)?)?;
-                return Ok(torcl_stdlib::pathname_type(pathname));
-            }
-            "PATHNAME-DIRECTORY" => {
-                let args = eval_args(cdr, env)?;
-                let mut pathname = pathname_accessor_arg("PATHNAME-DIRECTORY", &args)?;
-                // Coerce a namestring designator to a pathname first (ANSI).
-                if !torcl_stdlib::is_pathname(pathname) {
-                    pathname = coerce_pathname_designator(pathname)?;
-                }
-                // ANSI PATHNAME-DIRECTORY returns a list (:absolute|:relative
-                // comp…), not a namestring — UIOP does directory-list arithmetic
-                // on it (bliss-lb6). Build the keywords with the interpreter's
-                // interner so they are EQ to the reader's :absolute / :wild / ….
-                match torcl_stdlib::pathname_directory_components(pathname) {
-                    Some((absolute, comps)) => {
-                        let kw = |s: &str| resolve_sym(s).unwrap_or(NIL);
-                        let mut elems = Vec::with_capacity(comps.len() + 1);
-                        // Root the accumulator in place: each `make_lisp_string`
-                        // below allocates and `resolve_sym` can intern, so a
-                        // relocating minor GC on component N would leave the
-                        // strings already pushed for components < N as stale
-                        // pointers, and `vec_to_list` would then build the result
-                        // out of them. This handler runs 2062 times during a
-                        // first-load of Babel alone (bliss-noqr).
-                        torcl_rt::rooted_ref!(_elems_root = &mut elems);
-                        elems.push(kw(if absolute { ":ABSOLUTE" } else { ":RELATIVE" }));
-                        for c in comps {
-                            elems.push(match c {
-                                torcl_stdlib::PathDirComp::Name(s) => {
-                                    torcl_stdlib::make_lisp_string(&s)
-                                }
-                                torcl_stdlib::PathDirComp::Up => kw(":UP"),
-                                torcl_stdlib::PathDirComp::Wild => kw(":WILD"),
-                                torcl_stdlib::PathDirComp::WildInferiors => kw(":WILD-INFERIORS"),
-                            });
-                        }
-                        return Ok(vec_to_list(&elems));
-                    }
-                    None => return Ok(NIL),
-                }
-            }
-            "PATHNAME-HOST" => {
-                let args = eval_args(cdr, env)?;
-                let pathname =
-                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-HOST", &args)?)?;
-                return Ok(torcl_stdlib::pathname_host(pathname));
-            }
-            "PATHNAME-DEVICE" => {
-                let args = eval_args(cdr, env)?;
-                let pathname =
-                    coerce_pathname_designator(pathname_accessor_arg("PATHNAME-DEVICE", &args)?)?;
-                // A logical pathname's device is :UNSPECIFIC (ANSI 19.3.2.1;
-                // ansi pathname-device.7).
-                if torcl_stdlib::is_logical_pathname(pathname) {
-                    return Ok(resolve_sym(":UNSPECIFIC").unwrap_or(NIL));
-                }
-                return Ok(torcl_stdlib::pathname_device(pathname));
-            }
-            "PATHNAME-VERSION" => {
-                // (pathname-version pathname) — no :case keyword, so any extra
-                // argument is a PROGRAM-ERROR (ansi pathname-version.error.2).
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 {
-                    return Err(TorclError::ProgramError(format!(
-                        "PATHNAME-VERSION requires exactly 1 argument, got {}",
-                        args.len()
-                    )));
-                }
-                let pathname = coerce_pathname_designator(args[0])?;
-                return Ok(torcl_stdlib::pathname_version(pathname));
-            }
-            "WILD-PATHNAME-P" => {
-                // (wild-pathname-p pathname &optional field-key) — 1 or 2 args;
-                // other arity is a PROGRAM-ERROR (ansi wild-pathname-p.error.1/2).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() || args.len() > 2 {
-                    return Err(TorclError::ProgramError(format!(
-                        "WILD-PATHNAME-P requires 1 or 2 arguments, got {}",
-                        args.len()
-                    )));
-                }
-                // ANSI: the argument is a pathname designator (pathname, string,
-                // or file/synonym stream). A stream's pathname is never wild, so
-                // it answers NIL (ansi wild-pathname-p.29). A non-designator
-                // (number, char, list, …) is a TYPE-ERROR — coerce_to_pathname
-                // raises it (ansi wild-pathname-p.error.3/4).
-                if is_stream(args[0]) {
-                    return Ok(NIL);
-                }
-                let pathname = coerce_to_pathname(args[0])?;
-                let field = if args.len() > 1 { Some(args[1]) } else { None };
-                return Ok(if torcl_stdlib::wild_pathname_p(pathname, field) {
-                    T
-                } else {
-                    NIL
-                });
-            }
-            "PATHNAME-MATCH-P" => {
-                // (pathname-match-p pathname wildcard) — exactly two pathname
-                // designators (strings coerce to pathnames). Other arity is a
-                // PROGRAM-ERROR (ansi pathname-match-p.error.1/2/3).
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(format!(
-                        "PATHNAME-MATCH-P requires exactly 2 arguments, got {}",
-                        args.len()
-                    )));
-                }
-                torcl_rt::rooted!(pn = coerce_to_pathname(args[0])?);
-                let wc = coerce_to_pathname(args[1])?;
-                return Ok(if torcl_stdlib::pathname_match_p(*pn, wc)? {
-                    T
-                } else {
-                    NIL
-                });
-            }
+            "MERGE-PATHNAMES" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-NAME" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-TYPE" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-DIRECTORY" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-HOST" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-DEVICE" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-VERSION" => return eval_builtin_arguments(&name, cdr, env),
+            "WILD-PATHNAME-P" => return eval_builtin_arguments(&name, cdr, env),
+            "PATHNAME-MATCH-P" => return eval_builtin_arguments(&name, cdr, env),
             "TRANSLATE-PATHNAME" => {
                 // (translate-pathname source from-wildcard to-wildcard)
                 // Root values and pending forms across the later evaluations
@@ -22285,262 +20696,19 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                     expected: "real".into(),
                 });
             }
-            "MIN" | "MAX" => {
-                // Return the actual extreme ARGUMENT (preserving its exact type),
-                // compared with numeric_cmp — the old f64 path lost precision and
-                // overflowed the `as i64` cast on bignums (bliss-05hy).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    // ANSI: MIN/MAX require at least one argument; too few args
-                    // is a (catchable) PROGRAM-ERROR, not an internal error.
-                    return Err(TorclError::ProgramError(format!(
-                        "{name} requires at least one argument"
-                    )));
-                }
-                let want_min = name == "MIN";
-                let mut best = args[0];
-                numeric_cmp(best, best)?; // type-check the first argument
-                for &a in &args[1..] {
-                    let ord = numeric_cmp(a, best)?;
-                    let take = if want_min {
-                        ord == Ordering::Less
-                    } else {
-                        ord == Ordering::Greater
-                    };
-                    if take {
-                        best = a;
-                    }
-                }
-                return Ok(best);
-            }
+            "MIN" | "MAX" => return eval_builtin_arguments(&name, cdr, env),
             "FLOOR" => return eval_floor(cdr, env),
-            "REM" => {
-                // REM: remainder of TRUNCATE (sign of the dividend). Exact for
-                // rationals (bliss-05hy); f64 fallback for floats.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal("REM requires two arguments".into()));
-                }
-                if let Some(res) = exact_int_div(args[0], args[1], RoundMode::Truncate) {
-                    return Ok(res?.1);
-                }
-                let av = num_val(args[0])?;
-                let bv = num_val(args[1])?;
-                if bv == 0.0 {
-                    return Err(TorclError::ArithmeticError("division by zero".into()));
-                }
-                return Ok(TorclVal::from_single_float((av % bv) as f32));
-            }
-            "MOD" => {
-                // MOD: remainder of FLOOR (sign of the *divisor*, ANSI), so
-                // (mod -7 3) = 2. Exact for rationals; f64 fallback for floats.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal("MOD requires two arguments".into()));
-                }
-                if let Some(res) = exact_int_div(args[0], args[1], RoundMode::Floor) {
-                    return Ok(res?.1);
-                }
-                let av = num_val(args[0])?;
-                let bv = num_val(args[1])?;
-                if bv == 0.0 {
-                    return Err(TorclError::ArithmeticError("division by zero".into()));
-                }
-                return Ok(TorclVal::from_single_float(float_mod(av, bv) as f32));
-            }
-            "TRUNCATE" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() || args.len() > 2 {
-                    return Err(TorclError::ProgramError(
-                        "TRUNCATE takes one or two arguments".into(),
-                    ));
-                }
-                return eval_int_div(args[0], args.get(1).copied(), RoundMode::Truncate, env);
-            }
-            "CEILING" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() || args.len() > 2 {
-                    return Err(TorclError::ProgramError(
-                        "CEILING takes one or two arguments".into(),
-                    ));
-                }
-                return eval_int_div(args[0], args.get(1).copied(), RoundMode::Ceiling, env);
-            }
-            "ROUND" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() || args.len() > 2 {
-                    return Err(TorclError::ProgramError(
-                        "ROUND takes one or two arguments".into(),
-                    ));
-                }
-                return eval_int_div(args[0], args.get(1).copied(), RoundMode::Round, env);
-            }
-            "ASH" if global_fn(&name).is_none() => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(
-                        "ASH requires exactly two arguments".into(),
-                    ));
-                }
-                env.clear_mv();
-                return torcl_stdlib::numbers::ash(args[0], args[1]);
-            }
-            "LOGAND" | "LOGIOR" | "LOGXOR" => {
-                let args = eval_args(cdr, env)?;
-                return apply_logop(&name, &args);
-            }
-            "LOGNOT" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 {
-                    return Err(TorclError::ProgramError(
-                        "LOGNOT requires exactly one argument".into(),
-                    ));
-                }
-                return apply_logop("LOGNOT", &args);
-            }
-            "LOGBITP" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(
-                        "LOGBITP requires exactly two arguments".into(),
-                    ));
-                }
-                return apply_logbitp(args[0], args[1]);
-            }
-            "INTEGER-LENGTH" | "LOGCOUNT" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 {
-                    return Err(TorclError::ProgramError(format!(
-                        "{name} requires exactly one argument"
-                    )));
-                }
-                return apply_intlen_or_logcount(&name, args[0]);
-            }
-            "EXPT" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(
-                        "EXPT requires exactly two arguments".into(),
-                    ));
-                }
-                let a = args[0];
-                let b = args[1];
-                // Exact result when the base is rational and the exponent is an
-                // integer: an exact rational/bignum, promoting past i64 range.
-                if !a.is_single_float() && b.is_fixnum() {
-                    if let Some(base) = as_bigrat(a) {
-                        let e = b.as_fixnum();
-                        if e >= 0 {
-                            return Ok(bigrat_pow(&base, e as u64).to_val());
-                        }
-                        if base.num.is_zero() {
-                            return Err(TorclError::ArithmeticError("division by zero".into()));
-                        }
-                        // negative exponent: reciprocal of base^|e|
-                        let p = bigrat_pow(&base, e.unsigned_abs());
-                        return Ok(bigrat_div(&BigRat::from_i64(1), &p).to_val());
-                    }
-                }
-                // A complex base with an integer exponent is exact repeated
-                // multiplication (e.g. i^2 = -1, canonicalised to the real -1).
-                if torcl_rt::types::complexp(a) && b.is_fixnum() {
-                    let e = b.as_fixnum();
-                    if e == 0 {
-                        // (expt z 0) = 1, coerced to z's contagious float format:
-                        // a float complex yields #c(1.0 0.0) (CLHS type rules),
-                        // a rational complex the exact integer 1.
-                        let rp = torcl_rt::types::complex_realpart(a).unwrap_or(a);
-                        let ip = torcl_rt::types::complex_imagpart(a).unwrap_or(NIL);
-                        // `float_kind_of`, NOT `real_float_kind`: the latter
-                        // never returns None -- it answers Single for anything
-                        // that is not a double -- so this test was always true
-                        // and the rational-complex case below was UNREACHABLE.
-                        // `(expt #C(3 3) 0)` answered #C(1.0 0.0) instead of the
-                        // integer 1 the comment above promises (ansi EXPT.7).
-                        let kind = widen_float(float_kind_of(rp), float_kind_of(ip));
-                        if kind != FloatKind::None {
-                            torcl_rt::rooted!(one = box_float(1.0, kind));
-                            let zero = box_float(0.0, kind);
-                            return make_complex(*one, zero);
-                        }
-                        return Ok(TorclVal::from_fixnum(1));
-                    }
-                    torcl_rt::rooted!(factors = vec![a; e.unsigned_abs() as usize]);
-                    torcl_rt::rooted!(pos = complex_arith(CxOp::Mul, &factors)?);
-                    if e < 0 {
-                        // Negative exponent: reciprocal 1 / base^|e|.
-                        return complex_arith(CxOp::Div, &[TorclVal::from_fixnum(1), *pos]);
-                    }
-                    return Ok(*pos);
-                }
-                // A complex base, or a negative real base with a non-integer
-                // exponent, gives a complex result (real `powf` returns NaN for
-                // the latter): base^power = exp(power · log base) (bliss-mg63 kin).
-                let base_negative =
-                    !torcl_rt::types::complexp(a) && num_val(a).map(|x| x < 0.0).unwrap_or(false);
-                // A negative real base with a ZERO float exponent must not come
-                // here: CLHS makes (expt x 0) equal 1 of the result type, and
-                // the real path below already gets that right via powf(x, 0.0).
-                // Routing it to complex_expt answered #C(1.0 0.0) for
-                // `(expt -5 0.0)` instead of 1.0 (ansi EXPT.18, whose loop runs
-                // i from -1000 -- positive bases were already correct).
-                // A complex base with an integer zero exponent is handled
-                // above; with a FLOAT zero exponent, float contagion really
-                // does want #C(1.0 0.0), so complex_expt stays correct there.
-                let exponent_zero =
-                    !torcl_rt::types::complexp(b) && num_val(b).map(|x| x == 0.0).unwrap_or(false);
-                // (expt 0 y) with (realpart y) > 0 is (* x y) -- ansi
-                // EXPT.29 asserts exactly `(eql (* x y) (expt x y))` over every
-                // zero and every such exponent. Deferring to the multiply
-                // kernel makes the TYPE follow contagion for free: the integer
-                // 0 stays the integer 0 (because #C(0 0) canonicalises) while
-                // (expt 0.0 #C(2 2)) is #C(0.0 0.0). Computing it through
-                // complex_expt instead answered a bare 0.0 for every zero.
-                // "Zero" includes a COMPLEX zero: EXPT.29's bases are
-                // 0, 0.0, 0.0d0 AND #C(0.0 0.0), #C(0.0d0 0.0d0). Excluding the
-                // complex ones sent them to complex_expt, which answered a bare
-                // 0.0 instead of #C(0.0 0.0).
-                let base_is_zero = if let Some(re) = torcl_rt::types::complex_realpart(a) {
-                    let im = torcl_rt::types::complex_imagpart(a).unwrap_or(NIL);
-                    num_val(re).map(|x| x == 0.0).unwrap_or(false)
-                        && num_val(im).map(|x| x == 0.0).unwrap_or(false)
-                } else {
-                    num_val(a).map(|x| x == 0.0).unwrap_or(false)
-                };
-                let exp_real_positive = if let Some(re) = torcl_rt::types::complex_realpart(b) {
-                    num_val(re).map(|x| x > 0.0).unwrap_or(false)
-                } else {
-                    num_val(b).map(|x| x > 0.0).unwrap_or(false)
-                };
-                if base_is_zero && exp_real_positive {
-                    if let Some(r) = apply_numeric_op("*", &[a, b]) {
-                        return r;
-                    }
-                }
-                // A COMPLEX EXPONENT also needs the complex path -- `num_val`
-                // below rejects it, so `(expt 0 #C(2 2))` and
-                // `(expt 2.0 #C(2 2))` type-errored (ansi EXPT.29, which pairs
-                // every zero with every base including complex ones).
-                if torcl_rt::types::complexp(a)
-                    || torcl_rt::types::complexp(b)
-                    || (base_negative && !b.is_fixnum() && !exponent_zero)
-                {
-                    return complex_expt(a, b);
-                }
-                let av = num_val(a)?;
-                let bv = num_val(b)?;
-                let kind = widen_float(real_float_kind(a), real_float_kind(b));
-                // A nonzero base cannot raise to an exact zero, so a zero
-                // result is underflow; finite operands cannot give a true
-                // infinity, so that is overflow (CLHS 12.1.4.3).
-                let pow = check_float_range(
-                    av.powf(bv),
-                    kind,
-                    av.is_finite() && bv.is_finite(),
-                    av != 0.0,
-                )?;
-                return Ok(box_float(pow, kind));
-            }
+            "REM" => return eval_builtin_arguments(&name, cdr, env),
+            "MOD" => return eval_builtin_arguments(&name, cdr, env),
+            "TRUNCATE" => return eval_builtin_arguments(&name, cdr, env),
+            "CEILING" => return eval_builtin_arguments(&name, cdr, env),
+            "ROUND" => return eval_builtin_arguments(&name, cdr, env),
+            "ASH" if global_fn(&name).is_none() => return eval_builtin_arguments(&name, cdr, env),
+            "LOGAND" | "LOGIOR" | "LOGXOR" => return eval_builtin_arguments(&name, cdr, env),
+            "LOGNOT" => return eval_builtin_arguments(&name, cdr, env),
+            "LOGBITP" => return eval_builtin_arguments(&name, cdr, env),
+            "INTEGER-LENGTH" | "LOGCOUNT" => return eval_builtin_arguments(&name, cdr, env),
+            "EXPT" => return eval_builtin_arguments(&name, cdr, env),
             "SQRT" => {
                 let af = expect_one_arg(cdr, "SQRT")?;
                 let v = eval_form(af, env)?;
@@ -23053,140 +21221,11 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             "RESTART-BIND" => return eval_restart_bind(cdr, env),
             "RESTART-CASE" => return eval_restart_case(cdr, env),
             "WITH-CONDITION-RESTARTS" => return eval_with_condition_restarts(cdr, env),
-            "SIGNAL" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal("SIGNAL requires an argument".into()));
-                }
-                torcl_rt::rooted!(datum = args[0]);
-                let initargs = &args[1..];
-                // (signal datum &rest args): a condition-type symbol is built into
-                // an instance so handler type-matching runs against the real CLOS
-                // class hierarchy; a format-control string becomes a
-                // SIMPLE-CONDITION (CLHS 9.1; HANDLER-BIND.10, IGNORE-ERRORS.5/6).
-                let cond = match coerce_condition_designator(env, *datum, initargs)? {
-                    Some(condition) => condition,
-                    None => make_simple_condition("SIMPLE-CONDITION", *datum, initargs, env)?,
-                };
-                return signal_condition_object(cond, env);
-            }
-            "WARN" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    // Missing required argument (CLHS 3.5.1; WARN.15).
-                    return Err(TorclError::ProgramError("WARN requires an argument".into()));
-                }
-                torcl_rt::rooted!(datum = args[0]);
-                let rest_args = &args[1..];
-                // (warn datum &rest args): a warning-type symbol or condition is
-                // used directly; a format-control string becomes a SIMPLE-WARNING.
-                let message = if is_string_value(*datum) {
-                    format_control_message(&val_as_str(*datum), rest_args)?
-                } else {
-                    val_as_str(*datum)
-                };
-                let datum_is_instance = torcl_stdlib::is_instance(*datum);
-                let condition = match coerce_condition_designator(env, *datum, rest_args)? {
-                    Some(condition) => condition,
-                    None => make_simple_warning_condition(*datum, rest_args, env)?,
-                };
-                torcl_rt::rooted!(cond = condition);
-                // The effective condition must be of type WARNING, else a
-                // TYPE-ERROR (CLHS WARN; WARN.12/13/16/17/18). Passing initargs
-                // alongside an already-constructed condition is likewise invalid
-                // (WARN.14).
-                let warning_sym = resolve_sym("WARNING").unwrap_or(NIL);
-                let is_warning = typep_matches(env, *cond, warning_sym)?;
-                if !is_warning || (datum_is_instance && !rest_args.is_empty()) {
-                    return Err(TorclError::TypeError {
-                        datum: *datum,
-                        expected: "WARNING".into(),
-                    });
-                }
-                // Establish a MUFFLE-WARNING restart for the dynamic extent of the
-                // signal so a handler can suppress the default warning message.
-                let base_len = env.restarts.len();
-                env.restarts.push(RestartEntry {
-                    captured_blocks: env.block_stack.clone(),
-                    captured_tags: env.tag_stack.clone(),
-                    name: "MUFFLE-WARNING".to_string(),
-                    function: RestartFunction::ContinueNil,
-                    interactive_function: None,
-                    test_function: None,
-                    unwind_on_invoke: true,
-                    group_base: base_len,
-                    id: next_restart_id(),
-                    restart_obj: NIL,
-                    report: NIL,
-                });
-                let result = signal_condition_object(*cond, env);
-                env.restarts.truncate(base_len);
-                match result {
-                    Ok(_) => {
-                        // Unhandled (or handler declined): print the warning per
-                        // R5.104 to *ERROR-OUTPUT* (WARN.4) and return NIL.
-                        // Warnings never enter the debugger.
-                        let text = condition_report_string(env, *cond).unwrap_or(message);
-                        let stream = env.lookup_var("*ERROR-OUTPUT*").unwrap_or(NIL);
-                        if !stream.is_nil() {
-                            let _ = write_str_to(stream, &format!("WARNING: {}\n", text));
-                        } else {
-                            eprintln!("WARNING: {}", text);
-                        }
-                        return Ok(NIL);
-                    }
-                    Err(error) => {
-                        if restart_invoked_name(&error).as_deref() == Some("MUFFLE-WARNING") {
-                            return Ok(NIL);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            "MAKE-CONDITION" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    // A missing required argument is a PROGRAM-ERROR (CLHS 3.5.1;
-                    // MAKE-CONDITION.ERROR.1).
-                    return Err(TorclError::ProgramError(
-                        "MAKE-CONDITION requires a type".into(),
-                    ));
-                }
-                let type_val = args[0];
-                let type_name = if type_val.is_symbol() {
-                    sym_name(type_val)
-                } else {
-                    // A class metaobject (e.g. from FIND-CLASS) designates its
-                    // name (MAKE-CONDITION.2).
-                    let cname = torcl_stdlib::class_name(type_val);
-                    if !cname.is_nil() {
-                        sym_name(cname)
-                    } else {
-                        val_as_str(type_val)
-                    }
-                };
-                // Initarg key/value pairs (drop an odd trailing arg, as the
-                // original loop did) are already evaluated and rooted in `args`.
-                let pair_count = (args.len().saturating_sub(1)) & !1;
-                let initarg_pairs = &args[1..1 + pair_count];
-                return build_condition_instance(env, &type_name, initarg_pairs);
-            }
-            "SLOT-VALUE" => {
-                let args = eval_args(cdr, env)?;
-                let instance = args.first().copied().unwrap_or(NIL);
-                let slot = args.get(1).copied().unwrap_or(NIL);
-                return slot_value_or_signal(instance, slot, env);
-            }
-            "SLOT-BOUNDP" => {
-                let args = eval_args(cdr, env)?;
-                let instance = args.first().copied().unwrap_or(NIL);
-                let slot = args.get(1).copied().unwrap_or(NIL);
-                return Ok(if slot_is_bound(instance, slot, env)? {
-                    T
-                } else {
-                    NIL
-                });
-            }
+            "SIGNAL" => return eval_builtin_arguments(&name, cdr, env),
+            "WARN" => return eval_builtin_arguments(&name, cdr, env),
+            "MAKE-CONDITION" => return eval_builtin_arguments(&name, cdr, env),
+            "SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
+            "SLOT-BOUNDP" => return eval_builtin_arguments(&name, cdr, env),
             // (ALLOCATE-INSTANCE class &rest initargs) — CLHS 7.7.1. Returns a
             // new instance with EVERY slot unbound: no initforms, no initargs,
             // no INITIALIZE-INSTANCE. MAKE-INSTANCE is defined in terms of it,
@@ -23194,19 +21233,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             // wires to it rather than reimplementing (AGENTS.md architecture
             // principle). The initargs are accepted and ignored here, as they
             // are by the standard primary method (bliss-2icv).
-            "ALLOCATE-INSTANCE" => {
-                let args = eval_args(cdr, env)?;
-                let class_input = args.first().copied().unwrap_or(NIL);
-                // Resolved the same way MAKE-INSTANCE resolves it, deliberately.
-                // SBCL rejects `(allocate-instance 'foo)` because there a class
-                // and its name are different objects — but TorCL's FIND-CLASS
-                // RETURNS THE SYMBOL (classes are not yet distinct metaobjects),
-                // so rejecting symbols here would reject the only thing a caller
-                // can obtain. Tightening this is bliss-rj5o, and belongs with
-                // real class metaobjects rather than here.
-                let class = resolve_class_metaobject(env, class_input)?;
-                return torcl_stdlib::clos::allocate_instance(class);
-            }
+            "ALLOCATE-INSTANCE" => return eval_builtin_arguments(&name, cdr, env),
             "CLASS-OF" => {
                 let (object_form, _) = cp(cdr);
                 let object = eval_form(object_form, env)?;
@@ -23305,80 +21332,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let class = eval_form(class_form, env)?;
                 return Ok(torcl_stdlib::class_name(class));
             }
-            "FIND-METHOD" => {
-                // (find-method generic-function qualifiers specializers &optional
-                // errorp) → the method with those qualifiers and specializers, or
-                // (when errorp, the default, is NIL) NIL, else signal an error
-                // (CLHS 7.6.2; bliss-7y1s). `#'gf` on a generic function yields its
-                // NAME symbol here, so accept a symbol designator or a GF object.
-                let args = eval_args(cdr, env)?;
-                if args.len() < 3 {
-                    return Err(TorclError::ProgramError(
-                        "FIND-METHOD requires a generic function, qualifiers, and specializers"
-                            .into(),
-                    ));
-                }
-                let gf = args[0];
-                let want_qual = qualifiers_to_method_qualifier(args[1]);
-                let spec_args = list_to_vec(args[2]);
-                let errorp = args.get(3).map(|v| !v.is_nil()).unwrap_or(true);
-
-                let gf_name = if gf.is_symbol() {
-                    Some(sym_name(gf))
-                } else if let Some(n) = builtin_wrapper_name(gf)
-                    .filter(|n| env.generics.contains_key(n) || env.methods.contains_key(n))
-                {
-                    // `#'gf` reifies a FUNCTIONP wrapper rather than the bare
-                    // name symbol; map it back to the generic it stands for.
-                    Some(n)
-                } else {
-                    env.generics
-                        .borrow()
-                        .iter()
-                        .find(|(_, d)| d.generic_function == gf)
-                        .map(|(n, _)| n.clone())
-                };
-                let not_found = |env: &mut Env, msg: String| -> Result<TorclVal, TorclError> {
-                    if errorp {
-                        let condition = make_simple_error_condition(arena_str(&msg), env)?;
-                        return Err(signal_and_raise(env, condition, msg));
-                    }
-                    Ok(NIL)
-                };
-                let Some(gf_name) = gf_name else {
-                    return not_found(
-                        env,
-                        format!("FIND-METHOD: {} is not a generic function", format_val(gf)),
-                    );
-                };
-                // `want_qual == None` means a qualifier list torcl's standard
-                // combination never produces — no method can match.
-                if let Some(want_qual) = want_qual {
-                    let methods = env
-                        .methods
-                        .borrow()
-                        .get(&gf_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    for m in &methods {
-                        if m.qualifier == want_qual
-                            && m.specializers.len() == spec_args.len()
-                            && m.specializers
-                                .iter()
-                                .zip(spec_args.iter())
-                                .all(|(ms, arg)| method_specializer_matches_designator(ms, *arg))
-                        {
-                            return Ok(m.method_id);
-                        }
-                    }
-                }
-                return not_found(
-                    env,
-                    format!(
-                        "FIND-METHOD: no method for {gf_name} with the given qualifiers and specializers"
-                    ),
-                );
-            }
+            "FIND-METHOD" => return eval_builtin_arguments(&name, cdr, env),
             "SUBTYPEP" => {
                 // (subtypep type1 type2 &optional environment) → two values:
                 // subtype-p and certain-p. 2 or 3 args, else a PROGRAM-ERROR
@@ -23469,18 +21423,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             "TORCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "TORCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE requires 2 arguments, got {}",
-                        args.len()
-                    )));
-                }
-                let instance = args[0];
-                let raw_initargs = list_to_vec(args[1]);
-                let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
-                let initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?;
-                return reinitialize_instance_values(instance, &initargs, env);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "CHANGE-CLASS" => {
                 let (instance_form, rest) = cp(cdr);
@@ -23595,27 +21538,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let name_slot = resolve_sym("NAME").unwrap_or(NIL);
                 return read_slot_value(obj, name_slot, env);
             }
-            "PRINT-OBJECT" => {
-                // The system PRINT-OBJECT (CLHS 22.1.3): print OBJECT to STREAM
-                // honouring *PRINT-ESCAPE*. A condition with a DEFINE-CONDITION
-                // :report prints via it when escape is NIL (CONDITION-16/17/18).
-                let args = eval_args(cdr, env)?;
-                torcl_rt::rooted!(obj = args.first().copied().unwrap_or(NIL));
-                torcl_rt::rooted!(stream = args.get(1).copied().unwrap_or(NIL));
-                let escape = env
-                    .lookup_var("*PRINT-ESCAPE*")
-                    .map(|v| !v.is_nil())
-                    .unwrap_or(true);
-                if !escape && print_condition_defined_report(*obj, *stream, env)? {
-                    return Ok(*obj);
-                }
-                let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
-                let control = if escape { "~S" } else { "~A" };
-                let result = torcl_stdlib::format(*stream, control, &[*obj]);
-                PRINT_ENV.with(|c| c.set(prev_env));
-                result?;
-                return Ok(*obj);
-            }
+            "PRINT-OBJECT" => return eval_builtin_arguments(&name, cdr, env),
             "INVOKE-RESTART" => {
                 // Root the source-arg spine across the name evaluation (bliss-6b2 #2).
                 let (name_form, rest0) = cp(cdr);
@@ -23731,262 +21654,12 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return invoke_restart_function(&entry.function, &interactive_args, env);
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
-            "LOAD" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal("LOAD requires a pathname".into()));
-                }
-                let mut path_val = args[0];
-                torcl_rt::rooted_ref!(_path_root = &mut path_val);
-                // :if-does-not-exist nil → return NIL for a missing file instead
-                // of erroring (CLHS; slynk's load-user-init-file relies on this).
-                let mut if_missing_nil = false;
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    if args[i].is_symbol()
-                        && sym_bare_name_rc(args[i]).as_ref() == "IF-DOES-NOT-EXIST"
-                    {
-                        if_missing_nil = args[i + 1] == NIL;
-                    }
-                    i += 2;
-                }
-                // LOAD also accepts an open input STREAM (CLHS): read and evaluate
-                // every form from it. A SLY/SLIME client injects its runtime this
-                // way — `(with-input-from-string (s …) (load s))`.
-                if is_stream(path_val) {
-                    let mut contents = String::new();
-                    loop {
-                        let ch = if is_gray_stream(path_val) {
-                            invoke_generic_function("STREAM-READ-CHAR", &[path_val], env)?
-                        } else {
-                            torcl_stdlib::stream_read_char(path_val)?
-                        };
-                        if ch == EOF || !ch.is_character() {
-                            break;
-                        }
-                        contents.push(ch.as_char());
-                    }
-                    read_eval_all_env(&contents, env)?;
-                    return Ok(T);
-                }
-                // LOAD accepts a pathname designator — a namestring OR a pathname
-                // object (e.g. `#P"…"`, common in a ~/.torclrc). `val_as_str` on a
-                // pathname yields its debug repr, so coerce via its namestring.
-                let mut path = path_designator_to_string(path_val)?;
-                // A relative LOAD pathname resolves against *DEFAULT-PATHNAME-
-                // DEFAULTS* (CLHS): merge PATH with its directory when PATH is not
-                // absolute. Read the value cell first so a LET/binding of the
-                // variable is honored — ansi-test cons/load.lsp binds it to the
-                // chapter directory and then `(load "cons.lsp")` (bliss-cpm9). Merge
-                // through pathname objects so directory semantics are correct; the
-                // default ("./") leaves CWD-relative behaviour unchanged.
-                if !std::path::Path::new(&path).is_absolute() {
-                    let dpd = resolve_sym("*DEFAULT-PATHNAME-DEFAULTS*")
-                        .and_then(|s| global_value_cell(s.as_symbol_index()))
-                        .or_else(|| env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*"));
-                    if let Some(v) = dpd {
-                        if !v.is_nil() {
-                            if let (Ok(pn), Ok(dflt)) = (
-                                coerce_pathname_designator(path_val),
-                                coerce_pathname_designator(v),
-                            ) {
-                                if let Ok(merged) = torcl_stdlib::merge_pathnames(pn, dflt, NIL) {
-                                    if let Ok(s) = path_designator_to_string(merged) {
-                                        if std::path::Path::new(&s).is_absolute() {
-                                            path = s;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if if_missing_nil && !std::path::Path::new(&path).exists() {
-                    return Ok(NIL);
-                }
-                // ANSI LOAD returns a generalized boolean (T on success); the
-                // last top-level form's value is not the result.
-                load_path_into_env(&path, env)?;
-                return Ok(T);
-            }
-            "COMPILE-FILE" => {
-                // (compile-file source &key output-file &allow-other-keys) — compile
-                // SOURCE to a .bfasl (bliss-lb6.6). Returns three values per ANSI:
-                // output-truename, warnings-p, failure-p. ASDF passes the target as
-                // an :output-file keyword (not positional).
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "COMPILE-FILE requires a source".into(),
-                    ));
-                }
-                torcl_rt::rooted!(source_pathname = resolve_against_dpd(args[0], env)?);
-                let src_path = path_designator_to_string(*source_pathname)?;
-                let mut out_path: Option<String> = None;
-                let mut i = 1;
-                // Extension: accept `(compile-file src out)` with a positional
-                // output file (string/pathname). ANSI makes OUTPUT-FILE a
-                // keyword, but the positional form is what callers reach for,
-                // and it was previously ACCEPTED AND SILENTLY IGNORED — the
-                // compile overwrote the default output path (bliss-m1a).
-                if i < args.len() && !args[i].is_symbol() {
-                    out_path = Some(path_designator_to_string(args[i])?);
-                    i += 1;
-                }
-                // The remaining tail must be a well-formed &key list (output-file
-                // verbose print external-format …, other keys tolerated) —
-                // reject malformed tails instead of dropping arguments.
-                if (args.len() - i) % 2 != 0 {
-                    return Err(TorclError::ProgramError(
-                        "COMPILE-FILE: odd number of &KEY arguments".into(),
-                    ));
-                }
-                while i + 1 < args.len() {
-                    let key = args[i];
-                    let val = args[i + 1];
-                    if !key.is_symbol() {
-                        return Err(TorclError::ProgramError(format!(
-                            "COMPILE-FILE: {} is not a keyword argument name",
-                            format_val(key)
-                        )));
-                    }
-                    if sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE" && val != NIL {
-                        out_path = Some(path_designator_to_string(val)?);
-                    }
-                    i += 2;
-                }
-                let out_path = out_path.unwrap_or_else(|| {
-                    // CLHS 3.2.3: COMPILE-FILE's default output MUST equal
-                    // (COMPILE-FILE-PATHNAME input). Match COMPILE-FILE-PATHNAME
-                    // below exactly — strip `.lisp` OR `.lsp`, append `.fasl` —
-                    // or `compile-and-load` (ansi-test, which compiles a `.lsp`
-                    // then LOADs compile-file-pathname's result) fails to find
-                    // the artifact (bliss-30be).
-                    let stem = src_path
-                        .strip_suffix(".lisp")
-                        .or_else(|| src_path.strip_suffix(".lsp"))
-                        .unwrap_or(&src_path);
-                    format!("{stem}.fasl")
-                });
-                let source = std::fs::read_to_string(&src_path).map_err(|e| {
-                    TorclError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
-                })?;
-                // Per-file progress, gated on *COMPILE-VERBOSE* (default T, like
-                // SBCL). Only fires when compilation actually happens — ASDF
-                // calls COMPILE-FILE only for a missing/stale fasl — so warm
-                // loads stay silent.
-                let compile_verbose = env
-                    .lookup_var("*COMPILE-VERBOSE*")
-                    .map(|v| !v.is_nil())
-                    .unwrap_or(true);
-                let compile_start = std::time::Instant::now();
-                if compile_verbose {
-                    let written = std::fs::metadata(&src_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| format!(" (written {})", format_compile_note_date(d.as_secs())))
-                        .unwrap_or_default();
-                    println!("; compiling file \"{src_path}\"{written}:");
-                }
-                // ANSI COMPILE-FILE binds *PACKAGE* (and *READTABLE*) for the
-                // dynamic extent of the compilation (CLHS 3.2.1), so a file's
-                // IN-PACKAGE forms don't leak into the caller — after
-                // `(compile-file "lib/asdf.lisp")` the REPL stays in CL-USER, not
-                // ASDF/FOOTER. Snapshot the current package and restore it once
-                // compilation is done (mirrors LOAD in load_path_into_env).
-                let saved_package = env.current_package.clone();
-                let image = {
-                    // Bind BEFORE reading: #.*COMPILE-FILE-PATHNAME* must
-                    // capture the source, even when ASDF redirects the output.
-                    // Keep its spelling distinct from the canonical truename.
-                    torcl_rt::rooted!(source_truename = torcl_stdlib::truename(*source_pathname)?);
-                    let pathname_symbol = resolve_sym("*COMPILE-FILE-PATHNAME*").unwrap();
-                    let truename_symbol = resolve_sym("*COMPILE-FILE-TRUENAME*").unwrap();
-                    // Saved caller values also need roots across nested
-                    // compilation/GC. Dropping the guards restores on errors.
-                    torcl_rt::rooted!(
-                        _compile_paths = vec![
-                            DynBind::establish(pathname_symbol, *source_pathname),
-                            DynBind::establish(truename_symbol, *source_truename),
-                        ]
-                    );
-                    build_bfasl_from_source(&source, &src_path, env)
-                };
-                if env.current_package != saved_package {
-                    env.current_package = saved_package.clone();
-                    env.define_local("*PACKAGE*", package_object(&saved_package));
-                    sync_package_value_cell(&saved_package);
-                }
-                let image = image?;
-                // Create the output directory if needed. ASDF's output-translations
-                // route fasls into a per-implementation cache tree whose directories
-                // may not exist yet; real CL relies on ASDF pre-creating them, but
-                // creating them here is harmless and avoids a spurious file error.
-                if let Some(parent) = std::path::Path::new(&out_path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Write the fasl ATOMICALLY (temp file in the same directory +
-                // rename), so an interrupted or failed compile never leaves a
-                // half-written .bfasl that a later LOAD would choke on ("HeapObj
-                // not of type sequence") instead of recompiling (bliss-c3i).
-                write_file_atomic(&out_path, &image).map_err(|e| {
-                    TorclError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
-                })?;
-                if compile_verbose {
-                    let el = compile_start.elapsed();
-                    let secs = el.as_secs();
-                    println!("; wrote {out_path}");
-                    println!(
-                        "; compilation finished in {}:{:02}:{:02}.{:03}",
-                        secs / 3600,
-                        (secs % 3600) / 60,
-                        secs % 60,
-                        el.subsec_millis()
-                    );
-                }
-                let (out_pn, _) = torcl_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
-                env.set_mv(vec![out_pn, NIL, NIL]);
-                return Ok(out_pn);
-            }
-            "COMPILE-FILE-PATHNAME" => {
-                // (compile-file-pathname input-file &key output-file &allow-other-keys)
-                // Return the pathname COMPILE-FILE would write. With an explicit
-                // :output-file, return that (as a pathname); otherwise the input
-                // with a "fasl" type. ASDF calls this to compute output-files.
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "compile-file-pathname: missing input-file".into(),
-                    ));
-                }
-                // Scan &key args for :output-file.
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    let key = args[i];
-                    let val = args[i + 1];
-                    if key.is_symbol()
-                        && sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE"
-                        && val != NIL
-                    {
-                        let (pn, _) = torcl_stdlib::parse_namestring(
-                            arena_str(&path_designator_to_string(val)?),
-                            None,
-                            None,
-                        )?;
-                        return Ok(pn);
-                    }
-                    i += 2;
-                }
-                let src = path_designator_to_string(args[0])?;
-                let stem = src
-                    .strip_suffix(".lisp")
-                    .or_else(|| src.strip_suffix(".lsp"))
-                    .unwrap_or(&src);
-                let (pn, _) =
-                    torcl_stdlib::parse_namestring(arena_str(&format!("{stem}.fasl")), None, None)?;
-                return Ok(pn);
-            }
+            #[cfg(not(torcl_no_dynamic_code))]
+            "LOAD" => return eval_builtin_arguments(&name, cdr, env),
+            #[cfg(not(torcl_no_dynamic_code))]
+            "COMPILE-FILE" => return eval_builtin_arguments(&name, cdr, env),
+            "COMPILE-FILE-PATHNAME" => return eval_builtin_arguments(&name, cdr, env),
+            #[cfg(not(torcl_no_dynamic_code))]
             "REQUIRE" => {
                 let (module_form, _) = cp(cdr);
                 let module_val = eval_form(module_form, env)?;
@@ -24001,131 +21674,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 record_module(env, &name);
                 return Ok(module_val);
             }
-            "TORCL-EXT:DECLARATION-SPECIFIER" => {
-                let args = eval_args(cdr, env)?;
-                return macroexpand_declaration_specifier(args[0], args[1]);
-            }
-            "TORCL-EXT:DECLARATION-SPECIFIERS" => {
-                let args = eval_args(cdr, env)?;
-                return macroexpand_declaration_specifiers(args[0], args[1]);
-            }
-            "TORCL-EXT:PROCLAIMED-DECLARATIONS" => {
-                let args = eval_args(cdr, env)?;
-                if !args.is_empty() {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-EXT:PROCLAIMED-DECLARATIONS requires no arguments; got {}",
-                        args.len()
-                    )));
-                }
-                let mut list = NIL;
-                torcl_rt::rooted_ref!(_list_root = &mut list);
-                for name in proclaimed_declaration_names() {
-                    list = arena_cons(TorclVal::from_symbol_index(name), list);
-                }
-                return Ok(list);
-            }
-            "TORCL-EXT:HASH-TABLE-WEAKNESS" => {
-                // Trivial-Garbage's HASH-TABLE-WEAKNESS reads this; the keyword
-                // spelling matches what MAKE-HASH-TABLE's :WEAKNESS accepts.
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-EXT:HASH-TABLE-WEAKNESS requires one argument; got {}",
-                        args.len()
-                    )));
-                }
-                let name = match torcl_stdlib::hash_table_weakness(args[0])? {
-                    None => return Ok(NIL),
-                    Some(torcl_stdlib::Weakness::Key) => "KEY",
-                    Some(torcl_stdlib::Weakness::Value) => "VALUE",
-                    Some(torcl_stdlib::Weakness::KeyAndValue) => "KEY-AND-VALUE",
-                };
-                // Keywords are interned under "KEYWORD:NAME" registry keys.
-                return Ok(TorclVal::from_symbol_index(torcl_rt::symbols::intern(
-                    &format!("KEYWORD:{name}"),
-                )));
-            }
-            "TORCL-EXT:PROCLAIMED-OPTIMIZE" => {
-                let args = eval_args(cdr, env)?;
-                if !args.is_empty() {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-EXT:PROCLAIMED-OPTIMIZE requires no arguments; got {}",
-                        args.len()
-                    )));
-                }
-                return Ok(proclaimed_optimize_list());
-            }
-            "TORCL-EXT:FINALIZE" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 2 && args.len() != 4 {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-EXT:FINALIZE requires object, function, and optional :DONT-SAVE value; got {} arguments",
-                        args.len()
-                    )));
-                }
-                if args.len() == 4
-                    && (!args[2].is_symbol() || sym_bare_name_rc(args[2]).as_ref() != "DONT-SAVE")
-                {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-EXT:FINALIZE only accepts the :DONT-SAVE keyword".into(),
-                    ));
-                }
-                if !is_function_value(args[1]) {
-                    return Err(TorclError::TypeError {
-                        datum: args[1],
-                        expected: "FUNCTION".into(),
-                    });
-                }
-                let key = torcl_rt::finalizer_key(args[0])?;
-                torcl_rt::register_deferred_finalizer(key, args[1])?;
-                return Ok(args[0]);
-            }
-            "TORCL-EXT:CANCEL-FINALIZATION" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() != 1 {
-                    return Err(TorclError::ProgramError(format!(
-                        "TORCL-EXT:CANCEL-FINALIZATION requires one argument; got {}",
-                        args.len()
-                    )));
-                }
-                let key = torcl_rt::finalizer_key(args[0])?;
-                torcl_rt::cancel_deferred_finalizers(key);
-                return Ok(NIL);
-            }
-            "TORCL-EXT:GC" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() % 2 != 0 {
-                    return Err(TorclError::ProgramError(
-                        "TORCL-EXT:GC keyword arguments must be paired".into(),
-                    ));
-                }
-                let mut full = false;
-                let mut i = 0;
-                while i < args.len() {
-                    if !args[i].is_symbol() {
-                        return Err(TorclError::ProgramError(
-                            "TORCL-EXT:GC expected a keyword argument".into(),
-                        ));
-                    }
-                    match sym_bare_name_rc(args[i]).as_ref() {
-                        "FULL" => full = !args[i + 1].is_nil(),
-                        "VERBOSE" => {}
-                        other => {
-                            return Err(TorclError::ProgramError(format!(
-                                "TORCL-EXT:GC does not accept :{other}"
-                            )));
-                        }
-                    }
-                    i += 2;
-                }
-                if full {
-                    torcl_rt::full_gc()?;
-                } else {
-                    torcl_rt::collect_t0_minor()?;
-                }
-                run_deferred_lisp_finalizers(env);
-                return Ok(NIL);
-            }
+            "TORCL-EXT:DECLARATION-SPECIFIER" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:DECLARATION-SPECIFIERS" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:PROCLAIMED-DECLARATIONS" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:HASH-TABLE-WEAKNESS" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:PROCLAIMED-OPTIMIZE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:FINALIZE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:CANCEL-FINALIZATION" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:GC" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-EXT:GETENV" => {
                 let (name_form, _) = cp(cdr);
                 let name = val_as_str(eval_form(name_form, env)?);
@@ -24394,16 +21950,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             // Lisp-aware statistical profiler (bliss-sc4t): samples a shadow
             // stack of the Lisp call chain across tiers, so a flamegraph shows the
             // real functions (T2/T0/treewalk mixed), not just the interpreter.
-            "TORCL-EXT:SPROF-START" => {
-                let args = eval_args(cdr, env)?;
-                let hz = args
-                    .first()
-                    .filter(|v| v.is_fixnum())
-                    .map(|v| v.as_fixnum() as u32)
-                    .unwrap_or(1000);
-                sprof::start(hz);
-                return Ok(T);
-            }
+            "TORCL-EXT:SPROF-START" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-EXT:SPROF-STOP" => {
                 let _ = eval_args(cdr, env)?;
                 sprof::stop();
@@ -24420,46 +21967,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             // PROFILE-RESET manage the set. Exact counts from the engine's own
             // tiering counters — no function wrapper, so compiled/native call sites
             // are counted too (the bug that sank the earlier wrapper approach).
-            "TORCL-EXT:PROFILE" => {
-                let args = eval_args(cdr, env)?;
-                for &d in args.iter() {
-                    if let Some(idx) = profiled_index_of(d) {
-                        // Pin to T0 so counts are exact (native prologues stop
-                        // bumping the tiering counter), then snapshot the baseline.
-                        bytecode::profile_pin(idx);
-                        let f = torcl_rt::symbols::symbol_function(idx);
-                        let (ic, bc) = f
-                            .map(|f| {
-                                (
-                                    torcl_rt::function::invoke_count(f),
-                                    torcl_rt::function::back_edge_count(f),
-                                )
-                            })
-                            .unwrap_or((0, 0));
-                        PROFILED_FNS.with(|m| m.borrow_mut().insert(idx, (ic, bc)));
-                    }
-                }
-                return Ok(NIL);
-            }
-            "TORCL-EXT:UNPROFILE" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    PROFILED_FNS.with(|m| {
-                        for idx in m.borrow().keys().copied().collect::<Vec<_>>() {
-                            bytecode::profile_unpin(idx);
-                        }
-                        m.borrow_mut().clear();
-                    });
-                } else {
-                    for &d in args.iter() {
-                        if let Some(idx) = profiled_index_of(d) {
-                            bytecode::profile_unpin(idx);
-                            PROFILED_FNS.with(|m| m.borrow_mut().remove(&idx));
-                        }
-                    }
-                }
-                return Ok(NIL);
-            }
+            "TORCL-EXT:PROFILE" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL-EXT:UNPROFILE" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-EXT:PROFILE-RESET" => {
                 let _ = eval_args(cdr, env)?;
                 PROFILED_FNS.with(|m| {
@@ -24632,38 +22141,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let argv: Vec<TorclVal> = std::env::args().map(|a| arena_str(&a)).collect();
                 return Ok(vec_to_list(&argv));
             }
-            "READ-LINE" => {
-                // (read-line &optional stream eof-error-p eof-value recursive-p)
-                // Mirror READ-CHAR's eof handling (bliss-49qk): eof-error-p and
-                // eof-value were previously ignored — the stream arg was the only
-                // one evaluated and EOF always returned NIL. Per CLHS, at EOF with
-                // nothing read, signal END-OF-FILE unless eof-error-p is NIL, in
-                // which case return eof-value (with a true second value).
-                let args = eval_args(cdr, env)?;
-                let stream = if !args.is_empty() { args[0] } else { NIL };
-                let eof_error_p = if args.len() > 1 { args[1] } else { T };
-                let inp = resolve_input_stream(stream, env);
-                if is_gray_stream(inp) {
-                    // The Gray stream-read-line returns (values string eof-p);
-                    // invoke_generic_function yields the primary value (the line).
-                    let line = invoke_generic_function("STREAM-READ-LINE", &[inp], env)?;
-                    return Ok(line);
-                }
-                let (line_val, missing_newline) = torcl_stdlib::stream_read_line(inp)?;
-                if line_val == EOF {
-                    if eof_error_p.is_nil() {
-                        // Re-read eof-value from the rooted args after the
-                        // (allocating) read (bliss-6b2 #2). Second value is T at
-                        // EOF, matching read-line's missing-newline contract.
-                        let eof_value = if args.len() > 2 { args[2] } else { NIL };
-                        env.set_mv(vec![eof_value, T]);
-                        return Ok(eof_value);
-                    }
-                    return Err(TorclError::StreamError("end of file on READ-LINE".into()));
-                }
-                env.set_mv(vec![line_val, if missing_newline { T } else { NIL }]);
-                return Ok(line_val);
-            }
+            "READ-LINE" => return eval_builtin_arguments(&name, cdr, env),
             "READ-SEQUENCE" => {
                 // (read-sequence sequence stream &key start end) — destructively
                 // fill SEQUENCE from STREAM; returns the index of the first element
@@ -24758,80 +22236,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(seq);
             }
-            "WRITE-STRING" => {
-                // (write-string string &optional stream &key start end)
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "WRITE-STRING requires an argument".into(),
-                    ));
-                }
-                let full = val_as_str(args[0]);
-                // A second positional argument is the stream designator, unless
-                // it is a keyword (the start of &key start/end options).
-                let (stream, kv_from) = if args.len() > 1 && !is_keyword_arg(args[1]) {
-                    (args[1], 2)
-                } else {
-                    (NIL, 1)
-                };
-                // Honor &key start/end: write only the substring (cl-ppcre's
-                // regex-replace stitches output with `(write-string s :start :end)`
-                // and produced garbage when these were ignored).
-                let chars: Vec<char> = full.chars().collect();
-                let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
-                let s: String = chars[kstart..kend].iter().collect();
-                let mut out = resolve_output_stream(stream, env);
-                torcl_rt::rooted_ref!(_output_root = &mut out);
-                check_pending_sigpipe_for_output()?;
-                if is_gray_stream(out) {
-                    // Dispatch to the Gray stream-write-string generic (start 0,
-                    // end nil → whole string), passing the already-bounded slice.
-                    torcl_rt::rooted!(text = arena_str(&s));
-                    invoke_generic_function(
-                        "STREAM-WRITE-STRING",
-                        &[out, *text, TorclVal::from_fixnum(0), NIL],
-                        env,
-                    )?;
-                    return Ok(args[0]);
-                }
-                write_str_to(out, &s)?;
-                return Ok(args[0]);
-            }
-            "WRITE-LINE" => {
-                // (write-line string &optional stream &key start end) — WRITE-STRING
-                // followed by a newline; returns the string.
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal(
-                        "WRITE-LINE requires an argument".into(),
-                    ));
-                }
-                let full = val_as_str(args[0]);
-                let (stream, kv_from) = if args.len() > 1 && !is_keyword_arg(args[1]) {
-                    (args[1], 2)
-                } else {
-                    (NIL, 1)
-                };
-                let chars: Vec<char> = full.chars().collect();
-                let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
-                let s: String = chars[kstart..kend].iter().collect();
-                let mut out = resolve_output_stream(stream, env);
-                torcl_rt::rooted_ref!(_output_root = &mut out);
-                check_pending_sigpipe_for_output()?;
-                if is_gray_stream(out) {
-                    torcl_rt::rooted!(text = arena_str(&s));
-                    invoke_generic_function(
-                        "STREAM-WRITE-STRING",
-                        &[out, *text, TorclVal::from_fixnum(0), NIL],
-                        env,
-                    )?;
-                    invoke_generic_function("STREAM-TERPRI", &[out], env)?;
-                    return Ok(args[0]);
-                }
-                write_str_to(out, &s)?;
-                torcl_stdlib::stream_terpri(out)?;
-                return Ok(args[0]);
-            }
+            "WRITE-STRING" => return eval_builtin_arguments(&name, cdr, env),
+            "WRITE-LINE" => return eval_builtin_arguments(&name, cdr, env),
             "FILE-LENGTH" => {
                 // (file-length stream) — length in elements of an open file stream.
                 let args = list_to_vec(cdr);
@@ -25066,78 +22472,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // CLHS: IN-PACKAGE returns the package it makes current.
                 return Ok(package_object(&env.current_package));
             }
-            "MAKE-PACKAGE" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::ProgramError(
-                        "MAKE-PACKAGE requires a package name argument".into(),
-                    ));
-                }
-                // Validate the keyword tail (CLHS 3.5.1): pairs must be complete,
-                // keys must be symbols, and only :NICKNAMES / :USE are accepted
-                // unless :ALLOW-OTHER-KEYS is true. ansi-test MAKE-PACKAGE.ERROR.*.
-                validate_builtin_keywords(&args[1..], &["NICKNAMES", "USE"])?;
-                let pkg_name = normalize_package_name(&string_designator_name(args[0]));
-                // MAKE-PACKAGE on a name (or nickname) that already names a
-                // package is a PACKAGE-ERROR (CLHS) — unlike DEFPACKAGE, which
-                // redefines in place.
-                if torcl_stdlib::find_package(&pkg_name).is_some()
-                    || matches!(
-                        pkg_name.as_str(),
-                        "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
-                    )
-                {
-                    // Correctable: CONTINUE yields the EXISTING package, which
-                    // is the only correction that leaves the image consistent.
-                    let existing = package_object(&pkg_name);
-                    if signal_correctable_package_error(
-                        existing,
-                        &format!("a package named {pkg_name} already exists"),
-                        env,
-                    )? {
-                        return Ok(package_object(&pkg_name));
-                    }
-                    unreachable!("signal_correctable_package_error returns Err unless continued");
-                }
-                // Parse :nicknames and :use keyword options.
-                let mut nicknames = Vec::new();
-                let mut uses: Vec<String> = Vec::new();
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    let key = sym_bare_name_rc(args[i]);
-                    let value = args[i + 1];
-                    match key.as_ref() {
-                        "NICKNAMES" => {
-                            for nick in list_to_vec(value) {
-                                nicknames
-                                    .push(normalize_package_name(&string_designator_name(nick)));
-                            }
-                        }
-                        "USE" => {
-                            for used in list_to_vec(value) {
-                                uses.push(resolve_package_name(env, &string_designator_name(used)));
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 2;
-                }
-                let use_refs: Vec<&str> = uses.iter().map(String::as_str).collect();
-                ensure_package_available(env, &pkg_name, &use_refs);
-                if !nicknames.is_empty() {
-                    if let Some(pkg) = torcl_stdlib::find_package(&pkg_name) {
-                        for nick in nicknames {
-                            // Register the nickname with the reader too, so a
-                            // package-qualified symbol written with the nickname
-                            // (e.g. `uiop:foo`, UIOP being a nickname of
-                            // UIOP/DRIVER) resolves at read time (bliss-lb6).
-                            reader::register_package(&nick);
-                            let _ = torcl_stdlib::add_nickname(pkg, &nick);
-                        }
-                    }
-                }
-                return Ok(package_object(&pkg_name));
-            }
+            "MAKE-PACKAGE" => return eval_builtin_arguments(&name, cdr, env),
             "FIND-PACKAGE" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
@@ -25313,164 +22648,14 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             "LIST-ALL-PACKAGES" => {
                 return Ok(vec_to_list(&torcl_stdlib::list_all_packages()));
             }
-            "APROPOS-LIST" => {
-                // (apropos-list string &optional package) → matching symbols.
-                let args = eval_args(cdr, env)?;
-                let needle = val_as_str(args.first().copied().unwrap_or(NIL));
-                let package = args.get(1).copied().unwrap_or(NIL);
-                let matches = apropos_symbols(env, &needle, package);
-                return Ok(vec_to_list(&matches));
-            }
-            "APROPOS" => {
-                // (apropos string &optional package) — print each match to
-                // *standard-output*; CLHS specifies no values are returned.
-                let args = eval_args(cdr, env)?;
-                let needle = val_as_str(args.first().copied().unwrap_or(NIL));
-                let package = args.get(1).copied().unwrap_or(NIL);
-                let matches = apropos_symbols(env, &needle, package);
-                // Render everything BEFORE writing: `symbol_function`/variable
-                // lookups below allocate, and the stream write can re-enter Lisp
-                // through a Gray stream. Neither may run while we hold a
-                // half-built view of the symbol list.
-                let mut report = String::new();
-                for sym in &matches {
-                    let full = sym_name_rc(*sym);
-                    let home = symbol_home_package_name(*sym);
-                    let bare = symbol_name_string(&full);
-                    // An uninterned symbol has no home package; CLHS prints
-                    // those as #:NAME.
-                    let mut line = if home.is_empty() {
-                        format!("#:{bare}")
-                    } else {
-                        format!("{}:{}", prompt_package_name(&home), bare)
-                    };
-                    if callable_body_of_symbol(env, *sym, &symbol_name_string(&full)).is_some() {
-                        line.push_str(" (function)");
-                    }
-                    if env.lookup_var_symbol(*sym).is_some() {
-                        line.push_str(" (value)");
-                    }
-                    line.push('\n');
-                    report.push_str(&line);
-                }
-                write_standard_output(env, &report)?;
-                env.set_mv(Vec::new());
-                return Ok(NIL);
-            }
+            "APROPOS-LIST" => return eval_builtin_arguments(&name, cdr, env),
+            "APROPOS" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL-INTERNAL::PACKAGE-SYMBOLS" | "TORCL-INTERNAL:PACKAGE-SYMBOLS" => {
-                let args = eval_args(cdr, env)?;
-                let package = if args.is_empty() {
-                    effective_package_name(env)
-                } else {
-                    normalize_package_name(&string_designator_name(args[0]))
-                };
-                // 2nd arg: NIL → present symbols, :EXTERNAL → external symbols
-                // only (DO-EXTERNAL-SYMBOLS), any other true value → accessible
-                // (present + inherited) symbols.
-                let mode = args.get(1).copied().unwrap_or(NIL);
-                if mode.is_symbol() && sym_bare_name_rc(mode).as_ref() == "EXTERNAL" {
-                    return Ok(vec_to_list(&package_external_symbols(env, &package)));
-                }
-                return Ok(vec_to_list(&package_symbols(env, &package, !mode.is_nil())));
+                return eval_builtin_arguments(&name, cdr, env);
             }
-            "USE-PACKAGE" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Ok(T);
-                }
-                let mut names = Vec::new();
-                let pkgs_val = args[0];
-                if pkgs_val.is_cons() {
-                    for pkg in list_to_vec(pkgs_val) {
-                        names.push(resolve_package_name(env, &string_designator_name(pkg)));
-                    }
-                } else {
-                    names.push(resolve_package_name(env, &string_designator_name(pkgs_val)));
-                }
-                let target = if args.len() > 1 {
-                    let raw = string_designator_name(args[1]);
-                    resolve_package_name(env, &raw)
-                } else {
-                    effective_package_name(env)
-                };
-                // ensure_package_available creates the target if needed and adds
-                // each named package to its use-list (creating a placeholder for
-                // any not yet defined).
-                let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                ensure_package_available(env, &target, &name_refs);
-                return Ok(T);
-            }
-            "UNUSE-PACKAGE" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Ok(T);
-                }
-                // First arg is a package designator or a list of them.
-                let pkgs_val = args[0];
-                let mut used = Vec::new();
-                let names: Vec<TorclVal> = if pkgs_val.is_cons() {
-                    list_to_vec(pkgs_val)
-                } else if pkgs_val.is_nil() {
-                    Vec::new()
-                } else {
-                    vec![pkgs_val]
-                };
-                for pv in names {
-                    let name = resolve_package_name(env, &string_designator_name(pv));
-                    if let Some(p) = torcl_stdlib::find_package(&name) {
-                        used.push(p);
-                    }
-                }
-                let target = if args.len() > 1 {
-                    let raw = string_designator_name(args[1]);
-                    resolve_package_name(env, &raw)
-                } else {
-                    effective_package_name(env)
-                };
-                if let Some(target_pkg) = torcl_stdlib::find_package(&target) {
-                    let _ = torcl_stdlib::unuse_package(&used, target_pkg);
-                }
-                return Ok(T);
-            }
-            "RENAME-PACKAGE" => {
-                let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(TorclError::Internal(
-                        "RENAME-PACKAGE requires package and new name".into(),
-                    ));
-                }
-                let old_raw = string_designator_name(args[0]);
-                let old_name = resolve_package_name(env, &old_raw);
-                let new_name = normalize_package_name(&string_designator_name(args[1]));
-                // Optional new nicknames (3rd arg); default: keep the package's
-                // current nicknames (torcl has always preserved them on rename).
-                if let Some(pkg) = torcl_stdlib::find_package(&old_name) {
-                    let new_nicks: Vec<String> = if args.len() > 2 {
-                        list_to_vec(args[2])
-                            .iter()
-                            .map(|n| normalize_package_name(&string_designator_name(*n)))
-                            .collect()
-                    } else {
-                        torcl_stdlib::package_nicknames(pkg)
-                    };
-                    let nick_refs: Vec<&str> = new_nicks.iter().map(String::as_str).collect();
-                    let _ = torcl_stdlib::rename_package(pkg, &new_name, &nick_refs);
-                    for nick in &new_nicks {
-                        reader::register_package(nick);
-                    }
-                    // Rewrite the old qualifier baked into affected symbols'
-                    // registry keys and re-key the interpreter's name-keyed
-                    // definition maps, so SYMBOL-PACKAGE, printing, and
-                    // function/macro lookup all follow the rename (bliss-9fi3).
-                    if old_name != new_name {
-                        let renamed =
-                            torcl_rt::symbols::rename_package_prefix(&old_name, &new_name);
-                        rekey_renamed_symbols(env, &renamed);
-                    }
-                }
-                reader::register_package(&new_name);
-                return Ok(package_object(&new_name));
-            }
+            "USE-PACKAGE" => return eval_builtin_arguments(&name, cdr, env),
+            "UNUSE-PACKAGE" => return eval_builtin_arguments(&name, cdr, env),
+            "RENAME-PACKAGE" => return eval_builtin_arguments(&name, cdr, env),
             "DELETE-PACKAGE" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
@@ -25510,87 +22695,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 let _ = torcl_stdlib::delete_package(&pkg_name);
                 return Ok(T);
             }
-            "INTERN" => {
-                let args = eval_args(cdr, env)?;
-                let name_val = args.first().copied().unwrap_or(NIL);
-                // INTERN's first argument is a string, not reader input: a
-                // colon in it is an ordinary symbol-name character and must
-                // not be interpreted as a package marker.
-                let name_str = val_as_str(name_val);
-                let pkg_name = if args.len() > 1 {
-                    let raw = string_designator_name(args[1]);
-                    resolve_package_name(env, &raw)
-                } else {
-                    effective_package_name(env)
-                };
-                // KEYWORD is the one package whose symbols do NOT live in a
-                // package's symbol tables: they are keyed `KEYWORD:<name>` in
-                // the shared symbol registry, which is where the reader mints
-                // them and where FIND-SYMBOL looks them up
-                // (`present_symbol_with_status`). Interning one through the
-                // package registry minted a SECOND symbol of the same name that
-                // was not EQ to the reader's — so cl-json's decoded keys did not
-                // match the `:message` / `:content` literals its callers write,
-                // and completions read every Ollama reply as NIL (bliss-r8kt).
-                // The registry key is the VERBATIM name: INTERN is
-                // case-sensitive, so `(intern "abc" :keyword)` must name `:|abc|`.
-                if pkg_name == "KEYWORD" {
-                    let key = format!("KEYWORD:{name_str}");
-                    let existed = reader::find_symbol_index(&key).is_some();
-                    let sym = TorclVal::from_symbol_index(reader::intern_symbol(&key));
-                    let status = if existed {
-                        package_status_symbol("EXTERNAL")
-                    } else {
-                        NIL
-                    };
-                    env.set_mv(vec![sym, status]);
-                    return Ok(sym);
-                }
-                // Package behavior belongs to torcl-stdlib. Ensure the package
-                // exists, then let its registry perform the exact-case lookup,
-                // inherited-symbol handling, allocation, and insertion.
-                ensure_package_available(env, &pkg_name, &[]);
-                let package = torcl_stdlib::find_package(&pkg_name).ok_or_else(|| {
-                    TorclError::PackageError(format!("there is no package named {pkg_name}"))
-                })?;
-                let (mut sym, intern_status) = torcl_stdlib::intern(&name_str, package)?;
-                torcl_rt::rooted_ref!(_sym_root = &mut sym);
-                let status = match intern_status {
-                    torcl_stdlib::InternStatus::Internal => package_status_symbol("INTERNAL"),
-                    torcl_stdlib::InternStatus::External => package_status_symbol("EXTERNAL"),
-                    torcl_stdlib::InternStatus::Inherited => package_status_symbol("INHERITED"),
-                    torcl_stdlib::InternStatus::New => NIL,
-                };
-                env.set_mv(vec![sym, status]);
-                return Ok(sym);
-            }
-            "FIND-SYMBOL" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(TorclError::Internal("FIND-SYMBOL requires a name".into()));
-                }
-                // FIND-SYMBOL takes the name STRING verbatim (no readtable
-                // upcasing, no package-prefix parsing — the package is the second
-                // argument), and matches case-SENSITIVELY (CLHS): (find-symbol
-                // "car") is NIL, (find-symbol "CAR") finds CAR (bliss-961p). So do
-                // NOT run it through symbol_bare_name (which upcases + strips).
-                let name = val_as_str(args[0]);
-                // The package argument is optional and defaults to *PACKAGE*.
-                let pkg_name = if args.len() > 1 {
-                    let pkg_raw = string_designator_name(args[1]);
-                    resolve_package_name(env, &pkg_raw)
-                } else {
-                    effective_package_name(env)
-                };
-                if let Some((sym, status)) =
-                    find_symbol_in_package_cased(env, &pkg_name, &name, true)
-                {
-                    env.set_mv(vec![sym, package_status_symbol(status)]);
-                    return Ok(sym);
-                }
-                env.set_mv(vec![NIL, NIL]);
-                return Ok(NIL);
-            }
+            "INTERN" => return eval_builtin_arguments(&name, cdr, env),
+            "FIND-SYMBOL" => return eval_builtin_arguments(&name, cdr, env),
             "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
@@ -25730,146 +22836,9 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 return Ok(T);
             }
-            "UNEXPORT" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Ok(T);
-                }
-                let symbols = args[0];
-                let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&string_designator_name(args[1]))
-                } else {
-                    effective_package_name(env)
-                };
-                let sym_vals: Vec<TorclVal> = if symbols.is_cons() {
-                    list_to_vec(symbols)
-                } else if symbols.is_nil() {
-                    Vec::new()
-                } else {
-                    vec![symbols]
-                };
-                if let Some(pkg) = torcl_stdlib::find_package(&pkg_name) {
-                    let mut resolved = Vec::with_capacity(sym_vals.len());
-                    for sv in sym_vals {
-                        // UNEXPORT requires every symbol to be ACCESSIBLE in the
-                        // package; an inaccessible one is a PACKAGE-ERROR (CLHS
-                        // UNEXPORT; ansi-test UNEXPORT.5).
-                        let name = symbol_bare_name(&val_as_str(sv));
-                        let accessible = match find_symbol_in_package(env, &pkg_name, &name) {
-                            Some((found, _)) if !sv.is_symbol() || found == sv => Some(found),
-                            _ => None,
-                        };
-                        match accessible {
-                            Some(sym) => resolved.push(sym),
-                            None => {
-                                return Err(TorclError::PackageError(format!(
-                                    "symbol {name} is not accessible in package {pkg_name}"
-                                )));
-                            }
-                        }
-                    }
-                    let _ = torcl_stdlib::unexport(&resolved, pkg);
-                }
-                return Ok(T);
-            }
-            "SHADOW" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Ok(T);
-                }
-                let names_val = args[0];
-                let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&string_designator_name(args[1]))
-                } else {
-                    effective_package_name(env)
-                };
-                ensure_package_available(env, &pkg_name, &[]);
-                let mut names = Vec::new();
-                // Case-preserving designators: (shadow "foo") shadows |foo|
-                // (CLHS; the old symbol_bare_name upcased and shadowed FOO).
-                if names_val.is_cons() {
-                    for name in list_to_vec(names_val) {
-                        names.push(string_designator_name(name));
-                    }
-                } else {
-                    names.push(string_designator_name(names_val));
-                }
-                // SHADOW forks a distinct present symbol shadowing any inherited
-                // same-named one (bliss-b1o) — not a plain intern.
-                if let Some(pkg) = torcl_stdlib::find_package(&pkg_name) {
-                    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                    let _ = torcl_stdlib::shadow(&refs, pkg);
-                }
-                return Ok(T);
-            }
-            "UNINTERN" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Ok(NIL);
-                }
-                let symbol = args[0];
-                let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&string_designator_name(args[1]))
-                } else {
-                    effective_package_name(env)
-                };
-                let name = symbol_bare_name(&val_as_str(symbol));
-                let Some(pkg) = torcl_stdlib::find_package(&pkg_name) else {
-                    return Ok(NIL);
-                };
-                // Shadowing-reveal conflict (CLHS UNINTERN; ansi UNINTERN.8/9):
-                // uninterning a SHADOWING symbol uncovers the inherited
-                // same-named externals of the use list. If those are TWO OR
-                // MORE distinct symbols, the reveal creates a name conflict —
-                // a PACKAGE-ERROR; a single symbol (even via several used
-                // packages) is fine.
-                if torcl_stdlib::package_shadowing_symbols(pkg)
-                    .iter()
-                    .any(|s| string_designator_name(*s).eq_ignore_ascii_case(&name))
-                {
-                    let mut revealed: Vec<TorclVal> = Vec::new();
-                    for used in torcl_stdlib::package_use_list(pkg) {
-                        if let Some(ext) = torcl_stdlib::find_present_symbol(used, &name) {
-                            if torcl_stdlib::is_external_symbol(used, &name)
-                                && !revealed.contains(&ext)
-                            {
-                                revealed.push(ext);
-                            }
-                        }
-                    }
-                    if revealed.len() > 1 {
-                        return Err(TorclError::PackageError(format!(
-                            "uninterning shadowing symbol {name} from {pkg_name} would \
-                             reveal {} conflicting inherited symbols",
-                            revealed.len()
-                        )));
-                    }
-                }
-                let removed = match torcl_stdlib::find_present_symbol(pkg, &name) {
-                    Some(sym) => {
-                        // Read the home BEFORE removing the symbol: once it is
-                        // gone from the package, the name→home scan can no longer
-                        // see it.
-                        let home_is_this = sym.is_symbol()
-                            && sym != NIL
-                            && sym != T
-                            && normalize_package_name(&symbol_home_package_name(sym)) == pkg_name;
-                        let ok = torcl_stdlib::unintern(sym, pkg).unwrap_or(false);
-                        // CLHS: if this package was the symbol's home package,
-                        // uninterning makes the symbol homeless (SYMBOL-PACKAGE
-                        // becomes NIL). Record it — torcl's name-prefix home model
-                        // has no other way to represent "no home package".
-                        if ok && home_is_this {
-                            if let Some(idx) = sym.symbol_index() {
-                                mark_symbol_homeless(idx);
-                            }
-                        }
-                        ok
-                    }
-                    None => false,
-                };
-                return Ok(if removed { T } else { NIL });
-            }
+            "UNEXPORT" => return eval_builtin_arguments(&name, cdr, env),
+            "SHADOW" => return eval_builtin_arguments(&name, cdr, env),
+            "UNINTERN" => return eval_builtin_arguments(&name, cdr, env),
             "SYMBOL-PACKAGE" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
@@ -26181,6 +23150,11 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                if python::is_proxy(v) {
+                    return Ok(
+                        resolve_sym("TORCL-PYTHON::OBJECT").expect("Python object type symbol")
+                    );
+                }
                 if torcl_stdlib::synchronization::mutex_p(v) {
                     return Ok(resolve_sym("TORCL-THREAD::MUTEX").expect("mutex type symbol"));
                 }
@@ -26538,7 +23512,13 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             if parts.len() == 2 {
                 let _pkg_name = parts[0];
                 let fn_name = parts[1].trim_start_matches(':');
-                if let Some((params_form, body)) = callable_body(env, fn_name) {
+                if let Some((mut params_form, mut body)) = callable_body(env, fn_name) {
+                    // Both are source forms held across argument evaluation, which
+                    // allocates; without rooting, a minor GC there leaves the lambda
+                    // list and body pointing at moved conses (bliss-ep38p). The
+                    // LAMBDA fallback further down already does this (bliss-98mu).
+                    torcl_rt::rooted_ref!(_params_form_root = &mut params_form);
+                    torcl_rt::rooted_ref!(_body_root = &mut body);
                     let args = eval_args(cdr, env)?;
                     return eval_lambda_call(env, params_form, body, &args, Arc::clone(&env.frame));
                 }
@@ -26569,6 +23549,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
 
     // CL:DISASSEMBLE (spec §6) — render the callee's current tier: annotated
     // bytecode while interpreted (T0), decoded x86-64 once native (T1).
+    #[cfg(not(torcl_no_disassembly))]
     if car.is_symbol() && sym_bare_name_rc(car).as_ref() == "DISASSEMBLE" {
         let arg = if cdr.is_cons() {
             eval_form(cp(cdr).0, env)?
@@ -30569,49 +27550,44 @@ fn sort_sequence(
 // DEFUN, or DEFMETHOD nested in a LET — would copy-on-write into the discarded
 // child and never reach the caller. Keeping one env also lets multiple values
 // and dynamic state flow out of the body naturally.
-thread_local! {
-    // Symbol names proclaimed globally SPECIAL via `(declaim (special x))` /
-    // `(proclaim '(special x))`. Consulted by `is_special_var` (tree-walker) and
-    // `bytecode::is_special_name` (compiler) in addition to the earmuff
-    // convention, so a non-earmuffed proclaimed-special variable `let`-binds
-    // DYNAMICALLY on BOTH backends (bliss-7na). Populated by the
-    // `%PROCLAIM-SPECIAL` builtin.
-    //
-    // Keyed by the FULL (package-qualified) name. It was keyed by the BARE name
-    // to match the earmuff checks, which made proclaiming leak across packages:
-    // `(defvar zzp::zvar 1)` made every package's ZVAR special, so an unrelated
-    // `(let ((zvar 42)) ...)` bound DYNAMICALLY. That is not a near-miss -- it
-    // silently breaks closures, because the binding is unwound on exit:
-    // `(defun mk () (let ((zvar 7)) (lambda () zvar)))` then signalled "unbound
-    // variable: ZVAR" when the closure was called (bliss-eq72).
-    //
-    // The earmuff test stays bare-name -- it is about SPELLING, and `*x*` is
-    // spelled that way in every package. Only the proclaimed set is an identity
-    // question, so only it is keyed by identity. Both lookup sites derive the
-    // key with `sym_name`/`sym_name_rc` from the same interned symbol the
-    // proclamation used, so the two spellings cannot drift.
-    static PROCLAIMED_SPECIAL: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
-}
+// Symbol names proclaimed globally SPECIAL via `(declaim (special x))` /
+// `(proclaim '(special x))`. Consulted by `is_special_var` (tree-walker) and
+// `bytecode::is_special_name` (compiler) in addition to the earmuff
+// convention, so a non-earmuffed proclaimed-special variable `let`-binds
+// DYNAMICALLY on BOTH backends (bliss-7na). Populated by the
+// `%PROCLAIM-SPECIAL` builtin.
+//
+// Keyed by the FULL (package-qualified) name. It was keyed by the BARE name
+// to match the earmuff checks, which made proclaiming leak across packages:
+// `(defvar zzp::zvar 1)` made every package's ZVAR special, so an unrelated
+// `(let ((zvar 42)) ...)` bound DYNAMICALLY. That is not a near-miss -- it
+// silently breaks closures, because the binding is unwound on exit:
+// `(defun mk () (let ((zvar 7)) (lambda () zvar)))` then signalled "unbound
+// variable: ZVAR" when the closure was called (bliss-eq72).
+//
+// The earmuff test stays bare-name -- it is about SPELLING, and `*x*` is
+// spelled that way in every package. Only the proclaimed set is an identity
+// question, so only it is keyed by identity. Both lookup sites derive the
+// key with `sym_name`/`sym_name_rc` from the same interned symbol the
+// proclamation used, so the two spellings cannot drift.
+static PROCLAIMED_SPECIAL: LazyLock<SharedCell<std::collections::HashSet<String>>> =
+    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
 
-thread_local! {
-    /// Symbol indices proclaimed as DECLARATION names — `(proclaim
-    /// '(declaration foo))` / `(declaim (declaration foo))`. CLtL2's
-    /// DECLARATION-INFORMATION is defined only for such names (plus the standard
-    /// ones), so this set is what decides which specifiers a body keeps in
-    /// `Env::active_declarations`. Keyed by symbol identity, like
-    /// `PROCLAIMED_SPECIAL`: two packages' same-spelling names are distinct
-    /// declarations.
-    static PROCLAIMED_DECLARATIONS: RefCell<std::collections::HashSet<u32>> =
-        RefCell::new(std::collections::HashSet::new());
-}
+/// Symbol indices proclaimed as DECLARATION names — `(proclaim
+/// '(declaration foo))` / `(declaim (declaration foo))`. CLtL2's
+/// DECLARATION-INFORMATION is defined only for such names (plus the standard
+/// ones), so this set is what decides which specifiers a body keeps in
+/// `Env::active_declarations`. Keyed by symbol identity, like
+/// `PROCLAIMED_SPECIAL`: two packages' same-spelling names are distinct
+/// declarations.
+static PROCLAIMED_DECLARATIONS: LazyLock<SharedCell<std::collections::HashSet<u32>>> =
+    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
 
-thread_local! {
-    /// Globally proclaimed OPTIMIZE qualities: (quality symbol index, value).
-    /// Latest proclamation of a quality wins, as CLHS 3.3.4 requires of a global
-    /// proclamation. Values are small integers, so no GC roots are involved.
-    static PROCLAIMED_OPTIMIZE: RefCell<Vec<(u32, i64)>> = const { RefCell::new(Vec::new()) };
-}
+/// Globally proclaimed OPTIMIZE qualities: (quality symbol index, value).
+/// Latest proclamation of a quality wins, as CLHS 3.3.4 requires of a global
+/// proclamation. Values are small integers, so no GC roots are involved.
+static PROCLAIMED_OPTIMIZE: LazyLock<SharedCell<Vec<(u32, i64)>>> =
+    LazyLock::new(|| SharedCell::new(Vec::new()));
 
 /// Record `(proclaim '(optimize …))`. `quality` may be a bare symbol, which CLHS
 /// 3.3.4 reads as the value 3.
@@ -30637,19 +27613,17 @@ fn proclaim_optimize(spec: TorclVal) {
         return;
     }
     let idx = quality.as_symbol_index();
-    PROCLAIMED_OPTIMIZE.with(|qualities| {
-        let mut qualities = qualities.borrow_mut();
-        match qualities.iter_mut().find(|(q, _)| *q == idx) {
-            Some(entry) => entry.1 = value,
-            None => qualities.push((idx, value)),
-        }
-    });
+    let mut qualities = PROCLAIMED_OPTIMIZE.borrow_mut();
+    match qualities.iter_mut().find(|(q, _)| *q == idx) {
+        Some(entry) => entry.1 = value,
+        None => qualities.push((idx, value)),
+    }
 }
 
 /// The globally proclaimed OPTIMIZE qualities, as `((quality value) …)`.
 /// Allocates, so it must not run under a live borrow of GC-scanned state.
 fn proclaimed_optimize_list() -> TorclVal {
-    let qualities = PROCLAIMED_OPTIMIZE.with(|qualities| qualities.borrow().clone());
+    let qualities = PROCLAIMED_OPTIMIZE.borrow().clone();
     let mut list = NIL;
     torcl_rt::rooted_ref!(_list_root = &mut list);
     for (quality, value) in qualities.iter().rev() {
@@ -30666,20 +27640,20 @@ fn proclaimed_optimize_list() -> TorclVal {
 fn proclaim_declaration(sym: TorclVal) {
     if sym.is_symbol() {
         let idx = sym.as_symbol_index();
-        PROCLAIMED_DECLARATIONS.with(|d| d.borrow_mut().insert(idx));
+        PROCLAIMED_DECLARATIONS.borrow_mut().insert(idx);
     }
 }
 
 /// Every name proclaimed as a declaration, for `DECLARATION-INFORMATION` of the
 /// standard `DECLARATION` key.
 fn proclaimed_declaration_names() -> Vec<u32> {
-    PROCLAIMED_DECLARATIONS.with(|d| d.borrow().iter().copied().collect())
+    PROCLAIMED_DECLARATIONS.borrow().iter().copied().collect()
 }
 
 /// True when some `(declaration …)` proclamation has been made. Every body entry
 /// tests this first, so a program that proclaims none pays nothing.
 fn any_proclaimed_declarations() -> bool {
-    PROCLAIMED_DECLARATIONS.with(|d| !d.borrow().is_empty())
+    !PROCLAIMED_DECLARATIONS.borrow().is_empty()
 }
 
 /// The leading `(declare (name …))` specifiers of `body` that the environment
@@ -30713,7 +27687,8 @@ fn body_custom_declarations(body: TorclVal) -> Vec<TorclVal> {
             let retain = sym_bare_name_rc(name).as_ref() == "OPTIMIZE"
                 || (any_proclaimed_declarations()
                     && PROCLAIMED_DECLARATIONS
-                        .with(|set| set.borrow().contains(&name.as_symbol_index())));
+                        .borrow()
+                        .contains(&name.as_symbol_index()));
             if retain {
                 found.push(specifier);
             }
@@ -30742,7 +27717,7 @@ fn leave_body_declarations(env: &mut Env, mark: usize) {
 fn proclaim_special(sym: TorclVal) {
     if sym.is_symbol() {
         let full = sym_name_rc(sym).to_string();
-        PROCLAIMED_SPECIAL.with(|s| s.borrow_mut().insert(full));
+        PROCLAIMED_SPECIAL.borrow_mut().insert(full);
     }
 }
 
@@ -30752,7 +27727,7 @@ fn proclaim_special(sym: TorclVal) {
 /// by identity so a proclamation in one package does not make every package's
 /// same-bare-name symbol special (bliss-eq72).
 pub(super) fn is_proclaimed_special(name: &str) -> bool {
-    PROCLAIMED_SPECIAL.with(|s| s.borrow().contains(name))
+    PROCLAIMED_SPECIAL.borrow().contains(name)
 }
 
 /// True if `sym` names a special (dynamically-scoped) variable. torcl follows
@@ -30977,27 +27952,26 @@ fn let_binding_is_dynamic(sym: TorclVal, body_specials: &[u32]) -> bool {
 }
 
 /// RAII guard for a dynamic (special-variable) binding: it saves the symbol's
-/// current global value cell and restores it on drop, so the binding is undone
+/// current execution-local value and restores it on drop, so the binding is undone
 /// on every exit path from the `let` — normal return or an error unwinding
 /// through `?`.
 struct DynBind {
     idx: u32,
-    saved: TorclVal,
+    saved: Option<TorclVal>,
 }
 
 impl DynBind {
     /// Establish a dynamic binding of `sym` to `val`, returning the guard.
     fn establish(sym: TorclVal, val: TorclVal) -> Self {
         let idx = sym.as_symbol_index();
-        let saved = torcl_rt::symbols::symbol_value(idx).unwrap_or(torcl_rt::value::UNBOUND);
-        torcl_rt::symbols::set_symbol_value(idx, val);
+        let saved = torcl_rt::symbols::bind_symbol_value(idx, val);
         DynBind { idx, saved }
     }
 }
 
 impl Drop for DynBind {
     fn drop(&mut self) {
-        torcl_rt::symbols::set_symbol_value(self.idx, self.saved);
+        torcl_rt::symbols::restore_symbol_binding(self.idx, self.saved);
     }
 }
 
@@ -31006,7 +27980,9 @@ impl Drop for DynBind {
 /// drop writes back a relocated — not stale — value (moving GC; bliss-8qf).
 impl torcl_rt::gc::TraceHostRoots for DynBind {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
-        visit(&mut self.saved);
+        if let Some(saved) = self.saved.as_mut() {
+            visit(saved);
+        }
     }
 }
 
@@ -31279,7 +28255,7 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             eprintln!("[setf-dbg] eval_defun registers GLOBAL_SETF_FNS key: {name}");
         }
         let params = extract_params(params_form);
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut()
                 .insert(name, FunDef::plain(params, params_form, body))
         });
@@ -33202,6 +30178,7 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
     // Arc<dyn Fn + Send + Sync>, so it must own a Send snapshot of the defining
     // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
     let capture = register_frozen_macro_capture(FrozenMacroCapture {
+        registration: None,
         params_form,
         body,
         captured_frame: freeze_env_frame(&env.frame),
@@ -33924,6 +30901,7 @@ fn augment_env_with_macros(
                 debug_validate_form("define", name, macro_defs[idx].params_form);
                 debug_validate_form("define", name, macro_defs[idx].body);
                 let capture = register_frozen_macro_capture(FrozenMacroCapture {
+                    registration: Some((name.clone(), handle)),
                     params_form: macro_defs[idx].params_form,
                     body: macro_defs[idx].body,
                     captured_frame,
@@ -35942,6 +32920,7 @@ fn call_direct_builtin(
     apply_builtin_fast(name, args, env)
 }
 
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn apply_numeric_op(name: &str, args: &[TorclVal]) -> Option<Result<TorclVal, TorclError>> {
     Some(match name {
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
@@ -35988,9 +32967,8 @@ fn max_call_depth() -> usize {
     })
 }
 
-thread_local! {
-    static CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+static CALL_DEPTH: torcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
 
 /// Bounds one Lisp call nesting inside another for its lifetime.
 ///
@@ -36068,7 +33046,9 @@ fn apply_function(
                 // Lazy compile when hot (bliss-x5y) — this path handles a global
                 // function reached through funcall/apply or the c2i fallback from
                 // compiled code (e.g. a call inside a compiled top-level thunk).
-                maybe_lazy_compile(&name, params_form, body, env);
+                if !cfg!(torcl_no_tree_walker) {
+                    maybe_lazy_compile(&name, params_form, body, env);
+                }
                 let (dispatch_idx, fn_val) = dispatch_target_of_symbol(fn_val, &name);
                 if let Some(idx) = dispatch_idx {
                     if let Some(res) = bytecode::call_registered(idx, args, fn_val, env) {
@@ -36248,6 +33228,16 @@ fn apply_function(
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
+        if cfg!(torcl_no_tree_walker) {
+            return if is_builtin_function(&name) {
+                Err(TorclError::ProgramError(format!(
+                    "{name} has no evaluated builtin entry for {} argument(s)",
+                    args.len()
+                )))
+            } else {
+                Err(TorclError::UndefinedFunction(fn_val))
+            };
+        }
         torcl_rt::rooted!(fn_val = fn_val);
         torcl_rt::rooted!(args = args.to_vec());
         let quote_sym = quote_sym();
@@ -36338,6 +33328,11 @@ fn apply_function(
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
+            if cfg!(torcl_no_tree_walker) {
+                return Err(TorclError::ProgramError(
+                    "raw lambda invocation requires retained tree-walker support".into(),
+                ));
+            }
             let (params_form, body) = cp(lr);
             return eval_lambda_call(env, params_form, body, args, Arc::clone(&env.frame));
         }
@@ -36411,7 +33406,33 @@ fn apply_function(
 /// builtin like FUNCALL is reported bound and `(fdefinition 'funcall)` returns a
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
+/// Is `name` one of the interpreter's own builtin functions?
+///
+/// A CONSTRAINT ON WHAT MAY BE ADDED HERE. The compiled tier and the FUNCALL fast
+/// path both reduce an operator to its BARE name to decide what it is
+/// (`apply_builtin_fast` / `DIRECT_FAST`, `builtin_fn_wrapper`). So registering a
+/// builtin as `SOMEPKG:TYPEP` does not give you a distinct function: the bare name
+/// wins and CL's `TYPEP` answers instead, silently and with no warning
+/// (bliss-kliz4 — it cost a debugging session, since `(py:typep x "builtins.float")`
+/// returned NIL for every input while never being called at all).
+///
+/// The convention that avoids it, and which `TORCL-FFI` and the `PY` package both
+/// follow: register the primitive under a `TORCL::%`-prefixed name, whose bare form
+/// collides with nothing, and define the package-qualified function over it in
+/// `lib/boot.lisp`. That also gives it a real function cell, so `FUNCALL`, `APPLY`
+/// and `MAPCAR` work on it.
+///
+/// A USER's `DEFUN` of such a name is fine and needs nothing: a global function is
+/// keyed by its full name and is consulted before this predicate, so
+/// `(defun somepkg:length (x) ...)` is called correctly in both tiers. The hazard is
+/// specific to registering a *builtin* here.
 fn is_builtin_function(name: &str) -> bool {
+    if cfg!(torcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
+        return false;
+    }
+    if name == "DISASSEMBLE" {
+        return !cfg!(torcl_no_disassembly);
+    }
     if name == "TORCL::%STANDARD-CHARACTER-READER" {
         return true;
     }
@@ -36453,14 +33474,31 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL-THREAD::ALL-THREADS"
             | "TORCL-THREAD:THREAD-YIELD"
             | "TORCL-THREAD::THREAD-YIELD"
+            // Embedded CPython (§2.7.8). These are the internal primitives; the
+            // PY package's functions are boot.lisp wrappers over them.
+            | "TORCL::%PY-IMPORT"
+            | "TORCL::%PY-EXEC"
+            | "TORCL::%PY-RESOLVE"
+            | "TORCL::%PY-CALL"
+            | "TORCL::%PY-CALL-METHOD"
+            | "TORCL::%PY-GETATTR"
+            | "TORCL::%PY-SETATTR"
+            | "TORCL::%PY-TYPE-OF"
+            | "TORCL::%PY-TYPEP"
+            | "TORCL::%PY-STR"
+            | "TORCL::%PY-REPR"
+            | "TORCL::%PY-OBJECTP"
+            | "TORCL::%PY-DRAIN-OUTPUT"
+            | "TORCL::%PY-EXPORT"
+            | "TORCL::%PY-STOP"
     ) {
         return true;
     }
     matches!(
         name,
         // Introspection / devtools
-        "DISASSEMBLE"
-            | "TORCL::%NATIVE-MUTEX"
+        "TORCL::%NATIVE-MUTEX"
+            | "TORCL::%NATIVE-FIBER"
             | "TORCL::%FOREIGN-MEMORY"
             | "TORCL::%FOREIGN-LIBRARY"
             | "TORCL::%FOREIGN-CALLBACK"
@@ -36599,6 +33637,7 @@ fn is_builtin_function(name: &str) -> bool {
 /// (bliss-x5y.9). This is what closes most of the T1-bytecode-vs-T0-tree-walker
 /// gap on a source-free asdf.bfasl load, where `ensure-package` hammers TYPEP
 /// (check-type) and GETHASH.
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn apply_builtin_fast(
     name: &str,
     args: &[TorclVal],
@@ -37212,11 +34251,128 @@ fn apply_builtin_fast(
             };
             Some(eval_int_div(args[0], args.get(1).copied(), mode, env))
         }
-        _ => None,
+        _ => evaluated_builtins::call(name, args, env),
     }
 }
 
+/// The primitives behind the `PY` package (§2.7.8, bliss-dk3nr).
+///
+/// Named `TORCL::%PY-*` rather than `PY:*` deliberately. Both the bytecode lowerer
+/// and the FUNCALL fast path reduce an operator to its BARE name to decide what it
+/// is, so `PY:TYPEP` — whose bare name CL already claims — was compiled into
+/// CL:TYPEP and silently answered a different question. A `%`-prefixed internal
+/// name collides with nothing, and `lib/boot.lisp` puts the real `py:` functions
+/// on top, which is the convention TORCL-FFI already follows.
+///
+/// Argument checking lives here rather than in `cli/python.rs` so that the error
+/// messages read like every other builtin's, and so the bridge stays about Python.
+fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    // The package prefix is matched off so both the external (`PY:CALL`) and
+    // internal (`PY::CALL`) spellings reach one arm.
+    let short = name.strip_prefix("TORCL::%PY-").unwrap_or(name);
+
+    /// Require exactly `count` arguments, naming the function as the user wrote it.
+    fn exactly(name: &str, args: &[TorclVal], count: usize) -> Result<(), TorclError> {
+        if args.len() == count {
+            Ok(())
+        } else {
+            Err(TorclError::ProgramError(format!(
+                "{name} requires exactly {count} argument{}, got {}",
+                if count == 1 { "" } else { "s" },
+                args.len()
+            )))
+        }
+    }
+
+    /// A string argument, refused clearly rather than reaching `as_string`'s
+    /// assertion — a module or attribute name is the argument users get wrong.
+    fn text(name: &str, value: TorclVal, what: &str) -> Result<TorclVal, TorclError> {
+        if value.is_string() {
+            Ok(value)
+        } else {
+            Err(TorclError::TypeError {
+                datum: value,
+                expected: format!("a string naming {what} for {name}"),
+            })
+        }
+    }
+
+    match short {
+        "IMPORT" => {
+            exactly(name, args, 1)?;
+            python::import(text(name, args[0], "a Python module")?)
+        }
+        "EXEC" => {
+            exactly(name, args, 1)?;
+            python::exec(text(name, args[0], "Python source")?)
+        }
+        "RESOLVE" => {
+            exactly(name, args, 1)?;
+            python::resolve(text(name, args[0], "a Python object")?)
+        }
+        "CALL" => {
+            exactly(name, args, 2)?;
+            // The callable may be named or already in hand, so that both
+            // (py:call "numpy.mean" a) and (py:call f 1 2) read naturally.
+            python::call(args[0], args[1])
+        }
+        "CALL-METHOD" => {
+            exactly(name, args, 3)?;
+            python::call_method(args[0], text(name, args[1], "a method")?, args[2])
+        }
+        "GETATTR" => {
+            exactly(name, args, 2)?;
+            python::getattr(args[0], text(name, args[1], "an attribute")?)
+        }
+        "SETATTR" => {
+            exactly(name, args, 3)?;
+            python::setattr(args[0], text(name, args[1], "an attribute")?, args[2])
+        }
+        "TYPE-OF" => {
+            exactly(name, args, 1)?;
+            python::type_of(args[0])
+        }
+        "TYPEP" => {
+            exactly(name, args, 2)?;
+            python::typep(args[0], text(name, args[1], "a Python class")?)
+        }
+        "STR" => {
+            exactly(name, args, 1)?;
+            python::text(args[0], false)
+        }
+        "REPR" => {
+            exactly(name, args, 1)?;
+            python::text(args[0], true)
+        }
+        "OBJECTP" => {
+            exactly(name, args, 1)?;
+            Ok(if python::is_proxy(args[0]) { T } else { NIL })
+        }
+        "EXPORT" => {
+            exactly(name, args, 2)?;
+            python::export(text(name, args[0], "the Python name to bind")?, args[1])
+        }
+        "DRAIN-OUTPUT" => {
+            exactly(name, args, 0)?;
+            python::drain_output()
+        }
+        "STOP" => {
+            exactly(name, args, 0)?;
+            python::stop()
+        }
+        _ => Err(TorclError::Internal(format!(
+            "{name} is listed as a Python builtin but has no implementation"
+        ))),
+    }
+}
+
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclVal, TorclError> {
+    if cfg!(torcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
+        return Err(TorclError::ProgramError(format!(
+            "native delivery omitted dynamic code entry {name}"
+        )));
+    }
     match name {
         "TORCL-EXT:DECLARATION-SPECIFIER" | "TORCL-EXT::DECLARATION-SPECIFIER" => {
             if args.len() != 2 {
@@ -37238,6 +34394,38 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
         }
         "TORCL-EXT:PROCLAIMED-OPTIMIZE" | "TORCL-EXT::PROCLAIMED-OPTIMIZE" => {
             Ok(proclaimed_optimize_list())
+        }
+        // ── Embedded CPython (§2.7.8) ──
+        //
+        // Every one of these is a real function, not a special form: FUNCALL,
+        // APPLY and MAPCAR over them all work, which matters for a surface whose
+        // whole point is that calling Python should feel ordinary.
+        //
+        // Each is sandbox-gated with the FFI primitives. Embedding CPython grants
+        // strictly more than the FFI does — arbitrary code execution through
+        // `exec`, and the whole filesystem through Python's own library — so a
+        // sandbox that denies FFI must deny this.
+        name @ ("TORCL::%PY-IMPORT"
+        | "TORCL::%PY-EXEC"
+        | "TORCL::%PY-RESOLVE"
+        | "TORCL::%PY-CALL"
+        | "TORCL::%PY-CALL-METHOD"
+        | "TORCL::%PY-GETATTR"
+        | "TORCL::%PY-SETATTR"
+        | "TORCL::%PY-TYPE-OF"
+        | "TORCL::%PY-TYPEP"
+        | "TORCL::%PY-STR"
+        | "TORCL::%PY-REPR"
+        | "TORCL::%PY-OBJECTP"
+        | "TORCL::%PY-DRAIN-OUTPUT"
+        | "TORCL::%PY-EXPORT"
+        | "TORCL::%PY-STOP") => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation(
+                    "embedded Python access denied".into(),
+                ));
+            }
+            apply_python_builtin(name, args)
         }
         "TORCL::%NATIVE-MUTEX" => torcl_stdlib::synchronization::call(args),
         "TORCL::%FOREIGN-MEMORY" => {
@@ -37265,8 +34453,17 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
             torcl_stdlib::ffi::buffered_call(args)
         }
         "TORCL::%NATIVE-CONDITION" => torcl_stdlib::synchronization::condition_call(args),
+        "TORCL::%NATIVE-FIBER" => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation(
+                    "fiber runtime access denied".into(),
+                ));
+            }
+            torcl_stdlib::fibers::call(args)
+        }
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
+        #[cfg(not(torcl_no_disassembly))]
         "DISASSEMBLE" => {
             let listing = args.first().and_then(|a| {
                 if a.is_symbol() {
@@ -37599,14 +34796,25 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
     // A `(:no-error (lambda-list) body)` clause (CLHS 9.1) is not a handler: when
     // the protected form returns normally, its body runs with the lambda-list
     // bound to the returned values, OUTSIDE this HANDLER-CASE's handlers.
-    let mut no_error: Option<(TorclVal, TorclVal, Arc<SharedCell<EnvFrame>>)> = None;
+    // A :no-error clause's lambda list and body are source forms that must survive
+    // the PROTECTED FORM's evaluation — arbitrary user code, so arbitrarily many
+    // allocations. Held in a plain tuple they went stale under a relocating GC
+    // (bliss-ep38p); the `installed` handler list a few lines below was already
+    // rooted for exactly this reason. Kept as two rooted values plus the frame,
+    // because the root macros take a place and not a tuple field; the frame's
+    // presence is what says a :no-error clause was seen.
+    torcl_rt::rooted!(no_error_params = NIL);
+    torcl_rt::rooted!(no_error_body = NIL);
+    let mut no_error_frame: Option<Arc<SharedCell<EnvFrame>>> = None;
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);
         let (type_form, clause_rest) = cp(clause);
         let (bind_list, handler_body) = cp(clause_rest);
         if sym_bare_name_rc(type_form).as_ref() == "NO-ERROR" {
-            no_error = Some((bind_list, handler_body, Arc::clone(&env.frame)));
+            *no_error_params = bind_list;
+            *no_error_body = handler_body;
+            no_error_frame = Some(Arc::clone(&env.frame));
             c = rest;
             continue;
         }
@@ -37644,7 +34852,8 @@ fn eval_handler_case(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErro
         Ok(val) => {
             // Normal return: run a :no-error clause (if any) with its lambda list
             // bound to the values the protected form produced (HANDLER-CASE.20+).
-            if let Some((params, body, frame)) = no_error {
+            if let Some(frame) = no_error_frame {
+                let (params, body) = (*no_error_params, *no_error_body);
                 let mut values: Vec<TorclVal> = if env.mv_active {
                     env.mv.clone()
                 } else {
@@ -38989,6 +36198,7 @@ fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
 /// runtime-plus-core scheme SBCL uses for `:executable t`).
 fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut bytes = current_runtime_bytes()?;
+    delivery::remove_embedded_images(&mut bytes)?;
     bytes.extend_from_slice(image);
     bytes.extend_from_slice(EXE_IMAGE_MAGIC);
     bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
@@ -39005,6 +36215,17 @@ fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
 /// scheme, recovered by `embedded_image` at startup). GC-safe: no TorCL
 /// allocation between the GC and the serialize walk.
 fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), TorclError> {
+    save_core(path, executable, false, env)?;
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprintln!(
+        ";; wrote core {} to {path}; exiting",
+        if executable { "executable" } else { "image" }
+    );
+    std::process::exit(0);
+}
+
+fn save_core(path: &str, executable: bool, delivery: bool, env: &Env) -> Result<(), TorclError> {
     // Expose this Env's generic-function registries to the serialize hook
     // (whose signature has no Env). Rc shares — the full_gc below relocates
     // objects and the Env root scan updates this same storage (torcl-x0f2.7a).
@@ -39014,7 +36235,8 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Torc
     SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(env.generics));
     SAVE_METHODS.with(|m| *m.borrow_mut() = Some(env.methods));
     SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(env.classes));
-    // Compact so the live set is a dense prefix and garbage is dropped.
+    // Collect reclaimable garbage. Restored pinned objects require the delivery
+    // serializer's separate reachability pass to omit dead objects from disk.
     torcl_rt::gc::full_gc()?;
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
     // cell (serialized with the symbol table), not the image entry continuation.
@@ -39025,38 +36247,34 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Torc
         compression: torcl_rt::image::ImageCompression::None,
         purify: true,
     };
+    let save_image = if delivery {
+        torcl_rt::image::save_reachable_image
+    } else {
+        torcl_rt::image::save_image
+    };
 
     if executable {
         // Serialize to a temp core file, then append its bytes to a runtime copy.
-        let tmp = format!("{path}.core.tmp");
-        torcl_rt::image::save_image(&tmp, &opts)
+        let tmp = delivery::TemporaryFile::new(std::path::Path::new(path))
             .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
-        let core_bytes = std::fs::read(&tmp)
+        save_image(
+            tmp.path
+                .to_str()
+                .expect("temporary path derives from UTF-8 input"),
+            &opts,
+        )
+        .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
+        let core_bytes = std::fs::read(&tmp.path)
             .map_err(|e| TorclError::FileError(format!("%save-core: reread core: {e}")))?;
-        let _ = std::fs::remove_file(&tmp);
         let exe_bytes = wrap_executable(&core_bytes)
             .map_err(|e| TorclError::FileError(format!("%save-core :executable: {e}")))?;
-        std::fs::write(path, &exe_bytes)
+        delivery::write_atomic(std::path::Path::new(path), &exe_bytes, true)
             .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
-        }
     } else {
-        torcl_rt::image::save_image(path, &opts)
-            .map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
+        save_image(path, &opts).map_err(|e| TorclError::FileError(format!("%save-core: {e}")))?;
     }
 
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let kind = if executable {
-        "core executable"
-    } else {
-        "core image"
-    };
-    eprintln!(";; wrote {kind} to {path}; exiting");
-    std::process::exit(0);
+    Ok(())
 }
 
 /// Load a heap-snapshot CORE image into the (freshly initialized) runtime and
@@ -39240,14 +36458,33 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // name through apply_function on every call (bliss-x5y.27). The table lives
     // in this crate, so the T2 emitter cannot reach it without being told.
     bytecode::install_direct_builtin_hooks();
+    // A restored entry point can run without reading any source. Its formatter
+    // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
+    torcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     let ca = CliArgs::parse(args)?;
     if ca.help {
         print_help();
         return Ok(0);
     }
+    if ca.runtime_info {
+        print!("{}", native_runtime::contract().encode());
+        return Ok(0);
+    }
     if ca.version {
         print_version();
         return Ok(0);
+    }
+
+    if cfg!(torcl_no_dynamic_code)
+        && (!ca.eval_forms.is_empty()
+            || ca.load.is_some()
+            || ca.script.is_some()
+            || ca.load_report.is_some()
+            || ca.no_image)
+    {
+        return Err(TorclError::ProgramError(
+            "dynamic code entry points are absent from this delivered runtime".into(),
+        ));
     }
 
     torcl_rt::install_signal_handlers()?;
@@ -39277,7 +36514,11 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // stranded).
     let image_magic = torcl_rt::image::IMAGE_MAGIC.to_ne_bytes();
     let mut core_loaded = false;
-    let embedded_core = embedded_image().filter(|b| b.starts_with(&image_magic));
+    let embedded_core = if ca.deliver.is_some() || ca.image.is_some() {
+        None
+    } else {
+        embedded_image().filter(|b| b.starts_with(&image_magic))
+    };
     if let Some(bytes) = embedded_core {
         load_core_image_bytes(&bytes, &mut env)?;
         core_loaded = true;
@@ -39288,6 +36529,22 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
             load_core_image_bytes(&bytes, &mut env)?;
             core_loaded = true;
         }
+    }
+
+    if ca.deliver.is_some() {
+        if !core_loaded {
+            return Err(TorclError::FileError(
+                "delivery requires a saved TORCLIMG core image".into(),
+            ));
+        }
+        BOOT_COMPLETE.with(|c| c.set(true));
+        return delivery::run(&ca, &mut env);
+    }
+
+    if cfg!(torcl_no_dynamic_code) && !core_loaded {
+        return Err(TorclError::ProgramError(
+            "this delivered runtime requires a compatible core image".into(),
+        ));
     }
 
     // Set *command-line-args* (issue #4)
@@ -39313,10 +36570,18 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // homed present in CL-USER (bliss-v15i).
     BOOT_COMPLETE.with(|c| c.set(true));
 
+    if !ca.no_bootstrap && !core_loaded {
+        read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
+    }
+
     // A saved `:executable` binary carries its image appended to itself. Detect
     // and load it like `--image`, but treat the process as that saved program:
     // skip the user init file and run its recorded top-level entry point.
-    let embedded = embedded_image();
+    let embedded = if ca.image.is_some() {
+        None
+    } else {
+        embedded_image()
+    };
     if let Some(ref bytes) = embedded {
         if bytes.starts_with(&torcl_rt::bfasl::BFASL_MAGIC) {
             load_bfasl_into_env(bytes, &mut env)?;
@@ -39335,7 +36600,8 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // image`) is a general REPL: skipping ~/.torclrc there silently dropped
     // the user's ocicl system-search hook, so (asdf:load-system :babel) died
     // with MISSING-COMPONENT (SBCL's saved REPL images read ~/.sbclrc too).
-    if !ca.no_init
+    if !cfg!(torcl_no_dynamic_code)
+        && !ca.no_init
         && (embedded.is_none() || image_toplevel().is_none())
         && ca.eval_forms.is_empty()
         && ca.load.is_none()
@@ -39386,6 +36652,9 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
     // never hijacked by a stale entry symbol.
     if embedded.is_some() || ca.image.is_some() {
         if let Some(top) = image_toplevel() {
+            // Unlike run_eval_env, this path enters a callable directly. Its
+            // lexical frames and multiple values must remain visible to GC.
+            torcl_rt::rooted_ref!(_entry_env_root = &mut env);
             return match apply_function(top, &[], &mut env) {
                 Ok(_) => Ok(0),
                 Err(e) => {
@@ -39394,6 +36663,11 @@ pub fn run(args: &[String]) -> Result<i32, TorclError> {
                 }
             };
         }
+    }
+    if cfg!(torcl_no_dynamic_code) {
+        return Err(TorclError::ProgramError(
+            "the REPL is absent from this delivered runtime".into(),
+        ));
     }
     run_repl_env(&mut env)
 }
@@ -39660,6 +36934,11 @@ pub fn help_text() -> &'static str {
         "  --eval, -e EXPR      Evaluate EXPR and exit\n",
         "  --load FILE          Load FILE and exit\n",
         "  --image FILE         Path to the boot image\n",
+        "  --deliver SPEC       Deliver the saved --image using SPEC\n",
+        "  --output FILE        Delivered executable (with FILE.manifest report)\n",
+        "  --dry-run            Report delivery retention without writing files\n",
+        "  --runtime-source DIR Matching TorCL sources for specialized delivery\n",
+        "  --runtime-info       Print native runtime compatibility contract\n",
         "  --no-image           Start without loading an image\n",
         "  --bootstrap          Deprecated; the prelude now loads by default\n",
         "  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)\n",
@@ -39957,7 +37236,7 @@ mod host_registry_hook_tests {
         torcl_rt::rooted!(setf_body = arena_cons(*setf_v2, NIL));
         let setf_params_form = *setf_params_form;
         let setf_body = *setf_body;
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().insert(
                 setf_key.into(),
                 FunDef::plain(vec!["V".into()], setf_params_form, setf_body),
@@ -39968,7 +37247,7 @@ mod host_registry_hook_tests {
 
         // Forget our entries, then restore + drain them back.
         global_macro_remove(name);
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().remove(setf_key);
         });
         assert!(
@@ -40005,7 +37284,7 @@ mod host_registry_hook_tests {
 
         // Cleanup so we don't leak into other same-thread tests.
         global_macro_remove(name);
-        GLOBAL_SETF_FNS.with(|m| {
+        with_global_setf_fns(|m| {
             m.borrow_mut().remove(setf_key);
         });
     }
@@ -40463,6 +37742,74 @@ mod jtc5_numeric_tests {
         let mut env = Env::new(false);
         torcl_rt::rooted_ref!(_env_root = &mut env);
         test(&mut env);
+    }
+
+    #[test]
+    fn library_builtins_bypass_source_form_dispatch() {
+        with_value_bridge_env(|env| {
+            for (name, args, expected) in [
+                (
+                    "INTEGER-LENGTH",
+                    vec![TorclVal::from_fixnum(-9)],
+                    TorclVal::from_fixnum(4),
+                ),
+                (
+                    "LOGCOUNT",
+                    vec![TorclVal::from_fixnum(-9)],
+                    TorclVal::from_fixnum(1),
+                ),
+                (
+                    "EXPT",
+                    vec![TorclVal::from_fixnum(2), TorclVal::from_fixnum(10)],
+                    TorclVal::from_fixnum(1024),
+                ),
+                ("STREAMP", vec![NIL], NIL),
+            ] {
+                env.set_mv(vec![T, T]);
+                let value = apply_builtin_fast(name, &args, env)
+                    .unwrap_or_else(|| panic!("{name} still requires the source evaluator"))
+                    .unwrap();
+                assert_eq!(value, expected, "{name}");
+                assert!(!env.mv_active, "{name} leaked argument multiple values");
+            }
+            torcl_rt::rooted!(
+                stream = read_eval_all_env("(make-string-output-stream)", env).unwrap()
+            );
+            torcl_rt::rooted!(text = arena_str("héllo"));
+            env.set_mv(vec![T, T]);
+            let value = apply_builtin_fast("WRITE-LINE", &[*text, *stream], env)
+                .expect("WRITE-LINE must not construct a source form")
+                .unwrap();
+            assert_eq!(value, *text);
+            assert!(!env.mv_active);
+            let get = resolve_sym("GET-OUTPUT-STREAM-STRING").unwrap();
+            let output = apply_function(get, &[*stream], env).unwrap();
+            assert_eq!(val_as_str(output), "héllo\n");
+        });
+    }
+
+    #[test]
+    fn evaluated_library_callbacks_cannot_leak_multiple_values() {
+        with_value_bridge_env(|env| {
+            let result = read_eval_all_env(
+                "(multiple-value-list (funcall 'some (lambda (x) (declare (ignore x)) (values 7 8)) '(1)))",
+                env,
+            ).unwrap();
+            assert_eq!(format_val(result), "(7)");
+            let result = read_eval_all_env(
+                "(let ((table (make-hash-table))) (setf (gethash :a table) 1) (multiple-value-list (funcall 'maphash (lambda (k v) (declare (ignore k v)) (values 7 8)) table)))",
+                env,
+            ).unwrap();
+            assert_eq!(format_val(result), "(NIL)");
+            // The shared dispatcher must still preserve real multiple-value
+            // producers, including status values from package operations.
+            let result = read_eval_all_env(
+                "(multiple-value-list (funcall 'find-symbol \"CAR\" \"COMMON-LISP\"))",
+                env,
+            )
+            .unwrap();
+            assert_eq!(format_val(result), "(CAR :EXTERNAL)");
+        });
     }
 
     #[test]
@@ -40965,8 +38312,7 @@ mod jtc3_unified_tiering_tests {
 mod jtc5mf_storage_condition_pool_tests {
     use super::*;
 
-    /// bliss-5mf: after Env::new reseeds the STORAGE-CONDITION pool with
-    /// CLI-native instances, a preallocated pool condition carries the *same*
+    /// The stdlib preallocated pool condition carries the *same*
     /// condition class the CLI builds for `(make-condition 'storage-condition)`.
     /// Because TYPE-OF and HANDLER-CASE type matching both derive from that
     /// class, the pooled instance is recognized identically — it reports
@@ -40976,7 +38322,7 @@ mod jtc5mf_storage_condition_pool_tests {
     #[test]
     fn pooled_storage_condition_shares_the_cli_condition_class() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Env::new reseeds the thread-local pool with CLI-native instances.
+        // Env::new initializes the shared reserve.
         let mut env = Env::new(false);
 
         let pooled = torcl_stdlib::acquire_preallocated_storage_condition()
@@ -40991,7 +38337,7 @@ mod jtc5mf_storage_condition_pool_tests {
         );
     }
 
-    /// The reseeded pool instances survive a GC (they are pinned + immortal),
+    /// The shared pool instances survive a GC (they are pinned + immortal),
     /// and re-acquire keeps returning class-correct instances.
     #[test]
     fn pooled_storage_condition_survives_gc_and_stays_recognized() {

@@ -3935,6 +3935,187 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
       (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer fixed-count)
       (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer)))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Embedded CPython: the PY package (spec 2.7.8, bliss-dk3nr)
+;;;; ---------------------------------------------------------------------------
+;;;;
+;;;; Thin wrappers over TORCL::%PY-* primitives, following the same convention as
+;;;; the FFI surface above. The indirection is not ceremony: a function named
+;;;; PY:TYPEP is reduced to its BARE name by the bytecode lowerer and by the
+;;;; FUNCALL fast path, both of which then find CL:TYPEP and answer a different
+;;;; question entirely. A %-prefixed internal primitive collides with nothing, and
+;;;; defining the PY functions here also gives them real function cells, so
+;;;; (mapcar #'py:str objects) and (apply #'py:call ...) work.
+;;;;
+;;;; The PY package does not use COMMON-LISP, which is what lets IMPORT, TYPE-OF,
+;;;; TYPEP and CALL-METHOD keep the names Python gives them.
+
+;;; PYTHON'S OUTPUT REACHES *STANDARD-OUTPUT* (bliss-c4g9u).
+;;;
+;;; sys.stdout and sys.stderr are redirected into buffers on the Python side; this
+;;; is where their contents are written, and it has to be here rather than in Rust
+;;; because only here does *STANDARD-OUTPUT* mean what the caller intends -- a
+;;; WITH-OUTPUT-TO-STRING or a rebinding in force is respected for free.
+;;;
+;;; Before this, Python's output was not merely interleaved unpredictably: it was
+;;; SILENTLY LOST. CPython block-buffers a non-tty stdout, nothing flushed it, and
+;;; the interpreter is usually never finalized, so (py:exec "print('hi')") printed
+;;; nothing at all.
+;;; Never signals. It runs in UNWIND-PROTECT cleanup on the way out of every entry
+;;; point, so an error here would MASK the Python error being unwound -- replacing the
+;;; useful report with a confusing one from the machinery that was trying to print it.
+(defun py::drain-output ()
+  (ignore-errors
+    (let ((pair (torcl::%py-drain-output)))
+      (when pair
+        (let ((out (car pair)) (err (cdr pair)))
+          (when (plusp (length out)) (write-string out *standard-output*))
+          (when (plusp (length err)) (write-string err *error-output*))))))
+  (values))
+
+;;; Every entry point drains on the way out, including when it signals: a Python
+;;; traceback's own output, and anything printed before the raise, is exactly what a
+;;; reader needs and would otherwise be dropped.
+(defmacro py::draining (&body body)
+  `(unwind-protect (progn ,@body) (py::drain-output)))
+
+;;; Bring an interpreter up and take it down. Starting is implicit in every other
+;;; entry point, so START is only for choosing WHEN the cost is paid; STOP drains
+;;; the pending releases first, since a reference released after shutdown would be
+;;; a use-after-free.
+(defun py:start () (py:exec "pass"))
+(defun py:stop () (py::draining (torcl::%py-stop)))
+
+;;; (py:import "numpy") -> the module, as a PY:OBJECT.
+(defun py:import (name) (py::draining (torcl::%py-import name)))
+
+;;; (py:exec "print('hello')") -> NIL. A statement, run for its effect.
+(defun py:exec (source) (py::draining (torcl::%py-exec source)))
+
+;;; (py:resolve "numpy.mean") -> the object that dotted name names, whether the
+;;; segments are modules, attributes, or a builtin.
+(defun py:resolve (name) (py::draining (torcl::%py-resolve name)))
+
+;;; (py:call "numpy.mean" a) or (py:call f 1 2) -- the callable may be named or
+;;; already in hand.
+(defun py:call (callable &rest arguments)
+  (py::draining (torcl::%py-call callable arguments)))
+
+;;; (py:call-method x "reshape" 10 20)
+(defun py:call-method (object name &rest arguments)
+  (py::draining (torcl::%py-call-method object name arguments)))
+
+;;; (py:getattr x "shape"), and settable: (setf (py:getattr x "n") 5).
+(defun py:getattr (object name) (py::draining (torcl::%py-getattr object name)))
+(defun py:setattr (object name value)
+  (py::draining (torcl::%py-setattr object name value)))
+(defsetf py:getattr (object name) (value) `(py:setattr ,object ,name ,value))
+
+;;; (py:type-of x) -> the Python TYPE, as an object rather than a name, so it can
+;;; be called, compared and asked for its own attributes as Python code would.
+(defun py:type-of (object) (py::draining (torcl::%py-type-of object)))
+
+;;; (py:typep x "numpy.ndarray")
+(defun py:typep (object class) (py::draining (torcl::%py-typep object class)))
+
+;;; str() and repr(). PY:REPR is what the Lisp printer shows inside
+;;; #<PYTHON-OBJECT ...>.
+(defun py:str (object) (py::draining (torcl::%py-str object)))
+(defun py:repr (object) (py::draining (torcl::%py-repr object)))
+
+;;; (py:export "calculate_price" #'calculate-price) makes a Lisp function callable
+;;; from Python by that name:
+;;;
+;;;   (py:export "add" (lambda (a b) (+ a b)))
+;;;   (py:exec "print(add(2, 3))")        =>  5
+;;;
+;;; The Python callable reaches the Lisp function through a STABLE HANDLE, not a
+;;; pointer: the collector moves objects, and a Python callable can outlive any
+;;; address. The handle keeps the function alive for the process lifetime -- a
+;;; callable can be stored anywhere on the Python side, so there is no moment at
+;;; which releasing it would be safe.
+;;;
+;;; Arguments and the result cross by the same policy as everything else, so a Lisp
+;;; error becomes a Python exception rather than unwinding through CPython frames.
+(defun py:export (name function) (py::draining (torcl::%py-export name function)))
+
+;;; Flush Python's buffered output without doing anything else -- for a long
+;;; computation whose progress prints would otherwise arrive only when it returns.
+(defun py:flush () (py::drain-output) (values))
+
+;;; Is this a Python object rather than a converted Lisp value? A number, string,
+;;; NIL or T that crossed back is an ordinary Lisp object and answers NIL.
+(defun py:objectp (object) (torcl::%py-objectp object))
+(deftype py:object () '(satisfies py:objectp))
+
+;;; ---------------------------------------------------------------------------
+;;; A Python exception is a Lisp condition (bliss-wq5tw)
+;;; ---------------------------------------------------------------------------
+;;;
+;;; Signalled for every Python raise, so HANDLER-CASE works on it the way it works
+;;; on anything else, and so the failure carries its structure rather than a
+;;; formatted string: the exception's class, its message, the Python frames, and the
+;;; exception object itself, whose attributes are often the useful part (an
+;;; HTTPError's status, a KeyError's key).
+;;;
+;;; FRAMES are (FILE LINE FUNCTION) lists, outermost first -- Python's own order.
+;;;
+;;; NAMED PY:EXCEPTION, NOT PY:ERROR. Originally that was forced: the condition and
+;;; class registries were keyed by a class's BARE name, so a class named PY:ERROR
+;;; registered under "ERROR" and REPLACED CL:ERROR for the whole image -- after which
+;;; MAKE-CONDITION of any condition recursed until the stack was gone. It took a
+;;; SIGSEGV in (make-condition 'c1), a definition with nothing to do with Python, to
+;;; find it. That bug is FIXED (bliss-kliz4), so PY:ERROR would be safe now; the name
+;;; stays EXCEPTION because it is simply the better word for what this is.
+(define-condition py:exception (error)
+  ((kind :initarg :kind :initform "PythonError" :reader py:exception-kind)
+   (text :initarg :text :initform "" :reader py:exception-text)
+   (frames :initarg :frames :initform nil :reader py:exception-frames)
+   (object :initarg :object :initform nil :reader py:exception-object)
+   ;; FORMAT-CONTROL carries the already-rendered report, which is what TorCL's
+   ;; printer actually reads: a DEFINE-CONDITION :report is not honoured by ~A yet
+   ;; (even a constant string prints as the bare class name -- bliss-e5eh6), so the
+   ;; :report below is the portable declaration and this slot is what makes ~A and
+   ;; an uncaught error show the message and the frames today. The signaller fills
+   ;; it; the two agree by construction.
+   (format-control :initarg :format-control :initform nil)
+   (format-arguments :initarg :format-arguments :initform nil))
+  (:report (lambda (condition stream)
+             (format stream "~a: ~a"
+                     (py:exception-kind condition) (py:exception-text condition))
+             ;; The frames go beneath the message, innermost first, which is the
+             ;; direction a reader looks first and the order a Lisp backtrace uses.
+             (dolist (frame (reverse (py:exception-frames condition)))
+               (format stream "~%  Python  ~a at ~a:~a"
+                       (third frame) (first frame) (second frame))))))
+
+;;; The Python half of a mixed-language backtrace, innermost first:
+;;;
+;;;   0: Lisp    PROCESS-DATA
+;;;   1: Lisp    PY:CALL
+;;;   2: Python  fit at sklearn/base.py:1389
+;;;   3: Python  asarray at numpy/_core/numeric.py:330
+;;;
+;;; Returned as data rather than printed, so a debugger or a log formatter can
+;;; interleave it with the Lisp frames however it presents them.
+(defun py:backtrace (condition)
+  (mapcar (lambda (frame)
+            (list :python (third frame) (first frame) (second frame)))
+          (reverse (py:exception-frames condition))))
+
+;;; External, so TYPE-OF and error messages read PY:OBJECT rather than
+;;; TORCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
+;;; INTERN by name rather than writing '(py:import ...): a quoted list is read
+;;; before these are external, and the reader's own symbol for PY:IMPORT is not
+;;; necessarily the one in the package table, so the export lands on nothing. Every
+;;; other package here exports the same way for the same reason.
+(export (mapcar (lambda (name) (intern name "TORCL-PYTHON"))
+                '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
+                  "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
+                  "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
+                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH" "EXPORT"))
+        "TORCL-PYTHON")
+
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
 ;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures
 ;;; return zero to C, then signal FFI-ERROR after the enclosing foreign call;

@@ -25,6 +25,9 @@ default = ["thread-cache-alloc"]
 # out of musl's malloc, so this is the only way to attribute Rust allocation
 # (bliss-iry5, asked for by bliss-sgis).
 alloc-count = []
+# Embedded CPython as a second object system (spec 2.7.8): the PY package. Needs a
+# target whose loader can open libpython, so not the default static musl build.
+python = ["torcl-rt/python", "torcl-stdlib/python"]
 # A per-thread free-list cache over the system allocator. musl's mallocng has no
 # equivalent of glibc's tcache, and that accounts for ~53% of the musl<->glibc
 # gap on a babel load (bliss-05as). Mutually exclusive with alloc-count: both
@@ -32,6 +35,7 @@ alloc-count = []
 thread-cache-alloc = []
 
 [dependencies]
+torcl-delivery-macros = { path = "../torcl-delivery-macros" }
 torcl-rt.workspace = true
 torcl-compiler.workspace = true
 torcl-stdlib.workspace = true

@@ -201,6 +201,11 @@ pub mod type_id {
     pub const FOREIGN_LIBRARY: u8 = 0x1C;
     /// Retained callback registry token: one untraced process-local word.
     pub const FOREIGN_CALLBACK: u8 = 0x1D;
+    /// A proxy for a CPython object: one untraced word holding the `PyObject *`
+    /// this proxy owns a reference to. Untraced because CPython's heap is not
+    /// ours; the reference is released when the collector finalizes the proxy,
+    /// by queueing it rather than by calling CPython (see `python::PyRef`).
+    pub const PYTHON_OBJECT: u8 = 0x1E;
 }
 
 // ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────

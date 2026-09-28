@@ -141,40 +141,39 @@ alphabetized by unqualified name and display their package explicitly.
 | `java:with-resource` | [Dictionary entry](java.md#with-resource) |
 | `java:with-scope` | [Dictionary entry](java.md#with-scope) |
 
-## Proposed Lisp fiber symbols
+## Lisp fiber symbols
 
-These `TORCL-FIBER` symbols are specified but **not installed** in the current
-bootstrap. See [availability](fibers.md#availability).
+These `TORCL-FIBER` symbols are installed by the standard bootstrap. See [availability](fibers.md#availability).
 
-| Symbol | Proposed contract |
+| Symbol | Contract |
 | --- | --- |
-| `torcl-fiber:*pinned-blocking-action*` | [Specified interface](fibers.md#pinning) |
-| `torcl-fiber:current-fiber` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-alive-p` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-can-yield-p` | [Specified interface](fibers.md#pinning) |
-| `torcl-fiber:fiber-carrier-thread` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-error` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-error-p` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-group-done-p` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:fiber-join` | [Specified interface](fibers.md#waiting) |
-| `torcl-fiber:fiber-name` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-park` | [Specified interface](fibers.md#waiting) |
-| `torcl-fiber:fiber-pin` | [Specified interface](fibers.md#pinning) |
-| `torcl-fiber:fiber-result` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-sleep` | [Specified interface](fibers.md#waiting) |
-| `torcl-fiber:fiber-state` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-still-running` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:fiber-unpin` | [Specified interface](fibers.md#pinning) |
-| `torcl-fiber:fiber-yield` | [Specified interface](fibers.md#waiting) |
-| `torcl-fiber:finish-fibers` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:list-all-fibers` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:make-fiber` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:print-fiber-backtrace` | [Specified interface](fibers.md#observations) |
-| `torcl-fiber:run-fibers` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:scheduler-group-carriers` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:start-fibers` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:submit-fiber` | [Specified interface](fibers.md#lifecycle) |
-| `torcl-fiber:with-fiber-pinned` | [Specified interface](fibers.md#pinning) |
+| `torcl-fiber:*pinned-blocking-action*` | [Dictionary entry](fibers.md#pinning) |
+| `torcl-fiber:current-fiber` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-alive-p` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-can-yield-p` | [Dictionary entry](fibers.md#pinning) |
+| `torcl-fiber:fiber-carrier-thread` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-error` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-error-p` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-group-done-p` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:fiber-join` | [Dictionary entry](fibers.md#waiting) |
+| `torcl-fiber:fiber-name` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-park` | [Dictionary entry](fibers.md#waiting) |
+| `torcl-fiber:fiber-pin` | [Dictionary entry](fibers.md#pinning) |
+| `torcl-fiber:fiber-result` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-sleep` | [Dictionary entry](fibers.md#waiting) |
+| `torcl-fiber:fiber-state` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-still-running` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:fiber-unpin` | [Dictionary entry](fibers.md#pinning) |
+| `torcl-fiber:fiber-yield` | [Dictionary entry](fibers.md#waiting) |
+| `torcl-fiber:finish-fibers` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:list-all-fibers` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:make-fiber` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:print-fiber-backtrace` | [Dictionary entry](fibers.md#observations) |
+| `torcl-fiber:run-fibers` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:scheduler-group-carriers` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:start-fibers` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:submit-fiber` | [Dictionary entry](fibers.md#lifecycle) |
+| `torcl-fiber:with-fiber-pinned` | [Dictionary entry](fibers.md#pinning) |
 
 ## Rust fiber API
 

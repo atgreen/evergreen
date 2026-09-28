@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Embedded CPython. Only needed so the stdlib's finalizer dispatch — the single
+# global hook, which it owns — can release a dead PYTHON-OBJECT's reference.
+python = ["torcl-rt/python"]
+
 [dependencies]
 torcl-rt.workspace = true
 torcl-compiler.workspace = true

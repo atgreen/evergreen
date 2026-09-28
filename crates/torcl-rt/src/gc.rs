@@ -1170,6 +1170,7 @@ unsafe fn trace_object(
         | tid::FOREIGN_POINTER
         | tid::FOREIGN_LIBRARY
         | tid::FOREIGN_CALLBACK
+        | tid::PYTHON_OBJECT
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
@@ -2084,10 +2085,14 @@ impl HeapCollector {
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
         // to old-gen in place and must NOT be zeroed (bliss-jtc.18).
+        let mut regions_retained = 0u64;
+        let mut regions_evacuated = 0u64;
         for &nursery_idx in &nursery_indices {
             if pinned_indices.contains(&nursery_idx) {
+                regions_retained += 1;
                 continue;
             }
+            regions_evacuated += 1;
             let region = &mut state.regions[nursery_idx];
             // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
             let region_used =
@@ -2112,6 +2117,15 @@ impl HeapCollector {
         }
 
         // Update stats.
+        state.stats.nursery_regions_retained += regions_retained;
+        state.stats.nursery_regions_evacuated += regions_evacuated;
+        if gc_region_log_enabled() {
+            crate::syscall::dbg_write(b"[gc-regions] minor: retained ");
+            write_decimal(regions_retained);
+            crate::syscall::dbg_write(b" evacuated ");
+            write_decimal(regions_evacuated);
+            crate::syscall::dbg_write(b"\n");
+        }
         state.stats.minor_gc_count += 1;
         state.stats.bytes_promoted += bytes_promoted;
         state.stats.nursery_used = 0; // nursery was just collected
@@ -3112,6 +3126,62 @@ fn scan_external_roots(mut visit: impl FnMut(*mut TorclVal)) {
     }
 }
 
+/// Inspect host roots for application delivery, replacing registry scanners
+/// with the caller's semantic dependency graph.
+///
+/// # Safety
+/// Call only inside `with_heap_snapshot`, without allocating Lisp objects.
+/// `excluded` must be covered by the delivery analyzer (including captures).
+/// The callback must not mutate slots or let unrooted values escape the snapshot.
+pub unsafe fn visit_delivery_host_roots(
+    excluded: &[RootScanner],
+    visit: &mut dyn FnMut(*mut TorclVal),
+) {
+    advance_root_scan_pass();
+    let scanners = root_scanners().lock().unwrap().clone();
+    for scanner in scanners {
+        if !excluded
+            .iter()
+            .any(|&skip| scanner as usize == skip as usize)
+        {
+            scanner(visit);
+        }
+    }
+}
+
+/// Inspect a live object's reference fields using the same layouts as the GC.
+/// Symbol/package identity does not imply retention of all their definitions;
+/// delivery handles symbol cells separately.
+///
+/// # Safety
+/// `value` must be live, and the call must be inside `with_heap_snapshot`.
+/// The callback must neither allocate Lisp objects nor mutate reference slots.
+pub unsafe fn visit_delivery_references(value: TorclVal, visit: &mut dyn FnMut(TorclVal)) {
+    if !is_heap_ref(value) {
+        return;
+    }
+    let value = resolve_forwarded(value);
+    let address = ref_body_addr(value);
+    let base = HEAP_RANGE_BASE.load(Ordering::Relaxed);
+    let end = HEAP_RANGE_END.load(Ordering::Relaxed);
+    // Native entry points and pinned objects outside the managed heap also
+    // carry pointer tags. The GC does not interpret their bytes as headers.
+    if base == 0 || address < base + OBJECT_HEADER_SIZE || address >= end {
+        return;
+    }
+    let header = (address - OBJECT_HEADER_SIZE) as *const u8;
+    // SAFETY: the caller provides a live object under a stopped-world snapshot.
+    let (kind, size) = unsafe { read_object_header(header) };
+    if matches!(
+        kind,
+        crate::object::type_id::SYMBOL | crate::object::type_id::PACKAGE
+    ) {
+        return;
+    }
+    let body = unsafe { header.add(body_offset(header)) };
+    unsafe { trace_object(body as *mut u8, kind, size as usize, |slot| visit(*slot)) };
+}
+
 // ── Host-container / in-place stack roots (bliss-6b2 #2) ───────────────────
 //
 // `StackRoot` registers the *address of an existing Rust local* `TorclVal` slot
@@ -3199,6 +3269,11 @@ impl TraceHostRoots for TorclError {
             // The already-signalled condition is a live TorclVal and must be
             // relocated with the moving GC (bliss-9kc).
             TorclError::Signalled { condition, .. } => condition.trace_host_roots(visit),
+            // A Python raise carries strings and a PyObject pointer. The pointer
+            // names an object in CPython's heap, which this collector neither
+            // moves nor traces, so there is nothing here to visit.
+            #[cfg(feature = "python")]
+            TorclError::PythonRaised(_) => {}
             TorclError::Oom
             | TorclError::StackOverflow(_)
             | TorclError::InvalidImage(_)
@@ -3575,6 +3650,7 @@ fn install_host_root_scanner() {
 /// invalidate the registered address.
 pub struct HostRoot<T: TraceHostRoots> {
     thread: ThreadId,
+    fiber: Option<crate::thread::FiberId>,
     value: Box<T>,
     address: usize,
     _not_send: PhantomData<Rc<()>>,
@@ -3597,6 +3673,7 @@ impl<T: TraceHostRoots> HostRoot<T> {
             });
         Self {
             thread,
+            fiber: crate::thread::current_fiber_id(),
             value,
             address,
             _not_send: PhantomData,
@@ -3678,11 +3755,19 @@ impl<T: TraceHostRoots> DerefMut for HostRoot<T> {
 
 impl<T: TraceHostRoots> Drop for HostRoot<T> {
     fn drop(&mut self) {
-        assert_eq!(
-            self.thread,
-            std::thread::current().id(),
-            "host roots are thread-affine"
-        );
+        if let Some(fiber) = self.fiber {
+            assert_eq!(
+                Some(fiber),
+                crate::thread::current_fiber_id(),
+                "host root belongs to another fiber"
+            );
+        } else {
+            assert_eq!(
+                self.thread,
+                std::thread::current().id(),
+                "native host roots are thread-affine"
+            );
+        }
         let mut roots = host_roots().lock().unwrap_or_else(|e| e.into_inner());
         let remove_thread = if let Some(entries) = roots.get_mut(&self.thread) {
             let index = entries
@@ -4516,6 +4601,14 @@ thread_local! {
 /// compare their cached epoch before every allocation and lazily replace a stale
 /// TLAB. Keeping the old allocator installed throughout collection preserves
 /// the region's walkable reservation frontier.
+// Changes only when all heap identities are replaced, not on collections.
+static HEAP_IDENTITY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Detect stale process-lifetime reserves after heap reset or image restore.
+pub fn heap_identity_epoch() -> u64 {
+    HEAP_IDENTITY_EPOCH.load(Ordering::Acquire)
+}
+
 static GC_MOVE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Monotone counter bumped on every collection that may relocate objects
@@ -4562,6 +4655,37 @@ unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
 /// that into a deterministic, near-immediate failure at the offending site.
 /// Counterpart to `TORCL_GC_DISABLE` (which does the opposite).
 /// Whether `TORCL_GC_POISON` is set (cached). See the fill site in `minor_gc`.
+/// `TORCL_GC_REGION_LOG=1`: report each minor collection's retained/evacuated
+/// nursery-region split on stderr.
+///
+/// Off by default and deliberately allocation-free: this prints from inside a
+/// collection, where allocating on the Lisp heap is not allowed. Pair it with
+/// `TORCL_GC_STRESS_AT=N` for a single line rather than one per allocation.
+fn gc_region_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TORCL_GC_REGION_LOG").is_some())
+}
+
+/// Write a decimal number to stderr without allocating.
+fn write_decimal(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    if value == 0 {
+        crate::syscall::dbg_write(b"0");
+        return;
+    }
+    while value > 0 {
+        digits[n] = b'0' + (value % 10) as u8;
+        value /= 10;
+        n += 1;
+    }
+    let mut out = [0u8; 20];
+    for i in 0..n {
+        out[i] = digits[n - 1 - i];
+    }
+    crate::syscall::dbg_write(&out[..n]);
+}
+
 fn gc_poison_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TORCL_GC_POISON").is_some())
@@ -5438,6 +5562,20 @@ pub struct GcStats {
     pub large_object_bytes: u64,
     pub regions_total: u32,
     pub regions_free: u32,
+    /// Nursery regions a minor collection RETAINED IN PLACE, cumulative. A region
+    /// is retained whole when anything in it is pinned: it is promoted to old-gen
+    /// without being relocated or poisoned, so nothing in it moves.
+    ///
+    /// Counted because it decides whether a GC-stress run can detect a rooting bug
+    /// at all — an unrooted pointer into a retained region stays valid, so the bug
+    /// is invisible no matter how many collections are forced. Without this the
+    /// split was unobservable from outside, and a clean stress run could not be
+    /// distinguished from a stress run that moved nothing (bliss-ahnzt, measured in
+    /// bliss-c0diw).
+    pub nursery_regions_retained: u64,
+    /// Nursery regions a minor collection evacuated and reclaimed, cumulative.
+    /// Objects in these DID move, so an unrooted reference to one is detectable.
+    pub nursery_regions_evacuated: u64,
 }
 
 // ── Heap initialization ────────────────────────────────────────────
@@ -5651,6 +5789,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), TorclError> {
         std::sync::atomic::Ordering::Relaxed,
     );
     *heap_state().lock().unwrap() = Some(state);
+    HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
     Ok(())
@@ -5677,6 +5816,14 @@ pub fn walk_heap<F>(mut callback: F) -> Result<(), TorclError>
 where
     F: FnMut(*const u8, u8, usize) -> bool,
 {
+    walk_heap_records(|ptr, kind, size, _| callback(ptr, kind, size))
+}
+
+// Also expose header+8 identity internally: large objects have a 16-byte
+// payload offset, while tagged references still identify them by header+8.
+fn walk_heap_records(
+    mut callback: impl FnMut(*const u8, u8, usize, usize) -> bool,
+) -> Result<(), TorclError> {
     let guard = heap_state().lock().unwrap();
     let state = match &*guard {
         Some(s) => s,
@@ -5723,7 +5870,7 @@ where
             let _ = body_size;
             let exact = unsafe { header_exact_body_len(header_ptr) };
             let obj_ptr = unsafe { header_ptr.add(body_offset(header_ptr)) };
-            let should_continue = callback(obj_ptr, type_id, exact);
+            let should_continue = callback(obj_ptr, type_id, exact, cursor + OBJECT_HEADER_SIZE);
             if !should_continue {
                 return Ok(());
             }
@@ -5905,8 +6052,80 @@ pub fn full_gc() -> Result<(), TorclError> {
 /// per-object (not by a single uniform delta, which only worked when the restored
 /// heap reproduced the saved layout exactly — bliss-x0f2 M2.0).
 pub fn serialize_heap_objects() -> Vec<u8> {
+    serialize_heap_objects_matching(|_| true)
+}
+
+/// Serialize the reachable heap without retaining garbage merely because its
+/// region is pinned. Used only by application delivery; pins in the running
+/// process are unchanged. All symbol/package identity records remain roots.
+///
+/// # Safety
+/// Call inside `with_heap_snapshot`, with no concurrent Lisp allocation.
+pub(crate) unsafe fn serialize_reachable_heap_objects() -> Result<Vec<u8>, TorclError> {
+    let mut objects = HashMap::new();
+    let mut pending = Vec::new();
+    walk_heap_records(|ptr, kind, size, identity| {
+        objects.insert(identity, (ptr, kind, size));
+        if matches!(
+            kind,
+            crate::object::type_id::SYMBOL | crate::object::type_id::PACKAGE
+        ) {
+            pending.push(identity);
+        }
+        true
+    })?;
+    let mut root = |value| {
+        if is_heap_ref(value) {
+            pending.push(ref_body_addr(resolve_forwarded(value)));
+        }
+    };
+    root(get_entry_continuation());
+    HeapCollector::scan_cl_stack_roots(&mut root);
+    crate::symbols::for_each_root_slot(|slot| root(unsafe { *slot }));
+    // Includes all off-heap hash table entries, even weak entries below: their
+    // independent image section must never refer to an omitted heap object.
+    scan_external_roots(|slot| root(unsafe { *slot }));
+    let weak_roots = RefCell::new(Vec::new());
+    process_weak_containers(&|slot| {
+        // Weak referents are not ordinary roots, but preserving them in the
+        // delivered snapshot is conservative and keeps serialized slots valid.
+        let value = unsafe { *slot };
+        if is_heap_ref(value) {
+            weak_roots
+                .borrow_mut()
+                .push(ref_body_addr(resolve_forwarded(value)));
+        }
+        true
+    });
+    pending.extend(weak_roots.into_inner());
+    let mut retained = std::collections::HashSet::new();
+    while let Some(identity) = pending.pop() {
+        let Some(&(ptr, kind, size)) = objects.get(&identity) else {
+            continue;
+        };
+        if !retained.insert(ptr as usize) {
+            continue;
+        }
+        unsafe {
+            trace_object(ptr as *mut u8, kind, size, |slot| {
+                let value = *slot;
+                if is_heap_ref(value) {
+                    pending.push(ref_body_addr(resolve_forwarded(value)));
+                }
+            });
+        }
+    }
+    Ok(serialize_heap_objects_matching(|ptr| {
+        retained.contains(&(ptr as usize))
+    }))
+}
+
+fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) -> Vec<u8> {
     let mut out = Vec::new();
     let _ = walk_heap(|ptr, type_id, size| {
+        if !retain(ptr) {
+            return true;
+        }
         out.extend_from_slice(&(ptr as u64).to_le_bytes());
         out.push(type_id);
         out.extend_from_slice(&(size as u32).to_le_bytes());
@@ -5929,6 +6148,12 @@ pub fn serialize_heap_objects() -> Vec<u8> {
             crate::object::type_id::FOREIGN_POINTER
                 | crate::object::type_id::FOREIGN_LIBRARY
                 | crate::object::type_id::FOREIGN_CALLBACK
+                // A PyObject address names an object in an interpreter that does
+                // not outlive this process, so it must be nulled rather than
+                // carried: a restored proxy reports itself dead, which every
+                // accessor already handles, instead of dereferencing an address
+                // that now means something else entirely.
+                | crate::object::type_id::PYTHON_OBJECT
         ) {
             // Neither native addresses nor allocation identities survive an
             // image restart. Restore pointers as null and library tokens as
@@ -6060,6 +6285,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), TorclError> {
     let state = guard
         .as_mut()
         .ok_or_else(|| TorclError::Internal("heap not initialized".into()))?;
+    HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
     clear_heap_objects(state);
     // The pre-restore region set is gone: every cached per-thread T0 allocator
     // still holds a TLAB carved from it, and the reset region alloc_tops will

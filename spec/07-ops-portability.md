@@ -65,6 +65,13 @@ Offset  Section              Size
         Checksum Trailer     32 bytes
 ```
 
+Image format 5 adds native runtime requirements in the `Settings` section.
+The CLI validates source identity, target triple, Rust toolchain, Cargo features,
+compiler flags, and required native capabilities before restoring the heap
+(R7.04). A full runtime accepts legacy images without this section; a specialized
+runtime requires it. Source identity is a compatibility fingerprint, not a
+security signature. Numeric symbol and bytecode identifiers are unchanged.
+
 ### 7.2.3  Header — D7.01
 
 | Offset | Size | Field | Description |

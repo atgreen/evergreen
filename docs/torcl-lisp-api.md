@@ -38,6 +38,7 @@ the current bootstrap.
 | `TORCL-CLTL2` | Compile-time environment inspection | Specified | Planned `SB-CLTL2` alias |
 | `TORCL-GRAY-STREAMS` | Gray stream classes and generic functions | Partial internal dispatch | Intended to be re-exported from `COMMON-LISP` |
 | `TORCL-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp package not yet installed | CFFI/SB-ALIEN migration surface |
+| `TORCL-PYTHON` (nickname `PY`) | Embedded CPython as a second object system | Available in a build with the `python` feature | TorCL-specific; deliberately not CFFI-shaped |
 | `TORCL-DEBUG` | Breakpoints, watchpoints, and debugger plumbing | Partial Rust library; Lisp API specified | TorCL-specific |
 | `TORCL-PROFILER` | Runtime profiling controls and reports | Specified; tier counters have separate available accessors | TorCL-specific |
 | `TORCL-GC` | GC counters used by developer tools | Specified | TorCL-specific |
@@ -481,9 +482,9 @@ contract keeps `TORCL-THREADS` only as a deprecated nickname for
 
 ## Fibers
 
-All entries in `TORCL-FIBER` are **Specified**. The Rust scheduler and fiber
-data structures are under active development, but there is no public Lisp
-package or callable fiber object in the bootstrap yet.
+The `TORCL-FIBER` lifecycle, waiting, pinning, and observation APIs are installed
+by the standard bootstrap on x86-64 Unix and Windows. See the
+[fiber manual](manual/fibers.md) for result, timeout, stack-size, and error semantics.
 
 Fibers are lightweight managed executions multiplexed over a scheduler group's
 OS carrier threads. A fiber is not a thread, and `TORCL-THREAD` functions do
@@ -533,6 +534,12 @@ one. Carriers are ordinary visible `TORCL-THREAD` objects.
 
 These operations park an unpinned fiber without blocking its carrier. Timer
 and wake generations prevent an expired earlier wait from waking a later one.
+
+Established TCP stream reads, writes/flushes, and `%SOCKET-WAIT-FOR-INPUT`
+also park on socket readiness. They use shared epoll/kqueue services on Unix
+and one shared Winsock poller on Windows, preserving synchronous Lisp stream
+calls and receive timeouts. Connect, accept, DNS, regular file I/O, and terminal
+I/O are not yet cooperative. See [socket I/O limitations](manual/fibers.md#socket-io).
 
 ### Pinning
 
@@ -886,6 +893,215 @@ foreign type designators from the FFI type table (`:VOID`, signed and unsigned
 integer widths, pointer, C string, and callback pointer). Foreign operations
 require the sandbox `:FFI` capability; a missing capability signals
 `TORCL-EXT:SANDBOX-VIOLATION`.
+
+## Embedded Python
+
+`TORCL-PYTHON`, nicknamed `PY`, calls CPython as a second object system rather
+than as a foreign library. It is **available** in a build configured with the
+`python` Cargo feature, which needs a target whose loader can open `libpython` —
+glibc, not the default static musl. Without the feature every operation signals
+an error saying so.
+
+```lisp
+(py:import "numpy")                      ; -> the module
+(py:resolve "numpy.mean")                ; -> any dotted name: module, attribute, builtin
+(py:call "numpy.mean" a)                 ; the callable may be named or in hand
+(py:call-method x "reshape" 10 20)
+(py:getattr x "shape")                   ; settable: (setf (py:getattr x "n") 5)
+(py:type-of x)                           ; the Python TYPE, as an object
+(py:typep x "numpy.ndarray")
+(py:str x) (py:repr x)
+(py:exec "print('hello')")               ; a statement, for its effect
+(py:objectp x)                           ; also the type (typep x 'py:object)
+(py:start) (py:stop)                     ; an interpreter starts on first use
+```
+
+The package does not use `COMMON-LISP`, which is what lets `IMPORT`, `TYPE-OF`,
+`TYPEP` and `CALL-METHOD` keep the names Python gives them. Always write them
+package-qualified.
+
+### What crosses, and how
+
+One policy, applied in both directions with no exceptions:
+
+| Lisp | Python | |
+| --- | --- | --- |
+| integer, single/double float | `int`, `float` | by value |
+| string, character | `str` | **by copy** |
+| `NIL` | `None` | and `None`/`False` come back as `NIL` |
+| `T` | `True` | |
+| anything else from Python | `PY:OBJECT` | a proxy owning one reference |
+
+Strings are copied because Python's Unicode representation and TorCL's are not
+worth sharing: the conversion is O(n) either way, and sharing would buy a
+lifetime problem for nothing. Zero copy is for numeric arrays, through the
+buffer protocol, which is separate work.
+
+Two consequences are worth knowing rather than discovering:
+
+- **An integer too large for a fixnum stays a `PY:OBJECT`.** Python's integers
+  are unbounded; a fixnum holds 61 bits. Such a value is left visible and exact
+  rather than truncated or widened to a float — `(py:resolve "sys.maxsize")` is a
+  proxy.
+- **`True` is not `1`.** Python's `bool` is a subclass of `int`, so booleans are
+  classified first; `T` and `NIL` come back, never the integers.
+
+Every operation accepts any Lisp value as its receiver, not only a proxy, so
+`(py:str 5)` is `"5"` and `(py:call-method "hello" "upper")` is `"HELLO"`. A value
+with no Python equivalent — a list, say — signals an error naming what it was.
+
+### Lifetime
+
+A `PY:OBJECT` owns one Python reference. When the proxy becomes unreachable the
+collector queues the release, and it is performed the next time any thread crosses
+into Python. The indirection is required: a `Py_DECREF` can run `__del__`, and
+arbitrary Python must not run inside a Lisp collection.
+
+This means a released Python object is destroyed slightly later than a `del` in
+Python would destroy it — after a collection and the next crossing. Code that
+depends on a `__del__` running at a particular moment should call it explicitly.
+
+### Calling Lisp from Python
+
+`PY:EXPORT` binds a Python callable, in `__main__`, that calls back into Lisp:
+
+```lisp
+(py:export "add" (lambda (a b) (+ a b)))
+(py:exec "print(add(2, 3))")            ; => 5
+```
+
+The callable is an ordinary Python value, so it can be passed around and called from
+inside Python code, not just by name:
+
+```lisp
+(py:exec "def twice(f, x): return f(f(x))")
+(py:export "inc" (lambda (n) (+ n 1)))
+(py:call "__main__.twice" (py:resolve "__main__.inc") 5)   ; => 7
+```
+
+Arguments and results cross by the same value policy as everything else. A Lisp error
+becomes a Python exception (a `RuntimeError` carrying the Lisp message) rather than
+unwinding through CPython frames, which would leave their reference counts wrong.
+
+**The Lisp function is reached through a stable handle, and is retained for the process
+lifetime.** A Python callable can be stored anywhere on the Python side, so there is no
+moment at which releasing it would be safe without reference-counting that side; the
+handle also means the collector can move the function (and anything its closure
+captures) without invalidating the callable.
+
+Unlike the FFI's callbacks, this needs no generated trampoline: every export shares one
+static C entry point and carries its Lisp function in the handle rather than in code.
+So the only architecture-specific dependency is the foreign-to-managed thread
+transition, which x86-64, AArch64 and ppc64le all have. **Verified on x86-64 only** —
+the other two are expected to work by construction but have not been run.
+
+Not yet available: exporting a whole Lisp package as a Python module
+(`import lisp.statistics`), and `input()` reading `*standard-input*`.
+
+### Errors
+
+A Python raise is a first-class Lisp condition, `PY:EXCEPTION`, a subtype of
+`ERROR`:
+
+```lisp
+(handler-case (py:call "numpy.mean" x)
+  (py:exception (e)
+    (py:exception-kind e)     ; "ValueError"  -- the exception class's name
+    (py:exception-text e)     ; str(exception) -- Python's own message
+    (py:exception-frames e)   ; ((file line function) ...), outermost first
+    (py:exception-object e)   ; the exception itself, as a PY:OBJECT
+    (py:backtrace e)))        ; ((:python function file line) ...), innermost first
+```
+
+The exception object is carried, not just its message, because its attributes are
+usually the useful part -- an `HTTPError`'s status, a `KeyError`'s key. The message
+and the frames are rendered when the condition is printed, caught or not:
+
+```text
+ValueError: invalid literal for int() with base 10: 'bad'
+  Python  inner at <string>:2
+  Python  outer at <string>:4
+```
+
+`PY:BACKTRACE` returns the Python half of a mixed-language backtrace as data rather
+than printing it, so a debugger or log formatter can interleave it with the Lisp
+frames however it presents them:
+
+```text
+0: Lisp    PROCESS-DATA
+1: Lisp    PY:CALL
+2: Python  fit at sklearn/base.py:1389
+3: Python  asarray at numpy/_core/numeric.py:330
+```
+
+It is named `PY:EXCEPTION` rather than `PY:ERROR` because that is the better word for
+what it is. Originally the name was forced: the condition and class registries were
+keyed by a class's *bare* name, so `PY:ERROR` replaced `CL:ERROR` image-wide
+(bliss-kliz4, since fixed — a class or condition in another package now keeps its own
+identity).
+
+The inverse direction -- a Lisp condition escaping into Python becoming a Python
+exception rather than unwinding through CPython frames -- needs Python-to-Lisp
+calls, which do not exist yet.
+
+### Streams
+
+Python's `print` reaches `*standard-output*`, and `sys.stderr` reaches
+`*error-output*`, so the two runtimes' output interleaves in program order and a
+`WITH-OUTPUT-TO-STRING` or a rebinding captures both:
+
+```lisp
+(with-output-to-string (s)
+  (let ((*standard-output* s))
+    (princ "lisp ")
+    (py:exec "print('python', end='')")))
+;; => "lisp python"
+```
+
+Before this, Python's output was not merely interleaved unpredictably — it was
+**silently lost**. CPython block-buffers a non-tty stdout, nothing flushed it, and
+the interpreter is usually never finalized, so `(py:exec "print('hi')")` printed
+nothing at all.
+
+How it works, and what follows from it: `sys.stdout` and `sys.stderr` are
+redirected into in-memory buffers, whose contents are written to the Lisp streams at
+the end of each crossing. So **output appears when the call returns**, not as it is
+produced — a long computation's progress prints arrive together at the end. `PY:FLUSH`
+writes out what has accumulated so far, for a loop that wants to report as it goes.
+Output printed before a Python error still arrives, which is usually exactly what a
+reader needs.
+
+Two consequences worth knowing. `sys.stdout` has no `fileno()`, so a library that
+reaches for one will notice. And `input()` still reads file descriptor 0 directly
+rather than `*standard-input*`, because input is pulled rather than pushed and
+answering it needs Python to call Lisp (bliss-m4h70's callbacks).
+
+### Signals and faults
+
+TorCL stays the process's signal authority. The interpreter is started with
+`Py_InitializeEx(0)`, so CPython installs no handlers at all and TorCL's remain in
+place; from inside Python, `signal.getsignal(signal.SIGINT)` reports `None` — a
+handler Python did not install — which is what proves both halves.
+
+One consequence to know: **Ctrl-C cannot interrupt a running Python call.** TorCL's
+handler sets a flag that only Lisp code examines, and no Lisp code runs until Python
+returns, so an endless Python loop has to be killed (bliss-ziuwp).
+
+A **fault inside CPython kills the process**, as it would in Python itself, rather
+than being reported as a Lisp error. That is deliberate and it is not automatic:
+TorCL redirects a faulting instruction to a recovery epilogue that unwinds a JIT
+frame, and it decides to from the fault address alone — any address below one page
+is "a null guard", with nothing looking at where the fault happened. A crossing
+therefore disarms that recovery for its duration, so a null dereference in CPython,
+a C extension or libffi cannot be rewritten into an unwind of a Lisp frame that is
+not on top, which would leave CPython mid-operation with its reference counts wrong.
+The crash message still says `null guard SIGSEGV` for any such fault, which is
+misleading rather than wrong (bliss-p4mey).
+
+Embedded Python requires the same sandbox permission as the FFI, and a sandboxed
+image refuses to start an interpreter: `exec` is arbitrary code execution and
+Python's own library reaches the whole filesystem, so a sandbox that allowed this
+would not be one.
 
 ## Deferred extensible sequences
 
