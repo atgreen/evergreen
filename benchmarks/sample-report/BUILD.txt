@@ -1,0 +1,12 @@
+Runtime source commit: 1f8c88d4 (no runtime source modifications)
+Rust: rustc 1.94.1 (e408947bf 2026-03-25)
+Target: x86_64-unknown-linux-musl
+Profile: release, opt-level=3 (Cargo default), Thin LTO, codegen-units=1
+Build command (from repository root):
+XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 CARGO_TARGET_DIR=target/native-baseline scripts/torcl-limited.sh cargo build --release -p torcl --bin torcl
+Benchmark command:
+XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus python3 benchmarks/run.py --torcl target/native-baseline/x86_64-unknown-linux-musl/release/torcl --cpu 0 --output /tmp/torcl-showcase-t2-results
+Final artifacts copied from /tmp/torcl-showcase-t2-results/ to benchmarks/sample-report/.
+Process logs are losslessly gzip-compressed; all other generated files are unchanged.
+Every kernel AND batch driver verified at T2 before/after all 14 TorCL samples; zero timed deoptimizations.
+See results.json for binary SHA-256, workload hashes, system details and raw timings.

@@ -1,0 +1,562 @@
+{
+  "generated_at": "2026-09-28T09:43:01.895064+00:00",
+  "samples": 7,
+  "metadata": {
+    "commit": "1f8c88d49cbf115eb29e792ada8e5683a29728e8",
+    "working_tree": "M .beads/interactions.jsonl\nM  README.md\nA  benchmarks/.gitignore\nA  benchmarks/LICENSE.ironclad\nA  benchmarks/README.md\nAM benchmarks/cases.json\nAM benchmarks/fibonacci.lisp\nAM benchmarks/ironclad-power-mod.lisp\nAM benchmarks/run.py\nA  benchmarks/sample-report/BUILD.txt\nA  benchmarks/sample-report/fibonacci-sbcl-1.log\nA  benchmarks/sample-report/fibonacci-sbcl-2.log\nA  benchmarks/sample-report/fibonacci-sbcl-3.log\nA  benchmarks/sample-report/fibonacci-sbcl-4.log\nA  benchmarks/sample-report/fibonacci-sbcl-5.log\nA  benchmarks/sample-report/fibonacci-sbcl-6.log\nA  benchmarks/sample-report/fibonacci-sbcl-7.log\nA  benchmarks/sample-report/fibonacci-torcl-1.log\nA  benchmarks/sample-report/fibonacci-torcl-2.log\nA  benchmarks/sample-report/fibonacci-torcl-3.log\nA  benchmarks/sample-report/fibonacci-torcl-4.log\nA  benchmarks/sample-report/fibonacci-torcl-5.log\nA  benchmarks/sample-report/fibonacci-torcl-6.log\nA  benchmarks/sample-report/fibonacci-torcl-7.log\nA  benchmarks/sample-report/fibonacci.lisp\nA  benchmarks/sample-report/index.html\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-1.log\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-2.log\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-3.log\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-4.log\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-5.log\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-6.log\nA  benchmarks/sample-report/ironclad-power-mod-sbcl-7.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-1.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-2.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-3.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-4.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-5.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-6.log\nA  benchmarks/sample-report/ironclad-power-mod-torcl-7.log\nA  benchmarks/sample-report/ironclad-power-mod.lisp\nA  benchmarks/sample-report/results.json\nAM benchmarks/test_runner.py",
+    "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
+    "cpu": 0,
+    "cpu_model": "Intel(R) Core(TM) Ultra 7 255H",
+    "load_average": [
+      2.80517578125,
+      4.5400390625,
+      10.6708984375
+    ],
+    "memory_cap": "4G",
+    "binaries": {
+      "TorCL": {
+        "path": "/home/green/git/torcl/bliss/target/native-baseline/x86_64-unknown-linux-musl/release/torcl",
+        "sha256": "aed675056f67cf627c3dddcd57ea3bf82bd7c07804e90b4464fdf04574e5b93a"
+      },
+      "SBCL": {
+        "path": "/home/linuxbrew/.linuxbrew/Cellar/sbcl/2.6.8/bin/sbcl",
+        "sha256": "e6ff14f816e7a236010eaec058c886751d93fbbfde26c8dbfed312c351a019b6"
+      }
+    },
+    "sbcl_version": "SBCL 2.6.8",
+    "sources": {
+      "fibonacci.lisp": "6e0ba0e605767be022e648ccc1e7222890cbe70a01383bfefb8fe0d241ed759b",
+      "ironclad-power-mod.lisp": "40565c30414aa69d09a7cb174ef9887f2ba710fa26b6fae45247b15615c86e1d"
+    },
+    "runner_sha256": "ddbba606c502668dee9885731ccf5d96c9df93f6ed6ffa789f0f7c27c00dfebe",
+    "cases_sha256": "f5c0cdea094d63ad4328509622286dcbf1e4210e05825de3723b200ad2603bf3"
+  },
+  "benchmarks": [
+    {
+      "id": "fibonacci",
+      "title": "Fibonacci \u00b7 recursive",
+      "category": "Calls / no type annotations",
+      "description": "Ten evaluations of F(30), using the standard two-branch recursive algorithm. General integer arithmetic; no type annotations, memoization or implementation-specific shortcuts.",
+      "source": "fibonacci.lisp",
+      "expected": 8320400,
+      "hot_functions": [
+        "fibonacci",
+        "bench-workload"
+      ],
+      "tier_evidence": [
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14824,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14834,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14650,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14660,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15964,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15974,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15646,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15656,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15728,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15738,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14202,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14212,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14736,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14746,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        }
+      ],
+      "results": {
+        "TorCL": {
+          "samples_seconds": [
+            1.248,
+            1.258,
+            1.515,
+            1.503,
+            1.486,
+            1.372,
+            1.51
+          ],
+          "median_seconds": 1.486,
+          "iqr_seconds": 0.1915,
+          "min_seconds": 1.248,
+          "max_seconds": 1.515
+        },
+        "SBCL": {
+          "samples_seconds": [
+            0.098001,
+            0.116001,
+            0.101001,
+            0.098001,
+            0.120001,
+            0.119001,
+            0.120002
+          ],
+          "median_seconds": 0.116001,
+          "iqr_seconds": 0.01999999999999999,
+          "min_seconds": 0.098001,
+          "max_seconds": 0.120002
+        }
+      }
+    },
+    {
+      "id": "ironclad-power-mod",
+      "title": "Ironclad \u00b7 modular exponentiation",
+      "category": "Library kernel / small integers",
+      "description": "100,000 modular exponentiations: bases 2 through 100,001, exponent 65,537, modulus 104,729. Original Ironclad POWER-MOD and POWER-MOD-TAB source, including upstream optimization declarations. This is a small-integer kernel, not RSA-sized arithmetic.",
+      "source": "ironclad-power-mod.lisp",
+      "expected": 5242584863,
+      "hot_functions": [
+        "power-mod",
+        "bench-workload"
+      ],
+      "tier_evidence": [
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 70167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 70167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 70167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 70167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 60167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        }
+      ],
+      "results": {
+        "TorCL": {
+          "samples_seconds": [
+            1.536,
+            1.254,
+            1.259,
+            1.442,
+            1.401,
+            1.451,
+            1.252
+          ],
+          "median_seconds": 1.401,
+          "iqr_seconds": 0.18999999999999995,
+          "min_seconds": 1.252,
+          "max_seconds": 1.536
+        },
+        "SBCL": {
+          "samples_seconds": [
+            0.021,
+            0.02,
+            0.017,
+            0.018,
+            0.02,
+            0.017,
+            0.017
+          ],
+          "median_seconds": 0.018,
+          "iqr_seconds": 0.002999999999999999,
+          "min_seconds": 0.017,
+          "max_seconds": 0.021
+        }
+      }
+    }
+  ]
+}

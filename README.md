@@ -288,6 +288,13 @@ Use the gate mode when uncovered `MUST` requirements should fail the check:
 python3 scripts/spec-coverage.py --gate
 ```
 
+## Performance benchmarks
+
+The [performance lab](benchmarks/README.md) compares identical Fibonacci and
+Ironclad-derived workloads on TorCL and SBCL, with correctness checks, repeated
+measurements, and a standalone HTML report. Run `python3 benchmarks/run.py`
+after building the release binary. Results report whichever runtime is faster.
+
 ## Development Notes
 
 - The implementation is still in bootstrap form. Some spec goals describe the
