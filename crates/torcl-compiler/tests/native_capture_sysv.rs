@@ -3,10 +3,11 @@ use torcl_compiler::t2::deopt::{LoweredScope, Rebox, SlotDescriptor};
 use torcl_compiler::t2::ir::Inst;
 use torcl_compiler::t2::mach::{Location, PhysReg, RegClass, StackSlot};
 use torcl_compiler::t2::native_transfer::{
-    SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
+    SysvCaptureLocation, SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
 };
 use torcl_compiler::t2::transfer_capture::TransferSnapshot;
 use torcl_compiler::t2::transfer_map::TransferCaptureMap;
+use torcl_compiler::t2::x64_frame::ValueHome;
 use torcl_rt::jit::JitBuffer;
 use torcl_rt::native_transfer::{self, NativeExit, NativeOutcome, NativeSegment};
 use torcl_rt::value::TorclVal;
@@ -26,6 +27,8 @@ struct Request {
     payload: TorclVal,
     cold_spill: u64,
     exit: NativeExit,
+    recipes: Vec<(Location, SysvCaptureLocation)>,
+    call_adjust: usize,
 }
 struct Finished<'a>(&'a mut usize);
 impl Drop for Finished<'_> {
@@ -59,12 +62,16 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     torcl_rt::rooted!(payload = capture.value);
     request.observed = capture.preserved;
     request.return_pc = capture.return_pc as usize;
-    request.stack_bits = unsafe { capture.caller_sp.read() };
     let snapshot = unsafe { &mut *request.snapshot };
     unsafe {
-        snapshot.capture(|location| match location {
-            Location::Register(_) => capture.preserved[0],
-            Location::Stack(StackSlot(index)) => capture.caller_sp.add(index as usize).read(),
+        snapshot.capture(|location| {
+            request
+                .recipes
+                .iter()
+                .find(|(key, _)| *key == location)
+                .unwrap()
+                .1
+                .read(capture)
         });
     }
     torcl_rt::rooted!(
@@ -77,18 +84,23 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     );
     // Publish the relocated value back to the register image before native code
     // resumes. The fixture has no other heap roots or cleanup obligations.
-    capture.preserved[0] = frames[0].locals[0].to_raw();
+    unsafe {
+        snapshot
+            .write_back(|location, word| {
+                request
+                    .recipes
+                    .iter()
+                    .find(|(key, _)| *key == location)
+                    .unwrap()
+                    .1
+                    .write(capture, word);
+            })
+            .unwrap();
+    }
     for word in capture.preserved.iter_mut().skip(1) {
         *word += 200; // prove the stub reloads every updated nonvolatile
     }
     request.rebuilt_float = frames[0].locals[1].as_double_float();
-    unsafe {
-        capture
-            .caller_sp
-            .cast_mut()
-            .add(1)
-            .write(frames[0].locals[2].to_raw());
-    }
     capture.value = *payload;
 }
 #[unsafe(naked)]
@@ -97,10 +109,14 @@ unsafe extern "C" fn dispatch(_request: *mut u8, _value: u64, _exit: NativeExit)
         "endbr64", "lea rax, [rdi + {observed}]",
         "mov [rax], rbx", "mov [rax + 8], rbp", "mov [rax + 16], r12",
         "mov [rax + 24], r13", "mov [rax + 32], r14", "mov [rax + 40], r15",
-        "mov rax, [rsp + 16]", "mov [rdi + {spill}], rax",
+        "mov rcx, [rdi + {adjust}]",
+        "mov rax, [rsp + rcx + 8]", "mov [rdi + {float_spill}], rax",
+        "mov rax, [rsp + rcx + 16]", "mov [rdi + {spill}], rax",
         "mov rdi, [rdi]", "jmp {leave}",
         observed = const std::mem::offset_of!(Request, cold_registers),
         spill = const std::mem::offset_of!(Request, cold_spill),
+        float_spill = const std::mem::offset_of!(Request, stack_bits),
+        adjust = const std::mem::offset_of!(Request, call_adjust),
         leave = sym native_transfer::leave_native_segment,
     );
 }
@@ -113,11 +129,13 @@ fn emitted_capture_saves_real_registers_and_stack_before_moving_gc() {
         "native capture gate unavailable"
     );
     for exit in [NativeExit::Transfer, NativeExit::Deopt] {
-        exercise_capture(exit);
+        for call_adjust in [0, 16] {
+            exercise_capture(exit, call_adjust);
+        }
     }
 }
 
-fn exercise_capture(exit: NativeExit) {
+fn exercise_capture(exit: NativeExit, call_adjust: u32) {
     let reg = Location::Register(PhysReg {
         class: RegClass::Gpr,
         encoding: 9,
@@ -159,6 +177,7 @@ fn exercise_capture(exit: NativeExit) {
         code.extend_from_slice(&[0x48 | (register >> 3), 0xb8 | (register & 7)]);
         code.extend_from_slice(&value.to_le_bytes());
     }
+    code.extend_from_slice(&[0x48, 0x83, 0xec, call_adjust as u8]);
     code.extend_from_slice(&[0x48, 0xb8]);
     code.extend_from_slice(&(veneer.as_ptr() as u64).to_le_bytes());
     code.extend_from_slice(&[0xff, 0xd0]);
@@ -178,6 +197,21 @@ fn exercise_capture(exit: NativeExit) {
         payload: *expected,
         cold_spill: 0,
         exit,
+        recipes: vec![
+            (
+                reg,
+                SysvCaptureLocation::for_home(ValueHome::Reg(3), 2, call_adjust).unwrap(),
+            ),
+            (
+                spill,
+                SysvCaptureLocation::for_home(ValueHome::Stack(0), 2, call_adjust).unwrap(),
+            ),
+            (
+                heap_spill,
+                SysvCaptureLocation::for_home(ValueHome::Stack(1), 2, call_adjust).unwrap(),
+            ),
+        ],
+        call_adjust: call_adjust as usize,
     };
     let stack = TorclStack::new(64 * 1024);
     let outcome = unsafe {

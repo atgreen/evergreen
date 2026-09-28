@@ -29,6 +29,92 @@ pub struct SysvTransferCapture {
     pub return_pc: *const u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureHome {
+    Preserved(u8),
+    StackOffset(u32),
+}
+
+/// A checked physical access recipe. Construct it from the emitter's final
+/// home, not a transient allocator location. No lookup or allocation is needed
+/// to read/write the word once the recipe has been selected for a call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SysvCaptureLocation(CaptureHome);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureLocationError {
+    UnavailableRegister(u8),
+    StackSlotOutsideFrame(u32),
+    UnalignedStackAdjustment,
+    OffsetOverflow,
+}
+
+impl SysvCaptureLocation {
+    /// `call_stack_adjust` is the temporary stack space below the body's normal
+    /// RSP at this CALL. Include it so a spill is addressed from captured SP.
+    pub fn for_home(
+        home: crate::t2::x64_frame::ValueHome,
+        stack_slots: u32,
+        call_stack_adjust: u32,
+    ) -> Result<Self, CaptureLocationError> {
+        use crate::t2::x64_frame::ValueHome;
+        use CaptureLocationError::*;
+        if call_stack_adjust % 8 != 0 {
+            return Err(UnalignedStackAdjustment);
+        }
+        Ok(Self(match home {
+            ValueHome::Reg(register) => {
+                let index = [3, 5, 12, 13, 14, 15]
+                    .iter()
+                    .position(|r| *r == register)
+                    .ok_or(UnavailableRegister(register))?;
+                CaptureHome::Preserved(index as u8)
+            }
+            ValueHome::Stack(slot) => {
+                if slot >= stack_slots {
+                    return Err(StackSlotOutsideFrame(slot));
+                }
+                let offset = slot
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(call_stack_adjust))
+                    .filter(|n| *n <= i32::MAX as u32)
+                    .ok_or(OffsetOverflow)?;
+                CaptureHome::StackOffset(offset)
+            }
+        }))
+    }
+
+    /// # Safety
+    /// The capture must describe the still-live frame for which this recipe was
+    /// constructed. Its declared stack slots and call adjustment must match the
+    /// actual frame allocation. Do not allocate/yield while copying raw roots.
+    pub unsafe fn read(self, capture: &SysvTransferCapture) -> u64 {
+        match self.0 {
+            CaptureHome::Preserved(index) => capture.preserved[index as usize],
+            CaptureHome::StackOffset(offset) => unsafe {
+                capture.caller_sp.add(offset as usize / 8).read()
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same live-frame contract as `read`; stack homes must also be writable.
+    /// `word` must use the home's original machine representation. In particular
+    /// do not write a reboxed Lisp float over an unboxed native float slot.
+    pub unsafe fn write(self, capture: &mut SysvTransferCapture, word: u64) {
+        match self.0 {
+            CaptureHome::Preserved(index) => capture.preserved[index as usize] = word,
+            CaptureHome::StackOffset(offset) => unsafe {
+                capture
+                    .caller_sp
+                    .cast_mut()
+                    .add(offset as usize / 8)
+                    .write(word)
+            },
+        }
+    }
+}
+
 /// Preparation must publish the payload and mapped register/stack roots before
 /// allocating or yielding, and return normally. It must update all native homes
 /// needed by subsequent native cleanup/targets after relocation. The capture

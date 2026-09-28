@@ -18,6 +18,7 @@ use crate::osr::ConversionKind;
 use crate::t2::ir::Function;
 use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 use crate::t2::slot_map;
+use crate::t2::x64_frame::{GPR_X86, ValueHome as FramedHome, select_frame_homes};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
@@ -41,29 +42,6 @@ pub enum EmitError {
     /// Branch resolution failed (out-of-range / unbound label).
     BadBranch,
 }
-
-// ── PReg index → x86-64 hardware register encoding ──────────────────
-//
-// P6 stores regalloc2's PReg index (0..N_GPR) in `PhysReg.encoding`. This table
-// maps those abstract indices to real x86-64 GPR encodings, caller-saved first
-// so small functions never touch a callee-saved register (and thus need no
-// save/restore). rsp(4)/rbp(5) are excluded (frame/stack).
-const GPR_X86: [u8; 14] = [
-    0,  // rax   caller-saved
-    1,  // rcx   caller-saved
-    2,  // rdx   caller-saved
-    6,  // rsi   caller-saved
-    7,  // rdi   caller-saved
-    8,  // r8    caller-saved
-    9,  // r9    caller-saved
-    10, // r10   caller-saved
-    11, // r11   caller-saved
-    3,  // rbx   callee-saved
-    12, // r12   callee-saved
-    13, // r13   callee-saved
-    14, // r14   callee-saved
-    15, // r15   callee-saved
-];
 
 /// x86-64 encodings of the callee-saved GPRs SysV requires a function to
 /// preserve (rbx, r12–r15). rbp/rsp are handled separately.
@@ -754,12 +732,6 @@ fn cmp_rr(a: &mut Asm, l: u8, r: u8) {
     a.push(rex_w(l, r));
     a.push(0x3B); // cmp r64, r/m64 (reg=l, rm=r)
     a.push(modrm_rr(l, r));
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum FramedHome {
-    Reg(u8),
-    Stack(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -2918,42 +2890,13 @@ fn emit_framed_inner(
     if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
-    let mut ranges: HashMap<Value, Vec<Location>> = HashMap::new();
-    for range in &machine.value_locations {
-        if range.vreg.class == RegClass::Gpr {
-            ranges
-                .entry(Value(range.vreg.num))
-                .or_default()
-                .push(range.location);
-        }
-    }
-    let mut homes: HashMap<Value, FramedHome> = HashMap::new();
-    let mut next_stack = machine.num_spill_slots;
-    for value_num in 0..f.num_values() as u32 {
-        let value = Value(value_num);
-        if const_tagged.contains_key(&value)
+    let layout = select_frame_homes(f, &machine, |value| {
+        const_tagged.contains_key(&value)
             || fused.iter().any(|&i| f.inst(i).results.contains(&value))
-        {
-            continue;
-        }
-        let locs = ranges.get(&value).cloned().unwrap_or_default();
-        let stable = locs
-            .first()
-            .copied()
-            .filter(|first| locs.iter().all(|loc| loc == first));
-        let home = match stable {
-            Some(Location::Register(preg)) if preg.class == RegClass::Gpr => {
-                FramedHome::Reg(gpr_enc(preg)?)
-            }
-            Some(Location::Stack(slot)) => FramedHome::Stack(slot.0),
-            _ => {
-                let slot = next_stack;
-                next_stack += 1;
-                FramedHome::Stack(slot)
-            }
-        };
-        homes.insert(value, home);
-    }
+    })
+    .map_err(|_| EmitError::UnsupportedOp(0xFA))?;
+    let homes = layout.values;
+    let mut next_stack = layout.stack_slots;
     // `TORCL_RA_DBG` dump of the three facts a deopt-clobber bug is diagnosed
     // from (bliss-x9c9): each value's stable home, which MachInsts carry a
     // FrameState (and therefore contribute `deopt_uses` liveness), and what
@@ -2967,7 +2910,12 @@ fn emit_framed_inner(
                 "[homes] {} v{} -> {home:?} ranges={:?}",
                 f.name(),
                 value.0,
-                ranges.get(value)
+                machine
+                    .value_locations
+                    .iter()
+                    .filter(|range| range.vreg.class == RegClass::Gpr && range.vreg.num == value.0)
+                    .map(|range| range.location)
+                    .collect::<Vec<_>>()
             );
         }
         for (mi, inst) in machine.insts.iter().enumerate() {

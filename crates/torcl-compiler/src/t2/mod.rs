@@ -32,6 +32,7 @@ pub mod pass;
 pub mod slot_map;
 pub mod transfer_capture;
 pub mod transfer_map;
+pub mod x64_frame;
 
 // ── Wave 1 parcels (one module per sub-agent; disjoint files) ─────
 pub mod build; // P1 — bytecode → SSA

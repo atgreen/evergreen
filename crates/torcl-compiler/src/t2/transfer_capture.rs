@@ -92,6 +92,30 @@ impl TransferSnapshot {
         self.captured = true;
     }
 
+    /// Copy saved words back in their native representation, including GC's
+    /// updated tagged references. Reconstructed Lisp values are not substitutes
+    /// for raw native slots: an unboxed float must remain unboxed.
+    ///
+    /// # Safety
+    /// `write` must address the still-live home for each location, without
+    /// collecting, allocating Lisp objects or yielding during writeback.
+    pub unsafe fn write_back(
+        &self,
+        mut write: impl FnMut(Location, u64),
+    ) -> Result<(), CaptureError> {
+        if !self.captured {
+            return Err(CaptureError::NotCaptured);
+        }
+        for slot in &self.saved {
+            let raw = match &slot.word {
+                SavedWord::Tagged(value) => value.get().to_raw(),
+                SavedWord::Raw(value) => *value,
+            };
+            write(slot.location, raw);
+        }
+        Ok(())
+    }
+
     /// Rebuild logical values while rooting all captured tagged inputs. The
     /// returned frames must be rooted by the caller before its next allocation.
     /// Their PCs name unwind origins, not instructions to execute again.

@@ -412,8 +412,13 @@ Deopt outcomes, including GC stress/poison, with the explicit gate:
 cargo test -p torcl-compiler --test native_capture_sysv -- --include-ignored
 ```
 
-The fixture supplies its known physical frame recipe and preparation callback.
-Production emission still needs generated recipes, retained code/PC lookup,
+The fixture uses checked `SysvCaptureLocation` recipes for preserved registers
+and bounded spill slots, including temporary call-stack adjustments. It tests
+both an unchanged body SP and 16 bytes of temporary call space. Snapshot
+writeback preserves raw float/integer representations while updating relocated
+tagged references. Volatile registers and invalid stack offsets are rejected.
+The fixture still supplies its known frame layout and preparation callback.
+Production emission still needs installed recipes, retained code/PC lookup,
 payload/cursor preparation, cleanup/target dispatch and unwind metadata. This
 gate does not activate ordinary Lisp Invoke emission or remove its return checks.
 
@@ -529,6 +534,15 @@ These are pre-emission maps: machine instruction indices still need native PCs,
 allocator locations still need physical save recipes, and logical function names
 still need retained executing definitions before they form installable unwind
 sites. Tests cover actual Lisp lowering as well as malformed-map rejection.
+
+The rich x86 emitter can assign a permanent spill home to a value whose
+allocator ranges move between locations. Its `x64_frame::select_frame_homes`
+policy is now shared with transfer metadata rather than duplicated.
+`lower_framed_transfer_maps` resolves descriptors and roots against those final
+homes, materializes omitted immediate constants, and rejects moving heap
+literals. Tests cover split ranges whose final home differs from the allocator
+location and constants with no physical home. This is the map variant required
+by rich emission; raw allocator maps alone do not describe its physical frame.
 
 `transfer_capture::TransferSnapshot` reserves storage before native entry and
 copies located words without Lisp allocation while the source frame is still
