@@ -3,11 +3,10 @@ use torcl_compiler::t2::deopt::{LoweredScope, Rebox, SlotDescriptor};
 use torcl_compiler::t2::ir::Inst;
 use torcl_compiler::t2::mach::{Location, PhysReg, RegClass, StackSlot};
 use torcl_compiler::t2::native_transfer::{
-    SysvCaptureLocation, SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
+    SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
 };
-use torcl_compiler::t2::transfer_capture::TransferSnapshot;
 use torcl_compiler::t2::transfer_map::TransferCaptureMap;
-use torcl_compiler::t2::x64_frame::ValueHome;
+use torcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferSite, SysvTransferTable};
 use torcl_rt::jit::JitBuffer;
 use torcl_rt::native_transfer::{self, NativeExit, NativeOutcome, NativeSegment};
 use torcl_rt::value::TorclVal;
@@ -16,7 +15,7 @@ use torcl_rt::{Collector, HeapCollector, TorclStack};
 #[repr(C)]
 struct Request {
     anchor: *mut NativeSegment,
-    snapshot: *mut TransferSnapshot,
+    snapshot: *mut u8,
     observed: [u64; 6],
     return_pc: usize,
     stack_bits: u64,
@@ -27,7 +26,9 @@ struct Request {
     payload: TorclVal,
     cold_spill: u64,
     exit: NativeExit,
-    recipes: Vec<(Location, SysvCaptureLocation)>,
+    table: *const SysvTransferTable,
+    code_base: usize,
+    origin_bcp: u32,
     call_adjust: usize,
 }
 struct Finished<'a>(&'a mut usize);
@@ -39,12 +40,17 @@ impl Drop for Finished<'_> {
 
 unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     let request = unsafe { &mut *request.cast::<Request>() };
+    let exit = if request.helper_drops == 0 {
+        NativeExit::Returned
+    } else {
+        request.exit
+    };
     let _drop = Finished(&mut request.helper_drops);
     request.anchor = native_transfer::current_segment();
     unsafe {
         out.write(NativeOutcome {
             value: request.payload,
-            exit: request.exit,
+            exit,
         });
     }
 }
@@ -62,17 +68,15 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     torcl_rt::rooted!(payload = capture.value);
     request.observed = capture.preserved;
     request.return_pc = capture.return_pc as usize;
-    let snapshot = unsafe { &mut *request.snapshot };
+    let table = unsafe { &*request.table };
+    request.origin_bcp = table
+        .lookup(request.code_base, capture.return_pc as usize)
+        .expect("exact captured return PC")
+        .map()
+        .origin_bcp;
+    let snapshot = unsafe { &mut *request.snapshot.cast::<SysvSiteSnapshot<'_>>() };
     unsafe {
-        snapshot.capture(|location| {
-            request
-                .recipes
-                .iter()
-                .find(|(key, _)| *key == location)
-                .unwrap()
-                .1
-                .read(capture)
-        });
+        snapshot.capture(request.code_base, capture).unwrap();
     }
     torcl_rt::rooted!(
         frames = snapshot
@@ -85,17 +89,7 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     // Publish the relocated value back to the register image before native code
     // resumes. The fixture has no other heap roots or cleanup obligations.
     unsafe {
-        snapshot
-            .write_back(|location, word| {
-                request
-                    .recipes
-                    .iter()
-                    .find(|(key, _)| *key == location)
-                    .unwrap()
-                    .1
-                    .write(capture, word);
-            })
-            .unwrap();
+        snapshot.write_back(request.code_base, capture).unwrap();
     }
     for word in capture.preserved.iter_mut().skip(1) {
         *word += 200; // prove the stub reloads every updated nonvolatile
@@ -160,7 +154,6 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
             ],
         }],
     };
-    let mut snapshot = TransferSnapshot::new(&map).unwrap();
     let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)).unwrap();
     let veneer = JitBuffer::new(&emit_helper_veneer(helper, capture.as_ptr())).unwrap();
     torcl_rt::rooted!(expected = double(101.0));
@@ -181,12 +174,47 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
     code.extend_from_slice(&[0x48, 0xb8]);
     code.extend_from_slice(&(veneer.as_ptr() as u64).to_le_bytes());
     code.extend_from_slice(&[0xff, 0xd0]);
+    let first_return_offset = code.len();
+    // The first helper returns normally. The caller has no status test before
+    // the second call, which takes the exceptional route through its own site.
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(veneer.as_ptr() as u64).to_le_bytes());
+    code.extend_from_slice(&[0xff, 0xd0]);
     let return_offset = code.len();
     code.extend_from_slice(&[0x0f, 0x0b]); // exceptional call must not return here
     let caller = JitBuffer::new(&code).unwrap();
+    let mut first_map = map.clone();
+    first_map.call = Inst(1);
+    first_map.origin_bcp = 9;
+    first_map.frames[0].resume_pc = 9;
+    let table = SysvTransferTable::new(
+        code.len(),
+        vec![
+            SysvTransferSite {
+                return_offset: first_return_offset as u32,
+                stack_slots: 2,
+                call_stack_adjust: call_adjust,
+                map: first_map,
+            },
+            SysvTransferSite {
+                return_offset: return_offset as u32,
+                stack_slots: 2,
+                call_stack_adjust: call_adjust,
+                map,
+            },
+        ],
+    )
+    .unwrap();
+    let site = table
+        .lookup(
+            caller.as_ptr() as usize,
+            caller.as_ptr() as usize + return_offset,
+        )
+        .unwrap();
+    let mut snapshot = site.reserve_snapshot().unwrap();
     let mut request = Request {
         anchor: std::ptr::null_mut(),
-        snapshot: &mut snapshot,
+        snapshot: (&mut snapshot as *mut SysvSiteSnapshot<'_>).cast(),
         observed: [0; 6],
         return_pc: 0,
         stack_bits: 0,
@@ -197,20 +225,9 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
         payload: *expected,
         cold_spill: 0,
         exit,
-        recipes: vec![
-            (
-                reg,
-                SysvCaptureLocation::for_home(ValueHome::Reg(3), 2, call_adjust).unwrap(),
-            ),
-            (
-                spill,
-                SysvCaptureLocation::for_home(ValueHome::Stack(0), 2, call_adjust).unwrap(),
-            ),
-            (
-                heap_spill,
-                SysvCaptureLocation::for_home(ValueHome::Stack(1), 2, call_adjust).unwrap(),
-            ),
-        ],
+        table: &table,
+        code_base: caller.as_ptr() as usize,
+        origin_bcp: 0,
         call_adjust: call_adjust as usize,
     };
     let stack = TorclStack::new(64 * 1024);
@@ -226,6 +243,7 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
     assert_eq!(outcome.value, *expected, "transfer payload remains rooted");
     assert_eq!(request.observed, values);
     assert_eq!(request.return_pc, caller.as_ptr() as usize + return_offset);
+    assert_eq!(request.origin_bcp, 17);
     assert_eq!(request.stack_bits, 3.25f64.to_bits());
     assert_eq!(request.rebuilt_float, 3.25);
     assert_ne!(
@@ -238,7 +256,7 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
         expected.to_raw(),
         "reload relocated register before dispatch"
     );
-    assert_eq!((request.helper_drops, request.prepare_drops), (1, 1));
+    assert_eq!((request.helper_drops, request.prepare_drops), (2, 1));
     assert_eq!(&request.cold_registers[1..], &[302, 303, 304, 305, 306]);
     assert_eq!(
         request.cold_spill,

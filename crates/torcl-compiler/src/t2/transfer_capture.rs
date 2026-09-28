@@ -42,6 +42,16 @@ pub struct TransferSnapshot {
 }
 
 impl TransferSnapshot {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) fn locations(&self) -> impl Iterator<Item = Location> + '_ {
+        self.saved.iter().map(|slot| slot.location)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) fn invalidate(&mut self) {
+        self.captured = false;
+    }
+
     pub fn new(map: &TransferCaptureMap) -> Result<Self, CaptureError> {
         let mut saved = Vec::new();
         for frame in &map.frames {

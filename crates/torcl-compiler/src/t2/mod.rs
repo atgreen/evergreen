@@ -58,6 +58,8 @@ pub mod emit_ppc64le;
 pub mod emit_s390x;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native_transfer;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub mod transfer_sites;
 
 // ── Wave 3 parcels ────────────────────────────────────────────────
 pub mod opt_escape; // P4e — escape analysis + scalar replacement

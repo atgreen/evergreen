@@ -422,6 +422,20 @@ Production emission still needs installed recipes, retained code/PC lookup,
 payload/cursor preparation, cleanup/target dispatch and unwind metadata. This
 gate does not activate ordinary Lisp Invoke emission or remove its return checks.
 
+`transfer_sites::SysvTransferTable` now binds emitted return offsets to checked
+logical maps and physical capture recipes. Lookup is allocation-free and matches
+the exact PC within the owning code range; it never substitutes a nearby call.
+Construction rejects duplicate/out-of-range offsets, inconsistent logical frame
+dimensions/origins, unavailable registers, invalid stack slots, and missing roots.
+Execution-owned snapshots borrow their checked site and refuse capture/writeback
+at another return PC. A rejected recapture invalidates the previous snapshot.
+The executable fixture makes a normal call followed by an exceptional call, with
+no caller status check between them, and selects the second site's map using
+the captured return PC. Transfer and Deopt both preserve moved roots and raw
+spills with and without temporary stack adjustment. This verifies the lookup
+boundary; production code ownership, complete emitter site coverage, ABI checks,
+and dispatcher integration are still required before activation.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does
