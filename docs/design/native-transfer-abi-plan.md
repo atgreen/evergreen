@@ -738,6 +738,12 @@ The opt-in tests exercise same-tag shadowing, crossed catches, cleanup ordering
 and replacement throws, modified and branch-merged locals, enclosing operand-stack
 values, zero/one/many returned values, and actual moving-GC relocation. They require
 native catch execution and zero fallback for supported local destinations.
+A test-only unavailable-destination seam also withholds one selected catch landing
+while retaining its exact source map and live registrations. The regression
+requires one bytecode fallback, no native catch entry, no replay of the throwing
+call, correct cleanup order, preserved locals/multiple values and an unchanged
+enclosing catch, with actual tag relocation under GC stress. It covers both
+immediate fallback and fallback after an intervening native cleanup.
 This extension does not enable ordinary ABI installation. The compiler still
 declines direct exits requiring catch
 unregistration, and inherited OSR scope admission remains disabled. Host allocation

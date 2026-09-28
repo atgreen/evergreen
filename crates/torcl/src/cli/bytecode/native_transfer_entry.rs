@@ -29,9 +29,21 @@ pub(super) struct TransferCode {
     sites: SysvTransferTable,
     slots: u16,
     cleanup_depths: std::collections::HashMap<u32, usize>,
+    #[cfg(test)]
+    unavailable_catch: Option<u32>,
 }
 
 impl TransferCode {
+    #[cfg(test)]
+    pub(super) fn without_catch_destination(mut self, push_bcp: u32) -> Self {
+        assert!(matches!(
+            self.body.code.get(push_bcp as usize),
+            Some(Instr::PushCatch { .. })
+        ));
+        self.unavailable_catch = Some(push_bcp);
+        self
+    }
+
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
         if body.variadic || body.has_env {
             return None;
@@ -106,6 +118,8 @@ impl TransferCode {
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
         let code = JitBuffer::new(&emitted.code)?;
         Some(Self {
+            #[cfg(test)]
+            unavailable_catch: None,
             body,
             _body_roots: roots,
             code,
@@ -166,6 +180,8 @@ impl TransferCode {
         let mut prepared_catch = None::<PreparedCatch>;
         torcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
         let mut context = CaptureContext {
+            #[cfg(test)]
+            unavailable_catch: self.unavailable_catch,
             prepared_catch: &mut prepared_catch,
             frame,
             body: self.body.as_ref(),
@@ -654,6 +670,8 @@ pub(super) fn take_native_fallback_count() -> usize {
 }
 
 struct CaptureContext {
+    #[cfg(test)]
+    unavailable_catch: Option<u32>,
     prepared_catch: *mut Option<PreparedCatch>,
     frame: *mut Frame,
     body: *const BytecodeFunction,
@@ -794,6 +812,13 @@ unsafe fn prepare_transfer(
         }
         NativeUnwindStep::EnterTarget { scope_index } => {
             if !matches!(scopes[scope_index].kind, ScopeKind::Catch { .. }) {
+                return Ok(());
+            }
+            // Fault injection models a missing selected continuation while
+            // retaining the source capture map and all dynamic registrations.
+            // Production code always consults the verified landing table below.
+            #[cfg(test)]
+            if context.unavailable_catch == Some(scopes[scope_index].push_bcp) {
                 return Ok(());
             }
             let Some(landing) = site.native_catch_landing(
