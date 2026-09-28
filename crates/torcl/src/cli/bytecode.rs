@@ -29,6 +29,10 @@
 //! (closures / multiple values / special vars), nmq.6 (parity + default flip),
 //! nmq.2 (codegen via i2c/c2i), nmq.3 (precise GC of frames).
 
+mod pending_error;
+use pending_error::PendingError;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -297,7 +301,7 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut TorclVal)) {
     unsafe {
         NATIVE_ERROR.scan(|error| {
             use torcl_rt::gc::TraceHostRoots;
-            error.borrow_mut().trace_host_roots(visit);
+            error.visit(|value| value.trace_host_roots(visit));
         });
         NATIVE_ENV_FRAME.scan(|frame| {
             if let Some(frame) = frame.borrow().as_ref() {
@@ -15354,10 +15358,7 @@ fn emit_native_transfer_check(c: &mut Asm) {
 
 fn stash_native_error(error: TorclError) {
     NATIVE_ERROR.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(error);
-        }
+        cell.set_first(error);
     });
 }
 
@@ -15761,10 +15762,7 @@ extern "C" fn c2i_call_builtin(
         // re-raise on exit, without overwriting an earlier pending error.
         Err(e) => {
             NATIVE_ERROR.with(|c| {
-                let mut slot = c.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(e);
-                }
+                c.set_first(e);
             });
             NIL.0
         }
@@ -15841,10 +15839,7 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
         // other native paths that may still continue with the placeholder.
         Err(e) => {
             NATIVE_ERROR.with(|c| {
-                let mut slot = c.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(e);
-                }
+                c.set_first(e);
             });
             NIL.0
         }
@@ -15853,8 +15848,19 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
 
 /// Error raised by a c2i callback, re-raised by `run_native` after the
 /// native call returns.
-static NATIVE_ERROR: torcl_rt::execution_local::ExecutionLocal<RefCell<Option<TorclError>>> =
-    unsafe { torcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
+static PENDING_NATIVE_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_ERROR: torcl_rt::execution_local::ExecutionLocal<PendingError<'static, TorclError>> = unsafe {
+    torcl_rt::execution_local::ExecutionLocal::new(|| PendingError::new(&PENDING_NATIVE_ERRORS))
+};
+
+fn native_error_pending() -> bool {
+    // The current execution is the sole writer of its slot. Its own writes
+    // happen before this load; fiber migration supplies the scheduler handoff.
+    // Relaxed is sufficient: this summary never publishes the error payload.
+    // Other executions can cause extra lookups, but cannot hide our own error.
+    PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) != 0
+        && NATIVE_ERROR.with(|slot| slot.is_some())
+}
 /// Set by native (T1) code when a speculative guard fails (bliss-jtc.27): a
 /// non-fixnum operand or a fixnum-overflowing arithmetic result. `run_native`
 /// observes it, discards the native result, and re-runs the function in the
@@ -15911,15 +15917,12 @@ enum NativeDeoptResume {
 /// to the function's return: `run_native`/`run_native_osr` re-raise the stashed
 /// error regardless; this only makes it prompt instead of never.
 fn native_loop_should_exit() -> u64 {
-    if NATIVE_ERROR.with(|c| c.borrow().is_some()) {
+    if native_error_pending() {
         return 1;
     }
     if let Some(error) = pending_signal_error_for_current_execution() {
         NATIVE_ERROR.with(|c| {
-            let mut slot = c.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(error);
-            }
+            c.set_first(error);
         });
         return 1;
     }
@@ -16067,7 +16070,7 @@ extern "C" fn c2i_t1_backedge(
     // reconstructed a non-empty operand stack starting at this exact slot; do
     // not overwrite the resume state with the callback's dummy return value.
     let deopt = NATIVE_DEOPT.with(|state| state.get());
-    let errored = NATIVE_ERROR.with(|error| error.borrow().is_some());
+    let errored = native_error_pending();
     if !deopt && !errored {
         unsafe { slots.add(body.n_locals as usize).write(result) };
     }
@@ -16314,10 +16317,7 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
     let outer = stack.fp() as *mut Frame;
     let fail = |message: &'static str| {
         NATIVE_ERROR.with(|c| {
-            let mut error = c.borrow_mut();
-            if error.is_none() {
-                *error = Some(TorclError::Internal(message.into()));
-            }
+            c.set_first(TorclError::Internal(message.into()));
         });
     };
     if outer.is_null() || buf.is_null() || n_scopes == 0 {
@@ -18039,7 +18039,7 @@ fn run_native(
     // error from an outer native frame, run with a fresh slot, then restore the
     // outer's on exit — otherwise a nested call would clobber a first-error-wins
     // error stashed by an enclosing native function.
-    let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
+    let saved_err = NATIVE_ERROR.with(|c| c.take());
     NATIVE_DEOPT.with(|d| d.set(false));
     let saved_null_recovery = torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip();
     let saved_stack_recovery = torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
@@ -18060,8 +18060,8 @@ fn run_native(
 
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
-    let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
-    NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
+    let my_err = NATIVE_ERROR.with(|c| c.take());
+    NATIVE_ERROR.with(|c| c.replace(saved_err));
     if let Some(error) = pending_signal_error_for_current_execution() {
         stack.pop_frame();
         return Err(error);
@@ -20453,7 +20453,7 @@ fn run_native_osr(
     // functions that previously declined).
     let saved_env_frame =
         NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
-    let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
+    let saved_err = NATIVE_ERROR.with(|c| c.take());
     NATIVE_DEOPT.with(|d| d.set(false));
     let entry_addr = osr.entry as usize + stub_off;
     // SAFETY: `entry_addr` is inside the installed OSR buffer at a stub whose
@@ -20469,8 +20469,8 @@ fn run_native_osr(
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
-    let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
-    NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
+    let my_err = NATIVE_ERROR.with(|c| c.take());
+    NATIVE_ERROR.with(|c| c.replace(saved_err));
     let _ = osr.num_slots;
     let _ = osr.code_info;
     if let Some(err) = my_err {

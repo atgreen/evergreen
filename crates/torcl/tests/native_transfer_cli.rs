@@ -179,3 +179,47 @@ fn native_calls_stop_at_errors_and_nonlocal_exits() {
         }
     }
 }
+
+#[test]
+fn t2_transfer_checks_preserve_errors_across_fiber_yields() {
+    let program = r#"
+        (defun fiber-transfer-leaf (fail)
+          (when (torcl-fiber:current-fiber) (torcl-fiber:fiber-yield))
+          (when fail (error "expected fiber error"))
+          7)
+        (defun fiber-transfer-recursive (n fail)
+          (if (= n 0) (fiber-transfer-leaf fail)
+              (+ 1 (fiber-transfer-recursive (- n 1) fail))))
+        (dotimes (i 40) (assert (= 11 (fiber-transfer-recursive 4 nil))))
+        (assert (= 2 (torcl-ext:function-tier 'fiber-transfer-recursive)))
+        (dolist (carriers '(1 4))
+          (let ((fibers
+                  (loop for n below 16 collect
+                    (let ((n n))
+                      (torcl-fiber:make-fiber
+                        (lambda ()
+                          (dotimes (i 10)
+                            (assert (eq :caught
+                              (handler-case (fiber-transfer-recursive 4 t)
+                                (error () :caught))))
+                            (assert (= 11 (fiber-transfer-recursive 4 nil))))
+                          n))))))
+            (assert (equal (loop for n below 16 collect n)
+                           (torcl-fiber:run-fibers fibers :carrier-count carriers)))))
+        (assert (= 11 (fiber-transfer-recursive 4 nil)))
+        (format t "FIBER-TRANSFERS-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", program])
+        .env("TORCL_LAZY_COMPILE", "0")
+        .env("TORCL_FORCE_TIER", "t2")
+        .output()
+        .expect("run TorCL");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FIBER-TRANSFERS-OK"));
+}
