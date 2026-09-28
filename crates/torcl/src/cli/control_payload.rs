@@ -79,6 +79,48 @@ impl TraceHostRoots for ControlPayload {
 #[cfg(test)]
 mod tests {
     use super::super::*;
+
+    #[test]
+    fn catch_tags_use_object_identity_across_cleanup_and_gc() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env = &mut env);
+        super::super::read_eval_all_env(
+            "(setq heap-tag-a \"same tag\" heap-tag-b \"same tag\")
+             (defun catch-tag-gc-value () (%force-minor-gc-for-test) :kept)",
+            &mut env,
+        )
+        .unwrap();
+        for treewalker in [false, true] {
+            for source in [
+                "(let ((a (list :tag)) (b (list :tag)))
+                  (eq (catch a (catch b (throw a :outer)) :wrong) :outer))",
+                "(let ((a heap-tag-a) (b heap-tag-b))
+                  (eq (catch a (catch b (throw a :outer)) :wrong) :outer))",
+                "(let ((a (make-symbol \"TAG\")) (b (make-symbol \"TAG\")))
+                  (eq (catch a (catch b (throw a :outer)) :wrong) :outer))",
+                "(let ((tag (list :tag)))
+                  (eq (catch tag (catch tag (throw tag :inner)) :outer) :outer))",
+                "(let ((tag (list :tag)))
+                  (eq (catch tag (throw tag (catch-tag-gc-value))) :kept))",
+            ] {
+                let source = if treewalker {
+                    format!("(eval '{source})")
+                } else {
+                    source.to_owned()
+                };
+                assert_eq!(
+                    super::super::read_eval_all_env(&source, &mut env)
+                        .unwrap_or_else(|error| panic!("{source}: {error:?}")),
+                    T,
+                    "{source}"
+                );
+                assert!(env.catch_stack.is_empty());
+            }
+        }
+    }
     fn reentrant_cleanup_payloads(treewalker: bool) {
         let _lock = super::super::heap_test_lock()
             .lock()

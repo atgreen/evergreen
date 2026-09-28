@@ -1858,7 +1858,7 @@ struct Env {
     /// cache (bliss-p1t).
     closures: Arc<SharedCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>>,
     block_stack: Vec<(String, String)>,
-    catch_stack: Vec<(String, String)>,
+    catch_stack: Vec<(TorclVal, String)>,
     /// Tags visible for GO: (tag-name, tagbody-token)
     tag_stack: Vec<(String, String)>,
     method_context: Vec<MethodContext>,
@@ -7733,6 +7733,9 @@ impl Env {
         }
         for value in &mut self.mv {
             visit(value);
+        }
+        for (tag, _) in &mut self.catch_stack {
+            visit(tag);
         }
         // Raw declaration specifiers are source conses copied out of a body; the
         // body's own root does not cover this independent copy (AGENTS.md GC
@@ -16139,7 +16142,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // its source forms for the same reason.
                 let (tag_form, mut body) = cp(cdr);
                 torcl_rt::rooted_ref!(_body_root = &mut body);
-                let tag = val_as_str(eval_form(tag_form, env)?);
+                let tag = eval_form(tag_form, env)?;
                 let token = next_control_token("__THROW__");
                 env.catch_stack.push((tag, token.clone()));
                 let result = eval_progn(body, env);
@@ -16183,14 +16186,15 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
 
             "THROW" => {
                 let (tag_form, rest) = cp(cdr);
-                let (val_form, _) = cp(rest);
-                let tag = val_as_str(eval_form(tag_form, env)?);
+                let (mut val_form, _) = cp(rest);
+                torcl_rt::rooted_ref!(_value_form_root = &mut val_form);
+                torcl_rt::rooted!(tag = eval_form(tag_form, env)?);
                 let value = eval_form(val_form, env)?;
                 if let Some((_, token)) = env
                     .catch_stack
                     .iter()
                     .rev()
-                    .find(|(catch_tag, _)| catch_tag == &tag)
+                    .find(|(catch_tag, _)| *catch_tag == *tag)
                 {
                     let token = token.clone();
                     store_control_mv(&token, value, env);
@@ -16199,7 +16203,8 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 // A THROW with no matching CATCH is a catchable CONTROL-ERROR
                 // (CLHS 5.2), not an uncatchable internal error.
                 return Err(TorclError::ControlError(format!(
-                    "attempt to THROW to a tag that is not active: {tag}"
+                    "attempt to THROW to a tag that is not active: {}",
+                    val_as_str(*tag)
                 )));
             }
             "TAGBODY" => {

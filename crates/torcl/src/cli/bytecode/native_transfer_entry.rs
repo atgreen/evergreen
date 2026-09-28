@@ -396,12 +396,11 @@ unsafe extern "C" fn call_or_throw(
             torcl_rt::rooted!(tag = unsafe { call.args.read() });
             torcl_rt::rooted!(value = unsafe { call.args.add(1).read() });
             let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
-            let tag_name = val_as_str(*tag);
             let token = env
                 .catch_stack
                 .iter()
                 .rev()
-                .find(|(name, _)| *name == tag_name)
+                .find(|(live_tag, _)| *live_tag == *tag)
                 .map(|(_, token)| token.clone());
             match token {
                 Some(token) => {
@@ -409,7 +408,8 @@ unsafe extern "C" fn call_or_throw(
                     Err(TorclError::Internal(token))
                 }
                 None => Err(TorclError::ControlError(format!(
-                    "attempt to THROW to a tag that is not active: {tag_name}"
+                    "attempt to THROW to a tag that is not active: {}",
+                    val_as_str(*tag)
                 ))),
             }
         });

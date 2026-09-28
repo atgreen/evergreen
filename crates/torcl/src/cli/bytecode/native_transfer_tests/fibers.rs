@@ -37,8 +37,7 @@ fn cleanup_fiber() -> TorclVal {
     let code = TransferCode::compile(body).expect("fiber native cleanup");
     let token = super::super::super::next_control_token("FIBER-CLEANUP-EXIT");
     let tag = reader::read_from_string(":fiber-cleanup-exit").unwrap().0;
-    env.catch_stack
-        .push((super::super::super::val_as_str(tag), token.clone()));
+    env.catch_stack.push((tag, token.clone()));
     torcl_rt::rooted!(
         args = vec![super::super::super::arena_cons(
             TorclVal::from_fixnum(case as i64),

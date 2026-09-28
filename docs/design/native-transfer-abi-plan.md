@@ -702,6 +702,13 @@ landing validation and state restoration must still exist before a jump is legal
 Native CATCH execution is tracked in `bliss-shih7.12.6`; the selector does not claim
 that capability or enable ordinary ABI installation.
 
+Catch bindings retain the actual tagged Lisp object as a GC root, and THROW
+compares tags by object identity across bytecode, tree-walking and native helper
+paths (`bliss-shih7.12.6.2`). Printed tag text is only diagnostic: distinct lists,
+strings or uninterned symbols may print alike without naming the same catch.
+This representation is also required for upcoming native catch registration;
+moving GC must repair the saved tag before dynamic destination search.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does

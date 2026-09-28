@@ -214,8 +214,7 @@ fn native_v2_transfer_from_running_cleanup_discards_saved_answers_once() {
     let code = TransferCode::compile(body).expect("running native cleanup can transfer");
     let token = super::super::super::next_control_token("CLEANUP-REPLACEMENT");
     let tag = reader::read_from_string(":cleanup-replacement").unwrap().0;
-    env.catch_stack
-        .push((super::super::super::val_as_str(tag), token.clone()));
+    env.catch_stack.push((tag, token.clone()));
     torcl_rt::rooted!(args = vec![super::super::super::arena_str("replacement answer")]);
     let before = args[0].to_raw();
     let frame = torcl_rt::current_stack().fp();
@@ -400,8 +399,7 @@ fn native_v2_throw_enters_nested_native_cleanups_without_bytecode() {
     let code = TransferCode::compile(body).expect("native exceptional cleanup entry");
     let token = super::super::super::next_control_token("NATIVE-CLEANUP");
     let tag = reader::read_from_string(":native-cleanup").unwrap().0;
-    env.catch_stack
-        .push((super::super::super::val_as_str(tag), token.clone()));
+    env.catch_stack.push((tag, token.clone()));
     torcl_rt::rooted!(args = vec![super::super::super::arena_str("saved before throw")]);
     let original = args[0].to_raw();
     take_native_cleanup_count();
@@ -439,8 +437,7 @@ fn native_v2_throw_enters_nested_native_cleanups_without_bytecode() {
     .unwrap();
     let replacement = super::super::super::next_control_token("NATIVE-REPLACEMENT");
     let tag = reader::read_from_string(":new-native-cleanup").unwrap().0;
-    env.catch_stack
-        .push((super::super::super::val_as_str(tag), replacement.clone()));
+    env.catch_stack.push((tag, replacement.clone()));
     torcl_rt::rooted!(result = code.run(&args, &mut env));
     assert!(
         matches!(&*result, Err(TorclError::Internal(t)) if t == &replacement),

@@ -95,8 +95,7 @@ fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
             .expect("exceptional protected region has a mapped fallback");
         let token = super::super::super::next_control_token("REPLACEMENT");
         let tag = reader::read_from_string(":replacement").unwrap().0;
-        env.catch_stack
-            .push((super::super::super::val_as_str(tag), token.clone()));
+        env.catch_stack.push((tag, token.clone()));
         torcl_rt::rooted!(args = vec![super::super::super::arena_str("original error")]);
         let old_address = args[0].to_raw();
         let before = torcl_rt::current_stack().fp();
@@ -188,8 +187,7 @@ fn native_v2_fallback_propagates_without_replaying_the_original_definition() {
         let code = TransferCode::compile(original).expect("tagged Invoke caller");
         let token = super::super::super::next_control_token("OWNED-CATCH");
         let tag = reader::read_from_string(":owned-tag").unwrap().0;
-        env.catch_stack
-            .push((super::super::super::val_as_str(tag), token.clone()));
+        env.catch_stack.push((tag, token.clone()));
         torcl_rt::rooted!(
             args = vec![super::super::super::arena_cons(
                 TorclVal::from_fixnum(41),

@@ -118,8 +118,7 @@ fn native_v2_bridge_preserves_throw_multiple_values_and_first_error() {
     let side_effect = torcl_rt::symbols::intern("V2-SIDE-EFFECT");
     let tag = reader::read_from_string(":v2-tag").unwrap().0;
     let token = super::super::next_control_token("V2-CATCH");
-    env.catch_stack
-        .push((super::super::val_as_str(tag), token.clone()));
+    env.catch_stack.push((tag, token.clone()));
     let _native = NativeEnvGuard::enter(&mut env);
     torcl_rt::rooted!(args = vec![super::super::arena_cons(TorclVal::from_fixnum(23), NIL)]);
     let outcome = unsafe { invoke_bridge(throwing, args.as_mut_ptr(), args.len()) };

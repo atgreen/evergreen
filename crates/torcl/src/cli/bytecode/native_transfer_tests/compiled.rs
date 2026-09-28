@@ -121,8 +121,7 @@ fn native_v2_bridge_runs_compiled_lisp_callers_through_real_callees() {
         .unwrap();
         let tag = reader::read_from_string(":v2-tag").unwrap().0;
         let token = super::super::super::next_control_token("V2-COMPILED-CATCH");
-        env.catch_stack
-            .push((super::super::super::val_as_str(tag), token.clone()));
+        env.catch_stack.push((tag, token.clone()));
         torcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
         torcl_rt::rooted!(
             forms = reader::read_from_string("((v2-target (v2-tick x)))")

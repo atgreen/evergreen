@@ -14250,9 +14250,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 sp_restore,
             } => {
                 let tag = acts[top_idx].pop_op();
-                let tag_str = val_as_str(tag);
                 let token = next_control_token("__THROW__");
-                env.catch_stack.push((tag_str, token.clone()));
+                env.catch_stack.push((tag, token.clone()));
                 acts[top_idx].handlers.push(Handler::Catch {
                     token,
                     resume_bcp,
@@ -14365,12 +14364,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     let t = act.pop_op();
                     (v, t)
                 };
-                let tag_str = val_as_str(tag);
                 let token = env
                     .catch_stack
                     .iter()
                     .rev()
-                    .find(|(t, _)| *t == tag_str)
+                    .find(|(t, _)| *t == tag)
                     .map(|(_, tok)| tok.clone());
                 match token {
                     Some(tok) => {
@@ -14382,7 +14380,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         // (CLHS 5.2), not an uncatchable internal error (matches
                         // the tree-walker THROW arm).
                         let e = TorclError::ControlError(format!(
-                            "attempt to THROW to a tag that is not active: {tag_str}"
+                            "attempt to THROW to a tag that is not active: {}",
+                            val_as_str(tag)
                         ));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
