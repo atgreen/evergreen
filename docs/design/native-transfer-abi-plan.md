@@ -445,10 +445,21 @@ state and result availability. DCE keeps exceptional-only operands; inlining
 maps result definitions before successor arguments.
 
 This is compiler infrastructure, not activation of the native transfer ABI.
-The ordinary builder still emits Call. Complete scope coverage, automatic
-exception-edge construction, pass-wide integration, machine landing pads and
-unwind maps remain required. Lowering marks Invoke as unsupported until those
-machine contracts are implemented, preventing accidental ordinary-call emission.
+The ordinary installation path still emits Call. A separate
+`build_from_bytecode_for_transfers` entry constructs Invoke edges automatically
+for remaining calls after intrinsic expansion. Each exceptional edge reaches a
+distinct NlxTransfer continuation with the pre-call FrameState and a TransferSite
+snapshot of the source control scopes. That continuation starts propagation;
+it does not authorize replay of the throwing bytecode. Verification requires
+matching origin/capture metadata, transfer effects, and no normal successor.
+Exception-only state remains live through DCE and reaches the cold machine
+instruction's root liveness.
+
+This path covers bytecodes already modelled by the SSA builder and ordinary
+function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide
+integration, machine landing pads and unwind maps remain required. Lowering
+marks Invoke as unsupported until those machine contracts are implemented,
+preventing accidental ordinary-call emission.
 
 
 ### Ordered control-scope analysis
@@ -489,6 +500,6 @@ Special bindings and captured lexical environments are also ordered logical
 records. Normal LET* teardown may remove bindings and child environments from
 their separate runtime stacks; lexical exits report both in restoration order.
 Cleanups retain any surrounding bindings until unwinding crosses them.
-Automatic Invoke construction and attaching scope maps to installed native code
-remain required before native dispatch; this analysis does not enable emission
-of currently unsupported protected forms.
+Extending Invoke construction to protected forms and attaching scope maps to
+installed native code remain required before native dispatch; this analysis
+does not enable emission of currently unsupported protected forms.

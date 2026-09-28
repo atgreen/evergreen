@@ -128,6 +128,31 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 errors.push(VerifyError::new("V11 invoke-shape",
                     format!("block{bi} Invoke requires distinct normal/exceptional edges and call effects")));
             }
+            if data.opcode == Opcode::NlxTransfer {
+                let origin_matches = match (&data.aux, data.frame_state) {
+                    (AuxData::TransferSite { origin_bcp, .. }, Some(id))
+                        if (id.0 as usize) < f.frame_states.len() =>
+                    {
+                        f.frame_states
+                            .get(id)
+                            .scopes
+                            .last()
+                            .is_some_and(|scope| scope.bcp == *origin_bcp)
+                    }
+                    _ => false,
+                };
+                if !origin_matches
+                    || !data.targets.is_empty()
+                    || !data.results.is_empty()
+                    || !data.flags.effectful
+                    || !data.flags.call
+                    || !data.flags.safepoint
+                    || !data.flags.terminator
+                {
+                    errors.push(VerifyError::new("V12 transfer-shape",
+                        format!("block{bi} transfer requires matching capture/scope metadata, effects and no normal successor")));
+                }
+            }
             if is_term {
                 term_positions.push(pos);
             } else if !data.targets.is_empty() {
@@ -377,7 +402,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 }
 
                 // V8 — guard/FrameState well-formedness.
-                if data.flags.guard || data.opcode == Opcode::Invoke {
+                if data.flags.guard || matches!(data.opcode, Opcode::Invoke | Opcode::NlxTransfer) {
                     match data.frame_state {
                         None => errors.push(VerifyError::new(
                             "V8 guard-framestate",
