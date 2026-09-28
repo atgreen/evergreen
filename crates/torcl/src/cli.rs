@@ -21,6 +21,7 @@ use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
 pub mod events;
+mod python;
 pub mod sprof;
 use torcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use torcl_rt::runtime::parse_cli as parse_runtime_cli;
@@ -630,6 +631,14 @@ fn seed_standard_packages_registry() {
     // CLtL2 lexical-environment access (§4.14), the package a portability layer
     // such as trivial-cltl2 USEs — TorCL's counterpart of SB-CLTL2.
     let _ = torcl_stdlib::make_package("TORCL-CLTL2", &[], &["COMMON-LISP"]);
+    // Embedded CPython (§2.7.8), nicknamed PY so the calling surface reads the way
+    // the design intends: (py:import "numpy"), (py:call "numpy.mean" a).
+    //
+    // It does NOT use COMMON-LISP, and that is not an oversight: IMPORT, TYPE-OF,
+    // TYPEP and CALL-METHOD are all names this package needs and CL already
+    // exports. Inheriting them would make every one of those a conflict, and
+    // renaming them would make the surface read worse than Python's own.
+    let _ = torcl_stdlib::make_package("TORCL-PYTHON", &["PY"], &[]);
     for name in [
         "COMMON-LISP",
         "COMMON-LISP-USER",
@@ -640,10 +649,12 @@ fn seed_standard_packages_registry() {
         "TORCL-THREAD",
         "TORCL-FIBER",
         "TORCL-CLTL2",
+        "TORCL-PYTHON",
     ] {
         reader::register_package(name);
     }
     reader::register_package("CL-USER");
+    reader::register_package("PY");
     reader::register_package("TORCL-THREADS");
     // All 978 ANSI names live present+external in COMMON-LISP before boot.
     let _ = torcl_stdlib::seed_ansi_symbols();
@@ -8631,6 +8642,17 @@ fn print_val_inner(val: TorclVal, out: &mut String) {
         // A first-class package object (bliss-bhs) prints as #<PACKAGE name>.
         out.push_str("#<PACKAGE ");
         out.push_str(&name);
+        out.push('>');
+    } else if python::is_proxy(val) {
+        // Show Python's own repr, which is what makes a proxy legible in a
+        // backtrace. `describe_proxy` declines rather than failing when there is
+        // no interpreter or __repr__ itself raised: printing must not signal, and
+        // must not start an interpreter as a side effect.
+        out.push_str("#<PYTHON-OBJECT");
+        if let Some(rendered) = python::describe_proxy(val) {
+            out.push(' ');
+            out.push_str(&rendered);
+        }
         out.push('>');
     } else if torcl_stdlib::is_instance(val) {
         // A user-defined `print-object` method wins when one applies (and a print
@@ -16773,6 +16795,35 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             }
             "TORCL::%GETPID" => {
                 return Ok(TorclVal::from_fixnum(std::process::id() as i64));
+            }
+            // ── Embedded CPython: the PY package (§2.7.8, bliss-dk3nr) ──
+            //
+            // GC-SAFETY. `args` is an unrooted Vec, which is safe here for a
+            // specific reason rather than by luck: everything downstream reads
+            // those values BEFORE it allocates on the Lisp heap (`to_python` copies
+            // out and never allocates), and the single allocating step — converting
+            // the result — happens once no argument is live. See
+            // `cli/python.rs::crossing`.
+            name @ ("TORCL::%PY-IMPORT"
+            | "TORCL::%PY-EXEC"
+            | "TORCL::%PY-RESOLVE"
+            | "TORCL::%PY-CALL"
+            | "TORCL::%PY-CALL-METHOD"
+            | "TORCL::%PY-GETATTR"
+            | "TORCL::%PY-SETATTR"
+            | "TORCL::%PY-TYPE-OF"
+            | "TORCL::%PY-TYPEP"
+            | "TORCL::%PY-STR"
+            | "TORCL::%PY-REPR"
+            | "TORCL::%PY-OBJECTP"
+            | "TORCL::%PY-STOP") => {
+                if env.sandbox {
+                    return Err(TorclError::SandboxViolation(
+                        "embedded Python access denied".into(),
+                    ));
+                }
+                let args = eval_args(cdr, env)?;
+                return apply_python_builtin(name, &args);
             }
             "TORCL::%LOAD-FOREIGN-LIBRARY" => {
                 if env.sandbox {
@@ -26194,6 +26245,10 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                if python::is_proxy(v) {
+                    return Ok(resolve_sym("TORCL-PYTHON::OBJECT")
+                        .expect("Python object type symbol"));
+                }
                 if torcl_stdlib::synchronization::mutex_p(v) {
                     return Ok(resolve_sym("TORCL-THREAD::MUTEX").expect("mutex type symbol"));
                 }
@@ -36460,6 +36515,21 @@ fn is_builtin_function(name: &str) -> bool {
             | "TORCL-THREAD::ALL-THREADS"
             | "TORCL-THREAD:THREAD-YIELD"
             | "TORCL-THREAD::THREAD-YIELD"
+            // Embedded CPython (§2.7.8). These are the internal primitives; the
+            // PY package's functions are boot.lisp wrappers over them.
+            | "TORCL::%PY-IMPORT"
+            | "TORCL::%PY-EXEC"
+            | "TORCL::%PY-RESOLVE"
+            | "TORCL::%PY-CALL"
+            | "TORCL::%PY-CALL-METHOD"
+            | "TORCL::%PY-GETATTR"
+            | "TORCL::%PY-SETATTR"
+            | "TORCL::%PY-TYPE-OF"
+            | "TORCL::%PY-TYPEP"
+            | "TORCL::%PY-STR"
+            | "TORCL::%PY-REPR"
+            | "TORCL::%PY-OBJECTP"
+            | "TORCL::%PY-STOP"
     ) {
         return true;
     }
@@ -37224,6 +37294,109 @@ fn apply_builtin_fast(
     }
 }
 
+/// The primitives behind the `PY` package (§2.7.8, bliss-dk3nr).
+///
+/// Named `TORCL::%PY-*` rather than `PY:*` deliberately. Both the bytecode lowerer
+/// and the FUNCALL fast path reduce an operator to its BARE name to decide what it
+/// is, so `PY:TYPEP` — whose bare name CL already claims — was compiled into
+/// CL:TYPEP and silently answered a different question. A `%`-prefixed internal
+/// name collides with nothing, and `lib/boot.lisp` puts the real `py:` functions
+/// on top, which is the convention TORCL-FFI already follows.
+///
+/// Argument checking lives here rather than in `cli/python.rs` so that the error
+/// messages read like every other builtin's, and so the bridge stays about Python.
+fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    // The package prefix is matched off so both the external (`PY:CALL`) and
+    // internal (`PY::CALL`) spellings reach one arm.
+    let short = name.strip_prefix("TORCL::%PY-").unwrap_or(name);
+
+    /// Require exactly `count` arguments, naming the function as the user wrote it.
+    fn exactly(name: &str, args: &[TorclVal], count: usize) -> Result<(), TorclError> {
+        if args.len() == count {
+            Ok(())
+        } else {
+            Err(TorclError::ProgramError(format!(
+                "{name} requires exactly {count} argument{}, got {}",
+                if count == 1 { "" } else { "s" },
+                args.len()
+            )))
+        }
+    }
+
+    /// A string argument, refused clearly rather than reaching `as_string`'s
+    /// assertion — a module or attribute name is the argument users get wrong.
+    fn text(name: &str, value: TorclVal, what: &str) -> Result<TorclVal, TorclError> {
+        if value.is_string() {
+            Ok(value)
+        } else {
+            Err(TorclError::TypeError {
+                datum: value,
+                expected: format!("a string naming {what} for {name}"),
+            })
+        }
+    }
+
+    match short {
+        "IMPORT" => {
+            exactly(name, args, 1)?;
+            python::import(text(name, args[0], "a Python module")?)
+        }
+        "EXEC" => {
+            exactly(name, args, 1)?;
+            python::exec(text(name, args[0], "Python source")?)
+        }
+        "RESOLVE" => {
+            exactly(name, args, 1)?;
+            python::resolve(text(name, args[0], "a Python object")?)
+        }
+        "CALL" => {
+            exactly(name, args, 2)?;
+            // The callable may be named or already in hand, so that both
+            // (py:call "numpy.mean" a) and (py:call f 1 2) read naturally.
+            python::call(args[0], args[1])
+        }
+        "CALL-METHOD" => {
+            exactly(name, args, 3)?;
+            python::call_method(args[0], text(name, args[1], "a method")?, args[2])
+        }
+        "GETATTR" => {
+            exactly(name, args, 2)?;
+            python::getattr(args[0], text(name, args[1], "an attribute")?)
+        }
+        "SETATTR" => {
+            exactly(name, args, 3)?;
+            python::setattr(args[0], text(name, args[1], "an attribute")?, args[2])
+        }
+        "TYPE-OF" => {
+            exactly(name, args, 1)?;
+            python::type_of(args[0])
+        }
+        "TYPEP" => {
+            exactly(name, args, 2)?;
+            python::typep(args[0], text(name, args[1], "a Python class")?)
+        }
+        "STR" => {
+            exactly(name, args, 1)?;
+            python::text(args[0], false)
+        }
+        "REPR" => {
+            exactly(name, args, 1)?;
+            python::text(args[0], true)
+        }
+        "OBJECTP" => {
+            exactly(name, args, 1)?;
+            Ok(if python::is_proxy(args[0]) { T } else { NIL })
+        }
+        "STOP" => {
+            exactly(name, args, 0)?;
+            python::stop()
+        }
+        _ => Err(TorclError::Internal(format!(
+            "{name} is listed as a Python builtin but has no implementation"
+        ))),
+    }
+}
+
 fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclVal, TorclError> {
     match name {
         "TORCL-EXT:DECLARATION-SPECIFIER" | "TORCL-EXT::DECLARATION-SPECIFIER" => {
@@ -37246,6 +37419,36 @@ fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclV
         }
         "TORCL-EXT:PROCLAIMED-OPTIMIZE" | "TORCL-EXT::PROCLAIMED-OPTIMIZE" => {
             Ok(proclaimed_optimize_list())
+        }
+        // ── Embedded CPython (§2.7.8) ──
+        //
+        // Every one of these is a real function, not a special form: FUNCALL,
+        // APPLY and MAPCAR over them all work, which matters for a surface whose
+        // whole point is that calling Python should feel ordinary.
+        //
+        // Each is sandbox-gated with the FFI primitives. Embedding CPython grants
+        // strictly more than the FFI does — arbitrary code execution through
+        // `exec`, and the whole filesystem through Python's own library — so a
+        // sandbox that denies FFI must deny this.
+        name @ ("TORCL::%PY-IMPORT"
+        | "TORCL::%PY-EXEC"
+        | "TORCL::%PY-RESOLVE"
+        | "TORCL::%PY-CALL"
+        | "TORCL::%PY-CALL-METHOD"
+        | "TORCL::%PY-GETATTR"
+        | "TORCL::%PY-SETATTR"
+        | "TORCL::%PY-TYPE-OF"
+        | "TORCL::%PY-TYPEP"
+        | "TORCL::%PY-STR"
+        | "TORCL::%PY-REPR"
+        | "TORCL::%PY-OBJECTP"
+        | "TORCL::%PY-STOP") => {
+            if _env.sandbox {
+                return Err(TorclError::SandboxViolation(
+                    "embedded Python access denied".into(),
+                ));
+            }
+            apply_python_builtin(name, args)
         }
         "TORCL::%NATIVE-MUTEX" => torcl_stdlib::synchronization::call(args),
         "TORCL::%FOREIGN-MEMORY" => {

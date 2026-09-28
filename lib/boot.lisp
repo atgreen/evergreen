@@ -3935,6 +3935,79 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
       (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer fixed-count)
       (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer)))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Embedded CPython: the PY package (spec 2.7.8, bliss-dk3nr)
+;;;; ---------------------------------------------------------------------------
+;;;;
+;;;; Thin wrappers over TORCL::%PY-* primitives, following the same convention as
+;;;; the FFI surface above. The indirection is not ceremony: a function named
+;;;; PY:TYPEP is reduced to its BARE name by the bytecode lowerer and by the
+;;;; FUNCALL fast path, both of which then find CL:TYPEP and answer a different
+;;;; question entirely. A %-prefixed internal primitive collides with nothing, and
+;;;; defining the PY functions here also gives them real function cells, so
+;;;; (mapcar #'py:str objects) and (apply #'py:call ...) work.
+;;;;
+;;;; The PY package does not use COMMON-LISP, which is what lets IMPORT, TYPE-OF,
+;;;; TYPEP and CALL-METHOD keep the names Python gives them.
+
+;;; Bring an interpreter up and take it down. Starting is implicit in every other
+;;; entry point, so START is only for choosing WHEN the cost is paid; STOP drains
+;;; the pending releases first, since a reference released after shutdown would be
+;;; a use-after-free.
+(defun py:start () (py:exec "pass"))
+(defun py:stop () (torcl::%py-stop))
+
+;;; (py:import "numpy") -> the module, as a PY:OBJECT.
+(defun py:import (name) (torcl::%py-import name))
+
+;;; (py:exec "print('hello')") -> NIL. A statement, run for its effect.
+(defun py:exec (source) (torcl::%py-exec source))
+
+;;; (py:resolve "numpy.mean") -> the object that dotted name names, whether the
+;;; segments are modules, attributes, or a builtin.
+(defun py:resolve (name) (torcl::%py-resolve name))
+
+;;; (py:call "numpy.mean" a) or (py:call f 1 2) -- the callable may be named or
+;;; already in hand.
+(defun py:call (callable &rest arguments) (torcl::%py-call callable arguments))
+
+;;; (py:call-method x "reshape" 10 20)
+(defun py:call-method (object name &rest arguments)
+  (torcl::%py-call-method object name arguments))
+
+;;; (py:getattr x "shape"), and settable: (setf (py:getattr x "n") 5).
+(defun py:getattr (object name) (torcl::%py-getattr object name))
+(defun py:setattr (object name value) (torcl::%py-setattr object name value))
+(defsetf py:getattr (object name) (value) `(py:setattr ,object ,name ,value))
+
+;;; (py:type-of x) -> the Python TYPE, as an object rather than a name, so it can
+;;; be called, compared and asked for its own attributes as Python code would.
+(defun py:type-of (object) (torcl::%py-type-of object))
+
+;;; (py:typep x "numpy.ndarray")
+(defun py:typep (object class) (torcl::%py-typep object class))
+
+;;; str() and repr(). PY:REPR is what the Lisp printer shows inside
+;;; #<PYTHON-OBJECT ...>.
+(defun py:str (object) (torcl::%py-str object))
+(defun py:repr (object) (torcl::%py-repr object))
+
+;;; Is this a Python object rather than a converted Lisp value? A number, string,
+;;; NIL or T that crossed back is an ordinary Lisp object and answers NIL.
+(defun py:objectp (object) (torcl::%py-objectp object))
+(deftype py:object () '(satisfies py:objectp))
+
+;;; External, so TYPE-OF and error messages read PY:OBJECT rather than
+;;; TORCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
+;;; INTERN by name rather than writing '(py:import ...): a quoted list is read
+;;; before these are external, and the reader's own symbol for PY:IMPORT is not
+;;; necessarily the one in the package table, so the export lands on nothing. Every
+;;; other package here exports the same way for the same reason.
+(export (mapcar (lambda (name) (intern name "TORCL-PYTHON"))
+                '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
+                  "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"))
+        "TORCL-PYTHON")
+
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
 ;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures
 ;;; return zero to C, then signal FFI-ERROR after the enclosing foreign call;

@@ -796,8 +796,35 @@ Availability follows the FFI. Lisp→Python works wherever the per-ABI scalar pa
 does; Python→Lisp requires callbacks (§2.7.5) and is therefore x86-64 only until
 those are ported. Staging the two directions separately is deliberate.
 
-This is an approved design direction, **not an implemented ABI**. No JVM
-integration is implied or planned.
+**What exists as of 2026-09-27.** The direction above is now partly built, behind
+the `python` Cargo feature (CPython is resolved through the foreign-library loader
+rather than linked, so a build need not depend on `libpython`, and embedding
+requires a glibc target rather than the default static musl):
+
+- The interpreter lifecycle and the transition, with a crossing reentrant so
+  Lisp→Python→Lisp→Python works. Startup is explicit rather than lazy at the
+  runtime layer, because CPython binds the interpreter to its initialising thread
+  and shutdown from any other thread dereferences a thread state that may be gone.
+- Reference ownership in both directions: a queued release drained at a crossing,
+  and a stable handle table visited by a registered root scanner so a Lisp value
+  Python holds survives and is rewritten when the collector moves it.
+- The `TORCL-PYTHON` package, nicknamed `PY` — `import`, `resolve`, `call`,
+  `call-method`, `getattr`/`setattr`, `type-of`, `typep`, `str`, `repr`, `exec` —
+  with `PY:OBJECT` proxies whose references are released through the collector's
+  finalizer registry. Documented in `docs/torcl-lisp-api.md`.
+- The value policy: numbers by value, strings by copy, `NIL`↔`None`, `T`↔`True`,
+  everything else a proxy. An integer beyond a fixnum stays a proxy rather than
+  being truncated.
+
+Still unbuilt, and tracked separately: Python exceptions as Lisp conditions with a
+mixed-language backtrace (`bliss-wq5tw`), Python→Lisp callables (`bliss-89axw`,
+x86-64 only until callbacks are ported), the zero-copy buffer protocol
+(`bliss-s8wrr`), stream binding (`bliss-c4g9u`), and signal arbitration
+(`bliss-ztkuw`). Requirement numbers are deliberately not assigned yet; this
+section records a direction and its progress, and gains normative IDs when the
+surface stops moving.
+
+No JVM integration is implied or planned.
 
 ---
 

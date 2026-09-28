@@ -38,6 +38,7 @@ the current bootstrap.
 | `TORCL-CLTL2` | Compile-time environment inspection | Specified | Planned `SB-CLTL2` alias |
 | `TORCL-GRAY-STREAMS` | Gray stream classes and generic functions | Partial internal dispatch | Intended to be re-exported from `COMMON-LISP` |
 | `TORCL-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp package not yet installed | CFFI/SB-ALIEN migration surface |
+| `TORCL-PYTHON` (nickname `PY`) | Embedded CPython as a second object system | Available in a build with the `python` feature | TorCL-specific; deliberately not CFFI-shaped |
 | `TORCL-DEBUG` | Breakpoints, watchpoints, and debugger plumbing | Partial Rust library; Lisp API specified | TorCL-specific |
 | `TORCL-PROFILER` | Runtime profiling controls and reports | Specified; tier counters have separate available accessors | TorCL-specific |
 | `TORCL-GC` | GC counters used by developer tools | Specified | TorCL-specific |
@@ -886,6 +887,82 @@ foreign type designators from the FFI type table (`:VOID`, signed and unsigned
 integer widths, pointer, C string, and callback pointer). Foreign operations
 require the sandbox `:FFI` capability; a missing capability signals
 `TORCL-EXT:SANDBOX-VIOLATION`.
+
+## Embedded Python
+
+`TORCL-PYTHON`, nicknamed `PY`, calls CPython as a second object system rather
+than as a foreign library. It is **available** in a build configured with the
+`python` Cargo feature, which needs a target whose loader can open `libpython` —
+glibc, not the default static musl. Without the feature every operation signals
+an error saying so.
+
+```lisp
+(py:import "numpy")                      ; -> the module
+(py:resolve "numpy.mean")                ; -> any dotted name: module, attribute, builtin
+(py:call "numpy.mean" a)                 ; the callable may be named or in hand
+(py:call-method x "reshape" 10 20)
+(py:getattr x "shape")                   ; settable: (setf (py:getattr x "n") 5)
+(py:type-of x)                           ; the Python TYPE, as an object
+(py:typep x "numpy.ndarray")
+(py:str x) (py:repr x)
+(py:exec "print('hello')")               ; a statement, for its effect
+(py:objectp x)                           ; also the type (typep x 'py:object)
+(py:start) (py:stop)                     ; an interpreter starts on first use
+```
+
+The package does not use `COMMON-LISP`, which is what lets `IMPORT`, `TYPE-OF`,
+`TYPEP` and `CALL-METHOD` keep the names Python gives them. Always write them
+package-qualified.
+
+### What crosses, and how
+
+One policy, applied in both directions with no exceptions:
+
+| Lisp | Python | |
+| --- | --- | --- |
+| integer, single/double float | `int`, `float` | by value |
+| string, character | `str` | **by copy** |
+| `NIL` | `None` | and `None`/`False` come back as `NIL` |
+| `T` | `True` | |
+| anything else from Python | `PY:OBJECT` | a proxy owning one reference |
+
+Strings are copied because Python's Unicode representation and TorCL's are not
+worth sharing: the conversion is O(n) either way, and sharing would buy a
+lifetime problem for nothing. Zero copy is for numeric arrays, through the
+buffer protocol, which is separate work.
+
+Two consequences are worth knowing rather than discovering:
+
+- **An integer too large for a fixnum stays a `PY:OBJECT`.** Python's integers
+  are unbounded; a fixnum holds 61 bits. Such a value is left visible and exact
+  rather than truncated or widened to a float — `(py:resolve "sys.maxsize")` is a
+  proxy.
+- **`True` is not `1`.** Python's `bool` is a subclass of `int`, so booleans are
+  classified first; `T` and `NIL` come back, never the integers.
+
+Every operation accepts any Lisp value as its receiver, not only a proxy, so
+`(py:str 5)` is `"5"` and `(py:call-method "hello" "upper")` is `"HELLO"`. A value
+with no Python equivalent — a list, say — signals an error naming what it was.
+
+### Lifetime
+
+A `PY:OBJECT` owns one Python reference. When the proxy becomes unreachable the
+collector queues the release, and it is performed the next time any thread crosses
+into Python. The indirection is required: a `Py_DECREF` can run `__del__`, and
+arbitrary Python must not run inside a Lisp collection.
+
+This means a released Python object is destroyed slightly later than a `del` in
+Python would destroy it — after a collection and the next crossing. Code that
+depends on a `__del__` running at a particular moment should call it explicitly.
+
+Python errors are signalled as errors carrying the exception's type and message
+(`ValueError: invalid literal for int() ...`). Conditions carrying the traceback
+and a mixed-language backtrace are separate work.
+
+Embedded Python requires the same sandbox permission as the FFI, and a sandboxed
+image refuses to start an interpreter: `exec` is arbitrary code execution and
+Python's own library reaches the whole filesystem, so a sandbox that allowed this
+would not be one.
 
 ## Deferred extensible sequences
 
