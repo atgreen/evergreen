@@ -11889,6 +11889,41 @@ fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
     reader::register_package(name);
 }
 
+/// The identity of a condition type name for registry lookups: its FULL,
+/// package-qualified name, uppercased, with one colon and no redundant
+/// `COMMON-LISP` qualifier.
+///
+/// These registries were keyed by the package-STRIPPED bare name, which made a
+/// condition in any other package alias COMMON-LISP's of the same name. Defining
+/// `MYPKG::ERROR` put its definition where `ERROR`'s belonged, and since that
+/// definition's parent is `CL:ERROR` — also reduced to `ERROR` — walking the parents
+/// found the entry again and recursed until the stack was gone (bliss-kliz4):
+///
+///     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+///     (define-condition later (error) ((k :initarg :k)))
+///     (make-condition 'later :k 5)        => SIGSEGV
+///
+/// `COMMON-LISP:` is normalized away because a CL symbol's name is ordinarily
+/// reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must be one key. The
+/// same bare-name-keying hazard is noted for the DEFTYPE registry at
+/// `resolve_type_spec` (bliss-66ny) — this is that hazard in the condition
+/// registries.
+fn condition_type_key(type_name: &str) -> String {
+    let single = type_name.to_uppercase().replace("::", ":");
+    for qualifier in ["COMMON-LISP:", "CL:"] {
+        if let Some(rest) = single.strip_prefix(qualifier) {
+            return rest.to_string();
+        }
+    }
+    single
+}
+
+/// True when this name is COMMON-LISP's own — i.e. carries no package qualifier
+/// once normalized. Only such a name may match a standard condition type.
+fn names_a_standard_condition(type_name: &str) -> bool {
+    !condition_type_key(type_name).contains(':')
+}
+
 fn plist_get(list: TorclVal, key: &str) -> Option<TorclVal> {
     let mut cur = list;
     while cur.is_cons() {
@@ -11904,13 +11939,36 @@ fn plist_get(list: TorclVal, key: &str) -> Option<TorclVal> {
     None
 }
 
+/// Like [`plist_get`] but matching the FULL, package-qualified name — for the
+/// condition registries, whose keys must distinguish `MYPKG:ERROR` from `CL:ERROR`.
+///
+/// Deliberately not a change to `plist_get` itself: its other caller is the DEFTYPE
+/// registry, which is keyed by bare name ON PURPOSE (`resolve_type_spec`, bliss-66ny)
+/// and guards the collision a different way, by checking for a class of that name
+/// first. Making `plist_get` package-aware broke `(typep cv
+/// 'torcl-thread:condition-variable)`, because the deftype lookup passes a bare name.
+fn plist_get_qualified(list: TorclVal, key: &str) -> Option<TorclVal> {
+    let mut cur = list;
+    while cur.is_cons() {
+        let (entry, rest) = cp(cur);
+        if entry.is_cons() {
+            let (entry_key, entry_vals) = cp(entry);
+            if condition_type_key(&val_as_str(entry_key)) == key {
+                return Some(cp(entry_vals).0);
+            }
+        }
+        cur = rest;
+    }
+    None
+}
+
 fn plist_entry(list: TorclVal, key: &str) -> Option<TorclVal> {
     let mut cur = list;
     while cur.is_cons() {
         let (entry, rest) = cp(cur);
         if entry.is_cons() {
             let (entry_key, _) = cp(entry);
-            if symbol_bare_name(&val_as_str(entry_key)) == key {
+            if condition_type_key(&val_as_str(entry_key)) == key {
                 return Some(entry);
             }
         }
@@ -11944,7 +12002,7 @@ fn resolve_type_spec(env: &Env, type_spec: TorclVal) -> TorclVal {
 fn condition_definition_entry(env: &Env, type_name: &str) -> Option<TorclVal> {
     plist_entry(
         env.lookup_var("*CONDITION-DEFINITIONS*").unwrap_or(NIL),
-        &symbol_bare_name(type_name),
+        &condition_type_key(type_name),
     )
 }
 
@@ -11952,7 +12010,13 @@ fn condition_definition_entry(env: &Env, type_name: &str) -> Option<TorclVal> {
 type ConditionDefinition = (Vec<String>, Vec<(String, String)>);
 
 fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> {
-    match symbol_bare_name(type_name).as_str() {
+    // A qualified name is some other package's type, even when its bare name
+    // matches one of these: `MYPKG:ERROR` is not `CL:ERROR` and must not inherit
+    // its definition.
+    if !names_a_standard_condition(type_name) {
+        return None;
+    }
+    match condition_type_key(type_name).as_str() {
         "CONDITION" => Some((vec![], vec![])),
         "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "ERROR" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
@@ -12057,7 +12121,7 @@ fn condition_slot_defaults_to_nil(slot_name: &str) -> bool {
 
 fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
     let mut specs = Vec::new();
-    let type_name = symbol_bare_name(type_name);
+    let type_name = condition_type_key(type_name);
     if let Some((parents, own_slots)) = builtin_condition_definition(&type_name) {
         for parent in parents {
             specs.extend(condition_slot_specs(env, &parent));
@@ -12175,7 +12239,7 @@ fn print_condition_defined_report(
 
 fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclVal)> {
     let mut defaults = Vec::new();
-    let type_name = symbol_bare_name(type_name);
+    let type_name = condition_type_key(type_name);
     if let Some(entry) = condition_definition_entry(env, &type_name) {
         let (_, rest) = cp(entry);
         let (parents_form, rest2) = cp(rest);
@@ -12204,7 +12268,22 @@ fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, TorclV
 }
 
 fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<TorclVal, TorclError> {
-    let type_sym = resolve_sym(&symbol_bare_name(type_name)).unwrap_or(NIL);
+    // The FULL name, not the bare one. Reducing it to the bare name meant a class
+    // in any other package registered under COMMON-LISP's symbol of that name:
+    // `MYPKG::ERROR` was registered as `CL:ERROR`, replacing it. Its own parent
+    // `CL:ERROR` was then reduced the same way, resolved to the class just
+    // registered, and the class became its own superclass — after which
+    // MAKE-CONDITION of ANY condition recursed until the stack was gone
+    // (bliss-kliz4):
+    //
+    //     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+    //     (define-condition later (error) ((k :initarg :k)))
+    //     (make-condition 'later :k 5)        => SIGSEGV
+    //
+    // `resolve_sym` takes a package-qualified name (an exact registry probe first,
+    // then the reader), and every call site here passes either a bare COMMON-LISP
+    // name or an explicitly qualified one, so the full name is always resolvable.
+    let type_sym = resolve_sym(type_name).unwrap_or(NIL);
     if let Some(class) = torcl_stdlib::find_class(type_sym) {
         return Ok(class);
     }
@@ -12216,7 +12295,9 @@ fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<Torcl
         let (_, rest) = cp(entry);
         let (parents_form, _) = cp(rest);
         for parent in list_to_vec(parents_form) {
-            parent_names.push(sym_bare_name_rc(parent).to_string());
+            // Also the full name: a parent named in another package must resolve to
+            // ITS class, not to whatever COMMON-LISP calls by the same bare name.
+            parent_names.push(sym_name(parent));
         }
     } else {
         parent_names.push("CONDITION".into());
@@ -12286,9 +12367,9 @@ fn condition_type_hierarchy_names(cond: TorclVal) -> Option<Vec<String>> {
 
 fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
     let mut supers = Vec::new();
-    let mut cur = plist_get(
+    let mut cur = plist_get_qualified(
         env.lookup_var("*CONDITION-TYPES*").unwrap_or(NIL),
-        &symbol_bare_name(type_name),
+        &condition_type_key(type_name),
     );
     while let Some(list) = cur {
         for sup in list_to_vec(list) {
@@ -36529,6 +36610,26 @@ fn apply_function(
 /// builtin like FUNCALL is reported bound and `(fdefinition 'funcall)` returns a
 /// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
 /// operators and macros are intentionally excluded (they are not functions).
+/// Is `name` one of the interpreter's own builtin functions?
+///
+/// A CONSTRAINT ON WHAT MAY BE ADDED HERE. The compiled tier and the FUNCALL fast
+/// path both reduce an operator to its BARE name to decide what it is
+/// (`apply_builtin_fast` / `DIRECT_FAST`, `builtin_fn_wrapper`). So registering a
+/// builtin as `SOMEPKG:TYPEP` does not give you a distinct function: the bare name
+/// wins and CL's `TYPEP` answers instead, silently and with no warning
+/// (bliss-kliz4 — it cost a debugging session, since `(py:typep x "builtins.float")`
+/// returned NIL for every input while never being called at all).
+///
+/// The convention that avoids it, and which `TORCL-FFI` and the `PY` package both
+/// follow: register the primitive under a `TORCL::%`-prefixed name, whose bare form
+/// collides with nothing, and define the package-qualified function over it in
+/// `lib/boot.lisp`. That also gives it a real function cell, so `FUNCALL`, `APPLY`
+/// and `MAPCAR` work on it.
+///
+/// A USER's `DEFUN` of such a name is fine and needs nothing: a global function is
+/// keyed by its full name and is consulted before this predicate, so
+/// `(defun somepkg:length (x) ...)` is called correctly in both tiers. The hazard is
+/// specific to registering a *builtin* here.
 fn is_builtin_function(name: &str) -> bool {
     if name == "TORCL::%STANDARD-CHARACTER-READER" {
         return true;

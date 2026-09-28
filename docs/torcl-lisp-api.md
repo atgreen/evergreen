@@ -997,11 +997,11 @@ frames however it presents them:
 3: Python  asarray at numpy/_core/numeric.py:330
 ```
 
-It is named `PY:EXCEPTION` rather than `PY:ERROR` for a reason worth knowing if you
-define conditions of your own: TorCL's class registry is currently keyed by a
-class's *bare* name, so a class named `PY:ERROR` replaces `CL:ERROR` image-wide
-(bliss-kliz4). Until that is fixed, do not give a class a bare name that a standard
-class already uses.
+It is named `PY:EXCEPTION` rather than `PY:ERROR` because that is the better word for
+what it is. Originally the name was forced: the condition and class registries were
+keyed by a class's *bare* name, so `PY:ERROR` replaced `CL:ERROR` image-wide
+(bliss-kliz4, since fixed — a class or condition in another package now keeps its own
+identity).
 
 The inverse direction -- a Lisp condition escaping into Python becoming a Python
 exception rather than unwinding through CPython frames -- needs Python-to-Lisp

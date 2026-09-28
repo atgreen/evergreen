@@ -4044,15 +4044,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;;
 ;;; FRAMES are (FILE LINE FUNCTION) lists, outermost first -- Python's own order.
 ;;;
-;;; NAMED PY:EXCEPTION, NOT PY:ERROR, and that is not a style choice. TorCL's class
-;;; registry is keyed by a class's BARE name, so a class named PY:ERROR registers
-;;; under "ERROR" and REPLACES CL:ERROR for the whole image -- after which every
-;;; user condition's superclass "ERROR" resolves to that class, which is its own
-;;; superclass, and MAKE-CONDITION of anything recurses until the stack is gone.
-;;; It took a SIGSEGV in (make-condition 'c1) -- a definition with nothing to do
-;;; with Python -- to find that. Filed as bliss-kliz4; until it is fixed, no package
-;;; here may define a class whose bare name a standard class already uses.
-;;; EXCEPTION is also simply the better word: this is a Python exception.
+;;; NAMED PY:EXCEPTION, NOT PY:ERROR. Originally that was forced: the condition and
+;;; class registries were keyed by a class's BARE name, so a class named PY:ERROR
+;;; registered under "ERROR" and REPLACED CL:ERROR for the whole image -- after which
+;;; MAKE-CONDITION of any condition recursed until the stack was gone. It took a
+;;; SIGSEGV in (make-condition 'c1), a definition with nothing to do with Python, to
+;;; find it. That bug is FIXED (bliss-kliz4), so PY:ERROR would be safe now; the name
+;;; stays EXCEPTION because it is simply the better word for what this is.
 (define-condition py:exception (error)
   ((kind :initarg :kind :initform "PythonError" :reader py:exception-kind)
    (text :initarg :text :initform "" :reader py:exception-text)
