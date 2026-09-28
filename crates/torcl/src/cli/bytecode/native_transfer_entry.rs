@@ -46,6 +46,18 @@ fn try_clone_control_stack(
     Ok(copy)
 }
 
+struct RestartFunctionTemplates(Vec<Vec<Rc<RefCell<torcl_rt::bytecode::BytecodeFunction>>>>);
+
+impl torcl_rt::gc::TraceHostRoots for RestartFunctionTemplates {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        for templates in &self.0 {
+            for function in templates {
+                super::super::visit_bytecode_function_roots(&mut function.borrow_mut(), visit);
+            }
+        }
+    }
+}
+
 /// Only constructible through the host-specific emitter. Retaining this value
 /// retains every embedded code address and the original bytecode definition.
 pub(super) struct TransferCode {
@@ -278,6 +290,26 @@ impl TransferCode {
             Vec::<SavedHandlerBind>::with_capacity(self.body.handler_binds.len());
         let mut restart_cases =
             Vec::<SavedRestartCase>::with_capacity(self.body.restart_cases.len());
+        // Restart clause bytecode is immutable apart from GC relocation of its
+        // embedded values. Build one rooted template per static clause while
+        // ordinary Rust allocation is still allowed; dynamic scope entry then
+        // only clones an Rc handle instead of cloning the whole function.
+        let mut restart_templates = RestartFunctionTemplates(Vec::new());
+        restart_templates
+            .0
+            .try_reserve(self.body.restart_cases.len())
+            .map_err(|_| TorclError::Oom)?;
+        for info in &self.body.restart_cases {
+            let mut templates = Vec::new();
+            templates
+                .try_reserve(info.restarts.len())
+                .map_err(|_| TorclError::Oom)?;
+            for restart in &info.restarts {
+                templates.push(Rc::new(RefCell::new((*restart.function).clone())));
+            }
+            restart_templates.0.push(templates);
+        }
+        torcl_rt::rooted_ref!(_restart_templates = &mut restart_templates);
         let mut dynamic_scopes = Vec::<DynamicScope>::with_capacity(
             self.body.handler_cases.len()
                 + self.body.handler_binds.len()
@@ -309,6 +341,7 @@ impl TransferCode {
             handlers: &mut handlers,
             handler_binds: &mut handler_binds,
             restart_cases: &mut restart_cases,
+            restart_templates: &restart_templates,
             dynamic_scopes: &mut dynamic_scopes,
             cluster_frames: &mut cluster_frames,
             prepared_handler: &mut prepared_handler,
@@ -1002,15 +1035,30 @@ unsafe extern "C" fn call_or_throw(
                                 resolve_sym(&restart.name).ok_or_else(invalid_capture)?,
                             );
                         }
-                        for ((restart, (name, captured_blocks, captured_tags)), symbol) in
-                            info.restarts.iter().zip(prepared).zip(restart_symbols)
+                        let templates = unsafe { &*context.restart_templates };
+                        let Some(function_templates) = templates.0.get(*rc as usize) else {
+                            return Err(invalid_capture());
+                        };
+                        if function_templates.len() != info.restarts.len() {
+                            return Err(invalid_capture());
+                        }
+                        for (
+                            (_index, ((_restart, (name, captured_blocks, captured_tags)), symbol)),
+                            function,
+                        ) in info
+                            .restarts
+                            .iter()
+                            .zip(prepared)
+                            .zip(restart_symbols)
+                            .enumerate()
+                            .zip(function_templates)
                         {
                             env.restarts.push(RestartEntry {
                                 name,
                                 captured_blocks,
                                 captured_tags,
                                 function: RestartFunction::Bytecode {
-                                    function: Rc::new(RefCell::new((*restart.function).clone())),
+                                    function: Rc::clone(function),
                                     captured_frame: Arc::clone(&captured_frame),
                                 },
                                 interactive_function: None,
@@ -1367,6 +1415,7 @@ struct CaptureContext {
     handlers: *mut Vec<SavedHandler>,
     handler_binds: *mut Vec<SavedHandlerBind>,
     restart_cases: *mut Vec<SavedRestartCase>,
+    restart_templates: *const RestartFunctionTemplates,
     dynamic_scopes: *mut Vec<DynamicScope>,
     cluster_frames: *mut Vec<(u32, *mut Frame)>,
     prepared_handler: *mut Option<PreparedHandler>,

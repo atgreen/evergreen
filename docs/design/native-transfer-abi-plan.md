@@ -578,7 +578,9 @@ validating the native cluster stack after a transfer does not grow a Rust
 container. Native catch and handler registration now uses fallible string,
 token, and vector construction; restart names and captured exit stacks are
 prepared before mutating the live restart stack, so a failed reservation cannot
-leave a partial dynamic scope.
+leave a partial dynamic scope. Static restart clause bytecode is rooted in
+per-entry templates and dynamic scopes share handles to those templates rather
+than cloning a bytecode function after native entry.
 The reserve failure is reported as `STORAGE-CONDITION`/`Oom` before generated
 code runs. This removes two avoidable cold-path allocations; arbitrary cleanup
 code can still allocate, and the full preallocated emergency storage path is
