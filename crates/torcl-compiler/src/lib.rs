@@ -9,6 +9,7 @@ pub mod macroexpand;
 pub mod reader;
 
 // ── Intermediate representation ───────────────────────────────────
+pub mod control_scope;
 pub mod ir;
 
 // ── T2 optimising compiler (block-based SSA, spec §4.3–§4.10) ──────

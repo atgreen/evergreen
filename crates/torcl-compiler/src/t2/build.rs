@@ -24,6 +24,7 @@
 //! exits) return `Err(BuildError::Unsupported(..))`; the caller keeps such a
 //! function at T1 (spec R4.28). Correctness over coverage.
 
+use crate::control_scope::{ScopeError, ScopeMap, is_never_returning_call};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
@@ -41,6 +42,7 @@ use torcl_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc, typep_cl
 /// modelled). The caller keeps such a function at T1 (spec R4.28).
 #[derive(Clone, Debug)]
 pub enum BuildError {
+    InvalidScopes(ScopeError),
     Unsupported(&'static str),
     /// An instruction the builder does not model, named by its `Instr`
     /// discriminant. The bare `Unsupported("opcode not modelled by T2 builder")`
@@ -53,20 +55,6 @@ pub enum BuildError {
 /// The `Instr` variant name, for diagnostics. `Debug` renders the whole
 /// instruction including operands; the discriminant alone is what identifies
 /// the missing builder case.
-/// Calls that never return normally, so the path after them is unreachable
-/// (bliss-wukf). CLHS: ERROR "never returns normally". Deliberately narrow --
-/// SIGNAL returns when unhandled, CERROR returns when the continue restart is
-/// taken, and WARN returns normally, so none of them belong here.
-fn is_never_returning_call(sym: u32) -> bool {
-    matches!(
-        crate::reader::symbol_name(sym)
-            .as_deref()
-            .map(|n| n.rsplit(':').next().unwrap_or(n).to_string())
-            .as_deref(),
-        Some("ERROR")
-    )
-}
-
 fn instr_kind(instr: &Instr) -> String {
     let full = format!("{instr:?}");
     match full.find(['(', ' ', '{']) {
@@ -215,6 +203,7 @@ struct Builder<'a> {
     /// resetting the operand stack to `sp_restore` and pushing the value
     /// (bliss-8tlo).
     block_exits: HashMap<u32, (u32, u16)>,
+    control_scopes: Option<ScopeMap>,
     /// Predecessor edges of a block: `(pred_block, target_index_in_pred_terminator)`.
     pred_edges: HashMap<Block, Vec<(Block, usize)>>,
     /// Total structural predecessor-edge count of each block (drives sealing).
@@ -256,6 +245,7 @@ impl<'a> Builder<'a> {
             block_of: HashMap::new(),
             entry_depth: HashMap::new(),
             block_exits: HashMap::new(),
+            control_scopes: None,
             pred_edges: HashMap::new(),
             total_preds: Vec::new(),
             reachable: Vec::new(),
@@ -287,6 +277,7 @@ impl<'a> Builder<'a> {
 
         self.find_leaders()?;
         self.compute_depths()?;
+        self.control_scopes = Some(ScopeMap::analyze(code).map_err(BuildError::InvalidScopes)?);
         self.create_blocks();
         self.compute_reachable()?;
         self.compute_total_preds()?;
@@ -1011,7 +1002,7 @@ impl<'a> Builder<'a> {
                     term = Some(Term::Jump(s));
                     break;
                 }
-                Instr::ReturnFrom { block_id } => {
+                Instr::ReturnFrom { .. } => {
                     // The runtime pops the value, unwinds to the block, resets
                     // the operand stack to `sp_restore` and pushes the value
                     // back. Mirror that here so the exit stack matches what
@@ -1025,10 +1016,13 @@ impl<'a> Builder<'a> {
                     let v = stack
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (ReturnFrom)"))?;
-                    let (resume_bcp, sp_restore) = *self
-                        .block_exits
-                        .get(block_id)
-                        .ok_or(BuildError::Unsupported("ReturnFrom to an unknown block"))?;
+                    let exit = self
+                        .control_scopes
+                        .as_ref()
+                        .expect("scope analysis before SSA")
+                        .exit_at(i as u32)
+                        .ok_or(BuildError::Unsupported("ReturnFrom without active scope"))?;
+                    let (resume_bcp, sp_restore) = (exit.target_bcp, exit.sp_restore);
                     let restore = sp_restore as usize;
                     if stack.len() < restore {
                         return Err(BuildError::Unsupported("ReturnFrom below sp_restore"));

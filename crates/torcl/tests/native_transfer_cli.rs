@@ -374,3 +374,59 @@ fn throw_values_survive_cleanup_in_bytecode_and_eval() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("THROW-VALUES-OK"));
 }
+
+#[test]
+fn superseding_nested_cleanups_do_not_replay_outer_cleanup_suffixes() {
+    let program = r#"
+        (defvar *cleanup-effects* nil)
+        (defun cleanup-return ()
+          (unwind-protect (values (list :primary) (list :secondary))
+            (block done (unwind-protect 3 (return-from done 4)))
+            (push :suffix *cleanup-effects*)))
+        (defun cleanup-go ()
+          (unwind-protect (values (list :primary) (list :secondary))
+            (tagbody (unwind-protect 3 (go done)) done)
+            (push :suffix *cleanup-effects*)))
+        (defun cleanup-throw ()
+          (unwind-protect (values (list :primary) (list :secondary))
+            (catch 'done (unwind-protect 3 (throw 'done 4)))
+            (push :suffix *cleanup-effects*)))
+        (defun cleanup-pending-throw ()
+          (catch 'outer
+            (unwind-protect (throw 'outer (values (list :primary) (list :secondary)))
+              (block done (unwind-protect 3 (return-from done 4)))
+              (push :suffix *cleanup-effects*))))
+        (dolist (fn '(cleanup-return cleanup-go cleanup-throw cleanup-pending-throw))
+          (setq *cleanup-effects* nil)
+          (assert (equal '((:primary) (:secondary)) (multiple-value-list (funcall fn))))
+          (assert (equal '(:suffix) *cleanup-effects*)))
+        ;; An exit contained inside a cleanup must preserve that cleanup's
+        ;; continuation and the outer one; only crossed continuations expire.
+        (defun cleanup-contained-return ()
+          (unwind-protect (values (list :primary) (list :secondary))
+            (unwind-protect 3
+              (block local (return-from local 4))
+              (push :inner *cleanup-effects*))
+            (push :outer *cleanup-effects*)))
+        (setq *cleanup-effects* nil)
+        (assert (equal '((:primary) (:secondary))
+          (multiple-value-list (cleanup-contained-return))))
+        (assert (equal '(:outer :inner) *cleanup-effects*))
+        (format t "CLEANUP-CONTINUATIONS-OK~%")
+    "#;
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+            .args(["--no-init", "--eval", program])
+            .env("TORCL_LAZY_COMPILE", "0")
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .expect("run nested cleanup retirement oracle");
+        assert!(
+            output.status.success(),
+            "tier={tier} stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("CLEANUP-CONTINUATIONS-OK"));
+    }
+}

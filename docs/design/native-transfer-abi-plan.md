@@ -199,7 +199,11 @@ If native continuation is unavailable or invalidated:
    elide their scope transitions based on ordinary function-entry assumptions.
    Cleanup may allocate, yield, call native code, or supersede the original
    transfer. Restore bindings at their defined unwind points, not in one bulk
-   reset before cleanup.
+   reset before cleanup. A running cleanup's saved continuation also has a
+   dynamic extent: retire it when an exit crosses its enclosing handler boundary,
+   while preserving outer continuations and exits contained inside the cleanup.
+   The bytecode fallback records this handler depth (`bliss-8m8ac`); omitting it
+   replayed an outer cleanup suffix even when final return values were correct.
 4. **GC sees all live state throughout the transition.** Capture current
    register roots and publish call-site maps before any preparation allocation
    or safepoint. Keep old maps valid until the reconstructed frames/packet are
@@ -319,8 +323,8 @@ zero overhead for signal polling, or change the Fibonacci algorithm.
 
 ## Segment boundary implementation checkpoint
 
-The runtime now provides an x86-64 Linux SysV segment adapter in
-`crates/torcl-rt/src/native_transfer.rs`. Its Rust wrapper pins the anchor,
+The runtime provides x86-64 Linux SysV and Windows Win64 segment adapters in
+`crates/torcl-rt/src/native_transfer.rs` and its `win64` module. The Rust wrapper pins the anchor,
 records execution ownership and TorclStack watermarks, and restores the previous
 anchor with a Rust guard. The private assembly entry uses the explicit outcome
 out parameter above; the Rust wrapper returns `Result<NativeOutcome,
@@ -332,7 +336,12 @@ enclosing Rust frames alive.
 Activation currently requires a successful Linux shadow-stack status query
 reporting no enabled features. Unknown status and enabled shadow stacks refuse
 entry; no mitigation is disabled. Indirect assembly entries and the landing
-continuation have `ENDBR64`. Other targets refuse this adapter.
+continuation have `ENDBR64`. Win64 entry additionally preserves RDI, RSI and
+XMM6–XMM15, supplies the callee's 32-byte home area, and carries assembler-generated
+SEH unwind metadata. It requires successful CFG and user-shadow-stack policy
+queries with no enabled flags. Query output starts with an invalid sentinel;
+success without a written output does not grant permission. Other targets refuse
+this adapter.
 
 Assembly probes cover register/control-word restoration, stack alignment,
 anchor invalidation, ownership/watermarks, nested entries and Rust destructor
@@ -349,9 +358,45 @@ unchanged TorclStack watermarks and restoration of enclosing recovery targets.
 This is boundary infrastructure, not activation: generated Lisp calls
 still use the existing ABI and successful-return checks. Transfer payload
 rooting, cleanup/root retirement, native dispatch, actual JIT integration of the
-fault-recovery/unwind gates, fiber migration and the Win64 adapter remain
+fault-recovery/unwind gates, fiber migration and native-Windows execution gates remain
 required before rollout. The
 adapter records TorclStack watermarks but does not restore them itself.
+
+### Windows validation and Wine limits
+
+Wine remains a fast regression environment for Windows functionality. It does
+not establish Windows performance or hardware-mitigation behavior. Wine 11.0
+(Staging) here returns success from `GetProcessMitigationPolicy` for CFG and
+user shadow stacks without changing the output DWORD. The sentinel check
+therefore refuses segment execution. This does not invalidate independently
+exercised pathname, I/O or unwind-table tests.
+The behavior matches the [Wine 11.0 source stub](https://github.com/wine-mirror/wine/blob/wine-11.0/dlls/kernelbase/process.c#L828-L836),
+which returns success without writing the buffer. Repairing that query requires
+accurate policy reporting or an unsupported-query error; arbitrary zero output
+would conceal the missing information.
+
+The Win64 machine probe compiles the same instructions on Linux with Rust's
+`win64` calling convention and checks host shadow-stack compatibility before
+execution. It covers all eight integer nonvolatiles, all 128 bits of XMM6–XMM15,
+FP controls, home space, alignment, Rust helper destructors and all three exit
+kinds. Windows `RtlVirtualUnwind` separately checks the actual COFF metadata at
+the body and landing continuation under Wine using a synthetic saved frame.
+Neither substitutes for running the public entry on native Windows.
+
+Capability-dependent execution tests are explicitly ignored by default. Selecting
+them with `--include-ignored` makes unknown or incompatible mitigation state a
+failure, not a successful no-op. On native Windows, the release gate must run:
+
+```text
+cargo test -p torcl-rt --target x86_64-pc-windows-msvc --lib native_transfer -- --include-ignored --nocapture
+cargo test -p torcl-rt --target x86_64-pc-windows-msvc --test native_segment_windows -- --include-ignored --nocapture
+```
+
+Report machine execution, refusal behavior, ignored tests and metadata checks
+separately. Never disable mitigations to make a gate pass. Native Windows CI and
+the remaining SEH/mitigation gates are tracked in `bliss-shih7.14` and gate final
+activation. The boundary follows Microsoft's [x64 prologue/epilogue rules](https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog)
+and [process mitigation query contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessmitigationpolicy).
 
 ## Baseline contract oracles and boundary inventory
 
@@ -400,7 +445,38 @@ state and result availability. DCE keeps exceptional-only operands; inlining
 maps result definitions before successor arguments.
 
 This is compiler infrastructure, not activation of the native transfer ABI.
-The ordinary builder still emits Call. Scope ownership analysis, automatic
+The ordinary builder still emits Call. Complete scope coverage, automatic
 exception-edge construction, pass-wide integration, machine landing pads and
 unwind maps remain required. Lowering marks Invoke as unsupported until those
 machine contracts are implemented, preventing accidental ordinary-call emission.
+
+
+### Ordered control-scope analysis
+
+`control_scope::ScopeMap` tracks active BLOCK, TAGBODY and CATCH records at
+bytecode positions. Joins require the same ordered records; lexical exits must
+select an active target. GO retains its TAGBODY and reports intervening records
+in unwind order; RETURN-FROM also removes its target BLOCK. T2 validates this
+state before erasing handler instructions and uses it to resolve RETURN-FROM.
+
+OSR analysis marks records already live at entry as inherited, and subsequent
+pushes as local. Inherited BLOCK/CATCH exceptional resumes remain reachable even
+though their establishing PUSH is outside the segment. Ownership disagreements
+at joins conservatively refuse compilation. This metadata does not authorize
+eliding inherited runtime records or change the existing OSR fallback policy.
+
+UNWIND-PROTECT analysis distinguishes its installed handler, the normal-path
+POP/EnterCleanupNormal handoff, and a running saved continuation. Cleanup entry
+removes the installed handler. CleanupReturn reaches registered normal resumes;
+resumed unwinds retain their dynamic target selection. A lexical exit's removed
+records distinguish cleanups still to execute from running continuations that
+must be superseded. Nested cleanups and OSR inside a running cleanup preserve
+outer scope ownership. Malformed cleanup handoffs and orphan returns are refused.
+
+The analysis is conservative: cold target edges establish possible scope state,
+not proof that a cleanup will complete normally. Actual native control flow must
+run required cleanups and respect a cleanup's replacement transfer before
+reaching an exit target. T2 still declines cleanup bytecodes until that lowering
+exists. Condition and restart clusters remain explicitly unsupported by this
+analysis. Automatic Invoke construction and attaching scope maps to installed
+native code remain required before native dispatch.

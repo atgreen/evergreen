@@ -12942,8 +12942,16 @@ struct RuntimeClause {
     var_slot: Option<u16>,
 }
 
+/// A running cleanup's saved continuation and its dynamic extent. Handlers
+/// established inside that cleanup have indices at or above `handler_depth`.
+/// An unwind reaching a lower handler abandons this continuation (bliss-8m8ac).
+struct CleanupCont {
+    handler_depth: usize,
+    action: CleanupAction,
+}
+
 /// What to do when a cleanup body finishes (`CleanupReturn`).
-enum CleanupCont {
+enum CleanupAction {
     /// Normal completion of `unwind-protect`: restore the protected form's
     /// values and resume at `resume_bcp`.
     ///
@@ -12980,7 +12988,7 @@ fn visit_pending_roots(pending: &mut Pending, visit: &mut dyn FnMut(*mut TorclVa
         Pending::Return { value, .. } => visit(value),
         // A propagating error can carry movable TorclVals — TypeError.datum,
         // UNBOUND-VARIABLE/UNDEFINED-FUNCTION names, or a Signalled condition
-        // (bliss-9kc). While it is parked in a CleanupCont::Resume during an
+        // (bliss-9kc). While it is parked in a CleanupAction::Resume during an
         // UNWIND-PROTECT cleanup, that cleanup can allocate and move the nursery,
         // so those roots must be traced or they go stale (bliss-3scj).
         Pending::Propagate(error) => {
@@ -12999,8 +13007,8 @@ impl torcl_rt::gc::TraceHostRoots for Pending {
 
 impl torcl_rt::gc::TraceHostRoots for CleanupCont {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
-        match self {
-            CleanupCont::Normal { value, values, .. } => {
+        match &mut self.action {
+            CleanupAction::Normal { value, values, .. } => {
                 visit(value);
                 // The saved value list survives the cleanup body, which
                 // allocates freely, so every element is a root (bliss-pfgq).
@@ -13010,7 +13018,7 @@ impl torcl_rt::gc::TraceHostRoots for CleanupCont {
                     }
                 }
             }
-            CleanupCont::Resume(pending) => visit_pending_roots(pending, visit),
+            CleanupAction::Resume(pending) => visit_pending_roots(pending, visit),
         }
     }
 }
@@ -14495,10 +14503,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 };
                 let act = &mut acts[top_idx];
                 let value = act.pop_op();
-                act.cleanup_conts.push(CleanupCont::Normal {
-                    resume_bcp,
-                    value,
-                    values,
+                act.cleanup_conts.push(CleanupCont {
+                    handler_depth: act.handlers.len(),
+                    action: CleanupAction::Normal {
+                        resume_bcp,
+                        value,
+                        values,
+                    },
                 });
                 act.bcp = cleanup_bcp as usize;
             }
@@ -14507,8 +14518,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     .cleanup_conts
                     .pop()
                     .expect("CleanupReturn without a pending cleanup continuation");
-                match cont {
-                    CleanupCont::Normal {
+                match cont.action {
+                    CleanupAction::Normal {
                         resume_bcp,
                         value,
                         values,
@@ -14523,7 +14534,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         act.push_op(value);
                         act.bcp = resume_bcp as usize;
                     }
-                    CleanupCont::Resume(pending) => {
+                    CleanupAction::Resume(pending) => {
                         initiate_unwind(acts, stack, env, pending)?;
                     }
                 }
@@ -14749,7 +14760,19 @@ fn initiate_unwind(
     }
     loop {
         let top = acts.len() - 1;
-        let handler = acts[top].handlers.last().cloned();
+        let act = &mut acts[top];
+        // A transfer can exit an inner cleanup while retaining an outer one.
+        // Discard only continuations whose enclosing handler boundary is being
+        // crossed. Otherwise a later CleanupReturn resumes an abandoned inner
+        // protected form and replays the outer cleanup suffix (bliss-8m8ac).
+        while act
+            .cleanup_conts
+            .last()
+            .is_some_and(|cont| cont.handler_depth >= act.handlers.len())
+        {
+            act.cleanup_conts.pop();
+        }
+        let handler = act.handlers.last().cloned();
         match handler {
             Some(Handler::Unwind {
                 cleanup_bcp,
@@ -14758,7 +14781,10 @@ fn initiate_unwind(
                 let act = &mut acts[top];
                 act.handlers.pop();
                 act.sp_top = sp_restore;
-                act.cleanup_conts.push(CleanupCont::Resume(pending));
+                act.cleanup_conts.push(CleanupCont {
+                    handler_depth: act.handlers.len(),
+                    action: CleanupAction::Resume(pending),
+                });
                 act.bcp = cleanup_bcp as usize;
                 return Ok(());
             }
@@ -21074,6 +21100,113 @@ mod direct_call_invalidation_tests {
                     "offset {offset}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn native_control_scopes_follow_lowered_lisp_and_osr_ownership() {
+        use torcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun scope-probe () nil)", &mut env).unwrap();
+        torcl_rt::rooted!(
+            form = reader::read_from_string(
+                "((catch 'escape (block done (tagbody top
+                (block inner (scope-probe)) (go top)))))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = compile_function("SCOPE-PROBE-BODY", NIL, *form, &env, false, false)
+            .expect("lower nested control scopes");
+        let (go_pc, header) = body
+            .code
+            .iter()
+            .enumerate()
+            .find_map(|(pc, instr)| {
+                if let Instr::Go { target_bcp, .. } = instr {
+                    Some((pc as u32, *target_bcp))
+                } else {
+                    None
+                }
+            })
+            .expect("source loop has GO");
+        let normal = ScopeMap::analyze(&body.code).expect("lowered scopes agree");
+        let inherited = normal.before(header).unwrap();
+        assert!(
+            inherited
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::Catch { .. }))
+        );
+        assert!(
+            inherited
+                .iter()
+                .any(|s| matches!(s.kind, ScopeKind::Tagbody { .. }))
+        );
+        let osr = ScopeMap::analyze_osr(&body.code, header).expect("OSR scopes agree");
+        assert!(
+            osr.before(header)
+                .unwrap()
+                .iter()
+                .all(|s| s.ownership == Ownership::Inherited)
+        );
+        let probe_pc = body
+            .code
+            .iter()
+            .position(|instr| {
+                matches!(instr,
+                    Instr::CallNamed { sym, .. } if reader::symbol_name(*sym)
+                        .is_some_and(|n| n.ends_with("SCOPE-PROBE"))
+                )
+            })
+            .expect("source calls probe") as u32;
+        let at_probe = osr.before(probe_pc).unwrap();
+        assert_eq!(at_probe.len(), inherited.len() + 1);
+        assert_eq!(at_probe.last().unwrap().ownership, Ownership::Local);
+        assert_eq!(osr.before(go_pc).unwrap(), osr.before(header).unwrap());
+        assert!(osr.exit_at(go_pc).unwrap().removed.is_empty());
+    }
+
+    #[test]
+    fn native_control_scopes_follow_lowered_nested_cleanups() {
+        use torcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        torcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun cleanup-scope-probe () nil)", &mut env).unwrap();
+        for source in [
+            "((unwind-protect (cleanup-scope-probe) (cleanup-scope-probe)))",
+            "((unwind-protect
+                (unwind-protect (cleanup-scope-probe) (cleanup-scope-probe))
+                (unwind-protect (cleanup-scope-probe) (cleanup-scope-probe))))",
+            "((block done (unwind-protect (return-from done 1) (return-from done 2))))",
+            "((unwind-protect 1 (block done (return-from done 2))))",
+        ] {
+            torcl_rt::rooted!(form = reader::read_from_string(source).unwrap().0);
+            let body = compile_function("CLEANUP-SCOPE-PROBE", NIL, *form, &env, false, false)
+                .expect("lower cleanup source");
+            let map = ScopeMap::analyze(&body.code)
+                .unwrap_or_else(|e| panic!("{source}: {e:?}\n{:?}", body.code));
+            let mut cleanups = 0;
+            for instr in &body.code {
+                if let Instr::PushUnwind { cleanup_bcp, .. } = instr {
+                    cleanups += 1;
+                    let scope = map.before(*cleanup_bcp).unwrap().last().unwrap();
+                    assert!(matches!(scope.kind, ScopeKind::Cleanup { .. }));
+                    let osr = ScopeMap::analyze_osr(&body.code, *cleanup_bcp)
+                        .unwrap_or_else(|e| panic!("{source} OSR at {cleanup_bcp}: {e:?}"));
+                    assert_eq!(
+                        osr.before(*cleanup_bcp).unwrap().last().unwrap().ownership,
+                        Ownership::Inherited
+                    );
+                }
+            }
+            assert!(cleanups > 0, "source must actually lower a cleanup");
         }
     }
 
