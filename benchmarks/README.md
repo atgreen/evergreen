@@ -9,7 +9,10 @@ The current sample report is generated from the native-transfer ABI work. Five
 alternating samples measure Fibonacci, the Ironclad POWER-MOD kernel, and a
 caught TYPE-ERROR path. The report also records process-wide retired-instruction
 counts from `perf`; every TorCL sample passed its checksum and listed-hot-function
-T2 gates. These are local measurements, not a universal performance claim.
+T2 gates. The checked-in report enables the opt-in segment ABI; recursive
+Fibonacci is explicitly admitted through the direct-self-call fallback while
+the frame-safe recursive segment entry is developed. These are local
+measurements, not a universal performance claim.
 
 The sample report verifies T2 before and after every listed measured TorCL
 function. The exceptional-path case deliberately keeps its handler and error
@@ -22,7 +25,7 @@ On Linux with Python 3.10+, SBCL, `taskset`, and a working systemd user session:
 ```sh
 TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh \
   cargo build --release -p torcl --bin torcl
-python3 benchmarks/run.py --cpu 0
+python3 benchmarks/run.py --cpu 0 --native-transfer
 ```
 
 Add `--instructions` to collect process-wide retired-instruction counts with
