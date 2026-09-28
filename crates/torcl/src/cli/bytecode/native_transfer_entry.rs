@@ -77,6 +77,7 @@ pub(super) struct TransferCode {
     code: JitBuffer,
     _veneer: JitBuffer,
     _capture: JitBuffer,
+    _poll: JitBuffer,
     _completion: JitBuffer,
     landing: JitBuffer,
     sites: SysvTransferTable,
@@ -188,10 +189,11 @@ impl TransferCode {
         let ir = torcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
         let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
+        let poll = JitBuffer::new(&emit_helper_veneer(poll_or_transfer, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
         let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
         let landing = JitBuffer::new(&emit_native_landing_stub())?;
-        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_handlers(
+        let (emitted, sites) = torcl_compiler::t2::emit::emit_framed_native_handlers_with_poll(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -200,6 +202,7 @@ impl TransferCode {
             c2i_clear_mv as *const () as u64,
             deliver_catch as *const () as u64,
             deliver_handler as *const () as u64,
+            poll.as_ptr() as u64,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -260,6 +263,7 @@ impl TransferCode {
             code,
             _veneer: veneer,
             _capture: capture,
+            _poll: poll,
             _completion: completion,
             landing,
             sites,
@@ -1398,6 +1402,27 @@ unsafe extern "C" fn call_or_throw(
             value: NIL,
             exit: NativeExit::Transfer,
         });
+    }
+}
+
+/// Native loop-header poll used by the segment emitter. The poll may park for
+/// a moving-GC rendezvous and may publish a pending signal/error, so it runs
+/// behind the same rooted helper veneer as an exceptional call. A normal poll
+/// returns a successful outcome; the veneer never performs a status check in
+/// generated code. A nonzero result enters the existing capture/landing path.
+unsafe extern "C" fn poll_or_transfer(
+    _request: *mut u8,
+    out: *mut torcl_rt::native_transfer::NativeOutcome,
+) {
+    use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
+    torcl_rt::safepoint::poll_safepoint();
+    let exit = if super::native_loop_should_exit() != 0 {
+        NativeExit::Transfer
+    } else {
+        NativeExit::Returned
+    };
+    unsafe {
+        out.write(NativeOutcome { value: NIL, exit });
     }
 }
 

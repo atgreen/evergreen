@@ -2738,6 +2738,7 @@ enum CleanupEmission {
 struct TransferEmission {
     veneer: u64,
     cleanup: Option<CleanupEmission>,
+    poll_veneer: Option<u64>,
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
     landings: std::collections::HashMap<crate::t2::ir::Block, (u32, u32)>,
     catch_landings: std::collections::HashMap<crate::t2::ir::Block, Vec<(u32, u32, u32)>>,
@@ -2773,6 +2774,7 @@ pub fn emit_framed_transfers_with_cleanup(
         call_veneer,
         activation_slots,
         cleanup.map(|(save, restore)| CleanupEmission::Normal { save, restore }),
+        None,
     )
 }
 
@@ -2803,6 +2805,7 @@ pub fn emit_framed_native_cleanups(
             catch_landing: 0,
             handler_landing: 0,
         }),
+        None,
     )
 }
 
@@ -2832,6 +2835,7 @@ pub fn emit_framed_native_catches(
             catch_landing,
             handler_landing: 0,
         }),
+        None,
     )
 }
 
@@ -2848,6 +2852,36 @@ pub fn emit_framed_native_handlers(
     catch_landing: u64,
     handler_landing: u64,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_framed_native_handlers_with_poll(
+        f,
+        call_veneer,
+        activation_slots,
+        save,
+        complete,
+        clear_mv,
+        catch_landing,
+        handler_landing,
+        0,
+    )
+}
+
+/// Native-cleanup emission with a helper veneer used at loop-header polls.
+/// The veneer returns normally when the execution may continue and enters the
+/// existing capture/landing path when GC, a signal, or a pending native error
+/// requires the segment to leave.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_poll(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    clear_mv: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
@@ -2862,6 +2896,7 @@ pub fn emit_framed_native_handlers(
             catch_landing,
             handler_landing,
         }),
+        (poll_veneer != 0).then_some(poll_veneer),
     )
 }
 
@@ -2871,6 +2906,7 @@ fn emit_transfer_function(
     call_veneer: u64,
     activation_slots: u16,
     cleanup: Option<CleanupEmission>,
+    poll_veneer: Option<u64>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
     let native_cleanups = matches!(cleanup, Some(CleanupEmission::Native { .. }));
@@ -2965,6 +3001,7 @@ fn emit_transfer_function(
     let mut transfers = TransferEmission {
         veneer: call_veneer,
         cleanup,
+        poll_veneer,
         sites: vec![],
         landings: std::collections::HashMap::new(),
         catch_landings: std::collections::HashMap::new(),
@@ -3621,6 +3658,66 @@ fn emit_framed_inner(
         next_stack += 1;
         Some(home)
     };
+    // Native segment polling is placed at loop headers rather than after every
+    // branch. This keeps condition flags intact and guarantees that every
+    // cycle reaches a poll. Until terminator liveness maps are published, only
+    // loops with no moving roots are admitted: a poll may park for a moving GC,
+    // so synchronizing an incomplete root set would be unsound.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let backedge_headers = if transfers
+        .as_ref()
+        .and_then(|transfer| transfer.poll_veneer)
+        .is_some()
+    {
+        let mut successors: HashMap<_, Vec<_>> = HashMap::new();
+        for &block in &blocks {
+            successors.insert(
+                block,
+                f.terminator(block)
+                    .map(|terminator| {
+                        f.inst(terminator)
+                            .targets
+                            .iter()
+                            .map(|target| target.block)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        let reaches = |start, goal| {
+            let mut pending = vec![start];
+            let mut seen = HashSet::new();
+            while let Some(block) = pending.pop() {
+                if block == goal {
+                    return true;
+                }
+                if !seen.insert(block) {
+                    continue;
+                }
+                if let Some(next) = successors.get(&block) {
+                    pending.extend(next.iter().copied());
+                }
+            }
+            false
+        };
+        let mut headers = HashSet::new();
+        for &block in &blocks {
+            let Some(terminator) = f.terminator(block) else {
+                continue;
+            };
+            for target in &f.inst(terminator).targets {
+                if reaches(target.block, block) {
+                    headers.insert(target.block);
+                }
+            }
+        }
+        if !headers.is_empty() && root_shadow_slots != 0 {
+            return Err(EmitError::UnsupportedOp(0xFE));
+        }
+        headers
+    } else {
+        HashSet::new()
+    };
     let native_spill_slots = next_stack;
     let regalloc_spill_slots = machine.num_spill_slots;
     let allocation_edits = machine.allocation_edits.len();
@@ -3867,6 +3964,21 @@ fn emit_framed_inner(
     // (with block-parameter moves on each out-edge).
     for (bi, &b) in blocks.iter().enumerate() {
         a.bind(block_label[&b]);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if backedge_headers.contains(&b) {
+            let poll_veneer = transfers
+                .as_ref()
+                .and_then(|transfer| transfer.poll_veneer)
+                .ok_or(EmitError::UnsupportedOp(0xFE))?;
+            let frame_base = frame_base_home.ok_or(EmitError::UnsupportedOp(0xFE))?;
+            // The poll helper ignores the request payload. Passing the rooted
+            // activation pointer keeps the veneer ABI uniform and gives the
+            // capture stub a live, stable request word if it takes the cold
+            // transfer path.
+            load_home(&mut a, 7, frame_base, 0);
+            mov_imm64(&mut a, RAX, poll_veneer as i64);
+            emit_runtime_helper_call(&mut a, 0, None);
+        }
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).
         let mut proven: HashSet<Value> = if b == entry {

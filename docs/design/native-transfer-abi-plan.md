@@ -250,12 +250,16 @@ edges through a helper veneer. The explicit fallback prevents pathological
 segment nesting; `bliss-49gcf` tracks a frame-safe recursive segment entry.
 
 The segment emitter's exceptional edges and landing pads are exercised by the
-native POWER-MOD and caught-condition benchmarks. Independent asynchronous
-Each segment now performs a root-safe safepoint and pending-signal poll before
-generated entry. Independent asynchronous signal/GC polling at native loop
-back-edges remains a separate activation gate
-(`bliss-shih7.6`); a successful segment return must not be read as proof that
-the polling obligation is complete.
+native POWER-MOD and caught-condition benchmarks. Each segment now performs a
+root-safe safepoint and pending-signal poll before generated entry. Native loop
+headers also use the helper-v2 veneer to poll for GC and asynchronous signals;
+a slow poll transfers through the same capture and cleanup landing path as an
+exceptional helper result, without a successful-call status check. Until
+terminator liveness maps are published, the segment emitter admits only loop
+headers with no moving roots at the poll point. Loops that need those maps,
+unsupported platforms, and hardening failures conservatively use the legacy
+checked entry. `bliss-shih7.6` remains open for precise rootful loop maps,
+bounded straight-line poll sites, and the full fiber/foreign callback matrix.
 
 ## Polling independently of exceptions
 
