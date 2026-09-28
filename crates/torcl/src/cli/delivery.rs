@@ -194,6 +194,7 @@ fn bytecode_references_with_params(
 }
 
 struct Plan {
+    builtins: std::collections::BTreeSet<String>,
     unreachable_setf_writers: Vec<String>,
     unreachable_macros: Vec<(u32, String)>,
     generic_candidates: BTreeMap<String, u64>,
@@ -386,6 +387,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         }
         let mut capability_roots = std::collections::BTreeSet::new();
         let mut walker_roots = std::collections::BTreeSet::new();
+        let mut builtins = std::collections::BTreeSet::new();
         let mut capabilities = spec.runtime_keep.clone();
         if !spec.explicit_dynamic_roots {
             capabilities.extend(
@@ -536,6 +538,15 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                             || symbols::symbol_package(index)
                                 .and_then(torcl_stdlib::packages::package_name)
                                 .is_some_and(|package| package == "COMMON-LISP");
+                        if runtime_symbol {
+                            builtins.insert(name.clone());
+                            // Evaluated extension dispatch normalizes these aliases.
+                            for package in ["TORCL-EXT", "TORCL-INTERNAL"] {
+                                if let Some(rest) = name.strip_prefix(&format!("{package}::")) {
+                                    builtins.insert(format!("{package}:{rest}"));
+                                }
+                            }
+                        }
                         if runtime_symbol && !builtin_without_source_evaluation(&name) {
                             walker_roots.insert(format!(
                                 "{}: builtin evaluator dependency",
@@ -649,6 +660,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             .collect();
         unreachable_source_closures.sort_unstable();
         Plan {
+            builtins,
             unreachable_setf_writers: writer_definitions
                 .records
                 .into_iter()
@@ -769,6 +781,9 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     torcl_stdlib::pathnames::clear_delivery_string_caches()?;
     let plan = analyze(&spec, entry, &keeps, env)?;
     let mut selected = native_runtime::contract();
+    if !spec.specialized && selected.builtins.is_some() {
+        return Err(error("runtime = full requires a full delivery driver"));
+    }
     if !spec.specialized
         && crate::runtime_contract::CAPABILITIES
             .iter()
@@ -778,6 +793,13 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, TorclError> {
     }
     if spec.specialized {
         selected.capabilities = plan.capabilities.clone();
+        // Source evaluation still has implicit builtin calls. Keep its complete
+        // dispatch until those dependencies are expressed as graph edges.
+        selected.builtins = if plan.capabilities.contains("tree-walker") {
+            None
+        } else {
+            Some(plan.builtins.clone())
+        };
     }
     native_runtime::contract()
         .accepts(&selected)

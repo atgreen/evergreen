@@ -887,6 +887,20 @@ fn native_delivery_prunes_unused_bytecode_macro() {
         ],
     ));
     assert!(report.contains("capabilities=\n"), "{report}");
+    let builtins = report
+        .lines()
+        .find_map(|line| line.strip_prefix("builtins="))
+        .expect("native builtin selection");
+    assert_ne!(builtins, "*");
+    let names: Vec<_> = builtins.split(',').collect();
+    assert!(
+        names.contains(&"57524954452d4c494e45"),
+        "WRITE-LINE missing: {report}"
+    );
+    assert!(
+        !names.contains(&"53494e"),
+        "unreachable SIN retained: {report}"
+    );
     assert!(
         report.contains("remove COMPILED-MACROS::UNUSED:"),
         "{report}"
@@ -1513,7 +1527,7 @@ fn saved_images_validate_native_requirements_before_restore() {
         &["--eval", &format!("(save-lisp-and-die {core:?})")],
     ));
     let mut bytes = fs::read(&core).unwrap();
-    let marker = b"schema=1\nsource=";
+    let marker = b"schema=2\nsource=";
     let offset = bytes
         .windows(marker.len())
         .position(|w| w == marker)
@@ -1675,6 +1689,18 @@ fn native_delivery_removes_the_walker_for_source_free_code() {
     );
     let symbols = ok(Command::new("nm").args(["-C", &exe]).output().unwrap());
     assert!(symbols.contains("torcl::cli::"), "missing symbol table");
+    for omitted in [
+        "torcl_stdlib::ffi::memory_call",
+        "torcl_stdlib::pathnames::directory",
+        "torcl_stdlib::sequences::reverse",
+    ] {
+        assert!(
+            !symbols.contains(omitted),
+            "unreachable builtin remains linked: {omitted}"
+        );
+    }
+    println!("{report}");
+
     assert!(
         !symbols.contains("torcl::cli::eval_list"),
         "tree walker remains linked"

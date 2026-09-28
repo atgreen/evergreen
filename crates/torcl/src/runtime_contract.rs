@@ -35,6 +35,8 @@ pub struct Contract {
     pub features: BTreeSet<String>,
     pub rustflags: String,
     pub capabilities: BTreeSet<String>,
+    /// None means the complete builtin set; Some(empty) means no dispatch arms.
+    pub builtins: Option<BTreeSet<String>>,
 }
 impl Contract {
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -51,6 +53,7 @@ impl Contract {
                 "features",
                 "rustflags",
                 "capabilities",
+                "builtins",
             ]
             .contains(&key)
                 || fields.insert(key, value).is_some()
@@ -60,7 +63,7 @@ impl Contract {
                 ));
             }
         }
-        if fields.remove("schema") != Some("1") {
+        if fields.remove("schema") != Some("2") {
             return Err("unsupported runtime contract schema".into());
         }
         let mut required = |key| {
@@ -118,6 +121,39 @@ impl Contract {
         if closed != capabilities {
             return Err("dynamic-code requires every native capability".into());
         }
+        let raw = fields
+            .remove("builtins")
+            .ok_or("missing runtime builtins")?;
+        let builtins = if raw == "*" {
+            None
+        } else {
+            let mut names = BTreeSet::new();
+            if !raw.is_empty() {
+                for encoded in raw.split(',') {
+                    if encoded.is_empty()
+                        || encoded.len() % 2 != 0
+                        || !encoded.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return Err("invalid encoded builtin name".into());
+                    }
+                    let bytes = encoded
+                        .as_bytes()
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+                        })
+                        .collect();
+                    let name = String::from_utf8(bytes).map_err(|_| "invalid builtin UTF-8")?;
+                    if name.chars().any(char::is_control) || !names.insert(name) {
+                        return Err("invalid or duplicate builtin name".into());
+                    }
+                }
+            }
+            Some(names)
+        };
+        if capabilities.contains("dynamic-code") && builtins.is_some() {
+            return Err("dynamic-code requires every native builtin".into());
+        }
         Ok(Self {
             source,
             target,
@@ -125,11 +161,12 @@ impl Contract {
             features: feature_set,
             rustflags,
             capabilities,
+            builtins,
         })
     }
     pub fn encode(&self) -> String {
         format!(
-            "schema=1\nsource={}\ntarget={}\ntoolchain={}\nfeatures={}\nrustflags={}\ncapabilities={}\n",
+            "schema=2\nsource={}\ntarget={}\ntoolchain={}\nfeatures={}\nrustflags={}\ncapabilities={}\nbuiltins={}\n",
             self.source,
             self.target,
             self.toolchain,
@@ -139,7 +176,17 @@ impl Contract {
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            self.builtins.as_ref().map_or_else(
+                || "*".to_owned(),
+                |names| {
+                    names
+                        .iter()
+                        .map(|name| name.bytes().map(|b| format!("{b:02x}")).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            )
         )
     }
     pub fn accepts(&self, required: &Self) -> Result<(), String> {
@@ -158,6 +205,65 @@ impl Contract {
         if !required.capabilities.is_subset(&self.capabilities) {
             return Err("image requires unavailable native runtime capabilities".into());
         }
+        if let Some(available) = &self.builtins {
+            if required
+                .builtins
+                .as_ref()
+                .is_none_or(|needed| !needed.is_subset(available))
+            {
+                return Err("image requires unavailable native builtins".into());
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod builtin_contract_tests {
+    use super::Contract;
+
+    fn contract(builtins: &str, capabilities: &str) -> Result<Contract, String> {
+        Contract::parse(&format!(
+            "schema=2\nsource=test\ntarget=test\ntoolchain=test\nfeatures=\nrustflags=\ncapabilities={capabilities}\nbuiltins={builtins}\n"
+        ))
+    }
+
+    #[test]
+    fn builtin_requirements_are_checked_when_restoring_an_image() {
+        // Names are UTF-8 hex: '*' is multiplication, not the full-set marker.
+        let full = contract("*", "").unwrap();
+        let small = contract("2a,434152", "").unwrap();
+        let car = contract("434152", "").unwrap();
+        let empty = contract("", "").unwrap();
+        assert!(full.accepts(&small).is_ok());
+        assert!(small.accepts(&car).is_ok());
+        assert!(car.accepts(&small).is_err());
+        assert!(small.accepts(&full).is_err());
+        assert!(small.accepts(&empty).is_ok());
+        assert!(empty.accepts(&car).is_err());
+        assert_eq!(Contract::parse(&small.encode()).unwrap(), small);
+    }
+
+    #[test]
+    fn dynamic_code_requires_all_native_builtins() {
+        let capabilities = "disassembly,dynamic-code,tree-walker";
+        assert!(contract("*", capabilities).is_ok());
+        assert!(contract("434152", capabilities).is_err());
+        assert!(contract("", capabilities).is_err());
+    }
+
+    #[test]
+    fn malformed_builtin_sets_are_rejected() {
+        for names in [
+            "CAR",
+            "0",
+            "ff",
+            "00",
+            "434152,434152",
+            ",434152",
+            "434152,",
+        ] {
+            assert!(contract(names, "").is_err(), "accepted {names}");
+        }
     }
 }

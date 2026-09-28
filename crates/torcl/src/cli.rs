@@ -32740,6 +32740,7 @@ fn call_direct_builtin(
     apply_builtin_fast(name, args, env)
 }
 
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn apply_numeric_op(name: &str, args: &[TorclVal]) -> Option<Result<TorclVal, TorclError>> {
     Some(match name {
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
@@ -33435,6 +33436,7 @@ fn is_builtin_function(name: &str) -> bool {
 /// (bliss-x5y.9). This is what closes most of the T1-bytecode-vs-T0-tree-walker
 /// gap on a source-free asdf.bfasl load, where `ensure-package` hammers TYPEP
 /// (check-type) and GETHASH.
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn apply_builtin_fast(
     name: &str,
     args: &[TorclVal],
@@ -34159,6 +34161,7 @@ fn apply_python_builtin(name: &str, args: &[TorclVal]) -> Result<TorclVal, Torcl
     }
 }
 
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn apply_builtin(name: &str, args: &[TorclVal], _env: &mut Env) -> Result<TorclVal, TorclError> {
     if cfg!(torcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
         return Err(TorclError::ProgramError(format!(

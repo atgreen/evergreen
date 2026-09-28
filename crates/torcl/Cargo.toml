@@ -35,6 +35,7 @@ python = ["torcl-rt/python", "torcl-stdlib/python"]
 thread-cache-alloc = []
 
 [dependencies]
+torcl-delivery-macros = { path = "../torcl-delivery-macros" }
 torcl-rt.workspace = true
 torcl-compiler.workspace = true
 torcl-stdlib.workspace = true

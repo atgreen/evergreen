@@ -239,17 +239,21 @@ still retain all native capabilities even when its application
 entry point comes from BFASL. The source-free native-removal tests use images
 built with `--no-bootstrap`.
 
-This is not yet general removal of every unused Rust builtin.
-Retained bootstrap functions and macros can call open-code operations and keep
-all native capabilities even when the application entry does not call `EVAL`;
-the report identifies these dependencies.
+When the walker is unnecessary, delivery also selects native builtin dispatch
+arms from the reachable symbols. Unselected arms are removed before Rust code
+generation, allowing LTO and linker garbage collection to discard their helpers
+and library implementations. Aliases sharing an arm retain that implementation
+together. Builtin slot numbers remain stable across runtimes. Images requiring
+the walker currently retain the full builtin dispatcher until its implicit
+calls are represented in the dependency graph. Reachable dynamic-code
+operations always retain every builtin.
 
 Delivery generates a versioned native contract, builds through Cargo in
 `target/delivery/` under the source checkout, checks the resulting executable,
 and appends the reduced image. Compile-time selection removes references to the
 instruction decoder; release LTO and linker garbage collection can then remove
 its implementation. The cache separates source versions, targets, capabilities,
-Cargo features, compiler flags, and toolchain identities. Existing output files
+builtin selections, Cargo features, compiler flags, and toolchain identities. Existing output files
 survive a failed build or compatibility check. A dry run only reports selection
 and does not invoke Cargo.
 
@@ -257,7 +261,9 @@ and does not invoke Cargo.
 same compatibility information and is checked before heap restoration. Source
 content identity, target, Rust toolchain, Cargo features, and compiler flags
 must match; the runtime's native capabilities must include the image's required
-capabilities. The source fingerprint is a compatibility identifier, not a
+capabilities and builtin set. Contract schema 2 records builtin names as UTF-8
+hex strings; `builtins=*` denotes the complete set. The source fingerprint is a
+compatibility identifier, not a
 cryptographic signature. Full runtimes can still read older images; specialized
 runtimes require the new metadata. A reduced driver cannot be used for
 `runtime = full` delivery.

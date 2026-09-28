@@ -35,6 +35,7 @@ pub(super) fn call(
     Some(result)
 }
 
+#[torcl_delivery_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
         "PRINT" => Some(|_operator, args, env| {

@@ -30,7 +30,13 @@ fn fingerprint(root: &Path) -> String {
         root.join("Cargo.lock"),
         root.join(".cargo/config.toml"),
     ];
-    for name in ["torcl", "torcl-rt", "torcl-compiler", "torcl-stdlib"] {
+    for name in [
+        "torcl",
+        "torcl-rt",
+        "torcl-compiler",
+        "torcl-stdlib",
+        "torcl-delivery-macros",
+    ] {
         let package = root.join("crates").join(name);
         paths.push(package.join("Cargo.toml"));
         if package.join("build.rs").is_file() {
@@ -62,6 +68,8 @@ fn fingerprint(root: &Path) -> String {
 
 fn configure_runtime() {
     println!("cargo:rerun-if-env-changed=TORCL_RUNTIME_MANIFEST");
+    println!("cargo:rustc-check-cfg=cfg(torcl_specialized_builtins)");
+    println!("cargo:rustc-check-cfg=cfg(torcl_builtin, values(any()))");
     println!("cargo:rustc-check-cfg=cfg(torcl_no_disassembly)");
     println!("cargo:rustc-check-cfg=cfg(torcl_no_dynamic_code)");
     println!("cargo:rustc-check-cfg=cfg(torcl_no_tree_walker)");
@@ -95,6 +103,7 @@ fn configure_runtime() {
             .bytes()
             .map(|b| format!("{b:02x}"))
             .collect(),
+        builtins: None,
         capabilities: runtime_contract::CAPABILITIES
             .iter()
             .map(|s| (*s).to_owned())
@@ -131,6 +140,12 @@ fn configure_runtime() {
     }
     if !selected.capabilities.contains("tree-walker") {
         println!("cargo:rustc-cfg=torcl_no_tree_walker");
+    }
+    if let Some(builtins) = &selected.builtins {
+        println!("cargo:rustc-cfg=torcl_specialized_builtins");
+        for name in builtins {
+            println!("cargo:rustc-cfg=torcl_builtin={name:?}");
+        }
     }
     // Keep the shared builtin dependency catalog exercised by the build too.
     assert!(runtime_contract::opens_code_world("EVAL"));
