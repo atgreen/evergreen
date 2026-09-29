@@ -80,9 +80,12 @@ def main():
                     "--eval",
                     "(progn (defun ppc-segment-identity () 41) "
                     "(defun ppc-segment-argument (x) x) "
+                    "(defun ppc-segment-branch (x) (if x 1 2)) "
                     "(defun ppc-segment-add (x) (+ x 1)) "
                     "(assert (= (ppc-segment-identity) 41)) "
                     "(assert (= (ppc-segment-argument 42) 42)) "
+                    "(assert (= (ppc-segment-branch t) 1)) "
+                    "(assert (= (ppc-segment-branch nil) 2)) "
                     "(assert (= (ppc-segment-add 41) 42)) "
                     "(format t \"PPC-NATIVE-SEGMENT-OK~%\"))",
                 ],
@@ -97,7 +100,7 @@ def main():
                     f"{native.stdout}\n{native.stderr}"
                 )
             assert "PPC-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
-            assert native.stderr.count("[native-transfer/ppc64le] direct segment:") >= 2, native.stderr
+            assert native.stderr.count("[native-transfer/ppc64le] direct segment:") >= 3, native.stderr
             print(f"{arch}: opt-in native segment entry: OK", flush=True)
 
         if arch == "win64":
