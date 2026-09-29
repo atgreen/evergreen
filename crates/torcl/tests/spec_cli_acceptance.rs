@@ -2101,10 +2101,16 @@ fn runaway_recursion_signals_storage_condition_instead_of_crashing() {
     // Both shapes are checked: a direct self-call, which recurses inside the
     // bytecode loop, and one through FUNCALL, which leaves and re-enters the
     // runtime on every level.
+    //
+    // NOT tail calls -- the `1+` around each consumes the result, so a frame per
+    // level is genuinely required. Written in tail position this test HUNG once
+    // self tail calls started reusing the frame (bliss-ieajy.3): an infinite
+    // tail recursion is an infinite LOOP, which exhausts nothing and never
+    // returns. The property under test is unchanged, so the probe is what moved.
     // `--eval` echoes the form's value as well, so compare the printed line.
     let printed = eval_ok(
         "(progn
-               (defun runaway-direct (n) (runaway-direct (+ n 1)))
+               (defun runaway-direct (n) (1+ (runaway-direct (+ n 1))))
                (defun runaway-funcall (n) (funcall #'runaway-funcall (+ n 1)))
                (flet ((probe (thunk)
                         (handler-case (funcall thunk)

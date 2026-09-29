@@ -132,8 +132,11 @@ fn t1_promotes_non_leaf_functions() {
 #[test]
 fn t1_non_leaf_deep_recursion_is_catchable() {
     for prog in [
-        // self-recursion that compiles + promotes.
-        "(defun countdown (n) (if (= n 0) 0 (countdown (- n 1)))) (countdown 3)(countdown 3) \
+        // Self-recursion that compiles + promotes. NOT a tail call: the `1+`
+        // consumes the result, so a frame per level is required. In tail
+        // position this returned 0 rather than :CAUGHT once self tail calls
+        // started reusing the frame (bliss-ieajy.3) -- it exhausted nothing.
+        "(defun countdown (n) (if (= n 0) 0 (1+ (countdown (- n 1))))) (countdown 3)(countdown 3) \
            (format t \"~a\" (handler-case (countdown 1000000) (storage-condition () :caught)))",
         // a labels-local recursive function (also compiles + promotes).
         "(format t \"~a\" (handler-case (labels ((f (n) (+ 1 (f (+ n 1))))) (f 0)) \

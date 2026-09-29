@@ -52,6 +52,33 @@ const SAME_EITHER_WAY: &str = r#"
   (format t "SWAP ~A~%" (swap-args :x :y 101))
 "#;
 
+/// The COND shape, which is where adjacency was not enough. Each arm of a COND
+/// lowers to a jump to a shared join point, so the self call is followed by
+/// `Br`, not by the epilogue -- exactly UIOP's LEXICOGRAPHIC<, whose lowering
+/// reads `CallNamed{self} ; Br(42) ; … ; 42 PopHandler ; 43 Return`.
+const COND_SHAPED: &str = r#"
+  (defun walk (n acc)
+    (cond ((zerop n) acc)
+          ((evenp n) (walk (1- n) (1+ acc)))
+          (t (walk (1- n) acc))))
+  ;; Four arms, and the tail call is the middle one rather than the last, so the
+  ;; branch being threaded is a forward jump over the arms that follow it.
+  (defun pick (n acc)
+    (cond ((zerop n) (list :zero acc))
+          ((> n 0) (pick (- n 1) (+ acc 2)))
+          ((< n -5) (list :low acc))
+          (t (list :neg acc))))
+  ;; Multiple values out of a COND-shaped loop: they must not be truncated on
+  ;; the way through the threaded branch.
+  (defun cond-mv (n)
+    (cond ((zerop n) (values :a :b :c))
+          (t (cond-mv (1- n)))))
+  (dotimes (i 500) (walk 5 0) (pick 5 0) (cond-mv 3))
+  (format t "COND ~A~%" (walk 1000000 0))
+  (format t "ARMS ~A~%" (pick 1000000 0))
+  (format t "COND-VALUES ~A~%" (multiple-value-list (cond-mv 1000000)))
+"#;
+
 /// Cases that need the frame reuse to reach the depth they ask for.
 const DEEP: &str = r#"
   (defun count-down (n acc) (if (zerop n) acc (count-down (1- n) (1+ acc))))
@@ -125,6 +152,29 @@ fn a_self_tail_call_runs_a_million_deep() {
             "RETURN-FROM (EARLY 51)",
         ],
     );
+}
+
+#[test]
+fn a_cond_arm_is_a_tail_call_too() {
+    let (ok, stdout, stderr) = run(COND_SHAPED, false);
+    assert!(ok, "{stdout}\n{stderr}");
+    expect(
+        &stdout,
+        &stderr,
+        &[
+            // Half the million are even, so acc counts them.
+            "COND 500000",
+            "ARMS (ZERO 2000000)",
+            "COND-VALUES (A B C)",
+        ],
+    );
+    // And the same answers without the pass, at a depth both can reach.
+    let shallow = COND_SHAPED.replace("1000000", "300");
+    let (ok, plain, err) = run(&shallow, true);
+    assert!(ok, "{plain}\n{err}");
+    let (ok, opt, err2) = run(&shallow, false);
+    assert!(ok, "{opt}\n{err2}");
+    assert_eq!(plain, opt, "the rewrite changed a COND-shaped answer");
 }
 
 #[test]

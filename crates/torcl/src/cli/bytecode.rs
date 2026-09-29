@@ -12049,6 +12049,16 @@ fn tco_debug(func: &BytecodeFunction, why: &str) -> bool {
 ///
 /// Returns whether anything was rewritten. Every bail is safe: it only forgoes
 /// the optimisation.
+///
+/// ONE OBSERVABLE BEHAVIOUR CHANGES, and it is inherent to the optimisation
+/// rather than a defect: an INFINITE self tail recursion, `(defun f (n) (f (1+
+/// n)))`, used to exhaust the stack and raise a catchable STORAGE-CONDITION.
+/// It is now an infinite loop, which exhausts nothing and never returns --
+/// exactly what a tail call means. Four probes in the test suite were written
+/// that way and had to move to non-tail recursion to keep testing the stack
+/// bound they assert; one of them HUNG the suite for 900 seconds before it was
+/// found. Anything that relies on runaway recursion terminating itself needs a
+/// real termination condition instead.
 fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool {
     if tco_disabled() {
         return false;
@@ -12108,15 +12118,43 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
         .count();
 
     // ── sites ──────────────────────────────────────────────────────
+    //
+    // Tail position is decided by THREADING branches, not by looking at the one
+    // next instruction. A COND lowers each arm to a jump to a shared join, so in
+    // UIOP's LEXICOGRAPHIC< the self call is followed by `Br` to the epilogue:
+    //
+    //    38  CallNamed { sym: self, nargs: 3 }
+    //    39  Br(42)
+    //    42  PopHandler
+    //    43  Return
+    //
+    // That is a tail call by any reading, and adjacency alone misses it -- which
+    // is to say it misses nearly every multi-armed CL conditional. Measured over
+    // a full load of real ASDF/UIOP, adjacency found NO sites at all; threading
+    // finds them.
+    //
+    // Only `Br` and `PopHandler` may be threaded through. In particular NOT
+    // `ClearMv`: that truncates the call's result to one value, and a back-edge
+    // skipping it would let the base case's `(values 1 2)` escape a
+    // single-value context untruncated.
     let site_epilogue = |i: usize| -> bool {
         let mut j = i + 1;
         let mut pops = 0usize;
-        while j < code.len() && matches!(code[j], Instr::PopHandler) {
-            pops += 1;
-            j += 1;
+        // A Br chain cannot revisit an instruction without looping forever, so
+        // this bound is a safety net rather than a real limit.
+        for _ in 0..=code.len() {
+            match code.get(j) {
+                Some(Instr::Br(t)) => j = *t as usize,
+                Some(Instr::PopHandler) => {
+                    pops += 1;
+                    j += 1;
+                }
+                // Exactly the prologue's blocks left open, and then the return.
+                Some(Instr::Return) => return pops == entry,
+                _ => return false,
+            }
         }
-        // Exactly the prologue's blocks left open, and then the return.
-        pops == entry && j < code.len() && matches!(code[j], Instr::Return)
+        false
     };
     let sites: Vec<usize> = (0..code.len().saturating_sub(1))
         .filter(|&i| {
