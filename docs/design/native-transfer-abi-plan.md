@@ -1154,10 +1154,7 @@ call or branch; independent loop and straight-line poll veneers remain in
 place. The fallback and handler tests cover multiple values, inherited OSR
 handlers, replacing cleanups, fiber yields, and moving-GC roots on x86-64
 Linux. Narrow constant/identity segment entries also pass the AArch64 and
-s390x QEMU portability gates. Native transfer admission now also accepts
-verified T2 functions with non-entry OSR loop headers; a compiler regression
-checks that the loop poll veneer is emitted and that no return-status target is
-introduced.
+s390x QEMU portability gates.
 
 The legacy checked ABI remains a required compatibility path. It is still used
 for unsupported bodies and platforms, nested native-to-Lisp calls, allocation
