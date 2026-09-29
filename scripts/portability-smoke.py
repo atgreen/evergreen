@@ -103,6 +103,39 @@ def main():
             assert native.stderr.count("[native-transfer/ppc64le] direct segment:") >= 3, native.stderr
             print(f"{arch}: opt-in native segment entry: OK", flush=True)
 
+        if arch == "aarch64":
+            # The parity loop may use the checked fallback.  This separate
+            # opt-in probe proves that a leaf body reaches the AAPCS64 segment
+            # adapter at the Rust/native invocation boundary.
+            native_env = env.copy()
+            native_env["TORCL_FORCE_TIER"] = "t2"
+            native_env["TORCL_NATIVE_TRANSFER"] = "1"
+            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["TORCL_NN_DIRECT"] = "0"
+            native = subprocess.run(
+                command + [
+                    "--no-init",
+                    "--eval",
+                    "(progn (defun aarch64-segment-constant () 41) "
+                    "(defun aarch64-segment-identity (x) x) "
+                    "(assert (= (aarch64-segment-constant) 41)) "
+                    "(assert (= (aarch64-segment-identity 42) 42)) "
+                    "(format t \"AARCH64-NATIVE-SEGMENT-OK~%\"))",
+                ],
+                env=native_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if native.returncode:
+                raise RuntimeError(
+                    f"AArch64 native segment exit {native.returncode}\n"
+                    f"{native.stdout}\n{native.stderr}"
+                )
+            assert "AARCH64-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
+            assert native.stderr.count("[native-transfer/aarch64] direct segment:") >= 2, native.stderr
+            print(f"{arch}: opt-in native segment entry: OK", flush=True)
+
         if arch == "win64":
             home_env = env.copy()
             home_env.pop("HOME", None)

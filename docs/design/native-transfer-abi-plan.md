@@ -970,10 +970,13 @@ remain in the final portability audit.
 The AArch64 runtime now has the corresponding AAPCS64 segment enter/leave
 boundary in `crates/torcl-rt/src/native_transfer/aarch64.rs`, with a QEMU probe
 covering normal return, direct transfer, anchor cleanup and host-stack
-restoration. This is a machine-boundary milestone only: CLI compiler activation
-remains behind the checked fallback until generated entry admission,
-deoptimization metadata, fault recovery, handlers and cleanup capture have
-target-specific contracts.
+restoration. The CLI has a narrow `TORCL_NATIVE_TRANSFER=1` entry for constant
+and identity T2 bodies: it supplies the nonallocating multiple-values adapter,
+publishes the active environment, and falls back before any Lisp call,
+deoptimization, handler, cleanup, or loop-polling operation. This does not
+claim general AArch64 activation; generated entry admission, deoptimization
+metadata, fault recovery, handlers and cleanup capture remain target-specific
+gates.
 
 The s390x runtime now has the corresponding ELF64 segment enter/leave boundary
 in `crates/torcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering
