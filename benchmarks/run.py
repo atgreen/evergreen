@@ -132,10 +132,19 @@ def render(data):
             current = case['results']['TorCL']['median_seconds']
             change = (before / current - 1.0) * 100.0
             direction = 'faster' if change >= 0 else 'slower'
+            before_instructions = previous.get('instructions')
+            current_instructions = case['results']['TorCL'].get('instructions')
+            instruction_cells = ''
+            if before_instructions and current_instructions:
+                instruction_cells = (
+                    f'<td>{before_instructions["median"]:,}</td>'
+                    f'<td>{current_instructions["median"]:,}</td>'
+                )
             rows.append(
                 f'<tr><th>{esc(case["title"])}</th>'
                 f'<td>{1000 * before:.3f}</td>'
                 f'<td>{1000 * current:.3f}</td>'
+                f'{instruction_cells}'
                 f'<td>{abs(change):.1f}% {direction}</td></tr>'
             )
         baseline_html = (
@@ -144,7 +153,8 @@ def render(data):
             'using the same workloads and five-sample protocol. Lower is better.</p>'
             '<div class="table-wrap"><table><thead><tr>'
             '<th>Workload</th><th>Baseline median ms</th>'
-            '<th>Current median ms</th><th>Change</th></tr></thead><tbody>'
+            '<th>Current median ms</th><th>Baseline instructions</th>'
+            '<th>Current instructions</th><th>Change</th></tr></thead><tbody>'
             + ''.join(rows)
             + '</tbody></table></div>'
         )
