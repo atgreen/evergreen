@@ -325,6 +325,11 @@ step 7 and local-exit/scope work. Steps 9 and 10 follow final activation.
 Keep unsupported platforms on the old ABI until their own gates pass.
 QEMU proves functional behavior only; native hardware is required for platform
 performance claims. x86-64 Linux and Windows are the first delivery milestone.
+The portability gate now builds AArch64 and s390x with the cross-image-compatible
+Rust 1.93.0 override and runs them under QEMU. Both pass `portable_os`,
+interpreter/T0/T2, GC-stress and image round-trip probes; s390x also passes its
+native T1/T2, OSR, moving-GC, signal and JIT smoke probes. These results validate
+the legacy ABI boundary, not native transfer activation.
 
 The current Lisp segment entry is compiled and activated only on x86-64 Linux.
 The x86-64 Windows build deliberately routes ordinary invocations through the
