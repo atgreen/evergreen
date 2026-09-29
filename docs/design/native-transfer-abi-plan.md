@@ -333,8 +333,9 @@ the legacy ABI boundary, not native transfer activation.
 
 The full Lisp segment entry is compiled and activated only on x86-64 Linux.
 PPC64LE now has an opt-in, deliberately narrow entry for allocation-free,
-scope-free bodies; calls, loops requiring polls, handlers, cleanup, deopt and
-other unsupported shapes decline to the checked ABI. The x86-64 Windows build
+scope-free, deopt-free bodies; calls, speculative guards, loops requiring polls,
+handlers, cleanup and other unsupported shapes decline to the checked ABI. The
+x86-64 Windows build
 deliberately routes ordinary invocations through the checked legacy ABI while
 the native Windows mitigation and SEH gates remain unproven. These are rollout
 boundaries, not claims of full native transfer coverage; each platform's
@@ -959,8 +960,9 @@ support. The first ELFv2 segment slice is implemented in
 return, direct transfer landing, anchor cleanup, and ELFv2 nonvolatile state.
 The CLI also has a narrow opt-in PPC64LE entry in
 `crates/torcl/src/cli/bytecode/native_transfer_entry_ppc64le.rs`; it enters the
-real segment for bodies with no calls or protected scopes and falls back to the
-checked ABI otherwise. Full PPC fault-recovery metadata, native handlers,
+real segment for deopt-free bodies with no calls or protected scopes and falls
+back to the checked ABI otherwise. Full PPC deoptimization and fault-recovery
+metadata, native handlers,
 cleanup capture, loop polling and local-exit admission remain open under
 `bliss-1rt.2`. Foreign callbacks and all architecture-specific entry stubs
 remain in the final portability audit.
