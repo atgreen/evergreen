@@ -934,6 +934,12 @@ The checked-in `windows-native-transfer` job in `.github/workflows/ci.yml` runs
 the native Windows execution test with `--include-ignored`; the Linux/Wine job
 continues to provide only cross-build and regression coverage.
 
+The cross-target `native_segment_windows` test was also run under Wine outside
+the sandbox. Its refusal test passed, while the execution test failed with
+"mitigation state unavailable or incompatible". That is the intended refusal
+under Wine and confirms that the sentinel policy does not silently execute the
+segment without verified mitigations.
+
 ## Baseline contract oracles and boundary inventory
 
 `crates/torcl/tests/native_transfer_cli.rs` verifies real T1/T2 entries, direct
