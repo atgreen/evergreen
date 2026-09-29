@@ -967,6 +967,14 @@ cleanup capture, loop polling and local-exit admission remain open under
 `bliss-1rt.2`. Foreign callbacks and all architecture-specific entry stubs
 remain in the final portability audit.
 
+The AArch64 runtime now has the corresponding AAPCS64 segment enter/leave
+boundary in `crates/torcl-rt/src/native_transfer/aarch64.rs`, with a QEMU probe
+covering normal return, direct transfer, anchor cleanup and host-stack
+restoration. This is a machine-boundary milestone only: CLI compiler activation
+remains behind the checked fallback until generated entry admission,
+deoptimization metadata, fault recovery, handlers and cleanup capture have
+target-specific contracts.
+
 Compiler work decomposition under `bliss-shih7.11`:
 
 * `bliss-shih7.11.1`: Specify exceptional CFG and liveness invariants.

@@ -6,26 +6,49 @@ use crate::execution_local::ExecutionLocal;
 use crate::stack::{Frame, TorclStack};
 #[cfg(any(
     all(target_arch = "x86_64", any(target_os = "linux", windows)),
-    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
 ))]
 use crate::value::NIL;
 use crate::value::TorclVal;
 use std::cell::Cell;
 
+#[cfg(all(target_arch = "aarch64", unix))]
+mod aarch64;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+mod ppc64le;
 #[cfg(all(target_arch = "x86_64", any(windows, all(test, target_os = "linux"))))]
 mod win64;
-#[cfg(all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"))]
-mod ppc64le;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use self::enter_sysv as enter_platform;
+#[cfg(all(target_arch = "aarch64", unix))]
+use aarch64::enter as enter_platform;
+#[cfg(all(target_arch = "aarch64", unix))]
+pub use aarch64::leave_native_segment;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+use ppc64le::enter as enter_platform;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+pub use ppc64le::leave_native_segment;
 #[cfg(all(target_arch = "x86_64", windows))]
 use win64::enter as enter_platform;
-#[cfg(all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"))]
-use ppc64le::enter as enter_platform;
 #[cfg(all(target_arch = "x86_64", windows))]
 pub use win64::leave_native_segment;
-#[cfg(all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"))]
-pub use ppc64le::leave_native_segment;
 
 #[repr(u64)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,13 +160,26 @@ pub fn is_supported() -> bool {
     {
         win64::is_supported()
     }
-    #[cfg(all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ))]
     {
         ppc64le::is_supported()
     }
+    #[cfg(all(target_arch = "aarch64", unix))]
+    {
+        aarch64::is_supported()
+    }
     #[cfg(not(any(
         all(target_arch = "x86_64", any(target_os = "linux", windows)),
-        all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+        all(
+            target_arch = "powerpc64",
+            target_endian = "little",
+            target_os = "linux"
+        ),
+        all(target_arch = "aarch64", unix),
     )))]
     {
         false
@@ -152,12 +188,22 @@ pub fn is_supported() -> bool {
 
 #[cfg(any(
     all(target_arch = "x86_64", any(target_os = "linux", windows)),
-    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
 ))]
 struct ActiveSegment(*mut NativeSegment);
 #[cfg(any(
     all(target_arch = "x86_64", any(target_os = "linux", windows)),
-    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
 ))]
 impl Drop for ActiveSegment {
     fn drop(&mut self) {
@@ -178,7 +224,12 @@ impl Drop for ActiveSegment {
 /// The returned primary must be rooted before the caller next allocates.
 #[cfg(any(
     all(target_arch = "x86_64", any(target_os = "linux", windows)),
-    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
 ))]
 pub unsafe fn invoke_native_segment(
     entry: *const u8,
@@ -222,7 +273,12 @@ pub unsafe fn invoke_native_segment(
 /// Same entry/slot contract as the supported implementation; no code is entered.
 #[cfg(not(any(
     all(target_arch = "x86_64", any(target_os = "linux", windows)),
-    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
 )))]
 pub unsafe fn invoke_native_segment(
     _entry: *const u8,
