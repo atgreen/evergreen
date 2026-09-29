@@ -65,6 +65,37 @@ def main():
             print(f"{arch}: {tier or 'default'}: OK", flush=True)
         assert all(output == outputs[0] for output in outputs), outputs
 
+        if arch == "ppc64le":
+            # The parity loop may use the checked fallback.  This separate
+            # opt-in probe proves that a leaf body reaches the ELFv2 segment
+            # adapter at the Rust/native invocation boundary.
+            native_env = env.copy()
+            native_env["TORCL_FORCE_TIER"] = "t2"
+            native_env["TORCL_NATIVE_TRANSFER"] = "1"
+            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["TORCL_NN_DIRECT"] = "0"
+            native = subprocess.run(
+                command + [
+                    "--no-init",
+                    "--eval",
+                    "(progn (defun ppc-segment-identity () 41) "
+                    "(assert (= (ppc-segment-identity) 41)) "
+                    "(format t \"PPC-NATIVE-SEGMENT-OK~%\"))",
+                ],
+                env=native_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if native.returncode:
+                raise RuntimeError(
+                    f"PPC native segment exit {native.returncode}\n"
+                    f"{native.stdout}\n{native.stderr}"
+                )
+            assert "PPC-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
+            assert "[native-transfer/ppc64le] direct segment:" in native.stderr, native.stderr
+            print(f"{arch}: opt-in native segment entry: OK", flush=True)
+
         if arch == "win64":
             home_env = env.copy()
             home_env.pop("HOME", None)
