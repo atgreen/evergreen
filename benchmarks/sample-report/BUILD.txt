@@ -1,28 +1,27 @@
-Native-transfer ABI milestone benchmark report
+Current native-transfer ABI benchmark report
 
-Commit: 7d2eafda
+Commit: 07bcaf78
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
 
-The report uses five alternating TorCL/SBCL samples on CPU 0, the native
-transfer opt-in, retired-instruction counts from perf, and a bounded 8 GiB /
-1200-second child runner. Every TorCL sample passed its checksum gate, reached
-T2 for every listed hot function before and after timing, and recorded zero
-timed deoptimizations.
+Five alternating TorCL/SBCL samples on CPU 0 used the native-transfer opt-in,
+retired-instruction counts from perf, and the bounded child runner. Every TorCL
+sample passed its checksum gate, reached T2 for every listed hot function before
+and after timing, and recorded zero timed deoptimizations.
 
-Fibonacci F(30), ten evaluations per workload:
-  TorCL median 67 ms, 7,809,664 retired instructions
-  SBCL median 119 ms, 7,890,439 retired instructions
+Fibonacci · recursive:
+  TorCL median 33 ms, 7,811,498 retired instructions
+  SBCL median 57 ms, 7,896,004 retired instructions
 
-Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 1,100 ms, 7,734,380 retired instructions
-  SBCL median 20 ms, 7,893,008 retired instructions
+Ironclad · modular exponentiation:
+  TorCL median 1110 ms, 7,814,233 retired instructions
+  SBCL median 10 ms, 7,893,761 retired instructions
 
-Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 651 ms, 7,816,465 retired instructions
-  SBCL median 5 ms, 7,805,526 retired instructions
+Conditions · caught type errors:
+  TorCL median 734 ms, 7,816,835 retired instructions
+  SBCL median 5 ms, 7,895,059 retired instructions
 
-Historical baseline is retained in results.json. The HTML and JSON retain all
-samples, checksums, tier evidence, instruction counts, source hashes, and
-binary hashes. These are local workstation measurements; host contention and
-clock variance remain visible in the sample table.
+The historical baseline remains nested in results.json. The HTML and JSON
+retain all samples, checksums, tier evidence, instruction counts, source hashes,
+and binary hashes. These are local workstation measurements; host contention
+and clock variance remain visible in the sample table.
