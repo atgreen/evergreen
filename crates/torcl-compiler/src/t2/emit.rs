@@ -3706,10 +3706,86 @@ fn emit_framed_inner(
     };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let loop_roots: HashMap<crate::t2::ir::Block, Vec<Value>> = HashMap::new();
+    // Keep long straight-line native segments interruptible as well. Polls are
+    // attached to source instructions (before their first machine instruction)
+    // so they never disturb a branch's condition flags. Their roots are the
+    // values live at that exact machine program point, not a guessed block-wide
+    // set; an incomplete map rejects this native artifact before installation.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let (straight_poll_sources, straight_poll_roots):
+        (HashSet<Inst>, HashMap<Inst, Vec<Value>>) = if transfers
+        .as_ref()
+        .and_then(|transfer| transfer.poll_veneer)
+        .is_some()
+    {
+        const POLL_INTERVAL: usize = 64;
+        let mut sources = HashSet::new();
+        let mut count = 0usize;
+        for &block in &blocks {
+            for &inst in &f.block(block).insts {
+                let opcode = f.inst(inst).opcode;
+                if opcode.is_terminator()
+                    || opcode == Opcode::CleanupLanding
+                    || is_const_opcode(opcode)
+                {
+                    continue;
+                }
+                count = count.saturating_add(1);
+                if count % POLL_INTERVAL == 0 {
+                    sources.insert(inst);
+                }
+            }
+        }
+        let mut roots = HashMap::new();
+        for (mi, machine_inst) in machine.insts.iter().enumerate() {
+            let Some(source) = machine_inst.source_inst else {
+                continue;
+            };
+            if !sources.contains(&source) || roots.contains_key(&source) {
+                continue;
+            }
+            let pp = u32::try_from(mi).map_err(|_| EmitError::UnsupportedOp(0xFE))? * 2;
+            let mut live = HashSet::new();
+            for range in &machine.value_locations {
+                if range.vreg.class != RegClass::Gpr
+                    || range.start > pp
+                    || pp >= range.end
+                {
+                    continue;
+                }
+                let value = Value(range.vreg.num);
+                if machine_inst.defs.contains(&range.vreg) {
+                    continue;
+                }
+                if f.value(value).repr == ValueRepresentation::Tagged
+                    && homes.contains_key(&value)
+                    && !proven_immediate(value)
+                {
+                    live.insert(value);
+                }
+            }
+            let mut live: Vec<_> = live.into_iter().collect();
+            live.sort_by_key(|value| value.0);
+            roots.insert(source, live);
+        }
+        for source in &sources {
+            if !roots.contains_key(source) {
+                return Err(EmitError::UnsupportedOp(0xFE));
+            }
+        }
+        (sources, roots)
+    } else {
+        (HashSet::new(), HashMap::new())
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let straight_poll_roots: HashMap<crate::t2::ir::Inst, Vec<Value>> = HashMap::new();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let straight_poll_sources: HashSet<crate::t2::ir::Inst> = HashSet::new();
     let root_shadow_slots = safepoint_roots
         .values()
         .map(Vec::len)
         .chain(loop_roots.values().map(Vec::len))
+        .chain(straight_poll_roots.values().map(Vec::len))
         .max()
         .unwrap_or(0);
     let root_shadow_slots =
@@ -4046,6 +4122,38 @@ fn emit_framed_inner(
         proven.extend(fixnum_valued.iter().copied());
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if straight_poll_sources.contains(&inst) {
+                let poll_veneer = transfers
+                    .as_ref()
+                    .and_then(|transfer| transfer.poll_veneer)
+                    .ok_or(EmitError::UnsupportedOp(0xFE))?;
+                let frame_base = frame_base_home.ok_or(EmitError::UnsupportedOp(0xFE))?;
+                let roots = straight_poll_roots
+                    .get(&inst)
+                    .map(Vec::as_slice)
+                    .ok_or(EmitError::UnsupportedOp(0xFE))?;
+                emit_shadow_root_sync(
+                    &mut a,
+                    roots,
+                    &homes,
+                    frame_base,
+                    activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    shadow_root_slots,
+                )?;
+                load_home(&mut a, 7, frame_base, 0);
+                mov_imm64(&mut a, RAX, poll_veneer as i64);
+                emit_runtime_helper_call(&mut a, 0, None);
+                let restore_roots: HashSet<_> = roots.iter().copied().collect();
+                emit_shadow_root_restore(
+                    &mut a,
+                    roots,
+                    &restore_roots,
+                    &homes,
+                    frame_base,
+                    activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
+                )?;
+            }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
                 || d.opcode == Opcode::CleanupLanding
                 || (d.opcode.is_terminator() && d.opcode != Opcode::Invoke)

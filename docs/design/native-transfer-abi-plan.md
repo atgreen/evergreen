@@ -258,8 +258,10 @@ exceptional helper result, without a successful-call status check. Loop-header
 roots are derived from split allocation ranges and synchronized into the
 activation shadow area before the poll, then restored after relocation. Loops
 whose root maps cannot be proven, unsupported platforms, and hardening failures
-conservatively use the legacy checked entry. `bliss-shih7.6` remains open for
-bounded straight-line poll sites and the full fiber/foreign callback matrix.
+conservatively use the legacy checked entry. Long straight-line regions also
+receive bounded polls at fixed source-instruction intervals with the same
+precise shadow synchronization. `bliss-shih7.6` remains open for the full
+fiber/foreign callback matrix and platform-specific signal/deadline gates.
 
 ## Polling independently of exceptions
 
