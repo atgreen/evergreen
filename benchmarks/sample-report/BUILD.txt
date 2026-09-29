@@ -1,9 +1,9 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: 9e8a1b63bc9bd1e0c2e9b76e5c9ec270c6ce1295
+Commit: 95dbf486a451803bbc2d8e24b754df011e2ffbd1
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
-TorCL binary SHA256: 4b629236fd1c936783f04d1fd8922cdc8ad4d81cca7a57f6acc65811d7f1923d
+TorCL binary SHA256: 2bfce9c75ed8293d71fdcf52db59d224a063632dd634ee3522d050b952cf3178
 
 The report was generated with five alternating TorCL/SBCL samples on CPU 0,
 using a bounded 4 GiB / 300-second child runner and --native-transfer. Every
@@ -17,22 +17,22 @@ event; those counts include startup and compilation and are supplemental to the
 in-Lisp throughput timer.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 32 ms (samples 32, 32, 32, 31, 33)
-  SBCL  median 57 ms (samples 57, 56, 57, 57, 57)
-  TorCL median instructions 7,689,908
-  SBCL  median instructions 7,894,170
+  TorCL median 33 ms (samples 29, 34, 29, 33, 33)
+  SBCL  median 57 ms (samples 57, 57, 57, 57, 56)
+  TorCL median instructions 7,718,574
+  SBCL  median instructions 7,892,581
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 528 ms (samples 527, 530, 527, 528, 529)
+  TorCL median 533 ms (samples 531, 540, 533, 533, 532)
   SBCL  median   9 ms (samples   9,   9,   9,  10,  10)
-  TorCL median instructions 7,816,484
-  SBCL  median instructions 7,896,326
+  TorCL median instructions 7,815,841
+  SBCL  median instructions 7,897,669
 
 Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 348 ms (samples 348, 350, 346, 348, 349)
-  SBCL  median   5 ms (samples   6,   5,   5,   4,   5)
-  TorCL median instructions 7,815,392
-  SBCL  median instructions 7,895,536
+  TorCL median 347 ms (samples 346, 348, 347, 346, 347)
+  SBCL  median   5 ms (samples   4,   5,   5,   5,   5)
+  TorCL median instructions 7,814,371
+  SBCL  median instructions 7,794,806
 
 These are local workstation measurements, not universal performance claims.
 The HTML and JSON retain the machine, runtime, source, runner, and binary

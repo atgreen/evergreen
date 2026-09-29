@@ -254,12 +254,12 @@ native POWER-MOD and caught-condition benchmarks. Each segment now performs a
 root-safe safepoint and pending-signal poll before generated entry. Native loop
 headers also use the helper-v2 veneer to poll for GC and asynchronous signals;
 a slow poll transfers through the same capture and cleanup landing path as an
-exceptional helper result, without a successful-call status check. Until
-terminator liveness maps are published, the segment emitter admits only loop
-headers with no moving roots at the poll point. Loops that need those maps,
-unsupported platforms, and hardening failures conservatively use the legacy
-checked entry. `bliss-shih7.6` remains open for precise rootful loop maps,
-bounded straight-line poll sites, and the full fiber/foreign callback matrix.
+exceptional helper result, without a successful-call status check. Loop-header
+roots are derived from split allocation ranges and synchronized into the
+activation shadow area before the poll, then restored after relocation. Loops
+whose root maps cannot be proven, unsupported platforms, and hardening failures
+conservatively use the legacy checked entry. `bliss-shih7.6` remains open for
+bounded straight-line poll sites and the full fiber/foreign callback matrix.
 
 ## Polling independently of exceptions
 

@@ -3616,55 +3616,16 @@ fn emit_framed_inner(
             }
         }
     }
-    let root_shadow_slots = safepoint_roots.values().map(Vec::len).max().unwrap_or(0);
-    let root_shadow_slots =
-        u16::try_from(root_shadow_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-    // Wide c2i calls pass a contiguous slice. Reserve that slice inside the
-    // owning TorclStack activation so the precise GC scans and rewrites every
-    // argument while the Rust adapter/callee runs.
-    let call_arg_slots = f
-        .block_order()
-        .iter()
-        .flat_map(|&block| f.block(block).insts.iter().copied())
-        .map(|inst| f.inst(inst))
-        .filter(|data| {
-            (data.opcode == Opcode::Call && data.args.len() > 3) || data.opcode == Opcode::Invoke
-        })
-        .map(|data| data.args.len())
-        .max()
-        .unwrap_or(0);
-    let call_arg_slots =
-        u16::try_from(call_arg_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-    let shadow_root_slots = root_shadow_slots
-        .checked_add(call_arg_slots)
-        .ok_or(EmitError::UnsupportedOp(0xFD))?;
-    let needs_activation_frame = transfer_mode
-        || f.block_order().iter().any(|&block| {
-            f.block(block)
-                .insts
-                .iter()
-                .any(|&inst| f.inst(inst).opcode == Opcode::TakeValuesToLocals)
-        });
-    if needs_activation_frame && activation_slots.is_none() {
-        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)));
-    }
-    if call_arg_slots != 0 && activation_slots.is_none() {
-        return Err(EmitError::UnsupportedOp(0xF9));
-    }
-    let frame_base_home = if shadow_root_slots == 0 && !needs_activation_frame {
-        None
-    } else {
-        let home = FramedHome::Stack(next_stack);
-        next_stack += 1;
-        Some(home)
-    };
     // Native segment polling is placed at loop headers rather than after every
     // branch. This keeps condition flags intact and guarantees that every
-    // cycle reaches a poll. Until terminator liveness maps are published, only
-    // loops with no moving roots are admitted: a poll may park for a moving GC,
-    // so synchronizing an incomplete root set would be unsound.
+    // cycle reaches a poll. Header roots use the same split-aware ranges as
+    // runtime-call roots, but are evaluated at the machine block's first
+    // program point so a moving GC can update the homes before the body runs.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let backedge_headers = if transfers
+    let (backedge_headers, loop_roots): (
+        HashSet<crate::t2::ir::Block>,
+        HashMap<crate::t2::ir::Block, Vec<Value>>,
+    ) = if transfers
         .as_ref()
         .and_then(|transfer| transfer.poll_veneer)
         .is_some()
@@ -3711,12 +3672,86 @@ fn emit_framed_inner(
                 }
             }
         }
-        if !headers.is_empty() && root_shadow_slots != 0 {
-            return Err(EmitError::UnsupportedOp(0xFE));
+        let mut roots = HashMap::new();
+        for &header in &headers {
+            let Some(block_index) = blocks.iter().position(|&block| block == header) else {
+                return Err(EmitError::UnsupportedOp(0xFE));
+            };
+            let pp = u32::try_from(machine.blocks[block_index].start)
+                .map_err(|_| EmitError::UnsupportedOp(0xFE))?
+                * 2;
+            let mut live = HashSet::new();
+            for range in &machine.value_locations {
+                if range.vreg.class != RegClass::Gpr
+                    || range.start > pp
+                    || pp >= range.end
+                {
+                    continue;
+                }
+                let value = Value(range.vreg.num);
+                if f.value(value).repr == ValueRepresentation::Tagged
+                    && homes.contains_key(&value)
+                    && !proven_immediate(value)
+                {
+                    live.insert(value);
+                }
+            }
+            let mut live: Vec<_> = live.into_iter().collect();
+            live.sort_by_key(|value| value.0);
+            roots.insert(header, live);
         }
-        headers
+        (headers, roots)
     } else {
-        HashSet::new()
+        (HashSet::new(), HashMap::new())
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let loop_roots: HashMap<crate::t2::ir::Block, Vec<Value>> = HashMap::new();
+    let root_shadow_slots = safepoint_roots
+        .values()
+        .map(Vec::len)
+        .chain(loop_roots.values().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    let root_shadow_slots =
+        u16::try_from(root_shadow_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    // Wide c2i calls pass a contiguous slice. Reserve that slice inside the
+    // owning TorclStack activation so the precise GC scans and rewrites every
+    // argument while the Rust adapter/callee runs.
+    let call_arg_slots = f
+        .block_order()
+        .iter()
+        .flat_map(|&block| f.block(block).insts.iter().copied())
+        .map(|inst| f.inst(inst))
+        .filter(|data| {
+            (data.opcode == Opcode::Call && data.args.len() > 3) || data.opcode == Opcode::Invoke
+        })
+        .map(|data| data.args.len())
+        .max()
+        .unwrap_or(0);
+    let call_arg_slots =
+        u16::try_from(call_arg_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    let shadow_root_slots = root_shadow_slots
+        .checked_add(call_arg_slots)
+        .ok_or(EmitError::UnsupportedOp(0xFD))?;
+    let needs_activation_frame = transfer_mode
+        || f.block_order().iter().any(|&block| {
+            f.block(block)
+                .insts
+                .iter()
+                .any(|&inst| f.inst(inst).opcode == Opcode::TakeValuesToLocals)
+        });
+    if needs_activation_frame && activation_slots.is_none() {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)));
+    }
+    if call_arg_slots != 0 && activation_slots.is_none() {
+        return Err(EmitError::UnsupportedOp(0xF9));
+    }
+    let frame_base_home = if shadow_root_slots == 0 && !needs_activation_frame {
+        None
+    } else {
+        let home = FramedHome::Stack(next_stack);
+        next_stack += 1;
+        Some(home)
     };
     let native_spill_slots = next_stack;
     let regalloc_spill_slots = machine.num_spill_slots;
@@ -3971,6 +4006,18 @@ fn emit_framed_inner(
                 .and_then(|transfer| transfer.poll_veneer)
                 .ok_or(EmitError::UnsupportedOp(0xFE))?;
             let frame_base = frame_base_home.ok_or(EmitError::UnsupportedOp(0xFE))?;
+            let roots = loop_roots
+                .get(&b)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            emit_shadow_root_sync(
+                &mut a,
+                roots,
+                &homes,
+                frame_base,
+                activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
+                shadow_root_slots,
+            )?;
             // The poll helper ignores the request payload. Passing the rooted
             // activation pointer keeps the veneer ABI uniform and gives the
             // capture stub a live, stable request word if it takes the cold
@@ -3978,6 +4025,15 @@ fn emit_framed_inner(
             load_home(&mut a, 7, frame_base, 0);
             mov_imm64(&mut a, RAX, poll_veneer as i64);
             emit_runtime_helper_call(&mut a, 0, None);
+            let restore_roots: HashSet<_> = roots.iter().copied().collect();
+            emit_shadow_root_restore(
+                &mut a,
+                roots,
+                &restore_roots,
+                &homes,
+                frame_base,
+                activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
+            )?;
         }
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).
