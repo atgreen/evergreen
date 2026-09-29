@@ -10,9 +10,9 @@ alternating samples measure Fibonacci, the Ironclad POWER-MOD kernel, and a
 caught TYPE-ERROR path. The report also records process-wide retired-instruction
 counts from `perf`; every TorCL sample passed its checksum and listed-hot-function
 T2 gates. The checked-in report enables the opt-in segment ABI; recursive
-Fibonacci is explicitly admitted through the direct-self-call fallback while
-the frame-safe recursive segment entry is developed. These are local
-measurements, not a universal performance claim.
+Fibonacci enters an outer segment, while calls made from an active segment use
+the bounded legacy/native bridge until frame-aware nested entry is developed.
+These are local measurements, not a universal performance claim.
 
 The sample report verifies T2 before and after every listed measured TorCL
 function. The exceptional-path case deliberately keeps its handler and error
