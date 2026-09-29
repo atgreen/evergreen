@@ -305,7 +305,7 @@ The Beads contain task descriptions and acceptance criteria; the order is:
 | 7 | bliss-shih7.7 | Fiber migration and nested Rust/foreign callback ownership tests. |
 | 8 | bliss-shih7.8 | Enable mapped new-ABI T1/T2 code and remove checks after successful native calls. |
 | 9 | bliss-shih7.9 | Controlled release comparisons, instruction counts, regression gates and documentation. |
-| 10 | bliss-shih7.10 | AArch64/s390x adapters after host stabilization; PPC work remains deferred. |
+| 10 | bliss-shih7.10 | AArch64/s390x adapters after host stabilization; PPC follows as the next ELFv2 adapter milestone. |
 
 Required additions to the sequence (Beads dependencies are authoritative):
 
@@ -951,9 +951,12 @@ The following existing sites must be covered when installing the segment ABI:
 | Fault recovery | `c2i_set_native_sigsegv_recovery`, architecture recovery stubs and recovery guards; only generated-frame faults may use generated-frame recovery. No generic unwind through Rust helpers. |
 | Installation/lifetime | `NativeCode`, `OsrCode`, `ActiveNativeCode`, `publish_native`, `install_t2_completion`, `compile_t2_artifact` and retained direct callees; verify architecture plus ABI at every entry/cache/installation boundary. |
 
-PPC deferral is scheduling per user direction, not a claim that its existing
-backend lacks native compilation. Foreign callbacks and all architecture-specific
-entry stubs remain in the final portability audit.
+The ppc64le backend already has native T1/T2 compilation and ELFv2 foreign-call
+support. Its native-transfer segment adapter is now tracked as the next
+architecture milestone (`bliss-1rt.1`): until the register-save, landing, and
+fault-recovery probes pass under QEMU, ppc64le continues to use the checked
+legacy transfer ABI. Foreign callbacks and all architecture-specific entry
+stubs remain in the final portability audit.
 
 Compiler work decomposition under `bliss-shih7.11`:
 
