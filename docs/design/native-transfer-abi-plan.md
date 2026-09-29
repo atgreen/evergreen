@@ -249,6 +249,15 @@ segment cache and uses the bounded legacy/native bridge. This prevents
 pathological nested segment chains while preserving the existing stack-depth
 guard; `bliss-49gcf` tracks a fully frame-aware recursive segment entry.
 
+The process-level switch is deliberately inert until Lisp bootstrap has
+finished. Bootstrap itself exercises ordinary bytecode helpers while evaluator
+registries and image state are still being established; entering the segment
+cache there can select a body whose source-loading assumptions are not yet
+valid. The CLI regression gate covers this startup boundary. The benchmark
+harness also clears the switch while loading each workload's definitions and
+re-enables it immediately before validation, training, warmup, and timing, so
+the report measures admitted native work rather than source-loading helpers.
+
 The segment emitter's exceptional edges and landing pads are exercised by the
 native POWER-MOD and caught-condition benchmarks. Each segment now performs a
 root-safe safepoint and pending-signal poll before generated entry. Native loop
