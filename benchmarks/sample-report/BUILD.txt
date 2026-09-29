@@ -3,7 +3,7 @@ Native-transfer ABI milestone benchmark report
 Commit: 3c784904d3be54c57db82c42da822b0ef7b416f9
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
-TorCL binary SHA256: 78a4c0137e194b10c63f03f23bea7213404d5e4f0c80bc09a99ed3d9c206a05d
+TorCL binary SHA256: 87829f09b2affafb1dd09a77a13934ba14b46a5f956c659e2f5202510c1deb8f
 
 The report was generated with five alternating TorCL/SBCL samples on CPU 0,
 using a bounded 4 GiB / 300-second child runner and --native-transfer. Every
@@ -17,22 +17,22 @@ event; those counts include startup and compilation and are supplemental to the
 in-Lisp throughput timer.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 33 ms (samples 32, 34, 35, 33, 29)
+  TorCL median 32 ms (samples 33, 34, 32, 32, 32)
   SBCL  median 57 ms (samples 57, 57, 57, 57, 56)
-  TorCL median instructions 7,812,600
-  SBCL  median instructions 7,700,900
+  TorCL median instructions 7,814,010
+  SBCL  median instructions 7,892,419
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 530 ms (samples 528, 531, 528, 530, 531)
+  TorCL median 528 ms (samples 531, 528, 531, 527, 528)
   SBCL  median   9 ms (samples   9,   9,   9,  10,  10)
-  TorCL median instructions 7,816,435
-  SBCL  median instructions 7,894,067
+  TorCL median instructions 7,812,193
+  SBCL  median instructions 7,896,862
 
 Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 347 ms (samples 347, 346, 348, 348, 347)
+  TorCL median 345 ms (samples 346, 344, 346, 345, 345)
   SBCL  median   5 ms (samples   4,   5,   5,   5,   5)
-  TorCL median instructions 7,813,776
-  SBCL  median instructions 7,892,105
+  TorCL median instructions 7,814,663
+  SBCL  median instructions 7,896,578
 
 These are local workstation measurements, not universal performance claims.
 The HTML and JSON retain the machine, runtime, source, runner, and binary
