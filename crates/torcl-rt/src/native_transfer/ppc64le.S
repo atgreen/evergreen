@@ -4,11 +4,14 @@
     .globl enter_ppc
     .type enter_ppc,@function
 enter_ppc:
-    # Allocate an ELFv2 frame and save the caller's linkage state.
-    stdu 1,-512(1)
+    # Save LR/TOC in the caller's ELFv2 linkage area BEFORE claiming our frame.
+    # A Rust callee uses the new r1 and is allowed to overwrite its own 16/24
+    # slots; keeping these words in the old frame is what makes nested calls safe.
     mflr 0
     std 0,16(1)
     std 2,24(1)
+    # Allocate an ELFv2 frame. The back chain at 0(r1) points to the caller.
+    stdu 1,-512(1)
 
     # Save r14-r31 (ELFv2 nonvolatile GPRs).
     std 14,64(1)
@@ -144,10 +147,11 @@ enter_ppc:
     ld 29,184(1)
     ld 30,192(1)
     ld 31,200(1)
-    ld 0,16(1)
+    ld 12,0(1)
+    ld 0,16(12)
     mtlr 0
-    ld 2,24(1)
-    ld 1,0(1)
+    ld 2,24(12)
+    mr 1,12
     blr
     .size enter_ppc,.-enter_ppc
 

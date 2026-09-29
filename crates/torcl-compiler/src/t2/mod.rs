@@ -58,6 +58,12 @@ pub mod emit_ppc64le;
 pub mod emit_s390x;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native_transfer;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+pub mod native_transfer_ppc64le;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod transfer_sites;
 
