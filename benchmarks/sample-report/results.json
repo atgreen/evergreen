@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-09-29T00:36:40.766577+00:00",
+  "generated_at": "2026-09-29T00:45:25.363911+00:00",
   "samples": 5,
   "metadata": {
-    "commit": "a700031539768deaff6fd9369e9291b52f9cee6f",
+    "commit": "c3f4a9abde7ec0a98dfbfe1bdb111f20c9be0d64",
     "working_tree": "M .beads/interactions.jsonl\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs",
     "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
     "cpu": 0,
     "cpu_model": "Intel(R) Core(TM) Ultra 7 255H",
     "load_average": [
-      8.9482421875,
-      9.52880859375,
-      9.92138671875
+      8.873046875,
+      9.21044921875,
+      9.61279296875
     ],
     "memory_cap": "4G",
     "binaries": {
@@ -30,9 +30,63 @@
       "fibonacci.lisp": "6e0ba0e605767be022e648ccc1e7222890cbe70a01383bfefb8fe0d241ed759b",
       "ironclad-power-mod.lisp": "40565c30414aa69d09a7cb174ef9887f2ba710fa26b6fae45247b15615c86e1d"
     },
-    "runner_sha256": "a030f012792cfc5ec24e54c8c2a5fbaa33820daaf528932a013bbb2e6c809720",
+    "runner_sha256": "53215e50cbfece3f6410714048d19ad9a64600b1072842b9a1ea08d5e1bfbe3b",
     "cases_sha256": "1d123f8575f090586462d019346f1332520770b53dc8d126776862a2e0b1b4c2",
-    "instruction_event": "cpu_atom/instructions/"
+    "instruction_event": "cpu_atom/instructions/",
+    "baseline": {
+      "commit": "2c84d2e1",
+      "binary_sha256": "a47426a3ccfe65fe263c03da421342618bf0458389a674d3b8a87f2651c4cb03",
+      "benchmarks": {
+        "fibonacci": {
+          "median_seconds": 0.112,
+          "instructions": {
+            "samples": [
+              7804684,
+              7665545,
+              7803974,
+              7803753,
+              7803239
+            ],
+            "median": 7803753,
+            "iqr": 735.0,
+            "min": 7665545,
+            "max": 7804684
+          }
+        },
+        "ironclad-power-mod": {
+          "median_seconds": 0.508,
+          "instructions": {
+            "samples": [
+              7635703,
+              7806945,
+              7806840,
+              7822063,
+              7804160
+            ],
+            "median": 7806840,
+            "iqr": 2785.0,
+            "min": 7635703,
+            "max": 7822063
+          }
+        },
+        "exceptional-path": {
+          "median_seconds": 0.309,
+          "instructions": {
+            "samples": [
+              7804842,
+              7681192,
+              7806064,
+              7806618,
+              7806790
+            ],
+            "median": 7806064,
+            "iqr": 1776.0,
+            "min": 7681192,
+            "max": 7806790
+          }
+        }
+      }
+    }
   },
   "benchmarks": [
     {
@@ -51,99 +105,6 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15578,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 15588,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 14404,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 14414,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 14898,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 14908,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "FIBONACCI": {
-              "tier": 2,
               "calls": 14144,
               "back_edges": 0,
               "osr_entries": 0
@@ -190,6 +151,99 @@
             "FIBONACCI": {
               "tier": 2,
               "calls": 14154,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15026,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 15036,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 17284,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 17294,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14718,
+              "back_edges": 0,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "FIBONACCI": {
+              "tier": 2,
+              "calls": 14728,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -207,27 +261,27 @@
         "TorCL": {
           "samples_seconds": [
             0.033,
-            0.034,
-            0.032,
-            0.032,
+            0.029,
+            0.033,
+            0.031,
             0.032
           ],
           "median_seconds": 0.032,
-          "iqr_seconds": 0.0010000000000000009,
-          "min_seconds": 0.032,
-          "max_seconds": 0.034,
+          "iqr_seconds": 0.0020000000000000018,
+          "min_seconds": 0.029,
+          "max_seconds": 0.033,
           "instructions": {
             "samples": [
-              7381831,
-              7815211,
-              7814010,
-              7814889,
-              7813357
+              7816050,
+              7694082,
+              7813904,
+              7883624,
+              7838396
             ],
-            "median": 7814010,
-            "iqr": 1532.0,
-            "min": 7381831,
-            "max": 7815211
+            "median": 7816050,
+            "iqr": 24492.0,
+            "min": 7694082,
+            "max": 7883624
           }
         },
         "SBCL": {
@@ -235,25 +289,25 @@
             0.057,
             0.057,
             0.057,
-            0.057,
-            0.057
+            0.056,
+            0.057001
           ],
           "median_seconds": 0.057,
           "iqr_seconds": 0.0,
-          "min_seconds": 0.057,
-          "max_seconds": 0.057,
+          "min_seconds": 0.056,
+          "max_seconds": 0.057001,
           "instructions": {
             "samples": [
-              7894978,
-              7893547,
-              7769085,
-              7892419,
-              7780350
+              6782692,
+              7895983,
+              7893382,
+              7767410,
+              7895537
             ],
-            "median": 7892419,
-            "iqr": 113197.0,
-            "min": 7769085,
-            "max": 7894978
+            "median": 7893382,
+            "iqr": 128127.0,
+            "min": 6782692,
+            "max": 7895983
           }
         }
       }
@@ -430,53 +484,53 @@
         "TorCL": {
           "samples_seconds": [
             0.531,
-            0.528,
             0.531,
-            0.527,
-            0.528
+            0.534,
+            0.53,
+            0.53
           ],
-          "median_seconds": 0.528,
-          "iqr_seconds": 0.0030000000000000027,
-          "min_seconds": 0.527,
-          "max_seconds": 0.531,
+          "median_seconds": 0.531,
+          "iqr_seconds": 0.0010000000000000009,
+          "min_seconds": 0.53,
+          "max_seconds": 0.534,
           "instructions": {
             "samples": [
-              7826861,
-              7812193,
-              7816457,
-              7695112,
-              7650855
+              7855396,
+              7817245,
+              7813796,
+              7817792,
+              7819581
             ],
-            "median": 7812193,
-            "iqr": 121345.0,
-            "min": 7650855,
-            "max": 7826861
+            "median": 7817792,
+            "iqr": 2336.0,
+            "min": 7813796,
+            "max": 7855396
           }
         },
         "SBCL": {
           "samples_seconds": [
+            0.009,
+            0.011,
             0.01,
-            0.01,
-            0.01,
-            0.01,
-            0.009
+            0.009,
+            0.01
           ],
           "median_seconds": 0.01,
-          "iqr_seconds": 0.0,
+          "iqr_seconds": 0.0010000000000000009,
           "min_seconds": 0.009,
-          "max_seconds": 0.01,
+          "max_seconds": 0.011,
           "instructions": {
             "samples": [
-              7893072,
-              7897194,
-              7896862,
-              7897534,
-              7895369
+              7759605,
+              7961186,
+              7733779,
+              7895891,
+              7741390
             ],
-            "median": 7896862,
-            "iqr": 1825.0,
-            "min": 7893072,
-            "max": 7897534
+            "median": 7759605,
+            "iqr": 154501.0,
+            "min": 7733779,
+            "max": 7961186
           }
         }
       }
@@ -593,27 +647,27 @@
         "TorCL": {
           "samples_seconds": [
             0.346,
-            0.344,
             0.346,
-            0.345,
+            0.346,
+            0.343,
             0.345
           ],
-          "median_seconds": 0.345,
+          "median_seconds": 0.346,
           "iqr_seconds": 0.0010000000000000009,
-          "min_seconds": 0.344,
+          "min_seconds": 0.343,
           "max_seconds": 0.346,
           "instructions": {
             "samples": [
-              7813113,
-              7815796,
-              7681865,
-              7814663,
-              7833040
+              7818551,
+              7815047,
+              7818088,
+              7638584,
+              7816492
             ],
-            "median": 7814663,
-            "iqr": 2683.0,
-            "min": 7681865,
-            "max": 7833040
+            "median": 7816492,
+            "iqr": 3041.0,
+            "min": 7638584,
+            "max": 7818551
           }
         },
         "SBCL": {
@@ -621,25 +675,25 @@
             0.005,
             0.005,
             0.005,
-            0.004,
+            0.005,
             0.005
           ],
           "median_seconds": 0.005,
           "iqr_seconds": 0.0,
-          "min_seconds": 0.004,
+          "min_seconds": 0.005,
           "max_seconds": 0.005,
           "instructions": {
             "samples": [
-              7763392,
-              7897323,
-              7890691,
-              7896578,
-              7896758
+              7894216,
+              7892918,
+              7890365,
+              7891328,
+              7894904
             ],
-            "median": 7896578,
-            "iqr": 6067.0,
-            "min": 7763392,
-            "max": 7897323
+            "median": 7892918,
+            "iqr": 2888.0,
+            "min": 7890365,
+            "max": 7894904
           }
         }
       }

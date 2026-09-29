@@ -3,17 +3,17 @@
 <title>TorCL · Performance lab</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1220;--panel:#141f31;--muted:#adbbce;--mint:#68e0c2;--blue:#829eff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf3fa;font:16px/1.65 system-ui,sans-serif}main{max-width:1050px;margin:auto;padding:60px 24px}header{max-width:800px;margin-bottom:40px}h1{font-size:clamp(38px,6vw,66px);line-height:1.1;letter-spacing:-2px;margin:14px 0 24px}h2{font-size:26px;margin:8px 0}h3{margin-bottom:8px}.eyebrow{color:var(--mint);font-size:12px;letter-spacing:2px;text-transform:uppercase;font-weight:700}article,.method{background:var(--panel);border:1px solid #28364b;border-radius:18px;padding:28px;margin:24px 0}.verdict{display:block;font-size:27px;margin:24px 0;color:var(--mint)}.muted,footer{color:var(--muted);font-size:14px}.bar-row{display:grid;grid-template-columns:60px 1fr 115px;gap:16px;align-items:center;margin:16px 0}.bar-row span{text-align:right;font-variant-numeric:tabular-nums}.track{background:#202e44;border-radius:6px;overflow:hidden}.bar{height:25px;min-width:2px}.torcl{background:var(--mint)}.sbcl{background:var(--blue)}a{color:var(--mint)}summary{cursor:pointer}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:left;padding:12px;border-bottom:1px solid #33415a}.table-wrap{overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}code{font-size:13px}footer{margin-top:36px}@media(max-width:550px){main{padding:30px 14px}article,.method{padding:20px}.bar-row{grid-template-columns:50px 1fr 90px;gap:8px;font-size:13px}}
-</style><main><header><div class="eyebrow">TorCL / Performance lab</div><h1>Common Lisp.<br>Measured in motion.</h1><p>Recursive calls and real library kernels, measured against SBCL. Same Lisp, same inputs, checked results. These are local measurements of specific workloads, not a claim of universal performance.</p></header><article><div class="eyebrow">Calls / no type annotations</div><h2>Fibonacci · recursive</h2><p>Ten evaluations of F(30), using the standard two-branch recursive algorithm. General integer arithmetic; no type annotations, memoization or implementation-specific shortcuts.</p><strong class="verdict">TorCL 1.78× faster</strong><div class="bar-row"><b>TorCL</b><div class="track"><div class="bar torcl" style="width:56.14%"></div></div><span>32.000 ms</span></div><div class="bar-row"><b>SBCL</b><div class="track"><div class="bar sbcl" style="width:100.00%"></div></div><span>57.000 ms</span></div><p class="muted">T2 verified before and after every TorCL sample: fibonacci, bench-workload. Timed deoptimizations per sample: [0, 0, 0, 0, 0].</p><p class="muted">Retired instructions are process-wide (including startup and compilation): TorCL median 7,814,010, SBCL median 7,892,419. They are supplemental to the in-Lisp throughput timer.</p><p class="muted">Lower is better · identical workload · checksum 8,320,400 verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody><tr><th>TorCL</th><td>32.000</td><td>1.000</td><td>33.000, 34.000, 32.000, 32.000, 32.000</td></tr><tr><th>SBCL</th><td>57.000</td><td>0.000</td><td>57.000, 57.000, 57.000, 57.000, 57.000</td></tr></tbody></table></div></details></article><article><div class="eyebrow">Library kernel / small integers</div><h2>Ironclad · modular exponentiation</h2><p>100,000 modular exponentiations: bases 2 through 100,001, exponent 65,537, modulus 104,729. Original Ironclad POWER-MOD and POWER-MOD-TAB source, including upstream optimization declarations. This is a small-integer kernel, not RSA-sized arithmetic.</p><strong class="verdict">SBCL 52.80× faster</strong><div class="bar-row"><b>TorCL</b><div class="track"><div class="bar torcl" style="width:100.00%"></div></div><span>528.000 ms</span></div><div class="bar-row"><b>SBCL</b><div class="track"><div class="bar sbcl" style="width:1.89%"></div></div><span>10.000 ms</span></div><p class="muted">T2 verified before and after every TorCL sample: power-mod, bench-workload. Timed deoptimizations per sample: [0, 0, 0, 0, 0].</p><p class="muted">Retired instructions are process-wide (including startup and compilation): TorCL median 7,812,193, SBCL median 7,896,862. They are supplemental to the in-Lisp throughput timer.</p><p class="muted">Lower is better · identical workload · checksum 5,242,584,863 verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody><tr><th>TorCL</th><td>528.000</td><td>3.000</td><td>531.000, 528.000, 531.000, 527.000, 528.000</td></tr><tr><th>SBCL</th><td>10.000</td><td>0.000</td><td>10.000, 10.000, 10.000, 10.000, 9.000</td></tr></tbody></table></div></details></article><article><div class="eyebrow">Exceptional path / handler-case</div><h2>Conditions · caught type errors</h2><p>2,000 calls with a real TYPE-ERROR every 97th iteration, caught by HANDLER-CASE. The checksum includes all normal values while caught errors contribute zero.</p><strong class="verdict">SBCL 69.00× faster</strong><div class="bar-row"><b>TorCL</b><div class="track"><div class="bar torcl" style="width:100.00%"></div></div><span>345.000 ms</span></div><div class="bar-row"><b>SBCL</b><div class="track"><div class="bar sbcl" style="width:1.45%"></div></div><span>5.000 ms</span></div><p class="muted">T2 verified before and after every TorCL sample: bench-workload. Timed deoptimizations per sample: [0, 0, 0, 0, 0].</p><p class="muted">Retired instructions are process-wide (including startup and compilation): TorCL median 7,814,663, SBCL median 7,896,578. They are supplemental to the in-Lisp throughput timer.</p><p class="muted">Lower is better · identical workload · checksum 1,978,630 verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody><tr><th>TorCL</th><td>345.000</td><td>1.000</td><td>346.000, 344.000, 346.000, 345.000, 345.000</td></tr><tr><th>SBCL</th><td>5.000</td><td>0.000</td><td>5.000, 5.000, 5.000, 4.000, 5.000</td></tr></tbody></table></div></details></article>
+</style><main><header><div class="eyebrow">TorCL / Performance lab</div><h1>Common Lisp.<br>Measured in motion.</h1><p>Recursive calls and real library kernels, measured against SBCL. Same Lisp, same inputs, checked results. These are local measurements of specific workloads, not a claim of universal performance.</p></header><article><div class="eyebrow">Calls / no type annotations</div><h2>Fibonacci · recursive</h2><p>Ten evaluations of F(30), using the standard two-branch recursive algorithm. General integer arithmetic; no type annotations, memoization or implementation-specific shortcuts.</p><strong class="verdict">TorCL 1.78× faster</strong><div class="bar-row"><b>TorCL</b><div class="track"><div class="bar torcl" style="width:56.14%"></div></div><span>32.000 ms</span></div><div class="bar-row"><b>SBCL</b><div class="track"><div class="bar sbcl" style="width:100.00%"></div></div><span>57.000 ms</span></div><p class="muted">T2 verified before and after every TorCL sample: fibonacci, bench-workload. Timed deoptimizations per sample: [0, 0, 0, 0, 0].</p><p class="muted">Retired instructions are process-wide (including startup and compilation): TorCL median 7,816,050, SBCL median 7,893,382. They are supplemental to the in-Lisp throughput timer.</p><p class="muted">Lower is better · identical workload · checksum 8,320,400 verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody><tr><th>TorCL</th><td>32.000</td><td>2.000</td><td>33.000, 29.000, 33.000, 31.000, 32.000</td></tr><tr><th>SBCL</th><td>57.000</td><td>0.000</td><td>57.000, 57.000, 57.000, 56.000, 57.001</td></tr></tbody></table></div></details></article><article><div class="eyebrow">Library kernel / small integers</div><h2>Ironclad · modular exponentiation</h2><p>100,000 modular exponentiations: bases 2 through 100,001, exponent 65,537, modulus 104,729. Original Ironclad POWER-MOD and POWER-MOD-TAB source, including upstream optimization declarations. This is a small-integer kernel, not RSA-sized arithmetic.</p><strong class="verdict">SBCL 53.10× faster</strong><div class="bar-row"><b>TorCL</b><div class="track"><div class="bar torcl" style="width:100.00%"></div></div><span>531.000 ms</span></div><div class="bar-row"><b>SBCL</b><div class="track"><div class="bar sbcl" style="width:1.88%"></div></div><span>10.000 ms</span></div><p class="muted">T2 verified before and after every TorCL sample: power-mod, bench-workload. Timed deoptimizations per sample: [0, 0, 0, 0, 0].</p><p class="muted">Retired instructions are process-wide (including startup and compilation): TorCL median 7,817,792, SBCL median 7,759,605. They are supplemental to the in-Lisp throughput timer.</p><p class="muted">Lower is better · identical workload · checksum 5,242,584,863 verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody><tr><th>TorCL</th><td>531.000</td><td>1.000</td><td>531.000, 531.000, 534.000, 530.000, 530.000</td></tr><tr><th>SBCL</th><td>10.000</td><td>1.000</td><td>9.000, 11.000, 10.000, 9.000, 10.000</td></tr></tbody></table></div></details></article><article><div class="eyebrow">Exceptional path / handler-case</div><h2>Conditions · caught type errors</h2><p>2,000 calls with a real TYPE-ERROR every 97th iteration, caught by HANDLER-CASE. The checksum includes all normal values while caught errors contribute zero.</p><strong class="verdict">SBCL 69.20× faster</strong><div class="bar-row"><b>TorCL</b><div class="track"><div class="bar torcl" style="width:100.00%"></div></div><span>346.000 ms</span></div><div class="bar-row"><b>SBCL</b><div class="track"><div class="bar sbcl" style="width:1.45%"></div></div><span>5.000 ms</span></div><p class="muted">T2 verified before and after every TorCL sample: bench-workload. Timed deoptimizations per sample: [0, 0, 0, 0, 0].</p><p class="muted">Retired instructions are process-wide (including startup and compilation): TorCL median 7,816,492, SBCL median 7,892,918. They are supplemental to the in-Lisp throughput timer.</p><p class="muted">Lower is better · identical workload · checksum 1,978,630 verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody><tr><th>TorCL</th><td>346.000</td><td>1.000</td><td>346.000, 346.000, 346.000, 343.000, 345.000</td></tr><tr><th>SBCL</th><td>5.000</td><td>0.000</td><td>5.000, 5.000, 5.000, 5.000, 5.000</td></tr></tbody></table></div></details></article><section class="method"><h3>Historical TorCL baseline</h3><p>Compared with commit <code>2c84d2e1</code> using the same workloads and five-sample protocol. Lower is better.</p><div class="table-wrap"><table><thead><tr><th>Workload</th><th>Baseline median ms</th><th>Current median ms</th><th>Change</th></tr></thead><tbody><tr><th>Fibonacci · recursive</th><td>112.000</td><td>32.000</td><td>250.0% faster</td></tr><tr><th>Ironclad · modular exponentiation</th><td>508.000</td><td>531.000</td><td>4.3% slower</td></tr><tr><th>Conditions · caught type errors</th><td>309.000</td><td>346.000</td><td>10.7% slower</td></tr></tbody></table></div></section>
 <section class="method"><h2>How to read these results</h2><p>5 independent processes per runtime and workload. Each process performs correctness checks, 10,000 short training calls to the batch driver, and three untimed full-workload warmups before one timed sample. Every TorCL sample requires tier 2 for every listed hot function before and after timing; missing or lower tiers fail the run. The tier gate waits up to 10 seconds for background compilation to publish. SBCL receives the same training calls and warmup workloads. TorCL and SBCL run sequentially in alternating order, pinned to CPU 0. Timing uses GET-INTERNAL-REAL-TIME inside Lisp and excludes startup, source loading, compilation before execution, training, and warmup. JIT work and GC occurring during the measured region remain included.</p><p>Bars show median elapsed time; the table exposes every sample and its interquartile range. Speedup is the ratio of medians. This is an exploratory workstation report, not a controlled CI regression gate or a statistical significance claim. CPU frequency and background load are not controlled. GC pause telemetry is not collected.</p><p>TorCL uses its release build and automatic tiering with inherited TORCL_* tuning cleared. The native segment ABI is enabled for this report; unsupported bodies still use the checked fallback. SBCL compiles the same source with SPEED 3 / SAFETY 1 (individual upstream declarations are preserved). TorCL-specific checks observe tiers outside timing; no implementation-specific benchmark fast paths are added. Tier 2 does not imply that every operation avoids runtime calls.</p><h3>Scope of the Ironclad comparison</h3><p>Extracted source from Ironclad, with its declarations preserved. These rows measure the named kernels and input sizes only; they do not measure the full Ironclad API, encryption throughput, or cryptographic security. Small-integer workloads do not represent production public-key sizes.</p><p><a href="results.json">Raw JSON</a> · <a href="../README.md">Reproduction and source provenance</a></p><details><summary>Machine, versions and provenance</summary><pre>{
-  &quot;commit&quot;: &quot;a700031539768deaff6fd9369e9291b52f9cee6f&quot;,
+  &quot;commit&quot;: &quot;c3f4a9abde7ec0a98dfbfe1bdb111f20c9be0d64&quot;,
   &quot;working_tree&quot;: &quot;M .beads/interactions.jsonl\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs&quot;,
   &quot;platform&quot;: &quot;Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43&quot;,
   &quot;cpu&quot;: 0,
   &quot;cpu_model&quot;: &quot;Intel(R) Core(TM) Ultra 7 255H&quot;,
   &quot;load_average&quot;: [
-    8.9482421875,
-    9.52880859375,
-    9.92138671875
+    8.873046875,
+    9.21044921875,
+    9.61279296875
   ],
   &quot;memory_cap&quot;: &quot;4G&quot;,
   &quot;binaries&quot;: {
@@ -33,7 +33,61 @@
     &quot;fibonacci.lisp&quot;: &quot;6e0ba0e605767be022e648ccc1e7222890cbe70a01383bfefb8fe0d241ed759b&quot;,
     &quot;ironclad-power-mod.lisp&quot;: &quot;40565c30414aa69d09a7cb174ef9887f2ba710fa26b6fae45247b15615c86e1d&quot;
   },
-  &quot;runner_sha256&quot;: &quot;a030f012792cfc5ec24e54c8c2a5fbaa33820daaf528932a013bbb2e6c809720&quot;,
+  &quot;runner_sha256&quot;: &quot;53215e50cbfece3f6410714048d19ad9a64600b1072842b9a1ea08d5e1bfbe3b&quot;,
   &quot;cases_sha256&quot;: &quot;1d123f8575f090586462d019346f1332520770b53dc8d126776862a2e0b1b4c2&quot;,
-  &quot;instruction_event&quot;: &quot;cpu_atom/instructions/&quot;
-}</pre></details></section><footer>Generated 2026-09-29T00:36:40.766577+00:00. Source and binary SHA-256 hashes are retained in the JSON artifact.</footer></main></html>
+  &quot;instruction_event&quot;: &quot;cpu_atom/instructions/&quot;,
+  &quot;baseline&quot;: {
+    &quot;commit&quot;: &quot;2c84d2e1&quot;,
+    &quot;binary_sha256&quot;: &quot;a47426a3ccfe65fe263c03da421342618bf0458389a674d3b8a87f2651c4cb03&quot;,
+    &quot;benchmarks&quot;: {
+      &quot;fibonacci&quot;: {
+        &quot;median_seconds&quot;: 0.112,
+        &quot;instructions&quot;: {
+          &quot;samples&quot;: [
+            7804684,
+            7665545,
+            7803974,
+            7803753,
+            7803239
+          ],
+          &quot;median&quot;: 7803753,
+          &quot;iqr&quot;: 735.0,
+          &quot;min&quot;: 7665545,
+          &quot;max&quot;: 7804684
+        }
+      },
+      &quot;ironclad-power-mod&quot;: {
+        &quot;median_seconds&quot;: 0.508,
+        &quot;instructions&quot;: {
+          &quot;samples&quot;: [
+            7635703,
+            7806945,
+            7806840,
+            7822063,
+            7804160
+          ],
+          &quot;median&quot;: 7806840,
+          &quot;iqr&quot;: 2785.0,
+          &quot;min&quot;: 7635703,
+          &quot;max&quot;: 7822063
+        }
+      },
+      &quot;exceptional-path&quot;: {
+        &quot;median_seconds&quot;: 0.309,
+        &quot;instructions&quot;: {
+          &quot;samples&quot;: [
+            7804842,
+            7681192,
+            7806064,
+            7806618,
+            7806790
+          ],
+          &quot;median&quot;: 7806064,
+          &quot;iqr&quot;: 1776.0,
+          &quot;min&quot;: 7681192,
+          &quot;max&quot;: 7806790
+        }
+      }
+    }
+  }
+}</pre></details></section><footer>Generated 2026-09-29T00:45:25.363911+00:00. Source and binary SHA-256 hashes are retained in the JSON artifact.</footer></main></html>
