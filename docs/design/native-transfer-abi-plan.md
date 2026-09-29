@@ -1156,6 +1156,13 @@ handlers, replacing cleanups, fiber yields, and moving-GC roots on x86-64
 Linux. Narrow constant/identity segment entries also pass the AArch64 and
 s390x QEMU portability gates.
 
+Native segment admission still refuses functions with T2 OSR entries. A focused
+experiment briefly removed that guard and compiled a tagged non-entry loop, but
+executing its back-edge poll crashed in `revalidate_current_segment` while
+looking up the execution-local active segment. The guard was restored in
+`9ed5be21`; native OSR segment entry remains a correctness gate until that
+carrier/stack boundary has a regression test that executes the poll safely.
+
 The legacy checked ABI remains a required compatibility path. It is still used
 for unsupported bodies and platforms, nested native-to-Lisp calls, allocation
 and signaling helpers, deoptimization, fault recovery, incomplete protected
