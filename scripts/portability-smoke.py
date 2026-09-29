@@ -97,7 +97,7 @@ def main():
                     f"{native.stdout}\n{native.stderr}"
                 )
             assert "PPC-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
-            assert "[native-transfer/ppc64le] direct segment:" in native.stderr, native.stderr
+            assert native.stderr.count("[native-transfer/ppc64le] direct segment:") >= 2, native.stderr
             print(f"{arch}: opt-in native segment entry: OK", flush=True)
 
         if arch == "win64":
