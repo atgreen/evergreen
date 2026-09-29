@@ -699,6 +699,30 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(TorclVal::from_fixnum(id as i64))
         }),
 
+        "TORCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%make-struct 'name value...) -> a structure instance
+            //
+            // What a DEFSTRUCT constructor calls instead of MAKE-INSTANCE. The
+            // values arrive already defaulted by the constructor's own lambda
+            // list, so there is nothing left for the initialization protocol to
+            // do -- and CLHS does not run it for a structure anyway.
+
+            if args.is_empty() {
+                return Err(TorclError::ProgramError(
+                    "%make-struct: a structure name is required".into(),
+                ));
+            }
+            let class = torcl_stdlib::find_class(args[0]).ok_or_else(|| {
+                TorclError::ProgramError(format!(
+                    "%make-struct: no such structure: {}",
+                    format_val(args[0])
+                ))
+            })?;
+            torcl_stdlib::make_struct(class, &args[1..])
+        }),
+
         "TORCL::%SOCKET-LISTENER-READY-P" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

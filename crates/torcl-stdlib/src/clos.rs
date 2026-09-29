@@ -2038,6 +2038,64 @@ pub fn allocate_instance_pinned_gc(class: TorclVal) -> Result<TorclVal, TorclErr
 }
 
 /// Make an instance (MAKE-INSTANCE). R5.12.
+/// The slot names a DEFSTRUCT constructor supplies, in DEFSTRUCT's own order:
+/// inherited slots first, then the struct's own (CLHS 3.4.6).
+///
+/// Derived rather than registered. The instance LAYOUT is built from the class
+/// precedence list, which is most-specific-FIRST, so its index order is the
+/// reverse of what a struct constructor wants; walking the CPL backwards and
+/// collecting each class's direct slots reproduces DEFSTRUCT's order exactly.
+pub fn struct_slot_order(class: TorclVal) -> Vec<TorclVal> {
+    with_state_mut(|st| {
+        let cpl = c3_linearize(st, class).unwrap_or_else(|_| vec![class]);
+        let mut order: Vec<TorclVal> = Vec::new();
+        for c in cpl.iter().rev() {
+            if let Some(meta) = st.class_meta.get(c) {
+                for &slot in &meta.slots {
+                    if !order.contains(&slot) {
+                        order.push(slot);
+                    }
+                }
+            }
+        }
+        order
+    })
+}
+
+/// Build a structure instance from POSITIONAL slot values, skipping the CLOS
+/// initialization protocol entirely.
+///
+/// MAKE-INSTANCE is the wrong tool for a DEFSTRUCT constructor and was costing
+/// 11us a call: per instantiation it walked the class precedence list for
+/// :default-initargs, built a String class name and a Vec<String> of supplied
+/// slots, split instance from class slots, evaluated every :initform, and looked
+/// up SHARED-INITIALIZE and INITIALIZE-INSTANCE :after methods. A structure has
+/// none of those -- CLHS does not run the initialization protocol for one at all,
+/// so skipping it is more correct, not less -- and its slot values are already
+/// in hand, defaulted by the constructor's own lambda list.
+///
+/// Values are matched to slots by NAME through the layout index, not by
+/// position, because the two orders differ (see `struct_slot_order`). A missing
+/// trailing value leaves that slot at its allocated NIL.
+pub fn make_struct(class: TorclVal, values: &[TorclVal]) -> Result<TorclVal, TorclError> {
+    // allocate_instance allocates and can relocate; the caller's values may be
+    // in an unrooted Rust Vec, so root a copy and write from THAT (bliss-334).
+    torcl_rt::rooted!(values = values.to_vec());
+    let order = struct_slot_order(class);
+    let inst = allocate_instance(class)?;
+    for (i, &slot) in order.iter().enumerate() {
+        if i >= values.len() {
+            break;
+        }
+        unsafe {
+            if let Some(idx) = instance_slot_index(inst, slot) {
+                *slot_cell(inst, idx) = values[i];
+            }
+        }
+    }
+    Ok(inst)
+}
+
 pub fn make_instance(class: TorclVal, initargs: &[TorclVal]) -> Result<TorclVal, TorclError> {
     with_state(|st| {
         if is_builtin_class(st, class) {

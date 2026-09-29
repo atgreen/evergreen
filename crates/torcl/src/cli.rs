@@ -16565,6 +16565,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
             "TORCL::%SOCKET-FD" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%SOCKET-WAIT-FOR-INPUT" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%SOCKET-LISTENER-READY-P" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%MAKE-STRUCT" => return eval_builtin_arguments(&name, cdr, env),
             "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "READ-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "SLEEP" => return eval_builtin_arguments(&name, cdr, env),
@@ -32036,19 +32037,34 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
     for (ctor_name, boa) in &constructors {
         let ctor_defun = match boa {
             None => {
-                // (defun CTOR (&rest args) (apply #'make-instance 'NAME args)).
-                // Every movable cons intermediate is rooted before the next
-                // allocating sym()/quote()/vec_to_list() call — otherwise, under a
-                // minor GC (TORCL_GC_STRESS), a cons sitting unrooted in a Rust
-                // array while a later element allocates goes stale and the built
-                // form is corrupted (make-NAME then evaluated `(&REST args)` as a
-                // call → "undefined function: &REST") (bliss-bjue).
-                torcl_rt::rooted!(args = sym("ARGS"));
-                torcl_rt::rooted!(fn_mi = vec_to_list(&[sym("FUNCTION"), sym("MAKE-INSTANCE")]));
-                torcl_rt::rooted!(qname = quote(name_sym));
-                torcl_rt::rooted!(apply_call = vec_to_list(&[sym("APPLY"), *fn_mi, *qname, *args]));
-                torcl_rt::rooted!(lambda_list = vec_to_list(&[sym("&REST"), *args]));
-                vec_to_list(&[sym("DEFUN"), *ctor_name, *lambda_list, *apply_call])
+                // (defun CTOR (&key ((:slot slot) default) ...)
+                //   (torcl::%make-struct 'NAME slot ...))
+                //
+                // The lambda list does the defaulting, so the call site hands
+                // %MAKE-STRUCT a complete set of values in slot order and the
+                // CLOS initialization protocol is not involved at all. That
+                // protocol was costing 11us a struct (bliss-fskhm): per call it
+                // walked the class precedence list for :default-initargs, built
+                // a String class name, split instance from class slots,
+                // evaluated every :initform and looked up two sets of :after
+                // methods -- none of which a structure has.
+                //
+                // The initarg is written explicitly as ((:slot slot) …) rather
+                // than relying on the slot symbol's own name, because the slot
+                // symbol lives in the defining package and its keyword must not
+                // depend on that.
+                torcl_rt::rooted!(params = Vec::<TorclVal>::new());
+                torcl_rt::rooted!(call = vec![sym("TORCL::%MAKE-STRUCT"), quote(name_sym)]);
+                params.push(sym("&KEY"));
+                for slot in &slots {
+                    torcl_rt::rooted!(dflt = slot.default);
+                    torcl_rt::rooted!(keyform = vec_to_list(&[slot.initarg, slot.slot_sym]));
+                    params.push(vec_to_list(&[*keyform, *dflt]));
+                    call.push(slot.slot_sym);
+                }
+                torcl_rt::rooted!(kw_lambda = vec_to_list(&params));
+                torcl_rt::rooted!(kw_body = vec_to_list(&call));
+                vec_to_list(&[sym("DEFUN"), *ctor_name, *kw_lambda, *kw_body])
             }
             Some(params) => {
                 // BOA constructor (CLHS 3.4.6). Build
@@ -32169,8 +32185,45 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                         make_call.push(var);
                     }
                 }
+                // Rewrite the (MAKE-INSTANCE 'NAME :slot var …) pairs into a
+                // POSITIONAL (%MAKE-STRUCT 'NAME expr …) call, one expression per
+                // slot in DEFSTRUCT order. A slot the lambda list binds
+                // contributes its variable; one it does not contributes its own
+                // initform, which MAKE-INSTANCE would otherwise have applied
+                // afterwards. Left-to-right argument evaluation preserves the
+                // rule that a later default may refer to an earlier parameter.
+                torcl_rt::rooted!(bound = Vec::<TorclVal>::new());
+                {
+                    let mut i = 2; // past MAKE-INSTANCE and the quoted name
+                    while i + 1 < make_call.len() {
+                        bound.push(make_call[i]);
+                        bound.push(make_call[i + 1]);
+                        i += 2;
+                    }
+                }
+                torcl_rt::rooted!(
+                    positional = vec![sym("TORCL::%MAKE-STRUCT"), quote(name_sym)]
+                );
+                for slot_spec in &slots {
+                    let mut supplied = None;
+                    let mut i = 0;
+                    while i + 1 < bound.len() {
+                        if bound[i] == slot_spec.initarg {
+                            supplied = Some(bound[i + 1]);
+                            break;
+                        }
+                        i += 2;
+                    }
+                    match supplied {
+                        Some(var) => positional.push(var),
+                        None => {
+                            torcl_rt::rooted!(dflt = slot_spec.default);
+                            positional.push(*dflt);
+                        }
+                    }
+                }
                 torcl_rt::rooted!(boa_lambda = vec_to_list(&new_params));
-                torcl_rt::rooted!(boa_body = vec_to_list(&make_call));
+                torcl_rt::rooted!(boa_body = vec_to_list(&positional));
                 vec_to_list(&[sym("DEFUN"), *ctor_name, *boa_lambda, *boa_body])
             }
         };
