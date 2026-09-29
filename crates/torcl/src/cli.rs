@@ -16566,6 +16566,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
             "TORCL::%SOCKET-WAIT-FOR-INPUT" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%SOCKET-LISTENER-READY-P" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%MAKE-STRUCT" => return eval_builtin_arguments(&name, cdr, env),
+            "GETF" => return eval_builtin_arguments(&name, cdr, env),
             "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "READ-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "SLEEP" => return eval_builtin_arguments(&name, cdr, env),
@@ -33888,6 +33889,13 @@ fn apply_builtin_fast(
     env: &mut Env,
 ) -> Option<Result<TorclVal, TorclError>> {
     match name {
+        // See evaluated_builtins.rs: without these, COMPILED code reaches LIST
+        // and GETF through the synthesize-and-re-evaluate detour, at 8.67us and
+        // 7.31us against 0.035us for CAR.
+        "LIST" | "GETF" => {
+            env.clear_mv();
+            evaluated_builtins::call(name, args, env)
+        }
         "APPEND" => {
             env.clear_mv();
             Some(torcl_stdlib::sequences::append(args))

@@ -699,6 +699,38 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(TorclVal::from_fixnum(id as i64))
         }),
 
+        // LIST and GETF are here because they were the two operations a UI
+        // frame spends its time in and neither had an evaluated handler, so
+        // COMPILED code reached them through the synthesize-`(name 'arg …)`-and-
+        // re-evaluate detour. Measured on x86-64 release, 200k iterations:
+        // (list 1 2 3 4) 8.67us and (getf plist :key) 7.31us, against 0.195us
+        // for CONS and 0.035us for CAR, which do have handlers.
+        "LIST" => Some(|_operator, args, _env| Ok(vec_to_list(args))),
+
+        "GETF" => Some(|_operator, args, _env| {
+            // (getf plist indicator &optional default). Was a DEFUN in
+            // boot.lisp -- a DO loop plus an &optional -- which is why it cost
+            // 200x a CAR. The scan allocates nothing, so no rooting is needed.
+            if args.len() < 2 || args.len() > 3 {
+                return Err(TorclError::ProgramError(
+                    "GETF called with the wrong number of arguments; requires 2 to 3".into(),
+                ));
+            }
+            let indicator = args[1];
+            let mut cell = args[0];
+            while cell.is_cons() {
+                let (key, rest) = cp(cell);
+                if !rest.is_cons() {
+                    break;
+                }
+                if key == indicator {
+                    return Ok(cp(rest).0);
+                }
+                cell = cp(rest).1;
+            }
+            Ok(args.get(2).copied().unwrap_or(NIL))
+        }),
+
         "TORCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

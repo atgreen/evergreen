@@ -1549,10 +1549,10 @@
             (setf (elt result-sequence i) v))))
     (when fp (setf (fill-pointer result-sequence) n))
     result-sequence))
-(defun getf (plist key &optional default)
-  (do ((p plist (cddr p)))
-      ((null p) default)
-    (when (eq (car p) key) (return (cadr p)))))
+;;; GETF is a builtin (cli/evaluated_builtins.rs). It was a DEFUN here -- a DO
+;;; loop plus an &optional -- and cost 7.31us against 0.035us for CAR, which
+;;; matters because it is how every property list is read, including a UI
+;;; framework's per-node properties. A DEFUN here would SHADOW the builtin.
 ;; GET-PROPERTIES (CLHS): scan PLIST for the first indicator that is EQ to one in
 ;; INDICATOR-LIST; return three values — that indicator, its value, and the PLIST
 ;; tail beginning at it — or (values NIL NIL NIL) if none is found.
