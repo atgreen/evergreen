@@ -8,6 +8,13 @@
 
 use super::{NativeOutcome, NativeSegment, TorclStack};
 
+const _: () = {
+    assert!(std::mem::offset_of!(NativeSegment, saved_sp) == 0);
+    assert!(std::mem::offset_of!(NativeSegment, landing_pc) == 8);
+    assert!(std::mem::offset_of!(NativeOutcome, value) == 0);
+    assert!(std::mem::offset_of!(NativeOutcome, exit) == 8);
+};
+
 /// ELFv2 has no x86-style shadow-stack policy to query.  The adapter's safety
 /// contract is established by the ABI probe below and by the generated-code
 /// admission checks; unsupported hardening is therefore not a reason to fall
