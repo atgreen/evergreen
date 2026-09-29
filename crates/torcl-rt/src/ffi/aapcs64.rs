@@ -148,12 +148,22 @@ pub unsafe fn ffi_call(
             "foreign argument count does not match signature".into(),
         ));
     }
+    // TORCL_FFI_PROFILE (bliss-1dp): the same four phases the x86-64 path
+    // reports, so the two architectures can be compared directly.
+    let profile = crate::ffi::ffi_profile_enabled();
+    let t0 = if profile {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let result = Scalar::from_type(ret_type)?;
     let scalars = arg_types
         .iter()
         .map(Scalar::from_type)
         .collect::<Result<Vec<_>, _>>()?;
     let slots = classify(&scalars)?;
+    let t1 = t0.map(|_| std::time::Instant::now());
 
     let mut integers = [0u64; ARGUMENT_REGISTERS];
     let mut floats = [0u64; ARGUMENT_REGISTERS];
@@ -175,6 +185,7 @@ pub unsafe fn ffi_call(
     // Publish Native state so a collection can proceed while foreign code runs,
     // exactly as the x86-64 path does.
     let state_guard = crate::safepoint::ForeignStateScope::native();
+    let t2 = t0.map(|_| std::time::Instant::now());
     // SAFETY: the trampoline reads eight words from each register buffer and
     // `stack.len()` from the stack buffer, all initialised above. The caller
     // vouches for the target's signature.
@@ -212,7 +223,16 @@ pub unsafe fn ffi_call(
             )
         }
     };
+    let t3 = t0.map(|_| std::time::Instant::now());
     drop(state_guard);
+    if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+        crate::ffi::ffi_profile_record(
+            t1.duration_since(t0).as_nanos() as u64,
+            t2.duration_since(t1).as_nanos() as u64,
+            t3.duration_since(t2).as_nanos() as u64,
+            std::time::Instant::now().duration_since(t3).as_nanos() as u64,
+        );
+    }
     Ok(narrow_result(result, raw))
 }
 

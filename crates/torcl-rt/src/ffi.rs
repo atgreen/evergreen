@@ -63,6 +63,37 @@ pub use elfv2::{ffi_call, ffi_call_variadic};
 )))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
+pub(crate) fn ffi_profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TORCL_FFI_PROFILE").is_some())
+}
+
+/// Accumulate the four phases and report every 2000 calls, to stderr — which on
+/// Android is the logcat tag `torcl-err`.
+pub(crate) fn ffi_profile_record(adapter_ns: u64, enter_ns: u64, invoke_ns: u64, leave_ns: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    static ADAPTER: AtomicU64 = AtomicU64::new(0);
+    static ENTER: AtomicU64 = AtomicU64::new(0);
+    static INVOKE: AtomicU64 = AtomicU64::new(0);
+    static LEAVE: AtomicU64 = AtomicU64::new(0);
+    ADAPTER.fetch_add(adapter_ns, Ordering::Relaxed);
+    ENTER.fetch_add(enter_ns, Ordering::Relaxed);
+    INVOKE.fetch_add(invoke_ns, Ordering::Relaxed);
+    LEAVE.fetch_add(leave_ns, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 2000 == 0 {
+        eprintln!(
+            "[ffi-profile] {n} calls: adapter {:.1}us enter {:.1}us invoke {:.1}us leave {:.1}us",
+            ADAPTER.load(Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+            ENTER.load(Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+            INVOKE.load(Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+            LEAVE.load(Ordering::Relaxed) as f64 / 1000.0 / n as f64,
+        );
+    }
+}
+
 // ── Alien type system ──────────────────────────────────────────────
 
 /// Descriptor for a C/foreign type. D2.03.
@@ -254,18 +285,36 @@ unsafe fn ffi_call_impl(
             "foreign argument count does not match signature".into(),
         ));
     }
+    // TORCL_FFI_PROFILE: where a foreign call's time actually goes. A call
+    // measured 37us on x86-64 and 1311us on Android for the SAME zero-argument
+    // function, which is far more than the CPU gap, so the split matters more
+    // than the total (bliss-1dp).
+    let profile = ffi_profile_enabled();
+    let t0 = if profile { Some(std::time::Instant::now()) } else { None };
+
     // Compile/cache before publishing Native state. The adapter's Arc remains
     // live across foreign execution; no cache lock is held during callbacks.
     let adapter = call::CallAdapter::get(ret_type, arg_types, fixed_count)?;
+    let t1 = t0.map(|_| std::time::Instant::now());
 
     let errors = managed_callback::ForeignCallErrors::enter();
     let state_guard = crate::safepoint::ForeignStateScope::native();
+    let t2 = t0.map(|_| std::time::Instant::now());
 
     // SAFETY: the caller supplies a matching C signature; count and supported
     // types were checked above, and the adapter stays alive through the call.
     let result = unsafe { adapter.invoke(fn_ptr, args) };
+    let t3 = t0.map(|_| std::time::Instant::now());
     drop(state_guard);
     errors.finish()?;
+    if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
+        ffi_profile_record(
+            t1.duration_since(t0).as_nanos() as u64,
+            t2.duration_since(t1).as_nanos() as u64,
+            t3.duration_since(t2).as_nanos() as u64,
+            std::time::Instant::now().duration_since(t3).as_nanos() as u64,
+        );
+    }
     Ok(result)
 }
 
