@@ -25,6 +25,11 @@ class ResultTests(unittest.TestCase):
     def test_no_winner_for_a_tie(self):
         self.assertEqual(run.comparison(1, 1), ('Tie', 1))
 
+    def test_parse_perf_instruction_counts_and_ignores_uncounted_rows(self):
+        stderr = ('100,,cpu_core/instructions/u,1,2.0,,\n'
+                   '<not counted>,,cpu_atom/instructions/u,0,0.0,,\n')
+        self.assertEqual(run.parse_instructions(stderr), 100)
+
 class ReportTests(unittest.TestCase):
     def test_report_escapes_metadata_and_shows_the_actual_winner(self):
         import json
@@ -39,6 +44,40 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('<script>', page)
         self.assertIn('&lt;script&gt;', page)
         self.assertIn('not a', page)
+
+    def test_baseline_manifest_accepts_nested_checked_report(self):
+        nested = {
+            'metadata': {
+                'commit': 'current',
+                'baseline': {
+                    'commit': 'baseline',
+                    'binary_sha256': 'abc',
+                    'benchmarks': {
+                        'fibonacci': {'median_seconds': 0.112, 'instructions': {'median': 7}}
+                    },
+                },
+            },
+            'benchmarks': [],
+        }
+        result = run.baseline_manifest(nested)
+        self.assertEqual(result['commit'], 'baseline')
+        self.assertEqual(result['binary_sha256'], 'abc')
+        self.assertIn('fibonacci', result['benchmarks'])
+
+    def test_baseline_manifest_accepts_raw_results(self):
+        raw = {
+            'metadata': {
+                'commit': 'baseline',
+                'binaries': {'TorCL': {'sha256': 'abc'}},
+            },
+            'benchmarks': [{
+                'id': 'fibonacci',
+                'results': {'TorCL': {'median_seconds': 0.112}},
+            }],
+        }
+        result = run.baseline_manifest(raw)
+        self.assertEqual(result['commit'], 'baseline')
+        self.assertEqual(result['benchmarks']['fibonacci']['median_seconds'], 0.112)
 
 
 class TierTests(unittest.TestCase):

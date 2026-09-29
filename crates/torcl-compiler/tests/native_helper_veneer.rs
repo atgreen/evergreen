@@ -110,3 +110,19 @@ fn generated_caller_reaches_segment_landing_only_after_helper_returns() {
     }
     eprintln!("executed generated helper success/transfer/deopt segment routes");
 }
+
+#[test]
+fn capture_recipes_reject_clobbered_registers_and_invalid_stack_offsets() {
+    use torcl_compiler::t2::native_transfer::SysvCaptureLocation;
+    use torcl_compiler::t2::x64_frame::ValueHome;
+    for register in [0, 1, 2, 4, 6, 7, 8, 9, 10, 11, 16] {
+        assert!(SysvCaptureLocation::for_home(ValueHome::Reg(register), 0, 0).is_err());
+    }
+    for register in [3, 5, 12, 13, 14, 15] {
+        assert!(SysvCaptureLocation::for_home(ValueHome::Reg(register), 0, 0).is_ok());
+    }
+    assert!(SysvCaptureLocation::for_home(ValueHome::Stack(0), 1, 0).is_ok());
+    assert!(SysvCaptureLocation::for_home(ValueHome::Stack(1), 1, 0).is_err());
+    assert!(SysvCaptureLocation::for_home(ValueHome::Stack(0), 1, 3).is_err());
+    assert!(SysvCaptureLocation::for_home(ValueHome::Stack(u32::MAX - 1), u32::MAX, 0).is_err());
+}

@@ -32,6 +32,7 @@ pub mod pass;
 pub mod slot_map;
 pub mod transfer_capture;
 pub mod transfer_map;
+pub mod x64_frame;
 
 // ── Wave 1 parcels (one module per sub-agent; disjoint files) ─────
 pub mod build; // P1 — bytecode → SSA
@@ -57,6 +58,14 @@ pub mod emit_ppc64le;
 pub mod emit_s390x;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native_transfer;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+pub mod native_transfer_ppc64le;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub mod transfer_sites;
 
 // ── Wave 3 parcels ────────────────────────────────────────────────
 pub mod opt_escape; // P4e — escape analysis + scalar replacement

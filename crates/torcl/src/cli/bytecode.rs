@@ -29,7 +29,24 @@
 //! (closures / multiple values / special vars), nmq.6 (parity + default flip),
 //! nmq.2 (codegen via i2c/c2i), nmq.3 (precise GC of frames).
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod native_transfer_entry;
+#[cfg(all(target_arch = "aarch64", unix))]
+mod native_transfer_entry_aarch64;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+mod native_transfer_entry_ppc64le;
+#[cfg(all(target_arch = "s390x", unix))]
+mod native_transfer_entry_s390x;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_transfer_tests;
 mod pending_error;
+use super::control_payload::ControlPayload;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use super::control_payload::reserve_control_values;
 use pending_error::PendingError;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -13324,16 +13341,24 @@ enum CleanupAction {
         values: Option<Vec<TorclVal>>,
     },
     /// The cleanup ran during an unwind: resume that unwind afterwards.
-    Resume(Pending),
+    Resume {
+        pending: Pending,
+        payload: ControlPayload,
+    },
 }
 
 /// An in-progress non-local transfer looking for its matching handler.
 enum Pending {
     /// A `THROW` (or a tree-walker control transfer propagated as
-    /// `Err(Internal(token))`): value is held by `store_control_value(token)`.
+    /// `Err(Internal(token))`): values are in CONTROL_VALUES while in flight,
+    /// or privately owned by the cleanup continuation while it is paused.
     Token(String),
     /// A `RETURN-FROM` to the lexical block `block_id`.
-    Return { block_id: u32, value: TorclVal },
+    Return {
+        block_id: u32,
+        value: TorclVal,
+        values: Option<Vec<TorclVal>>,
+    },
     /// A `GO` to `target_bcp` within tagbody `tagbody_id`.
     Go { tagbody_id: u32, target_bcp: u32 },
     /// A genuine error (or uncaught throw): unwind all handlers running
@@ -13343,7 +13368,14 @@ enum Pending {
 
 fn visit_pending_roots(pending: &mut Pending, visit: &mut dyn FnMut(*mut TorclVal)) {
     match pending {
-        Pending::Return { value, .. } => visit(value),
+        Pending::Return { value, values, .. } => {
+            visit(value);
+            if let Some(values) = values {
+                for value in values {
+                    visit(value);
+                }
+            }
+        }
         // A propagating error can carry movable TorclVals — TypeError.datum,
         // UNBOUND-VARIABLE/UNDEFINED-FUNCTION names, or a Signalled condition
         // (bliss-9kc). While it is parked in a CleanupAction::Resume during an
@@ -13376,7 +13408,10 @@ impl torcl_rt::gc::TraceHostRoots for CleanupCont {
                     }
                 }
             }
-            CleanupAction::Resume(pending) => visit_pending_roots(pending, visit),
+            CleanupAction::Resume { pending, payload } => {
+                visit_pending_roots(pending, visit);
+                torcl_rt::gc::TraceHostRoots::trace_host_roots(payload, visit);
+            }
         }
     }
 }
@@ -14585,9 +14620,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                 sp_restore,
             } => {
                 let tag = acts[top_idx].pop_op();
-                let tag_str = val_as_str(tag);
                 let token = next_control_token("__THROW__");
-                env.catch_stack.push((tag_str, token.clone()));
+                env.catch_stack.push((tag, token.clone()));
                 acts[top_idx].handlers.push(Handler::Catch {
                     token,
                     resume_bcp,
@@ -14700,12 +14734,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                     let t = act.pop_op();
                     (v, t)
                 };
-                let tag_str = val_as_str(tag);
                 let token = env
                     .catch_stack
                     .iter()
                     .rev()
-                    .find(|(t, _)| *t == tag_str)
+                    .find(|(t, _)| *t == tag)
                     .map(|(_, tok)| tok.clone());
                 match token {
                     Some(tok) => {
@@ -14717,7 +14750,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         // (CLHS 5.2), not an uncatchable internal error (matches
                         // the tree-walker THROW arm).
                         let e = TorclError::ControlError(format!(
-                            "attempt to THROW to a tag that is not active: {tag_str}"
+                            "attempt to THROW to a tag that is not active: {}",
+                            val_as_str(tag)
                         ));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
@@ -14725,7 +14759,17 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
             }
             Instr::ReturnFrom { block_id } => {
                 let value = acts[top_idx].pop_op();
-                initiate_unwind(acts, stack, env, Pending::Return { block_id, value })?;
+                let values = env.mv_active.then(|| env.mv.clone());
+                initiate_unwind(
+                    acts,
+                    stack,
+                    env,
+                    Pending::Return {
+                        block_id,
+                        value,
+                        values,
+                    },
+                )?;
             }
             Instr::ReturnFromNamed { name_idx } => {
                 // Non-local return from an enclosing block: resolve the block's
@@ -14892,7 +14936,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<TorclVal, Torcl
                         act.push_op(value);
                         act.bcp = resume_bcp as usize;
                     }
-                    CleanupAction::Resume(pending) => {
+                    CleanupAction::Resume { pending, payload } => {
+                        payload.restore();
                         initiate_unwind(acts, stack, env, pending)?;
                     }
                 }
@@ -15141,7 +15186,14 @@ fn initiate_unwind(
                 act.sp_top = sp_restore;
                 act.cleanup_conts.push(CleanupCont {
                     handler_depth: act.handlers.len(),
-                    action: CleanupAction::Resume(pending),
+                    action: CleanupAction::Resume {
+                        payload: match &pending {
+                            Pending::Token(token) => ControlPayload::take(token),
+                            Pending::Propagate(error) => ControlPayload::for_error(error),
+                            _ => ControlPayload::default(),
+                        },
+                        pending,
+                    },
                 });
                 act.bcp = cleanup_bcp as usize;
                 return Ok(());
@@ -15175,12 +15227,19 @@ fn initiate_unwind(
                 // A compiled `return-from` matches by lexical id; a tree-walker
                 // `return-from` (e.g. from a handler function) arrives as this
                 // block's control token.
-                let matched = match &pending {
+                let matched = match &mut pending {
                     Pending::Return {
                         block_id: bid,
                         value,
-                    } if *bid == block_id => Some(*value),
-                    Pending::Token(t) if *t == token => Some(take_control_value(&token)),
+                        values,
+                    } if *bid == block_id => {
+                        match values.take() {
+                            Some(values) => env.set_mv(values),
+                            None => env.clear_mv(),
+                        }
+                        Some(*value)
+                    }
+                    Pending::Token(t) if *t == token => Some(super::take_control_mv(&token, env)),
                     _ => None,
                 };
                 if let Some(v) = matched {
@@ -16153,10 +16212,10 @@ extern "C" fn c2i_call_builtin(
     }
 }
 
-fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
+fn c2i_call_result(sym: u64, args: &[TorclVal], profile_site: u64) -> Result<TorclVal, TorclError> {
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
-        return NIL.0;
+        return Ok(NIL);
     }
     // SAFETY: `run_native` sets NATIVE_ENV to a live &mut Env for the duration
     // of the native call, and native code only calls this synchronously within
@@ -16168,7 +16227,7 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
     // Guard the interpreter reentry so a panic deep in the callee (e.g. a GC
     // root-scan RefCell reentrancy, bliss-011) is caught and re-raised as a
     // catchable condition rather than aborting across this `extern "C"` frame.
-    let result = guard_c2i(|| {
+    guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
         // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
         // run_loop dispatches ITS calls flatly on the TorclStack (bliss-x5y.4). This
@@ -16214,8 +16273,11 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
             }
             _ => apply_function(fn_val, args, env),
         }
-    });
-    match result {
+    })
+}
+
+fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
+    match c2i_call_result(sym, args, profile_site) {
         Ok(v) => v.0,
         // Rust cannot unwind through native code: stash the transfer and return
         // a placeholder. T1 checks immediately after the crossing and returns
@@ -16227,6 +16289,66 @@ fn c2i_call_args(sym: u64, args: &[TorclVal], profile_site: u64) -> u64 {
             });
             NIL.0
         }
+    }
+}
+
+/// Explicit compatibility bridge from helper-v2 to the existing Lisp dispatch
+/// and execution-owned transfer storage. Callee Rust frames finish normally
+/// before an outcome is published; only the generated veneer transfers control.
+/// Errors/control tokens stay rooted in NATIVE_ERROR/CONTROL_VALUES until cold
+/// preparation takes ownership. Nested legacy native deopts are handled by
+/// run_native and return their final value here, not a caller deopt request.
+///
+/// # Safety
+/// `request` is a live TransferCallRequest with a valid symbol and rooted,
+/// contiguous tagged arguments for its arity. `out` is writable. The owning
+/// native entry has published/rooted NATIVE_ENV for this execution. No GC may
+/// intervene between outcome publication and the veneer's cold preparation.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(dead_code)] // Installed only by the opt-in transfer integration until activation gates pass.
+unsafe extern "C" fn c2i_call_legacy_v2(
+    request: *mut u8,
+    out: *mut torcl_rt::native_transfer::NativeOutcome,
+) {
+    use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
+    let outcome = if native_error_pending() {
+        // Never execute another Lisp side effect over an existing transfer.
+        NativeOutcome {
+            value: NIL,
+            exit: NativeExit::Transfer,
+        }
+    } else {
+        let request = unsafe { &*request.cast::<torcl_compiler::t2::emit::TransferCallRequest>() };
+        let args = if request.nargs == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(request.args, request.nargs) }
+        };
+        let result = if NATIVE_ENV.with(|env| env.get().is_null()) {
+            Err(TorclError::Internal(
+                "helper-v2 called without a native environment".into(),
+            ))
+        } else {
+            c2i_call_result(request.symbol, args, 0)
+        };
+        match result {
+            Ok(value) => NativeOutcome {
+                value,
+                exit: NativeExit::Returned,
+            },
+            Err(error) => {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+                NativeOutcome {
+                    value: NIL,
+                    exit: NativeExit::Transfer,
+                }
+            }
+        }
+    };
+    // Neither Result handling nor publishing the execution-local error can
+    // allocate Lisp objects or yield. The returned value needs no unrooted gap.
+    unsafe {
+        out.write(outcome);
     }
 }
 
@@ -16804,6 +16926,12 @@ struct NativeCode {
     /// The exact metadata and constant slots this machine code was built from.
     /// Only synthetic signal-recovery test adapters have no bytecode body.
     body: Option<Arc<BytecodeFunction>>,
+    /// Transfer contract used by direct native calls. Versioned explicitly so
+    /// a future unchecked-return ABI cannot be mixed with legacy checked code.
+    transfer_abi_version: u16,
+    /// Machine target encoded separately from the transfer version. Saved or
+    /// cached code must never become a direct target on another ISA.
+    transfer_abi_arch: u16,
     /// A baked direct call can already be active when its name is redefined.
     /// Keep that exact callee (and its transitive dependencies) alive.
     _direct_calls: Vec<Rc<NativeCode>>,
@@ -16840,6 +16968,30 @@ struct NativeCode {
     /// Owns original T2 constant slots and every deoptimization scope's body.
     /// T1 uses the original `body` retained above.
     t2_metadata: Option<Arc<T2InstalledMetadata>>,
+}
+
+const NATIVE_TRANSFER_ABI_VERSION: u16 = 1;
+
+#[cfg(target_arch = "x86_64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0x8664;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0xaa64;
+#[cfg(target_arch = "powerpc64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0x9a64;
+#[cfg(target_arch = "s390x")]
+const NATIVE_TRANSFER_ARCH: u16 = 0xa390;
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "powerpc64",
+    target_arch = "s390x"
+)))]
+const NATIVE_TRANSFER_ARCH: u16 = 0;
+
+#[inline]
+fn native_transfer_abi_compatible(code: &NativeCode) -> bool {
+    code.transfer_abi_version == NATIVE_TRANSFER_ABI_VERSION
+        && code.transfer_abi_arch == NATIVE_TRANSFER_ARCH
 }
 
 struct NativeEmission {
@@ -18157,6 +18309,8 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     }
     let nc = Rc::new(NativeCode {
         body: Some(Arc::clone(&bf)),
+        transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+        transfer_abi_arch: NATIVE_TRANSFER_ARCH,
         _direct_calls: Vec::new(),
         entry,
         code_len: artifact.code.len(),
@@ -18335,6 +18489,38 @@ fn run_native(
     args: &[TorclVal],
     env: &mut Env,
 ) -> Result<TorclVal, TorclError> {
+    // The segment ABI carries exceptional exits out-of-band through its cold
+    // landing path, so it does not need the legacy post-call transfer poll.
+    // Keep rollout explicit while native Windows and hardening gates are still
+    // being completed; unsupported shapes remain on the checked ABI below.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry::try_run(body, args, env) {
+            return result;
+        }
+    }
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ))]
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry_ppc64le::try_run(body, args, env) {
+            return result;
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", unix))]
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry_aarch64::try_run(body, args, env) {
+            return result;
+        }
+    }
+    #[cfg(all(target_arch = "s390x", unix))]
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry_s390x::try_run(body, args, env) {
+            return result;
+        }
+    }
     let bf = nc.body.clone();
     if let Some(body) = bf.as_ref() {
         validate_declared_args(body, args)?;
@@ -19451,7 +19637,12 @@ fn emit_native(
                         // same rdi=slots run_native frame ABI. Only the real
                         // has_deopt gates them (a deopting callee would mid-flight
                         // resume to T0, which the direct path can't handle).
-                        if !cnc.has_deopt && fixed && no_types && not_closure {
+                        if native_transfer_abi_compatible(&cnc)
+                            && !cnc.has_deopt
+                            && fixed
+                            && no_types
+                            && not_closure
+                        {
                             torcl_rt::blog!(
                                 "compile",
                                 torcl_rt::log::TRACE,
@@ -20241,6 +20432,8 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
         body: Some(bf),
+        transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+        transfer_abi_arch: NATIVE_TRANSFER_ARCH,
         _direct_calls: direct_calls,
         entry,
         code_len: code.len(),
@@ -20839,6 +21032,15 @@ fn run_native_osr(
         NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
     let saved_err = NATIVE_ERROR.with(|c| c.take());
     NATIVE_DEOPT.with(|d| d.set(false));
+    // OSR executes inside the interpreter activation, so its fault-recovery
+    // window must be established just like a normal native entry. In
+    // particular, a Rust/c2i helper called from the OSR loop temporarily turns
+    // this off and restores it around the helper; leaving the enclosing value
+    // stale would route a helper fault through the wrong frame.
+    let saved_null_recovery = torcl_rt::runtime::current_sigsegv_null_guard_recovery_ip();
+    let saved_stack_recovery = torcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
+    let native_recovery = native_sigsegv_recovery_ip();
+    torcl_rt::runtime::set_sigsegv_recovery_ips(native_recovery, native_recovery);
     let entry_addr = osr.entry as usize + stub_off;
     // SAFETY: `entry_addr` is inside the installed OSR buffer at a stub whose
     // contract is `fn(*mut u64) -> u64` (prologue + jump to the loop header).
@@ -20849,6 +21051,7 @@ fn run_native_osr(
         slots,
         std::ptr::from_ref(torcl_rt::current_stack()) as *const u8,
     );
+    torcl_rt::runtime::set_sigsegv_recovery_ips(saved_null_recovery, saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
@@ -20857,6 +21060,9 @@ fn run_native_osr(
     NATIVE_ERROR.with(|c| c.replace(saved_err));
     let _ = osr.num_slots;
     let _ = osr.code_info;
+    if let Some(error) = pending_signal_error_for_current_execution() {
+        return Err(error);
+    }
     if let Some(err) = my_err {
         return Err(err);
     }
@@ -21777,6 +21983,26 @@ mod direct_call_invalidation_tests {
             .expect("resolve actual source transfer captures");
         assert_eq!(captures.len(), calls);
         assert!(!captures[0].control_scopes.is_empty());
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let (code, sites) = torcl_compiler::t2::emit::emit_framed_transfers(
+                &ir,
+                0x12345678,
+                body.n_locals + body.max_stack,
+            )
+            .expect("emit actual source call with exact recovery metadata");
+            assert_eq!(sites.sites().count(), calls);
+            assert_eq!(code.emitted_safepoints, calls);
+            assert!(
+                !sites
+                    .sites()
+                    .next()
+                    .unwrap()
+                    .map()
+                    .control_scopes
+                    .is_empty()
+            );
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -22454,6 +22680,8 @@ mod jtc4_stack_map_tests {
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
             body: None,
+            transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+            transfer_abi_arch: NATIVE_TRANSFER_ARCH,
             _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),
@@ -22466,9 +22694,16 @@ mod jtc4_stack_map_tests {
             has_deopt: false,
             t2_metadata: None,
         };
+        assert!(native_transfer_abi_compatible(&nc));
         let mut env = Env::new(false);
 
         let error = run_native(&nc, u32::MAX, &[], &mut env).unwrap_err();
+        let mut legacy = nc;
+        legacy.transfer_abi_version = 0;
+        assert!(!native_transfer_abi_compatible(&legacy));
+        legacy.transfer_abi_version = NATIVE_TRANSFER_ABI_VERSION;
+        legacy.transfer_abi_arch = 0;
+        assert!(!native_transfer_abi_compatible(&legacy));
 
         assert!(matches!(
             error,
@@ -22506,6 +22741,8 @@ mod jtc4_stack_map_tests {
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
             body: None,
+            transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
+            transfer_abi_arch: NATIVE_TRANSFER_ARCH,
             _direct_calls: Vec::new(),
             entry,
             code_len: code.len(),

@@ -1,6 +1,8 @@
 # Native transfers without checks after successful native returns
 
-Status: proposed implementation plan, not implemented.
+Status: in progress. The native transfer path and emergency cleanup slices are
+implemented; final activation still depends on inherited OSR state, native
+Windows mitigation gates, and the remaining cross-version bridge work.
 Tracking: **bliss-shih7**, with executable steps in its child Beads.
 Baseline: `2c84d2e1` (the counted pending-error fast path, `bliss-5fzra`).
 That completed mitigation retained return checks; this work replaces the protocol
@@ -229,6 +231,47 @@ If native continuation is unavailable or invalidated:
    Legacy code stays behind a bridge segment until converted. No old helper can
    silently return a placeholder into unchecked new code.
 
+The current implementation carries both `transfer_abi_version` and a target
+architecture identifier on every installed `NativeCode` object. Direct native
+calls are admitted only when both match the running backend. This is a
+compatibility fence, not a completed old-to-new bridge: artifacts with an older
+version or another architecture are conservatively kept on the checked/fallback
+path until an explicit bridge is implemented.
+
+The segment ABI can now be exercised for ordinary native invocations with
+`TORCL_NATIVE_TRANSFER=1`. Eligible bytecode bodies are compiled into a
+thread-local transfer-code cache and entered through `invoke_native_segment`;
+unsupported bodies, platforms, or hardening states fall back to the legacy
+checked entry. This rollout switch remains opt-in while native Windows gates and
+the full saved-image bridge are unfinished. Recursive bodies may now form the
+outer segment, but a call made while a segment is active is refused by the
+segment cache and uses the bounded legacy/native bridge. This prevents
+pathological nested segment chains while preserving the existing stack-depth
+guard; `bliss-49gcf` tracks a fully frame-aware recursive segment entry.
+
+The process-level switch is deliberately inert until Lisp bootstrap has
+finished. Bootstrap itself exercises ordinary bytecode helpers while evaluator
+registries and image state are still being established; entering the segment
+cache there can select a body whose source-loading assumptions are not yet
+valid. The CLI regression gate covers this startup boundary. The benchmark
+harness also clears the switch while loading each workload's definitions and
+re-enables it immediately before validation, training, warmup, and timing, so
+the report measures admitted native work rather than source-loading helpers.
+
+The segment emitter's exceptional edges and landing pads are exercised by the
+native POWER-MOD and caught-condition benchmarks. Each segment now performs a
+root-safe safepoint and pending-signal poll before generated entry. Native loop
+headers also use the helper-v2 veneer to poll for GC and asynchronous signals;
+a slow poll transfers through the same capture and cleanup landing path as an
+exceptional helper result, without a successful-call status check. Loop-header
+roots are derived from split allocation ranges and synchronized into the
+activation shadow area before the poll, then restored after relocation. Loops
+whose root maps cannot be proven, unsupported platforms, and hardening failures
+conservatively use the legacy checked entry. Long straight-line regions also
+receive bounded polls at fixed source-instruction intervals with the same
+precise shadow synchronization. `bliss-shih7.6` remains open for the full
+fiber/foreign callback matrix and platform-specific signal/deadline gates.
+
 ## Polling independently of exceptions
 
 Remove the signal/GC responsibility from ordinary return checks only after new
@@ -271,7 +314,7 @@ The Beads contain task descriptions and acceptance criteria; the order is:
 | 7 | bliss-shih7.7 | Fiber migration and nested Rust/foreign callback ownership tests. |
 | 8 | bliss-shih7.8 | Enable mapped new-ABI T1/T2 code and remove checks after successful native calls. |
 | 9 | bliss-shih7.9 | Controlled release comparisons, instruction counts, regression gates and documentation. |
-| 10 | bliss-shih7.10 | AArch64/s390x adapters after host stabilization; PPC work remains deferred. |
+| 10 | bliss-shih7.10 | AArch64/s390x adapters after host stabilization; PPC follows as the next ELFv2 adapter milestone. |
 
 Required additions to the sequence (Beads dependencies are authoritative):
 
@@ -291,6 +334,21 @@ step 7 and local-exit/scope work. Steps 9 and 10 follow final activation.
 Keep unsupported platforms on the old ABI until their own gates pass.
 QEMU proves functional behavior only; native hardware is required for platform
 performance claims. x86-64 Linux and Windows are the first delivery milestone.
+The portability gate now builds AArch64 and s390x with the cross-image-compatible
+Rust 1.93.0 override and runs them under QEMU. Both pass `portable_os`,
+interpreter/T0/T2, GC-stress and image round-trip probes; s390x also passes its
+native T1/T2, OSR, moving-GC, signal and JIT smoke probes. These results validate
+the legacy ABI boundary, not native transfer activation.
+
+The full Lisp segment entry is compiled and activated only on x86-64 Linux.
+PPC64LE now has an opt-in, deliberately narrow entry for allocation-free,
+scope-free, deopt-free bodies; calls, speculative guards, loops requiring polls,
+handlers, cleanup and other unsupported shapes decline to the checked ABI. The
+x86-64 Windows build
+deliberately routes ordinary invocations through the checked legacy ABI while
+the native Windows mitigation and SEH gates remain unproven. These are rollout
+boundaries, not claims of full native transfer coverage; each platform's
+release gate must be green before broadening its segment cache.
 
 The rollout gate requires:
 
@@ -317,6 +375,16 @@ The rollout gate requires:
   `TORCL_GC_REGION_LOG=1` as supporting evidence; a clean stress run alone does
   not prove movement. Test zero, one and several values across cleanup.
 * Run workspace gates and record unrelated baseline failures explicitly.
+
+The checked-in [native-transfer benchmark report](../../benchmarks/sample-report/index.html)
+contains the current five-sample T2/instruction measurements, SBCL comparison,
+and a same-protocol TorCL comparison against baseline commit `737be001`.
+`2c84d2e1` remains the counted pending-error fast-path baseline for the ABI
+design, while `737be001` is the executable baseline recorded by the report.
+The recorded baseline/current binary hashes and raw JSON are part of the report
+provenance. The comparison shows the current native path improving Fibonacci
+while POWER-MOD and caught conditions remain slower; those regressions are
+tracked as performance gaps rather than hidden by the Fibonacci result.
 
 This plan does not remove the interpreter, replace Rust's unwinder, promise
 zero overhead for signal polling, or change the Fibonacci algorithm.
@@ -392,6 +460,452 @@ allocation. There are no calls or safepoints between reading the outcome and
 entering the cold route. Win64 and other architecture veneers remain separate
 work; the ordinary pipeline continues to reject Invoke emission.
 
+The SysV `emit_capture_stub` now supplies the helper veneer's cold entry. It
+saves RBX/RBP/R12–R15, the caller's pre-CALL stack pointer, return PC and helper
+outcome before calling Rust preparation. Preparation returns normally; the stub
+reloads any updated preserved registers and outcome, removes only its own
+temporary frame, and tail-dispatches. Caller-saved GPRs and XMM registers are
+already clobbered by the helper, so exception-live values require preserved
+registers or spill homes. The capture image itself does not register GC roots.
+
+`native_capture_sysv` executes a generated caller and both adapters, copies an
+actual register root and caller-stack root into TransferSnapshot, roots the
+transfer payload, forces relocation during reconstruction, writes the relocated
+homes back, and reaches the segment landing. It checks all six preserved
+registers, exact return PC, an unboxed double spill, updated native register/stack
+roots, payload identity and both Rust destructor counts. It covers Transfer and
+Deopt outcomes, including GC stress/poison, with the explicit gate:
+
+```text
+cargo test -p torcl-compiler --test native_capture_sysv -- --include-ignored
+```
+
+The fixture uses checked `SysvCaptureLocation` recipes for preserved registers
+and bounded spill slots, including temporary call-stack adjustments. It tests
+both an unchanged body SP and 16 bytes of temporary call space. Snapshot
+writeback preserves raw float/integer representations while updating relocated
+tagged references. Volatile registers and invalid stack offsets are rejected.
+The fixture still supplies its known frame layout and preparation callback.
+Production emission still needs installed recipes, retained code/PC lookup,
+payload/cursor preparation, cleanup/target dispatch and unwind metadata. This
+gate does not activate ordinary Lisp Invoke emission or remove its return checks.
+
+`transfer_sites::SysvTransferTable` now binds emitted return offsets to checked
+logical maps and physical capture recipes. Lookup is allocation-free and matches
+the exact PC within the owning code range; it never substitutes a nearby call.
+Construction rejects duplicate/out-of-range offsets, inconsistent logical frame
+dimensions/origins, unavailable registers, invalid stack slots, and missing roots.
+Execution-owned snapshots borrow their checked site and refuse capture/writeback
+at another return PC. A rejected recapture invalidates the previous snapshot.
+The executable fixture makes a normal call followed by an exceptional call, with
+no caller status check between them, and selects the second site's map using
+the captured return PC. Transfer and Deopt both preserve moved roots and raw
+spills with and without temporary stack adjustment. This verifies the lookup
+boundary; production code ownership, complete emitter site coverage, ABI checks,
+and dispatcher integration are still required before activation.
+
+Capture also distinguishes a native home from its canonical GC shadow. A helper
+can collect and then transfer without executing the caller's normal shadow-root
+restoration, leaving saved registers/spills with stale addresses. Checked sites
+therefore carry bounded activation shadow slots for synchronized tagged roots.
+`capture_from_activation` reads those updated slots, reads raw words from their
+native homes, and rejects missing activation storage. Writeback repairs the
+native homes. The activation must remain rooted until its frame is retired.
+The execution gate forces GC inside the helper, proves that the shadow moved
+while the native register stayed stale, then collects again during reconstruction
+and checks repaired registers, stack roots and payload identity. It does not
+assume that an object already moved/tenured by the helper must move a second time.
+Production emission must derive shadow mappings from the same ordered root list
+used by its pre-call synchronization; omitted mappings must never be guessed.
+
+The opt-in x86 Linux `emit_framed_transfers` entry now emits Invoke through the
+rich emitter, using its actual allocation, final frame homes, root synchronization,
+result storage and normal-edge moves. A 32-byte `TransferCallRequest` passes the
+symbol, arity, rooted argument slice and owning activation to a helper-v2 veneer.
+The emitter records the exact post-CALL offset and stack adjustment, derives
+canonical shadow mappings from its synchronization list, and rejects an unmapped
+potentially moving root or an unconsumed capture map. Invoke arguments may spill;
+requiring all arguments in registers reproduced a regalloc2 panic at eight args.
+Legacy emitter entry points still reject Invoke.
+
+`native_invoke_emit` executes bytecode-built functions through the generated code,
+not a hand-written caller. Its explicit capability gate covers zero, one, four and
+eight arguments, normal return/Transfer/Deopt, collection inside both helpers,
+rooted argument slices, preserved logical locals/stack, exact second-call recovery,
+normal results distinct from the original argument, and Rust destructor counts:
+
+```text
+cargo test -p torcl-compiler --test native_invoke_emit -- --include-ignored
+```
+
+Actual Lisp-source lowering also reaches this emitter in the CLI unit gate.
+This entry remains an integration path rather than production activation: it
+refuses unboxed values, OSR, guards and other helper classes until their contracts
+are connected; helper argument slices currently contain tagged values only.
+The fixture supplies rooted activation storage, per-execution snapshot reservation
+and cold dispatch. Full runtime helper coverage, code/definition retention,
+installation ABI checks, native cleanup/handlers and polling remain required.
+
+The CLI now supplies `c2i_call_legacy_v2`, an explicit compatibility bridge to
+the existing Lisp dispatcher. Both ABIs share Result-based dispatch; the bridge
+publishes Returned or Transfer only after callee Rust frames finish. Pending
+errors and THROW multiple values remain rooted in the execution-owned legacy
+storage until cold preparation takes ownership. An already-pending error prevents
+another call from executing side effects. Nested legacy deoptimization completes
+inside the callee and returns its final value, rather than requesting a deopt of
+the new caller.
+
+The CLI `native_transfer_tests` exercise real Lisp callees with zero and multiple
+values, eight arguments, errors, THROW and first-error preservation. The explicit
+capability gate compiles a caller from Lisp source, emits both Invoke sites,
+executes those sites through the real bridge, and captures the second call on
+error. It checks relocated locals/operands, multiple values, normal Rust drops,
+and side effects/UNWIND-PROTECT cleanup occurring exactly once. All three tests
+also run with `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`:
+
+```text
+cargo test -p torcl --lib native_v2_bridge -- --include-ignored
+```
+
+This is still an opt-in integration test. The callee cleanup runs through the
+existing runtime; it does not prove native cleanup landing pads. The test cold
+dispatcher leaves the segment and inspects the pending transfer, rather than
+resuming a reconstructed caller in bytecode. Ordinary native installation and
+its successful-return checks remain unchanged.
+
+`native_transfer_entry::TransferCode` adds an opt-in runtime-owned entry for this
+emitter. It retains the original bytecode and all linked executable buffers,
+reserves and roots snapshots before invocation, and uses an execution-local
+capture context with nested save/restore. Cold preparation copies the failed
+site's values without allocation before assembly leaves the generated frame.
+The entry then reconstructs the logical activation and calls `initiate_unwind`
+before any bytecode execution. The failed call's PC is an origin, never a resume
+instruction. Exact scope maps rebuild admitted local, non-escaping BLOCK and
+TAGBODY records and pending UNWIND-PROTECT cleanups; missing dynamic identity or inherited state is refused at
+compilation. Enclosing pending errors are rooted while saved, and lexical scopes,
+native depth, environment pointer and fault-recovery settings are restored.
+
+The `native_v2_fallback` execution gates run real Lisp success/error/THROW cases,
+including redefining the caller inside its callee. They check retained-definition
+recovery, multiple values, moving-GC relocation, unchanged enclosing stack and
+pending error, and exactly-once calls and callee cleanup. The local-exit and
+fallback cleanup/replacement cases are regular tests on the supported host and
+also run under GC stress plus poison; the broader handler/fiber matrix remains
+explicitly enabled with `--include-ignored` until its platform gates are closed.
+This entry is not installed by ordinary tiering. General protected caller scopes, OSR,
+closures, other helper classes, native cleanup/handler destinations, and emergency
+reconstruction failure handling remain required. Output reconstruction still
+allocates; allocation-free cold capture alone does not satisfy the OOM gate.
+
+The transfer builder now admits UNWIND-PROTECT regions whose normal path ends
+in a known non-returning call. Calls within that region retain their exact
+pending cleanup scopes and cleanup-only locals. Cold cleanup bodies remain in
+the retained bytecode; the runtime reconstructs their handlers and enters them
+through the unwind driver. A real Lisp native caller with nested protected
+regions verifies inner-before-outer cleanup exactly once, replacement THROW
+with multiple values, and moving-GC preservation of a local used only by cleanup.
+This proves exceptional bytecode cleanup fallback, not native cleanup execution.
+The ordinary builder still refuses protected code. GO/RETURN-FROM crossing a
+cleanup are explicitly refused rather
+than silently branching past it; source-level tests cover both refusal cases.
+
+Normal cleanup now has explicit transfer-SSA operations: `CleanupSave` preserves
+the protected primary and complete runtime multiple-value state, while
+`CleanupRestore` restores that tuple and produces the primary on the normal
+resume edge. Both are effectful runtime boundaries with FrameState metadata;
+their continuation identity names the cleanup and normal resume bytecodes.
+The builder connects normal cleanup entry/return edges, including nested and
+branched forms. V13 verifies matching ordered continuation stacks, consistent
+joins, no abandoned values on normal return, and matching running-cleanup scopes
+on exceptional exits. Source tests cover cleanup inside cleanup, dead-code
+elimination preserving save/restore, and malformed identities and joins.
+The opt-in SysV emitter now lowers these operations to normal-returning runtime
+helpers. The owning invocation reserves and roots its continuation stack before
+machine entry. Save retains the primary, zero/one/many-value state, and exact
+handler depth; restore republishes the saved values after native cleanup code.
+Calls made during cleanup retain their running-cleanup identities in the transfer
+maps. Selected throws now enter native exceptional cleanup as described below;
+fallback adopts the already-rooted continuations for unsupported outcomes and
+unwinds them at their recorded handler depths, without replaying the failed call.
+Legacy emission and transfer emission without explicit cleanup helpers still
+refuse these operations.
+
+Source-level execution tests cover nested normal cleanup, all multiple-value
+shapes, forced moving GC during cleanup, and a replacement THROW crossing two
+running cleanup continuations before executing the outer cleanup once. The
+helper calls use the normal call-frame, clobber and shadow-root conventions;
+they add no generated caller status test. These helpers do not execute Lisp,
+yield, signal or collect. Multiple-value snapshots use a fallible reserve-and-
+copy and turn reservation failure into a resumable propagation continuation;
+the remaining dynamic handler/restart record allocations are still an ABI
+installation gate.
+Before native entry, the transfer path now reserves the execution-local
+control-value map for the statically possible primary, multiple-value and
+restart-argument records. Payload extraction finds existing secondary and
+restart keys by borrowed lookup, without formatting temporary Rust strings. The
+cold capture path also reuses a pre-reserved frame-chain scratch vector, so
+validating the native cluster stack after a transfer does not grow a Rust
+container. Native catch and handler registration now uses fallible string,
+token, and vector construction; restart names and captured exit stacks are
+prepared before mutating the live restart stack, so a failed reservation cannot
+leave a partial dynamic scope. Static restart clause bytecode is rooted in
+per-entry templates and dynamic scopes share handles to those templates rather
+than cloning a bytecode function after native entry.
+The reserve failure is reported as `STORAGE-CONDITION`/`Oom` before generated
+code runs. This removes two avoidable cold-path allocations; arbitrary cleanup
+code can still allocate, and the full preallocated emergency storage path is
+still required before ordinary ABI activation.
+A real-fiber gate also runs native cleanup on one and four carrier threads,
+observes at least two cleanup continuations suspended together, and collects
+from outside their stacks. On resumption, distinct per-fiber answers, multiple
+values, replacement THROW tokens, stack watermarks and native nesting depth must
+remain correct. It additionally forces collection within each resumed cleanup
+and verifies actual address relocation. This gate passes repeated stress/poison
+runs; it does not assert carrier migration and does not replace the wider
+fiber/foreign-boundary gates.
+
+The fiber gate now also suspends exceptionally entered native cleanup, with a
+pending THROW rooted across suspension, collection and a replacement THROW.
+Ordinary tier installation and broader handler/foreign/migration gates remain
+outstanding.
+
+### Native-frame landing adapter
+
+`emit_native_landing_stub` consumes an execution-owned `SysvNativeLanding`
+packet after the capture stub has returned from Rust preparation and restored
+its updated nonvolatile registers. It selects the destination frame's normal
+body SP, places the primary in RAX, and tail-jumps to the native landing pad.
+The original native frame remains live. The packet is a machine interface,
+not a target-admission check: dispatch must validate retained code,
+frame recipes, live-value homes, roots and segment ownership before selecting it.
+
+An executable fixture proves normal Rust destructor completion before landing,
+all six updated nonvolatile registers, stack-slot preservation, aligned calls
+from the landing pad, and return through the original native frame and segment.
+It exercises 0/16/32/64-byte temporary call areas, forces moving GC in the helper
+and preparation, and dereferences relocated register/stack pointers after landing.
+Run this capability gate explicitly with `cargo test -p torcl-compiler --test
+native_landing_sysv -- --include-ignored`.
+
+The opt-in Lisp transfer entry now selects this adapter for supported throws.
+`SysvTransferTable::with_cleanup_landings` binds a compiler-selected
+cold edge to an exact call site, checks the innermost local UNWIND-PROTECT identity,
+and requires an in-bounds ENDBR64 entry in the supplied code bytes. Duplicate or
+unknown call sites, inherited cleanup ownership and unaligned body-SP recipes
+are rejected. Unlisted sites retain fallback. The checked site can construct a
+same-frame landing packet without allocation, using its temporary call-area size;
+it rejects the wrong captured PC, exit kind, stack alignment and address overflow.
+This is metadata validation, not proof of runtime ownership: the dispatcher still
+must retain that exact code, establish current-segment/frame ownership, root the
+pending continuation and repair native homes before selecting the packet.
+
+`build_from_bytecode_for_native_cleanups` constructs exceptional cleanup
+predecessors **before** SSA sealing and phi simplification. Calls split into normal
+and cold blocks; the cold edge truncates the operand stack to the selected
+UNWIND-PROTECT's saved depth. Locals merge with the normal cleanup entry, so an
+assignment after a throwing call cannot replace the exceptional pre-call value.
+`CleanupLanding` retains the entry FrameState and continuation identity.
+Cleanup completion is an Invoke with `CleanupContinuation` metadata: only its
+normal edge pops/restores the saved answer, while its cold edge resumes the
+pending transfer. NlxTransfer may name a verified cleanup successor or leave the
+native CFG for fallback. V13 verifies landing identity, stack depth, retained
+running continuations and the distinct completion routes.
+
+Source tests cover nested normal/exceptional cleanup, ERROR-only protected paths,
+zero/multiple values, enclosing operand-stack prefixes and loop back edges,
+including DCE. Phi replacement also visits synthetic call-edge blocks; otherwise
+removing a trivial phi left dangling arguments on those new edges. Intrinsic
+expansion is conservatively deferred in this builder so structural throwing
+predecessors cannot disappear while SSA is being built. Ordinary tiering keeps
+its existing builder; the opt-in transfer runtime consumes this new CFG.
+
+`emit_framed_native_cleanups` emits ENDBR64 cold entries followed by parallel
+phi-home moves into the selected cleanup. The machine layer separates the cold
+FrameState use from its operand-free branch, as required by regalloc2 when the
+cleanup has multiple predecessors. CleanupLanding itself is a liveness marker.
+Admission currently requires each source Invoke's cold block to contain only
+NlxTransfer, with no incoming block arguments. A transform that adds work before
+that terminator is rejected until landing maps describe execution of the full
+edge; otherwise a native jump could silently skip that work.
+Cleanup completion uses a typed 32-byte helper-v2 request: normal completion
+restores the saved primary and multiple values, while exceptional completion
+retains its rooted continuation until cold capture consumes the pre-op map.
+Direct THROW is also an Invoke, with rooted tag/primary arguments and a reserved
+request discriminator outside the u32 symbol-index domain. Its helper preserves
+multiple values and returns through Rust before dispatch. SETQ's ClearMv uses
+the existing nonallocating reset helper; no successful-return check is added.
+
+The runtime retains code, maps and adapters for the invocation, captures exact
+source homes, and checks the current Lisp frame and active segment. For a selected
+throw to a live outer CATCH, it repairs native homes from canonical rooted shadows,
+parks the pending continuation before dispatch, and enters the cold edge. Running
+cleanup continuations are retired only at crossed handler depths. Completion
+continues through outer native cleanups or reconstructs bytecode for the remaining
+unwind; it never repeats the failed call or the completed cleanup. Raw errors
+retain fallback so signaling and restart search still happen in the live context.
+Native CATCH and HANDLER-CASE destinations are admitted by the opt-in entry;
+HANDLER-BIND and RESTART-CASE now have activation-owned registration records and
+exact bytecode fallback, but remain fallback barriers rather than native landing
+destinations. Inherited OSR scope state is still rejected at this entry.
+
+The compiler execution fixture verifies normal/exceptional phi values after
+actual moving GC, and both completion outcomes without any bytecode evaluator.
+Lisp gates count native cleanup entries for nested throws, direct THROW,
+replacement transfers and fiber suspension. A replacement to a different catch
+also checks retirement of the superseded token's payload roots.
+
+Paused cleanup continuations now privately own their control payloads
+(`bliss-shih7.12.4`). Catch/block tokens name destinations, so they cannot also
+identify individual pending transfers: a second throw to the same catch may be
+redirected inside cleanup while the original throw must still complete. Native,
+bytecode and tree-walker cleanup move primary/secondary values out of the shared
+token map, root them while paused, and restore them only when resuming that
+transfer. Dropping a superseded continuation cannot erase a newer transfer's
+values. Selected HANDLER-CASE conditions and restart arguments receive the same
+ownership; local bytecode RETURN-FROM
+retains its full multiple-value state. Tree-walker cleanup also roots the original
+error datum while running allocating cleanup.
+
+Regression gates cover reentrant throws with zero/one/many values, conditions, restart
+arguments, local-return multiple values, and actual relocation during native
+cleanup and error propagation. These changes do not activate the ABI for ordinary
+tiers. Emergency allocation guarantees (`bliss-shih7.12.3`) still apply to Rust
+key construction, map restoration and multiple-value vector snapshots, alongside
+the remaining ABI activation gates.
+
+### Selecting the next native unwind action
+
+`torcl-compiler::native_unwind` selects the next logical action from one retained
+activation's ordered scope map (`bliss-shih7.12.5`). The runtime resolves a live
+destination first; the selector neither signals conditions nor searches Lisp
+names. A local target is identified by its establishing bytecode PC within that
+exact activation, not its resume address. It selects an intervening cleanup before
+the target, never an outer cleanup beyond the selected destination. Existing
+native cleanup dispatch uses the selector for transfers to an outer activation.
+
+Inherited OSR records and unsupported dynamic restoration select fallback.
+Running cleanup continuations do not count as installed handlers. A local tagbody
+alone is insufficient evidence that its dynamic registration can be discarded;
+the scope map does not encode whether NamedTag exposed it to a closure. EnterTarget
+is only a logical action: native registration, destination-specific CFG/phi edges,
+landing validation and state restoration must still exist before a jump is legal.
+Native CATCH execution is tracked in `bliss-shih7.12.6`; the selector does not claim
+that capability or enable ordinary ABI installation.
+
+Catch bindings retain the actual tagged Lisp object as a GC root, and THROW
+compares tags by object identity across bytecode, tree-walking and native helper
+paths (`bliss-shih7.12.6.2`). Printed tag text is only diagnostic: distinct lists,
+strings or uninterned symbols may print alike without naming the same catch.
+This representation is also used by native catch registration;
+moving GC must repair the saved tag before dynamic destination search.
+
+The opt-in entry executes CATCH registration and normal retirement through
+helper-v2 (`bliss-shih7.12.6.1`). Catch requests carry an establishing BCP in a
+reserved request class outside the symbol-index domain; both preserve multiple
+values. The activation retains the generated control token, while Env roots the
+dynamic tag. A scope guard retires this invocation's registrations on exit without
+discarding enclosing catches. Bytecode fallback reconstructs handlers with the
+same tokens, so it delivers the already-selected throw without replaying its call.
+The native selector runs only cleanups inside the selected catch boundary.
+
+The next opt-in extension adds native catch delivery (`bliss-shih7.12.6.3`).
+Catch destinations enter the exceptional CFG before SSA sealing, with a separate
+landing block for each source site and selected catch. Its noncollecting helper
+produces the catch's primary value, and the resulting edge joins ordinary
+completion with the correct locals and enclosing operand-stack prefix. Emission
+binds each landing to an exact return PC, establishing BCP, resume BCP and checked
+machine entry; it cannot jump past an intervening cleanup.
+
+Runtime preparation plans explicit retirement of crossed local catches, validates
+the destination and live registrations before changing them, repairs native homes,
+and moves the selected values into a rooted payload. Rust returns before assembly
+enters the landing, whose helper consumes that payload and restores multiple
+values. Missing destinations retain the original registrations for bytecode
+fallback. Test counters distinguish actual catch landings from fallback, so a
+correct result alone cannot disguise interpreter execution.
+
+The opt-in tests exercise same-tag shadowing, crossed catches, cleanup ordering
+and replacement throws, modified and branch-merged locals, enclosing operand-stack
+values, zero/one/many returned values, and actual moving-GC relocation. They require
+native catch execution and zero fallback for supported local destinations.
+A test-only unavailable-destination seam also withholds one selected catch landing
+while retaining its exact source map and live registrations. The regression
+requires one bytecode fallback, no native catch entry, no replay of the throwing
+call, correct cleanup order, preserved locals/multiple values and an unchanged
+enclosing catch, with actual tag relocation under GC stress. It covers both
+immediate fallback and fallback after an intervening native cleanup.
+This extension does not enable ordinary ABI installation. The compiler still
+declines direct exits requiring catch unregistration, and the opt-in transfer
+entry does not yet start from an OSR continuation. The existing T0-to-native OSR
+path does preserve interpreter-owned handlers: `run_native_osr` keeps the live
+activation stacks, establishes a frame-scoped fault-recovery window, and hands
+pending signals back to the interpreter before restoring the outer native state.
+Host allocation failure during token construction and payload restoration remains
+part of `bliss-shih7.12.3`.
+
+### Opt-in native HANDLER-CASE delivery
+
+The SysV transfer entry also registers live HANDLER-CASE clusters with original
+activation-owned clause tokens and rooted condition-cluster frames. Raw errors
+are signaled while that dynamic context is still installed; selecting a clause
+then begins unwinding. The builder creates per-source, per-clause exceptional
+edges before sealing SSA. A checked HandlerLanding defines the condition local
+at the clause's bytecode destination, with the enclosing operand stack restored.
+The transfer table binds that destination to the exact source scope, clause,
+return PC and native stack recipe.
+
+Native preparation validates the owned cluster-frame chain and all registrations
+before retirement. It roots the selected condition across intervening native
+cleanup, retires crossed handler clusters in order, and delivers the condition
+only after Rust returns to the assembly dispatcher. A missing native destination
+retains the original cluster frames and tokens for bytecode transfer propagation;
+the failed call is not replayed. Normal completion unregisters the same records.
+
+The handler regressions distinguish native clause entry from fallback, check
+nested and declined clauses, replacement errors, collecting cleanup, multiple
+values and actual condition-datum relocation. Fiber tests suspend several pending
+conditions together, collect while suspended, and check each fiber's result and
+restored stack/segment state. A test-only missing-destination path exercises both
+immediate fallback and fallback after native cleanup.
+
+Already-signaled errors and transfers to a validated live enclosing restart can
+also run checked local native cleanup before materializing the outer boundary.
+The live-signaling regression requires a returning handler to run exactly once,
+before cleanup, and preserves the condition or restart arguments through moving
+GC. The outer handler/restart registration remains installed for its owner to
+consume. HANDLER-BIND and RESTART-CASE setup/retirement now uses helper-v2
+requests with a single ordered cluster-frame guard, and fallback reconstructs
+their interpreter records without replaying the failed call. They do not yet
+provide native local restart landing.
+The consumer test invokes the retained restart body after removing its bindings,
+checks that cleanup has finished, and preserves multiple values through another
+collection. A replacement-error regression also verifies that raw errors raised
+by a handler are signaled while its cluster is hidden: only older clusters see
+the new error. Shared signaling roots the condition, copied entries and hidden
+cluster tail throughout callbacks and nested signaling.
+
+This remains opt-in infrastructure. Inherited OSR scope admission, complete
+emergency allocation and production ABI installation still have separate gates;
+ordinary installed native functions retain their checks.
+
+### Direct local exits
+
+When a `RETURN-FROM` or `GO` crosses only locally established lexical block or
+tagbody metadata, the native builder lowers it to the ordinary SSA branch. The
+branch restores the destination operand-stack depth and carries the returned
+value through the same merge as normal control flow; it does not enter the
+generic transfer helper. A regular test with direct block and tagbody exits
+exercises the installed native path under moving-GC stress. Companion fallback
+tests cover replacement cleanup, error propagation and no replay of the original
+definition. The older rejection rule remains: an exit crossing `UNWIND-PROTECT`,
+a catch, or another dynamic registration is not converted to a branch, because
+it must run cleanup or preserve the live registration for fallback.
+
+OSR scope maps mark interpreter-established records as `Inherited`. The native
+unwind selector refuses to retire or branch across inherited records, even when
+the lexical target itself is a block or tagbody. Such an exit remains a bytecode
+fallback until the activation can prove ownership of every crossed record.
+
 ### Windows validation and Wine limits
 
 Wine remains a fast regression environment for Windows functionality. It does
@@ -427,6 +941,20 @@ separately. Never disable mitigations to make a gate pass. Native Windows CI and
 the remaining SEH/mitigation gates are tracked in `bliss-shih7.14` and gate final
 activation. The boundary follows Microsoft's [x64 prologue/epilogue rules](https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog)
 and [process mitigation query contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessmitigationpolicy).
+The checked-in `windows-native-transfer` job in `.github/workflows/ci.yml` runs
+the native Windows execution test with `--include-ignored`; the Linux/Wine job
+continues to provide only cross-build and regression coverage.
+
+The cross-target `native_segment_windows` test was also run under Wine outside
+the sandbox. Its refusal test passed, while the execution test failed with
+"mitigation state unavailable or incompatible". That is the intended refusal
+under Wine and confirms that the sentinel policy does not silently execute the
+segment without verified mitigations.
+
+The full `native_transfer_cli` integration target also passes 8/8 under the
+Windows GNU target with Wine. This exercises T2 transfers, OSR, fibers,
+multiple values, and cleanup replacement in the cross-built runtime; it remains
+separate from native Windows SEH and mitigation evidence.
 
 ## Baseline contract oracles and boundary inventory
 
@@ -451,9 +979,45 @@ The following existing sites must be covered when installing the segment ABI:
 | Fault recovery | `c2i_set_native_sigsegv_recovery`, architecture recovery stubs and recovery guards; only generated-frame faults may use generated-frame recovery. No generic unwind through Rust helpers. |
 | Installation/lifetime | `NativeCode`, `OsrCode`, `ActiveNativeCode`, `publish_native`, `install_t2_completion`, `compile_t2_artifact` and retained direct callees; verify architecture plus ABI at every entry/cache/installation boundary. |
 
-PPC deferral is scheduling per user direction, not a claim that its existing
-backend lacks native compilation. Foreign callbacks and all architecture-specific
-entry stubs remain in the final portability audit.
+The ppc64le backend already has native T1/T2 compilation and ELFv2 foreign-call
+support. The first ELFv2 segment slice is implemented in
+`crates/torcl-rt/src/native_transfer/ppc64le.S`: its QEMU probe covers normal
+return, direct transfer landing, anchor cleanup, and ELFv2 nonvolatile state.
+The CLI also has a narrow opt-in PPC64LE entry in
+`crates/torcl/src/cli/bytecode/native_transfer_entry_ppc64le.rs`; it enters the
+real segment for deopt-free bodies with no calls or protected scopes and falls
+back to the checked ABI otherwise. Full PPC deoptimization and fault-recovery
+metadata, native handlers,
+cleanup capture, loop polling and local-exit admission remain open under
+`bliss-1rt.2`. Foreign callbacks and all architecture-specific entry stubs
+remain in the final portability audit.
+
+The AArch64 runtime now has the corresponding AAPCS64 segment enter/leave
+boundary in `crates/torcl-rt/src/native_transfer/aarch64.rs`, with a QEMU probe
+covering normal return, direct transfer, anchor cleanup and host-stack
+restoration. The CLI has a narrow `TORCL_NATIVE_TRANSFER=1` entry for constant
+and identity T2 bodies: it supplies the nonallocating multiple-values adapter,
+publishes the active environment, and falls back before any Lisp call,
+deoptimization, handler, cleanup, or loop-polling operation. This does not
+claim general AArch64 activation; generated entry admission, deoptimization
+metadata, fault recovery, handlers and cleanup capture remain target-specific
+gates.
+
+The s390x runtime now has the corresponding ELF64 segment enter/leave boundary
+in `crates/torcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering
+normal return, direct transfer, anchor cleanup and host-stack restoration. The
+CLI now has the same narrow `TORCL_NATIVE_TRANSFER=1` entry for constant and
+identity T2 bodies, using the nonallocating multiple-values adapter and
+falling back before calls, deoptimization, handlers, cleanup, or loop polling.
+General s390x activation remains gated on generated entry admission,
+deoptimization metadata, fault recovery, handlers, cleanup capture and precise
+native polling.
+The separate s390x foreign-call adapter is also still pending: the System Z
+scalar ABI independently allocates integer arguments in `r2`–`r6` and even
+floating-point registers, with 32-bit overflow values using their ABI-specific
+save-area offsets. The generic legacy eighteen-shape dispatcher cannot safely
+stand in for that contract, so `bliss-0tazp` retains it until a generated adapter
+and QEMU foreign-call tests exist.
 
 Compiler work decomposition under `bliss-shih7.11`:
 
@@ -505,6 +1069,15 @@ allocator locations still need physical save recipes, and logical function names
 still need retained executing definitions before they form installable unwind
 sites. Tests cover actual Lisp lowering as well as malformed-map rejection.
 
+The rich x86 emitter can assign a permanent spill home to a value whose
+allocator ranges move between locations. Its `x64_frame::select_frame_homes`
+policy is now shared with transfer metadata rather than duplicated.
+`lower_framed_transfer_maps` resolves descriptors and roots against those final
+homes, materializes omitted immediate constants, and rejects moving heap
+literals. Tests cover split ranges whose final home differs from the allocator
+location and constants with no physical home. This is the map variant required
+by rich emission; raw allocator maps alone do not describe its physical frame.
+
 `transfer_capture::TransferSnapshot` reserves storage before native entry and
 copies located words without Lisp allocation while the source frame is still
 available. It scans only tagged saved words; raw integers/floats are preserved
@@ -526,7 +1099,7 @@ required emergency preparation-failure/OOM path.
 This path covers bytecodes already modelled by the SSA builder and ordinary
 function entry. Protected-bytecode SSA, inlined/OSR scope composition, pass-wide
 integration, machine landing pads and unwind maps remain required. Existing
-emitters still refuse Invoke; the machine emitter explicitly rejects the new
+legacy emission entry points still refuse Invoke; the compact machine emitter explicitly rejects the new
 call/route opcodes before applying ordinary-call allocation assumptions. This
 prevents accidental emission using the old ABI.
 
@@ -572,3 +1145,52 @@ Cleanups retain any surrounding bindings until unwinding crosses them.
 Extending Invoke construction to protected forms and attaching scope maps to
 installed native code remain required before native dispatch; this analysis
 does not enable emission of currently unsupported protected forms.
+
+### Current validation boundary (2026-09-29)
+
+The supported-host compiler and transfer integration gates currently pass:
+
+```text
+cargo test --locked -p torcl-compiler --lib                 153 passed
+cargo test --locked -p torcl-compiler --test native_poll_abi 2 passed
+cargo test --locked -p torcl --test native_transfer_cli     9 passed
+cargo test --locked -p torcl --lib native_v2_ -- --ignored 18 passed
+```
+
+The native segment emitter passes a zero `c2i_transfer_pending` address. Its
+eligible native-to-native returns therefore have no successful-return status
+call or branch; independent loop and straight-line poll veneers remain in
+place. The fallback and handler tests cover multiple values, inherited OSR
+handlers, replacing cleanups, fiber yields, and moving-GC roots on x86-64
+Linux. Narrow constant/identity segment entries also pass the AArch64 and
+s390x QEMU portability gates.
+
+T2 OSR segment entry now includes a regression for a call-free loop whose
+back-edge executes the poll veneer. The emitter treats the injected poll as a
+real Rust call when selecting its prologue, so the veneer enters Rust with the
+required SysV stack alignment; the test passes normally and under
+`TORCL_GC_STRESS=1 TORCL_GC_POISON=1`. The earlier crash in
+`revalidate_current_segment` was an unaligned call frame, not a reason to keep
+all OSR bodies on the checked ABI.
+
+The process-level opt-in smoke also passes with forced moving GC and poison:
+`TORCL_GC_STRESS=1 TORCL_GC_POISON=1 TORCL_NATIVE_TRANSFER=1` on a basic
+`--no-init --eval` form. This specifically covers the bootstrap activation gate
+that prevents the segment cache from running before `BOOT_COMPLETE`.
+
+The legacy checked ABI remains a required compatibility path. It is still used
+for unsupported bodies and platforms, nested native-to-Lisp calls, allocation
+and signaling helpers, deoptimization, fault recovery, incomplete protected
+scope lowering, foreign callbacks, and image/Windows boundaries. A full
+GC-stress run of the largest T2 transfer fixture is currently dominated by
+compilation under every-allocation collection and needs a bounded stress
+fixture before it can serve as a completion gate. The remaining delivery work
+is tracked in Beads (`bliss-shih7.6`, `bliss-shih7.14`, `bliss-0tazp`, and
+`bliss-x7qyn`); these are deliberately not represented as successful native
+coverage.
+
+The Windows GNU cross-build also completes with `scripts/windows-port.sh build`,
+and the resulting release executable runs a basic `--no-init --eval` smoke under
+Wine. Wine is recorded only as a regression environment: the native Windows
+SEH, CFG, and shadow-stack execution gates still require the checked-in
+`windows-native-transfer` job on an actual Windows runner.

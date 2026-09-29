@@ -1,7 +1,8 @@
 //! Resolve exception capture at the throwing call, before physical frames retire.
-//! These maps name machine instruction indices and allocator locations, NOT
+//! These maps name machine instruction indices and location keys, NOT
 //! emitted PCs or hardware save offsets. Emission must translate both and retain
 //! the executing definitions before installation can publish an unwind site.
+//! The framed variant resolves keys from the rich emitter's final stable homes.
 
 use crate::control_scope::ControlScope;
 use crate::t2::deopt::{self, LoweredScope, Rebox, SlotDescriptor};
@@ -157,4 +158,53 @@ fn collect_roots(slot: &SlotDescriptor, roots: &mut Vec<Location>) {
         }
         _ => {}
     }
+}
+
+/// Rebind validated call states to the rich emitter's final homes. Constants
+/// omitted from the home table are materialized directly; a moving heap literal
+/// is rejected by shared descriptor lowering. The emitter must publish roots
+/// from these final homes, not the raw allocator's transient stack-map locations.
+pub fn lower_framed_transfer_maps(
+    f: &Function,
+    machine: &MachFunc,
+    homes: &crate::t2::x64_frame::FrameHomes,
+    constants: &std::collections::HashMap<Value, u64>,
+) -> Result<Vec<TransferCaptureMap>, TransferMapError> {
+    use crate::t2::frame_state::ValueSource;
+    let mut maps = lower_transfer_maps(f, machine)?;
+    for map in &mut maps {
+        let mut state = f
+            .frame_states
+            .get(f.inst(map.call).frame_state.unwrap())
+            .clone();
+        let substitute = |source: &mut ValueSource| {
+            if let ValueSource::Value { value, .. } = source {
+                if let Some(&bits) = constants.get(value) {
+                    *source = ValueSource::Const(torcl_rt::value::TorclVal(bits));
+                }
+            }
+        };
+        for scope in &mut state.scopes {
+            for source in scope.locals.iter_mut().chain(&mut scope.stack) {
+                substitute(source);
+            }
+        }
+        for recipe in &mut state.remat {
+            for source in &mut recipe.inputs {
+                substitute(source);
+            }
+        }
+        map.frames = deopt::lower_one(0, &state, &|value| {
+            homes.values.get(&value).and_then(|home| home.location())
+        })
+        .map_err(TransferMapError::FrameState)?
+        .scopes;
+        map.roots.clear();
+        for frame in &map.frames {
+            for slot in &frame.slots {
+                collect_roots(slot, &mut map.roots);
+            }
+        }
+    }
+    Ok(maps)
 }

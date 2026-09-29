@@ -79,7 +79,6 @@ fn calls_runtime(opcode: Opcode) -> bool {
             | Opcode::SymbolValue
             | Opcode::SymbolFunction
             | Opcode::SetSymbolValue
-            | Opcode::ClearMv
             | Opcode::TakeValuesToLocals
     )
 }
@@ -498,6 +497,14 @@ impl Emitter<'_> {
 
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
+        // A direct native segment enters with the caller's multiple-value state
+        // already cleared.  The narrow no-call/no-handler path cannot produce
+        // additional values, so the bytecode ClearMv marker is a local no-op;
+        // routing it through a runtime adapter would make otherwise leaf bodies
+        // ineligible for the adapter-free emitter.
+        if data.opcode == ClearMv {
+            return Ok(());
+        }
         if self.polls.contains(&instruction) {
             // Sampled back-edge safepoint, so a hot loop still reaches GC
             // stop-the-world and remains interruptible.

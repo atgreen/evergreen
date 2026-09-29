@@ -28,3 +28,20 @@ jobs:
         run: bash scripts/gc-root-lint.sh
       - name: ansi-test
         run: cargo test -p torcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts
+
+  # The Linux build can only cross-compile the Win64 adapter.  Keep a native
+  # Windows gate for the SEH/shadow-space transition itself; mitigation refusal
+  # is a test failure here rather than a silently skipped ABI claim.
+  windows-native-transfer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo check (Windows workspace)
+        run: cargo check --workspace
+      - name: Win64 segment ABI execution
+        run: cargo test -p torcl-rt --test native_segment_windows -- --include-ignored --nocapture
+      - name: Win64 runtime adapter probes
+        run: cargo test -p torcl-rt --lib native_transfer -- --include-ignored --nocapture
+      - name: Win64 runtime transfer regressions
+        run: cargo test -p torcl --test native_transfer_cli --test tier_observability

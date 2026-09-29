@@ -4,15 +4,54 @@
 
 use crate::execution_local::ExecutionLocal;
 use crate::stack::{Frame, TorclStack};
-#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
+))]
 use crate::value::NIL;
 use crate::value::TorclVal;
 use std::cell::Cell;
 
+#[cfg(all(target_arch = "aarch64", unix))]
+mod aarch64;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+mod ppc64le;
+#[cfg(all(target_arch = "s390x", unix))]
+mod s390x;
 #[cfg(all(target_arch = "x86_64", any(windows, all(test, target_os = "linux"))))]
 mod win64;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use self::enter_sysv as enter_platform;
+#[cfg(all(target_arch = "aarch64", unix))]
+use aarch64::enter as enter_platform;
+#[cfg(all(target_arch = "aarch64", unix))]
+pub use aarch64::leave_native_segment;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+use ppc64le::enter as enter_platform;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+pub use ppc64le::leave_native_segment;
+#[cfg(all(target_arch = "s390x", unix))]
+use s390x::enter as enter_platform;
+#[cfg(all(target_arch = "s390x", unix))]
+pub use s390x::leave_native_segment;
 #[cfg(all(target_arch = "x86_64", windows))]
 use win64::enter as enter_platform;
 #[cfg(all(target_arch = "x86_64", windows))]
@@ -50,6 +89,7 @@ pub struct NativeSegment {
     pub landing_pc: usize,
     previous: *mut NativeSegment,
     owner: SegmentOwner,
+    carrier: crate::thread::NativeThreadId,
     stack_sp: *const u8,
     stack_fp: *const Frame,
     _pinned: std::marker::PhantomPinned,
@@ -61,6 +101,10 @@ impl NativeSegment {
     }
     pub fn owner(&self) -> SegmentOwner {
         self.owner
+    }
+
+    pub fn carrier(&self) -> crate::thread::NativeThreadId {
+        self.carrier
     }
     pub fn stack_watermark(&self) -> (*const u8, *const Frame) {
         (self.stack_sp, self.stack_fp)
@@ -77,6 +121,30 @@ static ACTIVE: ExecutionLocal<Cell<*mut NativeSegment>> =
 /// it must not be dereferenced after return or from another execution.
 pub fn current_segment() -> *mut NativeSegment {
     ACTIVE.with(Cell::get)
+}
+
+/// Revalidate the platform hardening contract when a suspended fiber resumes
+/// on a different carrier. The common case is a single comparison with no
+/// syscall or platform query. A failed revalidation is deliberately reported
+/// to the native poll caller so it can leave through the normal bytecode
+/// fallback; generated code must never continue under an unknown contract.
+pub fn revalidate_current_segment() -> bool {
+    let current = crate::thread::current_thread_id();
+    let segment = current_segment();
+    if segment.is_null() {
+        return true;
+    }
+    // SAFETY: ACTIVE contains a pinned segment owned by this execution and is
+    // only read on that execution's carrier at a poll boundary.
+    let segment = unsafe { &mut *segment };
+    if segment.carrier == current {
+        return true;
+    }
+    if !is_supported() {
+        return false;
+    }
+    segment.carrier = current;
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,15 +167,58 @@ pub fn is_supported() -> bool {
     {
         win64::is_supported()
     }
-    #[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ))]
+    {
+        ppc64le::is_supported()
+    }
+    #[cfg(all(target_arch = "aarch64", unix))]
+    {
+        aarch64::is_supported()
+    }
+    #[cfg(all(target_arch = "s390x", unix))]
+    {
+        s390x::is_supported()
+    }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", any(target_os = "linux", windows)),
+        all(
+            target_arch = "powerpc64",
+            target_endian = "little",
+            target_os = "linux"
+        ),
+        all(target_arch = "aarch64", unix),
+        all(target_arch = "s390x", unix),
+    )))]
     {
         false
     }
 }
 
-#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
+))]
 struct ActiveSegment(*mut NativeSegment);
-#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
+))]
 impl Drop for ActiveSegment {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.set(self.0));
@@ -125,7 +236,16 @@ impl Drop for ActiveSegment {
 /// leaving, generated frames' roots and Lisp cleanup must be handled by the
 /// transfer preparation protocol. Hardening cannot be enabled within a segment.
 /// The returned primary must be rooted before the caller next allocates.
-#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
+))]
 pub unsafe fn invoke_native_segment(
     entry: *const u8,
     slots: *mut u64,
@@ -138,12 +258,14 @@ pub unsafe fn invoke_native_segment(
         Some(id) => SegmentOwner::Fiber(id),
         None => SegmentOwner::Thread(crate::thread::current_thread_id()),
     };
+    let carrier = crate::thread::current_thread_id();
     let previous = current_segment();
     let mut segment = std::pin::pin!(NativeSegment {
         saved_sp: 0,
         landing_pc: 0,
         previous,
         owner,
+        carrier,
         stack_sp: stack.sp(),
         stack_fp: stack.fp(),
         _pinned: std::marker::PhantomPinned,
@@ -164,7 +286,16 @@ pub unsafe fn invoke_native_segment(
 ///
 /// # Safety
 /// Same entry/slot contract as the supported implementation; no code is entered.
-#[cfg(not(all(target_arch = "x86_64", any(target_os = "linux", windows))))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
+)))]
 pub unsafe fn invoke_native_segment(
     _entry: *const u8,
     _slots: *mut u64,
@@ -310,6 +441,7 @@ mod tests {
                 landing_pc: 0,
                 previous: std::ptr::null_mut(),
                 owner: SegmentOwner::Thread(crate::thread::NativeThreadId(0)),
+                carrier: crate::thread::NativeThreadId(0),
                 stack_sp: std::ptr::null(),
                 stack_fp: std::ptr::null(),
                 _pinned: std::marker::PhantomPinned,
@@ -328,5 +460,29 @@ mod tests {
             assert_eq!(outcome.value, TorclVal::from_fixnum(42));
             assert_eq!((anchor.saved_sp, anchor.landing_pc), (0, 0));
         }
+    }
+
+    #[test]
+    fn carrier_change_revalidates_before_resuming_a_segment() {
+        if !is_supported() {
+            eprintln!("native segment hardening probe unavailable on this host");
+            return;
+        }
+        let current = crate::thread::current_thread_id();
+        let mut segment = std::pin::pin!(NativeSegment {
+            saved_sp: 0,
+            landing_pc: 0,
+            previous: std::ptr::null_mut(),
+            owner: SegmentOwner::Thread(current),
+            carrier: crate::thread::NativeThreadId(current.0.wrapping_add(1)),
+            stack_sp: std::ptr::null(),
+            stack_fp: std::ptr::null(),
+            _pinned: std::marker::PhantomPinned,
+        });
+        let pointer = unsafe { segment.as_mut().get_unchecked_mut() as *mut NativeSegment };
+        let previous = ACTIVE.with(|active| active.replace(pointer));
+        assert!(revalidate_current_segment());
+        assert_eq!(unsafe { (*pointer).carrier }, current);
+        ACTIVE.with(|active| active.set(previous));
     }
 }

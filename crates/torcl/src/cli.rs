@@ -20,6 +20,7 @@ pub(super) use torcl_rt::bignum::{
 use torcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+mod control_payload;
 mod delivery;
 mod evaluated_builtins;
 pub mod events;
@@ -1857,7 +1858,7 @@ struct Env {
     /// cache (bliss-p1t).
     closures: Arc<SharedCell<HashMap<u64, Closure, torcl_rt::fxhash::FxBuildHasher>>>,
     block_stack: Vec<(String, String)>,
-    catch_stack: Vec<(String, String)>,
+    catch_stack: Vec<(TorclVal, String)>,
     /// Tags visible for GO: (tag-name, tagbody-token)
     tag_stack: Vec<(String, String)>,
     method_context: Vec<MethodContext>,
@@ -4277,16 +4278,19 @@ fn torcl_error_to_condition(
 ) -> Result<Option<TorclVal>, TorclError> {
     let name_sym = resolve_sym("NAME").unwrap_or(NIL);
     let mut condition = match error {
-        TorclError::TypeError { datum, expected } => build_condition_instance(
-            env,
-            "TYPE-ERROR",
-            &[
-                resolve_sym("DATUM").unwrap_or(NIL),
-                *datum,
-                resolve_sym("EXPECTED-TYPE").unwrap_or(NIL),
-                arena_str(expected),
-            ],
-        )?,
+        TorclError::TypeError { datum, expected } => {
+            // Build allocating siblings before copying either value into the
+            // initarg array: rooting the error does not repair an earlier copy.
+            torcl_rt::rooted!(datum = *datum);
+            torcl_rt::rooted!(expected = arena_str(expected));
+            let datum_key = resolve_sym("DATUM").unwrap_or(NIL);
+            let expected_key = resolve_sym("EXPECTED-TYPE").unwrap_or(NIL);
+            build_condition_instance(
+                env,
+                "TYPE-ERROR",
+                &[datum_key, *datum, expected_key, *expected],
+            )?
+        }
         TorclError::UnboundVariable(sym) => {
             build_condition_instance(env, "UNBOUND-VARIABLE", &[name_sym, *sym])?
         }
@@ -4646,12 +4650,23 @@ fn run_handler_cluster(env: &mut Env, condition: TorclVal, ci: usize) -> Result<
     if ci >= env.handlers.len() {
         return Ok(());
     }
-    let cluster = env.handlers[ci].clone();
-    for entry in &cluster.entries {
-        if condition_matches_handler(env, condition, &entry.type_name) {
-            let tail = env.handlers.split_off(ci);
-            let result = eval_handler_impl(&entry.handler, condition, env);
-            env.handlers.extend(tail);
+    torcl_rt::rooted!(condition = condition);
+    torcl_rt::rooted!(entries = env.handlers[ci].entries.clone());
+    for entry in entries.iter() {
+        if condition_matches_handler(env, *condition, &entry.type_name) {
+            let mut tail = env.handlers.split_off(ci);
+            torcl_rt::rooted_ref!(_tail = &mut tail);
+            // A raw evaluator error from the callback is a fresh signal in
+            // that callback's dynamic context. Keep this cluster hidden until
+            // older handlers have had their turn; restoring it first can call
+            // the same handler again while skipping the older ones.
+            let result = match eval_handler_impl(&entry.handler, *condition, env) {
+                Err(error) if !matches!(error, TorclError::Internal(_) | TorclError::Signalled { .. }) => {
+                    Err(signal_raw_error_in_context(env, error))
+                }
+                other => other,
+            };
+            env.handlers.append(&mut tail);
             result?;
         }
     }
@@ -7324,6 +7339,12 @@ fn visit_handler_roots(
 /// Let `rooted!`/`rooted_ref!` cover evaluator temporaries that hold heap forms
 /// in Rust-side containers across allocating evaluation (moving GC; bliss-8qf):
 /// handler clauses (HANDLER-CASE/HANDLER-BIND) and method specializers.
+impl torcl_rt::gc::TraceHostRoots for HandlerCluster {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
+        torcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.entries, visit);
+    }
+}
+
 impl torcl_rt::gc::TraceHostRoots for HandlerEntry {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut TorclVal)) {
         with_env_visit_state(|state| visit_handler_roots(&mut self.handler, state, visit));
@@ -7732,6 +7753,9 @@ impl Env {
         }
         for value in &mut self.mv {
             visit(value);
+        }
+        for (tag, _) in &mut self.catch_stack {
+            visit(tag);
         }
         // Raw declaration specifiers are source conses copied out of a body; the
         // body's own root does not cover this independent copy (AGENTS.md GC
@@ -16213,7 +16237,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                 // its source forms for the same reason.
                 let (tag_form, mut body) = cp(cdr);
                 torcl_rt::rooted_ref!(_body_root = &mut body);
-                let tag = val_as_str(eval_form(tag_form, env)?);
+                let tag = eval_form(tag_form, env)?;
                 let token = next_control_token("__THROW__");
                 env.catch_stack.push((tag, token.clone()));
                 let result = eval_progn(body, env);
@@ -16257,14 +16281,15 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
 
             "THROW" => {
                 let (tag_form, rest) = cp(cdr);
-                let (val_form, _) = cp(rest);
-                let tag = val_as_str(eval_form(tag_form, env)?);
+                let (mut val_form, _) = cp(rest);
+                torcl_rt::rooted_ref!(_value_form_root = &mut val_form);
+                torcl_rt::rooted!(tag = eval_form(tag_form, env)?);
                 let value = eval_form(val_form, env)?;
                 if let Some((_, token)) = env
                     .catch_stack
                     .iter()
                     .rev()
-                    .find(|(catch_tag, _)| catch_tag == &tag)
+                    .find(|(catch_tag, _)| *catch_tag == *tag)
                 {
                     let token = token.clone();
                     store_control_mv(&token, value, env);
@@ -16273,7 +16298,8 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                 // A THROW with no matching CATCH is a catchable CONTROL-ERROR
                 // (CLHS 5.2), not an uncatchable internal error.
                 return Err(TorclError::ControlError(format!(
-                    "attempt to THROW to a tag that is not active: {tag}"
+                    "attempt to THROW to a tag that is not active: {}",
+                    val_as_str(*tag)
                 )));
             }
             "TAGBODY" => {
@@ -16326,10 +16352,18 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                         env.mv_active = saved_mv_active;
                         return Ok(v);
                     }
-                    Err(e) => match eval_progn(cleanup, env) {
-                        Ok(_) => return Err(e),
-                        Err(cleanup_exit) => return Err(cleanup_exit),
-                    },
+                    Err(mut error) => {
+                        torcl_rt::rooted_ref!(_error_root = &mut error);
+                        let mut payload = control_payload::ControlPayload::for_error(&error);
+                        torcl_rt::rooted_ref!(_payload_root = &mut payload);
+                        match eval_progn(cleanup, env) {
+                            Ok(_) => {
+                                payload.restore();
+                                return Err(error);
+                            }
+                            Err(cleanup_exit) => return Err(cleanup_exit),
+                        }
+                    }
                 }
             }
             "PRINT" => return eval_builtin_arguments(&name, cdr, env),

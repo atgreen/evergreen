@@ -426,6 +426,81 @@ fn capture_maps_exclude_unboxed_words_and_refuse_uncomposed_inline_scopes() {
 }
 
 #[test]
+fn framed_capture_uses_the_emitters_final_home_for_a_split_value() {
+    use std::collections::HashMap;
+    use torcl_compiler::t2::deopt::{Rebox, SlotDescriptor};
+    use torcl_compiler::t2::lower::lower;
+    use torcl_compiler::t2::mach::{Location, StackSlot};
+    use torcl_compiler::t2::regalloc::allocate_framed;
+    use torcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
+    use torcl_compiler::t2::x64_frame::{ValueHome, select_frame_homes};
+    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut machine = lower(&f);
+    allocate_framed(&mut machine).unwrap();
+    let split = f.block(f.entry()).params[1];
+    // Model an allocator split: the rich emitter must choose a permanent home
+    // rather than using whichever register happened to hold this value first.
+    let mut extra = *machine
+        .value_locations
+        .iter()
+        .find(|r| r.vreg.num == split.0)
+        .unwrap();
+    extra.location = Location::Stack(StackSlot(machine.num_spill_slots));
+    machine.value_locations.push(extra);
+    let homes = select_frame_homes(&f, &machine, |_| false).unwrap();
+    let ValueHome::Stack(slot) = homes.values[&split] else {
+        panic!("split range needs a stable spill");
+    };
+    let captures = lower_framed_transfer_maps(&f, &machine, &homes, &HashMap::new()).unwrap();
+    for capture in captures {
+        assert_eq!(
+            capture.frames[0].slots[1],
+            SlotDescriptor::InLocation(Location::Stack(StackSlot(slot)), Rebox::None)
+        );
+        assert!(capture.roots.contains(&Location::Stack(StackSlot(slot))));
+    }
+}
+
+#[test]
+fn framed_capture_materializes_excluded_immediates_but_rejects_heap_literals() {
+    use std::collections::HashMap;
+    use torcl_compiler::t2::deopt::SlotDescriptor;
+    use torcl_compiler::t2::lower::lower;
+    use torcl_compiler::t2::regalloc::allocate_framed;
+    use torcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
+    use torcl_compiler::t2::x64_frame::select_frame_homes;
+    use torcl_rt::value::TorclVal;
+    let mut source = body();
+    source.code = vec![
+        Instr::Const(0),
+        Instr::CallNamed {
+            sym: 123456,
+            nargs: 1,
+        },
+        Instr::Return,
+    ];
+    source.constants = vec![TorclVal::from_fixnum(19)];
+    source.arity = 0;
+    source.min_args = 0;
+    source.max_args = Some(0);
+    source.n_locals = 0;
+    let f = build_from_bytecode_for_transfers(&source).unwrap();
+    let value = f.inst(instructions(&f, Opcode::ConstFixnum)[0]).results[0];
+    let mut machine = lower(&f);
+    allocate_framed(&mut machine).unwrap();
+    let homes = select_frame_homes(&f, &machine, |v| v == value).unwrap();
+    let mut constants = HashMap::from([(value, TorclVal::from_fixnum(19).to_raw())]);
+    let maps = lower_framed_transfer_maps(&f, &machine, &homes, &constants).unwrap();
+    assert_eq!(
+        maps[0].frames[0].slots,
+        vec![SlotDescriptor::MaterializeConst(TorclVal::from_fixnum(19))]
+    );
+    assert!(maps[0].roots.is_empty());
+    constants.insert(value, 0x1001);
+    assert!(lower_framed_transfer_maps(&f, &machine, &homes, &constants).is_err());
+}
+
+#[test]
 fn automatic_call_routes_preserve_loop_and_osr_header_state() {
     let mut source = body();
     source.code = vec![

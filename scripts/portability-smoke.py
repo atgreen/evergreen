@@ -65,6 +65,110 @@ def main():
             print(f"{arch}: {tier or 'default'}: OK", flush=True)
         assert all(output == outputs[0] for output in outputs), outputs
 
+        if arch == "ppc64le":
+            # The parity loop may use the checked fallback.  This separate
+            # opt-in probe proves that a leaf body reaches the ELFv2 segment
+            # adapter at the Rust/native invocation boundary.
+            native_env = env.copy()
+            native_env["TORCL_FORCE_TIER"] = "t2"
+            native_env["TORCL_NATIVE_TRANSFER"] = "1"
+            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["TORCL_NN_DIRECT"] = "0"
+            native = subprocess.run(
+                command + [
+                    "--no-init",
+                    "--eval",
+                    "(progn (defun ppc-segment-identity () 41) "
+                    "(defun ppc-segment-argument (x) x) "
+                    "(defun ppc-segment-branch (x) (if x 1 2)) "
+                    "(defun ppc-segment-add (x) (+ x 1)) "
+                    "(assert (= (ppc-segment-identity) 41)) "
+                    "(assert (= (ppc-segment-argument 42) 42)) "
+                    "(assert (= (ppc-segment-branch t) 1)) "
+                    "(assert (= (ppc-segment-branch nil) 2)) "
+                    "(assert (= (ppc-segment-add 41) 42)) "
+                    "(format t \"PPC-NATIVE-SEGMENT-OK~%\"))",
+                ],
+                env=native_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if native.returncode:
+                raise RuntimeError(
+                    f"PPC native segment exit {native.returncode}\n"
+                    f"{native.stdout}\n{native.stderr}"
+                )
+            assert "PPC-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
+            assert native.stderr.count("[native-transfer/ppc64le] direct segment:") >= 3, native.stderr
+            print(f"{arch}: opt-in native segment entry: OK", flush=True)
+
+        if arch == "aarch64":
+            # The parity loop may use the checked fallback.  This separate
+            # opt-in probe proves that a leaf body reaches the AAPCS64 segment
+            # adapter at the Rust/native invocation boundary.
+            native_env = env.copy()
+            native_env["TORCL_FORCE_TIER"] = "t2"
+            native_env["TORCL_NATIVE_TRANSFER"] = "1"
+            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["TORCL_NN_DIRECT"] = "0"
+            native = subprocess.run(
+                command + [
+                    "--no-init",
+                    "--eval",
+                    "(progn (defun aarch64-segment-constant () 41) "
+                    "(defun aarch64-segment-identity (x) x) "
+                    "(assert (= (aarch64-segment-constant) 41)) "
+                    "(assert (= (aarch64-segment-identity 42) 42)) "
+                    "(format t \"AARCH64-NATIVE-SEGMENT-OK~%\"))",
+                ],
+                env=native_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if native.returncode:
+                raise RuntimeError(
+                    f"AArch64 native segment exit {native.returncode}\n"
+                    f"{native.stdout}\n{native.stderr}"
+                )
+            assert "AARCH64-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
+            assert native.stderr.count("[native-transfer/aarch64] direct segment:") >= 2, native.stderr
+            print(f"{arch}: opt-in native segment entry: OK", flush=True)
+
+        if arch == "s390x":
+            # The parity loop may use the checked fallback.  This separate
+            # opt-in probe proves that a leaf body reaches the ELF64 segment
+            # adapter at the System Z/native invocation boundary.
+            native_env = env.copy()
+            native_env["TORCL_FORCE_TIER"] = "t2"
+            native_env["TORCL_NATIVE_TRANSFER"] = "1"
+            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["TORCL_NN_DIRECT"] = "0"
+            native = subprocess.run(
+                command + [
+                    "--no-init",
+                    "--eval",
+                    "(progn (defun s390x-segment-constant () 41) "
+                    "(defun s390x-segment-identity (x) x) "
+                    "(assert (= (s390x-segment-constant) 41)) "
+                    "(assert (= (s390x-segment-identity 42) 42)) "
+                    "(format t \"S390X-NATIVE-SEGMENT-OK~%\"))",
+                ],
+                env=native_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if native.returncode:
+                raise RuntimeError(
+                    f"s390x native segment exit {native.returncode}\n"
+                    f"{native.stdout}\n{native.stderr}"
+                )
+            assert "S390X-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
+            assert native.stderr.count("[native-transfer/s390x] direct segment:") >= 2, native.stderr
+            print(f"{arch}: opt-in native segment entry: OK", flush=True)
+
         if arch == "win64":
             home_env = env.copy()
             home_env.pop("HOME", None)

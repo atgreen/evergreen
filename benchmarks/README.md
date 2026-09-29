@@ -5,16 +5,18 @@ with a standalone HTML report, raw JSON, generated scripts, and process logs.
 This showcase complements the regression suite in `tests/benchmarks/`.
 
 [Open the checked-in sample HTML report](sample-report/index.html).
-The fast path keeps native error and signal delivery while skipping the
-execution-local mutex/hash lookup when no native error is pending. Five
-alternating pairs against untouched main measured 1.499 s versus 0.233 s
-(medians, 6.4× faster); see [build and measurement details](sample-report/BUILD.txt)
-and [raw before/after samples](sample-report/before-after.json).
-The updated seven-sample SBCL comparison still favors SBCL; this is progress,
-not a claimed win over SBCL.
+The current sample report is generated from the native-transfer ABI work. Five
+alternating samples measure Fibonacci, the Ironclad POWER-MOD kernel, and a
+caught TYPE-ERROR path. The report also records process-wide retired-instruction
+counts from `perf`; every TorCL sample passed its checksum and listed-hot-function
+T2 gates. The checked-in report enables the opt-in segment ABI; recursive
+Fibonacci enters an outer segment, while calls made from an active segment use
+the bounded legacy/native bridge until frame-aware nested entry is developed.
+These are local measurements, not a universal performance claim.
 
-The sample report verifies T2 before and after every measured TorCL kernel
-and batch driver. It reports whichever implementation is faster.
+The sample report verifies T2 before and after every listed measured TorCL
+function. The exceptional-path case deliberately keeps its handler and error
+path in the interpreter while its batch driver reaches T2.
 
 ## Run
 
@@ -23,8 +25,20 @@ On Linux with Python 3.10+, SBCL, `taskset`, and a working systemd user session:
 ```sh
 TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh \
   cargo build --release -p torcl --bin torcl
-python3 benchmarks/run.py --cpu 0
+python3 benchmarks/run.py --cpu 0 --native-transfer
 ```
+
+Add `--instructions` to collect process-wide retired-instruction counts with
+Linux `perf`; the HTML labels these separately because startup and compilation
+are included, while the Lisp timer measures only the warmed workload.
+Add `--native-transfer` to set `TORCL_NATIVE_TRANSFER=1` for TorCL children and
+exercise the opt-in native segment ABI. The harness temporarily clears that
+environment variable while loading benchmark definitions, then enables it for
+validation, training, warmup, and timing; this keeps source-loading helpers on
+the checked path while measuring the native workload. Unsupported bodies or
+platforms fall back to the checked entry; this switch records the mode in
+`results.json`. Use `--runner PATH` to select another bounded child runner;
+the default remains `scripts/torcl-limited.sh`.
 
 Open `benchmarks/results/index.html`. No server, JavaScript, external fonts, or
 network access is needed to view the report. `results.json` contains all samples,
@@ -35,7 +49,7 @@ write plain text logs.
 Output directories must be empty, preventing accidental overwrite of prior runs.
 
 Use `--torcl PATH`, `--sbcl PATH`, `--samples 9`, `--output DIRECTORY`, or
-`--case fibonacci` / `--case ironclad-power-mod` to select another run. The minimum
+`--case fibonacci` / `--case ironclad-power-mod` / `--case exceptional-path` to select another run. The minimum
 is five samples; the default is seven. `--cpu` defaults to the first allowed CPU.
 Every child runs through `scripts/torcl-limited.sh` with a 4 GiB cap (override via
 `TORCL_MEM_MAX`) and a 300-second process timeout. Missing tools, runtime failures,
@@ -51,6 +65,10 @@ are never converted into speedups.
   2 through 100,001, exponent 65,537, modulus 104,729. Checked sum: 5,242,584,863.
   This deliberately measures small-integer arithmetic, **not RSA-sized integers
   or complete encryption throughput**. Both runtimes execute the same code.
+* **Caught conditions:** 2,000 calls through `HANDLER-CASE`, with a real
+  `TYPE-ERROR` every 97th iteration. The handler contributes zero and the
+  checksum is 1,978,630. The timed region repeats this workload 100 times so
+  SBCL's millisecond clock has enough resolution; both runtimes do the same.
 
 Each independent process checks correctness, performs **10,000 short training
 calls to the batch driver**, then three untimed full-workload warmups. Both
@@ -58,8 +76,8 @@ runtimes receive the same training work: Fibonacci uses F(10) once per training
 batch, and modular exponentiation uses one input per training batch. The measured
 inputs and iteration counts are restored before full warmup and timing.
 
-Before starting its clock, TorCL must report `function-tier = 2` for **both the
-kernel and `bench-workload`**. The harness polls for up to ten seconds to allow
+Before starting its clock, TorCL must report `function-tier = 2` for every
+listed hot function. The harness polls for up to ten seconds to allow
 asynchronous compilation to publish. It checks again after timing and rejects
 the sample if either tier is missing or below T2. Raw JSON and logs record tiers,
 invocation counts, back-edge counts, OSR entries, and deoptimization deltas during

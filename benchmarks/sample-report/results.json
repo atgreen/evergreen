@@ -1,22 +1,22 @@
 {
-  "generated_at": "2026-09-28T10:23:02.913971+00:00",
-  "samples": 7,
+  "generated_at": "2026-09-29T11:35:24.848680+00:00",
+  "samples": 5,
   "metadata": {
-    "commit": "a7d2a90deeaae80a33de5710919fa01838f3a2c5",
-    "working_tree": "M .beads/interactions.jsonl\n M benchmarks/README.md\n M benchmarks/sample-report/BUILD.txt\n M benchmarks/sample-report/fibonacci-sbcl-1.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-2.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-3.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-4.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-5.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-6.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-7.log.gz\n M benchmarks/sample-report/fibonacci-torcl-1.log.gz\n M benchmarks/sample-report/fibonacci-torcl-2.log.gz\n M benchmarks/sample-report/fibonacci-torcl-3.log.gz\n M benchmarks/sample-report/fibonacci-torcl-4.log.gz\n M benchmarks/sample-report/fibonacci-torcl-5.log.gz\n M benchmarks/sample-report/fibonacci-torcl-6.log.gz\n M benchmarks/sample-report/fibonacci-torcl-7.log.gz\n M benchmarks/sample-report/index.html\n M benchmarks/sample-report/results.json\n M crates/torcl/src/cli/bytecode.rs\n M crates/torcl/tests/native_transfer_cli.rs\n?? benchmarks/fibonacci-fast-path-report/\n?? benchmarks/sample-report/before-after.json\n?? benchmarks/sample-report/fibonacci-head-summary-after-0.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-after-1.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-after-2.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-after-3.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-after-4.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-before-0.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-before-1.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-before-2.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-before-3.log.gz\n?? benchmarks/sample-report/fibonacci-head-summary-before-4.log.gz\n?? crates/torcl/src/cli/bytecode/pending_error.rs",
+    "commit": "b57604a58aef1d6ddd26ecc80ade912bfacab248",
+    "working_tree": "M .beads/interactions.jsonl\n M benchmarks/sample-report/exceptional-path-sbcl-1.log.gz\n M benchmarks/sample-report/exceptional-path-sbcl-2.log.gz\n M benchmarks/sample-report/exceptional-path-sbcl-3.log.gz\n M benchmarks/sample-report/exceptional-path-sbcl-4.log.gz\n M benchmarks/sample-report/exceptional-path-sbcl-5.log.gz\n M benchmarks/sample-report/exceptional-path-torcl-1.log.gz\n M benchmarks/sample-report/exceptional-path-torcl-2.log.gz\n M benchmarks/sample-report/exceptional-path-torcl-3.log.gz\n M benchmarks/sample-report/exceptional-path-torcl-4.log.gz\n M benchmarks/sample-report/exceptional-path-torcl-5.log.gz\n M benchmarks/sample-report/exceptional-path.lisp\n M benchmarks/sample-report/fibonacci-sbcl-1.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-2.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-3.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-4.log.gz\n M benchmarks/sample-report/fibonacci-sbcl-5.log.gz\n M benchmarks/sample-report/fibonacci-torcl-1.log.gz\n M benchmarks/sample-report/fibonacci-torcl-2.log.gz\n M benchmarks/sample-report/fibonacci-torcl-3.log.gz\n M benchmarks/sample-report/fibonacci-torcl-4.log.gz\n M benchmarks/sample-report/fibonacci-torcl-5.log.gz\n M benchmarks/sample-report/fibonacci.lisp\n M benchmarks/sample-report/index.html\n M benchmarks/sample-report/ironclad-power-mod-sbcl-1.log.gz\n M benchmarks/sample-report/ironclad-power-mod-sbcl-2.log.gz\n M benchmarks/sample-report/ironclad-power-mod-sbcl-3.log.gz\n M benchmarks/sample-report/ironclad-power-mod-sbcl-4.log.gz\n M benchmarks/sample-report/ironclad-power-mod-sbcl-5.log.gz\n M benchmarks/sample-report/ironclad-power-mod-torcl-1.log.gz\n M benchmarks/sample-report/ironclad-power-mod-torcl-2.log.gz\n M benchmarks/sample-report/ironclad-power-mod-torcl-3.log.gz\n M benchmarks/sample-report/ironclad-power-mod-torcl-4.log.gz\n M benchmarks/sample-report/ironclad-power-mod-torcl-5.log.gz\n M benchmarks/sample-report/ironclad-power-mod.lisp\n M benchmarks/sample-report/results.json\n M crates/torcl-compiler/src/lib.rs\n M crates/torcl-compiler/src/t2/build.rs\n M crates/torcl-compiler/src/t2/emit.rs\n M crates/torcl-compiler/src/t2/native_transfer_ppc64le.rs\n M crates/torcl-compiler/src/t2/verify.rs\n M crates/torcl-compiler/tests/native_helper_veneer_ppc64le.rs\n M crates/torcl-compiler/tests/t2_integration.rs\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/src/cli/bytecode/native_transfer_entry.rs\n M crates/torcl/tests/condition_report_cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs",
     "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
     "cpu": 0,
     "cpu_model": "Intel(R) Core(TM) Ultra 7 255H",
     "load_average": [
-      4.623046875,
-      6.0732421875,
-      10.77685546875
+      1.70703125,
+      2.80908203125,
+      4.3994140625
     ],
     "memory_cap": "4G",
     "binaries": {
       "TorCL": {
-        "path": "/home/green/git/torcl/bliss/target/native-baseline/x86_64-unknown-linux-musl/release/torcl",
-        "sha256": "e5fd8c66c8ddf9d473b59c18167e1ba1863dcba08b932a3f9c37adc7ee04689a"
+        "path": "/home/green/git/torcl/bliss/target/x86_64-unknown-linux-musl/release/torcl",
+        "sha256": "ab5a2f3b649f63d52b07eff7b9623161f17551f18ba3b1c141ee3c11cd2105b0"
       },
       "SBCL": {
         "path": "/home/linuxbrew/.linuxbrew/Cellar/sbcl/2.6.8/bin/sbcl",
@@ -24,12 +24,71 @@
       }
     },
     "sbcl_version": "SBCL 2.6.8",
+    "runner": "/tmp/bench-bounded-runner",
+    "runner_sha256": "99a3c8f10d5bfc546e225f1ae1d6f6f66d020920047b4ed3bdbbdb5e1cb1b8c6",
+    "native_transfer": true,
     "sources": {
+      "exceptional-path.lisp": "f5f965675a1e136ab37d9c4b0f334f91c05a2ef8f2ae57a115c482d8173a06dc",
       "fibonacci.lisp": "6e0ba0e605767be022e648ccc1e7222890cbe70a01383bfefb8fe0d241ed759b",
       "ironclad-power-mod.lisp": "40565c30414aa69d09a7cb174ef9887f2ba710fa26b6fae45247b15615c86e1d"
     },
-    "runner_sha256": "ddbba606c502668dee9885731ccf5d96c9df93f6ed6ffa789f0f7c27c00dfebe",
-    "cases_sha256": "f5c0cdea094d63ad4328509622286dcbf1e4210e05825de3723b200ad2603bf3"
+    "run_script_sha256": "dfefb3be75aed5f3f0ce290cb85a815675cfb18076a6aa52e246e807fa470b79",
+    "cases_sha256": "1d123f8575f090586462d019346f1332520770b53dc8d126776862a2e0b1b4c2",
+    "instruction_event": "cpu_atom/instructions/",
+    "baseline": {
+      "commit": "737be001",
+      "binary_sha256": "a47426a3ccfe65fe263c03da421342618bf0458389a674d3b8a87f2651c4cb03",
+      "benchmarks": {
+        "fibonacci": {
+          "median_seconds": 0.112,
+          "instructions": {
+            "samples": [
+              7804684,
+              7665545,
+              7803974,
+              7803753,
+              7803239
+            ],
+            "median": 7803753,
+            "iqr": 735.0,
+            "min": 7665545,
+            "max": 7804684
+          }
+        },
+        "ironclad-power-mod": {
+          "median_seconds": 0.508,
+          "instructions": {
+            "samples": [
+              7635703,
+              7806945,
+              7806840,
+              7822063,
+              7804160
+            ],
+            "median": 7806840,
+            "iqr": 2785.0,
+            "min": 7635703,
+            "max": 7822063
+          }
+        },
+        "exceptional-path": {
+          "median_seconds": 0.309,
+          "instructions": {
+            "samples": [
+              7804842,
+              7681192,
+              7806064,
+              7806618,
+              7806790
+            ],
+            "median": 7806064,
+            "iqr": 1776.0,
+            "min": 7681192,
+            "max": 7806790
+          }
+        }
+      }
+    }
   },
   "benchmarks": [
     {
@@ -48,7 +107,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 17698,
+              "calls": 34204,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -62,7 +121,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 17708,
+              "calls": 34234,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -79,7 +138,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 16152,
+              "calls": 34492,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -93,7 +152,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 16162,
+              "calls": 34522,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -110,7 +169,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15656,
+              "calls": 35394,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -124,7 +183,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15666,
+              "calls": 35424,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -141,7 +200,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 16578,
+              "calls": 37300,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -155,7 +214,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 16588,
+              "calls": 37330,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -172,7 +231,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15618,
+              "calls": 35736,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -186,69 +245,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15628,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 15034,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 15044,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 15134,
-              "back_edges": 0,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "FIBONACCI": {
-              "tier": 2,
-              "calls": 15144,
+              "calls": 35766,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -265,33 +262,55 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            0.173,
-            0.232,
-            0.233,
-            0.233,
-            0.233,
-            0.233,
-            0.233
+            0.029,
+            0.029,
+            0.033,
+            0.034,
+            0.035
           ],
-          "median_seconds": 0.233,
-          "iqr_seconds": 0.0005000000000000004,
-          "min_seconds": 0.173,
-          "max_seconds": 0.233
+          "median_seconds": 0.033,
+          "iqr_seconds": 0.005000000000000001,
+          "min_seconds": 0.029,
+          "max_seconds": 0.035,
+          "instructions": {
+            "samples": [
+              2115634,
+              2115710,
+              2115754,
+              2115576,
+              2115597
+            ],
+            "median": 2115634,
+            "iqr": 113.0,
+            "min": 2115576,
+            "max": 2115754
+          }
         },
         "SBCL": {
           "samples_seconds": [
-            0.12,
-            0.056001,
             0.057,
-            0.056,
-            0.119,
-            0.12,
-            0.056
+            0.057,
+            0.057,
+            0.057,
+            0.057
           ],
           "median_seconds": 0.057,
-          "iqr_seconds": 0.06349949999999999,
-          "min_seconds": 0.056,
-          "max_seconds": 0.12
+          "iqr_seconds": 0.0,
+          "min_seconds": 0.057,
+          "max_seconds": 0.057,
+          "instructions": {
+            "samples": [
+              2158379,
+              2158160,
+              2158264,
+              2158322,
+              2158351
+            ],
+            "median": 2158322,
+            "iqr": 87.0,
+            "min": 2158160,
+            "max": 2158379
+          }
         }
       }
     },
@@ -312,37 +331,6 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 310004,
-              "back_edges": 90167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 410004,
-              "back_edges": 90167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 310004,
               "back_edges": 80167,
               "osr_entries": 0
             },
@@ -451,37 +439,6 @@
               "tier": 2,
               "calls": 410004,
               "back_edges": 80167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 310004,
-              "back_edges": 90167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 410004,
-              "back_edges": 90167,
               "osr_entries": 0
             },
             "BENCH-WORKLOAD": {
@@ -528,33 +485,218 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            1.08,
-            1.053,
-            1.056,
-            1.063,
-            1.075,
-            1.056,
-            1.012
+            0.534,
+            0.535,
+            0.533,
+            0.535,
+            0.537
           ],
-          "median_seconds": 1.056,
-          "iqr_seconds": 0.014499999999999957,
-          "min_seconds": 1.012,
-          "max_seconds": 1.08
+          "median_seconds": 0.535,
+          "iqr_seconds": 0.0010000000000000009,
+          "min_seconds": 0.533,
+          "max_seconds": 0.537,
+          "instructions": {
+            "samples": [
+              2116825,
+              2116809,
+              2116934,
+              2116855,
+              2116766
+            ],
+            "median": 2116825,
+            "iqr": 46.0,
+            "min": 2116766,
+            "max": 2116934
+          }
         },
         "SBCL": {
           "samples_seconds": [
-            0.02,
-            0.02,
-            0.01,
             0.009,
-            0.02,
-            0.019,
-            0.009
+            0.01,
+            0.01,
+            0.01,
+            0.01
           ],
-          "median_seconds": 0.019,
-          "iqr_seconds": 0.0105,
+          "median_seconds": 0.01,
+          "iqr_seconds": 0.0,
           "min_seconds": 0.009,
-          "max_seconds": 0.02
+          "max_seconds": 0.01,
+          "instructions": {
+            "samples": [
+              2159545,
+              2159517,
+              2159501,
+              2159427,
+              2159414
+            ],
+            "median": 2159501,
+            "iqr": 90.0,
+            "min": 2159414,
+            "max": 2159545
+          }
+        }
+      }
+    },
+    {
+      "id": "exceptional-path",
+      "title": "Conditions \u00b7 caught type errors",
+      "category": "Exceptional path / handler-case",
+      "description": "2,000 calls with a real TYPE-ERROR every 97th iteration, caught by HANDLER-CASE. The checksum includes all normal values while caught errors contribute zero.",
+      "source": "exceptional-path.lisp",
+      "expected": 1978630,
+      "timed_repetitions": 100,
+      "hot_functions": [
+        "bench-workload"
+      ],
+      "tier_evidence": [
+        {
+          "before": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4099,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4199,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4099,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4199,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4099,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4199,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4099,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4199,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4099,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 4199,
+              "back_edges": 18000,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        }
+      ],
+      "results": {
+        "TorCL": {
+          "samples_seconds": [
+            0.362,
+            0.361,
+            0.36,
+            0.361,
+            0.361
+          ],
+          "median_seconds": 0.361,
+          "iqr_seconds": 0.0,
+          "min_seconds": 0.36,
+          "max_seconds": 0.362,
+          "instructions": {
+            "samples": [
+              2116668,
+              2116674,
+              2116615,
+              2116630,
+              2116516
+            ],
+            "median": 2116630,
+            "iqr": 53.0,
+            "min": 2116516,
+            "max": 2116674
+          }
+        },
+        "SBCL": {
+          "samples_seconds": [
+            0.006,
+            0.005,
+            0.005,
+            0.005,
+            0.005
+          ],
+          "median_seconds": 0.005,
+          "iqr_seconds": 0.0,
+          "min_seconds": 0.005,
+          "max_seconds": 0.006,
+          "instructions": {
+            "samples": [
+              2159220,
+              2159229,
+              2159444,
+              1859386,
+              2159326
+            ],
+            "median": 2159229,
+            "iqr": 106.0,
+            "min": 1859386,
+            "max": 2159444
+          }
         }
       }
     }

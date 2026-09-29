@@ -123,10 +123,123 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     || !data.flags.call
                     || !data.flags.effectful
                     || !data.flags.safepoint
-                    || !matches!(data.aux, AuxData::CallTarget(_)))
+                    || !matches!(
+                        data.aux,
+                        AuxData::CallTarget(_)
+                            | AuxData::TransferThrow
+                            | AuxData::CatchScope { .. }
+                            | AuxData::HandlerScope { .. }
+                            | AuxData::HandlerBindScope { .. }
+                            | AuxData::RestartCaseScope { .. }
+                            | AuxData::CleanupContinuation { .. }
+                    ))
             {
                 errors.push(VerifyError::new("V11 invoke-shape",
                     format!("block{bi} Invoke requires distinct normal/exceptional edges and call effects")));
+            }
+            if matches!(data.aux, AuxData::TransferThrow)
+                && (data.opcode != Opcode::Invoke || data.args.len() != 2)
+            {
+                errors.push(VerifyError::new(
+                    "V11 invoke-shape",
+                    "THROW requires an Invoke with tag and primary",
+                ));
+            }
+            if let AuxData::HandlerScope { push_bcp, enter } = data.aux {
+                let identity_matches = if enter {
+                    data.frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                        .is_some_and(|scope| scope.bcp == push_bcp)
+                } else {
+                    data.targets.get(1).and_then(|edge| {
+                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
+                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
+                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                            if scopes.last().is_some_and(|scope|
+                                scope.push_bcp == push_bcp
+                                && scope.ownership == crate::control_scope::Ownership::Local
+                                && matches!(scope.kind, crate::control_scope::ScopeKind::HandlerCase { .. })))
+                    })
+                };
+                if data.opcode != Opcode::Invoke || !data.args.is_empty() || !identity_matches {
+                    errors.push(VerifyError::new(
+                        "V15 handler",
+                        "invalid handler registration identity or shape",
+                    ));
+                }
+            }
+            if let AuxData::CatchScope { push_bcp, enter } = data.aux {
+                let identity_matches = if enter {
+                    data.frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                        .is_some_and(|scope| scope.bcp == push_bcp)
+                } else {
+                    data.targets.get(1).and_then(|edge| {
+                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
+                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
+                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                            if scopes.last().is_some_and(|scope|
+                                scope.push_bcp == push_bcp
+                                && scope.ownership == crate::control_scope::Ownership::Local
+                                && matches!(scope.kind, crate::control_scope::ScopeKind::Catch { .. })))
+                    })
+                };
+                if data.opcode != Opcode::Invoke
+                    || data.args.len() != usize::from(enter)
+                    || !identity_matches
+                {
+                    errors.push(VerifyError::new("V11 invoke-shape", "CATCH registration requires Invoke with one tag on entry and no arguments on exit"));
+                }
+            }
+            if let AuxData::HandlerBindScope { push_bcp, enter } = data.aux {
+                let identity_matches = if enter {
+                    data.frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                        .is_some_and(|scope| scope.bcp == push_bcp)
+                } else {
+                    data.targets.get(1).and_then(|edge| {
+                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
+                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
+                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                            if scopes.last().is_some_and(|scope|
+                                scope.push_bcp == push_bcp
+                                && scope.ownership == crate::control_scope::Ownership::Local
+                                && matches!(scope.kind, crate::control_scope::ScopeKind::HandlerBind { .. })))
+                    })
+                };
+                if data.opcode != Opcode::Invoke || !data.args.is_empty() || !identity_matches {
+                    errors.push(VerifyError::new(
+                        "V16 handler-bind",
+                        "invalid handler-bind registration identity or shape",
+                    ));
+                }
+            }
+            if let AuxData::RestartCaseScope { push_bcp, enter } = data.aux {
+                let identity_matches = if enter {
+                    data.frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                        .is_some_and(|scope| scope.bcp == push_bcp)
+                } else {
+                    data.targets.get(1).and_then(|edge| {
+                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
+                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
+                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                            if scopes.last().is_some_and(|scope|
+                                scope.push_bcp == push_bcp
+                                && scope.ownership == crate::control_scope::Ownership::Local
+                                && matches!(scope.kind, crate::control_scope::ScopeKind::RestartCase { .. })))
+                    })
+                };
+                if data.opcode != Opcode::Invoke || !data.args.is_empty() || !identity_matches {
+                    errors.push(VerifyError::new(
+                        "V17 restart-case",
+                        "invalid restart-case registration identity or shape",
+                    ));
+                }
             }
             if data.opcode == Opcode::NlxTransfer {
                 let origin_matches = match (&data.aux, data.frame_state) {
@@ -142,7 +255,6 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     _ => false,
                 };
                 if !origin_matches
-                    || !data.targets.is_empty()
                     || !data.results.is_empty()
                     || !data.flags.effectful
                     || !data.flags.call
@@ -459,9 +571,407 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
     }
 
     if errors.is_empty() {
+        verify_cleanup_continuations(f, &mut errors);
+    }
+    if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// A normal cleanup owns an execution-local saved value tuple. Joins must agree
+/// on the complete ordered continuation stack, not merely its depth. Exceptional
+/// exits retain that stack in their scope metadata for the unwind cursor.
+fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
+    use crate::control_scope::ScopeKind;
+    use crate::t2::ir::ValueRepresentation;
+    if !f.block_order().iter().any(|&b| {
+        f.block(b).insts.iter().any(|&i| {
+            matches!(&f.inst(i).aux, AuxData::CleanupContinuation { .. })
+                || (f.inst(i).opcode == Opcode::NlxTransfer && !f.inst(i).targets.is_empty())
+                || matches!(
+                    f.inst(i).opcode,
+                    Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CleanupLanding
+                )
+        })
+    }) {
+        return;
+    }
+    let mut incoming = HashMap::from([(f.entry(), Vec::<(u32, u32)>::new())]);
+    let mut work = vec![f.entry()];
+    while let Some(block) = work.pop() {
+        let mut stack = incoming[&block].clone();
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            if data.opcode == Opcode::HandlerLanding
+                && (!matches!(data.aux, AuxData::HandlerDestination { .. })
+                    || !data.args.is_empty()
+                    || data.results.len() != 1
+                    || !data.flags.effectful
+                    || !data.flags.call
+                    || data.flags.safepoint
+                    || data.flags.terminator
+                    || !data.targets.is_empty()
+                    || f.block(block).insts.first() != Some(&inst))
+            {
+                errors.push(VerifyError::new(
+                    "V15 handler",
+                    "invalid handler landing shape",
+                ));
+            }
+            if data.opcode == Opcode::CatchLanding
+                && (!matches!(data.aux, AuxData::CatchDestination { .. })
+                    || !data.args.is_empty()
+                    || data.results.len() != 1
+                    || !data.flags.effectful
+                    || !data.flags.call
+                    || data.flags.safepoint
+                    || data.flags.terminator
+                    || !data.targets.is_empty()
+                    || f.block(block).insts.first() != Some(&inst))
+            {
+                errors.push(VerifyError::new("V14 catch", "invalid catch landing shape"));
+            }
+            if matches!(&data.aux, AuxData::CleanupContinuation { .. })
+                && !matches!(
+                    data.opcode,
+                    Opcode::CleanupSave
+                        | Opcode::CleanupRestore
+                        | Opcode::CleanupLanding
+                        | Opcode::Invoke
+                )
+            {
+                errors.push(VerifyError::new(
+                    "V13 cleanup",
+                    "continuation metadata on a non-cleanup operation",
+                ));
+            }
+            if matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore) {
+                let save = data.opcode == Opcode::CleanupSave;
+                let valid_shape = data.args.len() == usize::from(save)
+                    && data.results.len() == usize::from(!save)
+                    && data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .all(|&v| f.value(v).repr == ValueRepresentation::Tagged)
+                    && data.flags.effectful
+                    && data.flags.call
+                    && data.flags.safepoint
+                    && !data.flags.terminator
+                    && data.frame_state.is_some();
+                let AuxData::CleanupContinuation {
+                    cleanup_bcp,
+                    resume_bcp,
+                } = data.aux
+                else {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "missing continuation identity",
+                    ));
+                    continue;
+                };
+                if !valid_shape {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "invalid cleanup effects or value shape",
+                    ));
+                }
+                if save {
+                    stack.push((cleanup_bcp, resume_bcp));
+                } else if stack.pop() != Some((cleanup_bcp, resume_bcp)) {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "restore does not match active continuation",
+                    ));
+                }
+            }
+            if matches!(data.opcode, Opcode::CleanupLanding | Opcode::Invoke)
+                && matches!(data.aux, AuxData::CleanupContinuation { .. })
+            {
+                let AuxData::CleanupContinuation {
+                    cleanup_bcp,
+                    resume_bcp,
+                } = data.aux
+                else {
+                    unreachable!()
+                };
+                let landing = data.opcode == Opcode::CleanupLanding;
+                let valid = data.args.is_empty()
+                    && data.results.len() == usize::from(!landing)
+                    && data
+                        .results
+                        .iter()
+                        .all(|&v| f.value(v).repr == ValueRepresentation::Tagged)
+                    && data.flags.effectful
+                    && data.frame_state.is_some()
+                    && (!landing
+                        || data.frame_state.is_some_and(|id| {
+                            f.frame_states
+                                .get(id)
+                                .scopes
+                                .last()
+                                .is_some_and(|frame| frame.bcp == cleanup_bcp)
+                        }))
+                    && if landing {
+                        !data.flags.call && !data.flags.terminator && data.targets.is_empty()
+                    } else {
+                        data.flags.call && data.flags.safepoint && data.flags.terminator
+                    };
+                if !valid || stack.last() != Some(&(cleanup_bcp, resume_bcp)) {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "invalid landing or cleanup dispatch state",
+                    ));
+                }
+                if landing && f.block(block).insts.first() != Some(&inst) {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "cleanup landing must start its block",
+                    ));
+                }
+            }
+            if data.opcode == Opcode::CleanupLanding
+                && !matches!(data.aux, AuxData::CleanupContinuation { .. })
+            {
+                errors.push(VerifyError::new("V13 cleanup", "missing landing identity"));
+            }
+            if matches!(data.opcode, Opcode::Return | Opcode::TailCall) && !stack.is_empty() {
+                errors.push(VerifyError::new(
+                    "V13 cleanup",
+                    "normal return abandons saved cleanup values",
+                ));
+            }
+            if let AuxData::TransferSite { scopes, .. } = &data.aux {
+                let captured: Vec<_> = scopes
+                    .iter()
+                    .filter_map(|scope| match scope.kind {
+                        ScopeKind::Cleanup { cleanup_bcp } => Some(cleanup_bcp),
+                        _ => None,
+                    })
+                    .collect();
+                if !captured
+                    .iter()
+                    .copied()
+                    .eq(stack.iter().map(|&(cleanup, _)| cleanup))
+                {
+                    errors.push(VerifyError::new(
+                        "V13 cleanup",
+                        "transfer lost active cleanup continuation",
+                    ));
+                }
+            }
+            for (edge_index, target) in data.targets.iter().enumerate() {
+                let mut outgoing = stack.clone();
+                let handler_landing = f
+                    .block(target.block)
+                    .insts
+                    .first()
+                    .map(|&i| f.inst(i))
+                    .filter(|landing| landing.opcode == Opcode::HandlerLanding);
+                if handler_landing.is_some() && data.opcode != Opcode::NlxTransfer {
+                    errors.push(VerifyError::new(
+                        "V15 handler",
+                        "handler landing requires an exceptional edge",
+                    ));
+                }
+                let catch_landing = f
+                    .block(target.block)
+                    .insts
+                    .first()
+                    .map(|&i| f.inst(i))
+                    .filter(|landing| landing.opcode == Opcode::CatchLanding);
+                if catch_landing.is_some() && data.opcode != Opcode::NlxTransfer {
+                    errors.push(VerifyError::new(
+                        "V14 catch",
+                        "catch landing requires an exceptional edge",
+                    ));
+                }
+                if data.opcode == Opcode::Invoke
+                    && edge_index == 0
+                    && matches!(data.aux, AuxData::CleanupContinuation { .. })
+                {
+                    outgoing.pop();
+                }
+                if data.opcode == Opcode::NlxTransfer {
+                    let AuxData::TransferSite { scopes, .. } = &data.aux else {
+                        unreachable!()
+                    };
+                    if let Some(landing) = handler_landing {
+                        let valid = match landing.aux {
+                            AuxData::HandlerDestination {
+                                push_bcp,
+                                table_index,
+                                clause_index,
+                            } => {
+                                let selected = scopes
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, scope)| scope.push_bcp == push_bcp);
+                                let clause = f
+                                    .handler_cases
+                                    .get(table_index as usize)
+                                    .and_then(|info| info.clauses.get(clause_index as usize));
+                                selected
+                                    .zip(clause)
+                                    .filter(|((index, scope), clause)| {
+                                        scope.ownership == crate::control_scope::Ownership::Local
+                                            && scope.kind == ScopeKind::HandlerCase { table_index }
+                                            && !scopes[index + 1..].iter().any(|s| {
+                                                s.ownership
+                                                    != crate::control_scope::Ownership::Local
+                                                    || matches!(s.kind, ScopeKind::Unwind { .. })
+                                            })
+                                            && landing
+                                                .frame_state
+                                                .and_then(|id| f.frame_states.get(id).scopes.last())
+                                                .is_some_and(|frame| {
+                                                    frame.bcp == clause.body_bcp
+                                                        && frame.stack.len()
+                                                            == usize::from(scope.sp_restore)
+                                                        && clause.var_slot.is_none_or(|slot| {
+                                                            usize::from(slot) < frame.locals.len()
+                                                        })
+                                                })
+                                    })
+                                    .map(|((index, _), _)| {
+                                        let retained: Vec<_> = scopes[..index]
+                                            .iter()
+                                            .filter_map(|scope| {
+                                                if let ScopeKind::Cleanup { cleanup_bcp } =
+                                                    scope.kind
+                                                {
+                                                    Some(cleanup_bcp)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect();
+                                        outgoing.retain(|(cleanup, _)| retained.contains(cleanup));
+                                    })
+                                    .is_some()
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            errors.push(VerifyError::new(
+                                "V15 handler",
+                                "handler landing does not match its live clause",
+                            ));
+                        }
+                    } else if let Some(landing) = catch_landing {
+                        let valid = match landing.aux {
+                            AuxData::CatchDestination {
+                                push_bcp,
+                                resume_bcp,
+                            } => scopes
+                                .iter()
+                                .enumerate()
+                                .find(|(_, scope)| scope.push_bcp == push_bcp)
+                                .filter(|(index, scope)| {
+                                    scope.ownership == crate::control_scope::Ownership::Local
+                                        && scope.kind == (ScopeKind::Catch { resume_bcp })
+                                        && !scopes[index + 1..]
+                                            .iter()
+                                            .any(|s| matches!(s.kind, ScopeKind::Unwind { .. }))
+                                })
+                                .filter(|(_, scope)| {
+                                    landing
+                                        .frame_state
+                                        .and_then(|id| f.frame_states.get(id).scopes.last())
+                                        .is_some_and(|frame| {
+                                            frame.bcp == resume_bcp
+                                                && frame.stack.len()
+                                                    == usize::from(scope.sp_restore)
+                                        })
+                                })
+                                .map(|(index, _)| {
+                                    let retained: Vec<_> = scopes[..index]
+                                        .iter()
+                                        .filter_map(|s| match s.kind {
+                                            ScopeKind::Cleanup { cleanup_bcp } => Some(cleanup_bcp),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    outgoing.retain(|(cleanup, _)| retained.contains(cleanup));
+                                })
+                                .is_some(),
+                            _ => false,
+                        };
+                        if !valid {
+                            errors.push(VerifyError::new(
+                                "V14 catch",
+                                "catch edge skips cleanup or names an invalid target",
+                            ));
+                        }
+                    } else {
+                        let selected = scopes
+                            .iter()
+                            .rposition(|scope| matches!(scope.kind, ScopeKind::Unwind { .. }));
+                        let landing = f.block(target.block).insts.first().map(|&i| f.inst(i));
+                        let valid = selected
+                            .zip(landing)
+                            .and_then(|(index, landing)| {
+                                let ScopeKind::Unwind { cleanup_bcp } = scopes[index].kind else {
+                                    return None;
+                                };
+                                let AuxData::CleanupContinuation {
+                                    cleanup_bcp: destination,
+                                    resume_bcp,
+                                } = landing.aux
+                                else {
+                                    return None;
+                                };
+                                let fs = landing
+                                    .frame_state
+                                    .and_then(|id| f.frame_states.get(id).scopes.last());
+                                if landing.opcode != Opcode::CleanupLanding
+                                    || destination != cleanup_bcp
+                                    || !fs.is_some_and(|frame| {
+                                        frame.bcp == cleanup_bcp
+                                            && frame.stack.len()
+                                                == usize::from(scopes[index].sp_restore)
+                                    })
+                                {
+                                    return None;
+                                }
+                                let retained: Vec<_> = scopes[..index]
+                                    .iter()
+                                    .filter_map(|scope| {
+                                        if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+                                            Some(cleanup_bcp)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                outgoing.retain(|(cleanup, _)| retained.contains(cleanup));
+                                outgoing.push((cleanup_bcp, resume_bcp));
+                                Some(())
+                            })
+                            .is_some();
+                        if !valid {
+                            errors.push(VerifyError::new(
+                                "V13 cleanup",
+                                "transfer target is not the selected cleanup landing",
+                            ));
+                        }
+                    }
+                }
+                if let Some(prior) = incoming.get(&target.block) {
+                    if prior != &outgoing {
+                        errors.push(VerifyError::new(
+                            "V13 cleanup",
+                            "join disagrees on active continuations",
+                        ));
+                    }
+                } else {
+                    incoming.insert(target.block, outgoing);
+                    work.push(target.block);
+                }
+            }
+        }
     }
 }
 
@@ -678,12 +1188,10 @@ mod tests {
     fn invoke_result_cannot_flow_to_exceptional_successor() {
         let (mut f, invoke, result) = invoke_graph();
         f.inst_mut(invoke).targets[1].args[0] = result;
-        assert!(
-            verify(&f)
-                .unwrap_err()
-                .iter()
-                .any(|e| e.check == "V11 invoke-result")
-        );
+        assert!(verify(&f)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.check == "V11 invoke-result"));
     }
 
     #[test]
@@ -691,12 +1199,10 @@ mod tests {
         let (mut f, _, result) = invoke_graph();
         let ret = f.terminator(Block(1)).unwrap();
         f.inst_mut(ret).args[0] = result;
-        assert!(
-            verify(&f)
-                .unwrap_err()
-                .iter()
-                .any(|e| e.check == "V3 dominance")
-        );
+        assert!(verify(&f)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.check == "V3 dominance"));
     }
 
     #[test]
@@ -713,12 +1219,10 @@ mod tests {
                 3 => d.flags.effectful = false,
                 _ => d.flags.safepoint = false,
             }
-            assert!(
-                verify(&f)
-                    .unwrap_err()
-                    .iter()
-                    .any(|e| e.check == "V11 invoke-shape")
-            );
+            assert!(verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V11 invoke-shape"));
         }
     }
 
@@ -726,12 +1230,10 @@ mod tests {
     fn invoke_requires_frame_state_before_the_call() {
         let (mut f, invoke, _) = invoke_graph();
         f.inst_mut(invoke).frame_state = None;
-        assert!(
-            verify(&f)
-                .unwrap_err()
-                .iter()
-                .any(|e| e.check == "V8 guard-framestate")
-        );
+        assert!(verify(&f)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.check == "V8 guard-framestate"));
     }
 
     #[test]
@@ -747,24 +1249,20 @@ mod tests {
             }],
             stack: vec![],
         });
-        assert!(
-            verify(&f)
-                .unwrap_err()
-                .iter()
-                .any(|e| e.check == "V8 framestate-dominance")
-        );
+        assert!(verify(&f)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.check == "V8 framestate-dominance"));
     }
 
     #[test]
     fn invoke_invalid_frame_handle_is_reported_without_panicking() {
         let (mut f, invoke, _) = invoke_graph();
         f.inst_mut(invoke).frame_state = Some(FrameStateId(u32::MAX));
-        assert!(
-            verify(&f)
-                .unwrap_err()
-                .iter()
-                .any(|e| e.check == "V8 framestate-handle")
-        );
+        assert!(verify(&f)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.check == "V8 framestate-handle"));
     }
 
     #[test]
@@ -787,7 +1285,7 @@ mod tests {
 
     #[test]
     fn invoke_machine_emission_is_explicitly_unsupported_until_landing_pads_exist() {
-        use crate::t2::emit::{EmitError, emit};
+        use crate::t2::emit::{emit, EmitError};
         use crate::t2::lower::op;
         let (f, _, _) = invoke_graph();
         let machine = crate::t2::lower::lower(&f);
@@ -1051,11 +1549,11 @@ mod tests {
         // Define a first, then b; but wire an add that consumes b before b is
         // defined by putting the add first.
         let a = const_fixnum(&mut f, e, 1); // a == Value(0)
-        // The add is pushed at position 0 (after the const) and its own single
-        // result takes the next id, Value(a.0 + 1). The const `b` that follows
-        // then takes Value(a.0 + 2). We wire the add to read `b` — a value
-        // defined *later* in the same block — to trip the intra-block order
-        // check.
+                                            // The add is pushed at position 0 (after the const) and its own single
+                                            // result takes the next id, Value(a.0 + 1). The const `b` that follows
+                                            // then takes Value(a.0 + 2). We wire the add to read `b` — a value
+                                            // defined *later* in the same block — to trip the intra-block order
+                                            // check.
         let (_, addr) = f.push_inst(
             e,
             InstData {

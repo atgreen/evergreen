@@ -215,6 +215,19 @@ pub enum Opcode {
     /// lexical locals. Results correspond positionally to `slot_base..` and
     /// are NIL-padded by the runtime helper.
     TakeValuesToLocals,
+    /// Save the protected primary and the complete runtime multiple-value state
+    /// in an execution-owned rooted cleanup continuation. No normal result.
+    CleanupSave,
+    /// Pop the matching normal cleanup continuation, restore its multiple-value
+    /// state and produce its primary. Exceptional entry uses the unwind cursor.
+    CleanupRestore,
+    /// Verified exceptional/normal cleanup entry with an entry FrameState.
+    CleanupLanding,
+    /// Consume the prepared catch payload and produce its primary value.
+    /// Native-only, noncollecting helper; secondary values remain in runtime state.
+    CatchLanding,
+    /// Define the condition delivered to a selected HANDLER-CASE clause.
+    HandlerLanding,
     // Cat 5a — non-terminator control: calls & guards
     Call,
     Guard,
@@ -287,10 +300,52 @@ pub enum AuxData {
     },
     FieldOffset(u32),
     CallTarget(u32),
+    /// Invoke a THROW with rooted tag and primary arguments; no normal result.
+    TransferThrow,
+    /// Establish/retire a dynamic CATCH binding in the owning activation.
+    /// The helper-v2 request preserves the existing multiple-value state.
+    CatchScope {
+        push_bcp: u32,
+        enter: bool,
+    },
+    HandlerScope {
+        push_bcp: u32,
+        enter: bool,
+    },
+    /// Establish/retire a dynamic HANDLER-BIND cluster.
+    HandlerBindScope {
+        push_bcp: u32,
+        enter: bool,
+    },
+    /// Establish/retire a dynamic RESTART-CASE cluster.
+    RestartCaseScope {
+        push_bcp: u32,
+        enter: bool,
+    },
+    HandlerDestination {
+        push_bcp: u32,
+        table_index: u32,
+        clause_index: u32,
+    },
+    CatchDestination {
+        push_bcp: u32,
+        resume_bcp: u32,
+    },
+    /// Save/restore or landing identity. On Invoke this selects cleanup
+    /// completion: normal edge pops/restores the saved value, exceptional edge
+    /// resumes its pending transfer with the continuation still described by
+    /// the cold site's pre-operation scope map. `u32::MAX` means no normal resume.
+    CleanupContinuation {
+        cleanup_bcp: u32,
+        resume_bcp: u32,
+    },
     /// Cold propagation after a transfer-capable operation. The attached
     /// FrameState captures the pre-operation values, but propagation must begin
     /// unwinding rather than executing that bytecode operation again. These
     /// static scopes describe required runtime state, not permission to elide it.
+    /// NlxTransfer may name verified cleanup and catch landing successors;
+    /// no successor means fallback/propagation outside this native CFG. A native target
+    /// remains conditional on runtime destination availability and signaling.
     TransferSite {
         origin_bcp: u32,
         scopes: Vec<crate::control_scope::ControlScope>,
@@ -382,6 +437,9 @@ pub struct Function {
     pub source_positions: Vec<SourcePosition>,
     /// Root-function loop headers eligible for on-stack replacement.
     pub osr_entries: Vec<OsrEntry>,
+    /// Root-definition clause metadata used by opt-in native transfer edges.
+    /// Inlining must remap this domain before admitting inlined handler scopes.
+    pub handler_cases: Vec<torcl_rt::bytecode::HandlerCaseInfo>,
     /// The interpreter state at function ENTRY (bcp 0, empty stack), recorded
     /// by the builder so speculation can place parameter pre-guards whose
     /// deopt harmlessly re-runs the whole function in T0 (bliss-x5y.25).
@@ -420,6 +478,7 @@ impl Function {
             frame_states: crate::t2::frame_state::FrameStateTable::default(),
             source_positions: vec![SourcePosition::default()],
             osr_entries: Vec::new(),
+            handler_cases: Vec::new(),
             entry_frame_state: None,
             checked_entry_params: Vec::new(),
             variadic: false,

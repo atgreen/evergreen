@@ -282,13 +282,10 @@ impl Adapter {
                 }
             }
             for &u in &inst.uses {
-                if stack_call_operands
-                    && matches!(
-                        inst.op,
-                        crate::t2::lower::op::CALL | crate::t2::lower::op::INVOKE
-                    )
+                if inst.op == crate::t2::lower::op::INVOKE
+                    || (stack_call_operands && inst.op == crate::t2::lower::op::CALL)
                 {
-                    // The System Z framed emitter copies arbitrary-arity call
+                    // Invoke and the slice-call framed emitters copy call
                     // arguments from their homes to a scanned slice. Requiring
                     // every argument in a GPR simultaneously would make calls
                     // wider than the register bank impossible to allocate.

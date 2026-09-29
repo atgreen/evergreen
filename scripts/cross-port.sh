@@ -10,8 +10,11 @@ if [[ $# -gt 2 || ! $action =~ ^(build|test)$ || ! $architecture =~ ^(all|aarch6
     exit 2
 fi
 cross=${CROSS:-cross}
-# Pin the compiler used for this bring-up; cross otherwise updates "stable".
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.94.1}
+# The 0.2.5 cross images carry an older host glibc: Rust 1.94.1's build
+# scripts require symbols those images do not provide. Keep the repository's
+# normal 1.94.1 pin untouched, but use the newest compatible compiler for the
+# foreign-target container. Callers can override this with RUSTUP_TOOLCHAIN.
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.93.0}
 export CROSS_CONTAINER_ENGINE=${CROSS_CONTAINER_ENGINE:-podman}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3}
 # Containers can have their own cgroup outside the torcl-limited scope.

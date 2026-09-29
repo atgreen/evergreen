@@ -22,5 +22,17 @@
       "power-mod",
       "bench-workload"
     ]
+  },
+  {
+    "id": "exceptional-path",
+    "title": "Conditions · caught type errors",
+    "category": "Exceptional path / handler-case",
+  "description": "2,000 calls with a real TYPE-ERROR every 97th iteration, caught by HANDLER-CASE. The checksum includes all normal values while caught errors contribute zero.",
+  "source": "exceptional-path.lisp",
+  "expected": 1978630,
+  "timed_repetitions": 100,
+    "hot_functions": [
+      "bench-workload"
+    ]
   }
 ]

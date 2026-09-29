@@ -53,6 +53,102 @@ fn bytecode_fn(
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
+fn native_transfer_check_is_omitted_only_for_pure_self_recursion() {
+    use torcl_compiler::t2::emit::emit_framed_with_activation_slots;
+
+    let self_sym = torcl_rt::symbols::intern("TRANSFER-CHECK-SELF");
+    let mixed_sym = torcl_rt::symbols::intern("TRANSFER-CHECK-MIXED");
+    let other_sym = torcl_rt::symbols::intern("TRANSFER-CHECK-OTHER");
+
+    let pure = bytecode_fn(
+        "TRANSFER-CHECK-SELF",
+        vec![
+            Instr::CallNamed {
+                sym: self_sym,
+                nargs: 0,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        0,
+        1,
+        0,
+    );
+    let mixed = bytecode_fn(
+        "TRANSFER-CHECK-MIXED",
+        vec![
+            Instr::CallNamed {
+                sym: other_sym,
+                nargs: 0,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        0,
+        1,
+        0,
+    );
+
+    let pure_ir = build_from_bytecode(&pure).expect("build pure self recursion");
+    let mixed_ir = build_from_bytecode(&mixed).expect("build mixed call");
+    let emit = |f: &torcl_compiler::t2::ir::Function, sym| {
+        emit_framed_with_activation_slots(
+            f,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0xfeed,
+            1,
+            1,
+            Some(sym),
+        )
+        .expect("emit transfer-check probe")
+    };
+
+    let pure_with_poll = emit(&pure_ir, self_sym);
+    let pure_without_poll = emit_framed_with_activation_slots(
+        &pure_ir, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, Some(self_sym),
+    )
+    .expect("emit pure self without transfer poll");
+    assert_eq!(
+        pure_with_poll.code,
+        pure_without_poll.code,
+        "pure self recursion must not grow a dead transfer-status branch"
+    );
+
+    let mixed_with_poll = emit(&mixed_ir, mixed_sym);
+    let mixed_without_poll = emit_framed_with_activation_slots(
+        &mixed_ir,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        Some(mixed_sym),
+    )
+    .expect("emit mixed call without transfer poll");
+    assert_ne!(
+        mixed_with_poll.code,
+        mixed_without_poll.code,
+        "mixed calls must retain the transfer-status branch"
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
 fn emitted_heap_literal_is_loaded_from_its_constant_pool_slot() {
     use torcl_compiler::t2::emit::emit_framed;
 
