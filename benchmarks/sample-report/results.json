@@ -2,7 +2,7 @@
   "generated_at": "2026-09-29T00:02:08.845089+00:00",
   "samples": 5,
   "metadata": {
-    "commit": "95dbf486a451803bbc2d8e24b754df011e2ffbd1",
+    "commit": "0342fc2164eeb33ac760eeeecc62f0a2395f1de1",
     "working_tree": "M .beads/interactions.jsonl\n M crates/torcl-compiler/src/t2/emit.rs\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs\n M docs/design/native-transfer-abi-plan.md",
     "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
     "cpu": 0,

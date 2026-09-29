@@ -1,6 +1,6 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: 95dbf486a451803bbc2d8e24b754df011e2ffbd1
+Commit: 0342fc2164eeb33ac760eeeecc62f0a2395f1de1
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
 TorCL binary SHA256: 2bfce9c75ed8293d71fdcf52db59d224a063632dd634ee3522d050b952cf3178
