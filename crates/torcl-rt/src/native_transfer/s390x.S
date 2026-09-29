@@ -124,7 +124,12 @@ s390x_probe_registers:
     lghi    %r11,106
     lghi    %r12,107
     lghi    %r13,108
-    brasl   %r14,s390x_probe_call
+    # Through the PLT: the callback is a WEAK, UNDEFINED symbol in a production
+    # library, and a bare brasl emits R_390_PC32DBL against it, which the linker
+    # refuses in the PIE that Rust links by default ("cannot be used against
+    # symbol s390x_probe_call; recompile with -fPIC"). @PLT is the PIC call form
+    # and still lets the test's strong definition override the weak reference.
+    brasl   %r14,s390x_probe_call@PLT
     lghi    %r0,1
     cghi    %r6,101
     jne     .Lregister_fail

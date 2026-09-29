@@ -74,7 +74,24 @@ def build(args):
                 str(compiler), '-fuse-ld=bfd', f'-B{crossbin}/',
                 f'--sysroot={sysroot}', f'-L{gcc_lib}']) + ' "$@"\n')
             linker.chmod(0o755)
-            target_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_LINKER'] = str(linker)
+            env_triple = triple.upper().replace('-', '_')
+            target_env[f'CARGO_TARGET_{env_triple}_LINKER'] = str(linker)
+            # torcl-rt/build.rs assembles native_transfer/{s390x,ppc64le}.S, so a
+            # cross C driver is needed to BUILD and not only to link. cc-rs looks
+            # for `<arch>-linux-gnu-gcc` on PATH, and this toolchain is extracted
+            # privately under target/fedora-rpm/tools rather than installed -- and
+            # the Fedora cross gcc's built-in sysroot is an absolute /usr path this
+            # checkout never creates. Hand cc-rs the same wrapper the linker uses,
+            # which already supplies --sysroot and -B, plus the matching ar.
+            # NOTE the spelling: cargo wants the triple UPPERCASED with
+            # underscores, cc-rs wants it lowercase and accepts either
+            # separator. Using cargo's spelling for CC is silently ignored and
+            # cc-rs falls back to searching PATH, which is how this looked like
+            # "the compiler is missing" when it was only misaddressed.
+            cc_ar = str(tools / 'usr/bin' / f'{compiler_arch}-linux-gnu-ar')
+            for spelling in (triple, triple.replace('-', '_')):
+                target_env[f'CC_{spelling}'] = str(linker)
+                target_env[f'AR_{spelling}'] = cc_ar
             private = directory / 'sysroot'
             (private / 'lib64').mkdir(parents=True, exist_ok=True)
             if not (private / 'lib').exists():
