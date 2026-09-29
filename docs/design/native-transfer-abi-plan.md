@@ -952,11 +952,14 @@ The following existing sites must be covered when installing the segment ABI:
 | Installation/lifetime | `NativeCode`, `OsrCode`, `ActiveNativeCode`, `publish_native`, `install_t2_completion`, `compile_t2_artifact` and retained direct callees; verify architecture plus ABI at every entry/cache/installation boundary. |
 
 The ppc64le backend already has native T1/T2 compilation and ELFv2 foreign-call
-support. Its native-transfer segment adapter is now tracked as the next
-architecture milestone (`bliss-1rt.1`): until the register-save, landing, and
-fault-recovery probes pass under QEMU, ppc64le continues to use the checked
-legacy transfer ABI. Foreign callbacks and all architecture-specific entry
-stubs remain in the final portability audit.
+support. The first ELFv2 segment slice is now implemented in
+`crates/torcl-rt/src/native_transfer/ppc64le.S`: its QEMU probe covers normal
+return, direct transfer landing, anchor cleanup, and ELFv2 nonvolatile state.
+The CLI transfer entry remains disabled on Power until fault-recovery metadata
+and compiler-side native scope admission are ported; those gates are tracked by
+`bliss-1rt.1`. Until then ppc64le continues to use the checked legacy transfer
+ABI. Foreign callbacks and all architecture-specific entry stubs remain in the
+final portability audit.
 
 Compiler work decomposition under `bliss-shih7.11`:
 

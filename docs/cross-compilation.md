@@ -86,6 +86,18 @@ floats), specialized arrays, loops, collections, CLOS, conditions, streams, and
 a compiled-file and a heap-image round trip in fresh processes. These tests establish the initial
 CLI port, not native performance or full ANSI conformance.
 
+The ppc64le runtime also has an ELFv2 native-segment ABI probe. It is run
+explicitly with:
+
+```sh
+cross test --target powerpc64le-unknown-linux-gnu -p torcl-rt \
+  --test native_segment_ppc64le -- --nocapture
+```
+
+That probe validates the machine boundary only; the compiler-side native
+transfer entry and fault-recovery path remain disabled on Power until their
+separate gates pass.
+
 For s390x, `scripts/s390x-jit-smoke.py` additionally requires observable native
 T1 promotion and live OSR entry. It compares native and bytecode results for
 loops, calls with more than five arguments, allocations, multiple values,
