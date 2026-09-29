@@ -2919,7 +2919,6 @@ fn emit_transfer_function(
             ..
         } => save == 0 || complete == 0 || clear_mv == 0,
     }) || call_veneer == 0
-        || !f.osr_entries.is_empty()
         || (0..f.num_values()).any(|i| {
             f.value(crate::t2::ir::Value(i as u32)).repr
                 != crate::t2::ir::ValueRepresentation::Tagged

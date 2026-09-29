@@ -13,16 +13,19 @@ use torcl_rt::bytecode::{BytecodeFunction, Instr};
 use torcl_rt::value::{TorclVal, NIL};
 
 fn bytecode_fn() -> BytecodeFunction {
-    let sym = torcl_rt::symbols::intern("NATIVE-POLL-ABI-CALLEE");
-    let mut code = Vec::with_capacity(150);
-    for _ in 0..70 {
-        code.push(Instr::CallNamed { sym, nargs: 0 });
-        code.push(Instr::Pop);
-    }
-    code.extend([Instr::CallNamed { sym, nargs: 0 }, Instr::Return]);
     BytecodeFunction {
-        code,
-        constants: vec![TorclVal::from_fixnum(1)],
+        // Keep the back-edge out of the entry block: this gives the native
+        // emitter a real OSR header and exercises its independent poll veneer.
+        code: vec![
+            Instr::Const(0),
+            Instr::Pop,
+            Instr::Const(0),
+            Instr::BrIfFalse(5),
+            Instr::Br(2),
+            Instr::Const(1),
+            Instr::Return,
+        ],
+        constants: vec![TorclVal::from_fixnum(0), TorclVal::from_fixnum(1)],
         load_time_values: vec![],
         handler_cases: vec![],
         handler_binds: vec![],
@@ -88,7 +91,7 @@ fn poll_enabled_native_emission_has_no_success_return_check() {
 
     // The poll veneer is an independent hook owned by the transfer emitter.
     assert!(framed.code.len() > 0);
-    assert!(framed.emitted_safepoints > 0);
+    assert!(framed.code.windows(8).any(|w| w == poll.to_le_bytes()));
 
     // The old emitter does encode the checked-return target when one is
     // supplied.  The poll-enabled transfer emitter must not copy that ABI

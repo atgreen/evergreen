@@ -80,6 +80,43 @@ fn native_v2_recursive_body_is_admitted_for_outer_segment() {
     );
 }
 
+#[test]
+fn native_v2_loop_body_is_admitted_with_an_osr_entry() {
+    let body = torcl_rt::bytecode::BytecodeFunction {
+        code: vec![
+            torcl_rt::bytecode::Instr::Const(0),
+            torcl_rt::bytecode::Instr::Pop,
+            torcl_rt::bytecode::Instr::Const(0),
+            torcl_rt::bytecode::Instr::BrIfFalse(5),
+            torcl_rt::bytecode::Instr::Br(2),
+            torcl_rt::bytecode::Instr::Const(1),
+            torcl_rt::bytecode::Instr::Return,
+        ],
+        constants: vec![TorclVal::from_fixnum(0), TorclVal::from_fixnum(1)],
+        load_time_values: vec![],
+        handler_cases: vec![],
+        handler_binds: vec![],
+        names: vec![],
+        restart_cases: vec![],
+        nested_functions: vec![],
+        param_layout: vec![],
+        param_types: vec![],
+        has_env: false,
+        n_locals: 0,
+        max_stack: 1,
+        arity: 0,
+        name: "NATIVE-OSR-SEGMENT-PROBE".into(),
+        params_form: torcl_rt::value::NIL,
+        min_args: 0,
+        max_args: Some(0),
+        variadic: false,
+    };
+    assert!(
+        native_transfer_entry::TransferCode::compile(Arc::new(body)).is_some(),
+        "native transfer compilation must admit a loop with a tagged OSR entry"
+    );
+}
+
 struct NativeEnvGuard(*mut Env);
 impl NativeEnvGuard {
     fn enter(env: &mut Env) -> Self {
