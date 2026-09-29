@@ -120,6 +120,34 @@ def lisp_string(value):
 
 def render(data):
     esc = html.escape
+    baseline_html = ''
+    baseline = data['metadata'].get('baseline')
+    if baseline:
+        rows = []
+        for case in data['benchmarks']:
+            previous = baseline['benchmarks'].get(case['id'])
+            if previous is None:
+                continue
+            before = previous['median_seconds']
+            current = case['results']['TorCL']['median_seconds']
+            change = (before / current - 1.0) * 100.0
+            direction = 'faster' if change >= 0 else 'slower'
+            rows.append(
+                f'<tr><th>{esc(case["title"])}</th>'
+                f'<td>{1000 * before:.3f}</td>'
+                f'<td>{1000 * current:.3f}</td>'
+                f'<td>{abs(change):.1f}% {direction}</td></tr>'
+            )
+        baseline_html = (
+            '<h3>Historical TorCL baseline</h3>'
+            f'<p>Compared with commit <code>{esc(baseline["commit"])}</code> '
+            'using the same workloads and five-sample protocol. Lower is better.</p>'
+            '<div class="table-wrap"><table><thead><tr>'
+            '<th>Workload</th><th>Baseline median ms</th>'
+            '<th>Current median ms</th><th>Change</th></tr></thead><tbody>'
+            + ''.join(rows)
+            + '</tbody></table></div>'
+        )
     cards = []
     for case in data['benchmarks']:
         a, b = case['results']['TorCL'], case['results']['SBCL']
@@ -142,6 +170,8 @@ def render(data):
             tier_html = f'<p class="muted">T2 verified before and after every TorCL sample: {esc(", ".join(case["hot_functions"]))}. Timed deoptimizations per sample: {esc(str(deopts))}.</p>'
         verdict = 'Equal medians' if winner == 'Tie' else f'{winner} {ratio:.2f}× faster'
         cards.append(f'<article><div class="eyebrow">{esc(case["category"])}</div><h2>{esc(case["title"])}</h2><p>{esc(case["description"])}</p><strong class="verdict">{verdict}</strong>{bars}{tier_html}{instruction_html}<p class="muted">Lower is better · identical workload · checksum {case["expected"]:,} verified in every run</p><details><summary>Samples and spread</summary><div class="table-wrap"><table><thead><tr><th>Runtime</th><th>Median ms</th><th>IQR ms</th><th>All samples, ms</th></tr></thead><tbody>{rows}</tbody></table></div></details></article>')
+    if baseline_html:
+        cards.append(f'<section class="method">{baseline_html}</section>')
     meta = data['metadata']
     return '''<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -166,6 +196,10 @@ def main():
                         help='Enable the opt-in native segment transfer ABI')
     parser.add_argument('--perf-event', default='cpu_atom/instructions/',
                         help='perf event used by --instructions')
+    parser.add_argument('--baseline-results', type=Path,
+                        help='JSON report from the pinned TorCL baseline')
+    parser.add_argument('--baseline-commit',
+                        help='commit label for --baseline-results')
     args = parser.parse_args()
     if args.samples < 5:
         parser.error('At least five samples are required')
@@ -202,6 +236,20 @@ def main():
                          'runner_sha256':sha256(__file__), 'cases_sha256':sha256(HERE/'cases.json'),
                          **({'instruction_event': args.perf_event} if args.instructions else {})},
             'benchmarks':[]}
+    if args.baseline_results:
+        baseline = json.loads(args.baseline_results.read_text())
+        baseline_benchmarks = {
+            case['id']: {
+                'median_seconds': case['results']['TorCL']['median_seconds'],
+                'instructions': case['results']['TorCL'].get('instructions'),
+            }
+            for case in baseline['benchmarks']
+        }
+        data['metadata']['baseline'] = {
+            'commit': args.baseline_commit or baseline['metadata']['commit'],
+            'binary_sha256': baseline['metadata']['binaries']['TorCL']['sha256'],
+            'benchmarks': baseline_benchmarks,
+        }
     for case in cases:
         measurements = {'TorCL':[], 'SBCL':[]}
         instruction_measurements = {'TorCL':[], 'SBCL':[]}
