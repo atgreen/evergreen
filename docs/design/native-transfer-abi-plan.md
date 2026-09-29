@@ -919,6 +919,9 @@ separately. Never disable mitigations to make a gate pass. Native Windows CI and
 the remaining SEH/mitigation gates are tracked in `bliss-shih7.14` and gate final
 activation. The boundary follows Microsoft's [x64 prologue/epilogue rules](https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog)
 and [process mitigation query contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessmitigationpolicy).
+The checked-in `windows-native-transfer` job in `.github/workflows/ci.yml` runs
+the native Windows execution test with `--include-ignored`; the Linux/Wine job
+continues to provide only cross-build and regression coverage.
 
 ## Baseline contract oracles and boundary inventory
 
