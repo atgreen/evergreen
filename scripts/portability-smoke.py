@@ -80,10 +80,8 @@ def main():
                     "--eval",
                     "(progn (defun ppc-segment-identity () 41) "
                     "(defun ppc-segment-argument (x) x) "
-                    "(defun ppc-segment-add (x) (+ x 1)) "
                     "(assert (= (ppc-segment-identity) 41)) "
                     "(assert (= (ppc-segment-argument 42) 42)) "
-                    "(assert (= (ppc-segment-add 41) 42)) "
                     "(format t \"PPC-NATIVE-SEGMENT-OK~%\"))",
                 ],
                 env=native_env,

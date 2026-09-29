@@ -87,7 +87,16 @@ impl PpcCode {
         let function = build_from_bytecode(&body).ok()?;
         torcl_compiler::t2::verify::verify(&function).ok()?;
         let slots = body.num_slots();
-        let emitted = emit_framed(&function, 0, slots).ok()?;
+        let emitted = match emit_framed(&function, 0, slots) {
+            Ok(emitted) => emitted,
+            Err(_) => return None,
+        };
+        // The adapter-free entry has no PPC deoptimization continuation yet.
+        // Keep guarded arithmetic and other speculative bodies on the checked
+        // bytecode/native path until their deopt state is installed.
+        if emitted.has_deopt {
+            return None;
+        }
         let code_len = emitted.code.len();
         let code = JitBuffer::new(&emitted.code)?;
         Some(Self {
