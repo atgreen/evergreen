@@ -940,6 +940,11 @@ the sandbox. Its refusal test passed, while the execution test failed with
 under Wine and confirms that the sentinel policy does not silently execute the
 segment without verified mitigations.
 
+The full `native_transfer_cli` integration target also passes 8/8 under the
+Windows GNU target with Wine. This exercises T2 transfers, OSR, fibers,
+multiple values, and cleanup replacement in the cross-built runtime; it remains
+separate from native Windows SEH and mitigation evidence.
+
 ## Baseline contract oracles and boundary inventory
 
 `crates/torcl/tests/native_transfer_cli.rs` verifies real T1/T2 entries, direct
