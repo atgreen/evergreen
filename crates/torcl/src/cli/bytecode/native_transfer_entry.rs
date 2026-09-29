@@ -1921,3 +1921,13 @@ unsafe fn prepare_transfer(
 unsafe extern "C" fn dispatch(_packet: *mut u8, _value: u64, _exit: NativeExit) -> ! {
     core::arch::naked_asm!("endbr64", "mov rax, [rdi]", "mov rdi, [rdi + 8]", "jmp rax");
 }
+    // Bootstrap exercises thousands of ordinary bytecode calls while the
+    // runtime is still constructing its Lisp world.  A process-wide opt-in
+    // must not enter the segment ABI during that phase: the bootstrap has not
+    // yet established the final evaluator registries and can run code that
+    // the segment cache cannot safely retain.  Direct unit tests call this
+    // helper after constructing their own test world, so keep that path
+    // available under cfg(test).
+    if !cfg!(test) && !super::super::BOOT_COMPLETE.with(|ready| ready.get()) {
+        return None;
+    }

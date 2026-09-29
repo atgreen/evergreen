@@ -32,8 +32,13 @@ Add `--instructions` to collect process-wide retired-instruction counts with
 Linux `perf`; the HTML labels these separately because startup and compilation
 are included, while the Lisp timer measures only the warmed workload.
 Add `--native-transfer` to set `TORCL_NATIVE_TRANSFER=1` for TorCL children and
-exercise the opt-in native segment ABI. Unsupported bodies or platforms fall
-back to the checked entry; this switch records the mode in `results.json`.
+exercise the opt-in native segment ABI. The harness temporarily clears that
+environment variable while loading benchmark definitions, then enables it for
+validation, training, warmup, and timing; this keeps source-loading helpers on
+the checked path while measuring the native workload. Unsupported bodies or
+platforms fall back to the checked entry; this switch records the mode in
+`results.json`. Use `--runner PATH` to select another bounded child runner;
+the default remains `scripts/torcl-limited.sh`.
 
 Open `benchmarks/results/index.html`. No server, JavaScript, external fonts, or
 network access is needed to view the report. `results.json` contains all samples,

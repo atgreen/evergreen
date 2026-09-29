@@ -1,27 +1,30 @@
 Current native-transfer ABI benchmark report
 
-Commit: 07bcaf78
+Commit: 8db45197 (native-transfer bootstrap gate and benchmark activation sequencing in the working tree)
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
 
 Five alternating TorCL/SBCL samples on CPU 0 used the native-transfer opt-in,
-retired-instruction counts from perf, and the bounded child runner. Every TorCL
-sample passed its checksum gate, reached T2 for every listed hot function before
-and after timing, and recorded zero timed deoptimizations.
+retired-instruction counts from perf, and a bounded portable child runner
+(`ulimit -v 4194304` plus a 300-second timeout) because this sandbox has no
+systemd user bus. The benchmark disables native transfer while loading each
+source file, then enables it before validation, training, warmup, and timing.
+Every TorCL sample passed its checksum gate, reached T2 for every listed hot
+function before and after timing, and recorded zero timed deoptimizations.
 
 Fibonacci · recursive:
-  TorCL median 33 ms, 7,811,498 retired instructions
-  SBCL median 57 ms, 7,896,004 retired instructions
+  TorCL median 33 ms, 2,115,664 retired instructions
+  SBCL median 57 ms, 2,158,300 retired instructions
 
 Ironclad · modular exponentiation:
-  TorCL median 1110 ms, 7,814,233 retired instructions
-  SBCL median 10 ms, 7,893,761 retired instructions
+  TorCL median 1115 ms, 2,116,878 retired instructions
+  SBCL median 20 ms, 2,159,477 retired instructions
 
 Conditions · caught type errors:
-  TorCL median 734 ms, 7,816,835 retired instructions
-  SBCL median 5 ms, 7,895,059 retired instructions
+  TorCL median 361 ms, 2,116,583 retired instructions
+  SBCL median 5 ms, 2,159,165 retired instructions
 
 The historical baseline remains nested in results.json. The HTML and JSON
 retain all samples, checksums, tier evidence, instruction counts, source hashes,
-and binary hashes. These are local workstation measurements; host contention
-and clock variance remain visible in the sample table.
+and binary hashes. These are local workstation measurements; host contention,
+clock variance, and the portable runner are visible in the report metadata.

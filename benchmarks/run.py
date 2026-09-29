@@ -225,6 +225,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--torcl', default=str(ROOT/'target/x86_64-unknown-linux-musl/release/torcl'))
     parser.add_argument('--sbcl', default=shutil.which('sbcl'))
+    parser.add_argument('--runner', default=str(ROOT/'scripts/torcl-limited.sh'),
+                        help='bounded child runner used for each process')
     parser.add_argument('--samples', type=int, default=7)
     parser.add_argument('--cpu', type=int, default=min(os.sched_getaffinity(0)))
     parser.add_argument('--output', type=Path, default=HERE/'results')
@@ -248,6 +250,9 @@ def main():
     for binary in binaries.values():
         if not binary.is_file() or not os.access(binary, os.X_OK):
             parser.error(f'Executable not found: {binary}')
+    runner = Path(args.runner).resolve()
+    if not runner.is_file() or not os.access(runner, os.X_OK):
+        parser.error(f'Runner executable not found: {runner}')
     cases = json.loads((HERE/'cases.json').read_text())
     if args.case:
         if set(args.case) - {c['id'] for c in cases}:
@@ -270,9 +275,11 @@ def main():
                          'load_average':os.getloadavg(), 'memory_cap':env['TORCL_MEM_MAX'],
                          'binaries':{name:{'path':str(path),'sha256':sha256(path)} for name,path in binaries.items()},
                          'sbcl_version':command_output([str(binaries['SBCL']), '--version']),
+                         'runner':str(runner),
+                         'runner_sha256':sha256(runner),
                          'native_transfer': args.native_transfer,
                          'sources': {p.name:sha256(p) for p in sorted(HERE.glob('*.lisp'))},
-                         'runner_sha256':sha256(__file__), 'cases_sha256':sha256(HERE/'cases.json'),
+                         'run_script_sha256':sha256(__file__), 'cases_sha256':sha256(HERE/'cases.json'),
                          **({'instruction_event': args.perf_event} if args.instructions else {})},
             'benchmarks':[]}
     if args.baseline_results:
@@ -286,8 +293,19 @@ def main():
         measurements = {'TorCL':[], 'SBCL':[]}
         instruction_measurements = {'TorCL':[], 'SBCL':[]}
         tier_evidence = []
-        source = '(declaim (optimize (speed 3) (safety 1) (debug 0)))\n' + (HERE/case['source']).read_text()
-        source += f'''\n(bench-validate)
+        # Keep the opt-in disabled while the source file establishes its
+        # definitions.  Some source-loading helpers are intentionally outside
+        # the native segment admission set; enabling the ABI for them can
+        # enter a fallback shape before the timed functions are warm.  The
+        # process-level gate still covers bootstrap, and the Lisp toggle below
+        # enables the ABI only for validation, training, warmup, and timing.
+        native_toggle = (
+            '#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "0" t)\n'
+            if args.native_transfer else ''
+        )
+        source = native_toggle + '(declaim (optimize (speed 3) (safety 1) (debug 0)))\n' + (HERE/case['source']).read_text()
+        source += f'''\n#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "1" t)
+(bench-validate)
 (bench-train)
 (dotimes (warmup 3) (unless (= (bench-workload) {case['expected']}) (error "Warmup checksum failed")))
 {tier_checks(case)}
@@ -314,7 +332,7 @@ def main():
                         fasl = Path(temp)/'case.fasl'
                         form = f'(multiple-value-bind (file warnings failure) (compile-file {lisp_string(script)} :output-file {lisp_string(fasl)}) (declare (ignore warnings)) (when failure (error "Compilation failed")) (load file))'
                         invocation = [str(binaries[name]), '--noinform','--no-sysinit','--no-userinit','--non-interactive','--eval',form]
-                    command = [str(ROOT/'scripts/torcl-limited.sh'), 'taskset','-c',str(args.cpu),*invocation]
+                    command = [str(runner), 'taskset','-c',str(args.cpu),*invocation]
                     measured_command = command
                     if args.instructions:
                         measured_command = ['perf', 'stat', '-x,', '-e', args.perf_event,

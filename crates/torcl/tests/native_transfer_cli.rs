@@ -3,6 +3,22 @@
 use std::process::Command;
 
 #[test]
+fn process_level_native_transfer_waits_until_bootstrap_finishes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", "(+ 1 2)"])
+        .env("TORCL_NATIVE_TRANSFER", "1")
+        .output()
+        .expect("run TorCL");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+}
+
+#[test]
 fn t2_calls_stop_before_later_side_effects() {
     let program = r#"
         (defvar *after-transfer* 0)
