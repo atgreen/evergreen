@@ -577,8 +577,10 @@ native depth, environment pointer and fault-recovery settings are restored.
 The `native_v2_fallback` execution gates run real Lisp success/error/THROW cases,
 including redefining the caller inside its callee. They check retained-definition
 recovery, multiple values, moving-GC relocation, unchanged enclosing stack and
-pending error, and exactly-once calls and callee cleanup. They are explicitly
-enabled with `--include-ignored` and also run under GC stress plus poison.
+pending error, and exactly-once calls and callee cleanup. The local-exit and
+fallback cleanup/replacement cases are regular tests on the supported host and
+also run under GC stress plus poison; the broader handler/fiber matrix remains
+explicitly enabled with `--include-ignored` until its platform gates are closed.
 This entry is not installed by ordinary tiering. General protected caller scopes, OSR,
 closures, other helper classes, native cleanup/handler destinations, and emergency
 reconstruction failure handling remain required. Output reconstruction still
@@ -881,11 +883,12 @@ When a `RETURN-FROM` or `GO` crosses only locally established lexical block or
 tagbody metadata, the native builder lowers it to the ordinary SSA branch. The
 branch restores the destination operand-stack depth and carries the returned
 value through the same merge as normal control flow; it does not enter the
-generic transfer helper. A test with direct block and tagbody exits exercises
-the installed native path under moving-GC stress. A companion test keeps the
-older rejection rule: an exit crossing `UNWIND-PROTECT`, a catch, or another
-dynamic registration is not converted to a branch, because it must run cleanup
-or preserve the live registration for fallback.
+generic transfer helper. A regular test with direct block and tagbody exits
+exercises the installed native path under moving-GC stress. Companion fallback
+tests cover replacement cleanup, error propagation and no replay of the original
+definition. The older rejection rule remains: an exit crossing `UNWIND-PROTECT`,
+a catch, or another dynamic registration is not converted to a branch, because
+it must run cleanup or preserve the live registration for fallback.
 
 OSR scope maps mark interpreter-established records as `Inherited`. The native
 unwind selector refuses to retire or branch across inherited records, even when

@@ -29,7 +29,6 @@ fn native_v2_protected_builder_refuses_cleanup_bypassing_direct_exits() {
 }
 
 #[test]
-#[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_eligible_local_exits_use_direct_native_branches() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -62,7 +61,6 @@ fn native_v2_eligible_local_exits_use_direct_native_branches() {
 }
 
 #[test]
-#[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -179,7 +177,6 @@ fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
 }
 
 #[test]
-#[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_fallback_propagates_without_replaying_the_original_definition() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
