@@ -31,6 +31,12 @@
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_entry;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_os = "linux"
+))]
+mod native_transfer_entry_ppc64le;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
 mod pending_error;
@@ -18128,6 +18134,16 @@ fn run_native(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(body) = nc.body.clone() {
         if let Some(result) = native_transfer_entry::try_run(body, args, env) {
+            return result;
+        }
+    }
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ))]
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry_ppc64le::try_run(body, args, env) {
             return result;
         }
     }

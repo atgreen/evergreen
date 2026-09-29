@@ -1,0 +1,147 @@
+//! PPC64LE native-segment entry for the first safe rollout slice.
+//!
+//! The x86 installer owns the complete native cleanup/capture protocol.  Power
+//! uses a separate ELFv2 machine adapter, so it starts with bodies whose T2
+//! code cannot call back into Lisp or cross a control scope.  Such a body can
+//! enter and leave the native segment directly; every other shape declines to
+//! the existing checked native ABI.
+
+#![allow(dead_code)]
+
+use super::*;
+use std::cell::RefCell;
+
+use torcl_compiler::t2::build::build_from_bytecode;
+use torcl_compiler::t2::emit_ppc64le::emit_framed;
+use torcl_rt::jit::JitBuffer;
+use torcl_rt::native_transfer;
+
+thread_local! {
+    static SEGMENT_CACHE: RefCell<std::collections::HashMap<usize, Option<std::rc::Rc<PpcCode>>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+struct PpcCode {
+    body: std::sync::Arc<BytecodeFunction>,
+    code: JitBuffer,
+    code_len: usize,
+    slots: u16,
+}
+
+pub(super) fn try_run(
+    body: std::sync::Arc<BytecodeFunction>,
+    args: &[TorclVal],
+    env: &mut Env,
+) -> Option<Result<TorclVal, TorclError>> {
+    if std::env::var_os("TORCL_NATIVE_TRANSFER") != Some(std::ffi::OsString::from("1"))
+        || !native_transfer::is_supported()
+        || !native_transfer::current_segment().is_null()
+    {
+        return None;
+    }
+    let key = std::sync::Arc::as_ptr(&body) as usize;
+    let code = SEGMENT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
+            .entry(key)
+            .or_insert_with(|| PpcCode::compile(std::sync::Arc::clone(&body)).map(std::rc::Rc::new))
+            .clone()
+    });
+    code.map(|code| code.run(args, env))
+}
+
+impl PpcCode {
+    fn compile(body: std::sync::Arc<BytecodeFunction>) -> Option<Self> {
+        if body.variadic
+            || body.has_env
+            || !body.handler_cases.is_empty()
+            || !body.handler_binds.is_empty()
+            || !body.restart_cases.is_empty()
+            || body.code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instr::CallNamed { .. }
+                        | Instr::PushCatch { .. }
+                        | Instr::PushHandlerCase { .. }
+                        | Instr::PopHandlerCase
+                        | Instr::PushHandlerBind { .. }
+                        | Instr::PopHandlerBind
+                        | Instr::PushRestartCase { .. }
+                        | Instr::PopRestartCase
+                        | Instr::PushUnwind { .. }
+                        | Instr::CleanupReturn
+                        | Instr::Throw
+                        | Instr::Go { .. }
+                        | Instr::PushBlock { .. }
+                        | Instr::PushTag { .. }
+                        | Instr::ReturnFrom { .. }
+                        | Instr::ReturnFromNamed { .. }
+                        | Instr::NamedTag { .. }
+                        | Instr::GoNamed { .. }
+                        | Instr::EnterCleanupNormal { .. }
+                )
+            })
+        {
+            return None;
+        }
+        let function = build_from_bytecode(&body).ok()?;
+        torcl_compiler::t2::verify::verify(&function).ok()?;
+        let slots = body.num_slots();
+        let emitted = emit_framed(&function, 0, slots).ok()?;
+        let code_len = emitted.code.len();
+        let code = JitBuffer::new(&emitted.code)?;
+        Some(Self {
+            body,
+            code,
+            code_len,
+            slots,
+        })
+    }
+
+    fn run(&self, args: &[TorclVal], env: &mut Env) -> Result<TorclVal, TorclError> {
+        torcl_rt::rooted!(args = args.to_vec());
+        torcl_rt::rooted_ref!(_env = &mut *env);
+        if args.len() != usize::from(self.body.arity) {
+            return Err(TorclError::ProgramError(
+                "native transfer entry: wrong argument count".into(),
+            ));
+        }
+        validate_declared_args(&self.body, &args)?;
+        env.clear_mv();
+        NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _depth = NativeDepthGuard;
+        let stack = torcl_rt::current_stack();
+        let frame = stack
+            .push_frame(NIL, std::ptr::null(), self.slots, FLAG_CALL)
+            .ok_or_else(|| {
+                TorclError::StackOverflow(
+                    torcl_rt::current_fiber_id()
+                        .unwrap_or_else(|| torcl_rt::FiberId(torcl_rt::current_thread_id().0)),
+                )
+            })?;
+        struct FrameGuard;
+        impl Drop for FrameGuard {
+            fn drop(&mut self) {
+                torcl_rt::current_stack().pop_frame();
+            }
+        }
+        let _frame = FrameGuard;
+        bind_params(&self.body, frame, &args, None);
+        let slots = unsafe { frame.add(1).cast::<u64>() };
+        if std::env::var_os("TORCL_NATIVE_TRANSFER_DEBUG").is_some() {
+            eprintln!(
+                "[native-transfer/ppc64le] direct segment: {} slots, {} bytes",
+                self.slots, self.code_len
+            );
+        }
+        let outcome =
+            unsafe { native_transfer::invoke_native_segment(self.code.as_ptr(), slots, stack) }
+                .map_err(|_| TorclError::Internal("PPC native segment unavailable".into()))?;
+        if outcome.exit != native_transfer::NativeExit::Returned {
+            return Err(TorclError::Internal(
+                "PPC direct segment returned an unsupported exit".into(),
+            ));
+        }
+        Ok(outcome.value)
+    }
+}
