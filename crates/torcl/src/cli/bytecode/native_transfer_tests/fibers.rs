@@ -3,9 +3,11 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
+static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn cleanup_fiber() -> TorclVal {
     let case = NEXT_CASE.fetch_add(2, Ordering::Relaxed);
+    let starting_carrier = torcl_rt::current_thread_id().0;
     // Match thread_entry_runner: workers share initialized classes/packages.
     let mut env = Env::new_impl(false, false, false);
     torcl_rt::rooted_ref!(_env = &mut env);
@@ -50,6 +52,9 @@ fn cleanup_fiber() -> TorclVal {
     let depth = NATIVE_DEPTH.with(|slot| slot.get());
     take_native_cleanup_count();
     torcl_rt::rooted!(result = code.run(&args, &mut env));
+    if torcl_rt::current_thread_id().0 != starting_carrier {
+        MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+    }
     assert_eq!(
         take_native_cleanup_count(),
         case % 2,
@@ -145,6 +150,13 @@ fn native_v2_cleanup_values_and_transfers_survive_fiber_suspension() {
             // multiple values are suspended on distinct stacks.
             HeapCollector::new().minor_gc().unwrap();
             assert_eq!(group.finish().unwrap(), vec![TorclVal::from_fixnum(1); 8]);
+            if num_workers == 4 {
+                assert!(
+                    MIGRATIONS.load(Ordering::Relaxed) > 0,
+                    "at least one suspended native segment must resume on another carrier"
+                );
+                MIGRATIONS.store(0, Ordering::Relaxed);
+            }
         }
     }
 }
