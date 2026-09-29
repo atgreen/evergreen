@@ -3088,7 +3088,29 @@ fn resolve(name: &str) -> Option<Handler> {
                     }
                     contents.push(ch.as_char());
                 }
-                read_eval_all_env(&contents, env)?;
+                // ANSI LOAD binds *PACKAGE* for the dynamic extent of the
+                // load, and a STREAM load is still a load. LOAD_PATH_INTO_ENV
+                // does this for the file case; this branch did not, so
+                // `(with-input-from-string (s "(in-package :foo)") (load s))`
+                // left the CALLER in FOO.
+                //
+                // That is the path a SLIME client injects its runtime through,
+                // so connecting icl to TorCL left the REPL in ICL-RUNTIME
+                // before the user had typed anything — the prompt said
+                // ICL-RUNTIME> and every bare symbol read there, which is a
+                // wrong-answer bug and not just a cosmetic one.
+                //
+                // CURRENT_PACKAGE as well as the value cell: it is the reader's
+                // bare-symbol resolution context and what the prompt shows, and
+                // the two are kept in step deliberately (bliss-lb6.12).
+                let saved_package = env.current_package.clone();
+                let result = read_eval_all_env(&contents, env);
+                if env.current_package != saved_package {
+                    env.current_package = saved_package.clone();
+                    env.define_local("*PACKAGE*", package_object(&saved_package));
+                    sync_package_value_cell(&saved_package);
+                }
+                result?;
                 return Ok(T);
             }
             // LOAD accepts a pathname designator — a namestring OR a pathname
