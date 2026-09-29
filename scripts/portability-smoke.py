@@ -79,7 +79,9 @@ def main():
                     "--no-init",
                     "--eval",
                     "(progn (defun ppc-segment-identity () 41) "
+                    "(defun ppc-segment-argument (x) x) "
                     "(assert (= (ppc-segment-identity) 41)) "
+                    "(assert (= (ppc-segment-argument 42) 42)) "
                     "(format t \"PPC-NATIVE-SEGMENT-OK~%\"))",
                 ],
                 env=native_env,
