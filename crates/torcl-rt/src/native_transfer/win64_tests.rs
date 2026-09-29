@@ -173,6 +173,7 @@ fn win64_preserves_integer_simd_and_fp_control_for_every_exit() {
             landing_pc: 0,
             previous: std::ptr::null_mut(),
             owner: SegmentOwner::Thread(crate::thread::NativeThreadId(0)),
+            carrier: crate::thread::NativeThreadId(0),
             stack_sp: std::ptr::null(),
             stack_fp: std::ptr::null(),
             _pinned: std::marker::PhantomPinned,

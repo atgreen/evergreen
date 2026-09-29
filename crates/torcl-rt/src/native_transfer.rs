@@ -50,6 +50,7 @@ pub struct NativeSegment {
     pub landing_pc: usize,
     previous: *mut NativeSegment,
     owner: SegmentOwner,
+    carrier: crate::thread::NativeThreadId,
     stack_sp: *const u8,
     stack_fp: *const Frame,
     _pinned: std::marker::PhantomPinned,
@@ -61,6 +62,10 @@ impl NativeSegment {
     }
     pub fn owner(&self) -> SegmentOwner {
         self.owner
+    }
+
+    pub fn carrier(&self) -> crate::thread::NativeThreadId {
+        self.carrier
     }
     pub fn stack_watermark(&self) -> (*const u8, *const Frame) {
         (self.stack_sp, self.stack_fp)
@@ -77,6 +82,30 @@ static ACTIVE: ExecutionLocal<Cell<*mut NativeSegment>> =
 /// it must not be dereferenced after return or from another execution.
 pub fn current_segment() -> *mut NativeSegment {
     ACTIVE.with(Cell::get)
+}
+
+/// Revalidate the platform hardening contract when a suspended fiber resumes
+/// on a different carrier. The common case is a single comparison with no
+/// syscall or platform query. A failed revalidation is deliberately reported
+/// to the native poll caller so it can leave through the normal bytecode
+/// fallback; generated code must never continue under an unknown contract.
+pub fn revalidate_current_segment() -> bool {
+    let current = crate::thread::current_thread_id();
+    let segment = current_segment();
+    if segment.is_null() {
+        return true;
+    }
+    // SAFETY: ACTIVE contains a pinned segment owned by this execution and is
+    // only read on that execution's carrier at a poll boundary.
+    let segment = unsafe { &mut *segment };
+    if segment.carrier == current {
+        return true;
+    }
+    if !is_supported() {
+        return false;
+    }
+    segment.carrier = current;
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,12 +167,14 @@ pub unsafe fn invoke_native_segment(
         Some(id) => SegmentOwner::Fiber(id),
         None => SegmentOwner::Thread(crate::thread::current_thread_id()),
     };
+    let carrier = crate::thread::current_thread_id();
     let previous = current_segment();
     let mut segment = std::pin::pin!(NativeSegment {
         saved_sp: 0,
         landing_pc: 0,
         previous,
         owner,
+        carrier,
         stack_sp: stack.sp(),
         stack_fp: stack.fp(),
         _pinned: std::marker::PhantomPinned,
@@ -310,6 +341,7 @@ mod tests {
                 landing_pc: 0,
                 previous: std::ptr::null_mut(),
                 owner: SegmentOwner::Thread(crate::thread::NativeThreadId(0)),
+                carrier: crate::thread::NativeThreadId(0),
                 stack_sp: std::ptr::null(),
                 stack_fp: std::ptr::null(),
                 _pinned: std::marker::PhantomPinned,
@@ -328,5 +360,29 @@ mod tests {
             assert_eq!(outcome.value, TorclVal::from_fixnum(42));
             assert_eq!((anchor.saved_sp, anchor.landing_pc), (0, 0));
         }
+    }
+
+    #[test]
+    fn carrier_change_revalidates_before_resuming_a_segment() {
+        if !is_supported() {
+            eprintln!("native segment hardening probe unavailable on this host");
+            return;
+        }
+        let current = crate::thread::current_thread_id();
+        let mut segment = std::pin::pin!(NativeSegment {
+            saved_sp: 0,
+            landing_pc: 0,
+            previous: std::ptr::null_mut(),
+            owner: SegmentOwner::Thread(current),
+            carrier: crate::thread::NativeThreadId(current.0.wrapping_add(1)),
+            stack_sp: std::ptr::null(),
+            stack_fp: std::ptr::null(),
+            _pinned: std::marker::PhantomPinned,
+        });
+        let pointer = unsafe { segment.as_mut().get_unchecked_mut() as *mut NativeSegment };
+        let previous = ACTIVE.with(|active| active.replace(pointer));
+        assert!(revalidate_current_segment());
+        assert_eq!(unsafe { (*pointer).carrier }, current);
+        ACTIVE.with(|active| active.set(previous));
     }
 }

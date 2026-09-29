@@ -1416,7 +1416,20 @@ unsafe extern "C" fn poll_or_transfer(
 ) {
     use torcl_rt::native_transfer::{NativeExit, NativeOutcome};
     torcl_rt::safepoint::poll_safepoint();
-    let exit = if super::native_loop_should_exit() != 0 {
+    // A fiber can resume this pinned segment on another carrier. Recheck the
+    // hardening contract only on that change; the unchanged-carrier path is a
+    // single execution-local comparison. If the new carrier is incompatible,
+    // leave through the ordinary capture/fallback path before running more
+    // generated code.
+    let carrier_ok = torcl_rt::native_transfer::revalidate_current_segment();
+    if !carrier_ok {
+        NATIVE_ERROR.with(|slot| {
+            slot.set_first(TorclError::Internal(
+                "native segment capability changed after fiber migration".into(),
+            ));
+        });
+    }
+    let exit = if !carrier_ok || super::native_loop_should_exit() != 0 {
         NativeExit::Transfer
     } else {
         NativeExit::Returned
