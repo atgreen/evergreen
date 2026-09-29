@@ -1,6 +1,6 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: 289d3eba
+Commit: 737be001
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
 The report was regenerated after admitting recursive outer segments. Recursive
@@ -13,17 +13,18 @@ counts. Every TorCL sample passed its checksum gate, reported T2 for every hot
 function before and after timing, and recorded zero timed deoptimizations.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 33 ms
-  SBCL median 57 ms
+  TorCL median 33 ms (samples 33, 33, 32, 33, 33)
+  SBCL median 57 ms (samples 57, 57, 56, 56, 57)
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 529 ms
-  SBCL median 10 ms
+  TorCL median 665 ms (samples 737, 530, 1115, 665, 529)
+  SBCL median 10 ms (samples 10, 9, 10, 10, 10)
 
 Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 350 ms
-  SBCL median 5 ms
+  TorCL median 484 ms (samples 484, 352, 351, 598, 735)
+  SBCL median 5 ms (samples 5, 5, 4, 4, 5)
 
 Historical baseline is commit 2c84d2e1; the HTML and JSON retain all samples,
 checksums, tier evidence, instruction counts, source hashes, and binary hashes.
-These are local workstation measurements, not universal performance claims.
+These are local workstation measurements; the wide kernel/exceptional spreads
+reflect host contention and are shown rather than hidden.
