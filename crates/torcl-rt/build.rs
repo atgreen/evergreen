@@ -7,4 +7,10 @@ fn main() {
             .flag("-mabi=elfv2")
             .compile("torcl_native_transfer_ppc64le");
     }
+    if target == "s390x-unknown-linux-gnu" {
+        println!("cargo:rerun-if-changed=src/native_transfer/s390x.S");
+        cc::Build::new()
+            .file("src/native_transfer/s390x.S")
+            .compile("torcl_native_transfer_s390x");
+    }
 }

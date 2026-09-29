@@ -12,6 +12,7 @@ use crate::stack::{Frame, TorclStack};
         target_os = "linux"
     ),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
 ))]
 use crate::value::NIL;
 use crate::value::TorclVal;
@@ -25,6 +26,8 @@ mod aarch64;
     target_os = "linux"
 ))]
 mod ppc64le;
+#[cfg(all(target_arch = "s390x", unix))]
+mod s390x;
 #[cfg(all(target_arch = "x86_64", any(windows, all(test, target_os = "linux"))))]
 mod win64;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -45,6 +48,10 @@ use ppc64le::enter as enter_platform;
     target_os = "linux"
 ))]
 pub use ppc64le::leave_native_segment;
+#[cfg(all(target_arch = "s390x", unix))]
+use s390x::enter as enter_platform;
+#[cfg(all(target_arch = "s390x", unix))]
+pub use s390x::leave_native_segment;
 #[cfg(all(target_arch = "x86_64", windows))]
 use win64::enter as enter_platform;
 #[cfg(all(target_arch = "x86_64", windows))]
@@ -172,6 +179,10 @@ pub fn is_supported() -> bool {
     {
         aarch64::is_supported()
     }
+    #[cfg(all(target_arch = "s390x", unix))]
+    {
+        s390x::is_supported()
+    }
     #[cfg(not(any(
         all(target_arch = "x86_64", any(target_os = "linux", windows)),
         all(
@@ -180,6 +191,7 @@ pub fn is_supported() -> bool {
             target_os = "linux"
         ),
         all(target_arch = "aarch64", unix),
+        all(target_arch = "s390x", unix),
     )))]
     {
         false
@@ -194,6 +206,7 @@ pub fn is_supported() -> bool {
         target_os = "linux"
     ),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
 ))]
 struct ActiveSegment(*mut NativeSegment);
 #[cfg(any(
@@ -204,6 +217,7 @@ struct ActiveSegment(*mut NativeSegment);
         target_os = "linux"
     ),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
 ))]
 impl Drop for ActiveSegment {
     fn drop(&mut self) {
@@ -230,6 +244,7 @@ impl Drop for ActiveSegment {
         target_os = "linux"
     ),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
 ))]
 pub unsafe fn invoke_native_segment(
     entry: *const u8,
@@ -279,6 +294,7 @@ pub unsafe fn invoke_native_segment(
         target_os = "linux"
     ),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
 )))]
 pub unsafe fn invoke_native_segment(
     _entry: *const u8,

@@ -975,6 +975,13 @@ remains behind the checked fallback until generated entry admission,
 deoptimization metadata, fault recovery, handlers and cleanup capture have
 target-specific contracts.
 
+The s390x runtime now has the corresponding ELF64 segment enter/leave boundary
+in `crates/torcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering
+normal return, direct transfer, anchor cleanup and host-stack restoration. As
+with AArch64, this does not yet enable CLI compiler activation: generated entry
+admission, deoptimization metadata, fault recovery, handlers, cleanup capture
+and precise native polling remain gated.
+
 Compiler work decomposition under `bliss-shih7.11`:
 
 * `bliss-shih7.11.1`: Specify exceptional CFG and liveness invariants.
