@@ -1,3 +1,4 @@
+#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "0" t)
 (declaim (optimize (speed 3) (safety 1) (debug 0)))
 (defun exceptional-kernel (x)
   (if (zerop (mod x 97))
@@ -24,6 +25,7 @@
     (dotimes (i 2000 sum)
       (incf sum (exceptional-call i)))))
 
+#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "1" t)
 (bench-validate)
 (bench-train)
 (dotimes (warmup 3) (unless (= (bench-workload) 1978630) (error "Warmup checksum failed")))

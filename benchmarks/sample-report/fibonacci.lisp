@@ -1,3 +1,4 @@
+#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "0" t)
 (declaim (optimize (speed 3) (safety 1) (debug 0)))
 ;;; No type declarations: identical general-integer recursion on both runtimes.
 (defun fibonacci (n)
@@ -19,6 +20,7 @@
   (let ((*fib-input* 10) (*fib-repetitions* 1))
     (dotimes (i 10000) (bench-workload))))
 
+#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "1" t)
 (bench-validate)
 (bench-train)
 (dotimes (warmup 3) (unless (= (bench-workload) 8320400) (error "Warmup checksum failed")))

@@ -1,3 +1,4 @@
+#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "0" t)
 (declaim (optimize (speed 3) (safety 1) (debug 0)))
 ;;; Extracted unchanged from Ironclad src/math.lisp at
 ;;; f6519450b47a7648f837126e9f269857033e352a. See LICENSE.ironclad.
@@ -68,6 +69,7 @@
   (let ((*power-count* 1))
     (dotimes (i 10000) (bench-workload))))
 
+#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "1" t)
 (bench-validate)
 (bench-train)
 (dotimes (warmup 3) (unless (= (bench-workload) 5242584863) (error "Warmup checksum failed")))
