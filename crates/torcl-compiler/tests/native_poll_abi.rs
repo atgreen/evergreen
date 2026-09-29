@@ -86,9 +86,7 @@ fn poll_enabled_native_emission_has_no_success_return_check() {
     )
     .expect("emit poll-enabled native body");
 
-    // The poll veneer is an independent hook.  This test uses a body without
-    // a loop, so its presence is represented in the transfer metadata rather
-    // than in an emitted back-edge; the emitter must still retain it.
+    // The poll veneer is an independent hook owned by the transfer emitter.
     assert!(framed.code.len() > 0);
     assert!(framed.emitted_safepoints > 0);
 
