@@ -184,6 +184,36 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
             .stack_size(16 * 1024 * 1024).spawn(move || {
                 let result = std::panic::catch_unwind(|| {
                     std::env::set_current_dir(root).map_err(|e| e.to_string())?;
+                    // Debug knobs, on a device where there is otherwise no way
+                    // to set one. An optional `torcl.env` asset, KEY=VALUE per
+                    // line, applied before the interpreter starts -- which is
+                    // when TORCL_GC_STRESS, TORCL_DISABLE_T2 and the rest are
+                    // read. `setprop wrap.<package>` is the usual route and is
+                    // denied to the shell user on a production build, so
+                    // without this an Android-only bug cannot be bisected with
+                    // the tools the rest of TorCL is debugged with. Read from
+                    // the unpacked asset directory, so it ships in the APK and
+                    // no app can be reconfigured from outside itself.
+                    if let Ok(text) = std::fs::read_to_string("torcl.env") {
+                        for line in text.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') {
+                                continue;
+                            }
+                            if let Some((name, value)) = line.split_once('=') {
+                                let (name, value) = (name.trim(), value.trim());
+                                if name.is_empty() || name.contains('\0') {
+                                    continue;
+                                }
+                                log(&format!("torcl.env: {name}={value}"));
+                                // SAFETY: the interpreter has not started and
+                                // no other thread in this process reads the
+                                // environment; the main thread is inside the
+                                // platform looper.
+                                unsafe { std::env::set_var(name, value) };
+                            }
+                        }
+                    }
                     let form = format!("(progn (load \"android.lisp\") (load \"app.lisp\") (funcall (find-symbol \"RUN\" \"TORCL-ANDROID\") {}))", Arc::as_ptr(&worker_state) as usize);
                     torcl::run(&["torcl".into(), "--no-init".into(), "--eval".into(), form])
                         .map_err(|e| e.to_string())
