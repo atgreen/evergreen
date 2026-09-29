@@ -1117,3 +1117,32 @@ Cleanups retain any surrounding bindings until unwinding crosses them.
 Extending Invoke construction to protected forms and attaching scope maps to
 installed native code remain required before native dispatch; this analysis
 does not enable emission of currently unsupported protected forms.
+
+### Current validation boundary (2026-09-29)
+
+The supported-host compiler and transfer integration gates currently pass:
+
+```text
+cargo test --locked -p torcl-compiler --lib                 153 passed
+cargo test --locked -p torcl --test native_transfer_cli     8 passed
+cargo test --locked -p torcl --lib native_v2_fallback_     2 passed
+```
+
+The native segment emitter passes a zero `c2i_transfer_pending` address. Its
+eligible native-to-native returns therefore have no successful-return status
+call or branch; independent loop and straight-line poll veneers remain in
+place. The fallback and handler tests cover multiple values, inherited OSR
+handlers, replacing cleanups, fiber yields, and moving-GC roots on x86-64
+Linux. Narrow constant/identity segment entries also pass the AArch64 and
+s390x QEMU portability gates.
+
+The legacy checked ABI remains a required compatibility path. It is still used
+for unsupported bodies and platforms, nested native-to-Lisp calls, allocation
+and signaling helpers, deoptimization, fault recovery, incomplete protected
+scope lowering, foreign callbacks, and image/Windows boundaries. A full
+GC-stress run of the largest T2 transfer fixture is currently dominated by
+compilation under every-allocation collection and needs a bounded stress
+fixture before it can serve as a completion gate. The remaining delivery work
+is tracked in Beads (`bliss-shih7.6`, `bliss-shih7.14`, `bliss-0tazp`, and
+`bliss-x7qyn`); these are deliberately not represented as successful native
+coverage.
