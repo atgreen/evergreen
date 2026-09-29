@@ -1153,8 +1153,8 @@ The supported-host compiler and transfer integration gates currently pass:
 ```text
 cargo test --locked -p torcl-compiler --lib                 153 passed
 cargo test --locked -p torcl-compiler --test native_poll_abi 2 passed
-cargo test --locked -p torcl --test native_transfer_cli     8 passed
-cargo test --locked -p torcl --lib native_v2_fallback_     2 passed
+cargo test --locked -p torcl --test native_transfer_cli     9 passed
+cargo test --locked -p torcl --lib native_v2_ -- --ignored 18 passed
 ```
 
 The native segment emitter passes a zero `c2i_transfer_pending` address. Its
@@ -1172,6 +1172,11 @@ required SysV stack alignment; the test passes normally and under
 `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`. The earlier crash in
 `revalidate_current_segment` was an unaligned call frame, not a reason to keep
 all OSR bodies on the checked ABI.
+
+The process-level opt-in smoke also passes with forced moving GC and poison:
+`TORCL_GC_STRESS=1 TORCL_GC_POISON=1 TORCL_NATIVE_TRANSFER=1` on a basic
+`--no-init --eval` form. This specifically covers the bootstrap activation gate
+that prevents the segment cache from running before `BOOT_COMPLETE`.
 
 The legacy checked ABI remains a required compatibility path. It is still used
 for unsupported bodies and platforms, nested native-to-Lisp calls, allocation
