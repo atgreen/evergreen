@@ -12024,9 +12024,11 @@ fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
 /// definition's parent is `CL:ERROR` — also reduced to `ERROR` — walking the parents
 /// found the entry again and recursed until the stack was gone (bliss-kliz4):
 ///
-///     (define-condition mypkg::error (cl:error) ((k :initarg :k)))
-///     (define-condition later (error) ((k :initarg :k)))
-///     (make-condition 'later :k 5)        => SIGSEGV
+/// ```text
+/// (define-condition mypkg::error (cl:error) ((k :initarg :k)))
+/// (define-condition later (error) ((k :initarg :k)))
+/// (make-condition 'later :k 5)        => SIGSEGV
+/// ```
 ///
 /// `COMMON-LISP:` is normalized away because a CL symbol's name is ordinarily
 /// reported unqualified, so `ERROR` and `COMMON-LISP:ERROR` must be one key. The
