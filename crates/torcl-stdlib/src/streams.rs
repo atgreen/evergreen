@@ -2770,6 +2770,55 @@ pub fn socket_accept(id: u64) -> Result<TorclVal, TorclError> {
     socket_stream(stream)
 }
 
+/// Whether a listener has a connection waiting, without accepting it.
+///
+/// `socket_accept` blocks, and a listener is an id into a map rather than a
+/// stream, so `stream_wait_for_input` cannot see it. Without this a program with
+/// its own event loop -- a UI serving slynk between frames, say -- has no way to
+/// offer a REPL without stalling on accept until somebody connects.
+pub fn socket_listener_ready(id: u64, timeout_ms: i32) -> Result<bool, TorclError> {
+    SOCKET_LISTENERS.with(|m| {
+        let map = m.borrow();
+        let listener = map.get(&id).ok_or_else(|| {
+            TorclError::FileError("socket-listener-ready: unknown or closed listener".into())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use torcl_rt::syscall::{POLLERR, POLLHUP, POLLIN, POLLNVAL, PollFd};
+            let mut descriptor = PollFd {
+                fd: listener.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            };
+            // SAFETY: the listener is alive for this borrow and owns the fd.
+            let count = unsafe { torcl_rt::syscall::poll(&mut descriptor, 1, timeout_ms) }
+                .map_err(|errno| {
+                    TorclError::FileError(format!("socket-listener-ready: errno {errno}"))
+                })?;
+            if descriptor.revents & POLLNVAL != 0 {
+                return Err(TorclError::FileError(
+                    "socket-listener-ready: invalid descriptor".into(),
+                ));
+            }
+            Ok(count > 0 && descriptor.revents & (POLLIN | POLLHUP | POLLERR) != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            // Fall back to a non-blocking accept probe, restoring the mode.
+            let _ = timeout_ms;
+            listener.set_nonblocking(true).ok();
+            let ready = match listener.accept() {
+                Ok(_) => true,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(_) => true,
+            };
+            listener.set_nonblocking(false).ok();
+            Ok(ready)
+        }
+    })
+}
+
 /// Transfer the owned socket to the common stream/finalizer machinery.
 fn socket_stream(stream: TcpStream) -> Result<TorclVal, TorclError> {
     let _ = stream.set_nodelay(true);

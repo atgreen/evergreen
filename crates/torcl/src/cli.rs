@@ -16564,6 +16564,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
             "TORCL::%SOCKET-CLOSE" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%SOCKET-FD" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::%SOCKET-WAIT-FOR-INPUT" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::%SOCKET-LISTENER-READY-P" => return eval_builtin_arguments(&name, cdr, env),
             "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "READ-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "SLEEP" => return eval_builtin_arguments(&name, cdr, env),

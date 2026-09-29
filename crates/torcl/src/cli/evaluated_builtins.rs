@@ -699,6 +699,34 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(TorclVal::from_fixnum(id as i64))
         }),
 
+        "TORCL::%SOCKET-LISTENER-READY-P" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%socket-listener-ready-p listener-id &optional timeout-ms) → T | NIL
+            //
+            // The listener counterpart of %SOCKET-WAIT-FOR-INPUT, which cannot
+            // see one: a listener is an id into a table, not a stream. Without
+            // this, %SOCKET-ACCEPT blocks until somebody connects, so a program
+            // with its own event loop cannot offer a REPL between frames.
+
+            if args.is_empty() || !args[0].is_fixnum() {
+                return Err(TorclError::ProgramError(
+                    "%socket-listener-ready-p: a listener id is required".into(),
+                ));
+            }
+            let id = args[0].as_fixnum() as u64;
+            let timeout = if args.len() > 1 && args[1].is_fixnum() {
+                args[1].as_fixnum() as i32
+            } else {
+                0
+            };
+            Ok(if torcl_stdlib::socket_listener_ready(id, timeout)? {
+                T
+            } else {
+                NIL
+            })
+        }),
+
         "TORCL::%SOCKET-LOCAL-PORT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

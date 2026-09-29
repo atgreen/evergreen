@@ -137,7 +137,7 @@ pub use streams::{
     make_lisp_string_fresh, make_stderr, make_stdin, make_stdout, make_string_input_stream,
     make_string_output_stream, make_synonym_stream, make_two_way_stream, open, open_stream_p,
     output_stream_p, set_file_position, set_file_position_to_end, socket_accept,
-    socket_close_listener, socket_connect, socket_listen, socket_local_port,
+    socket_close_listener, socket_connect, socket_listen, socket_listener_ready, socket_local_port,
     stream_advance_to_column, stream_clear_input, stream_clear_output, stream_element_type,
     stream_external_format, stream_finish_output, stream_force_output, stream_fresh_line,
     stream_line_column, stream_line_number, stream_listen, stream_peek_char, stream_raw_fd,
