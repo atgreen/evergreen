@@ -369,7 +369,9 @@ The rollout gate requires:
 
 The checked-in [native-transfer benchmark report](../../benchmarks/sample-report/index.html)
 contains the current five-sample T2/instruction measurements, SBCL comparison,
-and a same-protocol TorCL comparison against baseline commit `2c84d2e1`.
+and a same-protocol TorCL comparison against baseline commit `737be001`.
+`2c84d2e1` remains the counted pending-error fast-path baseline for the ABI
+design, while `737be001` is the executable baseline recorded by the report.
 The recorded baseline/current binary hashes and raw JSON are part of the report
 provenance. The comparison shows the current native path improving Fibonacci
 while POWER-MOD and caught conditions remain slower; those regressions are
