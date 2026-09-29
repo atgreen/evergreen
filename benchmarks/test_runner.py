@@ -45,6 +45,40 @@ class ReportTests(unittest.TestCase):
         self.assertIn('&lt;script&gt;', page)
         self.assertIn('not a', page)
 
+    def test_baseline_manifest_accepts_nested_checked_report(self):
+        nested = {
+            'metadata': {
+                'commit': 'current',
+                'baseline': {
+                    'commit': 'baseline',
+                    'binary_sha256': 'abc',
+                    'benchmarks': {
+                        'fibonacci': {'median_seconds': 0.112, 'instructions': {'median': 7}}
+                    },
+                },
+            },
+            'benchmarks': [],
+        }
+        result = run.baseline_manifest(nested)
+        self.assertEqual(result['commit'], 'baseline')
+        self.assertEqual(result['binary_sha256'], 'abc')
+        self.assertIn('fibonacci', result['benchmarks'])
+
+    def test_baseline_manifest_accepts_raw_results(self):
+        raw = {
+            'metadata': {
+                'commit': 'baseline',
+                'binaries': {'TorCL': {'sha256': 'abc'}},
+            },
+            'benchmarks': [{
+                'id': 'fibonacci',
+                'results': {'TorCL': {'median_seconds': 0.112}},
+            }],
+        }
+        result = run.baseline_manifest(raw)
+        self.assertEqual(result['commit'], 'baseline')
+        self.assertEqual(result['benchmarks']['fibonacci']['median_seconds'], 0.112)
+
 
 class TierTests(unittest.TestCase):
     def test_require_before_and_after_t2_for_each_hot_function(self):

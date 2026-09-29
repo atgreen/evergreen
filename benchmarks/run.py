@@ -100,6 +100,35 @@ def summarize_instructions(samples):
                 iqr=q3-q1, min=min(samples), max=max(samples))
 
 
+def baseline_manifest(report):
+    """Normalize raw results and a report's nested baseline metadata.
+
+    Checked-in reports retain their historical comparison under
+    ``metadata.baseline``; older standalone results put the same rows at the
+    top level. Accepting both keeps report regeneration reproducible without a
+    hand-written JSON conversion step.
+    """
+    metadata = report.get('metadata', {})
+    nested = metadata.get('baseline')
+    if nested and nested.get('benchmarks'):
+        return {
+            'commit': nested.get('commit', metadata.get('commit')),
+            'binary_sha256': nested.get('binary_sha256'),
+            'benchmarks': nested['benchmarks'],
+        }
+    return {
+        'commit': metadata.get('commit'),
+        'binary_sha256': metadata.get('binaries', {}).get('TorCL', {}).get('sha256'),
+        'benchmarks': {
+            case['id']: {
+                'median_seconds': case['results']['TorCL']['median_seconds'],
+                'instructions': case['results']['TorCL'].get('instructions'),
+            }
+            for case in report['benchmarks']
+        },
+    }
+
+
 def comparison(torcl, sbcl):
     if torcl == sbcl:
         return 'Tie', 1
@@ -247,18 +276,11 @@ def main():
                          **({'instruction_event': args.perf_event} if args.instructions else {})},
             'benchmarks':[]}
     if args.baseline_results:
-        baseline = json.loads(args.baseline_results.read_text())
-        baseline_benchmarks = {
-            case['id']: {
-                'median_seconds': case['results']['TorCL']['median_seconds'],
-                'instructions': case['results']['TorCL'].get('instructions'),
-            }
-            for case in baseline['benchmarks']
-        }
+        baseline = baseline_manifest(json.loads(args.baseline_results.read_text()))
         data['metadata']['baseline'] = {
-            'commit': args.baseline_commit or baseline['metadata']['commit'],
-            'binary_sha256': baseline['metadata']['binaries']['TorCL']['sha256'],
-            'benchmarks': baseline_benchmarks,
+            'commit': args.baseline_commit or baseline['commit'],
+            'binary_sha256': baseline['binary_sha256'],
+            'benchmarks': baseline['benchmarks'],
         }
     for case in cases:
         measurements = {'TorCL':[], 'SBCL':[]}
