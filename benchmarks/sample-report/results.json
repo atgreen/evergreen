@@ -1,18 +1,18 @@
 {
-  "generated_at": "2026-09-29T01:20:30.446504+00:00",
+  "generated_at": "2026-09-29T03:22:52.890605+00:00",
   "samples": 5,
   "metadata": {
-    "commit": "737be0012933c50bcc7c82b917e2a0b3839bc710",
-    "working_tree": "M .beads/interactions.jsonl\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs",
+    "commit": "7d2eafdadc7f13040482276d4b8f7c76dc4d1715",
+    "working_tree": "M .beads/interactions.jsonl\n M crates/torcl-compiler/src/t2/drive.rs\n M crates/torcl-compiler/src/t2/emit.rs\n M crates/torcl-compiler/src/t2/emit_a64.rs\n M crates/torcl-compiler/src/t2/emit_ppc64le.rs\n M crates/torcl-compiler/src/t2/emit_s390x.rs\n M crates/torcl-compiler/src/t2/native_transfer.rs\n M crates/torcl-compiler/src/t2/opt_dce.rs\n M crates/torcl-compiler/src/t2/transfer_capture.rs\n M crates/torcl-compiler/src/t2/transfer_sites.rs\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs",
     "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
     "cpu": 0,
     "cpu_model": "Intel(R) Core(TM) Ultra 7 255H",
     "load_average": [
-      10.109375,
-      9.6455078125,
-      9.45556640625
+      4.23681640625,
+      3.68115234375,
+      3.5849609375
     ],
-    "memory_cap": "4G",
+    "memory_cap": "8G",
     "binaries": {
       "TorCL": {
         "path": "/home/green/git/torcl/bliss/target/x86_64-unknown-linux-musl/release/torcl",
@@ -30,11 +30,11 @@
       "fibonacci.lisp": "6e0ba0e605767be022e648ccc1e7222890cbe70a01383bfefb8fe0d241ed759b",
       "ironclad-power-mod.lisp": "40565c30414aa69d09a7cb174ef9887f2ba710fa26b6fae45247b15615c86e1d"
     },
-    "runner_sha256": "6a5f2ddbfcba2400b3b23731e5b8c8b40dfead4a814cb0b69c343f2ee45467a8",
+    "runner_sha256": "637161549ec9e7a6665bc66abff55a8aa27a8d78d9dad9101e469a75efed1e05",
     "cases_sha256": "1d123f8575f090586462d019346f1332520770b53dc8d126776862a2e0b1b4c2",
     "instruction_event": "cpu_atom/instructions/",
     "baseline": {
-      "commit": "2c84d2e1",
+      "commit": "737be001",
       "binary_sha256": "a47426a3ccfe65fe263c03da421342618bf0458389a674d3b8a87f2651c4cb03",
       "benchmarks": {
         "fibonacci": {
@@ -105,7 +105,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35788,
+              "calls": 34204,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -119,7 +119,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35818,
+              "calls": 34234,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -136,7 +136,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 37394,
+              "calls": 35666,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -150,7 +150,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 37424,
+              "calls": 35696,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -167,7 +167,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35804,
+              "calls": 34204,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -181,7 +181,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35834,
+              "calls": 34234,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -198,7 +198,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35814,
+              "calls": 34204,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -212,7 +212,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35844,
+              "calls": 34234,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -229,7 +229,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35798,
+              "calls": 34972,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -243,7 +243,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 35828,
+              "calls": 35002,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -260,54 +260,54 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            0.033,
-            0.033,
-            0.032,
-            0.033,
-            0.033
+            0.055,
+            0.06,
+            0.069,
+            0.068,
+            0.067
           ],
-          "median_seconds": 0.033,
-          "iqr_seconds": 0.0,
-          "min_seconds": 0.032,
-          "max_seconds": 0.033,
+          "median_seconds": 0.067,
+          "iqr_seconds": 0.008000000000000007,
+          "min_seconds": 0.055,
+          "max_seconds": 0.069,
           "instructions": {
             "samples": [
-              7809426,
-              7708696,
-              7814823,
-              7813825,
-              7813465
+              7814598,
+              7690311,
+              7815707,
+              7679448,
+              7809664
             ],
-            "median": 7813465,
-            "iqr": 4399.0,
-            "min": 7708696,
-            "max": 7814823
+            "median": 7809664,
+            "iqr": 124287.0,
+            "min": 7679448,
+            "max": 7815707
           }
         },
         "SBCL": {
           "samples_seconds": [
-            0.057,
-            0.057,
-            0.056,
-            0.056,
-            0.057
+            0.119,
+            0.103,
+            0.119,
+            0.119,
+            0.12
           ],
-          "median_seconds": 0.057,
-          "iqr_seconds": 0.0010000000000000009,
-          "min_seconds": 0.056,
-          "max_seconds": 0.057,
+          "median_seconds": 0.119,
+          "iqr_seconds": 0.0,
+          "min_seconds": 0.103,
+          "max_seconds": 0.12,
           "instructions": {
             "samples": [
-              7896434,
-              7891043,
-              7273059,
-              7745136,
-              7889256
+              7890615,
+              7894708,
+              7749304,
+              7890439,
+              7798527
             ],
-            "median": 7889256,
-            "iqr": 145907.0,
-            "min": 7273059,
-            "max": 7896434
+            "median": 7890439,
+            "iqr": 92088.0,
+            "min": 7749304,
+            "max": 7894708
           }
         }
       }
@@ -329,6 +329,68 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 310004,
+              "back_edges": 90167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 90167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
+              "back_edges": 80167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10003,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "after": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 410004,
+              "back_edges": 80167,
+              "osr_entries": 0
+            },
+            "BENCH-WORKLOAD": {
+              "tier": 2,
+              "calls": 10004,
+              "back_edges": 9,
+              "osr_entries": 0
+            }
+          },
+          "deoptimizations": 0
+        },
+        {
+          "before": {
+            "POWER-MOD": {
+              "tier": 2,
+              "calls": 310004,
               "back_edges": 80167,
               "osr_entries": 0
             },
@@ -391,37 +453,6 @@
             "POWER-MOD": {
               "tier": 2,
               "calls": 310004,
-              "back_edges": 70167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 410004,
-              "back_edges": 70167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 310004,
               "back_edges": 80167,
               "osr_entries": 0
             },
@@ -437,37 +468,6 @@
               "tier": 2,
               "calls": 410004,
               "back_edges": 80167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10004,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "deoptimizations": 0
-        },
-        {
-          "before": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 310004,
-              "back_edges": 70167,
-              "osr_entries": 0
-            },
-            "BENCH-WORKLOAD": {
-              "tier": 2,
-              "calls": 10003,
-              "back_edges": 9,
-              "osr_entries": 0
-            }
-          },
-          "after": {
-            "POWER-MOD": {
-              "tier": 2,
-              "calls": 410004,
-              "back_edges": 70167,
               "osr_entries": 0
             },
             "BENCH-WORKLOAD": {
@@ -483,54 +483,54 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            0.737,
-            0.53,
-            1.115,
-            0.665,
-            0.529
+            1.1,
+            1.108,
+            1.117,
+            1.068,
+            1.058
           ],
-          "median_seconds": 0.665,
-          "iqr_seconds": 0.20699999999999996,
-          "min_seconds": 0.529,
-          "max_seconds": 1.115,
+          "median_seconds": 1.1,
+          "iqr_seconds": 0.040000000000000036,
+          "min_seconds": 1.058,
+          "max_seconds": 1.117,
           "instructions": {
             "samples": [
-              7812833,
-              7816129,
-              7814250,
-              7690350,
-              7814575
+              7672586,
+              7817990,
+              7734380,
+              7811328,
+              7658637
             ],
-            "median": 7814250,
-            "iqr": 1742.0,
-            "min": 7690350,
-            "max": 7816129
+            "median": 7734380,
+            "iqr": 138742.0,
+            "min": 7658637,
+            "max": 7817990
           }
         },
         "SBCL": {
           "samples_seconds": [
-            0.01,
-            0.009,
-            0.01,
-            0.01,
+            0.02,
+            0.02,
+            0.021,
+            0.02,
             0.01
           ],
-          "median_seconds": 0.01,
+          "median_seconds": 0.02,
           "iqr_seconds": 0.0,
-          "min_seconds": 0.009,
-          "max_seconds": 0.01,
+          "min_seconds": 0.01,
+          "max_seconds": 0.021,
           "instructions": {
             "samples": [
-              7892800,
-              7894462,
-              7890194,
-              7896478,
-              7890738
+              7894453,
+              7893008,
+              7763081,
+              7896756,
+              7892337
             ],
-            "median": 7892800,
-            "iqr": 3724.0,
-            "min": 7890194,
-            "max": 7896478
+            "median": 7893008,
+            "iqr": 2116.0,
+            "min": 7763081,
+            "max": 7896756
           }
         }
       }
@@ -646,54 +646,54 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            0.484,
-            0.352,
-            0.351,
-            0.598,
-            0.735
+            0.41,
+            0.728,
+            0.732,
+            0.651,
+            0.561
           ],
-          "median_seconds": 0.484,
-          "iqr_seconds": 0.246,
-          "min_seconds": 0.351,
-          "max_seconds": 0.735,
+          "median_seconds": 0.651,
+          "iqr_seconds": 0.16699999999999993,
+          "min_seconds": 0.41,
+          "max_seconds": 0.732,
           "instructions": {
             "samples": [
-              7812129,
-              7811510,
-              7814446,
-              7813770,
-              7813421
+              7816840,
+              7816465,
+              7670316,
+              7809289,
+              7816837
             ],
-            "median": 7813421,
-            "iqr": 1641.0,
-            "min": 7811510,
-            "max": 7814446
+            "median": 7816465,
+            "iqr": 7548.0,
+            "min": 7670316,
+            "max": 7816840
           }
         },
         "SBCL": {
           "samples_seconds": [
-            0.005,
-            0.005,
             0.004,
-            0.004,
+            0.01,
+            0.009,
+            0.005,
             0.005
           ],
           "median_seconds": 0.005,
-          "iqr_seconds": 0.001,
+          "iqr_seconds": 0.003999999999999999,
           "min_seconds": 0.004,
-          "max_seconds": 0.005,
+          "max_seconds": 0.01,
           "instructions": {
             "samples": [
-              7786991,
-              7894395,
-              7894027,
-              7892821,
-              7797078
+              7740499,
+              7805526,
+              7780065,
+              7890881,
+              7892480
             ],
-            "median": 7892821,
-            "iqr": 96949.0,
-            "min": 7786991,
-            "max": 7894395
+            "median": 7805526,
+            "iqr": 110816.0,
+            "min": 7740499,
+            "max": 7892480
           }
         }
       }
