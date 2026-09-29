@@ -1143,6 +1143,7 @@ The supported-host compiler and transfer integration gates currently pass:
 
 ```text
 cargo test --locked -p torcl-compiler --lib                 153 passed
+cargo test --locked -p torcl-compiler --test native_poll_abi 1 passed
 cargo test --locked -p torcl --test native_transfer_cli     8 passed
 cargo test --locked -p torcl --lib native_v2_fallback_     2 passed
 ```
