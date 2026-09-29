@@ -1003,6 +1003,12 @@ falling back before calls, deoptimization, handlers, cleanup, or loop polling.
 General s390x activation remains gated on generated entry admission,
 deoptimization metadata, fault recovery, handlers, cleanup capture and precise
 native polling.
+The separate s390x foreign-call adapter is also still pending: the System Z
+scalar ABI independently allocates integer arguments in `r2`–`r6` and even
+floating-point registers, with 32-bit overflow values using their ABI-specific
+save-area offsets. The generic legacy eighteen-shape dispatcher cannot safely
+stand in for that contract, so `bliss-0tazp` retains it until a generated adapter
+and QEMU foreign-call tests exist.
 
 Compiler work decomposition under `bliss-shih7.11`:
 
