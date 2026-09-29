@@ -3780,7 +3780,7 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let straight_poll_roots: HashMap<crate::t2::ir::Inst, Vec<Value>> = HashMap::new();
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    let straight_poll_sources: HashSet<crate::t2::ir::Inst> = HashSet::new();
+    let _straight_poll_sources: HashSet<crate::t2::ir::Inst> = HashSet::new();
     let root_shadow_slots = safepoint_roots
         .values()
         .map(Vec::len)

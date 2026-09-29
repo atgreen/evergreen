@@ -16,6 +16,7 @@ pub(super) struct ControlPayload {
 /// reported to the caller while the ordinary Rust/Lisp emergency path is still
 /// available; transfer dispatch must never discover a rehash failure halfway
 /// through retiring a cleanup.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) fn reserve_control_values(additional: usize) -> Result<(), ()> {
     CONTROL_VALUES.with(|values| values.borrow_mut().try_reserve(additional).map_err(|_| ()))
 }

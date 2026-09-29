@@ -34,7 +34,9 @@ mod native_transfer_entry;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
 mod pending_error;
-use super::control_payload::{ControlPayload, reserve_control_values};
+use super::control_payload::ControlPayload;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use super::control_payload::reserve_control_values;
 use pending_error::PendingError;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -18123,6 +18125,7 @@ fn run_native(
     // landing path, so it does not need the legacy post-call transfer poll.
     // Keep rollout explicit while native Windows and hardening gates are still
     // being completed; unsupported shapes remain on the checked ABI below.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(body) = nc.body.clone() {
         if let Some(result) = native_transfer_entry::try_run(body, args, env) {
             return result;

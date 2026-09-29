@@ -326,6 +326,13 @@ Keep unsupported platforms on the old ABI until their own gates pass.
 QEMU proves functional behavior only; native hardware is required for platform
 performance claims. x86-64 Linux and Windows are the first delivery milestone.
 
+The current Lisp segment entry is compiled and activated only on x86-64 Linux.
+The x86-64 Windows build deliberately routes ordinary invocations through the
+checked legacy ABI while the native Windows mitigation and SEH gates remain
+unproven. This is a build-time fallback, not a claim that Windows native
+transfer execution has passed; the Windows release gate below must be green
+before enabling the segment cache there.
+
 The rollout gate requires:
 
 * Disassembly proves no transfer helper call or status branch after successful
