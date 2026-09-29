@@ -1,9 +1,9 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: 0342fc2164eeb33ac760eeeecc62f0a2395f1de1
+Commit: 819b21c38725082e9262c946e9d6a63a8273bdbc
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
-TorCL binary SHA256: 2bfce9c75ed8293d71fdcf52db59d224a063632dd634ee3522d050b952cf3178
+TorCL binary SHA256: 78a4c0137e194b10c63f03f23bea7213404d5e4f0c80bc09a99ed3d9c206a05d
 
 The report was generated with five alternating TorCL/SBCL samples on CPU 0,
 using a bounded 4 GiB / 300-second child runner and --native-transfer. Every
@@ -17,22 +17,22 @@ event; those counts include startup and compilation and are supplemental to the
 in-Lisp throughput timer.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 33 ms (samples 29, 34, 29, 33, 33)
+  TorCL median 33 ms (samples 32, 34, 35, 33, 29)
   SBCL  median 57 ms (samples 57, 57, 57, 57, 56)
-  TorCL median instructions 7,718,574
-  SBCL  median instructions 7,892,581
+  TorCL median instructions 7,812,600
+  SBCL  median instructions 7,700,900
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 533 ms (samples 531, 540, 533, 533, 532)
+  TorCL median 530 ms (samples 528, 531, 528, 530, 531)
   SBCL  median   9 ms (samples   9,   9,   9,  10,  10)
-  TorCL median instructions 7,815,841
-  SBCL  median instructions 7,897,669
+  TorCL median instructions 7,816,435
+  SBCL  median instructions 7,894,067
 
 Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 347 ms (samples 346, 348, 347, 346, 347)
+  TorCL median 347 ms (samples 347, 346, 348, 348, 347)
   SBCL  median   5 ms (samples   4,   5,   5,   5,   5)
-  TorCL median instructions 7,814,371
-  SBCL  median instructions 7,794,806
+  TorCL median instructions 7,813,776
+  SBCL  median instructions 7,892,105
 
 These are local workstation measurements, not universal performance claims.
 The HTML and JSON retain the machine, runtime, source, runner, and binary
