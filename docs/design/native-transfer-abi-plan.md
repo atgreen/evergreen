@@ -359,6 +359,14 @@ The rollout gate requires:
   not prove movement. Test zero, one and several values across cleanup.
 * Run workspace gates and record unrelated baseline failures explicitly.
 
+The checked-in [native-transfer benchmark report](../../benchmarks/sample-report/index.html)
+contains the current five-sample T2/instruction measurements, SBCL comparison,
+and a same-protocol TorCL comparison against baseline commit `2c84d2e1`.
+The recorded baseline/current binary hashes and raw JSON are part of the report
+provenance. The comparison shows the current native path improving Fibonacci
+while POWER-MOD and caught conditions remain slower; those regressions are
+tracked as performance gaps rather than hidden by the Fibonacci result.
+
 This plan does not remove the interpreter, replace Rust's unwinder, promise
 zero overhead for signal polling, or change the Fibonacci algorithm.
 
