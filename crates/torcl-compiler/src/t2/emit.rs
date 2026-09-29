@@ -2919,7 +2919,6 @@ fn emit_transfer_function(
             ..
         } => save == 0 || complete == 0 || clear_mv == 0,
     }) || call_veneer == 0
-        || !f.osr_entries.is_empty()
         || (0..f.num_values()).any(|i| {
             f.value(crate::t2::ir::Value(i as u32)).repr
                 != crate::t2::ir::ValueRepresentation::Tagged
@@ -3191,10 +3190,21 @@ fn emit_framed_inner(
                 .is_some_and(|id| f.frame_states.get(id).scopes.len() > 1)
         })
     });
+    // A native poll veneer is also a real Rust call.  It can be inserted into
+    // an otherwise call-free loop, so it must participate in both ABI stack
+    // alignment and callee-saved allocation.  Omitting it leaves a no-call
+    // frame with rsp % 16 == 8 at the generated call site; the veneer then
+    // enters Rust misaligned and can corrupt unrelated runtime state.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let has_poll_calls = transfers
+        .as_ref()
+        .is_some_and(|transfer| transfer.poll_veneer.is_some());
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let has_poll_calls = false;
     // A multi-scope guard calls the reconstruction callback even if the fast
     // path has no ordinary call. Give it the call-capable prologue/register set
     // so the callback is ABI-aligned and every live value survives the call.
-    let has_calls = has_ir_calls || has_inlined_scopes;
+    let has_calls = has_ir_calls || has_inlined_scopes || has_poll_calls;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running

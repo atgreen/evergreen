@@ -1143,7 +1143,7 @@ The supported-host compiler and transfer integration gates currently pass:
 
 ```text
 cargo test --locked -p torcl-compiler --lib                 153 passed
-cargo test --locked -p torcl-compiler --test native_poll_abi 1 passed
+cargo test --locked -p torcl-compiler --test native_poll_abi 2 passed
 cargo test --locked -p torcl --test native_transfer_cli     8 passed
 cargo test --locked -p torcl --lib native_v2_fallback_     2 passed
 ```
@@ -1156,12 +1156,13 @@ handlers, replacing cleanups, fiber yields, and moving-GC roots on x86-64
 Linux. Narrow constant/identity segment entries also pass the AArch64 and
 s390x QEMU portability gates.
 
-Native segment admission still refuses functions with T2 OSR entries. A focused
-experiment briefly removed that guard and compiled a tagged non-entry loop, but
-executing its back-edge poll crashed in `revalidate_current_segment` while
-looking up the execution-local active segment. The guard was restored in
-`9ed5be21`; native OSR segment entry remains a correctness gate until that
-carrier/stack boundary has a regression test that executes the poll safely.
+T2 OSR segment entry now includes a regression for a call-free loop whose
+back-edge executes the poll veneer. The emitter treats the injected poll as a
+real Rust call when selecting its prologue, so the veneer enters Rust with the
+required SysV stack alignment; the test passes normally and under
+`TORCL_GC_STRESS=1 TORCL_GC_POISON=1`. The earlier crash in
+`revalidate_current_segment` was an unaligned call frame, not a reason to keep
+all OSR bodies on the checked ABI.
 
 The legacy checked ABI remains a required compatibility path. It is still used
 for unsupported bodies and platforms, nested native-to-Lisp calls, allocation

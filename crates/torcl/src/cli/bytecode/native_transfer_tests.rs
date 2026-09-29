@@ -80,6 +80,60 @@ fn native_v2_recursive_body_is_admitted_for_outer_segment() {
     );
 }
 
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_osr_loop_poll_preserves_native_segment_state() {
+    use super::native_transfer_entry::try_run;
+    assert!(torcl_rt::native_transfer::is_supported());
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let body = Arc::new(torcl_rt::bytecode::BytecodeFunction {
+        // The first pass through the loop changes a local from T to NIL; the
+        // second pass exits.  This gives the T2 OSR body a real back-edge poll
+        // without needing a bytecode call (the regression is stack alignment
+        // for a poll-only native frame).
+        code: vec![
+            torcl_rt::bytecode::Instr::LoadLocal(0),
+            torcl_rt::bytecode::Instr::Br(2),
+            torcl_rt::bytecode::Instr::LoadLocal(0),
+            torcl_rt::bytecode::Instr::BrIfFalse(7),
+            torcl_rt::bytecode::Instr::Const(0),
+            torcl_rt::bytecode::Instr::StoreLocal(0),
+            torcl_rt::bytecode::Instr::Br(2),
+            torcl_rt::bytecode::Instr::Const(1),
+            torcl_rt::bytecode::Instr::Return,
+        ],
+        constants: vec![NIL, TorclVal::from_fixnum(42)],
+        load_time_values: vec![],
+        handler_cases: vec![],
+        handler_binds: vec![],
+        names: vec![],
+        restart_cases: vec![],
+        nested_functions: vec![],
+        param_layout: vec![],
+        param_types: vec![],
+        has_env: false,
+        n_locals: 1,
+        max_stack: 1,
+        arity: 1,
+        name: "NATIVE-OSR-POLL-ALIGNMENT".into(),
+        params_form: NIL,
+        min_args: 1,
+        max_args: Some(1),
+        variadic: false,
+    });
+    let mut env = Env::new(false);
+    torcl_rt::rooted_ref!(_env = &mut env);
+    torcl_rt::rooted!(args = vec![torcl_rt::value::T]);
+    unsafe { std::env::set_var("TORCL_NATIVE_TRANSFER", "1") };
+    let result = try_run(body, &args, &mut env)
+        .expect("supported native segment should admit the OSR loop")
+        .expect("OSR loop should return normally");
+    unsafe { std::env::remove_var("TORCL_NATIVE_TRANSFER") };
+    assert_eq!(result, TorclVal::from_fixnum(42));
+}
+
 struct NativeEnvGuard(*mut Env);
 impl NativeEnvGuard {
     fn enter(env: &mut Env) -> Self {

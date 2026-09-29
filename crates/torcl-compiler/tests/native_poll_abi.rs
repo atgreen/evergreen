@@ -68,6 +68,41 @@ fn legacy_bytecode_fn() -> BytecodeFunction {
     }
 }
 
+fn call_free_loop_fn() -> BytecodeFunction {
+    // The loop has no bytecode call.  Its only call is the native poll veneer
+    // inserted by the transfer emitter, which must still receive an aligned
+    // SysV stack.
+    BytecodeFunction {
+        code: vec![
+            Instr::Const(0),
+            Instr::Br(2),
+            Instr::Const(0),
+            Instr::BrIfFalse(5),
+            Instr::Br(2),
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        constants: vec![TorclVal::from_fixnum(1)],
+        load_time_values: vec![],
+        handler_cases: vec![],
+        handler_binds: vec![],
+        names: vec![],
+        restart_cases: vec![],
+        nested_functions: vec![],
+        param_layout: vec![],
+        param_types: vec![],
+        has_env: false,
+        n_locals: 0,
+        max_stack: 1,
+        arity: 0,
+        name: "NATIVE-POLL-ALIGNMENT".into(),
+        params_form: NIL,
+        min_args: 0,
+        max_args: Some(0),
+        variadic: false,
+    }
+}
+
 #[test]
 fn poll_enabled_native_emission_has_no_success_return_check() {
     let function = build_from_bytecode_for_transfers(&bytecode_fn()).expect("build bytecode");
@@ -124,4 +159,26 @@ fn poll_enabled_native_emission_has_no_success_return_check() {
     // embedded as an immediate transfer-check target.
     let forbidden = legacy_pending.to_le_bytes();
     assert!(!framed.code.windows(forbidden.len()).any(|w| w == forbidden));
+}
+
+#[test]
+fn call_free_poll_loop_emits_an_aligned_call_frame() {
+    let function = build_from_bytecode_for_transfers(&call_free_loop_fn()).expect("build loop");
+    torcl_compiler::t2::verify::verify(&function).expect("verify loop");
+    let (framed, _) = emit_framed_native_handlers_with_poll(
+        &function,
+        0x1111_2222_3333_4444,
+        8,
+        0x10,
+        0x20,
+        0x30,
+        0x40,
+        0x50,
+        0x5555_6666_7777_8888,
+    )
+    .expect("emit poll loop");
+    // No value register needs saving, so the alignment-only prologue is the
+    // first instruction: sub rsp, 8.  Before this regression fix the emitter
+    // omitted it because the bytecode itself contained no call.
+    assert_eq!(&framed.code[..4], &[0x48, 0x83, 0xec, 0x08]);
 }
