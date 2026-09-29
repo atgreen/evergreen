@@ -14866,6 +14866,75 @@ fn poison_trap(v: TorclVal, what: &str) {
     }
 }
 
+/// TORCL_EVAL_DIAG (bliss-c0a): report the FIRST evaluator frame to see a form
+/// whose operator is neither a symbol nor a lambda expression. Such a form
+/// cannot come from the reader, so it is a body cursor or a source cons read
+/// back as something else -- and the frame that first sees it is much closer to
+/// the code that produced it than the frame that finally signals.
+fn eval_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TORCL_EVAL_DIAG").is_some())
+}
+
+thread_local! {
+    /// TORCL_EVAL_DIAG only: the operator symbols of the source forms currently
+    /// being evaluated, outermost first. TorCL has no Lisp-level backtrace, and
+    /// a native one is all `eval_list`/`eval_form`/`eval_progn` -- true and
+    /// useless. This names the Lisp code instead.
+    static EVAL_DIAG_STACK: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct EvalDiagFrame;
+
+impl Drop for EvalDiagFrame {
+    fn drop(&mut self) {
+        EVAL_DIAG_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+fn eval_diag_frame(car: TorclVal) -> Option<EvalDiagFrame> {
+    if !eval_diag_enabled() || !car.is_symbol() {
+        return None;
+    }
+    let name = sym_name(car);
+    EVAL_DIAG_STACK.with(|stack| stack.borrow_mut().push(name));
+    Some(EvalDiagFrame)
+}
+
+/// The innermost 40 operators being evaluated, innermost first.
+fn eval_diag_stack() -> String {
+    EVAL_DIAG_STACK.with(|stack| {
+        let stack = stack.borrow();
+        stack
+            .iter()
+            .rev()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" < ")
+    })
+}
+
+fn eval_diag_check(form: TorclVal, what: &str) {
+    if !eval_diag_enabled() || !form.is_cons() {
+        return;
+    }
+    let car = cp(form).0;
+    if car.is_symbol() || car.is_cons() {
+        return;
+    }
+    eprintln!(
+        "[eval-diag] {what}: operator {} is not callable, in form {}\n[eval-diag] lisp: {}",
+        format_val(car),
+        format_val(form),
+        eval_diag_stack()
+    );
+}
+
 fn eval_form(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     // The delivery proof excludes every reachable source-evaluation path.
     // Keep a checked boundary for incompatible internal calls; constant folding
@@ -14876,6 +14945,7 @@ fn eval_form(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         ));
     }
     poison_trap(form, "eval_form entry");
+    eval_diag_check(form, "eval_form entry");
     torcl_rt::rooted!(form = form);
     let form = *form;
     // Atoms, self-evaluating constants, and variable references each produce
@@ -15851,7 +15921,11 @@ fn eval_builtin_arguments(
     evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler")
 }
 
-fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
+fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
+    // FORM itself outlives several allocating lookups before it is handed to
+    // EXPAND-MACRO below, so it is rooted with the other two rather than left as
+    // a bare parameter (AGENTS.md GC invariant 1).
+    torcl_rt::rooted_ref!(_form_root = &mut form);
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
     // these (and every `cp(cdr)`-derived cursor read afterwards) dangling
@@ -15860,6 +15934,7 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     let (mut car, mut cdr) = cp(form);
     torcl_rt::rooted_ref!(_car_root = &mut car);
     torcl_rt::rooted_ref!(_cdr_root = &mut cdr);
+    let _diag_frame = eval_diag_frame(car);
     if car.is_symbol() {
         // A `torcl-ext:` / `torcl-internal:` builtin referenced from a source-free
         // `.bfasl` can materialise under the INTERNAL `PKG::NAME` spelling (the
@@ -21181,8 +21256,26 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
                 return apply_function(*fn_val, &args, env);
             }
             "MULTIPLE-VALUE-PROG1" => {
-                let (first_form, rest_forms) = cp(cdr);
-                let (primary, saved_values) = eval_form_collecting_values(first_form, env)?;
+                // REST_FORMS must be rooted BEFORE the first form runs, not
+                // after: the first form is the whole point of this operator and
+                // may be an entire program. Held as a bare Rust local across it,
+                // this cursor was invisible to the collector while thousands of
+                // allocations relocated the body out from under it, and the
+                // trailing forms then read back as whatever now occupied that
+                // address -- the address, not the object. Found as a Bliss UI
+                // frame (`(multiple-value-prog1 (progn <one frame>) (when
+                // *animating* (invalidate)))`) that died after its first frame
+                // with "The function #<heap-object type=27> is undefined",
+                // because the cleanup form had become a JNI argument list
+                // (bliss-c0a). Rooting `cdr` in EVAL-LIST cannot help: this is a
+                // separate copy in this Rust frame. UNWIND-PROTECT, three
+                // hundred lines up, already does exactly this.
+                let (first_form, mut rest_forms) = cp(cdr);
+                torcl_rt::rooted_ref!(_rest_forms_root = &mut rest_forms);
+                let (mut primary, saved_values) = eval_form_collecting_values(first_form, env)?;
+                // ...and the value being returned survives the trailing forms
+                // for the same reason.
+                torcl_rt::rooted_ref!(_primary_root = &mut primary);
                 // Root the saved values across the body's allocating forms (bliss-6b2 #2).
                 let saved_values = {
                     let mut sv = saved_values;
@@ -23619,6 +23712,23 @@ fn eval_list(form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         return Ok(NIL);
     }
 
+    // A form whose operator is not a symbol at all has no name to report, so
+    // the condition reads "The function #<heap-object type=27> is undefined."
+    // and says nothing about where it came from. That shape is worth more than
+    // a name: it means a CONS was evaluated as a form and its CAR is garbage,
+    // which is the signature of a source form relocated out from under an
+    // unrooted Rust local (AGENTS.md GC invariant 1). Under TORCL_EVAL_DIAG the
+    // whole form and a native backtrace go to stderr, which is the difference
+    // between "somewhere" and a line number.
+    if !car.is_symbol() && std::env::var_os("TORCL_EVAL_DIAG").is_some() {
+        eprintln!(
+            "[eval-diag] operator is not a symbol: {} arguments {} whole form {}\n[eval-diag] lisp: {}",
+            format_val(car),
+            format_val(cdr),
+            format_val(form),
+            eval_diag_stack()
+        );
+    }
     Err(TorclError::UndefinedFunction(car))
 }
 
@@ -23632,6 +23742,29 @@ fn eval_progn(forms: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         // (ansi MULTIPLE-VALUE-BIND.12/13; bliss-p3gu).
         env.clear_mv();
         return Ok(NIL);
+    }
+    // TORCL_EVAL_DIAG (bliss-c0a): a body element that is not evaluable source
+    // says the body list itself is wrong, and its SIBLINGS are the evidence --
+    // if they read as real source, one cell of a real body was overwritten; if
+    // the whole list is runtime data, the caller handed us the wrong object.
+    if eval_diag_enabled() {
+        let mut scan = forms;
+        while scan.is_cons() {
+            let (f, rest) = cp(scan);
+            if f.is_cons() {
+                let car = cp(f).0;
+                if !car.is_symbol() && !car.is_cons() {
+                    eprintln!(
+                        "[eval-diag] eval_progn body element {} is not evaluable; whole body {}\n[eval-diag] lisp: {}",
+                        format_val(f),
+                        format_val(forms),
+                        eval_diag_stack()
+                    );
+                    break;
+                }
+            }
+            scan = rest;
+        }
     }
     torcl_rt::rooted!(remaining = forms);
     let mut r = NIL;

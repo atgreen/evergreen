@@ -172,6 +172,7 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
         return;
     }
     ACTIVITY.store(activity, Ordering::SeqCst);
+    capture_standard_streams();
     // On the main thread, which is the only place the gate can be opened, and
     // before the worker starts so that its very first frame may use it.
     main_thread::install();
@@ -487,6 +488,64 @@ unsafe extern "C" fn torcl_android_touch(state: *const ActivityState, output: *m
 #[unsafe(no_mangle)]
 unsafe extern "C" fn torcl_android_log(text: *const c_char) {
     log(&unsafe { CStr::from_ptr(text) }.to_string_lossy());
+}
+
+/// Send this process's stderr and stdout to logcat, under the tag `torcl-err`.
+///
+/// Android discards both unless `setprop log.redirect-stdio true` is set, which
+/// is denied to the shell user on a production build -- so a Rust panic, an
+/// assertion, and every `eprintln!` diagnostic the runtime has (the GC stress
+/// bisector's allocation backtrace among them) vanished silently on a phone.
+/// The reader thread lives for the life of the process on purpose: the writer
+/// end is dup'd onto fd 1 and 2, which nothing closes.
+fn capture_standard_streams() {
+    unsafe extern "C" {
+        fn pipe(fds: *mut c_int) -> c_int;
+        fn dup2(from: c_int, to: c_int) -> c_int;
+        fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
+    }
+    let mut fds = [0 as c_int; 2];
+    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let (reader, writer) = (fds[0], fds[1]);
+    unsafe {
+        dup2(writer, 1);
+        dup2(writer, 2);
+    }
+    let _ = std::thread::Builder::new()
+        .name("torcl-stderr".into())
+        .spawn(move || {
+            let mut pending = Vec::<u8>::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let n = unsafe { read(reader, buffer.as_mut_ptr().cast(), buffer.len()) };
+                if n <= 0 {
+                    return;
+                }
+                pending.extend_from_slice(&buffer[..n as usize]);
+                // One logcat line per output line; a line longer than the log
+                // buffer is truncated by liblog, not by us.
+                while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=end).collect();
+                    let text = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                    log_tagged("torcl-err", text.replace('\0', " ").trim_end());
+                }
+            }
+        });
+}
+
+fn log_tagged(tag: &str, message: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+    if let (Ok(tag), Ok(text)) = (
+        std::ffi::CString::new(tag),
+        std::ffi::CString::new(message),
+    ) {
+        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
+    }
 }
 
 fn log(message: &str) {
