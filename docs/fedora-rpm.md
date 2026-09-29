@@ -26,7 +26,7 @@ Install host prerequisites (Rust through rustup):
 ```sh
 sudo dnf install gcc binutils rpm-build rpm cpio python3 curl unzip \
     qemu-user wine mingw64-gcc mingw64-binutils glibc make java-devel \
-    python3-mkdocs python3-mkdocs-material
+    mkdocs mkdocs-material
 rustup toolchain install 1.94.1 --profile minimal
 rustup target add --toolchain 1.94.1 x86_64-unknown-linux-gnu s390x-unknown-linux-gnu \
     aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-linux-android x86_64-linux-android

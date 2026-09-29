@@ -21,8 +21,11 @@ BuildRequires: python3
 BuildRequires: gcc
 BuildRequires: make
 BuildRequires: java-devel >= 17
-BuildRequires: python3-mkdocs
-BuildRequires: python3-mkdocs-material
+# Fedora ships these as `mkdocs` / `mkdocs-material`, NOT under a python3-
+# prefix, and neither name carries a compat provide -- so the prefixed spelling
+# is unsatisfiable and rpmbuild refuses the build outright.
+BuildRequires: mkdocs
+BuildRequires: mkdocs-material
 Requires: java-headless >= 17
 Requires: which
 Requires: coreutils
