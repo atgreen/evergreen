@@ -31940,10 +31940,26 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                 }
             }
             let slot_sym = resolve_sym(sname).unwrap_or(NIL);
+            // An INHERITED slot's name arrives from the class metadata fully
+            // QUALIFIED ("COMMON-LISP-USER::SOCKET"), while a direct slot's is
+            // bare. The qualified spelling is what `resolve_sym` needs to find
+            // the right symbol, but it must not leak into a name that is built
+            // by concatenation: the initarg became `:|COMMON-LISP-USER::SOCKET|`,
+            // which no caller writing `:socket` can match, and the accessor
+            // became `CHILD-COMMON-LISP-USER::SOCKET`.
+            //
+            // Latent until DEFSTRUCT's constructors stopped going through
+            // MAKE-INSTANCE (bliss-fskhm): that path matched initargs by SLOT
+            // NAME and never compared the keyword, so a wrong keyword cost
+            // nothing. Put one in a &key lambda list and every inherited slot
+            // silently takes its default instead — which, for slynk's
+            // `(socket (missing-arg))`, means an error the moment a client
+            // connects.
+            let bare_sname = sname.rsplit("::").next().unwrap_or(sname.as_str());
             let accessor = if conc_name.is_empty() {
                 slot_sym
             } else {
-                resolve_sym(&format!("{conc_name}{sname}")).unwrap_or(NIL)
+                resolve_sym(&format!("{conc_name}{bare_sname}")).unwrap_or(NIL)
             };
             // A `(slot … :read-only t)` override makes the inherited slot
             // read-only in the child.
@@ -31973,7 +31989,7 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                 slot_sym,
                 default,
                 accessor,
-                initarg: resolve_sym(&format!(":{sname}")).unwrap_or(NIL),
+                initarg: resolve_sym(&format!(":{bare_sname}")).unwrap_or(NIL),
                 read_only,
             });
         }
