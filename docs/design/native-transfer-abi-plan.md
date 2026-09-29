@@ -1146,3 +1146,9 @@ fixture before it can serve as a completion gate. The remaining delivery work
 is tracked in Beads (`bliss-shih7.6`, `bliss-shih7.14`, `bliss-0tazp`, and
 `bliss-x7qyn`); these are deliberately not represented as successful native
 coverage.
+
+The Windows GNU cross-build also completes with `scripts/windows-port.sh build`,
+and the resulting release executable runs a basic `--no-init --eval` smoke under
+Wine. Wine is recorded only as a regression environment: the native Windows
+SEH, CFG, and shadow-stack execution gates still require the checked-in
+`windows-native-transfer` job on an actual Windows runner.
