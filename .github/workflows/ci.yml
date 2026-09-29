@@ -41,5 +41,7 @@ jobs:
         run: cargo check --workspace
       - name: Win64 segment ABI execution
         run: cargo test -p torcl-rt --test native_segment_windows -- --include-ignored --nocapture
+      - name: Win64 runtime adapter probes
+        run: cargo test -p torcl-rt --lib native_transfer -- --include-ignored --nocapture
       - name: Win64 runtime transfer regressions
         run: cargo test -p torcl --test native_transfer_cli --test tier_observability
