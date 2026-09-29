@@ -45,7 +45,7 @@ fn native_v2_rollout_switch_enters_cached_segment_path() {
 }
 
 #[test]
-fn native_v2_recursive_body_uses_direct_self_call_fallback() {
+fn native_v2_recursive_body_is_admitted_for_outer_segment() {
     let self_symbol = torcl_rt::symbols::intern("NATIVE-RECURSION-PROBE");
     let body = torcl_rt::bytecode::BytecodeFunction {
         code: vec![
@@ -75,8 +75,8 @@ fn native_v2_recursive_body_uses_direct_self_call_fallback() {
         variadic: false,
     };
     assert!(
-        native_transfer_entry::TransferCode::compile(Arc::new(body)).is_none(),
-        "recursive bodies must use the established direct-self-call entry until the segment ABI has one"
+        native_transfer_entry::TransferCode::compile(Arc::new(body)).is_some(),
+        "recursive bodies should be admitted for an outer segment; nested calls are gated by the active-segment check"
     );
 }
 

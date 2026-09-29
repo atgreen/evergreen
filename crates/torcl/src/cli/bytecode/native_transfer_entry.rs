@@ -103,6 +103,14 @@ pub(super) fn try_run(
     {
         return None;
     }
+    // A nested segment would need a fresh activation frame and a second host
+    // landing boundary. Recursive calls already have a bounded, frame-safe
+    // c2i/native bridge, so keep them on that path while the outer segment
+    // remains active. This admits the outer native handler/cleanup machinery
+    // without manufacturing an unsafe recursive segment chain.
+    if !native_transfer::current_segment().is_null() {
+        return None;
+    }
     let key = Arc::as_ptr(&body) as usize;
     let code = SEGMENT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -146,33 +154,6 @@ impl TransferCode {
 
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
         if body.variadic || body.has_env {
-            return None;
-        }
-        // Native-cleanup Invoke currently enters every call through the helper
-        // veneer. A recursive function would therefore create a fresh segment
-        // for each recursive edge instead of using the established direct
-        // register-entry self-call path. Keep that shape on the legacy entry
-        // until the segment ABI has a frame-safe recursive entry; otherwise an
-        // opt-in run can turn ordinary recursion into an effectively unbounded
-        // slow path. This is a capability refusal, so `run_native` retains the
-        // checked/direct-self fallback and Lisp semantics are unchanged.
-        let self_symbol = torcl_rt::symbols::intern(&body.name);
-        if body.code.iter().any(|instruction| {
-            matches!(instruction, Instr::CallNamed { sym, .. } if *sym == self_symbol)
-        }) && body.handler_cases.is_empty()
-            && body.handler_binds.is_empty()
-            && body.restart_cases.is_empty()
-            && !body.code.iter().any(|instruction| {
-                matches!(
-                    instruction,
-                    Instr::PushUnwind { .. }
-                        | Instr::PushCatch { .. }
-                        | Instr::PushHandlerCase { .. }
-                        | Instr::PushHandlerBind { .. }
-                        | Instr::PushRestartCase { .. }
-                )
-            })
-        {
             return None;
         }
         // These scopes need executing identity, dynamic values or inherited
