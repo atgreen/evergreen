@@ -331,12 +331,14 @@ interpreter/T0/T2, GC-stress and image round-trip probes; s390x also passes its
 native T1/T2, OSR, moving-GC, signal and JIT smoke probes. These results validate
 the legacy ABI boundary, not native transfer activation.
 
-The current Lisp segment entry is compiled and activated only on x86-64 Linux.
-The x86-64 Windows build deliberately routes ordinary invocations through the
-checked legacy ABI while the native Windows mitigation and SEH gates remain
-unproven. This is a build-time fallback, not a claim that Windows native
-transfer execution has passed; the Windows release gate below must be green
-before enabling the segment cache there.
+The full Lisp segment entry is compiled and activated only on x86-64 Linux.
+PPC64LE now has an opt-in, deliberately narrow entry for allocation-free,
+scope-free bodies; calls, loops requiring polls, handlers, cleanup, deopt and
+other unsupported shapes decline to the checked ABI. The x86-64 Windows build
+deliberately routes ordinary invocations through the checked legacy ABI while
+the native Windows mitigation and SEH gates remain unproven. These are rollout
+boundaries, not claims of full native transfer coverage; each platform's
+release gate must be green before broadening its segment cache.
 
 The rollout gate requires:
 
@@ -952,14 +954,16 @@ The following existing sites must be covered when installing the segment ABI:
 | Installation/lifetime | `NativeCode`, `OsrCode`, `ActiveNativeCode`, `publish_native`, `install_t2_completion`, `compile_t2_artifact` and retained direct callees; verify architecture plus ABI at every entry/cache/installation boundary. |
 
 The ppc64le backend already has native T1/T2 compilation and ELFv2 foreign-call
-support. The first ELFv2 segment slice is now implemented in
+support. The first ELFv2 segment slice is implemented in
 `crates/torcl-rt/src/native_transfer/ppc64le.S`: its QEMU probe covers normal
 return, direct transfer landing, anchor cleanup, and ELFv2 nonvolatile state.
-The CLI transfer entry remains disabled on Power until fault-recovery metadata
-and compiler-side native scope admission are ported; those gates are tracked by
-`bliss-1rt.1`. Until then ppc64le continues to use the checked legacy transfer
-ABI. Foreign callbacks and all architecture-specific entry stubs remain in the
-final portability audit.
+The CLI also has a narrow opt-in PPC64LE entry in
+`crates/torcl/src/cli/bytecode/native_transfer_entry_ppc64le.rs`; it enters the
+real segment for bodies with no calls or protected scopes and falls back to the
+checked ABI otherwise. Full PPC fault-recovery metadata, native handlers,
+cleanup capture, loop polling and local-exit admission remain open under
+`bliss-1rt.2`. Foreign callbacks and all architecture-specific entry stubs
+remain in the final portability audit.
 
 Compiler work decomposition under `bliss-shih7.11`:
 

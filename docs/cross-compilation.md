@@ -94,9 +94,10 @@ cross test --target powerpc64le-unknown-linux-gnu -p torcl-rt \
   --test native_segment_ppc64le -- --nocapture
 ```
 
-That probe validates the machine boundary only; the compiler-side native
-transfer entry and fault-recovery path remain disabled on Power until their
-separate gates pass.
+That probe validates the machine boundary. With `TORCL_NATIVE_TRANSFER=1`, the
+CLI additionally admits allocation-free, scope-free PPC64LE bodies through the
+segment entry; calls, protected scopes, loop polls, and fault-recovery cases
+still fall back to the checked ABI until their separate gates pass.
 
 For s390x, `scripts/s390x-jit-smoke.py` additionally requires observable native
 T1 promotion and live OSR entry. It compares native and bytecode results for
