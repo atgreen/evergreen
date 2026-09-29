@@ -3,6 +3,7 @@
   (:use :cl) (:nicknames :android)
   (:shadow :log)
   (:export :running-p :paused-p :poll-touch :poll-key :activity :call-on-main
+           :save-state :saved-state
            :log :with-c-string :foreign-call))
 (in-package :torcl-android)
 (defvar *state*)
@@ -134,6 +135,97 @@ promoting one on a later call is not an error but a process abort."
               (:void nil))))
       (torcl-ffi:foreign-free args)
       (torcl-ffi:foreign-free out))))
+
+(defun %utf8-bytes (text)
+  "TEXT as a list of UTF-8 bytes. Saved state crosses into C as bytes, and a
+LENGTH is not a character count once anyone types a letter with an accent."
+  (let ((bytes '()))
+    (loop for ch across text
+          for code = (char-code ch)
+          do (cond ((< code #x80) (push code bytes))
+                   ((< code #x800)
+                    (push (logior #xc0 (ash code -6)) bytes)
+                    (push (logior #x80 (logand code #x3f)) bytes))
+                   ((< code #x10000)
+                    (push (logior #xe0 (ash code -12)) bytes)
+                    (push (logior #x80 (logand (ash code -6) #x3f)) bytes)
+                    (push (logior #x80 (logand code #x3f)) bytes))
+                   (t
+                    (push (logior #xf0 (ash code -18)) bytes)
+                    (push (logior #x80 (logand (ash code -12) #x3f)) bytes)
+                    (push (logior #x80 (logand (ash code -6) #x3f)) bytes)
+                    (push (logior #x80 (logand code #x3f)) bytes))))
+    (nreverse bytes)))
+
+(defun %utf8-string (bytes)
+  "BYTES, a vector of octets, as a string. A malformed sequence yields the
+replacement character rather than an error: this data came back from the
+platform, and refusing to start because of it would be worse than a wrong
+glyph."
+  (let ((out (make-string-output-stream)) (i 0) (n (length bytes)))
+    (loop while (< i n)
+          do (let* ((b (aref bytes i))
+                    (extra (cond ((< b #x80) 0) ((= (logand b #xe0) #xc0) 1)
+                                 ((= (logand b #xf0) #xe0) 2)
+                                 ((= (logand b #xf8) #xf0) 3) (t -1)))
+                    (code (cond ((< b #x80) b) ((= extra 1) (logand b #x1f))
+                                ((= extra 2) (logand b #x0f))
+                                ((= extra 3) (logand b #x07)) (t 0))))
+               (incf i)
+               (if (or (minusp extra) (> (+ i extra) n))
+                   (write-char (code-char #xfffd) out)
+                   (progn
+                     (dotimes (k extra)
+                       (setf code (logior (ash code 6) (logand (aref bytes i) #x3f)))
+                       (incf i))
+                     (write-char (code-char code) out)))))
+    (get-output-stream-string out)))
+
+(defun save-state (text)
+  "Keep TEXT for the next instance of this Activity.
+
+Android destroys an Activity whenever it likes -- a rotation, a configuration
+change, or reclaiming memory from a backgrounded app -- and recreates it later
+with whatever was handed to onSaveInstanceState. Everything else about the
+process, this interpreter included, is gone.
+
+PUSHED, not pulled: onSaveInstanceState arrives on the main thread at a moment
+Android chooses, and this interpreter may be anywhere at the time -- mid-frame,
+inside a JNI call, or waiting on the main-thread gate. Being asked then would
+deadlock or miss the deadline, so the answer is kept ready instead. Call this
+whenever the state worth keeping changes; it is a memcpy, not a write to disk.
+
+Small. The whole saved state of every Activity in the system shares one Binder
+transaction, and Android kills an app that hands over too much."
+  (let* ((bytes (%utf8-bytes text))
+         (count (length bytes))
+         (buffer (torcl-ffi:foreign-alloc (max 1 count))))
+    (unwind-protect
+        (progn
+          (loop for byte in bytes for i from 0
+                do (torcl-ffi:mem-set byte buffer :uchar i))
+          (runtime-call "torcl_android_set_saved_state" :void '(:pointer :pointer :ulong)
+                        (list *state* buffer count)))
+      (torcl-ffi:foreign-free buffer))
+    text))
+
+(defun saved-state ()
+  "What the PREVIOUS instance of this Activity saved, or NIL if there was none.
+
+NIL on a genuine cold start, and NIL is also what a fresh install gives, so an
+application must have a sensible answer for it rather than treating it as an
+error."
+  (let ((count (runtime-call "torcl_android_saved_state_size" :ulong '(:pointer) (list *state*))))
+    (when (plusp count)
+      (let ((buffer (torcl-ffi:foreign-alloc count)))
+        (unwind-protect
+            (let ((got (runtime-call "torcl_android_saved_state" :ulong
+                                     '(:pointer :pointer :ulong)
+                                     (list *state* buffer count))))
+              (let ((bytes (make-array got :element-type '(unsigned-byte 8))))
+                (dotimes (i got) (setf (aref bytes i) (torcl-ffi:mem-ref buffer :uchar i)))
+                (%utf8-string bytes)))
+          (torcl-ffi:foreign-free buffer))))))
 
 (defun run (address)
   ;; AT LEAST, not exactly: a runtime that has grown a capability this

@@ -11,6 +11,12 @@ struct State {
     paused: bool,
     touches: VecDeque<(i32, f32, f32)>,
     keys: VecDeque<(i32, i32, i32)>,
+    /// What Lisp last asked us to keep, handed to Android from
+    /// `onSaveInstanceState`.
+    saved: Vec<u8>,
+    /// What Android handed back when this Activity was created, for Lisp to
+    /// read once.
+    restored: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -66,6 +72,30 @@ impl ActivityState {
         let mut state = self.state.lock().unwrap();
         state.shutdown = true;
         self.changed.notify_all();
+    }
+
+    /// Keep BYTES for the next `onSaveInstanceState`.
+    ///
+    /// Lisp PUSHES its state rather than being asked for it, because
+    /// `onSaveInstanceState` arrives on the main thread at a moment Android
+    /// chooses and the interpreter may be anywhere -- mid-frame, inside a JNI
+    /// call, or waiting on the main-thread gate. Asking it synchronously would
+    /// deadlock against that gate; asking it asynchronously would miss the
+    /// deadline. So the answer is always ready before the question.
+    pub fn set_saved(&self, bytes: &[u8]) {
+        self.state.lock().unwrap().saved = bytes.to_vec();
+    }
+
+    pub fn saved(&self) -> Vec<u8> {
+        self.state.lock().unwrap().saved.clone()
+    }
+
+    pub fn set_restored(&self, bytes: &[u8]) {
+        self.state.lock().unwrap().restored = bytes.to_vec();
+    }
+
+    pub fn restored(&self) -> Vec<u8> {
+        self.state.lock().unwrap().restored.clone()
     }
 
     pub fn set_paused(&self, paused: bool) {

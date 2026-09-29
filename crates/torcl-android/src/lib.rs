@@ -160,8 +160,8 @@ fn unpack_assets(activity: &ANativeActivity) -> Result<PathBuf, String> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ANativeActivity_onCreate(
     activity: *mut ANativeActivity,
-    _saved_state: *mut c_void,
-    _saved_state_size: usize,
+    saved_state: *mut c_void,
+    saved_state_size: usize,
 ) {
     if activity.is_null() {
         return;
@@ -179,6 +179,15 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     let result = (|| -> Result<(), String> {
         let root = unpack_assets(unsafe { &*activity })?;
         let state = Arc::new(ActivityState::default());
+        // Whatever this Activity saved before it was destroyed, if Android kept
+        // it. Read into our own storage now: the buffer belongs to the
+        // framework and is freed the moment this function returns.
+        if !saved_state.is_null() && saved_state_size > 0 {
+            state.set_restored(unsafe {
+                std::slice::from_raw_parts(saved_state.cast::<u8>(), saved_state_size)
+            });
+            log(&format!("restoring {saved_state_size} saved bytes"));
+        }
         state.set_paused(true);
         let worker_state = state.clone();
         let worker = std::thread::Builder::new().name("torcl-android".into())
@@ -238,6 +247,7 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
             callbacks.on_pause = Some(paused);
             callbacks.on_resume = Some(resumed);
             callbacks.on_destroy = Some(destroyed);
+            callbacks.on_save_instance_state = Some(save_instance_state);
         }
         Ok(())
     })();
@@ -268,6 +278,34 @@ extern "C" fn window_destroyed(activity: *mut ANativeActivity, _window: *mut c_v
         context.window = std::ptr::null_mut();
     }
 }
+/// Hand Android the bytes Lisp last saved, so they come back to the next
+/// instance of this Activity through `ANativeActivity_onCreate`.
+///
+/// The framework frees the returned buffer with `free`, so it must come from
+/// `malloc` and not from Rust's allocator. Returning null with a zero size --
+/// which is what happens until Lisp saves anything -- is how you say "nothing
+/// to keep", and is not an error.
+extern "C" fn save_instance_state(activity: *mut ANativeActivity, size: *mut usize) -> *mut c_void {
+    unsafe extern "C" {
+        fn malloc(size: usize) -> *mut c_void;
+    }
+    let bytes = context(activity).state.saved();
+    if bytes.is_empty() {
+        unsafe { *size = 0 };
+        return std::ptr::null_mut();
+    }
+    let buffer = unsafe { malloc(bytes.len()) };
+    if buffer.is_null() {
+        unsafe { *size = 0 };
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len());
+        *size = bytes.len();
+    }
+    buffer
+}
+
 extern "C" fn paused(activity: *mut ANativeActivity) {
     context(activity).state.set_paused(true);
 }
@@ -356,10 +394,11 @@ extern "C" fn input_destroyed(_activity: *mut ANativeActivity, queue: *mut c_voi
 // only while the interpreter worker is running and the Activity owns its Arc.
 #[unsafe(no_mangle)]
 pub extern "C" fn torcl_android_api_version() -> i32 {
-    // 2 adds torcl_android_key; 3 adds torcl_android_call_on_main. Callers
-    // should test for AT LEAST the version they need rather than for equality,
-    // so that a later addition does not break an application that never uses it.
-    3
+    // 2 adds torcl_android_key; 3 adds torcl_android_call_on_main; 4 adds the
+    // saved-state pair. Callers should test for AT LEAST the version they need
+    // rather than for equality, so that a later addition does not break an
+    // application that never uses it.
+    4
 }
 
 /// Call `function` with `count` word-sized arguments on the Android main thread
@@ -434,6 +473,48 @@ unsafe extern "C" fn torcl_android_running(state: *const ActivityState) -> i32 {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn torcl_android_paused(state: *const ActivityState) -> i32 {
     unsafe { &*state }.paused() as i32
+}
+/// Keep `len` bytes at `bytes` for the next `onSaveInstanceState`.
+///
+/// # Safety
+/// `bytes` must point to `len` readable bytes, or `len` must be zero.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_set_saved_state(
+    state: *const ActivityState,
+    bytes: *const u8,
+    len: usize,
+) {
+    let bytes = if len == 0 || bytes.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    unsafe { &*state }.set_saved(bytes);
+}
+/// How many bytes the previous instance of this Activity saved; 0 if none.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_saved_state_size(state: *const ActivityState) -> usize {
+    unsafe { &*state }.restored().len()
+}
+/// Copy up to `len` of those bytes into `buffer`, returning how many were
+/// written. Two calls rather than one borrowed pointer: the bytes live behind a
+/// mutex this runtime owns, and lending their address out would outlive the
+/// lock.
+///
+/// # Safety
+/// `buffer` must point to `len` writable bytes.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn torcl_android_saved_state(
+    state: *const ActivityState,
+    buffer: *mut u8,
+    len: usize,
+) -> usize {
+    let bytes = unsafe { &*state }.restored();
+    let n = bytes.len().min(len);
+    if n > 0 && !buffer.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, n) };
+    }
+    n
 }
 /// The live ANativeActivity, or null when there is none.
 ///
