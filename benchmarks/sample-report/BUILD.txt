@@ -1,45 +1,29 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: 6df94aaa27fda09edfa7cb666b2367ba4ce365d9
+Commit: 289d3eba
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
-TorCL binary SHA256: 87829f09b2affafb1dd09a77a13934ba14b46a5f956c659e2f5202510c1deb8f
+The report was regenerated after admitting recursive outer segments. Recursive
+calls made while a segment is active use the bounded legacy/native bridge, so
+there is no nested segment chain or frame-ownership bypass.
 
-The report was generated with five alternating TorCL/SBCL samples on CPU 0,
-using a bounded 4 GiB / 300-second child runner and --native-transfer. Every
-TorCL sample passed the checksum gate and reported T2 for every listed hot
-function before and after timing. POWER-MOD and the exceptional path exercise
-native segment entry and landing behavior. Recursive Fibonacci is deliberately
-admitted through the established direct-self-call path until a frame-safe
-recursive segment entry is implemented (bead bliss-49gcf). Retired instructions
-were collected process-wide with perf stat using the cpu_atom/instructions/
-event; those counts include startup and compilation and are supplemental to the
-in-Lisp throughput timer.
+The report uses five alternating TorCL/SBCL samples on CPU 0, a bounded 4 GiB /
+300-second child runner, --native-transfer, and process-wide retired instruction
+counts. Every TorCL sample passed its checksum gate, reported T2 for every hot
+function before and after timing, and recorded zero timed deoptimizations.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 33 ms (samples 33, 31, 32, 33, 33)
-  SBCL  median 57 ms (samples 57, 57, 57, 57, 56)
-  TorCL median instructions 7,813,363
-  SBCL  median instructions 7,895,858
+  TorCL median 33 ms
+  SBCL median 57 ms
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 533 ms (samples 536, 533, 530, 537, 532)
-  SBCL  median  10 ms (samples  10,   9,  11,  10,   9)
-  TorCL median instructions 7,814,047
-  SBCL  median instructions 7,771,820
+  TorCL median 529 ms
+  SBCL median 10 ms
 
 Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 348 ms (samples 347, 348, 348, 346, 348)
-  SBCL  median   5 ms (samples   5,   5,   5,   5,   5)
-  TorCL median instructions 7,815,642
-  SBCL  median instructions 7,739,577
+  TorCL median 350 ms
+  SBCL median 5 ms
 
-Historical TorCL baseline (commit 2c84d2e1, identical five-sample protocol):
-  Fibonacci: 112 ms -> 33 ms (239.4% faster)
-  Ironclad POWER-MOD: 508 ms -> 533 ms (4.7% slower)
-  Exceptional path: 309 ms -> 348 ms (11.2% slower)
-
+Historical baseline is commit 2c84d2e1; the HTML and JSON retain all samples,
+checksums, tier evidence, instruction counts, source hashes, and binary hashes.
 These are local workstation measurements, not universal performance claims.
-The HTML and JSON retain the machine, runtime, source, runner, and binary
-hashes. The 27-case GC-stress suite remains the correctness evidence for this
-milestone.
