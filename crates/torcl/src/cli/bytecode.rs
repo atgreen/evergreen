@@ -8003,7 +8003,7 @@ fn compile_function_forcing_boxed(
     }
     lo.emit(Instr::Return);
 
-    Some(BytecodeFunction {
+    let mut function = BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -8031,7 +8031,35 @@ fn compile_function_forcing_boxed(
         min_args,
         max_args,
         variadic,
-    })
+    };
+
+    // Turn a self-tail call into a jump back to the entry (bliss-ieajy.3). Done
+    // here, on the finished bytecode, because `CallNamed{self} ; Return` being
+    // ADJACENT is exactly the proof that nothing is owed between the call and
+    // the return — no unbind, no cleanup, no handler pop. Declining changes
+    // nothing, so a shape the pass does not understand simply keeps its frames.
+    // Self tail calls become a back-edge (bliss-ieajy.3). A macro's lambda list
+    // is destructuring rather than an argument list, and its "self" call would
+    // be a call at expansion time, so macros are left alone.
+    if !macro_lambda_list {
+        if tco_debug_enabled() {
+            eprintln!("[tco] reached: {name} (arity {min_args}, variadic {variadic})");
+        }
+        match resolve_sym(name).map(|s| s.as_symbol_index()) {
+            Some(self_sym) => {
+                if eliminate_self_tail_calls(&mut function, self_sym) && tco_debug_enabled() {
+                    eprintln!("[tco] {}: self-tail calls turned into a loop", function.name);
+                }
+            }
+            None => {
+                if tco_debug_enabled() {
+                    eprintln!("[tco] {name}: symbol does not resolve");
+                }
+            }
+        }
+    }
+
+    Some(function)
 }
 
 /// Symbols referenced by a lambda list's INIT FORMS (`&optional`, `&key` and
@@ -11958,6 +11986,298 @@ fn execute_bbu_ensure_package(
 /// Heights at join points must be equal (the interpreter has one concrete
 /// height per pc entry); a mismatch means some path under- or over-supplies
 /// operands and is rejected before any load action mutates runtime state.
+/// Self-tail-call elimination (bliss-ieajy.3).
+///
+/// `CallNamed{self} ; Return` is a tail call by construction: nothing stands
+/// between the call and the return, so no cleanup, unbind or handler pop is
+/// owed. Such a call can reuse the current frame — store the arguments back
+/// into the parameter slots and branch to the entry — instead of pushing
+/// another one. Without it a self-tail-recursive function overflows the stack
+/// somewhere past 6,000 frames, fatally rather than catchably.
+///
+/// Done in the LOWERER rather than in T2, so it holds at every tier: T1 and T2
+/// compile this bytecode, so they inherit the loop without knowing about it,
+/// and a function that never gets hot is helped too — which is the case that
+/// crashes.
+///
+/// WHAT IS DELIBERATELY NOT ATTEMPTED. Mutual tail calls (they need the callee's
+/// frame layout), tail calls to other functions, and anything in a function
+/// whose shape makes frame reuse observable. The guards below are conservative
+/// by design: this returns false and changes nothing unless it can see that
+/// every one holds.
+/// Whether to trace what the self-tail-call pass did and, where it bailed, why.
+/// Looked up once: this sits on the lowering path, which runs per function.
+fn tco_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TORCL_TCO_DEBUG").is_some())
+}
+
+/// Whether the pass is switched off, so a suspected miscompile can be bisected
+/// against the unrewritten lowering without a rebuild.
+fn tco_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TORCL_TCO_DISABLE").is_some())
+}
+
+/// Report why the pass declined, and return false so bail sites read as
+/// `return tco_debug(func, "…")`.
+fn tco_debug(func: &BytecodeFunction, why: &str) -> bool {
+    if tco_debug_enabled() {
+        eprintln!("[tco] {}: {why}", func.name);
+    }
+    false
+}
+
+/// Turn `f`'s own tail calls to `f` into a back-edge, so the frame is reused
+/// instead of a new one being pushed (bliss-ieajy.3).
+///
+/// SELF only, and only a TOP-LEVEL function: the caller runs this from the
+/// DEFUN path, never for an FLET- or LABELS-local function, and that is a
+/// correctness property rather than an oversight. `SELF_SYM` is a plain symbol
+/// index, and a local function's name need not denote itself --
+///
+/// ```lisp
+/// (defun foo (z) (* z 10))
+/// (defun bar (y) (flet ((foo (z) (foo z))) (foo y)))   ; inner FOO calls GLOBAL foo
+/// ```
+///
+/// -- so keying on the symbol inside an FLET body would turn a call to another
+/// function into an infinite loop. LABELS *does* scope its own name and would
+/// be sound, but the two are not distinguishable from the symbol alone.
+///
+/// Returns whether anything was rewritten. Every bail is safe: it only forgoes
+/// the optimisation.
+fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool {
+    if tco_disabled() {
+        return false;
+    }
+
+    // ── whole-function guards ──────────────────────────────────────
+    //
+    // A boxed local lives in a heap EnvFrame shared with any closure that
+    // captured it, so reusing the frame would let that closure observe the NEXT
+    // iteration's value through a binding it captured from this one.
+    if func.has_env {
+        return tco_debug(func, "has a boxed local (heap EnvFrame)");
+    }
+    // A handler, handler-bind or restart frame established by this function is
+    // torn down by the frame's exit. Jumping back to the entry would re-enter
+    // its establishing code without tearing the previous one down.
+    if !func.handler_cases.is_empty()
+        || !func.handler_binds.is_empty()
+        || !func.restart_cases.is_empty()
+    {
+        return tco_debug(func, "establishes a handler or restart frame");
+    }
+    // Only a fixed all-required lambda list: &optional/&rest/&key are bound by
+    // the variadic binder before the body runs, and re-entering at the body's
+    // first instruction would skip it.
+    let arity = func.arity;
+    if func.param_layout.len() != arity as usize || !func.params_form.is_nil() {
+        return tco_debug(func, "not a fixed all-required lambda list");
+    }
+    let mut param_slots: Vec<u16> = Vec::with_capacity(arity as usize);
+    for (_, loc) in &func.param_layout {
+        match loc {
+            VarLoc::Slot(slot) => param_slots.push(*slot),
+            VarLoc::Boxed => return false,
+        }
+    }
+
+    // ── the loop entry ─────────────────────────────────────────────
+    //
+    // DEFUN wraps its body in an implicit BLOCK, so the code opens with
+    // PushBlock and every tail call is followed by the matching PopHandler:
+    //
+    //     0  PushBlock { resume_bcp: 12, … }   the implicit BLOCK
+    //    10  CallNamed { sym: self, nargs: 2 }
+    //    11  PopHandler
+    //    12  Return
+    //
+    // The loop therefore goes back to AFTER the prologue, not to 0: the block
+    // established on entry stays established for every iteration, which is both
+    // cheaper and what RETURN-FROM needs. Correspondingly the site must NOT pop
+    // it — the pops between the call and the Return are exactly the ones the
+    // jump-back declines to perform, so their count must match the prologue's.
+    let code = &func.code;
+    let entry = code
+        .iter()
+        .take_while(|i| matches!(i, Instr::PushBlock { .. }))
+        .count();
+
+    // ── sites ──────────────────────────────────────────────────────
+    let site_epilogue = |i: usize| -> bool {
+        let mut j = i + 1;
+        let mut pops = 0usize;
+        while j < code.len() && matches!(code[j], Instr::PopHandler) {
+            pops += 1;
+            j += 1;
+        }
+        // Exactly the prologue's blocks left open, and then the return.
+        pops == entry && j < code.len() && matches!(code[j], Instr::Return)
+    };
+    let sites: Vec<usize> = (0..code.len().saturating_sub(1))
+        .filter(|&i| {
+            matches!(code[i], Instr::CallNamed { sym, nargs }
+                     if sym == self_sym && nargs == arity)
+                && site_epilogue(i)
+        })
+        .collect();
+    if sites.is_empty() {
+        if tco_debug_enabled() {
+            let calls: Vec<String> = func.code.iter().filter_map(|i| match i {
+                Instr::CallNamed { sym, nargs } => Some(format!("{sym}/{nargs}")),
+                _ => None,
+            }).collect();
+            eprintln!("[tco] {}: no `CallNamed{{{self_sym}/{arity}}} ; Return` site; calls seen: {calls:?}",
+                      func.name);
+            for (i, ins) in func.code.iter().enumerate() {
+                eprintln!("[tco]   {i:3}  {ins:?}");
+            }
+        }
+        return false;
+    }
+
+    // ── stack depth at every pc ────────────────────────────────────
+    //
+    // A deliberately small allowlist. Anything that establishes a dynamic
+    // extent, touches an environment frame, produces multiple values or escapes
+    // to the host is NOT here, so this bails rather than reasoning about it —
+    // and bailing is always correct, it only forgoes the optimisation.
+    let n = code.len();
+    let mut depth: Vec<Option<u32>> = vec![None; n];
+    let mut work: Vec<(usize, u32)> = vec![(0, 0)];
+    while let Some((pc, d)) = work.pop() {
+        if pc >= n {
+            return false; // control flows off the end; leave it to the verifier
+        }
+        match depth[pc] {
+            Some(seen) if seen == d => continue,
+            Some(_) => return false, // inconsistent join: do not guess
+            None => depth[pc] = Some(d),
+        }
+        let (pops, pushes): (u32, u32) = match &code[pc] {
+            Instr::Const(_) | Instr::LoadLocal(_) | Instr::LoadGlobal(_)
+            | Instr::LoadFunction(_) => (0, 1),
+            Instr::StoreLocal(_) | Instr::Pop => (1, 0),
+            Instr::ClearMv => (0, 0),
+            Instr::Dup => (1, 2),
+            Instr::TypeP(_) => (1, 1),
+            Instr::AllocCons => (2, 1),
+            Instr::SetValues(nvals) => (*nvals as u32, 1),
+            Instr::ValuesToList => (1, 1),
+            Instr::StoreGlobal(_) => (1, 0),
+            Instr::CallNamed { nargs, .. } => (*nargs as u32, 1),
+            // Control-stack only: neither touches the operand stack. PushBlock
+            // is admitted because DEFUN always emits one; anything that opens a
+            // CLEANUP or catch extent is still refused above.
+            Instr::PushBlock { .. } | Instr::PopHandler => (0, 0),
+            // Terminators: no fall-through. ReturnFrom is always lexically local
+            // (a block in an enclosing function lowers to ReturnFromNamed
+            // instead), and the block it names is either the prologue's — still
+            // established, since the back-edge deliberately does not pop it —
+            // or a nested one pushed inside the loop body and therefore pushed
+            // afresh on every iteration. Its resume point restores the operand
+            // stack to the establishing PushBlock's sp_restore, which is the
+            // depth the back-edge target has too, so re-entering the loop does
+            // not drift it.
+            Instr::Return | Instr::ReturnFrom { .. } => {
+                if d < 1 {
+                    return false;
+                }
+                continue;
+            }
+            Instr::Br(t) => {
+                work.push((*t as usize, d));
+                continue;
+            }
+            Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => {
+                if d < 1 {
+                    return false;
+                }
+                work.push((*t as usize, d - 1));
+                work.push((pc + 1, d - 1));
+                continue;
+            }
+            other => {
+                return tco_debug(func, &format!("instruction not modelled: {other:?}"));
+            }
+        };
+        if d < pops {
+            return false;
+        }
+        work.push((pc + 1, d - pops + pushes));
+    }
+    // Every site must hold exactly the arguments and nothing else, or the
+    // leftovers would accumulate on the operand stack once per iteration.
+    if sites
+        .iter()
+        .any(|&i| depth[i] != Some(u32::from(arity)))
+    {
+        let found: Vec<_> = sites.iter().map(|&i| depth[i]).collect();
+        return tco_debug(func, &format!("stack depth at a site is not {arity}: {found:?}"));
+    }
+
+    // ── rewrite ────────────────────────────────────────────────────
+    //
+    // The trailing Return is KEPT, unreachable, so every old index still has a
+    // new one and a branch that targeted it stays well-formed.
+    let mut new_code: Vec<Instr> = Vec::with_capacity(n + sites.len() * (arity as usize + 1));
+    let mut map: Vec<u32> = vec![0; n];
+    for (i, instr) in code.iter().enumerate() {
+        map[i] = new_code.len() as u32;
+        if sites.contains(&i) {
+            // The last argument is on top, so the slots fill in reverse.
+            for slot in param_slots.iter().rev() {
+                new_code.push(Instr::StoreLocal(*slot));
+            }
+            new_code.push(Instr::Br(entry as u32));
+        } else {
+            new_code.push(instr.clone());
+        }
+    }
+    // Indices 0..entry are all PushBlock and none of them is a site, so each
+    // emits exactly one instruction and map[entry] == entry. The back-edges
+    // this pass just wrote therefore remap to themselves, and need no special
+    // case — they go through the same fixup as every original branch.
+    debug_assert_eq!(map.get(entry).copied(), Some(entry as u32));
+    for instr in new_code.iter_mut() {
+        match instr {
+            Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => {
+                let old = *t as usize;
+                if old >= map.len() {
+                    return false;
+                }
+                *t = map[old];
+            }
+            // PushBlock's resume_bcp is a program counter and moves with the
+            // code; missing it would resume a RETURN-FROM at the wrong place.
+            Instr::PushBlock { resume_bcp, .. } => {
+                let old = *resume_bcp as usize;
+                if old >= map.len() {
+                    return false;
+                }
+                *resume_bcp = map[old];
+            }
+            _ => {}
+        }
+    }
+
+    // ── safety net ─────────────────────────────────────────────────
+    //
+    // Hand the rewritten function to the same verifier the BFASL load path uses.
+    // If this pass has broken stack discipline, keep the original: a slower
+    // function that works beats a faster one that does not.
+    let original = std::mem::replace(&mut func.code, new_code);
+    if let Err(e) = verify_operand_stack_discipline(func) {
+        func.code = original;
+        return tco_debug(func, &format!("rewrite failed verification, reverted: {e:?}"));
+    }
+    true
+}
+
 fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), TorclError> {
     let code = &func.code;
     let n = code.len();

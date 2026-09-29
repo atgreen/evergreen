@@ -332,9 +332,18 @@ const GUARD_FREE_STORAGE_CONDITION: &[&str] = &[
 /// Full programs whose deep recursion must be bounded by the TorclStack
 /// (raising a catchable STORAGE-CONDITION), proving they run on the bytecode
 /// backend rather than the tree-walker's host-stack guard.
+/// NOT tail calls, deliberately: each result is consumed by the `1+` around it,
+/// so a frame per level is genuinely required.
+///
+/// These read `(down (- n 1))` in tail position until bliss-ieajy.3, which made
+/// a self tail call reuse the frame. That turned the first of them into a
+/// hundred-million-iteration loop that overflows nothing and returns eventually,
+/// and the bound under test stopped being exercised at all. The property is
+/// unchanged and still worth checking -- deep recursion must raise a CATCHABLE
+/// storage-condition rather than abort the process -- so the probe is what moved.
 const DEEP_RECURSION_BOUNDED: &[&str] = &[
-    "(defun down (n) (if (= n 0) (quote done) (down (- n 1)))) (handler-case (down 100000000) (storage-condition () (quote caught)))",
-    "(handler-case (labels ((g (k) (if (= k 0) 0 (g (- k 1))))) (g 100000000)) (storage-condition () (quote caught)))",
+    "(defun down (n) (if (= n 0) 0 (1+ (down (- n 1))))) (handler-case (down 100000000) (storage-condition () (quote caught)))",
+    "(handler-case (labels ((g (k) (if (= k 0) 0 (1+ (g (- k 1)))))) (g 100000000)) (storage-condition () (quote caught)))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
@@ -615,7 +624,9 @@ fn deep_recursion_raises_catchable_storage_condition() {
 /// capacity, not the host Rust stack.
 #[test]
 fn recursion_bound_scales_with_stack_size() {
-    let program = "(defun down (n) (if (= n 0) (quote done) (down (- n 1)))) (down 3000)";
+    // Non-tail for the reason given on DEEP_RECURSION_BOUNDED: a self tail call
+    // no longer consumes a frame, so it could not overflow any stack size.
+    let program = "(defun down (n) (if (= n 0) 0 (1+ (down (- n 1))))) (down 3000)";
 
     let big = Command::new(BIN)
         .arg("--eval")
