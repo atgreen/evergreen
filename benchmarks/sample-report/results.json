@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-09-29T00:45:25.363911+00:00",
+  "generated_at": "2026-09-29T00:51:00.864373+00:00",
   "samples": 5,
   "metadata": {
-    "commit": "c3f4a9abde7ec0a98dfbfe1bdb111f20c9be0d64",
+    "commit": "6df94aaa27fda09edfa7cb666b2367ba4ce365d9",
     "working_tree": "M .beads/interactions.jsonl\n M crates/torcl-rt/src/python.rs\n M crates/torcl/src/cli.rs\n M crates/torcl/tests/package_qualified_names_cli.rs",
     "platform": "Linux-7.2.5-200.fc44.x86_64-x86_64-with-glibc2.43",
     "cpu": 0,
     "cpu_model": "Intel(R) Core(TM) Ultra 7 255H",
     "load_average": [
-      8.873046875,
-      9.21044921875,
-      9.61279296875
+      12.75830078125,
+      11.08447265625,
+      10.267578125
     ],
     "memory_cap": "4G",
     "binaries": {
@@ -30,7 +30,7 @@
       "fibonacci.lisp": "6e0ba0e605767be022e648ccc1e7222890cbe70a01383bfefb8fe0d241ed759b",
       "ironclad-power-mod.lisp": "40565c30414aa69d09a7cb174ef9887f2ba710fa26b6fae45247b15615c86e1d"
     },
-    "runner_sha256": "53215e50cbfece3f6410714048d19ad9a64600b1072842b9a1ea08d5e1bfbe3b",
+    "runner_sha256": "6a5f2ddbfcba2400b3b23731e5b8c8b40dfead4a814cb0b69c343f2ee45467a8",
     "cases_sha256": "1d123f8575f090586462d019346f1332520770b53dc8d126776862a2e0b1b4c2",
     "instruction_event": "cpu_atom/instructions/",
     "baseline": {
@@ -167,7 +167,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15026,
+              "calls": 16406,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -181,7 +181,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 15036,
+              "calls": 16416,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -198,7 +198,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 17284,
+              "calls": 14762,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -212,7 +212,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 17294,
+              "calls": 14772,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -229,7 +229,7 @@
           "before": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 14718,
+              "calls": 14314,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -243,7 +243,7 @@
           "after": {
             "FIBONACCI": {
               "tier": 2,
-              "calls": 14728,
+              "calls": 14324,
               "back_edges": 0,
               "osr_entries": 0
             },
@@ -261,53 +261,53 @@
         "TorCL": {
           "samples_seconds": [
             0.033,
-            0.029,
-            0.033,
             0.031,
-            0.032
+            0.032,
+            0.033,
+            0.033
           ],
-          "median_seconds": 0.032,
-          "iqr_seconds": 0.0020000000000000018,
-          "min_seconds": 0.029,
+          "median_seconds": 0.033,
+          "iqr_seconds": 0.0010000000000000009,
+          "min_seconds": 0.031,
           "max_seconds": 0.033,
           "instructions": {
             "samples": [
-              7816050,
-              7694082,
-              7813904,
-              7883624,
-              7838396
+              7814950,
+              7685096,
+              7813363,
+              7683200,
+              7864253
             ],
-            "median": 7816050,
-            "iqr": 24492.0,
-            "min": 7694082,
-            "max": 7883624
+            "median": 7813363,
+            "iqr": 129854.0,
+            "min": 7683200,
+            "max": 7864253
           }
         },
         "SBCL": {
           "samples_seconds": [
-            0.057,
-            0.057,
+            0.069,
             0.057,
             0.056,
-            0.057001
+            0.057,
+            0.056
           ],
           "median_seconds": 0.057,
-          "iqr_seconds": 0.0,
+          "iqr_seconds": 0.0010000000000000009,
           "min_seconds": 0.056,
-          "max_seconds": 0.057001,
+          "max_seconds": 0.069,
           "instructions": {
             "samples": [
-              6782692,
-              7895983,
-              7893382,
-              7767410,
-              7895537
+              7894988,
+              7769265,
+              7975162,
+              7895858,
+              7904565
             ],
-            "median": 7893382,
-            "iqr": 128127.0,
-            "min": 6782692,
-            "max": 7895983
+            "median": 7895858,
+            "iqr": 9577.0,
+            "min": 7769265,
+            "max": 7975162
           }
         }
       }
@@ -483,37 +483,37 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
-            0.531,
-            0.531,
-            0.534,
+            0.536,
+            0.533,
             0.53,
-            0.53
+            0.537,
+            0.532
           ],
-          "median_seconds": 0.531,
-          "iqr_seconds": 0.0010000000000000009,
+          "median_seconds": 0.533,
+          "iqr_seconds": 0.0040000000000000036,
           "min_seconds": 0.53,
-          "max_seconds": 0.534,
+          "max_seconds": 0.537,
           "instructions": {
             "samples": [
-              7855396,
-              7817245,
-              7813796,
-              7817792,
-              7819581
+              7681676,
+              7816294,
+              7814047,
+              7813204,
+              8209631
             ],
-            "median": 7817792,
-            "iqr": 2336.0,
-            "min": 7813796,
-            "max": 7855396
+            "median": 7814047,
+            "iqr": 3090.0,
+            "min": 7681676,
+            "max": 8209631
           }
         },
         "SBCL": {
           "samples_seconds": [
+            0.01,
             0.009,
             0.011,
             0.01,
-            0.009,
-            0.01
+            0.009
           ],
           "median_seconds": 0.01,
           "iqr_seconds": 0.0010000000000000009,
@@ -521,16 +521,16 @@
           "max_seconds": 0.011,
           "instructions": {
             "samples": [
-              7759605,
-              7961186,
-              7733779,
-              7895891,
-              7741390
+              7771820,
+              7714685,
+              7798206,
+              7894547,
+              7741701
             ],
-            "median": 7759605,
-            "iqr": 154501.0,
-            "min": 7733779,
-            "max": 7961186
+            "median": 7771820,
+            "iqr": 56505.0,
+            "min": 7714685,
+            "max": 7894547
           }
         }
       }
@@ -646,28 +646,28 @@
       "results": {
         "TorCL": {
           "samples_seconds": [
+            0.347,
+            0.348,
+            0.348,
             0.346,
-            0.346,
-            0.346,
-            0.343,
-            0.345
+            0.348
           ],
-          "median_seconds": 0.346,
+          "median_seconds": 0.348,
           "iqr_seconds": 0.0010000000000000009,
-          "min_seconds": 0.343,
-          "max_seconds": 0.346,
+          "min_seconds": 0.346,
+          "max_seconds": 0.348,
           "instructions": {
             "samples": [
-              7818551,
-              7815047,
-              7818088,
-              7638584,
-              7816492
+              7815144,
+              7815642,
+              7677660,
+              9857599,
+              7815915
             ],
-            "median": 7816492,
-            "iqr": 3041.0,
-            "min": 7638584,
-            "max": 7818551
+            "median": 7815642,
+            "iqr": 771.0,
+            "min": 7677660,
+            "max": 9857599
           }
         },
         "SBCL": {
@@ -684,16 +684,16 @@
           "max_seconds": 0.005,
           "instructions": {
             "samples": [
-              7894216,
-              7892918,
-              7890365,
-              7891328,
-              7894904
+              7739577,
+              7277492,
+              7502898,
+              7892200,
+              7914208
             ],
-            "median": 7892918,
-            "iqr": 2888.0,
-            "min": 7890365,
-            "max": 7894904
+            "median": 7739577,
+            "iqr": 389302.0,
+            "min": 7277492,
+            "max": 7914208
           }
         }
       }

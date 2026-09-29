@@ -1,6 +1,6 @@
 Native-transfer ABI milestone benchmark report
 
-Commit: c3f4a9abde7ec0a98dfbfe1bdb111f20c9be0d64
+Commit: 6df94aaa27fda09edfa7cb666b2367ba4ce365d9
 Build: cargo build --release -p torcl --bin torcl
 Target: x86_64-unknown-linux-musl, default features, ThinLTO, codegen-units=1.
 TorCL binary SHA256: 87829f09b2affafb1dd09a77a13934ba14b46a5f956c659e2f5202510c1deb8f
@@ -17,27 +17,27 @@ event; those counts include startup and compilation and are supplemental to the
 in-Lisp throughput timer.
 
 Fibonacci F(30), ten evaluations per workload:
-  TorCL median 32 ms (samples 33, 29, 33, 31, 32)
+  TorCL median 33 ms (samples 33, 31, 32, 33, 33)
   SBCL  median 57 ms (samples 57, 57, 57, 57, 56)
-  TorCL median instructions 7,816,050
-  SBCL  median instructions 7,893,382
+  TorCL median instructions 7,813,363
+  SBCL  median instructions 7,895,858
 
 Ironclad POWER-MOD, 100,000 modular exponentiations:
-  TorCL median 531 ms (samples 531, 531, 534, 530, 530)
-  SBCL  median   9 ms (samples   9,   9,   9,  10,  10)
-  TorCL median instructions 7,817,792
-  SBCL  median instructions 7,759,605
+  TorCL median 533 ms (samples 536, 533, 530, 537, 532)
+  SBCL  median  10 ms (samples  10,   9,  11,  10,   9)
+  TorCL median instructions 7,814,047
+  SBCL  median instructions 7,771,820
 
 Caught conditions, 2,000 calls through HANDLER-CASE repeated 100 times:
-  TorCL median 346 ms (samples 346, 346, 346, 343, 345)
-  SBCL  median   5 ms (samples   4,   5,   5,   5,   5)
-  TorCL median instructions 7,816,492
-  SBCL  median instructions 7,892,918
+  TorCL median 348 ms (samples 347, 348, 348, 346, 348)
+  SBCL  median   5 ms (samples   5,   5,   5,   5,   5)
+  TorCL median instructions 7,815,642
+  SBCL  median instructions 7,739,577
 
 Historical TorCL baseline (commit 2c84d2e1, identical five-sample protocol):
-  Fibonacci: 112 ms -> 32 ms (250.0% faster)
-  Ironclad POWER-MOD: 508 ms -> 531 ms (4.3% slower)
-  Exceptional path: 309 ms -> 346 ms (10.7% slower)
+  Fibonacci: 112 ms -> 33 ms (239.4% faster)
+  Ironclad POWER-MOD: 508 ms -> 533 ms (4.7% slower)
+  Exceptional path: 309 ms -> 348 ms (11.2% slower)
 
 These are local workstation measurements, not universal performance claims.
 The HTML and JSON retain the machine, runtime, source, runner, and binary
