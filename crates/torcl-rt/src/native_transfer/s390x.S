@@ -106,6 +106,10 @@ s390x_probe_transfer:
     # verifies that r6-r13 survive the generated body.
     .globl s390x_probe_registers
     .type s390x_probe_registers,@function
+    # The Rust callback is supplied by the integration test.  Keep this
+    # assembly probe linkable in production libraries, where no test callback
+    # exists; the test's strong definition overrides the weak reference.
+    .weak s390x_probe_call
 s390x_probe_registers:
     lgr     %r0,%r15
     aghi    %r15,-512

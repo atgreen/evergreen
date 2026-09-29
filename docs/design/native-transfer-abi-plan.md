@@ -980,10 +980,13 @@ gates.
 
 The s390x runtime now has the corresponding ELF64 segment enter/leave boundary
 in `crates/torcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering
-normal return, direct transfer, anchor cleanup and host-stack restoration. As
-with AArch64, this does not yet enable CLI compiler activation: generated entry
-admission, deoptimization metadata, fault recovery, handlers, cleanup capture
-and precise native polling remain gated.
+normal return, direct transfer, anchor cleanup and host-stack restoration. The
+CLI now has the same narrow `TORCL_NATIVE_TRANSFER=1` entry for constant and
+identity T2 bodies, using the nonallocating multiple-values adapter and
+falling back before calls, deoptimization, handlers, cleanup, or loop polling.
+General s390x activation remains gated on generated entry admission,
+deoptimization metadata, fault recovery, handlers, cleanup capture and precise
+native polling.
 
 Compiler work decomposition under `bliss-shih7.11`:
 
