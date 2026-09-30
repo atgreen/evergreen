@@ -10547,18 +10547,25 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 // package (e.g. TORCL-THREAD:MAKE-THREAD) must intern into
                 // that package below, since the interpreter dispatches those
                 // extension builtins by their qualified spelling.
+                let legacy_package =
+                    pkg_name == "COMMON-LISP-USER" || pkg_name == "COMMON-LISP";
+                // The image-control spellings are legacy identities of CL-USER,
+                // so a read inside ANOTHER package must intern there instead —
+                // a program is entitled to its own SAVE-IMAGE. swank and slynk
+                // both define one: `(definterface save-image …)` in
+                // SWANK/BACKEND ends with `(export 'save-image :swank/backend)`,
+                // which reported "symbol SAVE-IMAGE is not accessible in package
+                // SWANK/BACKEND" while the bare read handed back CL-USER's
+                // (bliss-zfwfo). Other builtins still resolve bare from any
+                // package: that is how the interpreter dispatches them, and
+                // narrowing it is bliss-7l7cn.
+                let legacy_image_name = matches!(
+                    name,
+                    "SAVE-IMAGE" | "SAVE-LISP-AND-DIE" | "SAVE-IMAGE-AND-DIE" | "%SAVE-CORE"
+                );
                 (!cl_owns_name
-                    && (pkg.is_none()
-                        || pkg_name == "COMMON-LISP-USER"
-                        || pkg_name == "COMMON-LISP")
-                    && (is_builtin_function(name)
-                        || matches!(
-                            name,
-                            "SAVE-IMAGE"
-                                | "SAVE-LISP-AND-DIE"
-                                | "SAVE-IMAGE-AND-DIE"
-                                | "%SAVE-CORE"
-                        )))
+                    && (pkg.is_none() || legacy_package)
+                    && (is_builtin_function(name) || (legacy_image_name && legacy_package)))
                 .then(|| TorclVal::from_symbol_index(torcl_rt::symbols::intern(name)))
             })
             .or_else(|| {
