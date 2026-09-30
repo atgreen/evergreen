@@ -5903,6 +5903,10 @@ fn dispatch_builtin_discriminator(arg: TorclVal) -> u32 {
     bits
 }
 
+/// Distance standing for an unspecialized (T) parameter: less specific than any
+/// position a real class can occupy in a precedence list.
+const UNSPECIALIZED_DISTANCE: usize = usize::MAX / 4;
+
 fn method_specificity_vector(
     env: &Env,
     method: &MethodDef,
@@ -5914,7 +5918,7 @@ fn method_specificity_vector(
     let mut distances = Vec::with_capacity(method.specializers.len());
     for (arg, specializer) in args.iter().zip(method.specializers.iter()) {
         match specializer {
-            MethodSpecializer::Any => distances.push(usize::MAX / 4),
+            MethodSpecializer::Any => distances.push(UNSPECIALIZED_DISTANCE),
             MethodSpecializer::Eql(expected) => {
                 if arg != expected {
                     return None;
@@ -6467,6 +6471,9 @@ fn run_initialization_aux_methods(
         _ => return Ok(()),
     };
     torcl_rt::rooted_ref!(_methods_root = &mut methods);
+    let precedence = torcl_rt::symbols::find_index(gf_name)
+        .map(|idx| torcl_stdlib::clos::argument_precedence_order(TorclVal::from_symbol_index(idx)))
+        .unwrap_or_default();
     let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
     // Re-read the rooted vector after callbacks that may relocate its values.
     #[allow(clippy::needless_range_loop)]
@@ -6477,7 +6484,7 @@ fn run_initialization_aux_methods(
         let mut method = methods[index].clone();
         torcl_rt::rooted_ref!(_method_root = &mut method);
         if let Some(key) = method_specificity_vector(env, &method, args) {
-            applicable.push((index, key));
+            applicable.push((index, precedence_ordered_key(key, &precedence)));
         }
     }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
@@ -6567,11 +6574,14 @@ struct GfDispatchEntry {
 /// `cacheable` depend only on the generic's definition and method set, both
 /// gen-invalidated; caching them avoids the per-call `env.generics` lookup and
 /// the `generic_has_eql_specializer` method scan.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GfMeta {
     generation: u64,
     combination: torcl_stdlib::MethodCombinationType,
     cacheable: bool,
+    /// The generic's argument precedence order (bliss-nj6id). Shared rather than
+    /// cloned: dispatch only reads it, and most generics leave it empty.
+    precedence: Rc<[usize]>,
 }
 
 /// Allocation-free dispatch-cache key (bliss-fy37): the generic's interned
@@ -6789,13 +6799,13 @@ fn invoke_generic_function_inner(
     // AND generic_has_eql_specializer iterating EVERY method on every dispatch —
     // O(methods) per call, measurable on many-method generics (asdf). Memoize it,
     // gen-stamped, keyed by the generic's interned symbol index.
-    let (combination, cacheable) = match gf_idx {
+    let (combination, cacheable, precedence) = match gf_idx {
         Some(idx) => {
             let hit = GF_META_CACHE.with(|c| {
                 c.borrow()
                     .get(&idx)
                     .filter(|m| m.generation == generation)
-                    .map(|m| (m.combination, m.cacheable))
+                    .map(|m| (m.combination, m.cacheable, Rc::clone(&m.precedence)))
             });
             hit.unwrap_or_else(|| {
                 let combination = env
@@ -6807,6 +6817,9 @@ fn invoke_generic_function_inner(
                 let cacheable =
                     matches!(combination, torcl_stdlib::MethodCombinationType::Standard)
                         && !generic_has_eql_specializer(env, name);
+                let precedence: Rc<[usize]> =
+                    torcl_stdlib::clos::argument_precedence_order(TorclVal::from_symbol_index(idx))
+                        .into();
                 GF_META_CACHE.with(|c| {
                     c.borrow_mut().insert(
                         idx,
@@ -6814,10 +6827,11 @@ fn invoke_generic_function_inner(
                             generation,
                             combination,
                             cacheable,
+                            precedence: Rc::clone(&precedence),
                         },
                     );
                 });
-                (combination, cacheable)
+                (combination, cacheable, precedence)
             })
         }
         None => {
@@ -6831,7 +6845,7 @@ fn invoke_generic_function_inner(
                 .unwrap_or(torcl_stdlib::MethodCombinationType::Standard);
             let cacheable = matches!(combination, torcl_stdlib::MethodCombinationType::Standard)
                 && !generic_has_eql_specializer(env, name);
-            (combination, cacheable)
+            (combination, cacheable, Rc::from(&[][..]))
         }
     };
     // Build the allocation-free dispatch key (bliss-fy37): interned GF symbol
@@ -6896,7 +6910,7 @@ fn invoke_generic_function_inner(
         let mut method = methods[index].clone();
         torcl_rt::rooted_ref!(_method_root = &mut method);
         if let Some(key) = method_specificity_vector(env, &method, args) {
-            applicable.push((index, key));
+            applicable.push((index, precedence_ordered_key(key, &precedence)));
         }
     }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
@@ -32330,6 +32344,76 @@ fn eval_defstruct(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
     Ok(*name_sym_r)
 }
 
+/// Parse a `:argument-precedence-order` option into positions within the
+/// generic function's required parameters.
+///
+/// CLHS 7.6.6.1.2 compares methods parameter by parameter in this order, which
+/// need not be left to right, and 7.6.4 requires the option to name each
+/// required parameter exactly once.
+fn parse_argument_precedence_order(
+    name_form: TorclVal,
+    lambda_list: TorclVal,
+    names: TorclVal,
+) -> Result<Vec<usize>, TorclError> {
+    if names.is_nil() {
+        return Ok(Vec::new());
+    }
+    let malformed = || {
+        TorclError::ProgramError(format!(
+            "DEFGENERIC {}: :ARGUMENT-PRECEDENCE-ORDER must name each required \
+             parameter exactly once",
+            sym_name(name_form)
+        ))
+    };
+    let required: Vec<TorclVal> = list_to_vec(lambda_list)
+        .into_iter()
+        .take_while(|p| !(p.is_symbol() && sym_bare_name_rc(*p).starts_with('&')))
+        .collect();
+    let mut order = Vec::with_capacity(required.len());
+    for parameter in list_to_vec(names) {
+        match required.iter().position(|r| *r == parameter) {
+            Some(position) if !order.contains(&position) => order.push(position),
+            _ => return Err(malformed()),
+        }
+    }
+    if order.len() != required.len() {
+        return Err(malformed());
+    }
+    Ok(order)
+}
+
+/// Record a generic function's argument precedence order on its name symbol,
+/// where both dispatch paths read it and a saved image keeps it (the host-side
+/// generic registry is rebuilt from a narrower record). An empty order clears
+/// any earlier one, so redefining a generic without the option restores the
+/// default left-to-right comparison.
+fn store_argument_precedence_order(name_form: TorclVal, order: &[usize]) {
+    if !name_form.is_symbol() {
+        return; // a `(setf f)` name is a cons and carries no plist
+    }
+    let Some(indicator) = resolve_sym(torcl_stdlib::clos::ARGUMENT_PRECEDENCE_PROPERTY) else {
+        return;
+    };
+    torcl_rt::rooted!(positions = NIL);
+    for position in order.iter().rev() {
+        *positions = arena_cons(TorclVal::from_fixnum(*position as i64), *positions);
+    }
+    symbol_plist_put(name_form, indicator, *positions);
+}
+
+/// Reorder a method's per-argument specificity distances so that comparing two
+/// keys compares the arguments in the generic function's argument precedence
+/// order. A parameter the method did not specialize counts as T.
+fn precedence_ordered_key(key: Vec<usize>, precedence: &[usize]) -> Vec<usize> {
+    if precedence.is_empty() {
+        return key;
+    }
+    precedence
+        .iter()
+        .map(|&i| key.get(i).copied().unwrap_or(UNSPECIALIZED_DISTANCE))
+        .collect()
+}
+
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     invalidate_gf_dispatch_cache(); // generic (re)definition (bliss-x5y.20)
@@ -32339,12 +32423,21 @@ fn eval_defgeneric(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError>
     // f)` name is a list and is skipped by the helper) (bliss-4n3h).
     home_defined_symbol(env, name_form);
     let name = function_name_key(name_form);
+    // The first element after the name is the lambda list, not an option:
+    // scanning it as one also made `(defgeneric f (method x))` look like it
+    // carried a :METHOD option.
+    let (mut lambda_list, option_forms) = cp(options);
+    torcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
     let mut combination = torcl_stdlib::MethodCombinationType::Standard;
+    // `(:argument-precedence-order p...)`: the parameters, in the order method
+    // ordering must compare them (bliss-nj6id).
+    let mut precedence_names = NIL;
+    torcl_rt::rooted_ref!(_precedence_names_root = &mut precedence_names);
     // `(:method qualifier* specialized-lambda-list body...)` options each define a
     // method; collect their tails so they can be registered after the generic
     // function exists (with its method combination already known).
     torcl_rt::rooted!(method_options = Vec::<TorclVal>::new());
-    let mut opts = options;
+    let mut opts = option_forms;
     while opts.is_cons() {
         let (option, rest) = cp(opts);
         if option.is_cons() {
@@ -32356,6 +32449,7 @@ fn eval_defgeneric(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError>
                         combination = method_combination_from_name(&sym_name(method_combination))
                             .unwrap_or(torcl_stdlib::MethodCombinationType::Standard);
                     }
+                    "ARGUMENT-PRECEDENCE-ORDER" => precedence_names = option_rest,
                     "METHOD" => method_options.push(option_rest),
                     _ => {}
                 }
@@ -32363,6 +32457,8 @@ fn eval_defgeneric(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError>
         }
         opts = rest;
     }
+    // Reject a malformed precedence order before anything is defined.
+    let precedence = parse_argument_precedence_order(name_form, lambda_list, precedence_names)?;
     let generic_function = torcl_stdlib::make_generic_function(name_form, NIL)?;
     env.generics.borrow_mut().insert(
         name.clone(),
@@ -32372,6 +32468,7 @@ fn eval_defgeneric(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError>
         },
     );
     env.methods.borrow_mut().entry(name).or_default();
+    store_argument_precedence_order(name_form, &precedence);
 
     // Register each :method option by delegating to DEFMETHOD: the option tail
     // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr

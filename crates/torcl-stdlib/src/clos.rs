@@ -309,7 +309,8 @@ struct MethodMeta {
 
 #[derive(Clone)]
 struct GFData {
-    #[allow(dead_code)]
+    /// Read back by GENERIC_FUNCTION_NAME, which dispatch uses to find the
+    /// generic's argument precedence order.
     name: TorclVal,
     #[allow(dead_code)]
     lambda_list: TorclVal,
@@ -2397,31 +2398,116 @@ fn specializer_applicable(st: &ClosState, specializer: TorclVal, arg_class: Torc
     }
 }
 
-/// Compute a specificity score for sorting: position in CPL (lower = more specific).
-/// Returns the sum of positions across all specializer args.
-fn method_specificity(st: &ClosState, method: TorclVal, arg_classes: &[TorclVal]) -> usize {
-    let meta = match st.method_meta.get(&method) {
-        Some(m) => m,
-        None => return usize::MAX, // unspecialized methods are least specific
+/// Distance standing for an unspecialized (T) parameter: less specific than any
+/// position a real class can occupy in a precedence list.
+const UNSPECIALIZED_DISTANCE: usize = usize::MAX / 4;
+
+/// The specificity of a method as one distance per argument: the position of its
+/// specializer in that argument's class precedence list, lower being more
+/// specific.
+///
+/// CLHS 7.6.6.1.2 orders two methods by comparing these distances one argument
+/// at a time and letting the first difference decide — so the key is a vector
+/// compared lexicographically, not a sum. Summing let a method that is more
+/// specific on a later argument outrank one that is more specific on an earlier
+/// argument (bliss-nj6id).
+///
+/// `precedence` is the generic function's argument precedence order, as
+/// positions into its required parameters; empty means left to right. The
+/// comparison happens in that order, which is why it is applied to the key here
+/// rather than to the arguments.
+fn method_specificity_key(
+    st: &ClosState,
+    method: TorclVal,
+    arg_classes: &[TorclVal],
+    precedence: &[usize],
+) -> Vec<usize> {
+    let Some(meta) = st.method_meta.get(&method) else {
+        // No specializer metadata: unspecialized, and so least specific.
+        return vec![UNSPECIALIZED_DISTANCE; arg_classes.len().max(1)];
     };
-    let mut score = 0usize;
+    let distance = |i: usize, spec: TorclVal| -> usize {
+        if spec == st.t_class_val || spec == NIL {
+            return UNSPECIALIZED_DISTANCE;
+        }
+        match c3_linearize(st, arg_classes[i]) {
+            Ok(cpl) => cpl
+                .iter()
+                .position(|&c| c == spec)
+                .unwrap_or(UNSPECIALIZED_DISTANCE),
+            Err(_) => UNSPECIALIZED_DISTANCE,
+        }
+    };
+    let mut distances = Vec::with_capacity(arg_classes.len());
     for (i, spec) in meta.specializers.iter().enumerate() {
         if i >= arg_classes.len() {
             break;
         }
-        if *spec == st.t_class_val || *spec == NIL {
-            score += 1000; // T specializer: least specific
-        } else if let Ok(cpl) = c3_linearize(st, arg_classes[i]) {
-            if let Some(pos) = cpl.iter().position(|&c| c == *spec) {
-                score += pos;
-            } else {
-                score += 1000;
-            }
-        } else {
-            score += 1000;
-        }
+        distances.push(distance(i, *spec));
     }
-    score
+    if precedence.is_empty() {
+        return distances;
+    }
+    precedence
+        .iter()
+        .map(|&i| distances.get(i).copied().unwrap_or(UNSPECIALIZED_DISTANCE))
+        .collect()
+}
+
+/// The property indicator under which DEFGENERIC records a generic function's
+/// argument precedence order on its name symbol.
+fn argument_precedence_indicator() -> TorclVal {
+    use std::sync::OnceLock;
+    static INDICATOR: OnceLock<u32> = OnceLock::new();
+    TorclVal::from_symbol_index(
+        *INDICATOR.get_or_init(|| torcl_rt::symbols::intern(ARGUMENT_PRECEDENCE_PROPERTY)),
+    )
+}
+
+/// The name of that indicator, so the writer (DEFGENERIC, which has the cons
+/// allocator) and this reader agree on one symbol.
+pub const ARGUMENT_PRECEDENCE_PROPERTY: &str = "TORCL::%ARGUMENT-PRECEDENCE-ORDER";
+
+/// The argument precedence order DEFGENERIC recorded for the generic function
+/// named by `name`, as positions into its required parameters. Empty means the
+/// default left-to-right order.
+///
+/// It is kept as a symbol property rather than in a host-side registry so that
+/// it travels with a saved image like any other Lisp datum. Reading it allocates
+/// nothing.
+pub fn argument_precedence_order(name: TorclVal) -> Vec<usize> {
+    let Some(index) = name.symbol_index() else {
+        return Vec::new(); // a (setf f) name is a cons and carries no plist
+    };
+    let Some(plist) = torcl_rt::symbols::symbol_plist(index) else {
+        return Vec::new();
+    };
+    let indicator = argument_precedence_indicator();
+    let mut order = Vec::new();
+    let mut cursor = plist;
+    while cursor.is_cons() {
+        // SAFETY: every cons cell walked here is one this list's own CAR/CDR
+        // reached; no allocation happens in the loop, so none can go stale.
+        let cell = unsafe { &*(cursor.as_ptr() as *const torcl_rt::object::ConsCell) };
+        if !cell.cdr.is_cons() {
+            break; // malformed plist: an indicator with no value
+        }
+        let value_cell = unsafe { &*(cell.cdr.as_ptr() as *const torcl_rt::object::ConsCell) };
+        if cell.car == indicator {
+            let mut positions = value_cell.car;
+            while positions.is_cons() {
+                let position =
+                    unsafe { &*(positions.as_ptr() as *const torcl_rt::object::ConsCell) };
+                if position.car.is_fixnum() {
+                    order.push(position.car.as_fixnum().max(0) as usize);
+                }
+                positions = position.cdr;
+            }
+            return order;
+        }
+        cursor = value_cell.cdr;
+    }
+    order
 }
 
 /// Compute the applicable methods for given arguments.
@@ -2431,6 +2517,11 @@ fn method_specificity(st: &ClosState, method: TorclVal, arg_classes: &[TorclVal]
 /// most-specific-first using CPL position.
 pub fn compute_applicable_methods(generic_function: TorclVal, args: &[TorclVal]) -> Vec<TorclVal> {
     let arg_classes: Vec<TorclVal> = args.iter().copied().map(class_of).collect();
+    // Read the precedence order before taking the CLOS state lock: it reads the
+    // symbol registry, and no path here needs both at once.
+    let precedence = generic_function_name(generic_function)
+        .map(argument_precedence_order)
+        .unwrap_or_default();
     with_state(|st| {
         let gf = match st.generic_functions.get(&generic_function) {
             Some(gf) => gf,
@@ -2469,8 +2560,10 @@ pub fn compute_applicable_methods(generic_function: TorclVal, args: &[TorclVal])
             })
             .collect();
 
-        // Sort by specificity: most specific first (lowest score)
-        applicable.sort_by_key(|&m| method_specificity(st, m, &arg_classes));
+        // Sort by specificity: most specific first, comparing the arguments in
+        // the generic function's argument precedence order.
+        applicable
+            .sort_by_cached_key(|&m| method_specificity_key(st, m, &arg_classes, &precedence));
 
         applicable
     })
