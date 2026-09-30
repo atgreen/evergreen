@@ -15160,6 +15160,37 @@ fn initiate_unwind(
         {
             act.cleanup_conts.pop();
         }
+        // Fast path for the canonical loop back-edge (bliss-fyofj). A local GO
+        // whose target tagbody IS the innermost live handler has nothing to
+        // unwind: it only repositions the PC, exactly as the `Handler::Tag` arm
+        // below does. Deciding that BEFORE the clone matters because cloning a
+        // NAMED tagbody's handler — one whose body reifies a closure or a
+        // `#'function`, so `NamedTag` filled `token` and `tag_bcps` — allocates
+        // a String and a Vec, and this runs once per loop iteration: measured at
+        // 10 of the 17 Rust heap allocations a `(funcall #'f i)` loop made per
+        // iteration.
+        let local_go = if let Pending::Go {
+            tagbody_id: tid,
+            target_bcp,
+        } = &pending
+        {
+            match act.handlers.last() {
+                Some(Handler::Tag {
+                    tagbody_id,
+                    sp_restore,
+                    ..
+                }) if tagbody_id == tid => Some((*sp_restore, *target_bcp)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((sp_restore, target_bcp)) = local_go {
+            // Keep the tag handler live — tags can be re-targeted.
+            act.sp_top = sp_restore;
+            act.bcp = target_bcp as usize;
+            return Ok(());
+        }
         let handler = act.handlers.last().cloned();
         match handler {
             Some(Handler::Unwind {
