@@ -2129,3 +2129,61 @@ fn delivered_image_without_a_walker_still_honours_argument_precedence_order() {
     );
     assert!(out.contains("APO-OK"), "{out}");
 }
+
+/// A DEFMETHOD defined inside a LET must keep its captured lexicals across a
+/// saved image. It does not: the method's captured frame is never serialized, so
+/// a restored process signals "unbound variable".
+///
+/// KNOWN FAILURE, and the reproducer bliss-mxjr asked for as its first required
+/// proof — the bead had only source inspection. Remove the `#[ignore]` when the
+/// frame is serialized; nothing else about this test should need to change.
+///
+/// Measured: before saving, `peek` returns 42 and `bump` counts 1 then 2. After
+/// restore in a fresh process, `(peek o)` fails with
+/// `unbound variable: SECRET`. cli.rs sets `captured_frame: None` on the restore
+/// path with a comment naming this bead, so the drop is deliberate and pending.
+#[test]
+#[ignore = "bliss-mxjr: captured method environments are not serialized into an image"]
+fn a_let_captured_method_keeps_its_lexicals_across_a_saved_image() {
+    let f = Fixture::new();
+    let source = f.path("captured.lisp");
+    let core = f.path("captured.core");
+    fs::write(
+        &source,
+        r#"
+      (defclass thing () ())
+      (let ((secret 42) (counter 0))
+        (defmethod peek ((x thing)) secret)
+        (defmethod bump ((x thing)) (incf counter)))
+      (let ((o (make-instance 'thing)))
+        (format t "BEFORE ~S ~S ~S~%" (peek o) (bump o) (bump o)))
+    "#,
+    )
+    .unwrap();
+    let saved = ok(run(
+        BIN,
+        &[
+            "--eval",
+            &format!("(load {source:?})"),
+            "--eval",
+            &format!("(egcl-ext:save-lisp-and-die {core:?})"),
+        ],
+    ));
+    assert!(saved.contains("BEFORE 42 1 2"), "{saved}");
+
+    // Fresh process, restored image: the captured lexicals must still be there.
+    let out = ok(run(
+        BIN,
+        &[
+            "--image",
+            &core,
+            "--eval",
+            "(let ((o (make-instance 'thing))) \
+               (format t \"AFTER ~S ~S~%\" (peek o) (bump o)))",
+        ],
+    ));
+    assert!(
+        out.contains("AFTER 42 3"),
+        "captured method environment lost across the image: {out}"
+    );
+}
