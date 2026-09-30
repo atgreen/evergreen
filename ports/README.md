@@ -25,6 +25,8 @@ exercises these forks:
 | precise-time | https://github.com/atgreen/precise-time | `deadbdeb95ee98cd743c538e649880181e8416f7` |
 | fset | https://github.com/atgreen/fset | `60a28fe91abfddfc8c2a3f6971933a0c2c5b20aa` |
 | cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `8fc4b2b439525e87795efdfb848a1761869adc2a` |
+| iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `81ac1fdc376fbcdb491fe758a3bf957ec0a9c175` |
+| swank (in the slime tree, branch `torcl`) | https://github.com/atgreen/slime | `a1d235181efa139eb0f51feffbe74f784842c1b3` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
@@ -60,6 +62,8 @@ ocicl install git+https://github.com/atgreen/usocket@5f8ba3596b4be3b3962a26957ff
 ocicl install git+https://github.com/atgreen/bordeaux-threads@0251844d5e9482eb5fc91fa4686a05aacd24d9b4
 ocicl install git+https://github.com/atgreen/precise-time@deadbdeb95ee98cd743c538e649880181e8416f7
 ocicl install git+https://github.com/atgreen/cffi@8fc4b2b439525e87795efdfb848a1761869adc2a
+ocicl install git+https://github.com/atgreen/iolib@81ac1fdc376fbcdb491fe758a3bf957ec0a9c175
+ocicl install git+https://github.com/atgreen/slime@a1d235181efa139eb0f51feffbe74f784842c1b3
 ```
 
 The CFFI fork adds `src/cffi-torcl.lisp` (the CFFI-SYS backend over `TORCL-FFI`)
@@ -76,6 +80,28 @@ conformance bugs the port turned up (bliss-nj6id, bliss-cb3c7, bliss-msyk,
 bliss-hfn71, bliss-jre1u, bliss-06l4z, bliss-bpjw6). `cffi-grovel`,
 `cffi-toolchain`, `cffi-libffi`, `cffi-uffi-compat`, `uffi` and `cffi-examples`
 load unchanged, and the examples run.
+
+The iolib fork adds ONE line — `#+torcl :torcl-gray-streams` in
+`DEFINE-GRAY-STREAMS-PACKAGE`, plus `torcl` in its `#-(or …)` guard. No stubs
+were needed: all 28 Gray-stream symbols iolib imports are already exported from
+`TORCL-GRAY-STREAMS`. Everything else iolib needed was TorCL's own, and four
+fixes landed here for it — a DEFCONSTANT compiled in a file is now marked as a
+constant, `(setf (compiler-macro-function …))` works, the initialization protocol
+receives the initargs the caller supplied, and a LOOP `sum`/`count` accumulator
+starts at its identity. The last two were silent wrong answers in core CL. All of
+iolib loads: syscalls, multiplex, streams, zstreams, sockets, pathnames, over the
+CFFI backend above, with groveling and libfixposix.
+
+The swank fork lives on the slime tree's `torcl` branch and adds
+`swank/torcl.lisp` — the backend interface over TorCL's sockets, process and Gray
+streams at communication style NIL — plus its registration in `swank.asd` and
+`swank-loader.lisp`. One capability is declined rather than faked: TorCL exports
+the pretty-printer dispatch symbols but defines neither `SET-PPRINT-DISPATCH` nor
+`PPRINT-DISPATCH` (`bliss-kp8ix`), so swank's backtrace dispatch table is the
+plain one and backtrace strings print with standard escaping, said in a comment
+where it happens. TorCL's own bundled `lib/slynk` shares swank's `DEFINTERFACE`,
+so the fix that unblocked it — keeping the image-control builtin names
+package-local — mattered to both.
 
 The trivial-garbage fork uses TorCL's deferred Lisp finalizers and its native
 weak hash tables (`:key`, `:value`, `:key-and-value`, reported through
