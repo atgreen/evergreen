@@ -28658,6 +28658,22 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
         let idx = name_form.as_symbol_index();
         let f = torcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
         torcl_rt::symbols::set_symbol_function(idx, f);
+        // Retire the OLD compiled body: a redefinition replaces the definition,
+        // and nothing else did this. `lazy_compile_defun` returns early when the
+        // symbol is already registered, so once a function had been promoted, a
+        // later DEFUN installed a new function object that every call ignored —
+        // 300 calls then `(defun u2 (x) (* x 3))` inside a LET kept answering
+        // with `(* x 2)`, where SBCL takes the new definition (bliss-96hjb).
+        //
+        // Only when something IS registered (so an ordinary first definition
+        // costs nothing and does not invalidate baked direct-call targets), and
+        // only for a definition that HAS a body: a SOURCE-FREE function
+        // installed from a fasl carries a NIL body and its real code IS the
+        // registry entry, so clearing that would delete the callable code
+        // (the bliss-t9o1 hazard, from the other direction).
+        if !body.is_nil() && bytecode::is_registered(idx) {
+            bytecode::clear_lazy_state(idx);
+        }
         // Register the name as present INTERNAL in CL-USER so FIND-SYMBOL reports
         // :INTERNAL, not a fabricated :INHERITED (bliss-v15i).
         home_defined_symbol(env, name_form);
