@@ -1831,7 +1831,15 @@ struct Env {
     /// inside a child env — e.g. a MACROLET body or a macro expansion — is
     /// visible globally, matching how DEFUN installs into the symbol cell.
     setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
+    /// SYMBOL-MACROLET bindings: genuinely lexical, so a null lexical
+    /// environment (EVAL, CLHS 3.1.2.1) does not see them.
     symbol_macros: Rc<RefCell<HashMap<u32, TorclVal>>>,
+    /// DEFINE-SYMBOL-MACRO definitions: global, so they survive into a null
+    /// lexical environment exactly as a DEFUN or DEFPARAMETER does. Keeping
+    /// them in the lexical map meant EVAL dropped them, and a definition made
+    /// through EVAL was written into a table that was then discarded
+    /// (bliss-cb3c7).
+    global_symbol_macros: Rc<RefCell<HashMap<u32, TorclVal>>>,
     // These are GLOBAL definitions (classes, generic functions, methods):
     // shared and mutated in place so a definition made inside a child
     // Env (a FLET/MACROLET body, as when ASDF loads a system's files) is visible
@@ -7746,6 +7754,9 @@ impl Env {
         for expansion in self.symbol_macros.borrow_mut().values_mut() {
             visit(expansion);
         }
+        for expansion in self.global_symbol_macros.borrow_mut().values_mut() {
+            visit(expansion);
+        }
         for restart in &mut self.restarts {
             visit_restart_function_roots(&mut restart.function, state, visit);
             if let Some(function) = &mut restart.interactive_function {
@@ -7853,6 +7864,7 @@ impl Env {
             macros: Rc::new(RefCell::new(HashMap::new())),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
             symbol_macros: Rc::new(RefCell::new(HashMap::new())),
+            global_symbol_macros: Rc::new(RefCell::new(HashMap::new())),
             classes: &CLASS_DEFINITIONS,
             generics: &GENERIC_DEFINITIONS,
             methods: &METHOD_DEFINITIONS,
@@ -7889,6 +7901,9 @@ impl Env {
                     if let Some(t) = regs.symbol_macros.upgrade() {
                         env.symbol_macros = t;
                     }
+                    if let Some(t) = regs.global_symbol_macros.upgrade() {
+                        env.global_symbol_macros = t;
+                    }
                 }
             });
         } else {
@@ -7897,6 +7912,7 @@ impl Env {
                     funs: Arc::downgrade(&env.funs),
                     setf_expanders: Rc::downgrade(&env.setf_expanders),
                     symbol_macros: Rc::downgrade(&env.symbol_macros),
+                    global_symbol_macros: Rc::downgrade(&env.global_symbol_macros),
                 });
             });
         }
@@ -8145,6 +8161,7 @@ impl Env {
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
+            global_symbol_macros: Rc::clone(&self.global_symbol_macros),
             classes: self.classes,
             generics: self.generics,
             methods: self.methods,
@@ -8177,6 +8194,7 @@ impl Env {
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
+            global_symbol_macros: Rc::clone(&self.global_symbol_macros),
             classes: self.classes,
             generics: self.generics,
             methods: self.methods,
@@ -8304,11 +8322,33 @@ impl Env {
         // `as_symbol_index()` would abort on them. They can never be symbol
         // macros, so treat them (and any non-symbol) as "no symbol macro".
         let idx = symbol.symbol_index()?;
-        self.symbol_macros.borrow().get(&idx).copied()
+        // A SYMBOL-MACROLET binding shadows a global definition of the same name.
+        self.symbol_macros
+            .borrow()
+            .get(&idx)
+            .copied()
+            .or_else(|| self.global_symbol_macros.borrow().get(&idx).copied())
     }
 
+    /// Is this symbol index bound as a symbol macro, lexically or globally?
+    /// The bytecode lowerer asks so it can leave such a reference to the
+    /// tree-walker, which expands it.
+    pub(crate) fn has_symbol_macro(&self, idx: u32) -> bool {
+        self.symbol_macros.borrow().contains_key(&idx)
+            || self.global_symbol_macros.borrow().contains_key(&idx)
+    }
+
+    /// Bind a symbol macro lexically (SYMBOL-MACROLET).
     fn define_symbol_macro(&mut self, symbol: TorclVal, expansion: TorclVal) {
         self.symbol_macros_mut()
+            .insert(symbol.as_symbol_index(), expansion);
+    }
+
+    /// Define a symbol macro globally (DEFINE-SYMBOL-MACRO). The table is shared
+    /// by every env descended from the root, including a null lexical one.
+    fn define_global_symbol_macro(&mut self, symbol: TorclVal, expansion: TorclVal) {
+        self.global_symbol_macros
+            .borrow_mut()
             .insert(symbol.as_symbol_index(), expansion);
     }
 
@@ -9472,6 +9512,7 @@ struct DefinitionalRegistries {
     funs: std::sync::Weak<SharedCell<HashMap<String, FunDef>>>,
     setf_expanders: std::rc::Weak<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: std::rc::Weak<RefCell<HashMap<u32, TorclVal>>>,
+    global_symbol_macros: std::rc::Weak<RefCell<HashMap<u32, TorclVal>>>,
 }
 
 static LIVE_DEFINITIONAL_REGISTRIES: torcl_rt::execution_local::ExecutionLocal<
@@ -30437,7 +30478,7 @@ fn eval_define_symbol_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, To
             "DEFINE-SYMBOL-MACRO: name must be a symbol".into(),
         ));
     }
-    env.define_symbol_macro(symbol, expansion);
+    env.define_global_symbol_macro(symbol, expansion);
     Ok(symbol)
 }
 
@@ -30944,15 +30985,20 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         });
     };
 
-    let mut global_symbol_macros = Vec::new();
-    for (&symbol_index, &expansion) in env.symbol_macros.borrow().iter() {
-        global_symbol_macros.push((
-            TorclVal::from_symbol_index(symbol_index),
-            VariableInfo::SymbolMacro(expansion),
-        ));
+    // Both tables: DEFINE-SYMBOL-MACRO definitions and any SYMBOL-MACROLET
+    // bindings this env carries. A lexical binding shadows a global definition
+    // of the same name, so it is pushed last.
+    let mut symbol_macros = Vec::new();
+    for table in [&env.global_symbol_macros, &env.symbol_macros] {
+        for (&symbol_index, &expansion) in table.borrow().iter() {
+            symbol_macros.push((
+                TorclVal::from_symbol_index(symbol_index),
+                VariableInfo::SymbolMacro(expansion),
+            ));
+        }
     }
-    if !global_symbol_macros.is_empty() {
-        augment(&mut macro_env, global_symbol_macros);
+    if !symbol_macros.is_empty() {
+        augment(&mut macro_env, symbol_macros);
     }
 
     let mut frames = Vec::new();

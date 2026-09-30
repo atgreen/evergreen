@@ -2129,12 +2129,7 @@ impl<'e> Lowerer<'e> {
             // captured value instead of the live dynamic value (broke slynk's
             // `*emacs-connection*`). Symbol-macros still expand.
             if is_special_name(&name) || self.declared_special.contains_key(&name) {
-                if self
-                    .env
-                    .symbol_macros
-                    .borrow()
-                    .contains_key(&form.as_symbol_index())
-                {
+                if self.env.has_symbol_macro(form.as_symbol_index()) {
                     return Err(Bail);
                 }
                 self.emit(Instr::LoadGlobal(form.as_symbol_index()));
@@ -2164,12 +2159,7 @@ impl<'e> Lowerer<'e> {
             // A global / special / symbol-macro reference. Symbol-macros must
             // expand (tree-walker semantics) — bail on those; otherwise emit a
             // dynamic value load.
-            if self
-                .env
-                .symbol_macros
-                .borrow()
-                .contains_key(&form.as_symbol_index())
-            {
+            if self.env.has_symbol_macro(form.as_symbol_index()) {
                 return Err(Bail);
             }
             self.emit(Instr::LoadGlobal(form.as_symbol_index()));
@@ -3113,12 +3103,7 @@ impl<'e> Lowerer<'e> {
         if super::reject_assignment_to_constant(var).is_err() {
             return Err(Bail);
         }
-        if self
-            .env
-            .symbol_macros
-            .borrow()
-            .contains_key(&var.as_symbol_index())
-        {
+        if self.env.has_symbol_macro(var.as_symbol_index()) {
             return Err(Bail);
         }
         let name = sym_name(var);
