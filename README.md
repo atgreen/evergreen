@@ -2,9 +2,10 @@
   <img src="docs/assets/evergreen-banner2x.png" alt="Evergreen Common Lisp" width="1280">
 </p>
 
-**EGCL is Common Lisp with a HotSpot-inspired native runtime**, built from
-scratch in Rust. It starts executing in bytecode, compiles hot code to native
-instructions, and specializes dynamically typed programs as they run.
+**Evergreen Common Lisp (EGCL) is Common Lisp with a HotSpot-inspired native
+runtime**, built from scratch in Rust. It starts executing in bytecode, compiles
+hot code to native instructions, and specializes dynamically typed programs as
+they run.
 
 - **Tiered compilation with on-stack replacement.** Execution progresses from
   bytecode through a baseline native compiler to an optimizing compiler. Hot

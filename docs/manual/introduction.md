@@ -1,9 +1,9 @@
 # Introduction
 
-EGCL implements Common Lisp with a Rust bootstrap runtime and a tiered native
-compiler. This manual describes the behavior specific to EGCL: how a Lisp
-process starts, how code is compiled, which extensions are available, and what
-an application can expect from the runtime.
+Evergreen Common Lisp (EGCL) implements Common Lisp with a Rust bootstrap
+runtime and a tiered native compiler. This manual describes the behavior
+specific to EGCL: how a Lisp process starts, how code is compiled, which
+extensions are available, and what an application can expect from the runtime.
 
 It assumes familiarity with Common Lisp. The
 [first-program tutorial](user/tutorials/first-program.md) is available for an

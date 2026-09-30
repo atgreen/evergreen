@@ -6,14 +6,15 @@ production-grade GC, and a self-hosting runtime.
 
 ## 0  Scope & Goals
 
-EGCL is a from-scratch Common Lisp implementation written in Rust (bootstrap
-runtime) and, eventually, Common Lisp itself (compiler, optimiser, large parts
-of the standard library). The project targets ANSI X3.226-1994 (CLtL2 + ANSI
-errata) with SBCL-compatible extensions where the standard is silent.
-SBCL extensions are adopted when they are (a) widely depended upon by portable
-libraries (e.g., `sb-ext:defglobal`, `sb-thread` API shapes) and (b) do not
-conflict with ANSI semantics. Each adopted extension MUST be listed in
-`spec/09-extensions.md` with its rationale and compatibility notes.
+Evergreen Common Lisp (EGCL) is a from-scratch Common Lisp implementation
+written in Rust (bootstrap runtime) and, eventually, Common Lisp itself
+(compiler, optimiser, large parts of the standard library). The project targets
+ANSI X3.226-1994 (CLtL2 + ANSI errata) with SBCL-compatible extensions where
+the standard is silent. SBCL extensions are adopted when they are (a) widely
+depended upon by portable libraries (e.g., `sb-ext:defglobal`, `sb-thread` API
+shapes) and (b) do not conflict with ANSI semantics. Each adopted extension
+MUST be listed in `spec/09-extensions.md` with its rationale and compatibility
+notes.
 
 ### 0.1  Primary Goals
 

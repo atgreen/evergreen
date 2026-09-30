@@ -1,9 +1,10 @@
 # EGCL architecture overview
 
-EGCL is a Common Lisp implementation whose bootstrap system is written in
-Rust. Its long-term direction is a self-hosting Lisp with a HotSpot-inspired
-execution engine: cold code starts cheaply, hot code is promoted to native
-tiers, and optimized code can deoptimize without changing program semantics.
+Evergreen Common Lisp (EGCL) is a Common Lisp implementation whose bootstrap
+system is written in Rust. Its long-term direction is a self-hosting Lisp with
+a HotSpot-inspired execution engine: cold code starts cheaply, hot code is
+promoted to native tiers, and optimized code can deoptimize without changing
+program semantics.
 
 This document describes the architecture of the implementation in this
 repository. The normative design and roadmap live in the
