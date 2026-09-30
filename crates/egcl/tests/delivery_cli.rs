@@ -2046,3 +2046,86 @@ fn check_raw_lambda_delivery(dynamic: bool, build_runtime: bool) {
         }
     }
 }
+
+/// A generic function's `:argument-precedence-order` must still decide dispatch
+/// in an image delivered with NO tree-walker.
+///
+/// DEFGENERIC records that order as a plist property under the symbol
+/// `EGCL::%ARGUMENT-PRECEDENCE-ORDER`. The delivery walk classifies any symbol
+/// whose name starts with "EGCL" as a runtime symbol needing the source
+/// evaluator, so merely reaching that property key made it a walker root and
+/// every image defining a single generic shipped the tree-walker it never used
+/// — the saving `runtime = specialized` exists to make (bliss-h7oxk, root cause
+/// bliss-0a5z4).
+///
+/// Dropping a walker root is the dangerous direction: it fails at RUNTIME, not
+/// at delivery time. So this asserts both halves — that the capability is gone
+/// AND that the dispatch it governs is still correct. The program specializes on
+/// built-in types deliberately: MAKE-INSTANCE is itself a walker root, and a
+/// CLOS-instance program keeps the tree-walker for that unrelated reason and so
+/// could never detect this regression.
+#[test]
+fn delivered_image_without_a_walker_still_honours_argument_precedence_order() {
+    let f = Fixture::new();
+    let source = f.path("apo.lisp");
+    let fasl = f.path("apo.bfasl");
+    let core = f.path("apo.core");
+    let spec = f.path("apo.delivery");
+    let exe = f.path("apo");
+    fs::write(
+        &source,
+        r#"
+      (defpackage :apo (:use :cl))
+      (in-package :apo)
+      (defgeneric pick (a b) (:argument-precedence-order b a))
+      (defmethod pick ((a t) (b integer)) "t+integer")
+      (defmethod pick ((a integer) (b t)) "integer+t")
+      (defun main ()
+        ;; Both methods apply to (1 2). With B considered first the method
+        ;; specialized on B wins => "t+integer"; under the DEFAULT left-to-right
+        ;; order it would be "integer+t", so this distinguishes them.
+        (write-line (pick 1 2))
+        (write-line "APO-OK"))
+    "#,
+    )
+    .unwrap();
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(compile-file {source:?} :output-file {fasl:?})"),
+        ],
+    ));
+    ok(run(
+        BIN,
+        &[
+            "--no-bootstrap",
+            "--eval",
+            &format!("(load {fasl:?}) (egcl-ext:save-lisp-and-die {core:?})"),
+        ],
+    ));
+    fs::write(
+        &spec,
+        "version = 1\nentry = APO::MAIN\nprune-package = APO\ndynamic = explicit\nruntime = specialized\n",
+    )
+    .unwrap();
+    let report = ok(run(
+        BIN,
+        &[
+            "--image", &core, "--deliver", &spec, "--output", &exe,
+        ],
+    ));
+    assert!(
+        report.contains("capabilities=\n"),
+        "the image should need no capabilities at all:\n{report}"
+    );
+
+    let out = ok(run(&exe, &[]));
+    assert!(
+        out.contains("t+integer"),
+        "argument-precedence-order was lost in the delivered image \
+         (left-to-right would give \"integer+t\"):\n{out}"
+    );
+    assert!(out.contains("APO-OK"), "{out}");
+}

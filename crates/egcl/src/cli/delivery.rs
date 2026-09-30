@@ -830,6 +830,17 @@ fn builtin_without_source_evaluation(name: &str) -> bool {
             | "FUNCALL"
             | "APPLY"
             | "WRITE-LINE"
+            // NOT a builtin: a symbol used only as a plist INDICATOR, where
+            // DEFGENERIC records a generic's argument precedence order
+            // (egcl-stdlib clos.rs ARGUMENT_PRECEDENCE_PROPERTY). It is listed
+            // here because the caller classifies any name starting with "EGCL"
+            // as a runtime symbol needing the source evaluator, and a pure data
+            // symbol trivially does not need one. Reaching it is enough to make
+            // it a walker root, so EVERY delivered image that defines a single
+            // generic function was shipping the tree-walker it does not use —
+            // exactly the saving `runtime = specialized` exists to make
+            // (bliss-h7oxk). The over-broad "EGCL" prefix test is bliss-0a5z4.
+            | "EGCL::%ARGUMENT-PRECEDENCE-ORDER"
     )
 }
 
