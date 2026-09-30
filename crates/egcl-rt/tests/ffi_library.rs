@@ -25,8 +25,14 @@ fn library_imports_real_host_math_symbols_with_global_pointer_identity() {
     )
     .unwrap();
     assert!(
-        Command::new("cc")
-            .args(["-shared", "-fPIC", "-fno-builtin"])
+        // The C compiler comes from $EGCL_TEST_CC when set, so a cross/emulated run can
+        // build the fixture for the TARGET: the container's plain `cc` targets the host and
+        // produced a library the loader refused ("file arch mismatch"). Not $CC, which
+        // cargo and cc-rs own. -fno-stack-protector keeps the fixture minimal; its
+        // __stack_chk_guard reference does not resolve through host-symbol lookup on
+        // aarch64 (bliss-d3smh).
+        Command::new(std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"))
+            .args(["-shared", "-fPIC", "-fno-builtin", "-fno-stack-protector"])
             .arg(&source)
             .arg("-o")
             .arg(&library)
@@ -65,8 +71,8 @@ fn library_close_runs_destructors_and_invalidates_only_its_handle() {
     )
     .unwrap();
     assert!(
-        Command::new("cc")
-            .args(["-shared", "-fPIC"])
+        Command::new(std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"))
+            .args(["-shared", "-fPIC", "-fno-stack-protector"])
             .arg(&source)
             .arg("-o")
             .arg(&library)

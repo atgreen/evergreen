@@ -9,15 +9,35 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Compile a tiny shared library with the system C compiler. Returns None (and
-/// the test soft-skips) if no `cc` is available.
+/// Compile a tiny shared library with the C compiler. Returns None (and the test
+/// soft-skips) if that compiler is unavailable.
+///
+/// `$EGCL_TEST_CC` overrides it so the library can be built for the TARGET rather
+/// than the host. Under emulation those differ: cross's container runs an x86-64
+/// `cc` while the test process is the target architecture, so a plain `cc`
+/// produced a library the loader rightly refused —
+/// "file arch mismatch: expected AArch64, found x86_64". The cross images ship
+/// `<triple>-gcc`, so the workflow points this at it and the real loader is
+/// exercised on the real architecture instead of skipping (bliss-d3smh).
+///
+/// Deliberately NOT `$CC`: cargo and cc-rs give that name their own meaning when
+/// building the crate and its build scripts, and hijacking it to steer a test
+/// would risk misdirecting the compilation itself.
 fn build_test_so(dir: &Path, src: &str) -> Option<PathBuf> {
     std::fs::create_dir_all(dir).ok()?;
     let c = dir.join("t.c");
     std::fs::write(&c, src).ok()?;
     let so = dir.join("libt.so");
-    let ok = Command::new("cc")
-        .args(["-shared", "-fPIC"])
+    let compiler = std::env::var("EGCL_TEST_CC").unwrap_or_else(|_| "cc".to_string());
+    // -fno-stack-protector keeps the FIXTURE minimal. The cross toolchains enable
+    // stack protection by default, and the resulting __stack_chk_guard reference
+    // does not resolve through the loader's host-symbol lookup on aarch64:
+    // "relocation type: R_AARCH64_GLOB_DAT, symbol name: __stack_chk_guard,
+    // error: unknown symbol". That is a real loader gap for libraries built the
+    // way distributions build them, filed separately — but this test is about
+    // loading and calling, so it should not depend on it.
+    let ok = Command::new(&compiler)
+        .args(["-shared", "-fPIC", "-fno-stack-protector"])
         .arg(&c)
         .arg("-o")
         .arg(&so)
@@ -41,7 +61,7 @@ fn loads_a_library_and_calls_a_function() {
         int viahost(int x) { int y = x + ctor, z; memcpy(&z, &y, sizeof z); return z; }
     ";
     let Some(so) = build_test_so(&dir, src) else {
-        eprintln!("cc unavailable — skipping elf_loader FFI test");
+        eprintln!("C compiler unavailable — skipping elf_loader FFI test");
         return;
     };
     let so = so.to_str().unwrap();

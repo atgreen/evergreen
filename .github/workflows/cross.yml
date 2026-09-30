@@ -54,10 +54,16 @@ jobs:
         include:
           - target: aarch64-unknown-linux-gnu
             run_tests: true
+            qemu_ld_prefix: /usr/aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
           - target: powerpc64le-unknown-linux-gnu
             run_tests: true
+            qemu_ld_prefix: /usr/powerpc64le-linux-gnu
+            cc: powerpc64le-linux-gnu-gcc
           - target: s390x-unknown-linux-gnu
             run_tests: true
+            qemu_ld_prefix: /usr/s390x-linux-gnu
+            cc: s390x-linux-gnu-gcc
     name: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +79,21 @@ jobs:
         run: cross build --workspace --release --target ${{ matrix.target }}
       - name: run the runtime suite under qemu
         if: matrix.run_tests
+        # QEMU_LD_PREFIX is what lets a test SPAWN an emulated process: the target
+        # RUNNER's -L covers the test binary itself, but not anything it execs.
+        # Cross.toml passes this through into the container.
+        env:
+          QEMU_LD_PREFIX: ${{ matrix.qemu_ld_prefix }}
+          # ffi_elf_loader compiles a shared library at run time and loads it.
+          # The container's plain `cc` targets the HOST, so it produced an x86-64
+          # library for a target-architecture process and the loader refused it.
+          # NOT named CC: cargo and cc-rs own that name for building the crate.
+          EGCL_TEST_CC: ${{ matrix.cc }}
+        # STILL EXPECTED TO FAIL on the fiber and signal-recovery tests: qemu-user
+        # cannot run them, and they cannot be filtered out by name because whole
+        # binaries (test_fiber_sync, spec_threading_concurrency) crash with SIGSEGV
+        # or SIGILL before any filter applies. bliss-tg6mf has the evidence and the
+        # options; the two env vars above are what fixed everything else.
         run: cross test -p egcl-rt --release --target ${{ matrix.target }}
 
   # Android, built through packaging/android/build-runtime.py — the same script

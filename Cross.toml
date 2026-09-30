@@ -1,4 +1,22 @@
 # Pin the cross-toolchain image release used for Linux GNU CLI ports.
+#
+# QEMU_LD_PREFIX is forwarded into every container. cargo's target RUNNER emulates
+# the TEST binary with an explicit -L, but a test that SPAWNS a process — several
+# in egcl-rt re-execute themselves to drive thread registration and safepoints —
+# execs the child without it, and the child is then handed to the shell, which
+# reports `Syntax error: "(" unexpected` on an ELF header. qemu-user honours
+# QEMU_LD_PREFIX on every nested exec, which the runner's -L cannot reach. 15 of
+# 120 egcl-rt tests failed that way on all three targets (bliss-d3smh; the local
+# equivalent is the `cross-arch-cli-tests-under-qemu` memory).
+#
+# The workflow supplies the value per target; the paths are the images' own
+# multiarch sysroots, verified by inspecting each image rather than assumed:
+#   aarch64    /usr/aarch64-linux-gnu      ld-linux-aarch64.so.1
+#   ppc64le    /usr/powerpc64le-linux-gnu  ld64.so.2
+#   s390x      /usr/s390x-linux-gnu        ld64.so.1
+[build.env]
+passthrough = ["QEMU_LD_PREFIX", "EGCL_TEST_CC"]
+
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
 
