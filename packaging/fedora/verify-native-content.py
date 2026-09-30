@@ -11,13 +11,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def verify(stage):
     stage = stage.resolve()
-    system = stage / 'usr/share/common-lisp/source/torcl-jvm'
-    assert (system / 'libtorcl_jvm.so').is_file(), 'Missing native JVM bridge'
+    system = stage / 'usr/share/common-lisp/source/egcl-jvm'
+    assert (system / 'libegcl_jvm.so').is_file(), 'Missing native JVM bridge'
     assert not (system / 'Makefile').exists(), 'Installed system must not need compilation'
-    manual = stage / 'usr/share/doc/torcl/manual'
+    manual = stage / 'usr/share/doc/egcl/manual'
     for name in ('index.html', 'java.html', 'search/search_index.json'):
         assert (manual / name).is_file(), f'Missing manual file: {name}'
-    with tempfile.TemporaryDirectory(prefix='torcl-installed-java-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='egcl-installed-java-') as temporary:
         work = Path(temporary)
         blocked = work / 'bin'
         blocked.mkdir()
@@ -31,13 +31,13 @@ def verify(stage):
 (asdf:initialize-output-translations
  `(:output-translations (t (,(uiop:getenv "XDG_CACHE_HOME") :implementation))
    :ignore-inherited-configuration))
-(asdf:load-system :torcl-jvm)
-(unless (equal (truename (asdf:system-source-directory :torcl-jvm))
-               (truename (uiop:getenv "TORCL_EXPECTED_JVM_SYSTEM")))
+(asdf:load-system :egcl-jvm)
+(unless (equal (truename (asdf:system-source-directory :egcl-jvm))
+               (truename (uiop:getenv "EGCL_EXPECTED_JVM_SYSTEM")))
   (error "ASDF loaded a different Java system"))
 (let ((vm (java:start-jvm :options '("-Xcheck:jni" "-Xmx128m"))))
   (assert (= 42 (java:static "java.lang.Integer" "parseInt" "42")))
-  (assert (= 42 (torcl-jvm:call-static "java.lang.Math" "abs" "(I)I" -42)))
+  (assert (= 42 (egcl-jvm:call-static "java.lang.Math" "abs" "(I)I" -42)))
   (java:with-scope ()
     (let ((callback (java:lambda "java.util.function.IntUnaryOperator" (x)
                       (java:static "java.lang.Math" "addExact" x 1))))
@@ -52,9 +52,9 @@ def verify(stage):
                    XDG_CONFIG_HOME=str(work / 'config'),
                    XDG_CONFIG_DIRS=str(work / 'config'),
                    XDG_CACHE_HOME=str(work / 'cache'),
-                   TORCL_EXPECTED_JVM_SYSTEM=str(system))
-        result = subprocess.run([str(ROOT / 'scripts/torcl-limited.sh'),
-                                 str(stage / 'usr/bin/torcl'), '--no-init', '--load', str(script)],
+                   EGCL_EXPECTED_JVM_SYSTEM=str(system))
+        result = subprocess.run([str(ROOT / 'scripts/egcl-limited.sh'),
+                                 str(stage / 'usr/bin/egcl'), '--no-init', '--load', str(script)],
                                 cwd=work, env=env, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         print(result.stdout)

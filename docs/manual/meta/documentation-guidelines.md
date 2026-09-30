@@ -1,6 +1,6 @@
 # Writing documentation
 
-Use these rules when adding or changing the TorCL manual. They follow the
+Use these rules when adding or changing the EGCL manual. They follow the
 Gloopy manual's docs-as-code tooling and the SBCL manual's subject-oriented
 implementation-reference structure.
 
@@ -17,13 +17,13 @@ mkdocs build --strict
 mkdocs serve --dev-addr 127.0.0.1:8000
 ```
 
-Open `http://127.0.0.1:8000/torcl/`. The static output is in `site/`. Both the virtual
+Open `http://127.0.0.1:8000/egcl/`. The static output is in `site/`. Both the virtual
 environment and generated output are ignored by Git. The build uses
 [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/).
 
 ## Organize by implementation subject
 
-The primary reader knows Common Lisp and needs to know how TorCL behaves.
+The primary reader knows Common Lisp and needs to know how EGCL behaves.
 Organize the manual into subjects such as startup, compilation, debugging,
 foreign calls, memory, and concurrency. The
 [SBCL manual](https://www.sbcl.org/manual/) is the structural inspiration:
@@ -75,18 +75,18 @@ and distinguish compilation, emulation, and native-device evidence.
 
 Use normal Markdown links between manual pages. Source-code links should point
 to the repository, since source files are not part of the built site.
-Use relative links for assets so the site works below `/torcl/` as well as in a
+Use relative links for assets so the site works below `/egcl/` as well as in a
 local preview. The site uses system fonts and local search assets.
 
 ## Publication and versions
 
-The intended address is `https://atgreen.github.io/torcl/`. Publication is not
+The intended address is `https://atgreen.github.io/egcl/`. Publication is not
 enabled yet. The documentation workflow only builds and uploads a preview
 artifact; it does not deploy Pages or push a branch. Keep deployment disabled
 until the owner authorizes publication and the destination repository is ready.
 
 This first edition documents the development checkout. Do not label it as a
 stable release manual. When supported release versions need separate manuals,
-add versioned publication tied to TorCL releases and retain old references.
-Unlike Gloopy, TorCL does not currently have a separately versioned control
+add versioned publication tied to EGCL releases and retain old references.
+Unlike Gloopy, EGCL does not currently have a separately versioned control
 protocol that should drive manual versioning.

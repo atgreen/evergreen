@@ -1,13 +1,13 @@
 ;;;; A real HTTP round trip through the pinned Completions stack. No implicit
 ;;;; downloads. The fixture (fake-ollama.py) runs an Ollama-shaped server on
-;;;; TORCL_OLLAMA_PORT and echoes the prompt back, so a wrong request or a
+;;;; EGCL_OLLAMA_PORT and echoes the prompt back, so a wrong request or a
 ;;;; mis-decoded reply fails the assertions below instead of passing silently.
 (require :asdf)
 (asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
 (asdf:initialize-output-translations
- (list :output-translations (list t (uiop:getenv "TORCL_PORT_CACHE"))
+ (list :output-translations (list t (uiop:getenv "EGCL_PORT_CACHE"))
        :ignore-inherited-configuration))
-(load (uiop:getenv "TORCL_PORT_RUNTIME"))
+(load (uiop:getenv "EGCL_PORT_RUNTIME"))
 (setf ocicl-runtime:*download* nil
       ocicl-runtime:*local-only* t)
 
@@ -17,7 +17,7 @@
 (asdf:register-immutable-system "cl+ssl")
 
 (defvar *endpoint*
-  (format nil "http://127.0.0.1:~A/api/chat" (uiop:getenv "TORCL_OLLAMA_PORT")))
+  (format nil "http://127.0.0.1:~A/api/chat" (uiop:getenv "EGCL_OLLAMA_PORT")))
 
 ;; 1. Dexador on its own: the request must be well-formed enough for a strict
 ;; HTTP server, and the response must parse back into a body and a status.
@@ -36,13 +36,13 @@
 (asdf:load-system :completions)
 (let ((completer (make-instance 'completions:ollama-completer
                                 :endpoint *endpoint*
-                                :model "torcl-test-model")))
+                                :model "egcl-test-model")))
   (multiple-value-bind (text history)
       (completions:get-completion
-       completer '(((:role . "user") (:content . "hello from torcl"))))
+       completer '(((:role . "user") (:content . "hello from egcl"))))
     (assert (stringp text))
-    (assert (search "echo:hello from torcl" text))
-    (assert (search "model=torcl-test-model" text))
+    (assert (search "echo:hello from egcl" text))
+    (assert (search "model=egcl-test-model" text))
     ;; The returned history is the prompt plus the assistant turn.
     (assert (= 2 (length history)))
     (assert (string= "assistant" (cdr (assoc :role (second history)))))

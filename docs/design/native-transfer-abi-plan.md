@@ -35,14 +35,14 @@ only a selected escaping transfer begins unwinding.
 
 ## Evidence and existing integration points
 
-* `crates/torcl/src/cli/bytecode.rs`: `c2i_call_args` and other helpers store an
-  escaping `TorclError` and return a placeholder. `native_loop_should_exit`
+* `crates/egcl/src/cli/bytecode.rs`: `c2i_call_args` and other helpers store an
+  escaping `EgclError` and return a placeholder. `native_loop_should_exit`
   checks the slot and claims signals. `run_native` and `run_native_osr` restore
   enclosing evaluator state and deliver the error.
-* `crates/torcl-compiler/src/t2/emit.rs`: `emit_call` emits a transfer check even
+* `crates/egcl-compiler/src/t2/emit.rs`: `emit_call` emits a transfer check even
   after a direct recursive call. `emit_transfer_check` saves an **unrooted**
   primary result and calls a helper that must not collect, yield or invoke Lisp.
-* `crates/torcl-rt/src/stack.rs`: the host stack and `TorclStack` are distinct.
+* `crates/egcl-rt/src/stack.rs`: the host stack and `EgclStack` are distinct.
   Both must be restored consistently; changing only the host stack is invalid.
 * `NativeCode`, `ActiveNativeCode`, `NativeDepthGuard`, environment restoration,
   dynamic scope guards and fault-recovery state must remain valid on each exit.
@@ -59,7 +59,7 @@ feature (`bliss-ifws8`), not a substitute for this work.
 
 These names and signatures specify new interfaces; they are not existing APIs.
 
-`crates/torcl-rt/src/native_transfer.rs` owns the machine boundary contract:
+`crates/egcl-rt/src/native_transfer.rs` owns the machine boundary contract:
 
 ```rust
 #[repr(u64)]
@@ -67,7 +67,7 @@ enum NativeExit { Returned = 0, Transfer = 1, Deopt = 2 }
 
 #[repr(C)]
 struct NativeOutcome {
-    value: TorclVal,
+    value: EgclVal,
     exit: NativeExit,
 }
 
@@ -86,7 +86,7 @@ not at every recursive native call. Secondary values stay in rooted execution
 state, with their count preserved separately from the primary result.
 
 `NativeSegment` has a stable address for its active lifetime and records its
-previous segment, execution owner, host stack/register save area, TorclStack
+previous segment, execution owner, host stack/register save area, EgclStack
 watermark, exceptional landing continuation, and rooted transfer state. Machine
 save areas are backend-specific, with compile-time offset assertions. Landing
 stubs must also satisfy enabled control-flow hardening: Win64 unwind/CFG rules,
@@ -99,7 +99,7 @@ Do not introduce a mandatory lookup or new reserved register on each successful
 native return; exceptional/helper adapters can obtain the active anchor through
 execution-owned state. Fiber migration must preserve that ownership.
 
-`crates/torcl/src/cli/bytecode/native_transfer.rs` owns the evaluator-side
+`crates/egcl/src/cli/bytecode/native_transfer.rs` owns the evaluator-side
 transfer packet and preparation/dispatch:
 
 ```rust
@@ -107,12 +107,12 @@ fn prepare_native_transfer(
     segment: &mut NativeSegment,
     site: &NativeUnwindSite,
     registers: &NativeRegisterSnapshot,
-) -> Result<PreparedNativeTransfer, TorclError>;
+) -> Result<PreparedNativeTransfer, EgclError>;
 
 fn resume_native_transfer(
     transfer: PreparedNativeTransfer,
     env: &mut Env,
-) -> Result<TorclVal, TorclError>;
+) -> Result<EgclVal, EgclError>;
 ```
 
 The interfaces above describe the bytecode fallback. Preparation roots the
@@ -193,7 +193,7 @@ If native continuation is unavailable or invalidated:
    can inspect or resume live dynamic state. Run handler search/signaling while
    the required context is live (or equivalently reified and rooted). Only a
    selected escaping transfer may retire frames. Do not reinterpret every
-   `TorclError` as an unconditional throw.
+   `EgclError` as an unconditional throw.
 3. **Cleanup executes exactly once and in order.** Preserve active handlers,
    catch/block/tag targets, special-binding depths and `UNWIND-PROTECT` actions.
    Handlers live at segment entry may have been established by the interpreter
@@ -219,7 +219,7 @@ If native continuation is unavailable or invalidated:
 6. **Handle resource exhaustion.** Stack guards need enough reserved space to
    publish the failure and reach the landing continuation. OOM must not require
    another successful allocation to begin unwinding. Reuse
-   `torcl_stdlib::acquire_preallocated_storage_condition()` for the condition;
+   `egcl_stdlib::acquire_preallocated_storage_condition()` for the condition;
    reserve cursor/capture storage separately, since a preallocated condition
    alone does not supply unwind metadata storage. Test failed preparation,
    not only successful reconstruction.
@@ -239,7 +239,7 @@ version or another architecture are conservatively kept on the checked/fallback
 path until an explicit bridge is implemented.
 
 The segment ABI can now be exercised for ordinary native invocations with
-`TORCL_NATIVE_TRANSFER=1`. Eligible bytecode bodies are compiled into a
+`EGCL_NATIVE_TRANSFER=1`. Eligible bytecode bodies are compiled into a
 thread-local transfer-code cache and entered through `invoke_native_segment`;
 unsupported bodies, platforms, or hardening states fall back to the legacy
 checked entry. This rollout switch remains opt-in while native Windows gates and
@@ -372,13 +372,13 @@ The rollout gate requires:
   relocation: retain a raw copy of a rooted heap value before the allocation
   under test, require the rooted value to change address, then check its content
   and aliases. Never dereference the stale copy. Run with GC poison and use
-  `TORCL_GC_REGION_LOG=1` as supporting evidence; a clean stress run alone does
+  `EGCL_GC_REGION_LOG=1` as supporting evidence; a clean stress run alone does
   not prove movement. Test zero, one and several values across cleanup.
 * Run workspace gates and record unrelated baseline failures explicitly.
 
 The checked-in [native-transfer benchmark report](../../benchmarks/sample-report/index.html)
 contains the current five-sample T2/instruction measurements, SBCL comparison,
-and a same-protocol TorCL comparison against baseline commit `737be001`.
+and a same-protocol EGCL comparison against baseline commit `737be001`.
 `2c84d2e1` remains the counted pending-error fast-path baseline for the ABI
 design, while `737be001` is the executable baseline recorded by the report.
 The recorded baseline/current binary hashes and raw JSON are part of the report
@@ -392,8 +392,8 @@ zero overhead for signal polling, or change the Fibonacci algorithm.
 ## Segment boundary implementation checkpoint
 
 The runtime provides x86-64 Linux SysV and Windows Win64 segment adapters in
-`crates/torcl-rt/src/native_transfer.rs` and its `win64` module. The Rust wrapper pins the anchor,
-records execution ownership and TorclStack watermarks, and restores the previous
+`crates/egcl-rt/src/native_transfer.rs` and its `win64` module. The Rust wrapper pins the anchor,
+records execution ownership and EgclStack watermarks, and restores the previous
 anchor with a Rust guard. The private assembly entry uses the explicit outcome
 out parameter above; the Rust wrapper returns `Result<NativeOutcome,
 SegmentUnavailable>`. Normal return, transfer and deopt exits restore the six
@@ -418,17 +418,17 @@ epilogue stack adjustment. A backtrace probe crosses it from a Rust helper
 through an assembly fixture that clobbers all six nonvolatile integer registers.
 This proves stack walking through the adapter; emitted JIT frames still need
 their own metadata, and it does not authorize Rust panic unwinding across the
-native ABI. Separate probes cause real null-page and TorclStack guard faults,
+native ABI. Separate probes cause real null-page and EgclStack guard faults,
 then use the existing signal recovery targets to return through a Rust helper
 and the segment landing. They verify fault classification, destructor execution,
-unchanged TorclStack watermarks and restoration of enclosing recovery targets.
+unchanged EgclStack watermarks and restoration of enclosing recovery targets.
 
 This is boundary infrastructure, not activation: generated Lisp calls
 still use the existing ABI and successful-return checks. Transfer payload
 rooting, cleanup/root retirement, native dispatch, actual JIT integration of the
 fault-recovery/unwind gates, fiber migration and native-Windows execution gates remain
 required before rollout. The
-adapter records TorclStack watermarks but does not restore them itself.
+adapter records EgclStack watermarks but does not restore them itself.
 
 ### Generated helper outcome adapter
 
@@ -446,7 +446,7 @@ Rust destructor execution, and whether the caller's success continuation ran.
 Run the capability-dependent execution gate explicitly:
 
 ```text
-cargo test -p torcl-compiler --test native_helper_veneer -- --include-ignored --nocapture
+cargo test -p egcl-compiler --test native_helper_veneer -- --include-ignored --nocapture
 ```
 
 This is an adapter primitive, not production installation or a Lisp unwind
@@ -477,7 +477,7 @@ roots, payload identity and both Rust destructor counts. It covers Transfer and
 Deopt outcomes, including GC stress/poison, with the explicit gate:
 
 ```text
-cargo test -p torcl-compiler --test native_capture_sysv -- --include-ignored
+cargo test -p egcl-compiler --test native_capture_sysv -- --include-ignored
 ```
 
 The fixture uses checked `SysvCaptureLocation` recipes for preserved registers
@@ -535,7 +535,7 @@ rooted argument slices, preserved logical locals/stack, exact second-call recove
 normal results distinct from the original argument, and Rust destructor counts:
 
 ```text
-cargo test -p torcl-compiler --test native_invoke_emit -- --include-ignored
+cargo test -p egcl-compiler --test native_invoke_emit -- --include-ignored
 ```
 
 Actual Lisp-source lowering also reaches this emitter in the CLI unit gate.
@@ -561,10 +561,10 @@ capability gate compiles a caller from Lisp source, emits both Invoke sites,
 executes those sites through the real bridge, and captures the second call on
 error. It checks relocated locals/operands, multiple values, normal Rust drops,
 and side effects/UNWIND-PROTECT cleanup occurring exactly once. All three tests
-also run with `TORCL_GC_STRESS=1 TORCL_GC_POISON=1`:
+also run with `EGCL_GC_STRESS=1 EGCL_GC_POISON=1`:
 
 ```text
-cargo test -p torcl --lib native_v2_bridge -- --include-ignored
+cargo test -p egcl --lib native_v2_bridge -- --include-ignored
 ```
 
 This is still an opt-in integration test. The callee cleanup runs through the
@@ -684,7 +684,7 @@ all six updated nonvolatile registers, stack-slot preservation, aligned calls
 from the landing pad, and return through the original native frame and segment.
 It exercises 0/16/32/64-byte temporary call areas, forces moving GC in the helper
 and preparation, and dereferences relocated register/stack pointers after landing.
-Run this capability gate explicitly with `cargo test -p torcl-compiler --test
+Run this capability gate explicitly with `cargo test -p egcl-compiler --test
 native_landing_sysv -- --include-ignored`.
 
 The opt-in Lisp transfer entry now selects this adapter for supported throws.
@@ -775,7 +775,7 @@ the remaining ABI activation gates.
 
 ### Selecting the next native unwind action
 
-`torcl-compiler::native_unwind` selects the next logical action from one retained
+`egcl-compiler::native_unwind` selects the next logical action from one retained
 activation's ordered scope map (`bliss-shih7.12.5`). The runtime resolves a live
 destination first; the selector neither signals conditions nor searches Lisp
 names. A local target is identified by its establishing bytecode PC within that
@@ -932,8 +932,8 @@ them with `--include-ignored` makes unknown or incompatible mitigation state a
 failure, not a successful no-op. On native Windows, the release gate must run:
 
 ```text
-cargo test -p torcl-rt --target x86_64-pc-windows-msvc --lib native_transfer -- --include-ignored --nocapture
-cargo test -p torcl-rt --target x86_64-pc-windows-msvc --test native_segment_windows -- --include-ignored --nocapture
+cargo test -p egcl-rt --target x86_64-pc-windows-msvc --lib native_transfer -- --include-ignored --nocapture
+cargo test -p egcl-rt --target x86_64-pc-windows-msvc --test native_segment_windows -- --include-ignored --nocapture
 ```
 
 Report machine execution, refusal behavior, ignored tests and metadata checks
@@ -958,10 +958,10 @@ separate from native Windows SEH and mitigation evidence.
 
 ## Baseline contract oracles and boundary inventory
 
-`crates/torcl/tests/native_transfer_cli.rs` verifies real T1/T2 entries, direct
+`crates/egcl/tests/native_transfer_cli.rs` verifies real T1/T2 entries, direct
 calls, OSR, escaping side effects, multiple values, fiber yields and native
 reentry through resumable restarts and replacing cleanup transfers. The shared
-`crates/torcl/tests/fixtures/native-transfer-osr.lisp` is also consumed by
+`crates/egcl/tests/fixtures/native-transfer-osr.lisp` is also consumed by
 `scripts/s390x-jit-smoke.py`: expired catch, unwinding GO, and outer GO run with
 OSR traps and GC stress. Extend these oracles rather than duplicating them.
 
@@ -981,10 +981,10 @@ The following existing sites must be covered when installing the segment ABI:
 
 The ppc64le backend already has native T1/T2 compilation and ELFv2 foreign-call
 support. The first ELFv2 segment slice is implemented in
-`crates/torcl-rt/src/native_transfer/ppc64le.S`: its QEMU probe covers normal
+`crates/egcl-rt/src/native_transfer/ppc64le.S`: its QEMU probe covers normal
 return, direct transfer landing, anchor cleanup, and ELFv2 nonvolatile state.
 The CLI also has a narrow opt-in PPC64LE entry in
-`crates/torcl/src/cli/bytecode/native_transfer_entry_ppc64le.rs`; it enters the
+`crates/egcl/src/cli/bytecode/native_transfer_entry_ppc64le.rs`; it enters the
 real segment for deopt-free bodies with no calls or protected scopes and falls
 back to the checked ABI otherwise. Full PPC deoptimization and fault-recovery
 metadata, native handlers,
@@ -993,9 +993,9 @@ cleanup capture, loop polling and local-exit admission remain open under
 remain in the final portability audit.
 
 The AArch64 runtime now has the corresponding AAPCS64 segment enter/leave
-boundary in `crates/torcl-rt/src/native_transfer/aarch64.rs`, with a QEMU probe
+boundary in `crates/egcl-rt/src/native_transfer/aarch64.rs`, with a QEMU probe
 covering normal return, direct transfer, anchor cleanup and host-stack
-restoration. The CLI has a narrow `TORCL_NATIVE_TRANSFER=1` entry for constant
+restoration. The CLI has a narrow `EGCL_NATIVE_TRANSFER=1` entry for constant
 and identity T2 bodies: it supplies the nonallocating multiple-values adapter,
 publishes the active environment, and falls back before any Lisp call,
 deoptimization, handler, cleanup, or loop-polling operation. This does not
@@ -1004,9 +1004,9 @@ metadata, fault recovery, handlers and cleanup capture remain target-specific
 gates.
 
 The s390x runtime now has the corresponding ELF64 segment enter/leave boundary
-in `crates/torcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering
+in `crates/egcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering
 normal return, direct transfer, anchor cleanup and host-stack restoration. The
-CLI now has the same narrow `TORCL_NATIVE_TRANSFER=1` entry for constant and
+CLI now has the same narrow `EGCL_NATIVE_TRANSFER=1` entry for constant and
 identity T2 bodies, using the nonallocating multiple-values adapter and
 falling back before calls, deoptimization, handlers, cleanup, or loop polling.
 General s390x activation remains gated on generated entry admission,
@@ -1151,10 +1151,10 @@ does not enable emission of currently unsupported protected forms.
 The supported-host compiler and transfer integration gates currently pass:
 
 ```text
-cargo test --locked -p torcl-compiler --lib                 153 passed
-cargo test --locked -p torcl-compiler --test native_poll_abi 2 passed
-cargo test --locked -p torcl --test native_transfer_cli     9 passed
-cargo test --locked -p torcl --lib native_v2_ -- --ignored 18 passed
+cargo test --locked -p egcl-compiler --lib                 153 passed
+cargo test --locked -p egcl-compiler --test native_poll_abi 2 passed
+cargo test --locked -p egcl --test native_transfer_cli     9 passed
+cargo test --locked -p egcl --lib native_v2_ -- --ignored 18 passed
 ```
 
 The native segment emitter passes a zero `c2i_transfer_pending` address. Its
@@ -1169,12 +1169,12 @@ T2 OSR segment entry now includes a regression for a call-free loop whose
 back-edge executes the poll veneer. The emitter treats the injected poll as a
 real Rust call when selecting its prologue, so the veneer enters Rust with the
 required SysV stack alignment; the test passes normally and under
-`TORCL_GC_STRESS=1 TORCL_GC_POISON=1`. The earlier crash in
+`EGCL_GC_STRESS=1 EGCL_GC_POISON=1`. The earlier crash in
 `revalidate_current_segment` was an unaligned call frame, not a reason to keep
 all OSR bodies on the checked ABI.
 
 The process-level opt-in smoke also passes with forced moving GC and poison:
-`TORCL_GC_STRESS=1 TORCL_GC_POISON=1 TORCL_NATIVE_TRANSFER=1` on a basic
+`EGCL_GC_STRESS=1 EGCL_GC_POISON=1 EGCL_NATIVE_TRANSFER=1` on a basic
 `--no-init --eval` form. This specifically covers the bootstrap activation gate
 that prevents the segment cache from running before `BOOT_COMPLETE`.
 

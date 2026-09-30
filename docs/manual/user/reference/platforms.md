@@ -11,7 +11,7 @@ Tiers are defined in [How Lisp runs](../explanation/execution.md).
 | Linux AArch64 | T1 for supported opcode shapes; no AArch64 T2 backend | Fedora target RPM; baseline backend is under development |
 | Linux ppc64le | T1 and T2 for supported shapes | Fedora target RPM; QEMU image and GC stress checks |
 | Windows x86-64 | T1 and T2 for supported shapes | Target RPM runs via Wine; native OS validation remains distinct |
-| Android ARM64 CLI | Static runtime; current source includes partial AArch64 T1 | `torcl-android`; QEMU image checks |
+| Android ARM64 CLI | Static runtime; current source includes partial AArch64 T1 | `egcl-android`; QEMU image checks |
 | Android ARM64 APK | Dynamic NativeActivity runtime | EGL demo checked on an ARM64 phone |
 | Android x86-64 APK | Dynamic NativeActivity runtime | APK and native-library checks; emulator execution not yet verified |
 
@@ -24,13 +24,13 @@ foreign-callback implementations. This is not full architecture parity.
 
 | Package | Command | Host execution |
 | --- | --- | --- |
-| `torcl` | `torcl` | Native x86-64 |
-| `torcl-target-s390x-linux` | `torcl-s390x-linux` | QEMU s390x |
-| `torcl-target-aarch64-linux` | `torcl-aarch64-linux` | QEMU AArch64 |
-| `torcl-target-ppc64le-linux` | `torcl-ppc64le-linux` | QEMU little-endian POWER |
-| `torcl-target-windows` | `torcl-windows` | Wine |
-| `torcl-target-android` | `torcl-android` | QEMU ARM64 CLI |
-| `torcl-target-android` | `torcl-android-new` | Native Python project generator |
+| `egcl` | `egcl` | Native x86-64 |
+| `egcl-target-s390x-linux` | `egcl-s390x-linux` | QEMU s390x |
+| `egcl-target-aarch64-linux` | `egcl-aarch64-linux` | QEMU AArch64 |
+| `egcl-target-ppc64le-linux` | `egcl-ppc64le-linux` | QEMU little-endian POWER |
+| `egcl-target-windows` | `egcl-windows` | Wine |
+| `egcl-target-android` | `egcl-android` | QEMU ARM64 CLI |
+| `egcl-target-android` | `egcl-android-new` | Native Python project generator |
 
 The initial RPM baseline is Fedora 44. Target packages require the exact
 version and release of the base package. The Android APK libraries target API

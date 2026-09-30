@@ -110,7 +110,7 @@ pub struct MachBlock {
 | Stack alignment | 16-byte before `CALL` |
 | Red zone | MUST NOT be used (signal handlers / GC may clobber) |
 
-**TorCL-internal convention (x86-64):**
+**EGCL-internal convention (x86-64):**
 
 | Aspect | Register |
 |--------|----------|
@@ -129,7 +129,7 @@ its allocatable pool. [S6]
 **Why `R13`** (ABI audit, `bliss-q861`, 2026-09-26). The choice is settled by
 fiber switching, not by instruction cost:
 
-- The fiber context switch (`torcl-rt/src/context.rs`) already saves and
+- The fiber context switch (`egcl-rt/src/context.rs`) already saves and
   restores the callee-saved set — `rbp rbx r12 r13 r14 r15` — on each fiber's
   own stack. A context pointer in `R13` therefore **travels with the fiber for
   free**: it is saved when the fiber swaps out and restored when it resumes,
@@ -168,7 +168,7 @@ SSE2 scalar: `ADDSD/SUBSD/MULSD/DIVSD/UCOMISD` (double),
 `UCOMISD` sets PF+ZF — backend MUST check both for CL `=` semantics.
 MXCSR FTZ/DAZ MUST NOT be set (ANSI CL requires valid denormals).
 
-**SSE4.1 instructions (when `TORCL_ENABLE_SSE41 ≠ off`):**
+**SSE4.1 instructions (when `EGCL_ENABLE_SSE41 ≠ off`):**
 
 | Instruction | CL Use | Notes |
 |-------------|--------|-------|
@@ -214,7 +214,7 @@ the rounding mode for subsequent FP instructions.
 | Link register | `X30` (saved by callee) |
 | Stack alignment | 16-byte at all times |
 
-**TorCL-internal (AArch64):** Closure=`X20`, argc=`X2`, args=`X0,X1,X3,X4`,
+**EGCL-internal (AArch64):** Closure=`X20`, argc=`X2`, args=`X0,X1,X3,X4`,
 return=`X0`. The dedicated execution-context register follows §2.3.1;
 the execution-context register is `X21`, confirmed by the same audit
 (`bliss-q861`): it matches SBCL's arm64 thread register and is not otherwise
@@ -370,7 +370,7 @@ fixnums, floats, and raw pointers are excluded.
 
 **Current x86-64 T2 boundary form:** the framed emitter realizes the same map
 contract by synchronizing exact live tagged VRegs into dedicated tagged shadow
-slots appended to the owning `TorclStack` activation immediately before every
+slots appended to the owning `EgclStack` activation immediately before every
 runtime call. Unused shadow slots are cleared to `NIL`; after the call, possibly
 relocated values are restored to their allocated GPR or native spill homes.
 This makes moving-GC updates explicit without asynchronously inspecting a host
@@ -390,7 +390,7 @@ safepoint. Failures abort installation with `compiler-bug` condition.
 
 ## 4.7.10 Unwind Information
 
-TorCL emits DWARF `.eh_frame`-compatible unwind information for every
+EGCL emits DWARF `.eh_frame`-compatible unwind information for every
 installed function. This enables: (1) debugger stack walks (§6),
 (2) condition/restart stack unwinding (§5), and (3) OS signal-handler
 cooperation (recovering from SIGSEGV/SIGFPE at safepoints).
@@ -399,7 +399,7 @@ cooperation (recovering from SIGSEGV/SIGFPE at safepoints).
 pub struct UnwindInfo {
     pub format: UnwindFormat,
     pub fde_bytes: Vec<u8>,           // Frame Description Entry, DWARF .eh_frame
-    pub personality: Option<*const u8>, // pointer to TorCL personality routine
+    pub personality: Option<*const u8>, // pointer to EGCL personality routine
     pub lsda: Option<Vec<u8>>,        // Language-Specific Data Area for condition handlers
 }
 
@@ -427,8 +427,8 @@ the runtime's `.eh_frame` table. On Linux/macOS this uses
 registers `RUNTIME_FUNCTION` entries. Deregistration occurs when the
 enclosing `CodeRegion` transitions to `Dead`.
 
-**Personality routine:** TorCL installs a custom DWARF personality routine
-(`torcl_personality`) that cooperates with the CL condition system (§5).
+**Personality routine:** EGCL installs a custom DWARF personality routine
+(`egcl_personality`) that cooperates with the CL condition system (§5).
 It reads the LSDA to determine active `HANDLER-BIND`/`HANDLER-CASE`
 frames and routes conditions to the appropriate restart.
 
@@ -497,13 +497,13 @@ the entire region is dead.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TORCL_CODE_REGION_SIZE` | `2097152` | Code region size (bytes) |
-| `TORCL_MAX_CODE_REGIONS` | `1024` | Max live code regions |
-| `TORCL_SPILL_WEIGHT_LOOP_FACTOR` | `10.0` | Loop-depth spill weight base |
-| `TORCL_ENABLE_AVX2` | `auto` | `auto` / `on` / `off` |
-| `TORCL_ENABLE_SSE41` | `auto` | `auto` / `on` / `off` |
-| `TORCL_ENABLE_SVE` | `auto` | `auto` / `on` / `off` |
-| `TORCL_IC_MAX_ENTRIES` | `8` | Polymorphic IC → megamorphic threshold |
+| `EGCL_CODE_REGION_SIZE` | `2097152` | Code region size (bytes) |
+| `EGCL_MAX_CODE_REGIONS` | `1024` | Max live code regions |
+| `EGCL_SPILL_WEIGHT_LOOP_FACTOR` | `10.0` | Loop-depth spill weight base |
+| `EGCL_ENABLE_AVX2` | `auto` | `auto` / `on` / `off` |
+| `EGCL_ENABLE_SSE41` | `auto` | `auto` / `on` / `off` |
+| `EGCL_ENABLE_SVE` | `auto` | `auto` / `on` / `off` |
+| `EGCL_IC_MAX_ENTRIES` | `8` | Polymorphic IC → megamorphic threshold |
 
 ---
 
@@ -512,7 +512,7 @@ the entire region is dead.
 | Category | Method |
 |----------|--------|
 | Instruction selection | Compile IR patterns → disassemble → assert opcodes |
-| ABI compliance | Rust↔TorCL cross-calls with varied signatures, both platforms |
+| ABI compliance | Rust↔EGCL cross-calls with varied signatures, both platforms |
 | Register allocation | Synthetic IR with forced splits; verify move resolution |
 | Patching atomicity | Concurrent reader/writer stress test on patched loop body |
 | GC stack maps | Force GC at every safepoint; verify all live objects traced |

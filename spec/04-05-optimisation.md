@@ -102,7 +102,7 @@ schedule (DCE cleans stragglers).
 
 ### 4.5.3.1 CL Type Lattice — D4.08
 
-TorCL models CL types as a bounded lattice used for forward data-flow
+EGCL models CL types as a bounded lattice used for forward data-flow
 analysis on the SSA graph.
 
 ```text
@@ -246,10 +246,10 @@ A4.09 — Inlining Decision
 
 | Parameter | Default | Configurable | Description |
 |-----------|---------|-------------|-------------|
-| `SMALL_THRESHOLD` | 30 IR nodes | Yes (`torcl.opt.inline.small`) | Functions at or below this size are always inlined (unless `notinline`) |
-| `MAX_INLINE_DEPTH` | 6 | Yes (`torcl.opt.inline.depth`) | Maximum nesting depth of inlined calls |
-| `NODE_BUDGET` | 10 000 IR nodes | Yes (`torcl.opt.inline.budget`) | Total IR growth budget per compilation unit |
-| `HOT_THRESHOLD` | 80% | Yes (`torcl.opt.inline.hot-pct`) | Minimum executions of the call site per 100 caller invocations; loops may exceed 100% |
+| `SMALL_THRESHOLD` | 30 IR nodes | Yes (`egcl.opt.inline.small`) | Functions at or below this size are always inlined (unless `notinline`) |
+| `MAX_INLINE_DEPTH` | 6 | Yes (`egcl.opt.inline.depth`) | Maximum nesting depth of inlined calls |
+| `NODE_BUDGET` | 10 000 IR nodes | Yes (`egcl.opt.inline.budget`) | Total IR growth budget per compilation unit |
+| `HOT_THRESHOLD` | 80% | Yes (`egcl.opt.inline.hot-pct`) | Minimum executions of the call site per 100 caller invocations; loops may exceed 100% |
 
 The numerator and denominator MUST cover the same profiling window. T0 records
 both while interpreting saved bytecode bodies; T1 continues both counters, with
@@ -400,7 +400,7 @@ Algorithm: DCE(IR)
 
 **CL-specific concern:** A call to a user-defined function MUST be
 classified as `SideEffecting` unless the function is declared `pure`
-(a TorCL extension, §9) or the compiler can prove the function body
+(a EGCL extension, §9) or the compiler can prove the function body
 is free of side effects via inlining and analysis.
 
 ---
@@ -463,7 +463,7 @@ Constant folding MUST NOT:
 - Fold `(coerce x 'single-float)` when `x` is a ratio that would
   lose precision — the semantics require runtime conversion.
 - Evaluate calls to user-defined functions at compile time unless they
-  are declared `foldable` (TorCL extension, §9).
+  are declared `foldable` (EGCL extension, §9).
 
 ---
 
@@ -513,14 +513,14 @@ Per-function IR graphs are thread-local during optimisation.
 
 | Knob | Default | Env / Option | Effect |
 |------|---------|-------------|--------|
-| `torcl.opt.level` | `2` | `TORCL_OPT_LEVEL` | 0 = no opts, 1 = fold + DCE only, 2 = full pipeline, 3 = aggressive (larger inline budgets) |
-| `torcl.opt.inline.small` | `30` | — | Small-function threshold (IR nodes) |
-| `torcl.opt.inline.depth` | `6` | — | Max inline depth |
-| `torcl.opt.inline.budget` | `10000` | — | Total IR node budget |
-| `torcl.opt.inline.hot-pct` | `80` | — | Minimum call-site executions per 100 caller invocations |
-| `torcl.opt.escape.stack-max` | `256` | — | Max bytes for stack allocation |
-| `torcl.opt.licm.enable` | `true` | — | Enable/disable LICM |
-| `torcl.opt.type-union-cap` | `64` | — | Max union elements before widening to ⊤ |
+| `egcl.opt.level` | `2` | `EGCL_OPT_LEVEL` | 0 = no opts, 1 = fold + DCE only, 2 = full pipeline, 3 = aggressive (larger inline budgets) |
+| `egcl.opt.inline.small` | `30` | — | Small-function threshold (IR nodes) |
+| `egcl.opt.inline.depth` | `6` | — | Max inline depth |
+| `egcl.opt.inline.budget` | `10000` | — | Total IR node budget |
+| `egcl.opt.inline.hot-pct` | `80` | — | Minimum call-site executions per 100 caller invocations |
+| `egcl.opt.escape.stack-max` | `256` | — | Max bytes for stack allocation |
+| `egcl.opt.licm.enable` | `true` | — | Enable/disable LICM |
+| `egcl.opt.type-union-cap` | `64` | — | Max union elements before widening to ⊤ |
 
 ---
 

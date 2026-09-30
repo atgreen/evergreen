@@ -27,7 +27,7 @@ jobs:
       - name: gc-root-lint (bliss-jaf — new unrooted-across-alloc candidates fail)
         run: bash scripts/gc-root-lint.sh
       - name: ansi-test
-        run: cargo test -p torcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts
+        run: cargo test -p egcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts
 
   # The Linux build can only cross-compile the Win64 adapter.  Keep a native
   # Windows gate for the SEH/shadow-space transition itself; mitigation refusal
@@ -40,8 +40,8 @@ jobs:
       - name: cargo check (Windows workspace)
         run: cargo check --workspace
       - name: Win64 segment ABI execution
-        run: cargo test -p torcl-rt --test native_segment_windows -- --include-ignored --nocapture
+        run: cargo test -p egcl-rt --test native_segment_windows -- --include-ignored --nocapture
       - name: Win64 runtime adapter probes
-        run: cargo test -p torcl-rt --lib native_transfer -- --include-ignored --nocapture
+        run: cargo test -p egcl-rt --lib native_transfer -- --include-ignored --nocapture
       - name: Win64 runtime transfer regressions
-        run: cargo test -p torcl --test native_transfer_cli --test tier_observability
+        run: cargo test -p egcl --test native_transfer_cli --test tier_observability

@@ -1,20 +1,20 @@
 # Fedora RPMs and cross image-dumping tools
 
-This experimental packaging path builds native x86-64 Fedora TorCL and five
+This experimental packaging path builds native x86-64 Fedora EGCL and five
 optional target packages. Both building and using them are container-free.
 It produces local binary RPMs; it is not yet a Fedora-reviewed source RPM.
 The initial build baseline is Fedora 44 and Rust 1.94.1.
 
 | Package | Command | Application target | Host runner |
 | --- | --- | --- | --- |
-| `torcl` | `torcl` | Fedora x86-64, glibc | Native |
-| `torcl-target-s390x-linux` | `torcl-s390x-linux` | Fedora s390x | QEMU |
-| `torcl-target-aarch64-linux` | `torcl-aarch64-linux` | Fedora AArch64 | QEMU |
-| `torcl-target-ppc64le-linux` | `torcl-ppc64le-linux` | Fedora ppc64le (little-endian POWER) | QEMU |
-| `torcl-target-windows` | `torcl-windows` | Windows x86-64 | Wine |
-| `torcl-target-android` | `torcl-android`, `torcl-android-new` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
+| `egcl` | `egcl` | Fedora x86-64, glibc | Native |
+| `egcl-target-s390x-linux` | `egcl-s390x-linux` | Fedora s390x | QEMU |
+| `egcl-target-aarch64-linux` | `egcl-aarch64-linux` | Fedora AArch64 | QEMU |
+| `egcl-target-ppc64le-linux` | `egcl-ppc64le-linux` | Fedora ppc64le (little-endian POWER) | QEMU |
+| `egcl-target-windows` | `egcl-windows` | Windows x86-64 | Wine |
+| `egcl-target-android` | `egcl-android`, `egcl-android-new` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
 
-Each command-line runtime has ASDF preloaded. Target tools accept the normal TorCL arguments;
+Each command-line runtime has ASDF preloaded. Target tools accept the normal EGCL arguments;
 they execute the target runtime on the Fedora host, where it can load an
 application and dump an executable for its own architecture. They do not
 translate an existing x86-64 heap image into another platform's image.
@@ -43,26 +43,26 @@ Use `ANDROID_NDK_HOME` to supply an existing NDK and avoid that download; pass t
 same directory to `build.py --android-ndk`.
 
 The build uses ordinary `cargo`, native MinGW, Fedora cross-GCC and the NDK.
-The native RPM includes the `JAVA` and `TORCL-JVM` APIs as the ASDF system
-`torcl-jvm`, and `/usr/lib64/torcl/libtorcl_jvm.so` with its Java helper classes
+The native RPM includes the `JAVA` and `EGCL-JVM` APIs as the ASDF system
+`egcl-jvm`, and `/usr/lib64/egcl/libegcl_jvm.so` with its Java helper classes
 embedded. `%build` compiles this bridge from source using a JDK (17+) and builds
 the HTML manual with MkDocs. Installed users need only a Java runtime; starting
 the JVM never invokes a compiler. Load it from any directory:
 
 ```lisp
-(asdf:load-system :torcl-jvm)
+(asdf:load-system :egcl-jvm)
 (defparameter *jvm* (java:start-jvm))
 (java:static "java.lang.Integer" "parseInt" "42")
 (java:stop-jvm *jvm*)
 ```
 
-The manual is RPM documentation at `/usr/share/doc/torcl/manual/index.html`.
+The manual is RPM documentation at `/usr/share/doc/egcl/manual/index.html`.
 It includes local assets and explicit HTML links for browsing without a server.
 Java integration is for the native glibc binary, not the cross-target runtimes.
 
 The Android app libraries are compiled by the spec's `%build`, from a source
 archive with locked, vendored Cargo dependencies (`--offline`). The local builder
-sets `torcl_rustup=1` because Rust is installed through rustup; direct rpmbuild
+sets `egcl_rustup=1` because Rust is installed through rustup; direct rpmbuild
 otherwise requires Fedora's `cargo` package. Pass the absolute NDK directory as
 `--define 'android_ndk /path/to/android-ndk-r27d'`. Both Android Rust targets must
 already be installed. This does not yet convert the other prebuilt CLI payloads
@@ -72,9 +72,9 @@ extraction are disabled because modifying an executable after dumping can
 remove its appended image. Cross ELF files are excluded from host dependency
 and provides generation. The native binary retains automatic ELF dependencies.
 
-Builds and image probes run through `scripts/torcl-limited.sh`; a working user
-systemd session is required. `CARGO_BUILD_JOBS`, `TORCL_MEM_MAX`, and
-`TORCL_TIMEOUT` control resource limits. The builder does not use PGO.
+Builds and image probes run through `scripts/egcl-limited.sh`; a working user
+systemd session is required. `CARGO_BUILD_JOBS`, `EGCL_MEM_MAX`, and
+`EGCL_TIMEOUT` control resource limits. The builder does not use PGO.
 
 RPMs appear in `target/fedora-rpm/RPMS/x86_64/`. The builder checks each staged
 runtime, packages it, extracts the RPMs, compares payload bytes, then repeats
@@ -90,23 +90,23 @@ Install matching releases of the native package and whichever target packages
 you need. After building release 5, for example:
 
 ```sh
-sudo dnf install target/fedora-rpm/RPMS/x86_64/torcl-0.1.0-5.fc44.x86_64.rpm \
-    target/fedora-rpm/RPMS/x86_64/torcl-target-android-0.1.0-5.fc44.x86_64.rpm
+sudo dnf install target/fedora-rpm/RPMS/x86_64/egcl-0.1.0-5.fc44.x86_64.rpm \
+    target/fedora-rpm/RPMS/x86_64/egcl-target-android-0.1.0-5.fc44.x86_64.rpm
 ```
 
 For example, put this in `build.lisp` after your application's loading code:
 
 ```lisp
-(defun main () (format t "Hello from TorCL!~%"))
+(defun main () (format t "Hello from EGCL!~%"))
 (save-lisp-and-die "hello" :executable t :toplevel #'main)
 ```
 
-Then run `torcl-s390x-linux --no-init --load build.lisp` to produce an s390x
-executable. Use `torcl-aarch64-linux`, `torcl-windows`, or `torcl-android` for
+Then run `egcl-s390x-linux --no-init --load build.lisp` to produce an s390x
+executable. Use `egcl-aarch64-linux`, `egcl-windows`, or `egcl-android` for
 the other targets. Give Windows outputs an `.exe` suffix. Relative filenames
 and forward slashes work conveniently under Wine.
 
-The output includes TorCL and the saved application. QEMU/Wine are needed only
+The output includes EGCL and the saved application. QEMU/Wine are needed only
 on the build host, not on the target. Linux applications still require compatible
 glibc and libgcc on the deployment system: a Fedora 44 build is not a promise of
 compatibility with older RHEL, Ubuntu, or SUSE releases. Android uses static
@@ -116,14 +116,14 @@ must follow Android's executable-file and application sandbox rules.
 
 ## Android application projects
 
-The same Android RPM includes reusable `libtorcl_android.so` libraries for both
+The same Android RPM includes reusable `libegcl_android.so` libraries for both
 `aarch64-linux-android` (`arm64-v8a`) and `x86_64-linux-android` (`x86_64`), plus
-`torcl-android-new`. These libraries support Android's dynamic FFI and load the
+`egcl-android-new`. These libraries support Android's dynamic FFI and load the
 application's Lisp from APK assets. App builds require the Android SDK, a JDK,
-Python 3 and Make; no TorCL source checkout, Rust, NDK or containers are needed.
+Python 3 and Make; no EGCL source checkout, Rust, NDK or containers are needed.
 
 ```sh
-torcl-android-new hello --package org.example.hello --template egl \
+egcl-android-new hello --package org.example.hello --template egl \
     --host=aarch64-linux-android
 cd hello
 export ANDROID_HOME=/path/to/android-sdk
@@ -158,19 +158,19 @@ Saved-image APK payloads are not supported yet. The app libraries have checked
 16 KiB ELF LOAD and RELRO alignment; APKs use extracted, compressed libraries.
 Actual execution on a 16 KiB device still needs device validation.
 
-The Windows launcher uses `$XDG_DATA_HOME/torcl/wine` (default
-`~/.local/share/torcl/wine`) unless `WINEPREFIX` is explicitly supplied. It does
+The Windows launcher uses `$XDG_DATA_HOME/egcl/wine` (default
+`~/.local/share/egcl/wine`) unless `WINEPREFIX` is explicitly supplied. It does
 not use the desktop's default Wine prefix. Target payloads live under
-`/usr/libexec/torcl`; `TORCL_CROSS_ROOT` overrides that directory for testing.
+`/usr/libexec/egcl`; `EGCL_CROSS_ROOT` overrides that directory for testing.
 
 ## Runtime libraries and validation limits
 
 The Linux target packages contain private copies of Fedora's glibc runtime
 and target libgcc, with license notices. They do not expose foreign ELF
 capabilities to the host package manager. Rebuild these packages when their
-bundled libraries receive updates. `/usr/share/doc/torcl/build.json` records the
+bundled libraries receive updates. `/usr/share/doc/egcl/build.json` records the
 source commit, Rust/NDK versions, input RPM filenames, and dumped runtime hashes.
-`/usr/libexec/torcl/android/runtime.json` records the app runtime API/version,
+`/usr/libexec/egcl/android/runtime.json` records the app runtime API/version,
 NDK, Android ABI mapping and hashes of the two shared libraries.
 
 The packaging checks establish emulated execution and image round trips, not

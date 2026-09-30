@@ -1,24 +1,24 @@
 # Threads and synchronization
 
-TorCL distinguishes native operating-system threads from the runtime's managed
-fibers. The interface documented here is `TORCL-THREAD`; managed executions
-use the separate [TORCL-FIBER API](fibers.md). The
+EGCL distinguishes native operating-system threads from the runtime's managed
+fibers. The interface documented here is `EGCL-THREAD`; managed executions
+use the separate [EGCL-FIBER API](fibers.md). The
 [Runtime fiber API](contributing/reference/fibers.md) documents the Rust layer.
 
 ## Native thread lifecycle
 
-### `torcl-thread:make-thread` { #make-thread }
+### `egcl-thread:make-thread` { #make-thread }
 
-**Function** `(torcl-thread:make-thread function &key name)` → thread handle
+**Function** `(egcl-thread:make-thread function &key name)` → thread handle
 
 Starts a dedicated native thread that calls `function` with no arguments.
 Accepts a callable function or a symbol naming a global function. `name` is a
 string or `nil`. Treat the returned handle as opaque; its current representation
 is not a portable application data format.
 
-### `torcl-thread:join-thread` { #join-thread }
+### `egcl-thread:join-thread` { #join-thread }
 
-**Function** `(torcl-thread:join-thread thread &key timeout)` → value, completed-p
+**Function** `(egcl-thread:join-thread thread &key timeout)` → value, completed-p
 
 Waits for completion and returns the worker's primary result and `t`.
 If the timeout expires, returns `nil, nil`. A worker that successfully returns
@@ -29,9 +29,9 @@ An invalid timeout signals a type error. Do not depend on repeated joins
 returning the same result; consume the worker's result once.
 
 ```lisp
-(let ((worker (torcl-thread:make-thread (lambda () (+ 20 22))
+(let ((worker (egcl-thread:make-thread (lambda () (+ 20 22))
                                         :name "answer")))
-  (multiple-value-list (torcl-thread:join-thread worker :timeout 10)))
+  (multiple-value-list (egcl-thread:join-thread worker :timeout 10)))
 ;; => (42 T)
 ```
 
@@ -40,11 +40,11 @@ returning the same result; consume the worker's result once.
 **Functions**
 
 ```lisp
-(torcl-thread:current-thread)
-(torcl-thread:thread-name thread)
-(torcl-thread:thread-alive-p thread)
-(torcl-thread:all-threads)
-(torcl-thread:thread-yield)
+(egcl-thread:current-thread)
+(egcl-thread:thread-name thread)
+(egcl-thread:thread-alive-p thread)
+(egcl-thread:all-threads)
+(egcl-thread:thread-yield)
 ```
 
 `current-thread` returns the calling native thread's handle. `all-threads`
@@ -56,10 +56,10 @@ a substitute for a synchronization protocol.
 
 ### Construction { #make-mutex }
 
-**Function** `(torcl-thread:make-mutex &key name recursive)` → mutex
+**Function** `(egcl-thread:make-mutex &key name recursive)` → mutex
 
-Creates a mutex, non-recursive by default. `torcl-thread:mutex-p` tests the
-object and `torcl-thread:mutex` is its Lisp type. Use a recursive mutex only
+Creates a mutex, non-recursive by default. `egcl-thread:mutex-p` tests the
+object and `egcl-thread:mutex` is its Lisp type. Use a recursive mutex only
 when the locking protocol explicitly requires repeated acquisition by its owner.
 
 ### Acquisition and release { #grab-mutex }
@@ -67,8 +67,8 @@ when the locking protocol explicitly requires repeated acquisition by its owner.
 **Functions**
 
 ```lisp
-(torcl-thread:grab-mutex mutex &key (waitp t) timeout)
-(torcl-thread:release-mutex mutex &key (if-not-owner :error))
+(egcl-thread:grab-mutex mutex &key (waitp t) timeout)
+(egcl-thread:release-mutex mutex &key (if-not-owner :error))
 ```
 
 Acquisition returns true on success and false when it cannot obtain the lock
@@ -79,17 +79,17 @@ Release normally requires ownership. `:if-not-owner` accepts `:error`, `:warn`,
 or `:ignore`; it does not grant a different execution the right to unlock the
 owner's mutex. Release returns `nil`.
 
-### `torcl-thread:with-mutex` { #with-mutex }
+### `egcl-thread:with-mutex` { #with-mutex }
 
-**Macro** `(torcl-thread:with-mutex (mutex &key (waitp t) timeout) body...)`
+**Macro** `(egcl-thread:with-mutex (mutex &key (waitp t) timeout) body...)`
 
 Runs the body only if the mutex was acquired. Releases it on ordinary return or
 nonlocal exit, and preserves the body's values. Returns `nil` without running
 the body if acquisition fails.
 
 ```lisp
-(let ((lock (torcl-thread:make-mutex :name "state")))
-  (torcl-thread:with-mutex (lock)
+(let ((lock (egcl-thread:make-mutex :name "state")))
+  (egcl-thread:with-mutex (lock)
     (values 40 2)))
 ;; => 40, 2
 ```
@@ -105,9 +105,9 @@ runtime state rather than assuming locks survive an image boundary.
 **Functions**
 
 ```lisp
-(torcl-thread:make-condition-variable &key name)
-(torcl-thread:condition-variable-p object)
-(torcl-thread:condition-wait condition-variable mutex &key timeout)
+(egcl-thread:make-condition-variable &key name)
+(egcl-thread:condition-variable-p object)
+(egcl-thread:condition-wait condition-variable mutex &key timeout)
 ```
 
 Wait while holding the associated mutex. Waiting releases the mutex while the
@@ -120,8 +120,8 @@ must examine the shared state under the lock.
 **Functions**
 
 ```lisp
-(torcl-thread:condition-notify condition-variable &optional (count 1))
-(torcl-thread:condition-broadcast condition-variable)
+(egcl-thread:condition-notify condition-variable &optional (count 1))
+(egcl-thread:condition-broadcast condition-variable)
 ```
 
 `condition-notify` requests wakeup of up to `count` waiters; the count is a

@@ -1,18 +1,18 @@
 ;;;; Dependency-free PGO inputs, not performance benchmarks.
 ;;;; Run each phase in a fresh --no-init process from the checkout root.
-;;;; TORCL_PGO_WORK names a private directory; phases: prepare, load, runtime.
+;;;; EGCL_PGO_WORK names a private directory; phases: prepare, load, runtime.
 ;;;; Preparation profiles must NOT be merged into the cached-load profile.
 (require :asdf)
-(defpackage :torcl-pgo-driver (:use :cl))
-(defpackage :torcl-pgo-training (:use :cl))
-(in-package :torcl-pgo-driver)
-(defvar torcl-pgo-training::*loaded*)
+(defpackage :egcl-pgo-driver (:use :cl))
+(defpackage :egcl-pgo-training (:use :cl))
+(in-package :egcl-pgo-driver)
+(defvar egcl-pgo-training::*loaded*)
 
-(defparameter *phase* (uiop:getenv "TORCL_PGO_PHASE"))
+(defparameter *phase* (uiop:getenv "EGCL_PGO_PHASE"))
 (unless (member *phase* '("prepare" "load" "runtime") :test #'equal)
   (error "Unknown PGO phase: ~S" *phase*))
 (defparameter *work*
-  (let ((path (uiop:getenv "TORCL_PGO_WORK")))
+  (let ((path (uiop:getenv "EGCL_PGO_WORK")))
     (unless (and path (plusp (length path)) (uiop:absolute-pathname-p path))
       (error "PGO work directory must be absolute"))
     (uiop:ensure-directory-pathname path)))
@@ -36,20 +36,20 @@
       (dolist (form forms) (print form out)))))
 
 (defun unit-symbol (prefix index)
-  (intern (format nil "~A-~D" prefix index) :torcl-pgo-training))
+  (intern (format nil "~A-~D" prefix index) :egcl-pgo-training))
 
 (defun prepare-sources ()
   (ensure-directories-exist (merge-pathnames "placeholder" *source*))
   (ensure-directories-exist (merge-pathnames "placeholder" *cache*))
-  (write-forms "torcl-pgo-training.asd"
-    `((asdf:defsystem "torcl-pgo-training" :serial t
+  (write-forms "egcl-pgo-training.asd"
+    `((asdf:defsystem "egcl-pgo-training" :serial t
         :components ((:file "package")
                      ,@(loop for index from 1 to 24
                              collect `(:file ,(format nil "unit-~D" index)))))))
   (write-forms "package.lisp"
-    '((defpackage :torcl-pgo-training (:use :cl))
-      (defvar torcl-pgo-training::*loaded* nil)
-      (defgeneric torcl-pgo-training::score (object))))
+    '((defpackage :egcl-pgo-training (:use :cl))
+      (defvar egcl-pgo-training::*loaded* nil)
+      (defgeneric egcl-pgo-training::score (object))))
   (loop for index from 1 to 24 do
     (let ((class (unit-symbol "BOX" index))
           (reader (unit-symbol "VALUE" index))
@@ -57,7 +57,7 @@
           (table (unit-symbol "TABLE" index)))
       (write-forms (format nil "unit-~D.lisp" index)
         `((defclass ,class () ((value :initarg :value :reader ,reader)))
-          (defmethod torcl-pgo-training::score ((object ,class))
+          (defmethod egcl-pgo-training::score ((object ,class))
             (+ ,index (,reader object)))
           (defun ,sum (items &key (initial 0))
             (reduce #'+ items :initial-value initial))
@@ -69,19 +69,19 @@
             (dotimes (key 20)
               (setf (gethash (format nil "key-~D" key) ,table) key))
             (assert (= 19 (gethash "key-19" ,table)))
-            (assert (= (torcl-pgo-training::score
+            (assert (= (egcl-pgo-training::score
                          (make-instance ',class :value 10)) ,(+ 10 index)))
             (assert (= (,sum '(1 2 3) :initial 4) 10))
-            (push ,index torcl-pgo-training::*loaded*)))))))
+            (push ,index egcl-pgo-training::*loaded*)))))))
 
 (defun load-training-system ()
   (asdf:initialize-source-registry
    `(:source-registry (:directory ,(namestring *source*)) :ignore-inherited-configuration))
   (asdf:initialize-output-translations
    `(:output-translations (t ,(namestring *cache*)) :ignore-inherited-configuration))
-  (asdf:load-system :torcl-pgo-training)
-  (assert (= 24 (length torcl-pgo-training::*loaded*)))
-  (assert (equal (sort (copy-list torcl-pgo-training::*loaded*) #'<)
+  (asdf:load-system :egcl-pgo-training)
+  (assert (= 24 (length egcl-pgo-training::*loaded*)))
+  (assert (equal (sort (copy-list egcl-pgo-training::*loaded*) #'<)
                  (loop for index from 1 to 24 collect index))))
 
 (defclass counter () ((value :initform 0 :accessor counter-value)))
@@ -113,6 +113,6 @@
   ((equal *phase* "load")
    (unless (probe-file *ready*) (error "PGO workload is not prepared"))
    (load-training-system)
-   (format t "~&PGO-LOAD ~D ~D~%" (length torcl-pgo-training::*loaded*)
-           (reduce #'+ torcl-pgo-training::*loaded*)))
+   (format t "~&PGO-LOAD ~D ~D~%" (length egcl-pgo-training::*loaded*)
+           (reduce #'+ egcl-pgo-training::*loaded*)))
   (t (train-runtime)))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify s390x native execution, OSR and moving-GC safety through the CLI.
 
-Run under scripts/torcl-limited.sh, passing the binary or QEMU command after --.
+Run under scripts/egcl-limited.sh, passing the binary or QEMU command after --.
 The tier assertions are essential: correct bytecode fallback is not a JIT pass.
 """
 import os
@@ -49,11 +49,11 @@ def main():
     if command[:1] == ["--"]:
         command = command[1:]
     if not command:
-        raise SystemExit("usage: s390x-jit-smoke.py -- [qemu-s390x -L sysroot] torcl")
-    base = {k: v for k, v in os.environ.items() if not k.startswith("TORCL_")}
+        raise SystemExit("usage: s390x-jit-smoke.py -- [qemu-s390x -L sysroot] egcl")
+    base = {k: v for k, v in os.environ.items() if not k.startswith("EGCL_")}
 
     def run(source, **settings):
-        env = dict(base, TORCL_LAZY_COMPILE="0", TORCL_T1_T2_BACKEDGE_THRESHOLD="4", **settings)
+        env = dict(base, EGCL_LAZY_COMPILE="0", EGCL_T1_T2_BACKEDGE_THRESHOLD="4", **settings)
         # --eval prints the last form's value. Give every variant the same
         # final value even when it appends extra tier assertions.
         result = subprocess.run(command + ["--no-init", "--no-bootstrap", "--eval", source + "\nnil"],
@@ -62,56 +62,56 @@ def main():
             raise RuntimeError(f"exit {result.returncode}\n{result.stdout}\n{result.stderr}")
         return result.stdout
 
-    reference = run(PROGRAM, TORCL_FORCE_TIER="t0")
+    reference = run(PROGRAM, EGCL_FORCE_TIER="t0")
     assert "JIT-OK" in reference, reference
     native_checks = """
-      (jit-check (= (torcl-ext:function-tier 'jit-sum) 1))
-      (jit-check (= (torcl-ext:function-tier 'jit-roots) 1))
-      (jit-check (= (torcl-ext:function-tier 'jit-wide) 1))
-      (jit-check (= (torcl-ext:function-tier 'jit-recursive) 1))
-      (jit-check (> (torcl-ext:deopt-count) 0))
+      (jit-check (= (egcl-ext:function-tier 'jit-sum) 1))
+      (jit-check (= (egcl-ext:function-tier 'jit-roots) 1))
+      (jit-check (= (egcl-ext:function-tier 'jit-wide) 1))
+      (jit-check (= (egcl-ext:function-tier 'jit-recursive) 1))
+      (jit-check (> (egcl-ext:deopt-count) 0))
     """
-    native = run(PROGRAM + native_checks, TORCL_FORCE_TIER="t1")
-    stressed = run(PROGRAM + native_checks, TORCL_FORCE_TIER="t1",
-                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    native = run(PROGRAM + native_checks, EGCL_FORCE_TIER="t1")
+    stressed = run(PROGRAM + native_checks, EGCL_FORCE_TIER="t1",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert native == stressed == reference, (reference, native, stressed)
     print("s390x: native T1, deopt, calls, errors and GC stress match T0", flush=True)
 
     # Keep invocation promotion cold so this must enter through an OSR stub.
-    osr = PROGRAM + "(jit-check (> (torcl-ext:function-osr-count 'jit-sum) 0))"
-    output = run(osr, TORCL_T0_T1_THRESHOLD="1000000", TORCL_OSR_THRESHOLD="2",
-                 TORCL_DISABLE_T2="1")
-    stressed = run(osr, TORCL_T0_T1_THRESHOLD="1000000", TORCL_OSR_THRESHOLD="2",
-                   TORCL_DISABLE_T2="1", TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    osr = PROGRAM + "(jit-check (> (egcl-ext:function-osr-count 'jit-sum) 0))"
+    output = run(osr, EGCL_T0_T1_THRESHOLD="1000000", EGCL_OSR_THRESHOLD="2",
+                 EGCL_DISABLE_T2="1")
+    stressed = run(osr, EGCL_T0_T1_THRESHOLD="1000000", EGCL_OSR_THRESHOLD="2",
+                   EGCL_DISABLE_T2="1", EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert output == stressed == reference, (reference, output, stressed)
     print("s390x: live T0-to-native OSR and GC stress match T0", flush=True)
 
     trap = (Path(__file__).resolve().parents[1] /
-            "crates/torcl/tests/fixtures/native-transfer-osr.lisp").read_text()
-    ordinary = run(trap, TORCL_T0_T1_THRESHOLD="1000000", TORCL_OSR_THRESHOLD="2",
-                   TORCL_DISABLE_T2="1", TORCL_OSR_TRAPS="1")
-    stressed = run(trap, TORCL_T0_T1_THRESHOLD="1000000", TORCL_OSR_THRESHOLD="2",
-                   TORCL_DISABLE_T2="1", TORCL_OSR_TRAPS="1",
-                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+            "crates/egcl/tests/fixtures/native-transfer-osr.lisp").read_text()
+    ordinary = run(trap, EGCL_T0_T1_THRESHOLD="1000000", EGCL_OSR_THRESHOLD="2",
+                   EGCL_DISABLE_T2="1", EGCL_OSR_TRAPS="1")
+    stressed = run(trap, EGCL_T0_T1_THRESHOLD="1000000", EGCL_OSR_THRESHOLD="2",
+                   EGCL_DISABLE_T2="1", EGCL_OSR_TRAPS="1",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert ordinary == stressed and "OSR-TRAP-OK" in ordinary, (ordinary, stressed)
     print("s390x: OSR overflow and uncommon traps preserve active handlers", flush=True)
 
     auto = PROGRAM + """
       (jit-sum 10) (jit-sum 10)
-      (jit-check (= (torcl-ext:function-tier 'jit-sum) 1))
+      (jit-check (= (egcl-ext:function-tier 'jit-sum) 1))
     """
-    assert run(auto, TORCL_T0_T1_THRESHOLD="2", TORCL_DISABLE_T2="1") == reference
+    assert run(auto, EGCL_T0_T1_THRESHOLD="2", EGCL_DISABLE_T2="1") == reference
     print("s390x: automatic invocation promotion reaches T1", flush=True)
 
-    with tempfile.TemporaryDirectory(prefix="torcl-s390x-jit-") as directory:
+    with tempfile.TemporaryDirectory(prefix="egcl-s390x-jit-") as directory:
         dump_path = Path(directory) / "jit.dump"
         listing = run("""
           (defun jit-diagnostics (x) (+ x 1))
           (jit-diagnostics 2)
-          (if (= (torcl-ext:function-tier 'jit-diagnostics) 1) nil
+          (if (= (egcl-ext:function-tier 'jit-diagnostics) 1) nil
               (error "diagnostic fixture did not compile"))
           (disassemble 'jit-diagnostics)
-        """, TORCL_FORCE_TIER="t1", TORCL_PERF_JITDUMP=str(dump_path))
+        """, EGCL_FORCE_TIER="t1", EGCL_PERF_JITDUMP=str(dump_path))
         assert "bytes of s390x" in listing and "bytes of x86" not in listing, listing
         assert "+0000:" in listing and ".byte 0xeb, 0x6f" in listing, listing
         # jitdump fields use the producer's native byte order, not the host
@@ -150,20 +150,20 @@ def main():
                              (jit-t2-neg -4) (jit-t2-literal -1) (jit-t2-literal 1)))
     """
     tiers = r"""
-      (if (= (torcl-ext:function-tier 'jit-t2-add) 2) nil (error "ADD missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-branch) 2) nil (error "BRANCH missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-neg) 2) nil (error "NEG missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-literal) 2) nil (error "LITERAL missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-add) 2) nil (error "ADD missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-branch) 2) nil (error "BRANCH missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-neg) 2) nil (error "NEG missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-literal) 2) nil (error "LITERAL missed T2"))
     """
     traps = r"""
       (format t "~S~%" (jit-t2-add 1152921504606846975))
       (format t "~S~%" (jit-t2-branch 1.5))
       (format t "~S~%" (jit-t2-neg -1152921504606846976))
     """
-    reference = run(optimized + traps, TORCL_FORCE_TIER="t0")
-    native = run(optimized + tiers + traps, TORCL_FORCE_TIER="t2")
-    stressed = run(optimized + tiers + traps, TORCL_FORCE_TIER="t2",
-                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    reference = run(optimized + traps, EGCL_FORCE_TIER="t0")
+    native = run(optimized + tiers + traps, EGCL_FORCE_TIER="t2")
+    stressed = run(optimized + tiers + traps, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert reference == native == stressed, (reference, native, stressed)
     print("s390x: optimized T2 arithmetic, branches and guard exits match T0", flush=True)
 
@@ -184,7 +184,7 @@ def main():
                              (jit-t2-fmul -0.0 2.5) (jit-t2-fscale 3.25)))
     """
     numeric_tiers = "\n".join(
-        f"(if (= (torcl-ext:function-tier '{name}) 2) nil (error \"{name} missed T2\"))"
+        f"(if (= (egcl-ext:function-tier '{name}) 2) nil (error \"{name} missed T2\"))"
         for name in ["jit-t2-mul", "jit-t2-fadd", "jit-t2-fsub", "jit-t2-fmul", "jit-t2-fscale"]
     )
     numeric_traps = r"""
@@ -194,10 +194,10 @@ def main():
                              (jit-t2-fadd 1.0d0 2.0d0)
                              (jit-t2-fsub 9 3) (jit-t2-fmul 4 5)))
     """
-    reference = run(numeric + numeric_traps, TORCL_FORCE_TIER="t0")
-    native = run(numeric + numeric_tiers + numeric_traps, TORCL_FORCE_TIER="t2")
-    stressed = run(numeric + numeric_tiers + numeric_traps, TORCL_FORCE_TIER="t2",
-                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    reference = run(numeric + numeric_traps, EGCL_FORCE_TIER="t0")
+    native = run(numeric + numeric_tiers + numeric_traps, EGCL_FORCE_TIER="t2")
+    stressed = run(numeric + numeric_tiers + numeric_traps, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert reference == native == stressed, (reference, native, stressed)
     print("s390x: T2 multiplication and single-float arithmetic match T0 through guard exits", flush=True)
 
@@ -246,15 +246,15 @@ def main():
       (setq *jit-t2-effects* 0)
     """
     call_tiers = r"""
-      (if (= (torcl-ext:function-tier 'jit-t2-roots) 2) nil (error "ROOTS missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-wide) 2) nil (error "WIDE missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-spill-roots) 2) nil (error "SPILL-ROOTS missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-values) 2) nil (error "VALUES missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-many-values) 2) nil (error "MANY-VALUES missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-effect) 2) nil (error "EFFECT missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-error) 2) nil (error "ERROR missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-resolve) 2) nil (error "RESOLVE missed T2"))
-      (if (= (torcl-ext:function-tier 'jit-t2-nlx) 2) nil (error "NLX missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-roots) 2) nil (error "ROOTS missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-wide) 2) nil (error "WIDE missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-spill-roots) 2) nil (error "SPILL-ROOTS missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-values) 2) nil (error "VALUES missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-many-values) 2) nil (error "MANY-VALUES missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-effect) 2) nil (error "EFFECT missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-error) 2) nil (error "ERROR missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-resolve) 2) nil (error "RESOLVE missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-nlx) 2) nil (error "NLX missed T2"))
     """
     effects = r"""
       (format t "~S~%" (jit-t2-effect 1152921504606846975))
@@ -266,10 +266,10 @@ def main():
       (defun jit-t2-target (x) (+ x 10))
       (format t "~S~%" (jit-t2-resolve 5))
     """
-    reference = run(calls + effects, TORCL_FORCE_TIER="t0")
-    native = run(calls + call_tiers + effects, TORCL_FORCE_TIER="t2")
-    stressed = run(calls + call_tiers + effects, TORCL_FORCE_TIER="t2",
-                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    reference = run(calls + effects, EGCL_FORCE_TIER="t0")
+    native = run(calls + call_tiers + effects, EGCL_FORCE_TIER="t2")
+    stressed = run(calls + call_tiers + effects, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert reference == native == stressed, (reference, native, stressed)
     print("s390x: T2 calls, live roots, multiple values and committed effects match T0", flush=True)
 
@@ -287,18 +287,18 @@ def main():
       (format t "~S~%" *jit-loop-effects*)
     """
     loop_tiers = r"""
-      (if (= (torcl-ext:function-tier 'jit-t2-loop) 2) nil (error "LOOP missed T2"))
-      (if (> (torcl-ext:function-osr-count 'jit-t2-loop) 0) nil (error "LOOP missed live T2 OSR"))
-      (if (> (torcl-ext:deopt-count) 0) nil (error "LOOP missed overflow deopt"))
+      (if (= (egcl-ext:function-tier 'jit-t2-loop) 2) nil (error "LOOP missed T2"))
+      (if (> (egcl-ext:function-osr-count 'jit-t2-loop) 0) nil (error "LOOP missed live T2 OSR"))
+      (if (> (egcl-ext:deopt-count) 0) nil (error "LOOP missed overflow deopt"))
     """
     # Only loop heat can promote this activation. The overflowing increment
     # occurs near its end, after the compiler has time to publish an OSR entry.
     # One allocation halfway through also exercises GC in the grown frame.
-    settings = dict(TORCL_T0_T1_THRESHOLD="1", TORCL_T1_T2_INVOKE_THRESHOLD="1000000",
-                    TORCL_OSR_THRESHOLD="1000000")
-    reference = run(loops, TORCL_FORCE_TIER="t0")
+    settings = dict(EGCL_T0_T1_THRESHOLD="1", EGCL_T1_T2_INVOKE_THRESHOLD="1000000",
+                    EGCL_OSR_THRESHOLD="1000000")
+    reference = run(loops, EGCL_FORCE_TIER="t0")
     native = run(loops + loop_tiers, **settings)
-    stressed = run(loops + loop_tiers, TORCL_GC_STRESS="1", TORCL_GC_POISON="1", **settings)
+    stressed = run(loops + loop_tiers, EGCL_GC_STRESS="1", EGCL_GC_POISON="1", **settings)
     assert reference == native == stressed, (reference, native, stressed)
     print("s390x: live T1-to-T2 OSR, polling and late overflow preserve roots and effects", flush=True)
 
@@ -311,11 +311,11 @@ def main():
       (jit-t2-alloc-loop 0 '(root)) (jit-t2-alloc-loop 0 '(root))
       (format t "~S~%" (jit-t2-alloc-loop 100 '(root)))
     """
-    allocation_tier = "(if (= (torcl-ext:function-tier 'jit-t2-alloc-loop) 2) nil (error \"allocating loop missed T2\"))"
-    reference = run(allocating_loop, TORCL_FORCE_TIER="t0")
-    native = run(allocating_loop + allocation_tier, TORCL_FORCE_TIER="t2")
-    stressed = run(allocating_loop + allocation_tier, TORCL_FORCE_TIER="t2",
-                   TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+    allocation_tier = "(if (= (egcl-ext:function-tier 'jit-t2-alloc-loop) 2) nil (error \"allocating loop missed T2\"))"
+    reference = run(allocating_loop, EGCL_FORCE_TIER="t0")
+    native = run(allocating_loop + allocation_tier, EGCL_FORCE_TIER="t2")
+    stressed = run(allocating_loop + allocation_tier, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
     assert reference == native == stressed, (reference, native, stressed)
     print("s390x: optimized allocating loops preserve moving-GC roots", flush=True)
 
@@ -325,7 +325,7 @@ def main():
           (if (= i n) (return-from done i))
           (setq i (1+ i)) (go top)))))
       (jit-t2-spin 0) (jit-t2-spin 0)
-      (if (= (torcl-ext:function-tier 'jit-t2-spin) 2) nil (error "SPIN missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-spin) 2) nil (error "SPIN missed T2"))
       (format t "READY~%") (force-output)
       (jit-t2-spin -1)
       (format t "FELL-THROUGH~%")
@@ -335,9 +335,9 @@ def main():
     allocating_spin = spin.replace("(setq i (1+ i))", "(list i i) (setq i (1+ i))")
     for name, source, stress in [
         ("call-free", spin, {}),
-        ("allocating stress", allocating_spin, {"TORCL_GC_STRESS": "1", "TORCL_GC_POISON": "1"}),
+        ("allocating stress", allocating_spin, {"EGCL_GC_STRESS": "1", "EGCL_GC_POISON": "1"}),
     ]:
-        env = dict(base, TORCL_FORCE_TIER="t2", TORCL_LAZY_COMPILE="0", **stress)
+        env = dict(base, EGCL_FORCE_TIER="t2", EGCL_LAZY_COMPILE="0", **stress)
         child = subprocess.Popen(command + ["--no-init", "--no-bootstrap", "--eval", source],
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:

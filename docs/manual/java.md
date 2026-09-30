@@ -1,22 +1,22 @@
 # Java integration
 
-`torcl-jvm` connects TorCL to an in-process HotSpot JVM. Lisp programs can
+`egcl-jvm` connects EGCL to an in-process HotSpot JVM. Lisp programs can
 construct Java objects, call methods, and implement Java interfaces with Lisp
-functions. The `JAVA` package is the primary interface; `TORCL-JVM` provides
+functions. The `JAVA` package is the primary interface; `EGCL-JVM` provides
 explicit descriptor-based calls. Both are loaded by the same ASDF system.
 The two runtimes keep their own heaps and collectors. This is a checked API
 boundary, not a sandbox for untrusted Java or native code.
 
 The supported target is **native x86-64 Linux with glibc**. Install
-the native Fedora RPM, or build this checkout with `torcl-rt/c-ffi`. The static
+the native Fedora RPM, or build this checkout with `egcl-rt/c-ffi`. The static
 musl executable and Android ART are not supported.
 
 ## Setup and first calls { #setup }
 
-The native Fedora `torcl` RPM includes both APIs and a prebuilt bridge, and
-requires a Java runtime (17 or newer). Start `torcl` from any directory and load
-`(asdf:load-system :torcl-jvm)`; no compiler or JDK is needed. The installed HTML
-manual starts at `/usr/share/doc/torcl/manual/index.html`.
+The native Fedora `egcl` RPM includes both APIs and a prebuilt bridge, and
+requires a Java runtime (17 or newer). Start `egcl` from any directory and load
+`(asdf:load-system :egcl-jvm)`; no compiler or JDK is needed. The installed HTML
+manual starts at `/usr/share/doc/egcl/manual/index.html`.
 
 For a source checkout, install a JDK (17 or newer, including `javac` and JNI headers), a C compiler,
 Make and Python 3. Select the JDK root containing `bin/javac`, `include/jni.h`,
@@ -24,17 +24,17 @@ and `lib/server/libjvm.so`:
 
 ```sh
 export JAVA_HOME=/path/to/jdk
-cargo build --target x86_64-unknown-linux-gnu --features torcl-rt/c-ffi -p torcl
-make -C lib/torcl-jvm
-scripts/torcl-limited.sh target/x86_64-unknown-linux-gnu/debug/torcl --no-init
+cargo build --target x86_64-unknown-linux-gnu --features egcl-rt/c-ffi -p egcl
+make -C lib/egcl-jvm
+scripts/egcl-limited.sh target/x86_64-unknown-linux-gnu/debug/egcl --no-init
 ```
 
 From the repository root:
 
 ```lisp
 (require :asdf)
-(asdf:load-asd (truename "lib/torcl-jvm/torcl-jvm.asd"))
-(asdf:load-system :torcl-jvm)
+(asdf:load-asd (truename "lib/egcl-jvm/egcl-jvm.asd"))
+(asdf:load-system :egcl-jvm)
 (defparameter *jvm* (java:start-jvm :options '("-Xmx256m")))
 
 (java:static "java.lang.Integer" "parseInt" "42")
@@ -48,8 +48,8 @@ From the repository root:
 ;; => ("hello" 42)
 ```
 
-`JAVA` (the nickname of `TORCL-JAVA`) is the **primary API**, loaded by the
-`torcl-jvm` ASDF system. The descriptor-level `TORCL-JVM` package remains
+`JAVA` (the nickname of `EGCL-JAVA`) is the **primary API**, loaded by the
+`egcl-jvm` ASDF system. The descriptor-level `EGCL-JVM` package remains
 available for existing code and precise low-level calls. Loading diagnoses an
 existing, unrelated package named `JAVA` rather than modifying it.
 
@@ -59,7 +59,7 @@ bridge; that source directory must be writable.
 `:java-home` overrides `JAVA_HOME`, which overrides Java found on `PATH`.
 `:classpath` is a list of directory/JAR names; `:options` is a list of JVM option
 strings. Options are trusted configuration, not an isolation boundary. The
-bridge supplies `-Xrs` so TorCL retains responsibility for termination signals.
+bridge supplies `-Xrs` so EGCL retains responsibility for termination signals.
 A bad/missing JDK reports a condition; it does not install tools automatically.
 
 ## Calls, overloads, and bindings { #calls }
@@ -276,9 +276,9 @@ The native library is never unloaded.
 
 `:attach t` explicitly joins an existing JVM; stopping that session detaches
 the bridge and does not destroy the host JVM. Classpath/options apply only when
-creating a VM. A JVM started **before TorCL initialization** requires the JDK's
+creating a VM. A JVM started **before EGCL initialization** requires the JDK's
 `libjsig.so` preloaded at process launch, ahead of the embedding library. Late
-loading libjsig is insufficient. TorCL refuses detected JVM-first initialization
+loading libjsig is insufficient. EGCL refuses detected JVM-first initialization
 without signal interposition. Arbitrary third-party runtime embeddings are not
 certified by this package.
 
@@ -295,10 +295,10 @@ thread guarantees, or JVM resurrection from saved images.
 
 ## Primary API dictionary
 
-Names below use the `JAVA` nickname of `TORCL-JAVA`. Use package-qualified
+Names below use the `JAVA` nickname of `EGCL-JAVA`. Use package-qualified
 names: `JAVA:LAMBDA` and `JAVA:FIND-CLASS` are distinct from the Common Lisp
 operators. Lifecycle, condition, identity, and strong-reference operations
-are also exported from `TORCL-JVM` as the same symbols.
+are also exported from `EGCL-JVM` as the same symbols.
 
 ### Starting and stopping a JVM { #start-jvm }
 
@@ -407,7 +407,7 @@ public constructors, methods, and fields as ordinary Lisp strings.
 Establishes the dynamic ownership scope described under [Scopes and
 ownership](#ownership). Cleanup runs on every exit and attempts to release all
 tracked references. A cleanup failure signals a condition and can supersede a
-pending exit. Low-level `TORCL-JVM` results and explicit `retain` copies are not
+pending exit. Low-level `EGCL-JVM` results and explicit `retain` copies are not
 registered with this scope.
 
 **Functions**
@@ -425,7 +425,7 @@ explicitly. `release` is idempotent, but revoking the last owner of an active
 callback signals `jvm-error`; wait for it to return and retry. `java-object-p`
 recognizes proxy wrappers, including released wrappers, so it is not a liveness
 test. `same-object-p` compares live references by Java identity rather than Lisp
-wrapper identity. These functions are also exported by `TORCL-JVM`.
+wrapper identity. These functions are also exported by `EGCL-JVM`.
 
 ### Closing resources { #with-resource }
 
@@ -497,44 +497,44 @@ it signals, so `java:flush` is only needed to pull output *during* a call — fr
 callback, or from another thread watching a long computation. It never signals: it
 runs in cleanup positions where an error would mask the Java failure being unwound.
 
-Also exported from `TORCL-JVM` as `torcl-jvm:drain-output`, with
-`torcl-jvm:draining` wrapping a body so it drains on both normal and non-local exit.
+Also exported from `EGCL-JVM` as `egcl-jvm:drain-output`, with
+`egcl-jvm:draining` wrapping a body so it drains on both normal and non-local exit.
 
 See [Streams](#streams) for what is captured and what is not.
 
 ### Null and conditions { #java-conditions }
 
 **Constant** `java:+null+` represents Java null. NIL represents Java false.
-The constant is also exported as `torcl-jvm:+null+`.
+The constant is also exported as `egcl-jvm:+null+`.
 
 **Condition types** `java:jvm-error`, `java:java-error`, `java:ambiguous-call`.
 `jvm-error` is an ERROR subtype for lifecycle and bridge failures; `java-error`
 is its subtype for Java exceptions; `ambiguous-call` is a `java-error` subtype
 for overload-resolution ambiguity. The first two are also exported from
-`TORCL-JVM`.
+`EGCL-JVM`.
 
 **Function** `(java:error-message condition)` → diagnostic string.
-This accessor is also exported as `torcl-jvm:error-message`. See
+This accessor is also exported as `egcl-jvm:error-message`. See
 [Conditions](#conditions) for callback error translation and diagnostic limits.
 
 ## Descriptor API { #descriptor-api }
 
-Existing `TORCL-JVM` calls still take explicit JVM descriptors and retain their
+Existing `EGCL-JVM` calls still take explicit JVM descriptors and retain their
 original conversion rules: Lisp integers box as Long, with range checking for
 primitive integer parameters. User descriptors are checked by Java reflection,
 never used as unchecked JNI signatures. Low-level results are **not** enrolled
-in `java:with-scope`; release them or use `torcl-jvm:with-java-objects`:
+in `java:with-scope`; release them or use `egcl-jvm:with-java-objects`:
 
 ```lisp
-(torcl-jvm:with-java-objects
-    ((items (torcl-jvm:new "java.util.ArrayList" "()V")))
-  (torcl-jvm:call items "add" "(Ljava/lang/Object;)Z" "hello")
-  (torcl-jvm:call items "get" "(I)Ljava/lang/Object;" 0))
+(egcl-jvm:with-java-objects
+    ((items (egcl-jvm:new "java.util.ArrayList" "()V")))
+  (egcl-jvm:call items "add" "(Ljava/lang/Object;)Z" "hello")
+  (egcl-jvm:call items "get" "(I)Ljava/lang/Object;" 0))
 ```
 
-`torcl-jvm:implement` retains its `(method-name &rest arguments)` callback
+`egcl-jvm:implement` retains its `(method-name &rest arguments)` callback
 protocol. Its copies now share callback ownership as described above. Weak
-references remain available through `torcl-jvm:weak-reference`; `promote` returns
+references remain available through `egcl-jvm:weak-reference`; `promote` returns
 an independently owned strong proxy or NIL if collected. Release weak references
 too. Use the high-level interface for overload-aware callback dispatch.
 
@@ -562,10 +562,10 @@ A constructor descriptor must end in `V`, although `new` returns a proxy.
 **Functions**
 
 ```lisp
-(torcl-jvm:new class signature &rest arguments)          ; => owned proxy
-(torcl-jvm:call object method signature &rest arguments) ; => converted result
-(torcl-jvm:call-static class method signature &rest arguments)
-(torcl-jvm:find-java-class name &optional loader)         ; => owned Class proxy
+(egcl-jvm:new class signature &rest arguments)          ; => owned proxy
+(egcl-jvm:call object method signature &rest arguments) ; => converted result
+(egcl-jvm:call-static class method signature &rest arguments)
+(egcl-jvm:find-java-class name &optional loader)         ; => owned Class proxy
 ```
 
 Class arguments accept a case-sensitive string or Class proxy; they do not
@@ -581,7 +581,7 @@ use the [shared conditions](#java-conditions).
 
 ### Bound references and weak references { #with-java-objects }
 
-**Macro** `(torcl-jvm:with-java-objects ((name expression)...) &body body)`
+**Macro** `(egcl-jvm:with-java-objects ((name expression)...) &body body)`
 → values of body.
 
 Evaluates and binds expressions sequentially, releasing Java proxy bindings in
@@ -591,8 +591,8 @@ results still require explicit release. It does not call Java `close()`.
 **Functions**
 
 ```lisp
-(torcl-jvm:weak-reference object) ; => owned weak proxy
-(torcl-jvm:promote object)        ; => owned strong proxy, or NIL if collected
+(egcl-jvm:weak-reference object) ; => owned weak proxy
+(egcl-jvm:promote object)        ; => owned strong proxy, or NIL if collected
 ```
 
 Weak references permit collection of their Java referent. Release the weak
@@ -603,7 +603,7 @@ identity comparison use the [shared reference operations](#with-scope).
 
 ### Descriptor-level callbacks { #descriptor-callbacks }
 
-**Function** `(torcl-jvm:implement interface function)` → owned interface proxy.
+**Function** `(egcl-jvm:implement interface function)` → owned interface proxy.
 
 `function` receives the Java method name as a string, followed by converted
 arguments. It must return a value compatible with the Java method's return type.
@@ -612,13 +612,13 @@ in advance or distinguish overloads by a signature. Default methods also enter
 this Lisp dispatcher. Object identity methods are handled by the proxy itself.
 
 ```lisp
-(torcl-jvm:with-java-objects
+(egcl-jvm:with-java-objects
     ((increment
-       (torcl-jvm:implement "java.util.function.IntUnaryOperator"
+       (egcl-jvm:implement "java.util.function.IntUnaryOperator"
          (lambda (method value)
            (assert (string= method "applyAsInt"))
            (1+ value)))))
-  (torcl-jvm:call increment "applyAsInt" "(I)I" 41))
+  (egcl-jvm:call increment "applyAsInt" "(I)I" 41))
 ;; => 42
 ```
 
@@ -634,9 +634,9 @@ releasing the last owner revokes it. See [Callback lifetime](#callbacks).
 **Functions**
 
 ```lisp
-(torcl-jvm:array-length array)          ; => nonnegative integer
-(torcl-jvm:array-ref array index)      ; => converted element
-(torcl-jvm:array-set array index value) ; => +null+
+(egcl-jvm:array-length array)          ; => nonnegative integer
+(egcl-jvm:array-ref array index)      ; => converted element
+(egcl-jvm:array-set array index value) ; => +null+
 ```
 
 Indices are zero-based. Object-valued reads return caller-owned proxies.
@@ -656,9 +656,9 @@ After releasing references and callbacks, end the session:
 
 ## Implementation references
 
-The [Lisp API](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/torcl-jvm/api.lisp),
-[descriptor bridge](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/torcl-jvm/jvm.lisp),
-and [native integration tests](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/torcl-jvm/tests)
+The [Lisp API](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/egcl-jvm/api.lisp),
+[descriptor bridge](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/egcl-jvm/jvm.lisp),
+and [native integration tests](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/egcl-jvm/tests)
 provide the corresponding implementation and examples. Build and validation
 commands for contributors are in the
-[package README](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/torcl-jvm/README.md).
+[package README](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/lib/egcl-jvm/README.md).

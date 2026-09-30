@@ -1,13 +1,13 @@
 # Linux cross-compilation
 
-TorCL's CLI can be built on x86-64 for these Linux targets:
+EGCL's CLI can be built on x86-64 for these Linux targets:
 
 | Architecture | Rust target | Executable |
 |---|---|---|
-| AArch64 | `aarch64-unknown-linux-gnu` | `target/aarch64-unknown-linux-gnu/release/torcl` |
-| POWER little-endian | `powerpc64le-unknown-linux-gnu` | `target/powerpc64le-unknown-linux-gnu/release/torcl` |
-| IBM Z big-endian | `s390x-unknown-linux-gnu` | `target/s390x-unknown-linux-gnu/release/torcl` |
-| Android AArch64 | `aarch64-linux-android` | `target-android/aarch64-linux-android/debug/torcl` |
+| AArch64 | `aarch64-unknown-linux-gnu` | `target/aarch64-unknown-linux-gnu/release/egcl` |
+| POWER little-endian | `powerpc64le-unknown-linux-gnu` | `target/powerpc64le-unknown-linux-gnu/release/egcl` |
+| IBM Z big-endian | `s390x-unknown-linux-gnu` | `target/s390x-unknown-linux-gnu/release/egcl` |
+| Android AArch64 | `aarch64-linux-android` | `target-android/aarch64-linux-android/debug/egcl` |
 
 These are dynamically linked glibc executables, suitable for Fedora. All three
 support native T1 compilation and T0-to-T1 OSR, and a T2 backend emitting
@@ -48,7 +48,7 @@ scripts/cross-port.sh build all
 
 `Cross.toml` selects the cross-toolchain container images. Compilation runs on
 x86-64; no emulated compiler or full Fedora guest is needed. The script selects
-`torcl-rt/c-ffi` for glibc library loading and explicitly overrides the workspace's
+`egcl-rt/c-ffi` for glibc library loading and explicitly overrides the workspace's
 default x86-64 musl target. The default x86-64 build keeps its direct syscalls
 and static ELF loader.
 
@@ -72,7 +72,7 @@ This builds each CLI, runs the runtime OS ABI tests through `cross`, extracts
 matching runtime libraries to a temporary directory, and runs the CLI through
 the host's QEMU. It requires Python 3.11 or newer. No binfmt registration, root
 privileges, or KVM are required. Tests run with the project's memory/time caps;
-containers also receive a memory cap. `TORCL_MEM_MAX` and `TORCL_TIMEOUT` retain
+containers also receive a memory cap. `EGCL_MEM_MAX` and `EGCL_TIMEOUT` retain
 their usual meanings.
 
 The CLI regression compares interpreter, bytecode, default tiering, and forced
@@ -90,11 +90,11 @@ The ppc64le runtime also has an ELFv2 native-segment ABI probe. It is run
 explicitly with:
 
 ```sh
-cross test --target powerpc64le-unknown-linux-gnu -p torcl-rt \
+cross test --target powerpc64le-unknown-linux-gnu -p egcl-rt \
   --test native_segment_ppc64le -- --nocapture
 ```
 
-That probe validates the machine boundary. With `TORCL_NATIVE_TRANSFER=1`, the
+That probe validates the machine boundary. With `EGCL_NATIVE_TRANSFER=1`, the
 CLI additionally admits allocation-free, scope-free, deopt-free PPC64LE bodies
 through the segment entry; calls, speculative guards, protected scopes, loop
 polls, and fault-recovery cases still fall back to the checked ABI until their
@@ -135,7 +135,7 @@ Android runs the same AArch64 Linux kernel but a different libc, so it is a
 separate target rather than a variant of `aarch64-unknown-linux-gnu`:
 `target_os` is `"android"`, bionic spells the errno accessor `__errno` rather
 than `__errno_location`, and a saved image carries its own OS tag
-(`Os::Android`) so a bionic image cannot load in a glibc or musl TorCL.
+(`Os::Android`) so a bionic image cannot load in a glibc or musl EGCL.
 `*features*` gets **both** `:LINUX` and `:ANDROID` — kernel facilities like
 `/proc`, epoll and signals all hold, while `:ANDROID` is what code needs to
 branch on the platform itself.
@@ -149,9 +149,9 @@ keeps the Android artifacts from thrashing the host target directory:
 
 ```sh
 export CROSS_CONTAINER_ENGINE=podman CARGO_TARGET_DIR="$PWD/target-android"
-cross build --target aarch64-linux-android -p torcl --bin torcl --features torcl-rt/c-ffi
-cross test  --target aarch64-linux-android -p torcl-rt --features torcl-rt/c-ffi
-cross run   --target aarch64-linux-android -p torcl --bin torcl --features torcl-rt/c-ffi -- \
+cross build --target aarch64-linux-android -p egcl --bin egcl --features egcl-rt/c-ffi
+cross test  --target aarch64-linux-android -p egcl-rt --features egcl-rt/c-ffi
+cross run   --target aarch64-linux-android -p egcl --bin egcl --features egcl-rt/c-ffi -- \
     --no-init --load scripts/portability-smoke.lisp
 ```
 
@@ -167,8 +167,8 @@ and `cross test` execute Android binaries directly; the host's own
 emulation (or on a device). That works:
 
 ```sh
-CROSS_CONTAINER_OPTS="-e TORCL_IMAGE_OUT=/target/torcl-android-image" \
-  cross run --target aarch64-linux-android -p torcl --bin torcl --features torcl-rt/c-ffi -- \
+CROSS_CONTAINER_OPTS="-e EGCL_IMAGE_OUT=/target/egcl-android-image" \
+  cross run --target aarch64-linux-android -p egcl --bin egcl --features egcl-rt/c-ffi -- \
       --no-init --load scripts/build-image.lisp
 ```
 
@@ -184,7 +184,7 @@ not care:
 ```sh
 podman run --rm -v "$PWD/target-android:/img:ro" -w /img \
   ghcr.io/cross-rs/aarch64-linux-android:main \
-  /android-runner aarch64 /img/torcl-android-image \
+  /android-runner aarch64 /img/egcl-android-image \
   --eval '(cl:format t "~S~%" (asdf:asdf-version))'
 ```
 
@@ -194,7 +194,7 @@ describes emulated execution rather than the device.
 
 ### What has been observed, and what has not
 
-Verified under QEMU: the whole `torcl-rt` suite, `portable_os` 5/5 (kernel page
+Verified under QEMU: the whole `egcl-rt` suite, `portable_os` 5/5 (kernel page
 size, mapped memory and errno, a returning signal handler, and epoll — which was
 cfg'd out entirely before the `target_os` fix), `portability-smoke.lisp` end to
 end, and a dumped image that starts with ASDF preloaded and no source tree.
@@ -203,16 +203,16 @@ Those CLI checks do not establish 16 KiB-page behaviour or every Android app
 sandbox interaction. In-process ARM64 application execution is now verified on
 a physical Pixel; see the NativeActivity workflow below.
 
-### Driving a GUI: TorCL as a NativeActivity
+### Driving a GUI: EGCL as a NativeActivity
 
-`crates/torcl-android` embeds TorCL in an Android NativeActivity shared library.
+`crates/egcl-android` embeds EGCL in an Android NativeActivity shared library.
 The reusable host loads `android.lisp` and `app.lisp` from the APK's indexed
 assets into one Lisp worker. EGL and GLES calls stay in Lisp, using the dynamic
 FFI. Both ARM64 and x86-64 libraries are packaged by the Fedora RPM.
 
 ```sh
-# After installing torcl-target-android and Android SDK/JDK tools:
-torcl-android-new hello --host=aarch64-linux-android --template egl
+# After installing egcl-target-android and Android SDK/JDK tools:
+egcl-android-new hello --host=aarch64-linux-android --template egl
 cd hello
 make install
 make run

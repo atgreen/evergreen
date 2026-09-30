@@ -1,7 +1,7 @@
 # Your first program
 
 In this tutorial you will write a small expense report and run it as a script.
-You need a working `torcl` command on your `PATH`; if you do not have one,
+You need a working `egcl` command on your `PATH`; if you do not have one,
 [build and install it first](../how-to/build.md).
 
 ## Evaluate an expression
@@ -9,17 +9,17 @@ You need a working `torcl` command on your `PATH`; if you do not have one,
 In a terminal, run:
 
 ```sh
-torcl --no-init --eval '(+ 12 8 5)'
+egcl --no-init --eval '(+ 12 8 5)'
 ```
 
-TorCL prints `25` and exits.
+EGCL prints `25` and exits.
 
 ## Define a function in the REPL
 
 Start the interactive read–eval–print loop:
 
 ```sh
-torcl --no-init
+egcl --no-init
 ```
 
 At the `CL-USER>` prompt, enter:
@@ -56,7 +56,7 @@ Create `expenses.lisp` with this content:
 Run the file, passing a report label after `--`:
 
 ```sh
-torcl expenses.lisp -- Lunch
+egcl expenses.lisp -- Lunch
 ```
 
 The program prints:

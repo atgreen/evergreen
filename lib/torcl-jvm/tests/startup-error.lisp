@@ -1,8 +1,0 @@
-(require :asdf)
-(asdf:load-asd (truename "lib/torcl-jvm/torcl-jvm.asd"))
-(asdf:load-system :torcl-jvm)
-(assert (handler-case (progn (torcl-jvm:start-jvm :options '("-XX:TorclInvalidTestOption")) nil)
-          (torcl-jvm:jvm-error () t)))
-(assert (handler-case (progn (torcl-jvm:start-jvm) nil)
-          (torcl-jvm:jvm-error (e) (search "restart is unsupported" (torcl-jvm:error-message e)))))
-(format t "JVM-STARTUP-ERROR-PASS~%")

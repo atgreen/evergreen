@@ -1,11 +1,11 @@
 ---
 name: grind
-description: TorCL-local autonomous work loop. Survey the Beads queue, pick the highest-value next task (prioritizing correctness and progress toward the HotSpot-like tiered-JIT Common Lisp goal), reprioritize the queue accordingly, then execute it end-to-end with the project's validation + GC-safety discipline. Trigger when the user says "/grind", "grind", "pick the next thing and do it", "keep making progress", or wants an autonomous session that decides and works without hand-holding.
+description: EGCL-local autonomous work loop. Survey the Beads queue, pick the highest-value next task (prioritizing correctness and progress toward the HotSpot-like tiered-JIT Common Lisp goal), reprioritize the queue accordingly, then execute it end-to-end with the project's validation + GC-safety discipline. Trigger when the user says "/grind", "grind", "pick the next thing and do it", "keep making progress", or wants an autonomous session that decides and works without hand-holding.
 ---
 
-# grind — the TorCL progress loop
+# grind — the EGCL progress loop
 
-You are advancing **TorCL**: a Common Lisp implementation built like the Java
+You are advancing **EGCL**: a Common Lisp implementation built like the Java
 HotSpot VM — a tiered JIT (T0 bytecode → T1 → T2 native) with speculation,
 deoptimization, and OSR, over a **moving, precise, generational GC**, converging
 on real ANSI semantics and self-hosting (ASDF, real `uiop:getenv`, …).
@@ -28,9 +28,9 @@ and the next stage's gate. Pull the relevant `spec/NN-*.md` chapter on demand fo
 the subsystem you touch — do **not** read all of spec/. If you will touch Rust
 that allocates, re-read the **GC safety** section of `AGENTS.md` first (§ below).
 
-The real binary is `target/x86_64-unknown-linux-musl/debug/torcl` (musl is the
-default target; `target/debug/torcl` usually does **not** exist). Build with
-`cargo build -p torcl --bin torcl`.
+The real binary is `target/x86_64-unknown-linux-musl/debug/egcl` (musl is the
+default target; `target/debug/egcl` usually does **not** exist). Build with
+`cargo build -p egcl --bin egcl`.
 
 ## 1. Choose the next task — selection rubric
 
@@ -74,34 +74,34 @@ delivers real, verifiable value and do *that* this run.
 
 ## 3. GC-safety mandate (non-negotiable on the Rust side)
 
-TorCL has a **moving, precise minor GC**: any allocation can relocate nursery
+EGCL has a **moving, precise minor GC**: any allocation can relocate nursery
 objects. The two invariants (full detail in `AGENTS.md` "GC safety"):
 
-1. **Root every Rust-local `TorclVal` that must survive an allocation** — use
-   `torcl_rt::rooted!` / `rooted_ref!`. A `TorclVal` held only in a Rust local /
+1. **Root every Rust-local `EgclVal` that must survive an allocation** — use
+   `egcl_rt::rooted!` / `rooted_ref!`. A `EgclVal` held only in a Rust local /
    `Vec` across an allocating call is invisible to the collector; it moves and
    your copy goes stale → intermittent segfault / abort across the c2i boundary.
 2. **Never hold a `RefCell` borrow (or raw `&mut`) to GC-scanned state across an
    allocation** — drop the borrow, then allocate.
 
 A cheap, safe pattern: collect what you need into Rust-native data with **no
-TorCL allocation in the loop**, then allocate (and let `build_*` root its input).
+EGCL allocation in the loop**, then allocate (and let `build_*` root its input).
 State *why* a change is GC-safe in the commit.
 
 **Prove it before committing** on any allocating path you touched:
 
 ```bash
-TORCL_GC_STRESS=1 TORCL_GC_POISON=1 \
-  target/x86_64-unknown-linux-musl/debug/torcl --no-init --eval '(your form)'
+EGCL_GC_STRESS=1 EGCL_GC_POISON=1 \
+  target/x86_64-unknown-linux-musl/debug/egcl --no-init --eval '(your form)'
 bash scripts/gc-root-lint.sh    # must report "0 not in baseline"
 ```
 
-A clean `TORCL_GC_STRESS=1` run is the cheapest evidence a change is GC-safe; an
+A clean `EGCL_GC_STRESS=1` run is the cheapest evidence a change is GC-safe; an
 abort/segfault/"already borrowed" under stress that passes without it means you
 broke an invariant.
 
-Also: the interpreter (`crates/torcl/src/cli.rs`) **must not duplicate stdlib**
-behavior — wire builtins to `crates/torcl-stdlib`; extend stdlib rather than
+Also: the interpreter (`crates/egcl/src/cli.rs`) **must not duplicate stdlib**
+behavior — wire builtins to `crates/egcl-stdlib`; extend stdlib rather than
 growing cli.rs (`AGENTS.md` Architecture Principles).
 
 ## 4. Reprioritize the queue
@@ -128,14 +128,14 @@ bd update <id> --claim
 2. Build the real binary; **drive the affected flow** and observe the result
    (the /verify discipline) — not just tests. Wrong-result bugs demand you *see*
    the right value now.
-3. Run the relevant suites (`cargo test -p torcl --test <suite>`, plus
-   `-p torcl-stdlib` / `-p torcl-compiler` when touched). Run the lib tests
+3. Run the relevant suites (`cargo test -p egcl --test <suite>`, plus
+   `-p egcl-stdlib` / `-p egcl-compiler` when touched). Run the lib tests
    single-threaded (`--lib -- --test-threads=1`) — the deliberate-SIGSEGV
    recovery tests (`jtc4_stack_map_tests`) flake under parallel signal contention
    and pass in isolation. Don't attribute a flake to your change without
    re-running single-threaded.
 
-   **`cargo test --workspace` should now complete unattended.** The `torcl-rt`
+   **`cargo test --workspace` should now complete unattended.** The `egcl-rt`
    parallel-interference flakes — `spec_threading_concurrency`, `test_safepoint`,
    `test_scheduler`, `test_thread`, `test_runtime` — were fixed in `bliss-z11t`
    (2026-09-26/27) by serializing the tests that drive process-global state (the

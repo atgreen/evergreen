@@ -1,6 +1,6 @@
 # §5 Standard Library
 
-**Scope:** This chapter specifies the TorCL standard library — the CL-side code
+**Scope:** This chapter specifies the EGCL standard library — the CL-side code
 and Rust glue that implements ANSI Common Lisp's standard packages, types, and
 functions. It covers package layout (§5.1), bootstrap ordering (§5.2), CLOS
 (§5.3), the condition system (§5.4), streams (§5.5), sequences (§5.6), hash
@@ -22,28 +22,28 @@ companion is authoritative for §5.3.
 | `COMMON-LISP` | `CL` | — | All 978 ANSI-specified external symbols |
 | `COMMON-LISP-USER` | `CL-USER` | `(CL)` | Default interactive package |
 | `KEYWORD` | — | — | Self-evaluating keyword symbols |
-| `TORCL-EXT` | — | `(CL)` | Canonical TorCL-specific public extensions (§9) |
-| `TORCL` | `BL` | `(CL TORCL-EXT)` | Deprecated compatibility nickname/package for older extension spelling |
-| `TORCL-INTERNALS` | `BL-INT` | `(CL TORCL-EXT)` | Runtime internals, GC hooks, compiler intrinsics |
-| `TORCL-THREAD` | — | `(CL TORCL-EXT)` | OS-backed native threads and synchronization API (§13) |
-| `TORCL-THREADS` | `BL-THR` | `(CL TORCL-THREAD)` | Deprecated compatibility spelling for `TORCL-THREAD` |
-| `TORCL-FIBER` | — | `(CL TORCL-EXT)` | Lightweight managed fibers and scheduler groups (§13) |
-| `TORCL-FFI` | `BL-FFI` | `(CL TORCL-EXT)` | Foreign function interface (§2, §8) |
+| `EGCL-EXT` | — | `(CL)` | Canonical EGCL-specific public extensions (§9) |
+| `EGCL` | `BL` | `(CL EGCL-EXT)` | Deprecated compatibility nickname/package for older extension spelling |
+| `EGCL-INTERNALS` | `BL-INT` | `(CL EGCL-EXT)` | Runtime internals, GC hooks, compiler intrinsics |
+| `EGCL-THREAD` | — | `(CL EGCL-EXT)` | OS-backed native threads and synchronization API (§13) |
+| `EGCL-THREADS` | `BL-THR` | `(CL EGCL-THREAD)` | Deprecated compatibility spelling for `EGCL-THREAD` |
+| `EGCL-FIBER` | — | `(CL EGCL-EXT)` | Lightweight managed fibers and scheduler groups (§13) |
+| `EGCL-FFI` | `BL-FFI` | `(CL EGCL-EXT)` | Foreign function interface (§2, §8) |
 
 **R5.01** The `COMMON-LISP` package MUST export exactly the 978 external
-symbols specified by ANSI X3.226-1994. No TorCL-specific symbols may leak
+symbols specified by ANSI X3.226-1994. No EGCL-specific symbols may leak
 into `CL`.
 
 **R5.02** The `KEYWORD` package MUST intern symbols as self-evaluating
 constants with their name as the value. `(symbol-package :foo)` → `KEYWORD`.
 
-**R5.03** `TORCL-INTERNALS` symbols MUST NOT be exported into `TORCL-EXT`,
-`TORCL`, or `CL` without explicit review — they constitute an unstable API.
+**R5.03** `EGCL-INTERNALS` symbols MUST NOT be exported into `EGCL-EXT`,
+`EGCL`, or `CL` without explicit review — they constitute an unstable API.
 
-**R5.03a** New TorCL extension APIs MUST use `TORCL-EXT` for general runtime
-extensions, `TORCL-THREAD` for native thread/synchronization objects,
-`TORCL-FIBER` for lightweight fibers, and `TORCL-FFI` for foreign-function
-interfaces. `TORCL` and `TORCL-THREADS` are compatibility spellings only and
+**R5.03a** New EGCL extension APIs MUST use `EGCL-EXT` for general runtime
+extensions, `EGCL-THREAD` for native thread/synchronization objects,
+`EGCL-FIBER` for lightweight fibers, and `EGCL-FFI` for foreign-function
+interfaces. `EGCL` and `EGCL-THREADS` are compatibility spellings only and
 MUST NOT be used as the primary package in new specification text.
 
 **R5.04** Package objects MUST be protected by per-package reader-writer
@@ -53,7 +53,7 @@ read lock; mutations (`intern`, `unintern`, `export`) acquire the write lock.
 ### 5.1.2  Package Registry
 
 ```rust
-// crates/torcl-rt/src/package.rs
+// crates/egcl-rt/src/package.rs
 pub struct PackageRegistry {
     /// Name → Package, protected by a global RwLock for registry-level ops.
     packages: RwLock<HashMap<Box<str>, Arc<Package>>>,
@@ -120,24 +120,24 @@ dependency order:
 ```text
 Boot Load Order:
  1. lib/boot.lisp            — early macros, setf expansion, backquote
- 2. crates/torcl-stdlib/src/defstruct-full.lisp   — full defstruct with :include, printing
- 3. crates/torcl-stdlib/src/type-system.lisp      — subtypep, typep full, type specifiers
- 4. crates/torcl-stdlib/src/setf.lisp             — define-setf-expander, full setf
- 5. crates/torcl-stdlib/src/list-ops.lisp         — mapcar, mapc, mapcan, assoc, member, etc.
- 6. crates/torcl-stdlib/src/sequences.lisp        — generic sequence operations
- 7. crates/torcl-stdlib/src/hash-table-ext.lisp   — with-hash-table-iterator, hash-table-rehash-*
- 8. crates/torcl-stdlib/src/clos/boot.lisp        — standard-class, standard-object bootstrap
- 9. crates/torcl-stdlib/src/clos/generic.lisp     — defgeneric, defmethod, method dispatch
-10. crates/torcl-stdlib/src/clos/slots.lisp       — slot-value, slot protocol
-11. crates/torcl-stdlib/src/clos/combination.lisp — method combination
-12. crates/torcl-stdlib/src/clos/change.lisp      — change-class, class redefinition
-13. crates/torcl-stdlib/src/conditions.lisp       — condition types, handler-bind, restarts
-14. crates/torcl-stdlib/src/streams.lisp          — Gray streams, standard stream types
-15. crates/torcl-stdlib/src/pathnames.lisp        — pathname parsing, logical pathnames
-16. crates/torcl-stdlib/src/format-full.lisp      — full FORMAT, ~{, ~[, ~<, ~/, etc.
-17. crates/torcl-stdlib/src/printer.lisp          — pretty-printer, print-object methods
-18. crates/torcl-stdlib/src/loop-full.lisp        — extended LOOP macro
-19. crates/torcl-stdlib/src/environment.lisp      — describe, inspect, documentation
+ 2. crates/egcl-stdlib/src/defstruct-full.lisp   — full defstruct with :include, printing
+ 3. crates/egcl-stdlib/src/type-system.lisp      — subtypep, typep full, type specifiers
+ 4. crates/egcl-stdlib/src/setf.lisp             — define-setf-expander, full setf
+ 5. crates/egcl-stdlib/src/list-ops.lisp         — mapcar, mapc, mapcan, assoc, member, etc.
+ 6. crates/egcl-stdlib/src/sequences.lisp        — generic sequence operations
+ 7. crates/egcl-stdlib/src/hash-table-ext.lisp   — with-hash-table-iterator, hash-table-rehash-*
+ 8. crates/egcl-stdlib/src/clos/boot.lisp        — standard-class, standard-object bootstrap
+ 9. crates/egcl-stdlib/src/clos/generic.lisp     — defgeneric, defmethod, method dispatch
+10. crates/egcl-stdlib/src/clos/slots.lisp       — slot-value, slot protocol
+11. crates/egcl-stdlib/src/clos/combination.lisp — method combination
+12. crates/egcl-stdlib/src/clos/change.lisp      — change-class, class redefinition
+13. crates/egcl-stdlib/src/conditions.lisp       — condition types, handler-bind, restarts
+14. crates/egcl-stdlib/src/streams.lisp          — Gray streams, standard stream types
+15. crates/egcl-stdlib/src/pathnames.lisp        — pathname parsing, logical pathnames
+16. crates/egcl-stdlib/src/format-full.lisp      — full FORMAT, ~{, ~[, ~<, ~/, etc.
+17. crates/egcl-stdlib/src/printer.lisp          — pretty-printer, print-object methods
+18. crates/egcl-stdlib/src/loop-full.lisp        — extended LOOP macro
+19. crates/egcl-stdlib/src/environment.lisp      — describe, inspect, documentation
 ```
 
 **R5.08** Each file in the boot sequence MUST only depend on symbols defined
@@ -270,7 +270,7 @@ when an unhandled condition is signalled. Signature:
 
 Detailed specification in `spec/05-04-streams.md`. Summary:
 
-**R5.23** TorCL MUST implement the **Gray streams** protocol
+**R5.23** EGCL MUST implement the **Gray streams** protocol
 (trivial-gray-streams compatible) as the primary extensibility mechanism.
 All built-in stream classes derive from Gray stream base classes.
 
@@ -335,7 +335,7 @@ open addressing and backward-shift deletion.
 **D5.01** Hash table layout:
 
 ```rust
-pub struct TorclHashTable {
+pub struct EgclHashTable {
     test: HashTestFn,        // eq, eql, equal, equalp, or custom
     entries: Box<[Entry]>,   // flat array of key-value-hash triples
     count: usize,
@@ -351,7 +351,7 @@ SXHASH values MUST be non-negative fixnums. SXHASH MUST be deterministic
 within a session; it MAY differ across sessions (ASLR-seeded).
 
 **R5.33** `MAKE-HASH-TABLE` MUST accept a `:synchronized` keyword
-(TorCL extension, §9). When `:synchronized t`, all operations acquire the
+(EGCL extension, §9). When `:synchronized t`, all operations acquire the
 internal mutex.
 
 **R5.34** `WITH-HASH-TABLE-ITERATOR` MUST provide a local macro that
@@ -379,7 +379,7 @@ to physical paths.
 ANSI semantics exactly — these are common sources of portability bugs.
 
 **R5.39** Namestring parsing MUST handle: relative paths, `~` expansion
-(TorCL extension), `.` and `..` components, and trailing `/` to distinguish
+(EGCL extension), `.` and `..` components, and trailing `/` to distinguish
 directory from file.
 
 ---
@@ -411,11 +411,11 @@ standard types (lists, arrays, structures, CLOS objects).
 
 ## 5.10  Module Map
 
-Standard library source layout within `crates/torcl-stdlib/`:
+Standard library source layout within `crates/egcl-stdlib/`:
 
 ```text
-crates/torcl-stdlib/
-├── torcl-stdlib.asd
+crates/egcl-stdlib/
+├── egcl-stdlib.asd
 └── src/
     ├── boot-macros.lisp       — early macros needed by everything
     ├── setf.lisp              — setf expansion framework
@@ -471,10 +471,10 @@ concurrently on disjoint data without synchronisation.
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `TORCL-EXT:*DEFAULT-EXTERNAL-FORMAT*` | `:UTF-8` | Used by `OPEN`, stream creation; `TORCL:*DEFAULT-EXTERNAL-FORMAT*` is a deprecated compatibility spelling |
-| `TORCL-EXT:*HASH-TABLE-DEFAULT-SIZE*` | `16` | Initial capacity; `TORCL:*HASH-TABLE-DEFAULT-SIZE*` is a deprecated compatibility spelling |
-| `TORCL-EXT:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` | `NIL` | Extension: default :synchronized; `TORCL:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` is a deprecated compatibility spelling |
-| `TORCL-EXT:*SORT-PARALLEL-THRESHOLD*` | `10000` | Vectors larger than this MAY use parallel sort; `TORCL:*SORT-PARALLEL-THRESHOLD*` is a deprecated compatibility spelling |
+| `EGCL-EXT:*DEFAULT-EXTERNAL-FORMAT*` | `:UTF-8` | Used by `OPEN`, stream creation; `EGCL:*DEFAULT-EXTERNAL-FORMAT*` is a deprecated compatibility spelling |
+| `EGCL-EXT:*HASH-TABLE-DEFAULT-SIZE*` | `16` | Initial capacity; `EGCL:*HASH-TABLE-DEFAULT-SIZE*` is a deprecated compatibility spelling |
+| `EGCL-EXT:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` | `NIL` | Extension: default :synchronized; `EGCL:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` is a deprecated compatibility spelling |
+| `EGCL-EXT:*SORT-PARALLEL-THRESHOLD*` | `10000` | Vectors larger than this MAY use parallel sort; `EGCL:*SORT-PARALLEL-THRESHOLD*` is a deprecated compatibility spelling |
 
 ---
 
@@ -483,7 +483,7 @@ concurrently on disjoint data without synchronisation.
 **R5.48** The ANSI test suite (`ansi-test`) MUST pass for all standard
 library chapters. Target: 100% of applicable tests.
 
-**R5.49** TorCL-specific tests MUST cover:
+**R5.49** EGCL-specific tests MUST cover:
 - CLOS bootstrap circularity.
 - Thread safety of packages, hash tables, and streams.
 - Gray streams protocol conformance.

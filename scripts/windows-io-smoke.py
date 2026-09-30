@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run under torcl-limited.sh; uses Wine and a cross-built child test fixture."""
+"""Run under egcl-limited.sh; uses Wine and a cross-built child test fixture."""
 import concurrent.futures
 import os
 from pathlib import Path
@@ -22,12 +22,12 @@ def windows_path(path):
 def main():
     binary, child = sys.argv[1:]
     env = os.environ.copy()
-    env['TORCL_FORCE_TIER'] = 't0'
+    env['EGCL_FORCE_TIER'] = 't0'
 
     def run(form, stress=False, bootstrap=True):
         local_env = env.copy()
         if stress:
-            local_env.update(TORCL_GC_STRESS='1', TORCL_GC_POISON='1')
+            local_env.update(EGCL_GC_STRESS='1', EGCL_GC_POISON='1')
         # Loading UTF-8 source avoids relying on the Windows command-line decoder
         # for the Unicode values whose child-process transport we are testing.
         with tempfile.NamedTemporaryFile(mode='w', suffix='.lisp', encoding='utf-8') as source:
@@ -43,34 +43,34 @@ def main():
 
     shell = Path(__file__).with_name('windows-process.lisp').read_text()
     for tier in ['interp', 't0']:
-        env['TORCL_FORCE_TIER'] = tier
+        env['EGCL_FORCE_TIER'] = tier
         assert 'WINDOWS-PROCESS-OK' in run(shell)
     print('win64: native shell, redirections and exit status: OK', flush=True)
 
-    with tempfile.TemporaryDirectory(prefix='torcl child ') as directory:
+    with tempfile.TemporaryDirectory(prefix='egcl child ') as directory:
         executable = Path(directory) / 'child with spaces.exe'
         shutil.copyfile(child, executable)
         args = ['', 'two words', 'quote"inside', 'C:\\path with space\\', '&|<>^%', 'café-λ']
         argv = '(list ' + ' '.join(map(lisp_string, [windows_path(executable)] + args)) + ')'
         expected = ''.join(f'{len(arg.encode("utf-8"))}:{arg}\n' for arg in args)
-        form = f'''(multiple-value-bind (status out err) (torcl-ext:run-program {argv})
+        form = f'''(multiple-value-bind (status out err) (egcl-ext:run-program {argv})
                     (assert (= status 23))
                     (assert (string= out {lisp_string(expected)}))
                     (assert (string= err "")))
                    (format t "ARGV-OK~%")'''
         for tier in ['interp', 't0']:
-            env['TORCL_FORCE_TIER'] = tier
+            env['EGCL_FORCE_TIER'] = tier
             assert 'ARGV-OK' in run(form)
         quoted_shell = f'"{windows_path(executable)}" "two words"'
         assert 'QUOTED-SHELL-OK' in run(f'''
-            (multiple-value-bind (status out err) (torcl-ext:run-program {lisp_string(quoted_shell)})
+            (multiple-value-bind (status out err) (egcl-ext:run-program {lisp_string(quoted_shell)})
               (assert (= status 23)) (assert (search "9:two words" out)) (assert (string= err "")))
             (format t "QUOTED-SHELL-OK~%")''')
         print('win64: direct argv preserves spaces, quotes, backslashes and Unicode: OK', flush=True)
 
         # No prelude: stress every allocating step that returns the two strings.
         pipes = f'''(multiple-value-bind (status out err)
-                     (torcl-ext:run-program (list {lisp_string(windows_path(executable))} "pipes"))
+                     (egcl-ext:run-program (list {lisp_string(windows_path(executable))} "pipes"))
                      (if (and (= status 23) (= (length out) 131072) (= (length err) 131072)
                               (char= (aref out 131071) #\\O) (char= (aref err 131071) #\\E))
                          (format t "PIPES-OK~%") (error "pipe capture mismatch")))'''
@@ -96,9 +96,9 @@ def main():
             port = listener.getsockname()[1]
             source = f'''
               (defun check-io (v) (if v t (error "socket check failed")))
-              (let ((s (torcl::%socket-connect "127.0.0.1" {port} 2000)))
-                (check-io (torcl::%socket-wait-for-input s 2000))
-                (check-io (= (torcl::%socket-read-timeout s 2000) 2000))
+              (let ((s (egcl::%socket-connect "127.0.0.1" {port} 2000)))
+                (check-io (egcl::%socket-wait-for-input s 2000))
+                (check-io (= (egcl::%socket-read-timeout s 2000) 2000))
                 (check-io (= (read-byte s) 65))
                 (check-io (= (read-byte s) 200))
                 (write-byte 42 s) (finish-output s)

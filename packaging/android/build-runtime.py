@@ -44,14 +44,14 @@ def main():
     stage = args.stage.resolve()
     target = args.target_dir.resolve()
     tools = ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin'
-    runtime = stage / 'usr/libexec/torcl/android'
+    runtime = stage / 'usr/libexec/egcl/android'
     runtime.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.pop('CARGO_ENCODED_RUSTFLAGS', None)
     env['RUSTFLAGS'] = '-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384'
     env.setdefault('CARGO_BUILD_JOBS', '3')
-    metadata = {# Must match torcl_android_api_version in crates/torcl-android: this is
-                  # what torcl-android-new writes into app.json and checks against.
+    metadata = {# Must match egcl_android_api_version in crates/egcl-android: this is
+                  # what egcl-android-new writes into app.json and checks against.
                   'api': 4, 'version': tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version'],
                 'min_sdk': 28, 'ndk': (ndk / 'source.properties').read_text(), 'hosts': {}}
     for host, (abi, machine) in HOSTS.items():
@@ -61,12 +61,12 @@ def main():
         env[f'CC_{host.replace("-", "_")}'] = str(compiler)
         env[f'AR_{host.replace("-", "_")}'] = str(tools / 'llvm-ar')
         command = ['cargo', 'rustc', '--locked', '--release', '--manifest-path', str(ROOT / 'Cargo.toml'),
-                   '--target-dir', str(target), '-p', 'torcl-android', '--target', host, '--crate-type', 'cdylib']
+                   '--target-dir', str(target), '-p', 'egcl-android', '--target', host, '--crate-type', 'cdylib']
         if args.offline: command.append('--offline')
         subprocess.run(command, cwd=ROOT, env=env, check=True)
-        destination = runtime / host / 'libtorcl_android.so'
+        destination = runtime / host / 'libegcl_android.so'
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target / host / 'release/libtorcl_android.so', destination)
+        shutil.copy2(target / host / 'release/libegcl_android.so', destination)
         subprocess.run([tools / 'llvm-strip', '--strip-unneeded', destination], check=True)
         check_elf(destination, machine)
         metadata['hosts'][host] = {'abi': abi, 'sha256': hashlib.sha256(destination.read_bytes()).hexdigest()}
@@ -74,9 +74,9 @@ def main():
     shutil.copytree(ROOT / 'packaging/android/templates', runtime / 'templates', dirs_exist_ok=True)
     shutil.copy2(ROOT / 'packaging/android/build-apk.py', runtime / 'build-apk.py')
     (stage / 'usr/bin').mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / 'packaging/android/torcl-android-new', stage / 'usr/bin/torcl-android-new')
-    (stage / 'usr/bin/torcl-android-new').chmod(0o755)
-    license_dir = stage / 'usr/share/licenses/torcl-target-android'
+    shutil.copy2(ROOT / 'packaging/android/egcl-android-new', stage / 'usr/bin/egcl-android-new')
+    (stage / 'usr/bin/egcl-android-new').chmod(0o755)
+    license_dir = stage / 'usr/share/licenses/egcl-target-android'
     license_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ndk / 'NOTICE', license_dir / 'NOTICE')
     print(f'Android runtimes and generator staged in {stage}')

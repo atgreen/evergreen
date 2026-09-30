@@ -11,7 +11,7 @@ version=$("$compiler" -vV)
 host=$(sed -n 's/^host: //p' <<<"$version")
 llvm=$(sed -n 's/^LLVM version: //p' <<<"$version")
 [[ -n $host && -n $llvm ]] || die 'cannot identify rustc host and LLVM version'
-target=${TORCL_PGO_TARGET:-x86_64-unknown-linux-musl}
+target=${EGCL_PGO_TARGET:-x86_64-unknown-linux-musl}
 case "$host/$target" in
     x86_64-unknown-linux-gnu/x86_64-unknown-linux-musl) ;;
     "$host/$host") ;;
@@ -31,7 +31,7 @@ profversion=$("$profdata" --version) || die "cannot run LLVM_PROFDATA=$profdata"
 tool_llvm=$(sed -nE 's/.*LLVM version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<<"$profversion")
 [[ $tool_llvm == "$llvm" ]] || die "rustc uses LLVM $llvm, llvm-profdata uses $tool_llvm; set LLVM_PROFDATA to a matching tool"
 
-build_root=${TORCL_PGO_ROOT:-target/pgo}
+build_root=${EGCL_PGO_ROOT:-target/pgo}
 mkdir -p -- "$build_root"
 build_root=$(cd -- "$build_root" && pwd)
 work=$(mktemp -d "$build_root/run.XXXXXX")
@@ -65,16 +65,16 @@ require_marker() {
 
 logged generate env CARGO_TARGET_DIR="$work/generate" \
     CARGO_ENCODED_RUSTFLAGS="${base_flags}-Cprofile-generate=$work/raw" \
-    "$cargo" build --locked --release -p torcl --target "$target"
-instrumented="$work/generate/$target/release/torcl"
-logged prepare env TORCL_PGO_WORK="$work/training" TORCL_PGO_PHASE=prepare \
+    "$cargo" build --locked --release -p egcl --target "$target"
+instrumented="$work/generate/$target/release/egcl"
+logged prepare env EGCL_PGO_WORK="$work/training" EGCL_PGO_PHASE=prepare \
     LLVM_PROFILE_FILE="$work/prepare-profiles/%p-%m.profraw" \
     "$instrumented" --no-init --load scripts/pgo-workload.lisp
 require_marker prepare 'PGO-PREPARED 24'
 shopt -s nullglob
 for iteration in 1 2 3; do
     for phase in load runtime; do
-        logged "$phase-$iteration" env TORCL_PGO_WORK="$work/training" TORCL_PGO_PHASE="$phase" \
+        logged "$phase-$iteration" env EGCL_PGO_WORK="$work/training" EGCL_PGO_PHASE="$phase" \
             LLVM_PROFILE_FILE="$work/raw/$phase-$iteration-%p-%m.profraw" \
             "$instrumented" --no-init --load scripts/pgo-workload.lisp
         if [[ $phase == load ]]; then
@@ -95,23 +95,23 @@ logged merge "$profdata" merge -o "$work/merged.profdata" "${raw[@]}"
 [[ -s $work/merged.profdata ]] || die 'merge produced no profile'
 logged use env CARGO_TARGET_DIR="$work/use" \
     CARGO_ENCODED_RUSTFLAGS="${base_flags}-Cprofile-use=$work/merged.profdata${separator}-Cllvm-args=-pgo-warn-missing-function" \
-    "$cargo" build --locked --release -p torcl --target "$target"
+    "$cargo" build --locked --release -p egcl --target "$target"
 if grep -Ei 'warning:.*(profile|hash mismatch|control flow change)' "$work/use.log"; then
     die "profile-use build reported incompatible or missing profile data; see $work/use.log"
 fi
 
 # Dump beside the destination so publication is an atomic, same-filesystem
 # rename. Neither a failed save nor a failed restart touches the prior image.
-output=${TORCL_IMAGE_OUT:-target/torcl}
+output=${EGCL_IMAGE_OUT:-target/egcl}
 [[ ! -d $output ]] || die "image destination is a directory: $output"
 mkdir -p -- "$(dirname -- "$output")"
 output="$(cd -- "$(dirname -- "$output")" && pwd)/$(basename -- "$output")"
-staging=$(mktemp -d "$(dirname -- "$output")/.torcl-pgo.XXXXXX")
-logged image env TORCL_IMAGE_OUT="$staging/torcl" \
-    "$work/use/$target/release/torcl" --no-init --load scripts/build-image.lisp
-logged verify "$staging/torcl" --no-init --eval \
+staging=$(mktemp -d "$(dirname -- "$output")/.egcl-pgo.XXXXXX")
+logged image env EGCL_IMAGE_OUT="$staging/egcl" \
+    "$work/use/$target/release/egcl" --no-init --load scripts/build-image.lisp
+logged verify "$staging/egcl" --no-init --eval \
     '(progn (assert (find-package :asdf)) (assert (stringp (asdf:asdf-version))) (format t "PGO-IMAGE-OK~%"))'
 require_marker verify 'PGO-IMAGE-OK'
-mv -f -- "$staging/torcl" "$output"
+mv -f -- "$staging/egcl" "$output"
 rmdir -- "$staging" 2>/dev/null || echo "PGO: retained image-stage diagnostics in $staging" >&2
 echo "PGO image: $output"

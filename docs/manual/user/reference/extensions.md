@@ -1,15 +1,15 @@
 # Operating-system interface
 
 These extensions expose process state and synchronous subprocess execution.
-They are in `TORCL-EXT`. Their signatures differ from some similarly named
+They are in `EGCL-EXT`. Their signatures differ from some similarly named
 SBCL extensions; use this dictionary rather than substituting package names
 in an SBCL call.
 
 ## Environment
 
-### `torcl-ext:getenv` { #getenv }
+### `egcl-ext:getenv` { #getenv }
 
-**Function** `(torcl-ext:getenv name)` → string or `nil`
+**Function** `(egcl-ext:getenv name)` → string or `nil`
 
 Returns the process environment variable named by the string `name`. Returns
 `nil` when it is absent or cannot be represented by the host environment API.
@@ -17,14 +17,14 @@ The current evaluator does not enforce the specification's proposed `:env`
 sandbox capability check on this operation.
 
 ```lisp
-(or (torcl-ext:getenv "HOME") "no home directory")
+(or (egcl-ext:getenv "HOME") "no home directory")
 ```
 
 ## Current directory
 
-### `torcl-ext:getcwd` { #getcwd }
+### `egcl-ext:getcwd` { #getcwd }
 
-**Function** `(torcl-ext:getcwd)` → namestring or `nil`
+**Function** `(egcl-ext:getcwd)` → namestring or `nil`
 
 Returns the process working directory as a string with a trailing slash, or
 `nil` if the host query fails. This is process state; it is not the same thing
@@ -32,9 +32,9 @@ as a dynamically bound Lisp `*default-pathname-defaults*`.
 
 ## Subprocesses
 
-### `torcl-ext:run-program` { #run-program }
+### `egcl-ext:run-program` { #run-program }
 
-**Function** `(torcl-ext:run-program command)` → exit-code, stdout, stderr
+**Function** `(egcl-ext:run-program command)` → exit-code, stdout, stderr
 
 Runs a command synchronously and captures standard output and standard error.
 A list of strings names the executable and its arguments directly. On Unix,
@@ -51,7 +51,7 @@ asynchronous process management are not supplied by this function.
 
 ```lisp
 (multiple-value-bind (code output errors)
-    (torcl-ext:run-program '("printf" "%s" "hello"))
+    (egcl-ext:run-program '("printf" "%s" "hello"))
   (list code output errors))
 ;; => (0 "hello" "")
 ```
@@ -70,15 +70,15 @@ Contains the application arguments after the CLI's `--` separator. Without
 arguments it is `nil`.
 
 ```sh
-torcl report.lisp -- first second
+egcl report.lisp -- first second
 ```
 
 In that script the variable is `("first" "second")`. It does not include the
 executable name, script pathname, or interpreter options.
 
-### `torcl-ext:raw-command-line-arguments` { #raw-command-line-arguments }
+### `egcl-ext:raw-command-line-arguments` { #raw-command-line-arguments }
 
-**Function** `(torcl-ext:raw-command-line-arguments)` → list of strings
+**Function** `(egcl-ext:raw-command-line-arguments)` → list of strings
 
 Returns the host argument vector, including the executable as its first item.
 This is a lower-level interface used by integration libraries. It is distinct

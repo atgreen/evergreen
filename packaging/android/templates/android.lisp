@@ -1,51 +1,51 @@
-;;;; TorCL Android runtime API v1. The host runs one interpreter per Activity.
-(defpackage :torcl-android
+;;;; EGCL Android runtime API v1. The host runs one interpreter per Activity.
+(defpackage :egcl-android
   (:use :cl) (:nicknames :android)
   (:shadow :log)
   (:export :running-p :paused-p :poll-touch :poll-key :activity :call-on-main
            :save-state :saved-state
            :log :with-c-string :foreign-call))
-(in-package :torcl-android)
+(in-package :egcl-android)
 (defvar *state*)
-(defparameter *runtime* (torcl-ffi:load-foreign-library "libtorcl_android.so"))
+(defparameter *runtime* (egcl-ffi:load-foreign-library "libegcl_android.so"))
 
 (defun foreign-call (library name return-type argument-types arguments)
-  (let ((fn (torcl-ffi:foreign-symbol-pointer name library)))
-    (when (torcl-ffi:null-pointer-p fn) (error "Missing foreign function ~A" name))
-    (torcl-ffi:foreign-call fn return-type argument-types arguments)))
+  (let ((fn (egcl-ffi:foreign-symbol-pointer name library)))
+    (when (egcl-ffi:null-pointer-p fn) (error "Missing foreign function ~A" name))
+    (egcl-ffi:foreign-call fn return-type argument-types arguments)))
 
 (defun runtime-call (name return-type argument-types arguments)
   (foreign-call *runtime* name return-type argument-types arguments))
 
 (defmacro with-c-string ((pointer text) &body body)
   (let ((value (gensym "TEXT")))
-    `(let* ((,value ,text) (,pointer (torcl-ffi:foreign-alloc (1+ (length ,value)))))
+    `(let* ((,value ,text) (,pointer (egcl-ffi:foreign-alloc (1+ (length ,value)))))
        (unwind-protect
            (progn
              (loop for ch across ,value for i from 0
-                   do (torcl-ffi:mem-set (char-code ch) ,pointer :uchar i))
-             (torcl-ffi:mem-set 0 ,pointer :uchar (length ,value))
+                   do (egcl-ffi:mem-set (char-code ch) ,pointer :uchar i))
+             (egcl-ffi:mem-set 0 ,pointer :uchar (length ,value))
              ,@body)
-         (torcl-ffi:foreign-free ,pointer)))))
+         (egcl-ffi:foreign-free ,pointer)))))
 
 (defun log (message)
-  "Write an ASCII diagnostic to adb logcat, tag torcl."
+  "Write an ASCII diagnostic to adb logcat, tag egcl."
   (with-c-string (text message)
-    (runtime-call "torcl_android_log" :void '(:pointer) (list text))))
+    (runtime-call "egcl_android_log" :void '(:pointer) (list text))))
 
 (defun running-p ()
   "False when this surface must be released. Check on every render iteration."
-  (plusp (runtime-call "torcl_android_running" :int '(:pointer) (list *state*))))
+  (plusp (runtime-call "egcl_android_running" :int '(:pointer) (list *state*))))
 (defun paused-p ()
-  (plusp (runtime-call "torcl_android_paused" :int '(:pointer) (list *state*))))
+  (plusp (runtime-call "egcl_android_paused" :int '(:pointer) (list *state*))))
 (defun poll-touch ()
   "Return action, x, y (pixels), or NIL if no event; actions 0=down, 1=up, 2=move."
-  (let ((out (torcl-ffi:foreign-alloc 8)))
+  (let ((out (egcl-ffi:foreign-alloc 8)))
     (unwind-protect
-        (let ((action (runtime-call "torcl_android_touch" :int '(:pointer :pointer) (list *state* out))))
+        (let ((action (runtime-call "egcl_android_touch" :int '(:pointer :pointer) (list *state* out))))
           (when (>= action 0)
-            (values action (torcl-ffi:mem-ref out :float) (torcl-ffi:mem-ref out :float 4))))
-      (torcl-ffi:foreign-free out))))
+            (values action (egcl-ffi:mem-ref out :float) (egcl-ffi:mem-ref out :float 4))))
+      (egcl-ffi:foreign-free out))))
 
 (defun poll-key ()
   "Return action, key code, meta state, or NIL if no event.
@@ -54,12 +54,12 @@ the keyboard layout and the meta state, which is the caller's decision.
 
 Key events arrive on the same input queue as touches and are drained by the same
 loop; they were simply discarded before runtime API 2."
-  (let ((out (torcl-ffi:foreign-alloc 8)))
+  (let ((out (egcl-ffi:foreign-alloc 8)))
     (unwind-protect
-        (let ((action (runtime-call "torcl_android_key" :int '(:pointer :pointer) (list *state* out))))
+        (let ((action (runtime-call "egcl_android_key" :int '(:pointer :pointer) (list *state* out))))
           (when (>= action 0)
-            (values action (torcl-ffi:mem-ref out :int) (torcl-ffi:mem-ref out :int 4))))
-      (torcl-ffi:foreign-free out))))
+            (values action (egcl-ffi:mem-ref out :int) (egcl-ffi:mem-ref out :int 4))))
+      (egcl-ffi:foreign-free out))))
 
 (defun activity ()
   "This process's ANativeActivity, or a null pointer before one exists.
@@ -76,7 +76,7 @@ it leaves mInputShown false and no keyboard appears, whereas calling
 InputMethodManager.showSoftInput on the decor view through JNI raises it. A
 wrapper that reliably does nothing is worse than no wrapper, because its void
 return looks like success."
-  (runtime-call "torcl_android_activity" :pointer nil nil))
+  (runtime-call "egcl_android_activity" :pointer nil nil))
 
 (defun call-on-main (function arguments &key (result :pointer) promote release)
   "Call FUNCTION -- a C function pointer -- with ARGUMENTS on the Android main
@@ -106,21 +106,21 @@ exactly that -- the main thread reaches us from inside nativePollOnce, so its
 local reference table is popped the moment the looper returns to Java, and
 promoting one on a later call is not an error but a process abort."
   (let ((count (length arguments))
-        (args (torcl-ffi:foreign-alloc 48))
-        (out (torcl-ffi:foreign-alloc 8)))
+        (args (egcl-ffi:foreign-alloc 48))
+        (out (egcl-ffi:foreign-alloc 8)))
     (unwind-protect
         (progn
           (loop for argument in arguments
                 for offset from 0 by 8
-                do (torcl-ffi:mem-set (if (integerp argument)
+                do (egcl-ffi:mem-set (if (integerp argument)
                                           argument
-                                          (torcl-ffi:pointer-address argument))
+                                          (egcl-ffi:pointer-address argument))
                                       args :ulong offset))
-          (let ((status (runtime-call "torcl_android_call_on_main" :int
+          (let ((status (runtime-call "egcl_android_call_on_main" :int
                                       '(:pointer :pointer :int :pointer :pointer :pointer)
                                       (list function args count
-                                            (or promote (torcl-ffi:null-pointer))
-                                            (or release (torcl-ffi:null-pointer))
+                                            (or promote (egcl-ffi:null-pointer))
+                                            (or release (egcl-ffi:null-pointer))
                                             out))))
             (unless (zerop status)
               (error "Main-thread call failed: ~A"
@@ -130,11 +130,11 @@ promoting one on a later call is not an error but a process abort."
                        (-3 "too many arguments, or too few")
                        (t status))))
             (ecase result
-              (:pointer (torcl-ffi:make-pointer (torcl-ffi:mem-ref out :ulong)))
-              (:int (torcl-ffi:mem-ref out :int))
+              (:pointer (egcl-ffi:make-pointer (egcl-ffi:mem-ref out :ulong)))
+              (:int (egcl-ffi:mem-ref out :int))
               (:void nil))))
-      (torcl-ffi:foreign-free args)
-      (torcl-ffi:foreign-free out))))
+      (egcl-ffi:foreign-free args)
+      (egcl-ffi:foreign-free out))))
 
 (defun %utf8-bytes (text)
   "TEXT as a list of UTF-8 bytes. Saved state crosses into C as bytes, and a
@@ -199,14 +199,14 @@ Small. The whole saved state of every Activity in the system shares one Binder
 transaction, and Android kills an app that hands over too much."
   (let* ((bytes (%utf8-bytes text))
          (count (length bytes))
-         (buffer (torcl-ffi:foreign-alloc (max 1 count))))
+         (buffer (egcl-ffi:foreign-alloc (max 1 count))))
     (unwind-protect
         (progn
           (loop for byte in bytes for i from 0
-                do (torcl-ffi:mem-set byte buffer :uchar i))
-          (runtime-call "torcl_android_set_saved_state" :void '(:pointer :pointer :ulong)
+                do (egcl-ffi:mem-set byte buffer :uchar i))
+          (runtime-call "egcl_android_set_saved_state" :void '(:pointer :pointer :ulong)
                         (list *state* buffer count)))
-      (torcl-ffi:foreign-free buffer))
+      (egcl-ffi:foreign-free buffer))
     text))
 
 (defun saved-state ()
@@ -215,28 +215,28 @@ transaction, and Android kills an app that hands over too much."
 NIL on a genuine cold start, and NIL is also what a fresh install gives, so an
 application must have a sensible answer for it rather than treating it as an
 error."
-  (let ((count (runtime-call "torcl_android_saved_state_size" :ulong '(:pointer) (list *state*))))
+  (let ((count (runtime-call "egcl_android_saved_state_size" :ulong '(:pointer) (list *state*))))
     (when (plusp count)
-      (let ((buffer (torcl-ffi:foreign-alloc count)))
+      (let ((buffer (egcl-ffi:foreign-alloc count)))
         (unwind-protect
-            (let ((got (runtime-call "torcl_android_saved_state" :ulong
+            (let ((got (runtime-call "egcl_android_saved_state" :ulong
                                      '(:pointer :pointer :ulong)
                                      (list *state* buffer count))))
               (let ((bytes (make-array got :element-type '(unsigned-byte 8))))
-                (dotimes (i got) (setf (aref bytes i) (torcl-ffi:mem-ref buffer :uchar i)))
+                (dotimes (i got) (setf (aref bytes i) (egcl-ffi:mem-ref buffer :uchar i)))
                 (%utf8-string bytes)))
-          (torcl-ffi:foreign-free buffer))))))
+          (egcl-ffi:foreign-free buffer))))))
 
 (defun run (address)
   ;; AT LEAST, not exactly: a runtime that has grown a capability this
   ;; application never uses is not incompatible with it.
-  (when (< (runtime-call "torcl_android_api_version" :int nil nil) 3)
-    (error "TorCL Android runtime is older than API 3 (no main-thread gate)"))
-  (let ((*state* (torcl-ffi:make-pointer address)))
-    (loop for window = (runtime-call "torcl_android_wait_window" :ulong '(:pointer) (list *state*))
+  (when (< (runtime-call "egcl_android_api_version" :int nil nil) 3)
+    (error "EGCL Android runtime is older than API 3 (no main-thread gate)"))
+  (let ((*state* (egcl-ffi:make-pointer address)))
+    (loop for window = (runtime-call "egcl_android_wait_window" :ulong '(:pointer) (list *state*))
           until (zerop window)
           do (unwind-protect
-                 (handler-case (cl-user::android-main (torcl-ffi:make-pointer window))
+                 (handler-case (cl-user::android-main (egcl-ffi:make-pointer window))
                    (error (e) (log (format nil "Application error: ~A" e))))
-               (runtime-call "torcl_android_finish_window" :void '(:pointer) (list *state*))))))
+               (runtime-call "egcl_android_finish_window" :void '(:pointer) (list *state*))))))
 (in-package :cl-user)

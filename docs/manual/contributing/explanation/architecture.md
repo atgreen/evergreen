@@ -1,15 +1,15 @@
 # Runtime architecture
 
-TorCL's bootstrap is a Rust workspace. The runtime crate is the foundation;
+EGCL's bootstrap is a Rust workspace. The runtime crate is the foundation;
 the compiler and standard library build on it, and the command-line crate joins
 those pieces into a runnable Lisp system.
 
 ## Where behavior belongs
 
-`torcl-rt` owns the mechanisms that make Lisp values and execution possible:
+`egcl-rt` owns the mechanisms that make Lisp values and execution possible:
 allocation, object representation, roots, safepoints, threads, and native code
-memory. `torcl-compiler` owns reusable compilation machinery. `torcl-stdlib`
-owns Common Lisp library behavior. `torcl` integrates them with parsing of
+memory. `egcl-compiler` owns reusable compilation machinery. `egcl-stdlib`
+owns Common Lisp library behavior. `egcl` integrates them with parsing of
 command-line options, loading, evaluation, and tier dispatch.
 
 The large evaluator is an integration layer, not an invitation to duplicate

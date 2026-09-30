@@ -34,11 +34,11 @@ def build(args):
     bin_dir = stage / 'usr/bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
     target_dir = ROOT / 'target'
-    limited = ROOT / 'scripts/torcl-limited.sh'
+    limited = ROOT / 'scripts/egcl-limited.sh'
     env = dict(os.environ, RUSTUP_TOOLCHAIN=os.environ.get('RUSTUP_TOOLCHAIN', '1.94.1'),
                CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '3'),
-               TORCL_MEM_MAX=os.environ.get('TORCL_MEM_MAX', '8G'),
-               TORCL_TIMEOUT=os.environ.get('TORCL_TIMEOUT', '1800'))
+               EGCL_MEM_MAX=os.environ.get('EGCL_MEM_MAX', '8G'),
+               EGCL_TIMEOUT=os.environ.get('EGCL_TIMEOUT', '1800'))
     # No inherited target flags: Android alone uses the static bionic profile.
     env.pop('CARGO_ENCODED_RUSTFLAGS', None)
     env.pop('RUSTFLAGS', None)
@@ -61,8 +61,8 @@ def build(args):
     for name, triple in targets:
         target_env = env.copy()
         suffix = '.exe' if name == 'windows' else ''
-        directory = stage / 'usr/libexec/torcl' / name
-        runtime = target_dir / triple / 'release' / f'torcl{suffix}'
+        directory = stage / 'usr/libexec/egcl' / name
+        runtime = target_dir / triple / 'release' / f'egcl{suffix}'
         runner = []
         if name.endswith('-linux'):
             arch = name.split('-')[0]
@@ -81,7 +81,7 @@ def build(args):
             linker.chmod(0o755)
             env_triple = triple.upper().replace('-', '_')
             target_env[f'CARGO_TARGET_{env_triple}_LINKER'] = str(linker)
-            # torcl-rt/build.rs assembles native_transfer/{s390x,ppc64le}.S, so a
+            # egcl-rt/build.rs assembles native_transfer/{s390x,ppc64le}.S, so a
             # cross C driver is needed to BUILD and not only to link. cc-rs looks
             # for `<arch>-linux-gnu-gcc` on PATH, and this toolchain is extracted
             # privately under target/fedora-rpm/tools rather than installed -- and
@@ -107,7 +107,7 @@ def build(args):
             for loader in (sysroot / 'usr/lib').glob('ld*.so*'):
                 copy(loader, private / 'lib64' / loader.name)
             copy(gcc_lib / 'libgcc_s.so.1', private / 'lib64/libgcc_s.so.1')
-            license_dir = stage / 'usr/share/licenses' / f'torcl-target-{name}'
+            license_dir = stage / 'usr/share/licenses' / f'egcl-target-{name}'
             shutil.copytree('/usr/share/licenses/glibc', license_dir / 'glibc', dirs_exist_ok=True)
             shutil.copytree(tools / 'targets' / arch / 'usr/share/licenses/libgcc',
                             license_dir / 'libgcc', dirs_exist_ok=True)
@@ -121,10 +121,10 @@ def build(args):
                 ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang')
             target_env['RUSTFLAGS'] = '-C target-feature=+crt-static'
             runner = ['qemu-aarch64']
-            copy(ndk / 'NOTICE', stage / 'usr/share/licenses/torcl-target-android/NOTICE')
-        command = ['cargo', 'build', '--locked', '--release', '--target', triple, '-p', 'torcl']
+            copy(ndk / 'NOTICE', stage / 'usr/share/licenses/egcl-target-android/NOTICE')
+        command = ['cargo', 'build', '--locked', '--release', '--target', triple, '-p', 'egcl']
         if name != 'windows':
-            command += ['--features', 'torcl-rt/c-ffi']
+            command += ['--features', 'egcl-rt/c-ffi']
         run([limited, *command], env=target_env)
         # Strip BEFORE dumping; stripping an appended image destroys its trailer.
         stripped = output / 'stripped' / f'{name}{suffix}'
@@ -139,23 +139,23 @@ def build(args):
         }
         strip = strip_tools[name]
         run([strip, '--strip-debug', stripped])
-        destination = bin_dir / 'torcl' if name == 'native' else directory / f'torcl{suffix}'
+        destination = bin_dir / 'egcl' if name == 'native' else directory / f'egcl{suffix}'
         destination.parent.mkdir(parents=True, exist_ok=True)
-        dump_env = target_env | {'TORCL_IMAGE_OUT': str(destination)}
+        dump_env = target_env | {'EGCL_IMAGE_OUT': str(destination)}
         if name == 'windows':
             # Wine's Z: drive exposes host absolute paths to the guest.
-            dump_env['TORCL_IMAGE_OUT'] = 'Z:' + str(destination)
+            dump_env['EGCL_IMAGE_OUT'] = 'Z:' + str(destination)
         run([limited, *runner, stripped, '--no-init', '--load', 'scripts/build-image.lisp'], env=dump_env)
         if name == 'windows':
             run(['wineserver', '-k'], env=target_env)
         destination.chmod(0o755)
         if name != 'native':
-            launcher = bin_dir / f'torcl-{name}'
-            copy(Path(__file__).with_name('torcl-cross'), launcher)
+            launcher = bin_dir / f'egcl-{name}'
+            copy(Path(__file__).with_name('egcl-cross'), launcher)
             launcher.chmod(0o755)
         provenance['artifacts'][name] = hashlib.sha256(destination.read_bytes()).hexdigest()
     provenance['rpms'] = sorted(p.name for p in (tools / 'rpms').glob('*.rpm'))
-    docs = stage / 'usr/share/doc/torcl'
+    docs = stage / 'usr/share/doc/egcl'
     docs.mkdir(parents=True, exist_ok=True)
     (docs / 'build.json').write_text(json.dumps(provenance, indent=2) + '\n')
     copy(ROOT / 'docs/fedora-rpm.md', docs / 'fedora-rpm.md')
@@ -165,7 +165,7 @@ def build(args):
 
 def source_archive(output, sources):
     """Include current source plus locked, vendored crates for RPM %build."""
-    snapshot = output / 'rpm-source' / 'torcl-source'
+    snapshot = output / 'rpm-source' / 'egcl-source'
     snapshot.mkdir(parents=True, exist_ok=True)
     for name in ('Cargo.toml', 'Cargo.lock', 'mkdocs.yml'):
         copy(ROOT / name, snapshot / name)
@@ -176,7 +176,7 @@ def source_archive(output, sources):
         shutil.copytree(ROOT / name, destination,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'build', '*.fasl'))
     copy(ROOT / 'docs/hooks.py', snapshot / 'docs/hooks.py')
-    # Workspace membership includes the linter even though only torcl-android
+    # Workspace membership includes the linter even though only egcl-android
     # is built. Cargo still needs every member manifest when reading the lock.
     shutil.copytree(ROOT / 'tools/gc-root-lint', snapshot / 'tools/gc-root-lint',
                     dirs_exist_ok=True)
@@ -185,21 +185,21 @@ def source_archive(output, sources):
         cwd=snapshot, text=True)
     (snapshot / '.cargo').mkdir(exist_ok=True)
     (snapshot / '.cargo/config.toml').write_text(config)
-    with tarfile.open(sources / 'torcl-source.tar.gz', 'w:gz') as archive:
-        archive.add(snapshot, arcname='torcl-source')
+    with tarfile.open(sources / 'egcl-source.tar.gz', 'w:gz') as archive:
+        archive.add(snapshot, arcname='egcl-source')
 
 
 def package(output, stage, ndk):
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
     sources = output / 'SOURCES'
     sources.mkdir(parents=True, exist_ok=True)
-    copy(ROOT / 'docs/fedora-rpm.md', stage / 'usr/share/doc/torcl/fedora-rpm.md')
-    with tarfile.open(sources / 'torcl-payload.tar.gz', 'w:gz') as archive:
+    copy(ROOT / 'docs/fedora-rpm.md', stage / 'usr/share/doc/egcl/fedora-rpm.md')
+    with tarfile.open(sources / 'egcl-payload.tar.gz', 'w:gz') as archive:
         archive.add(stage, arcname='payload')
     source_archive(output, sources)
-    run(['rpmbuild', '-bb', ROOT / 'packaging/fedora/torcl.spec',
-         '--define', f'_topdir {output}', '--define', f'torcl_version {version}',
-         '--define', 'torcl_rustup 1',
+    run(['rpmbuild', '-bb', ROOT / 'packaging/fedora/egcl.spec',
+         '--define', f'_topdir {output}', '--define', f'egcl_version {version}',
+         '--define', 'egcl_rustup 1',
          '--define', f'android_ndk {ndk.resolve()}'])
     extract_and_verify(output, stage)
 
@@ -226,17 +226,17 @@ def extract_and_verify(output, stage):
                 raise RuntimeError(f'RPM changed payload file: {path}')
     run(['python3', ROOT / 'packaging/fedora/verify.py', extracted])
     run(['python3', ROOT / 'packaging/fedora/verify-native-content.py', extracted])
-    metadata = json.loads((extracted / 'usr/libexec/torcl/android/runtime.json').read_text())
+    metadata = json.loads((extracted / 'usr/libexec/egcl/android/runtime.json').read_text())
     checker_spec = importlib.util.spec_from_file_location(
         'android_runtime', ROOT / 'packaging/android/build-runtime.py')
     checker = importlib.util.module_from_spec(checker_spec)
     checker_spec.loader.exec_module(checker)
     for host, (_, machine) in checker.HOSTS.items():
-        library = extracted / 'usr/libexec/torcl/android' / host / 'libtorcl_android.so'
+        library = extracted / 'usr/libexec/egcl/android' / host / 'libegcl_android.so'
         checker.check_elf(library, machine)
         if hashlib.sha256(library.read_bytes()).hexdigest() != metadata['hosts'][host]['sha256']:
             raise RuntimeError(f'RPM changed Android library: {library}')
-    run(['python3', extracted / 'usr/bin/torcl-android-new', '--help'])
+    run(['python3', extracted / 'usr/bin/egcl-android-new', '--help'])
     print(f'RPMs built and verified: {output / "RPMS/x86_64"}')
 
 

@@ -1,6 +1,6 @@
 # Measure performance
 
-Use this procedure to compare changes to TorCL's runtime or generated code.
+Use this procedure to compare changes to EGCL's runtime or generated code.
 
 ## Fix the build and workload
 
@@ -32,9 +32,9 @@ other host allocations can dominate CPU time without appearing as Lisp consing.
 Use the allocation-count instrumentation when investigating host allocation:
 
 ```sh
-cargo build --release -p torcl --features alloc-count
-TORCL_PROBE_ALLOC_COUNT=1 scripts/torcl-limited.sh \
-  target/x86_64-unknown-linux-musl/release/torcl --no-init --load workload.lisp
+cargo build --release -p egcl --features alloc-count
+EGCL_PROBE_ALLOC_COUNT=1 scripts/egcl-limited.sh \
+  target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp
 ```
 
 Use the same memory cap and timeout in both comparisons. If the cap kills the

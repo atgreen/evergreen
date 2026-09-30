@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Package a TorCL Android project using RPM-supplied native runtimes."""
+"""Package a EGCL Android project using RPM-supplied native runtimes."""
 import argparse
 import hashlib
 import json
@@ -82,7 +82,7 @@ def install_tools(args, manifest):
 def runtime_libraries(root, hosts, config):
     metadata_path = root / 'runtime.json'
     if not metadata_path.is_file():
-        raise ValueError(f'Missing Android runtime metadata: {metadata_path}; install torcl-target-android or set RUNTIME')
+        raise ValueError(f'Missing Android runtime metadata: {metadata_path}; install egcl-target-android or set RUNTIME')
     metadata = json.loads(metadata_path.read_text())
     if metadata['api'] != config['runtime_api']:
         raise ValueError('Incompatible runtime API; regenerate the project with this RPM')
@@ -91,7 +91,7 @@ def runtime_libraries(root, hosts, config):
     libraries = {}
     for host in hosts:
         abi, machine = HOSTS[host]
-        path = root / host / 'libtorcl_android.so'
+        path = root / host / 'libegcl_android.so'
         data = path.read_bytes()
         if data[:6] != b'\x7fELF\x02\x01' or int.from_bytes(data[18:20], 'little') != machine:
             raise ValueError(f'Runtime is not a 64-bit {abi} ELF: {path}')
@@ -106,7 +106,7 @@ def sdk_tools(args, manifest):
     target = int(platform.get(NS + 'targetSdkVersion'))
     minimum = int(platform.get(NS + 'minSdkVersion'))
     if minimum < 28:
-        raise ValueError('The packaged TorCL runtime requires minSdkVersion >= 28')
+        raise ValueError('The packaged EGCL runtime requires minSdkVersion >= 28')
     build_tools = Path(args.build_tools) if args.build_tools else newest(args.sdk / 'build-tools')
     jar = Path(args.android_jar) if args.android_jar else args.sdk / f'platforms/android-{target}/android.jar'
     tools = {name: build_tools / name for name in ('aapt2', 'zipalign', 'apksigner')}
@@ -136,7 +136,7 @@ def assets(project):
         if path.is_symlink(): raise ValueError(f'Asset symlinks are not supported: {path}')
         if not path.is_file(): continue
         name = path.relative_to(directory).as_posix()
-        if any(c in name for c in '\r\n') or name == 'torcl-assets.txt':
+        if any(c in name for c in '\r\n') or name == 'egcl-assets.txt':
             raise ValueError(f'Invalid or reserved asset path: {name!r}')
         if path.stat().st_size > 64 * 1024 * 1024:
             raise ValueError(f'Asset exceeds the runtime 64 MiB limit: {name}')
@@ -197,7 +197,7 @@ def main():
         run([*adb_command(args), 'shell', 'am', 'start', '-W', '-n', f'{package}/android.app.NativeActivity'])
         return
     if args.command == 'logcat':
-        run([*adb_command(args), 'logcat', 'torcl:V', 'AndroidRuntime:E', 'libc:F', '*:S'])
+        run([*adb_command(args), 'logcat', 'egcl:V', 'AndroidRuntime:E', 'libc:F', '*:S'])
         return
     libraries = runtime_libraries(args.runtime, hosts, config)
     tools, jar = sdk_tools(args, manifest)
@@ -227,9 +227,9 @@ def main():
     with zipfile.ZipFile(unsigned, 'a', compression=zipfile.ZIP_DEFLATED) as archive:
         # Compressed native libraries are extracted by Android; ELF load segments
         # are 16 KiB aligned by the RPM build. ZIP mmap alignment is not required.
-        for abi, library in libraries.items(): archive.write(library, f'lib/{abi}/libtorcl_android.so')
+        for abi, library in libraries.items(): archive.write(library, f'lib/{abi}/libegcl_android.so')
         for name, path in inputs.items(): archive.write(path, f'assets/{name}')
-        archive.writestr('assets/torcl-assets.txt', 'torcl-android-assets-v1\n' + '\n'.join(inputs) + '\n')
+        archive.writestr('assets/egcl-assets.txt', 'egcl-android-assets-v1\n' + '\n'.join(inputs) + '\n')
     run([tools['zipalign'], '-f', '4', unsigned, aligned])
     sign(tools, aligned, output, release, project)
     if args.command == 'verify':
@@ -242,4 +242,4 @@ def main():
 if __name__ == '__main__':
     try: main()
     except (OSError, ValueError, KeyError, ET.ParseError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
-        sys.exit(f'torcl-android: {error}')
+        sys.exit(f'egcl-android: {error}')

@@ -2,7 +2,7 @@
 
 ## Source, bytecode, and native code
 
-TorCL lowers supported Lisp forms to bytecode and executes them in T0. The
+EGCL lowers supported Lisp forms to bytecode and executes them in T0. The
 runtime can compile hot functions to T1 baseline native code and then T2
 optimized code. Forms that are not lowered can use the tree-walking evaluator.
 Native backend coverage varies by architecture.
@@ -42,7 +42,7 @@ on success. It does not force installation of a T2 version.
 
 Writes a compiled-file artifact. For source names ending in `.lisp` or `.lsp`,
 the default output pathname replaces that suffix with `.fasl`. The contents use
-TorCL's BFASL format; the filename suffix is not the format identifier.
+EGCL's BFASL format; the filename suffix is not the format identifier.
 
 Use `:output-file` to choose the destination. The current implementation also
 accepts a positional output pathname as an extension, but portable code should
@@ -84,9 +84,9 @@ compiled, not the intended semantics of the source.
 
 ## Observing compilation
 
-### `torcl-ext:function-tier` { #function-tier }
+### `egcl-ext:function-tier` { #function-tier }
 
-**Function** `(torcl-ext:function-tier function)` → integer or `nil`
+**Function** `(egcl-ext:function-tier function)` → integer or `nil`
 
 Accepts a function designator. Returns `0`, `1`, or `2` for the installed tier,
 or `nil` if the designator is not recognized as a tiered function. Polls for
@@ -97,10 +97,10 @@ completed background compilation before reading the tier.
 **Functions**
 
 ```lisp
-(torcl-ext:function-invoke-count function)
-(torcl-ext:function-back-edge-count function)
-(torcl-ext:function-osr-count function)
-(torcl-ext:deopt-count)
+(egcl-ext:function-invoke-count function)
+(egcl-ext:function-back-edge-count function)
+(egcl-ext:function-osr-count function)
+(egcl-ext:deopt-count)
 ```
 
 The first two report invocation and back-edge counts, or `nil` for an
@@ -113,12 +113,12 @@ A function's installed tier does not identify the tier of an active OSR loop.
 For that purpose inspect OSR activity and execution behavior, rather than
 concluding from a T0 label that no native code ran.
 
-### `torcl-ext:bail-report` { #bail-report }
+### `egcl-ext:bail-report` { #bail-report }
 
-**Function** `(torcl-ext:bail-report)` → number of distinct reasons
+**Function** `(egcl-ext:bail-report)` → number of distinct reasons
 
 Prints collected bytecode-lowering decline reasons and counts. Enable collection
-by starting the process with `TORCL_BAIL_TRACE=1`. With collection disabled and
+by starting the process with `EGCL_BAIL_TRACE=1`. With collection disabled and
 no recorded failures, there is nothing to report.
 
 ## Experimental compiler controls
@@ -128,15 +128,15 @@ not a portable Common Lisp interface, and many are read once.
 
 | Variable | Use |
 | --- | --- |
-| `TORCL_BACKEND=tree-walker` | Compare against the tree-walking execution path |
-| `TORCL_LAZY_COMPILE=0` | Request eager bytecode compilation rather than lazy compilation |
-| `TORCL_T1_THRESHOLD` | Override the T1 invocation threshold |
-| `TORCL_T2_THRESHOLD` | Compatibility override for the T2 invocation threshold |
-| `TORCL_OSR_THRESHOLD` | Override named-loop OSR threshold; default 100,000 back edges |
-| `TORCL_BAIL_TRACE=1` | Collect bytecode-lowering decline reasons |
+| `EGCL_BACKEND=tree-walker` | Compare against the tree-walking execution path |
+| `EGCL_LAZY_COMPILE=0` | Request eager bytecode compilation rather than lazy compilation |
+| `EGCL_T1_THRESHOLD` | Override the T1 invocation threshold |
+| `EGCL_T2_THRESHOLD` | Compatibility override for the T2 invocation threshold |
+| `EGCL_OSR_THRESHOLD` | Override named-loop OSR threshold; default 100,000 back edges |
+| `EGCL_BAIL_TRACE=1` | Collect bytecode-lowering decline reasons |
 
 A threshold does not expand the target backend's supported instruction set.
 See [Platform support](user/reference/platforms.md) and
 [Profiling and efficiency](profiling.md).
 
-Implementation reference: [CLI compiler integration](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/torcl/src/cli/bytecode.rs).
+Implementation reference: [CLI compiler integration](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl/src/cli/bytecode.rs).

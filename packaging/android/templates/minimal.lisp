@@ -1,6 +1,6 @@
 (defun android-main (window)
   (declare (ignore window))
-  (android:log "Hello from TorCL on Android")
+  (android:log "Hello from EGCL on Android")
   (loop while (android:running-p)
         do (multiple-value-bind (action x y) (android:poll-touch)
              (when action (android:log (format nil "Touch ~A at ~A,~A" action x y))))

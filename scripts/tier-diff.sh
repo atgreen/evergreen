@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Tier-differential harness (bliss-19tm).
 #
-# Runs one Lisp corpus under TORCL_FORCE_TIER=interp|t0|t1|t2 and requires
+# Runs one Lisp corpus under EGCL_FORCE_TIER=interp|t0|t1|t2 and requires
 # byte-identical output from all four. The tree-walker (`interp`) is the
 # oracle; t0/t1/t2 are the bytecode, baseline-native, and optimising-native
-# tiers. Because TORCL_FORCE_TIER pins tier selection process-wide, ANY Lisp
+# tiers. Because EGCL_FORCE_TIER pins tier selection process-wide, ANY Lisp
 # file works as a corpus unmodified — growing test coverage grows tier
 # coverage for free.
 #
@@ -15,40 +15,40 @@
 # Usage:
 #   scripts/tier-diff.sh                          # default corpus
 #   scripts/tier-diff.sh path/to/corpus.lisp      # any Lisp file
-#   TORCL_GC_STRESS=1 scripts/tier-diff.sh        # under forced collection
+#   EGCL_GC_STRESS=1 scripts/tier-diff.sh        # under forced collection
 #
 # Environment:
-#   TORCL_BIN    torcl binary (default: the musl debug torcl)
+#   EGCL_BIN    egcl binary (default: the musl debug egcl)
 #   TIERS        tiers to compare (default: "interp t0 t1 t2")
 #   TIER_STRESS  1 = also force tier TRANSITIONS, not just tier states
 #
-# About TIER_STRESS: TORCL_FORCE_TIER pins which tier code ENDS UP in, but a
+# About TIER_STRESS: EGCL_FORCE_TIER pins which tier code ENDS UP in, but a
 # corpus can sit entirely in that tier and never exercise the crossings between
 # them. Measured on this corpus, the default run performs ZERO OSR native loop
-# entries (torcl-ext:profile-report "OSR: 0 native loop entries") — so the
+# entries (egcl-ext:profile-report "OSR: 0 native loop entries") — so the
 # T1->T2 back-edge transfer is completely uncovered. That is precisely the path
 # bliss-kqdr corrupted: it handed T2 code a T1-sized frame, and no corpus run
 # could see it. TIER_STRESS=1 lowers the back-edge and OSR thresholds so short
 # corpus loops cross them.
 #
 # Note the invocation thresholds are deliberately NOT set here: under
-# TORCL_FORCE_TIER the T0->T1 and T1->T2 invocation thresholds are already
+# EGCL_FORCE_TIER the T0->T1 and T1->T2 invocation thresholds are already
 # forced to 1, so setting them would be a no-op. Only the back-edge/OSR
 # thresholds still bite.
 #
-# Each tier runs under scripts/torcl-limited.sh (memory cap; see AGENTS.md).
+# Each tier runs under scripts/egcl-limited.sh (memory cap; see AGENTS.md).
 
 set -u
 
 cd "$(dirname "$0")/.."
 
 CORPUS="${1:-tests/differential/tier-corpus.lisp}"
-TORCL_BIN="${TORCL_BIN:-target/x86_64-unknown-linux-musl/debug/torcl}"
+EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"
 TIERS="${TIERS:-interp t0 t1 t2}"
 
-if [ ! -x "$TORCL_BIN" ]; then
-    echo "tier-diff: ERROR: torcl binary not found at $TORCL_BIN" >&2
-    echo "tier-diff: build it with: cargo build -p torcl --bin torcl" >&2
+if [ ! -x "$EGCL_BIN" ]; then
+    echo "tier-diff: ERROR: egcl binary not found at $EGCL_BIN" >&2
+    echo "tier-diff: build it with: cargo build -p egcl --bin egcl" >&2
     exit 2
 fi
 if [ ! -f "$CORPUS" ]; then
@@ -68,14 +68,14 @@ for tier in $TIERS; do
     # The oracle runs unstressed: it is the pure tree-walker and has no tiers to
     # cross, so stressing it would only slow the run down.
     if [ "${TIER_STRESS:-0}" = "1" ] && [ "$tier" != "$oracle" ]; then
-        TORCL_FORCE_TIER="$tier" \
-        TORCL_T1_T2_BACKEDGE_THRESHOLD=5 \
-        TORCL_OSR_THRESHOLD=10 \
-        TORCL_ANON_OSR_THRESHOLD=10 \
-            scripts/torcl-limited.sh "$TORCL_BIN" \
+        EGCL_FORCE_TIER="$tier" \
+        EGCL_T1_T2_BACKEDGE_THRESHOLD=5 \
+        EGCL_OSR_THRESHOLD=10 \
+        EGCL_ANON_OSR_THRESHOLD=10 \
+            scripts/egcl-limited.sh "$EGCL_BIN" \
             --no-init --load "$CORPUS" >"$work/$tier.raw" 2>&1
     else
-        TORCL_FORCE_TIER="$tier" scripts/torcl-limited.sh "$TORCL_BIN" \
+        EGCL_FORCE_TIER="$tier" scripts/egcl-limited.sh "$EGCL_BIN" \
             --no-init --load "$CORPUS" >"$work/$tier.raw" 2>&1
     fi
     rc=$?

@@ -2,11 +2,11 @@
 
 | Path | Responsibility |
 | --- | --- |
-| `crates/torcl-rt` | Values, heap, GC, safepoints, threads, fibers, FFI, images, OS services |
-| `crates/torcl-compiler` | Reader, macro expansion, IR, optimization, allocation, code emission, tier policy |
-| `crates/torcl-stdlib` | Standard-library behavior: packages, sequences, streams, CLOS, conditions, FORMAT |
-| `crates/torcl` | CLI, REPL, loading, evaluator, bytecode integration, native bridges |
-| `crates/torcl-android` | Android NativeActivity runtime |
+| `crates/egcl-rt` | Values, heap, GC, safepoints, threads, fibers, FFI, images, OS services |
+| `crates/egcl-compiler` | Reader, macro expansion, IR, optimization, allocation, code emission, tier policy |
+| `crates/egcl-stdlib` | Standard-library behavior: packages, sequences, streams, CLOS, conditions, FORMAT |
+| `crates/egcl` | CLI, REPL, loading, evaluator, bytecode integration, native bridges |
+| `crates/egcl-android` | Android NativeActivity runtime |
 | `lib/` | Lisp prelude and bundled library sources |
 | `packaging/android/` | Android runtime build and application templates |
 | `packaging/fedora/` | Container-free RPM build, launchers, and validation |
@@ -27,7 +27,7 @@ The current stage is 5; later requirements remain part of the design roadmap.
 
 ## Library compatibility ports
 
-Compatibility changes belong in maintained forks, using `#+torcl`, `#-torcl`,
+Compatibility changes belong in maintained forks, using `#+egcl`, `#-egcl`,
 or ASDF feature conditions. Tests import pinned fork revisions through ocicl's
 `git+URL@SHA` support and commit the corresponding `ocicl.csv`. Edited download
 caches are not durable port sources. See

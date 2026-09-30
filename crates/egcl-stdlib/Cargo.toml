@@ -1,0 +1,21 @@
+[package]
+name = "egcl-stdlib"
+description = "EGCL Common Lisp standard library: packages, CLOS, conditions, streams, sequences"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Embedded CPython. Only needed so the stdlib's finalizer dispatch — the single
+# global hook, which it owns — can release a dead PYTHON-OBJECT's reference.
+python = ["egcl-rt/python"]
+
+[dependencies]
+egcl-rt.workspace = true
+egcl-compiler.workspace = true
+rustyline = "18.0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_Pipes", "Win32_Foundation"] }

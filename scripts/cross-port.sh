@@ -17,8 +17,8 @@ cross=${CROSS:-cross}
 export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.93.0}
 export CROSS_CONTAINER_ENGINE=${CROSS_CONTAINER_ENGINE:-podman}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3}
-# Containers can have their own cgroup outside the torcl-limited scope.
-export CROSS_CONTAINER_OPTS="${CROSS_CONTAINER_OPTS:-} --memory=${TORCL_MEM_MAX:-4G} --memory-swap=${TORCL_MEM_MAX:-4G}"
+# Containers can have their own cgroup outside the egcl-limited scope.
+export CROSS_CONTAINER_OPTS="${CROSS_CONTAINER_OPTS:-} --memory=${EGCL_MEM_MAX:-4G} --memory-swap=${EGCL_MEM_MAX:-4G}"
 command -v "$cross" >/dev/null
 command -v "$CROSS_CONTAINER_ENGINE" >/dev/null
 architectures=($architecture)
@@ -32,14 +32,14 @@ for arch in "${architectures[@]}"; do
         ppc64le) target=powerpc64le-unknown-linux-gnu; toolchain=powerpc64le-linux-gnu ;;
         s390x) target=s390x-unknown-linux-gnu; toolchain=s390x-linux-gnu ;;
     esac
-    "$cross" build --locked --release -p torcl --bin torcl --target "$target" --features torcl-rt/c-ffi
-    binary="${CARGO_TARGET_DIR:-target}/$target/release/torcl"
+    "$cross" build --locked --release -p egcl --bin egcl --target "$target" --features egcl-rt/c-ffi
+    binary="${CARGO_TARGET_DIR:-target}/$target/release/egcl"
     echo "Built $binary"
     if [[ $action == build ]]; then
         continue
     fi
     command -v "qemu-$arch" >/dev/null
-    scripts/torcl-limited.sh "$cross" test --locked -p torcl-rt --target "$target" \
+    scripts/egcl-limited.sh "$cross" test --locked -p egcl-rt --target "$target" \
         --features c-ffi --test portable_os
 
     # Match the libraries used by the linker. Use the host's current QEMU for
@@ -50,17 +50,17 @@ with open("Cross.toml", "rb") as f:
     print(tomllib.load(f)["target"][sys.argv[1]]["image"])
 PY
     )
-    sysroot=$(mktemp -d "${TMPDIR:-/tmp}/torcl-$arch-sysroot.XXXXXX")
+    sysroot=$(mktemp -d "${TMPDIR:-/tmp}/egcl-$arch-sysroot.XXXXXX")
     trap 'rm -rf -- "$sysroot"' EXIT
     "$CROSS_CONTAINER_ENGINE" run --rm --entrypoint tar "$image" \
         -C "/usr/$toolchain" -cf - lib | tar -C "$sysroot" -xf -
     if [[ $arch == ppc64le ]]; then
         ln -s lib "$sysroot/lib64"
     fi
-    scripts/torcl-limited.sh python3 scripts/portability-smoke.py "$arch" -- \
+    scripts/egcl-limited.sh python3 scripts/portability-smoke.py "$arch" -- \
         "qemu-$arch" -L "$sysroot" "$binary"
     if [[ $arch == s390x ]]; then
-        scripts/torcl-limited.sh python3 scripts/s390x-jit-smoke.py -- \
+        scripts/egcl-limited.sh python3 scripts/s390x-jit-smoke.py -- \
             qemu-s390x -L "$sysroot" "$binary"
     fi
     rm -rf -- "$sysroot"

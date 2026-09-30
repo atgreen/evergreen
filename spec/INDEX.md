@@ -1,4 +1,4 @@
-# TorCL Specification — Master Index
+# EGCL Specification — Master Index
 
 **Version:** 0.1-draft
 **Last updated:** 2026-08-11
@@ -13,13 +13,13 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | File | § | Title | Key Topics |
 |------|---|-------|------------|
 | `00-overview.md` | §0 | Scope & Goals | Goals G1–G8, architecture diagram, design decisions, directory layout |
-| `01-object-model.md` | §1 | Object Model | TorclVal tagged pointers, type lattice, heap layouts, immediates |
+| `01-object-model.md` | §1 | Object Model | EgclVal tagged pointers, type lattice, heap layouts, immediates |
 | `02-runtime-core.md` | §2 | Runtime Core | Thread model, stack layout, safepoints, FFI, signals, startup |
 | `03-memory-gc.md` | §3 | Memory & GC | Nursery/old-gen, TLABs, concurrent marking, compaction, finalization |
 | `04-compiler.md` | §4 | Compiler Pipeline | Overview + 10 sub-chapters (§4.1–§4.10) |
 | `05-stdlib.md` | §5 | Standard Library | Overview + 7 companion files spanning §5.1–§5.9 |
 | `06-devtools.md` | §6 | Developer Tools | REPL, debugger, profiler, SLIME/SLY protocol |
-| `06-11-bfasl.md` | §6.11 | TorCL FASL format | `.bfasl` portable compiled-artifact format (R6.60–R6.70) |
+| `06-11-bfasl.md` | §6.11 | EGCL FASL format | `.bfasl` portable compiled-artifact format (R6.60–R6.70) |
 | `07-ops-portability.md` | §7 | Ops & Portability | Image format, deployment, platform matrix, build, logging |
 | `08-security-robustness.md` | §8 | Security & Robustness | Sandbox, safe FFI, resource limits, reader hardening, fuzzing |
 | `09-extensions.md` | §9 | SBCL-Compatible Extensions | Adopted extensions, rationale, compatibility mapping |
@@ -27,7 +27,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `11-phasing-roadmap.md` | §11 | Phasing & Roadmap | Bootstrap phases, milestone criteria, self-hosting path |
 | `12-glossary.md` | §12 | Glossary & Cross-Reference | Term glossary, D/A/R ID index, goal traceability |
 | `13-concurrency.md` | §13 | Concurrency Model | Memory model, lock ordering, green threads, safepoints |
-| `14-simd.md` | §14 | SIMD | SIMD packs, `TORCL-SIMD*` packages, instruction-set dispatch, image portability (R14.01–R14.55) |
+| `14-simd.md` | §14 | SIMD | SIMD packs, `EGCL-SIMD*` packages, instruction-set dispatch, image portability (R14.01–R14.55) |
 
 ## Compiler Sub-Chapters (§4)
 

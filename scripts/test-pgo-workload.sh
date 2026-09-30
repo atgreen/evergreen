@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run from the repository root; wrap this script in torcl-limited.sh.
+# Run from the repository root; wrap this script in egcl-limited.sh.
 set -euo pipefail
-binary=${1:?usage: bash scripts/test-pgo-workload.sh TORCL_OR_SBCL [sbcl]}
-mode=${2:-torcl}
-work=$(mktemp -d /tmp/torcl-pgo-workload-test.XXXXXX)
+binary=${1:?usage: bash scripts/test-pgo-workload.sh EGCL_OR_SBCL [sbcl]}
+mode=${2:-egcl}
+work=$(mktemp -d /tmp/egcl-pgo-workload-test.XXXXXX)
 echo "PGO workload test artifacts: $work"
 if [[ $mode == sbcl ]]; then
     args=(--noinform --no-sysinit --no-userinit --non-interactive)
@@ -11,7 +11,7 @@ else
     args=(--no-init)
 fi
 run_phase() {
-    TORCL_PGO_WORK="$work/system with spaces" TORCL_PGO_PHASE="$1" \
+    EGCL_PGO_WORK="$work/system with spaces" EGCL_PGO_PHASE="$1" \
         "$binary" "${args[@]}" --load scripts/pgo-workload.lisp
 }
 expect_failure() {
@@ -25,7 +25,7 @@ expect_failure() {
 expect_failure load 'PGO workload is not prepared'
 expect_failure bogus 'Unknown PGO phase'
 for invalid_work in '' relative-directory; do
-    if TORCL_PGO_WORK="$invalid_work" TORCL_PGO_PHASE=load \
+    if EGCL_PGO_WORK="$invalid_work" EGCL_PGO_PHASE=load \
         "$binary" "${args[@]}" --load scripts/pgo-workload.lisp \
         >"$work/invalid-work.log" 2>&1; then
         echo 'unexpected success with invalid work directory' >&2

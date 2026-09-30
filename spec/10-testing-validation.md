@@ -1,6 +1,6 @@
 # §10  Testing & Validation
 
-**Scope:** Strategy for verifying that TorCL meets its ANSI compliance,
+**Scope:** Strategy for verifying that EGCL meets its ANSI compliance,
 performance, correctness, and robustness goals. Covers test suites,
 benchmarking, continuous integration, fuzzing, property-based testing,
 differential testing, sanitizer integration, performance regression
@@ -8,7 +8,7 @@ detection, and test infrastructure.
 
 ## 10.1  ANSI Compliance Testing
 
-**R10.01** TorCL MUST pass Paul Dietz's `ansi-test` suite with zero
+**R10.01** EGCL MUST pass Paul Dietz's `ansi-test` suite with zero
 unexpected failures before any stable release. Known-failure lists MUST
 be tracked in `tests/ansi-test/expected-failures.txt` with per-failure
 rationale.
@@ -17,13 +17,13 @@ rationale.
 `main`. Regressions (new failures not in the expected-failures list)
 MUST block the merge.
 
-**R10.03** TorCL SHOULD additionally pass the `cl-test-grid` portable
+**R10.03** EGCL SHOULD additionally pass the `cl-test-grid` portable
 test suite for library compatibility validation.
 
 ## 10.2  Unit & Integration Tests
 
-**R10.04** Every Rust crate (`torcl-rt`, `torcl-compiler`, `torcl-stdlib`,
-`torcl`) MUST maintain unit tests in `tests/` subdirectories,
+**R10.04** Every Rust crate (`egcl-rt`, `egcl-compiler`, `egcl-stdlib`,
+`egcl`) MUST maintain unit tests in `tests/` subdirectories,
 exercising public API surfaces.
 
 **R10.05** Unit test coverage SHOULD exceed 80% line coverage for Rust
@@ -48,7 +48,7 @@ read → macroexpand → compile → execute → print. These live in
 
 ## 10.3  Performance Benchmarking
 
-**R10.09** TorCL MUST track performance on `cl-bench` (Gabriel
+**R10.09** EGCL MUST track performance on `cl-bench` (Gabriel
 benchmarks + Boehm GC benchmarks) against SBCL as the reference
 implementation. Target: within 2× of SBCL (goal G2).
 
@@ -93,13 +93,13 @@ under `fuzz/fuzz_targets/`:
 
 | Target | Entry point | Input format |
 |--------|------------|--------------|
-| `fuzz_reader` | `torcl_compiler::reader::read_from_string` | Raw bytes (UTF-8 lossy) |
+| `fuzz_reader` | `egcl_compiler::reader::read_from_string` | Raw bytes (UTF-8 lossy) |
 | `fuzz_macroexpand` | reader → macroexpand | Raw bytes → parsed form |
 | `fuzz_compile` | reader → macroexpand → IR → codegen | Raw bytes → compiled fn |
 | `fuzz_eval` | Full read-eval pipeline | Raw bytes |
-| `fuzz_format` | `torcl_stdlib::format::format_to_string` | Structured: control string + args |
-| `fuzz_ffi` | `torcl_rt::ffi::call_foreign` | Structured: type-tag + value bytes |
-| `fuzz_image_load` | `torcl_rt::image::load_image` | Raw bytes (corrupt image) |
+| `fuzz_format` | `egcl_stdlib::format::format_to_string` | Structured: control string + args |
+| `fuzz_ffi` | `egcl_rt::ffi::call_foreign` | Structured: type-tag + value bytes |
+| `fuzz_image_load` | `egcl_rt::image::load_image` | Raw bytes (corrupt image) |
 
 ### 10.4.2  Corpus Management
 
@@ -227,7 +227,7 @@ closures) is intact.
 
 ## 10.7  Property-Based Testing
 
-**R10.36** TorCL MUST employ property-based testing (QuickCheck-style)
+**R10.36** EGCL MUST employ property-based testing (QuickCheck-style)
 using the `proptest` crate for Rust components and a custom CL-side
 property test harness for self-hosted components.
 
@@ -280,7 +280,7 @@ atom complexity (e.g., large fixnum → 0, long string → `""`).
 
 ## 10.8  Differential Testing Against SBCL
 
-**R10.43** TorCL MUST support differential testing against SBCL as
+**R10.43** EGCL MUST support differential testing against SBCL as
 the reference implementation. The differential test harness lives in
 `tests/differential/`.
 
@@ -293,7 +293,7 @@ the reference implementation. The differential test harness lives in
 │                      │     └─────────────┘     └──────┬──────┘
 │                      │                                 │ compare
 │                      │     ┌─────────────┐     ┌──────▼──────┐
-│                      │────▶│ TorCL runner │────▶│  Test       │
+│                      │────▶│ EGCL runner │────▶│  Test       │
 │                      │     │ (subprocess) │     │  output     │
 │                      │     └─────────────┘     └─────────────┘
 └──────────────────────┘
@@ -301,7 +301,7 @@ the reference implementation. The differential test harness lives in
 
 **R10.44** The differential harness MUST:
 1. Accept input as a CL expression (text).
-2. Evaluate it under both SBCL and TorCL in sandboxed subprocesses
+2. Evaluate it under both SBCL and EGCL in sandboxed subprocesses
    with a 10-second timeout and 512 MB memory limit.
 3. Capture: printed output, return values (printed readably), condition
    type (if signalled), and exit status.
@@ -329,7 +329,7 @@ legitimate behavioural differences:
 ```toml
 [[exception]]
 pattern = "(type-of 42)"
-reason = "SBCL returns FIXNUM; TorCL returns (INTEGER 0 4611686018427387903)"
+reason = "SBCL returns FIXNUM; EGCL returns (INTEGER 0 4611686018427387903)"
 category = "type-specifier-detail"
 
 [[exception]]
@@ -339,7 +339,7 @@ category = "documentation"
 ```
 
 **R10.47** Each exception MUST reference the ANSI section that permits
-the divergence or be tagged `torcl-extension` if it stems from §9.
+the divergence or be tagged `egcl-extension` if it stems from §9.
 
 ### 10.8.4  Differential Test Corpus
 
@@ -357,7 +357,7 @@ MUST be filed as issues with label `differential`.
 
 ## 10.9  Sanitizer Integration
 
-**R10.50** TorCL MUST be regularly tested under LLVM sanitizers to
+**R10.50** EGCL MUST be regularly tested under LLVM sanitizers to
 detect memory safety, threading, and uninitialised-memory bugs in
 Rust `unsafe` blocks, inline assembly, and FFI code.
 
@@ -368,8 +368,8 @@ Rust `unsafe` blocks, inline assembly, and FFI code.
 | Sanitizer | Cargo flag | Scope | Frequency |
 |-----------|-----------|-------|-----------|
 | AddressSanitizer (ASan) | `-Z sanitizer=address` | All crates | Nightly CI |
-| ThreadSanitizer (TSan) | `-Z sanitizer=thread` | `torcl-rt` (thread, gc, scheduler) | Nightly CI |
-| MemorySanitizer (MSan) | `-Z sanitizer=memory` | `torcl-rt` (ffi, image loader) | Weekly CI |
+| ThreadSanitizer (TSan) | `-Z sanitizer=thread` | `egcl-rt` (thread, gc, scheduler) | Nightly CI |
+| MemorySanitizer (MSan) | `-Z sanitizer=memory` | `egcl-rt` (ffi, image loader) | Weekly CI |
 | LeakSanitizer (LSan) | `ASAN_OPTIONS=detect_leaks=1` | All crates (Linux only) | Nightly CI (with ASan) |
 
 **R10.52** Sanitizer builds MUST use the nightly Rust toolchain:
@@ -388,19 +388,19 @@ RUSTFLAGS="-Z sanitizer=address" \
 # tests/sanitizers/tsan.supp
 # False positive: GC safepoint handshake uses acquire/release
 # fencing that TSan cannot model (§3 write barrier)
-race:torcl_rt::safepoint::poll
-race:torcl_rt::gc::write_barrier_slow
+race:egcl_rt::safepoint::poll
+race:egcl_rt::gc::write_barrier_slow
 
 # False positive: symbol value cell uses SeqCst atomics but
 # TSan sees the non-atomic fast-path read
-race:torcl_rt::object::SymbolCell::value_relaxed
+race:egcl_rt::object::SymbolCell::value_relaxed
 ```
 
 ```text
 # tests/sanitizers/asan.supp
 # Intentional: stack-scanning reads past logical stack top
 # to find conservative GC roots (§3)
-interceptor_via_fun:torcl_rt::gc::scan_stack_conservative
+interceptor_via_fun:egcl_rt::gc::scan_stack_conservative
 ```
 
 **R10.54** Every suppression entry MUST include:
@@ -429,7 +429,7 @@ these adjustments. The flag MUST be automatically set when any
 
 ## 10.10  Performance Regression Detection
 
-**R10.58** TorCL MUST employ a statistically rigorous methodology for
+**R10.58** EGCL MUST employ a statistically rigorous methodology for
 detecting performance regressions in CI, avoiding false alerts from
 measurement noise.
 
@@ -548,12 +548,12 @@ JSON format and rendered as trend charts in a project dashboard
 
 ### 10.11.1  Test Harness Architecture
 
-**R10.68** TorCL MUST provide a unified test harness (`torcl-test`)
+**R10.68** EGCL MUST provide a unified test harness (`egcl-test`)
 that drives all CL-level tests. Architecture:
 
 ```text
 ┌────────────────────────────────────────────────────────┐
-│                    torcl-test harness                   │
+│                    egcl-test harness                   │
 ├──────────┬──────────┬──────────┬──────────┬────────────┤
 │  ANSI    │  Unit    │  Integ   │  Prop    │  Diff      │
 │  runner  │  runner  │  runner  │  runner  │  runner    │
@@ -564,8 +564,8 @@ that drives all CL-level tests. Architecture:
 └────────────────────────────────────────────────────────┘
 ```
 
-**R10.69** `torcl-test` MUST support:
-- Parallel test execution across multiple TorCL subprocess workers
+**R10.69** `egcl-test` MUST support:
+- Parallel test execution across multiple EGCL subprocess workers
 - Timeout per test (default 30 s, configurable)
 - Retry on flaky detection (max 2 retries; if a test passes on
   retry, it is marked `flaky` and tracked)
@@ -632,16 +632,16 @@ controlled vocabulary:
 
 ```bash
 # Run only smoke tests
-torcl-test --tags smoke
+egcl-test --tags smoke
 
 # Run everything except slow and nightly
-torcl-test --exclude-tags slow,nightly
+egcl-test --exclude-tags slow,nightly
 
 # Run tests matching a name pattern
-torcl-test --filter 'reader-*'
+egcl-test --filter 'reader-*'
 
 # Run tests for a specific spec section
-torcl-test --tags reader,compiler
+egcl-test --tags reader,compiler
 ```
 
 ### 10.11.4  Test Organisation on Disk
@@ -763,7 +763,7 @@ pretending the entire language is already complete.
 
 **R10.79** The primary acceptance gate for active development MUST be
 stage-aware: it MUST execute the current stage's gate scenario plus a
-no-regression pass of all earlier stages through the real `torcl`
+no-regression pass of all earlier stages through the real `egcl`
 binary.
 
 **R10.80** Advancing `spec/stages.json` `current_stage` MUST require
@@ -781,7 +781,7 @@ tests MUST NOT be used as sole evidence that a gate passes.
 ### 10.13.1  Real Entrypoint Contract
 
 **R10.82** Stage-gate acceptance scenarios MUST drive the same surface a
-user would drive in that stage: `torcl --eval`, `torcl --load`,
+user would drive in that stage: `egcl --eval`, `egcl --load`,
 positional script execution, or the interactive REPL. Calling internal
 library functions directly MAY supplement acceptance coverage, but MUST
 NOT replace the real-entrypoint gate.

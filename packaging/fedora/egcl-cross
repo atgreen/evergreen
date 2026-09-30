@@ -1,0 +1,31 @@
+#!/usr/bin/bash
+# The target is selected by the installed command name; arguments pass unchanged.
+set -euo pipefail
+target=${0##*/}
+target=${target#egcl-}
+root=${EGCL_CROSS_ROOT:-/usr/libexec/egcl}
+directory=$root/$target
+runtime=$directory/egcl
+case "$target" in
+    s390x-linux) runner=(qemu-s390x -L "$directory/sysroot") ;;
+    ppc64le-linux) runner=(qemu-ppc64le -L "$directory/sysroot") ;;
+    aarch64-linux) runner=(qemu-aarch64 -L "$directory/sysroot") ;;
+    android) runner=(qemu-aarch64) ;;
+    windows)
+        runner=(wine)
+        runtime=$directory/egcl.exe
+        export WINEPREFIX=${WINEPREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/egcl/wine}
+        export WINEDEBUG=${WINEDEBUG:--all}
+        mkdir -p "$WINEPREFIX"
+        ;;
+    *) echo "Unknown EGCL cross target: $target" >&2; exit 2 ;;
+esac
+if [[ ! -f "$runtime" ]]; then
+    echo "Missing EGCL runtime: $runtime; reinstall egcl-target-$target." >&2
+    exit 1
+fi
+if ! command -v "${runner[0]}" >/dev/null; then
+    echo "Missing ${runner[0]}; install the runtime dependencies of egcl-target-$target." >&2
+    exit 1
+fi
+exec "${runner[@]}" "$runtime" "$@"

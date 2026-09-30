@@ -1,6 +1,6 @@
 # Save an executable
 
-Use a saved executable to ship a loaded Lisp application. Start with the TorCL
+Use a saved executable to ship a loaded Lisp application. Start with the EGCL
 runtime for the machine that will run the application. For another target,
 follow [Build for another platform](cross-build.md).
 
@@ -8,7 +8,7 @@ Create `build.lisp`:
 
 ```lisp
 (defun main ()
-  (format t "Hello from TorCL!~%"))
+  (format t "Hello from EGCL!~%"))
 
 (save-lisp-and-die "hello" :executable t :toplevel #'main)
 ```
@@ -16,12 +16,12 @@ Create `build.lisp`:
 Run:
 
 ```sh
-torcl --no-init --load build.lisp
+egcl --no-init --load build.lisp
 ./hello
 ```
 
 Saving terminates the build process. Running `hello` invokes `main` and prints
-`Hello from TorCL!`. Load your own application and its libraries before calling
+`Hello from EGCL!`. Load your own application and its libraries before calling
 `save-lisp-and-die`.
 
 ## Save a development session
@@ -45,7 +45,7 @@ The result is `81`.
 Restart it with a compatible runtime:
 
 ```sh
-torcl --image session.core
+egcl --image session.core
 ```
 
 Use `--image` for a core file, not `load`. See the
@@ -81,8 +81,8 @@ dynamic = explicit
 Inspect the retention report, then deliver:
 
 ```sh
-torcl --image app.core --deliver app.delivery --output hello --dry-run
-torcl --image app.core --deliver app.delivery --output hello
+egcl --image app.core --deliver app.delivery --output hello --dry-run
+egcl --image app.core --deliver app.delivery --output hello
 ./hello
 ```
 
@@ -125,7 +125,7 @@ The current pass retains all global data, symbol identities, packages,
 classes, and functions outside the selected packages. It follows
 references through saved data and source/bytecode, including nested functions
 and captured environments. Conservatively retained registries can keep extra
-functions alive. Runtime packages such as `COMMON-LISP` and `TORCL-INTERNAL`
+functions alive. Runtime packages such as `COMMON-LISP` and `EGCL-INTERNAL`
 can be selected explicitly; `KEYWORD` cannot. Installed printing, instance
 initialization, and Gray stream protocols remain reachable through the
 runtime's implicit calls, even when application code does not name them.
@@ -197,8 +197,8 @@ runtime = specialized
 Then run delivery with a matching source checkout:
 
 ```sh
-torcl --image app.core --deliver app.delivery --output hello \
-  --runtime-source /path/to/torcl
+egcl --image app.core --deliver app.delivery --output hello \
+  --runtime-source /path/to/egcl
 ```
 
 The source checkout defaults to the location recorded when the driver was built.
@@ -230,7 +230,7 @@ optimizing compiler), or `max-tier = t0` (omit both native compilers).
 The omitted compiler entry points are removed at build time so native linking
 can remove their implementation. T0-only applications continue executing saved
 bytecode. Native promotion and OSR cannot exceed the selected tier;
-`TORCL_FORCE_TIER` requests above it are clamped to the available tier.
+`EGCL_FORCE_TIER` requests above it are clamped to the available tier.
 
 For example, a specification that selects the whole saved world and omits both
 native compilers is:

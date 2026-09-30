@@ -1,6 +1,6 @@
 # §8 Security & Robustness
 
-**Scope:** This chapter specifies TorCL's defences against hostile or
+**Scope:** This chapter specifies EGCL's defences against hostile or
 malformed input, resource exhaustion, unsafe memory access, and
 concurrency hazards. It covers the sandboxing model, safe FFI boundary,
 resource limits, signal safety, reader hardening, integer overflow
@@ -13,14 +13,14 @@ strategy that validates all of the above.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R8.01 | TorCL MUST provide a *restricted evaluation mode* (sandbox) that disables file I/O, network access, FFI calls, and OS process spawning. | MUST |
+| R8.01 | EGCL MUST provide a *restricted evaluation mode* (sandbox) that disables file I/O, network access, FFI calls, and OS process spawning. | MUST |
 | R8.02 | Sandbox capability grants MUST be whitelist-based; the default set MUST be empty (deny-all). | MUST |
-| R8.03 | All `unsafe` Rust blocks in the runtime MUST be confined to `crates/torcl-rt/src/ffi.rs`, `crates/torcl-rt/src/gc/*.rs`, and `crates/torcl-rt/src/signal.rs`; each block MUST be documented with a `// SAFETY:` comment. | MUST |
+| R8.03 | All `unsafe` Rust blocks in the runtime MUST be confined to `crates/egcl-rt/src/ffi.rs`, `crates/egcl-rt/src/gc/*.rs`, and `crates/egcl-rt/src/signal.rs`; each block MUST be documented with a `// SAFETY:` comment. | MUST |
 | R8.04 | Foreign-memory operations MUST reject null addresses, address overflow, and out-of-bounds or freed owned allocations. Typed access MUST honor alignment or use unaligned operations. Borrowed pointers MUST have an explicit caller-owned validity contract. | MUST |
 | R8.05 | Foreign pointers MUST use a distinct Lisp representation, never reinterpret a Lisp object as a C address, and remain unavailable in sandboxed execution. Explicit integer address construction and inspection MAY be provided for CFFI compatibility. | MUST |
 | R8.06 | The runtime MUST enforce a configurable maximum heap size hard cap; allocation beyond the cap MUST signal a `STORAGE-CONDITION`. | MUST |
-| R8.07 | The runtime MUST enforce a configurable stack-depth limit; exceeding it MUST signal a `TORCL-EXT:STACK-OVERFLOW-ERROR` (restartable). | MUST |
-| R8.08 | Sandbox mode MUST support a per-evaluation CPU time limit; exceeding it MUST signal `TORCL-EXT:TIMEOUT-CONDITION`. | MUST |
+| R8.07 | The runtime MUST enforce a configurable stack-depth limit; exceeding it MUST signal a `EGCL-EXT:STACK-OVERFLOW-ERROR` (restartable). | MUST |
+| R8.08 | Sandbox mode MUST support a per-evaluation CPU time limit; exceeding it MUST signal `EGCL-EXT:TIMEOUT-CONDITION`. | MUST |
 | R8.09 | An allocation-rate throttle SHOULD be available in sandbox mode to slow runaway loops without killing them outright. | SHOULD |
 | R8.10 | Signal handlers MUST be async-signal-safe; all non-trivial work MUST be deferred to the next safepoint. | MUST |
 | R8.11 | The reader MUST be hardened against deeply nested structures (configurable depth limit, default 4096). | MUST |
@@ -42,7 +42,7 @@ strategy that validates all of the above.
 
 ### 8.2.1  Overview
 
-TorCL provides a **restricted evaluation mode** that creates an isolated
+EGCL provides a **restricted evaluation mode** that creates an isolated
 execution context in which untrusted CL code can be evaluated with
 controlled access to system resources. The model is inspired by Java's
 `SecurityManager` (pre-deprecation) but uses a simpler, capability-based
@@ -79,7 +79,7 @@ and `max_stack_depth`.
 The context is stored in a thread-local `Option<Arc<SandboxContext>>`.
 Every guarded operation calls `check_capability(cap)` which returns
 `Ok(())` outside a sandbox or when the capability is granted, and
-`Err(TorclError::capability_denied(cap))` otherwise.
+`Err(EgclError::capability_denied(cap))` otherwise.
 
 **Thread propagation (R8.20):** When a new thread is spawned inside a
 sandbox (via `CAP_THREADS`), the runtime MUST propagate the parent
@@ -87,13 +87,13 @@ thread's `SandboxContext` to the child thread by cloning the `Arc` into
 the child's thread-local slot before any user code executes. A child
 thread MUST NOT run with a wider capability set than its parent.
 Spawning a thread without `CAP_THREADS` MUST signal
-`TorclError::capability_denied(CAP_THREADS)`.
+`EgclError::capability_denied(CAP_THREADS)`.
 
 ### 8.2.4  Sandbox Entry API
 
 ```lisp
 ;; CL-side entry point
-(torcl-ext:with-sandbox (:capabilities '(:file-read :eval)
+(egcl-ext:with-sandbox (:capabilities '(:file-read :eval)
                          :path-whitelist '("/tmp/scratch/*")
                          :max-heap-mb 64
                          :max-cpu-seconds 5)
@@ -121,24 +121,24 @@ The following operations are intercepted inside a sandbox:
 
 All `unsafe` blocks MUST be confined to the following modules:
 
-- **`crates/torcl-rt/src/ffi.rs`** — C-ABI bridge, pointer validation,
+- **`crates/egcl-rt/src/ffi.rs`** — C-ABI bridge, pointer validation,
   alien value marshalling.
-- **`crates/torcl-rt/src/gc/*.rs`** — raw memory manipulation required
+- **`crates/egcl-rt/src/gc/*.rs`** — raw memory manipulation required
   by the garbage collector: bump-pointer TLAB allocation, object header
   access, `mmap`/`mprotect` for memory-mapped heap regions, and write
   barrier implementations.
-- **`crates/torcl-rt/src/signal.rs`** — POSIX signal handler registration
+- **`crates/egcl-rt/src/signal.rs`** — POSIX signal handler registration
   (`sigaction`), `mprotect` for stack guard pages, and
   async-signal-safe flag operations.
 
 No other module may contain `unsafe` code. The `#![deny(unsafe_code)]`
-attribute is set at crate level in `torcl-rt`, `torcl-compiler`, and
-`torcl`, with per-module `#[allow(unsafe_code)]` only in the three
+attribute is set at crate level in `egcl-rt`, `egcl-compiler`, and
+`egcl`, with per-module `#[allow(unsafe_code)]` only in the three
 locations listed above.
 
 ### 8.3.2  Pointer Validation (R8.04)
 
-TorCL-owned allocations retain their bounds and allocation identity through
+EGCL-owned allocations retain their bounds and allocation identity through
 pointer arithmetic. Access checks that identity under the allocation registry
 lock, preventing use-after-free through tracked aliases even when addresses are
 reused. `MEM-REF` and `MEM-SET` use unaligned loads/stores, so packed C layouts
@@ -151,12 +151,12 @@ an aligned Rust reference additionally validate alignment:
 
 ```rust
 // A8.01 — FFI pointer validation
-fn validate_ptr<T>(ptr: *const T, context: &str) -> Result<&T, TorclError> {
+fn validate_ptr<T>(ptr: *const T, context: &str) -> Result<&T, EgclError> {
     if ptr.is_null() {
-        return Err(TorclError::ffi_null_pointer(context));
+        return Err(EgclError::ffi_null_pointer(context));
     }
     if (ptr as usize) % std::mem::align_of::<T>() != 0 {
-        return Err(TorclError::ffi_misaligned(context));
+        return Err(EgclError::ffi_misaligned(context));
     }
     // SAFETY: pointer is non-null, aligned, and caller guarantees
     // that the pointee is valid for the lifetime of the returned ref.
@@ -173,7 +173,7 @@ fn validate_ptr<T>(ptr: *const T, context: &str) -> Result<&T, TorclError> {
 | `DOUBLE-FLOAT` | `double` | `f64` | NaN/Inf pass-through (documented) |
 | `STRING` | `const char*` | `CStr` | UTF-8 validation, null-terminator check |
 | `(UNSIGNED-BYTE 8) VECTOR` | `uint8_t*` + `size_t` | `&[u8]` | Length bounds check |
-| `T` (boxed) | `torcl_val_t` | `TorclVal` | Tag validation |
+| `T` (boxed) | `egcl_val_t` | `EgclVal` | Tag validation |
 
 Truncation (e.g., `BIGNUM` → `int32_t`) MUST be explicitly requested via
 `:truncate t` in the FFI declaration and signals a warning when data is
@@ -181,7 +181,7 @@ actually lost.
 
 ### 8.3.4  Explicit Foreign Pointers (R8.05)
 
-Foreign pointers are wrapped in a `TORCL-FFI:FOREIGN-POINTER` object distinct
+Foreign pointers are wrapped in a `EGCL-FFI:FOREIGN-POINTER` object distinct
 from both Lisp integers and Lisp heap references. `MAKE-POINTER` imports an
 integer address as a borrowed pointer; `POINTER-ADDRESS` explicitly retrieves
 the address. Neither operation claims the borrowed address is safe to dereference.
@@ -203,7 +203,7 @@ wrappers as null pointers, clearing both addresses and allocation identities.
 
 | Parameter | Default | Env Var | CLI Flag |
 |-----------|---------|---------|----------|
-| Max heap | 4 GiB | `TORCL_MAX_HEAP` | `--max-heap` |
+| Max heap | 4 GiB | `EGCL_MAX_HEAP` | `--max-heap` |
 | Sandbox max heap | 256 MiB | (per-sandbox) | N/A |
 
 When the allocator cannot satisfy a request within the cap:
@@ -217,7 +217,7 @@ When the allocator cannot satisfy a request within the cap:
 The runtime maintains a call-depth counter incremented in every function
 prologue and decremented in every epilogue. Default limit: 10 000 frames.
 
-When the limit is reached, a `TORCL-EXT:STACK-OVERFLOW-ERROR` is
+When the limit is reached, a `EGCL-EXT:STACK-OVERFLOW-ERROR` is
 signalled. The condition is restartable via `CONTINUE` (which resets the
 counter and re-enters, allowing a debugger to intervene).
 
@@ -226,7 +226,7 @@ increment via a thread-local atomic).
 
 | Parameter | Default | Env Var |
 |-----------|---------|---------|
-| Max stack depth | 10 000 | `TORCL_STACK_DEPTH` |
+| Max stack depth | 10 000 | `EGCL_STACK_DEPTH` |
 
 ### 8.4.3  Allocation-Rate Throttle (R8.09)
 
@@ -249,7 +249,7 @@ In sandbox mode, wall-clock and CPU-time limits are enforced:
    `deadline = clock_gettime(CLOCK_THREAD_CPUTIME_ID) + limit`.
 2. At each safepoint (§2, loop back-edges and function prologues), the
    current thread CPU time is checked against the deadline.
-3. If expired, `TORCL-EXT:TIMEOUT-CONDITION` is signalled.
+3. If expired, `EGCL-EXT:TIMEOUT-CONDITION` is signalled.
 
 Safepoint checks are cheap (~3 ns) because they read a thread-local
 flag set by a timerfd/kqueue callback in a monitor thread.
@@ -260,7 +260,7 @@ flag set by a timerfd/kqueue callback in a monitor thread.
 
 ### 8.5.1  Signal Handling Strategy
 
-TorCL uses **deferred signal processing** at safepoints, following the
+EGCL uses **deferred signal processing** at safepoints, following the
 HotSpot model:
 
 1. **Signal handler** (async-signal-safe): sets a per-thread flag in a
@@ -318,15 +318,15 @@ GC uses guard pages on TLAB boundaries to trigger slow-path allocation.
 
 The reader is implemented as a recursive-descent parser. To prevent
 stack overflow in the Rust call stack, the reader tracks its current
-depth and returns `Err(TorclError::NestingTooDeep)` before exceeding
+depth and returns `Err(EgclError::NestingTooDeep)` before exceeding
 the limit.
 
 ```rust
 // A8.02 — Reader depth check
-fn read_list(&mut self) -> Result<TorclVal, TorclError> {
+fn read_list(&mut self) -> Result<EgclVal, EgclError> {
     self.depth += 1;
     if self.depth > self.max_depth {
-        return Err(TorclError::nesting_too_deep(self.depth));
+        return Err(EgclError::nesting_too_deep(self.depth));
     }
     let result = self.read_list_inner();
     self.depth -= 1;
@@ -344,9 +344,9 @@ All fixnum arithmetic operations check for overflow before returning:
 
 ```rust
 // A8.03 — Checked fixnum addition
-fn fixnum_add(a: i64, b: i64) -> TorclVal {
+fn fixnum_add(a: i64, b: i64) -> EgclVal {
     match a.checked_add(b) {
-        Some(sum) if is_fixnum_range(sum) => TorclVal::fixnum(sum),
+        Some(sum) if is_fixnum_range(sum) => EgclVal::fixnum(sum),
         _ => promote_to_bignum(a, b, Op::Add),
     }
 }
@@ -419,7 +419,7 @@ by `debug_assert!` in debug builds.
 
 The authoritative table, same-level sub-order rules, and protocol-lock
 exception are in §13.3.1. The checked wrappers are
-`torcl_rt::lock_order::{OrderedMutex, OrderedRwLock}`.
+`egcl_rt::lock_order::{OrderedMutex, OrderedRwLock}`.
 
 ### 8.8.4  Debug-Build Deadlock Detection (R8.21)
 
@@ -455,7 +455,7 @@ Every `.bimg` image file includes:
 
 | Field | Size | Purpose |
 |-------|------|---------|
-| Magic number | 8 bytes | `TORCLIMG` ASCII |
+| Magic number | 8 bytes | `EGCLIMG` ASCII |
 | Version | 4 bytes | Image format version |
 | Platform tag | 8 bytes | Architecture + OS hash |
 | Heap checksum | 32 bytes | SHA-256 hash of the heap region |
@@ -468,11 +468,11 @@ On load:
 2. Verify file size matches `total_size`.
 3. Compute SHA-256 of heap and code regions and compare against stored
    checksums (consistent with the image header checksum at §7.2.3).
-4. Reject with `TORCL-EXT:CORRUPT-IMAGE-ERROR` on mismatch.
+4. Reject with `EGCL-EXT:CORRUPT-IMAGE-ERROR` on mismatch.
 
 ### 8.9.2  Graceful Handling of Corrupted Images
 
-If image verification fails, TorCL:
+If image verification fails, EGCL:
 
 1. Prints a clear diagnostic to stderr (file path, expected vs actual
    hash, which region failed).
@@ -484,7 +484,7 @@ If image verification fails, TorCL:
 ### 8.9.3  Runtime Crash Handling
 
 On unrecoverable faults (double-fault, GC invariant violation): write a
-crash log to `~/.torcl/crash-<pid>-<timestamp>.log` (backtrace, register
+crash log to `~/.egcl/crash-<pid>-<timestamp>.log` (backtrace, register
 state, GC phase, last 16 safepoints), best-effort flush open streams
 (1 s timeout), then `_exit(134)`.
 
@@ -531,15 +531,15 @@ Fuzz-discovered crashes are triaged as:
 
 | Parameter | Default | Env Var | CLI Flag | Sandbox Override |
 |-----------|---------|---------|----------|-----------------|
-| Max heap size | 4 GiB | `TORCL_MAX_HEAP` | `--max-heap` | Per-sandbox |
-| Stack depth limit | 10 000 | `TORCL_STACK_DEPTH` | `--stack-depth` | Per-sandbox |
-| Reader nesting depth | 4 096 | `TORCL_READ_DEPTH` | — | Same |
-| Reader max token length | 1 MiB | `TORCL_READ_TOKEN_MAX` | — | Same |
+| Max heap size | 4 GiB | `EGCL_MAX_HEAP` | `--max-heap` | Per-sandbox |
+| Stack depth limit | 10 000 | `EGCL_STACK_DEPTH` | `--stack-depth` | Per-sandbox |
+| Reader nesting depth | 4 096 | `EGCL_READ_DEPTH` | — | Same |
+| Reader max token length | 1 MiB | `EGCL_READ_TOKEN_MAX` | — | Same |
 | `*READ-EVAL*` | NIL | — | `--read-eval` | Always NIL |
 | `*READ-CIRCULAR*` | NIL | — | — | Same |
 | CPU time limit (sandbox) | none | — | — | Per-sandbox |
 | Alloc rate limit (sandbox) | none | — | — | Per-sandbox |
-| Crash log directory | `~/.torcl/` | `TORCL_CRASH_DIR` | — | Same |
+| Crash log directory | `~/.egcl/` | `EGCL_CRASH_DIR` | — | Same |
 
 ---
 

@@ -17,7 +17,7 @@ primitive. Each entry gives the observed behavior and the correct ANSI result.
 1. **`mod` is wrong for negative arguments.**
    `(mod -7 3)` => `-1`; ANSI requires `2` (result takes the sign of the
    divisor). `rem` is also `-1` there, which *is* correct for `rem`. So `mod`
-   currently just aliases `rem`. TorCL's Lisp code works around this by using
+   currently just aliases `rem`. EGCL's Lisp code works around this by using
    `(floor a b)`'s second value instead of `mod`.
 
 2. **`member` ignores/breaks `:key`.**

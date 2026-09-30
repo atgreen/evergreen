@@ -1,4 +1,4 @@
-(let* ((text (format nil "~A-~D" 'torcl 3))
+(let* ((text (format nil "~A-~D" 'egcl 3))
        (numbers '(1 3 5))
        (table (make-hash-table :test 'equal))
        (seq (concatenate 'list '(1 2) '(3 4 5))))

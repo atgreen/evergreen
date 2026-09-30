@@ -44,7 +44,7 @@ the callee's per-call state lives in **Rust `thread_local!` + `RefCell`/`Cell`**
   entry, restored after; `emit_c2i_helper_call` *also* toggles recovery around
   the whole c2i window to protect the Rust dispatch frame.
 
-`push_frame` (a TorclStack bump-allocator) and `bind_params` (args → slots) *are*
+`push_frame` (a EgclStack bump-allocator) and `bind_params` (args → slots) *are*
 emittable in x86, but emitting correct TLS access + the RefCell indirection for
 the state above — and the deopt/error handler — in hand-written assembly is
 impractical and dangerously fragile. So there is **no safe incremental win**
@@ -72,13 +72,13 @@ transition). GC is precise/moving with compiler stack maps at safepoints.
 maps, and **no deopt**. ECL compiles to C, so calls are C calls and errors are
 `longjmp`. Their speed is direct calls + register allocation, not speculation.
 
-**HotSpot VM** (interpreter → C1 → C2 with OSR + deopt — torcl's model):
+**HotSpot VM** (interpreter → C1 → C2 with OSR + deopt — egcl's model):
 
 - **`r15` is pinned to the `JavaThread` pointer.** All thread/VM state is reached
-  through it; no TLS call. (This is torcl's `NATIVE_ENV` problem, solved with a
+  through it; no TLS call. (This is egcl's `NATIVE_ENV` problem, solved with a
   register.)
 - **c2i/i2c adapter stubs** bridge the interpreter's stack convention and the
-  compiled register convention — literally torcl's `c2i` — but *compiled→compiled*
+  compiled register convention — literally egcl's `c2i` — but *compiled→compiled*
   calls skip the adapter.
 - Static/special calls are **direct call instructions patched at the site** when
   the target compiles; virtual calls use **inline caches** (monomorphic → direct
@@ -90,18 +90,18 @@ maps, and **no deopt**. ECL compiles to C, so calls are C calls and errors are
 - **Exceptions** unwind via **per-method exception tables** (PC-range → handler).
 - **GC** is safepoint + oop-map based throughout.
 
-**Takeaway table** (torcl thread-local → the established fix):
+**Takeaway table** (egcl thread-local → the established fix):
 
-| torcl per-call thread-local | Established fix |
+| egcl per-call thread-local | Established fix |
 |---|---|
-| `NATIVE_ENV` (env pointer) | **Dedicate a register** (HotSpot `r15`). torcl already pins r14=slots, r15=operand-stack. |
+| `NATIVE_ENV` (env pointer) | **Dedicate a register** (HotSpot `r15`). egcl already pins r14=slots, r15=operand-stack. |
 | `NATIVE_ENV_FRAME` | Carry in the env register / frame header; only closures need it. |
-| `NATIVE_ERROR` (caller-checked) | **Unwind** through the frame chain / handler tables (torcl already has the TorclStack + catch/handler stack). |
-| `NATIVE_DEOPT` (caller-checked) | **Trap at the guard**; callee resumes on its own frame. torcl already has state-transfer deopt (bliss-izt.2). |
+| `NATIVE_ERROR` (caller-checked) | **Unwind** through the frame chain / handler tables (egcl already has the EgclStack + catch/handler stack). |
+| `NATIVE_DEOPT` (caller-checked) | **Trap at the guard**; callee resumes on its own frame. egcl already has state-transfer deopt (bliss-izt.2). |
 | SIGSEGV recovery IPs (per-c2i toggle) | Structural safepoints + a fixed handler, not per-call. |
 | redefinition / recompile safety | **fdefn-style indirection** (SBCL) or **patched call sites** (HotSpot): call through a stable per-function entry slot updated on (re)compile/deopt. |
 
-torcl already has the two hardest prerequisites — **stack maps** (`CodeInfo`) and
+egcl already has the two hardest prerequisites — **stack maps** (`CodeInfo`) and
 **state-transfer deopt on the same frame** (bliss-izt.2) — so it is closer than
 it looks. The work is relocating env/error/deopt off thread-locals into the ABI.
 
@@ -124,7 +124,7 @@ deopt.
   `Env` (HotSpot-`r15` style); rewrite `c2i_load_env`/`c2i_store_env`/… to read
   it; drop the `NATIVE_ENV` thread-local. Keeps the c2i bounce for now.
 - **Stage 2 — error unwinding.** Replace the caller-checked `NATIVE_ERROR` slot
-  with an unwind through the TorclStack frame chain to the nearest handler
+  with an unwind through the EgclStack frame chain to the nearest handler
   (reuse the catch/handler stack), so a callee need not have its error inspected
   by the caller.
 - **Stage 3 — self-contained deopt.** Make a guard failure resume T0 on the
@@ -135,13 +135,13 @@ deopt.
   emit `push_frame` + arg-bind + a **direct `CALL`** to the callee's entry
   (loaded from a stable per-function slot for redefinition safety), pop, and use
   the result; bounce to Rust only on the rare trap. Enforce the `NATIVE_DEPTH`
-  cap (or TorclStack overflow guard) so deep recursion stays bounded.
+  cap (or EgclStack overflow guard) so deep recursion stays bounded.
 
 ## 4. Risks and honest caveats
 
 - **GC/safepoint contract.** Direct calls must preserve precise rooting at the
   call safepoint (the caller's operand stack + the new callee frame) — the
-  hardest invariant; validate under `TORCL_GC_STRESS`/`POISON`.
+  hardest invariant; validate under `EGCL_GC_STRESS`/`POISON`.
 - **Deep recursion.** The whole point (bliss-x5y.8) of the current bounce is to
   keep native recursion bounded; a direct call uses the C stack, so the depth cap
   / overflow guard must still fire a catchable STORAGE-CONDITION, not a C-stack
@@ -149,8 +149,8 @@ deopt.
 - **Distributed payoff.** The ~1.44µs is spread across many small operations;
   even halving it takes asdf from ~6s to perhaps ~4.5s. Stage 0 exists to confirm
   the number before committing to Stages 1–4.
-- **Complexity torcl may not need.** SBCL/Chez are fast with **no deopt at all**.
-  torcl's tiering+deopt is HotSpot-shaped; the per-call state that blocks direct
+- **Complexity egcl may not need.** SBCL/Chez are fast with **no deopt at all**.
+  egcl's tiering+deopt is HotSpot-shaped; the per-call state that blocks direct
   calls exists *because* of deopt/speculation. If native-call throughput is the
   priority over speculation, the simpler direction is fewer moving parts, not
   more.
@@ -162,21 +162,21 @@ deopt.
 
 Register model & prereqs (confirmed against the codegen):
 - T1 emit uses only r14 (frame slots) and r15 (operand-stack top) among callee-
-  saved regs; **r12/r13/rbx are free**. Reserve **r12 = current `*mut TorclStack`**.
+  saved regs; **r12/r13/rbx are free**. Reserve **r12 = current `*mut EgclStack`**.
 - `NATIVE_ENV` is a `const`-init thread-local `Cell` — a ~few-ns read, NOT a
   syscall. Dropping it (the doc's original "Stage 1") is ~0 gain AND unnecessary:
   for native→native the callee reads the already-correct `NATIVE_ENV`, and the
   restricted (non-closure) shape never touches `NATIVE_ENV_FRAME`. **Skip
-  env-in-register.** The register that IS needed is the TorclStack pointer.
+  env-in-register.** The register that IS needed is the EgclStack pointer.
 - GC scans a thread's frames from the **safepoint-published** `fp`/`sp` snapshot
-  (`TorclStack::publish`), not live `fp`/`sp_offset`. So the emitted frame push
-  MUST update `TorclStack.fp` and `sp_offset` (and pop must restore them), or a
+  (`EgclStack::publish`), not live `fp`/`sp_offset`. So the emitted frame push
+  MUST update `EgclStack.fp` and `sp_offset` (and pop must restore them), or a
   GC while the callee runs won't scan the callee frame → live args/locals move →
   stale pointers. Reference the field offsets via `core::mem::offset_of!`
   (stable) so codegen tracks the real layout — no hardcoding.
 
 ABI surgery (the crash-on-mismatch step; do carefully, validate before commit):
-- Entry ABI `fn(*mut u64) -> u64` → `fn(*mut u64, *mut TorclStack) -> u64`
+- Entry ABI `fn(*mut u64) -> u64` → `fn(*mut u64, *mut EgclStack) -> u64`
   (rdi=slots, rsi=stack).
 - Prologue (bytecode.rs ~15473): `push r14; push r15; sub rsp,8; mov r14,rdi;
   lea r15,[r14+8n]` → `push r14; push r15; push r12; mov r14,rdi; mov r12,rsi;
@@ -187,7 +187,7 @@ ABI surgery (the crash-on-mismatch step; do carefully, validate before commit):
   rsp effect as `add rsp,8`, so alignment is preserved.
 - Update the 4 transmute sites (13417, 15000 run_native, 16818, 17456) to pass
   the stack pointer in rsi.
-- T2 (torcl-compiler/codegen.rs prologue ~232): mirror the r12 preservation and
+- T2 (egcl-compiler/codegen.rs prologue ~232): mirror the r12 preservation and
   exclude r12 from its allocator; until then, restrict direct-call EMISSION to
   T1 callers (T2 entries still accept the extra rsi arg harmlessly).
 
@@ -198,7 +198,7 @@ non-variadic, non-closure, `NATIVE_DEPTH < cap`; else fall through to c2i):
    overflow → c2i fallback (which raises the catchable STORAGE-CONDITION).
 3. Write the callee `Frame` header at `base+sp_offset`, zero its slots, copy the
    nargs from the caller operand stack into the callee slots, set the callee's
-   r14; update `TorclStack.fp` = new frame and `sp_offset` += framebytes.
+   r14; update `EgclStack.fp` = new frame and `sp_offset` += framebytes.
 4. Direct `CALL` the callee entry (native→native — NO set_recovery toggle, NO
    catch_unwind; those are only for Rust c2i crossings). `NATIVE_ENV` already
    correct; recovery IPs already `native_recovery` (set by the outer run_native).
@@ -209,22 +209,22 @@ non-variadic, non-closure, `NATIVE_DEPTH < cap`; else fall through to c2i):
    removing these post-checks; not required for a first working version.)
 
 Validation gates each step: acceptance, bytecode_differential (tier identity),
-t1_native, t1_deopt, torcl-rt lib single-threaded (SIGSEGV recovery), and
-TORCL_GC_STRESS=1/POISON on a native-call-heavy form + deep recursion (depth cap).
+t1_native, t1_deopt, egcl-rt lib single-threaded (SIGSEGV recovery), and
+EGCL_GC_STRESS=1/POISON on a native-call-heavy form + deep recursion (depth cap).
 
 ## Stage 2 — direct-call emission (concrete spec; measurement-prototype first)
 
-Prereq DONE: Stage 1 (c72eeaf) reserves r12 = *mut TorclStack in the native ABI.
+Prereq DONE: Stage 1 (c72eeaf) reserves r12 = *mut EgclStack in the native ABI.
 
 Emit-time gate (in emit_native_x86's `Instr::CallNamed { sym, nargs }` arm, behind
-TORCL_NN_DIRECT for the prototype): the callee `sym` is (a) currently in
+EGCL_NN_DIRECT for the prototype): the callee `sym` is (a) currently in
 NATIVE_REGISTRY (native entry E, code_info CI, num_slots NS), (b) fixed-arity ==
 nargs and non-variadic (registry_get(sym)), (c) not a closure (absent from
 CLOSURE_ENV and CLOSURE_CONTROL). Else emit the existing c2i path.
 
 Offsets via `core::mem::offset_of!` (robust): Frame{prev_fp@0,return_pc@8,
 function@16,code_info@24,flags@32,num_locals@36}, HDR=size_of::<Frame>()=40;
-TorclStack{base,capacity,sp_offset(Cell),fp(Cell)}. FRAMEBYTES = HDR + 8*NS.
+EgclStack{base,capacity,sp_offset(Cell),fp(Cell)}. FRAMEBYTES = HDR + 8*NS.
 
 Encoding notes: r12 and r15 as a base need a SIB byte (ModRM rm=100, SIB=0x24);
 r14 does not (rm=110). imm64 (E, CI) load via `mov r64, imm64`; NIL/FLAG_CALL fit
@@ -266,6 +266,6 @@ Prototype limitations (measurement only; add before production):
   deopted, the baked entry is stale. Add a guard (compare the callee's current
   entry to a stable per-fn cell) or invalidate the caller on callee change.
 
-Measure TORCL_NN_DIRECT on t0bench (expect ~0.52µs → ~0.2-0.3µs) to confirm the
+Measure EGCL_NN_DIRECT on t0bench (expect ~0.52µs → ~0.2-0.3µs) to confirm the
 win before hardening. Then add the four guards, drop the flag, and extend to T2
 callers (exclude r12 from the T2 allocator first).

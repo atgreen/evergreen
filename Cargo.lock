@@ -76,6 +76,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "egcl"
+version = "0.1.0"
+dependencies = [
+ "egcl-compiler",
+ "egcl-delivery-macros",
+ "egcl-rt",
+ "egcl-stdlib",
+ "iced-x86",
+ "windows-sys",
+]
+
+[[package]]
+name = "egcl-android"
+version = "0.1.0"
+dependencies = [
+ "egcl",
+ "egcl-rt",
+]
+
+[[package]]
+name = "egcl-compiler"
+version = "0.1.0"
+dependencies = [
+ "egcl-rt",
+ "iced-x86",
+ "proptest",
+ "regalloc2",
+ "windows-sys",
+]
+
+[[package]]
+name = "egcl-delivery-macros"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "egcl-rt"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "elf_loader",
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "egcl-stdlib"
+version = "0.1.0"
+dependencies = [
+ "egcl-compiler",
+ "egcl-rt",
+ "rustyline",
+ "windows-sys",
+]
+
+[[package]]
 name = "elf"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,65 +544,6 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys",
-]
-
-[[package]]
-name = "torcl"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "torcl-compiler",
- "torcl-delivery-macros",
- "torcl-rt",
- "torcl-stdlib",
- "windows-sys",
-]
-
-[[package]]
-name = "torcl-android"
-version = "0.1.0"
-dependencies = [
- "torcl",
- "torcl-rt",
-]
-
-[[package]]
-name = "torcl-compiler"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "proptest",
- "regalloc2",
- "torcl-rt",
- "windows-sys",
-]
-
-[[package]]
-name = "torcl-delivery-macros"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn",
-]
-
-[[package]]
-name = "torcl-rt"
-version = "0.1.0"
-dependencies = [
- "cc",
- "elf_loader",
- "libc",
- "windows-sys",
-]
-
-[[package]]
-name = "torcl-stdlib"
-version = "0.1.0"
-dependencies = [
- "rustyline",
- "torcl-compiler",
- "torcl-rt",
  "windows-sys",
 ]
 

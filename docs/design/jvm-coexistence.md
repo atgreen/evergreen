@@ -1,7 +1,7 @@
 # JVM coexistence contract and feasibility findings
 
 Status: coexistence design and historical diagnostic findings. An experimental
-native API now lives in [torcl-jvm](../../lib/torcl-jvm/README.md), tracked by
+native API now lives in [egcl-jvm](../../lib/egcl-jvm/README.md), tracked by
 `bliss-b4f28`. It implements checked calls, interface callbacks, explicit reference
 ownership and JVM lifecycle; it does not merge collectors or CLOS metaclasses.
 Tracked by `bliss-brbpc`. Scope is native x86-64 Linux on the developer's laptop.
@@ -16,7 +16,7 @@ or JIT code ownership. JNI is the supported execution boundary. Class integratio
 and compiler call-site optimization come after coexistence is demonstrated.
 
 The initial feasibility result at `1fa4fd9` was mixed: native Lisp-first embedding passed
-useful workloads, but JVM-first embedding crashed because TorCL overwrote
+useful workloads, but JVM-first embedding crashed because EGCL overwrote
 HotSpot's fault handlers. The same installer was reachable from a safepoint timeout
 fallback, so startup ordering alone could not constitute a supported solution.
 The crash was tracked in `bliss-95g0b` (now fixed as described below).
@@ -27,28 +27,28 @@ The native package adds per-thread alternate stacks, preserves an enabled host
 stack, and prevents safepoint fallback from reinstalling process handlers.
 GNU/c-ffi builds use interposable `sigaction`. JVM-first initialization requires
 preloaded JDK `libjsig.so`; detected JVM-first startup without it reports a
-condition before TorCL changes dispositions. Image saving is inhibited before
+condition before EGCL changes dispositions. Image saving is inhibited before
 bridge loading, and native entry rejects switched fiber stacks.
 
 The package tests run on the laptop with OpenJDK 26.0.2.1 and checked JNI.
 They include Java-created-thread callbacks, callback revocation, nested calls,
 explicit weak/strong handles and shutdown refusal with live resources. The guest
-test verifies that detaching TorCL leaves the host JVM usable, then lets the host
+test verifies that detaching EGCL leaves the host JVM usable, then lets the host
 destroy it. These results supersede the original signal/alternate-stack failures
 below; the original table remains a record of the investigation.
 
 ## Reproduction and evidence
 
 The [probe](../../tools/jvm-probe/README.md) builds a small Java workload and C
-shim, then loads the shim into the actual dynamic TorCL executable. It runs both
+shim, then loads the shim into the actual dynamic EGCL executable. It runs both
 initialization orders in separate, resource-limited processes. The shim does not
-repair or intercept TorCL's signal installation. It checks results and requires
+repair or intercept EGCL's signal installation. It checks results and requires
 a completion marker; failures remain nonzero exits.
 
 Initial measurements on 2026-09-27:
 
 - Runtime source: `1fa4fd9`, built with
-  `cargo build --target x86_64-unknown-linux-gnu --features torcl-rt/c-ffi -p torcl`.
+  `cargo build --target x86_64-unknown-linux-gnu --features egcl-rt/c-ffi -p egcl`.
 - JVM: local Homebrew OpenJDK 26.0.2.1, x86-64 HotSpot; checked JNI, 128 MiB Java
   heap, `-Xrs`. This is a tested combination, not a compatibility matrix.
 - The initial installed-RPM smoke test was exploratory; conclusions below use
@@ -71,7 +71,7 @@ Initial measurements on 2026-09-27:
 | Explicit bridge cleanup and `DestroyJavaVM` | 0 | not reached |
 
 Lisp-first also completed the callback/collection/reference/long-call workload
-with `TORCL_GC_STRESS=1 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1`,
+with `EGCL_GC_STRESS=1 EGCL_GC_POISON=1 EGCL_GC_VERIFY=1`,
 including the Lisp-exception and explicit JVM-shutdown checks. These are bounded examples, not a
 proof that all JNI, collector, or scheduler interactions are safe. Overlapping
 requests do not establish simultaneous collector phases. Calling `System.gc`
@@ -81,7 +81,7 @@ Stack observations: the original Lisp thread and its nested callbacks ran on
 its pthread stack with an enabled alternate signal stack (context bits 3).
 A Java-created callback thread ran on its pthread stack with the alternate
 signal stack disabled (bits 1). These probes do not execute Java on a switched
-TorCL fiber stack.
+EGCL fiber stack.
 
 The full stress/poison/verification run completed without JNI warnings or GC
 verification failures. It is a bounded diagnostic, not a broad library or
@@ -103,7 +103,7 @@ Guest embedding accepts an existing VM and must never destroy a VM it does not
 own. Initialization is serialized and has explicit not-started, starting, ready,
 stopping, stopped, and failed states. Restart in the same process is unsupported.
 
-TorCL needs a guest signal policy, not another unconditional call to its current
+EGCL needs a guest signal policy, not another unconditional call to its current
 installer. Install process handlers once; initialize thread-local facilities
 separately. Preserve prior dispositions, masks, relevant flags, and default/ignore
 semantics. A dispatcher may handle a fault only if the fault address, instruction
@@ -112,7 +112,7 @@ Neither a low address nor a registered thread alone proves fault ownership.
 Unknown faults must remain visible to the host VM or the normal fatal path.
 
 HotSpot can chain preinstalled handlers. `libjsig` interposes libc `sigaction`
-for later installation, but TorCL's x86-64 raw `rt_sigaction` syscall bypasses
+for later installation, but EGCL's x86-64 raw `rt_sigaction` syscall bypasses
 that interception. The current wrapper also discards the old action.
 `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` need an explicit process-control
 policy; HotSpot documents that these cannot be chained and suggests `-Xrs` when
@@ -125,7 +125,7 @@ threads. The current process-global `SIGNAL_ALT_STACK` allocation and installer
 require a separate ownership audit, tracked in `bliss-53j07`. Signal paths must not allocate, lock runtime
 mutexes, invoke JNI, or call Lisp.
 
-Source anchors: `crates/torcl-rt/src/runtime.rs` (`install_signal_handlers`,
+Source anchors: `crates/egcl-rt/src/runtime.rs` (`install_signal_handlers`,
 `classify_sigsegv_address`, `sigsegv_handler`), `syscall.rs` (`rt_sigaction`),
 `safepoint.rs` (timeout fallback calls the installer).
 
@@ -165,7 +165,7 @@ is complete, reject unsupported fiber-stack entry before invoking JNI.
 
 A Lisp Java proxy owns a strong global JNI reference or an explicitly weak one.
 A Java Lisp proxy owns a generation-checked stable handle whose table entry is a
-GC-visible Lisp root. Java never receives a raw moving `TorclVal` address.
+GC-visible Lisp root. Java never receives a raw moving `EgclVal` address.
 Temporary call arguments use scoped roots; persistent callbacks use retained
 roots, with revocation only after foreign publication and active calls end.
 
@@ -219,7 +219,7 @@ execution or blocking work.
 
 MethodHandles require a Java-side adapter or `invokeWithArguments`; directly
 calling signature-polymorphic `invoke`/`invokeExact` through JNI is unsupported.
-Neither MethodHandles nor `invokedynamic` remove the native boundary for TorCL
+Neither MethodHandles nor `invokedynamic` remove the native boundary for EGCL
 functions. A JVM bytecode backend has a different object-representation and
 runtime-semantics problem and is outside this contract.
 

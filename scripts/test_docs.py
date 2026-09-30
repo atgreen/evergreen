@@ -11,19 +11,19 @@ spec.loader.exec_module(hook)
 class CliReferenceTests(unittest.TestCase):
     def test_extracts_help_without_other_source_strings(self):
         source = '''pub fn help_text() -> &'static str {
-    concat!("Usage: torcl\\n", "  --eval EXPR\\n",)
+    concat!("Usage: egcl\\n", "  --eval EXPR\\n",)
 }
 pub fn unrelated() { println!("not documentation"); }
 '''
-        self.assertEqual(hook.cli_help(source), 'Usage: torcl\n  --eval EXPR\n')
+        self.assertEqual(hook.cli_help(source), 'Usage: egcl\n  --eval EXPR\n')
 
     def test_changed_source_shape_fails_instead_of_publishing_empty_help(self):
         with self.assertRaises(ValueError):
             hook.cli_help('pub fn help_text() -> String { build_help() }')
 
     def test_current_source_has_expected_public_interface(self):
-        text = hook.cli_help((ROOT / 'crates/torcl/src/cli.rs').read_text())
-        self.assertTrue(text.startswith('Usage: torcl'))
+        text = hook.cli_help((ROOT / 'crates/egcl/src/cli.rs').read_text())
+        self.assertTrue(text.startswith('Usage: egcl'))
         self.assertIn('--no-init', text)
         self.assertIn('*command-line-args*', text)
 

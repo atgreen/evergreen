@@ -1,14 +1,14 @@
 # Foreign function interface
 
-`TORCL-FFI` provides foreign pointers, explicit foreign storage, shared libraries,
+`EGCL-FFI` provides foreign pointers, explicit foreign storage, shared libraries,
 scalar calls, and callbacks on supported targets. These interfaces are callable
 from Lisp; the old extension inventory's “not installed” label is obsolete.
-They are TorCL interfaces, not drop-in substitutes for every CFFI or SB-ALIEN
+They are EGCL interfaces, not drop-in substitutes for every CFFI or SB-ALIEN
 operation.
 
 ## Runtime and ABI requirements
 
-Dynamic library loading requires a dynamic TorCL build with `torcl-rt/c-ffi`.
+Dynamic library loading requires a dynamic EGCL build with `egcl-rt/c-ffi`.
 The Fedora native RPM and Android APK runtime provide dynamic builds. The
 static Android CLI and default static musl CLI do not dynamically load libraries.
 Foreign call and callback support are architecture-specific; ordinary Lisp
@@ -33,8 +33,8 @@ specifies a fixed width.
 **Functions**
 
 ```lisp
-(torcl-ffi:foreign-type-size type)       ; size in bytes
-(torcl-ffi:foreign-type-alignment type)  ; alignment in bytes
+(egcl-ffi:foreign-type-size type)       ; size in bytes
+(egcl-ffi:foreign-type-alignment type)  ; alignment in bytes
 ```
 
 These report the runtime's layout for a supported foreign type. Do not use a
@@ -47,13 +47,13 @@ Lisp array's upgraded element type as proof that its storage has the same layout
 **Functions**
 
 ```lisp
-(torcl-ffi:pointerp object)
-(torcl-ffi:make-pointer address)
-(torcl-ffi:pointer-address pointer)
-(torcl-ffi:pointer-eq pointer-a pointer-b)
-(torcl-ffi:null-pointer)
-(torcl-ffi:null-pointer-p pointer)
-(torcl-ffi:inc-pointer pointer byte-offset)
+(egcl-ffi:pointerp object)
+(egcl-ffi:make-pointer address)
+(egcl-ffi:pointer-address pointer)
+(egcl-ffi:pointer-eq pointer-a pointer-b)
+(egcl-ffi:null-pointer)
+(egcl-ffi:null-pointer-p pointer)
+(egcl-ffi:inc-pointer pointer byte-offset)
 ```
 
 A foreign pointer is an opaque object, not an integer address or a pointer to a
@@ -62,8 +62,8 @@ or establish ownership. `inc-pointer` changes the address by bytes, not elements
 
 ### Allocation and release { #foreign-alloc }
 
-**Functions** `(torcl-ffi:foreign-alloc bytes)` → pointer;
-`(torcl-ffi:foreign-free pointer)`
+**Functions** `(egcl-ffi:foreign-alloc bytes)` → pointer;
+`(egcl-ffi:foreign-free pointer)`
 
 Foreign storage has an explicit lifetime. Release the owning allocation once,
 after C has stopped retaining or using it. Do not free an interior alias.
@@ -76,9 +76,9 @@ outside the allocator does not carry the same ownership information.
 **Functions**
 
 ```lisp
-(torcl-ffi:mem-ref pointer type &optional (offset 0))
-(torcl-ffi:mem-set value pointer type &optional (offset 0))
-(setf (torcl-ffi:mem-ref pointer type offset) value)
+(egcl-ffi:mem-ref pointer type &optional (offset 0))
+(egcl-ffi:mem-set value pointer type &optional (offset 0))
+(setf (egcl-ffi:mem-ref pointer type offset) value)
 ```
 
 Offsets are bytes. The allocation must be large enough for the offset plus the
@@ -86,20 +86,20 @@ size of the value. Tracked allocations receive bounds and lifetime checks; a
 foreign pointer is not permission to access arbitrary memory safely.
 
 ```lisp
-(let ((p (torcl-ffi:foreign-alloc 8)))
+(let ((p (egcl-ffi:foreign-alloc 8)))
   (unwind-protect
       (progn
-        (setf (torcl-ffi:mem-ref p :int32) 21)
-        (setf (torcl-ffi:mem-ref p :int32 4) 2)
-        (* (torcl-ffi:mem-ref p :int32)
-           (torcl-ffi:mem-ref p :int32 4)))
-    (torcl-ffi:foreign-free p)))
+        (setf (egcl-ffi:mem-ref p :int32) 21)
+        (setf (egcl-ffi:mem-ref p :int32 4) 2)
+        (* (egcl-ffi:mem-ref p :int32)
+           (egcl-ffi:mem-ref p :int32 4)))
+    (egcl-ffi:foreign-free p)))
 ;; => 42
 ```
 
 ### Vector access { #vector-data }
 
-**Macro** `(torcl-ffi:with-pointer-to-vector-data (pointer vector &optional type) body...)`
+**Macro** `(egcl-ffi:with-pointer-to-vector-data (pointer vector &optional type) body...)`
 
 Uses temporary foreign storage, copies the vector in, executes the body, copies
 values back, and frees the storage. The default type is `:unsigned-char`.
@@ -113,10 +113,10 @@ promise to pin the Lisp vector in place. Cleanup also runs on nonlocal exit.
 **Functions**
 
 ```lisp
-(torcl-ffi:load-foreign-library path)                 ; library object
-(torcl-ffi:foreign-library-p object)                 ; generalized boolean
-(torcl-ffi:foreign-symbol-pointer name &optional library)
-(torcl-ffi:close-foreign-library library)
+(egcl-ffi:load-foreign-library path)                 ; library object
+(egcl-ffi:foreign-library-p object)                 ; generalized boolean
+(egcl-ffi:foreign-symbol-pointer name &optional library)
+(egcl-ffi:close-foreign-library library)
 ```
 
 Supply a pathname understood by the platform's dynamic loader. A library object
@@ -125,12 +125,12 @@ makes the lookup scope explicit; omitting it uses the default lookup scope.
 Close the library only when no code can call its symbols or use its data.
 Failures are reported through the FFI error interface.
 
-### `torcl-ffi:foreign-call` { #foreign-call }
+### `egcl-ffi:foreign-call` { #foreign-call }
 
 **Function**
 
 ```lisp
-(torcl-ffi:foreign-call pointer return-type argument-types arguments
+(egcl-ffi:foreign-call pointer return-type argument-types arguments
                         &optional fixed-count)
 ```
 
@@ -142,12 +142,12 @@ runtime can apply the appropriate ABI rules and promotions.
 For example, with a library exporting `int twice(int)`:
 
 ```lisp
-(let ((library (torcl-ffi:load-foreign-library "./libexample.so")))
+(let ((library (egcl-ffi:load-foreign-library "./libexample.so")))
   (unwind-protect
-      (torcl-ffi:foreign-call
-        (torcl-ffi:foreign-symbol-pointer "twice" library)
+      (egcl-ffi:foreign-call
+        (egcl-ffi:foreign-symbol-pointer "twice" library)
         :int '(:int) '(21))
-    (torcl-ffi:close-foreign-library library)))
+    (egcl-ffi:close-foreign-library library)))
 ;; => 42
 ```
 
@@ -161,7 +161,7 @@ int twice(int value) { return value * 2; }
 cc -shared -fPIC example.c -o libexample.so
 ```
 
-The C compiler and library must target the same architecture as the TorCL
+The C compiler and library must target the same architecture as the EGCL
 runtime doing the call. The sample filename and command are Linux-specific.
 
 ## Callbacks
@@ -171,11 +171,11 @@ runtime doing the call. The sample filename and command are Linux-specific.
 **Functions**
 
 ```lisp
-(torcl-ffi:make-callback function return-type argument-types)
-(torcl-ffi:callback-pointer callback)
-(torcl-ffi:foreign-callback-p object)
-(torcl-ffi:free-callback callback)
-(torcl-ffi:callback-error callback)
+(egcl-ffi:make-callback function return-type argument-types)
+(egcl-ffi:callback-pointer callback)
+(egcl-ffi:foreign-callback-p object)
+(egcl-ffi:free-callback callback)
+(egcl-ffi:callback-error callback)
 ```
 
 `make-callback` returns a callback object; use `callback-pointer` to obtain the
@@ -192,17 +192,17 @@ On an x86-64 runtime with callback support, a callback can be exercised through
 the same call interface before giving it to a C library:
 
 ```lisp
-(let ((callback (torcl-ffi:make-callback (lambda (x) (+ x 1)) :int '(:int))))
+(let ((callback (egcl-ffi:make-callback (lambda (x) (+ x 1)) :int '(:int))))
   (unwind-protect
-      (torcl-ffi:foreign-call (torcl-ffi:callback-pointer callback)
+      (egcl-ffi:foreign-call (egcl-ffi:callback-pointer callback)
                               :int '(:int) '(41))
-    (torcl-ffi:free-callback callback)))
+    (egcl-ffi:free-callback callback)))
 ;; => 42
 ```
 
 ## Conditions and sandboxing
 
-`torcl-ffi:ffi-error` is the public FFI condition. Invalid pointer ownership,
+`egcl-ffi:ffi-error` is the public FFI condition. Invalid pointer ownership,
 unsupported signatures, loader failures, and callback bridge errors can reach
 this interface. Sandbox mode denies foreign access; using `funcall` instead of
 a direct call does not bypass that policy.
@@ -212,6 +212,6 @@ Implementation reference: [Public FFI wrappers](https://cave.moxielogic.com/atgr
 ## Java integration
 
 The [Java integration chapter](java.md) covers the in-process HotSpot JVM,
-the primary `JAVA` API, descriptor-based `TORCL-JVM` calls, Java interfaces
+the primary `JAVA` API, descriptor-based `EGCL-JVM` calls, Java interfaces
 implemented by Lisp callbacks, and reference ownership. Java calls use the
 checked JVM bridge rather than application-supplied JNI prototypes.

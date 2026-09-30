@@ -1,11 +1,11 @@
 # §5.8 Pathnames and Logical Pathnames
 
-**Scope:** This section specifies the pathname abstraction in TorCL,
+**Scope:** This section specifies the pathname abstraction in EGCL,
 covering the `PATHNAME` and `LOGICAL-PATHNAME` class hierarchy,
 component representation, parsing and reconstruction algorithms,
 logical pathname translation, pathname merging, wildcard matching,
-and file-system interaction. TorCL targets ANSI X3.226-1994 §19
-with POSIX-oriented physical pathnames and a TorCL-specific `~`
+and file-system interaction. EGCL targets ANSI X3.226-1994 §19
+with POSIX-oriented physical pathnames and a EGCL-specific `~`
 expansion extension. On Windows, physical pathnames additionally support drive
 and UNC volumes: a drive letter occupies the device component; a UNC server
 and share occupy host and device. Directory lists exclude these volume
@@ -18,8 +18,8 @@ platform's rendering, merging, and case-comparison rules.
 
 | ID | Requirement |
 |----|-------------|
-| R5.181 | TorCL MUST implement the `PATHNAME` class as a sealed, immutable structure with slots: host, device, directory, name, type, version. |
-| R5.182 | TorCL MUST implement `LOGICAL-PATHNAME` as a subclass of `PATHNAME` whose components are canonically uppercase strings. |
+| R5.181 | EGCL MUST implement the `PATHNAME` class as a sealed, immutable structure with slots: host, device, directory, name, type, version. |
+| R5.182 | EGCL MUST implement `LOGICAL-PATHNAME` as a subclass of `PATHNAME` whose components are canonically uppercase strings. |
 | R5.183 | The directory component MUST be represented as a list with a keyword head (`:ABSOLUTE` or `:RELATIVE`) followed by string or keyword elements (`:WILD`, `:WILD-INFERIORS`, `:UP`, `:BACK`). |
 | R5.184 | `MAKE-PATHNAME` MUST accept keyword arguments `:HOST`, `:DEVICE`, `:DIRECTORY`, `:NAME`, `:TYPE`, `:VERSION`, `:DEFAULTS`, and `:CASE` per ANSI 19.4.2. |
 | R5.185 | `PARSE-NAMESTRING` MUST accept a string and optional host, default-pathname, and return a pathname plus the index where parsing stopped. |
@@ -31,7 +31,7 @@ platform's rendering, merging, and case-comparison rules.
 | R5.191 | `MERGE-PATHNAMES` (algorithm A5.14) MUST implement the ANSI 19.2.3 defaulting protocol: fill `NIL` components from the default pathname, then from `*DEFAULT-PATHNAME-DEFAULTS*`. |
 | R5.192 | `PATHNAME-MATCH-P` MUST support wildcards `:WILD`, `:WILD-INFERIORS` (in directories), and `*` within name/type strings. |
 | R5.193 | `TRANSLATE-PATHNAME` MUST transfer wildcard-matched fragments from a source pathname to a target pattern per ANSI 19.2.2.5. |
-| R5.194 | TorCL MUST expand leading `~` and `~user` in namestrings at parse time as a TorCL extension (§9). The expanded pathname stores the resolved absolute path, not the tilde form. |
+| R5.194 | EGCL MUST expand leading `~` and `~user` in namestrings at parse time as a EGCL extension (§9). The expanded pathname stores the resolved absolute path, not the tilde form. |
 | R5.195 | `ENOUGH-NAMESTRING` MUST return a string sufficient to reconstruct the pathname relative to a given default. |
 | R5.196 | `PROBE-FILE` MUST return the truename if the file exists, or `NIL`. It MUST resolve symlinks. |
 | R5.197 | `TRUENAME` MUST call `realpath(3)` on POSIX and signal `FILE-ERROR` if the file does not exist. |
@@ -52,13 +52,13 @@ platform's rendering, merging, and case-comparison rules.
 #[repr(C)]
 pub struct Pathname {
     pub header: ObjectHeader,  // class-id, GC bits
-    pub host:      TorclVal,   // NIL | string | logical-host-designator
-    pub device:    TorclVal,   // NIL | string | :UNSPECIFIC
-    pub directory: TorclVal,   // NIL | (:ABSOLUTE|:RELATIVE . components)
-    pub name:      TorclVal,   // NIL | string | :WILD | :UNSPECIFIC
-    pub type_:     TorclVal,   // NIL | string | :WILD | :UNSPECIFIC
-    pub version:   TorclVal,   // NIL | :NEWEST | :WILD | :UNSPECIFIC | integer
-    pub namestring_cache: AtomicPtr<TorclVal>, // lazily computed, immutable once set
+    pub host:      EgclVal,   // NIL | string | logical-host-designator
+    pub device:    EgclVal,   // NIL | string | :UNSPECIFIC
+    pub directory: EgclVal,   // NIL | (:ABSOLUTE|:RELATIVE . components)
+    pub name:      EgclVal,   // NIL | string | :WILD | :UNSPECIFIC
+    pub type_:     EgclVal,   // NIL | string | :WILD | :UNSPECIFIC
+    pub version:   EgclVal,   // NIL | :NEWEST | :WILD | :UNSPECIFIC | integer
+    pub namestring_cache: AtomicPtr<EgclVal>, // lazily computed, immutable once set
 }
 ```
 
@@ -133,7 +133,7 @@ The directory slot is a proper list with one of two structures:
 
 ```text
 PARSE-PHYSICAL-POSIX(S):
-  1. TILDE EXPANSION (TorCL extension, R5.194):
+  1. TILDE EXPANSION (EGCL extension, R5.194):
      a. If S starts with "~/" → replace "~" with value of
         environment variable HOME (or pw_dir from getpwuid).
      b. If S starts with "~user/" → replace "~user" with
@@ -144,7 +144,7 @@ PARSE-PHYSICAL-POSIX(S):
   2. ABSOLUTE / RELATIVE DETECTION:
      a. If S starts with "/" → dir-head ← :ABSOLUTE, advance past
         leading "/" (collapse multiple leading "/" into one,
-        except "//" which is implementation-defined — TorCL treats
+        except "//" which is implementation-defined — EGCL treats
         "//" identically to "/").
      b. Else → dir-head ← :RELATIVE.
 
@@ -335,9 +335,9 @@ word               ::= { letter | digit | "-" }+
 
 ```lisp
 (setf (logical-pathname-translations "SYS")
-      '(("SYS:SRC;**;*.*.*" #P"/opt/torcl/src/**/*.*")))
+      '(("SYS:SRC;**;*.*.*" #P"/opt/egcl/src/**/*.*")))
 (translate-logical-pathname "SYS:SRC;COMPILER;IR.LISP")
-;; → #P"/opt/torcl/src/compiler/ir.lisp"
+;; → #P"/opt/egcl/src/compiler/ir.lisp"
 ```
 
 ---
@@ -482,7 +482,7 @@ word               ::= { letter | digit | "-" }+
 - Returns truename pathnames for all matching files/directories.
 - `:WILD-INFERIORS` triggers recursive traversal (`nftw(3)` or
   manual `opendir`/`readdir` recursion).
-- Result order is unspecified by ANSI; TorCL sorts lexicographically
+- Result order is unspecified by ANSI; EGCL sorts lexicographically
   by namestring for deterministic output.
 - Symlinks: follows symlinks (returns truenames of targets).
 
@@ -502,9 +502,9 @@ word               ::= { letter | digit | "-" }+
 
 ---
 
-## 5.8.7 Tilde Expansion (TorCL Extension)
+## 5.8.7 Tilde Expansion (EGCL Extension)
 
-Per R5.194, TorCL expands `~` at parse time (A5.11 step 1):
+Per R5.194, EGCL expands `~` at parse time (A5.11 step 1):
 
 | Input | Expansion |
 |-------|-----------|
@@ -558,8 +558,8 @@ the offending pathname in the condition's `:PATHNAME` slot
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `*DEFAULT-PATHNAME-DEFAULTS*` | Current directory at startup | Per-thread default pathname for merging. |
-| Logical host `"SYS"` | TorCL installation root | Pre-defined logical host for system sources. |
-| Env `TORCL_HOME` | `/usr/local/lib/torcl` | Fallback for `SYS:` translation root. |
+| Logical host `"SYS"` | EGCL installation root | Pre-defined logical host for system sources. |
+| Env `EGCL_HOME` | `/usr/local/lib/egcl` | Fallback for `SYS:` translation root. |
 
 ---
 
@@ -580,10 +580,10 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 | Source file | Contents |
 |-------------|----------|
-| `crates/torcl-rt/src/pathname.rs` | D5.30 `Pathname` struct, D5.31 `LogicalPathname`, construction, component accessors, namestring cache. |
-| `crates/torcl-rt/src/pathname_parse.rs` | A5.11 POSIX parsing, tilde expansion, `PARSE-NAMESTRING` entry point. |
-| `crates/torcl-rt/src/pathname_print.rs` | A5.12 namestring reconstruction, `ENOUGH-NAMESTRING`. |
-| `crates/torcl-rt/src/pathname_logical.rs` | Logical pathname parsing, D5.32 translation table, A5.13 `TRANSLATE-LOGICAL-PATHNAME`. |
-| `crates/torcl-rt/src/pathname_merge.rs` | A5.14 `MERGE-PATHNAMES`, `PATHNAME-MATCH-P`, `TRANSLATE-PATHNAME`. |
-| `crates/torcl-rt/src/pathname_fs.rs` | `PROBE-FILE`, `TRUENAME`, `DIRECTORY`, `ENSURE-DIRECTORIES-EXIST` — thin wrappers around POSIX `libc` calls. |
-| `crates/torcl-stdlib/src/pathnames.lisp` | CL-level convenience functions, `WITH-OPEN-FILE` pathname integration, user-facing `WILD-PATHNAME-P`, `PATHNAME-HOST` etc. accessor wrappers. |
+| `crates/egcl-rt/src/pathname.rs` | D5.30 `Pathname` struct, D5.31 `LogicalPathname`, construction, component accessors, namestring cache. |
+| `crates/egcl-rt/src/pathname_parse.rs` | A5.11 POSIX parsing, tilde expansion, `PARSE-NAMESTRING` entry point. |
+| `crates/egcl-rt/src/pathname_print.rs` | A5.12 namestring reconstruction, `ENOUGH-NAMESTRING`. |
+| `crates/egcl-rt/src/pathname_logical.rs` | Logical pathname parsing, D5.32 translation table, A5.13 `TRANSLATE-LOGICAL-PATHNAME`. |
+| `crates/egcl-rt/src/pathname_merge.rs` | A5.14 `MERGE-PATHNAMES`, `PATHNAME-MATCH-P`, `TRANSLATE-PATHNAME`. |
+| `crates/egcl-rt/src/pathname_fs.rs` | `PROBE-FILE`, `TRUENAME`, `DIRECTORY`, `ENSURE-DIRECTORIES-EXIST` — thin wrappers around POSIX `libc` calls. |
+| `crates/egcl-stdlib/src/pathnames.lisp` | CL-level convenience functions, `WITH-OPEN-FILE` pathname integration, user-facing `WILD-PATHNAME-P`, `PATHNAME-HOST` etc. accessor wrappers. |

@@ -10,9 +10,9 @@ the wasted effort in this investigation came from skipping it.
 No runtime change was retained in this investigation; the shipping baseline is
 still **d883d5b**. A portable ASDF `PERFORM :AROUND` probe timed 51 Babel source
 components and 17 CL-PPCRE components. Single-run Babel component CPU totals were
-182 ms of 391 ms overall on TorCL, versus 151 ms of 291 ms on SBCL. These are
+182 ms of 391 ms overall on EGCL, versus 151 ms of 291 ms on SBCL. These are
 attribution observations, not new speed ratios: CPU frequency varied between runs.
-TorCL's largest Babel component was `enc-jpn` (52 ms versus SBCL's 7.6 ms).
+EGCL's largest Babel component was `enc-jpn` (52 ms versus SBCL's 7.6 ms).
 
 Fresh frame-pointer profiles of unchanged HEAD show diffuse whole-load costs.
 Component-only samples narrow the encoding initialization cost: `enc-jpn` has
@@ -41,10 +41,10 @@ tagbody's recorded stack depth also preserved a pending cons in a focused loop
 and recorded one native entry. A keeper needs promotion assertions plus GC,
 deoptimization, exact-once side-effect and control-flow coverage; it is not shipped.
 
-Artifacts: `/tmp/torcl-load-delta.MU6lKF/` contains component timings, unchanged
+Artifacts: `/tmp/egcl-load-delta.MU6lKF/` contains component timings, unchanged
 HEAD profiles, OSR traces, both private probe images and comparison scripts/logs.
 Do not use the probe images as production controls. The installed executable and
-default `target/torcl` were not replaced.
+default `target/egcl` were not replaced.
 
 ## Amortize optimizing compilation (2026-09-25, bliss-304g)
 
@@ -58,8 +58,8 @@ code is bad. On the unchanged PGO baseline, Babel's default / snapshot-only /
 compile-but-discard / fully-disabled T2 cycle medians were 1.188 / 1.091 /
 1.191 / 1.077 G. CL-PPCRE showed the same pattern. Optimizing these warm helpers
 barely repaid compilation during the initial load. Earlier T1 promotion did not
-help. Note that `TORCL_T2_NO_QUEUE` **still constructs compiler snapshots**;
-only `TORCL_DISABLE_T2` removes that work too.
+help. Note that `EGCL_T2_NO_QUEUE` **still constructs compiler snapshots**;
+only `EGCL_DISABLE_T2` removes that work too.
 
 Final ordinary and freshly trained PGO images were compared with **c738741**
 controls after builds/tests stopped. Five alternating CPU-0-pinned fresh
@@ -84,7 +84,7 @@ widely. A separate **15-run alternating repeat** gives Babel 0.543 → 0.518 s
 (ranges 0.317–0.569 / 0.272–0.523), and CL-PPCRE 0.273 → 0.260 s
 (0.259–0.278 / 0.245–0.263). Cycles fall 1.176 → 1.073 G / 0.579 → 0.519 G.
 Treat those wall medians as observations, not precise hardware-independent
-speedups. All 170 final comparison runs pass functional checks; all 120 TorCL
+speedups. All 170 final comparison runs pass functional checks; all 120 EGCL
 load windows report zero collections.
 
 Before changing the default, all seven existing steady-state workloads ran five
@@ -113,10 +113,10 @@ strict Clippy retains nine runtime diagnostics; spec coverage retains 14 uncover
 MUSTs. Formatting/diff checks, 12 PGO orchestration tests and GC-root lint pass
 (six baseline root findings, zero new). Review was adversarial self-review.
 
-Artifacts: `/tmp/torcl-load-bridge.6r6ZPA/` contains final images, comparison
+Artifacts: `/tmp/egcl-load-bridge.6r6ZPA/` contains final images, comparison
 scripts/counters and validation logs. Fresh PGO run `target/pgo/run.UoGXxE/`
 used LLVM 21.1.8; generate 2m10s, use 2m40s, training/image verification pass.
-The installed executable and default `target/torcl` were not replaced.
+The installed executable and default `target/egcl` were not replaced.
 
 A preceding five-pathname-builtin bridge-removal prototype saved only 2% / 0.8%
 ordinary load cycles and was removed completely (`bliss-nn4k`). Its census and
@@ -135,7 +135,7 @@ Five alternating CPU-0-pinned fresh processes per library/build compare ordinary
 and freshly trained PGO images with **4167171** controls. Builds and tests had
 stopped. Counters/timers cover only the first cached ASDF load; the
 `COMPILE-FILE` error guard prevents recompilation. All 50 functional checks pass;
-all 40 TorCL windows have zero collections.
+all 40 EGCL windows have zero collections.
 
 | First cached load, CPU cycles | Before | After | Reduction |
 |---|---:|---:|---:|
@@ -175,11 +175,11 @@ instructions barely changed and CL-PPCRE instructions increased. The entire
 prototype was removed (`bliss-1u43`); its ownership/profiling complexity was not
 justified by this initial-load result.
 
-Artifacts: `/tmp/torcl-load-profile-new.cCSpqN/` contains `copy-image`,
+Artifacts: `/tmp/egcl-load-profile-new.cCSpqN/` contains `copy-image`,
 `copy-pgo-image`, `final-compare.sh`, `summary.pl`, counters and validation logs.
 Fresh PGO artifacts are `target/pgo/run.f9wpMq/` (LLVM 21.1.8, generate 2m08s,
 use 2m47s; training/verification pass, no profile mismatch warnings).
-The installed executable and default `target/torcl` were not replaced.
+The installed executable and default `target/egcl` were not replaced.
 
 ## Keep native builtin calls fast across definitions (2026-09-25, bliss-lyat)
 
@@ -195,7 +195,7 @@ Five alternating CPU-0-pinned fresh processes per library/build compare final
 ordinary and freshly trained PGO images with **538d543** controls. Build/test jobs
 had stopped. Timers/counters surround only the first cached ASDF load, and a
 `COMPILE-FILE` error guard forbids recompilation. All 50 runs pass their functional
-checks; all 40 TorCL windows report zero GCs.
+checks; all 40 EGCL windows report zero GCs.
 
 | First cached load, CPU cycles | Before | After | Reduction |
 |---|---:|---:|---:|
@@ -210,7 +210,7 @@ Babel allocation stays at 10,270,032 bytes; CL-PPCRE falls 3,809,456 → 3,804,3
 An instrumented probe attributes the improvement to native builtin dispatch:
 44,753 fallbacks become zero, with direct calls rising 87,869 → 131,700.
 
-| Current PGO versus SBCL | TorCL | SBCL | Ratio |
+| Current PGO versus SBCL | EGCL | SBCL | Ratio |
 |---|---:|---:|---:|
 | Babel load wall median | 0.580 s | 0.296 s | 1.96× |
 | Babel CPU cycles | 1.190 G | 0.630 G | 1.89× |
@@ -247,11 +247,11 @@ bails but saved only about 2% of Babel instructions; it was discarded. That lead
 is `bliss-ev6m`, and a separately reproduced EVAL lexical-scope defect is
 `bliss-e57h`. Neither is part of this change.
 
-Artifacts: `/tmp/torcl-load-next.XmjeGn/` contains `final-image`, `final-pgo-image`,
+Artifacts: `/tmp/egcl-load-next.XmjeGn/` contains `final-image`, `final-pgo-image`,
 `final-compare.sh`, `final-summary.pl`, final counters and validation logs. PGO
 artifacts are `target/pgo/run.swxEIn/` (LLVM 21.1.8, generate 2m34s/use 3m43s,
 all training/verification markers, no profile mismatch warnings). The installed
-`/usr/local/bin/torcl` and default `target/torcl` were not replaced.
+`/usr/local/bin/egcl` and default `target/egcl` were not replaced.
 
 ## Compile nested method callbacks (2026-09-25, bliss-fq2q)
 
@@ -266,7 +266,7 @@ Rebuild the saved image to get the new ASDF method bodies.
 Five alternating CPU-0-pinned fresh processes per library/build, after all build
 and test jobs stopped, compare unchanged **823e413** images with the final code.
 Counters/timers surround only the **first cached ASDF load**, excluding startup;
-`COMPILE-FILE` is replaced with an error. All 50 TorCL windows have zero GCs and
+`COMPILE-FILE` is replaced with an error. All 50 EGCL windows have zero GCs and
 all 60 runs pass their functional checks without source compilation.
 
 | Ordinary ThinLTO image | Before | After | Reduction |
@@ -282,7 +282,7 @@ Lisp allocation falls from 10,566,416 to 10,270,032 bytes for Babel and from
 Their load wall medians fall 0.657 → 0.610 s and 0.304 → 0.291 s respectively.
 Training uses the dependency-free fixture, not these held-out libraries.
 
-| Current default-PGO image versus SBCL | TorCL | SBCL | Ratio |
+| Current default-PGO image versus SBCL | EGCL | SBCL | Ratio |
 |---|---:|---:|---:|
 | Babel CPU cycles | 1.259 G | 0.634 G | 1.99× |
 | Babel load wall median | 0.610 s | 0.296 s | 2.06× |
@@ -338,14 +338,14 @@ Review was adversarial self-review, not independent. `bliss-e3op` records a
 separate, unproven rooting hazard noticed in the older named-function retry;
 the final method policy does not retain bytecode across a second compilation.
 
-Artifacts: `/tmp/torcl-load-profile.C3WW9C/` holds the final `simple-image` and
+Artifacts: `/tmp/egcl-load-profile.C3WW9C/` holds the final `simple-image` and
 `simple-pgo-image`, `simple-final-*` counters/logs, `compare-simple.sh`, final
 `simple-*` validation logs, and the rejected conditional/probe controls. Summarize
 the final batch with `perl summarize.pl simple-final` from that directory.
 Fresh PGO artifacts are `target/pgo/run.n9PTrL/`. Profiling reports used
 `perf report --no-inline -g none`; default inline-DWARF reporting exceeded the
 240-second cap, whereas these reports completed promptly. Neither the installed
-`/usr/local/bin/torcl` nor the default `target/torcl` was replaced.
+`/usr/local/bin/egcl` nor the default `target/egcl` was replaced.
 
 ## Preserve compiled ASDF methods across image restart (2026-09-24, bliss-13he)
 
@@ -360,8 +360,8 @@ Callable pointers are relocated into the existing GC-scanned table before
 startup allocations; the existing bytecode registry supplies their code.
 Actual format-1 and format-2 images still load, with their previous interpreted
 dispatch behavior. A format-2 runtime rejects format 3 clearly. Rebuild the
-image to obtain the improvement; neither `/usr/local/bin/torcl` nor the default
-`target/torcl` was replaced during this work.
+image to obtain the improvement; neither `/usr/local/bin/egcl` nor the default
+`target/egcl` was replaced during this work.
 
 Five alternating CPU-0-pinned fresh processes per library and image, after
 build/test jobs finished, compare a saved **6950da9** release baseline with the
@@ -379,7 +379,7 @@ fix. Both are ordinary ThinLTO release builds, isolating this change from PGO:
 The timer/counters surround the **first** ASDF load, not startup or a no-op
 reload. Private FASL caches are populated beforehand, and `COMPILE-FILE` is
 replaced by an error during measured runs. No measured load recompiles a library
-source file; all TorCL windows report zero minor/major GCs. Allocation falls from
+source file; all EGCL windows report zero minor/major GCs. Allocation falls from
 12,094,992 to 10,566,416 bytes for Babel and 4,298,224 to 3,890,480 for CL-PPCRE.
 Whole-process wall medians, including startup, fall 1.29 → 1.01 s and
 0.71 → 0.61 s respectively. Babel wall samples remain clock-sensitive
@@ -389,7 +389,7 @@ The same batch includes five runs of a **freshly trained default-PGO image**
 and five SBCL references per library. These give the current default-build
 gap, not an isolated PGO-before/after measurement for this fix:
 
-| Initial cached load | Fixed PGO image | SBCL | TorCL / SBCL |
+| Initial cached load | Fixed PGO image | SBCL | EGCL / SBCL |
 |---|---:|---:|---:|
 | Babel CPU cycles | 1.372 G | 0.628 G | **2.18×** |
 | Babel wall median | 0.660 s | 0.292 s | **2.26×** |
@@ -431,10 +431,10 @@ unused-mut warning. Formatting/diff checks pass and root lint has zero new
 findings. Review was solo, not independent. This is not a full PGO-compiled
 Rust-harness validation; `bliss-lm5f` remains open.
 
-Artifacts: `/tmp/torcl-image-method.Mi1Nzh/` contains baseline/fixed/PGO images,
+Artifacts: `/tmp/egcl-image-method.Mi1Nzh/` contains baseline/fixed/PGO images,
 private caches, the guarded benchmark scripts and all per-run counters/logs;
 fresh PGO profiles/build logs are in `target/pgo/run.2LX2dN/`. Broad validation
-logs are `/tmp/torcl-image-method-{workspace,runtime-serial,stress}.log`.
+logs are `/tmp/egcl-image-method-{workspace,runtime-serial,stress}.log`.
 
 ## PGO is the default image build (2026-09-24, bliss-jcr9)
 
@@ -442,7 +442,7 @@ At the user's request, `make image` now runs the guarded PGO pipeline described
 below. `make pgo-image` is an alias; `make image-no-pgo` retains the ordinary
 release-image recipe. `make install` still only copies the existing executable.
 The image target always retrains for the current sources and toolchain, including
-when `target/torcl` already exists. A missing or mismatched `llvm-profdata` is an
+when `target/egcl` already exists. A missing or mismatched `llvm-profdata` is an
 error, not a silent fallback. Ordinary Cargo builds remain unchanged.
 
 This changes the build default, not the scope of the performance evidence below.
@@ -454,7 +454,7 @@ override, failure isolation, alias coalescing, and non-PGO/install separation.
 A real capped `make image` completed both compiler passes (2m12s/2m46s), all
 training phases, image save and restart (`PGO-IMAGE-OK`), then loaded cached
 Babel with the correct Hello encoding. The isolated output is
-`target/pgo-default-check/torcl`; profiles/logs are in `target/pgo/run.urm6ec/`.
+`target/pgo-default-check/egcl`; profiles/logs are in `target/pgo/run.urm6ec/`.
 Neither the installed executable nor the user's default image was replaced.
 Shellcheck, shell syntax, formatting and diff checks pass. Spec coverage still
 reports the tracked 14 uncovered/11 unstaged requirements; the separate full
@@ -477,8 +477,8 @@ run also exercises a space-containing build directory. Musl compiler passes
 took 2m55s and 2m44s; GNU passes took 1m25s and 1m59s, with concurrent validation
 affecting those times. Both have only the tracked unused-mut warning, no
 profile-mismatch warnings. Validation outputs are isolated at
-`target/pgo-candidate/torcl` and `target/pgo-gnu-candidate/torcl`: neither the
-existing default `target/torcl` nor `/usr/local/bin/torcl` was replaced.
+`target/pgo-candidate/egcl` and `target/pgo-gnu-candidate/egcl`: neither the
+existing default `target/egcl` nor `/usr/local/bin/egcl` was replaced.
 
 After build/test jobs stopped, five alternating CPU-0-pinned fresh processes
 per workload/build measured first cached loads using the **actual ASDF-preloaded
@@ -515,7 +515,7 @@ instructions, 1.388 G cycles, and 10,120,080 Lisp bytes in the Babel window.
 That single sample suggests the source/FASL difference alone does not explain
 most of the image gap; compare images built both ways and profile restoration
 before assigning a cause. Its log/counters are
-`/tmp/torcl-pgo-source-asdf-control.{log,stat}`.
+`/tmp/egcl-pgo-source-asdf-control.{log,stat}`.
 
 Focused musl PGO checks pass: all 15,106 Babel reverse-table entries match
 normal/stress-20,000/poison/verify/SBCL; the actual regex scanner survives full
@@ -540,9 +540,9 @@ PGO validation remains tracked in `bliss-lm5f`; the workspace is not all green
 and the overall performance goal is not complete.
 
 Artifacts: `target/pgo/run.huOVbE/`, `target/pgo gnu/run.UEKgAt/`,
-`/tmp/torcl-pgo-keeper[-image]-{babel,ppcre}-{before,after,sbcl}-*.{log,stat}`,
-`/tmp/torcl-pgo-keeper-{default,release}-tests.log`, and
-`/tmp/torcl-pgo-keeper-{tables-normal,tables-stress,regex-gc,image-load}.log`.
+`/tmp/egcl-pgo-keeper[-image]-{babel,ppcre}-{before,after,sbcl}-*.{log,stat}`,
+`/tmp/egcl-pgo-keeper-{default,release}-tests.log`, and
+`/tmp/egcl-pgo-keeper-{tables-normal,tables-stress,regex-gc,image-load}.log`.
 An earlier real run stopped because its executing shell script was edited
 mid-run; that failed validation attempt is retained at `target/pgo/run.NTaujw/`.
 The successful runs used a frozen script. A subsequently added regression
@@ -552,8 +552,8 @@ image into an apparent build failure; cleanup now retains them with a note.
 ## Reproducible PGO training fixture (2026-09-24, bliss-08hq)
 
 `scripts/pgo-workload.lisp` supplies dependency-free training phases for the
-opt-in PGO build. It requires an absolute `TORCL_PGO_WORK` private
-directory and `TORCL_PGO_PHASE` set to `prepare`, `load`, or `runtime`. Run each
+opt-in PGO build. It requires an absolute `EGCL_PGO_WORK` private
+directory and `EGCL_PGO_PHASE` set to `prepare`, `load`, or `runtime`. Run each
 phase in a fresh process from the checkout root, with init files disabled.
 Preparation generates and compiles a 24-file ASDF system into its private
 cache. Cached loading checks every unit and refuses any attempted compilation;
@@ -563,24 +563,24 @@ CL-PPCRE, ocicl, user configuration, or downloaded data is needed.
 For example, with a built release CLI:
 
 ```sh
-pgo_work=$(mktemp -d /tmp/torcl-pgo-training.XXXXXX)
-TORCL_PGO_WORK="$pgo_work" TORCL_PGO_PHASE=prepare \
-  scripts/torcl-limited.sh target/x86_64-unknown-linux-musl/release/torcl \
+pgo_work=$(mktemp -d /tmp/egcl-pgo-training.XXXXXX)
+EGCL_PGO_WORK="$pgo_work" EGCL_PGO_PHASE=prepare \
+  scripts/egcl-limited.sh target/x86_64-unknown-linux-musl/release/egcl \
   --no-init --load scripts/pgo-workload.lisp
-# In separate fresh processes, use TORCL_PGO_PHASE=load and =runtime.
+# In separate fresh processes, use EGCL_PGO_PHASE=load and =runtime.
 # An instrumented build must keep preparation's raw profile separate and
 # merge only the intended load/runtime profiles, never all profiles blindly.
 ```
 
 The real-process regression is `bash scripts/test-pgo-workload.sh BINARY`,
-wrapped in `scripts/torcl-limited.sh` for TorCL, or the same command with a
+wrapped in `scripts/egcl-limited.sh` for EGCL, or the same command with a
 third argument `sbcl` for the SBCL oracle. It checks missing preparation,
 invalid phase/path, space-containing paths, clean and repeated preparation,
 two fresh cached loads with unchanged source/cache metadata, runtime results,
 and rejection of a deliberately removed FASL. Test artifacts are retained in
 the printed temporary directory. ASDF configuration uses string path
 designators; the equivalent pathname-object destination exposes a baseline
-TorCL bug tracked as `bliss-hw5x`.
+EGCL bug tracked as `bliss-hw5x`.
 
 The fixture's profile has now been remeasured through the guarded build
 (`bliss-84km`), as recorded above. The experimental gains below are historical
@@ -636,7 +636,7 @@ not committed or silently reused across unrelated sources/toolchains.
 Training exposed two baseline correctness bugs, not PGO regressions:
 `bliss-7zc7` (Flexi in-memory input constructor has no applicable VECTOR
 method), and `bliss-t4qs` (ordinary top-level INCF executes during COMPILE-FILE:
-TorCL counter 1 after compile / 2 after load, SBCL 0 / 1). Fresh cached synthetic
+EGCL counter 1 after compile / 2 after load, SBCL 0 / 1). Fresh cached synthetic
 loads correctly execute each of the 24 units once. Keeper training must make
 its phases explicit without concealing the compile-time side-effect defect.
 
@@ -647,11 +647,11 @@ proposed default pending user preference; the spike scripts are disposable,
 not an existing supported build workflow. The overall initial-load goal remains
 open.
 
-Artifacts: `/tmp/torcl-pgo-portable-{babel,ppcre}-{before,after}-[12345].{log,stat}`,
-`/tmp/torcl-pgo-{babel,ppcre}-sbcl-[123].{log,stat}`,
-`/tmp/torcl-pgo-portable-tables-{normal,stress}.log`,
-`/tmp/torcl-pgo-portable-regex-gc.log`, and
-`/tmp/torcl-pgo-portable-{training-v2,build}.log`. Exclude the
+Artifacts: `/tmp/egcl-pgo-portable-{babel,ppcre}-{before,after}-[12345].{log,stat}`,
+`/tmp/egcl-pgo-{babel,ppcre}-sbcl-[123].{log,stat}`,
+`/tmp/egcl-pgo-portable-tables-{normal,stress}.log`,
+`/tmp/egcl-pgo-portable-regex-gc.log`, and
+`/tmp/egcl-pgo-portable-{training-v2,build}.log`. Exclude the
 `ppcre-sbcl-warm` files from performance comparisons: they include compilation.
 
 ## Cross-crate release optimization (2026-09-24, bliss-zjwh)
@@ -663,7 +663,7 @@ LLVM optimize across the runtime, standard-library, compiler, and CLI boundaries
 without changing Lisp semantics, tiering thresholds, or cached FASLs.
 
 Five alternating CPU-0-pinned, fresh-process initial Babel loads with populated
-FASL caches and the isolated TorCL dependency port give:
+FASL caches and the isolated EGCL dependency port give:
 
 | Median | Before | ThinLTO + one codegen unit |
 |---|---:|---:|
@@ -672,9 +672,9 @@ FASL caches and the isolated TorCL dependency port give:
 | Initial-load wall time | 0.737 s | 0.680 s |
 | Lisp bytes allocated | 10,185,616 | 10,185,616 |
 
-All measured TorCL loads return the correct Hello encoding, perform zero
+All measured EGCL loads return the correct Hello encoding, perform zero
 collections, and do not recompile source. SBCL's same-batch median is 0.291 s,
-but clock variation is substantial: TorCL before spans 0.629–0.754 s, after
+but clock variation is substantial: EGCL before spans 0.629–0.754 s, after
 0.336–0.684 s, and SBCL 0.155–0.293 s. The raw median ratio is 2.34×; use the
 repeated instruction/cycle reduction as the improvement evidence, not a claim
 of a universally stable ratio or a closed gap. Whole-process startup was not
@@ -685,7 +685,7 @@ confirms **3.856 → 3.494 G instructions (9.4% less)** and
 **1.590 → 1.452 G cycles (8.7% less)**. SBCL's isolated-load medians are
 1.219 G instructions and 0.636 G cycles: the remaining cycle gap is about
 **2.3×**, not closed. This batch's wall medians reverse direction
-(0.368 → 0.502 s) despite the consistent cycle reduction: individual TorCL
+(0.368 → 0.502 s) despite the consistent cycle reduction: individual EGCL
 samples switch between roughly 2.1 and 4.3 GHz effective clock rates. Do not
 claim a stable wall-time speedup from these batches. SBCL spans 0.159–0.296 s.
 
@@ -717,13 +717,13 @@ symbol-function lookup 4.69%, evaluator and symbol-index lookup 4.00% each.
 Constant materialization is only 2.98% inclusive; BBU loading including its
 Lisp execution is 20.66%. This is a runtime optimization, not a new FASL format.
 
-Artifacts: `/tmp/torcl-initial-current.perf`,
-`/tmp/torcl-initial-sprof.log`, `/tmp/torcl-initial-lto-bench.sh`,
-`/tmp/torcl-initial-lto-{before,after,sbcl}-*.{log,stat}`, and
-`/tmp/torcl-initial-lto-final-{before,after,sbcl}-*.{log,stat}`;
-validation logs are `/tmp/torcl-initial-lto-{default-workspace,workspace}.log`,
-`/tmp/torcl-initial-lto-final-tables-{normal,stress}.log`, and
-`/tmp/torcl-initial-nolto-{controls,repeat-*}.log`.
+Artifacts: `/tmp/egcl-initial-current.perf`,
+`/tmp/egcl-initial-sprof.log`, `/tmp/egcl-initial-lto-bench.sh`,
+`/tmp/egcl-initial-lto-{before,after,sbcl}-*.{log,stat}`, and
+`/tmp/egcl-initial-lto-final-{before,after,sbcl}-*.{log,stat}`;
+validation logs are `/tmp/egcl-initial-lto-{default-workspace,workspace}.log`,
+`/tmp/egcl-initial-lto-final-tables-{normal,stress}.log`, and
+`/tmp/egcl-initial-nolto-{controls,repeat-*}.log`.
 
 ## Keep FASL methods compiled and their captures GC-safe (2026-09-24)
 
@@ -754,7 +754,7 @@ Validation: **796 CLI unit/integration tests pass, zero fail, three ignored**;
 four focused method/closure tests also pass every-allocation stress with poison
 and verification. A further full-GC liveness assertion passes after dropping the
 test's independent capture root. All 15,106 Babel reverse-table entries match
-between normal TorCL, stress-20,000/poison/verify TorCL, and SBCL. Workspace check,
+between normal EGCL, stress-20,000/poison/verify EGCL, and SBCL. Workspace check,
 format and diff checks pass; root lint has six baseline findings and zero new.
 The existing unused-mut warning remains tracked as `bliss-d3hs`. Non-CLI test
 suites were not rerun for these internal CLI changes.
@@ -764,12 +764,12 @@ beyond the callable corruption but hits the 6 GiB cap after 410 seconds; its
 last sampled input offset is 270,336 bytes. `bliss-het3` tracks unbounded compiled
 closure/environment retention and repeated bytecode-body cloning. Do not remove
 necessary roots to mask that cost, or present this partial progress as a completed
-Unicode load. The TorCL dependency-rename port is separately available in
-`ports/trivial-features-torcl/`.
+Unicode load. The EGCL dependency-rename port is separately available in
+`ports/trivial-features-egcl/`.
 
-Artifacts: `/tmp/torcl-unicode.UQCFUA/` (regex, stream, and full-generation
-probes), `/tmp/torcl-babel-port.Fs7oj1/roots-tables-*.log`, and
-`/tmp/torcl-closure-roots-cli-full.log`.
+Artifacts: `/tmp/egcl-unicode.UQCFUA/` (regex, stream, and full-generation
+probes), `/tmp/egcl-babel-port.Fs7oj1/roots-tables-*.log`, and
+`/tmp/egcl-closure-roots-cli-full.log`.
 
 ## Remove five more evaluated-argument form bridges (2026-09-24, bliss-f7qh)
 
@@ -782,9 +782,9 @@ decoding: already-evaluated arguments were being wrapped in temporary Lisp
 forms and evaluated again.
 
 Five paths now share evaluated-argument kernels with their source handlers:
-APPEND, COERCE, SUBSEQ, `TORCL::SET-SLOT-VALUE`, and
-`TORCL::%CALL-NEXT-METHOD`. APPEND's library behavior moved out of the
-interpreter into `torcl-stdlib::sequences`; the other paths reuse existing
+APPEND, COERCE, SUBSEQ, `EGCL::SET-SLOT-VALUE`, and
+`EGCL::%CALL-NEXT-METHOD`. APPEND's library behavior moved out of the
+interpreter into `egcl-stdlib::sequences`; the other paths reuse existing
 coercion, sequence, slot, and method machinery. Non-leaf operations were not
 added to the native direct-builtin table. Cross-tier testing also exposed
 and fixed three interpreter operator arms that ignored global function
@@ -816,7 +816,7 @@ errors, and lexical/global replacement. A fresh-process FASL regression
 deletes its source before loading and agrees at normal and GC-stress strides
 1/7/31 with poison and heap verification. A stdlib full-GC regression checks
 APPEND's copied heads and shared tail. All **15,106** entries in Babel's two
-encoding tables agree between normal TorCL, stress/poison/verify TorCL,
+encoding tables agree between normal EGCL, stress/poison/verify EGCL,
 and SBCL. Review was adversarial self-review, not independent review.
 
 Final gates: **733 CLI integration tests pass, zero fail, three ignored**;
@@ -870,7 +870,7 @@ processes with populated build-specific FASL caches, before test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 0.932 s | **0.801 s (14.1% less)** |
 | SBCL initial load, same batch | 0.287 s | 0.287 s |
-| TorCL / SBCL | 3.25× | **2.79×** |
+| EGCL / SBCL | 3.25× | **2.79×** |
 | Initial-load cycles (three isolated windows) | 1.974 G | **1.692 G (14.3% less)** |
 | Initial-load instructions (same windows) | 4.135 G | 4.109 G (0.6% less) |
 | Whole-process wall time | 3.40 s | 3.01 s |
@@ -887,11 +887,11 @@ outlier, for the claim. Performance evidence is from this host, not a
 cross-machine guarantee. The gap remains substantial.
 
 A second five-pair batch after the test-harness binding correction and all
-test jobs confirms **0.929 → 0.796 s (14.3% less)** for TorCL. Isolated-load
+test jobs confirms **0.929 → 0.796 s (14.3% less)** for EGCL. Isolated-load
 cycles are **1.971 → 1.686 G (14.4% less)**, with instructions 4.128 → 4.113 G
 and unchanged allocation/GC. Whole-process wall medians are 3.38 → 2.88 s.
 However, this batch has pronounced frequency-regime shifts: SBCL spans
-0.153–0.286 s (median 0.206), and TorCL has a 0.404 s candidate sample.
+0.153–0.286 s (median 0.206), and EGCL has a 0.404 s candidate sample.
 Its wall-time ratio is not comparable to the stable first batch; the ~2.8×
 headline above refers specifically to that first batch, not universal parity
 across clock regimes. The repeated cycle reduction corroborates the change.
@@ -962,7 +962,7 @@ processes with populated build-specific FASL caches, before test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 0.969 s | **0.925 s (4.5% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 3.39× | **3.23×** |
+| EGCL / SBCL | 3.39× | **3.23×** |
 | Initial-load instructions (three isolated windows) | 4.354 G | **4.138 G (5.0% less)** |
 | Lisp bytes allocated during load | 13,465,040 | **12,610,480 (6.3% less)** |
 | Whole-process instructions | 17.522 G | **17.313 G (1.2% less)** |
@@ -1030,7 +1030,7 @@ with populated build-specific FASL caches, before test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.015 s | **0.969 s (4.5% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 3.55× | **3.39×** |
+| EGCL / SBCL | 3.55× | **3.39×** |
 | Initial-load instructions (three isolated windows) | 4.612 G | **4.350 G (5.7% less)** |
 | Lisp bytes allocated during load | 17,090,960 | **13,465,040 (21.2% less)** |
 | Whole-process instructions | 17.850 G | **17.528 G (1.8% less)** |
@@ -1097,7 +1097,7 @@ with populated build-specific FASL caches, before running test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.222 s | **1.015 s (16.9% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 4.27× | **3.55×** |
+| EGCL / SBCL | 4.27× | **3.55×** |
 | Initial-load instructions (three isolated windows) | 5.444 G | **4.621 G (15.1% less)** |
 | Lisp bytes allocated during load | 21,175,568 | **17,090,960 (19.3% less)** |
 | Whole-process instructions | 18.687 G | **17.861 G (4.4% less)** |
@@ -1174,7 +1174,7 @@ with populated build-specific FASL caches, before running test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.249 s | **1.224 s (2.0% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 4.37× | **4.28×** |
+| EGCL / SBCL | 4.37× | **4.28×** |
 | Initial-load instructions (three separate isolated windows) | 5.583 G | **5.447 G (2.4% less)** |
 | Whole-process instructions | 18.825 G | 18.680 G |
 
@@ -1228,7 +1228,7 @@ A fresh load-only profile after `d4427b8` put minor GC at 9.8% inclusive,
 but also exposed **8.0% under ASH**. The bootstrap implementation calculated
 powers of two and multiplied or divided, paying for general rational arithmetic,
 GCD, interpreter calls, and temporary values merely to shift integers.
-`torcl-stdlib::numbers::ash` now shifts fixnums directly and bignums limb-wise.
+`egcl-stdlib::numbers::ash` now shifts fixnums directly and bignums limb-wise.
 Both tree-walked and compiled builtin calls use that kernel; the bootstrap
 workaround is gone. Right shifts preserve negative rounding and huge-count
 saturation. Both arguments remain type-checked, including zero cases.
@@ -1240,7 +1240,7 @@ process with its build-specific FASL cache populated, before any test jobs:
 |---|---:|---:|
 | Initial Babel FASL load | 1.362 s | **1.250 s (8.2% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 4.8× | **4.4×** |
+| EGCL / SBCL | 4.8× | **4.4×** |
 | Initial-load instructions (three separate isolated windows) | 6.250 G | **5.583 G (10.7% less)** |
 | Whole-process instructions | 19.502 G | 18.827 G |
 | Minor-GC pause during load | 0.146229 s | 0.146936 s |
@@ -1304,12 +1304,12 @@ processes and populated build-specific FASL caches:
 |---|---:|---:|
 | Initial Babel FASL load | 1.412 s | **1.361 s (3.6% less)** |
 | SBCL initial load, same batch | 0.287 s | 0.287 s |
-| TorCL / SBCL | 4.9× | **4.7×** |
+| EGCL / SBCL | 4.9× | **4.7×** |
 | Minor-GC pause during load | 0.195733 s | **0.146118 s (25.3% less)** |
 | Initial-load instructions (three separate isolated windows) | 6.426 G | **6.256 G (2.6% less)** |
 | Whole-process instructions | 19.689 G | 19.496 G |
 
-Every measured TorCL load performs one minor and zero major collections.
+Every measured EGCL load performs one minor and zero major collections.
 Wall samples remain noisy: 1.073–1.415 s before, 1.036–1.362 s after.
 Whole-process medians, including ASDF startup, were 3.51 s before and 3.85 s
 after despite fewer instructions; this batch does **not** establish a startup
@@ -1378,7 +1378,7 @@ already populated build-specific FASL cache, against `ff97468`:
 |---|---:|---:|
 | Initial Babel FASL load | 1.476 s | **1.410 s (4.5% less)** |
 | SBCL initial load, same batch | 0.287 s | 0.287 s |
-| TorCL / SBCL | 5.1× | **4.9×** |
+| EGCL / SBCL | 5.1× | **4.9×** |
 | Minor-GC pause during load | 0.258 s | **0.196 s (23.8% less)** |
 | Initial-load retired instructions (three isolated windows) | 7.090 G | **6.422 G (9.4% less)** |
 | Whole-process retired instructions | 20.349 G | 19.687 G |
@@ -1396,7 +1396,7 @@ The deterministic regression first failed at 2,001 searches for 2,000 conses.
 It now bounds searches by the number of destination regions, checks every
 list element, and covers both survivor copying and immediate promotion.
 The full runtime suite passes all 621 tests. Normal execution and
-`TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1` agree with SBCL on
+`EGCL_GC_STRESS=20000 EGCL_GC_POISON=1 EGCL_GC_VERIFY=1` agree with SBCL on
 all 15,106 Babel reverse-table entries. An every-allocation stress/poison/verify
 probe also preserves source-free native-cons results. Root lint has no new
 findings. Review is adversarial self-review, not independent.
@@ -1446,11 +1446,11 @@ Five alternating CPU-0-pinned release runs, after all test processes finished:
 |---|---:|---:|
 | Initial Babel FASL load | 1.628 s | **1.475 s (9.4% less)** |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 5.7× | **5.2×** |
+| EGCL / SBCL | 5.7× | **5.2×** |
 | Whole-process wall time, including ASDF startup | 4.07 s | 3.96 s |
 
 Baseline load samples ranged 1.383–1.632 s, candidate 1.474–1.490 s, SBCL
-0.285–0.287 s. Both TorCL versions collected once during each timed load;
+0.285–0.287 s. Both EGCL versions collected once during each timed load;
 candidate GC time was about 0.260 s versus 0.255 s baseline, so the gain did
 not come from deferring collection. This is incremental progress, not parity.
 
@@ -1473,8 +1473,8 @@ do not sum them. Constant materialization is only about 1.6%. Next leads are
 remaining source-evaluated initializers (`bliss-mbzt`) and redundant
 multiple-value classification (`bliss-amyr`), not a binary-decoder rewrite.
 
-The real Babel load under `TORCL_GC_STRESS=20000 TORCL_GC_POISON=1
-TORCL_GC_VERIFY=1` matches normal execution and SBCL for all 15,106 entries in
+The real Babel load under `EGCL_GC_STRESS=20000 EGCL_GC_POISON=1
+EGCL_GC_VERIFY=1` matches normal execution and SBCL for all 15,106 entries in
 the two reverse tables. The focused final suites pass: 48 FASL tests, five OSR,
 14 T1-deoptimization tests (one ignored), and five T1-native tests. Root lint
 has zero new findings. Review was adversarial self-review, not independent.
@@ -1502,7 +1502,7 @@ build-specific FASL cache already populated, against saved baseline `66c6d4f`:
 |---|---:|---:|
 | Initial Babel FASL load | 1.964 s | 1.631 s (**17.0% less**) |
 | SBCL initial load, same batch | 0.286 s | 0.286 s |
-| TorCL / SBCL | 6.9× | **5.7×** |
+| EGCL / SBCL | 6.9× | **5.7×** |
 | Initial-load retired instructions (three isolated windows) | 9.569 G | 7.761 G (**18.9% less**) |
 | Initial-load allocation | 32.56 MB | 26.83 MB (**17.6% less**) |
 | Whole-process retired instructions | 22.975 G | 21.177 G |
@@ -1534,7 +1534,7 @@ GC stress exposed three correctness bugs, fixed alongside the optimization:
 
 Validation includes source-free FASL action assertions, deleting source before
 load, every-allocation GC/poison testing, and a real Babel load with
-`TORCL_GC_STRESS=20000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1`. All 15,106 entries in
+`EGCL_GC_STRESS=20000 EGCL_GC_POISON=1 EGCL_GC_VERIFY=1`. All 15,106 entries in
 the two reverse tables match SBCL, and stressed output matches normal output.
 
 The workspace test run (non-CLI serial, CLI four threads) recorded **2,502 passed,
@@ -1565,7 +1565,7 @@ release runs against saved baseline `94f7570`, with SBCL in the same batch:
 |---|---:|---:|
 | Initial Babel FASL load | 2.428 s | 1.686 s (**30.6% less**) |
 | SBCL initial load | 0.247 s | 0.247 s |
-| TorCL / SBCL | 9.8× | **6.8×** |
+| EGCL / SBCL | 9.8× | **6.8×** |
 | Minor GC during initial load | 0.925 s | 0.234 s |
 | Whole process, including ASDF startup | 4.67 s | 4.08 s |
 | Whole-process retired instructions | 24.585 G | 22.976 G |
@@ -1589,7 +1589,7 @@ Reproduce the load phase from the repository root with this shared script:
 
 ```lisp
 #+sbcl (require :asdf)
-#+torcl (load "lib/asdf.bfasl")
+#+egcl (load "lib/asdf.bfasl")
 (asdf:initialize-source-registry
  `(:source-registry (:tree ,(truename "ocicl/")) :inherit-configuration))
 (time (asdf:load-system :babel))
@@ -1597,7 +1597,7 @@ Reproduce the load phase from the repository root with this shared script:
         (babel:string-to-octets "Hello" :encoding :utf-8))
 ```
 
-Use `scripts/torcl-limited.sh taskset -c 0` for each process. TorCL uses
+Use `scripts/egcl-limited.sh taskset -c 0` for each process. EGCL uses
 `--no-init --load`; SBCL uses
 `--noinform --no-sysinit --no-userinit --non-interactive --load`. Populate each
 binary's build-hash-specific FASL cache first, then alternate saved baseline and
@@ -1619,7 +1619,7 @@ now                      ~14.4 s
 
 Against SBCL 2.6.8 on the same machine, alternating runs, both warm from fasls:
 
-| | torcl | SBCL | ratio |
+| | egcl | SBCL | ratio |
 |---|---|---|---|
 | cold load from fasl | 3.15 s | 0.31 s | ~10x |
 | no-op re-load (each) | 0.89 s | 0.0046 s | **~193x** |
@@ -1731,13 +1731,13 @@ Recorded so they are not repeated:
   three different directions, so re-measure before believing any of it.
 - **Integer control tokens** (bliss-taqn, closed). Ceiling ≤7% on
   catch/handler-case-heavy code and ~0 elsewhere, against a blast radius that
-  includes a new `TorclError` variant, because tokens ride through errors as
+  includes a new `EgclError` variant, because tokens ride through errors as
   strings with prefix parsing.
 - **Replacing the allocator wholesale** (bliss-05as). mimalloc will not build for
   musl here; dlmalloc builds and is 8% SLOWER. What worked was adding the one
   thing musl lacks — a per-thread free-list cache — which is now default-on for
   musl and was worth 28.7%.
-- **Lowering `TORCL_CLOSURE_PRUNE_FLOOR`** — strictly worse, see §5.4.
+- **Lowering `EGCL_CLOSURE_PRUNE_FLOOR`** — strictly worse, see §5.4.
 
 ## 7. Known-flaky / pre-existing failures
 
@@ -1748,21 +1748,21 @@ Do not spend time on these; both reproduce without any local change:
   bliss-zzty, which also fixed three real cross-thread signal-delivery races
   found while chasing it. An early 0/15 baseline made this look like a
   regression; it was sampling noise. Use n>=40 for flaky baselines here.
-- `torcl-compiler --test t2_integration stringp_reaches_string_typecheck_through_inline_metadata`
+- `egcl-compiler --test t2_integration stringp_reaches_string_typecheck_through_inline_metadata`
   — fails at HEAD with everything stashed.
 
 ## 8. Useful knobs
 
 ```
-TORCL_DISABLE_T2=1            no T2
-TORCL_T2_DISCARD=1            compile at T2, install nothing  (separates compile
+EGCL_DISABLE_T2=1            no T2
+EGCL_T2_DISCARD=1            compile at T2, install nothing  (separates compile
                               cost from emitted-code cost)
-TORCL_T2_NO_QUEUE=1           snapshot for T2, never queue    (isolates the
+EGCL_T2_NO_QUEUE=1           snapshot for T2, never queue    (isolates the
                               mutator-side snapshot)
-TORCL_BAIL_TRACE=1            record why the lowerer bailed; read with
-                              (torcl-ext:bail-report)
-TORCL_DIRECT_BUILTIN_STATS=1  direct-builtin hit/fallback counts
-TORCL_GC_STRESS=1 TORCL_GC_POISON=1   mandatory for anything that allocates
+EGCL_BAIL_TRACE=1            record why the lowerer bailed; read with
+                              (egcl-ext:bail-report)
+EGCL_DIRECT_BUILTIN_STATS=1  direct-builtin hit/fallback counts
+EGCL_GC_STRESS=1 EGCL_GC_POISON=1   mandatory for anything that allocates
 ```
 
 The bail reporter now reports the reason from the attempt that actually decides,

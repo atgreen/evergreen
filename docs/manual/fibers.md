@@ -2,11 +2,11 @@
 
 Fibers are managed executions multiplexed over native carrier threads. A fiber
 can suspend while waiting and let another fiber run on that carrier. Native
-threads created by `torcl-thread:make-thread` remain dedicated OS threads.
+threads created by `egcl-thread:make-thread` remain dedicated OS threads.
 
 ## Availability { #availability }
 
-The `TORCL-FIBER` Lisp package is loaded by the standard bootstrap. Stackful
+The `EGCL-FIBER` Lisp package is loaded by the standard bootstrap. Stackful
 fibers are supported on x86-64 Unix and Windows. Native Windows validation is
 separate from testing under Wine. See [Platform support](user/reference/platforms.md).
 
@@ -19,14 +19,14 @@ completion operations have different contracts from the Lisp wrappers.
 **Functions**
 
 ```lisp
-(torcl-fiber:make-fiber function
+(egcl-fiber:make-fiber function
   &key name arguments stack-size initial-bindings) -> fiber
-(torcl-fiber:start-fibers fibers &key carrier-count idle-hook) -> group
-(torcl-fiber:run-fibers fibers &key carrier-count idle-hook) -> results
-(torcl-fiber:submit-fiber group fiber) -> unspecified
-(torcl-fiber:finish-fibers group) -> results
-(torcl-fiber:fiber-group-done-p group) -> boolean
-(torcl-fiber:scheduler-group-carriers group) -> list-of-threads
+(egcl-fiber:start-fibers fibers &key carrier-count idle-hook) -> group
+(egcl-fiber:run-fibers fibers &key carrier-count idle-hook) -> results
+(egcl-fiber:submit-fiber group fiber) -> unspecified
+(egcl-fiber:finish-fibers group) -> results
+(egcl-fiber:fiber-group-done-p group) -> boolean
+(egcl-fiber:scheduler-group-carriers group) -> list-of-threads
 ```
 
 The lifecycle separates creation from scheduling. `make-fiber` creates
@@ -56,10 +56,10 @@ it can run concurrently; protect shared state as usual. Hook errors are saved
 and reported by `finish-fibers` after work drains. Hooks should return promptly.
 
 ```lisp
-(torcl-fiber:run-fibers
-  (list (torcl-fiber:make-fiber
-          (lambda () (torcl-fiber:fiber-yield) (values 41 :extra)))
-        (torcl-fiber:make-fiber (lambda () 42)))
+(egcl-fiber:run-fibers
+  (list (egcl-fiber:make-fiber
+          (lambda () (egcl-fiber:fiber-yield) (values 41 :extra)))
+        (egcl-fiber:make-fiber (lambda () 42)))
   :carrier-count 2)
 ;; => (41 42)
 ```
@@ -69,10 +69,10 @@ and reported by `finish-fibers` after work drains. Hooks should return promptly.
 **Functions**
 
 ```lisp
-(torcl-fiber:fiber-yield)
-(torcl-fiber:fiber-sleep seconds)
-(torcl-fiber:fiber-park predicate &key timeout) -> predicate-won-p
-(torcl-fiber:fiber-join fiber &key timeout) -> entry-values
+(egcl-fiber:fiber-yield)
+(egcl-fiber:fiber-sleep seconds)
+(egcl-fiber:fiber-park predicate &key timeout) -> predicate-won-p
+(egcl-fiber:fiber-join fiber &key timeout) -> entry-values
 ```
 
 These operations suspend an unpinned fiber without occupying
@@ -96,7 +96,7 @@ cooperative waits and returns true when it succeeds, or false at the timeout.
 Established TCP streams keep the usual synchronous Lisp interface: `read-byte`,
 `read-char`, writes, and output flushing park an unpinned fiber when the socket
 would block. Another fiber can run on that carrier until the socket is ready.
-`torcl::%socket-wait-for-input` also parks; a zero timeout only checks readiness.
+`egcl::%socket-wait-for-input` also parks; a zero timeout only checks readiness.
 Receive timeouts still apply, and EOF retains the normal stream behavior.
 
 Linux/Android use the shared epoll service, BSD/macOS use kqueue, and Windows
@@ -116,18 +116,18 @@ stream ownership and can be woken by close.
 **Functions, macro, and variable**
 
 ```lisp
-(torcl-fiber:fiber-pin &optional fiber)
-(torcl-fiber:fiber-unpin &optional fiber)
-(torcl-fiber:fiber-can-yield-p &optional fiber) -> boolean
-(torcl-fiber:with-fiber-pinned ((&optional fiber)) body*)
-torcl-fiber:*pinned-blocking-action*
+(egcl-fiber:fiber-pin &optional fiber)
+(egcl-fiber:fiber-unpin &optional fiber)
+(egcl-fiber:fiber-can-yield-p &optional fiber) -> boolean
+(egcl-fiber:with-fiber-pinned ((&optional fiber)) body*)
+egcl-fiber:*pinned-blocking-action*
 ```
 
 Pinning is a balanced counter that prevents carrier migration. The
 macro balances the counter across ordinary and nonlocal exits. Explicit yield
 while pinned signals `program-error`. The blocking policy is `:warn`
 by default, `:error` to reject blocking, or `nil` for silent native blocking.
-Bind `torcl-fiber:*pinned-blocking-action*` dynamically to configure the current
+Bind `egcl-fiber:*pinned-blocking-action*` dynamically to configure the current
 execution. Rust callers retain the runtime policy/environment interface.
 
 ## Lisp observations { #observations }
@@ -136,15 +136,15 @@ execution. Rust callers retain the runtime policy/environment interface.
 
 | Function | Result |
 | --- | --- |
-| `(torcl-fiber:current-fiber)` | Current fiber, or `nil` on a plain native thread |
-| `(torcl-fiber:list-all-fibers)` | Snapshot of non-reclaimed fibers |
-| `(torcl-fiber:fiber-state fiber)` | Lisp lifecycle state keyword |
-| `(torcl-fiber:fiber-name fiber)` | Name string or `nil` |
-| `(torcl-fiber:fiber-result fiber)` | Result values as a list after completion |
-| `(torcl-fiber:fiber-error-p fiber)` | Whether an unhandled condition ended execution |
-| `(torcl-fiber:fiber-alive-p fiber)` | Whether the fiber has not completed |
-| `(torcl-fiber:fiber-carrier-thread fiber)` | Current or last carrier, or `nil` |
-| `(torcl-fiber:print-fiber-backtrace fiber &key stream count)` | Print the saved stack |
+| `(egcl-fiber:current-fiber)` | Current fiber, or `nil` on a plain native thread |
+| `(egcl-fiber:list-all-fibers)` | Snapshot of non-reclaimed fibers |
+| `(egcl-fiber:fiber-state fiber)` | Lisp lifecycle state keyword |
+| `(egcl-fiber:fiber-name fiber)` | Name string or `nil` |
+| `(egcl-fiber:fiber-result fiber)` | Result values as a list after completion |
+| `(egcl-fiber:fiber-error-p fiber)` | Whether an unhandled condition ended execution |
+| `(egcl-fiber:fiber-alive-p fiber)` | Whether the fiber has not completed |
+| `(egcl-fiber:fiber-carrier-thread fiber)` | Current or last carrier, or `nil` |
+| `(egcl-fiber:print-fiber-backtrace fiber &key stream count)` | Print the saved stack |
 
 Observations are snapshots. States are `:created`, `:runnable`, `:running`,
 `:suspended`, and `:dead`. A carrier can change after a yield. Joining transfers
@@ -161,5 +161,5 @@ entry and its saved condition.
 Runtime handles are not resumable through saved images. Using a fiber or group
 from a previous process signals an error rather than reusing a stale identity.
 
-Design sources: [Lisp API inventory](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/docs/torcl-lisp-api.md#fibers)
+Design sources: [Lisp API inventory](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/docs/egcl-lisp-api.md#fibers)
 and [concurrency specification](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/spec/13-concurrency.md).

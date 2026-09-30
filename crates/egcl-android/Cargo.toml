@@ -1,0 +1,28 @@
+[package]
+name = "egcl-android"
+description = "EGCL as an Android NativeActivity: the runtime in-process, driving EGL from Lisp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Declared rlib, built as a cdylib on demand:
+#
+#   cargo rustc --release -p egcl-android --target x86_64-linux-android \
+#         --crate-type cdylib
+#
+# A cdylib IS the point — Android hands a drawable surface only to code inside
+# the app process, never to a spawned executable — but the workspace's default
+# target is static musl, which cannot produce one at all. Saying "cdylib" here
+# would break `cargo build --workspace` for everybody, and making the crate
+# standalone would also duplicate workspace configuration.
+[lib]
+crate-type = ["rlib"]
+
+# Do not enable the Android dynamic-loader backend in host workspace builds.
+[target.'cfg(target_os = "android")'.dependencies]
+egcl = { path = "../egcl" }
+# dlopen-based FFI: the Lisp half reaches libEGL/libGLESv2/libandroid through it,
+# and on Android the system libraries are bionic's, so the bundled ELF loader is
+# not the right backend here.
+egcl-rt = { path = "../egcl-rt", features = ["c-ffi"] }

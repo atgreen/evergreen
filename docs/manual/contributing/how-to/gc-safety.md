@@ -1,6 +1,6 @@
 # Keep values safe across GC
 
-TorCL's minor collector is precise and moving. Apply these rules to every path
+EGCL's minor collector is precise and moving. Apply these rules to every path
 that allocates, evaluates Lisp, interns a symbol, constructs an error, or calls
 another function that may do so.
 
@@ -9,18 +9,18 @@ another function that may do so.
 Use an owning root for a new local:
 
 ```rust
-torcl_rt::rooted!(value = eval_form(expr, env)?);
+egcl_rt::rooted!(value = eval_form(expr, env)?);
 // Later allocations may update *value through the registered root.
 ```
 
 To root an existing local or a supported aggregate in place:
 
 ```rust
-torcl_rt::rooted_ref!(_roots = &mut values);
+egcl_rt::rooted_ref!(_roots = &mut values);
 ```
 
 Keep the guard alive for as long as the value must survive allocations.
-A copied `TorclVal` in a Rust local, register, or ordinary `Vec` is not by itself
+A copied `EgclVal` in a Rust local, register, or ordinary `Vec` is not by itself
 visible to the collector. Avoid new uses of the legacy globally locked root
 primitives; the intrusive root macros are the current approach.
 
@@ -37,10 +37,10 @@ After building the affected binary, run a small reproducer normally and with
 stress plus poisoning:
 
 ```sh
-scripts/torcl-limited.sh target/x86_64-unknown-linux-musl/debug/torcl \
+scripts/egcl-limited.sh target/x86_64-unknown-linux-musl/debug/egcl \
   --no-init --load reproduce.lisp
-TORCL_GC_STRESS=1 TORCL_GC_POISON=1 \
-  scripts/torcl-limited.sh target/x86_64-unknown-linux-musl/debug/torcl \
+EGCL_GC_STRESS=1 EGCL_GC_POISON=1 \
+  scripts/egcl-limited.sh target/x86_64-unknown-linux-musl/debug/egcl \
   --no-init --load reproduce.lisp
 ```
 
@@ -55,8 +55,8 @@ stored and produce a quietly wrong result instead of a poisoned-pointer crash.
 | Exit 124 | Wall-clock timeout |
 | Exit 139, exit 134, or an “already borrowed” panic | Investigate corruption or borrow/rooting discipline |
 
-`TORCL_GC_STRESS_SKIP=N` can narrow a reproducer to a suffix of allocations.
+`EGCL_GC_STRESS_SKIP=N` can narrow a reproducer to a suffix of allocations.
 First confirm that N is within the program's allocation count with
-`TORCL_GC_STRESS_AT=N`: an out-of-range skip disables stressing and proves
+`EGCL_GC_STRESS_AT=N`: an out-of-range skip disables stressing and proves
 nothing. See the full debugging instructions in
 [AGENTS.md](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/AGENTS.md).

@@ -1,4 +1,4 @@
-# TorCL Android application
+# EGCL Android application
 
 Edit `assets/app.lisp`, then build and install:
 
@@ -11,8 +11,8 @@ make run
 make logcat
 ```
 
-Requires `torcl-target-android`, Python 3, GNU Make, a JDK (`keytool`), and
-Android SDK build-tools, platform-tools and platform 34. No TorCL source
+Requires `egcl-target-android`, Python 3, GNU Make, a JDK (`keytool`), and
+Android SDK build-tools, platform-tools and platform 34. No EGCL source
 checkout, Rust compiler, NDK, Gradle or containers are needed for application
 builds. The RPM supplies both native libraries.
 
@@ -67,9 +67,9 @@ state. `android:poll-touch` returns action, x, y or NIL (primary-pointer events;
 0 down, 1 up, 2 move). Coordinates are window pixels. The queue retains the last
 64 events. The EGL template handles these details and changes color on touch.
 
-`android:log` writes ASCII diagnostics to the `torcl` logcat tag. The minimal
+`android:log` writes ASCII diagnostics to the `egcl` logcat tag. The minimal
 template logs lifecycle/input activity and intentionally draws nothing.
-There is one Lisp interpreter per Activity and one TorCL Activity per process.
+There is one Lisp interpreter per Activity and one EGCL Activity per process.
 This version starts from Lisp source assets; saved-image application payloads
 are not yet supported.
 

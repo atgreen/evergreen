@@ -4,13 +4,13 @@
 implementations, external-format encoding/decoding, buffering strategies,
 OS integration, and thread safety.
 
-TorCL streams follow ANSI X3.226-1994 Chapter 21 and implement the
+EGCL streams follow ANSI X3.226-1994 Chapter 21 and implement the
 *Gray streams* extension (David N. Gray, 1989; de-facto standard across
 SBCL, CCL, ECL, ABCL).  Gray streams are the user-facing extensibility
 mechanism; all built-in stream types are built on top of the same protocol.
 
-Source location: `crates/torcl-stdlib/src/streams.lisp` (CL layer) and
-`crates/torcl-rt/src/io/` (Rust I/O primitives).
+Source location: `crates/egcl-stdlib/src/streams.lisp` (CL layer) and
+`crates/egcl-rt/src/io/` (Rust I/O primitives).
 
 ---
 
@@ -45,7 +45,7 @@ Source location: `crates/torcl-stdlib/src/streams.lisp` (CL layer) and
 
 ### 5.5.2.1  Base Classes
 
-All Gray stream classes live in the `TORCL-GRAY-STREAMS` package, re-exported
+All Gray stream classes live in the `EGCL-GRAY-STREAMS` package, re-exported
 from `COMMON-LISP`.
 
 | Class | Superclasses | Role |
@@ -101,26 +101,26 @@ on `fundamental-stream` subclasses (R5.113):
 | `stream-element-type` | `(stream) → typespec` | Return the element type of the stream (e.g. `character`, `(unsigned-byte 8)`). Subclass MUST implement or inherit a correct default. |
 | `open-stream-p` | `(stream) → boolean` | Return `T` if the stream is open. Default on `fundamental-stream`: check the `open` slot. |
 | `close` | `(stream &key abort) → t` | Close the stream. If `:abort` is true, discard pending output without flushing. Default on `fundamental-stream`: set `open` to `nil`, deregister finalizer. MUST be idempotent (R5.122). |
-| `interactive-stream-p` | `(stream) → boolean` | Return `T` if the stream is interactive (e.g. a terminal). Default on `fundamental-stream`: `nil`. `torcl-file-stream` overrides to check `isatty(3)`. |
+| `interactive-stream-p` | `(stream) → boolean` | Return `T` if the stream is interactive (e.g. a terminal). Default on `fundamental-stream`: `nil`. `egcl-file-stream` overrides to check `isatty(3)`. |
 
 ---
 
 ## 5.5.3  Built-in Stream Implementations
 
-### 5.5.3.1  `torcl-file-stream`
+### 5.5.3.1  `egcl-file-stream`
 
 **Superclasses:** `fundamental-character-input-stream`,
 `fundamental-character-output-stream` (for character mode); or
 `fundamental-binary-input-stream` / `fundamental-binary-output-stream`
 (binary mode).  Direction determined at open time.
 
-**Data structure — D5.15 (`TorclFileStream`):**
+**Data structure — D5.15 (`EgclFileStream`):**
 
 ```rust
-struct TorclFileStream {
+struct EgclFileStream {
     fd: RawFd,                      // OS file descriptor
     direction: Direction,           // :input | :output | :io
-    element_type: TorclVal,         // character or (unsigned-byte N)
+    element_type: EgclVal,         // character or (unsigned-byte N)
     external_format: ExternalFormat,// §5.5.4
     buffer: StreamBuffer,           // §5.5.5
     position: u64,                  // logical byte position in file
@@ -175,13 +175,13 @@ buffered data.  It is maintained as follows:
    invalidates the read buffer, calls `lseek(fd, new_pos, SEEK_SET)`, and
    sets `position = new_pos`.
 
-### 5.5.3.2  `torcl-string-stream`
+### 5.5.3.2  `egcl-string-stream`
 
-**Data structure — D5.16 (`TorclStringStream`):**
+**Data structure — D5.16 (`EgclStringStream`):**
 
 ```rust
-struct TorclStringStream {
-    string: TorclVal,         // underlying string (simple or adjustable)
+struct EgclStringStream {
+    string: EgclVal,         // underlying string (simple or adjustable)
     index: usize,             // current read/write position
     limit: usize,             // end index for input streams
     direction: Direction,     // :input or :output
@@ -337,7 +337,7 @@ All file-stream I/O goes through Rust wrappers around POSIX
 `read(2)`/`write(2)`/`lseek(2)`/`close(2)`:
 
 ```
-crates/torcl-rt/src/io/
+crates/egcl-rt/src/io/
 ├── fd.rs          // RawFd wrapper, non-blocking mode toggle
 ├── buffer.rs      // StreamBuffer implementation
 ├── codec.rs       // Rust-side bootstrap UTF-8 codec (see below)
@@ -354,7 +354,7 @@ primitives (e.g., reading `*.lisp` source files to build the image).
 
 Once the CL stream class hierarchy is initialised (end of Phase 1):
 
-1. The bootstrap Rust codec is **replaced**: `torcl-file-stream` methods
+1. The bootstrap Rust codec is **replaced**: `egcl-file-stream` methods
    switch to dispatching through the CL `codec-encode` / `codec-decode`
    generic functions.  The Rust entry points are no longer called for
    normal stream operations.
@@ -383,7 +383,7 @@ Once the CL stream class hierarchy is initialised (end of Phase 1):
 
 ### 5.5.6.3  GC Finalizer Auto-Close (R5.121)
 
-- When a `torcl-file-stream` is allocated, a weak reference + closure is
+- When a `egcl-file-stream` is allocated, a weak reference + closure is
   registered with the GC finalizer queue (§3).
 - If the stream becomes unreachable without `close`:
   1. Finalizer calls `close(fd)`.
@@ -490,10 +490,10 @@ All encoding/decoding errors establish these restarts:
 
 | Tunable | Default | Env Var | Effect |
 |---------|---------|---------|--------|
-| Default external format | `:utf-8` | `TORCL_EXTERNAL_FORMAT` | Applied to all `open` calls without explicit `:external-format`. |
-| File-stream buffer size | 8192 | `TORCL_STREAM_BUFFER_SIZE` | Bytes. Must be ≥ 512. |
-| Line-buffer size | 4096 | `TORCL_LINE_BUFFER_SIZE` | Bytes. |
-| GC finalizer warnings | enabled | `TORCL_WARN_UNCLOSED_STREAMS=0` | Set to `0` to suppress `file-stream-gc-warning`. |
+| Default external format | `:utf-8` | `EGCL_EXTERNAL_FORMAT` | Applied to all `open` calls without explicit `:external-format`. |
+| File-stream buffer size | 8192 | `EGCL_STREAM_BUFFER_SIZE` | Bytes. Must be ≥ 512. |
+| Line-buffer size | 4096 | `EGCL_LINE_BUFFER_SIZE` | Bytes. |
+| GC finalizer warnings | enabled | `EGCL_WARN_UNCLOSED_STREAMS=0` | Set to `0` to suppress `file-stream-gc-warning`. |
 
 ---
 
@@ -516,13 +516,13 @@ All encoding/decoding errors establish these restarts:
 ## 5.5.11  Module Map
 
 ```
-crates/torcl-stdlib/src/
+crates/egcl-stdlib/src/
 ├── streams/
-│   ├── package.lisp          # TORCL-GRAY-STREAMS package definition
+│   ├── package.lisp          # EGCL-GRAY-STREAMS package definition
 │   ├── gray-classes.lisp     # fundamental-* class definitions (§5.5.2.1)
 │   ├── gray-protocol.lisp    # generic function definitions (§5.5.2.2–3)
-│   ├── file-stream.lisp      # torcl-file-stream (§5.5.3.1)
-│   ├── string-stream.lisp    # torcl-string-stream (§5.5.3.2)
+│   ├── file-stream.lisp      # egcl-file-stream (§5.5.3.1)
+│   ├── string-stream.lisp    # egcl-string-stream (§5.5.3.2)
 │   ├── broadcast.lisp        # broadcast-stream
 │   ├── concatenated.lisp     # concatenated-stream
 │   ├── two-way.lisp          # two-way-stream + echo-stream
@@ -536,7 +536,7 @@ crates/torcl-stdlib/src/
 │   │   └── utf-32.lisp
 │   └── conditions.lisp       # stream conditions & restarts (§5.5.8)
 
-crates/torcl-rt/src/io/
+crates/egcl-rt/src/io/
 ├── fd.rs                     # RawFd wrapper
 ├── buffer.rs                 # StreamBuffer (D5.22)
 ├── codec.rs                  # bootstrap UTF-8 fast path

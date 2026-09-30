@@ -3,7 +3,7 @@
 ## Generator
 
 ```text
-torcl-android-new DIRECTORY [--host HOST] [--template egl|minimal]
+egcl-android-new DIRECTORY [--host HOST] [--template egl|minimal]
                   [--package PACKAGE] [--name NAME] [--runtime DIRECTORY]
 ```
 
@@ -13,7 +13,7 @@ torcl-android-new DIRECTORY [--host HOST] [--template egl|minimal]
 | `--template` | `egl`; `minimal` logs lifecycle/input without drawing |
 | `--package` | `org.example.hello`; dotted Android application ID |
 | `--name` | Destination directory name; Android display label |
-| `--runtime` | Installed runtime directory; also configurable through `TORCL_ANDROID_RUNTIME` |
+| `--runtime` | Installed runtime directory; also configurable through `EGCL_ANDROID_RUNTIME` |
 
 The destination must not exist. The runtime provides both architectures.
 
@@ -27,7 +27,7 @@ The destination must not exist. The runtime provides both architectures.
 | `verify` | Build a debug APK, check signature/alignment, and print package metadata |
 | `install` | Check device ABI, then build and install the debug APK |
 | `run` | Launch the installed Activity |
-| `logcat` | Follow TorCL, Android runtime, and libc diagnostics |
+| `logcat` | Follow EGCL, Android runtime, and libc diagnostics |
 | `release` | Build an APK using supplied release-signing credentials |
 | `clean` | Remove `build/`; preserve the debug keystore |
 | `help` | Print build and device-selection help |
@@ -48,7 +48,7 @@ selected build-tools version. It does not install system packages or the NDK.
 | `BUILD_TOOLS` | Explicit build-tools directory; otherwise newest installed numeric version |
 | `ANDROID_JAR` | Platform JAR override; otherwise selected from the manifest |
 | `SERIAL` | `adb` device selector |
-| `RUNTIME` | Runtime installation; default `/usr/libexec/torcl/android` |
+| `RUNTIME` | Runtime installation; default `/usr/libexec/egcl/android` |
 | `KEYSTORE`, `KEY_ALIAS`, `KEYSTORE_PASSWORD` | Required environment variables for release signing |
 | `KEY_PASSWORD` | Optional separate key password |
 
@@ -78,7 +78,7 @@ APKs are written to `build/<hosts>/debug/app.apk` or
 Manifest identity is used for packaging and launching. Changing the recorded
 runtime version in `app.json` requires checking compatibility with the installed
 runtime. Asset symlinks are rejected; individual assets are limited to 64 MiB.
-`torcl-assets.txt` is a reserved generated asset name.
+`egcl-assets.txt` is a reserved generated asset name.
 
 ## Lisp lifecycle API
 
@@ -91,7 +91,7 @@ thread. Keep durable-in-process application state in Lisp globals.
 | `(android:running-p)` | False when the current surface must be released |
 | `(android:paused-p)` | True when rendering should pause |
 | `(android:poll-touch)` | Action, x, y as multiple values; `nil` if no queued event |
-| `(android:log message)` | ASCII diagnostic under the `torcl` logcat tag |
+| `(android:log message)` | ASCII diagnostic under the `egcl` logcat tag |
 
 Touch coordinates are pixels. Actions are `0` down, `1` up, and `2` move;
 only the primary pointer is exposed. The queue keeps the last 64 events.
@@ -99,7 +99,7 @@ only the primary pointer is exposed. The queue keeps the last 64 events.
 Check `running-p` on every render iteration, return promptly when it becomes
 false, and release EGL resources with `unwind-protect`. Android waits for cleanup
 before releasing the window. There is one interpreter per Activity and one
-TorCL Activity per process.
+EGCL Activity per process.
 
 The runtime replaces the extracted asset directory on Activity creation.
 Relative `load` and file operations use that directory. Do not store persistent

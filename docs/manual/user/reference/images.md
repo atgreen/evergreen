@@ -16,7 +16,7 @@ Writes a core image of the live Lisp world and terminates the saving process.
 | `:toplevel` | Function to call when the saved application starts |
 
 Without `:toplevel`, an executable starts a REPL. Without `:executable`, the
-output is a core file restored with `torcl --image FILE`.
+output is a core file restored with `egcl --image FILE`.
 
 The current implementation accepts some additional SBCL-style keywords,
 including `:compression` and `:save-runtime-options`, without implementing
@@ -35,7 +35,7 @@ their effects. Do not rely on them to change the output format or startup.
 A core image is not a compiled source file. A different filename extension
 does not convert between formats. Images require a compatible runtime and
 target architecture; they are not an interchange format between machines of
-different architectures or arbitrary TorCL builds.
+different architectures or arbitrary EGCL builds.
 
 The Android project generator currently packages Lisp source assets, not saved
 core images. See [Images and applications](../explanation/images.md).

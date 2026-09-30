@@ -7,7 +7,7 @@ on:
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
       - 'scripts/test_docs.py'
-      - 'crates/torcl/src/cli.rs'
+      - 'crates/egcl/src/cli.rs'
       - '.github/workflows/docs.yml'
   push:
     branches: [main]
@@ -16,7 +16,7 @@ on:
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
       - 'scripts/test_docs.py'
-      - 'crates/torcl/src/cli.rs'
+      - 'crates/egcl/src/cli.rs'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -39,6 +39,6 @@ jobs:
       - run: mkdocs build --strict
       - uses: actions/upload-artifact@v4
         with:
-          name: torcl-manual
+          name: egcl-manual
           path: site/
           if-no-files-found: error

@@ -1,12 +1,12 @@
 # Build for another platform
 
 This guide uses the container-free target RPMs on x86-64 Fedora. Install the
-base `torcl` package and the matching target package from your local RPM build.
+base `egcl` package and the matching target package from your local RPM build.
 The [platform reference](../reference/platforms.md) lists the commands.
 
 ## Create an IBM Z Linux executable
 
-Install `torcl-target-s390x-linux` alongside the same release of `torcl`.
+Install `egcl-target-s390x-linux` alongside the same release of `egcl`.
 Create `build.lisp`:
 
 ```lisp
@@ -17,7 +17,7 @@ Create `build.lisp`:
 Build and inspect the result:
 
 ```sh
-torcl-s390x-linux --no-init --load build.lisp
+egcl-s390x-linux --no-init --load build.lisp
 file hello-s390x
 ```
 
@@ -30,7 +30,7 @@ The launcher supplies a private runtime library tree to QEMU. For a dumped
 executable, explicitly provide that same tree:
 
 ```sh
-qemu-s390x -L /usr/libexec/torcl/s390x-linux/sysroot ./hello-s390x
+qemu-s390x -L /usr/libexec/egcl/s390x-linux/sysroot ./hello-s390x
 ```
 
 If running `./hello-s390x` reports that `/lib/ld64.so.1` is missing, the host's
@@ -39,12 +39,12 @@ explicit QEMU command above. Do not put foreign libraries in your host `/lib`.
 
 ## Select a different target
 
-Use `torcl-aarch64-linux`, `torcl-ppc64le-linux`, or `torcl-windows` in place
+Use `egcl-aarch64-linux`, `egcl-ppc64le-linux`, or `egcl-windows` in place
 of the s390x launcher. POWER uses little-endian ppc64le Linux. Test a dumped
 POWER executable with:
 
 ```sh
-qemu-ppc64le -L /usr/libexec/torcl/ppc64le-linux/sysroot ./hello-ppc64le
+qemu-ppc64le -L /usr/libexec/egcl/ppc64le-linux/sysroot ./hello-ppc64le
 ```
 
 Give Windows executable outputs an `.exe` suffix. Windows creation runs under
@@ -56,4 +56,4 @@ Linux distributions. QEMU and Wine are build-host tools, not dependencies of
 the resulting program on its native target.
 
 For Android graphical applications, use the [APK workflow](android.md).
-`torcl-android` produces an ARM64 command-line executable, not an APK.
+`egcl-android` produces an ARM64 command-line executable, not an APK.

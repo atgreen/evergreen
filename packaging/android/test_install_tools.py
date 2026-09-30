@@ -56,7 +56,7 @@ class InstallToolsTests(unittest.TestCase):
 
     def test_generated_make_target_runs_without_runtime_or_sdk_packages(self):
         project = Path(self.tmp.name) / 'project'
-        subprocess.run(['python3', ROOT / 'torcl-android-new', project,
+        subprocess.run(['python3', ROOT / 'egcl-android-new', project,
                         '--runtime', ROOT], check=True, capture_output=True)
         manager = self.sdk / 'cmdline-tools/latest/bin/sdkmanager'
         manager.parent.mkdir(parents=True)

@@ -33,7 +33,7 @@ class BuildTests(unittest.TestCase):
         link.symlink_to('/etc/passwd')
         with self.assertRaisesRegex(ValueError, 'symlinks'): apk.assets(self.root)
         link.unlink()
-        (assets / 'torcl-assets.txt').write_text('bad')
+        (assets / 'egcl-assets.txt').write_text('bad')
         with self.assertRaisesRegex(ValueError, 'reserved'): apk.assets(self.root)
 
     def test_runtime_api_mismatch_fails_before_packaging(self):

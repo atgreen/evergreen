@@ -5,7 +5,7 @@ Usage: fake-ollama.py COMMAND [ARG...]
 
 The server echoes the user's message back as the assistant's reply, so the
 Lisp side can assert that the text it sent survived the round trip in both
-directions. TORCL_OLLAMA_PORT is exported to the child. Exits with the child's
+directions. EGCL_OLLAMA_PORT is exported to the child. Exits with the child's
 status.
 """
 import http.server
@@ -54,7 +54,7 @@ def main(argv):
     port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    env = dict(os.environ, TORCL_OLLAMA_PORT=str(port))
+    env = dict(os.environ, EGCL_OLLAMA_PORT=str(port))
     try:
         return subprocess.call(argv, env=env)
     finally:

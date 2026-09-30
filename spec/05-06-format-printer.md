@@ -30,7 +30,7 @@ variables. Implements ANSI CL §22 (Printer) and §22.3 (FORMAT).
 | R5.173 [S3] | `*print-miser-width*` MUST enable miser mode when available width ≤ threshold. | MUST |
 | R5.174 [S3] | `*print-right-margin*` MUST control the right margin; `nil` → auto-detect terminal width. | MUST |
 | R5.175 [S3] | Array printing MUST respect `*print-array*`, `*print-level*`, `*print-length*`, `*print-readably*`. | MUST |
-| R5.176 [S3] | Hash-table printing: `#<HASH-TABLE :TEST eql :COUNT n>` by default. When `*print-readably*` is true, signal `print-not-readable` (per R5.171), since ANSI CL defines no standard readable syntax for hash tables. See §5.9.15 for a TorCL-extension reader macro that may be provided separately. | MUST |
+| R5.176 [S3] | Hash-table printing: `#<HASH-TABLE :TEST eql :COUNT n>` by default. When `*print-readably*` is true, signal `print-not-readable` (per R5.171), since ANSI CL defines no standard readable syntax for hash tables. See §5.9.15 for a EGCL-extension reader macro that may be provided separately. | MUST |
 | R5.177 [S3] | Structure printing MUST use print-function/print-object, falling back to `#S(...)`. | MUST |
 | R5.178 [S3] | CLOS objects MUST dispatch through `print-object`. | MUST |
 | R5.179 [S3] | Pretty-printer directives `~W`, `~I`, `~:T`, `~_` MUST work within FORMAT. | MUST |
@@ -131,8 +131,8 @@ struct DispatchEntry {
 
 ```rust
 struct CircularityDetector {
-    visits: EqHashMap<TorclVal, u32>,      // pass 1: visit counts
-    labels: EqHashMap<TorclVal, usize>,    // pass 2: shared → label id
+    visits: EqHashMap<EgclVal, u32>,      // pass 1: visit counts
+    labels: EqHashMap<EgclVal, usize>,    // pass 2: shared → label id
     next_label: usize,
 }
 ```
@@ -327,7 +327,7 @@ PROCEDURE pprint_dispatch(object, table) -> function:
         best = entry
       ELSE IF entry.priority == best_priority:
         // ANSI CL §22.2.1.4: behavior is unspecified when priorities are equal.
-        // TorCL extension: prefer the more specific type via subtypep.
+        // EGCL extension: prefer the more specific type via subtypep.
         // When neither type is a subtype of the other, the most recently
         // added entry wins (stable-order tiebreak).
         IF subtypep(entry.type, best.type) AND NOT subtypep(best.type, entry.type):
@@ -335,10 +335,10 @@ PROCEDURE pprint_dispatch(object, table) -> function:
   RETURN best.function OR default_print_function
 ```
 
-> **Note (TorCL extension):** The `subtypep` tiebreaker when priorities are
-> equal is a TorCL design choice. ANSI CL §22.2.1.4 leaves this behavior
+> **Note (EGCL extension):** The `subtypep` tiebreaker when priorities are
+> equal is a EGCL design choice. ANSI CL §22.2.1.4 leaves this behavior
 > unspecified (implementation-dependent). When neither type is a subtype of the
-> other, TorCL uses insertion order as the final tiebreak.
+> other, EGCL uses insertion order as the final tiebreak.
 
 ### Default Entries (R5.168)
 
@@ -394,7 +394,7 @@ FOR (obj, count) IN det.visits WHERE count > 1:
 | `*print-escape*` | T | → T | Backslash / `#\` in output |
 | `*print-readably*` | NIL | (master) | Re-readable output or signal error |
 | `*print-pretty*` | NIL | — | Enable XP pretty-printer |
-| `*print-circle*` | NIL | → T | Circularity detection (TorCL forces T under `*print-readably*` to guarantee re-readable output for circular structures) |
+| `*print-circle*` | NIL | → T | Circularity detection (EGCL forces T under `*print-readably*` to guarantee re-readable output for circular structures) |
 | `*print-level*` | NIL | → NIL | Depth truncation (`#`) |
 | `*print-length*` | NIL | → NIL | Length truncation (`...`) |
 | `*print-lines*` | NIL | — | Line count limit |
@@ -456,15 +456,15 @@ approximate character position.
 
 | Parameter | Default | Env Override | Description |
 |-----------|---------|-------------|-------------|
-| FORMAT cache capacity | 256 | `TORCL_FMT_CACHE_SIZE` | Thread-local LRU size |
-| Default right margin | 80 | `TORCL_PRINT_RIGHT_MARGIN` | Fallback when terminal undetectable |
-| Max circularity walk depth | 100000 | `TORCL_PRINT_CIRCLE_DEPTH` | Stack guard for pathological structures |
+| FORMAT cache capacity | 256 | `EGCL_FMT_CACHE_SIZE` | Thread-local LRU size |
+| Default right margin | 80 | `EGCL_PRINT_RIGHT_MARGIN` | Fallback when terminal undetectable |
+| Max circularity walk depth | 100000 | `EGCL_PRINT_CIRCLE_DEPTH` | Stack guard for pathological structures |
 
 ---
 
-## 5.9.15 TorCL Extension: Hash-Table Readable Syntax (Future)
+## 5.9.15 EGCL Extension: Hash-Table Readable Syntax (Future)
 
-ANSI CL defines no standard readable syntax for hash tables. TorCL MAY provide
+ANSI CL defines no standard readable syntax for hash tables. EGCL MAY provide
 an optional reader macro (e.g., `#H((:test eql) (k1 v1) (k2 v2))`) as a
 non-standard extension to enable readable hash-table output. Until such a macro
 is defined and documented, `*print-readably*` with a hash-table argument MUST

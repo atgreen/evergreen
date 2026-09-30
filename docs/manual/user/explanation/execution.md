@@ -1,6 +1,6 @@
 # How Lisp runs
 
-TorCL balances startup cost against the value of optimizing frequently executed
+EGCL balances startup cost against the value of optimizing frequently executed
 code. It does not require every function to pass through an optimizing compiler
 before the program can run.
 
@@ -26,7 +26,7 @@ depend on whether it is interpreted or compiled.
 
 A function called repeatedly may have its entry point replaced by native code.
 A long-running loop may instead enter compiled code during the current call.
-That transition is **on-stack replacement**, or OSR. TorCL transfers live values
+That transition is **on-stack replacement**, or OSR. EGCL transfers live values
 to the compiled loop's expected locations and continues the same computation.
 
 This distinction matters when observing performance. A function can still be

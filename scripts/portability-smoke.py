@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Exercise a real CLI through a supplied native or QEMU command.
 
-Run under scripts/torcl-limited.sh. Example:
-  scripts/torcl-limited.sh python3 scripts/portability-smoke.py aarch64 -- \
-    qemu-aarch64 -L /path/to/sysroot target/aarch64-unknown-linux-gnu/release/torcl
+Run under scripts/egcl-limited.sh. Example:
+  scripts/egcl-limited.sh python3 scripts/portability-smoke.py aarch64 -- \
+    qemu-aarch64 -L /path/to/sysroot target/aarch64-unknown-linux-gnu/release/egcl
 """
 import os
 from pathlib import Path
@@ -48,17 +48,17 @@ def main():
             raise RuntimeError(f"exit {result.returncode}\n{result.stdout}\n{result.stderr}")
         return result.stdout
 
-    with tempfile.TemporaryDirectory(prefix="torcl portability-" if arch == "win64" else "torcl-portability-") as directory:
+    with tempfile.TemporaryDirectory(prefix="egcl portability-" if arch == "win64" else "egcl-portability-") as directory:
         script = Path(directory) / "smoke.lisp"
         script.write_text(source)
         outputs = []
         for tier in ["interp", "t0", None, "t2"]:
             env = os.environ.copy()
             for key in list(env):
-                if key.startswith("TORCL_"):
+                if key.startswith("EGCL_"):
                     del env[key]
             if tier:
-                env["TORCL_FORCE_TIER"] = tier
+                env["EGCL_FORCE_TIER"] = tier
             output = run(["--load", target_path(script)], env)
             assert "PORTABILITY-OK" in output, output
             outputs.append(output)
@@ -70,10 +70,10 @@ def main():
             # opt-in probe proves that a leaf body reaches the ELFv2 segment
             # adapter at the Rust/native invocation boundary.
             native_env = env.copy()
-            native_env["TORCL_FORCE_TIER"] = "t2"
-            native_env["TORCL_NATIVE_TRANSFER"] = "1"
-            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
-            native_env["TORCL_NN_DIRECT"] = "0"
+            native_env["EGCL_FORCE_TIER"] = "t2"
+            native_env["EGCL_NATIVE_TRANSFER"] = "1"
+            native_env["EGCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["EGCL_NN_DIRECT"] = "0"
             native = subprocess.run(
                 command + [
                     "--no-init",
@@ -108,10 +108,10 @@ def main():
             # opt-in probe proves that a leaf body reaches the AAPCS64 segment
             # adapter at the Rust/native invocation boundary.
             native_env = env.copy()
-            native_env["TORCL_FORCE_TIER"] = "t2"
-            native_env["TORCL_NATIVE_TRANSFER"] = "1"
-            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
-            native_env["TORCL_NN_DIRECT"] = "0"
+            native_env["EGCL_FORCE_TIER"] = "t2"
+            native_env["EGCL_NATIVE_TRANSFER"] = "1"
+            native_env["EGCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["EGCL_NN_DIRECT"] = "0"
             native = subprocess.run(
                 command + [
                     "--no-init",
@@ -141,10 +141,10 @@ def main():
             # opt-in probe proves that a leaf body reaches the ELF64 segment
             # adapter at the System Z/native invocation boundary.
             native_env = env.copy()
-            native_env["TORCL_FORCE_TIER"] = "t2"
-            native_env["TORCL_NATIVE_TRANSFER"] = "1"
-            native_env["TORCL_NATIVE_TRANSFER_DEBUG"] = "1"
-            native_env["TORCL_NN_DIRECT"] = "0"
+            native_env["EGCL_FORCE_TIER"] = "t2"
+            native_env["EGCL_NATIVE_TRANSFER"] = "1"
+            native_env["EGCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["EGCL_NN_DIRECT"] = "0"
             native = subprocess.run(
                 command + [
                     "--no-init",
@@ -174,7 +174,7 @@ def main():
             home_env.pop("HOME", None)
             home = target_path(directory) + "/"
             profile = target_path(directory).replace("/", "\\").replace("\\", "\\\\")
-            output = run(["--eval", f'(progn (torcl-ext:setenv "USERPROFILE" "{profile}") '
+            output = run(["--eval", f'(progn (egcl-ext:setenv "USERPROFILE" "{profile}") '
                           f'(assert (string= (namestring (user-homedir-pathname)) "{home}")) '
                           f'(assert (string= (namestring (parse-namestring "~/probe.txt")) "{home}probe.txt")) '
                           '(format t "HOME-OK~%"))'], home_env)
@@ -195,7 +195,7 @@ def main():
             assert "DIRECTORY-OK" in output, output
             print(f"{arch}: wildcard directory preserves its drive: OK", flush=True)
             for tier in ["interp", "t0"]:
-                home_env["TORCL_FORCE_TIER"] = tier
+                home_env["EGCL_FORCE_TIER"] = tier
                 output = run(["--eval", '(progn (defun recurse (n) (if (= n 0) 0 '
                               '(1+ (funcall (symbol-function (quote recurse)) (1- n))))) '
                               '(handler-case (recurse 10000) (storage-condition () '
@@ -207,19 +207,19 @@ def main():
         # the entire Lisp prelude under software emulation takes minutes before
         # the test starts; --no-bootstrap avoids that cost without a SKIP knob.
         stress_script = Path(__file__).with_name("portability-stress.lisp").resolve()
-        env["TORCL_FORCE_TIER"] = "t0"
+        env["EGCL_FORCE_TIER"] = "t0"
         reference = run(["--no-bootstrap", "--load", target_path(stress_script)], env)
-        env.update(TORCL_GC_STRESS="1", TORCL_GC_POISON="1")
+        env.update(EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
         stressed = run(["--no-bootstrap", "--load", target_path(stress_script)], env)
         assert "STRESS-OK" in stressed and stressed == reference, (reference, stressed)
         print(f"{arch}: raw-runtime GC stress + poison matches baseline: OK", flush=True)
-        del env["TORCL_GC_STRESS"]
-        del env["TORCL_GC_POISON"]
+        del env["EGCL_GC_STRESS"]
+        del env["EGCL_GC_POISON"]
 
         if arch == "win64":
             paths = Path(__file__).with_name("windows-pathnames.lisp").resolve()
             for tier in ["interp", "t0"]:
-                env["TORCL_FORCE_TIER"] = tier
+                env["EGCL_FORCE_TIER"] = tier
                 output = run(["--load", target_path(paths)], env)
                 assert "WINDOWS-PATHNAMES-OK" in output, output
             print(f"{arch}: pathname components, merging, matching and hashing: OK", flush=True)

@@ -8,17 +8,17 @@ import subprocess
 
 
 def install(source, manual, stage, *, libdir, datadir, docdir):
-    system = stage / datadir.lstrip('/') / 'common-lisp/source/torcl-jvm'
-    library = stage / libdir.lstrip('/') / 'torcl/libtorcl_jvm.so'
+    system = stage / datadir.lstrip('/') / 'common-lisp/source/egcl-jvm'
+    library = stage / libdir.lstrip('/') / 'egcl/libegcl_jvm.so'
     system.mkdir(parents=True, exist_ok=True)
     library.parent.mkdir(parents=True, exist_ok=True)
-    for name in ('torcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp'):
-        shutil.copy2(source / 'lib/torcl-jvm' / name, system / name)
-    shutil.copy2(source / 'lib/torcl-jvm/build/libtorcl_jvm.so', library)
+    for name in ('egcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp'):
+        shutil.copy2(source / 'lib/egcl-jvm' / name, system / name)
+    shutil.copy2(source / 'lib/egcl-jvm/build/libegcl_jvm.so', library)
     link = system / library.name
     link.unlink(missing_ok=True)
     link.symlink_to(os.path.relpath(library, system))
-    destination = stage / docdir.lstrip('/') / 'torcl/manual'
+    destination = stage / docdir.lstrip('/') / 'egcl/manual'
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(manual, destination)
@@ -32,7 +32,7 @@ def main():
     parser.add_argument('--docdir', default='/usr/share/doc')
     args = parser.parse_args()
     source = Path(__file__).resolve().parents[2]
-    subprocess.run(['make', '-C', str(source / 'lib/torcl-jvm')], check=True)
+    subprocess.run(['make', '-C', str(source / 'lib/egcl-jvm')], check=True)
     manual = source / 'build/rpm-manual'
     # File URLs need explicit index.html links, rather than web-server redirects.
     config = source / 'mkdocs-rpm.yml'

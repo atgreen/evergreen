@@ -18,7 +18,7 @@ TARGETS = {
 
 def verify(root, limited):
     root = root.resolve()
-    env = dict(os.environ, TORCL_CROSS_ROOT=str(root / 'usr/libexec/torcl'),
+    env = dict(os.environ, EGCL_CROSS_ROOT=str(root / 'usr/libexec/egcl'),
                WINEDEBUG='-all')
     # Wine prefixes are large; keep them on the build filesystem, not /tmp's tmpfs.
     with tempfile.TemporaryDirectory(prefix='verify-', dir=root.parent) as temporary:
@@ -26,7 +26,7 @@ def verify(root, limited):
         env['WINEPREFIX'] = str(cwd / 'wine')
         try:
             for target in TARGETS:
-                command = root / 'usr/bin' / ('torcl' if target == 'native' else f'torcl-{target}')
+                command = root / 'usr/bin' / ('egcl' if target == 'native' else f'egcl-{target}')
                 if not command.is_file():
                     raise RuntimeError(f'Missing packaged command: {command}')
                 exe = cwd / ('application.exe' if target == 'windows' else 'application')
@@ -65,7 +65,7 @@ def verify(root, limited):
                     runner = ['qemu-aarch64']
                 else:
                     runner = ['qemu-' + target.split('-')[0], '-L',
-                              str(root / 'usr/libexec/torcl' / target / 'sysroot')]
+                              str(root / 'usr/libexec/egcl' / target / 'sysroot')]
                 output = run([*runner, exe, '--no-init'])
                 if 'RPM-IMAGE-OK:42' not in output:
                     raise RuntimeError(f'{target}: dumped image did not restart correctly: {output}')
@@ -73,7 +73,7 @@ def verify(root, limited):
                          '(let ((result nil)) (dotimes (i 300) '
                          '(setq result (cons i result))) (list (length result) (car result)))']
                 normal = run(probe)
-                stressed = run(probe, {'TORCL_GC_STRESS': '100', 'TORCL_GC_POISON': '1'})
+                stressed = run(probe, {'EGCL_GC_STRESS': '100', 'EGCL_GC_POISON': '1'})
                 # systemd scope notices can differ; compare the Lisp result.
                 expected = '(300 299)'
                 if expected not in normal or expected not in stressed:
@@ -88,6 +88,6 @@ def verify(root, limited):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path)
-    parser.add_argument('--limited', type=Path, default=Path(__file__).resolve().parents[2] / 'scripts/torcl-limited.sh')
+    parser.add_argument('--limited', type=Path, default=Path(__file__).resolve().parents[2] / 'scripts/egcl-limited.sh')
     args = parser.parse_args()
     verify(args.root, args.limited.resolve())

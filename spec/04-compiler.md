@@ -1,6 +1,6 @@
 # §4  Compiler Pipeline
 
-**Scope:** This chapter specifies TorCL's complete compilation pipeline —
+**Scope:** This chapter specifies EGCL's complete compilation pipeline —
 from source text to executing machine code.  The pipeline follows the
 HotSpot model: cold code is interpreted (T0), warm code is baseline-compiled
 (T1), and hot code is aggressively optimised (T2).  Between tiers, On-Stack
@@ -26,7 +26,7 @@ file:
 Current source map:
 
 ```
-crates/torcl-compiler/src/
+crates/egcl-compiler/src/
 ├── reader.rs          §4.1  CL reader (Rust bootstrap)
 ├── macroexpand.rs     §4.2  Macro expansion engine
 ├── ir.rs              §4.3  Block-based SSA IR core types
@@ -94,9 +94,9 @@ subsection; the master list is collected here for cross-referencing.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R4.23 | The compiler front-end MUST lower any valid executable CL form to portable TorCL bytecode before T0 execution | MUST |
+| R4.23 | The compiler front-end MUST lower any valid executable CL form to portable EGCL bytecode before T0 execution | MUST |
 | R4.24 | T0 MUST maintain per-function invocation counters (§4.9) | MUST |
-| R4.25 | T1 MUST compile a CL function from TorCL bytecode to native code with < 1 ms latency for typical functions (≤ 200 bytecode instructions) | MUST |
+| R4.25 | T1 MUST compile a CL function from EGCL bytecode to native code with < 1 ms latency for typical functions (≤ 200 bytecode instructions) | MUST |
 | R4.26 | T1 code MUST include profiling stubs for T2 promotion | MUST |
 | R4.27 | T2 MUST apply the full optimisation pass pipeline (§4.5) | MUST |
 | R4.28 | Tier promotion thresholds MUST be configurable at runtime | MUST |
@@ -206,7 +206,7 @@ properties.
 
 See `spec/04-03-ir.md` for the full specification.
 
-TorCL uses a **block-based SSA IR** in the Cranelift / TurboFan-lite lineage: a
+EGCL uses a **block-based SSA IR** in the Cranelift / TurboFan-lite lineage: a
 CFG of basic blocks over instruction/value arenas (D4.01).
 
 **Structure (D4.01):**
@@ -234,7 +234,7 @@ effectful instructions within a block, refined by alias analysis. A deoptimising
 
 See `spec/04-04-tiered.md` for the full specification.
 
-**T0 — Bytecode Interpreter:**  Executes portable TorCL bytecode produced by
+**T0 — Bytecode Interpreter:**  Executes portable EGCL bytecode produced by
 the compiler front-end from macroexpanded forms.  Maintains invocation and
 back-edge counters (§4.9).  Used for cold code, `eval`, bootstrap execution,
 and architecture-independent FASL loading.  The interpreter uses an operand
@@ -388,7 +388,7 @@ reads the profile to insert speculative type guards.
   `*readtable*`).
 - **Macro expansion** acquires read locks on packages for symbol resolution.
 - **T2 compilation** runs on dedicated background threads (one per core,
-  configurable via `TORCL_COMPILE_THREADS`).  It reads profiling data
+  configurable via `EGCL_COMPILE_THREADS`).  It reads profiling data
   lock-free (§4.9) and installs code via atomic pointer swap.
 - **IC patching** uses CAS on x86-64; on AArch64 it uses a store + `ISB`
   barrier.  No stop-the-world required.
@@ -397,16 +397,16 @@ reads the profile to insert speculative type guards.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TORCL_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation (`TORCL_T1_THRESHOLD` alias) |
-| `TORCL_T1_T2_INVOKE_THRESHOLD` | 4096 | Invocation count to trigger T2 compilation (`TORCL_T1_T2_THRESHOLD` / `TORCL_T2_THRESHOLD` aliases) |
-| `TORCL_T1_T2_BACKEDGE_THRESHOLD` | 10000 | Back-edge count to trigger T2 compilation (`TORCL_LOOP_HEAT_THRESHOLD` alias) |
-| `TORCL_DISABLE_T2` | unset | Explicit debug/differential switch that keeps functions at T1 |
-| `TORCL_OSR_THRESHOLD` | 10000 | Back-edge count to trigger OSR entry |
-| `TORCL_INLINE_BUDGET` | 50 | Max IR nodes per inline expansion |
-| `TORCL_INLINE_DEPTH` | 5 | Max inlining depth |
-| `TORCL_COMPILE_THREADS` | `num_cpus / 2` | Background compilation threads |
-| `TORCL_DEOPT_BLACKLIST` | 4 | Deopt count before T2 blacklist |
-| `TORCL_IC_POLY_MAX` | 4 | Max polymorphic IC entries before megamorphic |
+| `EGCL_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation (`EGCL_T1_THRESHOLD` alias) |
+| `EGCL_T1_T2_INVOKE_THRESHOLD` | 4096 | Invocation count to trigger T2 compilation (`EGCL_T1_T2_THRESHOLD` / `EGCL_T2_THRESHOLD` aliases) |
+| `EGCL_T1_T2_BACKEDGE_THRESHOLD` | 10000 | Back-edge count to trigger T2 compilation (`EGCL_LOOP_HEAT_THRESHOLD` alias) |
+| `EGCL_DISABLE_T2` | unset | Explicit debug/differential switch that keeps functions at T1 |
+| `EGCL_OSR_THRESHOLD` | 10000 | Back-edge count to trigger OSR entry |
+| `EGCL_INLINE_BUDGET` | 50 | Max IR nodes per inline expansion |
+| `EGCL_INLINE_DEPTH` | 5 | Max inlining depth |
+| `EGCL_COMPILE_THREADS` | `num_cpus / 2` | Background compilation threads |
+| `EGCL_DEOPT_BLACKLIST` | 4 | Deopt count before T2 blacklist |
+| `EGCL_IC_POLY_MAX` | 4 | Max polymorphic IC entries before megamorphic |
 
 ## 4.13  Test Strategy
 

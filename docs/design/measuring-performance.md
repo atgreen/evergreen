@@ -1,4 +1,4 @@
-# Measuring performance in torcl
+# Measuring performance in egcl
 
 Status: **notes from practice** · Related: bliss-iry5, bliss-ou03, bliss-sgis,
 bliss-yb10, AGENTS.md ("Never compare timings of two debug binaries",
@@ -30,21 +30,21 @@ Use `ROOM` for footprint and GC-pressure questions. Use `alloc-count` for speed.
 
 ## 2. perf cannot unwind out of musl's malloc
 
-`perf record --call-graph dwarf` symbolises torcl frames fine, but musl has no
+`perf record --call-graph dwarf` symbolises egcl frames fine, but musl has no
 CFI for `malloc`, so the callers of `__libc_malloc_impl` do not resolve — the
 stack above it comes back blank. The same is true for `alloc_slot`.
 
-That is why the `alloc-count` cargo feature exists (`crates/torcl/src/main.rs`).
+That is why the `alloc-count` cargo feature exists (`crates/egcl/src/main.rs`).
 It wraps the global allocator:
 
 ```bash
-cargo build --release -p torcl --features alloc-count
+cargo build --release -p egcl --features alloc-count
 
 # totals
-TORCL_PROBE_ALLOC_COUNT=1 ./torcl … 2>&1 | grep @ALLOCS
+EGCL_PROBE_ALLOC_COUNT=1 ./egcl … 2>&1 | grep @ALLOCS
 
 # attribution: backtrace on every Nth allocation
-TORCL_PROBE_ALLOC_SAMPLE=10000 TORCL_PROBE_ALLOC_SAMPLE_OUT=/tmp/bt.txt ./torcl …
+EGCL_PROBE_ALLOC_SAMPLE=10000 EGCL_PROBE_ALLOC_SAMPLE_OUT=/tmp/bt.txt ./egcl …
 ```
 
 Then aggregate `/tmp/bt.txt` (blocks separated by `=====`) on the first frame
@@ -92,7 +92,7 @@ three consecutive measurements by ~2x.
 The repeated failure mode in this investigation was picking an optimisation
 target by reading code, confirming it was *plausible*, fixing it, and measuring
 zero. It happened with the T2 compile queue (a real pathology on a path never
-taken: 0 queue-full events even at `TORCL_COMPILE_QUEUE_SIZE=1`), with CLOS slot
+taken: 0 queue-full events even at `EGCL_COMPILE_QUEUE_SIZE=1`), with CLOS slot
 access, with pathname accessors chosen from a microbenchmark rather than the
 workload, and with `get_record` cloning (refuted: ~28,000 record accesses cannot
 explain 7.86M allocations).
@@ -108,7 +108,7 @@ The cheap instruments that actually settled these:
 - an env-gated `eprintln!` at a candidate site, counted with `sort | uniq -c`,
   with markers on `*error-output*` so the measurement window excludes startup
   (putting markers on stdout once made per-call figures ~130x too high)
-- `TORCL_PROBE_ALLOC_SAMPLE` for allocation attribution
+- `EGCL_PROBE_ALLOC_SAMPLE` for allocation attribution
 - ablation: delete the work behind an env flag and measure the ceiling *before*
   designing a fix
 
@@ -120,7 +120,7 @@ eliminated. Consume the result (`(setf *sink* …)`) or the probe is meaningless
 ## 6a. Profiling artifacts live in RAM
 
 `/tmp` here is tmpfs. A `perf record` of a babel run is 60–200 MB and a saved
-torcl image is 23 MB, so a session that profiles repeatedly quietly accumulates
+egcl image is 23 MB, so a session that profiles repeatedly quietly accumulates
 gigabytes of *memory*. This investigation reached 1.3 GB and got a `cargo test`
 run OOM-killed mid-suite.
 
@@ -135,9 +135,9 @@ bytecode. Twice in this investigation a flat counter was read as evidence of
 tree-walking when the real cause was promotion.
 
 The tell that finally worked: call the function **fewer times than the
-promotion threshold** (`TORCL_T0_T1_THRESHOLD`, default 10). Below it a
+promotion threshold** (`EGCL_T0_T1_THRESHOLD`, default 10). Below it a
 compiled body still runs bytecode, so a genuinely tree-walked body is the only
-thing that reads zero. `TORCL_DISABLE_T2=1` alone does *not* isolate this — T1
+thing that reads zero. `EGCL_DISABLE_T2=1` alone does *not* isolate this — T1
 still promotes, and all three of this session's readings were bit-identical
 with and without it.
 
@@ -168,7 +168,7 @@ process AND name the P-core's PMU explicitly:
 
 ```bash
 taskset -c 0 perf stat -e cpu_core/instructions/u -x, \
-    taskset -c 0 ./torcl --no-init --load bench.lisp
+    taskset -c 0 ./egcl --no-init --load bench.lisp
 ```
 
 Caveat: instructions are not time. A change that trades many cheap instructions
@@ -195,7 +195,7 @@ touch the latter:
   musl mallocng                21.54 s   (+7.59)
 ```
 
-~53% of the gap is the thread cache. torcl now ships its own for musl
+~53% of the gap is the thread cache. egcl now ships its own for musl
 (bliss-05as), which recovered most of it.
 
 Corollary for profiling: `__lock` and `__unlock` high in a musl profile read
@@ -216,15 +216,15 @@ Build with frame pointers and unwinding works:
 ```bash
 RUSTFLAGS="-C force-frame-pointers=yes" \
     cargo build --release --target x86_64-unknown-linux-musl
-taskset -c 0 perf record -F 999 --call-graph fp -- taskset -c 0 ./torcl …
+taskset -c 0 perf record -F 999 --call-graph fp -- taskset -c 0 ./egcl …
 perf report --children --comms <binary-name>          # inclusive
 perf report --no-children --symbols memcpy -g caller  # who calls this leaf
 ```
 
 Two traps that cost time here:
 
-- **`--comms` takes the BINARY name**, so a copied/renamed binary (`torcl-FP`)
-  needs that name, not `torcl`. The wrong filter silently reports nothing at
+- **`--comms` takes the BINARY name**, so a copied/renamed binary (`egcl-FP`)
+  needs that name, not `egcl`. The wrong filter silently reports nothing at
   all rather than erroring.
 - This is a hybrid CPU: an unpinned run lands on E-cores and reports
   `cpu_atom/cycles`, with far fewer samples. Pin with `taskset -c 0` to get
@@ -235,7 +235,7 @@ them.
 
 ## 7. Same path, different build
 
-`target/<target>/release/torcl` is written by every `cargo build`, whatever
+`target/<target>/release/egcl` is written by every `cargo build`, whatever
 features or `RUSTFLAGS` were set. A workspace warning-check silently replaced an
 `alloc-count` binary mid-investigation; a `RUSTFLAGS` rebuild replaced a binary
 while a test suite was running, invalidating that run. Rebuild deliberately

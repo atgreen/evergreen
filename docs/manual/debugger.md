@@ -2,7 +2,7 @@
 
 ## Conditions in application code
 
-TorCL implements Common Lisp condition handling and restarts. Handle an expected
+EGCL implements Common Lisp condition handling and restarts. Handle an expected
 failure at the point where the application can recover; leave an unexpected
 failure available for inspection.
 
@@ -82,4 +82,4 @@ should follow the [GC safety procedure](contributing/how-to/gc-safety.md);
 application users should include the relevant environment settings in the bug
 report instead of interpreting every abort as an application condition.
 
-Implementation reference: [Debugger command implementation](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/torcl-stdlib/src/devtools.rs).
+Implementation reference: [Debugger command implementation](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl-stdlib/src/devtools.rs).

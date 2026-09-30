@@ -1,7 +1,7 @@
 # Windows x86-64 CLI
 
-TorCL can be cross-built on Linux as a Windows console executable:
-`target/x86_64-pc-windows-gnu/release/torcl.exe`.
+EGCL can be cross-built on Linux as a Windows console executable:
+`target/x86_64-pc-windows-gnu/release/egcl.exe`.
 
 The port supports the interpreter, T0 bytecode, native T1 and optimizing T2
 compilation, and on-stack replacement (OSR) from T0 to T1 and T1 to T2.
@@ -46,11 +46,11 @@ usual Linux musl target. Override `RUSTUP_TOOLCHAIN`, `CARGO_BUILD_JOBS`, or
 `CARGO_TARGET_DIR` if needed. No container or Windows SDK is required for this
 GNU cross-build. MSVC builds have not been validated.
 
-Copy `torcl.exe` to Windows and use it from a terminal:
+Copy `egcl.exe` to Windows and use it from a terminal:
 
 ```powershell
-.\torcl.exe --no-init --eval "(+ 40 2)"
-.\torcl.exe --no-init --load program.lisp
+.\egcl.exe --no-init --eval "(+ 40 2)"
+.\egcl.exe --no-init --load program.lisp
 ```
 
 The standard Lisp bootstrap is embedded in the executable. No separate Lisp
@@ -58,7 +58,7 @@ installation is required. The tested executable imports Windows system DLLs;
 no MinGW runtime DLL needs to be copied alongside it.
 
 `*FEATURES*` includes `:WINDOWS`, `:X86-64`, and `:LITTLE-ENDIAN`. Home-directory
-and default `.torclrc` discovery use `USERPROFILE` (with `HOME` as a fallback).
+and default `.egclrc` discovery use `USERPROFILE` (with `HOME` as a fallback).
 Use forward slashes inside Lisp path strings, for example `C:/work/demo.lisp`.
 Physical pathnames support absolute drives (`C:/work/demo.lisp`), drive-relative
 paths (`C:demo.lisp`), root-relative paths, UNC shares (`//server/share/file`),
@@ -86,7 +86,7 @@ through waits and unlocks. Native runtime mutex guards pin their owning fiber
 until the guard is released.
 
 TCP client and accepted connections are owned bidirectional octet streams.
-The existing `torcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
+The existing `egcl::%socket-connect`, `%socket-listen`, `%socket-accept`,
 `%socket-read-timeout`, and `%socket-wait-for-input` primitives work on Windows.
 Buffered input, readiness timeouts, EOF, `LISTEN`, and explicit `CLOSE` are
 supported; closing releases the socket without waiting for GC. Socket position
@@ -94,7 +94,7 @@ and length queries return `NIL`. Windows sockets are not Unix descriptors, so
 `%socket-fd` returns `NIL`; descriptor-based fiber waits remain unsupported.
 Socket readiness uses [Winsock WSAPoll](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll).
 
-`torcl-ext:run-program` runs synchronously and returns three values: exit status,
+`egcl-ext:run-program` runs synchronously and returns three values: exit status,
 stdout, and stderr. A list supplies an executable and its arguments directly;
 a string supplies shell syntax to `COMSPEC` (normally `cmd.exe`) with
 `/D /S /C`. Both output pipes are drained concurrently, and stdin receives EOF.
@@ -111,7 +111,7 @@ managed fibers and admits GC for native callers. Pipe position and length
 queries return `NIL`; closing stdin sends EOF, and closing an input pipe cancels
 outstanding readiness waits. Windows pipe readiness uses
 [PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe).
-The Rust `torcl_stdlib::process::launch_program` API returns an owned `Process`
+The Rust `egcl_stdlib::process::launch_program` API returns an owned `Process`
 with separately transferable stdin/stdout/stderr pipes. `try_wait` observes exit
 without blocking; `wait` supports an optional timeout and retains exit status
 for repeated or concurrent waiters. A timeout leaves the child running.
@@ -168,6 +168,6 @@ alignment and isolation of indirect copies.
 
 The GC stress probe uses `--no-bootstrap` and stresses every allocation in the
 probe; the broader functional tests load the normal prelude. Tests use
-`scripts/torcl-limited.sh` and honor `TORCL_MEM_MAX` and `TORCL_TIMEOUT`.
+`scripts/egcl-limited.sh` and honor `EGCL_MEM_MAX` and `EGCL_TIMEOUT`.
 Wine validation does not replace testing on a native Windows installation;
 native Windows CI and the remaining OS/ABI work are tracked in Beads.

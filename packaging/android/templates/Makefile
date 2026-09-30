@@ -2,7 +2,7 @@
 -include local.mk
 HOST ?= @HOST@
 HOSTS ?= $(HOST)
-RUNTIME ?= /usr/libexec/torcl/android
+RUNTIME ?= /usr/libexec/egcl/android
 SDK ?= $(if $(ANDROID_HOME),$(ANDROID_HOME),$(if $(ANDROID_SDK_ROOT),$(ANDROID_SDK_ROOT),$(HOME)/Android/Sdk))
 SDK_BUILD_TOOLS ?= 35.0.0
 BUILD_TOOLS ?=

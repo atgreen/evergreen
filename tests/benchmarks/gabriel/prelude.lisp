@@ -4,7 +4,7 @@
 ;;; (run-benchmark "name" #'thunk).  Timing is IN-PROCESS via
 ;;; get-internal-real-time, so implementation startup cost never pollutes the
 ;;; number (the old caveat about subtracting startup disappears).  One untimed
-;;; warmup run precedes the timed run so a tiering implementation (torcl) is
+;;; warmup run precedes the timed run so a tiering implementation (egcl) is
 ;;; measured at its promoted tier — the spec goal G2 is PEAK throughput.
 ;;;
 ;;; Output protocol (parsed by ../run.sh): a single line
@@ -14,7 +14,7 @@
   (round (* 1000 (- end start)) internal-time-units-per-second))
 
 (defun run-benchmark (name thunk)
-  ;; Untimed warmup: lets torcl promote the hot code (T0 -> bytecode -> T1/T2)
+  ;; Untimed warmup: lets egcl promote the hot code (T0 -> bytecode -> T1/T2)
   ;; and warms caches on any implementation.
   (funcall thunk)
   (let ((start (get-internal-real-time)))

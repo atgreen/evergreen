@@ -1,10 +1,10 @@
-# A more idiomatic Java interface for TorCL
+# A more idiomatic Java interface for EGCL
 
 Research and design, 2026-09-27. Research: `bliss-jd785`; implementation: `bliss-of7zk`.
 The primary `JAVA` API now implements dynamic calls, named bindings, scopes,
 callbacks, collection copies, SETF array/field access, resource cleanup and member
-inspection. See the [package guide](../../lib/torcl-jvm/README.md) for the actual
-public API. The descriptor-based `TORCL-JVM` interface remains available.
+inspection. See the [package guide](../../lib/egcl-jvm/README.md) for the actual
+public API. The descriptor-based `EGCL-JVM` interface remains available.
 The research below records the rationale and distinguishes longer-term ideas.
 
 The recommendation is a small, ordinary Common Lisp interface combining dynamic
@@ -14,7 +14,7 @@ selection, callback ownership, or runtime transitions implicit and unpredictable
 
 ## What existing systems teach us
 
-| System | Documented interface | Lesson for TorCL |
+| System | Documented interface | Lesson for EGCL |
 |---|---|---|
 | [ABCL and JSS](https://www.abcl.org/releases/1.9.0/abcl.pdf), §§3.1, 4.5, 4.8, 5.3 | ABCL offers explicit method references and dynamic name-based calls. JSS adds `#"method"` reader syntax and shorter class lookup. ABCL also supports Java-class method specializers. | Offer easy dynamic calls and an exact escape hatch; defer reader extensions and deep CLOS integration. |
 | [LispWorks](https://www.lispworks.com/documentation/lw80/lw/lw-java-ug-2.htm), §15.2 | Class imports and defining macros generate ordinary Lisp callers; callers can resolve overloads dynamically. | Named wrappers should be useful with normal Lisp tooling and higher-order functions. |
@@ -29,17 +29,17 @@ callback reference scopes. Its
 [local/global reference discussion](https://www.lispworks.com/documentation/pdf/lw80/lw-8-0.pdf)
 is particularly relevant to borrowing callback arguments.
 
-ABCL and Clojure execute inside the JVM. TorCL retains a native Lisp heap and a
+ABCL and Clojure execute inside the JVM. EGCL retains a native Lisp heap and a
 separate JVM heap. Their compact syntax is useful inspiration, but it does not
 supply a solution to our cross-heap cycles or native callback lifetimes.
 
 ## Package boundary and compatibility
 
-Keep `TORCL-JVM` as the explicit, descriptor-based interface. Load the primary
-ASDF system `torcl-jvm`, which exposes `TORCL-JAVA`. Use `JAVA` as its short name
+Keep `EGCL-JVM` as the explicit, descriptor-based interface. Load the primary
+ASDF system `egcl-jvm`, which exposes `EGCL-JAVA`. Use `JAVA` as its short name
 in applications; installation must detect an existing conflicting package,
 not change another library's `JAVA` package. Applications can always use the
-full `TORCL-JAVA` name.
+full `EGCL-JAVA` name.
 
 Do not change the old `call` to guess whether its first string argument is a
 JNI descriptor. A Java method can legitimately accept a descriptor-looking
@@ -66,7 +66,7 @@ aliases introduce Lisp names without guessing capitalization:
 not yet install a CLOS class, start a JVM, or scan the classpath. Fully qualified
 strings and actual Java Class proxies remain supported. A binding records its
 class-loader context; identical class names from different loaders stay distinct.
-Startup stays explicit through `torcl-jvm:start-jvm`.
+Startup stays explicit through `egcl-jvm:start-jvm`.
 
 An optional JSS-style reader could later expand into this API, using a named
 readtable. Reader mutation on library load is not part of the proposal.
@@ -117,7 +117,7 @@ class-loader identity, method kind/name, argument types, and numeric range
 classification. Caching only “Lisp integer” would be wrong when a value crosses
 the int/long boundary. Session teardown releases cached Java references.
 
-This is a TorCL dynamic-language policy, not a promise to reproduce every Java
+This is a EGCL dynamic-language policy, not a promise to reproduce every Java
 source-language overload rule. It needs a documented conformance table and
 adversarial tests before becoming the default application interface.
 

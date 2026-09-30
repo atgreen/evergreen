@@ -1,0 +1,17 @@
+[package]
+name = "egcl-delivery-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(egcl_specialized_builtins)', 'cfg(egcl_builtin, values(any()))'] }

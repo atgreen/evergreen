@@ -239,11 +239,11 @@ fn check_seq_bounds(
     seq_len: usize,
     start: Option<usize>,   // default 0
     end: Option<usize>,     // default seq_len (NIL in CL)
-) -> Result<(usize, usize), TorclError> {
+) -> Result<(usize, usize), EgclError> {
     let s = start.unwrap_or(0);
     let e = end.unwrap_or(seq_len);
     if s > e || e > seq_len {
-        Err(TorclError::type_error(
+        Err(EgclError::type_error(
             "Bounding indices", format!("START={} END={} LENGTH={}", s, e, seq_len)))
     } else {
         Ok((s, e))
@@ -271,23 +271,23 @@ displacing entries with shorter PSL during insertion.
 #### Data Structure D5.20 — Hash Table Layout
 
 ```rust
-struct TorclHashTable {
+struct EgclHashTable {
     entries:      *mut Entry,      // contiguous array of Entry
     capacity:     usize,           // always a power of two
     count:        usize,           // number of live entries
     mask:         usize,           // capacity - 1
     max_psl:      u8,              // current maximum probe sequence length
     test:         HashTestTag,     // EQ | EQL | EQUAL | EQUALP
-    hash_fn:      fn(TorclVal) -> u64,
-    eq_fn:        fn(TorclVal, TorclVal) -> bool,
+    hash_fn:      fn(EgclVal) -> u64,
+    eq_fn:        fn(EgclVal, EgclVal) -> bool,
     rehash_size:  f32,             // growth factor (default 2.0)
     rehash_threshold: f32,         // load factor trigger (default 0.75)
     lock:         Option<RwLock>,  // present only for synchronized tables
 }
 
 struct Entry {
-    key:   TorclVal,               // UNBOUND sentinel for empty
-    value: TorclVal,
+    key:   EgclVal,               // UNBOUND sentinel for empty
+    value: EgclVal,
     hash:  u64,                    // cached full hash
     psl:   u8,                     // probe sequence length from home slot
 }
@@ -403,12 +403,12 @@ to the equality test for collision resolution.
 Implementation: `sxhash(x) = equal-hash(x) & MOST-POSITIVE-FIXNUM`.
 
 The per-boot random seed means SXHASH values are NOT stable across
-image saves/loads unless the seed is serialized in the image.  TorCL
+image saves/loads unless the seed is serialized in the image.  EGCL
 chooses NOT to serialize the seed (§7 image format) — rehash on load.
 
 ### 5.7.4  Synchronized Hash Tables
 
-TorCL offers two levels of thread safety for hash tables:
+EGCL offers two levels of thread safety for hash tables:
 
 #### Mutex-Based Synchronized Table
 
@@ -519,10 +519,10 @@ values as supplied by the user (or defaults).
 
 | ID | Name | Location | Description |
 |----|------|----------|-------------|
-| D5.20 | `TorclHashTable` | `crates/torcl-rt/src/hashtable.rs` | Robin Hood open-addressing hash table (§5.7.1) |
-| D5.21 | `SEQ-DISPATCH-TABLE` | `crates/torcl-stdlib/src/sequences.lisp` | 2D dispatch table `[fn-id][type-tag]` mapping to specialized impls |
-| D5.22 | `TimsortMergeBuffer` | `crates/torcl-rt/src/sort.rs` | Thread-local scratch buffer for Timsort galloping merge; grown to `n/2`, reused |
-| D5.23 | `check_seq_bounds` | `crates/torcl-rt/src/sequence.rs` | Shared bounds-validation utility for `:START`/`:END` keywords |
+| D5.20 | `EgclHashTable` | `crates/egcl-rt/src/hashtable.rs` | Robin Hood open-addressing hash table (§5.7.1) |
+| D5.21 | `SEQ-DISPATCH-TABLE` | `crates/egcl-stdlib/src/sequences.lisp` | 2D dispatch table `[fn-id][type-tag]` mapping to specialized impls |
+| D5.22 | `TimsortMergeBuffer` | `crates/egcl-rt/src/sort.rs` | Thread-local scratch buffer for Timsort galloping merge; grown to `n/2`, reused |
+| D5.23 | `check_seq_bounds` | `crates/egcl-rt/src/sequence.rs` | Shared bounds-validation utility for `:START`/`:END` keywords |
 
 ## Algorithms Summary
 
@@ -558,8 +558,8 @@ values as supplied by the user (or defaults).
 
 | Knob | Default | Env Var | Description |
 |------|---------|---------|-------------|
-| `*sort-parallel-threshold*` | 100,000 | `TORCL_SORT_PAR_THRESHOLD` | Min vector length for parallel sort |
-| `*sort-parallel-max-workers*` | 8 | `TORCL_SORT_PAR_WORKERS` | Max threads for parallel sort |
+| `*sort-parallel-threshold*` | 100,000 | `EGCL_SORT_PAR_THRESHOLD` | Min vector length for parallel sort |
+| `*sort-parallel-max-workers*` | 8 | `EGCL_SORT_PAR_WORKERS` | Max threads for parallel sort |
 | `*hash-table-initial-capacity*` | 16 | — | Minimum capacity for new hash tables |
 | `*hash-table-psl-cap*` | 128 | — | Max probe sequence length before forced rehash |
 | `*hash-table-rehash-threshold*` | 0.75 | — | Load factor triggering growth |

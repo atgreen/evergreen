@@ -2,12 +2,12 @@
 
 ## Invocation modes
 
-With no batch operation, `torcl` starts a read–eval–print loop. At the prompt,
+With no batch operation, `egcl` starts a read–eval–print loop. At the prompt,
 enter forms and read their results. End of input or the standalone form `(quit)`
 or `(exit)` leaves the REPL successfully.
 
 ```sh
-torcl --no-init
+egcl --no-init
 ```
 
 The REPL recognizes those exit forms directly. Do not assume this provides an
@@ -17,14 +17,14 @@ For batch evaluation, use `--eval` (or `-e`). Repeated occurrences run in order
 in the same environment; an error stops the sequence.
 
 ```sh
-torcl --eval '(defparameter *answer* 40)' --eval '(+ *answer* 2)'
+egcl --eval '(defparameter *answer* 40)' --eval '(+ *answer* 2)'
 ```
 
 `--load FILE` loads a file and exits. A positional pathname runs a script.
 Arguments following `--` become the script's `*command-line-args*`.
 
 ```sh
-torcl report.lisp -- input.csv output.csv
+egcl report.lisp -- input.csv output.csv
 ```
 
 Prefer one batch mode per invocation. The current driver selects evaluation
@@ -38,7 +38,7 @@ loaded automatically for ordinary starts that have not restored a core.
 `--bootstrap` is retained as a compatibility option; `--no-bootstrap` requests
 the raw evaluator and is intended for bootstrap work.
 
-The interactive REPL then looks for `TORCL_INIT_FILE`, or `~/.torclrc` if that
+The interactive REPL then looks for `EGCL_INIT_FILE`, or `~/.egclrc` if that
 environment variable is unset. An absent init file is normal. An evaluation
 error in the init file is printed to standard error and startup continues.
 
@@ -50,7 +50,7 @@ error in the init file is printed to standard error and startup continues.
 | Embedded saved executable with an application toplevel | No |
 | Embedded saved REPL without an application toplevel | Yes, unless `--no-init` |
 
-Do not put a batch application's required dependency setup only in `~/.torclrc`.
+Do not put a batch application's required dependency setup only in `~/.egclrc`.
 Load it explicitly in the script. This is particularly relevant to ASDF source
 registries and package-manager search hooks.
 
@@ -66,7 +66,7 @@ conditions handled by the application need not become process failures.
 
 ## Restoring and saving a world
 
-Use `torcl --image FILE` to start from a core file. To save the current world,
+Use `egcl --image FILE` to start from a core file. To save the current world,
 call `save-lisp-and-die`; saving terminates that process. A saved executable's
 `:toplevel` designates the application entry function.
 
@@ -80,4 +80,4 @@ The complete public help listing is [Command line](user/reference/cli.md).
 Options present only in implementation diagnostics should not be treated as
 stable application configuration simply because the parser accepts them.
 
-Implementation reference: [CLI startup and REPL](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/torcl/src/cli.rs).
+Implementation reference: [CLI startup and REPL](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl/src/cli.rs).

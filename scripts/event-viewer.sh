@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# event-viewer.sh — render a torcl run's JIT/GC event stream as a self-contained,
+# event-viewer.sh — render a egcl run's JIT/GC event stream as a self-contained,
 # JITWatch-style HTML page (bliss-3gme, profiling epic bliss-bfxm).
 #
-# TorCL records a JFR-style event stream (tier promotions, deopt-with-reason,
-# OSR entries, GC pauses) into a low-overhead ring buffer when TORCL_EVENTS=1.
-# This wrapper runs a torcl command with recording on, has it dump the stream as
-# JSON via TORCL-EXT:EVENTS-JSON, and injects that JSON into
+# EGCL records a JFR-style event stream (tier promotions, deopt-with-reason,
+# OSR entries, GC pauses) into a low-overhead ring buffer when EGCL_EVENTS=1.
+# This wrapper runs a egcl command with recording on, has it dump the stream as
+# JSON via EGCL-EXT:EVENTS-JSON, and injects that JSON into
 # tools/event-viewer/viewer.html to produce a standalone page (no server, no
 # external assets) you open in a browser — the offline model of JITWatch / JDK
 # Mission Control.
 #
 # Usage:
-#   scripts/event-viewer.sh [--out FILE] -- <torcl command...>
+#   scripts/event-viewer.sh [--out FILE] -- <egcl command...>
 #
 # The command runs exactly as given (add --load / --eval yourself); this wrapper
-# sets TORCL_EVENTS=1 (record) and TORCL_EVENTS_DUMP=<file> (torcl writes the
+# sets EGCL_EVENTS=1 (record) and EGCL_EVENTS_DUMP=<file> (egcl writes the
 # stream as JSON to that file as it exits), so it works with any workload —
 # --load, --eval, or a REPL session — without editing your program.
 #
 # Options:
-#   --out FILE   output HTML path (default: /tmp/torcl-events.html)
+#   --out FILE   output HTML path (default: /tmp/egcl-events.html)
 #
 # Example:
 #   scripts/event-viewer.sh --out /tmp/babel-jit.html -- \
-#     target/x86_64-unknown-linux-musl/release/torcl --no-init --load babel-load.lisp
+#     target/x86_64-unknown-linux-musl/release/egcl --no-init --load babel-load.lisp
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$HERE/tools/event-viewer/viewer.html"
-OUT="/tmp/torcl-events.html"
+OUT="/tmp/egcl-events.html"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,22 +38,22 @@ while [[ $# -gt 0 ]]; do
     *) echo "event-viewer.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
-[[ $# -gt 0 ]] || { echo "event-viewer.sh: no torcl command given (use: ... -- <torcl ...>)" >&2; exit 2; }
+[[ $# -gt 0 ]] || { echo "event-viewer.sh: no egcl command given (use: ... -- <egcl ...>)" >&2; exit 2; }
 [[ -f "$TEMPLATE" ]] || { echo "event-viewer.sh: template not found: $TEMPLATE" >&2; exit 1; }
 
-WORK="$(mktemp -d /tmp/torcl-events.XXXXXX)"
+WORK="$(mktemp -d /tmp/egcl-events.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 DUMP="$WORK/events.json"
 
-# TORCL_EVENTS_DUMP makes torcl write the ring buffer as JSON to $DUMP as it
+# EGCL_EVENTS_DUMP makes egcl write the ring buffer as JSON to $DUMP as it
 # exits — after the whole workload has run, whatever way it ends.
-echo "[event-viewer] recording (TORCL_EVENTS=1) ..." >&2
-TORCL_EVENTS=1 TORCL_EVENTS_DUMP="$DUMP" "$@" >/dev/null 2>&1 || true
+echo "[event-viewer] recording (EGCL_EVENTS=1) ..." >&2
+EGCL_EVENTS=1 EGCL_EVENTS_DUMP="$DUMP" "$@" >/dev/null 2>&1 || true
 
 JSON="$(grep -m1 '^{"events":' "$DUMP" 2>/dev/null || true)"
 if [[ -z "$JSON" ]]; then
   echo "[event-viewer] no event JSON captured (is $DUMP written?)." >&2
-  echo "  The command must reach process exit so torcl can flush the dump." >&2
+  echo "  The command must reach process exit so egcl can flush the dump." >&2
   exit 1
 fi
 

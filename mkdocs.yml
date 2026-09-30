@@ -1,9 +1,9 @@
-site_name: TorCL
+site_name: EGCL
 site_description: Common Lisp with a tiered JIT, saved applications, and cross-target tooling.
 # Intended address; publication is not enabled by this configuration.
-site_url: https://atgreen.github.io/torcl/
+site_url: https://atgreen.github.io/egcl/
 repo_url: https://cave.moxielogic.com/atgreen/bliss
-repo_name: TorCL source
+repo_name: EGCL source
 edit_uri: _edit/main/docs/manual/
 docs_dir: docs/manual
 site_dir: site

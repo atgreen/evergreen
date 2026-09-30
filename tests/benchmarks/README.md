@@ -1,14 +1,14 @@
-# Benchmarks (torcl vs SBCL)
+# Benchmarks (egcl vs SBCL)
 
 Spec G2 makes competitive peak throughput a top-level goal ("within 2x of
 SBCL on cl-bench within 2 years"); R10.09/R10.10 mandate a standing suite,
 R10.59 min-of-N≥5 runs. This directory is the first slice (bliss-jpd0): a
 Gabriel-benchmark core that runs **unmodified on both implementations**, plus
-a runner that reports the per-benchmark ratio and whether torcl actually
+a runner that reports the per-benchmark ratio and whether egcl actually
 promoted the workload to T2.
 
 ```sh
-cargo build --release -p torcl --bin torcl
+cargo build --release -p egcl --bin egcl
 tests/benchmarks/run.sh              # all benchmarks
 tests/benchmarks/run.sh tak fib      # a subset
 N=9 tests/benchmarks/run.sh          # more repetitions

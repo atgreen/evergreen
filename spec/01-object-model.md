@@ -1,11 +1,11 @@
 # §1 Object Model
 
-All Common Lisp values in TorCL are represented as 64-bit tagged words
-(`TorclVal`). This chapter specifies the tagged-pointer encoding,
+All Common Lisp values in EGCL are represented as 64-bit tagged words
+(`EgclVal`). This chapter specifies the tagged-pointer encoding,
 object header format, memory layouts for every built-in type, the CL
 type lattice mapping, and the NIL representation.
 
-Source: `crates/torcl-rt/src/object.rs`, `crates/torcl-rt/src/types/`.
+Source: `crates/egcl-rt/src/object.rs`, `crates/egcl-rt/src/types/`.
 
 ---
 
@@ -13,8 +13,8 @@ Source: `crates/torcl-rt/src/object.rs`, `crates/torcl-rt/src/types/`.
 
 | ID | Requirement |
 |----|-------------|
-| R1.01 | Every Lisp value MUST be representable as a single 64-bit `TorclVal`. |
-| R1.02 | The low 3 bits of a `TorclVal` MUST encode the primary type tag per §4.1 of §0. |
+| R1.01 | Every Lisp value MUST be representable as a single 64-bit `EgclVal`. |
+| R1.02 | The low 3 bits of a `EgclVal` MUST encode the primary type tag per §4.1 of §0. |
 | R1.03 | Fixnums MUST represent at least the range [−2⁶⁰, 2⁶⁰−1] (61-bit signed). |
 | R1.04 | Characters MUST support the full Unicode range (U+0000 – U+10FFFF). |
 | R1.05 | Single-float immediates MUST use IEEE 754 binary32 representation. |
@@ -23,21 +23,21 @@ Source: `crates/torcl-rt/src/object.rs`, `crates/torcl-rt/src/types/`.
 | R1.08 | The object header MUST contain a type-ID field sufficient to distinguish all built-in types (≥ 8 bits). |
 | R1.09 | The GC MUST be able to read and write mark/forward bits in the header without a lock in the common (non-forwarding) case. |
 | R1.10 | `NIL` MUST satisfy `SYMBOLP`, `LISTP`, and `NULL` simultaneously. |
-| R1.11 | `NIL` MUST be encoded as the `TorclVal` bit pattern `0b111` (tag `111`, payload zero). |
-| R1.12 | `T` MUST be encoded as `TorclVal` with tag `111` and payload `1` (bit pattern `0b1_111` = `0x0F`). |
-| R1.13 | Cons cells MUST be exactly 16 bytes (two `TorclVal` fields: CAR, CDR), with no header. |
+| R1.11 | `NIL` MUST be encoded as the `EgclVal` bit pattern `0b111` (tag `111`, payload zero). |
+| R1.12 | `T` MUST be encoded as `EgclVal` with tag `111` and payload `1` (bit pattern `0b1_111` = `0x0F`). |
+| R1.13 | Cons cells MUST be exactly 16 bytes (two `EgclVal` fields: CAR, CDR), with no header. |
 | R1.14 | Simple strings MUST use fixed-width specialised-vector internal storage (§1.6.3), with the element width fixed at construction and encoded by the `type_id`: `SIMPLE_BASE_STRING` = 1 byte/char (`BASE-CHAR`, code points < 256), `SIMPLE_CHARACTER_STRING` = 4 bytes/char (`CHARACTER`, full range), so `CHAR`/`SCHAR`/`AREF` are O(1) by character index. There is no runtime coder promotion; growable strings use complex arrays (§1.6.4). UTF-8 is an external-format encoding only, applied at I/O boundaries — NOT the internal representation. |
 | R1.15 | Arrays MUST support all element-type specialisations required by ANSI CL §15.1. |
 | R1.16 | Symbols MUST contain at least: name, value, function, plist, and package cells. |
-| R1.17 | The `UNBOUND` marker MUST be a unique `TorclVal` with tag `111` that is distinct from NIL, T, and every other value. |
-| R1.18 | The runtime MUST provide O(1) type-tag extraction from any `TorclVal`. |
+| R1.17 | The `UNBOUND` marker MUST be a unique `EgclVal` with tag `111` that is distinct from NIL, T, and every other value. |
+| R1.18 | The runtime MUST provide O(1) type-tag extraction from any `EgclVal`. |
 | R1.19 | Hash codes stored in object headers MUST be lazily computed on first call to `SXHASH` and cached. |
 | R1.20 | All heap object layouts MUST be naturally aligned (fields aligned to their size, overall object aligned to 8 bytes). |
-| R1.21 | Every `TorclVal` MUST be passable across FFI boundaries as a `u64` / `uint64_t`. |
+| R1.21 | Every `EgclVal` MUST be passable across FFI boundaries as a `u64` / `uint64_t`. |
 
 ---
 
-## 1.2  TorclVal Tagged Pointer — D1.01
+## 1.2  EgclVal Tagged Pointer — D1.01
 
 ```text
 63                              3  2  1  0
@@ -46,7 +46,7 @@ Source: `crates/torcl-rt/src/object.rs`, `crates/torcl-rt/src/types/`.
 └──────────────────────────────┴──┴──┴──┘
 ```
 
-`TorclVal` is a `#[repr(transparent)]` wrapper around `u64` in Rust.
+`EgclVal` is a `#[repr(transparent)]` wrapper around `u64` in Rust.
 
 ### 1.2.1  Tag Table
 
@@ -72,7 +72,7 @@ Source: `crates/torcl-rt/src/object.rs`, `crates/torcl-rt/src/types/`.
 | `4` | `EOF` | `0x0000_0000_0000_0027` | Reader EOF marker (internal) |
 
 `NIL` and `T` also appear in the symbol table (see §1.7) but their
-`TorclVal` encoding is always the special-tag form, never the symbol-index
+`EgclVal` encoding is always the special-tag form, never the symbol-index
 form. Runtime code MUST compare with the canonical bit patterns (R1.11, R1.12).
 
 ---
@@ -152,9 +152,9 @@ Bits 50:48: reserved for future use (MUST be zero)
 
 ```rust
 // Encoding
-fn fixnum(n: i64) -> TorclVal { TorclVal((n << 3) as u64) }
+fn fixnum(n: i64) -> EgclVal { EgclVal((n << 3) as u64) }
 // Decoding
-fn as_fixnum(v: TorclVal) -> i64 { (v.0 as i64) >> 3 }
+fn as_fixnum(v: EgclVal) -> i64 { (v.0 as i64) >> 3 }
 ```
 
 Range: [−2⁶⁰, 2⁶⁰ − 1]. Overflow to `BIGNUM` MUST be handled by
@@ -200,7 +200,7 @@ The 32-bit float occupies bits 63:32. `DOUBLE-FLOAT` is heap-allocated
 32-bit index into the global symbol table (max ~4 billion symbols).
 The symbol table itself is a heap-resident `Vec<*mut SymbolData>`.
 Index 0 is reserved (maps to `NIL`'s symbol data); index 1 maps to
-`T`'s symbol data. However, the `TorclVal` for `NIL`/`T` always uses
+`T`'s symbol data. However, the `EgclVal` for `NIL`/`T` always uses
 tag `111` — the symbol-index encoding is used only for other symbols.
 
 ---
@@ -213,8 +213,8 @@ Cons cells are **headerless** to minimise memory: exactly 16 bytes.
 
 ```text
 Offset  Size   Field
-  0       8    car: TorclVal
-  8       8    cdr: TorclVal
+  0       8    car: EgclVal
+  8       8    cdr: EgclVal
 ```
 
 Allocation: bump-pointer in the nursery TLAB (§3). Pointer tag `001`
@@ -223,19 +223,19 @@ points directly at byte offset 0 of the cons cell; untag by
 
 Headerless cons cells mean the GC must identify cons cells by their
 allocation region (nursery cons pages vs. object pages) or by the
-`TorclVal` tag of the referring pointer.
+`EgclVal` tag of the referring pointer.
 
 **Cons forwarding protocol.** When a cons is evacuated during GC, it is
 copied to another cons page (remaining headerless at the destination —
 it does NOT gain an `ObjectHeader`). The original cell is then
 overwritten in place as follows:
 
-- `car` ← a **forwarding sentinel**: the special `TorclVal` bit pattern
+- `car` ← a **forwarding sentinel**: the special `EgclVal` bit pattern
   `0x0000_0000_0000_0017` (`UNBOUND`). Because `UNBOUND` can never
   legitimately appear as a `car` value, its presence signals that the
   cell has been forwarded.
 - `cdr` ← the new address of the evacuated cons, encoded as a raw
-  `TorclVal` with tag `001` (cons pointer to the destination cell).
+  `EgclVal` with tag `001` (cons pointer to the destination cell).
 
 During GC pointer-fix-up, any cons reference is checked by loading the
 `car` field of the target cell: if it equals the `UNBOUND` sentinel,
@@ -256,7 +256,7 @@ their lifetime, including after evacuation).
 Offset  Size       Field
   0       8        ObjectHeader { type_id=0x03, ..., size }
   8       8        length: u64 (number of elements)
- 16       8×N      data[0..N]: TorclVal[]
+ 16       8×N      data[0..N]: EgclVal[]
 ```
 
 Element type is `T` (general). Total size = 16 + 8×N, rounded up to
@@ -279,7 +279,7 @@ Element type tags:
 
 | Tag | CL Type | Bits per element |
 |-----|---------|-----------------|
-| `0` | `T` | 64 (TorclVal) |
+| `0` | `T` | 64 (EgclVal) |
 | `1` | `BIT` | 1 |
 | `2` | `(UNSIGNED-BYTE 8)` | 8 |
 | `3` | `(UNSIGNED-BYTE 16)` | 16 |
@@ -370,7 +370,7 @@ Complex arrays add displacement, fill-pointer, and adjustability.
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x07 }
-  8       8      underlying: TorclVal  — points to a simple array (the data store)
+  8       8      underlying: EgclVal  — points to a simple array (the data store)
  16       8      displacement: u64     — element offset into underlying
  24       8      fill_pointer: u64     — MOST-POSITIVE-FIXNUM if none
  32       1      flags: u8            — bit 0: adjustable, bit 1: has-fill-pointer
@@ -389,11 +389,11 @@ Offset  Size     Field
 ```text
 Offset  Size  Field
   0       8   ObjectHeader { type_id=0x02 }
-  8       8   name: TorclVal        — string (the symbol name)
- 16       8   value: TorclVal       — global value cell (UNBOUND if unbound)
- 24       8   function: TorclVal    — global function cell (UNBOUND if undefined)
- 32       8   plist: TorclVal       — property list (NIL or cons)
- 40       8   package: TorclVal     — home package (NIL for uninterned)
+  8       8   name: EgclVal        — string (the symbol name)
+ 16       8   value: EgclVal       — global value cell (UNBOUND if unbound)
+ 24       8   function: EgclVal    — global function cell (UNBOUND if undefined)
+ 32       8   plist: EgclVal       — property list (NIL or cons)
+ 40       8   package: EgclVal     — home package (NIL for uninterned)
  48       4   flags: u32            — bit 0: constant, bit 1: special, bit 2: macro, bit 3: compiler-macro
  52       4   tls_index: u32        — thread-local-storage slot index (0 = no TLS binding)
 ```
@@ -402,11 +402,11 @@ Total: 56 bytes per symbol.
 
 The **global symbol table** is a `Vec<*mut SymbolData>` guarded by a
 read-write lock. Interning inserts into both the table and the owning
-package's hash-maps (§1.12). The symbol-index in a `TorclVal` (tag
+package's hash-maps (§1.12). The symbol-index in a `EgclVal` (tag
 `101`) is the index into this vector.
 
 `NIL` and `T` have symbol table entries at indices 0 and 1, but their
-`TorclVal` representation is always the special-tag encoding. Type
+`EgclVal` representation is always the special-tag encoding. Type
 checks for `SYMBOLP` MUST accept both tag `101` and the special-tag
 NIL/T bit patterns.
 
@@ -437,8 +437,8 @@ GMP-style algorithms (see §5 numbers).
 ```text
 Offset  Size  Field
   0       8   ObjectHeader { type_id=0x09 }
-  8       8   numerator: TorclVal   — fixnum or bignum
- 16       8   denominator: TorclVal — fixnum or bignum, always positive
+  8       8   numerator: EgclVal   — fixnum or bignum
+ 16       8   denominator: EgclVal — fixnum or bignum, always positive
 ```
 
 Ratios MUST be stored in lowest terms (GCD = 1). The denominator MUST
@@ -449,8 +449,8 @@ NOT be 1 (use fixnum/bignum instead).
 ```text
 Offset  Size  Field
   0       8   ObjectHeader { type_id=0x0A }
-  8       8   realpart: TorclVal
- 16       8   imagpart: TorclVal
+  8       8   realpart: EgclVal
+ 16       8   imagpart: EgclVal
 ```
 
 If both parts are rational, the type is `(COMPLEX RATIONAL)`. If either
@@ -483,7 +483,7 @@ Offset  Size     Field
 ```
 
 Buckets use Robin Hood open addressing. Each `Bucket` is 24 bytes:
-`{ hash: u64, key: TorclVal, value: TorclVal }`.
+`{ hash: u64, key: EgclVal, value: EgclVal }`.
 
 Synchronized hash-tables (bit 0 of flags) use a per-table reader-writer
 lock; unsynchronized tables require external synchronisation.
@@ -497,8 +497,8 @@ lock; unsynchronized tables require external synchronisation.
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x0D }
-  8       8      layout: TorclVal    — pointer to structure-class descriptor
- 16       8×N    slots[0..N]: TorclVal
+  8       8      layout: EgclVal    — pointer to structure-class descriptor
+ 16       8×N    slots[0..N]: EgclVal
 ```
 
 Slot count N is determined by the `layout` descriptor at structure
@@ -509,8 +509,8 @@ definition time. Slot access is direct indexed — no hash lookup.
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x0E }
-  8       8      class: TorclVal     — pointer to standard-class metaobject
- 16       8      slot_vector: TorclVal — pointer to simple-vector of slot values
+  8       8      class: EgclVal     — pointer to standard-class metaobject
+ 16       8      slot_vector: EgclVal — pointer to simple-vector of slot values
 ```
 
 Indirection through `slot_vector` enables class redefinition (CLOS
@@ -531,10 +531,10 @@ type_id enables fast `CONDITIONP` checks.
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x0F }
-  8       8      lambda_list: TorclVal  — parsed lambda list
- 16       8      body: TorclVal         — cons-tree of body forms
- 24       8      env: TorclVal          — captured lexical environment
- 32       8      name: TorclVal         — function name (symbol or list) or NIL
+  8       8      lambda_list: EgclVal  — parsed lambda list
+ 16       8      body: EgclVal         — cons-tree of body forms
+ 24       8      env: EgclVal          — captured lexical environment
+ 32       8      name: EgclVal         — function name (symbol or list) or NIL
 ```
 
 ### 1.11.2  Compiled Function — D1.18
@@ -544,13 +544,13 @@ Offset  Size     Field
   0       8      ObjectHeader { type_id=0x10 }
   8       8      entry_point: *const u8  — native code address
  16       8      code_size: u64         — size of native code in bytes
- 24       8      name: TorclVal
- 32       8      lambda_list: TorclVal  — for introspection
+ 24       8      name: EgclVal
+ 32       8      lambda_list: EgclVal  — for introspection
  40       2      min_args: u16
  42       2      max_args: u16 (0xFFFF = &rest)
  44       1      tier: u8 (1=baseline, 2=optimised)
  45       3      padding
- 48       8      constants: TorclVal    — simple-vector of referenced constants
+ 48       8      constants: EgclVal    — simple-vector of referenced constants
 ```
 
 ### 1.11.3  Closure — D1.19
@@ -558,8 +558,8 @@ Offset  Size     Field
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x11 }
-  8       8      function: TorclVal   — compiled-function or interpreted-function
- 16       8×N    closed_vars[0..N]: TorclVal  — captured variable values
+  8       8      function: EgclVal   — compiled-function or interpreted-function
+ 16       8×N    closed_vars[0..N]: EgclVal  — captured variable values
 ```
 
 Closures share the underlying function and add a flat array of captured
@@ -574,11 +574,11 @@ mutable binding see the same cell (standard CL semantics).
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x12 }
-  8       8      name: TorclVal          — string
- 16       8      internal_symbols: TorclVal — hash-table (string → symbol)
- 24       8      external_symbols: TorclVal — hash-table (string → symbol)
- 32       8      use_list: TorclVal       — list of used packages
- 40       8      nicknames: TorclVal      — list of strings
+  8       8      name: EgclVal          — string
+ 16       8      internal_symbols: EgclVal — hash-table (string → symbol)
+ 24       8      external_symbols: EgclVal — hash-table (string → symbol)
+ 32       8      use_list: EgclVal       — list of used packages
+ 40       8      nicknames: EgclVal      — list of strings
  48       8      lock: *mut RwLock<()>    — pointer to heap-allocated per-package reader-writer lock
 ```
 
@@ -608,12 +608,12 @@ own `StreamOps` implementations.
 ```text
 Offset  Size   Field
   0       8    ObjectHeader { type_id=0x14 }
-  8       8    host: TorclVal
- 16       8    device: TorclVal
- 24       8    directory: TorclVal   — list
- 32       8    name: TorclVal
- 40       8    type_field: TorclVal
- 48       8    version: TorclVal
+  8       8    host: EgclVal
+ 16       8    device: EgclVal
+ 24       8    directory: EgclVal   — list
+ 32       8    name: EgclVal
+ 40       8    type_field: EgclVal
+ 48       8    version: EgclVal
 ```
 
 All components are either strings, symbols (`:WILD`, `:UNSPECIFIC`,
@@ -629,17 +629,17 @@ Offset  Size     Field
   0       8      ObjectHeader { type_id=0x15 }
   8       8      case_mode: u8  — 0=:upcase 1=:downcase 2=:preserve 3=:invert
   9       7      padding
- 16       8      char_table: TorclVal — simple-vector of 128 entries (syntax types for ASCII)
- 24       8      extended_table: TorclVal — hash-table for non-ASCII chars
- 32       8      macro_table: TorclVal — hash-table char→function for reader macros
- 40       8      dispatch_table: TorclVal — hash-table char→(hash-table sub-char→function)
+ 16       8      char_table: EgclVal — simple-vector of 128 entries (syntax types for ASCII)
+ 24       8      extended_table: EgclVal — hash-table for non-ASCII chars
+ 32       8      macro_table: EgclVal — hash-table char→function for reader macros
+ 40       8      dispatch_table: EgclVal — hash-table char→(hash-table sub-char→function)
 ```
 
 ---
 
 ## 1.16  Type Lattice
 
-The CL type hierarchy maps onto `TorclVal` tag + `type_id` as follows.
+The CL type hierarchy maps onto `EgclVal` tag + `type_id` as follows.
 Type tests proceed from tag check (O(1)) to header type_id check (one
 memory load). The lattice below shows the `SUBTYPEP` relationships
 that the type system must implement.
@@ -695,25 +695,25 @@ the logic; the compiler (§4) SHOULD emit these as branchless or
 minimal-branch instruction sequences.
 
 ```rust
-fn fixnump(v: TorclVal)   -> bool { v.0 & 0x7 == 0b000 }
-fn consp(v: TorclVal)     -> bool { v.0 & 0x7 == 0b001 }
-fn characterp(v: TorclVal)-> bool { v.0 & 0x7 == 0b011 }
-fn single_float_p(v: TorclVal) -> bool { v.0 & 0x7 == 0b100 }
-fn symbolp(v: TorclVal)   -> bool {
+fn fixnump(v: EgclVal)   -> bool { v.0 & 0x7 == 0b000 }
+fn consp(v: EgclVal)     -> bool { v.0 & 0x7 == 0b001 }
+fn characterp(v: EgclVal)-> bool { v.0 & 0x7 == 0b011 }
+fn single_float_p(v: EgclVal) -> bool { v.0 & 0x7 == 0b100 }
+fn symbolp(v: EgclVal)   -> bool {
     let tag = v.0 & 0x7;
     tag == 0b101 || v.0 == NIL_BITS || v.0 == T_BITS
 }
-fn functionp(v: TorclVal) -> bool { v.0 & 0x7 == 0b110 }
-fn nullp(v: TorclVal)     -> bool { v.0 == NIL_BITS }
-fn listp(v: TorclVal)     -> bool { v.0 & 0x7 == 0b001 || v.0 == NIL_BITS }
-fn heap_object_p(v: TorclVal) -> bool { v.0 & 0x7 == 0b010 }
+fn functionp(v: EgclVal) -> bool { v.0 & 0x7 == 0b110 }
+fn nullp(v: EgclVal)     -> bool { v.0 == NIL_BITS }
+fn listp(v: EgclVal)     -> bool { v.0 & 0x7 == 0b001 || v.0 == NIL_BITS }
+fn heap_object_p(v: EgclVal) -> bool { v.0 & 0x7 == 0b010 }
 
 // For heap objects, secondary dispatch on type_id:
-fn type_id_of(v: TorclVal) -> u8 {
+fn type_id_of(v: EgclVal) -> u8 {
     let ptr = (v.0 & !0x7) as *const u64;
     (unsafe { *ptr } >> 56) as u8
 }
-fn stringp(v: TorclVal) -> bool {
+fn stringp(v: EgclVal) -> bool {
     if !heap_object_p(v) { return false; }
     let tid = type_id_of(v);
     // Simple strings: direct type_id check
@@ -736,7 +736,7 @@ fn stringp(v: TorclVal) -> bool {
 
 // VECTORP: rank-1 arrays (simple-vector, simple strings, simple
 // specialised arrays with rank=1, or complex arrays with rank=1).
-fn vectorp(v: TorclVal) -> bool {
+fn vectorp(v: EgclVal) -> bool {
     if !heap_object_p(v) { return false; }
     let tid = type_id_of(v);
     // Simple-vector and simple strings are always vectors (rank 1)
@@ -755,12 +755,12 @@ fn vectorp(v: TorclVal) -> bool {
 }
 
 // ARRAYP: any array type
-fn arrayp(v: TorclVal) -> bool {
+fn arrayp(v: EgclVal) -> bool {
     heap_object_p(v) && matches!(type_id_of(v), 0x03 | 0x04 | 0x05 | 0x06 | 0x07)
 }
 
 // BIT-VECTOR-P: rank-1 array with BIT element type
-fn bit_vector_p(v: TorclVal) -> bool {
+fn bit_vector_p(v: EgclVal) -> bool {
     if !heap_object_p(v) { return false; }
     let tid = type_id_of(v);
     if tid == 0x04 {
@@ -798,7 +798,7 @@ is expanded by the compiler into compositions of these primitives (§4).
 
 ## 1.18  NIL Representation
 
-`NIL` is the most polymorphic value in CL. TorCL encodes it as a
+`NIL` is the most polymorphic value in CL. EGCL encodes it as a
 special-tag immediate (R1.11: bit pattern `0x07`) but also maintains a
 full `SymbolData` entry at symbol-table index 0.
 
@@ -817,7 +817,7 @@ This means:
 
 All type-mismatch errors (e.g., `(CAR 42)`) MUST signal a `TYPE-ERROR`
 condition with `:datum` and `:expected-type` slots filled. In Rust
-bootstrap code this is `Err(TorclError::TypeError { datum, expected })`,
+bootstrap code this is `Err(EgclError::TypeError { datum, expected })`,
 which the condition-system bridge converts to a CL condition (§5).
 
 Header-corruption detected during GC or type dispatch (e.g., `type_id`
@@ -845,10 +845,10 @@ non-recoverable runtime error.
 
 | Knob | Default | Description |
 |------|---------|-------------|
-| `TORCL_SYMBOL_TABLE_INIT` | 8192 | Initial symbol table capacity |
-| `TORCL_HASH_TABLE_DEFAULT_SIZE` | 16 | Default bucket count for `MAKE-HASH-TABLE` |
-| `TORCL_CONS_PAGE_SIZE` | 2 MiB | Size of cons-only allocation pages |
-| `TORCL_LARGE_OBJECT_THRESHOLD` | `region_size / 2` (1 MB) | Objects above this go to large-object regions (§3.2.5). Derived from region size; not directly settable. |
+| `EGCL_SYMBOL_TABLE_INIT` | 8192 | Initial symbol table capacity |
+| `EGCL_HASH_TABLE_DEFAULT_SIZE` | 16 | Default bucket count for `MAKE-HASH-TABLE` |
+| `EGCL_CONS_PAGE_SIZE` | 2 MiB | Size of cons-only allocation pages |
+| `EGCL_LARGE_OBJECT_THRESHOLD` | `region_size / 2` (1 MB) | Objects above this go to large-object regions (§3.2.5). Derived from region size; not directly settable. |
 
 ---
 
@@ -857,7 +857,7 @@ non-recoverable runtime error.
 1. **Unit tests** (`tests/unit/object_test.rs`): Encode/decode round-trip
    for every immediate type. Construct and inspect every heap layout.
    Verify header field packing/unpacking.
-2. **Property tests** (proptest): Random `TorclVal` → encode → decode
+2. **Property tests** (proptest): Random `EgclVal` → encode → decode
    preserves value. Random fixnum arithmetic detects overflow to bignum.
 3. **Type-predicate exhaustiveness**: For each type predicate, test true
    and false cases against every other type tag and type_id.

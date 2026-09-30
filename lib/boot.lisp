@@ -1,11 +1,11 @@
-;;;; boot.lisp — TorCL bootstrap prelude.
+;;;; boot.lisp — EGCL bootstrap prelude.
 ;;;;
 ;;;; This file is loaded by the CLI when invoked with --bootstrap. It is the
 ;;;; first slice of the standard library written in Lisp rather than Rust: the
 ;;;; goal is to push everything that can be expressed as a macro or ordinary
 ;;;; function out of the `eval_form` interpreter and into this file.
 ;;;;
-;;;; Constraints of the current bootstrap evaluator (see crates/torcl):
+;;;; Constraints of the current bootstrap evaluator (see crates/egcl):
 ;;;;   * macro lambda lists are flat — &optional and &rest work, but nested
 ;;;;     destructuring does NOT yet. Keep parameter lists simple.
 ;;;;   * user macros are expanded before builtins, so nothing here should
@@ -27,20 +27,20 @@
 ;;; so every doc-type shares a single store. Defined BEFORE DEFVAR because
 ;;; DEFVAR's expansion records its docstring through it — and set up with plain
 ;;; SETQ rather than DEFVAR for the same reason (bliss-61u1).
-(torcl-internal::%proclaim-special (list 'torcl-internal::*documentation*))
-(setq torcl-internal::*documentation* (make-hash-table :test 'equal))
+(egcl-internal::%proclaim-special (list 'egcl-internal::*documentation*))
+(setq egcl-internal::*documentation* (make-hash-table :test 'equal))
 
 (defun documentation (object &optional doc-type)
   ;; GETHASH returns two values; DOCUMENTATION returns one.
-  (values (gethash (cons object doc-type) torcl-internal::*documentation*)))
+  (values (gethash (cons object doc-type) egcl-internal::*documentation*)))
 
 (defun (setf documentation) (new object &optional doc-type)
-  (setf (gethash (cons object doc-type) torcl-internal::*documentation*) new)
+  (setf (gethash (cons object doc-type) egcl-internal::*documentation*) new)
   new)
 
 ;;; Record DOC for NAME under DOC-TYPE, ignoring a NIL docstring so the definers
 ;;; can pass their optional one unconditionally.
-(defun torcl-internal::%set-documentation (name doc-type doc)
+(defun egcl-internal::%set-documentation (name doc-type doc)
   (when doc
     (setf (documentation name doc-type) doc))
   name)
@@ -50,20 +50,20 @@
   ;; NOT assign a value (NAME stays unbound if it was unbound). Only
   ;; (defvar name value) initialises it, and only when currently unbound (CLHS).
   `(progn
-     (torcl-internal::%proclaim-special (list ',name))
+     (egcl-internal::%proclaim-special (list ',name))
      ,@(when value
          `((unless (boundp ',name)
              (setq ,name ,(car value)))))
      ,@(when (cdr value)
-         `((torcl-internal::%set-documentation ',name 'variable ,(cadr value))))
+         `((egcl-internal::%set-documentation ',name 'variable ,(cadr value))))
      ',name))
 
 (defmacro defparameter (name &rest value)
   `(progn
-     (torcl-internal::%proclaim-special (list ',name))
+     (egcl-internal::%proclaim-special (list ',name))
      (setq ,name ,(if value (car value) nil))
      ,@(when (cdr value)
-         `((torcl-internal::%set-documentation ',name 'variable ,(cadr value))))
+         `((egcl-internal::%set-documentation ',name 'variable ,(cadr value))))
      ',name))
 
 ;; defconstant: this interpreter has no separate constant cell; model it as a
@@ -78,10 +78,10 @@
   ;; %defconstant assigns and marks as one operation (bliss-sci0).
   `(progn (%defconstant ',name ,value)
           ,@(when doc
-              `((torcl-internal::%set-documentation ',name 'variable ,(car doc))))
+              `((egcl-internal::%set-documentation ',name 'variable ,(car doc))))
           ',name))
 
-;; Fixnums are 61-bit signed (TorclVal tags the low 3 bits): the value is
+;; Fixnums are 61-bit signed (EgclVal tags the low 3 bits): the value is
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].
 (defconstant most-positive-fixnum 1152921504606846975)
 (defconstant most-negative-fixnum -1152921504606846976)
@@ -97,7 +97,7 @@
 (defconstant array-rank-limit 8)
 (defconstant array-dimension-limit 1152921504606846975)
 (defconstant array-total-size-limit 1152921504606846975)
-;; PI (a float approximation of π; torcl floats are single-precision, so the
+;; PI (a float approximation of π; egcl floats are single-precision, so the
 ;; long-float literal rounds to 3.1415927) and the single-float magnitude
 ;; extremes, plus the least-positive / normalized / epsilon family for both
 ;; float formats (bliss-pzz4; values match SBCL / IEEE-754 binary32 & binary64).
@@ -118,10 +118,10 @@
 (defconstant least-negative-normalized-double-float -2.2250738585072014d-308)
 (defconstant double-float-epsilon 1.1102230246251568d-16)
 (defconstant double-float-negative-epsilon 5.551115123125784d-17)
-;; torcl has two float formats: SHORT-FLOAT ≡ SINGLE-FLOAT and LONG-FLOAT ≡
+;; egcl has two float formats: SHORT-FLOAT ≡ SINGLE-FLOAT and LONG-FLOAT ≡
 ;; DOUBLE-FLOAT. The corresponding limit constants are aliases of the single/
 ;; double values so that code referencing the short/long family (e.g. ansi-test
-;; make-hash-table.26/.29) resolves them (torcl hash-tables chapter).
+;; make-hash-table.26/.29) resolves them (egcl hash-tables chapter).
 (defconstant most-positive-short-float most-positive-single-float)
 (defconstant most-negative-short-float most-negative-single-float)
 (defconstant least-positive-short-float least-positive-single-float)
@@ -140,7 +140,7 @@
 (defconstant long-float-negative-epsilon double-float-negative-epsilon)
 (defconstant lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &body &whole &environment))
-;; Implementation limits: torcl caps these at MOST-POSITIVE-FIXNUM so they are
+;; Implementation limits: egcl caps these at MOST-POSITIVE-FIXNUM so they are
 ;; themselves fixnums (a larger literal like 2^62 would be a bignum and is not a
 ;; meaningful arg-count ceiling here). Must match the seed_standard_constant
 ;; values in cli.rs (bliss-1i3q).
@@ -323,18 +323,18 @@
       (when (consp spec)
         (case (car spec)
           (special
-           (push (list 'torcl-internal::%proclaim-special (list 'quote (cdr spec)))
+           (push (list 'egcl-internal::%proclaim-special (list 'quote (cdr spec)))
                  forms))
           ;; (declaration name …) names declarations the implementation must
           ;; accept; the environment then records them for
-          ;; TORCL-CLTL2:DECLARATION-INFORMATION.
+          ;; EGCL-CLTL2:DECLARATION-INFORMATION.
           (declaration
-           (push (list 'torcl-internal::%proclaim-declaration (list 'quote (cdr spec)))
+           (push (list 'egcl-internal::%proclaim-declaration (list 'quote (cdr spec)))
                  forms))
           ;; The qualities are advisory to this compiler, but the global policy
-          ;; is reported by TORCL-CLTL2:DECLARATION-INFORMATION.
+          ;; is reported by EGCL-CLTL2:DECLARATION-INFORMATION.
           (optimize
-           (push (list 'torcl-internal::%proclaim-optimize (list 'quote (cdr spec)))
+           (push (list 'egcl-internal::%proclaim-optimize (list 'quote (cdr spec)))
                  forms)))))
     (if forms (cons 'progn (nreverse forms)) nil)))
 
@@ -343,14 +343,14 @@
 ;; The parameter is deliberately NOT named DECLARATION-SPECIFIER: boot.lisp is
 ;; read into COMMON-LISP, so every name it mentions mints a bare, home-package-
 ;; less symbol identity, and a qualified read of the same name (e.g.
-;; TORCL-EXT:DECLARATION-SPECIFIER) then resolves to that bare identity instead
+;; EGCL-EXT:DECLARATION-SPECIFIER) then resolves to that bare identity instead
 ;; of the extension package's symbol.
 (defun proclaim (decl-spec)
   (when (consp decl-spec)
     (case (car decl-spec)
-      (special (torcl-internal::%proclaim-special (cdr decl-spec)))
-      (declaration (torcl-internal::%proclaim-declaration (cdr decl-spec)))
-      (optimize (torcl-internal::%proclaim-optimize (cdr decl-spec)))))
+      (special (egcl-internal::%proclaim-special (cdr decl-spec)))
+      (declaration (egcl-internal::%proclaim-declaration (cdr decl-spec)))
+      (optimize (egcl-internal::%proclaim-optimize (cdr decl-spec)))))
   nil)
 
 ;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
@@ -376,13 +376,13 @@
                            (or (ignore-errors (funcall (lambda ,lambda-list ,@body)))
                                t))
                      *type-definitions*))
-         (torcl-internal::%home-symbol ',name)
+         (egcl-internal::%home-symbol ',name)
          ',name)
       `(progn
          (setq *type-definitions*
                (cons (list ',name ,(if body (cons 'progn body) t))
                      *type-definitions*))
-         (torcl-internal::%home-symbol ',name)
+         (egcl-internal::%home-symbol ',name)
          ',name)))
 
 ;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match
@@ -484,7 +484,7 @@
 ;; participate in ordinary :around/:before/:after combination; only the slot
 ;; update itself delegates to the stdlib-backed evaluator primitive.
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
-  (torcl-internal::%standard-reinitialize-instance instance initargs))
+  (egcl-internal::%standard-reinitialize-instance instance initargs))
 
 (defmacro with-slots (slots instance &rest body)
   (let ((obj (gensym)))
@@ -516,7 +516,7 @@
 ;; condition built with :operation and :operands supplied (ansi
 ;; ARITHMETIC-ERROR.3 constructs one and reads both back).
 ;; The slots carry no initform, so reading one the signaller never supplied
-;; would raise "slot OPERATION is unbound" rather than answering. torcl's
+;; would raise "slot OPERATION is unbound" rather than answering. egcl's
 ;; internal arithmetic signallers do not record the operation or operands yet
 ;; (a separate gap, filed), so guard the read: an arithmetic error with nothing
 ;; recorded reports NIL rather than erroring inside a handler.
@@ -709,7 +709,7 @@
     (values (float q (%float-quotient-proto number divisor)) r)))
 
 ;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
-;; actually stores. torcl specialises only bit and character arrays; every other
+;; actually stores. egcl specialises only bit and character arrays; every other
 ;; element type upgrades to T.
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
@@ -718,7 +718,7 @@
         (t t)))
 
 ;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
-;; the given part type. torcl stores complex parts unspecialised, so a float part
+;; the given part type. egcl stores complex parts unspecialised, so a float part
 ;; keeps its float type and everything else upgrades to RATIONAL (CL default).
 (defun upgraded-complex-part-type (type &optional environment)
   (declare (ignore environment))
@@ -792,7 +792,7 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Lenient package layer
 ;;;
-;;; TorCL's evaluator provides package primitives from the Rust CLI/runtime.
+;;; EGCL's evaluator provides package primitives from the Rust CLI/runtime.
 ;;; Keep only thin symbol helpers here; package functions themselves should
 ;;; resolve to the real builtins so bundled ASDF can exercise actual package
 ;;; state instead of bootstrap stubs.
@@ -817,14 +817,14 @@
     ;; :external — only the package's exported symbols (CLHS); passing NIL here
     ;; enumerated every PRESENT symbol, which broke UIOP's ensure-package
     ;; export bookkeeping (bliss-jnzb).
-    `(dolist (,var (torcl-internal::package-symbols ,package :external) ,result)
+    `(dolist (,var (egcl-internal::package-symbols ,package :external) ,result)
        ,@body)))
 
 (defmacro do-symbols (binding &rest body)
   (let ((var (car binding))
         (package (if (cdr binding) (car (cdr binding)) '*package*))
         (result (if (cdr (cdr binding)) (car (cdr (cdr binding))) nil)))
-    `(dolist (,var (torcl-internal::package-symbols ,package t) ,result)
+    `(dolist (,var (egcl-internal::package-symbols ,package t) ,result)
        ,@body)))
 
 (defmacro do-all-symbols (binding &rest body)
@@ -840,7 +840,7 @@
     ;; DOLIST also evaluates the result-form with VAR bound to NIL (CLHS).
     `(dolist (,var (let ((,all nil))
                      (dolist (,pkg (list-all-packages))
-                       (dolist (,s (torcl-internal::package-symbols ,pkg t))
+                       (dolist (,s (egcl-internal::package-symbols ,pkg t))
                          (push ,s ,all)))
                      (nreverse ,all))
              ,result)
@@ -848,13 +848,13 @@
 
 ;;; WITH-PACKAGE-ITERATOR / FIND-ALL-SYMBOLS
 ;;;
-;;; Built on the TORCL-INTERNAL::PACKAGE-SYMBOLS primitive:
+;;; Built on the EGCL-INTERNAL::PACKAGE-SYMBOLS primitive:
 ;;;   (… pkg nil)       → present symbols (internal + external)
 ;;;   (… pkg :external)  → external symbols only
 ;;;   (… pkg t)          → accessible symbols (present + inherited)
 ;;; from which internal = present \ external and inherited = accessible \ present.
 
-(defun torcl-internal::%package-iterator-tuples (packages symbol-types)
+(defun egcl-internal::%package-iterator-tuples (packages symbol-types)
   ;; PACKAGES is a single package designator or a list of them. Returns a list
   ;; of (symbol access-type package) triples for the requested SYMBOL-TYPES.
   (let ((pkgs (if (listp packages) packages (list packages)))
@@ -862,9 +862,9 @@
     (dolist (pd pkgs result)
       (let* ((p (find-package pd)))
         (when p
-          (let ((present (torcl-internal::package-symbols p nil))
-                (external (torcl-internal::package-symbols p :external))
-                (accessible (torcl-internal::package-symbols p t)))
+          (let ((present (egcl-internal::package-symbols p nil))
+                (external (egcl-internal::package-symbols p :external))
+                (accessible (egcl-internal::package-symbols p t)))
             (when (member :external symbol-types)
               (dolist (s external) (push (list s :external p) result)))
             (when (member :internal symbol-types)
@@ -883,7 +883,7 @@
       (error 'program-error)))
   (let ((tuples (gensym "TUPLES"))
         (tup (gensym "TUP")))
-    `(let ((,tuples (torcl-internal::%package-iterator-tuples
+    `(let ((,tuples (egcl-internal::%package-iterator-tuples
                      ,package-list-form ',symbol-types)))
        (macrolet ((,name ()
                     '(if ,tuples
@@ -952,14 +952,14 @@
 ;; pprint dispatch, but the variable must be bound: ASDF's DEFINE-OP saves and
 ;; rebinds it around loading a .asd (bliss-lb6.17).
 (defvar *print-pprint-dispatch* nil)
-;; TorCL has no pretty-print dispatch table (the printer ignores it); provide
+;; EGCL has no pretty-print dispatch table (the printer ignores it); provide
 ;; COPY-PPRINT-DISPATCH so portable code that rebinds *PRINT-PPRINT-DISPATCH*
 ;; around output loads and runs. With a NIL table there is nothing to copy, so
 ;; return NIL (bordeaux-threads' +STANDARD-IO-BINDINGS+ uses this).
 (defun copy-pprint-dispatch (&optional table)
   (declare (ignore table))
   nil)
-;; Random-state and readtable copiers. TorCL's RANDOM uses a single global PRNG
+;; Random-state and readtable copiers. EGCL's RANDOM uses a single global PRNG
 ;; and its readtable is the immutable :STANDARD-READTABLE, so these return
 ;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
 ;; +STANDARD-IO-BINDINGS+) that rebinds *RANDOM-STATE* / *READTABLE* to fresh
@@ -969,7 +969,7 @@
   ;; CLHS: STATE is a RANDOM-STATE, T, or NIL. The argument was simply IGNORED,
   ;; so (make-random-state 0) handed back a fresh state instead of signalling
   ;; (ansi MAKE-RANDOM-STATE.ERROR.4). The placeholder RESULT is unchanged --
-  ;; torcl has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
+  ;; egcl has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
   ;; wants a real independent copy and still fails).
   (unless (or (null state) (eq state t) (random-state-p state))
     (error 'type-error
@@ -983,27 +983,27 @@
   ;; (bliss-r4mk). (copy-readtable nil) per CLHS restores standard syntax —
   ;; the builtin copies from the CURRENT readtable when from is nil, which
   ;; still yields a fresh table without user registrations at boot time.
-  (torcl::%copy-readtable from-readtable to-readtable))
+  (egcl::%copy-readtable from-readtable to-readtable))
 (defun readtablep (object)
   (typep object 'readtable))
-;; TorCL has a single immutable standard readtable; its case mode is :UPCASE
+;; EGCL has a single immutable standard readtable; its case mode is :UPCASE
 ;; (CLHS 23.1.2 default). Portable code (e.g. chunga) reads READTABLE-CASE to
 ;; decide how to case-fold tokens; supporting the reader — and a SETF that
 ;; accepts the one mode we implement — is enough to load such systems.
 ;; Placeholder reader-macro function reported by GET-MACRO-CHARACTER for a
-;; standard macro character (torcl's built-in char readers are in Rust, so there
+;; standard macro character (egcl's built-in char readers are in Rust, so there
 ;; is no real Lisp function to hand back; this fbound stub satisfies portable
 ;; code that only checks FUNCTIONP / FBOUNDP of the result).
-(defun torcl::%standard-reader-macro (stream char)
+(defun egcl::%standard-reader-macro (stream char)
   (declare (ignore stream char))
   (error "The standard reader macro cannot be invoked directly."))
 (defun readtable-case (readtable)
-  (torcl::%readtable-case readtable))
+  (egcl::%readtable-case readtable))
 (defun (setf readtable-case) (mode readtable)
   (unless (member mode '(:upcase :downcase :preserve :invert))
     (error 'type-error :datum mode
                        :expected-type '(member :upcase :downcase :preserve :invert)))
-  (torcl::%set-readtable-case mode readtable)
+  (egcl::%set-readtable-case mode readtable)
   mode)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
@@ -1411,7 +1411,7 @@
 ;; pairwise distinct. cl-ppcre's char-class matcher relies on (char<= lo c hi)
 ;; range tests (3 args) (bliss-omw).
 ;; CHAR=, CHAR/=, CHAR<, CHAR>, CHAR<= and CHAR>= are Rust builtins wired to
-;; torcl-stdlib::characters (bliss-7oa5). They were defuns here, which made
+;; egcl-stdlib::characters (bliss-7oa5). They were defuns here, which made
 ;; every 2-argument call allocate a rest list, run an interpreted DOLIST,
 ;; dispatch CHAR-CODE twice and then generic `=` -- 9.8us against 0.27us for
 ;; EQ. A defun here would SHADOW the builtin (the function cell wins over the
@@ -1817,7 +1817,7 @@
              (t (copy-seq (coerce (car (cdr ic-cell)) 'vector)))))
       (stringp
        (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
-      ;; A BIT array is a real SIMPLE-BIT-VECTOR (torcl builds these immutably,
+      ;; A BIT array is a real SIMPLE-BIT-VECTOR (egcl builds these immutably,
       ;; so the whole content is supplied at construction). Default fill 0.
       (bitp
        (%bit-vector-from-bits
@@ -1856,7 +1856,7 @@
 ;; Bit-vector boolean operations (CLHS 14.2.1). Each takes two simple-bit-vectors
 ;; of the same length and returns a fresh SIMPLE-BIT-VECTOR of the elementwise
 ;; result; BIT-NOT is unary. The optional OPT-RESULT arg (NIL/omitted, T, or a
-;; bit-vector) selects the destination in ANSI, but torcl bit-vectors are built
+;; bit-vector) selects the destination in ANSI, but egcl bit-vectors are built
 ;; immutable (bliss-27f5), so these always allocate a fresh result — value-correct
 ;; for the ubiquitous 2-arg use; a caller relying on in-place identity is not
 ;; served until bit-vectors become mutable. Each op is a bit of a boolean of two
@@ -2083,7 +2083,7 @@
 (defun copy-list (list)
   ;; Iterative (tail-pointer) copy so a long list does not recurse one stack
   ;; frame per element — deep lists (flexi-streams code-page tables, bliss-2r5)
-  ;; overflowed the default TorclStack. A dotted tail is preserved.
+  ;; overflowed the default EgclStack. A dotted tail is preserved.
   (if (consp list)
       (let* ((head (cons (car list) nil))
              (tail head))
@@ -3027,12 +3027,12 @@
      (mask-field bytespec newbyte)))
 
 ;; The standard `(setf ACCESSOR)` FUNCTIONS (CLHS 5.1.2.9). These make
-;; #'(setf car) and friends real callable functions for portable code. TorCL's
+;; #'(setf car) and friends real callable functions for portable code. EGCL's
 ;; GET-SETF-EXPANSION uses SETF directly for known built-in places that lack a
 ;; writer, while retaining the canonical callable-writer form for other function
 ;; places (bliss-0qd8, bliss-42iv).
 ;;
-;; They are written against the STORE PRIMITIVES (RPLACA/RPLACD/TORCL::SET-AREF/
+;; They are written against the STORE PRIMITIVES (RPLACA/RPLACD/EGCL::SET-AREF/
 ;; …), never against SETF itself: routing them through `(setf (car o) v)` would
 ;; make each writer's correctness depend on SETF continuing to prefer its builtin
 ;; place handling over the writer we are defining here, which is exactly the kind
@@ -3102,33 +3102,33 @@
 ;; store primitive are tracked in bliss-rwpmq; a wrapper for any of them would
 ;; also BREAK places that work today, which is how this rule was found.
 (defun (setf slot-value) (new object slot-name)
-  (torcl::set-slot-value object slot-name new)
+  (egcl::set-slot-value object slot-name new)
   new)
 (defun (setf symbol-function) (new symbol)
-  (torcl::set-symbol-function symbol new)
+  (egcl::set-symbol-function symbol new)
   new)
-;; No (SETF SYMBOL-PLIST) here, though TORCL::SET-SYMBOL-PLIST exists for it:
+;; No (SETF SYMBOL-PLIST) here, though EGCL::SET-SYMBOL-PLIST exists for it:
 ;; defining it regressed ironclad-text and pure-tls, which then failed with
 ;; FLEXI-STREAMS::+BUFFER-SIZE+ unbound whenever flexi-streams' fasls had been
 ;; compiled by a drakma- or cl+ssl-driven load. Bisected to this one line and
 ;; reverted pending a cause (bliss-rpo1w).
-(defun (setf char) (new string index) (torcl::set-aref string index new) new)
-(defun (setf schar) (new string index) (torcl::set-aref string index new) new)
+(defun (setf char) (new string index) (egcl::set-aref string index new) new)
+(defun (setf schar) (new string index) (egcl::set-aref string index new) new)
 (defun (setf row-major-aref) (new array index)
-  ;; TORCL::SET-AREF indexes in row-major order already.
-  (torcl::set-aref array index new)
+  ;; EGCL::SET-AREF indexes in row-major order already.
+  (egcl::set-aref array index new)
   new)
-;; TORCL::SET-AREF takes a single ROW-MAJOR index, so a multidimensional store
+;; EGCL::SET-AREF takes a single ROW-MAJOR index, so a multidimensional store
 ;; must flatten the subscripts first — passing them through verbatim silently
 ;; stored nothing and broke (setf (aref a 1 2) 99).
 (defun (setf aref) (new array &rest subscripts)
-  (torcl::set-aref array (apply (function array-row-major-index) array subscripts) new)
+  (egcl::set-aref array (apply (function array-row-major-index) array subscripts) new)
   new)
-(defun (setf svref) (new v i) (torcl::set-aref v i new) new)
-(defun (setf elt) (new seq i) (torcl::set-elt seq i new) new)
+(defun (setf svref) (new v i) (egcl::set-aref v i new) new)
+(defun (setf elt) (new seq i) (egcl::set-elt seq i new) new)
 (defun (setf gethash) (new key table &optional default)
   (declare (ignore default))
-  (torcl::put-gethash new key table)
+  (egcl::put-gethash new key table)
   new)
 (defun (setf symbol-value) (new sym) (set sym new) new)
 
@@ -3343,7 +3343,7 @@
 ;; place defers and delegates here — expressing it in Lisp reuses
 ;; GET-SETF-EXPANSION rather than re-implementing setf expansion in Rust
 ;; (bliss-dj5k).
-(defmacro torcl::%setf-values (places form &environment env)
+(defmacro egcl::%setf-values (places form &environment env)
   (if (null places)
       ;; (setf (values) form) evaluates FORM and returns NO values -- not NIL.
       ;; ansi SETF-VALUES.6 (bliss-prdk).
@@ -3483,7 +3483,7 @@
 
 ;;; ---------------------------------------------------------------------------
 ;;; Gray streams: CLOS class hierarchy and generic-function protocol (spec
-;;; §5.5.2, torcl-jtc.7b).
+;;; §5.5.2, egcl-jtc.7b).
 ;;;
 ;;; Built-in streams stay Rust-backed for speed; these classes and generics let
 ;;; user code define its own stream types. The standard stream functions
@@ -3536,20 +3536,20 @@
 ;;; Flexi Streams extend these CL functions and call them on an underlying
 ;;; native stream; adding a wrapper method must not discard native support.
 (defmethod open-stream-p ((stream t))
-  (torcl::%native-open-stream-p stream))
+  (egcl::%native-open-stream-p stream))
 (defmethod input-stream-p ((stream t))
-  (torcl::%native-input-stream-p stream))
+  (egcl::%native-input-stream-p stream))
 (defmethod output-stream-p ((stream t))
-  (torcl::%native-output-stream-p stream))
+  (egcl::%native-output-stream-p stream))
 (defmethod stream-element-type ((stream t))
-  (let ((element-type (torcl::%native-stream-element-type stream)))
+  (let ((element-type (egcl::%native-stream-element-type stream)))
     (cond ((eq element-type t) 'character)
           ((eql element-type 8) '(unsigned-byte 8))
           (t (error 'type-error :datum stream :expected-type 'stream)))))
 (defmethod stream-element-type ((stream fundamental-stream))
   (gray-stream-element-type stream))
 (defmethod close ((stream t) &key abort)
-  (torcl::%native-close stream :abort abort))
+  (egcl::%native-close stream :abort abort))
 
 ;;; Required-to-implement operations: a subclass that does not provide a method
 ;;; gets a clear error rather than a mysterious no-applicable-method.
@@ -3619,7 +3619,7 @@
 
 ;;; Publish the existing protocol symbols, not a second same-named protocol.
 ;;; Portable libraries import these symbols and specialize their methods.
-(defpackage :torcl-gray-streams (:use))
+(defpackage :egcl-gray-streams (:use))
 (let ((protocol '(fundamental-stream fundamental-input-stream fundamental-output-stream
                   fundamental-character-stream fundamental-binary-stream
                   fundamental-character-input-stream fundamental-character-output-stream
@@ -3633,8 +3633,8 @@
   ;; Bootstrap symbols were historically available by their unqualified names.
   ;; Keep them present in CL-USER as well as in the public protocol package.
   (import protocol :cl-user)
-  (import protocol :torcl-gray-streams)
-  (export protocol :torcl-gray-streams))
+  (import protocol :egcl-gray-streams)
+  (export protocol :egcl-gray-streams))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Pathname namestring helpers (bliss-lb6). These are standard CL functions
@@ -3666,7 +3666,7 @@
                                      (t part))
                                "/")))))))
 
-;; All torcl strings are simple (no fill pointers / displacement yet), so the
+;; All egcl strings are simple (no fill pointers / displacement yet), so the
 ;; SIMPLE- predicates coincide with their general counterparts (bliss-d0b:
 ;; cl-cookie calls simple-string-p via ppcre).
 (defun simple-string-p (x) (stringp x))
@@ -3710,7 +3710,7 @@ by that pair's cdr (ANSI 14.2; bliss-d0b: flexi-streams)."
 
 (defun host-namestring (pathname)
   "The host portion of pathname PATHNAME as a string, or NIL when it has no
-host (ANSI 19.4). torcl physical pathnames carry no host, so this is NIL for
+host (ANSI 19.4). egcl physical pathnames carry no host, so this is NIL for
 them and the host name for a logical pathname."
   (let* ((p (pathname pathname))
          (host (pathname-host p)))
@@ -3744,82 +3744,82 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; ---------------------------------------------------------------------------
 
 ;;; Native mutex policy lives here; %NATIVE-MUTEX delegates to the stdlib.
-(export (mapcar (lambda (name) (intern name "TORCL-THREAD"))
+(export (mapcar (lambda (name) (intern name "EGCL-THREAD"))
                 '("MAKE-THREAD" "JOIN-THREAD" "CURRENT-THREAD" "THREAD-NAME"
                   "THREAD-ALIVE-P" "ALL-THREADS" "THREAD-YIELD"))
-        "TORCL-THREAD")
+        "EGCL-THREAD")
 
-(defun torcl-thread:make-mutex (&key name recursive)
-  (torcl::%native-mutex :make name recursive))
+(defun egcl-thread:make-mutex (&key name recursive)
+  (egcl::%native-mutex :make name recursive))
 
-(defun torcl-thread:mutex-p (object)
-  (torcl::%native-mutex :p object))
+(defun egcl-thread:mutex-p (object)
+  (egcl::%native-mutex :p object))
 
-(deftype torcl-thread:mutex () '(satisfies torcl-thread:mutex-p))
+(deftype egcl-thread:mutex () '(satisfies egcl-thread:mutex-p))
 
-(defun torcl-thread:grab-mutex (mutex &key (waitp t) timeout)
+(defun egcl-thread:grab-mutex (mutex &key (waitp t) timeout)
   (unless (or (null timeout) (and (realp timeout) (not (minusp timeout))))
     (error 'type-error :datum timeout :expected-type '(or null (real 0))))
-  (torcl::%native-mutex :grab mutex waitp (and timeout (float timeout 1d0))))
+  (egcl::%native-mutex :grab mutex waitp (and timeout (float timeout 1d0))))
 
-(defun torcl-thread:release-mutex (mutex &key (if-not-owner :error))
+(defun egcl-thread:release-mutex (mutex &key (if-not-owner :error))
   (unless (member if-not-owner '(:error :warn :ignore))
     (error 'type-error :datum if-not-owner :expected-type '(member :error :warn :ignore)))
   (if (eq if-not-owner :error)
-      (torcl::%native-mutex :release mutex)
-      (unless (torcl::%native-mutex :release-if-owned mutex)
+      (egcl::%native-mutex :release mutex)
+      (unless (egcl::%native-mutex :release-if-owned mutex)
         (when (eq if-not-owner :warn)
           (warn "Attempt to release a mutex not owned by the current execution"))))
   nil)
 
-(defmacro torcl-thread:with-mutex ((mutex &key (waitp t) timeout) &body body)
+(defmacro egcl-thread:with-mutex ((mutex &key (waitp t) timeout) &body body)
   (let ((lock (gensym "MUTEX"))
         (results (gensym "MUTEX-VALUES")))
     `(let ((,lock ,mutex) (,results nil))
-       (when (torcl-thread:grab-mutex ,lock :waitp ,waitp :timeout ,timeout)
+       (when (egcl-thread:grab-mutex ,lock :waitp ,waitp :timeout ,timeout)
          ;; Keep all values explicit across cleanup until the general compiled
          ;; UNWIND-PROTECT multiple-value defect (bliss-pfgq) is resolved.
          (unwind-protect
              (setf ,results (multiple-value-list (progn ,@body)))
-           (torcl-thread:release-mutex ,lock))
+           (egcl-thread:release-mutex ,lock))
          (values-list ,results)))))
 
-(export '(torcl-thread:make-mutex torcl-thread:mutex-p torcl-thread:mutex
-          torcl-thread:grab-mutex torcl-thread:release-mutex torcl-thread:with-mutex)
-        "TORCL-THREAD")
+(export '(egcl-thread:make-mutex egcl-thread:mutex-p egcl-thread:mutex
+          egcl-thread:grab-mutex egcl-thread:release-mutex egcl-thread:with-mutex)
+        "EGCL-THREAD")
 
-(defun torcl-thread:make-condition-variable (&key name)
-  (torcl::%native-condition :make name))
+(defun egcl-thread:make-condition-variable (&key name)
+  (egcl::%native-condition :make name))
 
-(defun torcl-thread:condition-variable-p (object)
-  (torcl::%native-condition :p object))
+(defun egcl-thread:condition-variable-p (object)
+  (egcl::%native-condition :p object))
 
-(deftype torcl-thread:condition-variable ()
-  '(satisfies torcl-thread:condition-variable-p))
+(deftype egcl-thread:condition-variable ()
+  '(satisfies egcl-thread:condition-variable-p))
 
-(defun torcl-thread:condition-wait (condition-variable mutex &key timeout)
+(defun egcl-thread:condition-wait (condition-variable mutex &key timeout)
   (unless (or (null timeout) (and (realp timeout) (not (minusp timeout))))
     (error 'type-error :datum timeout :expected-type '(or null (real 0))))
-  (torcl::%native-condition :wait condition-variable mutex (and timeout (float timeout 1d0))))
+  (egcl::%native-condition :wait condition-variable mutex (and timeout (float timeout 1d0))))
 
-(defun torcl-thread:condition-notify (condition-variable &optional (count 1))
+(defun egcl-thread:condition-notify (condition-variable &optional (count 1))
   (unless (and (integerp count) (not (minusp count)))
     (error 'type-error :datum count :expected-type '(integer 0)))
   ;; There cannot be more live waiters than this process can address.
-  (torcl::%native-condition :notify condition-variable (min count most-positive-fixnum)))
+  (egcl::%native-condition :notify condition-variable (min count most-positive-fixnum)))
 
-(defun torcl-thread:condition-broadcast (condition-variable)
-  (torcl::%native-condition :broadcast condition-variable))
+(defun egcl-thread:condition-broadcast (condition-variable)
+  (egcl::%native-condition :broadcast condition-variable))
 
-(export '(torcl-thread:make-condition-variable torcl-thread:condition-variable
-          torcl-thread:condition-variable-p torcl-thread:condition-wait
-          torcl-thread:condition-notify torcl-thread:condition-broadcast)
-        "TORCL-THREAD")
+(export '(egcl-thread:make-condition-variable egcl-thread:condition-variable
+          egcl-thread:condition-variable-p egcl-thread:condition-wait
+          egcl-thread:condition-notify egcl-thread:condition-broadcast)
+        "EGCL-THREAD")
 
-(defun lisp-implementation-type () "TorCL")
+(defun lisp-implementation-type () "EGCL")
 (defun lisp-implementation-version () "0.1.0")
-(defun machine-type () (torcl-ext::%machine-type))
-(defun machine-version () (torcl-ext::%machine-type))
+(defun machine-type () (egcl-ext::%machine-type))
+(defun machine-version () (egcl-ext::%machine-type))
 (defun machine-instance () "localhost")
 (defun software-type () "Linux")
 (defun software-version () "1.0")
@@ -3863,10 +3863,10 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                   :format-arguments (list (subseq string start end))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; TORCL-CLTL2 — CLtL2 lexical-environment access (R4.14).
+;;; EGCL-CLTL2 — CLtL2 lexical-environment access (R4.14).
 ;;;
-;;; TorCL's counterpart of SB-CLTL2: the package a portability layer such as
-;;; trivial-cltl2 USEs. Only what TorCL can answer truthfully is defined here.
+;;; EGCL's counterpart of SB-CLTL2: the package a portability layer such as
+;;; trivial-cltl2 USEs. Only what EGCL can answer truthfully is defined here.
 ;;; The rest of the CLtL2 environment API — VARIABLE-INFORMATION,
 ;;; FUNCTION-INFORMATION, AUGMENT-ENVIRONMENT, PARSE-MACRO, ENCLOSE,
 ;;; COMPILER-LET — is deliberately ABSENT rather than stubbed, so a caller's own
@@ -3874,22 +3874,22 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; function that lies (bliss-powf).
 ;;; ---------------------------------------------------------------------------
 
-(defvar torcl-cltl2::*declaration-handlers* (make-hash-table :test 'eq))
+(defvar egcl-cltl2::*declaration-handlers* (make-hash-table :test 'eq))
 
 ;; A declaration handler is installed by DEFINE-DECLARATION and invoked when
 ;; DECLARATION-INFORMATION is asked about its name, with the raw source
 ;; specifier the environment recorded and the environment itself.
-(defmacro torcl-cltl2:define-declaration (name lambda-list &rest body)
+(defmacro egcl-cltl2:define-declaration (name lambda-list &rest body)
   (list 'eval-when '(:compile-toplevel :load-toplevel :execute)
         (list 'proclaim (list 'quote (list 'declaration name)))
         (list 'setf
-              (list 'gethash (list 'quote name) 'torcl-cltl2::*declaration-handlers*)
+              (list 'gethash (list 'quote name) 'egcl-cltl2::*declaration-handlers*)
               (cons 'lambda (cons lambda-list body)))
         (list 'quote name)))
 
 ;; (quality value) for `item`, which CLtL2 permits as a bare quality symbol or a
 ;; (quality) list — both meaning the value 3.
-(defun torcl-cltl2::%optimize-entry (item)
+(defun egcl-cltl2::%optimize-entry (item)
   (cond ((symbolp item) (list item 3))
         ((and (consp item) (null (cdr item))) (list (car item) 3))
         ((consp item) (list (car item) (car (cdr item))))
@@ -3898,57 +3898,57 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;; The OPTIMIZE policy in force: the standard qualities at their default value
 ;; of 1, overridden by global proclamations, then by the lexical declarations of
 ;; `env` from outermost to innermost.
-(defun torcl-cltl2::%optimize-policy (env)
+(defun egcl-cltl2::%optimize-policy (env)
   (let ((policy (list (list 'compilation-speed 1)
                       (list 'debug 1)
                       (list 'safety 1)
                       (list 'space 1)
                       (list 'speed 1))))
     (flet ((note (item)
-             (let ((entry (torcl-cltl2::%optimize-entry item)))
+             (let ((entry (egcl-cltl2::%optimize-entry item)))
                (when entry
                  (let ((existing (assoc (car entry) policy)))
                    (if existing
                        (rplaca (cdr existing) (car (cdr entry)))
                        (setf policy (append policy (list entry)))))))))
-      (dolist (entry (torcl-ext:proclaimed-optimize))
+      (dolist (entry (egcl-ext:proclaimed-optimize))
         (note entry))
-      (dolist (specifier (torcl-ext:declaration-specifiers 'optimize env))
+      (dolist (specifier (egcl-ext:declaration-specifiers 'optimize env))
         (dolist (item (cdr specifier))
           (note item))))
     policy))
 
-(defun torcl-cltl2:declaration-information (decl-name &optional env)
+(defun egcl-cltl2:declaration-information (decl-name &optional env)
   (cond
     ((eq decl-name 'optimize)
-     (torcl-cltl2::%optimize-policy env))
+     (egcl-cltl2::%optimize-policy env))
     ((eq decl-name 'declaration)
-     (torcl-ext:proclaimed-declarations))
+     (egcl-ext:proclaimed-declarations))
     (t
-     (let ((handler (gethash decl-name torcl-cltl2::*declaration-handlers*)))
+     (let ((handler (gethash decl-name egcl-cltl2::*declaration-handlers*)))
        (cond
          (handler
-          (let ((specifier (torcl-ext:declaration-specifier decl-name env)))
+          (let ((specifier (egcl-ext:declaration-specifier decl-name env)))
             (when specifier
               (multiple-value-bind (kind info) (funcall handler specifier env)
                 (cond
                   ((eq kind :declare) (cdr info))
-                  (t (error "TORCL-CLTL2: the ~s declaration kind returned by the ~s handler is not supported on TorCL"
+                  (t (error "EGCL-CLTL2: the ~s declaration kind returned by the ~s handler is not supported on EGCL"
                             kind decl-name)))))))
-         ((member decl-name (torcl-ext:proclaimed-declarations))
+         ((member decl-name (egcl-ext:proclaimed-declarations))
           ;; Proclaimed, but nothing was taught how to read it.
           nil)
          (t
-          (error "TORCL-CLTL2:DECLARATION-INFORMATION: ~s does not name a declaration TorCL can report"
+          (error "EGCL-CLTL2:DECLARATION-INFORMATION: ~s does not name a declaration EGCL can report"
                  decl-name)))))))
 
-(export '(torcl-cltl2:define-declaration torcl-cltl2:declaration-information)
-        "TORCL-CLTL2")
+(export '(egcl-cltl2:define-declaration egcl-cltl2:declaration-information)
+        "EGCL-CLTL2")
 
 ;;; Foreign addresses are opaque heap objects, never tagged Lisp addresses.
 ;;; Foreign storage has an explicit lifetime: C may retain it after Lisp drops
 ;;; its last wrapper. FREE invalidates every tracked alias of an allocation.
-(export (mapcar (lambda (name) (intern name "TORCL-FFI"))
+(export (mapcar (lambda (name) (intern name "EGCL-FFI"))
                 '("FOREIGN-POINTER" "POINTERP" "MAKE-POINTER" "POINTER-ADDRESS"
                   "POINTER-EQ" "NULL-POINTER" "NULL-POINTER-P" "INC-POINTER"
                   "FOREIGN-ALLOC" "FOREIGN-FREE" "MEM-REF" "MEM-SET"
@@ -3959,52 +3959,52 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                   "FOREIGN-CALL-BUFFERED"
                   "FOREIGN-CALLBACK" "FOREIGN-CALLBACK-P" "MAKE-CALLBACK"
                   "CALLBACK-POINTER" "FREE-CALLBACK" "CALLBACK-ERROR"))
-        "TORCL-FFI")
-(define-condition torcl-ffi:ffi-error (simple-error) ())
-(defun torcl-ffi:pointerp (value) (torcl::%foreign-memory :pointerp value))
-(deftype torcl-ffi:foreign-pointer () '(satisfies torcl-ffi:pointerp))
-(defun torcl-ffi:make-pointer (address) (torcl::%foreign-memory :make-pointer address))
-(defun torcl-ffi:pointer-address (pointer) (torcl::%foreign-memory :pointer-address pointer))
-(defun torcl-ffi:pointer-eq (a b) (torcl::%foreign-memory :pointer-eq a b))
-(defun torcl-ffi:null-pointer () (torcl-ffi:make-pointer 0))
-(defun torcl-ffi:null-pointer-p (pointer) (= 0 (torcl-ffi:pointer-address pointer)))
-(defun torcl-ffi:inc-pointer (pointer bytes) (torcl::%foreign-memory :inc-pointer pointer bytes))
-(defun torcl-ffi:foreign-alloc (bytes) (torcl::%foreign-memory :alloc bytes))
-(defun torcl-ffi:foreign-free (pointer) (torcl::%foreign-memory :free pointer))
-(defun torcl-ffi:mem-ref (pointer type &optional (offset 0))
-  (torcl::%foreign-memory :ref pointer type offset))
-(defun torcl-ffi:mem-set (value pointer type &optional (offset 0))
-  (torcl::%foreign-memory :set pointer type offset value))
-(defun (setf torcl-ffi:mem-ref) (value pointer type &optional (offset 0))
-  (torcl-ffi:mem-set value pointer type offset))
-(defun torcl-ffi:foreign-type-size (type) (torcl::%foreign-memory :type-size type))
-(defun torcl-ffi:foreign-type-alignment (type) (torcl::%foreign-memory :type-alignment type))
+        "EGCL-FFI")
+(define-condition egcl-ffi:ffi-error (simple-error) ())
+(defun egcl-ffi:pointerp (value) (egcl::%foreign-memory :pointerp value))
+(deftype egcl-ffi:foreign-pointer () '(satisfies egcl-ffi:pointerp))
+(defun egcl-ffi:make-pointer (address) (egcl::%foreign-memory :make-pointer address))
+(defun egcl-ffi:pointer-address (pointer) (egcl::%foreign-memory :pointer-address pointer))
+(defun egcl-ffi:pointer-eq (a b) (egcl::%foreign-memory :pointer-eq a b))
+(defun egcl-ffi:null-pointer () (egcl-ffi:make-pointer 0))
+(defun egcl-ffi:null-pointer-p (pointer) (= 0 (egcl-ffi:pointer-address pointer)))
+(defun egcl-ffi:inc-pointer (pointer bytes) (egcl::%foreign-memory :inc-pointer pointer bytes))
+(defun egcl-ffi:foreign-alloc (bytes) (egcl::%foreign-memory :alloc bytes))
+(defun egcl-ffi:foreign-free (pointer) (egcl::%foreign-memory :free pointer))
+(defun egcl-ffi:mem-ref (pointer type &optional (offset 0))
+  (egcl::%foreign-memory :ref pointer type offset))
+(defun egcl-ffi:mem-set (value pointer type &optional (offset 0))
+  (egcl::%foreign-memory :set pointer type offset value))
+(defun (setf egcl-ffi:mem-ref) (value pointer type &optional (offset 0))
+  (egcl-ffi:mem-set value pointer type offset))
+(defun egcl-ffi:foreign-type-size (type) (egcl::%foreign-memory :type-size type))
+(defun egcl-ffi:foreign-type-alignment (type) (egcl::%foreign-memory :type-alignment type))
 
-(defun torcl-ffi:make-shareable-byte-vector (size)
+(defun egcl-ffi:make-shareable-byte-vector (size)
   (make-array size :element-type '(unsigned-byte 8) :initial-element 0))
 
-(defun torcl-ffi:foreign-library-p (value) (torcl::%foreign-library :p value))
-(deftype torcl-ffi:foreign-library () '(satisfies torcl-ffi:foreign-library-p))
-(defun torcl-ffi:load-foreign-library (path) (torcl::%foreign-library :load path))
-(defun torcl-ffi:close-foreign-library (library) (torcl::%foreign-library :close library))
-(defun torcl-ffi:foreign-symbol-pointer (name &optional library)
-  (torcl::%foreign-library :symbol name library))
-(defun torcl-ffi:foreign-call (pointer return-type argument-types arguments &optional (fixed-count nil variadic-p))
+(defun egcl-ffi:foreign-library-p (value) (egcl::%foreign-library :p value))
+(deftype egcl-ffi:foreign-library () '(satisfies egcl-ffi:foreign-library-p))
+(defun egcl-ffi:load-foreign-library (path) (egcl::%foreign-library :load path))
+(defun egcl-ffi:close-foreign-library (library) (egcl::%foreign-library :close library))
+(defun egcl-ffi:foreign-symbol-pointer (name &optional library)
+  (egcl::%foreign-library :symbol name library))
+(defun egcl-ffi:foreign-call (pointer return-type argument-types arguments &optional (fixed-count nil variadic-p))
   (if variadic-p
-      (torcl::%ffi-call pointer return-type argument-types arguments fixed-count)
-      (torcl::%ffi-call pointer return-type argument-types arguments)))
+      (egcl::%ffi-call pointer return-type argument-types arguments fixed-count)
+      (egcl::%ffi-call pointer return-type argument-types arguments)))
 
-(defun torcl-ffi:foreign-call-buffered (pointer return-type argument-types argument-buffers result-buffer
+(defun egcl-ffi:foreign-call-buffered (pointer return-type argument-types argument-buffers result-buffer
                                       &optional (fixed-count nil variadic-p))
   (if variadic-p
-      (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer fixed-count)
-      (torcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer)))
+      (egcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer fixed-count)
+      (egcl::%ffi-call-buffered pointer return-type argument-types argument-buffers result-buffer)))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Embedded CPython: the PY package (spec 2.7.8, bliss-dk3nr)
 ;;;; ---------------------------------------------------------------------------
 ;;;;
-;;;; Thin wrappers over TORCL::%PY-* primitives, following the same convention as
+;;;; Thin wrappers over EGCL::%PY-* primitives, following the same convention as
 ;;;; the FFI surface above. The indirection is not ceremony: a function named
 ;;;; PY:TYPEP is reduced to its BARE name by the bytecode lowerer and by the
 ;;;; FUNCALL fast path, both of which then find CL:TYPEP and answer a different
@@ -4031,7 +4031,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; useful report with a confusing one from the machinery that was trying to print it.
 (defun py::drain-output ()
   (ignore-errors
-    (let ((pair (torcl::%py-drain-output)))
+    (let ((pair (egcl::%py-drain-output)))
       (when pair
         (let ((out (car pair)) (err (cdr pair)))
           (when (plusp (length out)) (write-string out *standard-output*))
@@ -4049,44 +4049,44 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; the pending releases first, since a reference released after shutdown would be
 ;;; a use-after-free.
 (defun py:start () (py:exec "pass"))
-(defun py:stop () (py::draining (torcl::%py-stop)))
+(defun py:stop () (py::draining (egcl::%py-stop)))
 
 ;;; (py:import "numpy") -> the module, as a PY:OBJECT.
-(defun py:import (name) (py::draining (torcl::%py-import name)))
+(defun py:import (name) (py::draining (egcl::%py-import name)))
 
 ;;; (py:exec "print('hello')") -> NIL. A statement, run for its effect.
-(defun py:exec (source) (py::draining (torcl::%py-exec source)))
+(defun py:exec (source) (py::draining (egcl::%py-exec source)))
 
 ;;; (py:resolve "numpy.mean") -> the object that dotted name names, whether the
 ;;; segments are modules, attributes, or a builtin.
-(defun py:resolve (name) (py::draining (torcl::%py-resolve name)))
+(defun py:resolve (name) (py::draining (egcl::%py-resolve name)))
 
 ;;; (py:call "numpy.mean" a) or (py:call f 1 2) -- the callable may be named or
 ;;; already in hand.
 (defun py:call (callable &rest arguments)
-  (py::draining (torcl::%py-call callable arguments)))
+  (py::draining (egcl::%py-call callable arguments)))
 
 ;;; (py:call-method x "reshape" 10 20)
 (defun py:call-method (object name &rest arguments)
-  (py::draining (torcl::%py-call-method object name arguments)))
+  (py::draining (egcl::%py-call-method object name arguments)))
 
 ;;; (py:getattr x "shape"), and settable: (setf (py:getattr x "n") 5).
-(defun py:getattr (object name) (py::draining (torcl::%py-getattr object name)))
+(defun py:getattr (object name) (py::draining (egcl::%py-getattr object name)))
 (defun py:setattr (object name value)
-  (py::draining (torcl::%py-setattr object name value)))
+  (py::draining (egcl::%py-setattr object name value)))
 (defsetf py:getattr (object name) (value) `(py:setattr ,object ,name ,value))
 
 ;;; (py:type-of x) -> the Python TYPE, as an object rather than a name, so it can
 ;;; be called, compared and asked for its own attributes as Python code would.
-(defun py:type-of (object) (py::draining (torcl::%py-type-of object)))
+(defun py:type-of (object) (py::draining (egcl::%py-type-of object)))
 
 ;;; (py:typep x "numpy.ndarray")
-(defun py:typep (object class) (py::draining (torcl::%py-typep object class)))
+(defun py:typep (object class) (py::draining (egcl::%py-typep object class)))
 
 ;;; str() and repr(). PY:REPR is what the Lisp printer shows inside
 ;;; #<PYTHON-OBJECT ...>.
-(defun py:str (object) (py::draining (torcl::%py-str object)))
-(defun py:repr (object) (py::draining (torcl::%py-repr object)))
+(defun py:str (object) (py::draining (egcl::%py-str object)))
+(defun py:repr (object) (py::draining (egcl::%py-repr object)))
 
 ;;; (py:export "calculate_price" #'calculate-price) makes a Lisp function callable
 ;;; from Python by that name:
@@ -4102,7 +4102,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;;
 ;;; Arguments and the result cross by the same policy as everything else, so a Lisp
 ;;; error becomes a Python exception rather than unwinding through CPython frames.
-(defun py:export (name function) (py::draining (torcl::%py-export name function)))
+(defun py:export (name function) (py::draining (egcl::%py-export name function)))
 
 ;;; Flush Python's buffered output without doing anything else -- for a long
 ;;; computation whose progress prints would otherwise arrive only when it returns.
@@ -4110,7 +4110,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 
 ;;; Is this a Python object rather than a converted Lisp value? A number, string,
 ;;; NIL or T that crossed back is an ordinary Lisp object and answers NIL.
-(defun py:objectp (object) (torcl::%py-objectp object))
+(defun py:objectp (object) (egcl::%py-objectp object))
 (deftype py:object () '(satisfies py:objectp))
 
 ;;; ---------------------------------------------------------------------------
@@ -4138,7 +4138,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
    (frames :initarg :frames :initform nil :reader py:exception-frames)
    (object :initarg :object :initform nil :reader py:exception-object)
    ;; FORMAT-CONTROL carries the already-rendered report. It was once the ONLY thing
-   ;; TorCL's printer read, because a DEFINE-CONDITION :report was not honoured at all
+   ;; EGCL's printer read, because a DEFINE-CONDITION :report was not honoured at all
    ;; (bliss-e5eh6); the :report below is now consulted first and supplies the message,
    ;; so this slot no longer decides what ~A or an uncaught error shows. It is kept
    ;; because the signaller fills it and SIMPLE-CONDITION-FORMAT-CONTROL can read it;
@@ -4169,39 +4169,39 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
           (reverse (py:exception-frames condition))))
 
 ;;; External, so TYPE-OF and error messages read PY:OBJECT rather than
-;;; TORCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
+;;; EGCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
 ;;; INTERN by name rather than writing '(py:import ...): a quoted list is read
 ;;; before these are external, and the reader's own symbol for PY:IMPORT is not
 ;;; necessarily the one in the package table, so the export lands on nothing. Every
 ;;; other package here exports the same way for the same reason.
-(export (mapcar (lambda (name) (intern name "TORCL-PYTHON"))
+(export (mapcar (lambda (name) (intern name "EGCL-PYTHON"))
                 '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
                   "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
                   "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
                   "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH" "EXPORT"))
-        "TORCL-PYTHON")
+        "EGCL-PYTHON")
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
 ;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures
 ;;; return zero to C, then signal FFI-ERROR after the enclosing foreign call;
 ;;; CALLBACK-ERROR consumes diagnostic text, also for foreign-thread failures.
-(defun torcl-ffi:foreign-callback-p (value) (torcl::%foreign-callback :p value))
-(deftype torcl-ffi:foreign-callback () '(satisfies torcl-ffi:foreign-callback-p))
-(defun torcl-ffi:make-callback (function return-type argument-types)
+(defun egcl-ffi:foreign-callback-p (value) (egcl::%foreign-callback :p value))
+(deftype egcl-ffi:foreign-callback () '(satisfies egcl-ffi:foreign-callback-p))
+(defun egcl-ffi:make-callback (function return-type argument-types)
   (check-type function function)
-  (torcl::%foreign-callback :make function return-type argument-types))
-(defun torcl-ffi:callback-pointer (callback) (torcl::%foreign-callback :pointer callback))
-(defun torcl-ffi:free-callback (callback) (torcl::%foreign-callback :free callback))
-(defun torcl-ffi:callback-error (callback) (torcl::%foreign-callback :error callback))
+  (egcl::%foreign-callback :make function return-type argument-types))
+(defun egcl-ffi:callback-pointer (callback) (egcl::%foreign-callback :pointer callback))
+(defun egcl-ffi:free-callback (callback) (egcl::%foreign-callback :free callback))
+(defun egcl-ffi:callback-error (callback) (egcl::%foreign-callback :error callback))
 
 ;;; Copying is deliberate: Lisp storage can move, and upgraded array element
 ;;; types need not have C layout. The pointer is valid only inside this scope.
-(defmacro torcl-ffi:with-pointer-to-vector-data ((pointer vector &optional (type :unsigned-char)) &body body)
+(defmacro egcl-ffi:with-pointer-to-vector-data ((pointer vector &optional (type :unsigned-char)) &body body)
   (let ((v (gensym "VECTOR")) (ty (gensym "TYPE")) (ready (gensym "COPIED"))
         (storage (gensym "STORAGE")))
     `(let* ((,v ,vector)
             (,ty ,type)
-            (,storage (torcl-ffi:foreign-alloc (torcl::%foreign-memory :vector-size ,v ,ty)))
+            (,storage (egcl-ffi:foreign-alloc (egcl::%foreign-memory :vector-size ,v ,ty)))
             (,pointer ,storage)
             (,ready nil))
        ;; Keep all values in the protected form's primary value across cleanup
@@ -4209,18 +4209,18 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
        (values-list
          (unwind-protect
              (progn
-               (torcl::%foreign-memory :copy-in ,storage ,v ,ty)
+               (egcl::%foreign-memory :copy-in ,storage ,v ,ty)
                (setf ,ready t)
                (multiple-value-list (progn ,@body)))
            (unwind-protect
-               (when ,ready (torcl::%foreign-memory :copy-out ,storage ,v ,ty))
-             (torcl-ffi:foreign-free ,storage)))))))
+               (when ,ready (egcl::%foreign-memory :copy-out ,storage ,v ,ty))
+             (egcl-ffi:foreign-free ,storage)))))))
 
 ;;; ── CLOS slot-definition metaobjects (bliss-h1mx) ─────────────────────────
 ;;;
 ;;; closer-mop needs CLASS-SLOTS to return objects it can hand to the
 ;;; SLOT-DEFINITION-* accessors. The raw data comes from
-;;; TORCL-INTERNAL::%CLASS-SLOT-DESCRIPTORS — one plist per EFFECTIVE slot, in
+;;; EGCL-INTERNAL::%CLASS-SLOT-DESCRIPTORS — one plist per EFFECTIVE slot, in
 ;;; class-precedence order, built from the same effective_slots_for_class walk
 ;;; MAKE-INSTANCE uses. The Lisp-visible surface lives here rather than in
 ;;; cli.rs, per the architecture principle: the interpreter exposes data, the
@@ -4235,7 +4235,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; the slots the class itself declared. That distinction is not cosmetic —
 ;;; SLOT-DEFINITION-READERS and -WRITERS are defined by AMOP only on DIRECT slot
 ;;; definitions, and SBCL signals NO-APPLICABLE-METHOD if you call them on an
-;;; effective one. TorCL answers them for both, which is a permissive superset
+;;; effective one. EGCL answers them for both, which is a permissive superset
 ;;; rather than a different answer.
 ;;;
 ;;; One honest limit: SLOT-DEFINITION-TYPE answers T for every slot, because
@@ -4253,13 +4253,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   "Effective slot definitions of CLASS, in class-precedence order."
   (mapcar (lambda (descriptor)
             (apply #'make-instance 'slot-definition descriptor))
-          (torcl-internal::%class-slot-descriptors class)))
+          (egcl-internal::%class-slot-descriptors class)))
 
 (defun class-direct-slots (class)
   "Slot definitions CLASS itself declares, excluding inherited slots."
   (mapcar (lambda (descriptor)
             (apply #'make-instance 'slot-definition descriptor))
-          (torcl-internal::%class-slot-descriptors class t)))
+          (egcl-internal::%class-slot-descriptors class t)))
 
 (defun slot-definition-type (slot)
   "Declared type of SLOT. Always T: DEFCLASS discards :type (bliss-52ze)."

@@ -1,7 +1,7 @@
-# TorCL User Manual
+# Evergreen Common Lisp — User Manual
 
-This manual describes TorCL's implementation of Common Lisp and its extensions.
-It concentrates on behavior specific to TorCL: startup, compilation, debugging,
+This manual describes EGCL's implementation of Common Lisp and its extensions.
+It concentrates on behavior specific to EGCL: startup, compilation, debugging,
 memory, foreign calls, Java integration, concurrency, and application delivery.
 
 The manual follows the development checkout. For differences between targets,
@@ -37,7 +37,7 @@ operator, use the [Symbol index](symbol-index.md); for a topic, use the
 
 ## Recipes and supplementary reference
 
-- [Build and install TorCL](user/how-to/build.md)
+- [Build and install EGCL](user/how-to/build.md)
 - [Run a first Lisp program](user/tutorials/first-program.md)
 - [Load an ASDF system](user/how-to/asdf.md)
 - [Save an executable](user/how-to/save-executable.md)

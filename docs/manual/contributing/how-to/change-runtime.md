@@ -18,7 +18,7 @@ current functionality.
 
 Find both the tree-walking and compiled paths for the behavior you are changing.
 If an operation belongs in the standard library, implement or extend it in
-`torcl-stdlib` and call it from the evaluator. Avoid another implementation of
+`egcl-stdlib` and call it from the evaluator. Avoid another implementation of
 the same library operation in `cli.rs`.
 
 ## Add a regression at the right boundary
@@ -37,7 +37,7 @@ Run the affected tests and their direct callers. For a broad runtime change,
 run the wider workspace gates with the project's memory cap:
 
 ```sh
-TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh cargo test --workspace
+EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh cargo test --workspace
 cargo check --workspace
 cargo fmt --all -- --check
 bash scripts/gc-root-lint.sh

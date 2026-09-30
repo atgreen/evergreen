@@ -7,13 +7,13 @@
 - Subsections: §1.1.1, §1.1.2, …
 - Requirements use the prefix **R** followed by chapter and sequence:
   `R1.01`, `R1.02`, `R2.01`, etc.
-- Data structures use the prefix **D**: `D1.01` (TorclVal), `D1.02` (ObjectHeader).
+- Data structures use the prefix **D**: `D1.01` (EgclVal), `D1.02` (ObjectHeader).
 - Algorithms use the prefix **A**: `A3.01` (minor GC copy), `A3.02` (concurrent mark).
 
 ## Cross-references
 
 - Refer to other spec sections as `§N.M`.
-- Refer to source files as `crates/torcl-rt/src/object.rs` (repo-relative).
+- Refer to source files as `crates/egcl-rt/src/object.rs` (repo-relative).
 - Refer to requirements as `R1.01` etc.
 
 ## Requirement levels
@@ -34,10 +34,10 @@ with ≥3 parallel fields.
 
 ## Build stages
 
-TorCL is built in ordered **stages**, each a runnable vertical slice with an
+EGCL is built in ordered **stages**, each a runnable vertical slice with an
 end-to-end **Gate** (see `spec/stages.json`, `spec/00-overview.md`, and
 `spec/11-phasing-roadmap.md`).
-A stage is done only when its Gate genuinely passes through the real `torcl`
+A stage is done only when its Gate genuinely passes through the real `egcl`
 binary — never by stubbing the capability under test.
 
 Every stage-gated requirement is expected to have an authoritative stage

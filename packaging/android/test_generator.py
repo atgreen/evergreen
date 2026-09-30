@@ -14,7 +14,7 @@ class GeneratorTests(unittest.TestCase):
         self.project = Path(self.tmp.name) / 'hello'
 
     def generate(self, *args):
-        return subprocess.run(['python3', str(ROOT / 'torcl-android-new'), str(self.project), *args], text=True, capture_output=True)
+        return subprocess.run(['python3', str(ROOT / 'egcl-android-new'), str(self.project), *args], text=True, capture_output=True)
 
     def test_host_and_identity_are_written(self):
         result = self.generate('--host=x86_64-linux-android', '--package=org.example.hello', '--name=Hello & World')

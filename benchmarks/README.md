@@ -1,6 +1,6 @@
-# TorCL performance lab
+# EGCL performance lab
 
-Reproducible comparisons of the **same Common Lisp source** on TorCL and SBCL,
+Reproducible comparisons of the **same Common Lisp source** on EGCL and SBCL,
 with a standalone HTML report, raw JSON, generated scripts, and process logs.
 This showcase complements the regression suite in `tests/benchmarks/`.
 
@@ -8,13 +8,13 @@ This showcase complements the regression suite in `tests/benchmarks/`.
 The current sample report is generated from the native-transfer ABI work. Five
 alternating samples measure Fibonacci, the Ironclad POWER-MOD kernel, and a
 caught TYPE-ERROR path. The report also records process-wide retired-instruction
-counts from `perf`; every TorCL sample passed its checksum and listed-hot-function
+counts from `perf`; every EGCL sample passed its checksum and listed-hot-function
 T2 gates. The checked-in report enables the opt-in segment ABI; recursive
 Fibonacci enters an outer segment, while calls made from an active segment use
 the bounded legacy/native bridge until frame-aware nested entry is developed.
 These are local measurements, not a universal performance claim.
 
-The sample report verifies T2 before and after every listed measured TorCL
+The sample report verifies T2 before and after every listed measured EGCL
 function. The exceptional-path case deliberately keeps its handler and error
 path in the interpreter while its batch driver reaches T2.
 
@@ -23,22 +23,22 @@ path in the interpreter while its batch driver reaches T2.
 On Linux with Python 3.10+, SBCL, `taskset`, and a working systemd user session:
 
 ```sh
-TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh \
-  cargo build --release -p torcl --bin torcl
+EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh \
+  cargo build --release -p egcl --bin egcl
 python3 benchmarks/run.py --cpu 0 --native-transfer
 ```
 
 Add `--instructions` to collect process-wide retired-instruction counts with
 Linux `perf`; the HTML labels these separately because startup and compilation
 are included, while the Lisp timer measures only the warmed workload.
-Add `--native-transfer` to set `TORCL_NATIVE_TRANSFER=1` for TorCL children and
+Add `--native-transfer` to set `EGCL_NATIVE_TRANSFER=1` for EGCL children and
 exercise the opt-in native segment ABI. The harness temporarily clears that
 environment variable while loading benchmark definitions, then enables it for
 validation, training, warmup, and timing; this keeps source-loading helpers on
 the checked path while measuring the native workload. Unsupported bodies or
 platforms fall back to the checked entry; this switch records the mode in
 `results.json`. Use `--runner PATH` to select another bounded child runner;
-the default remains `scripts/torcl-limited.sh`.
+the default remains `scripts/egcl-limited.sh`.
 
 Open `benchmarks/results/index.html`. No server, JavaScript, external fonts, or
 network access is needed to view the report. `results.json` contains all samples,
@@ -48,11 +48,11 @@ Logs in the checked-in sample report are losslessly gzip-compressed; new runs
 write plain text logs.
 Output directories must be empty, preventing accidental overwrite of prior runs.
 
-Use `--torcl PATH`, `--sbcl PATH`, `--samples 9`, `--output DIRECTORY`, or
+Use `--egcl PATH`, `--sbcl PATH`, `--samples 9`, `--output DIRECTORY`, or
 `--case fibonacci` / `--case ironclad-power-mod` / `--case exceptional-path` to select another run. The minimum
 is five samples; the default is seven. `--cpu` defaults to the first allowed CPU.
-Every child runs through `scripts/torcl-limited.sh` with a 4 GiB cap (override via
-`TORCL_MEM_MAX`) and a 300-second process timeout. Missing tools, runtime failures,
+Every child runs through `scripts/egcl-limited.sh` with a 4 GiB cap (override via
+`EGCL_MEM_MAX`) and a 300-second process timeout. Missing tools, runtime failures,
 failed assertions, wrong checksums, missing T2 evidence, and zero-length timings
 fail the run; they
 are never converted into speedups.
@@ -76,7 +76,7 @@ runtimes receive the same training work: Fibonacci uses F(10) once per training
 batch, and modular exponentiation uses one input per training batch. The measured
 inputs and iteration counts are restored before full warmup and timing.
 
-Before starting its clock, TorCL must report `function-tier = 2` for every
+Before starting its clock, EGCL must report `function-tier = 2` for every
 listed hot function. The harness polls for up to ten seconds to allow
 asynchronous compilation to publish. It checks again after timing and rejects
 the sample if either tier is missing or below T2. Raw JSON and logs record tiers,
@@ -91,9 +91,9 @@ known answers, including a zero exponent and a bignum exponent to cover the
 retained sliding-window branch. The aggregate modular checksum was independently
 computed using Python's three-argument `pow`.
 
-TorCL and SBCL alternate order between samples and never run concurrently. Both
-are pinned to the requested CPU. TorCL uses a release build and automatic tiering;
-the runner clears inherited `TORCL_*` tuning except the memory cap. SBCL compiles
+EGCL and SBCL alternate order between samples and never run concurrently. Both
+are pinned to the requested CPU. EGCL uses a release build and automatic tiering;
+the runner clears inherited `EGCL_*` tuning except the memory cap. SBCL compiles
 the identical workload to a temporary FASL and loads it. The shared policy is
 `(optimize (speed 3) (safety 1) (debug 0))`; upstream function declarations remain
 intact, including Ironclad's `safety 0` declarations.
@@ -106,7 +106,7 @@ IQR, all samples, and the ratio of medians. A losing case names SBCL as the winn
 This is an exploratory workstation comparison, not the controlled CI regression
 gate specified in §10.10. Frequency scaling, turbo, and background activity are
 not controlled. No statistical-significance claim is made, and GC pause telemetry
-is not collected. TorCL's timer has millisecond resolution on the measured build;
+is not collected. EGCL's timer has millisecond resolution on the measured build;
 batches should be long enough to make clock quantization insignificant. Large
 variance is visible in the sample table. Do not generalize a kernel win to all
 Common Lisp or all of Ironclad.

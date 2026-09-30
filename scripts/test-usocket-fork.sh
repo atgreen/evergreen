@@ -3,21 +3,21 @@
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 ocicl=$(command -v "${OCICL_BIN:-ocicl}")
-torcl=$(realpath "${TORCL_BIN:-$repo/target/torcl}")
+egcl=$(realpath "${EGCL_BIN:-$repo/target/egcl}")
 runtime=$(realpath "${OCICL_RUNTIME:-${XDG_DATA_HOME:-$HOME/.local/share}/ocicl/ocicl-runtime.lisp}")
-[[ -x $torcl && -f $runtime ]] || { echo 'Missing TorCL binary or ocicl runtime' >&2; exit 1; }
-work=$(mktemp -d "${TMPDIR:-/tmp}/torcl-usocket-test.XXXXXX")
+[[ -x $egcl && -f $runtime ]] || { echo 'Missing EGCL binary or ocicl runtime' >&2; exit 1; }
+work=$(mktemp -d "${TMPDIR:-/tmp}/egcl-usocket-test.XXXXXX")
 echo "Usocket test artifacts: $work"
 cp -- "$repo/tests/usocket-fork/ocicl.csv" "$repo/tests/usocket-fork/check.lisp" "$work/"
 cd "$work"
-export OCICL_LOCAL_ONLY=1 TORCL_PORT_RUNTIME="$runtime"
-"$repo/scripts/torcl-limited.sh" "$ocicl" install >install.log 2>&1
+export OCICL_LOCAL_ONLY=1 EGCL_PORT_RUNTIME="$runtime"
+"$repo/scripts/egcl-limited.sh" "$ocicl" install >install.log 2>&1
 cmp -- "$repo/tests/usocket-fork/ocicl.csv" ocicl.csv
-fixture=ocicl/usocket-5f8ba35/tests/torcl-client-fixture.py
-export TORCL_PORT_CACHE="$work/cache/"
+fixture=ocicl/usocket-5f8ba35/tests/egcl-client-fixture.py
+export EGCL_PORT_CACHE="$work/cache/"
 for phase in cold cached; do
-    "$repo/scripts/torcl-limited.sh" python3 "$fixture" \
-        "$torcl" --no-init --load check.lisp >"$phase.log" 2>&1
+    "$repo/scripts/egcl-limited.sh" python3 "$fixture" \
+        "$egcl" --no-init --load check.lisp >"$phase.log" 2>&1
     grep -Fxq 'USOCKET-NATIVE-CLIENT-OK' "$phase.log"
     grep -Fxq 'USOCKET-LOOPBACK-FIXTURE-OK' "$phase.log"
 done
@@ -25,15 +25,15 @@ if grep -qi 'compiling file' cached.log; then
     echo "Cached load unexpectedly compiled source; see $work/cached.log" >&2
     exit 1
 fi
-if [[ ${TORCL_PORT_STRESS:-0} == 1 ]]; then
-    TORCL_GC_STRESS=1000 TORCL_GC_POISON=1 TORCL_GC_VERIFY=1 USOCKET_TEST_TIMEOUT=330 \
-        "$repo/scripts/torcl-limited.sh" python3 "$fixture" \
-        "$torcl" --no-init --load check.lisp >stress.log 2>&1
+if [[ ${EGCL_PORT_STRESS:-0} == 1 ]]; then
+    EGCL_GC_STRESS=1000 EGCL_GC_POISON=1 EGCL_GC_VERIFY=1 USOCKET_TEST_TIMEOUT=330 \
+        "$repo/scripts/egcl-limited.sh" python3 "$fixture" \
+        "$egcl" --no-init --load check.lisp >stress.log 2>&1
     grep -Fxq 'USOCKET-NATIVE-CLIENT-OK' stress.log
     grep -Fxq 'USOCKET-LOOPBACK-FIXTURE-OK' stress.log
 fi
 if [[ -n ${SBCL_BIN:-} ]]; then
-    TORCL_PORT_CACHE="$work/sbcl-cache/" "$repo/scripts/torcl-limited.sh" \
+    EGCL_PORT_CACHE="$work/sbcl-cache/" "$repo/scripts/egcl-limited.sh" \
         python3 "$fixture" "$SBCL_BIN" --noinform --no-sysinit --no-userinit \
         --non-interactive --load check.lisp >sbcl.log 2>&1
     grep -Fxq 'USOCKET-NATIVE-CLIENT-OK' sbcl.log

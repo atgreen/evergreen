@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/torcl-rt",
-    "crates/torcl-compiler",
-    "crates/torcl-stdlib",
-    "crates/torcl",
-    "crates/torcl-delivery-macros",
+    "crates/egcl-rt",
+    "crates/egcl-compiler",
+    "crates/egcl-stdlib",
+    "crates/egcl",
+    "crates/egcl-delivery-macros",
     # The Android NativeActivity shim. Declared rlib so the default musl target
     # can build it; the .so is produced with `cargo rustc --crate-type cdylib`
     # for an Android target (bliss-w2vp).
-    "crates/torcl-android",
+    "crates/egcl-android",
     "tools/gc-root-lint",
 ]
 
@@ -20,9 +20,9 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
-torcl-rt = { path = "crates/torcl-rt" }
-torcl-compiler = { path = "crates/torcl-compiler" }
-torcl-stdlib = { path = "crates/torcl-stdlib" }
+egcl-rt = { path = "crates/egcl-rt" }
+egcl-compiler = { path = "crates/egcl-compiler" }
+egcl-stdlib = { path = "crates/egcl-stdlib" }
 
 [profile.test]
 opt-level = 3
@@ -36,8 +36,8 @@ codegen-units = 1
 
 # The DEV profile must optimize the same crates the TEST profile does, or the
 # two cargo subcommands produce measurably different binaries at the SAME path
-# (target/<target>/debug/torcl) and whichever ran last silently decides how
-# fast it is. torcl-rt, torcl-stdlib and torcl-compiler hold the GC, the sequence
+# (target/<target>/debug/egcl) and whichever ran last silently decides how
+# fast it is. egcl-rt, egcl-stdlib and egcl-compiler hold the GC, the sequence
 # library and the lowerer -- most of the hot code -- so leaving them at
 # opt-level 0 under `cargo build` while `cargo test` built them at 3 made the
 # same source run ~8x slower:
@@ -53,16 +53,16 @@ codegen-units = 1
 # was invalid because the snapshots compared had been built by different
 # commands (bliss-em8x).
 #
-# Optimizing torcl alone -- the one package that is NOT the bottleneck --
+# Optimizing egcl alone -- the one package that is NOT the bottleneck --
 # was the original override and is kept for consistency.
-[profile.dev.package.torcl]
+[profile.dev.package.egcl]
 opt-level = 2
 
-[profile.dev.package.torcl-rt]
+[profile.dev.package.egcl-rt]
 opt-level = 2
 
-[profile.dev.package.torcl-stdlib]
+[profile.dev.package.egcl-stdlib]
 opt-level = 2
 
-[profile.dev.package.torcl-compiler]
+[profile.dev.package.egcl-compiler]
 opt-level = 2

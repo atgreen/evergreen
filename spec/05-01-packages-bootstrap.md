@@ -2,7 +2,7 @@
 
 ## §5.1.0  Scope
 
-This section specifies the TorCL package registry, symbol tables, locking
+This section specifies the EGCL package registry, symbol tables, locking
 protocol, iteration protocol, package-local nicknames, and conduit packages.
 It covers data structures D5.02–D5.12, requirements R5.51–R5.58, and
 algorithms A5.01–A5.04.
@@ -19,8 +19,8 @@ algorithms A5.01–A5.04.
 | R5.54 | Lock acquisition MUST follow a total ordering (§5.1.5) to prevent deadlock when operations span multiple packages (e.g., `USE-PACKAGE`, `IMPORT`). | MUST |
 | R5.55 | Symbol table lookup MUST complete in amortised O(1) time using open-addressing hashing (§5.1.4). | MUST |
 | R5.56 | `DO-SYMBOLS`, `DO-EXTERNAL-SYMBOLS`, `DO-ALL-SYMBOLS` MUST iterate without holding write locks and MUST tolerate concurrent insertions (may or may not see them) but MUST NOT crash or return garbage. | MUST |
-| R5.57 | TorCL MUST implement package-local nicknames (PLN) per SBCL `sb-ext:add-package-local-nickname` semantics (§5.1.6). | MUST |
-| R5.58 | TorCL SHOULD support conduit packages — packages that re-export symbols from other packages without owning them — as a TorCL extension. | SHOULD |
+| R5.57 | EGCL MUST implement package-local nicknames (PLN) per SBCL `sb-ext:add-package-local-nickname` semantics (§5.1.6). | MUST |
+| R5.58 | EGCL SHOULD support conduit packages — packages that re-export symbols from other packages without owning them — as a EGCL extension. | SHOULD |
 
 ---
 
@@ -102,7 +102,7 @@ pub struct Package {
 
 Symbols are heap-allocated objects (tag `010`, §1).  Fields: `name: Box<str>`
 (immutable), `package: AtomicPtr<Package>` (home package, NULL if uninterned),
-`value: AtomicU64`, `function: AtomicU64`, `plist: RwLock<TorclVal>`,
+`value: AtomicU64`, `function: AtomicU64`, `plist: RwLock<EgclVal>`,
 `flags: AtomicU8` (CONSTANT_P, SPECIAL_P, MACRO_P bits).  The `package`
 pointer is mutated only by `INTERN`/`UNINTERN` under the owning package's
 write lock.
@@ -192,7 +192,7 @@ needed (re-checks for races after upgrade).
 Each package carries a `local_nicknames` map (D5.03) that provides
 private aliases visible only when that package is `*PACKAGE*`.
 
-### API (TorCL extension, exported from `TORCL-EXT`)
+### API (EGCL extension, exported from `EGCL-EXT`)
 
 | Function | Signature | Behaviour |
 |----------|-----------|-----------|
@@ -209,7 +209,7 @@ global canonical names and global nicknames.
 
 ---
 
-## §5.1.7  Conduit Packages (R5.58, TorCL Extension)
+## §5.1.7  Conduit Packages (R5.58, EGCL Extension)
 
 A **conduit package** is a convenience that re-exports all external
 symbols of designated source packages.  It owns no symbols itself.
@@ -217,7 +217,7 @@ symbols of designated source packages.  It owns no symbols itself.
 ### `DEFCONDUIT` Macro
 
 ```lisp
-(torcl-ext:defconduit :my-api
+(egcl-ext:defconduit :my-api
   (:use)
   (:extends :package-a :package-b))
 ```
@@ -225,7 +225,7 @@ symbols of designated source packages.  It owns no symbols itself.
 Expands to `DEFPACKAGE` with empty `:use`, then imports and re-exports
 all external symbols from each `:extends` package.  The conduit records
 its source packages (`conduit_sources: Option<Vec<Arc<Package>>>` in
-D5.03) so `TORCL-EXT:REFRESH-CONDUIT` can re-synchronise.
+D5.03) so `EGCL-EXT:REFRESH-CONDUIT` can re-synchronise.
 
 ---
 
@@ -256,9 +256,9 @@ SHOULD be tolerated.
 
 | Knob | Default | Description |
 |------|---------|-------------|
-| `TORCL_PKG_INITIAL_CAPACITY` | 64 | Initial slot count for new `SymbolTable`. |
-| `TORCL_PKG_LOAD_FACTOR` | 75 | Percent load factor triggering rehash. |
-| `TORCL_PKG_TOMBSTONE_RATIO` | 25 | Percent tombstone ratio triggering compaction. |
+| `EGCL_PKG_INITIAL_CAPACITY` | 64 | Initial slot count for new `SymbolTable`. |
+| `EGCL_PKG_LOAD_FACTOR` | 75 | Percent load factor triggering rehash. |
+| `EGCL_PKG_TOMBSTONE_RATIO` | 25 | Percent tombstone ratio triggering compaction. |
 
 ---
 
@@ -291,7 +291,7 @@ paths, and bootstrap self-test assertions.  Requirements R5.59–R5.65.
 |----|-----|-------|
 | R5.59 | The Rust runtime MUST provide a minimal set of primitive functions (§5.2.3) sufficient to load and execute `lib/boot.lisp`. | MUST |
 | R5.60 | `boot.lisp` MUST be loadable by the Rust reader and evaluable by the tree-walk interpreter (Tier 0) without requiring any CL code to be pre-loaded. | MUST |
-| R5.61 | The bootstrap sequence MUST create the `COMMON-LISP`, `COMMON-LISP-USER`, `KEYWORD`, and `TORCL-INTERNAL` packages before loading any CL source. | MUST |
+| R5.61 | The bootstrap sequence MUST create the `COMMON-LISP`, `COMMON-LISP-USER`, `KEYWORD`, and `EGCL-INTERNAL` packages before loading any CL source. | MUST |
 | R5.62 | Cold start (no image) MUST complete in < 100 ms on a 2020-era x86-64 machine with SSD. | MUST |
 | R5.63 | Warm start (image resume) MUST complete in < 20 ms by memory-mapping the `.bimg` file and performing pointer relocation without re-executing `boot.lisp`. | MUST |
 | R5.64 | Bootstrap MUST run a self-test assertion suite (§5.2.7) before entering the REPL or executing user code.  Failure MUST abort with a diagnostic message and exit code 70 (`EX_SOFTWARE`). | MUST |
@@ -318,9 +318,9 @@ Created in step 4 (cold start), in this order:
 |-------|---------|-----------|----------|-------|
 | 1 | `KEYWORD` | — | — | Home for keyword symbols. |
 | 2 | `COMMON-LISP` | `CL` | — | ANSI symbols interned by Rust. |
-| 3 | `TORCL-INTERNAL` | `BI` | `CL` | Runtime internals, not exported to users. |
-| 4 | `TORCL-EXT` | — | `CL` | TorCL extensions (PLN, conduits, etc.). |
-| 5 | `COMMON-LISP-USER` | `CL-USER` | `CL`, `TORCL-EXT` | Default user package. |
+| 3 | `EGCL-INTERNAL` | `BI` | `CL` | Runtime internals, not exported to users. |
+| 4 | `EGCL-EXT` | — | `CL` | EGCL extensions (PLN, conduits, etc.). |
+| 5 | `COMMON-LISP-USER` | `CL-USER` | `CL`, `EGCL-EXT` | Default user package. |
 
 `COMMON-LISP` MUST have all 978 ANSI external symbols interned and
 exported before any CL loads.  Unimplemented symbols are created unbound.
@@ -330,7 +330,7 @@ exported before any CL loads.  Unimplemented symbols are created unbound.
 ## §5.2.3  Phase 1 Primitive Functions
 
 Phase 1 primitives are Rust functions exposed as CL function objects in
-the `COMMON-LISP` or `TORCL-INTERNAL` package.  They are the minimal
+the `COMMON-LISP` or `EGCL-INTERNAL` package.  They are the minimal
 set needed to execute `boot.lisp`.
 
 ### D5.10 — PrimitiveFn
@@ -343,7 +343,7 @@ pub struct PrimitiveFn {
     min_args: u16,
     max_args: u16,
     /// The Rust implementation.
-    func: fn(args: &[TorclVal], env: &Environment) -> Result<TorclVal, TorclError>,
+    func: fn(args: &[EgclVal], env: &Environment) -> Result<EgclVal, EgclError>,
 }
 ```
 
@@ -382,7 +382,7 @@ load sub-files (e.g., per-section or platform-specific files).  Semantics
 match `A5.05` (Rust-side read/eval loop), restricted to `:direction :input`.
 `LOAD` is registered in `CL` alongside the Phase 1 primitives.
 
-**TORCL-INTERNAL primitives** (package `BI`):
+**EGCL-INTERNAL primitives** (package `BI`):
 
 | Symbol | Contract |
 |--------|----------|
@@ -390,7 +390,7 @@ match `A5.05` (Rust-side read/eval loop), restricted to `:direction :input`.
 | `%SET-SYMBOL-VALUE` | Low-level write to value cell. |
 | `%MAKE-CLOSURE` | Wrap code pointer + environment vector into closure. |
 | `%ALLOCATE-VECTOR` | Raw vector allocation (element-type, length). |
-| `%TYPEP-TAG` | Return tag bits (0–7) of a `TorclVal`. |
+| `%TYPEP-TAG` | Return tag bits (0–7) of a `EgclVal`. |
 | `%GC-COLLECT` | Force GC (`:full t` for full collection). |
 
 ---
@@ -400,7 +400,7 @@ match `A5.05` (Rust-side read/eval loop), restricted to `:direction :input`.
 ### A5.05 — Boot Load Algorithm
 
 Locate `lib/boot.lisp` relative to the executable; exit 72 if missing.
-Open stream, bind `*PACKAGE*` to `TORCL-INTERNAL`.  Loop: `READ` a form
+Open stream, bind `*PACKAGE*` to `EGCL-INTERNAL`.  Loop: `READ` a form
 (with EOF sentinel); `EVAL` it.  On error: report with stream position,
 invoke `SKIP-FORM` restart in dev mode or exit 70 in strict mode.
 Close stream on completion or fatal error.
@@ -489,7 +489,7 @@ the runtime executes a battery of self-test assertions.
 Self-tests are a table of `(expression-string, expected-printed-result)`
 pairs (~30 entries).  `rust_read_from_string` → `eval` → `print_to_string`;
 compare against expected.  On mismatch: print expression, expected, and
-actual to stderr, return `Err(TorclError::BootstrapFailure)` → exit 70.
+actual to stderr, return `Err(EgclError::BootstrapFailure)` → exit 70.
 
 ---
 
@@ -532,11 +532,11 @@ Bootstrap is **single-threaded** — worker pool starts only after
 
 | Knob | Default | Description |
 |------|---------|-------------|
-| `--image PATH` | `torcl.bimg` | Image file for warm start. |
+| `--image PATH` | `egcl.bimg` | Image file for warm start. |
 | `--no-image` | — | Force cold start. |
 | `--strict-boot` | On (release) | Fatal on any boot error. |
 | `--boot-file PATH` | `lib/boot.lisp` | Override boot.lisp path. |
-| `TORCL_BOOT_TRACE` | `0` | Print each form before eval if `1`. |
+| `EGCL_BOOT_TRACE` | `0` | Print each form before eval if `1`. |
 
 ## §5.2.11  Test Strategy
 

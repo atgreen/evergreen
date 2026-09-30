@@ -21,5 +21,5 @@ def cli_help(source):
 def on_page_markdown(markdown, page, config, files):
     if MARKER not in markdown:
         return markdown
-    help_text = cli_help((ROOT / 'crates/torcl/src/cli.rs').read_text())
+    help_text = cli_help((ROOT / 'crates/egcl/src/cli.rs').read_text())
     return markdown.replace(MARKER, '```text\n' + help_text + '```')

@@ -8,18 +8,18 @@ import subprocess
 import tempfile
 import unittest
 
-SOURCE = Path(__file__).with_name('torcl-cross')
+SOURCE = Path(__file__).with_name('egcl-cross')
 
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='torcl launcher ')
+        self.tmp = tempfile.TemporaryDirectory(prefix='egcl launcher ')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.env = dict(os.environ, PATH=f'{self.bin}:/usr/bin:/bin',
-                        TORCL_CROSS_ROOT=str(self.root / 'targets'),
+                        EGCL_CROSS_ROOT=str(self.root / 'targets'),
                         XDG_DATA_HOME=str(self.root / 'data'),
                         RECORD=str(self.root / 'record'))
         self.env.pop('WINEPREFIX', None)
@@ -31,13 +31,13 @@ class LauncherTests(unittest.TestCase):
             path.chmod(0o755)
 
     def run_target(self, target, args=(), present=True):
-        launcher = self.bin / f'torcl-{target}'
+        launcher = self.bin / f'egcl-{target}'
         shutil.copyfile(SOURCE, launcher)
         launcher.chmod(0o755)
         directory = self.root / 'targets' / target
         directory.mkdir(parents=True)
         if present:
-            (directory / ('torcl.exe' if target == 'windows' else 'torcl')).touch()
+            (directory / ('egcl.exe' if target == 'windows' else 'egcl')).touch()
         return subprocess.run([str(launcher), *args], env=self.env,
                               text=True, capture_output=True)
 
@@ -51,7 +51,7 @@ class LauncherTests(unittest.TestCase):
                 argv, _ = json.loads((self.root / 'record').read_text())
                 base = self.root / 'targets' / target
                 self.assertEqual(argv, [str(self.bin / emulator), '-L',
-                                        str(base / 'sysroot'), str(base / 'torcl'), *args])
+                                        str(base / 'sysroot'), str(base / 'egcl'), *args])
 
     def test_android_static_needs_no_sysroot(self):
         result = self.run_target('android', ['--eval', '(+ 1 2)'])
@@ -64,8 +64,8 @@ class LauncherTests(unittest.TestCase):
         result = self.run_target('windows')
         self.assertEqual(result.returncode, 0, result.stderr)
         argv, prefix = json.loads((self.root / 'record').read_text())
-        self.assertTrue(argv[1].endswith('/windows/torcl.exe'))
-        self.assertEqual(prefix, str(self.root / 'data/torcl/wine'))
+        self.assertTrue(argv[1].endswith('/windows/egcl.exe'))
+        self.assertEqual(prefix, str(self.root / 'data/egcl/wine'))
 
     def test_windows_respects_explicit_prefix(self):
         self.env['WINEPREFIX'] = str(self.root / 'custom wine')

@@ -16,11 +16,11 @@ class NativeContentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / 'source'
-            system = source / 'lib/torcl-jvm'
+            system = source / 'lib/egcl-jvm'
             (system / 'build').mkdir(parents=True)
-            for name in ('torcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp'):
+            for name in ('egcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp'):
                 (system / name).write_text(name)
-            (system / 'build/libtorcl_jvm.so').write_bytes(b'native bridge')
+            (system / 'build/libegcl_jvm.so').write_bytes(b'native bridge')
             (system / 'Makefile').write_text('must not ship')
             (system / 'native.c').write_text('must not ship')
             manual = root / 'manual'
@@ -31,16 +31,16 @@ class NativeContentTests(unittest.TestCase):
             (manual / 'assets/local.css').write_text('local assets')
             stage = root / 'stage'
             content.install(source, manual, stage, libdir='/usr/lib64', datadir='/usr/share', docdir='/usr/share/doc')
-            installed = stage / 'usr/share/common-lisp/source/torcl-jvm'
+            installed = stage / 'usr/share/common-lisp/source/egcl-jvm'
             self.assertEqual({p.name for p in installed.iterdir()},
-                             {'torcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp', 'libtorcl_jvm.so'})
-            self.assertTrue((installed / 'libtorcl_jvm.so').is_symlink())
-            self.assertFalse((installed / 'libtorcl_jvm.so').readlink().is_absolute())
+                             {'egcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp', 'libegcl_jvm.so'})
+            self.assertTrue((installed / 'libegcl_jvm.so').is_symlink())
+            self.assertFalse((installed / 'libegcl_jvm.so').readlink().is_absolute())
             relocated = root / 'extracted'
             stage.rename(relocated)
-            self.assertEqual((relocated / 'usr/share/common-lisp/source/torcl-jvm/libtorcl_jvm.so').read_bytes(), b'native bridge')
-            self.assertEqual((relocated / 'usr/share/doc/torcl/manual/java/index.html').read_text(), 'Java API')
-            self.assertTrue((relocated / 'usr/share/doc/torcl/manual/assets/local.css').is_file())
+            self.assertEqual((relocated / 'usr/share/common-lisp/source/egcl-jvm/libegcl_jvm.so').read_bytes(), b'native bridge')
+            self.assertEqual((relocated / 'usr/share/doc/egcl/manual/java/index.html').read_text(), 'Java API')
+            self.assertTrue((relocated / 'usr/share/doc/egcl/manual/assets/local.css').is_file())
 
 
 if __name__ == '__main__':

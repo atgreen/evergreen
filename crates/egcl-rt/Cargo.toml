@@ -1,0 +1,48 @@
+[package]
+name = "egcl-rt"
+description = "EGCL Common Lisp runtime: object model, GC, threads, FFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# On x86-64, internal OS services use direct syscalls (src/syscall.rs), and
+# libc is optional for dlopen-based C-ABI FFI. Other Linux architectures use
+# libc's ABI wrappers below. The default x86-64 musl build remains fully static.
+libc = { version = "0.2", optional = true }
+
+# The static ELF loader currently supports neither POWER nor IBM Z. These
+# targets use the system dynamic loader; their Linux ABI wrappers also use libc.
+[target.'cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+elf_loader = { version = "0.16", default-features = false, features = ["use-syscall", "version", "tls"] }
+
+[target.'cfg(not(target_arch = "x86_64"))'.dependencies]
+libc = "0.2"
+
+# The macOS/BSD kqueue I/O poller still uses libc; keep it available off-Linux.
+# (On Linux the poller uses epoll via direct syscalls, so no libc is needed.)
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+# C-ABI FFI: dlopen-based foreign-library loading. Requires a dynamic loader, so
+# it is incompatible with a fully static executable — off by default.
+c-ffi = ["dep:libc"]
+# Embedded CPython (spec 2.7.8). Resolved through the foreign-library loader
+# rather than linked, so it needs c-ffi and a target whose loader can open
+# libpython -- which in practice means glibc, not the default static musl.
+python = ["c-ffi"]
+
+[dev-dependencies]
+# Tests exercise runtime self-hosting by calling libc directly (raise a signal,
+# build a pipe for fiber I/O, etc.). This is test-only and does not make the
+# library depend on libc.
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Networking_WinSock"] }

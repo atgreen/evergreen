@@ -1,4 +1,4 @@
-#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "0" t)
+#+egcl (egcl-ext:setenv "EGCL_NATIVE_TRANSFER" "0" t)
 (declaim (optimize (speed 3) (safety 1) (debug 0)))
 (defun exceptional-kernel (x)
   (if (zerop (mod x 97))
@@ -25,29 +25,29 @@
     (dotimes (i 2000 sum)
       (incf sum (exceptional-call i)))))
 
-#+torcl (torcl-ext:setenv "TORCL_NATIVE_TRANSFER" "1" t)
+#+egcl (egcl-ext:setenv "EGCL_NATIVE_TRANSFER" "1" t)
 (bench-validate)
 (bench-train)
 (dotimes (warmup 3) (unless (= (bench-workload) 1978630) (error "Warmup checksum failed")))
 
-#+torcl
+#+egcl
 (defun bench-report-tiers (phase)
-  (format t "BENCH-TIER ~a BENCH-WORKLOAD ~d ~d ~d ~d~%" phase (torcl-ext:function-tier 'bench-workload) (torcl-ext:function-invoke-count 'bench-workload) (torcl-ext:function-back-edge-count 'bench-workload) (torcl-ext:function-osr-count 'bench-workload)))
-#+torcl
+  (format t "BENCH-TIER ~a BENCH-WORKLOAD ~d ~d ~d ~d~%" phase (egcl-ext:function-tier 'bench-workload) (egcl-ext:function-invoke-count 'bench-workload) (egcl-ext:function-back-edge-count 'bench-workload) (egcl-ext:function-osr-count 'bench-workload)))
+#+egcl
 (progn
   (dotimes (attempt 1000)
-    (when (and (eql 2 (torcl-ext:function-tier 'bench-workload))) (return))
+    (when (and (eql 2 (egcl-ext:function-tier 'bench-workload))) (return))
     (sleep 0.01))
-  (unless (and (eql 2 (torcl-ext:function-tier 'bench-workload))) (error "Timed functions did not reach T2"))
+  (unless (and (eql 2 (egcl-ext:function-tier 'bench-workload))) (error "Timed functions did not reach T2"))
   (bench-report-tiers "before"))
 
-(let* ((deopts-before #+torcl (torcl-ext:deopt-count) #-torcl 0)
+(let* ((deopts-before #+egcl (egcl-ext:deopt-count) #-egcl 0)
        (start (get-internal-real-time))
        (value (let ((value nil))
                 (dotimes (repeat 100 value)
                   (setf value (bench-workload)))))
        (end (get-internal-real-time))
-       (deopts-after #+torcl (torcl-ext:deopt-count) #-torcl 0))
+       (deopts-after #+egcl (egcl-ext:deopt-count) #-egcl 0))
   (format t "BENCH ~d ~d ~d~%" (- end start) internal-time-units-per-second value)
   (format t "BENCH-DEOPTS ~d~%" (- deopts-after deopts-before)))
-#+torcl (bench-report-tiers "after")
+#+egcl (bench-report-tiers "after")

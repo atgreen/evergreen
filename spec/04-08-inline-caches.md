@@ -2,7 +2,7 @@
 
 Inline caches (ICs) accelerate polymorphic operations — generic function
 dispatch, type checks, slot access, and arithmetic — by caching the result
-of a slow lookup directly at the call site in emitted code.  TorCL follows
+of a slow lookup directly at the call site in emitted code.  EGCL follows
 the HotSpot model: every call site that performs a dynamic lookup is backed
 by an IC that transitions through monomorphic → polymorphic → megamorphic
 states, and is atomically patchable without stopping the world.
@@ -269,7 +269,7 @@ When a generic function call site is monomorphic (single receiver class):
 
 ```asm
 ; x86-64 monomorphic GF IC stub
-; rdi = receiver (TorclVal, tag = 010 heap object)
+; rdi = receiver (EgclVal, tag = 010 heap object)
   mov   rax, [rdi - 2]          ; load object header (subtract heap tag)
   mov   rax, [rax + 8]          ; load class pointer from header
   cmp   rax, QWORD [rip + ic_guard]  ; compare against cached class
@@ -542,7 +542,7 @@ optimisation and developer tooling.
 
 | Counter | Type | Updated By |
 |---------|------|-----------|
-| `hit_count` | `AtomicU32` | Profiling subsystem (§4.9): sampled periodically via timer-based profiling interrupts, NOT incremented on every fast-path hit.  When `TORCL_IC_STATS_ENABLED` is `false`, hit counting is disabled entirely. |
+| `hit_count` | `AtomicU32` | Profiling subsystem (§4.9): sampled periodically via timer-based profiling interrupts, NOT incremented on every fast-path hit.  When `EGCL_IC_STATS_ENABLED` is `false`, hit counting is disabled entirely. |
 | `miss_count` | `AtomicU32` | `ic_miss` handler (always incremented; miss path is already slow). |
 
 ### Aggregate Metrics
@@ -562,7 +562,7 @@ maintains:
 
 ```lisp
 ;; Retrieve IC statistics for a function.
-(torcl-ext:function-ic-stats #'my-generic-function)
+(egcl-ext:function-ic-stats #'my-generic-function)
 ;; => (:sites 12
 ;;     :monomorphic 9
 ;;     :polymorphic 2
@@ -572,7 +572,7 @@ maintains:
 ;;     :miss-rate 0.000031)
 
 ;; Dump all megamorphic IC sites (for performance debugging).
-(torcl-ext:dump-megamorphic-ics :stream *trace-output*)
+(egcl-ext:dump-megamorphic-ics :stream *trace-output*)
 ```
 
 ### Tier Promotion Feedback
@@ -667,15 +667,15 @@ When the dispatch table is resized:
 
 | Knob | Type | Default | Description |
 |------|------|---------|-------------|
-| `TORCL_IC_MAX_POLY` | `usize` | 8 | Maximum polymorphic entries before megamorphic transition |
-| `TORCL_IC_SPECULATE_THRESHOLD` | `u32` | 10,000 | Minimum hit count for type-check elimination |
-| `TORCL_IC_HASH_INITIAL_CAPACITY` | `usize` | 32 | Initial capacity of megamorphic dispatch hash table |
-| `TORCL_IC_HASH_MAX_PROBE` | `usize` | 8 | Maximum linear probe length |
-| `TORCL_IC_STATS_ENABLED` | `bool` | `true` | Enable per-site hit/miss counters (disable for minimal overhead) |
-| `TORCL_IC_EPOCH_INVALIDATION` | `bool` | `true` | Use epoch-based bulk invalidation |
+| `EGCL_IC_MAX_POLY` | `usize` | 8 | Maximum polymorphic entries before megamorphic transition |
+| `EGCL_IC_SPECULATE_THRESHOLD` | `u32` | 10,000 | Minimum hit count for type-check elimination |
+| `EGCL_IC_HASH_INITIAL_CAPACITY` | `usize` | 32 | Initial capacity of megamorphic dispatch hash table |
+| `EGCL_IC_HASH_MAX_PROBE` | `usize` | 8 | Maximum linear probe length |
+| `EGCL_IC_STATS_ENABLED` | `bool` | `true` | Enable per-site hit/miss counters (disable for minimal overhead) |
+| `EGCL_IC_EPOCH_INVALIDATION` | `bool` | `true` | Use epoch-based bulk invalidation |
 
 All knobs are settable via environment variables or the runtime
-configuration API (`torcl-ext:set-runtime-option`).
+configuration API (`egcl-ext:set-runtime-option`).
 
 ---
 

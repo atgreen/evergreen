@@ -105,7 +105,7 @@ their ancestors' slots and add none of their own.
 ### D5.10 — HandlerCluster
 
 A handler cluster groups the handlers from a single `HANDLER-BIND` form.
-Clusters are allocated on the TorCL control stack (not the heap) as a
+Clusters are allocated on the EGCL control stack (not the heap) as a
 fixed-size frame.
 
 ```rust
@@ -123,10 +123,10 @@ struct HandlerCluster {
 
 #[repr(C)]
 struct HandlerEntry {
-    /// The condition type specifier (a class object pointer / TorclVal).
-    type_spec: TorclVal,
-    /// The handler function (a TorclVal pointing to a closure or compiled fn).
-    handler_fn: TorclVal,
+    /// The condition type specifier (a class object pointer / EgclVal).
+    type_spec: EgclVal,
+    /// The handler function (a EgclVal pointing to a closure or compiled fn).
+    handler_fn: EgclVal,
 }
 ```
 
@@ -152,24 +152,24 @@ struct RestartCluster {
 #[repr(C)]
 struct RestartEntry {
     /// Restart name (symbol) or NIL for anonymous restarts.
-    name: TorclVal,
+    name: EgclVal,
     /// The restart function.
-    function: TorclVal,
+    function: EgclVal,
     /// :interactive function (or NIL).
-    interactive_fn: TorclVal,
-    /// :report function (or NIL, or a format string TorclVal).
-    report_fn: TorclVal,
+    interactive_fn: EgclVal,
+    /// :report function (or NIL, or a format string EgclVal).
+    report_fn: EgclVal,
     /// :test function (or NIL, meaning always applicable).
-    test_fn: TorclVal,
+    test_fn: EgclVal,
     /// The condition this restart is associated with (or NIL for general).
-    associated_condition: TorclVal,
+    associated_condition: EgclVal,
 }
 ```
 
 ### D5.12 — ThreadConditionState
 
 Each thread (see §2) maintains its own condition-system state. This structure
-is part of the `TorclThread` object (§2).
+is part of the `EgclThread` object (§2).
 
 ```rust
 struct ThreadConditionState {
@@ -178,7 +178,7 @@ struct ThreadConditionState {
     /// Top of the restart cluster stack.
     restart_stack: *const RestartCluster,
     /// Current *debugger-hook* value for this thread.
-    debugger_hook: TorclVal,
+    debugger_hook: EgclVal,
 }
 ```
 
@@ -200,7 +200,7 @@ the GC or allocator detects OOM, one of these is signalled instead of attempting
 allocation.
 
 **Thread-locality (rather than a single process-wide `static`).** CLOS instance
-identity in TorCL is thread-local (the live-instance registry is per-thread), so
+identity in EGCL is thread-local (the live-instance registry is per-thread), so
 an instance created on one thread cannot be safely inspected — `class_of`,
 condition-type matching — from another. Each thread therefore pre-allocates its
 own pool against its own condition classes. This is also what lets a pooled
@@ -219,7 +219,7 @@ slot 0 (shared) so the storage path can always produce a condition to signal.
 The acquire and release paths take no lock that could block or allocate behind
 the already-failing allocator.
 
-**Design decision (bliss-7z8): pool-first, with guard-page detection.** TorCL
+**Design decision (bliss-7z8): pool-first, with guard-page detection.** EGCL
 keeps the pre-allocated object pool as the normative R5.110 mechanism rather
 than adopting an SBCL-style reserve-only model. The pool gives the one property
 the storage-failure path cannot fake: producing a signallable
@@ -228,16 +228,16 @@ definition, and no contended lock after memory is already exhausted. Reserve
 headroom remains useful as a detection and recovery aid, but it is not the
 condition-construction contract.
 
-| Model | Strength | Weakness | TorCL decision |
+| Model | Strength | Weakness | EGCL decision |
 |-------|----------|----------|----------------|
 | Pool-only | The failure path is small, deterministic, and allocation-free. | Pooled instances carry minimal detail and must be pinned/thread-local. | Kept as the required last-resort payload for heap exhaustion and stack overflow. |
 | Reserve-only | Normal condition construction can carry rich, freshly allocated diagnostic data. | Requires careful reserve sizing, disarm/re-arm discipline, and can still fail if the reserve path allocates unexpectedly. | Rejected as the normative contract for R5.110. |
 | Hybrid | Guard pages or reserved headroom detect/contain the failure, while a canned condition handles the no-allocation edge. | More moving parts than the pool alone. | Adopted only for detection: stack guards and stack-capacity checks may report overflow, but signalling still uses the pool. |
 
-For stack overflow, TorCL may borrow the guard-page part of the reserve model:
+For stack overflow, EGCL may borrow the guard-page part of the reserve model:
 the stack implementation can reserve an inaccessible guard page or maintain a
 checked stack-capacity boundary, and the runtime maps that event to
-`TorclError::StackOverflow`. The condition system must then acquire from
+`EgclError::StackOverflow`. The condition system must then acquire from
 `STORAGE_POOL`; it must not attempt to allocate a fresh `STORAGE-CONDITION`
 inside the overflow handler. For heap exhaustion, any future allocator
 headroom/watermark may be used to finish unwinding, logging, or cleanup, but the
@@ -504,7 +504,7 @@ that point). This is standard dynamic-extent semantics.
   restrictions enforced at class finalization time:
   - No `:default-initargs` for `MAKE-CONDITION`.
   - Slot access MUST go through defined accessors; `SLOT-VALUE` on condition
-    slots is unspecified (per ANSI) but TorCL permits it as an extension.
+    slots is unspecified (per ANSI) but EGCL permits it as an extension.
   - Multiple inheritance is allowed (e.g., `SIMPLE-TYPE-ERROR` inherits
     both `SIMPLE-CONDITION` and `TYPE-ERROR`).
 - `DEFINE-CONDITION` is a macro that expands to `DEFCLASS` with
@@ -526,7 +526,7 @@ The `coerce-to-condition` helper (used by `SIGNAL`, `ERROR`, etc.) converts:
 
 ## 5.4.7 Thread-Local Handler and Restart Stacks (R5.108)
 
-Each TorCL thread (§2) maintains independent handler and restart stacks
+Each EGCL thread (§2) maintains independent handler and restart stacks
 via `ThreadConditionState` (D5.12). There is no sharing of handler or
 restart registrations between threads.
 
@@ -534,7 +534,7 @@ restart registrations between threads.
 The creating thread's handlers/restarts are NOT inherited.
 
 **Thread-local binding:** The handler/restart stack pointers are stored in
-the `TorclThread` structure, accessed via a thread-local pointer (TLS on
+the `EgclThread` structure, accessed via a thread-local pointer (TLS on
 the platform level). This avoids any locking on handler establishment or
 search.
 
@@ -602,8 +602,8 @@ bind its own debugger hook independently.
 
 | Knob | Default | Description |
 |------|---------|-------------|
-| `TORCL_MAX_HANDLER_DEPTH` | 1024 | Maximum handler cluster nesting depth before signalling `CONTROL-ERROR` (stack overflow guard). |
-| `TORCL_STORAGE_CONDITION_POOL_SIZE` | 4 | Number of pre-allocated `STORAGE-CONDITION` instances. |
+| `EGCL_MAX_HANDLER_DEPTH` | 1024 | Maximum handler cluster nesting depth before signalling `CONTROL-ERROR` (stack overflow guard). |
+| `EGCL_STORAGE_CONDITION_POOL_SIZE` | 4 | Number of pre-allocated `STORAGE-CONDITION` instances. |
 | `*DEBUGGER-HOOK*` | `NIL` | Per-thread; user-settable hook before default debugger. |
 | `*BREAK-ON-SIGNALS*` | `NIL` | Type specifier; matching signals enter debugger before handler search. |
 

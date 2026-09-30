@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""spec-coverage.py — staged requirement traceability gate for TorCL.
+"""spec-coverage.py — staged requirement traceability gate for EGCL.
 
 Enumerates the normative requirements declared in ``spec/`` (both markdown
 table rows of the form ``| R6.45 | ... | MUST |`` and prose entries of the
@@ -31,7 +31,7 @@ Usage:
     python3 scripts/spec-coverage.py --repo DIR # repo root (default: cwd)
 
 The current stage defaults to spec/stages.json's ``current_stage``, overridable
-by ``--stage`` or the ``TORCL_STAGE`` env var. If stages.json is absent the tool
+by ``--stage`` or the ``EGCL_STAGE`` env var. If stages.json is absent the tool
 falls back to legacy behavior (every MUST is in scope).
 
 Do NOT delete: this is the traceability tool invoked by bureau's verify gate.
@@ -161,7 +161,7 @@ def main() -> int:
     ap.add_argument("--gate", action="store_true",
                     help="exit non-zero if an in-scope MUST requirement is uncovered")
     ap.add_argument("--stage", type=int, default=None,
-                    help="override current stage (default: spec/stages.json or $TORCL_STAGE)")
+                    help="override current stage (default: spec/stages.json or $EGCL_STAGE)")
     ap.add_argument("--all", action="store_true",
                     help="ignore staging; gate the entire spec (legacy behavior)")
     args = ap.parse_args()
@@ -173,14 +173,14 @@ def main() -> int:
         return 2
 
     manifest_stage, file_stage, stage_defs = load_stages(spec_dir)
-    # Resolve the current stage: --stage > $TORCL_STAGE > stages.json.
+    # Resolve the current stage: --stage > $EGCL_STAGE > stages.json.
     current_stage: int | None
     if args.all:
         current_stage = None
     elif args.stage is not None:
         current_stage = args.stage
-    elif os.environ.get("TORCL_STAGE"):
-        current_stage = int(os.environ["TORCL_STAGE"])
+    elif os.environ.get("EGCL_STAGE"):
+        current_stage = int(os.environ["EGCL_STAGE"])
     else:
         current_stage = manifest_stage
 

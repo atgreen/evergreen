@@ -74,13 +74,13 @@ ocicl.csv
 !tests/completions/ocicl.csv
 ocicl/
 
-# compiled TorCL FASL artifacts
+# compiled EGCL FASL artifacts
 *.bfasl
 
 # Local-only standing goal prompt (kept out of the repo per owner)
 GOAL.md
 
-# stray build artifact (static torcl copy)
+# stray build artifact (static egcl copy)
 hellos
 target-android/
 target-cross/

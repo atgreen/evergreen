@@ -1,15 +1,15 @@
 # Build an Android app
 
-Build an EGL application from Linux using the installed `torcl-target-android`
+Build an EGL application from Linux using the installed `egcl-target-android`
 RPM. It supplies native libraries for ARM64 phones and x86-64 emulators, plus
-`torcl-android-new`. Application builds need Python 3, GNU Make, a JDK, and the
-Android SDK. They do not need Rust, the NDK, a TorCL checkout, or containers.
+`egcl-android-new`. Application builds need Python 3, GNU Make, a JDK, and the
+Android SDK. They do not need Rust, the NDK, a EGCL checkout, or containers.
 
 ## Generate the project
 
 ```sh
-torcl-android-new hello --package org.example.hello \
-  --name "Hello TorCL" --host=aarch64-linux-android --template=egl
+egcl-android-new hello --package org.example.hello \
+  --name "Hello EGCL" --host=aarch64-linux-android --template=egl
 cd hello
 ```
 

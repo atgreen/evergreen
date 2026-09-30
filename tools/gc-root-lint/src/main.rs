@@ -1,13 +1,13 @@
-//! gc-root-lint — flag bare `TorclVal` locals read across allocating calls
+//! gc-root-lint — flag bare `EgclVal` locals read across allocating calls
 //! (bliss-jaf; docs/design/gc-rooting.md Part B rung 1).
 //!
-//! torcl has a precise MOVING minor GC: any allocation can relocate heap
-//! objects, so a `TorclVal` held in a plain Rust local across an allocating
+//! egcl has a precise MOVING minor GC: any allocation can relocate heap
+//! objects, so a `EgclVal` held in a plain Rust local across an allocating
 //! call is a stale pointer afterwards unless the local is rooted. This lint
 //! finds the smell mechanically:
 //!
 //!   a candidate local (one bound from a known heap-value producer, or
-//!   explicitly typed `TorclVal`) that is READ in a statement AFTER an
+//!   explicitly typed `EgclVal`) that is READ in a statement AFTER an
 //!   intervening statement that contains a known-ALLOCATING call, without
 //!   having been rooted (`rooted!`/`rooted_ref!`/`StackRoot`/`HostRoot`/
 //!   `ShadowRootScope::root`) or reassigned in between.
@@ -93,7 +93,7 @@ const ALLOCATING: &[&str] = &[
     "bind_macrolet_lambda_list",
 ];
 
-/// Producers whose results are (or may be) MOVABLE heap `TorclVal`s. A `let`
+/// Producers whose results are (or may be) MOVABLE heap `EgclVal`s. A `let`
 /// binding initialized from one of these becomes a lint candidate. Immediates
 /// (fixnum/symbol constructors) are intentionally NOT here.
 const PRODUCERS: &[&str] = &[
@@ -153,10 +153,10 @@ fn main() {
     let root = repo_root();
     let mut findings: Vec<Finding> = Vec::new();
     for dir in [
-        "crates/torcl/src",
-        "crates/torcl-compiler/src",
-        "crates/torcl-stdlib/src",
-        "crates/torcl-rt/src",
+        "crates/egcl/src",
+        "crates/egcl-compiler/src",
+        "crates/egcl-stdlib/src",
+        "crates/egcl-rt/src",
     ] {
         walk_dir(&root.join(dir), &root, &mut findings);
     }
@@ -232,7 +232,7 @@ fn repo_root() -> PathBuf {
             return dir;
         }
         if !dir.pop() {
-            panic!("run from within the torcl repo");
+            panic!("run from within the egcl repo");
         }
     }
 }
@@ -353,11 +353,11 @@ fn lint_block(block: &syn::Block, file: &str, function: &str, findings: &mut Vec
             }
         }
 
-        // 2. New candidate bindings from producer calls or explicit TorclVal type.
+        // 2. New candidate bindings from producer calls or explicit EgclVal type.
         if let syn::Stmt::Local(local) = stmt {
             let from_producer = calls.iter().any(|c| PRODUCERS.contains(&c.as_str()));
-            let typed_torclval = local_is_typed_torclval(local);
-            if from_producer || typed_torclval {
+            let typed_egclval = local_is_typed_egclval(local);
+            if from_producer || typed_egclval {
                 for name in pattern_names(&local.pat) {
                     // (Re)binding resets any prior state for the name.
                     candidates.retain(|(n, _)| n != &name);
@@ -385,7 +385,7 @@ fn lint_block(block: &syn::Block, file: &str, function: &str, findings: &mut Vec
     }
 }
 
-fn local_is_typed_torclval(local: &syn::Local) -> bool {
+fn local_is_typed_egclval(local: &syn::Local) -> bool {
     if let syn::Pat::Type(t) = &local.pat
         && let syn::Type::Path(p) = &*t.ty
     {
@@ -393,7 +393,7 @@ fn local_is_typed_torclval(local: &syn::Local) -> bool {
             .path
             .segments
             .last()
-            .is_some_and(|s| s.ident == "TorclVal");
+            .is_some_and(|s| s.ident == "EgclVal");
     }
     false
 }

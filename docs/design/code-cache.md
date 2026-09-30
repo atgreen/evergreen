@@ -5,7 +5,7 @@ bliss-p1t, bliss-qerr, spec §4.4, §6.11
 
 ## 1. Goal
 
-A freshly started torcl should reach T2 speed on code it has already seen hot,
+A freshly started egcl should reach T2 speed on code it has already seen hot,
 without re-running the counters that discovered it. Today every process starts
 cold: invocation counters at zero, no profile, no native code, and the whole
 tier-up ladder re-climbed from scratch. What a previous run *learned* — which
@@ -30,8 +30,8 @@ of it would be waste.
 
 | Piece | Where | State |
 |---|---|---|
-| Background T2 worker pool | `cli/bytecode.rs:15214` (`t2_compile_queue`) | built — `TORCL_T2_THREADS` default 2 |
-| Bounded priority compile queue | same, `T2QueueState` | built — `TORCL_COMPILE_QUEUE_SIZE` default 64, drop-not-block |
+| Background T2 worker pool | `cli/bytecode.rs:15214` (`t2_compile_queue`) | built — `EGCL_T2_THREADS` default 2 |
+| Bounded priority compile queue | same, `T2QueueState` | built — `EGCL_COMPILE_QUEUE_SIZE` default 64, drop-not-block |
 | GC-safe off-thread compilation | `job.input.with_gc_stable(compile_t2_artifact)` | built |
 | Install on the owning mutator | completion channel → `T2Completion` | built |
 | Guards + deopt to T0 | `t2/speculate.rs`, `t2/deopt.rs` | built |
@@ -64,7 +64,7 @@ Enumerated here because the design hinges on which are *relocated* and which are
    with ASLR on every start.
 2. **Constant-pool slot addresses.** `FramedCode::heap_constant_slots`
    (`t2/emit.rs:577`) — raw addresses of cells living inside `Arc`'d bytecode
-   bodies. Note the *cell* address is baked; the collector updates the `TorclVal`
+   bodies. Note the *cell* address is baked; the collector updates the `EgclVal`
    inside it. That indirection is already the right shape for relocation.
 3. **Symbol indices as immediates.** `t2/emit.rs:1343`:
    ```rust
@@ -199,7 +199,7 @@ The cache key is a conjunction; any mismatch means ignore the section and fall
 back to bytecode:
 
 ```
-(torcl binary build id, target triple + ABI, bfasl content_hash,
+(egcl binary build id, target triple + ABI, bfasl content_hash,
  compiler policy flags, bytecode_version)
 ```
 
@@ -209,7 +209,7 @@ new file format.
 
 ## 7. Vehicle: per-`.bfasl`, not whole-image
 
-Decided 2026-09-22. torcl already has whole-image save/restore
+Decided 2026-09-22. egcl already has whole-image save/restore
 (`scripts/build-image.lisp`, `save-lisp-and-die`), and an image is in several ways
 the *easier* place to put native code: it can freeze symbol indices and heap
 layout together with the code, so most of §3 evaporates.
@@ -223,7 +223,7 @@ where the coarseness costs nothing.
 
 ## 8. Scope boundary — SUPERSEDED, see §8a
 
-This section argued, from a measurement of `TORCL_DISABLE_T2=1` that showed
+This section argued, from a measurement of `EGCL_DISABLE_T2=1` that showed
 "~3%, within noise, one run faster *with* T2", that **"T2 is currently worth
 approximately nothing on this workload"**, and concluded that caching T2 would
 have approximately zero effect on babel load time.
@@ -235,7 +235,7 @@ corrected numbers. Two specific failures:
 - The `~3%` reading did not survive a clean re-measurement (`taskset -c 0`, no
   `systemd-run` wrapper, retired-instruction counts). The real effect is ~30%.
 - Earlier in the same investigation an 18% T2 regression *was* observed and then
-  explained away as an artifact of the wrapper in `scripts/torcl-limited.sh`.
+  explained away as an artifact of the wrapper in `scripts/egcl-limited.sh`.
   That dismissal removed a real signal. A surprising result is not automatically
   an artifact.
 
@@ -265,7 +265,7 @@ code onto the compiled tier — it was always true.
 
 ### §8b. Attributed: it is the compiler running, not the code it emits
 
-`TORCL_T2_DISCARD=1` pays the full T2 compilation cost and then installs
+`EGCL_T2_DISCARD=1` pays the full T2 compilation cost and then installs
 nothing, so execution stays at T1. Moving the threshold cannot separate
 "compiling costs time" from "the emitted code is slower" — both scale with the
 number of functions promoted — but this does. Babel load, 3 reps,
@@ -298,7 +298,7 @@ This is the number §8 said would be "approximately zero".
 
 ### §8c. …but most of that saving has since been taken directly (bliss-fhci)
 
-Splitting the compile cost again — `TORCL_T2_NO_QUEUE` snapshots without
+Splitting the compile cost again — `EGCL_T2_NO_QUEUE` snapshots without
 queueing — showed that **82% of it was not the compiler at all**, but the
 mutator-side inline-candidate snapshot: `snapshot_t2_input` walked the whole
 registry (9,626 functions) and deep-cloned every invoked one, on each of 109

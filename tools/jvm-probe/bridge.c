@@ -61,8 +61,8 @@ static jint callback(JNIEnv *env, jclass cls, jint value) {
 
 static void *create_vm(void *unused) {
     (void)unused;
-    const char *directory = getenv("TORCL_JVM_PROBE_DIR");
-    if (!directory) fatal("TORCL_JVM_PROBE_DIR missing");
+    const char *directory = getenv("EGCL_JVM_PROBE_DIR");
+    if (!directory) fatal("EGCL_JVM_PROBE_DIR missing");
     char *classpath;
     if (asprintf(&classpath, "-Djava.class.path=%s", directory) < 0)
         fatal("classpath allocation failed");
@@ -99,7 +99,7 @@ int probe_start(void) {
 }
 
 __attribute__((constructor)) static void preload_start(void) {
-    const char *order = getenv("TORCL_JVM_PROBE_ORDER");
+    const char *order = getenv("EGCL_JVM_PROBE_ORDER");
     if (order && !strcmp(order, "jvm-first") && probe_start())
         fatal("preloaded JVM creation failed");
 }

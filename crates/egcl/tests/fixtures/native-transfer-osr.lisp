@@ -1,0 +1,47 @@
+; Shared host/s390x oracle: OSR enters with interpreter handlers already live.
+(defun jit-check (x) (if x t (error "OSR trap check failed")))
+(defun jit-protected-loop (initial)
+  (handler-case
+    (let ((i 0) (sum initial))
+      (block done (tagbody top
+        (if (>= i 10) (return-from done sum))
+        (setq sum (+ sum 1)) (setq i (1+ i)) (go top))))
+    (error () :bad)))
+(jit-check (= (jit-protected-loop 0) 10))
+(jit-check (> (egcl-ext:function-osr-count 'jit-protected-loop) 0))
+(setq jit-before (egcl-ext:function-osr-count 'jit-protected-loop))
+(jit-check (= (jit-protected-loop 1152921504606846970) 1152921504606846980))
+(jit-check (> (egcl-ext:function-osr-count 'jit-protected-loop) jit-before))
+(setq *scope-effects* 0)
+(defun jit-expired-catch ()
+  (catch 'expired
+    (let ((i 0))
+      (block done (tagbody top
+        (if (>= i 10) (return-from done i))
+        (setq i (1+ i)) (go top)))))
+  (setq *scope-effects* (1+ *scope-effects*))
+  (throw 'expired 99))
+(handler-case (jit-expired-catch)
+  (control-error () (jit-check (= *scope-effects* 1))))
+(jit-check (= *scope-effects* 1))
+(jit-check (> (egcl-ext:function-osr-count 'jit-expired-catch) 0))
+(setq *cleanups* 0)
+(defun jit-unwinding-go ()
+  (let ((i 0))
+    (block done (tagbody top
+      (if (>= i 10) (return-from done i))
+      (unwind-protect (progn (setq i (1+ i)) (go top))
+        (setq *cleanups* (1+ *cleanups*)))))))
+(jit-check (= (jit-unwinding-go) 10))
+(jit-check (= *cleanups* 10))
+(defun jit-outer-go ()
+  (let ((i 0) (visits 0))
+    (block done (tagbody outer
+      (setq visits (1+ visits))
+      (if (>= visits 3) (return-from done (list i visits)))
+      (tagbody inner
+        (if (>= i 10) (go outer))
+        (setq i (1+ i)) (go inner))))))
+(jit-check (equal (jit-outer-go) '(10 3)))
+(jit-check (> (egcl-ext:function-osr-count 'jit-outer-go) 0))
+(format t "OSR-TRAP-OK~%")

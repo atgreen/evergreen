@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build-orchestration tests with cheap external-tool substitutes.
 
-These test failure isolation and command contracts, not LLVM or TorCL itself.
+These test failure isolation and command contracts, not LLVM or EGCL itself.
 A real capped `make image` is the separate end-to-end validation.
 """
 import json
@@ -22,7 +22,7 @@ with open(env["PGO_TEST_LOG"], "a") as out:
         "flags": env.get("CARGO_ENCODED_RUSTFLAGS", ""),
         "target_dir": env.get("CARGO_TARGET_DIR", ""),
         "profile": env.get("LLVM_PROFILE_FILE", ""),
-        "phase": env.get("TORCL_PGO_PHASE", "")}) + "\n")
+        "phase": env.get("EGCL_PGO_PHASE", "")}) + "\n")
 def fail(stage):
     if env.get("PGO_TEST_FAIL") == stage:
         sys.exit(42)
@@ -43,7 +43,7 @@ elif name == "cargo":
     if env.get("PGO_TEST_FAIL") == "profile-warning" and "profile-use" in flags:
         print("warning: no profile data available for function fixture")
     target = args[args.index("--target") + 1]
-    binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / target / "release/torcl"
+    binary = pathlib.Path(env["CARGO_TARGET_DIR"]) / target / "release/egcl"
     binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(__file__, binary)
     binary.chmod(0o755)
@@ -54,13 +54,13 @@ else:
             print("PGO-IMAGE-OK")
     elif args[-1].endswith("build-image.lisp"):
         fail("image")
-        image = pathlib.Path(env["TORCL_IMAGE_OUT"])
+        image = pathlib.Path(env["EGCL_IMAGE_OUT"])
         shutil.copyfile(__file__, image)
         image.chmod(0o755)
         if env.get("PGO_TEST_LEFTOVER"):
             (image.parent / "retained-diagnostic").write_text("diagnostic")
     else:
-        phase = env["TORCL_PGO_PHASE"]
+        phase = env["EGCL_PGO_PHASE"]
         fail(phase)
         if env.get("PGO_TEST_FAIL") != "no-profile" and not (
                 env.get("PGO_TEST_FAIL") == "missing-runtime-profile" and phase == "runtime"):
@@ -75,7 +75,7 @@ else:
 
 class PgoBuildTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="torcl pgo build ")
+        self.temp = tempfile.TemporaryDirectory(prefix="egcl pgo build ")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
         self.tools = self.work / "tools"
@@ -84,19 +84,19 @@ class PgoBuildTests(unittest.TestCase):
             path = self.tools / name
             path.write_text(FAKE)
             path.chmod(0o755)
-        self.image = self.work / "output" / "torcl"
+        self.image = self.work / "output" / "egcl"
         self.image.parent.mkdir()
         self.image.write_bytes(b"previous image")
         self.log = self.work / "commands.jsonl"
         self.env = os.environ.copy()
         for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE",
-                     "RUSTC", "CARGO", "TORCL_PGO_TARGET"):
+                     "RUSTC", "CARGO", "EGCL_PGO_TARGET"):
             self.env.pop(name, None)
         self.env.update(
             PATH=str(self.tools) + os.pathsep + os.environ["PATH"],
             LLVM_PROFDATA=str(self.tools / "llvm-profdata"),
-            TORCL_PGO_ROOT=str(self.work / "builds"),
-            TORCL_IMAGE_OUT=str(self.image),
+            EGCL_PGO_ROOT=str(self.work / "builds"),
+            EGCL_IMAGE_OUT=str(self.image),
             PGO_TEST_LOG=str(self.log), PGO_TEST_SYSROOT=str(self.work / "sysroot"),
         )
 
@@ -193,7 +193,7 @@ class PgoBuildTests(unittest.TestCase):
         self.assertFalse(any(c["name"] == "cargo" for c in self.commands()))
 
     def test_cross_target_fails_before_build(self):
-        result = self.run_build(TORCL_PGO_TARGET="aarch64-unknown-linux-gnu")
+        result = self.run_build(EGCL_PGO_TARGET="aarch64-unknown-linux-gnu")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("target", result.stderr)
         self.assertFalse(any(c["name"] == "cargo" for c in self.commands()))
@@ -226,7 +226,7 @@ class PgoBuildTests(unittest.TestCase):
         result = self.run_build(PGO_TEST_LEFTOVER="1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotEqual(self.image.read_bytes(), b"previous image")
-        self.assertEqual(len(list(self.image.parent.glob(".torcl-pgo.*/retained-diagnostic"))), 1)
+        self.assertEqual(len(list(self.image.parent.glob(".egcl-pgo.*/retained-diagnostic"))), 1)
 
 
 if __name__ == "__main__":

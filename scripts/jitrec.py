@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""jitrec — record a torcl JIT/GC event stream into SQLite and explore it.
+"""jitrec — record a egcl JIT/GC event stream into SQLite and explore it.
 
 The static HTML viewer (tools/event-viewer) embeds a whole run in one page, which
-does not scale: torcl's in-memory ring drops events past ~65k, and a large
+does not scale: egcl's in-memory ring drops events past ~65k, and a large
 program's disassembly makes a multi-megabyte file. This tool takes the
 record-then-explore path (JFR/JDK-Mission-Control model):
 
-  1. torcl STREAMS an unbounded NDJSON event log:
-         TORCL_EVENTS_STREAM=run.ndjson torcl --load big-system.lisp
+  1. egcl STREAMS an unbounded NDJSON event log:
+         EGCL_EVENTS_STREAM=run.ndjson egcl --load big-system.lisp
      (`e` records live per event, then bounded `sym`/`fn` records at exit).
 
   2. jitrec INGESTS that log into an indexed SQLite database:
@@ -20,7 +20,7 @@ record-then-explore path (JFR/JDK-Mission-Control model):
 
 `ingest` also accepts `-` to read NDJSON from stdin (live: `... | tee run.ndjson`
 or pipe straight through). No third-party dependencies — stdlib sqlite3 +
-http.server. A Rust `torcl-jitrec` binary is the natural productionization.
+http.server. A Rust `egcl-jitrec` binary is the natural productionization.
 """
 import sys
 import os
@@ -242,7 +242,7 @@ def serve(db_path, port):
 
 
 EXPLORER_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>TorCL JIT Explorer</title>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>EGCL JIT Explorer</title>
 <link rel=preconnect href=https://fonts.googleapis.com><link rel=preconnect href=https://fonts.gstatic.com crossorigin>
 <link rel=stylesheet href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
 <style>
@@ -287,7 +287,7 @@ input#filter{font:inherit;padding:6px 11px;border:1px solid var(--line);border-r
 .corr .ln.bcpmark{color:var(--accent);opacity:.72;letter-spacing:.04em;margin-top:4px;font-size:.92em}.corr .ln.bcpmark.lit{color:#fff;opacity:1}.corr-hint .mk{color:var(--accent);font-family:var(--font-mono)}.corr-hint b{color:var(--muted)}
 .corr-hint{font-size:.78rem;color:var(--faint);margin:2px 0 8px}.empty{color:var(--faint);font-style:italic}
 </style></head><body><div class=wrap>
-<header class=m><div><div class=e>torcl · jitrec explorer</div><h1>JIT Recording</h1></div><span class=sub id=sub>loading…</span></header>
+<header class=m><div><div class=e>egcl · jitrec explorer</div><h1>JIT Recording</h1></div><span class=sub id=sub>loading…</span></header>
 <div class=chips id=chips></div>
 <section><h2>Timeline <span class=h>event density over the run, by kind (bucketed — scales to any size)</span></h2><div class=panel><svg class=tl id=tl></svg></div></section>
 <section><h2>Functions <span class=h>JIT activity, hottest first — click to inspect</span></h2><input id=filter placeholder="filter by name…"><div class=panel style=overflow-x:auto><table><thead><tr><th>Function<th>T1<th>T2<th>Deopts<th>OSR<th>Activity</tr></thead><tbody id=fnbody></tbody></table></div></section>

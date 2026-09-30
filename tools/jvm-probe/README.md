@@ -1,34 +1,34 @@
 # Native Linux JVM coexistence probe
 
-This diagnostic runs **on the local Linux host**, in the real TorCL process.
+This diagnostic runs **on the local Linux host**, in the real EGCL process.
 It uses neither containers nor a phone, emulator, remote machine, or Java
 subprocess for the workload. `javac` builds the test class; the C shim embeds
 HotSpot with `JNI_CreateJavaVM` on a dedicated pthread.
 
-Requirements: x86-64 Linux, a glibc TorCL build with `torcl-rt/c-ffi`, a local
+Requirements: x86-64 Linux, a glibc EGCL build with `egcl-rt/c-ffi`, a local
 JDK with headers, C compiler, and the user systemd bus required by
-`scripts/torcl-limited.sh`.
+`scripts/egcl-limited.sh`.
 
 ```sh
-cargo build --target x86_64-unknown-linux-gnu --features torcl-rt/c-ffi -p torcl
-# Optional: point at a particular local JDK or TorCL executable.
-export TORCL_JAVA_HOME=/path/to/jdk
-# export TORCL_PROBE_BIN=/path/to/dynamic/torcl
-TORCL_JVM_PROBE_JSIG="$TORCL_JAVA_HOME/lib/libjsig.so" tools/jvm-probe/run.sh
+cargo build --target x86_64-unknown-linux-gnu --features egcl-rt/c-ffi -p egcl
+# Optional: point at a particular local JDK or EGCL executable.
+export EGCL_JAVA_HOME=/path/to/jdk
+# export EGCL_PROBE_BIN=/path/to/dynamic/egcl
+EGCL_JVM_PROBE_JSIG="$EGCL_JAVA_HOME/lib/libjsig.so" tools/jvm-probe/run.sh
 ```
 
-The script prints and retains a unique `/tmp/torcl-jvm-probe.*` directory with
+The script prints and retains a unique `/tmp/egcl-jvm-probe.*` directory with
 classes, the native shim, and separate logs. Each startup order runs under
 4 GiB memory / 90 second limits (plus the limiter's termination grace period).
 The script returns nonzero for crashes, mismatches, or missing completion
 markers. A known runtime failure is **not** converted into a passing test.
 
 - `lisp-first`: the preloaded shim does nothing until Lisp calls `probe_start`.
-- `jvm-first`: the shim starts HotSpot in its constructor, before TorCL `main`.
-  TorCL then performs its ordinary initialization without probe modifications.
+- `jvm-first`: the shim starts HotSpot in its constructor, before EGCL `main`.
+  EGCL then performs its ordinary initialization without probe modifications.
 
-Use `TORCL_JVM_PROBE_ORDERS=lisp-first` to repeat an individual case. The
-preload applies only to the tested TorCL process, not to the resource limiter.
+Use `EGCL_JVM_PROBE_ORDERS=lisp-first` to repeat an individual case. The
+preload applies only to the tested EGCL process, not to the resource limiter.
 The JVM uses `-Xcheck:jni`, `-Xrs`, and `-Xmx128m`. After releasing its bridge resources, the probe calls `DestroyJavaVM` on a
 dedicated thread. It does not attempt to restart the JVM in the same process.
 
@@ -53,6 +53,6 @@ or arbitrary Java method resolution here. See
 
 The runtime now preserves process handlers after its first installation and uses
 per-thread alternate stacks. JVM-first startup requires preloaded `libjsig.so`;
-without `TORCL_JVM_PROBE_JSIG`, that case is expected to be refused and this
+without `EGCL_JVM_PROBE_JSIG`, that case is expected to be refused and this
 script returns nonzero. For the Lisp API and its ownership tests, see
-[torcl-jvm](../../lib/torcl-jvm/README.md).
+[egcl-jvm](../../lib/egcl-jvm/README.md).

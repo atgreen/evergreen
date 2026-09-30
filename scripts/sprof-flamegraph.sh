@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sprof-flamegraph.sh — a self-contained HTML flamegraph of a torcl run's LISP
+# sprof-flamegraph.sh — a self-contained HTML flamegraph of a egcl run's LISP
 # call stacks, across tiers (treewalk / T0 bytecode / T1 / T2), from the
 # Lisp-aware sampler (bliss-sc4t). Needs no external tools — unlike perf +
 # FlameGraph, it renders directly in a browser.
@@ -11,20 +11,20 @@
 # Usage:
 #   # profile a workload and open the flamegraph:
 #   scripts/sprof-flamegraph.sh --out /tmp/flame.html -- \
-#       target/.../torcl --no-init --load prog.lisp
+#       target/.../egcl --no-init --load prog.lisp
 #
-#   # or render an existing folded file (from TORCL_SPROF_OUT):
+#   # or render an existing folded file (from EGCL_SPROF_OUT):
 #   scripts/sprof-flamegraph.sh --folded run.folded --out /tmp/flame.html
 #
 # Options:
-#   --out FILE     output HTML (default: /tmp/torcl-flame.html)
+#   --out FILE     output HTML (default: /tmp/egcl-flame.html)
 #   --hz N         sampling frequency for a profiled run (default: 1000)
 #   --folded FILE  render an existing folded-stacks file instead of running
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$HERE/tools/sprof-flamegraph/flame.html"
-OUT="/tmp/torcl-flame.html"
+OUT="/tmp/egcl-flame.html"
 HZ=1000
 FOLDED=""
 
@@ -40,14 +40,14 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -f "$TEMPLATE" ]] || { echo "sprof-flamegraph.sh: template not found: $TEMPLATE" >&2; exit 1; }
 
-WORK="$(mktemp -d /tmp/torcl-flame.XXXXXX)"
+WORK="$(mktemp -d /tmp/egcl-flame.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
 if [[ -z "$FOLDED" ]]; then
-  [[ $# -gt 0 ]] || { echo "sprof-flamegraph.sh: give a torcl command after -- (or use --folded FILE)" >&2; exit 2; }
+  [[ $# -gt 0 ]] || { echo "sprof-flamegraph.sh: give a egcl command after -- (or use --folded FILE)" >&2; exit 2; }
   FOLDED="$WORK/run.folded"
-  echo "[sprof-flamegraph] recording (TORCL_SPROF=$HZ) ..." >&2
-  TORCL_SPROF="$HZ" TORCL_SPROF_OUT="$FOLDED" "$@" >/dev/null 2>&1 || true
+  echo "[sprof-flamegraph] recording (EGCL_SPROF=$HZ) ..." >&2
+  EGCL_SPROF="$HZ" EGCL_SPROF_OUT="$FOLDED" "$@" >/dev/null 2>&1 || true
 fi
 [[ -s "$FOLDED" ]] || { echo "[sprof-flamegraph] no samples captured in $FOLDED (did the workload run long enough?)" >&2; exit 1; }
 

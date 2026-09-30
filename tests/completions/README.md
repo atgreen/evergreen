@@ -1,30 +1,30 @@
 # Completions HTTP round-trip scenario
 
 This scenario proves that the [Completions](https://github.com/atgreen/cl-completions)
-library performs a real HTTP request/response cycle on TorCL — JSON encode,
+library performs a real HTTP request/response cycle on EGCL — JSON encode,
 socket write, HTTP parse, JSON decode, and the assistant text pulled back out of
-the decoded alist. It imports every TorCL compatibility fork by immutable Git
+the decoded alist. It imports every EGCL compatibility fork by immutable Git
 commit and pins the rest of the graph by digest; it never patches a downloaded
 registry copy.
 
-From the TorCL repository:
+From the EGCL repository:
 
 ```sh
 OCICL_BIN="$HOME/git/ocicl/ocicl" \
 OCICL_RUNTIME="$HOME/git/ocicl/runtime/ocicl-runtime.lisp" \
-TORCL_BIN="$PWD/target/torcl" \
+EGCL_BIN="$PWD/target/egcl" \
 SBCL_BIN="$(command -v sbcl)" \
   bash scripts/test-completions.sh
 ```
 
 The defaults are `ocicl` on PATH, its installed runtime under
-`${XDG_DATA_HOME:-$HOME/.local/share}/ocicl/`, and `target/torcl`. The ocicl
+`${XDG_DATA_HOME:-$HOME/.local/share}/ocicl/`, and `target/egcl`. The ocicl
 binary must support `git+` sources.
 
 Each run creates and retains a private temporary project with the committed
 `ocicl.csv`. `ocicl install` fetches its pins. `fake-ollama.py` then binds an
 Ollama-shaped `/api/chat` server on an ephemeral loopback port, exports the port
-as `TORCL_OLLAMA_PORT`, and runs the Lisp under it:
+as `EGCL_OLLAMA_PORT`, and runs the Lisp under it:
 
 - Cold: compile and load the graph (455 files), then `dex:post` the endpoint and
   assert a 200 with the echoed prompt in the body, then load `:completions` and
@@ -56,11 +56,11 @@ show up in the cold phase when the machine is loaded.
 pulls the CFFI-based original; the endpoint is plain HTTP either way, so this is
 **not** a claim of HTTPS support. Nor is it a claim that Completions' whole
 upstream suite passes — that suite currently reports 66 of 67 checks passing on
-TorCL, the exception being the Gemini tool-name baseline (`bliss-0xlb`), which
+EGCL, the exception being the Gemini tool-name baseline (`bliss-0xlb`), which
 SBCL fails identically.
 
-Commands are memory/time capped by `scripts/torcl-limited.sh`; the cold phase
-raises the defaults to `TORCL_MEM_MAX=8G` and `TORCL_TIMEOUT=2400` because
+Commands are memory/time capped by `scripts/egcl-limited.sh`; the cold phase
+raises the defaults to `EGCL_MEM_MAX=8G` and `EGCL_TIMEOUT=2400` because
 compiling the graph is slow.
 
 Refresh pins deliberately with `ocicl install git+URL@SHA` in an isolated

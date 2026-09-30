@@ -1,10 +1,10 @@
-;;;; Real clients of the pinned TorCL compatibility forks. No implicit downloads.
+;;;; Real clients of the pinned EGCL compatibility forks. No implicit downloads.
 (require :asdf)
 (asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
 (asdf:initialize-output-translations
- (list :output-translations (list t (uiop:getenv "TORCL_PORT_CACHE"))
+ (list :output-translations (list t (uiop:getenv "EGCL_PORT_CACHE"))
        :ignore-inherited-configuration))
-(load (uiop:getenv "TORCL_PORT_RUNTIME"))
+(load (uiop:getenv "EGCL_PORT_RUNTIME"))
 (setf ocicl-runtime:*download* nil
       ocicl-runtime:*local-only* t)
 
@@ -16,11 +16,11 @@
                          alternatives))))
 
 (asdf:load-system :flexi-streams)
-#+(or torcl sbcl)
+#+(or egcl sbcl)
 (dolist (name '("STREAM-READ-CHAR" "STREAM-READ-BYTE" "STREAM-WRITE-CHAR"
                 "STREAM-UNREAD-CHAR" "STREAM-FINISH-OUTPUT"))
   (assert (eq (find-symbol name :trivial-gray-streams)
-              (find-symbol name #+torcl :torcl-gray-streams #+sbcl :sb-gray))))
+              (find-symbol name #+egcl :egcl-gray-streams #+sbcl :sb-gray))))
 (with-open-file (binary "sample-ascii.txt" :element-type '(unsigned-byte 8))
   (let ((stream (flexi-streams:make-flexi-stream
                  binary :external-format '(:utf-8 :eol-style :lf))))

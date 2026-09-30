@@ -1,8 +1,8 @@
 # Pin the Rust toolchain for everyone working in this repo.
 #
 # Why: the toolchain was a shared, mutable, machine-wide setting. When this
-# machine's rustup default moved off 1.94.1, `cargo build -p torcl` broke in every
-# checkout at once (bliss-cice: rustc 1.98 rejects torcl-rt's opaque declarations
+# machine's rustup default moved off 1.94.1, `cargo build -p egcl` broke in every
+# checkout at once (bliss-cice: rustc 1.98 rejects egcl-rt's opaque declarations
 # of the runtime symbols std relies on). Two dev sessions on one laptop have
 # separate working trees and separate target/ dirs, but they share ~/.rustup — so
 # one `rustup update` changes the compiler under both. This file removes that
@@ -11,7 +11,7 @@
 #
 # 1.94.1 rather than latest stable: scripts/cross-port.sh already pins exactly
 # this version for the AArch64/POWER/IBM Z bring-up ("cross otherwise updates
-# stable"), so this keeps one answer to "which compiler builds TorCL" instead of
+# stable"), so this keeps one answer to "which compiler builds EGCL" instead of
 # two. An explicit `cargo +stable …`, or RUSTUP_TOOLCHAIN in the environment,
 # still overrides this file when you deliberately want another compiler — which
 # is how cross-port.sh sets its own.

@@ -17,7 +17,7 @@ unboxing, and register allocation have rewritten the fast path beyond
 recognition.
 
 > **Physical layout.** This chapter specifies the *IR-level* FrameState.
-> The concrete native frame it is reconstructed from — the TorclStack
+> The concrete native frame it is reconstructed from — the EgclStack
 > `Frame` header, the activation slot area, shadow root slots, and the
 > rule that T2 code may only be entered on a frame large enough to hold
 > them — is documented in `docs/design/t2-frame-layout.md`.
@@ -82,10 +82,10 @@ struct FrameScope {
 enum ValueSource {
     /// A live SSA value in representation `repr`. The allocator binds it to a
     /// Location; if `repr` is unboxed, the deopt path reboxes it to a tagged
-    /// TorclVal before writing the interpreter slot (§4.6 A4.04 step 3).
+    /// EgclVal before writing the interpreter slot (§4.6 A4.04 step 3).
     Value { value: SsaValue, repr: ValueRepresentation },
-    /// A compile-time-constant immediate TorclVal.
-    Const(TorclVal),
+    /// A compile-time-constant immediate EgclVal.
+    Const(EgclVal),
     /// Not live in T2. The interpreter slot receives UNBOUND-MARKER; a
     /// reference in the interpreter signals the correct CL error
     /// (§4.6 A4.04 step 6).
@@ -113,7 +113,7 @@ representation while preserving type.
 
 | Variant | Storage | GC-visible? | Notes |
 |---------|---------|-------------|-------|
-| `Tagged` | GPR | Yes (may be a pointer) | A normal TorclVal; the only representation a T0 slot can hold. |
+| `Tagged` | GPR | Yes (may be a pointer) | A normal EgclVal; the only representation a T0 slot can hold. |
 | `UnboxedFixnum` | GPR | No | Raw 61-bit-range `i64`, untagged. Reboxed by tag-shift on deopt. |
 | `UnboxedF32` | XMM | No | Raw `f32`; the immediate single-float (§4.10.3) reboxed by `shl 32 | tag`. |
 | `UnboxedF64` | XMM | No | Raw `f64`; a boxed CL `double-float` reboxed by heap allocation on deopt. |
@@ -162,7 +162,7 @@ at all.
 
 Now suppose the preheader guard on `s` had instead been left per-iteration and
 one iteration sees a double-float. Deopt fires inside the loop. The interpreter
-frame for `fsum` needs `s`, `i`, and `n` as ordinary tagged TorclVals at the
+frame for `fsum` needs `s`, `i`, and `n` as ordinary tagged EgclVals at the
 `top` bytecode position. The FrameState attached to the guard records exactly
 that:
 
@@ -261,7 +261,7 @@ authority on the metadata's IR origin and preservation.
 T2 is built as an ordered sequence of runnable slices, each gated by R4.68 (the
 tier-differential and deopt-correctness harnesses, extending the existing T1 OSR
 differential tests to T2). No stage begins until the previous stage's gate is
-green through the real `torcl` binary.
+green through the real `egcl` binary.
 
 | Stage | Deliverable | Gate |
 |-------|-------------|------|
@@ -323,7 +323,7 @@ so they are tracked rather than discovered:
 | Test | Scope | Method |
 |------|-------|--------|
 | FrameState round-trip | Unit | For each T2-a construct, force a deopt at every guard; assert the reconstructed interpreter frame's locals/stack equal a T0 run stopped at the same `bcp`. |
-| Tier-differential | Integration | Run the OSR/deopt corpus under T0, T1, and T2 (`TORCL_BACKEND`/threshold env, as the T1 `osr.rs` suite does); assert byte-identical stdout across all three. |
+| Tier-differential | Integration | Run the OSR/deopt corpus under T0, T1, and T2 (`EGCL_BACKEND`/threshold env, as the T1 `osr.rs` suite does); assert byte-identical stdout across all three. |
 | Preservation invariant | Property/fuzz | After every pass in a randomised pass pipeline, run the IR verifier (A4.07/R4.64); assert no FrameState is orphaned and all sources dominate. |
 | Rematerialisation | Unit | Construct a value used only by a FrameState via a pure chain; assert DCE removes it from the fast path and a forced deopt still yields the correct slot value (A4.13). |
 | Unbox/rebox correctness | Unit | Unboxed fixnum/f32/f64 loops; force deopt mid-loop; assert reboxed values are bit-identical to interpretation (extends the T1 `t1_deopt` float cases). |

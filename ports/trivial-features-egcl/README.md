@@ -1,0 +1,28 @@
+# EGCL support for trivial-features
+
+Use the [atgreen fork and ocicl Git pin](../README.md) for new test scenarios.
+The patch below is retained as a historical reference, not the installation path.
+
+`implementation.patch` adds EGCL to ocicl's
+`trivial-features-20260908-828246a`. EGCL already provides the canonical OS,
+architecture, endianness and word-size features; the port enables implementation
+selection and supplies an explicit ASDF component. It does not advertise the
+old implementation name in EGCL's `*features*`.
+
+Apply from the dependency's source directory:
+
+```sh
+patch -p1 < /path/to/egcl/ports/trivial-features-egcl/implementation.patch
+```
+
+Restart EGCL and load Babel with that directory in ASDF's source registry.
+If using ocicl, preserve its initialization when migrating by copying your old
+init file to `~/.egclrc`; EGCL does not read `~/.blissrc` automatically.
+
+The unpatched release accepts `bliss` but rejects `egcl`. In the tested EGCL
+installation, reaching this dependency error through ASDF ran until the memory
+cap or timeout; the patch makes Babel compile and load successfully. It does
+not fix the separate ASDF error-handling runaway.
+
+This is a local compatibility patch, not an upstream release. An ocicl update
+can replace it. Existing locally modified copies may require manual merging.

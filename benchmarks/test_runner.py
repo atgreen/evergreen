@@ -19,8 +19,8 @@ class ResultTests(unittest.TestCase):
         self.assertGreater(result['iqr_seconds'], 0)
 
     def test_report_never_turns_a_loss_into_a_win(self):
-        for torcl, sbcl, winner in [(1, 4, 'TorCL'), (4, 1, 'SBCL')]:
-            self.assertEqual(run.comparison(torcl, sbcl), (winner, 4))
+        for egcl, sbcl, winner in [(1, 4, 'EGCL'), (4, 1, 'SBCL')]:
+            self.assertEqual(run.comparison(egcl, sbcl), (winner, 4))
 
     def test_no_winner_for_a_tie(self):
         self.assertEqual(run.comparison(1, 1), ('Tie', 1))
@@ -35,12 +35,12 @@ class ReportTests(unittest.TestCase):
         import json
         from pathlib import Path
         case = json.loads((Path(__file__).parent/'cases.json').read_text())[0]
-        case['results'] = {'TorCL': run.summarize([4]*5), 'SBCL': run.summarize([1]*5)}
+        case['results'] = {'EGCL': run.summarize([4]*5), 'SBCL': run.summarize([1]*5)}
         data = {'benchmarks':[case], 'samples':5, 'generated_at':'today',
                 'metadata':{'cpu':0, 'host':'<script>alert(1)</script>'}}
         page = run.render(data)
         self.assertIn('SBCL 4.00× faster', page)
-        self.assertNotIn('TorCL 4.00× faster', page)
+        self.assertNotIn('EGCL 4.00× faster', page)
         self.assertNotIn('<script>', page)
         self.assertIn('&lt;script&gt;', page)
         self.assertIn('not a', page)
@@ -68,11 +68,11 @@ class ReportTests(unittest.TestCase):
         raw = {
             'metadata': {
                 'commit': 'baseline',
-                'binaries': {'TorCL': {'sha256': 'abc'}},
+                'binaries': {'EGCL': {'sha256': 'abc'}},
             },
             'benchmarks': [{
                 'id': 'fibonacci',
-                'results': {'TorCL': {'median_seconds': 0.112}},
+                'results': {'EGCL': {'median_seconds': 0.112}},
             }],
         }
         result = run.baseline_manifest(raw)

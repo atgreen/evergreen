@@ -10,9 +10,9 @@ one million iterations and inspect several input sizes.
 
 ## Engine observations
 
-### `torcl-ext:profile-report` { #profile-report }
+### `egcl-ext:profile-report` { #profile-report }
 
-**Function** `(torcl-ext:profile-report)` → `nil`
+**Function** `(egcl-ext:profile-report)` → `nil`
 
 Writes an engine report to `*trace-output*`, including GC activity,
 deoptimizations, and native OSR entries. It is an implementation report, not a
@@ -29,10 +29,10 @@ separate evidence of loop entry through OSR.
 **Functions**
 
 ```lisp
-(torcl-ext:profile function-designator...)
-(torcl-ext:unprofile function-designator...)
-(torcl-ext:profile-reset)
-(torcl-ext:profile-report-calls)
+(egcl-ext:profile function-designator...)
+(egcl-ext:unprofile function-designator...)
+(egcl-ext:profile-reset)
+(egcl-ext:profile-report-calls)
 ```
 
 `profile` marks recognized functions and establishes count baselines.
@@ -51,13 +51,13 @@ of uninstrumented native execution.
 **Functions**
 
 ```lisp
-(torcl-ext:events-start)     ; enable recording, returns T
-(torcl-ext:events-stop)      ; disable recording, returns NIL
-(torcl-ext:events-reset)     ; clear recorded events, returns NIL
-(torcl-ext:events-count)     ; current recorded event count
-(torcl-ext:events-report)    ; chronological text report
-(torcl-ext:events-summary)   ; aggregated report
-(torcl-ext:events-json)      ; JSON export
+(egcl-ext:events-start)     ; enable recording, returns T
+(egcl-ext:events-stop)      ; disable recording, returns NIL
+(egcl-ext:events-reset)     ; clear recorded events, returns NIL
+(egcl-ext:events-count)     ; current recorded event count
+(egcl-ext:events-report)    ; chronological text report
+(egcl-ext:events-summary)   ; aggregated report
+(egcl-ext:events-json)      ; JSON export
 ```
 
 Reports write to `*trace-output*` and return `nil`. Recording exposes events
@@ -66,14 +66,14 @@ application to infer them from elapsed time alone. Start recording before the
 workload whose events you need to observe.
 
 ```lisp
-(torcl-ext:events-reset)
-(torcl-ext:events-start)
+(egcl-ext:events-reset)
+(egcl-ext:events-start)
 (defun measured-sum (n)
   (let ((sum 0))
     (dotimes (i n sum) (incf sum i))))
 (measured-sum 1000000)
-(torcl-ext:events-stop)
-(torcl-ext:events-summary)
+(egcl-ext:events-stop)
+(egcl-ext:events-summary)
 ```
 
 ## Statistical sampling
@@ -83,9 +83,9 @@ workload whose events you need to observe.
 **Functions**
 
 ```lisp
-(torcl-ext:sprof-start &optional (frequency 1000))
-(torcl-ext:sprof-stop)
-(torcl-ext:sprof-fold)
+(egcl-ext:sprof-start &optional (frequency 1000))
+(egcl-ext:sprof-stop)
+(egcl-ext:sprof-fold)
 ```
 
 The sampler records Lisp call-chain information across execution tiers.
@@ -104,4 +104,4 @@ host allocations can dominate execution time independently. The contributor
 [measurement guide](contributing/how-to/performance.md) describes host-allocation
 instrumentation, reproducible builds, and the memory-limit wrapper.
 
-Implementation reference: [Profiling entry points](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/torcl/src/cli.rs).
+Implementation reference: [Profiling entry points](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl/src/cli.rs).

@@ -976,7 +976,7 @@ MIX directives, and reexport their contents as per the REEXPORT directive."
   #+(or mcl cmucl) (:shadow #:user-homedir-pathname))
 (in-package :uiop/common-lisp)
 
-#-(or abcl allegro torcl clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
+#-(or abcl allegro egcl clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
 (error "ASDF is not supported on your implementation. Please help us port it.")
 
 ;; (declaim (optimize (speed 1) (debug 3) (safety 3))) ; DON'T: trust implementation defaults.
@@ -2115,7 +2115,7 @@ that is neither Unix, nor Windows, nor Genera, nor even old MacOS.~%Now you port
 Beware: may return empty string if a variable is present but empty;
 use getenvp to return NIL in such a case."
     (declare (ignorable x))
-    #+torcl (torcl-ext:getenv x)
+    #+egcl (egcl-ext:getenv x)
     #+(or abcl clasp clisp ecl xcl) (ext:getenv x)
     #+allegro (sys:getenv x)
     #+clozure (ccl:getenv x)
@@ -2140,7 +2140,7 @@ use getenvp to return NIL in such a case."
                 (ccl:%get-cstring value))))
     #+mkcl (#.(or (find-symbol* 'getenv :si nil) (find-symbol* 'getenv :mk-ext nil)) x)
     #+sbcl (sb-ext:posix-getenv x)
-    #-(or abcl allegro torcl clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
+    #-(or abcl allegro egcl clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
     (not-implemented-error 'getenv))
 
   (defsetf getenv (x) (val)
@@ -2157,8 +2157,8 @@ use getenvp to return NIL in such a case."
          #+lispworks `(setf (lispworks:environment-variable ,x) ,val)
          #+mkcl `(mkcl:setenv ,x ,val)
          #+sbcl `(progn (require :sb-posix) (symbol-call :sb-posix :setenv ,x ,val 1))
-         #+torcl `(torcl-ext:setenv ,x ,val)
-         #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
+         #+egcl `(egcl-ext:setenv ,x ,val)
+         #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl egcl)
          '(not-implemented-error '(setf getenv))
          ;; VAL is NIL, unset the variable
          #+allegro `(symbol-call :excl.osi :unsetenv ,x)
@@ -2170,8 +2170,8 @@ use getenvp to return NIL in such a case."
          #+lispworks `(setf (lispworks:environment-variable ,x) ,val) ; according to their docs, this should unset the variable
          #+mkcl `(mkcl:setenv ,x ,val) ; like other ECL-family implementations, don't see UNSETENV
          #+sbcl `(progn (require :sb-posix) (symbol-call :sb-posix :unsetenv ,x))
-         #+torcl `(torcl-ext:unsetenv ,x)
-         #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
+         #+egcl `(egcl-ext:unsetenv ,x)
+         #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl egcl)
          '(not-implemented-error 'unsetenv))
         `(if ,val
              #+allegro (setf (sys:getenv ,x) ,val)
@@ -2183,8 +2183,8 @@ use getenvp to return NIL in such a case."
              #+lispworks (setf (lispworks:environment-variable ,x) ,val)
              #+mkcl (mkcl:setenv ,x ,val)
              #+sbcl (progn (require :sb-posix) (symbol-call :sb-posix :setenv ,x ,val 1))
-             #+torcl (torcl-ext:setenv ,x ,val)
-             #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
+             #+egcl (egcl-ext:setenv ,x ,val)
+             #-(or allegro clasp clisp clozure cmucl ecl lispworks mkcl sbcl egcl)
              '(not-implemented-error '(setf getenv))
              ;; VAL is NIL, unset the variable
              #+allegro (symbol-call :excl.osi :unsetenv ,x)
@@ -2196,8 +2196,8 @@ use getenvp to return NIL in such a case."
              #+lispworks (setf (lispworks:environment-variable ,x) ,val) ; according to their docs, this should unset the variable
              #+mkcl (mkcl:setenv ,x ,val) ; like other ECL-family implementations, don't see UNSETENV
              #+sbcl (progn (require :sb-posix) (symbol-call :sb-posix :unsetenv ,x))
-             #+torcl (torcl-ext:unsetenv ,x)
-             #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl torcl)
+             #+egcl (egcl-ext:unsetenv ,x)
+             #-(or allegro clisp clozure cmucl ecl lispworks mkcl sbcl egcl)
              '(not-implemented-error 'unsetenv))))
 
   (defun getenvp (x)
@@ -2285,11 +2285,11 @@ then returning the non-empty string value of the variable"
                 (excl:ics-target-case (:-ics "8"))
                 (and (member :smp *features*) "SBT"))
         #+armedbear (format nil "~a-fasl~a" s system::*fasl-version*)
-        ;; TorCL: append a per-binary build fingerprint so the FASL cache dir
-        ;; is segregated per build — a rebuilt torcl never loads bytecode a
+        ;; EGCL: append a per-binary build fingerprint so the FASL cache dir
+        ;; is segregated per build — a rebuilt egcl never loads bytecode a
         ;; different binary wrote (bliss-nk2o). Mirrors ABCL/Clozure/Mezzano,
         ;; which fold their fasl-version into the identifier here.
-        #+torcl (format nil "~a-b~a" s (torcl-ext::%build-fingerprint))
+        #+egcl (format nil "~a-b~a" s (egcl-ext::%build-fingerprint))
         #+clisp
         (subseq s 0 (position #\space s)) ; strip build information (date, etc.)
         #+clozure
@@ -2359,7 +2359,7 @@ suitable for use as a directory name to segregate Lisp FASLs, C dynamic librarie
 
   (defun getcwd ()
     "Get the current working directory as per POSIX getcwd(3), as a pathname object"
-    (or #+torcl (parse-namestring (torcl-ext:getcwd))
+    (or #+egcl (parse-namestring (egcl-ext:getcwd))
         #+(or abcl genera mezzano xcl) (truename *default-pathname-defaults*) ;; d-p-d is canonical!
         #+allegro (excl::current-directory)
         #+clisp (ext:default-directory)
@@ -2570,7 +2570,7 @@ by the underlying implementation's MAKE-PATHNAME and other primitives"
   ;; This will be :unspecific if supported, or NIL if not.
   (defparameter *unspecific-pathname-type*
     #+(or abcl allegro clozure cmucl lispworks sbcl scl) :unspecific
-    #+(or torcl genera clasp clisp ecl mkcl gcl xcl #|These haven't been tested:|# cormanlisp mcl mezzano) nil
+    #+(or egcl genera clasp clisp ecl mkcl gcl xcl #|These haven't been tested:|# cormanlisp mcl mezzano) nil
     "Unspecific type component to use with the underlying implementation's MAKE-PATHNAME")
 
   (defun make-pathname* (&rest keys &key directory host device name type version defaults
@@ -4898,7 +4898,7 @@ depending on whether *LISP-INTERACTION* is set, enter debugger or die"
 (with-upgradability ()
   (defun raw-command-line-arguments ()
     "Find what the actual command line for this process was."
-    #+torcl (torcl-ext:raw-command-line-arguments)
+    #+egcl (egcl-ext:raw-command-line-arguments)
     #+abcl ext:*command-line-argument-list* ; Use 1.0.0 or later!
     #+allegro (sys:command-line-arguments) ; default: :application t
     #+(or clasp ecl) (loop :for i :from 0 :below (si:argc) :collect (si:argv i))
@@ -4911,7 +4911,7 @@ depending on whether *LISP-INTERACTION* is set, enter debugger or die"
     #+mkcl (loop :for i :from 0 :below (mkcl:argc) :collect (mkcl:argv i))
     #+sbcl sb-ext:*posix-argv*
     #+xcl system:*argv*
-    #-(or abcl allegro torcl clasp clisp clozure cmucl ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
+    #-(or abcl allegro egcl clasp clisp clozure cmucl ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
     (not-implemented-error 'raw-command-line-arguments))
 
   (defun command-line-arguments (&optional (arguments (raw-command-line-arguments)))
@@ -7326,13 +7326,13 @@ RUN-PROGRAM returns 3 values:
 or an indication of failure via the EXIT-CODE of the process"
     (declare (ignorable input output error-output if-input-does-not-exist if-output-exists
                         if-error-output-exists element-type external-format ignore-error-status))
-    #+torcl
+    #+egcl
     (return-from run-program
       (multiple-value-bind (exit-code out-str err-str)
-          (torcl-ext:run-program command)
+          (egcl-ext:run-program command)
         (flet ((process (spec str)
                  ;; Handle the common OUTPUT/ERROR-OUTPUT slurp specs directly
-                 ;; (torcl lacks SLURP-INPUT-STREAM's stream methods).
+                 ;; (egcl lacks SLURP-INPUT-STREAM's stream methods).
                  (cond
                    ((null spec) nil)
                    ((or (eq spec t) (eq spec :interactive)) (write-string str) nil)
@@ -7349,7 +7349,7 @@ or an indication of failure via the EXIT-CODE of the process"
               (cerror "Continue anyway."
                       'subprocess-error :command command :code exit-code))
             (values out-result err-result exit-code)))))
-    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl lispworks mcl mkcl sbcl scl xcl torcl)
+    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl lispworks mcl mkcl sbcl scl xcl egcl)
     (not-implemented-error 'run-program)
     (apply (if (or force-shell
                    ;; Per doc string, set FORCE-SHELL to T if we get command as a string.

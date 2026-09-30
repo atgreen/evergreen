@@ -1,6 +1,6 @@
 # §3  Memory Management & Garbage Collection
 
-TorCL uses a generational, region-based garbage collector inspired by
+EGCL uses a generational, region-based garbage collector inspired by
 HotSpot's G1 and ZGC. The design targets sub-10 ms GC pauses for heaps
 up to 32 GB, concurrent old-generation marking, and per-thread
 bump-pointer allocation for zero-contention fast paths. This chapter
@@ -275,7 +275,7 @@ logged to a per-thread SATB buffer:
 ```rust
 // Inserted by compiler at every reference store (§4).
 #[inline(always)]
-fn satb_write_barrier(slot: *mut TorclVal, old_val: TorclVal) {
+fn satb_write_barrier(slot: *mut EgclVal, old_val: EgclVal) {
     if gc_marking_in_progress() {
         if is_heap_pointer(old_val) {
             let buf = current_thread().satb_buffer;
@@ -405,9 +405,9 @@ sequence:
 /// Single function, two fast-path checks, to minimise branch overhead.
 #[inline(always)]
 fn combined_write_barrier(
-    slot_addr: *mut TorclVal,
-    old_val: TorclVal,
-    new_val: TorclVal,
+    slot_addr: *mut EgclVal,
+    old_val: EgclVal,
+    new_val: EgclVal,
 ) {
     // 1. SATB barrier (only when concurrent marking is active)
     if gc_marking_in_progress() {
@@ -488,7 +488,7 @@ is a MAY for v2+.
 
 ## 3.9  Safepoint Protocol
 
-Mutator threads must reach a **safepoint** before GC can proceed. TorCL
+Mutator threads must reach a **safepoint** before GC can proceed. EGCL
 uses a polling-based safepoint mechanism (R3.14 — no asynchronous
 signal-based suspension). The mechanism uses a synchronous page-fault
 trap: the GC thread `mprotect`s a polling page, causing the mutator
@@ -558,7 +558,7 @@ At a safepoint, each thread's state is fully walkable:
 ```rust
 struct WeakPointer {
     header: ObjectHeader,
-    referent: AtomicU64,   // holds a TorclVal (tagged 64-bit value); cleared to NIL when referent dies
+    referent: AtomicU64,   // holds a EgclVal (tagged 64-bit value); cleared to NIL when referent dies
     broken: AtomicBool,
 }
 ```
@@ -642,7 +642,7 @@ unmarked are removed.
 
 ## 3.15  Module Map
 
-GC implementation lives under `crates/torcl-rt/src/gc/`:
+GC implementation lives under `crates/egcl-rt/src/gc/`:
 
 ```
 gc/
