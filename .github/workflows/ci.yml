@@ -1,3 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#
+# Per-PR gates. Anything slow, scheduled, or cross-target lives in its own
+# workflow: gc.yml (GC-safety fuzzing), cross.yml (the ports), nightly-fuzz.yml
+# and sanitizers.yml.
+#
+# TOOLCHAIN: no toolchain action. rust-toolchain.toml pins 1.94.1 and lists the
+# components and targets a fresh checkout needs, and rustup installs from that
+# file on first use — so `rustup show` is the whole setup step and there is one
+# place that decides which compiler builds EGCL. A `dtolnay/rust-toolchain@stable`
+# step here would be silently overridden by that file anyway, which is how CI
+# stopped noticing new-compiler breakage (bliss-cice); the deliberate
+# stable-drift check lives in nightly-fuzz.yml instead (bliss-75yx).
+#
+# TARGET: .cargo/config.toml sets `[build] target = x86_64-unknown-linux-musl`
+# unconditionally, so every non-Linux job MUST override CARGO_BUILD_TARGET to its
+# own host. Without that, a Windows or macOS runner tries to link a Linux musl
+# binary and the job cannot pass. (The macOS leg was removed for exactly this
+# reason: there is no macOS target in the port set.)
+
 name: ci
 
 on:
@@ -5,38 +26,132 @@ on:
     branches: [main]
   pull_request:
 
+# A second push to the same branch supersedes the first; CI here costs tens of
+# minutes per run, so let the stale one go.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: PGO build orchestration contracts
-        run: make test-pgo-build
-      - uses: dtolnay/rust-toolchain@stable
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      # NOTE: `make fmt-check` is deliberately NOT a gate yet. The tree has
+      # pre-existing rustfmt drift, so switching it on fails on unrelated files;
+      # it goes in once that is cleaned in its own commit.
       - name: spec coverage gate
         run: python3 scripts/spec-coverage.py --gate
-      - name: cargo check
-        run: cargo check --workspace
-      - name: cargo test
-        run: cargo test --workspace
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: gc-root-lint (bliss-jaf — new unrooted-across-alloc candidates fail)
+        run: make clippy
+      - name: gc-root-lint (new unrooted-across-alloc candidates fail — bliss-jaf)
         run: bash scripts/gc-root-lint.sh
-      - name: ansi-test
+      - name: ansi-test expectations and CI contracts
         run: cargo test -p egcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts
 
-  # The Linux build can only cross-compile the Win64 adapter.  Keep a native
+  # PGO orchestration contracts. Its own job because it must run AFTER a
+  # toolchain exists — in the previous layout it ran before the toolchain step
+  # and only worked because the runner image happens to ship a Rust.
+  pgo-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pgo
+      - name: PGO build orchestration contracts
+        run: make test-pgo-build
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-debug
+      - name: cargo check
+        run: cargo check --workspace
+      - name: cargo test (debug, musl)
+        run: make test
+
+  # The same suite at opt-level 3. Tiering is profile-sensitive: OSR promotion,
+  # T1/T2 installation and deopt all depend on optimized code, and AGENTS.md
+  # treats release as the profile that counts for anything timing-related. A
+  # debug-only gate cannot see a bug that only appears once a loop promotes.
+  test-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-release
+      - name: cargo test (release, musl)
+        run: cargo test --workspace --release
+
+  # The FFI surface. `c-ffi` is OFF by default because dlopen is incompatible
+  # with the static musl executable, so the default `cargo test --workspace`
+  # above compiles NONE of the dlopen path — test_ffi, ffi_elf_loader,
+  # spec_security_sandbox_ffi and spec_threading_concurrency are all gated behind
+  # that feature and were therefore never run in CI. This is also the
+  # configuration every Common Lisp library port needs (CFFI's backend is built
+  # on it), so a regression here breaks the library ecosystem rather than just a
+  # test. glibc, not musl, because the feature needs a dynamic loader.
+  test-ffi-gnu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - name: add the glibc target
+        run: rustup target add x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-ffi-gnu
+      - name: cargo test with the C-ABI FFI enabled
+        run: cargo test --features egcl-rt/c-ffi -p egcl-rt -p egcl
+
+  # The Linux build can only cross-compile the Win64 adapter. Keep a native
   # Windows gate for the SEH/shadow-space transition itself; mitigation refusal
   # is a test failure here rather than a silently skipped ABI claim.
   windows-native-transfer:
     runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # Override the repo's musl default — see the TARGET note at the top.
+      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - name: add the host target
+        run: rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
       - name: cargo check (Windows workspace)
         run: cargo check --workspace
       - name: Win64 segment ABI execution

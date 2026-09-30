@@ -1,3 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#
+# Nightly sanitizers and Miri.
+#
+# The previous version of this file could not have run: `cargo test -Z
+# sanitizer=address` passes a RUSTC flag to cargo. A sanitizer needs the flag in
+# RUSTFLAGS, an explicit --target (so the flag is not also applied to build
+# scripts and proc macros), and -Z build-std so std itself is instrumented —
+# without build-std, ASan reports inside std are unattributable and MSan reports
+# are pure false positives. Miri also needs its component installed and `miri
+# setup` run before it can touch a test.
+#
+# Sanitizers force the GNU target: musl plus -Z build-std plus a sanitizer
+# runtime is not a combination worth debugging here, and these are looking for
+# UB in the runtime's own unsafe code, which is not libc-specific.
+
 name: sanitizers
 
 on:
@@ -5,17 +22,60 @@ on:
     - cron: "0 5 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+
 jobs:
-  sanitizers:
+  sanitizer:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - san: address
+          - san: thread
+          # MSan needs every dependency instrumented or it reports uninitialised
+          # reads inside uninstrumented code. build-std covers std; a C
+          # dependency compiled by cc would still need its own instrumentation.
+          - san: memory
+    name: ${{ matrix.san }}sanitizer
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: asan
-        run: cargo +nightly test -Z sanitizer=address
-      - name: tsan
-        run: cargo +nightly test -Z sanitizer=thread
-      - name: msan
-        run: cargo +nightly test -Z sanitizer=memory
-      - name: miri
-        run: cargo +nightly miri test
+      - name: install nightly with rust-src (build-std needs the source)
+        run: |
+          rustup toolchain install nightly --component rust-src --profile minimal
+          rustup target add x86_64-unknown-linux-gnu --toolchain nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: san-${{ matrix.san }}
+      - name: ${{ matrix.san }}sanitizer over the runtime
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.san }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.san }}
+        run: |
+          cargo +nightly test -Z build-std \
+            --target x86_64-unknown-linux-gnu \
+            -p egcl-rt
+
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Miri interprets; it cannot execute JIT-emitted machine code or the native
+    # transfer assembly, so the runtime and interpreter crates are out of scope
+    # for it by construction. Point it at the crates that are pure Rust.
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nightly with miri
+        run: |
+          rustup toolchain install nightly --component miri --profile minimal
+          cargo +nightly miri setup
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri
+      - name: miri over the compiler crate
+        run: cargo +nightly miri test -p egcl-compiler

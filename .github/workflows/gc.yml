@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#
+# The GC-safety gate. AGENTS.md makes a clean EGCL_GC_STRESS run the required
+# evidence for any change that allocates, because the moving collector turns
+# missing roots into intermittent, load-dependent segfaults that ordinary tests
+# pass straight through. Nothing in CI exercised those knobs before this, which
+# is why this is a workflow rather than a step.
+#
+# The three knobs, and why all three:
+#   EGCL_GC_STRESS=1  fire a minor GC on (almost) every allocation, so a value
+#                     left unrooted across an allocation moves under the holder.
+#   EGCL_GC_POISON=1  fill freed nursery with a non-canonical pattern, so a stale
+#                     deref segfaults at once instead of quietly reading moved data.
+#   EGCL_GC_VERIFY=1  after relocation, walk every root slot and live field and
+#                     panic on any reference still pointing into the freed range.
+#                     This is the one that catches a root the scanner SKIPS —
+#                     stress and poison only catch a stale pointer being read, and
+#                     a clean run over objects that never moved proves nothing.
+#
+# Scope: stress fires a collection per allocation, so the full acceptance suite
+# under it takes hours. The PR job runs an allocation-heavy subset; the scheduled
+# job runs the whole thing.
+
+name: gc
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # 03:00 UTC, before the fuzz (04:00) and sanitizer (05:00) nightlies.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Per-PR: a curated subset, chosen for allocation density rather than breadth —
+  # CLOS instances, FFI buffers, closures over captured namespaces, and the
+  # tiering paths that hand values across the c2i boundary.
+  stress-subset:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stress+poison
+            env: EGCL_GC_STRESS=1 EGCL_GC_POISON=1
+          - name: verify
+            env: EGCL_GC_VERIFY=1 EGCL_GC_STRESS=1
+    name: ${{ matrix.name }} (subset)
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gc
+      # Release, because stress multiplies the collection count and a debug
+      # runtime makes the subset itself time out.
+      - name: build the test binaries
+        run: cargo test --release --no-run -p egcl -p egcl-rt
+      - name: ${{ matrix.name }}
+        run: |
+          env ${{ matrix.env }} cargo test --release -p egcl \
+            --test ffi_memory_cli \
+            --test function_object_dispatch_cli \
+            --test defun_redefinition_retires_bytecode_cli \
+            --test setf_function_names_cli \
+            --test tier_observability
+          env ${{ matrix.env }} cargo test --release -p egcl-rt
+
+  # Scheduled: the whole suite under stress, which is where a rarely-exercised
+  # path gets its collection. Allowed the full timeout budget.
+  stress-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stress+poison
+            env: EGCL_GC_STRESS=1 EGCL_GC_POISON=1
+          - name: verify
+            env: EGCL_GC_VERIFY=1 EGCL_GC_STRESS=1
+    name: ${{ matrix.name }} (full)
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gc
+      - name: ${{ matrix.name }} over the whole workspace
+        run: env ${{ matrix.env }} cargo test --release --workspace

@@ -1,3 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#
+# Nightly fuzzing, coverage, and the deliberate new-compiler check.
+#
+# Two things the previous version could not do: it called `cargo llvm-cov`
+# without installing cargo-llvm-cov, and it set RUSTFLAGS=-C instrument-coverage
+# for the whole job — which also lands on the fuzz build, where cargo-fuzz sets
+# its own conflicting flags. Coverage is now its own job with its own flags.
+
 name: nightly-fuzz
 
 on:
@@ -5,19 +15,98 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # All seven targets, not just the reader: the previous version fuzzed
+  # fuzz_reader alone, so the eval, macroexpand, compile, format, FFI and
+  # image-load entry points — every one of which parses attacker-shaped input —
+  # were never exercised. One job each so a crash names its target, and
+  # fail-fast off so one crash does not cancel the other six.
   fuzz:
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -C instrument-coverage
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_reader
+          - fuzz_eval
+          - fuzz_macroexpand
+          - fuzz_compile
+          - fuzz_format
+          - fuzz_ffi
+          - fuzz_image_load
+    name: fuzz ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: install cargo-fuzz
-        run: cargo install cargo-fuzz
+      - name: install nightly (cargo-fuzz requires it)
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
       - name: short fuzz run
-        run: cargo fuzz run fuzz_reader -- -max_total_time=60
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
       - name: corpus minimisation
-        run: cargo fuzz cmin fuzz_reader fuzz/corpus/fuzz_reader
-      - name: weekly llvm-cov report
+        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+      - name: keep the crashing inputs, if any
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+      - name: workspace coverage
         run: cargo llvm-cov --workspace --lcov --output-path coverage.lcov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: coverage.lcov
+          if-no-files-found: error
+
+  # rust-toolchain.toml pins 1.94.1, which every other job correctly follows —
+  # and which therefore hides the exact failure mode of bliss-cice, where a newer
+  # rustc rejected egcl-rt's opaque declarations of the runtime symbols std relies
+  # on. Override the pin here so the breakage is found deliberately, nightly,
+  # rather than by accident the next time someone runs `rustup update`
+  # (bliss-75yx). Informational: a new compiler's regression is not a reason to
+  # fail the tree, but it should be visible the morning it appears.
+  toolchain-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: install current stable and the musl target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-musl --toolchain stable
+      - name: report which compiler this is
+        run: rustc --version
+      - name: cargo check on current stable
+        run: cargo check --workspace
+      - name: cargo test on current stable
+        run: cargo test --workspace

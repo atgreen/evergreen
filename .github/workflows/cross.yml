@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#
+# The ports. scripts/cross-port.sh, Cross.toml and packaging/fedora all treat
+# AArch64, POWER, IBM Z and Android as supported, and none of them was built in
+# CI — so a codegen change that declines or miscompiles on a non-x86 backend was
+# only ever caught by hand on this laptop.
+#
+# `cross` rather than a local toolchain: Cross.toml already pins the container
+# image per target (including the Android image chosen for its NDK version —
+# bliss-w2vp), so the images decide the sysroots and this workflow does not
+# duplicate that knowledge.
+#
+# Those images ship qemu-user, so the runtime tests can be RUN and not merely
+# built. egcl-rt is the crate whose assumptions are architecture-specific
+# (native transfer, the JIT emitters, atomics); running its suite under qemu is
+# the part that actually proves a port.
+
+name: cross
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'crates/egcl-rt/**'
+      - 'crates/egcl-compiler/**'
+      - 'crates/egcl-android/**'
+      - 'Cross.toml'
+      - 'scripts/cross-port.sh'
+      - '.github/workflows/cross.yml'
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      # One failing architecture must not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            run_tests: true
+          - target: powerpc64le-unknown-linux-gnu
+            run_tests: true
+          - target: s390x-unknown-linux-gnu
+            run_tests: true
+          # Android: build only. The shim is an rlib in the workspace and the .so
+          # is produced with `cargo rustc --crate-type cdylib`, so a plain
+          # workspace test run is not the artifact that matters here.
+          - target: aarch64-linux-android
+            run_tests: false
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-${{ matrix.target }}
+      - name: build the workspace for ${{ matrix.target }}
+        run: cross build --workspace --release --target ${{ matrix.target }}
+      - name: run the runtime suite under qemu
+        if: matrix.run_tests
+        run: cross test -p egcl-rt --release --target ${{ matrix.target }}
+      - name: build the Android NativeActivity shim as a cdylib
+        if: matrix.target == 'aarch64-linux-android'
+        run: cross rustc -p egcl-android --release --target ${{ matrix.target }} --crate-type cdylib
