@@ -14,6 +14,7 @@
 
 use crate::t2::frame_state::FrameStateId;
 use crate::t2::ir::{AuxData, Function, IRType, Inst, InstFlags, Opcode, TypeBits, Value};
+use std::collections::HashMap;
 
 /// The single type a call site may be speculated as (mutually exclusive).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -48,6 +49,33 @@ fn arith_of(sym: u32) -> Option<Arith> {
     }
 }
 
+/// `(MOD x c)` where `c` is a constant, positive power of two → the AND mask
+/// that computes it, or `None` when this shape does not apply.
+///
+/// A tagged fixnum is `n << 3` with a zero tag (value.rs `from_fixnum`), so the
+/// shift factors straight out of a bitwise AND and the result is already tagged:
+///
+///   (mod -7 8):  -7 tagged = -56 = …11001000
+///                mask  7 tagged =  56 =   00111000
+///                AND            =    8 = tagged 1   ✓ CL says 1
+///
+/// FLOORED, which is what MOD means, and that is why this works at all: for a
+/// POSITIVE power-of-two divisor, two's complement low bits already carry the
+/// floored remainder, sign included. REM is NOT this -- `(rem -7 8)` is -7, not
+/// 1 -- so REM must not be routed here, and it is not.
+///
+/// A negative divisor is refused: `(mod 7 -8)` is -1, which the mask does not
+/// give. Zero cannot appear (`is_power_of_two` excludes it), so the
+/// DIVISION-BY-ZERO path is untouched and still signals from the generic call.
+fn mod_mask_of(f: &Function, args: &[crate::t2::ir::Value], consts: &HashMap<Value, i64>) -> Option<i64> {
+    let _ = f;
+    if args.len() != 2 {
+        return None;
+    }
+    let c = *consts.get(&args[1])?;
+    (c > 0 && (c as u64).is_power_of_two()).then(|| c - 1)
+}
+
 /// `1+` / `1-` — unary increment/decrement, speculated as the binary fixnum
 /// op with a materialised constant-1 operand (bliss-x5y.25: TAK's `(1- z)`
 /// stayed a generic call, keeping a safepoint per site and `z` forever
@@ -78,6 +106,11 @@ enum ExtraArg {
     None,
     FixnumOne,
     Nil,
+    /// Replace the SECOND operand with a materialised fixnum constant, rather
+    /// than appending a third. `MOD` by a constant power of two becomes a mask
+    /// (see `mod_mask_of`), so the divisor operand is not merely unused — it
+    /// must go, or the rewritten `LogAnd` would AND against the divisor.
+    ReplaceSecondWithFixnum(i64),
 }
 
 #[derive(Copy, Clone)]
@@ -212,6 +245,21 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
     let mut work: Vec<(Inst, Opcode, IRType, ExtraArg)> = Vec::new();
+    // Constant fixnum operands, so a divisor can be recognised without relying
+    // on ConstFold having run -- the T2 driver only runs the mid-end pipeline
+    // when `opt` is set, so a rewrite that needed folding afterwards would go
+    // unlowered in the unoptimised path.
+    let mut consts: HashMap<Value, i64> = HashMap::new();
+    for i in 0..f.num_insts() {
+        let d = f.inst(Inst(i as u32));
+        if d.opcode == Opcode::ConstFixnum {
+            if let AuxData::FixnumImm(k) = d.aux {
+                if let Some(&r) = d.results.first() {
+                    consts.insert(r, k);
+                }
+            }
+        }
+    }
     for &b in f.block_order() {
         for &inst in &f.block(b).insts {
             let data = f.inst(inst);
@@ -280,6 +328,26 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                         ExtraArg::None,
                     ));
                 }
+            } else if torcl_rt::symbols::symbol_name(sym).as_deref() == Some("MOD") {
+                // MOD by a constant power of two is a mask, so it lowers to the
+                // LogAnd every one of the four emitters already implements --
+                // no new emitter arm, and ppc64le/s390x get it too.
+                //
+                // Deliberately ONLY this shape. A general fixnum MOD would need
+                // FixnumMod, which exists in the IR and in lower.rs but that NO
+                // EMITTER implements, so producing it would make the emitter
+                // decline and cost the whole function its T2 code -- slower than
+                // the generic call it replaced.
+                if spec == SpecType::Fixnum {
+                    if let Some(mask) = mod_mask_of(f, &data.args, &consts) {
+                        work.push((
+                            inst,
+                            Opcode::LogAnd,
+                            result_type(SpecType::Fixnum),
+                            ExtraArg::ReplaceSecondWithFixnum(mask),
+                        ));
+                    }
+                }
             } else if torcl_rt::symbols::symbol_name(sym).as_deref() == Some("ASH") {
                 // Arithmetic shift by a (constant, checked at emit) amount: left is a
                 // multiply by 2^n (overflow-checked), right is an untag/sar/retag.
@@ -317,13 +385,25 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                 AuxData::None,
                 IRType::of(TypeBits::NULL),
             )),
+            ExtraArg::ReplaceSecondWithFixnum(k) => Some(push_const_before(
+                f,
+                inst,
+                Opcode::ConstFixnum,
+                AuxData::FixnumImm(k),
+                IRType::of(TypeBits::FIXNUM),
+            )),
         };
+        let replace_second = matches!(extra, ExtraArg::ReplaceSecondWithFixnum(_));
         let results = f.inst(inst).results.clone();
         {
             let data = f.inst_mut(inst);
             data.opcode = opcode;
             if let Some(v) = extra_value {
-                data.args.push(v);
+                if replace_second {
+                    data.args[1] = v;
+                } else {
+                    data.args.push(v);
+                }
             }
             if opcode == Opcode::GenericEq {
                 // (eq x nil) is PURE and total: no guard, no deopt state, no
