@@ -2288,26 +2288,25 @@ fn an_arithmetic_loop_variable_is_the_iteration_counter() {
             "(loop for x on '(1 2) collect (car x) do (setq x nil))",
             "(1 2)",
         ),
-        // A LOOP that does not touch its variable is unchanged, including the
-        // last-in-range value FINALLY sees (ansi-test LOOP.1.40-43, which those
-        // tests tag :ansi-spec-problem; SBCL answers the stepped-past way and
-        // TorCL follows ansi-test — see bliss-uj7m).
+        // A LOOP that does not touch its variable is unchanged, and FINALLY sees
+        // the value that failed the termination test (CLHS 6.1.2.1.1;
+        // bliss-bpjw6). The COLLECTED values are the same either way.
         ("(loop for i from 1 to 5 collect i)", "(1 2 3 4 5)"),
         (
             "(loop for x from 1 to 5 do (progn) finally (return x))",
-            "5",
+            "6",
         ),
         (
             "(loop for x from 1 below 5 do (progn) finally (return x))",
-            "4",
+            "5",
         ),
         (
             "(loop for x from 10 downto 0 do (progn) finally (return x))",
-            "0",
+            "-1",
         ),
         (
             "(loop for x from 10 above 0 do (progn) finally (return x))",
-            "1",
+            "0",
         ),
         // A zero-iteration loop still leaves the start value.
         (

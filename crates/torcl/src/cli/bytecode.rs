@@ -4212,20 +4212,27 @@ impl<'e> Lowerer<'e> {
                             let down = kw(forms[i + 2]).as_deref() == Some("DOWNFROM");
                             let mut start = *forms.get(i + 3).ok_or(Bail)?;
                             torcl_rt::rooted_ref!(_start_root = &mut start);
-                            // Step an internal COUNTER, not VAR itself. When the
-                            // counter passes the bound the loop exits with VAR still
-                            // holding the last IN-RANGE value — the last-in-range
-                            // FINALLY semantics the tree-walker (eval_loop) uses and
-                            // ansi-test LOOP.1.40-43 require, rather than the
-                            // stepped-past value (bliss-uj7m, an S5 tier-consistency
-                            // fix). LET* binds VAR from the counter (start evaluated
-                            // once) so a zero-iteration loop still gives FINALLY the
-                            // start value; `SETQ var ctr` at the top of each iteration
-                            // republishes the in-range value for the body and finally.
+                            // Step an internal COUNTER rather than VAR itself, so
+                            // that the step can read VAR back (see below) while the
+                            // limit test consumes the counter. LET* binds VAR from
+                            // the counter (start evaluated once) so a zero-iteration
+                            // loop still gives FINALLY the start value, and `SETQ var
+                            // ctr` publishes each stepped value — including the one
+                            // that fails the test, which is what FINALLY must see
+                            // (CLHS 6.1.2.1.1; bliss-bpjw6). The tree-walker
+                            // (eval_loop) binds before testing for the same reason,
+                            // so both tiers agree.
                             let ctr = fresh("CTR", &mut nsym)?;
                             bindings.push(form_list(&[ctr, start]));
                             bindings.push(form_list(&[var, ctr]));
                             let mut adv = 4;
+                            // VAR is published at the top of the iteration — before
+                            // the limit test below — so the iteration that ends the
+                            // loop leaves the value that failed the test in VAR for
+                            // FINALLY (bliss-bpjw6), the same order the tree-walker
+                            // uses. A driver with no limit still needs it: that is
+                            // the only place VAR ever advances.
+                            pre.push(form_list(&[s("SETQ")?, var, ctr]));
                             let mut limit: Option<(TorclVal, &str)> = None;
                             match kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() {
                                 Some("TO") | Some("UPTO") => {
@@ -4294,10 +4301,6 @@ impl<'e> Lowerer<'e> {
                                 torcl_rt::rooted_ref!(_go_form_root = &mut go_form);
                                 pre.push(form_list(&[s("WHEN")?, test_form, go_form]));
                             }
-                            // Republish the in-range counter into VAR at the top of
-                            // the iteration (in driver source order), matching the
-                            // tree-walker's bind-then-step order.
-                            pre.push(form_list(&[s("SETQ")?, var, ctr]));
                             let op = if descending { "-" } else { "+" };
                             // Advance from VAR, not from CTR: a body that assigns
                             // to the loop variable moves the iteration with it
@@ -4307,10 +4310,7 @@ impl<'e> Lowerer<'e> {
                             // that ignored `i` re-read every continuation byte as a
                             // starter byte, so octets-to-string signalled
                             // INVALID-UTF8-STARTER-BYTE on bytes string-to-octets
-                            // had just produced. CTR stays a separate variable
-                            // because it, not VAR, is what the limit test above
-                            // consumes — that is what leaves VAR holding the last
-                            // IN-RANGE value on exit (bliss-uj7m / LOOP.1.40-43).
+                            // had just produced.
                             steps.push(form_list(&[
                                 s("SETQ")?,
                                 ctr,

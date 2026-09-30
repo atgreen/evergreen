@@ -25622,8 +25622,7 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                     let limit = limit_kind.map(|kind| (kind, *limit_v));
                     // Bind the driver variable to its start value up front so a
                     // zero-iteration loop (start already past the limit) still
-                    // gives FINALLY the start value; the stepping below leaves it
-                    // at the last in-range value otherwise (LOOP.1.40-43).
+                    // gives FINALLY the start value.
                     loop_bind(*pat, current, env);
                     states.push(ForState::From {
                         pat: *pat,
@@ -25790,16 +25789,21 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                         // way; `across`/`in`/`on`/`repeat` step private state, so
                         // assigning to their variable does not move them.
                         //
-                        // `current` is still kept separately, because it — not the
-                        // variable — is what the limit test consumes: when the
-                        // stepped value passes the limit the loop exits WITHOUT
-                        // rebinding, so FINALLY sees the last IN-RANGE value
-                        // (`from 1 to 5` ends at 5, `from 1 below 5` at 4). That
-                        // is ansi-test LOOP.1.40-43, which those tests tag
-                        // `:ansi-spec-problem` and SBCL answers the stepped-past
-                        // way; TorCL follows ansi-test here (bliss-uj7m) and the
-                        // lowerer matches. The COLLECTED values agree with SBCL
-                        // either way.
+                        // `current` is still kept separately because the body may
+                        // assign to the variable, and the next step reads the
+                        // variable back (above) rather than this counter.
+                        //
+                        // The variable is published BEFORE the limit test, so on
+                        // exit it holds the value that failed the test — `from 1
+                        // to 5` leaves 6, `from 1 below 5` leaves 5 — which is
+                        // what CLHS 6.1.2.1.1 describes and what SBCL, CCL, ECL
+                        // and CLISP all answer. ansi-test LOOP.1.40-43 want the
+                        // last in-range value instead and tag themselves
+                        // `:ansi-spec-problem`; TorCL followed them until
+                        // bliss-bpjw6, where the cost showed up as silent data
+                        // loss: Babel's octet counters return this variable from
+                        // FINALLY, so encoding a Lisp string into a caller-sized
+                        // foreign buffer dropped its last character.
                         if !first {
                             // `loop for nil from 10 to 15` is legal — the clause
                             // drives the iteration and discards the value, so
@@ -25816,11 +25820,11 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
                             torcl_rt::rooted_ref!(_prev_root = &mut prev);
                             *current = loop_add_numbers(prev, *step)?;
                         }
+                        loop_bind(*pat, *current, env);
                         if loop_from_exhausted(*current, limit.as_ref())? {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, *current, env);
                     }
                     ForState::Across { pat, items, idx } => {
                         if *idx >= items.len() {

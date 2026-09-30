@@ -684,16 +684,17 @@ fn loop_for_var_with_type_spec_and_parallel_and() {
 fn loop_with_bare_type_and_final_arithmetic_value() {
     // Babel's generated UTF-8 counters combine a typed WITH binding with a
     // FINALLY form that returns both the count and the exhausted loop index.
-    // Per ansi-test LOOP.1.40-43, FINALLY sees the last IN-RANGE value of an
-    // arithmetic driver, not the stepped-past one: `for i from 0 below 2`
-    // leaves i=1, so this is (2 1). The compiled and tree-walked tiers must
-    // agree here (S5 tier consistency; bliss-uj7m) — the original (2 2)
-    // assertion encoded the compiled path's stepped-past bug.
+    // FINALLY sees the value that FAILED the termination test, so `for i from 0
+    // below 2` leaves i=2 (CLHS 6.1.2.1.1; SBCL, CCL, ECL and CLISP agree).
+    // Both tiers must answer this (S5 tier consistency). TorCL answered the
+    // last-in-range value that ansi-test LOOP.1.40-43 assert — those tests tag
+    // themselves :ansi-spec-problem — until bliss-bpjw6, where that cost Babel
+    // the last character of every string it encoded into a sized buffer.
     assert_eq!(
         eval_ok(
             "(multiple-value-list (loop with n fixnum = 0 for i fixnum from 0 below 2 do (incf n) finally (return (values n i))))"
         ),
-        "(2 1)"
+        "(2 2)"
     );
 }
 
