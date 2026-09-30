@@ -28369,6 +28369,50 @@ fn eval_let(cdr: TorclVal, env: &mut Env, sequential: bool) -> Result<TorclVal, 
     })
 }
 
+/// Record a definition's docstring where DOCUMENTATION can find it, the way
+/// DEFVAR's expansion does (bliss-jre1u). DEFUN and DEFMACRO are special forms
+/// handled here, so nothing was recording their docstrings and
+/// `(documentation 'f 'function)` answered NIL for every one of them.
+///
+/// A leading string is a docstring only when the body has something after it;
+/// `(defun f () "text")` returns that string instead.
+fn record_function_documentation(name: TorclVal, body: TorclVal, env: &mut Env) {
+    if !name.is_symbol() || !body.is_cons() {
+        return;
+    }
+    let (first, rest) = cp(body);
+    if !rest.is_cons() || !is_string_value(first) {
+        return;
+    }
+    // boot.lisp defines functions of its own before the documentation table
+    // exists; until then there is nowhere to record one.
+    let (Some(setter), Some(quote), Some(kind)) = (
+        resolve_sym("TORCL-INTERNAL::%SET-DOCUMENTATION"),
+        resolve_sym("QUOTE"),
+        resolve_sym("FUNCTION"),
+    ) else {
+        return;
+    };
+    if !fn_bound(env, &sym_name(setter)) {
+        return;
+    }
+    torcl_rt::rooted!(doc = first);
+    torcl_rt::rooted!(quoted_name = quote_form(quote, name));
+    torcl_rt::rooted!(quoted_kind = quote_form(quote, kind));
+    torcl_rt::rooted!(args = arena_cons(*doc, NIL));
+    *args = arena_cons(*quoted_kind, *args);
+    *args = arena_cons(*quoted_name, *args);
+    torcl_rt::rooted!(call = arena_cons(setter, *args));
+    // A failure here must not fail the definition: the docstring is metadata.
+    let _ = eval_form(*call, env);
+}
+
+/// `(quote value)` as a fresh rooted form.
+fn quote_form(quote: TorclVal, value: TorclVal) -> TorclVal {
+    torcl_rt::rooted!(tail = arena_cons(value, NIL));
+    arena_cons(quote, *tail)
+}
+
 // ── DEFUN ────────────────────────────────────────────────────────
 fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
     let (mut name_form, rest) = cp(cdr);
@@ -28397,6 +28441,8 @@ fn eval_defun(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             bytecode::set_source_text(sym_idx, src);
         }
     }
+    // Record the docstring before the wrap below replaces `body`.
+    record_function_documentation(name_form, body, env);
     // A defun body is wrapped in an implicit block named after the function
     // (ANSI 3.1.2.1), so `(return-from NAME ...)` works from anywhere in the
     // body — including inside nested flet/loop/etypecase forms. For `(setf x)`
@@ -29756,6 +29802,8 @@ fn eval_defmacro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> {
             function: None,
         },
     );
+    // CFFI's DEFCFUN defines a variadic binding as a macro, docstring and all.
+    record_function_documentation(name_form, body, env);
     Ok(name_form)
 }
 
