@@ -1396,6 +1396,10 @@ fn is_known_special_operator(val: TorclVal) -> bool {
             name.as_str(),
             "BLOCK"
                 | "CATCH"
+                // SETF's first subform of each pair is a PLACE, not an
+                // expression, so it must not be walked as a call (bliss-msyk).
+                | "SETF"
+                | "PSETF"
                 // Definers whose LAMBDA LIST binds variables over the body: the
                 // parameters shadow an enclosing symbol macro, and the name,
                 // qualifiers and lambda list are not expressions (bliss-ump7).
@@ -1504,6 +1508,7 @@ fn expand_special_form(
         "RETURN-FROM" => expand_return_from(form, env),
         "TAGBODY" => expand_tagbody(form, env),
         "SETQ" => expand_setq(form, env),
+        "SETF" | "PSETF" => expand_setf(form, env),
         "MULTIPLE-VALUE-SETQ" => expand_multiple_value_setq(form, env),
         "THE" => expand_the(form, env),
         "EVAL-WHEN" => expand_eval_when(form, env),
@@ -1733,6 +1738,138 @@ fn expand_multiple_value_setq(
     );
     torcl_rt::rooted!(wrapped = vec_to_cons(&[make_symbol("VALUES"), *setf_form]));
     macroexpand_all(*wrapped, env)
+}
+
+/// Expand SETF: `(setf {place value}*)`.
+///
+/// A place is not an expression. Its value forms expand normally, but the place
+/// itself expands as a place: a symbol macro expands (its expansion is again a
+/// place), and the place's own subforms expand as expressions — while the head
+/// keeps its identity. Walking a place as an ordinary call let a compiler macro
+/// on the accessor rewrite it, and the rewritten form was no longer a place at
+/// all: CFFI's WITH-FOREIGN-SLOTS binds a symbol macro standing for
+/// `(foreign-slot-value …)`, whose accessor has both a compiler macro and a SETF
+/// expander, so `(setf slot value)` reached SETF as
+/// `(setf (translate-from-foreign …) value)` and failed as an unsupported place
+/// (bliss-msyk). CLHS 3.2.2.1 allows a compiler macro only for a function call.
+fn expand_setf(mut form: TorclVal, env: &Environment) -> Result<TorclVal, TorclError> {
+    torcl_rt::rooted_ref!(_form_root = &mut form);
+    let mut operator = unsafe { cons_car(form) };
+    torcl_rt::rooted_ref!(_operator_root = &mut operator);
+    torcl_rt::rooted!(items = cons_to_vec(unsafe { cons_cdr(form) }));
+    // An odd number of subforms is a program error SETF itself reports; leave
+    // such a form alone rather than guessing at its pairing.
+    if items.is_empty() || items.len() % 2 != 0 {
+        return Ok(form);
+    }
+    torcl_rt::rooted!(rebuilt = Vec::<TorclVal>::new());
+    let mut changed = false;
+    for i in (0..items.len()).step_by(2) {
+        let place = expand_place(items[i], env, 0)?;
+        changed |= place != items[i];
+        rebuilt.push(place);
+        let value = macroexpand_all(items[i + 1], env)?;
+        changed |= value != items[i + 1];
+        rebuilt.push(value);
+    }
+    // Share the original form when nothing in it expanded, rather than
+    // allocating an identical copy: a caller may hold the place by identity.
+    if !changed {
+        return Ok(form);
+    }
+    Ok(alloc_cons(operator, vec_to_cons(&rebuilt)))
+}
+
+/// Expand a SETF place, keeping it a place.
+///
+/// A symbol macro expands and its expansion is expanded again as a place; an
+/// ordinary macro in the head position expands the same way (CLHS 5.1.2.7). A
+/// function-call place keeps its head and expands only its argument subforms —
+/// no compiler macro is applied to it.
+fn expand_place(
+    mut place: TorclVal,
+    env: &Environment,
+    depth: usize,
+) -> Result<TorclVal, TorclError> {
+    torcl_rt::rooted_ref!(_place_root = &mut place);
+    // A place that expands to itself — `(symbol-macrolet ((a a)) (setf a 1))` —
+    // must be reported, not recursed on until the Rust stack runs out.
+    if depth > PLACE_EXPANSION_LIMIT {
+        return Err(TorclError::Internal("circular SETF place expansion".into()));
+    }
+    if place.is_symbol() {
+        if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(place) {
+            return expand_place(expansion, env, depth + 1);
+        }
+        return Ok(place);
+    }
+    if !place.is_cons() {
+        return macroexpand_all(place, env);
+    }
+    let mut head = unsafe { cons_car(place) };
+    torcl_rt::rooted_ref!(_head_root = &mut head);
+    if head.is_symbol() && !is_quote_symbol(head) {
+        // A macro place (a DEFMACRO accessor, or one a MACROLET bound) expands
+        // first; whatever it expands to is again a place.
+        let (expanded, changed) = macroexpand_1(place, env)?;
+        if changed {
+            return expand_place(expanded, env, depth + 1);
+        }
+    }
+    // Some places hold places of their own, and one holds a type specifier.
+    // Expanding those as expressions would walk a subform that is not one.
+    let nested: &[PlaceArgument] = match get_symbol_name(head).as_deref() {
+        // (the type place): the type is not a form at all.
+        Some("THE") => &[PlaceArgument::Verbatim, PlaceArgument::Place],
+        // (values place*): every subform is a place.
+        Some("VALUES") => &[PlaceArgument::Place],
+        // (ldb bytespec place) / (mask-field bytespec place)
+        Some("LDB") | Some("MASK-FIELD") => &[PlaceArgument::Expression, PlaceArgument::Place],
+        // (getf place indicator &optional default)
+        Some("GETF") => &[PlaceArgument::Place, PlaceArgument::Expression],
+        _ => &[PlaceArgument::Expression],
+    };
+    torcl_rt::rooted!(arguments = Vec::<TorclVal>::new());
+    let mut cursor = unsafe { cons_cdr(place) };
+    torcl_rt::rooted_ref!(_cursor_root = &mut cursor);
+    let mut index = 0usize;
+    let mut changed = false;
+    while cursor.is_cons() {
+        let argument = unsafe { cons_car(cursor) };
+        // The last entry repeats, so `(values a b c)` treats every subform as a
+        // place and an ordinary call treats every subform as an expression.
+        let expanded = match nested[index.min(nested.len() - 1)] {
+            PlaceArgument::Verbatim => argument,
+            PlaceArgument::Place => expand_place(argument, env, depth + 1)?,
+            PlaceArgument::Expression => macroexpand_all(argument, env)?,
+        };
+        changed |= expanded != argument;
+        arguments.push(expanded);
+        cursor = unsafe { cons_cdr(cursor) };
+        index += 1;
+    }
+    // A place whose subforms did not expand is returned as it came in, so the
+    // caller's own reference to it stays EQ (spec_reader_macroexpand asserts
+    // exactly that for a symbol macro's expansion).
+    if !changed {
+        return Ok(place);
+    }
+    Ok(alloc_cons(head, vec_to_cons(&arguments)))
+}
+
+/// How deep a place may expand before it is treated as circular. A real place
+/// nests a handful of levels; this only stops a self-referential one.
+const PLACE_EXPANSION_LIMIT: usize = 100;
+
+/// How one subform of a place is to be expanded.
+#[derive(Clone, Copy)]
+enum PlaceArgument {
+    /// An ordinary expression.
+    Expression,
+    /// A place in its own right.
+    Place,
+    /// Not a form: THE's type specifier.
+    Verbatim,
 }
 
 /// Expand SETQ: (setq {var value}*)
