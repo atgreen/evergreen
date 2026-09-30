@@ -2134,16 +2134,15 @@ fn delivered_image_without_a_walker_still_honours_argument_precedence_order() {
 /// saved image. It does not: the method's captured frame is never serialized, so
 /// a restored process signals "unbound variable".
 ///
-/// KNOWN FAILURE, and the reproducer bliss-mxjr asked for as its first required
-/// proof — the bead had only source inspection. Remove the `#[ignore]` when the
-/// frame is serialized; nothing else about this test should need to change.
+/// Was a known failure: before the fix a restored process signalled
+/// `unbound variable: SECRET`, because the method's captured frame was reachable
+/// from neither the closure registry nor the bytecode CLOSURE_ENV and so was
+/// never serialized (bliss-mxjr).
 ///
-/// Measured: before saving, `peek` returns 42 and `bump` counts 1 then 2. After
-/// restore in a fresh process, `(peek o)` fails with
-/// `unbound variable: SECRET`. cli.rs sets `captured_frame: None` on the restore
-/// path with a comment naming this bead, so the drop is deliberate and pending.
+/// `bump` is asserted to CONTINUE at 3 rather than restart at 1. That is the half
+/// a naive fix gets wrong: `peek` and `bump` close over one LET, so they must come
+/// back sharing a single frame, not holding a copy each.
 #[test]
-#[ignore = "bliss-mxjr: captured method environments are not serialized into an image"]
 fn a_let_captured_method_keeps_its_lexicals_across_a_saved_image() {
     let f = Fixture::new();
     let source = f.path("captured.lisp");

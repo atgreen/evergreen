@@ -2792,7 +2792,13 @@ pub(crate) fn global_setf_fn_source(place: &str) -> Option<(EgclVal, EgclVal)> {
 type SpecRec = (u8, String, u64);
 /// A serialized MethodDef: (method_id_raw, lambda_list_raw, body_raw,
 /// qualifier, specializers).
-type MethodRec = (u64, u64, u64, u8, Vec<SpecRec>);
+/// (method-id, lambda-list, body, qualifier, captured-frame id, specializers).
+///
+/// The frame id indexes the CLSR block's frame table, or is `u32::MAX` for a
+/// method that captured nothing. Without it a DEFMETHOD defined inside a LET
+/// lost its lexicals across a saved image and a restored process signalled
+/// "unbound variable" (bliss-mxjr).
+type MethodRec = (u64, u64, u64, u8, u32, Vec<SpecRec>);
 type SetfRec = (String, Vec<String>, u64, u64);
 
 thread_local! {
@@ -2817,6 +2823,15 @@ thread_local! {
     /// records awaiting drain into the fresh root Env after an image load.
     static PENDING_HOST_GENERICS: RefCell<Vec<(String, u64, u8)>> = const { RefCell::new(Vec::new()) };
     /// Remapped per-generic method records awaiting the same drain.
+    /// The CLSR block's restored frame table, indexed by the ids in MethodRec.
+    ///
+    /// CLSR is read BEFORE the methods are drained (after Env::new), so the table
+    /// is populated by the time a method needs its captured frame. Holding the
+    /// Arcs keeps identity: two methods that closed over one LET resolve to the
+    /// SAME frame, which is what makes a shared counter keep counting rather than
+    /// restart per method (bliss-mxjr).
+    static PENDING_CLSR_FRAMES: RefCell<Vec<Arc<SharedCell<EnvFrame>>>> =
+        const { RefCell::new(Vec::new()) };
     static PENDING_HOST_METHODS: RefCell<Vec<(String, Vec<MethodRec>)>> =
         const { RefCell::new(Vec::new()) };
     /// Remapped interpreter class definitions (slot initforms/initargs/
@@ -2933,6 +2948,58 @@ fn host_serialize_registries() -> Vec<u8> {
         out.extend_from_slice(&gf_raw.to_le_bytes());
         out.push(*comb);
     }
+    // Assign the CLSR frame ids HERE rather than inside the CLSR block below,
+    // because the method records are written first and each needs the id of the
+    // frame it captured. Three root sources: tree-walker closures, the bytecode
+    // CLOSURE_ENV, and — new in bliss-mxjr — the captured frame of every saved
+    // method. A method defined inside a LET used to lose its lexicals across an
+    // image because its frame was reachable from none of the other two, so it was
+    // never serialized at all.
+    //
+    // Frames are SHARED: two methods closing over one LET must come back sharing
+    // a single frame, not holding copies. Keying by `Arc::as_ptr` and walking
+    // parents once is what preserves that, and it is the same walk the CLSR block
+    // used before this was hoisted.
+    let (frame_ids, clsr_frames) = {
+        let reg = closure_registry();
+        let reg = reg.borrow();
+        let bc_env = bytecode::closure_env_entries();
+        let method_frames: Vec<Arc<SharedCell<EnvFrame>>> = SAVE_METHODS.with(|m| {
+            m.borrow().as_ref().map_or_else(Vec::new, |map| {
+                map.borrow()
+                    .values()
+                    .flat_map(|defs| defs.iter())
+                    .filter_map(|d| d.captured_frame.as_ref().map(Arc::clone))
+                    .collect()
+            })
+        });
+        let mut frame_ids: HashMap<usize, u32> = HashMap::new();
+        let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
+        let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
+            .values()
+            .map(|c| Arc::clone(&c.captured_frame))
+            .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
+            .chain(method_frames)
+            .collect();
+        for root in roots {
+            let mut cur = Some(root);
+            while let Some(f) = cur {
+                let key = Arc::as_ptr(&f) as usize;
+                if frame_ids.contains_key(&key) {
+                    break;
+                }
+                frame_ids.insert(key, frames.len() as u32);
+                let parent = f.borrow().parent.clone();
+                frames.push(f);
+                cur = parent;
+            }
+        }
+        (frame_ids, frames)
+    };
+    let frame_id_of = |f: Option<&Arc<SharedCell<EnvFrame>>>| -> u32 {
+        f.and_then(|f| frame_ids.get(&(Arc::as_ptr(f) as usize)).copied())
+            .unwrap_or(u32::MAX)
+    };
     let methods: Vec<(String, Vec<MethodRec>)> = SAVE_METHODS.with(|m| {
         m.borrow().as_ref().map_or_else(Vec::new, |map| {
             map.borrow()
@@ -2947,6 +3014,7 @@ fn host_serialize_registries() -> Vec<u8> {
                                     d.lambda_list.to_raw(),
                                     d.body.to_raw(),
                                     qualifier_to_u8(d.qualifier),
+                                    frame_id_of(d.captured_frame.as_ref()),
                                     d.specializers
                                         .iter()
                                         .map(|s| match s {
@@ -2969,11 +3037,12 @@ fn host_serialize_registries() -> Vec<u8> {
     for (name, defs) in &methods {
         hr_put_str(&mut out, name);
         out.extend_from_slice(&(defs.len() as u32).to_le_bytes());
-        for (mid, ll, body, qual, specs) in defs {
+        for (mid, ll, body, qual, frame_id, specs) in defs {
             out.extend_from_slice(&mid.to_le_bytes());
             out.extend_from_slice(&ll.to_le_bytes());
             out.extend_from_slice(&body.to_le_bytes());
             out.push(*qual);
+            out.extend_from_slice(&frame_id.to_le_bytes());
             out.extend_from_slice(&(specs.len() as u32).to_le_bytes());
             for (tag, name, eql_raw) in specs {
                 out.push(*tag);
@@ -3087,30 +3156,12 @@ fn host_serialize_registries() -> Vec<u8> {
         let reg = closure_registry();
         let reg = reg.borrow();
         let bc_env = bytecode::closure_env_entries();
-        // Assign dense ids to every reachable frame (worklist over parents),
-        // from BOTH the tree-walker closures and the bytecode CLOSURE_ENV.
-        let mut frame_ids: HashMap<usize, u32> = HashMap::new();
-        let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
-        let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
-            .values()
-            .map(|c| Arc::clone(&c.captured_frame))
-            .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
-            .collect();
-        for root in roots {
-            let mut cur = Some(root);
-            while let Some(f) = cur {
-                let key = Arc::as_ptr(&f) as usize;
-                if frame_ids.contains_key(&key) {
-                    break;
-                }
-                frame_ids.insert(key, frames.len() as u32);
-                let parent = f.borrow().parent.clone();
-                frames.push(f);
-                cur = parent;
-            }
-        }
+        // Ids and the frame list were assigned above the method block, which is
+        // written earlier and needs them; reuse that single assignment so a frame
+        // shared by a closure and a method gets ONE id (bliss-mxjr).
+        let frames = &clsr_frames;
         out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-        for f in &frames {
+        for f in frames {
             let fb = f.borrow();
             out.extend_from_slice(&(fb.vars.len() as u32).to_le_bytes());
             for (k, v) in &fb.vars {
@@ -3385,6 +3436,16 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 }
                 let qual = data[off];
                 off += 1;
+                // Captured-frame id, resolved against the CLSR frame table when
+                // these records are drained after Env::new (bliss-mxjr).
+                let frame_id = {
+                    if data.len() < off + 4 {
+                        return Err(bad());
+                    }
+                    let v = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                    off += 4;
+                    v
+                };
                 let n_specs = {
                     if data.len() < off + 4 {
                         return Err(bad());
@@ -3404,7 +3465,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     let eql_raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                     specs.push((tag, cname, if tag == 2 { remap(eql_raw) } else { eql_raw }));
                 }
-                defs.push((remap(mid), remap(ll), remap(body), qual, specs));
+                defs.push((remap(mid), remap(ll), remap(body), qual, frame_id, specs));
             }
             methods.push((name, defs));
         }
@@ -3578,6 +3639,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 }
             }
         }
+        // Publish for the method drain below; parents are linked first so a
+        // method resolving a frame gets the whole chain (bliss-mxjr).
+        PENDING_CLSR_FRAMES.with(|p| *p.borrow_mut() = frames.clone());
         let n_closures = get_u32(data, &mut off).ok_or_else(bad)? as usize;
         let registry = closure_registry();
         for _ in 0..n_closures {
@@ -3764,9 +3828,16 @@ fn drain_pending_host_generics(env: &Env) {
     for (name, defs) in methods {
         let defs: Vec<MethodDef> = defs
             .into_iter()
-            .map(|(mid, ll, body, qual, specs)| MethodDef {
+            .map(|(mid, ll, body, qual, frame_id, specs)| MethodDef {
                 method_id: EgclVal::from_raw(mid),
-                captured_frame: None, // Captured-method image persistence: bliss-mxjr.
+                // Resolved against the CLSR frame table restored above. u32::MAX
+                // means the method captured nothing (bliss-mxjr).
+                captured_frame: if frame_id == u32::MAX {
+                    None
+                } else {
+                    PENDING_CLSR_FRAMES
+                        .with(|p| p.borrow().get(frame_id as usize).map(Arc::clone))
+                },
                 specializers: specs
                     .into_iter()
                     .map(|(tag, cname, eql_raw)| match tag {
