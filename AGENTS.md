@@ -79,7 +79,8 @@ Keep EGCL compatibility changes in GitHub forks under `atgreen`, using
 `#+egcl` / `#-egcl` or ASDF `:if-feature :egcl` as appropriate. Test scenarios
 must import these through ocicl's `git+URL@SHA` support and commit the pinned
 `ocicl.csv`; do not use edited download directories as the durable port source.
-See [ports/README.md](ports/README.md) and `~/git/ocicl/README.md`.
+See [docs/library-forks.md](docs/library-forks.md) and `~/git/ocicl/README.md`.
+The forks are the only copy: there is no `ports/` directory of patch sources.
 
 **Do not submit upstream patches, PRs, or issues yet.** Fork commits and test
 integration are authorized; upstream submissions require a new user instruction.

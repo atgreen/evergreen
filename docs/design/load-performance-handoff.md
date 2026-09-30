@@ -765,7 +765,7 @@ last sampled input offset is 270,336 bytes. `bliss-het3` tracks unbounded compil
 closure/environment retention and repeated bytecode-body cloning. Do not remove
 necessary roots to mask that cost, or present this partial progress as a completed
 Unicode load. The EGCL dependency-rename port is separately available in
-`ports/trivial-features-egcl/`.
+the `atgreen/trivial-features` fork (see `docs/library-forks.md`).
 
 Artifacts: `/tmp/egcl-unicode.UQCFUA/` (regex, stream, and full-generation
 probes), `/tmp/egcl-babel-port.Fs7oj1/roots-tables-*.log`, and

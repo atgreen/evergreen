@@ -332,8 +332,8 @@ you choose. Modifications to Evergreen *itself* stay under the GPL.
 
 See [LICENSE](LICENSE) for the licence and
 [LICENSE.classpath-exception](LICENSE.classpath-exception) for the exception,
-which also lists the third-party components that keep their own licences
-(`lib/asdf.lisp`, `lib/slynk/`, `ports/`).
+which also names the one third-party component that keeps its own licence
+(`lib/asdf.lisp`).
 
 Version 3 rather than OpenJDK's version 2 because Evergreen links a register
 allocator offered only under Apache-2.0, which is compatible with GPLv3 but not

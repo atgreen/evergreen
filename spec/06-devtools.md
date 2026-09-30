@@ -73,8 +73,10 @@ the editor's releases, and is already maintained upstream; reimplementing it in
 the core would duplicate library behaviour and drift. Instead — exactly as on
 SBCL — EGCL loads a standard upstream backend (`slynk` or `swank`) as an
 ordinary Common Lisp library, and the runtime's job is to provide the primitives
-that backend depends on. A vendored copy of the backend lives under `lib/slynk/`
-with a thin EGCL adapter (`communication-style nil`, single-threaded).
+that backend depends on. The backend is not carried in this repository — as on
+SBCL, it is an external library: the EGCL adapter (`communication-style nil`,
+single-threaded) lives on the `egcl` branch of the `atgreen/sly` fork, recorded
+in `docs/library-forks.md`.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
@@ -188,7 +190,7 @@ A runtime representation of a single stack frame exposed to the debugger.
 ### D6.07 — `swank-connection` (informative)
 
 This connection state is maintained by the **loaded** IDE backend
-(`lib/slynk/`), not by the EGCL runtime — it is documented here only so the
+(slynk, loaded as an external library), not by the EGCL runtime — it is documented here only so the
 primitives §6.1.5 requires can be traced to a concrete consumer. EGCL supplies
 the `socket` stream (an `(unsigned-byte 8)` TCP stream, R6.34) and, when threads
 are available (§13), the `thread`/`repl-thread` objects; the remaining fields are
@@ -384,8 +386,8 @@ inserting an allocation-site callback:
 
 ### 6.3.7 IDE Protocol Dispatch — A6.07 (informative)
 
-The dispatch loop below is implemented by the **loaded** backend (`lib/slynk/`),
-not by the EGCL runtime; it is shown to make the primitive requirements of
+The dispatch loop below is implemented by the **loaded** backend (slynk, loaded
+as an external library), not by the EGCL runtime; it is shown to make the primitive requirements of
 §6.1.5 concrete. EGCL's contribution is the framed `(unsigned-byte 8)` socket
 I/O (R6.34) that `read-message`/`write-message` build on, the reader/evaluator,
 and the introspection operations `eval-for-emacs` calls (R6.35).
@@ -647,7 +649,7 @@ consists of:
 | Profiler sample rate | 1000 Hz | `EGCL_PROF_RATE` | Samples per second (10–10000) |
 | Profiler max depth | 64 frames | `EGCL_PROF_DEPTH` | Maximum backtrace depth per sample |
 | Profiler sample buffer | 1 M samples | `EGCL_PROF_BUFSIZE` | Ring buffer capacity |
-| IDE backend listen port | 4005 | — | Default port the loaded backend (`lib/slynk/`) listens on; chosen by the editor/backend, not a runtime knob |
+| IDE backend listen port | 4005 | — | Default port the loaded backend listens on; chosen by the editor/backend, not a runtime knob |
 | IDE backend interface | `127.0.0.1` | — | Bind address; EGCL's socket primitives default to localhost-only for security (R6.37) |
 | ASDF output dir | `~/.cache/egcl/asdf/` | `EGCL_ASDF_CACHE` | Output translation root |
 | Debug default quality | 1 | `EGCL_DEBUG` | Default `(optimize (debug N))` |
@@ -710,7 +712,7 @@ lib/
 | Sampling profiler | Run a known CPU-bound loop, verify the top function in the report matches | Self-time of target function > 80% of total; overhead < 5% |
 | Allocation profiler | Allocate known quantities of known types, verify report matches | Reported counts and sizes within 1% of actual |
 | Disassembler | Compile a known function, verify disassembly contains expected instruction patterns | Source annotations point to correct line numbers |
-| IDE protocol | Load the vendored `lib/slynk/` backend into `egcl`, have it listen, connect a SLIME/SLY client (e.g. `icl`), and exercise the handshake | Client verifies the connection, injects its runtime, and round-trips eval + completion; replies are delivered (framed octets reach the socket) |
+| IDE protocol | Load the external slynk backend into `egcl`, have it listen, connect a SLIME/SLY client (e.g. `icl`), and exercise the handshake | Client verifies the connection, injects its runtime, and round-trips eval + completion; replies are delivered (framed octets reach the socket) |
 | Trace | Trace a function, call it, verify `*trace-output*` contains expected entry/exit lines | Nested call depth indentation is correct |
 | `room` | Allocate known objects, call `room t`, parse output, verify reported sizes | Nursery/old-gen sizes within 10% of expected |
 | `time` | Time a known-duration form (busy loop), verify wall-clock and bytes-consed | Wall-clock within 20% of expected; bytes-consed accurate |

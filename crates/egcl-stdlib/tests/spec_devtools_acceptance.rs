@@ -101,19 +101,29 @@ fn trace_disassemble_describe_inspect_and_room_hooks_are_callable_end_to_end() {
 }
 
 #[test]
-fn ide_protocol_uses_vendored_slynk_library_not_rust_swank_server() {
-    // Per R6.33, EGCL must load upstream Slynk/SWANK as Lisp code and must not
-    // implement the wire protocol in the Rust runtime/stdlib.
+fn ide_protocol_uses_an_upstream_slynk_library_not_a_rust_swank_server() {
+    // R6.33: EGCL must support SLIME/SLY integration by loading a standard
+    // upstream backend "as an ordinary library, the same way that backend loads
+    // on SBCL", and must NOT build the wire protocol into the runtime.
+    //
+    // The falsifiable half of that requirement lives in THIS repository and is
+    // the MUST NOT: no message framing, no :emacs-rex dispatch, no RPCs in Rust.
+    // That is what the assertions below check.
+    //
+    // The backend itself is deliberately NOT here. It used to be a vendored copy
+    // under lib/slynk/, which satisfied the requirement's letter less well than
+    // it appeared — SBCL does not carry slynk inside its own source tree either.
+    // It now lives beside every other implementation's backend, on the `egcl`
+    // branch of the sly fork, and is consumed like any other ported library.
+    // docs/library-forks.md is the record of where, so assert it stays recorded:
+    // losing the pointer is the realistic regression now, not losing the files.
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let slynk = repo_root.join("lib/slynk");
-    assert!(slynk.join("slynk.lisp").is_file());
-    assert!(slynk.join("slynk-rpc.lisp").is_file());
-    assert!(slynk.join("backend/egcl.lisp").is_file());
-    assert!(slynk.join("start-slynk.lisp").is_file());
-
-    let start_slynk =
-        std::fs::read_to_string(slynk.join("start-slynk.lisp")).expect("read start-slynk.lisp");
-    assert!(start_slynk.contains("slynk:create-server"));
+    let forks = std::fs::read_to_string(repo_root.join("docs/library-forks.md"))
+        .expect("read docs/library-forks.md");
+    assert!(
+        forks.contains("atgreen/sly"),
+        "docs/library-forks.md no longer records where the slynk backend lives"
+    );
 
     let devtools = std::fs::read_to_string(repo_root.join("crates/egcl-stdlib/src/devtools.rs"))
         .expect("read devtools.rs");

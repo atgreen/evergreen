@@ -8,6 +8,11 @@ different Lisp implementation or replace required semantics with silent stubs.
 **Do not submit patches, pull requests, or issues upstream yet.** Publishing to
 the `atgreen` forks is authorized; upstream submissions require a new instruction.
 
+The forks are the ONLY copy. This repository no longer carries a `ports/`
+directory of patch sources or a vendored `lib/slynk/`: each adaptation lives in
+its fork, which is what the pinned `ocicl.csv` entries fetch. Edit the fork, push
+it, re-pin the SHA here and in the scenario's `ocicl.csv`.
+
 Use ocicl Git sources instead of editing downloaded registry copies. Pin full
 commit SHAs and commit `ocicl.csv`, not the fetched source trees. The Git-source
 workflow is documented in `~/git/ocicl/README.md` under “Installing Systems from
@@ -27,6 +32,7 @@ exercises these forks:
 | cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `8fc4b2b439525e87795efdfb848a1761869adc2a` |
 | iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `81ac1fdc376fbcdb491fe758a3bf957ec0a9c175` |
 | swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `a1d235181efa139eb0f51feffbe74f784842c1b3` |
+| slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332e` — the EGCL backend, moved out of `lib/slynk/` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new

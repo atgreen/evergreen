@@ -60,10 +60,10 @@ keep the licences their authors gave them, and they carry no Evergreen SPDX
 header:
 
   lib/asdf.lisp   ASDF, under the MIT/X Consortium licence (notice in-file)
-  lib/slynk/      slynk, from the SLY project — placed in the public domain by
-                  its authors, with individual copyright notices in-file
-  ports/          adaptations intended for third-party upstream forks; each
-                  file belongs to the licence of the project it patches
+
+Adaptations of other Common Lisp libraries are NOT kept here at all.  They live
+in forks under https://github.com/atgreen, each under the licence of the project
+it adapts, and are listed in docs/library-forks.md.
 
 Evergreen also builds against third-party Rust crates that are not distributed
 in this repository.  Every one of them is GPLv3-compatible: most are available

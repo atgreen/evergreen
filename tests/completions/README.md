@@ -65,5 +65,5 @@ compiling the graph is slow.
 
 Refresh pins deliberately with `ocicl install git+URL@SHA` in an isolated
 project, rerun this scenario, and update the committed CSV and
-[ports/README.md](../../ports/README.md). Do not submit upstream patches or PRs
+[docs/library-forks.md](../../docs/library-forks.md). Do not submit upstream patches or PRs
 without new authorization.

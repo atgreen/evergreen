@@ -31,5 +31,5 @@ Compatibility changes belong in maintained forks, using `#+egcl`, `#-egcl`,
 or ASDF feature conditions. Tests import pinned fork revisions through ocicl's
 `git+URL@SHA` support and commit the corresponding `ocicl.csv`. Edited download
 caches are not durable port sources. See
-[ports/README.md](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/ports/README.md).
+[docs/library-forks.md](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/docs/library-forks.md).
 Repository policy requires explicit authorization for upstream submissions.

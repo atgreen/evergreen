@@ -36,7 +36,7 @@ package depends on all three and connects them to a runnable Lisp.
 | `crates/egcl-stdlib` | Rust bootstrap implementation of library behavior: packages, CLOS, conditions and restarts, streams, sequences, hash tables, `FORMAT`, pathnames, time, and developer tools |
 | `crates/egcl` | Process-facing integration: CLI and REPL, loading, evaluator state, tree-walking fallback, form-to-bytecode lowering, T0 interpretation, T1 emission, tier dispatch, and bridges between compiler, runtime, and stdlib |
 | `lib/boot.lisp` | Lisp-side bootstrap prelude. It implements macros and ordinary functions that do not belong in the evaluator |
-| `lib/asdf.*` and `lib/slynk/` | Bundled real-world library and editor-integration payloads |
+| `lib/asdf.*` | Bundled real-world library payload |
 
 The large `crates/egcl/src/cli.rs` is therefore both a user interface and a
 bootstrap integration layer. It is not the desired final home for library
