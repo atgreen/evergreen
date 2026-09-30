@@ -17,10 +17,14 @@
 > of AI-driven development. 
 > See [Authorship & Governance](#authorship--governance).
 
-**Evergreen Common Lisp (EGCL) is Common Lisp with a HotSpot-inspired native
-runtime**, built from scratch in Rust. It starts executing in bytecode, compiles
-hot code to native instructions, and specializes dynamically typed programs as
-they run.
+Common Lisp is an evergreen language: mature, enduring, and remarkably
+resistant to obsolescence. **Evergreen Common Lisp (EGCL)** is a new
+implementation built to carry it forward.
+
+**Evergreen is Common Lisp with a HotSpot-inspired native runtime**,
+built from scratch in Rust. It starts executing in bytecode, compiles
+hot code to native instructions, and specializes dynamically typed
+programs as they run.
 
 - **Tiered compilation with on-stack replacement.** Execution progresses from
   bytecode through a baseline native compiler to an optimizing compiler. Hot
