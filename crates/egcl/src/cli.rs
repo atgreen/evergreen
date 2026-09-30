@@ -5790,6 +5790,23 @@ fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclV
 }
 
 fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+    // FAST PATH. An `:allocation :class` slot is stored in the owning class's
+    // cell and is NOT in the instance's inline layout — that is the whole reason
+    // the class-slot lookup below exists. So a slot that IS in this instance's
+    // layout cannot be class-allocated, and none of that machinery applies.
+    //
+    // Worth a guard because the slow path opens by rebuilding the class name as a
+    // String and then walks the precedence list comparing strings, per call, for
+    // every slot read in the system — SLOT-VALUE reaches here too, not just
+    // accessors. `slot_present_p` is a hash lookup on the symbol and calls
+    // `update_if_obsolete` itself, so it answers about the instance's CURRENT
+    // shape rather than a stale layout (bliss-51m0l).
+    //
+    // A non-instance answers false and falls through, preserving the NIL that
+    // ASDF's readers rely on at the end of this function (bliss-lb6.14).
+    if egcl_stdlib::slot_present_p(instance, slot) {
+        return egcl_stdlib::slot_value(instance, slot);
+    }
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
     let slot_name = sym_bare_name_rc(slot);
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {

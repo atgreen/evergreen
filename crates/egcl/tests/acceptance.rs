@@ -18886,3 +18886,45 @@ fn redefining_a_class_invalidates_the_accessor_slot_cache() {
         ),
     ]);
 }
+
+/// The instance-slot fast path in `read_slot_value` must not swallow
+/// `:allocation :class` slots (bliss-51m0l).
+///
+/// A class slot lives in the owning class's cell, not in the instance's inline
+/// layout, which is exactly why the slow path that looks it up exists. The fast
+/// path skips that lookup whenever the slot IS in the instance layout — sound
+/// only because the two are mutually exclusive. These cases are the ways that
+/// could be wrong: reading a class slot through a subclass instance (bliss-x4p),
+/// the sharing semantics that make it a class slot at all, and the NIL that
+/// ASDF's readers depend on from a non-instance receiver (bliss-lb6.14).
+#[test]
+fn the_instance_slot_fast_path_still_honours_class_allocated_slots() {
+    run_expression_cases(&[
+        // Shared through inheritance, and a write through the SUBCLASS is visible
+        // through the superclass — the defining property of a class slot.
+        (
+            "(progn (defclass cs-base ()
+                      ((cs-shared :initform 'init :allocation :class :accessor cs-sh)
+                       (cs-own :initform 'own :accessor cs-ow)))
+                    (defclass cs-derived (cs-base) ())
+                    (let ((b (make-instance 'cs-base)) (d (make-instance 'cs-derived)))
+                      (let ((before (list (cs-sh b) (cs-sh d))))
+                        (setf (cs-sh d) 'changed)
+                        (append before (list (cs-sh b) (cs-sh d) (cs-ow d))))))",
+            "(INIT INIT CHANGED CHANGED OWN)",
+        ),
+        // An unbound INSTANCE slot must still signal rather than read as NIL.
+        (
+            "(progn (defclass cs-ub () ((cs-u :accessor cs-uu)))
+                    (handler-case (cs-uu (make-instance 'cs-ub))
+                      (error () 'signalled)))",
+            "SIGNALLED",
+        ),
+        // A reader on a non-instance yields NIL, not an error.
+        (
+            "(progn (defclass cs-n () ((cs-v :initform 1 :accessor cs-nv)))
+                    (list (cs-nv (make-instance 'cs-n)) (cs-nv nil)))",
+            "(1 NIL)",
+        ),
+    ]);
+}
