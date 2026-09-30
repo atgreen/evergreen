@@ -25600,13 +25600,6 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
         loop_bind(*var, v, env);
     }
 
-    // Bind all :into accumulators to NIL up front.
-    let mut into_names = Vec::new();
-    loop_collect_intos(&body, &mut into_names);
-    for n in &into_names {
-        env.define_local(n, NIL);
-    }
-
     let mut accs = LoopAccs::default();
     torcl_rt::rooted_ref!(_accs_root = &mut accs);
     // Establish the vacuous-truth default for ALWAYS/NEVER at setup so an
@@ -25619,6 +25612,25 @@ fn eval_loop_extended(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
     // i)` is 0 (LOOP.10.94-101). Zero is the additive identity regardless of the
     // (ignored) of-type declaration.
     loop_seed_accs(&body, &mut accs);
+
+    // Bind all :into accumulators up front. A SUM or COUNT accumulator starts at
+    // its identity, NOT at NIL: the variable is readable from the first
+    // iteration, including by clauses that appear BEFORE the accumulating one.
+    // split-sequence's :count path is exactly that shape —
+    //   :if (and count (>= nr-elts count)) :return … :else :collect … :and :sum 1 :into nr-elts
+    // — so a NIL nr-elts made (>= NIL 5) a type error, which is why
+    // (split-sequence #\. "0.0.0.0" :count 5) failed and iolib could not parse
+    // an IP address (bliss-vhr6e). MAXIMIZE and MINIMIZE have no identity and
+    // stay NIL until they first accumulate, as elsewhere.
+    let mut into_names = Vec::new();
+    loop_collect_intos(&body, &mut into_names);
+    for n in &into_names {
+        let initial = match accs.nums.get(&Some(n.clone())) {
+            Some(NumAcc::Sum(identity)) => *identity,
+            _ => NIL,
+        };
+        env.define_local(n, initial);
+    }
     let mut ret: Option<TorclVal> = None;
 
     for f in &initially {
