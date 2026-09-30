@@ -1557,6 +1557,19 @@ pub(in crate::cli) fn accessor_slot_symbol_cached(
     Some(slot)
 }
 
+/// [`accessor_slot_symbol_cached`] for callers holding the accessor's NAME.
+///
+/// Interning the name is one hash lookup on an already-interned string, which is
+/// far less work than the chain walk it replaces: string compares down the
+/// precedence list plus a second intern for the slot name (bliss-1qjmm).
+pub(in crate::cli) fn accessor_slot_symbol_cached_by_name(
+    env: &Env,
+    instance: EgclVal,
+    accessor: &str,
+) -> Option<EgclVal> {
+    accessor_slot_symbol_cached(env, instance, resolve_sym(accessor)?)
+}
+
 /// The slot an accessor names on this instance, searching ONLY the instance's
 /// class precedence list — no name-only fallback.
 ///
@@ -19383,15 +19396,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     // (bliss-i6ga1). Falls back to that answer when
                                     // the target is not an instance of a class that
                                     // declares the accessor.
-                                    let slot_name =
-                                        accessor_slot_name_for_instance(env, *tgt, other)
-                                            .unwrap_or(slot_name);
-                                    write_slot_value(
-                                        *tgt,
-                                        resolve_sym(&slot_name).unwrap_or(NIL),
-                                        *val,
-                                        env,
-                                    )?;
+                                    // Memoized per (class, accessor); falls back to
+                                    // the uncached resolution when the class has no
+                                    // naming symbol (bliss-1qjmm).
+                                    let slot = accessor_slot_symbol_cached_by_name(
+                                        env, *tgt, other,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        let name =
+                                            accessor_slot_name_for_instance(env, *tgt, other)
+                                                .unwrap_or(slot_name);
+                                        resolve_sym(&name).unwrap_or(NIL)
+                                    });
+                                    write_slot_value(*tgt, slot, *val, env)?;
                                 } else if let Some((params_form, body)) =
                                     local_setf_writer(env, other)
                                 {
@@ -24153,9 +24170,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // which branch runs here is unchanged; only the slot is re-resolved.
             // This runs BEFORE resolve_sym for the reason the comment above
             // gives: it takes no EgclVal across an interning allocation.
-            let slot_name =
-                accessor_slot_name_for_instance(env, *inst, &name).unwrap_or(slot_name);
-            let slot_sym = resolve_sym(&slot_name).unwrap_or(NIL);
+            // Memoized per (class, accessor), same as the compiled read primitive,
+            // so the interpreter's accessor reads stop paying the string round trip
+            // too (bliss-1qjmm). Falls back when the class has no naming symbol.
+            let slot_sym = accessor_slot_symbol_cached_by_name(env, *inst, &name)
+                .unwrap_or_else(|| {
+                    let n = accessor_slot_name_for_instance(env, *inst, &name)
+                        .unwrap_or(slot_name);
+                    resolve_sym(&n).unwrap_or(NIL)
+                });
             return read_slot_value(*inst, slot_sym, env);
         }
 
