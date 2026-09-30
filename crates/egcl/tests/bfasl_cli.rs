@@ -3397,3 +3397,81 @@ fn compiled_slot_value_store_does_not_call_the_bootstrap_setf_writer() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// A macro's `&environment` must describe the CALL SITE, whether the macro was
+/// loaded from source or from a `.bfasl`.
+///
+/// A compiled expander ran through a registered callback that built a fresh
+/// `Env` for the expansion and discarded the caller's environment, so
+/// `(macroexpand sym env)` inside it could not see an enclosing
+/// SYMBOL-MACROLET. The same macro then answered differently depending on how it
+/// had been loaded — source said the symbol expanded, `.bfasl` said it did not
+/// (bliss-1pve). SBCL answers as the source case does.
+///
+/// The third probe is the one that matters: it returns the EXPANSION rather than
+/// a flag, and before the fix it came back as the bare symbol `B` instead of
+/// `(+ 2 3)` — a macro emitting silently wrong code, with nothing to signal it.
+/// The fourth is the negative control: a symbol with no binding must still be
+/// reported as unexpanded, so a fix cannot pass by answering "known" always.
+#[test]
+fn a_compiled_macros_environment_sees_the_call_sites_symbol_macrolet() {
+    let dir = workdir("macro-environment");
+    let macros = dir.join("menv-macros.lisp");
+    let fasl = dir.join("menv-macros.bfasl");
+    let user = dir.join("menv-user.lisp");
+    fs::write(
+        &macros,
+        r#"
+      (defmacro menv-knows-sym (s &environment env)
+        (multiple-value-bind (x p) (macroexpand s env)
+          (declare (ignore x))
+          (if p :known :unknown)))
+      (defmacro menv-expands-to (s &environment env)
+        (list 'quote (macroexpand s env)))
+    "#,
+    )
+    .unwrap();
+    fs::write(
+        &user,
+        r#"
+      (defun menv-p1 () (symbol-macrolet ((a 1)) (menv-knows-sym a)))
+      (defun menv-p2 () (symbol-macrolet ((b (+ 2 3))) (menv-expands-to b)))
+      (defun menv-p3 () (menv-knows-sym never-bound))
+      (format t "MENV ~A ~S ~A~%" (menv-p1) (menv-p2) (menv-p3))
+    "#,
+    )
+    .unwrap();
+
+    let compiled = run(&format!(
+        "(compile-file {macros:?} :output-file {fasl:?})"
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    // Source and .bfasl must agree, and must agree on the RIGHT answer.
+    for (label, loaded) in [("source", &macros), ("bfasl", &fasl)] {
+        let out = Command::new(BIN)
+            .args([
+                "--eval",
+                &format!("(load {loaded:?})"),
+                "--eval",
+                &format!("(load {user:?})"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{label} load failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("MENV KNOWN (+ 2 3) UNKNOWN"),
+            "{label}: &environment did not describe the call site\n{stdout}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

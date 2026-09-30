@@ -13695,6 +13695,7 @@ fn bind_macro_variadic(
     explicit_whole: Option<EgclVal>,
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
+    call_menv: Option<&super::MacroexpandEnv>,
 ) -> Result<(), EgclError> {
     let parent = Arc::clone(&env.frame);
     super::with_child_frame(env, parent, |env| {
@@ -13727,10 +13728,22 @@ fn bind_macro_variadic(
         // `(macroexpand-1 form env)` inside the expander failed with "MACROEXPAND:
         // invalid lexical environment" (bliss-66ny; broke bordeaux-threads v2's
         // WITH-LOCK-HELD, which macroexpands `%with-lock` through its env).
-        let menv = if super::params_form_uses_environment(func.params_form) {
-            Some(super::macroexpand_environment_from_cli(env))
-        } else {
+        //
+        // Prefer the CALLER's environment when one was threaded in. The
+        // reconstruction below is built from the expander's own `Env`, which for
+        // a bytecode macro is the fresh `Env::new_for_macro_expansion` its
+        // registered callback creates — so it holds none of the call site's
+        // lexical bindings. A macro that asked `(macroexpand sym env)` therefore
+        // could not see an enclosing SYMBOL-MACROLET, and the SAME macro answered
+        // differently depending on whether it had been loaded from source (which
+        // takes the tree-walker's path and does get the call-site environment) or
+        // from a .bfasl. SBCL answers as the source case does (bliss-1pve).
+        let menv = if !super::params_form_uses_environment(func.params_form) {
             None
+        } else if let Some(caller) = call_menv {
+            Some(caller.clone())
+        } else {
+            Some(super::macroexpand_environment_from_cli(env))
         };
         super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole, None)?;
         env.clear_mv();
@@ -13784,16 +13797,23 @@ pub(super) fn run_with_sym(
     sym: u32,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    run_with_binding(entry, args, entry_fn_val, sym, env, false, None)
+    run_with_binding(entry, args, entry_fn_val, sym, env, false, None, None)
 }
 
+/// Run a compiled macro expander.
+///
+/// `call_menv` is the environment of the CALL SITE being expanded. It must be
+/// passed whenever the caller has one: an expander's `&environment` has to
+/// describe where the macro was USED, not where it runs, or `(macroexpand sym
+/// env)` inside it cannot see an enclosing MACROLET/SYMBOL-MACROLET (bliss-1pve).
 pub(super) fn run_macro(
     entry: Arc<BytecodeFunction>,
     args: &[EgclVal],
     whole: Option<EgclVal>,
     env: &mut Env,
+    call_menv: Option<&super::MacroexpandEnv>,
 ) -> Result<EgclVal, EgclError> {
-    run_with_binding(entry, args, NIL, u32::MAX, env, true, whole)
+    run_with_binding(entry, args, NIL, u32::MAX, env, true, whole, call_menv)
 }
 
 fn run_with_binding(
@@ -13804,6 +13824,7 @@ fn run_with_binding(
     env: &mut Env,
     macro_lambda_list: bool,
     mut macro_whole: Option<EgclVal>,
+    call_menv: Option<&super::MacroexpandEnv>,
 ) -> Result<EgclVal, EgclError> {
     let _active_bytecode_root = ActiveBytecodeRoot::new(&entry);
     egcl_rt::rooted!(args = args.to_vec());
@@ -13846,7 +13867,15 @@ fn run_with_binding(
     let env_frame = make_env_frame(&entry, parent).or(closure_env);
     if macro_lambda_list {
         if let Err(e) =
-            bind_macro_variadic(&entry, frame, &args, macro_whole, env_frame.as_ref(), env)
+            bind_macro_variadic(
+                &entry,
+                frame,
+                &args,
+                macro_whole,
+                env_frame.as_ref(),
+                env,
+                call_menv,
+            )
         {
             stack.pop_frame();
             return Err(e);

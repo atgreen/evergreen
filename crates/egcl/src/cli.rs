@@ -3855,7 +3855,7 @@ fn install_loaded_compiler_macro(
         .push(Arc::downgrade(&function));
     compiler_macroexpand::define_compiler_macro(
         name,
-        Arc::new(move |form, _macro_env| {
+        Arc::new(move |form, macro_env| {
             // The callback's FORM copy and argument vector must survive Env
             // construction, which can allocate and relocate nursery objects.
             egcl_rt::rooted!(form = form);
@@ -3883,7 +3883,13 @@ fn install_loaded_compiler_macro(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            bytecode::run_macro(Arc::new(function), &args, Some(*form), &mut env)
+            bytecode::run_macro(
+                Arc::new(function),
+                &args,
+                Some(*form),
+                &mut env,
+                Some(macro_env),
+            )
         }),
     );
 }
@@ -30394,7 +30400,23 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
                         // A source-free bytecode expander (loaded from a .bfasl):
                         // run it like a macro; its (values …) land on the child mv.
                         let function = Arc::new(function.lock().unwrap().clone());
-                        bytecode::run_macro(function, &arg_list, Some(*place), &mut child)?
+                        // Built from the CALLER's env, exactly as the source
+                        // branch below does. `child` is forked from the
+                        // expander's captured frame, so reconstructing from it
+                        // would describe the expander rather than the call site
+                        // (bliss-1pve).
+                        let call_menv = if params_form_uses_environment(*params_form) {
+                            Some(macroexpand_environment_from_cli(env))
+                        } else {
+                            None
+                        };
+                        bytecode::run_macro(
+                            function,
+                            &arg_list,
+                            Some(*place),
+                            &mut child,
+                            call_menv.as_ref(),
+                        )?
                     } else {
                         let macroexpand_env = if params_form_uses_environment(*params_form) {
                             Some(macroexpand_environment_from_cli(env))
@@ -31236,7 +31258,17 @@ fn expand_macro(
         egcl_rt::rooted_ref!(_child_root = &mut child_env);
         if let Some(function) = &mdef.bytecode {
             let function = Arc::new(function.lock().unwrap().clone());
-            bytecode::run_macro(function, &arg_list, Some(whole), &mut child_env)
+            bytecode::run_macro(
+                function,
+                &arg_list,
+                Some(whole),
+                &mut child_env,
+                // None: this is the tree-walker's path, where the Env handed to
+                // bind_macro_variadic descends from the CALL SITE, so its own
+                // reconstruction already describes the right scope. This is why a
+                // source-loaded macro always saw the correct environment.
+                None,
+            )
         } else {
             // Building the macroexpand environment walks every frame and
             // re-registers all global macros. Do that only for the uncommon
@@ -31515,7 +31547,7 @@ fn augment_env_with_macros(
                         .push(Arc::downgrade(&function));
                     compiler_macroexpand::register_macro_function(
                         handle,
-                        Arc::new(move |form, _call_macro_env| {
+                        Arc::new(move |form, call_macro_env| {
                             egcl_rt::rooted!(form = form);
                             egcl_rt::rooted!(args = list_to_vec(cp(*form).1));
                             let mut macro_env = Env::new_for_macro_expansion(false);
@@ -31524,11 +31556,17 @@ fn augment_env_with_macros(
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .clone();
+                            // `macro_env` above is FRESH — it exists only to run
+                            // the expander and holds none of the call site's
+                            // lexical bindings. Handing the caller's environment
+                            // through is what lets `&environment` describe where
+                            // the macro was used (bliss-1pve).
                             bytecode::run_macro(
                                 Arc::new(function),
                                 &args,
                                 Some(*form),
                                 &mut macro_env,
+                                Some(call_macro_env),
                             )
                         }),
                     );
