@@ -4861,8 +4861,20 @@ fn is_function_value(v: TorclVal) -> bool {
         return true;
     }
     if v.is_cons() {
+        // The closure marker is `(TORCL::CLOSURE . <fixnum id>)`. Test the two
+        // CHEAP tag predicates before rendering any name: this ran once per
+        // builtin call and was the LAST remaining Rust heap allocation per call
+        // (bliss-iry5). `sym_name` allocates a String, and for the overwhelmingly
+        // common argument -- a cons whose car is NIL -- it allocated "NIL" purely
+        // to compare it against a literal it cannot equal. Requiring a fixnum cdr
+        // first rejects every ordinary cons with no allocation at all, and
+        // `sym_name_rc` keeps the rare survivor off the heap too by going through
+        // the interned-name cache instead of building a String.
         let (h, t) = cp(v);
-        return h.is_symbol() && sym_name(h) == "TORCL::CLOSURE" && t.is_fixnum();
+        if !h.is_symbol() || !t.is_fixnum() {
+            return false;
+        }
+        return &*sym_name_rc(h) == "TORCL::CLOSURE";
     }
     // A funcallable instance IS a function (bliss-cr53) — checked last, and
     // behind the cheap heap-object tag test, so ATOM/LISTP/CONSP on a fixnum or a
