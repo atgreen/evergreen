@@ -1,6 +1,8 @@
-# TorCL
+<p align="center">
+  <img src="docs/assets/evergreen-banner2x.png" alt="Evergreen Common Lisp" width="1280">
+</p>
 
-**TorCL is Common Lisp with a HotSpot-inspired native runtime**, built from
+**EGCL is Common Lisp with a HotSpot-inspired native runtime**, built from
 scratch in Rust. It starts executing in bytecode, compiles hot code to native
 instructions, and specializes dynamically typed programs as they run.
 
@@ -25,7 +27,7 @@ instructions, and specializes dynamically typed programs as they run.
   [Windows support](docs/windows.md).
 - **Native interoperability.** Call C libraries through the
   [foreign function interface](docs/manual/foreign.md), and access the JVM through
-  `torcl-jvm`. The `PY` package provides Lisp-facing CPython object and calling
+  `egcl-jvm`. The `PY` package provides Lisp-facing CPython object and calling
   APIs in builds with Python support enabled.
 - **Standalone applications and saved images.** Save a running Lisp environment
   with its libraries preloaded, restore it later, or package it as a native
@@ -39,10 +41,10 @@ instructions, and specializes dynamically typed programs as they run.
   to omit both native compilers. Explicit retention roots and `--dry-run` explain
   what stays and why. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
 - **Native Android applications.** Generate and package APKs with Lisp lifecycle,
-  touch-input, and EGL/OpenGL ES code using `torcl-android-new`. See
+  touch-input, and EGL/OpenGL ES code using `egcl-android-new`. See
   [building Android applications](docs/manual/user/how-to/android.md).
 
-TorCL combines a precise generational garbage collector with Common Lisp's
+EGCL combines a precise generational garbage collector with Common Lisp's
 macros, CLOS, conditions, and restarts. It targets ANSI Common Lisp, supports
 ASDF systems, and provides selected SBCL-compatible extensions. The project is
 under active development; the manual describes current interfaces and
@@ -50,7 +52,7 @@ limitations, while `spec/` records the design and self-hosting roadmap.
 
 ## Manual
 
-The [TorCL manual](docs/manual/index.md) covers running Lisp, ASDF systems,
+The [EGCL manual](docs/manual/index.md) covers running Lisp, ASDF systems,
 saved executables, cross-target tools, Android applications, and runtime
 contributions. It uses Material for MkDocs with a subject-oriented implementation
 reference inspired by the SBCL manual, plus symbol and concept indexes. Preview
@@ -72,10 +74,10 @@ This is a Cargo workspace using Rust 2024 and requiring Rust 1.85 or newer.
 
 | Path | Purpose |
 | --- | --- |
-| `crates/torcl-rt` | Runtime core: object model, values, GC, threads, FFI, sandboxing, images |
-| `crates/torcl-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
-| `crates/torcl-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
-| `crates/torcl` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
+| `crates/egcl-rt` | Runtime core: object model, values, GC, threads, FFI, sandboxing, images |
+| `crates/egcl-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
+| `crates/egcl-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
+| `crates/egcl` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
 | `lib/` | Lisp-side prelude (`boot.lisp`) and bundled sources loaded at startup |
 | `tests/` | Cross-cutting suites: ANSI conformance, differential, integration, property, and sanitizer configs |
 | `fuzz/` | `cargo-fuzz` targets and corpora for the reader, compiler, evaluator, FORMAT, FFI, and image loader |
@@ -91,19 +93,19 @@ cargo build
 Build the CLI binary:
 
 ```sh
-cargo build -p torcl
+cargo build -p egcl
 ```
 
 For native x86-64 Fedora RPMs with optional s390x Linux, AArch64 Linux,
 Windows, and Android image-dumping tools, see
 [container-free Fedora packaging](docs/fedora-rpm.md).
 
-The Android RPM also provides `torcl-android-new` and shared runtimes for ARM64
+The Android RPM also provides `egcl-android-new` and shared runtimes for ARM64
 phones and x86-64 emulators. Generate an EGL app with
-`torcl-android-new hello --host=aarch64-linux-android --template egl`, then run
+`egcl-android-new hello --host=aarch64-linux-android --template egl`, then run
 `make install` and `make run` in `hello`. Use `make HOST=x86_64-linux-android`
 to build for an emulator. App builds use the installed runtime and Android SDK;
-they do not require rebuilding TorCL.
+they do not require rebuilding EGCL.
 
 For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
 [cross-compilation and QEMU validation](docs/cross-compilation.md). All four
@@ -126,7 +128,7 @@ see [Java integration in the manual](docs/manual/java.md). The current
 implementation uses a native x86-64 glibc build and a local JDK, with explicit
 reference ownership and checks for JVM startup, signals, callbacks, and shutdown.
 The primary `JAVA` API provides inferred calls, named bindings, Lisp callbacks
-and `with-scope` cleanup; the explicit `TORCL-JVM` descriptor API remains available.
+and `with-scope` cleanup; the explicit `EGCL-JVM` descriptor API remains available.
 
 For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
 The Android AArch64 CLI is built and validated the same way — same kernel, a
@@ -135,11 +137,11 @@ different libc — and is
 including how the installable executable is dumped under emulation, since
 `make image` runs the target binary and so cannot cross-compile.
 
-Build the standalone `torcl` executable with ASDF preloaded, then install it:
+Build the standalone `egcl` executable with ASDF preloaded, then install it:
 
 ```sh
-make image              # trains PGO and produces target/torcl
-sudo make install       # installs /usr/local/bin/torcl
+make image              # trains PGO and produces target/egcl
+sudo make install       # installs /usr/local/bin/egcl
 ```
 
 `make image` uses profile-guided optimization (PGO) by default, with dependency-free
@@ -149,11 +151,11 @@ preferred; alternatively set `LLVM_PROFDATA` to a matching executable):
 
 ```sh
 rustup component add llvm-tools-preview
-TORCL_MEM_MAX=8G TORCL_TIMEOUT=1200 scripts/torcl-limited.sh make image
+EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh make image
 ```
 
 This performs two release builds plus training, then saves and restarts the
-ASDF image before atomically replacing `target/torcl`. It does not install it.
+ASDF image before atomically replacing `target/egcl`. It does not install it.
 `make pgo-image` remains an alias. For an ordinary release image without training
 or `llvm-profdata`, use `make image-no-pgo`; ordinary Cargo builds are unchanged.
 PGO failures are reported, never silently replaced with a non-PGO build. Build logs, private
@@ -162,18 +164,18 @@ directory; preparation profiles are excluded from optimization training.
 Profiles are local build artifacts, not distributable inputs to unrelated
 source revisions or toolchains. Allow several minutes and extra build storage.
 
-Overrides: `TORCL_PGO_TARGET` (default `x86_64-unknown-linux-musl`, must be
-runnable on the build host), `TORCL_PGO_ROOT` (artifact directory),
-`TORCL_IMAGE_OUT` (output executable), and `CARGO_BUILD_JOBS` (build parallelism).
+Overrides: `EGCL_PGO_TARGET` (default `x86_64-unknown-linux-musl`, must be
+runnable on the build host), `EGCL_PGO_ROOT` (artifact directory),
+`EGCL_IMAGE_OUT` (output executable), and `CARGO_BUILD_JOBS` (build parallelism).
 Both compiler passes preserve the same `CARGO_ENCODED_RUSTFLAGS` or `RUSTFLAGS`.
 Failures leave the previous output executable intact and retain logs; failed
-image stages may also leave a `.torcl-pgo.*` directory beside the output.
+image stages may also leave a `.egcl-pgo.*` directory beside the output.
 Run `make test-pgo-build` for the orchestration tests (Python 3, no Rust build).
 Performance evidence and outstanding validation are in
 [the load-performance handoff](docs/design/load-performance-handoff.md).
 
-The implementation identifies itself as `TorCL` and provides the `:torcl`
-feature. Configuration uses `~/.torclrc` and `TORCL_*` environment variables.
+The implementation identifies itself as `EGCL` and provides the `:egcl`
+feature. Configuration uses `~/.egclrc` and `EGCL_*` environment variables.
 When migrating an existing installation, update initialization files and
 library feature conditionals, and rebuild saved images and compiled caches.
 The rename does not install compatibility aliases for the previous names.
@@ -187,10 +189,10 @@ cargo test
 Run tests for one crate:
 
 ```sh
-cargo test -p torcl-rt
-cargo test -p torcl-compiler
-cargo test -p torcl-stdlib
-cargo test -p torcl
+cargo test -p egcl-rt
+cargo test -p egcl-compiler
+cargo test -p egcl-stdlib
+cargo test -p egcl
 ```
 
 Fuzz targets live under `fuzz/` and run via `cargo-fuzz`:
@@ -206,7 +208,7 @@ clippy on Linux and macOS, a nightly fuzzing job, and sanitizer builds.
 
 ## CLI Usage
 
-The [TorCL-specific Lisp API manual](docs/torcl-lisp-api.md) documents the
+The [EGCL-specific Lisp API manual](docs/egcl-lisp-api.md) documents the
 currently callable extensions and the status of the complete planned Lisp API,
 including fibers, native threads, synchronization, compiler introspection,
 sandboxing, and developer tools.
@@ -214,33 +216,33 @@ sandboxing, and developer tools.
 Run the REPL:
 
 ```sh
-cargo run -p torcl
+cargo run -p egcl
 ```
 
 Evaluate an expression:
 
 ```sh
-cargo run -p torcl -- --eval "(+ 1 2)"
+cargo run -p egcl -- --eval "(+ 1 2)"
 ```
 
 Load a file:
 
 ```sh
-cargo run -p torcl -- --load path/to/file.lisp
+cargo run -p egcl -- --load path/to/file.lisp
 ```
 
 Run a script and pass arguments through to Lisp as `*COMMAND-LINE-ARGS*`:
 
 ```sh
-cargo run -p torcl -- path/to/script.lisp -- arg1 arg2
+cargo run -p egcl -- path/to/script.lisp -- arg1 arg2
 ```
 
 The CLI currently accepts:
 
 ```text
-Usage: torcl [OPTIONS] [SCRIPT] [-- CL-ARGS...]
+Usage: egcl [OPTIONS] [SCRIPT] [-- CL-ARGS...]
 
-TorCL Common Lisp
+EGCL Common Lisp
 
 Options:
   --help               Print this help message and exit
@@ -269,8 +271,8 @@ The bootstrap prelude (`lib/boot.lisp`) now loads by default; `--bootstrap`
 is retained only for compatibility, and `--no-bootstrap` starts the raw
 evaluator without it.
 
-When starting the REPL without `--no-init`, TorCL attempts to load the file
-specified by `TORCL_INIT_FILE`; if that is unset, it falls back to `~/.torclrc`.
+When starting the REPL without `--no-init`, EGCL attempts to load the file
+specified by `EGCL_INIT_FILE`; if that is unset, it falls back to `~/.egclrc`.
 
 ## Specification
 
@@ -298,7 +300,7 @@ python3 scripts/spec-coverage.py --gate
 ## Performance benchmarks
 
 The [performance lab](benchmarks/README.md) compares identical Fibonacci and
-Ironclad-derived workloads on TorCL and SBCL, with correctness checks, repeated
+Ironclad-derived workloads on EGCL and SBCL, with correctness checks, repeated
 measurements, and a standalone HTML report. Run `python3 benchmarks/run.py`
 after building the release binary. Results report whichever runtime is faster.
 
