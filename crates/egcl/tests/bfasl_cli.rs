@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! End-to-end `.bfasl` compile/load through the CLI (bliss-lb6.6, spec §6.11):
 //! compile a source file to a `.bfasl`, load it in a *fresh* process, and verify
 //! version-mismatch rejection.
@@ -3329,4 +3332,68 @@ fn asdf_bfasl_load_asd_runs_under_bytecode() {
         stdout.contains("LOAD-ASD-OK"),
         "missing success marker\nstdout: {stdout}\nstderr: {stderr}"
     );
+}
+
+/// A compiled `(setf (slot-value o 's) v)` must lower to the internal store
+/// primitive, not to a call to the bootstrap's `(setf slot-value)` writer.
+///
+/// boot.lisp defines `(defun (setf slot-value) …)` so that `#'(setf slot-value)`
+/// is a real function designator (bliss-6buay). The lowerer probed
+/// `user_setf_writer_place` BEFORE its own direct `SET-SLOT-VALUE` arm, so that
+/// definition silently converted every compiled slot store into a `CallNamed`
+/// on `EGCL-INTERNAL::%SETF-WRITER-SLOT-VALUE` — a function only the bootstrap
+/// defines. The .bfasl then failed to load under `--no-bootstrap` with
+/// "undefined function" (bliss-42oty).
+///
+/// Both halves matter. The byte check pins the lowering DECISION, so reordering
+/// the place-dispatch chain again fails here for the right reason; the load
+/// proves the consequence the user actually saw.
+#[test]
+fn compiled_slot_value_store_does_not_call_the_bootstrap_setf_writer() {
+    let dir = workdir("slot-value-store");
+    let src = dir.join("store.lisp");
+    let out = dir.join("store.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defclass holder () ((item :initarg :item)))
+      (defun holder-store (x v) (setf (slot-value x 'item) v))
+      (let ((o (make-instance 'holder :item nil)))
+        (format t "STORED ~S~%" (list (holder-store o 42) (slot-value o 'item))))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} :output-file {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let bytes = fs::read(&out).unwrap();
+    let needle = b"%SETF-WRITER-SLOT-VALUE";
+    assert!(
+        !bytes.windows(needle.len()).any(|w| w == needle),
+        "the .bfasl names the bootstrap writer, so the place took the writer \
+         call instead of the direct EGCL::SET-SLOT-VALUE store"
+    );
+
+    // Source-free, and with no bootstrap to supply the writer even if it were
+    // referenced.
+    fs::remove_file(&src).unwrap();
+    let loaded = Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--load"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "STORED (42 42)"
+    );
+    fs::remove_dir_all(dir).unwrap();
 }

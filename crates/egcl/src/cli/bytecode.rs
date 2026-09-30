@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T0 bytecode interpreter — slice 1: spine + fallback harness (bliss-nmq.1).
 //!
 //! This is the first slice of the unified control-stack execution model
@@ -3284,6 +3287,35 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some((mut inst, mut slot)) = slot_value_setf_place(place) {
+                // `(setf (slot-value o 's) v)` → the internal store primitive.
+                //
+                // MUST stay ABOVE user_setf_writer_place. boot.lisp defines
+                // `(defun (setf slot-value) …)` so that #'(setf slot-value) is a
+                // real function designator (bliss-6buay) — and that registration
+                // made the writer probe, which used to run first, hijack this
+                // direct store: every compiled `(setf (slot-value …))` became a
+                // CALL to EGCL-INTERNAL::%SETF-WRITER-SLOT-VALUE, a function only
+                // the bootstrap defines, so the .bfasl stopped loading under
+                // --no-bootstrap (bliss-42oty). `(setf symbol-function)` is
+                // defined in boot.lisp too and was never affected, because its
+                // direct arm already sat above the writer probe; that asymmetry is
+                // exactly what this ordering removes.
+                egcl_rt::rooted_ref!(_inst_root = &mut inst);
+                egcl_rt::rooted_ref!(_slot_root = &mut slot);
+                let sym = resolve_sym("EGCL::SET-SLOT-VALUE")
+                    .ok_or(Bail)?
+                    .as_symbol_index();
+                self.lower_expr(inst)?;
+                self.lower_expr(slot)?;
+                self.lower_expr(items[2 * i + 1])?;
+                self.emit(Instr::CallNamed { sym, nargs: 3 });
+                self.pop_n(3);
+                self.push_n(1);
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else if let Some((writer, args)) = self.user_setf_writer_place(place) {
                 // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
                 // call the writer as `(writer val a b)` — the new value is the
@@ -3349,22 +3381,6 @@ impl<'e> Lowerer<'e> {
                 }
                 self.emit(Instr::CallNamed { sym: writer, nargs });
                 self.pop_n(nargs);
-                self.push_n(1);
-                if !last {
-                    self.emit(Instr::Pop);
-                    self.pop_n(1);
-                }
-            } else if let Some((mut inst, mut slot)) = slot_value_setf_place(place) {
-                egcl_rt::rooted_ref!(_inst_root = &mut inst);
-                egcl_rt::rooted_ref!(_slot_root = &mut slot);
-                let sym = resolve_sym("EGCL::SET-SLOT-VALUE")
-                    .ok_or(Bail)?
-                    .as_symbol_index();
-                self.lower_expr(inst)?;
-                self.lower_expr(slot)?;
-                self.lower_expr(items[2 * i + 1])?;
-                self.emit(Instr::CallNamed { sym, nargs: 3 });
-                self.pop_n(3);
                 self.push_n(1);
                 if !last {
                     self.emit(Instr::Pop);
