@@ -10,6 +10,8 @@
 >
 > Everything below describes what Evergreen is *trying* to be. Read it as a
 > statement of intent, not as a description of something you can depend on.
+> Evergreen can be both incredibly fast and embarrassingly slow.  Just know that 
+> this is a work in progress.
 >
 > Evergreen exists to find out
 > whether a real language implementation (a tiered JIT, a moving generational
