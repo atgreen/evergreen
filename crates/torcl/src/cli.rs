@@ -5743,10 +5743,22 @@ fn apply_class_initforms(
     Ok(())
 }
 
+/// Evaluate a `(initarg value)*` list into the slot-symbol representation the
+/// stdlib CLOS core fills slots from.
+///
+/// `supplied` — when given — additionally collects the same values keyed by the
+/// initarg NAMES the caller wrote. The initialization protocol needs those: CLHS
+/// 7.1.2 hands INITIALIZE-INSTANCE and SHARED-INITIALIZE the initargs, so a
+/// method's `&key components` binds the `:components` the caller passed. Keying
+/// those by slot name instead made every such parameter NIL whenever the initarg
+/// named a slot — iolib's FILE-PATH checks its :components in an :after method
+/// and saw nothing (bliss-vhr6e). It must be rooted by the caller: the values
+/// pushed into it are heap objects that later allocations can relocate.
 fn evaluated_initargs(
     class_name: &str,
     init_args: TorclVal,
     env: &mut Env,
+    mut supplied: Option<&mut Vec<TorclVal>>,
 ) -> Result<Vec<TorclVal>, TorclError> {
     let mut args_vec = list_to_vec(init_args);
     // Root the source FORMS and the accumulated key/value pairs across the
@@ -5763,6 +5775,10 @@ fn evaluated_initargs(
         let value = eval_form(args_vec[i + 1], env)?;
         initargs.push(*resolved);
         initargs.push(value);
+        if let Some(supplied) = supplied.as_deref_mut() {
+            supplied.push(*key);
+            supplied.push(value);
+        }
         i += 2;
     }
     Ok(std::mem::take(&mut *initargs))
@@ -21725,7 +21741,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                 let (instance_form, init_args) = cp(cdr);
                 let instance = eval_form(instance_form, env)?;
                 let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
-                let initargs = evaluated_initargs(&class_name, init_args, env)?;
+                let initargs = evaluated_initargs(&class_name, init_args, env, None)?;
                 let explicit_slots: Vec<String> = initargs
                     .chunks_exact(2)
                     .map(|pair| sym_bare_name_rc(pair[0]).to_string())
@@ -21743,7 +21759,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                 let (instance_form, init_args) = cp(cdr);
                 let instance = eval_form(instance_form, env)?;
                 let class_name = class_name_for_instance_class(torcl_stdlib::class_of(instance));
-                let initargs = evaluated_initargs(&class_name, init_args, env)?;
+                let initargs = evaluated_initargs(&class_name, init_args, env, None)?;
                 return reinitialize_instance_values(instance, &initargs, env);
             }
             "TORCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
@@ -33037,7 +33053,11 @@ fn eval_make_instance(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
     torcl_rt::rooted!(class_input = eval_form(class_form, env)?);
     let class = resolve_class_metaobject(env, *class_input)?;
     let class_name = class_name_for_instance_class(class);
-    let mut initargs = evaluated_initargs(&class_name, init_args, env)?;
+    // The initargs as the caller wrote them, for the initialization protocol
+    // below; `initargs` itself is keyed by slot name, for filling slots.
+    torcl_rt::rooted!(supplied_initargs = Vec::<TorclVal>::new());
+    let mut initargs =
+        evaluated_initargs(&class_name, init_args, env, Some(&mut supplied_initargs))?;
 
     // Apply :default-initargs (CLHS 7.1.4): for each effective default whose
     // initarg the caller did NOT supply, evaluate its value form and append it
@@ -33067,13 +33087,16 @@ fn eval_make_instance(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
             if supplied.contains(&initarg) {
                 continue;
             }
-            let initarg_kw = resolve_sym(&format!(":{}", initarg)).unwrap_or(NIL);
+            torcl_rt::rooted!(initarg_kw_root = resolve_sym(&format!(":{}", initarg)).unwrap_or(NIL));
             // resolve_slot_symbol interns (allocates); root the slot symbol
             // before the value form's eval_form can GC.
-            torcl_rt::rooted!(slot_root = resolve_slot_symbol(&class_name, initarg_kw, env)?);
+            torcl_rt::rooted!(slot_root = resolve_slot_symbol(&class_name, *initarg_kw_root, env)?);
             let value = eval_form(form, env)?;
             rooted.push(*slot_root);
             rooted.push(value);
+            // A default-initarg reaches the protocol under its own name too.
+            supplied_initargs.push(*initarg_kw_root);
+            supplied_initargs.push(value);
         }
         initargs = std::mem::take(&mut *rooted);
     }
@@ -33101,14 +33124,14 @@ fn eval_make_instance(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, TorclErr
     // primary, hence before initialize-instance's own :after methods.
     // initialize-instance is called as (instance &rest initargs); shared-initialize
     // as (instance slot-names &rest initargs) with slot-names = T (all slots).
-    let mut ii_args = Vec::with_capacity(initargs.len() + 1);
+    let mut ii_args = Vec::with_capacity(supplied_initargs.len() + 1);
     ii_args.push(instance);
-    ii_args.extend_from_slice(&initargs);
+    ii_args.extend_from_slice(&supplied_initargs);
     torcl_rt::rooted_ref!(_iig = &mut ii_args);
-    let mut si_args = Vec::with_capacity(initargs.len() + 2);
+    let mut si_args = Vec::with_capacity(supplied_initargs.len() + 2);
     si_args.push(instance);
     si_args.push(T);
-    si_args.extend_from_slice(&initargs);
+    si_args.extend_from_slice(&supplied_initargs);
     torcl_rt::rooted_ref!(_sig = &mut si_args);
     run_initialization_aux_methods(
         env,
@@ -33362,6 +33385,20 @@ const DIRECT_FAST: &[&str] = &[
     "VALUES-LIST",
     "REVERSE",
     "ENDP",
+    // INTEGER-LENGTH and LOGCOUNT (bliss-dvfk5). Their fixnum kernels are
+    // already a single instruction each -- leading_zeros and count_ones -- so
+    // the entire cost was reaching them: a native call resolved the callee by
+    // NAME on every iteration, the overhead this table exists to remove.
+    // Measured in a warmed T2 loop against a 151 ns empty-loop floor:
+    //
+    //   (integer-length i)  1041.00 ns/iter    (abs …) is 301.50, and it is
+    //   (logcount i)        1042.50 ns/iter     already in this list
+    //
+    // Both satisfy the membership rule above: leaf (pure arithmetic, no
+    // re-entry into Lisp) and dispatched by `apply_builtin_fast` on evaluated
+    // arguments, so the direct call reaches an identical kernel.
+    "INTEGER-LENGTH",
+    "LOGCOUNT",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
