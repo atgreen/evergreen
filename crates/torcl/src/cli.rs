@@ -18899,6 +18899,21 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
                                     },
                                 );
                             }
+                            "COMPILER-MACRO-FUNCTION" => {
+                                // (setf (compiler-macro-function name) fn) — how
+                                // CLHS 3.2.2.1 says a compiler macro is installed,
+                                // and how a library aliases one: iolib's DEFALIAS
+                                // copies a compiler macro from one name to another
+                                // that way (bliss-vhr6e).
+                                let sym = eval_form(tgt_form, env)?;
+                                if !sym.is_symbol() {
+                                    return Err(TorclError::TypeError {
+                                        datum: sym,
+                                        expected: "SYMBOL".to_string(),
+                                    });
+                                }
+                                install_compiler_macro_function(env, sym, *val)?;
+                            }
                             "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT"
                             | "BIT" | "SBIT" => {
                                 // (setf (char string index) val) and friends —
@@ -30396,6 +30411,7 @@ fn get_setf_expansion(place: TorclVal, env: &mut Env) -> Result<SetfExpansion, T
                     | "SYMBOL-FUNCTION"
                     | "FDEFINITION"
                     | "MACRO-FUNCTION"
+                    | "COMPILER-MACRO-FUNCTION"
                     | "CHAR"
                     | "SCHAR"
                     | "AREF"
@@ -30647,6 +30663,74 @@ fn eval_define_compiler_macro(cdr: TorclVal, env: &mut Env) -> Result<TorclVal, 
     );
 
     Ok(name_form)
+}
+
+/// Indicator under which a compiler macro installed as a FUNCTION is kept on its
+/// name symbol. A symbol property is scanned by the collector and travels with a
+/// saved image, so the function object stays rooted without a second registry.
+const COMPILER_MACRO_FUNCTION_PROPERTY: &str = "TORCL::%COMPILER-MACRO-FUNCTION";
+
+/// NAME's compiler macro when it was installed as a function, else None.
+pub(crate) fn installed_compiler_macro_function(name: TorclVal) -> Option<TorclVal> {
+    resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY)
+        .and_then(|indicator| plist_lookup(symbol_plist_of(name), indicator))
+        .filter(|function| !function.is_nil())
+}
+
+/// `(setf (compiler-macro-function name) fn)`: install FN as NAME's compiler
+/// macro, or remove NAME's compiler macro when FN is NIL.
+///
+/// CLHS calls the expander with the whole form and an environment, so that is
+/// what FN receives. The expander reads FN back from the symbol rather than
+/// capturing it, because the registered closure outlives any root a local would
+/// give the function object.
+fn install_compiler_macro_function(
+    env: &mut Env,
+    name: TorclVal,
+    function: TorclVal,
+) -> Result<(), TorclError> {
+    let Some(indicator) = resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY) else {
+        return Err(TorclError::Internal(
+            "SETF COMPILER-MACRO-FUNCTION: indicator symbol is unavailable".into(),
+        ));
+    };
+    if function.is_nil() {
+        symbol_plist_put(name, indicator, NIL);
+        compiler_macroexpand::undefine_compiler_macro(name);
+        return Ok(());
+    }
+    // COMPILER-MACRO-FUNCTION answers T for a DEFINE-COMPILER-MACRO expander,
+    // which has no Lisp function object to install here (bliss-0g5lg). Copying
+    // that answer to another name therefore gives the other name no compiler
+    // macro — legal, since a compiler macro is always optional (CLHS 3.2.2.1),
+    // and better than installing something uncallable.
+    if function == T {
+        return Ok(());
+    }
+    let installed = coerce_installed_function(env, function);
+    symbol_plist_put(name, indicator, installed);
+    let sandbox = env.sandbox;
+    let eval_context = env.eval_context;
+    compiler_macroexpand::define_compiler_macro(
+        name,
+        Arc::new(move |form, _macro_env| {
+            torcl_rt::rooted!(form = form);
+            let expander = resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY)
+                .and_then(|indicator| plist_lookup(symbol_plist_of(name), indicator))
+                .filter(|expander| !expander.is_nil());
+            // Removed between registration and this call: decline by answering
+            // the form unchanged, which is always a legal compiler-macro result.
+            let Some(expander) = expander else {
+                return Ok(*form);
+            };
+            torcl_rt::rooted!(expander = expander);
+            let mut macro_env = Env::new_for_macro_expansion(sandbox);
+            torcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
+            macro_env.eval_context = eval_context;
+            apply_function(*expander, &[*form, NIL], &mut macro_env)
+        }),
+    );
+    Ok(())
 }
 
 /// True if a macro lambda list references `&ENVIRONMENT` — the only reason

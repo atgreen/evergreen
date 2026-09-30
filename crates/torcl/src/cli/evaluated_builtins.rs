@@ -986,15 +986,26 @@ fn resolve(name: &str) -> Option<Handler> {
             let args = RootedVals::new(args.to_vec());
             // (compiler-macro-function name &optional environment) → the
             // compiler macro or NIL. Compiler macros are always optional
-            // (CLHS 3.2.2.1). Like MACRO-FUNCTION above, torcl compiler macros
-            // are not first-class function objects, so return T when one is
-            // registered for NAME and NIL otherwise (callers use it as a
-            // boolean existence check). A `(setf f)` name never has one (the
-            // definer skips non-symbol names), so NIL is correct there.
+            // (CLHS 3.2.2.1).
+            //
+            // One installed as a FUNCTION — `(setf (compiler-macro-function …) fn)`
+            // — is handed back as that function, which is what CLHS specifies and
+            // what lets a caller copy it to another name (iolib's DEFALIAS does).
+            // One defined by DEFINE-COMPILER-MACRO is a host closure with no Lisp
+            // function object behind it, so it still answers T, the boolean
+            // existence answer callers have relied on; making that a real function
+            // needs the expander to become a Lisp lambda (bliss-0g5lg). A
+            // `(setf f)` name never has one (the definer skips non-symbol names),
+            // so NIL is correct there.
 
             let s = args.first().copied().unwrap_or(NIL);
-            if s.is_symbol() && compiler_macroexpand::has_compiler_macro(s) {
-                return Ok(T);
+            if s.is_symbol() {
+                if let Some(installed) = super::installed_compiler_macro_function(s) {
+                    return Ok(installed);
+                }
+                if compiler_macroexpand::has_compiler_macro(s) {
+                    return Ok(T);
+                }
             }
             Ok(NIL)
         }),
