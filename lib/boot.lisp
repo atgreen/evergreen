@@ -2005,9 +2005,14 @@
 ;;; ===========================================================================
 ;;; Conformance layer: sequence/list/string/number/control functions that were
 ;;; missing from the bootstrap prelude.  Everything here is pure Lisp on top of
-;;; the existing primitives (ELT, LENGTH, COERCE, FLOOR, REM, EXPT, ...).  The
-;;; builtin MOD is unreliable for negative arguments and MEMBER's :KEY is
-;;; broken, so these definitions avoid both (see CONFORMANCE-TODO.md).
+;;; the existing primitives (ELT, LENGTH, COERCE, FLOOR, REM, EXPT, ...).
+;;;
+;;; HISTORICAL: several definitions below route around builtin MOD (wrong sign
+;;; for negative arguments) and builtin MEMBER's :KEY (ignored).  BOTH BUILTINS
+;;; ARE NOW CORRECT -- measured: (mod -7 3) => 2 and (member 2 '((2)) :key #'car)
+;;; => ((2)).  The workarounds are kept only because they work and removing them
+;;; is a change to load-bearing bootstrap code; bliss-p3jme tracks unwinding
+;;; them.  Do not add NEW workarounds for either builtin.
 ;;; ===========================================================================
 
 ;;; --- shared helpers --------------------------------------------------------
@@ -2887,7 +2892,7 @@
 (%defstringcmp string-not-lessp '(> =) t)
 (%defstringcmp string-not-equal '(< >) t)
 
-;;; --- integer bit operations (non-negative; see CONFORMANCE-TODO.md) --------
+;;; --- integer bit operations (non-negative) ---------------------------------
 
 (defun floatp (x) (typep x 'float))
 (defun integerp (x) (typep x 'integer))
