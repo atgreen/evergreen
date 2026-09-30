@@ -7115,19 +7115,63 @@ fn visit_env_frame_roots(
     }
 }
 
-/// Walk a shared function-namespace map once per collection pass.
+thread_local! {
+    /// Function maps already walked in the CURRENT root-scan pass, by address.
+    /// Keyed by `torcl_rt::gc::root_scan_pass()` and cleared when the pass id
+    /// changes, exactly like `ENV_VISIT_STATE` (bliss-s56e). Use ONLY from GC
+    /// scan callbacks: outside a pass the id is stale and the set would wrongly
+    /// suppress visits.
+    static FUN_MAP_SCAN: RefCell<(u64, HashSet<usize>)> =
+        RefCell::new((u64::MAX, HashSet::new()));
+}
+
+/// Claim the function map at `addr` for this root-scan pass: `true` means it has
+/// already been walked and the caller must skip it.
+fn fun_map_scan_claimed(addr: usize) -> bool {
+    FUN_MAP_SCAN.with(|c| {
+        let mut c = c.borrow_mut();
+        let pass = torcl_rt::gc::root_scan_pass();
+        if c.0 != pass {
+            c.0 = pass;
+            c.1.clear();
+        }
+        !c.1.insert(addr)
+    })
+}
+
 fn visit_fun_map_roots(
     funs: &Arc<SharedCell<HashMap<String, FunDef>>>,
     _state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut TorclVal),
 ) {
-    // Deliberately NOT deduplicated by map address, and `try_borrow_mut` rather
-    // than `borrow_mut`: preserve the existing function-map scanning policy.
-    // An earlier version here skipped a map it had
-    // already seen this pass, which measured no faster (tracing cost 557s vs
-    // 558s on an identical workload) and is exactly the kind of cleverness that
-    // makes a root scanner wrong. A map reachable twice is simply walked twice.
+    visit_shared_fun_map_roots(funs, visit);
+}
+
+/// Walk one function map's FunDefs, at most once per root-scan pass.
+///
+/// The dedup is load-bearing now, where it once was not. This used to be
+/// deliberately un-deduplicated, on the grounds that skipping a map already seen
+/// measured no faster (tracing 557s vs 558s) and that cleverness in a root
+/// scanner is how root scanners go wrong. That held while these maps were
+/// reached only as a closure's captured namespace. Since `FunDef::def_funs`
+/// SHARES the enclosing map instead of owning a copy (bliss-fyofj), one map is
+/// reachable from every FunDef bound in its scope, and the walk multiplies with
+/// nesting depth: on a compile of one 34k-cons parser body,
+/// `visit_fun_def_roots` was 82% of the whole run. Walking a map once per pass
+/// is also strictly safer than walking it twice — the slots are the same memory
+/// either way, and one visit per collection is what the collector needs.
+fn visit_shared_fun_map_roots(
+    funs: &Arc<SharedCell<HashMap<String, FunDef>>>,
+    visit: &mut dyn FnMut(*mut TorclVal),
+) {
+    // `try_borrow_mut` (not `borrow_mut`) keeps the existing policy: a map the
+    // interpreter is holding is skipped rather than deadlocking the scan. Claim
+    // the address only once the borrow SUCCEEDED, so a skipped attempt does not
+    // consume this pass's one chance to walk it.
     if let Ok(mut map) = funs.try_borrow_mut() {
+        if fun_map_scan_claimed(Arc::as_ptr(funs) as usize) {
+            return;
+        }
         for def in map.values_mut() {
             visit_fun_def_roots(def, visit);
         }
@@ -7149,14 +7193,9 @@ fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut TorclVal)) {
     // strictly-older scope, so the parent chain is acyclic and this terminates;
     // the maps are distinct from the one being scanned, so the borrow is safe.
     if let Some(scope) = &def.def_funs {
-        // Same policy as `visit_fun_map_roots`, which walks these maps when they
-        // are reached as a closure's captured namespace: `try_borrow_mut`, and no
-        // deduplication by address — a map reachable twice is simply walked twice.
-        if let Ok(mut scope) = scope.try_borrow_mut() {
-            for inner in scope.values_mut() {
-                visit_fun_def_roots(inner, visit);
-            }
-        }
+        // The same shared map every other reference to this scope reaches, so it
+        // goes through the once-per-pass walk (see `visit_shared_fun_map_roots`).
+        visit_shared_fun_map_roots(scope, visit);
     }
 }
 
